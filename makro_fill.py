@@ -13,26 +13,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import sync_playwright
 
 from app.answer_resolver import RESOLVED, resolve_fields
-from app.browser_session import DEFAULT_CDP_PORT, connect_single_edge
-from app.makro_dryrun import fill_resolved_field
-from app.platforms.makro import is_makro_listing_page, parse_makro_listing_url
+from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness
+from app.makro import MAKRO_HOME_URL, base_section_title
+from app.makro.domain import MakroDomainAdapter
 from app.source_bundle import bundle_from_product_table, bundle_from_qa_file
-from makro_probe import (
-    MAKRO_HOME_URL,
-    build_semantic_fields,
-    find_sections,
-    scan_section_fields,
-    scan_sections,
-    wait_for_authenticated_listing,
-)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -96,56 +87,6 @@ def _load_bundle(args: argparse.Namespace):
         return bundle_from_qa_file(args.product, sku=args.sku or "", **kwargs)
 
 
-def _base_section_title(title: str) -> str:
-    """Return a stable Makro section identity, ignoring UI-only suffixes.
-
-    Makro appends changing completion counters such as ``(14/14)`` and can also
-    append ``(Optional)`` to section labels. Neither suffix is part of the
-    semantic section identity used by CLI selection or resolver matching.
-    """
-
-    normalized = re.sub(r"\s*\(\d+\s*/\s*\d+\)\s*$", "", title).strip()
-    normalized = re.sub(r"\s*\(\s*optional\s*\)\s*$", "", normalized, flags=re.IGNORECASE).strip()
-    return normalized
-
-
-def _assert_expected_vertical(page: Page, expected_vertical: str | None) -> None:
-    """Stop before scanning/filling if the current listing is the wrong vertical."""
-
-    if not expected_vertical:
-        return
-    target = parse_makro_listing_url(page.url)
-    actual = (target.vertical or "").strip()
-    expected = expected_vertical.strip()
-    if actual.casefold() != expected.casefold():
-        raise RuntimeError(
-            "当前 Add Listing vertical 与商品资料不匹配，已在扫描/填写前停止："
-            f" expected={expected!r}, actual={actual or '(missing)'!r}。"
-        )
-    print(f"vertical 安全校验通过：{actual}")
-
-
-def _find_section(page: Page, wanted: str) -> dict[str, Any] | None:
-    wanted_base = _base_section_title(wanted).casefold()
-    for section in find_sections(page):
-        if _base_section_title(str(section.get("title") or "")).casefold() == wanted_base:
-            return section
-    return None
-
-
-def _open_section_for_edit(page: Page, section: dict[str, Any]) -> None:
-    if not section.get("has_edit"):
-        return
-    path = str(section.get("path") or "")
-    if not path:
-        raise RuntimeError("section 缺少 DOM path，无法安全打开。")
-    card = page.locator(path).first
-    button = card.get_by_text("EDIT", exact=True).first
-    button.scroll_into_view_if_needed()
-    button.click()
-    page.wait_for_timeout(500)
-
-
 def _select_target_section(
     sections_payload: list[dict[str, Any]],
     resolutions: list[dict[str, Any]],
@@ -155,16 +96,16 @@ def _select_target_section(
     for item in resolutions:
         if item.get("status") != RESOLVED:
             continue
-        section = _base_section_title(str(item.get("section_heading") or ""))
+        section = base_section_title(str(item.get("section_heading") or ""))
         if section:
             resolved_by_section[section] = resolved_by_section.get(section, 0) + 1
 
     if requested:
-        wanted = _base_section_title(requested)
+        wanted = base_section_title(requested)
         return wanted if resolved_by_section.get(wanted, 0) else None
 
     for section in sections_payload:
-        title = _base_section_title(str(section.get("title") or ""))
+        title = base_section_title(str(section.get("title") or ""))
         if resolved_by_section.get(title, 0):
             return title
     return None
@@ -186,40 +127,41 @@ def main() -> int:
         print(f"预期 vertical：{args.expected_vertical}")
 
     with sync_playwright() as playwright:
-        session = connect_single_edge(
+        harness = EdgeHarness(
             playwright,
             profile_dir=profile_dir,
             port=args.cdp_port,
             start_url=MAKRO_HOME_URL,
         )
-        page = session.page
+        page = harness.page
         page.set_default_timeout(15_000)
+        adapter = MakroDomainAdapter(page)
 
-        if session.launched_now:
+        if harness.launched_now:
             print("已启动长期 Makro Edge。以后脚本将复用这个浏览器，不再重复启动。")
         else:
             print("已连接现有 Makro Edge；不会新开浏览器。")
 
         # Never navigate away from an already-open listing. If the long-lived
         # Edge was just created (or is on another page), let the user navigate in
-        # that same window and then continue.
-        if not is_makro_listing_page(page):
-            wait_for_authenticated_listing(
-                page,
+        # that same window and then continue. The Makro domain adapter owns all
+        # listing recognition and waiting; the CLI only supplies policy flags.
+        if not adapter.is_listing_page():
+            adapter.wait_for_authenticated_listing(
                 MAKRO_HOME_URL,
                 headless=False,
-                navigate_first=session.launched_now,
+                navigate_first=harness.launched_now,
             )
 
-        _assert_expected_vertical(page, args.expected_vertical)
+        page = harness.ensure_page()
+        adapter.assert_expected_vertical(args.expected_vertical)
 
-        sections_payload, flat_controls, scan_stats = scan_sections(
-            page,
+        sections_payload, flat_controls, scan_stats = adapter.scan_sections(
             include_values=False,
             wait_ms=args.scroll_wait_ms,
             max_scroll_steps=args.max_scroll_steps,
         )
-        semantic_fields = build_semantic_fields(flat_controls)
+        semantic_fields = adapter.build_semantic_fields(flat_controls)
         resolved = resolve_fields(semantic_fields, bundle)
 
         resolutions_payload: list[dict[str, Any]] = []
@@ -249,20 +191,19 @@ def main() -> int:
         else:
             print(f"本次 dry-run 只填写一个 section：{target_section}")
             print("其他 section 已解析但不填写，避免在禁止 Save 的阶段跨 section 丢失状态。")
-            current = _find_section(page, target_section)
+            current = adapter.find_section(target_section)
             if current is None:
                 raise RuntimeError(f"当前页面找不到 section：{target_section}")
-            _open_section_for_edit(page, current)
-            current = _find_section(page, target_section) or current
+            adapter.open_section_for_edit(current)
+            current = adapter.find_section(target_section) or current
             section_path = str(current.get("path") or "")
-            fresh_controls = scan_section_fields(
-                page,
+            fresh_controls = adapter.scan_section_fields(
                 section_path,
                 include_values=False,
                 wait_ms=args.scroll_wait_ms,
                 max_scroll_steps=args.max_scroll_steps,
             )
-            fresh_fields = build_semantic_fields(fresh_controls)
+            fresh_fields = adapter.build_semantic_fields(fresh_controls)
             fresh_answers = resolve_fields(fresh_fields, bundle)
             fresh_field_by_key = {
                 str(field.get("attribute_key") or ""): field for field in fresh_fields
@@ -273,7 +214,7 @@ def main() -> int:
                 semantic_field = fresh_field_by_key.get(answer.attribute_key)
                 if semantic_field is None:
                     continue
-                result = fill_resolved_field(page, semantic_field, answer)
+                result = adapter.fill_resolved_field(semantic_field, answer)
                 verifications.append(result.as_dict())
                 print(f"  {answer.label}: {result.status}")
 

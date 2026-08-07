@@ -219,9 +219,45 @@ def _select_evidence(candidates: list[SourceEvidence]) -> tuple[SourceEvidence |
     return candidates[0], None
 
 
-def resolve_field(
-    semantic_field: dict[str, Any], bundle: ProductSourceBundle
+def _missing_or_fallback(
+    semantic_field: dict[str, Any],
+    bundle: ProductSourceBundle,
+    fallback: Any | None,
+    detail: str,
 ) -> ResolvedAnswer:
+    """Return a fallback answer when allowed, otherwise the MISSING answer.
+
+    Business fields are never eligible for fallback: their values must come
+    from explicit structured/config/rule sources only.
+    """
+
+    attribute_key = str(semantic_field.get("attribute_key") or "")
+    label = str(semantic_field.get("label") or attribute_key)
+    if fallback is not None and not _is_business_field(attribute_key):
+        candidate = fallback.try_resolve(semantic_field, bundle)
+        if isinstance(candidate, ResolvedAnswer) and candidate.status == RESOLVED:
+            return candidate
+    return ResolvedAnswer(
+        attribute_key=attribute_key,
+        label=label,
+        status=MISSING,
+        detail=detail,
+    )
+
+
+def resolve_field(
+    semantic_field: dict[str, Any],
+    bundle: ProductSourceBundle,
+    fallback: Any | None = None,
+) -> ResolvedAnswer:
+    """Resolve one semantic field from explicit evidence only.
+
+    ``fallback`` is an optional last-resort resolver (see
+    ``app.makro.fallback``). It is consulted only when deterministic semantic
+    resolution has no safe answer, and never for business/operational fields
+    (SKU, price, MOQ, stock, shipping...). The default ``None`` keeps the
+    current behavior unchanged; no LLM is called in this task.
+    """
     attribute_key = str(semantic_field.get("attribute_key") or "")
     label = str(semantic_field.get("label") or attribute_key)
     candidates = bundle.candidates(_candidate_keys(semantic_field))
@@ -247,23 +283,18 @@ def resolve_field(
             detail=f"发现来源冲突：{conflict_detail}",
         )
     if chosen is None:
-        return ResolvedAnswer(
-            attribute_key=attribute_key,
-            label=label,
-            status=MISSING,
-            detail="没有找到与 attribute_key/label 精确对应的明确证据。",
+        return _missing_or_fallback(
+            semantic_field,
+            bundle,
+            fallback,
+            "没有找到与 attribute_key/label 精确对应的明确证据。",
         )
 
     values = _raw_values(chosen.value, multi_value=bool(semantic_field.get("multi_value")))
     qualifier_options = _qualifier_options(semantic_field)
     values, qualifier, qualifier_match = _extract_qualifier(values, qualifier_options)
     if not values:
-        return ResolvedAnswer(
-            attribute_key=attribute_key,
-            label=label,
-            status=MISSING,
-            detail="证据值为空。",
-        )
+        return _missing_or_fallback(semantic_field, bundle, fallback, "证据值为空。")
 
     option_matches: list[dict[str, str]] = []
     value_options = _value_options(semantic_field)
@@ -306,6 +337,9 @@ def resolve_field(
 
 
 def resolve_fields(
-    semantic_fields: Iterable[dict[str, Any]], bundle: ProductSourceBundle
+    semantic_fields: Iterable[dict[str, Any]],
+    bundle: ProductSourceBundle,
+    fallback: Any | None = None,
 ) -> list[ResolvedAnswer]:
-    return [resolve_field(field, bundle) for field in semantic_fields]
+    """Resolve every semantic field; see :func:`resolve_field` for fallback."""
+    return [resolve_field(field, bundle, fallback=fallback) for field in semantic_fields]

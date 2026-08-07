@@ -31,23 +31,7 @@ class FillVerification:
         }
 
 
-def _css_attr(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def selector_for_control(control: dict[str, Any]) -> str:
-    """Prefer selectors that remain unique for Makro multi-value controls."""
-
-    name = str(control.get("name") or "")
-    if name:
-        return f'[name="{_css_attr(name)}"]'
-    path = str(control.get("path") or "")
-    if path:
-        return path
-    candidates = control.get("selector_candidates") or []
-    if candidates:
-        return str(candidates[0])
-    raise ValueError("控件没有可用 selector。")
+from .makro.locators import selector_for_control  # noqa: F401  (re-exported for back-compat)
 
 
 def _value_index(control: dict[str, Any]) -> tuple[int, str]:

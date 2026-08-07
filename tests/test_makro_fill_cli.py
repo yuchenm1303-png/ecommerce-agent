@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import makro_fill
+from app.makro import assert_expected_vertical, base_section_title
 
 
 def test_makro_fill_cli_imports_and_defaults_to_dry_run():
@@ -18,9 +19,9 @@ def test_makro_fill_cli_imports_and_defaults_to_dry_run():
 
 
 def test_section_ui_suffixes_are_not_part_of_identity():
-    assert makro_fill._base_section_title("Product Description (14/14)") == "Product Description"
-    assert makro_fill._base_section_title("Additional Description (Optional) (0/46)") == "Additional Description"
-    assert makro_fill._base_section_title("Additional Description (optional)") == "Additional Description"
+    assert base_section_title("Product Description (14/14)") == "Product Description"
+    assert base_section_title("Additional Description (Optional) (0/46)") == "Additional Description"
+    assert base_section_title("Additional Description (optional)") == "Additional Description"
 
 
 def test_target_section_uses_resolved_answers_only():
@@ -56,7 +57,7 @@ def test_expected_vertical_guard_accepts_matching_listing():
         url="https://seller.makro.co.za/index.html#dashboard/addListings/single?vertical=vehicle_camera_system"
     )
 
-    makro_fill._assert_expected_vertical(page, "vehicle_camera_system")
+    assert_expected_vertical(page, "vehicle_camera_system")
 
 
 def test_expected_vertical_guard_blocks_wrong_listing_before_fill():
@@ -65,7 +66,7 @@ def test_expected_vertical_guard_blocks_wrong_listing_before_fill():
     )
 
     with pytest.raises(RuntimeError, match="vertical"):
-        makro_fill._assert_expected_vertical(page, "vehicle_camera_system")
+        assert_expected_vertical(page, "vehicle_camera_system")
 
 
 def test_cli_has_no_save_submit_or_owned_browser_launch_action():

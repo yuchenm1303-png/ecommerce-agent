@@ -57,13 +57,24 @@
 - `app/`：核心业务代码。
   - `data_loader.py`：CSV/XLSX 商品表读取。
   - `source_bundle.py`：`ProductSourceBundle` / `SourceEvidence`，标准商品表与 QA 文件加载。
-  - `answer_resolver.py`：动态 semantic field → evidence-grounded answer。
+  - `answer_resolver.py`：动态 semantic field → evidence-grounded answer；可注入
+    `fallback`（仅确定性 MISSING 时咨询，经营字段永远不允许 fallback，本任务不调用 LLM）。
   - `makro_dryrun.py`：真实 Makro 安全填写与 readback。
+  - `browser_session.py`：`EdgeHarness` 长期 Edge 会话抽象（localhost CDP 附加、
+    不关闭外部浏览器、确定性页面选择、健康检查/重连）。
+  - `makro/`：Makro 领域适配层（skill layer）。
+    - `listing.py`：页面识别 / vertical 守卫 / 登录等待（只读启发式，不读凭据）。
+    - `sections.py`：section 标题归一化 / 发现 / 安全 EDIT 展开 / 安全 Cancel / 逐 section 扫描。
+    - `fields.py`：确定性 DOM 控件采集、滚动扫描、semantic field 分组（不硬编码类目字段）。
+    - `snapshot.py`：安全 DOM 快照（清洗值/脚本/敏感属性）。
+    - `locators.py`：字段定位策略（name → path → selector candidates）。
+    - `fallback.py`：`SemanticFallback` 协议 + `DeterministicOnlyFallback` 占位。
+    - `domain.py`：`MakroDomainAdapter` 门面，CLI 只保留策略。
   - `extractor.py`：普通 `<label>` 表单字段提取（mock/通用保守策略）。
   - `matcher.py`：旧通用字段匹配，只接受精确或明确别名。
   - `filler.py` / `validator.py`：旧通用填写与读回校验。
   - `runner.py`：旧 mock 批量执行与 JSONL 日志。
-  - `platforms/`：平台适配器（`base.py`、`mock.py`、`makro.py`）。
+  - `platforms/`：平台适配器（`base.py`、`mock.py`、`makro.py` 委托 `app.makro`）。
 - `makro_probe.py`：登录后的真实 DOM 动态探测 CLI（只读）。
 - `makro_fill.py`：真实 Makro evidence-grounded no-save dry-run CLI。
 - `mock_site/`：本地 mock 卖家后台。
