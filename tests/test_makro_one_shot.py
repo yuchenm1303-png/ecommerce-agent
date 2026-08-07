@@ -3,7 +3,12 @@ from __future__ import annotations
 import inspect
 
 import makro_listing_one_shot
-from app.makro.persisted_inspection import _SAVE_SAFE_VALUES, _save_candidate_for, run_one_shot_persisted_inspection
+from app.makro.persisted_inspection import (
+    _SAVE_SAFE_VALUES,
+    _gtin_check_digit,
+    _save_candidate_for,
+    run_one_shot_persisted_inspection,
+)
 
 
 def test_parser_requires_explicit_persist_switch():
@@ -20,6 +25,14 @@ def test_business_test_values_are_consistent():
     assert _SAVE_SAFE_VALUES["listing_status"] == "Inactive"
     sku = _save_candidate_for("sku_id", "20260807-234700")
     assert sku is not None and sku.startswith("COV") and sku.isalnum()
+
+
+def test_ean_test_value_is_valid_ean13():
+    ean = _SAVE_SAFE_VALUES["ean"]
+    assert len(ean) == 13
+    assert ean.isdigit()
+    assert _gtin_check_digit(ean[:-1]) == ean[-1]
+    assert ean == "2000000000015"
 
 
 def test_one_shot_has_no_manual_gate_between_sections():
