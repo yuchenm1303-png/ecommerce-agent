@@ -89,34 +89,53 @@
 
 **重要边界：** 普通 `EvidencePacket` 是通用数据交换格式，不等于“已经完成 grounded semantic 验证”。任何未来会驱动真实 Makro 写入的路径，都必须使用本次 source universe 重新校验 semantic packet，或使用由 grounded pipeline 直接产生的受控结果；不能仅因为 JSON 形状合法就授权浏览器写入。
 
-### OpenAI provider
+### Pluggable AI provider layer
 
-`app/providers/openai_semantic.py` 是第一套真实 multimodal provider adapter。核心 resolver 仍然保持 provider-neutral。
+Resolver 不再把 AI 能力绑定到单一厂商。`makro_resolve_ai.py` 是统一入口，provider 只负责把本次 QA + grounded text/image sources 转换为**未受信任候选 JSON**；后续 EvidencePacket、身份校验、business lock、冲突检测、置信度门槛和 field constraints 完全由项目自己的代码执行。
 
-它使用 OpenAI Responses API + strict JSON Schema，把文本 grounded sources 与本地商品图片发送给模型。模型输出首先被视为 **untrusted candidate JSON**，随后仍必须经过上述 grounding、QA、business、identity、confidence、conflict 和 field constraint 校验。
+当前正式支持两种 adapter：
 
-API key 只从标准环境变量 `OPENAI_API_KEY` 读取。项目没有 `--api-key` 命令行参数，也不会把 key 写入 report / manifest / Git。
+- `openai`：保留原生 OpenAI Responses API + strict JSON Schema adapter。
+- `openai-compatible`：通用 OpenAI-compatible Chat Completions 多模态 adapter，可接入提供兼容 API 且支持图片输入的第三方/其他厂商模型。
 
-单次完成“grounded semantic extraction + deterministic resolver + review queue”，且完全不打开 Makro：
+因此“API 协议兼容”与“模型有视觉能力”缺一不可。仅有文本模型不能完成商品图片解析；非 OpenAI-compatible 的原生 Gemini/Anthropic 等 API 以后只需要新增薄 adapter，不需要修改 Resolver。
+
+API key **只通过环境变量读取**。统一入口没有 `--api-key` 参数，避免 secret 落入 shell history、report 或 Git。默认：
+
+- `provider=openai` → `OPENAI_API_KEY`
+- `provider=openai-compatible` → `AI_API_KEY`
+
+也可以通过 `--api-key-env VENDOR_KEY` 指定任意环境变量名。
+
+通用 OpenAI-compatible 示例：
 
 ```powershell
-python makro_resolve_openai.py --qa <qa.xlsx> --image <front.jpg> --image <back.jpg> [source/trusted-data options]
+python makro_resolve_ai.py `
+  --provider openai-compatible `
+  --base-url "<vendor OpenAI-compatible API base URL>" `
+  --model "<vendor multimodal model name>" `
+  --api-key-env "VENDOR_API_KEY" `
+  --qa "<qa.xlsx>" `
+  --image "<front.png>" `
+  --image "<composite.png>" `
+  --supplier-snapshot "<source-snapshot.json>"
 ```
 
-常用可选输入：
+默认 `--structured-mode prompt_only`，兼容面更广；服务商明确支持 `response_format={type:json_object}` 时可使用：
 
 ```text
---supplier-snapshot <snapshot.json>
---official-snapshot <snapshot.json>
---product-table <products.xlsx>
---facts-json <trusted-facts.json>
---expected-model <model>
---expected-brand <brand>
---openai-model gpt-5.6
---batch-size 12
+--structured-mode json_object
 ```
 
-输出包括：
+原生 OpenAI 仍可通过统一入口：
+
+```powershell
+python makro_resolve_ai.py --provider openai --model gpt-5.6 --qa <qa.xlsx> --image <front.jpg>
+```
+
+旧的 `makro_resolve_openai.py` 暂时保留作为兼容入口，但新集成优先使用 `makro_resolve_ai.py`。
+
+统一输出：
 
 - `validated-semantic-evidence.json`
 - `source-manifest.json`
@@ -127,7 +146,7 @@ python makro_resolve_openai.py --qa <qa.xlsx> --image <front.jpg> --image <back.
 - `review-queue.xlsx`
 - `run-manifest.json`
 
-该命令明确记录 `makro_browser_opened=false`、`writes_performed=0`、`save_clicked=false`、`send_to_qc_clicked=false`。
+`run-manifest.json` 记录 provider/model/base URL/API-key 环境变量名等**非 secret 配置**，并明确记录 `makro_browser_opened=false`、`writes_performed=0`、`save_clicked=false`、`send_to_qc_clicked=false`。
 
 ### 来源置信度上限
 
