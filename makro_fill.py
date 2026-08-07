@@ -21,6 +21,7 @@ from playwright.sync_api import Page, sync_playwright
 
 from app.answer_resolver import RESOLVED, resolve_fields
 from app.makro_dryrun import fill_resolved_field
+from app.platforms.makro import parse_makro_listing_url
 from app.source_bundle import bundle_from_product_table, bundle_from_qa_file
 from makro_probe import (
     MAKRO_HOME_URL,
@@ -52,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--section",
         default=None,
         help="只填写指定 section（可写 Product Description 等，不含 (x/y) 计数）；默认选首个有 resolved 答案的 section",
+    )
+    parser.add_argument(
+        "--expected-vertical",
+        default=None,
+        help="可选安全门。要求当前 Add Listing URL 的 vertical 与此值完全一致；不一致时在扫描/填写前停止",
     )
     parser.add_argument("--browser", choices=("edge", "chromium"), default="edge")
     parser.add_argument("--profile-dir", default="browser_profiles/makro-edge")
@@ -87,6 +93,22 @@ def _load_bundle(args: argparse.Namespace):
 
 def _base_section_title(title: str) -> str:
     return re.sub(r"\s*\(\d+\s*/\s*\d+\)\s*$", "", title).strip()
+
+
+def _assert_expected_vertical(page: Page, expected_vertical: str | None) -> None:
+    """Stop before scanning/filling if the current listing is the wrong vertical."""
+
+    if not expected_vertical:
+        return
+    target = parse_makro_listing_url(page.url)
+    actual = (target.vertical or "").strip()
+    expected = expected_vertical.strip()
+    if actual.casefold() != expected.casefold():
+        raise RuntimeError(
+            "当前 Add Listing vertical 与商品资料不匹配，已在扫描/填写前停止："
+            f" expected={expected!r}, actual={actual or '(missing)'!r}。"
+        )
+    print(f"vertical 安全校验通过：{actual}")
 
 
 def _find_section(page: Page, wanted: str) -> dict[str, Any] | None:
@@ -145,6 +167,8 @@ def main() -> int:
     print(f"SKU：{bundle.sku or '(QA 文件未指定)'}")
     print(f"user_data_dir：{profile_dir}")
     print("安全模式：dry-run；不会点击 Save / Send to QC。")
+    if args.expected_vertical:
+        print(f"预期 vertical：{args.expected_vertical}")
 
     with sync_playwright() as playwright:
         context = playwright.chromium.launch_persistent_context(
@@ -163,6 +187,7 @@ def main() -> int:
                 headless=args.headless,
                 navigate_first=True,
             )
+            _assert_expected_vertical(page, args.expected_vertical)
 
             sections_payload, flat_controls, scan_stats = scan_sections(
                 page,
@@ -174,10 +199,6 @@ def main() -> int:
             resolved = resolve_fields(semantic_fields, bundle)
 
             resolutions_payload: list[dict[str, Any]] = []
-            field_lookup = {
-                (str(field.get("section_heading") or ""), str(field.get("attribute_key") or "")): field
-                for field in semantic_fields
-            }
             for answer in resolved:
                 data = answer.as_dict()
                 matching_field = next(
@@ -241,6 +262,7 @@ def main() -> int:
                 "page_url": page.url,
                 "sku": bundle.sku,
                 "source_file": str(Path(args.product).resolve()),
+                "expected_vertical": args.expected_vertical,
                 "scan": scan_stats,
                 "semantic_field_count": len(semantic_fields),
                 "target_section": target_section,
