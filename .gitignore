@@ -18,9 +18,19 @@ Thumbs.db
 storage_state.json
 *.cookie.json
 
+# Local authenticated browser state
+browser_profiles/
+.auth/
+
+# Customer/private source material
+private_data/
+*.rar
+*.zip
+
 # Runtime output
 logs/*.jsonl
 logs/*.log
+logs/makro-probe/
 !logs/.gitkeep
 
 # Generated local spreadsheets
