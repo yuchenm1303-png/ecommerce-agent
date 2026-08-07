@@ -54,6 +54,8 @@ _JSON_CONTRACT = {
     },
 }
 
+SUPPORTED_COMPAT_PROFILES = ("generic", "qwen-omni")
+
 
 def _image_data_uri(path_value: str) -> str:
     path = Path(path_value)
@@ -156,6 +158,32 @@ def _extract_message_text(response: Any) -> str:
     return str(content or "").strip()
 
 
+def _extract_stream_text(stream: Any) -> str:
+    """Collect text deltas from OpenAI-compatible streaming Chat Completions."""
+
+    parts: list[str] = []
+    for chunk in stream:
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            continue
+        delta = getattr(choices[0], "delta", None)
+        if delta is None:
+            continue
+        content = getattr(delta, "content", None)
+        if isinstance(content, str):
+            parts.append(content)
+            continue
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                else:
+                    text = getattr(item, "text", None)
+                if text:
+                    parts.append(str(text))
+    return "".join(parts).strip()
+
+
 def _parse_json_object(text: str) -> dict[str, Any]:
     raw = text.strip()
     if not raw:
@@ -187,11 +215,10 @@ def _parse_json_object(text: str) -> dict[str, Any]:
 class OpenAICompatibleSemanticProvider:
     """Generic multimodal adapter for OpenAI-compatible Chat Completions APIs.
 
-    This adapter intentionally does not trust the model response. It only turns
-    a provider response into an untrusted JSON candidate. The existing grounded
-    semantic validation layer still enforces exact QA keys, source references,
-    literal evidence, identity guards, business locks, conflict handling and
-    confidence ceilings before anything can reach the resolver.
+    The optional compatibility profile only changes transport quirks. It never
+    weakens grounding or trust checks. `qwen-omni` follows Alibaba Bailian's
+    Qwen-Omni requirement to use streaming Chat Completions and text-only output
+    modalities while still accepting image_url inputs.
     """
 
     name = "openai-compatible-chat-semantic"
@@ -206,6 +233,7 @@ class OpenAICompatibleSemanticProvider:
         image_detail: str = "auto",
         max_output_tokens: int = 12000,
         structured_mode: str = "prompt_only",
+        compat_profile: str = "generic",
     ) -> None:
         if not model.strip():
             raise ValueError("model 不能为空。")
@@ -219,6 +247,10 @@ class OpenAICompatibleSemanticProvider:
             raise ValueError("max_output_tokens 不能小于 1000。")
         if structured_mode not in {"prompt_only", "json_object"}:
             raise ValueError("structured_mode 必须是 prompt_only/json_object。")
+        if compat_profile not in SUPPORTED_COMPAT_PROFILES:
+            raise ValueError(
+                "compat_profile 必须是 " + "/".join(SUPPORTED_COMPAT_PROFILES) + "。"
+            )
 
         if client is None:
             try:
@@ -235,6 +267,7 @@ class OpenAICompatibleSemanticProvider:
         self.image_detail = image_detail
         self.max_output_tokens = int(max_output_tokens)
         self.structured_mode = structured_mode
+        self.compat_profile = compat_profile
 
     def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -260,6 +293,12 @@ class OpenAICompatibleSemanticProvider:
         if self.structured_mode == "json_object":
             kwargs["response_format"] = {"type": "json_object"}
 
+        streaming = self.compat_profile == "qwen-omni"
+        if streaming:
+            kwargs["stream"] = True
+            kwargs["stream_options"] = {"include_usage": True}
+            kwargs["modalities"] = ["text"]
+
         try:
             response = self.client.chat.completions.create(**kwargs)
         except Exception as exc:
@@ -267,6 +306,7 @@ class OpenAICompatibleSemanticProvider:
                 f"OpenAI-compatible semantic extraction 调用失败：{exc}"
             ) from exc
 
-        payload = _parse_json_object(_extract_message_text(response))
+        output_text = _extract_stream_text(response) if streaming else _extract_message_text(response)
+        payload = _parse_json_object(output_text)
         payload["extractor"] = self.name
         return payload
