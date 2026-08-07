@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from .openai_compatible import OpenAICompatibleSemanticProvider
+from .openai_compatible import (
+    SUPPORTED_COMPAT_PROFILES,
+    OpenAICompatibleSemanticProvider,
+)
 from .openai_semantic import OpenAISemanticProvider
 
 
@@ -47,6 +50,7 @@ class ProviderConfig:
     image_detail: str = "auto"
     max_output_tokens: int = 12000
     structured_mode: str = "prompt_only"
+    compat_profile: str = "generic"
 
     def as_safe_dict(self) -> dict[str, Any]:
         """Return audit metadata without exposing secret values."""
@@ -59,6 +63,7 @@ class ProviderConfig:
             "image_detail": self.image_detail,
             "max_output_tokens": self.max_output_tokens,
             "structured_mode": self.structured_mode,
+            "compat_profile": self.compat_profile,
         }
 
 
@@ -108,6 +113,15 @@ def validate_provider_config(config: ProviderConfig) -> ProviderConfig:
         raise ProviderConfigurationError(
             "--structured-mode 必须是 prompt_only/json_object。"
         )
+    if config.compat_profile not in SUPPORTED_COMPAT_PROFILES:
+        raise ProviderConfigurationError(
+            "--compat-profile 必须是 " + "/".join(SUPPORTED_COMPAT_PROFILES) + "。"
+        )
+    if provider == "openai" and config.compat_profile != "generic":
+        raise ProviderConfigurationError(
+            "--compat-profile 仅用于 openai-compatible provider；原生 OpenAI 请使用 generic。"
+        )
+
     return ProviderConfig(
         provider=provider,
         model=config.model.strip(),
@@ -116,6 +130,7 @@ def validate_provider_config(config: ProviderConfig) -> ProviderConfig:
         image_detail=config.image_detail,
         max_output_tokens=int(config.max_output_tokens),
         structured_mode=config.structured_mode,
+        compat_profile=config.compat_profile,
     )
 
 
@@ -137,6 +152,7 @@ def build_semantic_provider(
             image_detail=normalized.image_detail,
             max_output_tokens=normalized.max_output_tokens,
             structured_mode=normalized.structured_mode,
+            compat_profile=normalized.compat_profile,
         )
 
     # Native OpenAI keeps the existing Responses API adapter and strict JSON
