@@ -13,26 +13,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import sync_playwright
 
 from app.answer_resolver import RESOLVED, resolve_fields
-from app.browser_session import DEFAULT_CDP_PORT, connect_single_edge
-from app.makro_dryrun import fill_resolved_field
-from app.platforms.makro import is_makro_listing_page, parse_makro_listing_url
+from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness
+from app.makro import MAKRO_HOME_URL, base_section_title, is_listing_url, parse_makro_listing_url
+from app.makro.domain import MakroDomainAdapter
 from app.source_bundle import bundle_from_product_table, bundle_from_qa_file
-from makro_probe import (
-    MAKRO_HOME_URL,
-    build_semantic_fields,
-    find_sections,
-    scan_section_fields,
-    scan_sections,
-    wait_for_authenticated_listing,
-)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -96,54 +87,33 @@ def _load_bundle(args: argparse.Namespace):
         return bundle_from_qa_file(args.product, sku=args.sku or "", **kwargs)
 
 
-def _base_section_title(title: str) -> str:
-    """Return a stable Makro section identity, ignoring UI-only suffixes.
+def _assert_single_listing_tab(context: Any) -> None:
+    """Fail explicitly instead of silently guessing when several listing tabs exist.
 
-    Makro appends changing completion counters such as ``(14/14)`` and can also
-    append ``(Optional)`` to section labels. Neither suffix is part of the
-    semantic section identity used by CLI selection or resolver matching.
+    Each listing tab is a different Makro draft; writing to the wrong one would
+    produce exactly the kind of "validated on the wrong page" false positive we
+    are guarding against. The user must close the extra tabs and re-run.
     """
 
-    normalized = re.sub(r"\s*\(\d+\s*/\s*\d+\)\s*$", "", title).strip()
-    normalized = re.sub(r"\s*\(\s*optional\s*\)\s*$", "", normalized, flags=re.IGNORECASE).strip()
-    return normalized
-
-
-def _assert_expected_vertical(page: Page, expected_vertical: str | None) -> None:
-    """Stop before scanning/filling if the current listing is the wrong vertical."""
-
-    if not expected_vertical:
+    listing_pages = [page for page in context.pages if is_listing_url(page.url)]
+    if len(listing_pages) <= 1:
         return
-    target = parse_makro_listing_url(page.url)
-    actual = (target.vertical or "").strip()
-    expected = expected_vertical.strip()
-    if actual.casefold() != expected.casefold():
-        raise RuntimeError(
-            "当前 Add Listing vertical 与商品资料不匹配，已在扫描/填写前停止："
-            f" expected={expected!r}, actual={actual or '(missing)'!r}。"
-        )
-    print(f"vertical 安全校验通过：{actual}")
-
-
-def _find_section(page: Page, wanted: str) -> dict[str, Any] | None:
-    wanted_base = _base_section_title(wanted).casefold()
-    for section in find_sections(page):
-        if _base_section_title(str(section.get("title") or "")).casefold() == wanted_base:
-            return section
-    return None
-
-
-def _open_section_for_edit(page: Page, section: dict[str, Any]) -> None:
-    if not section.get("has_edit"):
-        return
-    path = str(section.get("path") or "")
-    if not path:
-        raise RuntimeError("section 缺少 DOM path，无法安全打开。")
-    card = page.locator(path).first
-    button = card.get_by_text("EDIT", exact=True).first
-    button.scroll_into_view_if_needed()
-    button.click()
-    page.wait_for_timeout(500)
+    print("发现多个 Add a Single Listing 标签页，为避免填写到错误页面，请先关闭多余标签页：")
+    for index, page in enumerate(listing_pages):
+        target = None
+        try:
+            target = parse_makro_listing_url(page.url)
+        except ValueError:
+            pass
+        vertical = target.vertical if target else "?"
+        brand = target.brand if target else "?"
+        request_id = target.request_id if target else "?"
+        print(f"  tab {index}: vertical={vertical!r}, brand={brand!r}, requestId={request_id!r}")
+        print(f"    {page.url}")
+    raise RuntimeError(
+        "检测到多个 Add a Single Listing 标签页；已停止，不做任何填写。"
+        "请关闭多余标签页后重新运行。"
+    )
 
 
 def _select_target_section(
@@ -155,16 +125,16 @@ def _select_target_section(
     for item in resolutions:
         if item.get("status") != RESOLVED:
             continue
-        section = _base_section_title(str(item.get("section_heading") or ""))
+        section = base_section_title(str(item.get("section_heading") or ""))
         if section:
             resolved_by_section[section] = resolved_by_section.get(section, 0) + 1
 
     if requested:
-        wanted = _base_section_title(requested)
+        wanted = base_section_title(requested)
         return wanted if resolved_by_section.get(wanted, 0) else None
 
     for section in sections_payload:
-        title = _base_section_title(str(section.get("title") or ""))
+        title = base_section_title(str(section.get("title") or ""))
         if resolved_by_section.get(title, 0):
             return title
     return None
@@ -186,40 +156,52 @@ def main() -> int:
         print(f"预期 vertical：{args.expected_vertical}")
 
     with sync_playwright() as playwright:
-        session = connect_single_edge(
+        harness = EdgeHarness(
             playwright,
             profile_dir=profile_dir,
             port=args.cdp_port,
             start_url=MAKRO_HOME_URL,
         )
-        page = session.page
+        page = harness.page
         page.set_default_timeout(15_000)
+        adapter = MakroDomainAdapter(page)
 
-        if session.launched_now:
+        if harness.launched_now:
             print("已启动长期 Makro Edge。以后脚本将复用这个浏览器，不再重复启动。")
         else:
             print("已连接现有 Makro Edge；不会新开浏览器。")
 
         # Never navigate away from an already-open listing. If the long-lived
         # Edge was just created (or is on another page), let the user navigate in
-        # that same window and then continue.
-        if not is_makro_listing_page(page):
-            wait_for_authenticated_listing(
-                page,
+        # that same window and then continue. The Makro domain adapter owns all
+        # listing recognition and waiting; the CLI only supplies policy flags.
+        if not adapter.is_listing_page():
+            adapter.wait_for_authenticated_listing(
                 MAKRO_HOME_URL,
                 headless=False,
-                navigate_first=session.launched_now,
+                navigate_first=harness.launched_now,
             )
 
-        _assert_expected_vertical(page, args.expected_vertical)
+        # The user may have closed/replaced the original tab while the CLI was
+        # waiting. EdgeHarness can recover/select a different Page object, so
+        # always bind a fresh domain adapter to the recovered page before any
+        # guard, scan or write. Never keep an adapter pointing at a stale page.
+        page = harness.ensure_page()
+        adapter = MakroDomainAdapter(page)
+        # Never silently guess the target tab when several listing drafts are open.
+        _assert_single_listing_tab(harness.context)
+        listing_tab_count = sum(
+            1 for candidate in harness.context.pages if is_listing_url(candidate.url)
+        )
+        print(f"操作标签页：{page.url}")
+        adapter.assert_expected_vertical(args.expected_vertical)
 
-        sections_payload, flat_controls, scan_stats = scan_sections(
-            page,
+        sections_payload, flat_controls, scan_stats = adapter.scan_sections(
             include_values=False,
             wait_ms=args.scroll_wait_ms,
             max_scroll_steps=args.max_scroll_steps,
         )
-        semantic_fields = build_semantic_fields(flat_controls)
+        semantic_fields = adapter.build_semantic_fields(flat_controls)
         resolved = resolve_fields(semantic_fields, bundle)
 
         resolutions_payload: list[dict[str, Any]] = []
@@ -249,20 +231,19 @@ def main() -> int:
         else:
             print(f"本次 dry-run 只填写一个 section：{target_section}")
             print("其他 section 已解析但不填写，避免在禁止 Save 的阶段跨 section 丢失状态。")
-            current = _find_section(page, target_section)
+            current = adapter.find_section(target_section)
             if current is None:
                 raise RuntimeError(f"当前页面找不到 section：{target_section}")
-            _open_section_for_edit(page, current)
-            current = _find_section(page, target_section) or current
+            adapter.open_section_for_edit(current)
+            current = adapter.find_section(target_section) or current
             section_path = str(current.get("path") or "")
-            fresh_controls = scan_section_fields(
-                page,
+            fresh_controls = adapter.scan_section_fields(
                 section_path,
                 include_values=False,
                 wait_ms=args.scroll_wait_ms,
                 max_scroll_steps=args.max_scroll_steps,
             )
-            fresh_fields = build_semantic_fields(fresh_controls)
+            fresh_fields = adapter.build_semantic_fields(fresh_controls)
             fresh_answers = resolve_fields(fresh_fields, bundle)
             fresh_field_by_key = {
                 str(field.get("attribute_key") or ""): field for field in fresh_fields
@@ -273,9 +254,11 @@ def main() -> int:
                 semantic_field = fresh_field_by_key.get(answer.attribute_key)
                 if semantic_field is None:
                     continue
-                result = fill_resolved_field(page, semantic_field, answer)
+                result = adapter.fill_resolved_field(
+                    semantic_field, answer, section_path=section_path
+                )
                 verifications.append(result.as_dict())
-                print(f"  {answer.label}: {result.status}")
+                print(f"  {answer.label}: {result.status}  {result.detail}")
 
             print("\n已停在 Save 前：程序不会点击 Save。请直接在当前 Edge 中检查填写结果。")
 
@@ -291,6 +274,7 @@ def main() -> int:
             "expected_vertical": args.expected_vertical,
             "scan": scan_stats,
             "semantic_field_count": len(semantic_fields),
+            "listing_tab_count": listing_tab_count,
             "target_section": target_section,
             "resolutions": resolutions_payload,
             "verifications": verifications,

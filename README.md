@@ -47,6 +47,16 @@
 - 新增 `makro_fill.py`：真实 Makro dry-run CLI，动态扫描 → 解析 → 填写 → 回读，**绝不点击 Save / Send to QC**。
 - 当前 no-save 阶段一次只填写一个 section，并停在该 section 的 Save 前供人工检查；其他 section 会完成解析但不写入，避免跨 section 时依赖保存未验证的数据。
 
+### V0.4：成熟浏览器架构重构（Issue #6 baseline）
+
+- `app/makro/` 成为 Makro 领域适配层（skill layer）：`listing.py`（页面识别/vertical 守卫/登录等待）、`sections.py`（section 归一化/发现/安全展开/Cancel）、`fields.py`（确定性 DOM 控件采集与 semantic field 分组）、`snapshot.py`（安全 DOM 快照）、`locators.py`（字段定位策略）、`fallback.py`（deterministic-first 接口占位）。
+- `app/browser_session.py` 提供 `EdgeHarness`：附加唯一长期 Edge（localhost CDP）、永不关闭外部浏览器、确定性页面选择、健康检查/重连；`connect_single_edge()` 保留为兼容包装。
+- `makro_probe.py` / `makro_fill.py` 收敛为薄 CLI：Makro 行为全部委托 `app.makro`，CLI 只保留参数与策略（选哪个 section、dry-run）。
+- Deterministic-first：稳定 id / 已知组件结构走确定性 Playwright；选项匹配只允许精确规范化匹配；AI fallback 仅保留接口占位，本任务不调用任何 LLM，且经营字段永远不允许 fallback。
+- 证据边界不变：浏览器层只回答“页面有哪些字段”，`AnswerResolver` 只回答“哪些证据值安全”，执行层只写 `resolved`。
+- 日志继续保留字段级结构化输出（attribute_key / label / section / evidence / confidence / expected / actual / readback），不记录任何凭据。
+- 禁止 Save / Send to QC 的代码路径保持不变；`makro_fill.py` 仍只允许 no-save dry-run。
+
 ## 项目结构
 
 ```text
@@ -54,8 +64,17 @@ ecommerce-agent/
 ├─ app/
 │  ├─ data_loader.py
 │  ├─ source_bundle.py       # 商品证据统一模型 / table + QA 文件加载
-│  ├─ answer_resolver.py     # 动态 semantic field → 证据答案
+│  ├─ answer_resolver.py     # 动态 semantic field → 证据答案（可注入 fallback 接口）
 │  ├─ makro_dryrun.py        # 真实 Makro 安全填写 + readback
+│  ├─ browser_session.py     # EdgeHarness：长期 Edge 会话抽象（不关闭外部浏览器）
+│  ├─ makro/                 # Makro 领域适配层（skill layer）
+│  │  ├─ listing.py          #   页面识别 / vertical 守卫 / 登录等待
+│  │  ├─ sections.py         #   section 归一化 / 发现 / 安全展开 / Cancel
+│  │  ├─ fields.py           #   DOM 控件采集 + semantic field 分组
+│  │  ├─ snapshot.py         #   安全 DOM 快照
+│  │  ├─ locators.py         #   字段定位策略
+│  │  ├─ fallback.py         #   deterministic-first / AI-fallback 占位
+│  │  └─ domain.py           #   MakroDomainAdapter 门面
 │  ├─ extractor.py
 │  ├─ matcher.py
 │  ├─ filler.py
@@ -65,7 +84,7 @@ ecommerce-agent/
 │  └─ platforms/
 │     ├─ base.py
 │     ├─ mock.py
-│     └─ makro.py
+│     └─ makro.py            # 旧 PlatformAdapter 接口，Makro 行为委托 app.makro
 ├─ data/
 │  └─ products.csv
 ├─ mock_site/

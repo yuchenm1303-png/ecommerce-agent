@@ -140,7 +140,7 @@ def launch_detached_edge(
     )
 
 
-def _choose_page(context: BrowserContext) -> Page:
+def select_listing_page(context: BrowserContext) -> Page:
     pages = list(context.pages)
     if not pages:
         return context.new_page()
@@ -156,6 +156,92 @@ def _choose_page(context: BrowserContext) -> Page:
     return pages[-1]
 
 
+
+
+# Backward-compatible alias used by earlier tests/scripts.
+_choose_page = select_listing_page
+
+
+
+class EdgeHarness:
+    """Browser-Harness-style session abstraction for the long-lived Makro Edge.
+
+    Responsibilities:
+
+    - attach to the one long-lived Edge over localhost CDP (launching it only
+      when no CDP endpoint exists yet);
+    - never own/close the external Edge process (``detach`` is a no-op by
+      design; the Edge is launched detached and outlives every script);
+    - deterministic page selection (prefer an open listing, then any Makro
+      tab, then the most recently created tab);
+    - health check and reconnect helpers for long-running sessions.
+
+    The harness never reads or logs cookies, tokens, sessionStorage or
+    Authorization data.
+    """
+
+    def __init__(
+        self,
+        playwright: Playwright,
+        *,
+        profile_dir: Path,
+        port: int = DEFAULT_CDP_PORT,
+        start_url: str = DEFAULT_START_URL,
+    ) -> None:
+        self.playwright = playwright
+        self.profile_dir = Path(profile_dir).resolve()
+        self.cdp_port = int(port)
+        self.launched_now = not is_cdp_ready(self.cdp_port)
+        if self.launched_now:
+            launch_detached_edge(
+                profile_dir=self.profile_dir, port=self.cdp_port, start_url=start_url
+            )
+        self.browser: Browser | None = None
+        self.context: BrowserContext | None = None
+        self.page: Page | None = None
+        self._connect()
+
+    def _connect(self) -> None:
+        browser = self.playwright.chromium.connect_over_cdp(cdp_endpoint(self.cdp_port))
+        contexts = list(browser.contexts)
+        if not contexts:
+            raise RuntimeError("已连接 Edge，但没有可用 browser context。")
+        self.browser = browser
+        self.context = contexts[0]
+        self.page = select_listing_page(self.context)
+
+    def health_check(self) -> bool:
+        """True when the long-lived Edge still exposes its CDP endpoint."""
+        return is_cdp_ready(self.cdp_port)
+
+    def select_page(self) -> Page:
+        """Deterministically re-select the best page in the current context."""
+        if self.context is None:
+            raise RuntimeError("Edge harness 尚未连接 context。")
+        self.page = select_listing_page(self.context)
+        return self.page
+
+    def ensure_page(self) -> Page:
+        """Return the current page, re-attaching when it was closed/detached."""
+        if not self.health_check():
+            raise RuntimeError("长期 Makro Edge 的 CDP 端点不可达，无法继续。")
+        if self.page is None or self.page.is_closed():
+            self._connect()
+        assert self.page is not None
+        return self.page
+
+    def detach(self) -> None:
+        """Drop our connection without closing the external Edge process.
+
+        The Edge is launched independently (launch_detached_edge) and is
+        intentionally never closed by scripts; leaving the Playwright
+        connection is enough for later runs to re-attach over CDP.
+        """
+        self.page = None
+        self.context = None
+        self.browser = None
+
+
 def connect_single_edge(
     playwright: Playwright,
     *,
@@ -163,29 +249,24 @@ def connect_single_edge(
     port: int = DEFAULT_CDP_PORT,
     start_url: str = DEFAULT_START_URL,
 ) -> SingleEdgeSession:
-    """Attach to the existing Makro Edge, launching it only if none exists.
+    """Backward-compatible wrapper around :class:`EdgeHarness`.
 
-    Once the detached Edge has been launched, later invocations reconnect to the
-    same browser/profile/login session through localhost CDP. Callers must simply
-    let their Playwright connection end; do not close the browser/context.
+    Returns a :class:`SingleEdgeSession` exposing the same fields as before.
+    Callers must simply let their Playwright connection end; the harness never
+    closes the external Edge.
     """
 
-    launched_now = False
-    if not is_cdp_ready(port):
-        launch_detached_edge(profile_dir=profile_dir, port=port, start_url=start_url)
-        launched_now = True
-
-    browser = playwright.chromium.connect_over_cdp(cdp_endpoint(port))
-    contexts = list(browser.contexts)
-    if not contexts:
-        raise RuntimeError("已连接 Edge，但没有可用 browser context。")
-    context = contexts[0]
-    page = _choose_page(context)
+    harness = EdgeHarness(
+        playwright,
+        profile_dir=profile_dir,
+        port=port,
+        start_url=start_url,
+    )
     return SingleEdgeSession(
-        browser=browser,
-        context=context,
-        page=page,
-        launched_now=launched_now,
-        cdp_port=port,
-        profile_dir=profile_dir.resolve(),
+        browser=harness.browser,
+        context=harness.context,
+        page=harness.page,
+        launched_now=harness.launched_now,
+        cdp_port=harness.cdp_port,
+        profile_dir=harness.profile_dir,
     )
