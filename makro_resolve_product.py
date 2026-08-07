@@ -13,18 +13,10 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from app.evidence_contract import EvidencePacket, ProductIdentity, bundle_from_evidence_packet
-from app.evidence_pipeline import (
-    bundle_from_catalog_answers,
-    bundle_from_facts_json,
-    bundle_from_key_value_text,
-    merge_bundles,
-)
-from app.evidence_validation import validate_evidence_packet
-from app.qa_catalog import QuestionCatalog, load_question_catalog
+from app.qa_catalog import load_question_catalog
 from app.resolution_engine import ResolutionPolicy, resolve_catalog, summarize_resolution
 from app.resolution_report import write_resolution_json, write_resolution_xlsx
-from app.source_bundle import ProductSourceBundle, bundle_from_product_table
+from app.resolver_inputs import ResolutionInputSpec, build_resolution_inputs
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -64,68 +56,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _expected_identity(args: argparse.Namespace) -> ProductIdentity:
-    return ProductIdentity(
+def _input_spec(args: argparse.Namespace) -> ResolutionInputSpec:
+    return ResolutionInputSpec(
         sku=args.sku,
-        model_number=args.expected_model,
-        brand=args.expected_brand,
+        expected_model=args.expected_model,
+        expected_brand=args.expected_brand,
+        product_table=args.product_table,
+        facts_json=tuple(args.facts_json),
+        evidence_packets=tuple(args.evidence_packet),
+        supplemental_text=args.supplemental_text,
+        supplemental_text_file=args.supplemental_text_file,
+        image_paths=tuple(args.image),
+        product_url=args.product_url,
     )
-
-
-def _load_bundle(
-    args: argparse.Namespace,
-    catalog: QuestionCatalog,
-) -> tuple[ProductSourceBundle, list[str]]:
-    bundles: list[ProductSourceBundle] = [
-        bundle_from_catalog_answers(
-            catalog,
-            sku=args.sku,
-            image_paths=args.image,
-            product_url=args.product_url,
-            supplemental_text=args.supplemental_text,
-        )
-    ]
-    warnings: list[str] = []
-
-    if args.product_table:
-        bundles.append(bundle_from_product_table(args.product_table, sku=args.sku or None))
-
-    for path in args.facts_json:
-        bundles.append(bundle_from_facts_json(path, sku=args.sku))
-
-    expected = _expected_identity(args)
-    for path in args.evidence_packet:
-        packet_path = Path(path)
-        payload = json.loads(packet_path.read_text(encoding="utf-8"))
-        packet = EvidencePacket.from_mapping(payload)
-        validated = validate_evidence_packet(
-            packet,
-            catalog,
-            expected_identity=expected,
-        )
-        warnings.extend(
-            f"{packet_path.name}: {warning}" for warning in validated.warnings
-        )
-        bundles.append(
-            bundle_from_evidence_packet(
-                validated.packet,
-                expected_identity=expected,
-            )
-        )
-
-    text_parts = [args.supplemental_text]
-    if args.supplemental_text_file:
-        text_parts.append(Path(args.supplemental_text_file).read_text(encoding="utf-8"))
-    explicit_text = "\n".join(part for part in text_parts if part.strip())
-    if explicit_text:
-        bundles.append(
-            bundle_from_key_value_text(
-                explicit_text,
-                source_reference=args.supplemental_text_file or "--supplemental-text",
-            )
-        )
-
-    return merge_bundles(*bundles), warnings
 
 
 def main() -> int:
@@ -138,7 +81,8 @@ def main() -> int:
             raise SystemExit(f"--{name} 必须在 0..1")
 
     catalog = load_question_catalog(args.qa)
-    bundle, evidence_warnings = _load_bundle(args, catalog)
+    input_result = build_resolution_inputs(catalog, _input_spec(args))
+    bundle = input_result.bundle
     policy = ResolutionPolicy(
         auto_fill_min_confidence=args.auto_fill_min_confidence,
         ai_auto_fill_min_confidence=args.ai_auto_fill_min_confidence,
@@ -156,14 +100,14 @@ def main() -> int:
         json.dumps(
             {
                 "identity_guard": {
-                    "sku": args.sku,
-                    "model_number": args.expected_model,
-                    "brand": args.expected_brand,
+                    "sku": input_result.expected_identity.sku,
+                    "model_number": input_result.expected_identity.model_number,
+                    "brand": input_result.expected_identity.brand,
                 },
                 "qa_source": str(Path(args.qa).resolve()),
-                "evidence_packet_files": [str(Path(item).resolve()) for item in args.evidence_packet],
+                "evidence_packet_files": input_result.evidence_packet_files,
                 "evidence_items": len(bundle.evidence),
-                "warnings": evidence_warnings,
+                "warnings": input_result.warnings,
             },
             ensure_ascii=False,
             indent=2,
@@ -173,11 +117,12 @@ def main() -> int:
 
     print("===== ANSWER RESOLVER REPORT =====")
     print(f"QA: {Path(args.qa).resolve()}")
-    if any((args.sku, args.expected_model, args.expected_brand)):
+    identity = input_result.expected_identity
+    if any((identity.sku, identity.model_number, identity.brand)):
         print(
             "identity guard: "
-            f"sku={args.sku or '-'}, model={args.expected_model or '-'}, "
-            f"brand={args.expected_brand or '-'}"
+            f"sku={identity.sku or '-'}, model={identity.model_number or '-'}, "
+            f"brand={identity.brand or '-'}"
         )
     print(
         f"questions={summary['total']}, explicit_answers={catalog.answered_count}, "
@@ -189,8 +134,8 @@ def main() -> int:
         f"blocked={summary['blocked']}"
     )
     print(f"evidence_items={len(bundle.evidence)}")
-    if evidence_warnings:
-        print(f"evidence_warnings={len(evidence_warnings)}（详见 evidence-manifest.json）")
+    if input_result.warnings:
+        print(f"evidence_warnings={len(input_result.warnings)}（详见 evidence-manifest.json）")
     print(f"JSON: {json_path.resolve()}")
     print(f"XLSX: {xlsx_path.resolve()}")
     print(f"Evidence manifest: {evidence_manifest.resolve()}")
