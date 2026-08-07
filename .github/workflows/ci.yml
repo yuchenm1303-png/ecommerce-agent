@@ -49,3 +49,6 @@ jobs:
 
       - name: Run browser automation dry-run
         run: python main.py --headless --dry-run
+
+      - name: Run browser probe tests
+        run: pytest -q -m probe

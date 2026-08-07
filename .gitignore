@@ -15,7 +15,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
-storage_state.json
+storage_state*.json
 *.cookie.json
 
 # Local authenticated browser state
