@@ -51,6 +51,7 @@ def packet(
     *,
     key="Screen Size",
     aliases=None,
+    value="3.0 inch",
     source_reference="supplier:001:text:0001",
     source_type="supplier_web",
     evidence="Screen Size: 3.0 inch.",
@@ -62,7 +63,7 @@ def packet(
             {
                 "key": key,
                 "aliases": aliases or [],
-                "value": "3.0 inch",
+                "value": value,
                 "source_type": source_type,
                 "source_reference": source_reference,
                 "confidence": 0.88,
@@ -84,6 +85,7 @@ def test_request_exposes_exact_source_ids_and_business_lock():
     assert payload["business_locked_questions"] == ["Selling Price"]
     assert "exactly equal" in payload["source_reference_rule"]
     assert payload["required_output_shape"]["facts"][0]["aliases"] == []
+    assert any("every returned value" in rule for rule in payload["rules"])
 
 
 def test_literal_text_evidence_is_accepted():
@@ -97,6 +99,40 @@ def test_literal_text_evidence_is_accepted():
     assert len(validated.facts) == 1
     assert validated.facts[0].key == "Screen Size"
     assert validated.facts[0].source_reference == "supplier:001:text:0001"
+
+
+def test_mechanically_equivalent_direct_value_is_accepted():
+    validated = validate_grounded_semantic_packet(
+        packet(value="3 inch", evidence="Screen Size: 3.0 inch."),
+        catalog(),
+        grounding(),
+        expected_identity=ProductIdentity(model_number="L11"),
+    )
+    assert validated.facts[0].value == "3 inch"
+
+
+def test_direct_answer_cannot_disagree_with_quoted_evidence():
+    with pytest.raises(SemanticGroundingError, match="未机械出现在"):
+        validate_grounded_semantic_packet(
+            packet(value="3.16 inch", evidence="Screen Size: 3.0 inch."),
+            catalog(),
+            grounding(),
+            expected_identity=ProductIdentity(model_number="L11"),
+        )
+
+
+def test_inferred_answer_may_differ_only_when_labeled_ai_synthesis():
+    validated = validate_grounded_semantic_packet(
+        packet(
+            value="3.16 inch",
+            source_type="ai_synthesis",
+            evidence="Screen Size: 3.0 inch.",
+        ),
+        catalog(),
+        grounding(),
+        expected_identity=ProductIdentity(model_number="L11"),
+    )
+    assert validated.facts[0].source_type == "ai_synthesis"
 
 
 def test_model_cannot_map_unrequested_key_using_self_authored_alias():
@@ -182,6 +218,31 @@ def test_image_fact_requires_precise_visual_evidence_description():
         expected_identity=ProductIdentity(model_number="L11"),
     )
     assert validated.facts[0].source_reference == "image:001"
+
+
+def test_image_direct_answer_must_match_visual_evidence_description():
+    image_packet = {
+        "extractor": "vision-stub",
+        "product_identity": {"model_number": "L11"},
+        "facts": [
+            {
+                "key": "Image Resolution",
+                "aliases": [],
+                "value": "720P",
+                "source_type": "product_image",
+                "source_reference": "image:001",
+                "confidence": 0.92,
+                "evidence_text": "The product label visibly reads '1080P'.",
+            }
+        ],
+    }
+    with pytest.raises(SemanticGroundingError, match="未机械出现在"):
+        validate_grounded_semantic_packet(
+            image_packet,
+            catalog(),
+            grounding(),
+            expected_identity=ProductIdentity(model_number="L11"),
+        )
 
 
 def test_business_question_is_rejected_even_with_real_source():
