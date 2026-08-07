@@ -97,7 +97,16 @@ def _load_bundle(args: argparse.Namespace):
 
 
 def _base_section_title(title: str) -> str:
-    return re.sub(r"\s*\(\d+\s*/\s*\d+\)\s*$", "", title).strip()
+    """Return a stable Makro section identity, ignoring UI-only suffixes.
+
+    Makro appends changing completion counters such as ``(14/14)`` and can also
+    append ``(Optional)`` to section labels. Neither suffix is part of the
+    semantic section identity used by CLI selection or resolver matching.
+    """
+
+    normalized = re.sub(r"\s*\(\d+\s*/\s*\d+\)\s*$", "", title).strip()
+    normalized = re.sub(r"\s*\(\s*optional\s*\)\s*$", "", normalized, flags=re.IGNORECASE).strip()
+    return normalized
 
 
 def _assert_expected_vertical(page: Page, expected_vertical: str | None) -> None:
