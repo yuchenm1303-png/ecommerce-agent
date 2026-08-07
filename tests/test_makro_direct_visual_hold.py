@@ -4,6 +4,7 @@ import inspect
 
 import makro_listing_visual_hold
 from app.makro.direct_visual_hold import is_listing_attribute_field
+from app.makro.listing_preflight import CORE_FORM_SECTIONS
 
 
 def test_helper_search_box_is_not_a_listing_attribute():
@@ -45,3 +46,17 @@ def test_cli_requires_expected_vertical():
         ["--expected-vertical", "vehicle_camera_system"]
     )
     assert args.expected_vertical == "vehicle_camera_system"
+    assert args.section is None
+
+
+def test_cli_can_target_exactly_one_core_section():
+    args = makro_listing_visual_hold.build_parser().parse_args(
+        [
+            "--expected-vertical",
+            "vehicle_camera_system",
+            "--section",
+            "Product Description",
+        ]
+    )
+    assert args.section == ["Product Description"]
+    assert args.section[0] in CORE_FORM_SECTIONS
