@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
+
+import pytest
 
 import makro_fill
 
@@ -11,6 +14,7 @@ def test_makro_fill_cli_imports_and_defaults_to_dry_run():
     assert args.dry_run is True
     assert args.source_format == "auto"
     assert args.browser == "edge"
+    assert args.expected_vertical is None
 
 
 def test_section_title_count_is_not_part_of_identity():
@@ -29,6 +33,23 @@ def test_target_section_uses_resolved_answers_only():
     ]
 
     assert makro_fill._select_target_section(sections, resolutions, None) == "Product Description"
+
+
+def test_expected_vertical_guard_accepts_matching_listing():
+    page = SimpleNamespace(
+        url="https://seller.makro.co.za/index.html#dashboard/addListings/single?vertical=vehicle_camera_system"
+    )
+
+    makro_fill._assert_expected_vertical(page, "vehicle_camera_system")
+
+
+def test_expected_vertical_guard_blocks_wrong_listing_before_fill():
+    page = SimpleNamespace(
+        url="https://seller.makro.co.za/index.html#dashboard/addListings/single?vertical=sports_action_camera"
+    )
+
+    with pytest.raises(RuntimeError, match="vertical"):
+        makro_fill._assert_expected_vertical(page, "vehicle_camera_system")
 
 
 def test_cli_has_no_save_or_submit_action():
