@@ -87,6 +87,7 @@ def _provenance(field: dict[str, Any], bundle: ProductSourceBundle) -> list[dict
             "source_reference": item.source_reference,
             "priority": item.priority,
             "confidence": item.confidence,
+            "evidence_text": item.evidence_text,
             "note": item.note,
         }
         for item in sorted(
