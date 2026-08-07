@@ -42,6 +42,17 @@ SOURCE_POLICIES: dict[str, SourcePolicy] = {
     "ai_synthesis": SourcePolicy(90, 0.70, "AI synthesis from cited source material", 0.84),
 }
 
+# --facts-json is intentionally the trusted/manual channel. Anything extracted
+# from images, webpages or an LLM must use EvidencePacket so identity, question
+# scope, evidence_text and business-field restrictions cannot be bypassed.
+MANUAL_FACT_SOURCE_TYPES = {
+    "structured",
+    "business",
+    "config",
+    "rule",
+    "customer_file",
+}
+
 
 def source_policy(source_type: str) -> SourcePolicy:
     return SOURCE_POLICIES.get(
@@ -143,7 +154,7 @@ def merge_bundles(*bundles: ProductSourceBundle) -> ProductSourceBundle:
 
 
 def bundle_from_facts_json(path: str | Path, *, sku: str = "") -> ProductSourceBundle:
-    """Load normalized facts produced by deterministic/manual extractors.
+    """Load explicit deterministic/manual facts only.
 
     Accepted shape:
       {"facts": [{"key": ..., "value": ..., "source_type": ...,
@@ -151,8 +162,8 @@ def bundle_from_facts_json(path: str | Path, *, sku: str = "") -> ProductSourceB
                   "aliases": [...] }]}
 
     A plain object mapping keys to scalar values is also accepted as a convenient
-    structured/manual source. AI/image/web output should use strict
-    EvidencePacket files so catalog/identity validation cannot be bypassed.
+    structured/manual source. Image/web/AI evidence is rejected here and must use
+    strict EvidencePacket files instead.
     """
 
     source = Path(path)
@@ -188,6 +199,11 @@ def bundle_from_facts_json(path: str | Path, *, sku: str = "") -> ProductSourceB
         else:
             stored_value = str(value)
         source_type = str(item.get("source_type") or "structured").strip()
+        if source_type not in MANUAL_FACT_SOURCE_TYPES:
+            raise ValueError(
+                f"facts[{index}].source_type={source_type!r} 不允许通过 --facts-json 输入。"
+                "图片/网页/AI/文档抽取结果必须使用 --evidence-packet。"
+            )
         reference = str(item.get("source_reference") or f"{source.name}:facts[{index}]").strip()
         confidence = item.get("confidence")
         aliases = item.get("aliases") or []
