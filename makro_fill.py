@@ -153,7 +153,12 @@ def main() -> int:
                 navigate_first=harness.launched_now,
             )
 
+        # The user may have closed/replaced the original tab while the CLI was
+        # waiting. EdgeHarness can recover/select a different Page object, so
+        # always bind a fresh domain adapter to the recovered page before any
+        # guard, scan or write. Never keep an adapter pointing at a stale page.
         page = harness.ensure_page()
+        adapter = MakroDomainAdapter(page)
         adapter.assert_expected_vertical(args.expected_vertical)
 
         sections_payload, flat_controls, scan_stats = adapter.scan_sections(
