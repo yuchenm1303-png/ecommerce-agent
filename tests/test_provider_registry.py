@@ -48,6 +48,32 @@ def test_openai_compatible_requires_base_url():
         )
 
 
+def test_invalid_base_url_is_rejected():
+    with pytest.raises(ProviderConfigurationError, match="http/https"):
+        validate_provider_config(
+            ProviderConfig(
+                provider="openai-compatible",
+                model="vision-model",
+                api_key_env="VENDOR_KEY",
+                base_url="api.vendor.test/v1",
+            )
+        )
+
+
+def test_safe_config_does_not_log_url_credentials_or_query_tokens():
+    config = ProviderConfig(
+        provider="openai-compatible",
+        model="vision-model",
+        api_key_env="VENDOR_KEY",
+        base_url="https://user:pass@api.vendor.test/v1?token=secret#fragment",
+    )
+    safe = config.as_safe_dict()
+
+    assert safe["base_url"] == "https://api.vendor.test/v1"
+    assert "pass" not in repr(safe)
+    assert "secret" not in repr(safe)
+
+
 def test_registry_builds_compatible_provider_from_arbitrary_env_name():
     config = ProviderConfig(
         provider="openai-compatible",
