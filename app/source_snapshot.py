@@ -140,7 +140,7 @@ def capture_page_snapshot(
     """
 
     payload = page.evaluate(
-        """() => {
+        r"""() => {
           const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
           const visible = (el) => {
             const style = getComputedStyle(el);
