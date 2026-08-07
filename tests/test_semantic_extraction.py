@@ -101,14 +101,18 @@ def test_literal_text_evidence_is_accepted():
     assert validated.facts[0].source_reference == "supplier:001:text:0001"
 
 
-def test_mechanically_equivalent_direct_value_is_accepted():
-    validated = validate_grounded_semantic_packet(
-        packet(value="3 inch", evidence="Screen Size: 3.0 inch."),
-        catalog(),
-        grounding(),
-        expected_identity=ProductIdentity(model_number="L11"),
-    )
-    assert validated.facts[0].value == "3 inch"
+def test_direct_value_representation_change_is_rejected_fail_closed():
+    # The model should return the value as directly shown. Safe mechanical
+    # normalization still exists later in the resolver for comparing independent
+    # evidence sources, but it is not used to excuse a model changing its cited
+    # source at this ingestion boundary.
+    with pytest.raises(SemanticGroundingError, match="未机械出现在"):
+        validate_grounded_semantic_packet(
+            packet(value="3 inch", evidence="Screen Size: 3.0 inch."),
+            catalog(),
+            grounding(),
+            expected_identity=ProductIdentity(model_number="L11"),
+        )
 
 
 def test_direct_answer_cannot_disagree_with_quoted_evidence():
