@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 from .evidence_contract import EvidencePacket, ProductIdentity, assert_identity_compatible
 from .evidence_validation import is_business_question
@@ -59,14 +58,12 @@ def build_semantic_question_batches(
     *,
     batch_size: int = 12,
     skip_answered: bool = True,
-    skip_business: bool = True,
 ) -> list[SemanticQuestionBatch]:
-    """Split only questions that actually need semantic extraction.
+    """Split only questions that are legally eligible for semantic extraction.
 
-    Customer-confirmed answers and seller operating fields should not consume a
-    model call by default. Business fields are never eligible for semantic
-    extraction even when callers disable ``skip_business`` later at other layers;
-    this helper keeps the safe default explicit.
+    Business/operational fields are excluded unconditionally. There is no flag
+    that can turn this protection off: price, MOQ, fulfilment, shipping and
+    similar seller settings must enter through structured/config/rule sources.
     """
 
     if batch_size < 1 or batch_size > 50:
@@ -76,7 +73,7 @@ def build_semantic_question_batches(
         question
         for question in catalog.questions
         if not (skip_answered and question.has_answer)
-        and not (skip_business and is_business_question(question.question))
+        and not is_business_question(question.question)
     ]
 
     batches: list[SemanticQuestionBatch] = []
@@ -94,8 +91,6 @@ def build_semantic_question_batches(
 
 
 def _merge_observed_identity(current: ProductIdentity, observed: ProductIdentity) -> ProductIdentity:
-    # Compatibility is symmetric for populated fields: a disagreement on any
-    # jointly-populated identity anchor is fatal.
     assert_identity_compatible(current, observed)
     assert_identity_compatible(observed, current)
     return ProductIdentity(
