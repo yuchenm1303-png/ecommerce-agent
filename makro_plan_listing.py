@@ -20,6 +20,7 @@ from typing import Any
 
 from playwright.sync_api import sync_playwright
 
+from app.alias_config import load_alias_config
 from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness
 from app.fill_plan import build_live_fill_plan
 from app.fill_plan_report import write_fill_plan_json, write_fill_plan_xlsx
@@ -43,11 +44,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--product-table", default=None)
     parser.add_argument("--facts-json", action="append", default=[])
     parser.add_argument("--evidence-packet", action="append", default=[])
+    parser.add_argument("--supplier-snapshot", action="append", default=[])
+    parser.add_argument("--official-snapshot", action="append", default=[])
     parser.add_argument("--supplemental-text", default="")
     parser.add_argument("--supplemental-text-file", default=None)
     parser.add_argument("--image", action="append", default=[])
     parser.add_argument("--product-url", default=None)
     parser.add_argument("--expected-vertical", required=True)
+    parser.add_argument(
+        "--alias-config",
+        default=None,
+        help=(
+            "可选 JSON：经过人工审核的 QA question -> Makro label 显式别名。"
+            "配置必须声明与 --expected-vertical 相同的 vertical。"
+        ),
+    )
     parser.add_argument("--auto-fill-min-confidence", type=float, default=0.85)
     parser.add_argument("--ai-auto-fill-min-confidence", type=float, default=0.92)
     parser.add_argument("--profile-dir", default="browser_profiles/makro-edge")
@@ -66,6 +77,8 @@ def _input_spec(args: argparse.Namespace) -> ResolutionInputSpec:
         product_table=args.product_table,
         facts_json=tuple(args.facts_json),
         evidence_packets=tuple(args.evidence_packet),
+        supplier_snapshots=tuple(args.supplier_snapshot),
+        official_snapshots=tuple(args.official_snapshot),
         supplemental_text=args.supplemental_text,
         supplemental_text_file=args.supplemental_text_file,
         image_paths=tuple(args.image),
@@ -112,6 +125,11 @@ def main() -> int:
         auto_fill_min_confidence=args.auto_fill_min_confidence,
         ai_auto_fill_min_confidence=args.ai_auto_fill_min_confidence,
     )
+    alias_config = (
+        load_alias_config(args.alias_config, expected_vertical=args.expected_vertical)
+        if args.alias_config
+        else None
+    )
 
     with sync_playwright() as playwright:
         harness = EdgeHarness(
@@ -152,6 +170,7 @@ def main() -> int:
             semantic_fields,
             input_result.bundle,
             policy=policy,
+            aliases=alias_config.aliases if alias_config else None,
         )
 
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -167,11 +186,14 @@ def main() -> int:
                     "page_url": page.url,
                     "expected_vertical": args.expected_vertical,
                     "qa_source": str(Path(args.qa).resolve()),
+                    "alias_config": alias_config.source_path if alias_config else None,
                     "semantic_fields_before_filter": len(all_semantic_fields),
                     "listing_attribute_fields": len(semantic_fields),
                     "scan": scan_stats,
                     "sections": [item.get("title") for item in sections_payload],
                     "evidence_items": len(input_result.bundle.evidence),
+                    "evidence_packet_files": input_result.evidence_packet_files,
+                    "source_snapshot_files": input_result.source_snapshot_files,
                     "evidence_warnings": input_result.warnings,
                     "plan_summary": plan.summary(),
                     "writes_performed": 0,
@@ -199,6 +221,8 @@ def main() -> int:
             f"qa_matched={summary['qa_matched']}, qa_unmatched={summary['qa_unmatched']}, "
             f"qa_ambiguous={summary['qa_ambiguous']}"
         )
+        if alias_config:
+            print(f"alias_config={alias_config.source_path}")
         print(f"JSON={json_path.resolve()}")
         print(f"XLSX={xlsx_path.resolve()}")
         print(f"Manifest={manifest.resolve()}")
