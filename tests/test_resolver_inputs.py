@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from app.evidence_contract import IdentityMismatchError
 from app.evidence_validation import EvidenceValidationError
 from app.qa_catalog import QuestionCatalog, QuestionRecord
 from app.resolver_inputs import ResolutionInputSpec, build_resolution_inputs
@@ -15,6 +16,19 @@ def catalog() -> QuestionCatalog:
         sheet_name="Sheet1",
         header_row=3,
         questions=[QuestionRecord(number="1", question="Image Resolution")],
+    )
+
+
+def catalog_with_identity() -> QuestionCatalog:
+    return QuestionCatalog(
+        source_path="qa.xlsx",
+        sheet_name="Sheet1",
+        header_row=3,
+        questions=[
+            QuestionRecord(number="1", question="Model Number", answer="L11", source_reference="qa.xlsx:row=4"),
+            QuestionRecord(number="2", question="Brand", answer="SHANMING", source_reference="qa.xlsx:row=5"),
+            QuestionRecord(number="3", question="Image Resolution"),
+        ],
     )
 
 
@@ -80,4 +94,47 @@ def test_packet_cannot_inject_question_not_in_catalog(tmp_path):
         build_resolution_inputs(
             catalog(),
             ResolutionInputSpec(evidence_packets=(str(packet),)),
+        )
+
+
+def test_expected_identity_is_automatically_derived_from_explicit_qa_answers():
+    result = build_resolution_inputs(catalog_with_identity(), ResolutionInputSpec())
+
+    assert result.expected_identity.model_number == "L11"
+    assert result.expected_identity.brand == "SHANMING"
+
+
+def test_derived_identity_blocks_wrong_product_packet(tmp_path):
+    packet = tmp_path / "wrong-product.json"
+    packet.write_text(
+        json.dumps(
+            {
+                "product_identity": {"model_number": "L12", "brand": "SHANMING"},
+                "facts": [
+                    {
+                        "key": "Image Resolution",
+                        "value": "1920x1080",
+                        "source_type": "product_image",
+                        "source_reference": "wrong.jpg:spec",
+                        "confidence": 0.95,
+                        "evidence_text": "1080P",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(IdentityMismatchError):
+        build_resolution_inputs(
+            catalog_with_identity(),
+            ResolutionInputSpec(evidence_packets=(str(packet),)),
+        )
+
+
+def test_explicit_identity_conflicting_with_trusted_qa_is_rejected():
+    with pytest.raises(ValueError, match="显式 Model Number"):
+        build_resolution_inputs(
+            catalog_with_identity(),
+            ResolutionInputSpec(expected_model="L99"),
         )
