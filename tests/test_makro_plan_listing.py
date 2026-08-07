@@ -11,6 +11,49 @@ def test_live_planner_requires_expected_vertical():
     assert args.expected_vertical == "vehicle_camera_system"
 
 
+def test_live_planner_accepts_snapshot_and_alias_inputs():
+    parser = makro_plan_listing.build_parser()
+    args = parser.parse_args(
+        [
+            "--qa",
+            "qa.xlsx",
+            "--expected-vertical",
+            "vehicle_camera_system",
+            "--supplier-snapshot",
+            "supplier.json",
+            "--official-snapshot",
+            "official.json",
+            "--alias-config",
+            "aliases.json",
+        ]
+    )
+    assert args.supplier_snapshot == ["supplier.json"]
+    assert args.official_snapshot == ["official.json"]
+    assert args.alias_config == "aliases.json"
+
+
+def test_input_spec_forwards_all_external_evidence_inputs():
+    parser = makro_plan_listing.build_parser()
+    args = parser.parse_args(
+        [
+            "--qa",
+            "qa.xlsx",
+            "--expected-vertical",
+            "vehicle_camera_system",
+            "--evidence-packet",
+            "image.json",
+            "--supplier-snapshot",
+            "supplier.json",
+            "--official-snapshot",
+            "official.json",
+        ]
+    )
+    spec = makro_plan_listing._input_spec(args)
+    assert spec.evidence_packets == ("image.json",)
+    assert spec.supplier_snapshots == ("supplier.json",)
+    assert spec.official_snapshots == ("official.json",)
+
+
 def test_live_planner_contains_no_browser_fill_or_save_path():
     source = inspect.getsource(makro_plan_listing.main)
     assert "fill_resolved_field(" not in source
