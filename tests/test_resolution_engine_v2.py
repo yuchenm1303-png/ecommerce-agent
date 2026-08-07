@@ -120,7 +120,7 @@ def test_conflicting_sources_are_blocked_with_provenance():
     assert len(record.provenance) == 2
 
 
-def test_facts_json_supports_aliases(tmp_path):
+def test_facts_json_supports_aliases_for_manual_structured_facts(tmp_path):
     path = tmp_path / "facts.json"
     path.write_text(
         json.dumps(
@@ -130,8 +130,8 @@ def test_facts_json_supports_aliases(tmp_path):
                         "key": "Video Resolution",
                         "aliases": ["Image Resolution"],
                         "value": "1920x1080",
-                        "source_type": "supplier_doc",
-                        "source_reference": "1688:spec-table",
+                        "source_type": "structured",
+                        "source_reference": "manual-spec-table",
                         "confidence": 0.95,
                     }
                 ]
@@ -147,4 +147,4 @@ def test_facts_json_supports_aliases(tmp_path):
     assert record.status == RESOLVED
     assert record.eligible_for_autofill is True
     assert record.answer == "1920x1080"
-    assert record.source_reference == "1688:spec-table"
+    assert record.source_reference == "manual-spec-table"
