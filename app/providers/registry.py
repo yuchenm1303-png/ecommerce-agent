@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from .openai_compatible import OpenAICompatibleSemanticProvider
 from .openai_semantic import OpenAISemanticProvider
@@ -15,13 +16,35 @@ class ProviderConfigurationError(ValueError):
 SUPPORTED_PROVIDERS = ("openai", "openai-compatible")
 
 
+def _validated_base_url(value: str) -> str:
+    url = value.strip().rstrip("/")
+    if not url:
+        return ""
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ProviderConfigurationError("--base-url 必须是完整 http/https API 根地址。")
+    return url
+
+
+def _safe_base_url(value: str) -> str:
+    """Strip credentials/query/fragment before writing provider metadata to logs."""
+
+    if not value:
+        return ""
+    parsed = urlsplit(value)
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+
+
 @dataclass(slots=True, frozen=True)
 class ProviderConfig:
     provider: str
     model: str
     api_key_env: str
     base_url: str = ""
-    image_detail: str = "high"
+    image_detail: str = "auto"
     max_output_tokens: int = 12000
     structured_mode: str = "prompt_only"
 
@@ -32,7 +55,7 @@ class ProviderConfig:
             "provider": self.provider,
             "model": self.model,
             "api_key_env": self.api_key_env,
-            "base_url": self.base_url,
+            "base_url": _safe_base_url(self.base_url),
             "image_detail": self.image_detail,
             "max_output_tokens": self.max_output_tokens,
             "structured_mode": self.structured_mode,
@@ -71,7 +94,9 @@ def validate_provider_config(config: ProviderConfig) -> ProviderConfig:
         raise ProviderConfigurationError("--model 不能为空。")
     if not config.api_key_env.strip():
         raise ProviderConfigurationError("--api-key-env 不能为空。")
-    if provider == "openai-compatible" and not config.base_url.strip():
+
+    base_url = _validated_base_url(config.base_url)
+    if provider == "openai-compatible" and not base_url:
         raise ProviderConfigurationError(
             "openai-compatible provider 必须提供 --base-url，例如服务商文档给出的 OpenAI-compatible API 根地址。"
         )
@@ -87,7 +112,7 @@ def validate_provider_config(config: ProviderConfig) -> ProviderConfig:
         provider=provider,
         model=config.model.strip(),
         api_key_env=config.api_key_env.strip(),
-        base_url=config.base_url.strip(),
+        base_url=base_url,
         image_detail=config.image_detail,
         max_output_tokens=int(config.max_output_tokens),
         structured_mode=config.structured_mode,
