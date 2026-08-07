@@ -1,0 +1,1 @@
+"""Seller-platform adapters."""
