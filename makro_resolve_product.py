@@ -20,7 +20,8 @@ from app.evidence_pipeline import (
     bundle_from_key_value_text,
     merge_bundles,
 )
-from app.qa_catalog import load_question_catalog
+from app.evidence_validation import validate_evidence_packet
+from app.qa_catalog import QuestionCatalog, load_question_catalog
 from app.resolution_engine import ResolutionPolicy, resolve_catalog, summarize_resolution
 from app.resolution_report import write_resolution_json, write_resolution_xlsx
 from app.source_bundle import ProductSourceBundle, bundle_from_product_table
@@ -50,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help=(
             "可重复：图片/网页/AI 抽取结果。必须包含 product_identity、facts、"
-            "source_reference、evidence_text、confidence；身份冲突时立即停止。"
+            "source_reference、evidence_text、confidence；还会校验 fact 是否属于当前 QA。"
         ),
     )
     parser.add_argument("--supplemental-text", default="", help="仅解析明确的 key: value 行；自由文本不会猜")
@@ -71,7 +72,10 @@ def _expected_identity(args: argparse.Namespace) -> ProductIdentity:
     )
 
 
-def _load_bundle(args: argparse.Namespace, catalog) -> ProductSourceBundle:
+def _load_bundle(
+    args: argparse.Namespace,
+    catalog: QuestionCatalog,
+) -> tuple[ProductSourceBundle, list[str]]:
     bundles: list[ProductSourceBundle] = [
         bundle_from_catalog_answers(
             catalog,
@@ -81,6 +85,7 @@ def _load_bundle(args: argparse.Namespace, catalog) -> ProductSourceBundle:
             supplemental_text=args.supplemental_text,
         )
     ]
+    warnings: list[str] = []
 
     if args.product_table:
         bundles.append(bundle_from_product_table(args.product_table, sku=args.sku or None))
@@ -90,9 +95,23 @@ def _load_bundle(args: argparse.Namespace, catalog) -> ProductSourceBundle:
 
     expected = _expected_identity(args)
     for path in args.evidence_packet:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        packet_path = Path(path)
+        payload = json.loads(packet_path.read_text(encoding="utf-8"))
         packet = EvidencePacket.from_mapping(payload)
-        bundles.append(bundle_from_evidence_packet(packet, expected_identity=expected))
+        validated = validate_evidence_packet(
+            packet,
+            catalog,
+            expected_identity=expected,
+        )
+        warnings.extend(
+            f"{packet_path.name}: {warning}" for warning in validated.warnings
+        )
+        bundles.append(
+            bundle_from_evidence_packet(
+                validated.packet,
+                expected_identity=expected,
+            )
+        )
 
     text_parts = [args.supplemental_text]
     if args.supplemental_text_file:
@@ -106,7 +125,7 @@ def _load_bundle(args: argparse.Namespace, catalog) -> ProductSourceBundle:
             )
         )
 
-    return merge_bundles(*bundles)
+    return merge_bundles(*bundles), warnings
 
 
 def main() -> int:
@@ -119,7 +138,7 @@ def main() -> int:
             raise SystemExit(f"--{name} 必须在 0..1")
 
     catalog = load_question_catalog(args.qa)
-    bundle = _load_bundle(args, catalog)
+    bundle, evidence_warnings = _load_bundle(args, catalog)
     policy = ResolutionPolicy(
         auto_fill_min_confidence=args.auto_fill_min_confidence,
         ai_auto_fill_min_confidence=args.ai_auto_fill_min_confidence,
@@ -129,8 +148,28 @@ def main() -> int:
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = Path(args.output_dir) / f"resolve-{stamp}"
+    output_dir.mkdir(parents=True, exist_ok=True)
     json_path = write_resolution_json(records, output_dir / "resolution.json")
     xlsx_path = write_resolution_xlsx(records, output_dir / "resolution.xlsx")
+    evidence_manifest = output_dir / "evidence-manifest.json"
+    evidence_manifest.write_text(
+        json.dumps(
+            {
+                "identity_guard": {
+                    "sku": args.sku,
+                    "model_number": args.expected_model,
+                    "brand": args.expected_brand,
+                },
+                "qa_source": str(Path(args.qa).resolve()),
+                "evidence_packet_files": [str(Path(item).resolve()) for item in args.evidence_packet],
+                "evidence_items": len(bundle.evidence),
+                "warnings": evidence_warnings,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     print("===== ANSWER RESOLVER REPORT =====")
     print(f"QA: {Path(args.qa).resolve()}")
@@ -150,8 +189,11 @@ def main() -> int:
         f"blocked={summary['blocked']}"
     )
     print(f"evidence_items={len(bundle.evidence)}")
+    if evidence_warnings:
+        print(f"evidence_warnings={len(evidence_warnings)}（详见 evidence-manifest.json）")
     print(f"JSON: {json_path.resolve()}")
     print(f"XLSX: {xlsx_path.resolve()}")
+    print(f"Evidence manifest: {evidence_manifest.resolve()}")
     print("本阶段只做解析报告；没有打开 Makro，也没有填写任何页面。")
     return 0
 
