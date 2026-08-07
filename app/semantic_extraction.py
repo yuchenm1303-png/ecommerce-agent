@@ -9,6 +9,7 @@ from .evidence_validation import EvidenceValidationError, validate_evidence_pack
 from .extraction_request import build_extraction_request_payload
 from .qa_catalog import QuestionCatalog
 from .semantic_grounding import GroundedSource, GroundingCatalog, IMAGE_KIND, TEXT_KIND
+from .source_bundle import normalize_key
 
 
 class SemanticGroundingError(EvidenceValidationError):
@@ -71,6 +72,8 @@ def build_grounded_semantic_request(
     base["rules"].extend(
         [
             "Use only grounded_sources supplied in this request; do not use prior knowledge or unstated web knowledge.",
+            "Each fact.key must exactly equal one question string from this request. Do not invent aliases or canonical field names.",
+            "Return aliases as an empty array. Model-authored aliases are not trusted for question matching.",
             "For text sources, evidence_text must be a short literal excerpt copied from the cited source content.",
             "For image sources, evidence_text must be a concise description of the exact visible feature/text that supports the answer.",
             "fact.source_type must equal the cited source source_type, unless the answer requires inference; inferred answers must use ai_synthesis.",
@@ -80,6 +83,10 @@ def build_grounded_semantic_request(
             "Do not cite a source id that is absent from grounded_sources.",
         ]
     )
+    base["required_output_shape"]["facts"][0]["key"] = (
+        "exact current QA question string"
+    )
+    base["required_output_shape"]["facts"][0]["aliases"] = []
     base["required_output_shape"]["facts"][0]["source_reference"] = (
         "exact grounded_sources[].source_id"
     )
@@ -92,6 +99,26 @@ def build_grounded_semantic_request(
 
 def _literal_normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip().casefold()
+
+
+def _validate_model_question_keys(packet: EvidencePacket, catalog: QuestionCatalog) -> None:
+    """Do not let an untrusted model self-authorize a QA match via aliases."""
+
+    counts: dict[str, int] = {}
+    for question in catalog.questions:
+        counts[question.normalized_question] = counts.get(question.normalized_question, 0) + 1
+
+    for fact in packet.facts:
+        normalized = normalize_key(fact.key)
+        if counts.get(normalized, 0) != 1:
+            raise SemanticGroundingError(
+                f"semantic fact key={fact.key!r} 不是当前 QA 中唯一的精确问题名；禁止模型通过自造别名映射。"
+            )
+        if fact.aliases:
+            raise SemanticGroundingError(
+                f"semantic fact {fact.key!r} 返回了 aliases={list(fact.aliases)!r}；"
+                "模型输出不得自行定义 QA alias。"
+            )
 
 
 def _validate_text_grounding(fact_evidence: str, source: GroundedSource) -> None:
@@ -126,15 +153,10 @@ def validate_grounded_semantic_packet(
     *,
     expected_identity: ProductIdentity = ProductIdentity(),
 ) -> EvidencePacket:
-    """Validate model output against both QA scope and exact supplied sources.
-
-    Existing EvidencePacket validation proves question scope, business-field
-    isolation and identity compatibility. This extra boundary proves that every
-    cited source actually existed in the semantic request and that text evidence
-    is literally present in the cited source chunk.
-    """
+    """Validate model output against QA scope and the exact supplied sources."""
 
     packet = payload if isinstance(payload, EvidencePacket) else EvidencePacket.from_mapping(payload)
+    _validate_model_question_keys(packet, catalog)
     validated = validate_evidence_packet(
         packet,
         catalog,
@@ -158,7 +180,7 @@ def validate_grounded_semantic_packet(
             _validate_text_grounding(fact.evidence_text, source)
         elif source.kind == IMAGE_KIND:
             _validate_image_grounding(fact.evidence_text, source)
-        else:  # GroundingCatalog already rejects this; retain fail-closed guard.
+        else:
             raise SemanticGroundingError(
                 f"不支持的 grounded source kind={source.kind!r}。"
             )
