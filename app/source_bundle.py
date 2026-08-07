@@ -54,8 +54,10 @@ def _stringify(value: object) -> str:
 class SourceEvidence:
     """One explicit piece of product evidence.
 
-    The resolver never invents product facts. Every resolved answer must point
-    back to one or more SourceEvidence objects.
+    ``evidence_text`` is the source-grounded snippet/visual transcription that
+    justifies the value. ``note`` is reserved for pipeline/audit metadata such as
+    confidence capping. Keeping them separate prevents reports from confusing a
+    resolver value with the actual supporting evidence.
     """
 
     key: str
@@ -64,6 +66,7 @@ class SourceEvidence:
     source_reference: str
     priority: int
     confidence: float = 1.0
+    evidence_text: str = ""
     note: str = ""
 
     @property
@@ -88,6 +91,7 @@ class ProductSourceBundle:
         source_reference: str,
         priority: int,
         confidence: float = 1.0,
+        evidence_text: str = "",
         note: str = "",
     ) -> None:
         if isinstance(value, str):
@@ -106,6 +110,7 @@ class ProductSourceBundle:
                 source_reference=source_reference,
                 priority=priority,
                 confidence=confidence,
+                evidence_text=evidence_text.strip(),
                 note=note,
             )
         )
@@ -151,6 +156,7 @@ def bundle_from_product_table(
         source_type="structured",
         source_reference=f"{source.name}:row={record.row_number}",
         priority=10,
+        evidence_text=f"SKU={record.sku}",
     )
     for key, value in record.values.items():
         bundle.add_evidence(
@@ -159,6 +165,7 @@ def bundle_from_product_table(
             source_type="structured",
             source_reference=f"{source.name}:row={record.row_number}:column={key}",
             priority=10,
+            evidence_text=f"{key}={value}",
         )
     return bundle
 
@@ -182,13 +189,7 @@ def _looks_like_qa_header(row: Iterable[Any]) -> bool:
 def _locate_qa_table(
     rows: list[list[Any]], *, max_header_rows: int = 50
 ) -> tuple[list[str], list[list[Any]], int]:
-    """Find the actual QA header row instead of assuming row 1.
-
-    Real client workbooks often contain a title/instructions block above the
-    table. We only accept a row when it independently contains both a known
-    question header and a known answer header, so this remains conservative.
-    Returns headers, following data rows and the 1-based header row number.
-    """
+    """Find the actual QA header row instead of assuming row 1."""
 
     if not rows:
         raise ValueError("QA 文件为空。")
@@ -238,13 +239,7 @@ def bundle_from_qa_file(
     product_url: str | None = None,
     supplemental_text: str = "",
 ) -> ProductSourceBundle:
-    """Load a question/answer workbook like the client's current manual workflow.
-
-    The loader is intentionally tolerant of English/Chinese header names,
-    leading title/instruction rows and a non-active data worksheet. It remains
-    conservative about content: only rows with both an explicit
-    question/attribute and an explicit answer/value are imported.
-    """
+    """Load a question/answer workbook like the client's current manual workflow."""
 
     source = Path(path)
     suffix = source.suffix.lower()
@@ -283,6 +278,7 @@ def bundle_from_qa_file(
             source_type="customer_file",
             source_reference=location,
             priority=20,
+            evidence_text=f"{question}={answer}",
         )
     if not bundle.evidence:
         raise ValueError("QA 文件中没有可用的明确答案。")
