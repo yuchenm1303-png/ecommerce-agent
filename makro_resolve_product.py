@@ -9,9 +9,11 @@ It does not invent answers for missing evidence and does not modify Makro.
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import datetime
 from pathlib import Path
 
+from app.evidence_contract import EvidencePacket, ProductIdentity, bundle_from_evidence_packet
 from app.evidence_pipeline import (
     bundle_from_catalog_answers,
     bundle_from_facts_json,
@@ -33,12 +35,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--qa", required=True, help="客户 Question/Answer .xlsx/.xlsm/.csv")
     parser.add_argument("--sku", default="", help="SKU；商品表包含多行时必须提供")
+    parser.add_argument("--expected-model", default="", help="可选身份安全门：预期 Model Number")
+    parser.add_argument("--expected-brand", default="", help="可选身份安全门：预期 Brand")
     parser.add_argument("--product-table", default=None, help="可选：结构化商品/经营数据表")
     parser.add_argument(
         "--facts-json",
         action="append",
         default=[],
-        help="可重复：图片/网页/人工抽取后的结构化 facts JSON",
+        help="可重复：人工/确定性抽取后的普通结构化 facts JSON",
+    )
+    parser.add_argument(
+        "--evidence-packet",
+        action="append",
+        default=[],
+        help=(
+            "可重复：图片/网页/AI 抽取结果。必须包含 product_identity、facts、"
+            "source_reference、evidence_text、confidence；身份冲突时立即停止。"
+        ),
     )
     parser.add_argument("--supplemental-text", default="", help="仅解析明确的 key: value 行；自由文本不会猜")
     parser.add_argument("--supplemental-text-file", default=None, help="可选 UTF-8 文本；仅解析 key: value 行")
@@ -48,6 +61,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ai-auto-fill-min-confidence", type=float, default=0.92)
     parser.add_argument("--output-dir", default="logs/answer-resolver")
     return parser
+
+
+def _expected_identity(args: argparse.Namespace) -> ProductIdentity:
+    return ProductIdentity(
+        sku=args.sku,
+        model_number=args.expected_model,
+        brand=args.expected_brand,
+    )
 
 
 def _load_bundle(args: argparse.Namespace, catalog) -> ProductSourceBundle:
@@ -66,6 +87,12 @@ def _load_bundle(args: argparse.Namespace, catalog) -> ProductSourceBundle:
 
     for path in args.facts_json:
         bundles.append(bundle_from_facts_json(path, sku=args.sku))
+
+    expected = _expected_identity(args)
+    for path in args.evidence_packet:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        packet = EvidencePacket.from_mapping(payload)
+        bundles.append(bundle_from_evidence_packet(packet, expected_identity=expected))
 
     text_parts = [args.supplemental_text]
     if args.supplemental_text_file:
@@ -107,6 +134,12 @@ def main() -> int:
 
     print("===== ANSWER RESOLVER REPORT =====")
     print(f"QA: {Path(args.qa).resolve()}")
+    if any((args.sku, args.expected_model, args.expected_brand)):
+        print(
+            "identity guard: "
+            f"sku={args.sku or '-'}, model={args.expected_model or '-'}, "
+            f"brand={args.expected_brand or '-'}"
+        )
     print(
         f"questions={summary['total']}, explicit_answers={catalog.answered_count}, "
         f"resolved={summary['resolved']}, needs_review={summary['needs_review']}, "
