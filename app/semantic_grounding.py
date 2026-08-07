@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,13 +13,22 @@ TEXT_KIND = "text"
 IMAGE_KIND = "image"
 
 
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_text(text: str) -> str:
+    return _sha256_bytes(text.encode("utf-8"))
+
+
 @dataclass(slots=True, frozen=True)
 class GroundedSource:
     """One exact source unit that a semantic extractor is allowed to cite.
 
-    Text sources are deliberately chunked before being sent to a model so every
-    returned fact can cite one bounded piece of captured source text. Image
-    sources use stable ids and retain the local path only in the manifest.
+    Every source has a content digest. Builder-generated source ids include a
+    digest prefix as well, so a packet created for one captured page/image cannot
+    be silently replayed against changed source content while keeping the same
+    citation id.
     """
 
     source_id: str
@@ -27,6 +37,7 @@ class GroundedSource:
     origin: str
     content: str = ""
     image_path: str = ""
+    sha256: str = ""
 
     def as_request_dict(self) -> dict[str, str]:
         payload = {
@@ -34,6 +45,7 @@ class GroundedSource:
             "source_type": self.source_type,
             "kind": self.kind,
             "origin": self.origin,
+            "sha256": self.sha256,
         }
         if self.kind == TEXT_KIND:
             payload["content"] = self.content
@@ -47,6 +59,7 @@ class GroundedSource:
             "source_type": self.source_type,
             "kind": self.kind,
             "origin": self.origin,
+            "sha256": self.sha256,
             "image_path": self.image_path,
             "content": self.content,
         }
@@ -70,6 +83,8 @@ class GroundingCatalog:
                 raise ValueError(f"文本 source {source.source_id} 内容为空。")
             if source.kind == IMAGE_KIND and not source.image_path.strip():
                 raise ValueError(f"图片 source {source.source_id} 缺少 image_path。")
+            if source.sha256 and not re.fullmatch(r"[0-9a-f]{64}", source.sha256):
+                raise ValueError(f"source {source.source_id} 的 sha256 格式无效。")
 
     def by_id(self, source_id: str) -> GroundedSource | None:
         wanted = source_id.strip()
@@ -83,14 +98,10 @@ class GroundingCatalog:
 
     def as_manifest(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "source_count": len(self.sources),
             "sources": [source.as_manifest_dict() for source in self.sources],
         }
-
-
-def _normalize_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value or "").strip()
 
 
 def _snapshot_text(snapshot: SourceSnapshot) -> str:
@@ -111,12 +122,7 @@ def chunk_text(
     max_chars: int = 3000,
     overlap_chars: int = 250,
 ) -> list[str]:
-    """Deterministically split captured text while retaining small overlap.
-
-    This is character based rather than token based on purpose: the provider
-    adapter remains model-neutral. Boundaries are moved left to whitespace when
-    practical so evidence snippets are less likely to be split mid-word.
-    """
+    """Deterministically split captured text while retaining small overlap."""
 
     if max_chars < 500:
         raise ValueError("max_chars 不能小于 500。")
@@ -148,9 +154,30 @@ def chunk_text(
             chunks.append(chunk)
         if end >= length:
             break
-        next_start = max(start + 1, end - overlap_chars)
-        start = next_start
+        start = max(start + 1, end - overlap_chars)
     return chunks
+
+
+def _text_source(
+    *,
+    prefix: str,
+    source_type: str,
+    ordinal: int,
+    chunk_index: int,
+    origin: str,
+    content: str,
+) -> GroundedSource:
+    digest = _sha256_text(content)
+    return GroundedSource(
+        source_id=(
+            f"{prefix}:{ordinal:03d}:text:{chunk_index:04d}:{digest[:12]}"
+        ),
+        source_type=source_type,
+        kind=TEXT_KIND,
+        origin=origin,
+        content=content,
+        sha256=digest,
+    )
 
 
 def _sources_from_snapshot(
@@ -163,15 +190,18 @@ def _sources_from_snapshot(
     overlap_chars: int,
 ) -> list[GroundedSource]:
     path = Path(snapshot_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"source snapshot 不存在：{path}")
     snapshot = source_snapshot_from_json(path)
     text = _snapshot_text(snapshot)
     chunks = chunk_text(text, max_chars=max_chars, overlap_chars=overlap_chars)
     origin = snapshot.final_url or snapshot.requested_url or str(path.resolve())
     return [
-        GroundedSource(
-            source_id=f"{prefix}:{ordinal:03d}:text:{index:04d}",
+        _text_source(
+            prefix=prefix,
             source_type=source_type,
-            kind=TEXT_KIND,
+            ordinal=ordinal,
+            chunk_index=index,
             origin=origin,
             content=chunk,
         )
@@ -190,22 +220,26 @@ def build_grounding_catalog(
 ) -> GroundingCatalog:
     """Create the exact source universe visible to a semantic model.
 
-    The returned source ids are the *only* references accepted later by grounded
-    packet validation. This prevents a model from citing a URL, image or text
-    chunk that was never supplied to the extraction step.
+    Builder-generated source ids contain a digest prefix. Rebuilding the catalog
+    after a source file changes therefore produces different ids and old model
+    output fails closed instead of being validated against new content.
     """
 
     sources: list[GroundedSource] = []
 
     for index, raw_path in enumerate(image_paths, start=1):
         path = Path(raw_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"商品图片不存在：{path}")
+        digest = _sha256_bytes(path.read_bytes())
         sources.append(
             GroundedSource(
-                source_id=f"image:{index:03d}",
+                source_id=f"image:{index:03d}:{digest[:12]}",
                 source_type="product_image",
                 kind=IMAGE_KIND,
                 origin=str(path.resolve()),
                 image_path=str(path),
+                sha256=digest,
             )
         )
 
@@ -242,13 +276,17 @@ def build_grounding_catalog(
             ),
             start=1,
         ):
+            digest = _sha256_text(chunk)
             sources.append(
                 GroundedSource(
-                    source_id=f"customer-text:001:text:{index:04d}",
+                    source_id=(
+                        f"customer-text:001:text:{index:04d}:{digest[:12]}"
+                    ),
                     source_type="customer_file",
                     kind=TEXT_KIND,
                     origin="supplemental_text",
                     content=chunk,
+                    sha256=digest,
                 )
             )
 
