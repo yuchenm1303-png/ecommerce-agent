@@ -17,6 +17,12 @@ from app.qa_catalog import load_question_catalog
 from app.resolution_engine import ResolutionPolicy, resolve_catalog, summarize_resolution
 from app.resolution_report import write_resolution_json, write_resolution_xlsx
 from app.resolver_inputs import ResolutionInputSpec, build_resolution_inputs
+from app.review_queue import (
+    build_review_queue,
+    summarize_review_queue,
+    write_review_queue_json,
+    write_review_queue_xlsx,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -103,12 +109,16 @@ def main() -> int:
     )
     records = resolve_catalog(catalog, bundle, policy=policy)
     summary = summarize_resolution(records)
+    review_items = build_review_queue(records)
+    review_summary = summarize_review_queue(review_items)
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = Path(args.output_dir) / f"resolve-{stamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = write_resolution_json(records, output_dir / "resolution.json")
     xlsx_path = write_resolution_xlsx(records, output_dir / "resolution.xlsx")
+    review_json = write_review_queue_json(review_items, output_dir / "review-queue.json")
+    review_xlsx = write_review_queue_xlsx(review_items, output_dir / "review-queue.xlsx")
     evidence_manifest = output_dir / "evidence-manifest.json"
     evidence_manifest.write_text(
         json.dumps(
@@ -122,6 +132,8 @@ def main() -> int:
                 "evidence_packet_files": input_result.evidence_packet_files,
                 "source_snapshot_files": input_result.source_snapshot_files,
                 "evidence_items": len(bundle.evidence),
+                "resolution_summary": summary,
+                "review_queue_summary": review_summary,
                 "warnings": input_result.warnings,
             },
             ensure_ascii=False,
@@ -148,11 +160,18 @@ def main() -> int:
         f"eligible_for_autofill={summary['eligible_for_autofill']}, "
         f"blocked={summary['blocked']}"
     )
+    print(
+        f"review_queue={review_summary['total']} "
+        f"(conflict={review_summary['conflict']}, needs_review={review_summary['needs_review']}, "
+        f"missing={review_summary['missing']})"
+    )
     print(f"evidence_items={len(bundle.evidence)}")
     if input_result.warnings:
         print(f"evidence_warnings={len(input_result.warnings)}（详见 evidence-manifest.json）")
     print(f"JSON: {json_path.resolve()}")
     print(f"XLSX: {xlsx_path.resolve()}")
+    print(f"Review JSON: {review_json.resolve()}")
+    print(f"Review XLSX: {review_xlsx.resolve()}")
     print(f"Evidence manifest: {evidence_manifest.resolve()}")
     print("本阶段只做解析报告；没有打开 Makro，也没有填写任何页面。")
     return 0
