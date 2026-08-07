@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
 from .evidence_pipeline import add_fact
 from .source_bundle import ProductSourceBundle, normalize_key
@@ -155,6 +155,7 @@ def bundle_from_evidence_packet(
             source_reference=fact.source_reference,
             confidence=fact.confidence,
             aliases=fact.aliases,
-            note=" | ".join(item for item in (fact.evidence_text, fact.note) if item),
+            evidence_text=fact.evidence_text,
+            note=fact.note,
         )
     return bundle
