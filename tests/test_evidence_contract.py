@@ -51,6 +51,7 @@ def test_packet_converts_to_bundle_with_provenance():
                     "source_reference": "image:front:crop=spec-table",
                     "confidence": 0.96,
                     "evidence_text": "1080P",
+                    "note": "printed on packaging",
                 }
             ],
         }
@@ -65,4 +66,5 @@ def test_packet_converts_to_bundle_with_provenance():
     assert len(evidence) == 1
     assert evidence[0].value == "1920x1080"
     assert evidence[0].source_reference == "image:front:crop=spec-table"
-    assert "1080P" in evidence[0].note
+    assert evidence[0].evidence_text == "1080P"
+    assert evidence[0].note == "printed on packaging"
