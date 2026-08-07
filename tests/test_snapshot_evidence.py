@@ -45,7 +45,9 @@ def test_exact_snapshot_rows_become_traceable_evidence_packet():
     result = extract_snapshot_evidence(snapshot(), catalog())
 
     assert result.matched_rows == 2
-    assert result.ignored_rows == 2
+    # selling price is business-locked, marketing name is unrequested, and the
+    # JSON-LD model pair is not a current QA question in this fixture.
+    assert result.ignored_rows == 3
     assert [fact.key for fact in result.packet.facts] == ["Image Resolution", "Screen Size"]
     assert result.packet.facts[0].source_type == "supplier_web"
     assert "#table-1-row-1" in result.packet.facts[0].source_reference
