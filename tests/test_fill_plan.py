@@ -26,24 +26,21 @@ def catalog() -> QuestionCatalog:
     )
 
 
-def test_plan_resolves_matched_product_question_and_unmatched_business_field():
-    bundle = ProductSourceBundle()
+def add_structured(bundle: ProductSourceBundle, key: str, value: str):
     bundle.add_evidence(
-        key="Model Number",
-        value="L11",
+        key=key,
+        value=value,
         source_type="structured",
-        source_reference="products.xlsx:model",
-        priority=10,
-        confidence=0.99,
-    )
-    bundle.add_evidence(
-        key="Selling Price",
-        value="899",
-        source_type="structured",
-        source_reference="products.xlsx:price",
+        source_reference=f"products.xlsx:{key}",
         priority=10,
         confidence=1.0,
     )
+
+
+def test_plan_resolves_matched_product_question_and_unmatched_business_field():
+    bundle = ProductSourceBundle()
+    add_structured(bundle, "Model Number", "L11")
+    add_structured(bundle, "Selling Price", "899")
 
     plan = build_live_fill_plan(
         catalog(),
@@ -63,14 +60,7 @@ def test_plan_resolves_matched_product_question_and_unmatched_business_field():
 
 def test_missing_required_business_field_blocks_plan():
     bundle = ProductSourceBundle()
-    bundle.add_evidence(
-        key="Model Number",
-        value="L11",
-        source_type="structured",
-        source_reference="products.xlsx:model",
-        priority=10,
-        confidence=0.99,
-    )
+    add_structured(bundle, "Model Number", "L11")
 
     plan = build_live_fill_plan(
         catalog(),
@@ -86,3 +76,39 @@ def test_missing_required_business_field_blocks_plan():
     assert plan.items[1].required is True
     assert plan.summary()["required_blocked"] == 1
     assert plan.summary()["safe_to_autofill_required_fields"] is False
+
+
+def test_selling_price_above_base_price_blocks_both_fields():
+    bundle = ProductSourceBundle()
+    add_structured(bundle, "Base Price", "800")
+    add_structured(bundle, "Selling Price", "899")
+
+    plan = build_live_fill_plan(
+        catalog(),
+        [
+            field("mrp", "Base Price"),
+            field("flipkart_selling_price", "Your selling price"),
+        ],
+        bundle,
+    )
+
+    assert [item.action for item in plan.items] == [BLOCKED, BLOCKED]
+    assert all("价格关系无效" in item.reason for item in plan.items)
+
+
+def test_minimum_order_quantity_above_maximum_blocks_both_fields():
+    bundle = ProductSourceBundle()
+    add_structured(bundle, "Minimum Order Quantity", "10")
+    add_structured(bundle, "Maximum Order Quantity", "5")
+
+    plan = build_live_fill_plan(
+        catalog(),
+        [
+            field("minimum_order_quantity", "Minimum Order Quantity (MinOQ)"),
+            field("max_order_quantity_allowed", "Maximum Order Quantity (MaxOQ)"),
+        ],
+        bundle,
+    )
+
+    assert [item.action for item in plan.items] == [BLOCKED, BLOCKED]
+    assert all("MOQ 关系无效" in item.reason for item in plan.items)
