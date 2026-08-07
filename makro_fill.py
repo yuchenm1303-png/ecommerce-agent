@@ -21,7 +21,7 @@ from playwright.sync_api import sync_playwright
 
 from app.answer_resolver import RESOLVED, resolve_fields
 from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness
-from app.makro import MAKRO_HOME_URL, base_section_title
+from app.makro import MAKRO_HOME_URL, base_section_title, is_listing_url, parse_makro_listing_url
 from app.makro.domain import MakroDomainAdapter
 from app.source_bundle import bundle_from_product_table, bundle_from_qa_file
 
@@ -85,6 +85,35 @@ def _load_bundle(args: argparse.Namespace):
         return bundle_from_product_table(args.product, sku=args.sku, **kwargs)
     except (ValueError, KeyError):
         return bundle_from_qa_file(args.product, sku=args.sku or "", **kwargs)
+
+
+def _assert_single_listing_tab(context: Any) -> None:
+    """Fail explicitly instead of silently guessing when several listing tabs exist.
+
+    Each listing tab is a different Makro draft; writing to the wrong one would
+    produce exactly the kind of "validated on the wrong page" false positive we
+    are guarding against. The user must close the extra tabs and re-run.
+    """
+
+    listing_pages = [page for page in context.pages if is_listing_url(page.url)]
+    if len(listing_pages) <= 1:
+        return
+    print("发现多个 Add a Single Listing 标签页，为避免填写到错误页面，请先关闭多余标签页：")
+    for index, page in enumerate(listing_pages):
+        target = None
+        try:
+            target = parse_makro_listing_url(page.url)
+        except ValueError:
+            pass
+        vertical = target.vertical if target else "?"
+        brand = target.brand if target else "?"
+        request_id = target.request_id if target else "?"
+        print(f"  tab {index}: vertical={vertical!r}, brand={brand!r}, requestId={request_id!r}")
+        print(f"    {page.url}")
+    raise RuntimeError(
+        "检测到多个 Add a Single Listing 标签页；已停止，不做任何填写。"
+        "请关闭多余标签页后重新运行。"
+    )
 
 
 def _select_target_section(
@@ -159,6 +188,12 @@ def main() -> int:
         # guard, scan or write. Never keep an adapter pointing at a stale page.
         page = harness.ensure_page()
         adapter = MakroDomainAdapter(page)
+        # Never silently guess the target tab when several listing drafts are open.
+        _assert_single_listing_tab(harness.context)
+        listing_tab_count = sum(
+            1 for candidate in harness.context.pages if is_listing_url(candidate.url)
+        )
+        print(f"操作标签页：{page.url}")
         adapter.assert_expected_vertical(args.expected_vertical)
 
         sections_payload, flat_controls, scan_stats = adapter.scan_sections(
@@ -219,9 +254,11 @@ def main() -> int:
                 semantic_field = fresh_field_by_key.get(answer.attribute_key)
                 if semantic_field is None:
                     continue
-                result = adapter.fill_resolved_field(semantic_field, answer)
+                result = adapter.fill_resolved_field(
+                    semantic_field, answer, section_path=section_path
+                )
                 verifications.append(result.as_dict())
-                print(f"  {answer.label}: {result.status}")
+                print(f"  {answer.label}: {result.status}  {result.detail}")
 
             print("\n已停在 Save 前：程序不会点击 Save。请直接在当前 Edge 中检查填写结果。")
 
@@ -237,6 +274,7 @@ def main() -> int:
             "expected_vertical": args.expected_vertical,
             "scan": scan_stats,
             "semantic_field_count": len(semantic_fields),
+            "listing_tab_count": listing_tab_count,
             "target_section": target_section,
             "resolutions": resolutions_payload,
             "verifications": verifications,

@@ -16,7 +16,7 @@ class FakeSelectedOption:
     def __init__(self, owner):
         self.owner = owner
 
-    def inner_text(self):
+    def inner_text(self, timeout=None):
         return self.owner.selected_label
 
 
@@ -24,6 +24,8 @@ class FakeLocator:
     def __init__(self, value="", selected_label=""):
         self.value = value
         self.selected_label = selected_label
+        self.visible = True
+        self._count = 1
         self.first = self
 
     def wait_for(self, state="visible"):
@@ -40,8 +42,18 @@ class FakeLocator:
         assert selector == "option:checked"
         return FakeSelectedOption(self)
 
-    def input_value(self):
+    def input_value(self, timeout=None):
         return self.value
+
+    def get_attribute(self, name, timeout=None):
+        assert name == "value"
+        return self.value
+
+    def count(self):
+        return self._count
+
+    def is_visible(self):
+        return self.visible
 
 
 class FakePage:
@@ -49,7 +61,11 @@ class FakePage:
         self.controls = controls
 
     def locator(self, selector):
-        return self.controls[selector]
+        key = selector.split(" >> ")[-1]
+        return self.controls[key]
+
+    def wait_for_timeout(self, ms):
+        pass
 
 
 def _control(name, kind="input"):
@@ -201,6 +217,53 @@ def test_acceptance_chain_resolver_section_selection_fill_readback():
     assert page.controls['[name="sku_id"]'].value == "SKU-001"
     assert page.controls['[name="listing_status_0_value"]'].selected_label == "Active"
     assert page.controls['[name="model_number_0_value"]'].value == "VC-9"
+
+
+def _listing_url(request_id, vertical="vehicle_camera_system"):
+    return (
+        "https://seller.makro.co.za/index.html#dashboard/addListings/single"
+        "?brand=experimental&vertical={0}&requestId={1}&context=CPUI&firstDraft=1&vid=847"
+    ).format(vertical, request_id)
+
+
+def test_single_listing_tab_is_accepted():
+    import makro_fill
+
+    context = SimpleNamespace(
+        pages=[
+            SimpleNamespace(url="https://seller.makro.co.za/"),
+            SimpleNamespace(url=_listing_url("REQAAA")),
+        ]
+    )
+    # Must not raise.
+    makro_fill._assert_single_listing_tab(context)
+
+
+def test_multiple_listing_tabs_fail_closed_before_fill():
+    import makro_fill
+
+    context = SimpleNamespace(
+        pages=[
+            SimpleNamespace(url=_listing_url("REQAAA")),
+            SimpleNamespace(url=_listing_url("REQBBB", vertical="sports_action_camera")),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="Add a Single Listing"):
+        makro_fill._assert_single_listing_tab(context)
+
+
+def test_multiple_listing_tabs_does_not_silently_pick_first():
+    import makro_fill
+
+    context = SimpleNamespace(
+        pages=[
+            SimpleNamespace(url=_listing_url("REQWRONG")),
+            SimpleNamespace(url=_listing_url("REQRIGHT")),
+        ]
+    )
+    with pytest.raises(RuntimeError):
+        makro_fill._assert_single_listing_tab(context)
 
 
 def test_adapter_has_no_save_or_submit_path():

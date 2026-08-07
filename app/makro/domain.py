@@ -149,7 +149,19 @@ class MakroDomainAdapter:
         return selector_for_control(control)
 
     def fill_resolved_field(
-        self, semantic_field: dict[str, Any], answer: Any
+        self,
+        semantic_field: dict[str, Any],
+        answer: Any,
+        *,
+        section_path: str | None = None,
+        recheck_wait_ms: int = 800,
     ) -> FillVerification:
-        """Fill only a resolved answer and read it back; never Save / Send to QC."""
-        return fill_resolved_field(self.page, semantic_field, answer)
+        """Fill only a resolved answer, scoped to its section card, and verify it
+        survives a render cycle. Never Save / Send to QC."""
+        return fill_resolved_field(
+            self.page,
+            semantic_field,
+            answer,
+            section_path=section_path,
+            recheck_wait_ms=recheck_wait_ms,
+        )
