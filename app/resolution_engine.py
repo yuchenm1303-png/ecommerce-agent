@@ -12,8 +12,9 @@ from .answer_resolver import (
     ResolvedAnswer,
     resolve_field,
 )
+from .fact_validators import validate_resolved_answer
 from .qa_catalog import QuestionCatalog, QuestionRecord
-from .source_bundle import ProductSourceBundle, SourceEvidence, normalize_key
+from .source_bundle import ProductSourceBundle
 
 
 @dataclass(slots=True, frozen=True)
@@ -21,6 +22,7 @@ class ResolutionPolicy:
     auto_fill_min_confidence: float = 0.85
     ai_auto_fill_min_confidence: float = 0.92
     require_source_reference: bool = True
+    validate_field_constraints: bool = True
 
 
 @dataclass(slots=True)
@@ -87,7 +89,10 @@ def _provenance(field: dict[str, Any], bundle: ProductSourceBundle) -> list[dict
             "confidence": item.confidence,
             "note": item.note,
         }
-        for item in sorted(candidates, key=lambda value: (value.priority, -value.confidence, value.source_reference))
+        for item in sorted(
+            candidates,
+            key=lambda value: (value.priority, -value.confidence, value.source_reference),
+        )
     ]
 
 
@@ -123,6 +128,13 @@ def resolve_one(
     answer = resolve_field(semantic_field, bundle, fallback=fallback)
     status, eligible, detail = _confidence_gate(answer, policy)
 
+    if status == RESOLVED and policy.validate_field_constraints:
+        validation = validate_resolved_answer(semantic_field, answer)
+        if not validation.valid:
+            status = NEEDS_REVIEW
+            eligible = False
+            detail = validation.detail
+
     return ResolutionRecord(
         attribute_key=answer.attribute_key,
         label=answer.label,
@@ -137,12 +149,22 @@ def resolve_one(
         detail=detail,
         eligible_for_autofill=eligible,
         provenance=_provenance(semantic_field, bundle),
-        question_number=question.number if question else str(semantic_field.get("question_number") or ""),
-        question_explanation=(
-            question.explanation if question else str(semantic_field.get("question_explanation") or "")
+        question_number=(
+            question.number if question else str(semantic_field.get("question_number") or "")
         ),
-        question_category=question.category if question else str(semantic_field.get("section_heading") or ""),
-        question_unit=question.unit if question else str(semantic_field.get("question_unit") or ""),
+        question_explanation=(
+            question.explanation
+            if question
+            else str(semantic_field.get("question_explanation") or "")
+        ),
+        question_category=(
+            question.category
+            if question
+            else str(semantic_field.get("section_heading") or "")
+        ),
+        question_unit=(
+            question.unit if question else str(semantic_field.get("question_unit") or "")
+        ),
         question_options=(list(question.options) if question else []),
     )
 
