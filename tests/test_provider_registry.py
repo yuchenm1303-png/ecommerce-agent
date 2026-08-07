@@ -92,6 +92,25 @@ def test_registry_builds_compatible_provider_from_arbitrary_env_name():
     assert provider.model == "vision-model"
     assert provider.base_url == "https://api.vendor.test/v1"
     assert provider.structured_mode == "json_object"
+    assert provider.compat_profile == "generic"
+
+
+def test_qwen_omni_model_auto_selects_streaming_compat_profile():
+    config = ProviderConfig(
+        provider="openai-compatible",
+        model="qwen3.5-omni-plus-2026-03-15",
+        api_key_env="DASHSCOPE_API_KEY",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
+    normalized = validate_provider_config(config)
+    assert normalized.compat_profile == "qwen-omni"
+
+    provider = build_semantic_provider(
+        config,
+        environ={"DASHSCOPE_API_KEY": "secret"},
+        client=DummyClient(),
+    )
+    assert provider.compat_profile == "qwen-omni"
 
 
 def test_registry_keeps_native_openai_adapter_available():
