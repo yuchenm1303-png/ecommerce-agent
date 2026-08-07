@@ -15,33 +15,38 @@ class SourcePolicy:
     priority: int
     default_confidence: float
     description: str
+    max_confidence: float = 1.0
 
 
 # Lower priority number wins when agreeing evidence is otherwise equivalent.
 # Conflicting accepted evidence is never silently overridden; the resolver sends
-# it to review instead.
+# it to review instead. max_confidence is a trust ceiling: extractor/model output
+# is not allowed to promote its own confidence beyond the source class itself.
 SOURCE_POLICIES: dict[str, SourcePolicy] = {
-    "business": SourcePolicy(5, 1.00, "explicit seller operating data"),
-    "config": SourcePolicy(6, 1.00, "explicit seller configuration"),
-    "rule": SourcePolicy(7, 0.99, "explicit deterministic seller rule"),
-    "structured": SourcePolicy(10, 0.99, "structured product table"),
-    "customer_answer": SourcePolicy(12, 0.99, "customer-confirmed QA answer"),
-    "manufacturer_doc": SourcePolicy(20, 0.98, "manufacturer specification/document"),
-    "supplier_doc": SourcePolicy(25, 0.95, "supplier product specification/document"),
-    "product_image": SourcePolicy(30, 0.92, "fact read from product image/packaging"),
-    "official_doc": SourcePolicy(35, 0.95, "official product documentation"),
-    "knowledge_base": SourcePolicy(40, 0.95, "previously confirmed knowledge base fact"),
-    "official_web": SourcePolicy(50, 0.90, "official web page"),
-    "supplier_web": SourcePolicy(55, 0.86, "supplier marketplace/product page"),
-    "customer_file": SourcePolicy(60, 0.90, "unstructured customer file evidence"),
-    "ai_synthesis": SourcePolicy(90, 0.70, "AI synthesis from cited source material"),
+    "business": SourcePolicy(5, 1.00, "explicit seller operating data", 1.00),
+    "config": SourcePolicy(6, 1.00, "explicit seller configuration", 1.00),
+    "rule": SourcePolicy(7, 0.99, "explicit deterministic seller rule", 0.99),
+    "structured": SourcePolicy(10, 0.99, "structured product table", 1.00),
+    "customer_answer": SourcePolicy(12, 0.99, "customer-confirmed QA answer", 1.00),
+    "manufacturer_doc": SourcePolicy(20, 0.98, "manufacturer specification/document", 0.99),
+    "supplier_doc": SourcePolicy(25, 0.95, "supplier product specification/document", 0.97),
+    "product_image": SourcePolicy(30, 0.92, "fact read from product image/packaging", 0.96),
+    "official_doc": SourcePolicy(35, 0.95, "official product documentation", 0.98),
+    "knowledge_base": SourcePolicy(40, 0.95, "previously confirmed knowledge base fact", 0.99),
+    "official_web": SourcePolicy(50, 0.90, "official web page", 0.95),
+    "supplier_web": SourcePolicy(55, 0.86, "supplier marketplace/product page", 0.90),
+    "customer_file": SourcePolicy(60, 0.90, "unstructured customer file evidence", 0.90),
+    # AI synthesis means the answer itself required inference/synthesis instead
+    # of being a direct source fact. It is intentionally below the default
+    # autofill threshold; it can inform review but cannot self-authorize writes.
+    "ai_synthesis": SourcePolicy(90, 0.70, "AI synthesis from cited source material", 0.84),
 }
 
 
 def source_policy(source_type: str) -> SourcePolicy:
     return SOURCE_POLICIES.get(
         source_type,
-        SourcePolicy(80, 0.75, "unknown/uncategorized source"),
+        SourcePolicy(80, 0.75, "unknown/uncategorized source", 0.75),
     )
 
 
@@ -57,9 +62,19 @@ def add_fact(
     note: str = "",
 ) -> None:
     policy = source_policy(source_type)
-    actual_confidence = policy.default_confidence if confidence is None else float(confidence)
-    if not 0.0 <= actual_confidence <= 1.0:
-        raise ValueError(f"confidence 必须在 0..1，当前 {actual_confidence}")
+    requested_confidence = (
+        policy.default_confidence if confidence is None else float(confidence)
+    )
+    if not 0.0 <= requested_confidence <= 1.0:
+        raise ValueError(f"confidence 必须在 0..1，当前 {requested_confidence}")
+    actual_confidence = min(requested_confidence, policy.max_confidence)
+    effective_note = note
+    if actual_confidence < requested_confidence:
+        cap_note = (
+            f"confidence capped by source policy: requested={requested_confidence:.4f}, "
+            f"effective={actual_confidence:.4f}, source_type={source_type}"
+        )
+        effective_note = " | ".join(item for item in (note, cap_note) if item)
 
     keys = [key, *aliases]
     seen: set[str] = set()
@@ -75,7 +90,7 @@ def add_fact(
             source_reference=source_reference,
             priority=policy.priority,
             confidence=actual_confidence,
-            note=note,
+            note=effective_note,
         )
 
 
@@ -128,7 +143,7 @@ def merge_bundles(*bundles: ProductSourceBundle) -> ProductSourceBundle:
 
 
 def bundle_from_facts_json(path: str | Path, *, sku: str = "") -> ProductSourceBundle:
-    """Load normalized facts produced by future image/web/AI extractors.
+    """Load normalized facts produced by deterministic/manual extractors.
 
     Accepted shape:
       {"facts": [{"key": ..., "value": ..., "source_type": ...,
@@ -136,7 +151,8 @@ def bundle_from_facts_json(path: str | Path, *, sku: str = "") -> ProductSourceB
                   "aliases": [...] }]}
 
     A plain object mapping keys to scalar values is also accepted as a convenient
-    structured/manual source.
+    structured/manual source. AI/image/web output should use strict
+    EvidencePacket files so catalog/identity validation cannot be bypassed.
     """
 
     source = Path(path)
