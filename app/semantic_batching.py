@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .evidence_contract import EvidencePacket, ProductIdentity, assert_identity_compatible
+from .evidence_contract import (
+    EvidenceContractError,
+    EvidencePacket,
+    IdentityMismatchError,
+    ProductIdentity,
+    assert_identity_compatible,
+)
 from .evidence_validation import is_business_question
 from .qa_catalog import QuestionCatalog, QuestionRecord
 from .semantic_extraction import (
@@ -111,11 +117,12 @@ def run_grounded_semantic_batches(
 ) -> SemanticBatchRunResult:
     """Run bounded semantic extraction while preserving fail-closed behavior.
 
-    A bad model response never enters the evidence bundle. When
-    ``continue_on_batch_error`` is true, other independent batches may still
-    contribute validated facts; questions from failed batches remain unanswered
-    and therefore blocked by the resolver. Identity conflicts are never treated
-    as recoverable batch errors.
+    Invalid model packets are isolated to their batch: none of their facts enter
+    the evidence bundle, while unrelated validated batches may still complete.
+    Product identity disagreement is different: it means we may be looking at a
+    different product, so IdentityMismatchError always aborts the entire run.
+    Provider/API failures also surface immediately rather than being hidden as a
+    content-validation failure.
     """
 
     batches = build_semantic_question_batches(catalog, batch_size=batch_size)
@@ -147,7 +154,9 @@ def run_grounded_semantic_batches(
                 expected_identity=expected_identity,
             )
             observed_identity = _merge_observed_identity(observed_identity, packet.identity)
-        except SemanticGroundingError as exc:
+        except IdentityMismatchError:
+            raise
+        except EvidenceContractError as exc:
             if not continue_on_batch_error:
                 raise
             failures.append(
