@@ -7,9 +7,10 @@ from typing import Any, Protocol
 from .evidence_contract import EvidencePacket, ProductIdentity
 from .evidence_validation import EvidenceValidationError, validate_evidence_packet
 from .extraction_request import build_extraction_request_payload
-from .qa_catalog import QuestionCatalog
+from .qa_catalog import QuestionCatalog, QuestionRecord
 from .semantic_grounding import GroundedSource, GroundingCatalog, IMAGE_KIND, TEXT_KIND
 from .source_bundle import normalize_key
+from .value_normalization import canonical_scalar_for_field
 
 
 class SemanticGroundingError(EvidenceValidationError):
@@ -37,6 +38,13 @@ class SemanticExtractionResult:
     provider_name: str
     request_payload: dict[str, Any]
     warnings: list[str] = field(default_factory=list)
+
+
+_RESOLUTION_IN_TEXT = re.compile(r"\d{2,5}\s*[x×*]\s*\d{2,5}", re.IGNORECASE)
+_NUMBER_IN_TEXT = re.compile(
+    r"(?<![\w.])([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:\s*[a-zA-Z°%]+(?:\s+[a-zA-Z]+)?)?)(?![\w.])",
+    re.IGNORECASE,
+)
 
 
 def _business_locked_questions(payload: dict[str, Any]) -> set[str]:
@@ -76,6 +84,7 @@ def build_grounded_semantic_request(
             "Return aliases as an empty array. Model-authored aliases are not trusted for question matching.",
             "For text sources, evidence_text must be a short literal excerpt copied from the cited source content.",
             "For image sources, evidence_text must be a concise description of the exact visible feature/text that supports the answer.",
+            "For direct source facts, every returned value must be explicitly present in evidence_text; if the answer requires inference or conversion, use ai_synthesis instead.",
             "fact.source_type must equal the cited source source_type, unless the answer requires inference; inferred answers must use ai_synthesis.",
             "Do not create a fact when evidence is ambiguous, partially visible, inferred from product category, or merely plausible.",
             "Do not silently normalize conflicting values into one answer; emit separate facts with separate source_reference values.",
@@ -99,6 +108,20 @@ def build_grounded_semantic_request(
 
 def _literal_normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip().casefold()
+
+
+def _question_lookup(catalog: QuestionCatalog) -> dict[str, QuestionRecord]:
+    output: dict[str, QuestionRecord] = {}
+    duplicates: set[str] = set()
+    for question in catalog.questions:
+        key = question.normalized_question
+        if key in output:
+            duplicates.add(key)
+        else:
+            output[key] = question
+    for key in duplicates:
+        output.pop(key, None)
+    return output
 
 
 def _validate_model_question_keys(packet: EvidencePacket, catalog: QuestionCatalog) -> None:
@@ -146,6 +169,63 @@ def _validate_image_grounding(fact_evidence: str, source: GroundedSource) -> Non
         )
 
 
+def _candidate_canonical_values(question: QuestionRecord, evidence_text: str) -> set[str]:
+    field = question.as_semantic_field()
+    candidates: set[str] = set()
+    for match in _RESOLUTION_IN_TEXT.finditer(evidence_text):
+        candidates.add(canonical_scalar_for_field(field, match.group(0)))
+    for match in _NUMBER_IN_TEXT.finditer(evidence_text):
+        candidates.add(canonical_scalar_for_field(field, match.group(1)))
+    return candidates
+
+
+def _direct_value_supported(
+    question: QuestionRecord,
+    value: str,
+    evidence_text: str,
+) -> bool:
+    raw_value = str(value).strip()
+    if not raw_value:
+        return False
+
+    # Exact normalized textual containment covers ordinary dropdown/text values
+    # and most direct numeric/unit strings while ignoring punctuation/case.
+    normalized_value = normalize_key(raw_value)
+    normalized_evidence = normalize_key(evidence_text)
+    if len(normalized_value) >= 2 and normalized_value in normalized_evidence:
+        return True
+
+    # Mechanical equivalence handles safe representation-only differences such
+    # as 3 inch vs 3.0 inches or 1920x1080 vs 1920 × 1080. It intentionally does
+    # not turn marketing labels like 1080P into pixel dimensions.
+    target = canonical_scalar_for_field(question.as_semantic_field(), raw_value)
+    if target.startswith(("num:", "px:")):
+        return target in _candidate_canonical_values(question, evidence_text)
+    return False
+
+
+def _validate_direct_claim_against_evidence(
+    *,
+    question: QuestionRecord,
+    value: str | tuple[str, ...],
+    source_type: str,
+    evidence_text: str,
+) -> None:
+    if source_type == "ai_synthesis":
+        return
+    values = value if isinstance(value, tuple) else (value,)
+    unsupported = [
+        item
+        for item in values
+        if not _direct_value_supported(question, item, evidence_text)
+    ]
+    if unsupported:
+        raise SemanticGroundingError(
+            f"fact {question.question!r} 的直接答案 {unsupported!r} 未机械出现在 evidence_text 中；"
+            "若答案需要推理/换算，必须标记为 ai_synthesis 并进入人工复核。"
+        )
+
+
 def validate_grounded_semantic_packet(
     payload: dict[str, Any] | EvidencePacket,
     catalog: QuestionCatalog,
@@ -162,6 +242,7 @@ def validate_grounded_semantic_packet(
         catalog,
         expected_identity=expected_identity,
     ).packet
+    questions = _question_lookup(catalog)
 
     for fact in validated.facts:
         source = grounding.by_id(fact.source_reference)
@@ -184,6 +265,16 @@ def validate_grounded_semantic_packet(
             raise SemanticGroundingError(
                 f"不支持的 grounded source kind={source.kind!r}。"
             )
+
+        question = questions.get(normalize_key(fact.key))
+        if question is None:  # should already be impossible after validation.
+            raise SemanticGroundingError(f"无法恢复 QA 问题：{fact.key!r}")
+        _validate_direct_claim_against_evidence(
+            question=question,
+            value=fact.value,
+            source_type=fact.source_type,
+            evidence_text=fact.evidence_text,
+        )
 
     return validated
 
