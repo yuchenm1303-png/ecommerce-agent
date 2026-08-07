@@ -83,7 +83,8 @@ def _assert_clean_start(adapter: Any) -> None:
 def _save_candidate_for(key: str, run_token: str) -> str | None:
     if key == "sku_id":
         # Deliberately short, alphanumeric and unique enough for a disposable test draft.
-        return f"COV{run_token[-10:]}"
+        safe = re.sub(r"[^A-Za-z0-9]", "", run_token)[-10:] or "TEST000001"
+        return f"COV{safe}"
     return _SAVE_SAFE_VALUES.get(key)
 
 
