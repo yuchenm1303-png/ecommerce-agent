@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from .source_bundle import ProductSourceBundle, SourceEvidence, normalize_key
+from .source_bundle import ProductSourceBundle, SourceEvidence
 from .value_normalization import canonical_evidence_value_for_field
 
 
@@ -41,8 +41,6 @@ BUSINESS_ATTRIBUTE_ALIASES: dict[str, tuple[str, ...]] = {
         "最大订购量",
     ),
     "shipping_days": ("shipping days", "pick pack sla", "shipping_days", "发货天数"),
-    # Fulfilment and shipping-region settings are seller operating policy, not
-    # product facts. They must never be invented by a semantic/LLM fallback.
     "service_profile": (
         "service profile",
         "service_profile",
@@ -101,8 +99,6 @@ def _raw_values(value: str | tuple[str, ...], *, multi_value: bool) -> list[str]
         return []
     if not multi_value:
         return [text]
-    # Prefer explicit list delimiters. Comma is supported last because many
-    # product descriptions legitimately contain commas.
     if re.search(r"[|;\n]", text):
         return [item.strip() for item in re.split(r"[|;\n]+", text) if item.strip()]
     if "," in text:
@@ -143,7 +139,6 @@ def _value_options(semantic_field: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         options.extend(control.get("options") or [])
     if not options:
-        # Fixtures or future probes may only carry options at semantic level.
         options = list(semantic_field.get("options") or [])
     return _clean_options(options)
 
@@ -177,15 +172,14 @@ def _extract_qualifier(
 ) -> tuple[list[str], str | None, dict[str, str] | None]:
     if not qualifier_options or not values:
         return values, None, None
-
-    # Qualifier controls generally apply to a single numeric/text value. Only
-    # strip a suffix when it exactly matches an allowed qualifier text/value.
     if len(values) != 1:
         return values, None, None
     raw = values[0].strip()
     ordered = sorted(
         qualifier_options,
-        key=lambda item: max(len(str(item.get("text") or "")), len(str(item.get("value") or ""))),
+        key=lambda item: max(
+            len(str(item.get("text") or "")), len(str(item.get("value") or ""))
+        ),
         reverse=True,
     )
     for option in ordered:
@@ -222,7 +216,6 @@ def _select_evidence(
 ) -> tuple[SourceEvidence | None, str | None]:
     if not candidates:
         return None, None
-
     canonical_values = {
         canonical_evidence_value_for_field(semantic_field, item.value)
         for item in candidates
@@ -232,11 +225,12 @@ def _select_evidence(
             f"{item.source_type}:{item.source_reference}={item.value}" for item in candidates
         )
         return None, details
-
-    # When sources agree after conservative mechanical normalization, retain the
-    # highest-priority original source/value instead of rewriting its evidence.
     candidates = sorted(candidates, key=lambda item: (item.priority, -item.confidence))
     return candidates[0], None
+
+
+def _evidence_display(chosen: SourceEvidence) -> str:
+    return chosen.evidence_text or str(chosen.value)
 
 
 def _missing_or_fallback(
@@ -245,12 +239,6 @@ def _missing_or_fallback(
     fallback: Any | None,
     detail: str,
 ) -> ResolvedAnswer:
-    """Return a fallback answer when allowed, otherwise the MISSING answer.
-
-    Business fields are never eligible for fallback: their values must come
-    from explicit structured/config/rule sources only.
-    """
-
     attribute_key = str(semantic_field.get("attribute_key") or "")
     label = str(semantic_field.get("label") or attribute_key)
     if fallback is not None and not _is_business_field(attribute_key):
@@ -270,14 +258,6 @@ def resolve_field(
     bundle: ProductSourceBundle,
     fallback: Any | None = None,
 ) -> ResolvedAnswer:
-    """Resolve one semantic field from explicit evidence only.
-
-    ``fallback`` is an optional last-resort resolver (see
-    ``app.makro.fallback``). It is consulted only when deterministic semantic
-    resolution has no safe answer, and never for business/operational fields
-    (SKU, price, MOQ, stock, shipping...). The default ``None`` keeps the
-    current behavior unchanged; no LLM is called in this task.
-    """
     attribute_key = str(semantic_field.get("attribute_key") or "")
     label = str(semantic_field.get("label") or attribute_key)
     candidates = bundle.candidates(_candidate_keys(semantic_field))
@@ -330,7 +310,7 @@ def resolve_field(
                     answer_values=values,
                     source_type=chosen.source_type,
                     source_reference=chosen.source_reference,
-                    evidence=str(chosen.value),
+                    evidence=_evidence_display(chosen),
                     confidence=chosen.confidence,
                     detail=f"答案 {value!r} 无法唯一精确匹配当前 Makro 下拉选项。",
                 )
@@ -349,7 +329,7 @@ def resolve_field(
         qualifier=qualifier,
         source_type=chosen.source_type,
         source_reference=chosen.source_reference,
-        evidence=str(chosen.value),
+        evidence=_evidence_display(chosen),
         confidence=chosen.confidence,
         option_match=option_matches,
         detail="仅使用明确证据解析；未调用无依据 AI 猜测。",
@@ -361,5 +341,4 @@ def resolve_fields(
     bundle: ProductSourceBundle,
     fallback: Any | None = None,
 ) -> list[ResolvedAnswer]:
-    """Resolve every semantic field; see :func:`resolve_field` for fallback."""
     return [resolve_field(field, bundle, fallback=fallback) for field in semantic_fields]
