@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
+from .answer_resolver import NEEDS_REVIEW
 from .qa_catalog import QuestionCatalog, QuestionRecord
 from .question_matcher import AMBIGUOUS, MATCHED, UNMATCHED, MatchAudit, match_questions_to_fields
 from .resolution_engine import ResolutionPolicy, ResolutionRecord, resolve_one
@@ -99,6 +101,55 @@ def _matched_question_by_field_id(audit: MatchAudit) -> dict[int, tuple[Question
     return output
 
 
+def _decimal_answer(item: LiveFillPlanItem) -> Decimal | None:
+    values = item.resolution.answer_values
+    if not values:
+        return None
+    try:
+        return Decimal(values[0].strip())
+    except (InvalidOperation, AttributeError):
+        return None
+
+
+def _block_items(items: list[LiveFillPlanItem], keys: tuple[str, ...], detail: str) -> None:
+    for item in items:
+        if item.attribute_key not in keys:
+            continue
+        item.action = BLOCKED
+        item.reason = detail
+        item.resolution.status = NEEDS_REVIEW
+        item.resolution.eligible_for_autofill = False
+        item.resolution.detail = detail
+
+
+def _apply_cross_field_business_rules(items: list[LiveFillPlanItem]) -> None:
+    by_key = {item.attribute_key: item for item in items}
+
+    mrp = by_key.get("mrp")
+    selling = by_key.get("flipkart_selling_price")
+    if mrp and selling and mrp.action == READY and selling.action == READY:
+        mrp_value = _decimal_answer(mrp)
+        selling_value = _decimal_answer(selling)
+        if mrp_value is not None and selling_value is not None and selling_value > mrp_value:
+            _block_items(
+                items,
+                ("mrp", "flipkart_selling_price"),
+                f"价格关系无效：Selling Price={selling_value} 高于 Base Price/MRP={mrp_value}。",
+            )
+
+    minimum = by_key.get("minimum_order_quantity")
+    maximum = by_key.get("max_order_quantity_allowed")
+    if minimum and maximum and minimum.action == READY and maximum.action == READY:
+        min_value = _decimal_answer(minimum)
+        max_value = _decimal_answer(maximum)
+        if min_value is not None and max_value is not None and min_value > max_value:
+            _block_items(
+                items,
+                ("minimum_order_quantity", "max_order_quantity_allowed"),
+                f"MOQ 关系无效：MinOQ={min_value} 高于 MaxOQ={max_value}。",
+            )
+
+
 def build_live_fill_plan(
     catalog: QuestionCatalog,
     semantic_fields: Iterable[dict[str, Any]],
@@ -155,6 +206,8 @@ def build_live_fill_plan(
                 match_basis=match_basis,
             )
         )
+
+    _apply_cross_field_business_rules(items)
 
     unmatched_questions = []
     for match in audit.matches:
