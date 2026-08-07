@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from .source_bundle import ProductSourceBundle, SourceEvidence, normalize_key
+from .value_normalization import canonical_evidence_value_for_field
 
 
 RESOLVED = "resolved"
@@ -90,16 +91,6 @@ class ResolvedAnswer:
             "option_match": self.option_match,
             "detail": self.detail,
         }
-
-
-def _canonical_scalar(value: str) -> str:
-    return re.sub(r"\s+", " ", value.strip()).casefold()
-
-
-def _canonical_evidence_value(value: str | tuple[str, ...]) -> tuple[str, ...]:
-    if isinstance(value, tuple):
-        return tuple(_canonical_scalar(item) for item in value)
-    return (_canonical_scalar(value),)
 
 
 def _raw_values(value: str | tuple[str, ...], *, multi_value: bool) -> list[str]:
@@ -198,7 +189,10 @@ def _extract_qualifier(
         reverse=True,
     )
     for option in ordered:
-        for candidate in (str(option.get("text") or "").strip(), str(option.get("value") or "").strip()):
+        for candidate in (
+            str(option.get("text") or "").strip(),
+            str(option.get("value") or "").strip(),
+        ):
             if not candidate:
                 continue
             pattern = re.compile(rf"^(.*?)\s*{re.escape(candidate)}\s*$", re.IGNORECASE)
@@ -222,15 +216,25 @@ def _is_business_field(attribute_key: str) -> bool:
     return attribute_key in BUSINESS_ATTRIBUTE_ALIASES
 
 
-def _select_evidence(candidates: list[SourceEvidence]) -> tuple[SourceEvidence | None, str | None]:
+def _select_evidence(
+    candidates: list[SourceEvidence],
+    semantic_field: dict[str, Any],
+) -> tuple[SourceEvidence | None, str | None]:
     if not candidates:
         return None, None
-    canonical_values = {_canonical_evidence_value(item.value) for item in candidates}
+
+    canonical_values = {
+        canonical_evidence_value_for_field(semantic_field, item.value)
+        for item in candidates
+    }
     if len(canonical_values) > 1:
         details = " | ".join(
             f"{item.source_type}:{item.source_reference}={item.value}" for item in candidates
         )
         return None, details
+
+    # When sources agree after conservative mechanical normalization, retain the
+    # highest-priority original source/value instead of rewriting its evidence.
     candidates = sorted(candidates, key=lambda item: (item.priority, -item.confidence))
     return candidates[0], None
 
@@ -290,7 +294,7 @@ def resolve_field(
                 detail="经营字段只能来自明确结构化数据/config/rule；禁止 AI 或非结构化来源猜测。",
             )
 
-    chosen, conflict_detail = _select_evidence(candidates)
+    chosen, conflict_detail = _select_evidence(candidates, semantic_field)
     if conflict_detail is not None:
         return ResolvedAnswer(
             attribute_key=attribute_key,
