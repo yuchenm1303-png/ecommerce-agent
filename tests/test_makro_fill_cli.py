@@ -13,8 +13,8 @@ def test_makro_fill_cli_imports_and_defaults_to_dry_run():
 
     assert args.dry_run is True
     assert args.source_format == "auto"
-    assert args.browser == "edge"
     assert args.expected_vertical is None
+    assert args.cdp_port == 9222
 
 
 def test_section_title_count_is_not_part_of_identity():
@@ -52,10 +52,13 @@ def test_expected_vertical_guard_blocks_wrong_listing_before_fill():
         makro_fill._assert_expected_vertical(page, "vehicle_camera_system")
 
 
-def test_cli_has_no_save_or_submit_action():
+def test_cli_has_no_save_submit_or_browser_close_action():
     source = inspect.getsource(makro_fill)
 
     assert "select_option" not in source  # field writes live in makro_dryrun, not ad-hoc CLI code
     assert 'get_by_text("Save"' not in source
     assert 'get_by_text("Send to QC"' not in source
     assert ".save(" not in source
+    assert "launch_persistent_context" not in source
+    assert "context.close()" not in source
+    assert "browser.close()" not in source
