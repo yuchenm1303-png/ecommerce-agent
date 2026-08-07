@@ -41,6 +41,15 @@ def _safe_base_url(value: str) -> str:
     return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
 
 
+def _effective_compat_profile(provider: str, model: str, requested: str) -> str:
+    if provider != "openai-compatible" or requested != "generic":
+        return requested
+    normalized_model = model.casefold()
+    if normalized_model.startswith(("qwen3.5-omni-", "qwen3-omni-", "qwen-omni-")):
+        return "qwen-omni"
+    return requested
+
+
 @dataclass(slots=True, frozen=True)
 class ProviderConfig:
     provider: str
@@ -95,7 +104,8 @@ def validate_provider_config(config: ProviderConfig) -> ProviderConfig:
         raise ProviderConfigurationError(
             f"不支持的 provider={config.provider!r}；当前支持：{', '.join(SUPPORTED_PROVIDERS)}"
         )
-    if not config.model.strip():
+    model = config.model.strip()
+    if not model:
         raise ProviderConfigurationError("--model 不能为空。")
     if not config.api_key_env.strip():
         raise ProviderConfigurationError("--api-key-env 不能为空。")
@@ -122,15 +132,16 @@ def validate_provider_config(config: ProviderConfig) -> ProviderConfig:
             "--compat-profile 仅用于 openai-compatible provider；原生 OpenAI 请使用 generic。"
         )
 
+    effective_profile = _effective_compat_profile(provider, model, config.compat_profile)
     return ProviderConfig(
         provider=provider,
-        model=config.model.strip(),
+        model=model,
         api_key_env=config.api_key_env.strip(),
         base_url=base_url,
         image_detail=config.image_detail,
         max_output_tokens=int(config.max_output_tokens),
         structured_mode=config.structured_mode,
-        compat_profile=config.compat_profile,
+        compat_profile=effective_profile,
     )
 
 
@@ -155,9 +166,6 @@ def build_semantic_provider(
             compat_profile=normalized.compat_profile,
         )
 
-    # Native OpenAI keeps the existing Responses API adapter and strict JSON
-    # schema behavior. When a custom env variable is requested we construct the
-    # SDK client explicitly rather than mutating process-global environment.
     if client is None:
         try:
             from openai import OpenAI
