@@ -124,9 +124,10 @@ def _message_content(request_payload: dict[str, Any], *, image_detail: str) -> l
         image_url: dict[str, Any] = {
             "url": _image_data_uri(str(source.get("image_path") or "")),
         }
-        # Many OpenAI-compatible APIs accept detail; some ignore it. Keeping it
-        # inside image_url follows the common Chat Completions multimodal shape.
-        if image_detail:
+        # `detail` is not universal across OpenAI-compatible providers. In auto
+        # mode we omit it entirely; callers may request low/high only when their
+        # vendor documents support this extension.
+        if image_detail in {"low", "high"}:
             image_url["detail"] = image_detail
         content.append({"type": "image_url", "image_url": image_url})
     return content
@@ -202,7 +203,7 @@ class OpenAICompatibleSemanticProvider:
         api_key: str,
         base_url: str,
         client: Any | None = None,
-        image_detail: str = "high",
+        image_detail: str = "auto",
         max_output_tokens: int = 12000,
         structured_mode: str = "prompt_only",
     ) -> None:
@@ -254,7 +255,6 @@ class OpenAICompatibleSemanticProvider:
                     ),
                 },
             ],
-            "temperature": 0,
             "max_tokens": self.max_output_tokens,
         }
         if self.structured_mode == "json_object":
