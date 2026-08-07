@@ -17,9 +17,10 @@ def test_makro_fill_cli_imports_and_defaults_to_dry_run():
     assert args.cdp_port == 9222
 
 
-def test_section_title_count_is_not_part_of_identity():
+def test_section_ui_suffixes_are_not_part_of_identity():
     assert makro_fill._base_section_title("Product Description (14/14)") == "Product Description"
-    assert makro_fill._base_section_title("Additional Description (Optional) (0/46)") == "Additional Description (Optional)"
+    assert makro_fill._base_section_title("Additional Description (Optional) (0/46)") == "Additional Description"
+    assert makro_fill._base_section_title("Additional Description (optional)") == "Additional Description"
 
 
 def test_target_section_uses_resolved_answers_only():
@@ -33,6 +34,21 @@ def test_target_section_uses_resolved_answers_only():
     ]
 
     assert makro_fill._select_target_section(sections, resolutions, None) == "Product Description"
+
+
+def test_requested_additional_description_matches_optional_ui_suffix():
+    sections = [{"title": "Additional Description (Optional) (0/46)"}]
+    resolutions = [
+        {
+            "status": "resolved",
+            "section_heading": "Additional Description (Optional) (0/46)",
+        }
+    ]
+
+    assert (
+        makro_fill._select_target_section(sections, resolutions, "Additional Description")
+        == "Additional Description"
+    )
 
 
 def test_expected_vertical_guard_accepts_matching_listing():
