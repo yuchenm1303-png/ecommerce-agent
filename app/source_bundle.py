@@ -171,22 +171,61 @@ def _find_header(headers: list[str], aliases: set[str]) -> int | None:
     return None
 
 
-def _qa_rows_from_csv(path: Path) -> tuple[list[str], list[list[Any]]]:
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        rows = list(csv.reader(handle))
+def _looks_like_qa_header(row: Iterable[Any]) -> bool:
+    headers = [_stringify(item) for item in row]
+    return (
+        _find_header(headers, QUESTION_HEADERS) is not None
+        and _find_header(headers, ANSWER_HEADERS) is not None
+    )
+
+
+def _locate_qa_table(
+    rows: list[list[Any]], *, max_header_rows: int = 50
+) -> tuple[list[str], list[list[Any]], int]:
+    """Find the actual QA header row instead of assuming row 1.
+
+    Real client workbooks often contain a title/instructions block above the
+    table. We only accept a row when it independently contains both a known
+    question header and a known answer header, so this remains conservative.
+    Returns headers, following data rows and the 1-based header row number.
+    """
+
     if not rows:
-        raise ValueError("QA CSV 文件为空。")
-    return [_stringify(item) for item in rows[0]], rows[1:]
+        raise ValueError("QA 文件为空。")
+    for index, row in enumerate(rows[:max_header_rows]):
+        if _looks_like_qa_header(row):
+            return [_stringify(item) for item in row], rows[index + 1 :], index + 1
+    raise ValueError(
+        "未识别到 QA 列。请确认前 50 行内存在同时包含 Question/Attribute/问题/字段 "
+        "与 Answer/Value/答案 的表头行。"
+    )
 
 
-def _qa_rows_from_excel(path: Path) -> tuple[list[str], list[list[Any]]]:
+def _qa_rows_from_csv(path: Path) -> tuple[list[str], list[list[Any]], int, str | None]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = [list(row) for row in csv.reader(handle)]
+    headers, data_rows, header_row = _locate_qa_table(rows)
+    return headers, data_rows, header_row, None
+
+
+def _qa_rows_from_excel(path: Path) -> tuple[list[str], list[list[Any]], int, str | None]:
     workbook = load_workbook(path, read_only=True, data_only=True)
     try:
-        sheet = workbook.active
-        rows = list(sheet.iter_rows(values_only=True))
-        if not rows:
+        saw_any_rows = False
+        for sheet in workbook.worksheets:
+            rows = [list(row) for row in sheet.iter_rows(values_only=True)]
+            if rows:
+                saw_any_rows = True
+            try:
+                headers, data_rows, header_row = _locate_qa_table(rows)
+            except ValueError:
+                continue
+            return headers, data_rows, header_row, sheet.title
+        if not saw_any_rows:
             raise ValueError("QA Excel 文件为空。")
-        return [_stringify(item) for item in rows[0]], [list(row) for row in rows[1:]]
+        raise ValueError(
+            "未识别到 QA 列。已检查所有工作表前 50 行；请确认存在同时包含问题/字段与答案的表头。"
+        )
     finally:
         workbook.close()
 
@@ -201,17 +240,18 @@ def bundle_from_qa_file(
 ) -> ProductSourceBundle:
     """Load a question/answer workbook like the client's current manual workflow.
 
-    The loader is intentionally tolerant of English/Chinese header names but
-    conservative about content: it only imports rows with both an explicit
-    question/attribute and an explicit answer/value.
+    The loader is intentionally tolerant of English/Chinese header names,
+    leading title/instruction rows and a non-active data worksheet. It remains
+    conservative about content: only rows with both an explicit
+    question/attribute and an explicit answer/value are imported.
     """
 
     source = Path(path)
     suffix = source.suffix.lower()
     if suffix == ".csv":
-        headers, rows = _qa_rows_from_csv(source)
+        headers, rows, header_row, sheet_name = _qa_rows_from_csv(source)
     elif suffix in {".xlsx", ".xlsm"}:
-        headers, rows = _qa_rows_from_excel(source)
+        headers, rows, header_row, sheet_name = _qa_rows_from_excel(source)
     else:
         raise ValueError("QA 文件当前仅支持 .csv / .xlsx / .xlsm。")
 
@@ -228,17 +268,20 @@ def bundle_from_qa_file(
         product_url=product_url,
         supplemental_text=supplemental_text,
     )
-    for row_number, row in enumerate(rows, start=2):
+    for row_number, row in enumerate(rows, start=header_row + 1):
         padded = list(row) + [None] * max(0, len(headers) - len(row))
         question = _stringify(padded[question_index])
         answer = _stringify(padded[answer_index])
         if not question or not answer:
             continue
+        location = f"{source.name}:row={row_number}"
+        if sheet_name:
+            location = f"{source.name}:sheet={sheet_name}:row={row_number}"
         bundle.add_evidence(
             key=question,
             value=answer,
             source_type="customer_file",
-            source_reference=f"{source.name}:row={row_number}",
+            source_reference=location,
             priority=20,
         )
     if not bundle.evidence:
