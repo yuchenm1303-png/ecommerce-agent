@@ -85,7 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--official-snapshot", action="append", default=[], help="官方网页 snapshot JSON，可重复")
     parser.add_argument("--supplemental-text", default="")
     parser.add_argument("--supplemental-text-file", default=None)
-    parser.add_argument("--image-detail", choices=("auto", "low", "high"), default="high")
+    parser.add_argument(
+        "--image-detail",
+        choices=("auto", "low", "high"),
+        default="auto",
+        help="默认 auto：兼容接口不发送 vendor-specific detail 字段；确认服务商支持时可选 low/high。",
+    )
     parser.add_argument("--batch-size", type=int, default=12)
     parser.add_argument("--max-output-tokens", type=int, default=12000)
     parser.add_argument("--max-text-chars", type=int, default=3000)
