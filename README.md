@@ -87,6 +87,8 @@
 
 语义问题默认按小批次执行。某个批次输出结构/证据不合法时，该批次所有事实全部丢弃，对应问题继续保持 missing/blocked；其他独立批次可继续。身份冲突和 API/provider 故障不会被静默吞掉。
 
+**重要边界：** 普通 `EvidencePacket` 是通用数据交换格式，不等于“已经完成 grounded semantic 验证”。任何未来会驱动真实 Makro 写入的路径，都必须使用本次 source universe 重新校验 semantic packet，或使用由 grounded pipeline 直接产生的受控结果；不能仅因为 JSON 形状合法就授权浏览器写入。
+
 ### OpenAI provider
 
 `app/providers/openai_semantic.py` 是第一套真实 multimodal provider adapter。核心 resolver 仍然保持 provider-neutral。
@@ -209,6 +211,7 @@ python makro_plan_listing.py --qa <qa.xlsx> --expected-vertical <vertical> [evid
 - 经营字段拒绝 AI / image / web 来源。
 - 模型不得自造 QA alias、source id 或高可信 source type。
 - direct semantic fact 的 answer 必须能在其 evidence 中直接核对；推理只能进 review。
+- 普通 EvidencePacket 不能单独作为真实浏览器写入授权；semantic evidence 必须重新绑定并校验本次 sources。
 - CAPTCHA / 风控只允许人工正常处理，不自动绕过。
 - Makro 长期 Edge 与 source Edge 使用不同 profile / CDP port。
 - 最终 `Send to QC` 始终是独立的高风险提交动作，不与解析/测试隐式绑定。
