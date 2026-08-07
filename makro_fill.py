@@ -4,8 +4,9 @@ This command intentionally does NOT click Save or Send to QC. It scans all
 current Makro semantic fields, resolves answers from explicit product evidence,
 then fills one editable section and leaves it open for human inspection.
 
-Example:
-    python makro_fill.py --product data/product.xlsx --sku ABC123 --dry-run
+The default browser model is one long-lived detached Microsoft Edge instance.
+Later invocations reconnect to that same Edge/profile/login through localhost
+CDP instead of launching a new browser.
 """
 
 from __future__ import annotations
@@ -20,12 +21,12 @@ from typing import Any
 from playwright.sync_api import Page, sync_playwright
 
 from app.answer_resolver import RESOLVED, resolve_fields
+from app.browser_session import DEFAULT_CDP_PORT, connect_single_edge
 from app.makro_dryrun import fill_resolved_field
-from app.platforms.makro import parse_makro_listing_url
+from app.platforms.makro import is_makro_listing_page, parse_makro_listing_url
 from app.source_bundle import bundle_from_product_table, bundle_from_qa_file
 from makro_probe import (
     MAKRO_HOME_URL,
-    build_launch_kwargs,
     build_semantic_fields,
     find_sections,
     scan_section_fields,
@@ -59,10 +60,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="可选安全门。要求当前 Add Listing URL 的 vertical 与此值完全一致；不一致时在扫描/填写前停止",
     )
-    parser.add_argument("--browser", choices=("edge", "chromium"), default="edge")
     parser.add_argument("--profile-dir", default="browser_profiles/makro-edge")
+    parser.add_argument(
+        "--cdp-port",
+        type=int,
+        default=DEFAULT_CDP_PORT,
+        help="长期 Edge 的 localhost CDP 端口；默认 9222。后续运行复用同一浏览器，不会重新启动 Edge。",
+    )
     parser.add_argument("--logs-dir", default="logs/makro-fill")
-    parser.add_argument("--headless", action="store_true")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -166,118 +171,130 @@ def main() -> int:
     print(f"商品资料：{Path(args.product).resolve()}")
     print(f"SKU：{bundle.sku or '(QA 文件未指定)'}")
     print(f"user_data_dir：{profile_dir}")
+    print(f"长期 Edge CDP：127.0.0.1:{args.cdp_port}")
     print("安全模式：dry-run；不会点击 Save / Send to QC。")
     if args.expected_vertical:
         print(f"预期 vertical：{args.expected_vertical}")
 
     with sync_playwright() as playwright:
-        context = playwright.chromium.launch_persistent_context(
-            **build_launch_kwargs(
-                browser=args.browser,
-                profile_dir=profile_dir,
-                headless=args.headless,
-            )
+        session = connect_single_edge(
+            playwright,
+            profile_dir=profile_dir,
+            port=args.cdp_port,
+            start_url=MAKRO_HOME_URL,
         )
-        page = context.pages[0] if context.pages else context.new_page()
+        page = session.page
         page.set_default_timeout(15_000)
-        try:
+
+        if session.launched_now:
+            print("已启动长期 Makro Edge。以后脚本将复用这个浏览器，不再重复启动。")
+        else:
+            print("已连接现有 Makro Edge；不会新开浏览器。")
+
+        # Never navigate away from an already-open listing. If the long-lived
+        # Edge was just created (or is on another page), let the user navigate in
+        # that same window and then continue.
+        if not is_makro_listing_page(page):
             wait_for_authenticated_listing(
                 page,
                 MAKRO_HOME_URL,
-                headless=args.headless,
-                navigate_first=True,
+                headless=False,
+                navigate_first=session.launched_now,
             )
-            _assert_expected_vertical(page, args.expected_vertical)
 
-            sections_payload, flat_controls, scan_stats = scan_sections(
+        _assert_expected_vertical(page, args.expected_vertical)
+
+        sections_payload, flat_controls, scan_stats = scan_sections(
+            page,
+            include_values=False,
+            wait_ms=args.scroll_wait_ms,
+            max_scroll_steps=args.max_scroll_steps,
+        )
+        semantic_fields = build_semantic_fields(flat_controls)
+        resolved = resolve_fields(semantic_fields, bundle)
+
+        resolutions_payload: list[dict[str, Any]] = []
+        for answer in resolved:
+            data = answer.as_dict()
+            matching_field = next(
+                (
+                    field
+                    for field in semantic_fields
+                    if field.get("attribute_key") == answer.attribute_key
+                    and field.get("label") == answer.label
+                ),
+                None,
+            )
+            data["section_heading"] = (
+                str(matching_field.get("section_heading") or "") if matching_field else ""
+            )
+            resolutions_payload.append(data)
+
+        target_section = _select_target_section(
+            sections_payload, resolutions_payload, args.section
+        )
+        verifications: list[dict[str, Any]] = []
+
+        if target_section is None:
+            print("没有找到可安全自动填写的 resolved section；不会修改页面。")
+        else:
+            print(f"本次 dry-run 只填写一个 section：{target_section}")
+            print("其他 section 已解析但不填写，避免在禁止 Save 的阶段跨 section 丢失状态。")
+            current = _find_section(page, target_section)
+            if current is None:
+                raise RuntimeError(f"当前页面找不到 section：{target_section}")
+            _open_section_for_edit(page, current)
+            current = _find_section(page, target_section) or current
+            section_path = str(current.get("path") or "")
+            fresh_controls = scan_section_fields(
                 page,
+                section_path,
                 include_values=False,
                 wait_ms=args.scroll_wait_ms,
                 max_scroll_steps=args.max_scroll_steps,
             )
-            semantic_fields = build_semantic_fields(flat_controls)
-            resolved = resolve_fields(semantic_fields, bundle)
-
-            resolutions_payload: list[dict[str, Any]] = []
-            for answer in resolved:
-                data = answer.as_dict()
-                matching_field = next(
-                    (
-                        field
-                        for field in semantic_fields
-                        if field.get("attribute_key") == answer.attribute_key
-                        and field.get("label") == answer.label
-                    ),
-                    None,
-                )
-                data["section_heading"] = (
-                    str(matching_field.get("section_heading") or "") if matching_field else ""
-                )
-                resolutions_payload.append(data)
-
-            target_section = _select_target_section(
-                sections_payload, resolutions_payload, args.section
-            )
-            verifications: list[dict[str, Any]] = []
-
-            if target_section is None:
-                print("没有找到可安全自动填写的 resolved section；不会修改页面。")
-            else:
-                print(f"本次 dry-run 只填写一个 section：{target_section}")
-                print("其他 section 已解析但不填写，避免在禁止 Save 的阶段跨 section 丢失状态。")
-                current = _find_section(page, target_section)
-                if current is None:
-                    raise RuntimeError(f"当前页面找不到 section：{target_section}")
-                _open_section_for_edit(page, current)
-                current = _find_section(page, target_section) or current
-                section_path = str(current.get("path") or "")
-                fresh_controls = scan_section_fields(
-                    page,
-                    section_path,
-                    include_values=False,
-                    wait_ms=args.scroll_wait_ms,
-                    max_scroll_steps=args.max_scroll_steps,
-                )
-                fresh_fields = build_semantic_fields(fresh_controls)
-                fresh_answers = resolve_fields(fresh_fields, bundle)
-                fresh_field_by_key = {
-                    str(field.get("attribute_key") or ""): field for field in fresh_fields
-                }
-                for answer in fresh_answers:
-                    if answer.status != RESOLVED:
-                        continue
-                    semantic_field = fresh_field_by_key.get(answer.attribute_key)
-                    if semantic_field is None:
-                        continue
-                    result = fill_resolved_field(page, semantic_field, answer)
-                    verifications.append(result.as_dict())
-                    print(f"  {answer.label}: {result.status}")
-
-                print("\n已停在 Save 前：程序不会点击 Save。请在 Edge 中检查填写结果。")
-
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            output = logs_dir / f"makro-fill-{timestamp}.json"
-            payload = {
-                "mode": "dry_run",
-                "page_url": page.url,
-                "sku": bundle.sku,
-                "source_file": str(Path(args.product).resolve()),
-                "expected_vertical": args.expected_vertical,
-                "scan": scan_stats,
-                "semantic_field_count": len(semantic_fields),
-                "target_section": target_section,
-                "resolutions": resolutions_payload,
-                "verifications": verifications,
-                "save_clicked": False,
-                "send_to_qc_clicked": False,
+            fresh_fields = build_semantic_fields(fresh_controls)
+            fresh_answers = resolve_fields(fresh_fields, bundle)
+            fresh_field_by_key = {
+                str(field.get("attribute_key") or ""): field for field in fresh_fields
             }
-            output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"日志：{output.resolve()}")
+            for answer in fresh_answers:
+                if answer.status != RESOLVED:
+                    continue
+                semantic_field = fresh_field_by_key.get(answer.attribute_key)
+                if semantic_field is None:
+                    continue
+                result = fill_resolved_field(page, semantic_field, answer)
+                verifications.append(result.as_dict())
+                print(f"  {answer.label}: {result.status}")
 
-            if not args.headless:
-                input("检查完成后回终端按 Enter，关闭自动化 Edge（未保存修改会被丢弃）。")
-        finally:
-            context.close()
+            print("\n已停在 Save 前：程序不会点击 Save。请直接在当前 Edge 中检查填写结果。")
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        output = logs_dir / f"makro-fill-{timestamp}.json"
+        payload = {
+            "mode": "dry_run",
+            "browser_session": "single_edge_cdp",
+            "cdp_port": args.cdp_port,
+            "page_url": page.url,
+            "sku": bundle.sku,
+            "source_file": str(Path(args.product).resolve()),
+            "expected_vertical": args.expected_vertical,
+            "scan": scan_stats,
+            "semantic_field_count": len(semantic_fields),
+            "target_section": target_section,
+            "resolutions": resolutions_payload,
+            "verifications": verifications,
+            "save_clicked": False,
+            "send_to_qc_clicked": False,
+        }
+        output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"日志：{output.resolve()}")
+        print("脚本已结束，但长期 Edge 会继续保持打开；不会因终端返回而关闭浏览器。")
+
+        # Important: the browser is an externally launched long-lived process.
+        # Do NOT call browser.close() or context.close(). Leaving the Playwright
+        # connection is enough; the same Edge remains available to later runs.
     return 0
 
 
