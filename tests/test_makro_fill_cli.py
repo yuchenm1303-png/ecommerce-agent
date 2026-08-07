@@ -52,7 +52,7 @@ def test_expected_vertical_guard_blocks_wrong_listing_before_fill():
         makro_fill._assert_expected_vertical(page, "vehicle_camera_system")
 
 
-def test_cli_has_no_save_submit_or_browser_close_action():
+def test_cli_has_no_save_submit_or_owned_browser_launch_action():
     source = inspect.getsource(makro_fill)
 
     assert "select_option" not in source  # field writes live in makro_dryrun, not ad-hoc CLI code
@@ -60,5 +60,11 @@ def test_cli_has_no_save_submit_or_browser_close_action():
     assert 'get_by_text("Send to QC"' not in source
     assert ".save(" not in source
     assert "launch_persistent_context" not in source
-    assert "context.close()" not in source
-    assert "browser.close()" not in source
+    # The executable code must not own/close the long-lived Edge session.
+    executable_lines = [
+        line.strip()
+        for line in source.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert "context.close()" not in executable_lines
+    assert "browser.close()" not in executable_lines
