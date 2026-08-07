@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+storage_state.json
+*.cookie.json
+
+# Runtime output
+logs/*.jsonl
+logs/*.log
+!logs/.gitkeep
+
+# Generated local spreadsheets
+# Keep the CSV fixture in git; generated Excel files stay local.
+data/*.xlsx
+
+# Playwright
+playwright-report/
+test-results/
