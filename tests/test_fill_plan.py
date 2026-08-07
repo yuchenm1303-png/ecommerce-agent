@@ -3,7 +3,7 @@ from __future__ import annotations
 from app.fill_plan import BLOCKED, READY, build_live_fill_plan
 from app.qa_catalog import QuestionCatalog, QuestionRecord
 from app.resolution_engine import ResolutionPolicy
-from app.source_bundle import ProductSourceBundle
+from app.source_bundle import ProductSourceBundle, normalize_key
 
 
 def field(key: str, label: str, *, required: bool = True):
@@ -112,3 +112,29 @@ def test_minimum_order_quantity_above_maximum_blocks_both_fields():
 
     assert [item.action for item in plan.items] == [BLOCKED, BLOCKED]
     assert all("MOQ 关系无效" in item.reason for item in plan.items)
+
+
+def test_explicit_question_alias_also_resolves_evidence_under_qa_label():
+    qa = QuestionCatalog(
+        source_path="qa.xlsx",
+        sheet_name="Sheet1",
+        header_row=3,
+        questions=[QuestionRecord(number="1", question="Video Resolution")],
+    )
+    bundle = ProductSourceBundle()
+    add_structured(bundle, "Video Resolution", "1920x1080")
+    aliases = {normalize_key("Video Resolution"): ("Image Resolution",)}
+
+    plan = build_live_fill_plan(
+        qa,
+        [field("image_resolution", "Image Resolution")],
+        bundle,
+        aliases=aliases,
+    )
+
+    assert plan.items[0].action == READY
+    assert plan.items[0].question == "Video Resolution"
+    assert plan.items[0].match_basis == "explicit-alias"
+    assert plan.items[0].resolution.answer == "1920x1080"
+    assert plan.items[0].resolution.label == "Image Resolution"
+    assert plan.items[0].resolution.provenance[0]["key"] == "Video Resolution"
