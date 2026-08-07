@@ -13,7 +13,9 @@ from .evidence_pipeline import (
 )
 from .evidence_validation import validate_evidence_packet
 from .qa_catalog import QuestionCatalog
+from .snapshot_evidence import extract_snapshot_evidence
 from .source_bundle import ProductSourceBundle, bundle_from_product_table, normalize_key
+from .source_snapshot import source_snapshot_from_json
 
 
 _TRUSTED_IDENTITY_SOURCE_TYPES = {
@@ -33,6 +35,8 @@ class ResolutionInputSpec:
     product_table: str | None = None
     facts_json: tuple[str, ...] = ()
     evidence_packets: tuple[str, ...] = ()
+    supplier_snapshots: tuple[str, ...] = ()
+    official_snapshots: tuple[str, ...] = ()
     supplemental_text: str = ""
     supplemental_text_file: str | None = None
     image_paths: tuple[str, ...] = ()
@@ -53,6 +57,7 @@ class ResolutionInputResult:
     expected_identity: ProductIdentity
     warnings: list[str] = field(default_factory=list)
     evidence_packet_files: list[str] = field(default_factory=list)
+    source_snapshot_files: list[str] = field(default_factory=list)
 
 
 def _trusted_identity_value(
@@ -134,15 +139,75 @@ def _derive_expected_identity(
     )
 
 
+def _append_validated_packet(
+    *,
+    packet: EvidencePacket,
+    catalog: QuestionCatalog,
+    expected: ProductIdentity,
+    bundles: list[ProductSourceBundle],
+    warnings: list[str],
+    warning_prefix: str,
+) -> None:
+    validated = validate_evidence_packet(
+        packet,
+        catalog,
+        expected_identity=expected,
+    )
+    warnings.extend(
+        f"{warning_prefix}: {warning}" for warning in validated.warnings
+    )
+    bundles.append(
+        bundle_from_evidence_packet(
+            validated.packet,
+            expected_identity=expected,
+        )
+    )
+
+
+def _append_snapshot_files(
+    *,
+    paths: tuple[str, ...],
+    source_type: str,
+    confidence: float,
+    catalog: QuestionCatalog,
+    expected: ProductIdentity,
+    bundles: list[ProductSourceBundle],
+    warnings: list[str],
+    snapshot_files: list[str],
+) -> None:
+    for path in paths:
+        snapshot_path = Path(path)
+        snapshot = source_snapshot_from_json(snapshot_path)
+        extracted = extract_snapshot_evidence(
+            snapshot,
+            catalog,
+            source_type=source_type,
+            confidence=confidence,
+        )
+        _append_validated_packet(
+            packet=extracted.packet,
+            catalog=catalog,
+            expected=expected,
+            bundles=bundles,
+            warnings=warnings,
+            warning_prefix=snapshot_path.name,
+        )
+        if extracted.ignored_rows:
+            warnings.append(
+                f"{snapshot_path.name}: ignored_source_rows={extracted.ignored_rows}"
+            )
+        snapshot_files.append(str(snapshot_path.resolve()))
+
+
 def build_resolution_inputs(
     catalog: QuestionCatalog,
     spec: ResolutionInputSpec,
 ) -> ResolutionInputResult:
     """Load every explicit evidence source through one shared safety boundary.
 
-    Both the offline report CLI and the live Makro planner use this same function.
-    External image/web/AI packets are validated only after the expected product
-    identity has been derived from explicit trusted inputs whenever possible.
+    Explicit trusted inputs establish product identity first. External image/web/
+    AI evidence is then question-scoped and identity-checked before entering the
+    resolver. Deterministic source snapshots take the same validated packet path.
     """
 
     trusted_bundles: list[ProductSourceBundle] = [
@@ -176,21 +241,37 @@ def build_resolution_inputs(
         packet_path = Path(path)
         payload = json.loads(packet_path.read_text(encoding="utf-8"))
         packet = EvidencePacket.from_mapping(payload)
-        validated = validate_evidence_packet(
-            packet,
-            catalog,
-            expected_identity=expected,
-        )
-        warnings.extend(
-            f"{packet_path.name}: {warning}" for warning in validated.warnings
-        )
-        bundles.append(
-            bundle_from_evidence_packet(
-                validated.packet,
-                expected_identity=expected,
-            )
+        _append_validated_packet(
+            packet=packet,
+            catalog=catalog,
+            expected=expected,
+            bundles=bundles,
+            warnings=warnings,
+            warning_prefix=packet_path.name,
         )
         packet_files.append(str(packet_path.resolve()))
+
+    snapshot_files: list[str] = []
+    _append_snapshot_files(
+        paths=spec.supplier_snapshots,
+        source_type="supplier_web",
+        confidence=0.88,
+        catalog=catalog,
+        expected=expected,
+        bundles=bundles,
+        warnings=warnings,
+        snapshot_files=snapshot_files,
+    )
+    _append_snapshot_files(
+        paths=spec.official_snapshots,
+        source_type="official_web",
+        confidence=0.92,
+        catalog=catalog,
+        expected=expected,
+        bundles=bundles,
+        warnings=warnings,
+        snapshot_files=snapshot_files,
+    )
 
     text_parts = [spec.supplemental_text]
     if spec.supplemental_text_file:
@@ -211,4 +292,5 @@ def build_resolution_inputs(
         expected_identity=expected,
         warnings=warnings,
         evidence_packet_files=packet_files,
+        source_snapshot_files=snapshot_files,
     )
