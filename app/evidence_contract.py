@@ -141,21 +141,47 @@ def bundle_from_evidence_packet(
     packet: EvidencePacket,
     *,
     expected_identity: ProductIdentity | None = None,
+    confidence_ceiling: float | None = None,
+    quarantine_note: str = "",
 ) -> ProductSourceBundle:
+    """Convert a validated packet into resolver evidence.
+
+    ``confidence_ceiling`` is a second trust boundary used for generic external
+    packet files. A packet may have a correct JSON shape and QA/identity scope
+    without proving that its cited image/web evidence belongs to the current
+    source universe. Callers can therefore quarantine it below the system
+    autofill floor while still keeping its candidate values visible for review.
+
+    Grounded semantic pipelines and deterministic snapshot extractors omit this
+    ceiling only after they have independently validated their source binding.
+    """
+
     if expected_identity is not None:
         assert_identity_compatible(expected_identity, packet.identity)
+    if confidence_ceiling is not None and not 0.0 <= confidence_ceiling <= 1.0:
+        raise ValueError("confidence_ceiling 必须在 0..1。")
 
     bundle = ProductSourceBundle(sku=packet.identity.sku)
     for fact in packet.facts:
+        confidence = fact.confidence
+        note_parts = [fact.note]
+        if confidence_ceiling is not None and confidence > confidence_ceiling:
+            confidence = confidence_ceiling
+            note_parts.append(
+                "external packet quarantined below autofill trust floor: "
+                f"original={fact.confidence:.4f}, effective={confidence:.4f}"
+            )
+        if quarantine_note:
+            note_parts.append(quarantine_note)
         add_fact(
             bundle,
             key=fact.key,
             value=fact.value,
             source_type=fact.source_type,
             source_reference=fact.source_reference,
-            confidence=fact.confidence,
+            confidence=confidence,
             aliases=fact.aliases,
             evidence_text=fact.evidence_text,
-            note=fact.note,
+            note=" | ".join(part for part in note_parts if part),
         )
     return bundle
