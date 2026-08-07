@@ -39,7 +39,7 @@
 - 答案
 - 来源工作表/行号
 
-答案为空的行仍然保留为待解析问题。
+答案为空的行仍然保留为待解析问题。表头检测要求 `Question/问题/字段` 之外至少还有一个 QA companion column，避免把单独写着 `Questions` 的标题行误识别为表头。
 
 ### 证据输入
 
@@ -61,6 +61,71 @@
 - 必须有 `evidence_text`
 - 必须有 `confidence`
 - 若已有 SKU / Model / Brand 身份锚点，必须匹配当前商品
+
+### Grounded Semantic Extraction
+
+对于图片、1688/供应商网页中的自由文本等无法靠 table / JSON-LD 直接读取的内容，系统增加了一层独立的 **grounded semantic extraction boundary**。模型不是答案数据库，也不能直接控制 Makro；它只能从本次明确提供的 source universe 中提出候选事实。
+
+`app/semantic_grounding.py` 会把每个输入源绑定成稳定、可审计的 source id：
+
+- 图片：读取实际文件 bytes，计算 SHA-256，source id 含 digest prefix。
+- supplier / official snapshot：把已捕获页面文本按固定规则切块，每块计算 SHA-256，source id 含 digest prefix。
+- supplemental text：同样按块绑定 digest。
+
+因此源文件或网页 snapshot 内容发生变化后，重新生成的 source id 会变化，旧模型输出不能无声复用到新内容。
+
+模型返回的每个 semantic fact 还必须同时通过：
+
+- `fact.key` 必须精确对应当前 QA 中唯一问题；模型不得自己发明 alias。
+- `source_reference` 必须精确等于本次 request 中存在的 source id。
+- 文本 evidence 必须是 cited text chunk 中真实存在的逐字片段。
+- 图片 evidence 必须明确描述支撑答案的可见文字/特征。
+- direct-source answer 必须直接出现在 evidence 中；需要翻译、换算、推理时必须标成 `ai_synthesis`，随后会被低置信度安全门挡到 review。
+- source type 不得冒充更高可信来源。
+- 经营字段无条件排除在 semantic batches 之外。
+- 商品身份不一致时整个 semantic run fail closed。
+
+语义问题默认按小批次执行。某个批次输出结构/证据不合法时，该批次所有事实全部丢弃，对应问题继续保持 missing/blocked；其他独立批次可继续。身份冲突和 API/provider 故障不会被静默吞掉。
+
+### OpenAI provider
+
+`app/providers/openai_semantic.py` 是第一套真实 multimodal provider adapter。核心 resolver 仍然保持 provider-neutral。
+
+它使用 OpenAI Responses API + strict JSON Schema，把文本 grounded sources 与本地商品图片发送给模型。模型输出首先被视为 **untrusted candidate JSON**，随后仍必须经过上述 grounding、QA、business、identity、confidence、conflict 和 field constraint 校验。
+
+API key 只从标准环境变量 `OPENAI_API_KEY` 读取。项目没有 `--api-key` 命令行参数，也不会把 key 写入 report / manifest / Git。
+
+单次完成“grounded semantic extraction + deterministic resolver + review queue”，且完全不打开 Makro：
+
+```powershell
+python makro_resolve_openai.py --qa <qa.xlsx> --image <front.jpg> --image <back.jpg> [source/trusted-data options]
+```
+
+常用可选输入：
+
+```text
+--supplier-snapshot <snapshot.json>
+--official-snapshot <snapshot.json>
+--product-table <products.xlsx>
+--facts-json <trusted-facts.json>
+--expected-model <model>
+--expected-brand <brand>
+--openai-model gpt-5.6
+--batch-size 12
+```
+
+输出包括：
+
+- `validated-semantic-evidence.json`
+- `source-manifest.json`
+- `semantic-batches.json`
+- `resolution.json`
+- `resolution.xlsx`
+- `review-queue.json`
+- `review-queue.xlsx`
+- `run-manifest.json`
+
+该命令明确记录 `makro_browser_opened=false`、`writes_performed=0`、`save_clicked=false`、`send_to_qc_clicked=false`。
 
 ### 来源置信度上限
 
@@ -114,6 +179,18 @@ python makro_capture_source.py --url <product-url>
 python makro_extract_snapshot.py --qa <qa.xlsx> --snapshot <source-snapshot.json>
 ```
 
+生成 grounded semantic request 但不调用模型：
+
+```powershell
+python makro_prepare_grounded_extraction.py --qa <qa.xlsx> [source options]
+```
+
+校验一个外部模型返回的 packet 是否真的绑定到本次 grounded sources：
+
+```powershell
+python makro_validate_semantic_packet.py --qa <qa.xlsx> --packet <packet.json> [same source options]
+```
+
 只读扫描当前 Makro 页面并生成 READY/BLOCKED 填写计划：
 
 ```powershell
@@ -130,6 +207,8 @@ python makro_plan_listing.py --qa <qa.xlsx> --expected-vertical <vertical> [evid
 - 商品身份冲突时 fail closed。
 - 下拉选项只接受唯一精确匹配。
 - 经营字段拒绝 AI / image / web 来源。
+- 模型不得自造 QA alias、source id 或高可信 source type。
+- direct semantic fact 的 answer 必须能在其 evidence 中直接核对；推理只能进 review。
 - CAPTCHA / 风控只允许人工正常处理，不自动绕过。
 - Makro 长期 Edge 与 source Edge 使用不同 profile / CDP port。
 - 最终 `Send to QC` 始终是独立的高风险提交动作，不与解析/测试隐式绑定。
