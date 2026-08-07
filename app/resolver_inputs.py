@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
 from .evidence_contract import EvidencePacket, ProductIdentity, bundle_from_evidence_packet
 from .evidence_pipeline import (
@@ -14,7 +13,16 @@ from .evidence_pipeline import (
 )
 from .evidence_validation import validate_evidence_packet
 from .qa_catalog import QuestionCatalog
-from .source_bundle import ProductSourceBundle, bundle_from_product_table
+from .source_bundle import ProductSourceBundle, bundle_from_product_table, normalize_key
+
+
+_TRUSTED_IDENTITY_SOURCE_TYPES = {
+    "structured",
+    "customer_answer",
+    "business",
+    "config",
+    "rule",
+}
 
 
 @dataclass(slots=True, frozen=True)
@@ -47,18 +55,97 @@ class ResolutionInputResult:
     evidence_packet_files: list[str] = field(default_factory=list)
 
 
+def _trusted_identity_value(
+    bundle: ProductSourceBundle,
+    keys: tuple[str, ...],
+    *,
+    identity_name: str,
+) -> str:
+    candidates = [
+        item
+        for item in bundle.candidates(keys)
+        if item.source_type in _TRUSTED_IDENTITY_SOURCE_TYPES
+        and isinstance(item.value, str)
+        and item.value.strip()
+    ]
+    if not candidates:
+        return ""
+
+    canonical: dict[str, list[str]] = {}
+    for item in candidates:
+        canonical.setdefault(normalize_key(item.value), []).append(item.value.strip())
+    if len(canonical) > 1:
+        details = " | ".join(
+            f"{item.source_type}:{item.source_reference}={item.value}"
+            for item in candidates
+        )
+        raise ValueError(f"可信来源中的 {identity_name} 身份锚点互相冲突：{details}")
+
+    candidates.sort(key=lambda item: (item.priority, -item.confidence, item.source_reference))
+    return str(candidates[0].value).strip()
+
+
+def _coalesce_identity_value(
+    explicit: str,
+    derived: str,
+    *,
+    identity_name: str,
+) -> str:
+    explicit = explicit.strip()
+    derived = derived.strip()
+    if explicit and derived and normalize_key(explicit) != normalize_key(derived):
+        raise ValueError(
+            f"显式 {identity_name}={explicit!r} 与可信资料推导值 {derived!r} 冲突。"
+        )
+    return explicit or derived
+
+
+def _derive_expected_identity(
+    spec: ResolutionInputSpec,
+    trusted_bundle: ProductSourceBundle,
+) -> ProductIdentity:
+    derived_sku = trusted_bundle.sku or _trusted_identity_value(
+        trusted_bundle,
+        ("SKU", "SKU ID", "sku_id"),
+        identity_name="SKU",
+    )
+    derived_model = _trusted_identity_value(
+        trusted_bundle,
+        ("Model Number", "Model", "model_number", "型号"),
+        identity_name="Model Number",
+    )
+    derived_brand = _trusted_identity_value(
+        trusted_bundle,
+        ("Brand", "Brand Name", "brand_name", "品牌"),
+        identity_name="Brand",
+    )
+    return ProductIdentity(
+        sku=_coalesce_identity_value(spec.sku, derived_sku, identity_name="SKU"),
+        model_number=_coalesce_identity_value(
+            spec.expected_model,
+            derived_model,
+            identity_name="Model Number",
+        ),
+        brand=_coalesce_identity_value(
+            spec.expected_brand,
+            derived_brand,
+            identity_name="Brand",
+        ),
+    )
+
+
 def build_resolution_inputs(
     catalog: QuestionCatalog,
     spec: ResolutionInputSpec,
 ) -> ResolutionInputResult:
     """Load every explicit evidence source through one shared safety boundary.
 
-    Both the offline report CLI and the future live Makro planner use this same
-    function. That prevents the browser path from accidentally accepting looser
-    evidence than the offline audit path.
+    Both the offline report CLI and the live Makro planner use this same function.
+    External image/web/AI packets are validated only after the expected product
+    identity has been derived from explicit trusted inputs whenever possible.
     """
 
-    bundles: list[ProductSourceBundle] = [
+    trusted_bundles: list[ProductSourceBundle] = [
         bundle_from_catalog_answers(
             catalog,
             sku=spec.sku,
@@ -70,7 +157,7 @@ def build_resolution_inputs(
     warnings: list[str] = []
 
     if spec.product_table:
-        bundles.append(
+        trusted_bundles.append(
             bundle_from_product_table(
                 spec.product_table,
                 sku=spec.sku or None,
@@ -78,9 +165,12 @@ def build_resolution_inputs(
         )
 
     for path in spec.facts_json:
-        bundles.append(bundle_from_facts_json(path, sku=spec.sku))
+        trusted_bundles.append(bundle_from_facts_json(path, sku=spec.sku))
 
-    expected = spec.expected_identity
+    trusted_bundle = merge_bundles(*trusted_bundles)
+    expected = _derive_expected_identity(spec, trusted_bundle)
+    bundles = list(trusted_bundles)
+
     packet_files: list[str] = []
     for path in spec.evidence_packets:
         packet_path = Path(path)
