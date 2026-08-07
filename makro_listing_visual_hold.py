@@ -1,4 +1,4 @@
-"""Fill all current empty Makro listing attributes and leave them for inspection.
+"""Fill current empty Makro listing attributes and leave them for inspection.
 
 This is a development/inspection command. It never clicks Save, Send to QC, or
 Cancel. Synthetic values intentionally remain in the current draft after the
@@ -22,16 +22,26 @@ from app.makro.direct_visual_hold import (
     summarize_direct_hold,
 )
 from app.makro.domain import MakroDomainAdapter
+from app.makro.listing_preflight import CORE_FORM_SECTIONS
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "动态发现并填写三个核心 Makro section 的所有当前空 listing attribute，"
+            "动态发现并填写 Makro 核心 section 的所有当前空 listing attribute，"
             "填完后保持测试值供人工检查；不 Save / Send to QC / Cancel。"
         )
     )
     parser.add_argument("--expected-vertical", required=True)
+    parser.add_argument(
+        "--section",
+        action="append",
+        choices=CORE_FORM_SECTIONS,
+        help=(
+            "只检查指定核心 section；可重复传入。未指定时按三个核心 section 依次处理。"
+            "Makro 若一次只能编辑一个 section，建议人工验收时一次只传一个。"
+        ),
+    )
     parser.add_argument("--profile-dir", default="browser_profiles/makro-edge")
     parser.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT)
     parser.add_argument("--logs-dir", default="logs/makro-listing-visual-hold")
@@ -70,15 +80,17 @@ def _print_progress(section: str, item: Any, index: int, total: int) -> None:
 
 def main() -> int:
     args = build_parser().parse_args()
+    sections = tuple(args.section) if args.section else CORE_FORM_SECTIONS
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = Path(args.logs_dir) / f"visual-hold-{stamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     print("===== MAKRO DYNAMIC LISTING VISUAL HOLD =====")
     print("本命令不使用 14/46/74/78 等固定字段数量。")
-    print("运行时动态发现当前商品三个核心 section 的真实 listing attributes。")
+    print("运行时动态发现当前商品所选 section 的真实 listing attributes。")
     print("只填当前空字段；已有值不覆盖。")
     print("不会 Save，不会 Send to QC，不会 Cancel；测试值会留在页面供你检查。")
+    print("本次 section：" + " | ".join(sections))
 
     harness: EdgeHarness | None = None
     summary: dict[str, Any] | None = None
@@ -113,6 +125,7 @@ def main() -> int:
 
             results_by_section = fill_all_current_empty_attributes(
                 adapter,
+                sections=sections,
                 recheck_wait_ms=args.recheck_wait_ms,
                 wait_ms=args.scroll_wait_ms,
                 max_scroll_steps=args.max_scroll_steps,
@@ -125,6 +138,7 @@ def main() -> int:
                 "page_url": page_url,
                 "expected_vertical": args.expected_vertical,
                 "listing_tab_count": listing_tab_count,
+                "sections_requested": list(sections),
                 "summary": summary,
                 "results": {
                     title: [item.as_dict() for item in results]
