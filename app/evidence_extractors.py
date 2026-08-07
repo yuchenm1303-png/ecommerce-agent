@@ -5,11 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from .evidence_contract import (
-    EvidencePacket,
-    ProductIdentity,
-    assert_identity_compatible,
-)
+from .evidence_contract import EvidencePacket, ProductIdentity
+from .evidence_validation import validate_evidence_packet
 from .qa_catalog import QuestionCatalog
 
 
@@ -45,8 +42,11 @@ class JsonPacketExtractor:
     def extract(self, request: ExtractionRequest) -> EvidencePacket:
         payload = json.loads(self.path.read_text(encoding="utf-8"))
         packet = EvidencePacket.from_mapping(payload)
-        assert_identity_compatible(request.expected_identity, packet.identity)
-        return packet
+        return validate_evidence_packet(
+            packet,
+            request.catalog,
+            expected_identity=request.expected_identity,
+        ).packet
 
 
 @dataclass(slots=True)
@@ -65,14 +65,22 @@ def run_extractors(
 ) -> CompositeExtractionResult:
     """Run independent extractors and keep their provenance separate.
 
-    Extractors are not allowed to reconcile disagreements here. Conflicts remain
-    visible as separate evidence and are resolved/blocked later by the resolver.
+    Every packet is validated against the exact current QA catalog before it can
+    leave this boundary. Extractors cannot inject unrequested generic facts,
+    cannot supply business/operational fields and cannot silently reconcile
+    disagreements. Conflicts stay as separate evidence for the resolver.
     """
 
     output = CompositeExtractionResult()
     for extractor in extractors:
-        packet = extractor.extract(request)
-        assert_identity_compatible(request.expected_identity, packet.identity)
-        output.packets.append(packet)
-        output.warnings.extend(f"{extractor.name}: {warning}" for warning in packet.warnings)
+        raw_packet = extractor.extract(request)
+        validated = validate_evidence_packet(
+            raw_packet,
+            request.catalog,
+            expected_identity=request.expected_identity,
+        )
+        output.packets.append(validated.packet)
+        output.warnings.extend(
+            f"{extractor.name}: {warning}" for warning in validated.warnings
+        )
     return output
