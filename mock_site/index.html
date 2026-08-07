@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mock Seller Center</title>
+  <style>
+    :root {
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #172033;
+      background: #f3f6fb;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; }
+    header {
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 32px;
+      background: #111827;
+      color: white;
+    }
+    header strong { font-size: 18px; }
+    header span { color: #aeb8ca; font-size: 13px; }
+    main { max-width: 980px; margin: 34px auto; padding: 0 20px 60px; }
+    .crumb { color: #6b7280; font-size: 13px; margin-bottom: 16px; }
+    .card {
+      background: white;
+      border: 1px solid #e5e7eb;
+      border-radius: 16px;
+      box-shadow: 0 12px 40px rgba(15, 23, 42, .06);
+      overflow: hidden;
+    }
+    .card-head {
+      padding: 24px 28px;
+      border-bottom: 1px solid #edf0f5;
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      align-items: flex-start;
+    }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    .meta { color: #667085; font-size: 14px; }
+    .sku-pill {
+      border-radius: 999px;
+      background: #eef4ff;
+      color: #3157d5;
+      padding: 8px 12px;
+      font-weight: 700;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    form { padding: 26px 28px 30px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px 26px; }
+    .field { display: flex; flex-direction: column; gap: 8px; }
+    label { font-weight: 650; font-size: 14px; }
+    .required::after { content: " *"; color: #d92d20; }
+    input, select {
+      width: 100%;
+      height: 42px;
+      border: 1px solid #cfd6e2;
+      border-radius: 9px;
+      padding: 0 12px;
+      background: #fff;
+      color: #182230;
+      font-size: 14px;
+      outline: none;
+    }
+    input:focus, select:focus { border-color: #6c86f5; box-shadow: 0 0 0 3px rgba(90, 116, 235, .12); }
+    .actions {
+      margin-top: 28px;
+      padding-top: 22px;
+      border-top: 1px solid #edf0f5;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 14px;
+    }
+    button {
+      height: 42px;
+      padding: 0 20px;
+      border: 0;
+      border-radius: 9px;
+      background: #3157d5;
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    #save-status { margin-right: auto; font-size: 14px; }
+    #save-status[data-state="success"] { color: #087a55; }
+    #save-status[data-state="error"] { color: #b42318; }
+    .notice {
+      margin-bottom: 18px;
+      border: 1px solid #dbe3f2;
+      border-radius: 12px;
+      padding: 14px 16px;
+      background: #f8faff;
+      color: #4b5c77;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    @media (max-width: 720px) {
+      .grid { grid-template-columns: 1fr; }
+      header { padding: 0 18px; }
+      .card-head { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>Mock Seller Center</strong>
+    <span>仅用于 ecommerce-agent 本地自动化测试</span>
+  </header>
+
+  <main>
+    <div class="crumb">商品管理 / 编辑商品</div>
+    <div class="notice">
+      这是项目内置的假卖家后台。自动化程序会先核对 SKU，再读取这些表单问题、匹配表格答案、填写并二次校验，全部通过后才允许保存。
+    </div>
+
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <h1 id="product-name">商品</h1>
+          <div class="meta" id="product-category">类目：照明设备</div>
+        </div>
+        <div class="sku-pill">SKU：<span id="sku-value"></span></div>
+      </div>
+
+      <form id="product-form">
+        <div class="grid">
+          <div class="field">
+            <label class="required" for="brand">品牌</label>
+            <input id="brand" name="brand" type="text" required autocomplete="off" />
+          </div>
+
+          <div class="field">
+            <label class="required" for="rated-power">额定功率</label>
+            <input id="rated-power" name="rated_power" type="text" required autocomplete="off" placeholder="例如 60W" />
+          </div>
+
+          <div class="field">
+            <label class="required" for="color-temperature">色温</label>
+            <select id="color-temperature" name="color_temperature" required>
+              <option value="">请选择</option>
+              <option value="3000K">3000K</option>
+              <option value="4000K">4000K</option>
+              <option value="6500K">6500K</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label class="required" for="ip-rating">防水等级</label>
+            <select id="ip-rating" name="ip_rating" required>
+              <option value="">请选择</option>
+              <option value="IP20">IP20</option>
+              <option value="IP44">IP44</option>
+              <option value="IP65">IP65</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label class="required" for="housing-material">外壳材质</label>
+            <input id="housing-material" name="housing_material" type="text" required autocomplete="off" />
+          </div>
+        </div>
+
+        <div class="actions">
+          <div id="save-status" data-state="idle"></div>
+          <button id="save-button" type="submit">保存商品</button>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <script>
+    const products = {
+      A001: { name: "Luma X60 吸顶灯", category: "照明设备 / 吸顶灯" },
+      A002: { name: "BrightHome B40 壁灯", category: "照明设备 / 壁灯" },
+      A003: { name: "NorthStar N24 台灯", category: "照明设备 / 台灯" }
+    };
+
+    const params = new URLSearchParams(window.location.search);
+    const sku = params.get("sku") || "A001";
+    const product = products[sku] || { name: "未知测试商品", category: "未识别类目" };
+
+    document.querySelector("#sku-value").textContent = sku;
+    document.querySelector("#product-name").textContent = product.name;
+    document.querySelector("#product-category").textContent = `类目：${product.category}`;
+
+    const form = document.querySelector("#product-form");
+    const status = document.querySelector("#save-status");
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (!form.reportValidity()) {
+        status.dataset.state = "error";
+        status.textContent = "还有必填项未完成";
+        return;
+      }
+
+      const payload = Object.fromEntries(new FormData(form).entries());
+      localStorage.setItem(`mock-seller:${sku}`, JSON.stringify(payload));
+      status.dataset.state = "success";
+      status.textContent = `保存成功：${sku}`;
+    });
+  </script>
+</body>
+</html>
