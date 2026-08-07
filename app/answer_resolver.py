@@ -40,6 +40,22 @@ BUSINESS_ATTRIBUTE_ALIASES: dict[str, tuple[str, ...]] = {
         "最大订购量",
     ),
     "shipping_days": ("shipping days", "pick pack sla", "shipping_days", "发货天数"),
+    # Fulfilment and shipping-region settings are seller operating policy, not
+    # product facts. They must never be invented by a semantic/LLM fallback.
+    "service_profile": (
+        "service profile",
+        "service_profile",
+        "fulfillment by",
+        "fulfilment by",
+        "fulfillment",
+        "fbs",
+    ),
+    "forbid_shipping": (
+        "selling region preference",
+        "selling region",
+        "shipping region",
+        "forbid_shipping",
+    ),
 }
 BUSINESS_ALLOWED_SOURCE_TYPES = {"structured", "business", "config", "rule"}
 
