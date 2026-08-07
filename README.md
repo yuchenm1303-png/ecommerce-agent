@@ -2,11 +2,11 @@
 
 电商卖家后台批量信息采集、匹配、填写与校验自动化原型。
 
-项目已经从本地 `mock_site` 进入第一个真实平台适配阶段：**Makro Marketplace Seller Center**。
+项目已经从本地 `mock_site` 进入真实平台适配阶段：**Makro Marketplace Seller Center**。
 
 核心目标：
 
-**读取商品资料 → 打开 Add Listing → 抓取页面问题 → 查找/生成可靠答案 → 自动填写 → 二次校验 → 人工/规则安全门 → 保存 → 记录日志**
+**读取商品资料 → 打开 Add Listing → 动态抓取页面问题 → 从证据中解析可靠答案 → 自动填写 → 二次校验 → 人工/规则安全门 → 保存 → 记录日志**
 
 ## 当前进度
 
@@ -24,14 +24,28 @@
 - 每个商品的执行结果写入 `logs/*.jsonl`。
 - GitHub Actions 执行单元测试和 mock 浏览器 E2E。
 
-### V0.2：Makro 真实平台接入
+### V0.2：Makro 动态页面探测
 
 - 新增 `app/platforms/makro.py`，校验 Makro Add a Single Listing hash route。
-- 不依赖 `requestId` 作为长期稳定标识，因为该参数可能由平台动态生成。
+- 不依赖 `requestId` 作为长期稳定标识，因为该参数由平台动态生成。
 - 新增 `makro_probe.py`：在用户自己的电脑上登录后，采集真实页面控件的 DOM 元数据。
-- 使用本地持久化 Playwright 浏览器目录，账号密码不写入代码、不上传 GitHub。
-- Probe 默认不记录输入框当前值，也不会点击 `Save` / `Send to QC`。
-- Makro 最终保存目前故意保持禁用，等真实 DOM 结构和保存成功信号验证后再开放。
+- 使用本地持久化 Playwright Edge profile，账号密码不写入代码、不上传 GitHub。
+- 可展开所有带 EDIT 的 section，识别真实 label、mandatory-star、下拉选项、内部滚动容器。
+- Semantic Field Grouping 把多个 DOM control 聚合成真实 Makro attribute，多值字段不会被误算成多道问题。
+- 已用真实产物验证不同 vertical 的动态字段变化：页面字段数量和控件数量变化时，semantic field 仍可稳定还原。
+- Probe 不记录 Cookie/token/sessionStorage/Authorization，不点击 `Save` / `Send to QC`。
+
+### V0.3：证据驱动 Answer Resolver + 真实 Dry-Run Fill
+
+- 新增 `app/source_bundle.py`：统一商品证据模型 `ProductSourceBundle` / `SourceEvidence`。
+- 支持两种明确资料：标准“每行一个商品”的 CSV/XLSX/XLSM，以及客户当前使用的 Question/Answer 工作簿。
+- 新增 `app/answer_resolver.py`：输入当前页面动态 `semantic_fields`，按 `attribute_key + label` 从明确证据解析答案，不依赖固定类目字段表。
+- 来源冲突返回 `conflict`；没有证据返回 `missing`；下拉选项无法唯一精确匹配返回 `needs_review`。
+- SKU、Listing Status、价格、MOQ、shipping 等经营字段只接受明确结构化数据/config/rule，不允许 AI 或非结构化来源猜测。
+- 支持 multi-value 数组，以及 value + qualifier（例如数值 + Hours/Minutes）解析。
+- 新增 `app/makro_dryrun.py`：只填写 `resolved` 字段，填后立即 readback 验证。
+- 新增 `makro_fill.py`：真实 Makro dry-run CLI，动态扫描 → 解析 → 填写 → 回读，**绝不点击 Save / Send to QC**。
+- 当前 no-save 阶段一次只填写一个 section，并停在该 section 的 Save 前供人工检查；其他 section 会完成解析但不写入，避免跨 section 时依赖保存未验证的数据。
 
 ## 项目结构
 
@@ -39,6 +53,9 @@
 ecommerce-agent/
 ├─ app/
 │  ├─ data_loader.py
+│  ├─ source_bundle.py       # 商品证据统一模型 / table + QA 文件加载
+│  ├─ answer_resolver.py     # 动态 semantic field → 证据答案
+│  ├─ makro_dryrun.py        # 真实 Makro 安全填写 + readback
 │  ├─ extractor.py
 │  ├─ matcher.py
 │  ├─ filler.py
@@ -48,15 +65,15 @@ ecommerce-agent/
 │  └─ platforms/
 │     ├─ base.py
 │     ├─ mock.py
-│     └─ makro.py          # Makro 真实平台守护适配器
+│     └─ makro.py
 ├─ data/
 │  └─ products.csv
 ├─ mock_site/
 │  └─ index.html
-├─ scripts/
 ├─ tests/
 ├─ logs/
-├─ makro_probe.py          # 登录后采集真实 Makro DOM
+├─ makro_probe.py            # 登录后动态采集真实 Makro DOM
+├─ makro_fill.py             # 证据驱动真实 dry-run fill
 ├─ main.py
 └─ requirements.txt
 ```
@@ -74,7 +91,9 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-## 先测试本地 mock
+默认真实 Makro 使用本机 Microsoft Edge `channel="msedge"`，Chromium 主要用于测试。
+
+## 本地 mock
 
 终端 1：
 
@@ -88,153 +107,135 @@ python -m http.server 8000 --directory mock_site
 python main.py --dry-run
 ```
 
-
-## Makro 真实页面：第一步先采集 DOM
+## Makro 动态页面 Probe
 
 不要把 Makro 邮箱、密码写进代码或发到仓库。
 
-在 PowerShell 中运行：
-
 ```powershell
-python makro_probe.py
+python makro_probe.py --keep-open --scan-sections
 ```
 
-程序默认打开 Makro 首页（`https://seller.makro.co.za/`），不会直接跳转旧的
-Add Listing 深层 URL（旧 `requestId` 可能随 SPA 会话失效）。操作步骤：
+流程：
 
-1. 程序会自动检测登录状态：persistent profile 登录仍有效时直接复用，
-   失效时才需要在自动化 Edge 窗口里手动登录；
-2. 从页面正常进入 `Add a Single Listing`（保持在该页面）；
-3. 回到终端按 Enter；
-4. 程序直接采集当前页面（不会再强制 goto 旧 URL），只采集表单元数据、
-   截图和安全的 DOM 快照，不提交商品；
-5. 使用 `--keep-open` 时，扫描后询问“继续扫描下一个页面？ [Y/n]”，
-   选择 Y 即可在同一 Edge 会话中反复扫描多个 Add Listing 页面（只需登录一次），
-   全部结束后还会询问是否保持 Edge 打开。
+1. 程序复用 `browser_profiles/makro-edge/`；登录仍有效则直接使用，失效时手动登录一次；
+2. 从 Makro UI 正常进入 `Add a Single Listing`；
+3. 回终端按 Enter；
+4. 程序展开并扫描当前页面所有 listing section；
+5. `--keep-open` 可在同一个 Edge 会话里继续扫描下一商品/类目。
 
 ### Probe 采集能力
 
-- 默认使用本机 Microsoft Edge（`channel="msedge"`）和独立持久化 profile `browser_profiles/makro-edge/`，不接管日常 Edge，登录状态不出现在代码里；
-- 启动时输出实际使用的 `user_data_dir`（始终是 `browser_profiles/makro-edge` 的绝对路径）并确认持久化目录存在；
-- 启动时自动检测登录状态：登录仍有效则直接使用，不要求重新登录；
-- 扫描整个 DOM，识别 `input` / `textarea` / `select` / `[role="combobox"]` /
-  自定义 dropdown / checkbox / radio / autocomplete 等控件；
-- 自动遍历页面窗口和所有内部滚动容器，逐步滚动等待懒加载，避免漏掉
-  viewport 之外的字段；
-- 字段名称优先从 Makro 真实 label 结构提取（`.styles__AttributeItemLabelName...`），
-  不依赖 error/context 文本；required 通过字段 wrapper 内的
-  `sup.mandatory-star__MandatoryStarContainer` 检测，并写入
-  `required_hint="mandatory-star"`；
-- 对每个字段采集：显示名称、required、控件类型、id、name、aria-label、
-  aria-labelledby、placeholder、role、可用选项、所属 section、周围 context
-  文本、稳定 selector 候选；
-- 不读取密码/隐藏字段；默认不记录输入值；`--include-values` 仅用于调试；
-- 不记录 Cookie、token、sessionStorage、Authorization 等认证数据（DOM 快照会清洗敏感属性）；
-- 默认不点击 `Save` / `Send to QC`。
-- `--scan-sections` 逐 section 扫描：对所有带 EDIT 的 listing card 使用统一策略——
-  点击 EDIT 展开（含 Price, Stock and Shipping Information / Product Description /
-  Additional Description / Product Photos），等待字段渲染后单独滚动扫描，为每个字段
-  写入 `section_heading`；只点安全的 Cancel 收起，不填写、不上传、不保存、
-  不点 Send to QC。
-- Semantic Field Grouping：把 DOM controls 按 Makro attribute 聚合（优先稳定 id，
-  其次从 name 去除 `_0_value` / `_1_value` 等重复索引；label 仅兜底），多值字段
-  只生成一个 semantic field，内部包含全部 controls；JSON 新增 `semantic_fields` 与
-  `semantic_field_count`（真实属性数），`control_count` 仍表示 DOM 控件数。
+- 识别 `input` / `textarea` / `select` / combobox / dropdown / checkbox / radio / autocomplete；
+- 遍历页面与内部滚动容器，等待懒加载；
+- 从 Makro `.styles__AttributeItemLabelName...` 提取真实 label；
+- 从 `sup.mandatory-star__MandatoryStarContainer` 判断 required；
+- 采集下拉 options、section/subsection、context、稳定 selector 候选；
+- 统一展开 Price/Stock、Product Description、Additional Description、Product Photos 等带 EDIT 的 section；
+- Semantic Field Grouping：优先稳定 id，其次去除 name 中 `_0_value` / `_1_value` / qualifier 索引，把多值控件还原成一个真实属性；
+- 不记录认证数据，不上传图片，不点击 Save / Send to QC。
 
-### 常用参数
-
-```text
---url               可选。仅作为初始导航/校验；Enter 后采集当前页面，不再强制跳转
---browser           edge（默认）/ chromium（调试用）
---profile-dir       默认 browser_profiles/makro-edge（Edge 独立目录）
---include-values    调试时记录当前输入值（默认关闭）
---open-dropdowns    尝试点击自定义下拉框读取弹出选项（可能有轻微副作用）
---scan-sections    统一展开所有带 EDIT 的 section 后逐 section 扫描（含 Price/Stock）
---keep-open        同一 Edge 会话反复扫描：每次扫描后询问是否继续，结束时询问是否保持打开
---no-dom-snapshot   不生成 makro-dom-*.html
---headless          无头模式（仅 profile 已登录时使用）
---scroll-wait-ms    滚动后等待懒加载的毫秒数（默认 350）
---max-scroll-steps  单个滚动容器的滚动次数上限（默认 200）
-```
-
-例如：
-
-```powershell
-# 完整采集（推荐）：打开首页 → 登录 → 进入 Add Listing → Enter
-python makro_probe.py
-
-# 已有 Add Listing URL 时，也可作为初始导航传入（Enter 后仍采集当前页面）
-python makro_probe.py --url "你的完整网址"
-
-# 调试时用 Playwright 内置 Chromium
-python makro_probe.py --browser chromium
-
-# 调试时连下拉框选项也读出来
-python makro_probe.py --open-dropdowns
-
-# 采集全部 section（含折叠的 Product Description / Additional Description / Product Photos）
-python makro_probe.py --scan-sections
-
-# 推荐：单次登录后在同一 Edge 会话中反复扫描多个 Add Listing 页面
-python makro_probe.py --keep-open
-```
-
-### 输出文件
+### Probe 输出
 
 ```text
 logs/makro-probe/
-├─ makro-fields-时间.json   字段元数据（含控件、真实 label、required、section、selector、
-│                          semantic_fields 分组与 semantic_field_count；
-│                          --scan-sections 时另含按 section 分组的 sections 列表）
-├─ makro-page-时间.png      整页截图
-└─ makro-dom-时间.html      安全的 DOM 快照（已去掉脚本内容、输入值和敏感属性）
+├─ makro-fields-时间.json
+├─ makro-page-时间.png
+└─ makro-dom-时间.html
 ```
 
-本地登录状态保存在：
+真实探测产物与 browser profile 都已经被 `.gitignore` 排除。
+
+## Answer Resolver
+
+Resolver 的输入不是固定类目模板，而是**当前页面实时得到的 semantic fields**。
+
+每个解析结果包含：
 
 ```text
-browser_profiles/makro-edge/
+attribute_key
+label
+status: resolved / needs_review / missing / conflict
+answer / answer_values
+qualifier
+source_type / source_reference
+evidence / confidence
+option_match
+detail
 ```
 
-`browser_profiles/`、`storage_state*.json`、`private_data/`、客户压缩包和
-`logs/makro-probe/` 都已经加入 `.gitignore`，真实探测数据不会提交 GitHub。
+当前来源规则：
 
-真实 Makro DOM 探测已跑通：字段真实名称、mandatory-star 必填标记、semantic field
-聚合（如 sports_action_camera 的 Product Description 36 个属性 vs 50 个 DOM 控件）
-都已正确提取；Price/Stock 等所有带 EDIT 的 section 可由 `--scan-sections` 统一展开
-扫描。下一步基于 `makro-fields-*.json` 实现：
+1. 标准商品表里的明确结构化值；
+2. 客户 Question/Answer 文件里的明确答案；
+3. 后续可以接入图片识别、知识库、供应商/官方页面提取器；
+4. LLM 只能在已有证据基础上归纳，不能凭常识生成产品参数。
 
-- `SKU ID`、Listing Status、价格、MOQ、库存/运输字段；
-- Product Info 中不同 vertical 的动态属性；
-- 单选、下拉、多选、可重复输入（`+`）等复杂控件；
-- 每个字段填写后的读回校验；
-- 分区 `Save` 的成功反馈；
-- 最终 `Send to QC` 前的总校验。
+来源冲突不自动裁决；下拉框只做规范化后的唯一精确匹配，不做危险的模糊猜测。
+
+### 标准商品表
+
+```powershell
+python makro_fill.py --product private_data/products.xlsx --sku ABC123 --dry-run
+```
+
+标准商品表要求存在 SKU 列，每一行代表一个商品，其他表头直接作为证据字段。
+
+### 客户 Question/Answer 文件
+
+支持类似：
+
+```text
+Question | Explanation | Answer
+Model Number | ... | L11
+Ports | ... | USB-C
+Colour | ... | Black
+```
+
+运行：
+
+```powershell
+python makro_fill.py --product private_data/product-qa.xlsx --source-format qa --dry-run
+```
+
+也支持中文 `问题/属性/字段 + 答案/值` 等常见表头。
+
+## 真实 Makro Dry-Run Fill
+
+```powershell
+python makro_fill.py --product private_data/product-qa.xlsx --source-format qa --dry-run
+```
+
+或标准商品表：
+
+```powershell
+python makro_fill.py --product private_data/products.xlsx --sku ABC123 --dry-run
+```
+
+程序会：
+
+1. 打开/复用自动化 Edge；
+2. 让用户进入真实 Add a Single Listing；
+3. 动态扫描当前所有 semantic fields；
+4. 从 `ProductSourceBundle` 解析全部字段；
+5. 找到一个存在 `resolved` 答案的 section；
+6. 只填写该 section 的可靠答案；
+7. 每个字段立即 readback；
+8. 停在 Save 前供人工检查；
+9. 写入 `logs/makro-fill/makro-fill-*.json`；
+10. **绝不点击 Save / Send to QC**。
+
+可以用 `--section "Product Description"` 指定本次要测试的 section。
+
+`--image`、`--product-url`、`--supplemental-text` 已进入统一 source bundle 接口，但当前版本不会自动从它们推断参数；图片识别/网页证据提取会作为下一层 provider 接入，避免在证据提取器尚未验证前偷偷猜值。
 
 ## 测试
 
 ```powershell
-pytest -q          # 单元测试 + 可用的浏览器探测测试
-pytest -q -m probe # 仅运行浏览器探测测试（需要本机安装 Playwright Chromium）
+pytest -q
+pytest -q -m probe
 ```
 
-GitHub Actions：`tests` job 跑 `pytest -q`；`mock-e2e` job 保留原 mock 浏览器
-自动化，并额外运行 `pytest -q -m probe` 覆盖探测逻辑。
-
-## 商品答案引擎规划
-
-客户现有人工流程通常是：产品链接/图片/规格资料 + 问题模板 → 人工交给大模型分析 → 把答案再填回后台。
-
-自动化版本会拆成：
-
-1. **Question Schema**：从 Makro 页面/问题模板得到标准问题、类型、单位和可选项。
-2. **Evidence Store**：保存产品图片、供应商页面、说明书、已有 Excel 等来源。
-3. **Answer Resolver**：优先从明确资料找答案，再进行语义匹配/AI 推理。
-4. **Confidence Gate**：来源冲突或低置信度时不自动填写。
-5. **Browser Executor**：Playwright 精确写入对应控件。
-6. **Validator**：重新读取页面值，确认无误后才允许保存。
-
-AI 负责“理解问题和资料”，Playwright 负责“精确执行”，避免纯视觉 Agent 直接猜位置。
+GitHub Actions：`tests` job 跑全部单元测试；`mock-e2e` job 跑原有 mock browser dry-run 并执行 probe 浏览器测试。
 
 ## 安全原则
 
@@ -244,7 +245,10 @@ AI 负责“理解问题和资料”，Playwright 负责“精确执行”，避
 - 不绕过验证码或平台风控；
 - 不把客户资料、Cookie、Token 提交 GitHub；
 - 未验证字段不提交；
-- 来源冲突时进入人工复核；
-- 真实平台最初始终使用 dry-run / probe 模式。
+- 来源冲突进入人工复核；
+- 下拉选项无法唯一精确匹配时不自动选择；
+- 经营字段禁止 AI 猜测；
+- 当前真实 Makro 仍只有 probe / no-save dry-run；
+- `makro_fill.py` 代码路径中没有 Save / Send to QC 动作。
 
-当前仓库如果保持 **Public**，正式放入客户资料之前强烈建议改成 **Private**。
+正式放入客户资料前，建议将仓库改为 **Private**。
