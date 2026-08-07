@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--facts-json",
         action="append",
         default=[],
-        help="可重复：人工/确定性抽取后的普通结构化 facts JSON",
+        help="可重复：人工/确定性抽取后的可信结构化 facts JSON",
     )
     parser.add_argument(
         "--evidence-packet",
@@ -43,13 +43,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help=(
             "可重复：图片/网页/AI 抽取结果。必须包含 product_identity、facts、"
-            "source_reference、evidence_text、confidence；还会校验 fact 是否属于当前 QA。"
+            "source_reference、evidence_text、confidence。"
         ),
+    )
+    parser.add_argument(
+        "--supplier-snapshot",
+        action="append",
+        default=[],
+        help="可重复：makro_capture_source.py 产生的供应商页面 snapshot JSON。",
+    )
+    parser.add_argument(
+        "--official-snapshot",
+        action="append",
+        default=[],
+        help="可重复：官方页面 snapshot JSON。",
     )
     parser.add_argument("--supplemental-text", default="", help="仅解析明确的 key: value 行；自由文本不会猜")
     parser.add_argument("--supplemental-text-file", default=None, help="可选 UTF-8 文本；仅解析 key: value 行")
-    parser.add_argument("--image", action="append", default=[], help="记录商品图片路径；当前 CLI 不自行识图")
-    parser.add_argument("--product-url", default=None, help="记录商品/供应商 URL；当前 CLI 不自行联网抓取")
+    parser.add_argument("--image", action="append", default=[], help="记录商品图片路径；模型识图模块单独生成 evidence packet")
+    parser.add_argument("--product-url", default=None, help="记录商品/供应商 URL")
     parser.add_argument("--auto-fill-min-confidence", type=float, default=0.85)
     parser.add_argument("--ai-auto-fill-min-confidence", type=float, default=0.92)
     parser.add_argument("--output-dir", default="logs/answer-resolver")
@@ -64,6 +76,8 @@ def _input_spec(args: argparse.Namespace) -> ResolutionInputSpec:
         product_table=args.product_table,
         facts_json=tuple(args.facts_json),
         evidence_packets=tuple(args.evidence_packet),
+        supplier_snapshots=tuple(args.supplier_snapshot),
+        official_snapshots=tuple(args.official_snapshot),
         supplemental_text=args.supplemental_text,
         supplemental_text_file=args.supplemental_text_file,
         image_paths=tuple(args.image),
@@ -106,6 +120,7 @@ def main() -> int:
                 },
                 "qa_source": str(Path(args.qa).resolve()),
                 "evidence_packet_files": input_result.evidence_packet_files,
+                "source_snapshot_files": input_result.source_snapshot_files,
                 "evidence_items": len(bundle.evidence),
                 "warnings": input_result.warnings,
             },
