@@ -133,8 +133,25 @@ class QuestionCatalog:
 
 
 def _looks_like_header(row: Iterable[Any]) -> bool:
+    """Require a real tabular header, not a title cell such as ``Questions``.
+
+    A single title/instruction cell can legitimately equal one of our question
+    aliases. Accept the row only when it contains the question column plus at
+    least one independent companion column used by the QA schema.
+    """
+
     headers = [_stringify(item) for item in row]
-    return _find_header(headers, QUESTION_HEADERS) is not None
+    if _find_header(headers, QUESTION_HEADERS) is None:
+        return False
+    companion_groups = (
+        ANSWER_HEADERS,
+        NUMBER_HEADERS,
+        EXPLANATION_HEADERS,
+        CATEGORY_HEADERS,
+        OPTION_HEADERS,
+        UNIT_HEADERS,
+    )
+    return any(_find_header(headers, aliases) is not None for aliases in companion_groups)
 
 
 def _locate_table(rows: list[list[Any]], max_header_rows: int = 50) -> tuple[list[str], list[list[Any]], int]:
@@ -143,7 +160,10 @@ def _locate_table(rows: list[list[Any]], max_header_rows: int = 50) -> tuple[lis
     for index, row in enumerate(rows[:max_header_rows]):
         if _looks_like_header(row):
             return [_stringify(item) for item in row], rows[index + 1 :], index + 1
-    raise ValueError("前 50 行内未识别到 Question/问题/字段 表头。")
+    raise ValueError(
+        "前 50 行内未识别到完整 QA 表头。表头必须包含 Question/问题/字段，"
+        "以及 Answer/编号/说明/类别/选项/单位 中至少一列。"
+    )
 
 
 def _load_rows(path: Path) -> tuple[list[str], list[list[Any]], int, str | None]:
