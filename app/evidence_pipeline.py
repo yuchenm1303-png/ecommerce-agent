@@ -70,6 +70,7 @@ def add_fact(
     source_reference: str,
     confidence: float | None = None,
     aliases: Iterable[str] = (),
+    evidence_text: str = "",
     note: str = "",
 ) -> None:
     policy = source_policy(source_type)
@@ -101,6 +102,7 @@ def add_fact(
             source_reference=source_reference,
             priority=policy.priority,
             confidence=actual_confidence,
+            evidence_text=evidence_text,
             note=effective_note,
         )
 
@@ -131,6 +133,7 @@ def bundle_from_catalog_answers(
             source_type="customer_answer",
             source_reference=item.source_reference,
             confidence=0.99,
+            evidence_text=f"{item.question}: {item.answer}",
             note="explicit Answer cell in customer QA workbook",
         )
     return bundle
@@ -156,12 +159,7 @@ def merge_bundles(*bundles: ProductSourceBundle) -> ProductSourceBundle:
 def bundle_from_facts_json(path: str | Path, *, sku: str = "") -> ProductSourceBundle:
     """Load explicit deterministic/manual facts only.
 
-    Accepted shape:
-      {"facts": [{"key": ..., "value": ..., "source_type": ...,
-                  "source_reference": ..., "confidence": 0.95,
-                  "aliases": [...] }]}
-
-    A plain object mapping keys to scalar values is also accepted as a convenient
+    A plain object mapping keys to scalar values is accepted as a convenient
     structured/manual source. Image/web/AI evidence is rejected here and must use
     strict EvidencePacket files instead.
     """
@@ -180,6 +178,7 @@ def bundle_from_facts_json(path: str | Path, *, sku: str = "") -> ProductSourceB
                 value=str(value),
                 source_type="structured",
                 source_reference=f"{source.name}:key={key}",
+                evidence_text=f"{key}: {value}",
             )
         return bundle
 
@@ -196,8 +195,10 @@ def bundle_from_facts_json(path: str | Path, *, sku: str = "") -> ProductSourceB
             continue
         if isinstance(value, list):
             stored_value: str | Iterable[str] = [str(part) for part in value]
+            default_evidence = f"{key}: {' | '.join(stored_value)}"
         else:
             stored_value = str(value)
+            default_evidence = f"{key}: {stored_value}"
         source_type = str(item.get("source_type") or "structured").strip()
         if source_type not in MANUAL_FACT_SOURCE_TYPES:
             raise ValueError(
@@ -217,6 +218,7 @@ def bundle_from_facts_json(path: str | Path, *, sku: str = "") -> ProductSourceB
             source_reference=reference,
             confidence=float(confidence) if confidence is not None else None,
             aliases=[str(alias) for alias in aliases],
+            evidence_text=str(item.get("evidence_text") or default_evidence),
             note=str(item.get("note") or ""),
         )
     return bundle
@@ -231,11 +233,7 @@ def bundle_from_key_value_text(
     source_reference: str = "supplemental_text",
     source_type: str = "customer_file",
 ) -> ProductSourceBundle:
-    """Conservatively parse explicit `key: value` lines only.
-
-    Free prose is deliberately ignored. This prevents accidental extraction of
-    guessed facts before the AI evidence extractor is implemented.
-    """
+    """Conservatively parse explicit `key: value` lines only."""
 
     bundle = ProductSourceBundle(supplemental_text=text)
     for line_number, line in enumerate(text.splitlines(), start=1):
@@ -251,5 +249,6 @@ def bundle_from_key_value_text(
             value=value,
             source_type=source_type,
             source_reference=f"{source_reference}:line={line_number}",
+            evidence_text=line.strip(),
         )
     return bundle
