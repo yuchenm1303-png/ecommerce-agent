@@ -47,13 +47,21 @@ def grounding() -> GroundingCatalog:
     )
 
 
-def packet(*, source_reference="supplier:001:text:0001", source_type="supplier_web", evidence="Screen Size: 3.0 inch."):
+def packet(
+    *,
+    key="Screen Size",
+    aliases=None,
+    source_reference="supplier:001:text:0001",
+    source_type="supplier_web",
+    evidence="Screen Size: 3.0 inch.",
+):
     return {
         "extractor": "stub-model",
         "product_identity": {"model_number": "L11"},
         "facts": [
             {
-                "key": "Screen Size",
+                "key": key,
+                "aliases": aliases or [],
                 "value": "3.0 inch",
                 "source_type": source_type,
                 "source_reference": source_reference,
@@ -75,6 +83,7 @@ def test_request_exposes_exact_source_ids_and_business_lock():
     assert payload["grounded_sources"][1]["source_id"] == "image:001"
     assert payload["business_locked_questions"] == ["Selling Price"]
     assert "exactly equal" in payload["source_reference_rule"]
+    assert payload["required_output_shape"]["facts"][0]["aliases"] == []
 
 
 def test_literal_text_evidence_is_accepted():
@@ -88,6 +97,26 @@ def test_literal_text_evidence_is_accepted():
     assert len(validated.facts) == 1
     assert validated.facts[0].key == "Screen Size"
     assert validated.facts[0].source_reference == "supplier:001:text:0001"
+
+
+def test_model_cannot_map_unrequested_key_using_self_authored_alias():
+    with pytest.raises(SemanticGroundingError, match="自造别名"):
+        validate_grounded_semantic_packet(
+            packet(key="Display Diagonal", aliases=["Screen Size"]),
+            catalog(),
+            grounding(),
+            expected_identity=ProductIdentity(model_number="L11"),
+        )
+
+
+def test_model_aliases_are_rejected_even_when_key_is_exact():
+    with pytest.raises(SemanticGroundingError, match="aliases"):
+        validate_grounded_semantic_packet(
+            packet(aliases=["Display Size"]),
+            catalog(),
+            grounding(),
+            expected_identity=ProductIdentity(model_number="L11"),
+        )
 
 
 def test_unknown_source_reference_is_rejected():
@@ -137,6 +166,7 @@ def test_image_fact_requires_precise_visual_evidence_description():
         "facts": [
             {
                 "key": "Image Resolution",
+                "aliases": [],
                 "value": "1080P",
                 "source_type": "product_image",
                 "source_reference": "image:001",
@@ -161,6 +191,7 @@ def test_business_question_is_rejected_even_with_real_source():
         "facts": [
             {
                 "key": "Selling Price",
+                "aliases": [],
                 "value": "999",
                 "source_type": "supplier_web",
                 "source_reference": "supplier:001:text:0001",
