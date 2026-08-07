@@ -93,12 +93,34 @@ def test_prompt_only_provider_parses_fenced_json_and_keeps_api_key_out_of_prompt
     kwargs = client.create_api.calls[0]
     assert kwargs["model"] == "vision-model"
     assert "response_format" not in kwargs
+    assert "temperature" not in kwargs
     serialized = repr(kwargs)
     assert "secret-key" not in serialized
     assert str(image) not in serialized
     user_content = kwargs["messages"][1]["content"]
-    assert any(item.get("type") == "image_url" for item in user_content)
-    assert "data:image/png;base64," in repr(user_content)
+    image_items = [item for item in user_content if item.get("type") == "image_url"]
+    assert len(image_items) == 1
+    assert "data:image/png;base64," in repr(image_items[0])
+    assert "detail" not in image_items[0]["image_url"]
+
+
+def test_explicit_high_detail_is_only_sent_when_requested(tmp_path):
+    image = tmp_path / "front.png"
+    image.write_bytes(b"image-bytes")
+    client = FakeClient(valid_json())
+    provider = OpenAICompatibleSemanticProvider(
+        model="vision-model",
+        api_key="secret-key",
+        base_url="https://api.vendor.test/v1",
+        client=client,
+        image_detail="high",
+    )
+
+    provider.extract_json(request_payload(str(image)))
+
+    user_content = client.create_api.calls[0]["messages"][1]["content"]
+    image_item = next(item for item in user_content if item.get("type") == "image_url")
+    assert image_item["image_url"]["detail"] == "high"
 
 
 def test_json_object_mode_requests_common_compat_response_format():
