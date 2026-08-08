@@ -10,25 +10,15 @@ Makro Marketplace Seller Center 的 AI-first 商品资料补全、字段决策�
 
 ## 核心原则
 
-### AI 负责商品语义
+AI 负责商品语言理解、翻译、同义词、计数、规格含义、字段映射、来源综合、冲突判断；本地 Python 不维护颜色、双镜头、G-Sensor、FOV、Vehicle Brand、SD Card、Camera Type 等商品语义规则，也不恢复 QA matcher / alias / deterministic synthesis。
 
-商品语言理解、翻译、同义词、计数、规格含义、字段映射、来源综合、冲突判断都交给 AI。
+Python 只保留机械边界：live schema / field id / product identity / source provenance、seller-operated business field lock、Makro option / qualifier / multi-value 控件形态、GTIN checksum、numeric min/max、maxlength、Selling Price <= Base Price/MRP、MinOQ <= MaxOQ、DOM 唯一定位、React readback、Save/reopen persistence，以及禁止自动 `Send to QC`。
 
-不要重新增加本地商品语义规则，例如：颜色别名、双镜头计数、G-Sensor、FOV / Vehicle Brand / SD Card / Camera Type marker 表、QA alias/matcher、deterministic synthesis product rules。
-
-### Python 只负责硬边界
-
-本地只保留机械规则：live schema / field id / product identity / source provenance、seller-operated business field lock、Makro option / qualifier / multi-value 控件形态、GTIN checksum、numeric min/max、maxlength、Selling Price <= Base Price/MRP、MinOQ <= MaxOQ、DOM 唯一定位、React readback、Save/reopen persistence，以及禁止自动 `Send to QC`。
-
-## 唯一目标 Schema
+## 唯一目标 Schema 与 Source Pack
 
 Makro 当前页面发现的 live schema 是 AI 唯一目标字段集合。客户 Excel/QA 是商品资料来源，不再是另一套待匹配问题 schema。
 
-## Product Source Pack
-
-第一遍 AI 一次看到客户 workbook/context、selected variant / SKU、explicit facts/product table、商品图片、supplier/official snapshot，以及当前 Makro live fields/options/units/required/section。
-
-图片和网页资料不再先转换为本地 semantic facts；AI直接理解原始 grounded sources。
+第一遍 AI 一次看到客户 workbook/context、selected variant / SKU、explicit facts/product table、商品图片、supplier/official snapshot，以及当前 Makro live fields/options/units/required/section。图片和网页资料不再先转换为本地 semantic facts；AI直接理解原始 grounded sources。
 
 ## 本地 AI 填空
 
@@ -74,9 +64,9 @@ Price、Stock、MOQ、Fulfilment、Shipping 等不允许图片、供应商网页
 
 浏览器层保留 live field discovery、text/textarea/dropdown/number/qualifier/multi-value、React settled readback、section Save、Save 后 reopen persisted verification、Product Photos persistence、schema/source/identity drift fail closed，以及禁止自动 Send to QC。
 
-## 正确运行顺序
+## 运行顺序
 
-### 1. 首次只读扫描 live schema
+### 1. 只读扫描 live schema
 
 ```powershell
 python makro_plan_listing.py `
@@ -141,6 +131,12 @@ python makro_preview_listing.py `
 ## 安全不变量
 
 复用已登录长期 Edge/CDP；多 Add Listing tabs、vertical/schema/source/identity 不一致、已有用户未保存 section 都 fail closed；不覆盖当前非-placeholder 用户值；option/qualifier/slot 不满足时写入前失败；React readback 不一致不算 validated；Save 后 reopen 不一致不算 persisted；Product Photos staged 不等于 persisted；`Send to QC` 始终禁止。
+
+## 当前真实验证边界
+
+旧的 AI-first 实机版本曾在真实 M8 上出现：两个本地模型调用合计约 509 秒，并最终因为模型响应不是可解析 JSON 而失败。当前版本针对这个失败已经改为 Qwen 原生 JSON mode、JSON mode 无 `max_tokens`、默认无整商品 repair、真正 wall-clock deadline、15 秒进度输出和 compact model contract。
+
+这些修复已经通过自动化回归，但真实 Qwen 冷运行耗时和最终 coverage 仍必须重新在用户本机验收；在此之前不能声称真实性能已经通过。
 
 ## 关键文件
 
