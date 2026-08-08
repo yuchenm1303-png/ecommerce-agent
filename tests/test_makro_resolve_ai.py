@@ -22,6 +22,42 @@ def _qa_file(tmp_path):
     return path
 
 
+def _live_schema_file(tmp_path):
+    path = tmp_path / "live-schema.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "fields": [
+                    {
+                        "attribute_key": "screen_size",
+                        "label": "Screen Size",
+                        "section_heading": "Product Description (0/14)",
+                        "required": True,
+                        "multi_value": False,
+                        "options": [],
+                        "qualifier_options": ["inch"],
+                        "help_text": "",
+                    },
+                    {
+                        "attribute_key": "package_length",
+                        "label": "Length",
+                        "section_heading": "Price, Stock and Shipping Information (0/14)",
+                        "required": True,
+                        "multi_value": False,
+                        "options": [],
+                        "qualifier_options": ["cm"],
+                        "help_text": "",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 class FakeProvider:
     name = "fake-pluggable-provider"
 
@@ -35,7 +71,9 @@ class FakeProvider:
             None,
         )
         facts = []
-        if image_source is not None:
+        if image_source is not None and any(
+            item["question"] == "Screen Size" for item in request_payload["questions"]
+        ):
             facts.append(
                 {
                     "key": "Screen Size",
@@ -44,7 +82,7 @@ class FakeProvider:
                     "source_type": "product_image",
                     "source_reference": image_source["source_id"],
                     "confidence": 0.92,
-                    "evidence_text": "Visible printed specification: 3.0 inch.",
+                    "evidence_text": "Visible printed specification: Screen Size 3.0 inch.",
                     "note": "",
                 }
             )
@@ -56,8 +94,9 @@ class FakeProvider:
         }
 
 
-def test_provider_neutral_resolver_writes_same_audit_outputs(tmp_path, monkeypatch):
+def test_provider_neutral_resolver_writes_same_audit_outputs_and_uses_live_schema(tmp_path, monkeypatch):
     qa = _qa_file(tmp_path)
+    live_schema = _live_schema_file(tmp_path)
     image = tmp_path / "front.jpg"
     image.write_bytes(b"fake-product-image")
     output = tmp_path / "out"
@@ -83,6 +122,8 @@ def test_provider_neutral_resolver_writes_same_audit_outputs(tmp_path, monkeypat
             "VENDOR_KEY",
             "--qa",
             str(qa),
+            "--live-schema",
+            str(live_schema),
             "--image",
             str(image),
             "--output-dir",
@@ -115,6 +156,10 @@ def test_provider_neutral_resolver_writes_same_audit_outputs(tmp_path, monkeypat
     assert manifest["provider_config"]["api_key_env"] == "VENDOR_KEY"
     assert "api_key" not in manifest["provider_config"]
     assert manifest["customer_context_chars"] > 0
+    assert manifest["base_question_count"] == 2
+    assert manifest["effective_question_count"] == 3
+    assert manifest["live_extra_question_count"] == 1
+    assert manifest["live_schema"] == str(live_schema.resolve())
     assert manifest["makro_browser_opened"] is False
     assert manifest["writes_performed"] == 0
     assert manifest["save_clicked"] is False
@@ -131,6 +176,7 @@ def test_generic_cli_never_accepts_raw_api_key():
     assert "--api-key" not in option_strings
     assert "--openai-api-key" not in option_strings
     assert "--api-key-env" in option_strings
+    assert "--live-schema" in option_strings
 
 
 def test_generic_cli_contains_no_makro_browser_or_fill_path():
