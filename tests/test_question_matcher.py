@@ -60,3 +60,63 @@ def test_duplicate_live_labels_fail_as_ambiguous():
 
     assert audit.matches[0].status == AMBIGUOUS
     assert audit.matched_count == 0
+
+
+def test_question_category_disambiguates_same_key_across_live_sections():
+    qa = QuestionCatalog(
+        source_path="qa.xlsx",
+        sheet_name="Sheet1",
+        header_row=3,
+        questions=[
+            QuestionRecord(
+                number="59",
+                question="Height",
+                category="Additional Description",
+            )
+        ],
+    )
+    fields = [
+        {
+            "attribute_key": "height",
+            "label": "Height",
+            "section_heading": "Additional Description (Optional) (0/46)",
+        },
+        {
+            "attribute_key": "height",
+            "label": "Length",
+            "section_heading": "Price, Stock and Shipping Information (0/14)",
+        },
+    ]
+
+    audit = match_questions_to_fields(qa, fields)
+
+    assert audit.matches[0].status == MATCHED
+    assert audit.matches[0].semantic_field is fields[0]
+    assert audit.ambiguous_count == 0
+
+
+def test_question_category_does_not_fall_back_to_wrong_section():
+    qa = QuestionCatalog(
+        source_path="qa.xlsx",
+        sheet_name="Sheet1",
+        header_row=3,
+        questions=[
+            QuestionRecord(
+                number="59",
+                question="Height",
+                category="Additional Description",
+            )
+        ],
+    )
+    fields = [
+        {
+            "attribute_key": "height",
+            "label": "Length",
+            "section_heading": "Price, Stock and Shipping Information (0/14)",
+        }
+    ]
+
+    audit = match_questions_to_fields(qa, fields)
+
+    assert audit.matches[0].status == UNMATCHED
+    assert audit.matched_count == 0
