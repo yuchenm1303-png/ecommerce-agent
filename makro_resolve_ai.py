@@ -164,18 +164,24 @@ def main() -> int:
         _base_input_spec(args, supplemental_text),
     )
 
+    # The QA workbook preamble is real customer source context (often exact SKU,
+    # selected variant, memory-card option, supplier URL and instructions). The
+    # shared resolver-input loader retains it in bundle.supplemental_text, so the
+    # semantic model must receive that same source universe rather than silently
+    # seeing only command-line supplemental text.
+    grounded_text = base_inputs.bundle.supplemental_text
     grounding = build_grounding_catalog(
         image_paths=args.image,
         supplier_snapshots=args.supplier_snapshot,
         official_snapshots=args.official_snapshot,
-        supplemental_text=supplemental_text,
+        supplemental_text=grounded_text,
         max_text_chars=args.max_text_chars,
         overlap_chars=args.overlap_chars,
     )
     if not grounding.sources:
         raise SystemExit(
             "没有可供语义抽取的 grounded source。请至少提供 --image、"
-            "--supplier-snapshot、--official-snapshot 或 supplemental text。"
+            "--supplier-snapshot、--official-snapshot、QA 商品上下文或 supplemental text。"
         )
 
     provider_config = _provider_config(args)
@@ -193,8 +199,6 @@ def main() -> int:
         continue_on_batch_error=not args.fail_on_batch_error,
     )
 
-    # Defense in depth: every batch already passed grounded validation. Validate
-    # the merged packet again before it becomes resolver evidence.
     semantic_packet = validate_evidence_packet(
         semantic.packet,
         catalog,
@@ -274,6 +278,7 @@ def main() -> int:
                 "provider_adapter": provider.name,
                 "provider_config": provider_config.as_safe_dict(),
                 "grounded_source_count": len(grounding.sources),
+                "customer_context_chars": len(grounded_text),
                 "semantic_fact_count": len(semantic_packet.facts),
                 "semantic_partial": semantic.partial,
                 "semantic_failed_batches": semantic.failed_batches,
