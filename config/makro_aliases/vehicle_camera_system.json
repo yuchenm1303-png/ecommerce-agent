@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "vertical": "vehicle_camera_system",
+  "aliases": {},
+  "sections": {
+    "Height": "Additional Description"
+  }
+}
