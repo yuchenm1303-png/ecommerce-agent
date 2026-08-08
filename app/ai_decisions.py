@@ -8,8 +8,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
+from .business_fields import is_business_question
 from .evidence_contract import ProductIdentity, assert_identity_compatible
-from .evidence_validation import is_business_question
+from .providers.errors import JSONTaskResponseError
 from .semantic_grounding import GroundedSource, GroundingCatalog, IMAGE_KIND, TEXT_KIND
 from .source_bundle import normalize_key
 
@@ -98,11 +99,7 @@ def field_contract(field: dict[str, Any]) -> dict[str, Any]:
 
 
 def field_id(field: dict[str, Any]) -> str:
-    """Return a deterministic structural id for one live Makro field.
-
-    This is intentionally semantic-free. It identifies the exact live target by
-    its stable schema contract and does not try to understand product meaning.
-    """
+    """Return a deterministic structural id for one live Makro field."""
 
     payload = field_contract(field)
     payload["section_heading"] = _stable_section(payload["section_heading"])
@@ -124,10 +121,7 @@ def indexed_fields(fields: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]
 
 
 def schema_digest(fields: Iterable[dict[str, Any]]) -> str:
-    contracts = [
-        {"field_id": field_id(field), **field_contract(field)}
-        for field in fields
-    ]
+    contracts = [{"field_id": field_id(field), **field_contract(field)} for field in fields]
     contracts.sort(key=lambda item: item["field_id"])
     raw = json.dumps(contracts, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -232,14 +226,20 @@ class FieldDecision:
         if not isinstance(raw_values, list):
             raise AIDecisionError(f"decisions[{index}].values 必须是数组。")
         values = [str(value).strip() for value in raw_values if str(value).strip()]
-        confidence = float(payload.get("confidence", 0.0))
+        try:
+            confidence = float(payload.get("confidence", 0.0))
+        except (TypeError, ValueError) as exc:
+            raise AIDecisionError(f"decisions[{index}].confidence 不是有效数字。") from exc
         if not 0.0 <= confidence <= 1.0:
             raise AIDecisionError(f"decisions[{index}].confidence 必须在 0..1。")
         raw_citations = payload.get("citations") or []
         if not isinstance(raw_citations, list):
             raise AIDecisionError(f"decisions[{index}].citations 必须是数组。")
         citations = [
-            DecisionCitation.from_mapping(item, where=f"decisions[{index}].citations[{citation_index}]")
+            DecisionCitation.from_mapping(
+                item,
+                where=f"decisions[{index}].citations[{citation_index}]",
+            )
             for citation_index, item in enumerate(raw_citations, start=1)
             if isinstance(item, dict)
         ]
@@ -247,14 +247,17 @@ class FieldDecision:
         if not isinstance(raw_alternatives, list):
             raise AIDecisionError(f"decisions[{index}].alternatives 必须是数组。")
         alternatives = [
-            DecisionAlternative.from_mapping(item, where=f"decisions[{index}].alternatives[{alt_index}]")
+            DecisionAlternative.from_mapping(
+                item,
+                where=f"decisions[{index}].alternatives[{alt_index}]",
+            )
             for alt_index, item in enumerate(raw_alternatives, start=1)
             if isinstance(item, dict)
         ]
         raw_queries = payload.get("search_queries") or []
         if not isinstance(raw_queries, list):
             raise AIDecisionError(f"decisions[{index}].search_queries 必须是数组。")
-        queries = []
+        queries: list[str] = []
         seen_queries: set[str] = set()
         for query in raw_queries:
             value = str(query).strip()
@@ -319,7 +322,10 @@ class AIDecisionPacket:
     def from_mapping(cls, payload: dict[str, Any]) -> "AIDecisionPacket":
         if not isinstance(payload, dict):
             raise AIDecisionError("AI decision packet 顶层必须是 object。")
-        version = int(payload.get("contract_version", DECISION_CONTRACT_VERSION))
+        try:
+            version = int(payload.get("contract_version", DECISION_CONTRACT_VERSION))
+        except (TypeError, ValueError) as exc:
+            raise AIDecisionError("AI decision contract_version 无效。") from exc
         if version != DECISION_CONTRACT_VERSION:
             raise AIDecisionError(
                 f"AI decision contract_version={version} 不受支持。"
@@ -482,8 +488,6 @@ def build_ai_resolution_request(
     identity: ProductIdentity = ProductIdentity(),
 ) -> dict[str, Any]:
     field_list = list(fields)
-    schema_sha = schema_digest(field_list)
-    source_sha = source_manifest_digest(grounding)
     return {
         "task": "resolve_all_live_marketplace_fields_from_product_sources",
         "system_instruction": AI_RESOLUTION_SYSTEM_INSTRUCTION,
@@ -496,8 +500,8 @@ def build_ai_resolution_request(
             "model_number": identity.model_number,
             "brand": identity.brand,
         },
-        "schema_sha256": schema_sha,
-        "source_manifest_sha256": source_sha,
+        "schema_sha256": schema_digest(field_list),
+        "source_manifest_sha256": source_manifest_digest(grounding),
         "target_fields": [_target_field_payload(field) for field in field_list],
         "rules": list(AI_RESOLUTION_RULES),
         "grounded_sources": grounding.as_request_list(),
@@ -554,7 +558,7 @@ def validate_ai_decision_packet(
     *,
     expected_identity: ProductIdentity = ProductIdentity(),
 ) -> AIDecisionPacket:
-    """Validate only hard boundaries; do not re-implement product semantics locally."""
+    """Validate hard boundaries only; product semantics stay with AI."""
 
     field_list = list(fields)
     by_id = indexed_fields(field_list)
@@ -621,10 +625,6 @@ def validate_ai_decision_packet(
                     f"{decision.field_id}: READY downgraded to REVIEW because value/citation is missing"
                 )
                 decision.status = REVIEW
-        elif decision.status == REVIEW:
-            # REVIEW may intentionally have no candidate value; it then stays
-            # non-previewable but still records what research is needed.
-            pass
         elif decision.status == CONFLICT:
             usable = [
                 alternative
@@ -658,7 +658,7 @@ def validate_ai_decision_packet(
         observed[identifier] = FieldDecision(
             field_id=identifier,
             status=status,
-            reason="model omitted this target field" if not locked else "seller-operated field",
+            reason="seller-operated field" if locked else "model omitted this target field",
         )
         warnings.append(f"model omitted field_id={identifier}; synthesized status={status}")
 
@@ -718,6 +718,35 @@ class AIResolutionRunResult:
     elapsed_seconds: float
 
 
+def _validate_model_response(
+    raw: dict[str, Any],
+    *,
+    provider_name: str,
+    fields: list[dict[str, Any]],
+    grounding: GroundingCatalog,
+    expected_identity: ProductIdentity,
+) -> AIDecisionPacket:
+    packet = AIDecisionPacket.from_mapping(raw)
+    packet.extractor = packet.extractor or provider_name
+    return validate_ai_decision_packet(
+        packet,
+        fields,
+        grounding,
+        expected_identity=expected_identity,
+    )
+
+
+def _repair_instruction(request: dict[str, Any], error: Exception) -> dict[str, Any]:
+    repaired = dict(request)
+    repaired["validation_error"] = str(error)
+    repaired["prompt_instruction"] = (
+        str(request.get("prompt_instruction") or "")
+        + "\nYour prior response was received but failed the JSON/decision structural safety contract. "
+        "Return one corrected complete packet; do not add unsupported product facts."
+    )
+    return repaired
+
+
 def run_ai_resolution(
     provider: JSONDecisionProvider,
     fields: Iterable[dict[str, Any]],
@@ -728,7 +757,13 @@ def run_ai_resolution(
     cache_namespace: str = "",
     max_repair_attempts: int = 1,
 ) -> AIResolutionRunResult:
-    """Resolve the whole product in one multimodal model call in the normal path."""
+    """Resolve one whole product.
+
+    Normal path is exactly one multimodal model call. A second call is permitted
+    only when a model response was actually received but its JSON/decision
+    structure is invalid. Transport/API/local-input failures are never semantic
+    repair retries.
+    """
 
     if max_repair_attempts not in {0, 1}:
         raise ValueError("max_repair_attempts 必须是 0 或 1。")
@@ -763,7 +798,7 @@ def run_ai_resolution(
                 repair_attempts=0,
                 elapsed_seconds=time.monotonic() - started,
             )
-        except (OSError, ValueError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
 
     request = build_ai_resolution_request(
@@ -771,44 +806,57 @@ def run_ai_resolution(
         grounding,
         identity=expected_identity,
     )
+    calls = 0
+    repairs = 0
     last_error: Exception | None = None
+
     for attempt in range(max_repair_attempts + 1):
         try:
+            calls += 1
             raw = provider.extract_json(request)
-            packet = AIDecisionPacket.from_mapping(raw)
-            packet.extractor = packet.extractor or provider.name
-            validated = validate_ai_decision_packet(
-                packet,
-                field_list,
-                grounding,
-                expected_identity=expected_identity,
-            )
-            if cache_path is not None:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-                temp.write_text(
-                    json.dumps(validated.as_dict(), ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                temp.replace(cache_path)
-            return AIResolutionRunResult(
-                packet=validated,
-                model_calls=attempt + 1,
-                cache_hit=False,
-                repair_attempts=attempt,
-                elapsed_seconds=time.monotonic() - started,
-            )
-        except Exception as exc:
+        except JSONTaskResponseError as exc:
+            # A remote model response existed but its text/JSON envelope was
+            # unusable. This is the only provider-side failure eligible for one
+            # structural correction call.
             last_error = exc
-            if attempt >= max_repair_attempts:
-                break
-            request["validation_error"] = str(exc)
-            request["prompt_instruction"] = (
-                str(request.get("prompt_instruction") or "")
-                + "\nYour prior JSON failed the structural safety contract. Return one corrected complete packet; "
-                "do not add unsupported product facts."
-            )
-    raise AIDecisionError(f"AI product resolution failed: {last_error}")
+        except Exception as exc:
+            raise AIDecisionError(
+                f"AI provider failed before a usable response; no semantic repair attempted: {exc}"
+            ) from exc
+        else:
+            try:
+                validated = _validate_model_response(
+                    raw,
+                    provider_name=provider.name,
+                    fields=field_list,
+                    grounding=grounding,
+                    expected_identity=expected_identity,
+                )
+            except (AIDecisionError, ValueError, TypeError) as exc:
+                last_error = exc
+            else:
+                if cache_path is not None:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+                    temp.write_text(
+                        json.dumps(validated.as_dict(), ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    temp.replace(cache_path)
+                return AIResolutionRunResult(
+                    packet=validated,
+                    model_calls=calls,
+                    cache_hit=False,
+                    repair_attempts=repairs,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+
+        if attempt >= max_repair_attempts:
+            break
+        repairs += 1
+        request = _repair_instruction(request, last_error or AIDecisionError("invalid response"))
+
+    raise AIDecisionError(f"AI product resolution failed after structural validation: {last_error}")
 
 
 def write_ai_decision_packet(packet: AIDecisionPacket, path: str | Path) -> Path:
