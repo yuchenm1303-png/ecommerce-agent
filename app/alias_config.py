@@ -16,6 +16,7 @@ class AliasConfigError(ValueError):
 class AliasConfig:
     vertical: str
     aliases: dict[str, tuple[str, ...]]
+    sections: dict[str, str]
     source_path: str
 
 
@@ -24,6 +25,8 @@ def _clean_vertical(value: object) -> str:
 
 
 def _parse_alias_mapping(payload: Any) -> dict[str, tuple[str, ...]]:
+    if payload is None:
+        return {}
     if not isinstance(payload, dict):
         raise AliasConfigError("aliases 必须是 JSON object：{QA Question: [Makro Label, ...]}。")
 
@@ -64,26 +67,57 @@ def _parse_alias_mapping(payload: Any) -> dict[str, tuple[str, ...]]:
     return output
 
 
+def _parse_section_mapping(payload: Any) -> dict[str, str]:
+    """Parse explicit QA question -> Makro section constraints.
+
+    This is configuration, not category-specific code. It exists for cases where
+    the customer QA sheet does not carry section metadata and the live page has
+    the same generic label in several cards (for example ``Height``).
+    """
+
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise AliasConfigError("sections 必须是 JSON object：{QA Question: Makro Section}。")
+
+    output: dict[str, str] = {}
+    for raw_question, raw_section in payload.items():
+        question = str(raw_question or "").strip()
+        section = str(raw_section or "").strip()
+        normalized_question = normalize_key(question)
+        if not normalized_question:
+            raise AliasConfigError("sections 中存在空 question key。")
+        if not section:
+            raise AliasConfigError(f"sections[{question!r}] 不能为空。")
+        if normalized_question in output and output[normalized_question] != section:
+            raise AliasConfigError(f"question {question!r} 声明了多个 section。")
+        output[normalized_question] = section
+    return output
+
+
 def load_alias_config(
     path: str | Path,
     *,
     expected_vertical: str | None = None,
 ) -> AliasConfig:
-    """Load an explicit, auditable QA-question -> Makro-field alias map.
+    """Load explicit, auditable QA -> live-field matching metadata.
 
-    Accepted JSON shape::
+    Accepted shape::
 
         {
           "schema_version": 1,
           "vertical": "vehicle_camera_system",
           "aliases": {
             "Video Resolution": ["Image Resolution"]
+          },
+          "sections": {
+            "Height": "Additional Description"
           }
         }
 
-    Aliases are never learned implicitly at runtime. A vertical mismatch fails
-    closed so a mapping reviewed for one Makro category cannot silently affect a
-    different category.
+    ``aliases`` changes only the accepted live label/key. ``sections`` adds a
+    deterministic section constraint and is the correct way to resolve duplicate
+    generic labels without hard-coding a vertical or SKU in Python.
     """
 
     source = Path(path)
@@ -107,8 +141,10 @@ def load_alias_config(
         )
 
     aliases = _parse_alias_mapping(payload.get("aliases"))
+    sections = _parse_section_mapping(payload.get("sections"))
     return AliasConfig(
         vertical=vertical,
         aliases=aliases,
+        sections=sections,
         source_path=str(source.resolve()),
     )
