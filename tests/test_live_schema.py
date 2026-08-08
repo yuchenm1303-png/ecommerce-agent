@@ -77,3 +77,23 @@ def test_live_schema_ignores_dom_values_and_paths_in_drift_check():
     current = [{**field, "value": "16", "path": "body > div:nth-child(99)"}]
 
     assert_live_schema_matches(planned, current)
+
+
+def test_live_schema_preserves_qualifier_options_after_serialization():
+    field = {
+        **_field("package_length", "Length"),
+        "controls": [
+            {
+                "name": "package_length_qualifier",
+                "options": [
+                    {"text": "cm", "value": "cm"},
+                    {"text": "mm", "value": "mm"},
+                    {"text": "inch", "value": "inch"},
+                ],
+            }
+        ],
+    }
+    planned = live_schema_payload([field])["fields"]
+
+    assert planned[0]["qualifier_options"] == ["cm", "mm", "inch"]
+    assert_live_schema_matches(planned, [field])
