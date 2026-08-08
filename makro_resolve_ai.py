@@ -1,11 +1,13 @@
 """Resolve the current Makro product schema without opening Makro.
 
-Production model:
-1) one compact whole-product multimodal AI fill over all local evidence;
-2) only for unresolved fields that request research, at most one sourced web pass.
+Production pipeline:
+1) understand the complete local product once (images are used only here);
+2) map the compact product profile into small live-field batches in parallel;
+3) research only unresolved fields in bounded parallel web batches;
+4) run one text-only final resolve over fields that received web evidence.
 
-AI owns product semantics. Python owns provenance, seller business locks, schema
-identity, hard marketplace constraints and browser safety downstream.
+AI owns product semantics. Python owns scheduling, provenance, seller-business locks,
+schema identity, hard marketplace constraints and browser safety downstream.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,11 +27,12 @@ from app.ai_decisions import (
     READY,
     REVIEW,
     field_id,
-    run_ai_resolution,
     write_ai_decision_packet,
 )
+from app.field_mapping import run_field_mapping
 from app.live_schema import load_live_schema
 from app.product_context import build_ai_product_context
+from app.product_profile import run_product_profile, write_product_profile
 from app.providers.dashscope_web_search import DashScopeWebSearchProvider
 from app.providers.registry import (
     ProviderConfig,
@@ -41,29 +45,34 @@ from app.providers.registry import (
 from app.qa_catalog import load_question_catalog
 from app.resolver_inputs import ResolutionInputSpec
 from app.semantic_grounding import build_grounding_catalog
-from app.web_enrichment import (
-    WebEnrichmentResult,
-    run_web_enrichment,
-    write_enriched_ai_decision_packet,
+from app.web_enrichment import WebEnrichmentResult, run_web_enrichment, write_enriched_ai_decision_packet
+
+
+EXECUTION_MODEL = (
+    "product_profile_then_parallel_field_mapping_then_parallel_web_research_then_final_text_resolve"
 )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "以当前 Makro live schema 为唯一目标：先用一次整商品 AI 填本地能确定的字段，"
-            "再按需用一次有来源联网搜索补 unresolved 字段。全程不打开或修改 Makro。"
+            "以 Makro live schema 为目标：图片/原始资料只做一次商品理解，再用 compact profile 并行映射字段，"
+            "仅对 unresolved 字段并行联网研究，最后做一次 text-only 补全。全程不打开或修改 Makro。"
         )
     )
     parser.add_argument("--provider", choices=SUPPORTED_PROVIDERS, default="openai-compatible")
-    parser.add_argument("--model", default="qwen3.6-plus", help="本地商品解析模型；默认 qwen3.6-plus。")
+    parser.add_argument(
+        "--model",
+        default="qwen3.7-plus",
+        help="商品理解、字段映射和最终 text-only resolve 模型；默认 qwen3.7-plus。",
+    )
     parser.add_argument("--api-key-env", default=None)
     parser.add_argument("--base-url", default="")
     parser.add_argument(
         "--structured-mode",
         choices=("auto", "prompt_only", "json_object"),
         default="json_object",
-        help="本地 Qwen3.6 默认使用原生 JSON mode；需要兼容旧服务时可显式改为 prompt_only。",
+        help="本地 Qwen 默认使用原生 JSON mode。",
     )
     thinking = parser.add_mutually_exclusive_group()
     thinking.add_argument("--enable-thinking", dest="enable_thinking", action="store_true")
@@ -74,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--live-schema",
         required=True,
-        help="read-only Makro planner 导出的 live-schema.json；AI 只回答这里的字段。",
+        help="read-only Makro planner 导出的 live-schema.json。",
     )
     parser.add_argument("--sku", default="")
     parser.add_argument("--expected-model", default="")
@@ -92,46 +101,48 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-output-tokens",
         type=int,
         default=12000,
-        help="仅 prompt_only 模式使用；JSON mode 按官方建议不设置 max_tokens，避免截断 JSON。",
+        help="仅 prompt_only 模式使用；JSON mode 不设置 max_tokens。",
     )
     parser.add_argument(
         "--request-timeout-seconds",
         type=float,
         default=120.0,
-        help="每个本地/联网 AI 阶段的真实 wall-clock deadline。",
+        help="每个 AI 请求的真实 wall-clock deadline。",
     )
     parser.add_argument("--max-text-chars", type=int, default=5000)
     parser.add_argument("--overlap-chars", type=int, default=250)
-    parser.add_argument(
-        "--max-repair-attempts",
-        type=int,
-        choices=(0, 1),
-        default=0,
-        help=(
-            "默认 0：结构输出失败直接停止，不再把整商品和图片自动重发一遍。"
-            "仅诊断时可显式设为 1。网络/API/timeout 永不 semantic repair。"
-        ),
-    )
 
     parser.add_argument(
-        "--web-enrich",
-        choices=("auto", "off"),
-        default="auto",
-        help=(
-            "auto: 对第一遍仍 unresolved 的非经营字段追加最多一次带来源联网研究；off: 完全不联网。"
-        ),
+        "--field-batch-size",
+        type=int,
+        default=12,
+        help="字段映射机械分批大小；只按 live schema 顺序切片，不按商品语义分组。",
     )
-    parser.add_argument("--web-search-model", default="", help="联网阶段模型；默认复用 --model。")
+    parser.add_argument(
+        "--field-concurrency",
+        type=int,
+        default=4,
+        help="字段映射最大并发请求数。",
+    )
+
+    parser.add_argument("--web-enrich", choices=("auto", "off"), default="auto")
+    parser.add_argument(
+        "--web-search-model",
+        default="qwen3.7-max",
+        help="Responses web_search 研究模型；默认 qwen3.7-max。",
+    )
     parser.add_argument(
         "--web-base-url",
         default="",
         help="Responses API base URL；默认复用 --base-url。",
     )
+    parser.add_argument("--web-batch-size", type=int, default=5)
+    parser.add_argument("--web-concurrency", type=int, default=3)
 
     parser.add_argument(
         "--semantic-cache-dir",
         default="logs/semantic-cache",
-        help="本地整商品决策和联网补全共用 content-addressed cache 根目录。",
+        help="Product Profile、字段 batch、Web Research、Final Resolve 的 content-addressed cache 根目录。",
     )
     parser.add_argument("--no-semantic-cache", action="store_true")
     parser.add_argument("--output-dir", default="logs/ai-resolver")
@@ -200,6 +211,7 @@ def _search_requests(decisions: list[Any], fields: list[dict[str, Any]]) -> list
         output.append(
             {
                 "field_id": decision.field_id,
+                "attribute_key": str(item.get("attribute_key") or ""),
                 "label": str(item.get("label") or item.get("attribute_key") or ""),
                 "section_heading": str(item.get("section_heading") or ""),
                 "status": decision.status,
@@ -225,7 +237,7 @@ def _dashscope_web_provider(
         return None, f"missing API key env {config.api_key_env}"
     return (
         DashScopeWebSearchProvider(
-            model=args.web_search_model.strip() or config.model,
+            model=args.web_search_model.strip(),
             api_key=api_key,
             base_url=args.web_base_url.strip() or config.base_url,
             request_timeout_seconds=args.request_timeout_seconds,
@@ -234,8 +246,8 @@ def _dashscope_web_provider(
     )
 
 
-def _empty_web_result(packet: Any, reason: str = "") -> WebEnrichmentResult:
-    return WebEnrichmentResult(packet=packet, warning=reason)
+def _empty_web_result(packet: Any, warning: str = "") -> WebEnrichmentResult:
+    return WebEnrichmentResult(packet=packet, warnings=[warning] if warning else [])
 
 
 def _set_progress(provider: Any, prefix: str) -> None:
@@ -245,6 +257,7 @@ def _set_progress(provider: Any, prefix: str) -> None:
 
 
 def main() -> int:
+    started = time.monotonic()
     args = build_parser().parse_args()
     if args.max_text_chars < 500:
         raise SystemExit("--max-text-chars 不能小于 500")
@@ -264,16 +277,13 @@ def main() -> int:
         overlap_chars=args.overlap_chars,
     )
     if not grounding.sources:
-        raise SystemExit(
-            "没有可供 AI 解析的商品资料。请至少提供客户上下文、图片、supplier snapshot 或 official snapshot。"
-        )
+        raise SystemExit("没有可供 AI 解析的商品资料。")
 
     try:
         provider_config = _provider_config(args)
         provider = build_semantic_provider(provider_config)
     except ProviderConfigurationError as exc:
         raise SystemExit(str(exc)) from exc
-    _set_progress(provider, "LOCAL")
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = Path(args.output_dir) / f"resolve-ai-{stamp}"
@@ -284,63 +294,101 @@ def main() -> int:
         encoding="utf-8",
     )
     cache_dir = None if args.no_semantic_cache else Path(args.semantic_cache_dir)
+    namespace = _cache_namespace(provider_config)
+    expected_identity = product_context.trusted_inputs.expected_identity
 
     print("===== AI-FIRST PRODUCT RESOLUTION =====", flush=True)
     print(
         f"provider={provider_config.provider}, model={provider_config.model}, "
         f"structured_mode={provider_config.structured_mode}, thinking={provider_config.enable_thinking}, "
-        f"wall_deadline={provider_config.request_timeout_seconds:.0f}s, "
-        f"live_fields={len(live_fields)}, citation_sources={len(grounding.sources)}",
+        f"wall_deadline={provider_config.request_timeout_seconds:.0f}s, live_fields={len(live_fields)}, "
+        f"citation_sources={len(grounding.sources)}",
         flush=True,
     )
-    print("execution_model=1 local whole-product fill + optional 1 sourced web fill", flush=True)
-    print(f"automatic_full_product_repair={args.max_repair_attempts}", flush=True)
+    print(f"execution_model={EXECUTION_MODEL}", flush=True)
+    print(
+        f"field_batches=size:{args.field_batch_size},concurrency:{args.field_concurrency}; "
+        f"web_batches=size:{args.web_batch_size},concurrency:{args.web_concurrency}",
+        flush=True,
+    )
 
-    local_result = run_ai_resolution(
+    _set_progress(provider, "PROFILE")
+    profile_result = run_product_profile(
+        provider,
+        grounding,
+        expected_identity=expected_identity,
+        cache_dir=cache_dir,
+        cache_namespace=namespace,
+    )
+    profile_path = write_product_profile(profile_result.profile, output_dir / "product-profile.json")
+    print(
+        f"profile=DONE calls={profile_result.model_calls} cache_hit={profile_result.cache_hit} "
+        f"facts={len(profile_result.profile.facts)} elapsed={profile_result.elapsed_seconds:.3f}s",
+        flush=True,
+    )
+
+    _set_progress(provider, "MAP")
+    mapping_result = run_field_mapping(
         provider,
         live_fields,
+        profile_result.profile,
         grounding,
-        expected_identity=product_context.trusted_inputs.expected_identity,
+        batch_size=args.field_batch_size,
+        concurrency=args.field_concurrency,
         cache_dir=cache_dir,
-        cache_namespace=_cache_namespace(provider_config),
-        max_repair_attempts=args.max_repair_attempts,
+        cache_namespace=namespace,
     )
-    local_summary = _decision_summary(local_result.packet.decisions)
-    search_requests = _search_requests(local_result.packet.decisions, live_fields)
+    local_packet = mapping_result.packet
+    local_packet_path = write_ai_decision_packet(local_packet, output_dir / "ai-decisions.local.json")
+    local_summary = _decision_summary(local_packet.decisions)
+    search_requests = _search_requests(local_packet.decisions, live_fields)
     search_path = output_dir / "search-requests.json"
-    search_path.write_text(
-        json.dumps(search_requests, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    search_path.write_text(json.dumps(search_requests, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(
+        f"mapping=DONE batches={mapping_result.batch_count} calls={mapping_result.model_calls} "
+        f"cache_hits={mapping_result.cache_hits} failed_batches={mapping_result.failed_batches} "
+        f"elapsed={mapping_result.elapsed_seconds:.3f}s unresolved={len(search_requests)}",
+        flush=True,
     )
 
     web_provider, web_availability = _dashscope_web_provider(args, provider_config)
     if search_requests and web_provider is not None:
         _set_progress(web_provider, "WEB")
+        _set_progress(provider, "FINAL")
         print(
-            f"web_enrichment=START targets={len(search_requests)} model={web_provider.model}",
+            f"web_research=START targets={len(search_requests)} model={web_provider.model}",
             flush=True,
         )
         web_result = run_web_enrichment(
             web_provider,
-            local_result.packet,
+            provider,
+            local_packet,
             live_fields,
             grounding,
+            profile_result.profile,
+            batch_size=args.web_batch_size,
+            concurrency=args.web_concurrency,
             cache_dir=cache_dir,
+            final_cache_namespace=namespace,
         )
         print(
-            f"web_enrichment=DONE calls={web_result.model_calls} cache_hit={web_result.cache_hit} "
-            f"targets={web_result.target_field_count} elapsed={web_result.elapsed_seconds:.3f}s",
+            f"web_research=DONE batches={web_result.search_batch_count} calls={web_result.search_model_calls} "
+            f"cache_hits={web_result.search_cache_hits} failed_batches={web_result.search_failed_batches} "
+            f"evidence={len(web_result.evidence)} sources={len(web_result.web_sources)} "
+            f"elapsed={web_result.search_elapsed_seconds:.3f}s",
             flush=True,
         )
-        if web_result.warning:
-            print(f"web_enrichment_warning={web_result.warning}", flush=True)
+        print(
+            f"final_resolve=DONE calls={web_result.final_model_calls} cache_hit={web_result.final_cache_hit} "
+            f"elapsed={web_result.final_elapsed_seconds:.3f}s",
+            flush=True,
+        )
+        for warning in web_result.warnings:
+            print(f"web_warning={warning}", flush=True)
     else:
-        reason = "no unresolved field requested web research" if not search_requests else web_availability
-        web_result = _empty_web_result(local_result.packet, reason)
-        print(f"web_enrichment=SKIP reason={reason}", flush=True)
-
-    if web_result.searched:
-        write_ai_decision_packet(local_result.packet, output_dir / "ai-decisions.local.json")
+        reason = "no unresolved non-business fields" if not search_requests else web_availability
+        web_result = _empty_web_result(local_packet, reason)
+        print(f"web_research=SKIP reason={reason}", flush=True)
 
     packet_path = write_enriched_ai_decision_packet(
         web_result.packet,
@@ -352,28 +400,48 @@ def main() -> int:
         json.dumps([source.as_dict() for source in web_result.web_sources], ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    web_evidence_path = output_dir / "web-evidence.json"
+    web_evidence_path.write_text(
+        json.dumps([item.as_dict() for item in web_result.evidence], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     final_summary = _decision_summary(web_result.packet.decisions)
-    total_model_calls = local_result.model_calls + web_result.model_calls
-    total_elapsed = local_result.elapsed_seconds + web_result.elapsed_seconds
+    total_model_calls = (
+        profile_result.model_calls
+        + mapping_result.model_calls
+        + web_result.search_model_calls
+        + web_result.final_model_calls
+    )
+    total_elapsed = time.monotonic() - started
     run_manifest = output_dir / "run-manifest.json"
     run_manifest.write_text(
         json.dumps(
             {
                 "mode": "browser_free_ai_first_product_resolution",
-                "execution_model": "one_local_whole_product_fill_plus_optional_one_sourced_web_fill",
+                "execution_model": EXECUTION_MODEL,
                 "qa_source": str(Path(args.qa).resolve()),
                 "live_schema": str(Path(args.live_schema).resolve()),
                 "live_field_count": len(live_fields),
                 "provider_adapter": provider.name,
                 "provider_config": provider_config.as_safe_dict(),
+                "web_search_model": args.web_search_model,
                 "grounded_source_count": len(grounding.sources),
                 "customer_context_chars": len(product_context.text),
-                "local_ai": {
-                    "model_calls": local_result.model_calls,
-                    "cache_hit": local_result.cache_hit,
-                    "repair_attempts": local_result.repair_attempts,
-                    "elapsed_seconds": round(local_result.elapsed_seconds, 3),
+                "product_profile": {
+                    "model_calls": profile_result.model_calls,
+                    "cache_hit": profile_result.cache_hit,
+                    "fact_count": len(profile_result.profile.facts),
+                    "elapsed_seconds": round(profile_result.elapsed_seconds, 3),
+                },
+                "field_mapping": {
+                    "batch_size": args.field_batch_size,
+                    "concurrency": args.field_concurrency,
+                    "batch_count": mapping_result.batch_count,
+                    "model_calls": mapping_result.model_calls,
+                    "cache_hits": mapping_result.cache_hits,
+                    "failed_batches": mapping_result.failed_batches,
+                    "elapsed_seconds": round(mapping_result.elapsed_seconds, 3),
                     "decision_summary": local_summary,
                 },
                 "web_enrichment": {
@@ -381,19 +449,35 @@ def main() -> int:
                     "availability": web_availability,
                     "requested_fields": len(search_requests),
                     "searched": web_result.searched,
-                    "model_calls": web_result.model_calls,
-                    "cache_hit": web_result.cache_hit,
-                    "target_field_count": web_result.target_field_count,
-                    "returned_source_count": len(web_result.web_sources),
-                    "elapsed_seconds": round(web_result.elapsed_seconds, 3),
-                    "warning": web_result.warning,
+                    "batch_size": args.web_batch_size,
+                    "concurrency": args.web_concurrency,
+                    "search_batch_count": web_result.search_batch_count,
+                    "search_model_calls": web_result.search_model_calls,
+                    "search_cache_hits": web_result.search_cache_hits,
+                    "search_failed_batches": web_result.search_failed_batches,
+                    "evidence_count": len(web_result.evidence),
+                    "source_count": len(web_result.web_sources),
+                    "search_elapsed_seconds": round(web_result.search_elapsed_seconds, 3),
+                    "final_model_calls": web_result.final_model_calls,
+                    "final_cache_hit": web_result.final_cache_hit,
+                    "final_elapsed_seconds": round(web_result.final_elapsed_seconds, 3),
+                    "warnings": list(web_result.warnings),
                 },
-                "total_model_calls": total_model_calls,
-                "total_ai_elapsed_seconds": round(total_elapsed, 3),
                 "final_decision_summary": final_summary,
+                "total_model_calls": total_model_calls,
+                "wall_elapsed_seconds": round(total_elapsed, 3),
                 "writes_performed": 0,
                 "save_clicked": False,
                 "send_to_qc_clicked": False,
+                "outputs": {
+                    "product_profile": str(profile_path.resolve()),
+                    "local_decisions": str(local_packet_path.resolve()),
+                    "final_decisions": str(packet_path.resolve()),
+                    "search_requests": str(search_path.resolve()),
+                    "web_sources": str(web_sources_path.resolve()),
+                    "web_evidence": str(web_evidence_path.resolve()),
+                    "source_manifest": str(source_manifest_path.resolve()),
+                },
             },
             ensure_ascii=False,
             indent=2,
@@ -401,25 +485,27 @@ def main() -> int:
         encoding="utf-8",
     )
 
-    print("\n===== AI-FIRST RESOLUTION COMPLETE =====")
+    print("\n===== AI-FIRST RESOLUTION COMPLETE =====", flush=True)
     print(
-        f"ready={final_summary[READY]}, review={final_summary[REVIEW]}, "
-        f"conflict={final_summary[CONFLICT]}, missing={final_summary[MISSING]}, "
-        f"business_locked={final_summary[BUSINESS_LOCKED]}"
+        f"ready={final_summary[READY]}, review={final_summary[REVIEW]}, conflict={final_summary[CONFLICT]}, "
+        f"missing={final_summary[MISSING]}, business_locked={final_summary[BUSINESS_LOCKED]}",
+        flush=True,
     )
     print(
-        f"local_calls={local_result.model_calls}, web_calls={web_result.model_calls}, "
-        f"total_calls={total_model_calls}, local_cache={local_result.cache_hit}, "
-        f"web_cache={web_result.cache_hit}, total_ai_elapsed={total_elapsed:.1f}s"
+        f"profile_calls={profile_result.model_calls}, mapping_calls={mapping_result.model_calls}, "
+        f"web_search_calls={web_result.search_model_calls}, final_calls={web_result.final_model_calls}, "
+        f"total_calls={total_model_calls}, wall={total_elapsed:.3f}s",
+        flush=True,
     )
-    print(f"AI decisions: {packet_path.resolve()}")
-    print(f"Search requests: {search_path.resolve()}")
-    print(f"Web sources: {web_sources_path.resolve()}")
-    print(f"Source manifest: {source_manifest_path.resolve()}")
-    print(f"Run manifest: {run_manifest.resolve()}")
-    print("没有打开 Makro；没有填写字段；没有 Save；没有 Send to QC。")
+    print(f"Product profile: {profile_path}", flush=True)
+    print(f"AI decisions: {packet_path}", flush=True)
+    print(f"Run manifest: {run_manifest}", flush=True)
+    print("没有打开 Makro；没有填写字段；没有 Save；没有 Send to QC。", flush=True)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except ProviderConfigurationError as exc:
+        raise SystemExit(str(exc)) from exc
