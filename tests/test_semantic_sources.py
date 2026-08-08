@@ -281,6 +281,37 @@ def test_all_rejected_facts_allow_only_one_bounded_source_repair():
     assert [fact.key for fact in result.packet.facts] == ["Screen Size"]
 
 
+class TransportFailureProvider:
+    name = "transport-failure-stub"
+
+    def __init__(self):
+        self.calls = 0
+
+    def extract_json(self, request_payload):
+        self.calls += 1
+        raise RuntimeError("network timeout")
+
+
+def test_transport_failure_is_not_retried_as_semantic_repair():
+    provider = TransportFailureProvider()
+    single = GroundingCatalog(sources=[grounding().sources[0]])
+    result = run_grounded_semantic_sources(
+        provider,
+        catalog(),
+        single,
+        expected_identity=ProductIdentity(model_number="L11"),
+        max_repair_attempts=1,
+        cache_dir=None,
+    )
+
+    assert provider.calls == 1
+    assert result.model_calls == 1
+    assert result.completed_sources == 0
+    assert result.failed_sources == 1
+    assert result.source_stats[0].repair_attempts == 0
+    assert "network timeout" in result.failures[0].error
+
+
 def test_validated_source_cache_makes_identical_retry_zero_call(tmp_path):
     single = GroundingCatalog(sources=[grounding().sources[0]])
     first_provider = PartiallyBadProvider()
