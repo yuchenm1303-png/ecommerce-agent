@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from app.fill_plan import BLOCKED, READY, build_live_fill_plan
+from app.fill_plan import (
+    BLOCKED,
+    GATE_SHARED_SYNTHESIS_BINDING,
+    READY,
+    build_live_fill_plan,
+)
 from app.qa_catalog import QuestionCatalog, QuestionRecord
 from app.resolution_engine import ResolutionPolicy
 from app.source_bundle import ProductSourceBundle, normalize_key
@@ -46,6 +51,25 @@ def add_product_image(bundle: ProductSourceBundle, key: str, value: str):
         priority=30,
         confidence=0.96,
         evidence_text=f"{key}: {value}",
+    )
+
+
+def add_ai_synthesis(
+    bundle: ProductSourceBundle,
+    key: str,
+    value: str,
+    *,
+    reference: str,
+    evidence: str,
+):
+    bundle.add_evidence(
+        key=key,
+        value=value,
+        source_type="ai_synthesis",
+        source_reference=reference,
+        priority=90,
+        confidence=0.84,
+        evidence_text=evidence,
     )
 
 
@@ -193,3 +217,41 @@ def test_unmatched_live_field_may_autofill_from_explicit_structured_input():
     assert plan.items[0].question == ""
     assert plan.items[0].action == READY
     assert plan.items[0].resolution.source_type == "structured"
+
+
+def test_same_ai_synthesis_source_value_cannot_preview_two_different_fields():
+    qa = QuestionCatalog(
+        source_path="qa.xlsx",
+        sheet_name="Sheet1",
+        header_row=3,
+        questions=[
+            QuestionRecord(number="10", question="Interior Field of View"),
+            QuestionRecord(number="11", question="Exterior Field of View"),
+        ],
+    )
+    bundle = ProductSourceBundle()
+    for question in ("Interior Field of View", "Exterior Field of View"):
+        add_ai_synthesis(
+            bundle,
+            question,
+            "120",
+            reference="image:attributes",
+            evidence="拍摄角度: 120°",
+        )
+
+    plan = build_live_fill_plan(
+        qa,
+        [
+            field("interior_field_of_view", "Interior Field of View"),
+            field("exterior_field_of_view", "Exterior Field of View"),
+        ],
+    bundle,
+    )
+
+    assert plan.summary()["preview_eligible"] == 0
+    assert all(item.action == BLOCKED for item in plan.items)
+    assert all(
+        item.resolution.gate_reason == GATE_SHARED_SYNTHESIS_BINDING
+        for item in plan.items
+    )
+    assert all("字段归属不唯一" in item.reason for item in plan.items)
