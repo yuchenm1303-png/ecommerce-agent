@@ -1,15 +1,8 @@
 """Makro domain adapter / skill layer facade.
 
-Owns all Makro-specific behavior used by the fill CLI:
-
-- listing-page recognition and vertical guard;
-- section title normalization, discovery, open/cancel/save lifecycle;
-- semantic field discovery and field locator strategy;
-- product photo staging and post-Save persistence verification;
-- pre-save and post-save field readback verification.
-
-The CLI keeps policy/orchestration only. No category field lists are hard-coded;
-everything is discovered from the live DOM.
+The adapter is the single bridge between policy/orchestration and Makro DOM
+behavior: listing guards, section lifecycle, semantic discovery, multi-value
+expansion, real field fill/readback, photo persistence and post-Save checks.
 """
 
 from __future__ import annotations
@@ -28,7 +21,7 @@ from .listing import (
     parse_makro_listing_url,
     wait_for_authenticated_listing,
 )
-from .locators import selector_for_control
+from .locators import click_add_value_for_control, selector_for_control
 from .photos import (
     PhotoUploadResult,
     inspect_product_photos,
@@ -46,6 +39,28 @@ from .sections import (
     scan_sections,
     visible_section_errors,
 )
+
+
+def _value_controls(field: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        control
+        for control in field.get("controls") or []
+        if control.get("field_kind") != "option"
+        and not str(control.get("name") or "").endswith("_qualifier")
+    ]
+
+
+def _same_semantic_field(
+    candidate: dict[str, Any],
+    original: dict[str, Any],
+) -> bool:
+    return (
+        str(candidate.get("attribute_key") or "")
+        == str(original.get("attribute_key") or "")
+        and str(candidate.get("label") or "") == str(original.get("label") or "")
+        and base_section_title(str(candidate.get("section_heading") or ""))
+        == base_section_title(str(original.get("section_heading") or ""))
+    )
 
 
 class MakroDomainAdapter:
@@ -182,6 +197,70 @@ class MakroDomainAdapter:
     def selector_for(self, control: dict[str, Any]) -> str:
         return selector_for_control(control)
 
+    def _refresh_field(
+        self,
+        semantic_field: dict[str, Any],
+        section_path: str,
+    ) -> dict[str, Any]:
+        controls = self.scan_section_fields(
+            section_path,
+            include_values=True,
+            wait_ms=200,
+            max_scroll_steps=200,
+        )
+        matches = [
+            field
+            for field in self.build_semantic_fields(controls)
+            if _same_semantic_field(field, semantic_field)
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"multi-value 刷新后字段匹配数={len(matches)}，期望 1："
+                f"{semantic_field.get('label') or semantic_field.get('attribute_key')}"
+            )
+        return matches[0]
+
+    def _ensure_answer_value_slots(
+        self,
+        semantic_field: dict[str, Any],
+        answer: Any,
+        section_path: str | None,
+    ) -> dict[str, Any]:
+        """Expand the live ``+`` control until every answer value has one slot.
+
+        Expansion is attempted only when the answer actually contains more
+        values than currently rendered controls and a section path is known. No
+        synthetic value is written here; the field is re-discovered after every
+        click so React-created indexed controls become first-class live controls.
+        """
+
+        needed = len(list(getattr(answer, "answer_values", []) or []))
+        current = semantic_field
+        if needed <= len(_value_controls(current)) or needed <= 1:
+            return current
+        if not section_path:
+            return current
+
+        while len(_value_controls(current)) < needed:
+            value_controls = _value_controls(current)
+            if not value_controls:
+                return current
+            before = len(value_controls)
+            click = click_add_value_for_control(
+                self.page,
+                section_path,
+                value_controls[0],
+            )
+            if not click.get("clicked"):
+                return current
+            self.page.wait_for_timeout(300)
+            refreshed = self._refresh_field(current, section_path)
+            after = len(_value_controls(refreshed))
+            if after <= before:
+                return refreshed
+            current = refreshed
+        return current
+
     def fill_resolved_field(
         self,
         semantic_field: dict[str, Any],
@@ -190,9 +269,14 @@ class MakroDomainAdapter:
         section_path: str | None = None,
         recheck_wait_ms: int = 800,
     ) -> FillVerification:
+        expanded = self._ensure_answer_value_slots(
+            semantic_field,
+            answer,
+            section_path,
+        )
         return fill_resolved_field(
             self.page,
-            semantic_field,
+            expanded,
             answer,
             section_path=section_path,
             recheck_wait_ms=recheck_wait_ms,
