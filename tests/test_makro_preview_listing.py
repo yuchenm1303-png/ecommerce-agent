@@ -54,6 +54,7 @@ def test_full_step3_mode_keeps_evidence_images_separate_from_upload_images():
             "--expected-vertical",
             "vehicle_camera_system",
             "--all-step3",
+            "--allow-section-save",
             "--image",
             "evidence.png",
             "--upload-image",
@@ -62,6 +63,24 @@ def test_full_step3_mode_keeps_evidence_images_separate_from_upload_images():
     )
 
     assert args.all_step3 is True
+    assert args.allow_section_save is True
     assert args.section is None
     assert args.image == ["evidence.png"]
     assert args.upload_image == ["listing.png"]
+
+
+def test_single_section_mode_does_not_implicitly_authorize_save():
+    args = build_parser().parse_args(
+        [
+            "--qa",
+            "qa.xlsx",
+            "--expected-vertical",
+            "vehicle_camera_system",
+            "--section",
+            "Product Description",
+        ]
+    )
+
+    assert args.section == "Product Description"
+    assert args.all_step3 is False
+    assert args.allow_section_save is False
