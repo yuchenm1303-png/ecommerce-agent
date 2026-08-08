@@ -6,7 +6,7 @@ from pathlib import Path
 import makro_plan_listing
 import makro_preview_listing
 import makro_resolve_ai
-from app import fill_plan, hard_field_validators, web_enrichment
+from app import ai_decisions, fill_plan, hard_field_validators, web_enrichment
 from app.providers import openai_compatible, openai_semantic
 
 
@@ -55,16 +55,28 @@ def test_production_path_has_no_legacy_semantic_import_or_rule_layer():
             assert token not in source, f"{module.__name__} reintroduced {token}"
 
 
-def test_ai_resolver_is_whole_product_local_plus_optional_single_web_pass():
+def test_ai_resolver_is_one_compact_local_fill_plus_optional_single_web_fill():
     source = inspect.getsource(makro_resolve_ai)
     web_source = inspect.getsource(web_enrichment)
+    decision_source = inspect.getsource(ai_decisions)
     assert "run_ai_resolution(" in source
     assert "run_web_enrichment(" in source
-    assert "one_local_whole_product_call_plus_optional_one_sourced_web_call" in source
+    assert "one_local_whole_product_fill_plus_optional_one_sourced_web_fill" in source
     assert "source_concurrency" not in source
     assert "batch_size" not in source
-    assert "for decision in targets" not in web_source
     assert "provider.search_json(" in web_source
+    assert 'max_repair_attempts: int = 0' in decision_source
+    assert '"schema_sha256" not in request' not in source
+
+
+def test_model_output_contract_does_not_echo_local_packet_metadata():
+    schema = ai_decisions.AI_DECISION_JSON_SCHEMA
+    properties = schema["properties"]
+    assert schema["required"] == ["decisions"]
+    assert "product_identity" not in properties
+    assert "schema_sha256" not in properties
+    assert "source_manifest_sha256" not in properties
+    assert "warnings" not in properties
 
 
 def test_hard_validator_contains_no_product_attribute_marker_tables():
