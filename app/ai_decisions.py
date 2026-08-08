@@ -365,6 +365,62 @@ def _validated_citations(
     return output
 
 
+_GENERIC_IDENTITY_VALUES = {
+    "",
+    "other",
+    "unknown",
+    "generic",
+    "none",
+    "na",
+    "n/a",
+    "not specified",
+    "not applicable",
+}
+
+
+def _identity_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def _meaningful_identity(value: str) -> str:
+    raw = str(value or "").strip()
+    if raw.casefold() in _GENERIC_IDENTITY_VALUES:
+        return ""
+    return _identity_token(raw)
+
+
+def _external_identity_sufficient(
+    citations: Iterable[DecisionCitation],
+    external_sources: dict[str, str],
+    identity: ProductIdentity,
+) -> bool:
+    """Fail closed only when the product has a strong identity anchor that generic web pages do not match."""
+    refs = {
+        citation.source_reference
+        for citation in citations
+        if citation.source_reference in external_sources
+    }
+    if not refs:
+        return True
+
+    combined = _identity_token("\n".join(external_sources[ref] for ref in refs))
+    sku = _meaningful_identity(identity.sku)
+    model = _meaningful_identity(identity.model_number)
+    brand = _meaningful_identity(identity.brand)
+
+    strong_sku = bool(sku) and len(sku) >= 8 and any(char.isdigit() for char in sku)
+    if strong_sku and sku in combined:
+        return True
+    if brand and model and brand in combined and model in combined:
+        return True
+
+    # With no strong SKU and no usable brand+model pair there is not enough deterministic
+    # identity information for Python to make a stronger claim; leave semantics with AI.
+    if not strong_sku and not (brand and model):
+        return True
+    return False
+
+
 def validate_ai_decision_packet(
     packet: AIDecisionPacket,
     fields: Iterable[dict[str, Any]],
@@ -435,6 +491,18 @@ def validate_ai_decision_packet(
                 )
             )
         decision.alternatives = validated_alternatives
+
+        if decision.status == READY and not _external_identity_sufficient(
+            decision.citations,
+            external,
+            expected_identity,
+        ):
+            warnings.append(
+                f"{decision.field_id}: external-web READY downgraded to REVIEW because source identity does not match the strong SKU or a brand+model pair"
+            )
+            decision.status = REVIEW
+            guard = "web source identity insufficient for exact-product automatic entry"
+            decision.reason = f"{decision.reason} | {guard}".strip(" |")
 
         if decision.status == READY and (not decision.values or not decision.citations):
             warnings.append(
