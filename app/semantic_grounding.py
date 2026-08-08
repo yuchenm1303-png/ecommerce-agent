@@ -25,10 +25,9 @@ def _sha256_text(text: str) -> str:
 class GroundedSource:
     """One exact source unit that a semantic extractor is allowed to cite.
 
-    Every source has a content digest. Builder-generated source ids include a
-    digest prefix as well, so a packet created for one captured page/image cannot
-    be silently replayed against changed source content while keeping the same
-    citation id.
+    Text can be split into several chunks for precise citation/validation, but
+    chunks belonging to one original file/page are still one *logical source*
+    for AI execution. This prevents chunking from multiplying model calls.
     """
 
     source_id: str
@@ -38,6 +37,22 @@ class GroundedSource:
     content: str = ""
     image_path: str = ""
     sha256: str = ""
+
+    @property
+    def logical_source_id(self) -> str:
+        """Stable execution identity shared by chunks from the same source.
+
+        Builder-generated text ids look like ``supplier:001:text:0001:<sha>``
+        or ``customer-text:001:text:0001:<sha>``. Everything before ``:text:``
+        identifies the original source. Images are already one source per id.
+        Unknown externally constructed ids remain isolated rather than being
+        guessed into a group.
+        """
+
+        marker = ":text:"
+        if self.kind == TEXT_KIND and marker in self.source_id:
+            return self.source_id.split(marker, 1)[0]
+        return self.source_id
 
     def as_request_dict(self) -> dict[str, str]:
         payload = {
@@ -56,6 +71,7 @@ class GroundedSource:
     def as_manifest_dict(self) -> dict[str, str]:
         return {
             "source_id": self.source_id,
+            "logical_source_id": self.logical_source_id,
             "source_type": self.source_type,
             "kind": self.kind,
             "origin": self.origin,
@@ -93,13 +109,36 @@ class GroundingCatalog:
                 return source
         return None
 
+    def logical_groups(self) -> list[tuple[str, "GroundingCatalog"]]:
+        """Return source groups in first-seen order for one-call-per-source AI.
+
+        A long supplier page may be represented by many citation chunks, but all
+        of those chunks are passed to the model together in one request. A
+        product image always remains its own logical group.
+        """
+
+        order: list[str] = []
+        grouped: dict[str, list[GroundedSource]] = {}
+        for source in self.sources:
+            key = source.logical_source_id
+            if key not in grouped:
+                grouped[key] = []
+                order.append(key)
+            grouped[key].append(source)
+        return [(key, GroundingCatalog(sources=grouped[key])) for key in order]
+
+    @property
+    def logical_source_count(self) -> int:
+        return len({source.logical_source_id for source in self.sources})
+
     def as_request_list(self) -> list[dict[str, str]]:
         return [source.as_request_dict() for source in self.sources]
 
     def as_manifest(self) -> dict[str, object]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "source_count": len(self.sources),
+            "logical_source_count": self.logical_source_count,
             "sources": [source.as_manifest_dict() for source in self.sources],
         }
 
@@ -122,7 +161,11 @@ def chunk_text(
     max_chars: int = 3000,
     overlap_chars: int = 250,
 ) -> list[str]:
-    """Deterministically split captured text while retaining small overlap."""
+    """Deterministically split captured text while retaining small overlap.
+
+    Chunking is a citation/validation detail only. It no longer controls how
+    many model requests are made.
+    """
 
     if max_chars < 500:
         raise ValueError("max_chars 不能小于 500。")
