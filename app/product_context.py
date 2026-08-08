@@ -49,7 +49,6 @@ def build_ai_product_context(
         spec,
         supplier_snapshots=(),
         official_snapshots=(),
-        evidence_packets=(),
         image_paths=(),
     )
     trusted = build_resolution_inputs(customer_catalog, trusted_spec)
