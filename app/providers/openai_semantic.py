@@ -154,13 +154,7 @@ def _input_content(request_payload: dict[str, Any], *, image_detail: str) -> lis
 
 
 class OpenAISemanticProvider:
-    """OpenAI Responses API adapter for the provider-neutral semantic boundary.
-
-    The adapter only obtains structured candidate facts. It does *not* decide
-    whether they are trusted. app.semantic_extraction validates QA keys, source
-    ids, literal text evidence, source types, identity and business-field rules
-    after this method returns.
-    """
+    """OpenAI Responses API adapter for the provider-neutral semantic boundary."""
 
     name = "openai-responses-semantic"
 
@@ -171,6 +165,7 @@ class OpenAISemanticProvider:
         client: Any | None = None,
         image_detail: str = "high",
         max_output_tokens: int = 12000,
+        request_timeout_seconds: float = 120.0,
     ) -> None:
         if not model.strip():
             raise ValueError("OpenAI model 不能为空。")
@@ -178,6 +173,8 @@ class OpenAISemanticProvider:
             raise ValueError("image_detail 必须是 auto/low/high。")
         if max_output_tokens < 1000:
             raise ValueError("max_output_tokens 不能小于 1000。")
+        if not 10.0 <= float(request_timeout_seconds) <= 600.0:
+            raise ValueError("request_timeout_seconds 必须在 10..600 秒。")
 
         if client is None:
             try:
@@ -186,12 +183,16 @@ class OpenAISemanticProvider:
                 raise OpenAIProviderError(
                     "缺少 openai Python SDK。请先安装 requirements.txt。"
                 ) from exc
-            client = OpenAI()
+            client = OpenAI(
+                timeout=float(request_timeout_seconds),
+                max_retries=0,
+            )
 
         self.client = client
         self.model = model.strip()
         self.image_detail = image_detail
         self.max_output_tokens = int(max_output_tokens)
+        self.request_timeout_seconds = float(request_timeout_seconds)
 
     def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
         content = _input_content(request_payload, image_detail=self.image_detail)
@@ -217,8 +218,9 @@ class OpenAISemanticProvider:
                     }
                 },
                 max_output_tokens=self.max_output_tokens,
+                timeout=self.request_timeout_seconds,
             )
-        except Exception as exc:  # SDK/API errors are surfaced; no silent retry here.
+        except Exception as exc:
             raise OpenAIProviderError(f"OpenAI semantic extraction 调用失败：{exc}") from exc
 
         status = str(getattr(response, "status", "") or "")
@@ -238,6 +240,5 @@ class OpenAISemanticProvider:
         if not isinstance(payload, dict):
             raise OpenAIProviderError("OpenAI structured output 顶层必须是 JSON object。")
 
-        # Provider identity is an execution fact, not something the model chooses.
         payload["extractor"] = self.name
         return payload
