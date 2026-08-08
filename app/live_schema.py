@@ -53,8 +53,11 @@ def _field_options(field: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _qualifier_options(field: dict[str, Any]) -> tuple[str, ...]:
-    output: list[str] = []
-    seen: set[str] = set()
+    # Serialized live-schema fields already carry qualifier_options at top
+    # level. Start with them so a save/load round trip compares equal to the
+    # current DOM controls instead of producing false schema drift.
+    output = list(_clean_options(field.get("qualifier_options") or []))
+    seen = {normalize_key(item) for item in output}
     for control in field.get("controls") or []:
         if not str(control.get("name") or "").endswith("_qualifier"):
             continue
