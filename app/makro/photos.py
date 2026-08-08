@@ -143,11 +143,7 @@ def upload_product_photos(
     *,
     timeout_ms: int = 8_000,
 ) -> PhotoUploadResult:
-    """Stage explicit listing images into Product Photos; never Save the card.
-
-    Persistence is a separate transaction. A caller must subsequently invoke the
-    section Save primitive and verify the completion counter after re-open.
-    """
+    """Stage explicit listing images into Product Photos; never Save the card."""
 
     resolved_paths: list[Path] = []
     seen: set[str] = set()
@@ -301,36 +297,52 @@ def verify_persisted_photo_count(
     *,
     initial_count: int | None,
     expected_added: int,
+    timeout_ms: int = 10_000,
 ) -> dict[str, Any]:
-    """Verify Product Photos only after the section Save transaction finished."""
+    """Poll the collapsed Product Photos counter after its Save transaction."""
 
-    state = inspect_product_photos(page)
-    final_count = state.get("completion_count")
     if expected_added <= 0:
+        state = inspect_product_photos(page)
         return {
             "status": "skipped",
             "initial_count": initial_count,
-            "final_count": final_count,
+            "final_count": state.get("completion_count"),
             "expected_added": expected_added,
             "detail": "没有 staged 图片需要持久化复核。",
         }
-    if initial_count is None or final_count is None:
+    if initial_count is None:
         return {
             "status": "validation_failed",
             "initial_count": initial_count,
-            "final_count": final_count,
+            "final_count": None,
             "expected_added": expected_added,
-            "detail": "Save 后无法读取 Product Photos 完成计数，不能证明图片已持久化。",
+            "detail": "Save 前无法读取 Product Photos 完成计数，不能证明计数增长。",
         }
-    passed = int(final_count) >= int(initial_count) + expected_added
+
+    target = int(initial_count) + int(expected_added)
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    final_count: int | None = None
+    while time.monotonic() < deadline:
+        state = inspect_product_photos(page)
+        raw = state.get("completion_count")
+        final_count = int(raw) if raw is not None else None
+        if final_count is not None and final_count >= target:
+            return {
+                "status": "persisted_verified",
+                "initial_count": initial_count,
+                "final_count": final_count,
+                "expected_added": expected_added,
+                "detail": "Product Photos Save 后完成计数按预期增加。",
+            }
+        page.wait_for_timeout(250)
+
     return {
-        "status": "persisted_verified" if passed else "validation_failed",
+        "status": "validation_failed",
         "initial_count": initial_count,
         "final_count": final_count,
         "expected_added": expected_added,
         "detail": (
-            "Product Photos Save 后完成计数按预期增加。"
-            if passed
-            else "Product Photos Save 后完成计数没有按 staged 图片数量增加。"
+            f"Product Photos Save 后 {timeout_ms}ms 内完成计数未达到 {target}；"
+            "不能证明 staged 图片已持久化。"
         ),
     }
