@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +27,7 @@ from app.ai_decisions import (
     write_ai_decision_packet,
 )
 from app.live_schema import load_live_schema
+from app.product_context import build_ai_product_context
 from app.providers.registry import (
     ProviderConfig,
     ProviderConfigurationError,
@@ -36,23 +36,9 @@ from app.providers.registry import (
     default_api_key_env,
     validate_provider_config,
 )
-from app.qa_catalog import QuestionCatalog, load_question_catalog
-from app.resolver_inputs import (
-    ResolutionInputSpec,
-    build_resolution_inputs,
-    customer_context_for_resolution,
-)
+from app.qa_catalog import load_question_catalog
+from app.resolver_inputs import ResolutionInputSpec
 from app.semantic_grounding import build_grounding_catalog
-
-
-_TRUSTED_CONTEXT_SOURCE_TYPES = {
-    "structured",
-    "customer_answer",
-    "business",
-    "config",
-    "rule",
-    "customer_file",
-}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -169,52 +155,6 @@ def _cache_namespace(config: ProviderConfig) -> str:
     return json.dumps(safe, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
-def _format_value(value: object) -> str:
-    if isinstance(value, tuple):
-        return " | ".join(str(item) for item in value)
-    return str(value)
-
-
-def _trusted_product_context(
-    customer_catalog: QuestionCatalog,
-    spec: ResolutionInputSpec,
-) -> tuple[str, Any]:
-    """Build product context for AI without invoking old semantic product rules."""
-
-    trusted_spec = replace(
-        spec,
-        supplier_snapshots=(),
-        official_snapshots=(),
-        evidence_packets=(),
-        image_paths=(),
-    )
-    trusted = build_resolution_inputs(customer_catalog, trusted_spec)
-    parts: list[str] = []
-    canonical_context = customer_context_for_resolution(customer_catalog, trusted_spec)
-    if canonical_context:
-        parts.append("Customer/product context:\n" + canonical_context)
-
-    evidence_lines: list[str] = []
-    seen: set[tuple[str, str, str]] = set()
-    for item in trusted.bundle.evidence:
-        if item.source_type not in _TRUSTED_CONTEXT_SOURCE_TYPES:
-            continue
-        value = _format_value(item.value).strip()
-        if not value:
-            continue
-        fingerprint = (item.key.strip(), value, item.source_type)
-        if fingerprint in seen:
-            continue
-        seen.add(fingerprint)
-        evidence_lines.append(
-            f"- {item.key}: {value} [source_type={item.source_type}; source={item.source_reference}]"
-        )
-    if evidence_lines:
-        parts.append("Explicit customer/structured facts:\n" + "\n".join(evidence_lines))
-
-    return "\n\n".join(parts).strip(), trusted
-
-
 def _decision_summary(decisions: list[Any]) -> dict[str, int]:
     counts = {READY: 0, REVIEW: 0, CONFLICT: 0, MISSING: 0, BUSINESS_LOCKED: 0}
     for decision in decisions:
@@ -253,13 +193,13 @@ def main() -> int:
     live_fields = load_live_schema(args.live_schema)
     supplemental_text = _read_supplemental_text(args)
     spec = _input_spec(args, supplemental_text)
-    product_context, trusted_inputs = _trusted_product_context(customer_catalog, spec)
+    product_context = build_ai_product_context(customer_catalog, spec)
 
     grounding = build_grounding_catalog(
         image_paths=args.image,
         supplier_snapshots=args.supplier_snapshot,
         official_snapshots=args.official_snapshot,
-        supplemental_text=product_context,
+        supplemental_text=product_context.text,
         max_text_chars=args.max_text_chars,
         overlap_chars=args.overlap_chars,
     )
@@ -297,7 +237,7 @@ def main() -> int:
         provider,
         live_fields,
         grounding,
-        expected_identity=trusted_inputs.expected_identity,
+        expected_identity=product_context.trusted_inputs.expected_identity,
         cache_dir=cache_dir,
         cache_namespace=_cache_namespace(provider_config),
         max_repair_attempts=args.max_repair_attempts,
@@ -323,7 +263,7 @@ def main() -> int:
                 "provider_config": provider_config.as_safe_dict(),
                 "grounded_source_count": len(grounding.sources),
                 "grounded_logical_source_count": grounding.logical_source_count,
-                "customer_context_chars": len(product_context),
+                "customer_context_chars": len(product_context.text),
                 "model_calls": result.model_calls,
                 "cache_hit": result.cache_hit,
                 "repair_attempts": result.repair_attempts,
