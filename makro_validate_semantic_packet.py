@@ -1,9 +1,8 @@
-"""Validate a model-produced semantic EvidencePacket against exact supplied sources.
+"""Validate a semantic EvidencePacket against the exact current source universe.
 
-The model output is treated as untrusted input. A fact is accepted only when it
-belongs to the current QA, does not target a business field, cites a real source
-id from this run, and (for text sources) quotes evidence literally from that
-source chunk. The command never opens or modifies Makro.
+The packet is untrusted until every grounded citation is reproduced from the
+current QA customer context, images and captured snapshots. This command never
+opens or modifies Makro.
 """
 
 from __future__ import annotations
@@ -15,13 +14,14 @@ from pathlib import Path
 
 from app.evidence_contract import ProductIdentity
 from app.qa_catalog import load_question_catalog
+from app.resolver_inputs import ResolutionInputSpec, customer_context_for_resolution
 from app.semantic_extraction import validate_grounded_semantic_packet
 from app.semantic_grounding import build_grounding_catalog
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="校验模型输出是否真正引用本次提供的图片/网页证据；不修改 Makro。"
+        description="校验模型输出是否真正引用本次 QA/图片/网页证据；不修改 Makro。"
     )
     parser.add_argument("--qa", required=True)
     parser.add_argument("--packet", required=True, help="模型返回的 EvidencePacket JSON")
@@ -66,21 +66,27 @@ def _packet_dict(packet) -> dict[str, object]:
 
 def main() -> int:
     args = build_parser().parse_args()
-    supplemental_text = args.supplemental_text
-    if args.supplemental_text_file:
-        file_text = Path(args.supplemental_text_file).read_text(encoding="utf-8")
-        supplemental_text = "\n".join(
-            part for part in (supplemental_text, file_text) if part.strip()
-        )
-
     catalog = load_question_catalog(args.qa)
+    spec = ResolutionInputSpec(
+        sku=args.sku,
+        expected_model=args.model,
+        expected_brand=args.brand,
+        supplier_snapshots=tuple(args.supplier_snapshot),
+        official_snapshots=tuple(args.official_snapshot),
+        supplemental_text=args.supplemental_text,
+        supplemental_text_file=args.supplemental_text_file,
+        image_paths=tuple(args.image),
+        grounding_max_text_chars=args.max_text_chars,
+        grounding_overlap_chars=args.overlap_chars,
+    )
+    customer_context = customer_context_for_resolution(catalog, spec)
     grounding = build_grounding_catalog(
-        image_paths=args.image,
-        supplier_snapshots=args.supplier_snapshot,
-        official_snapshots=args.official_snapshot,
-        supplemental_text=supplemental_text,
-        max_text_chars=args.max_text_chars,
-        overlap_chars=args.overlap_chars,
+        image_paths=spec.image_paths,
+        supplier_snapshots=spec.supplier_snapshots,
+        official_snapshots=spec.official_snapshots,
+        supplemental_text=customer_context,
+        max_text_chars=spec.grounding_max_text_chars,
+        overlap_chars=spec.grounding_overlap_chars,
     )
     raw = json.loads(Path(args.packet).read_text(encoding="utf-8"))
     packet = validate_grounded_semantic_packet(
@@ -111,6 +117,7 @@ def main() -> int:
     print("===== SEMANTIC EVIDENCE VALIDATED =====")
     print(f"facts={len(packet.facts)}")
     print(f"grounded_sources={len(grounding.sources)}")
+    print(f"customer_context_chars={len(customer_context)}")
     print(f"validated_packet={validated_path.resolve()}")
     print(f"manifest={manifest_path.resolve()}")
     print("校验通过仅代表证据边界通过；后续仍要经过 Resolver 冲突/置信度/字段约束。")
