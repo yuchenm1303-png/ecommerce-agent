@@ -108,6 +108,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="默认 auto：兼容接口不发送 vendor-specific detail 字段；确认服务商支持时可选 low/high。",
     )
     parser.add_argument("--max-output-tokens", type=int, default=12000)
+    parser.add_argument(
+        "--request-timeout-seconds",
+        type=float,
+        default=120.0,
+        help="单个 logical source 的 API 请求超时；默认 120 秒，允许范围 10..600。",
+    )
     parser.add_argument("--max-text-chars", type=int, default=3000)
     parser.add_argument("--overlap-chars", type=int, default=250)
     parser.add_argument("--auto-fill-min-confidence", type=float, default=0.85)
@@ -178,7 +184,27 @@ def _provider_config(args: argparse.Namespace) -> ProviderConfig:
             image_detail=args.image_detail,
             max_output_tokens=args.max_output_tokens,
             structured_mode=args.structured_mode,
+            request_timeout_seconds=args.request_timeout_seconds,
         )
+    )
+
+
+def _semantic_cache_namespace(config: ProviderConfig) -> str:
+    """Cache only on provider settings that can change semantic output.
+
+    Transport timeout/retry policy changes latency, not the meaning of an
+    already validated packet, so changing it must not force expensive images to
+    be recognized again.
+    """
+
+    safe = config.as_safe_dict()
+    safe.pop("request_timeout_seconds", None)
+    safe.pop("sdk_max_retries", None)
+    return json.dumps(
+        safe,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
     )
 
 
@@ -266,12 +292,7 @@ def main() -> int:
 
     pending = build_semantic_pending_catalog(catalog)
     cache_dir = None if args.no_semantic_cache else Path(args.semantic_cache_dir)
-    cache_namespace = json.dumps(
-        provider_config.as_safe_dict(),
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    cache_namespace = _semantic_cache_namespace(provider_config)
 
     print("===== GROUNDED AI SOURCE-FIRST RESOLUTION =====", flush=True)
     print(
