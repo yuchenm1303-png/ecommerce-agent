@@ -95,7 +95,8 @@ class FakeProvider:
         if request["task"] == "map_product_profile_to_marketplace_fields":
             decisions = []
             profile_payload = json.loads(request["grounded_sources"][0]["content"])
-            profile_citation = profile_payload["facts"][0]["candidates"][0]["citations"][0]
+            profile_fact = profile_payload["facts"][0]
+            profile_citation = profile_fact["candidates"][0]["citations"][0]
             for target in request["target_fields"]:
                 if target["label"] == "Screen Size":
                     decisions.append(
@@ -105,6 +106,7 @@ class FakeProvider:
                             "values": ["3.0"],
                             "qualifier": "inch",
                             "citations": [profile_citation],
+                            "profile_fact_ids": [profile_fact["fact_id"]],
                         }
                     )
                 else:
