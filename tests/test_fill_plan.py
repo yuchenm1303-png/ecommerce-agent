@@ -95,10 +95,11 @@ def test_ai_ready_field_goes_directly_to_fill_plan_without_qa_matcher():
 
     item = plan.items[0]
     assert item.action == READY
-    assert item.match_basis == "ai-field-id"
     assert item.resolution.answer_values == ["Black"]
     assert item.resolution.source_type == "ai_decision"
     assert item.resolution.eligible_for_autofill is True
+    assert "question" not in item.as_dict()
+    assert "match_basis" not in item.as_dict()
 
 
 def test_ai_review_is_previewable_but_not_autofill_ready():
