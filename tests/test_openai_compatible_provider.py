@@ -96,6 +96,7 @@ def test_prompt_only_provider_parses_fenced_json_and_keeps_api_key_out_of_prompt
     assert kwargs["timeout"] == 80
     assert "response_format" not in kwargs
     assert "temperature" not in kwargs
+    assert "extra_body" not in kwargs
     serialized = repr(kwargs)
     assert "secret-key" not in serialized
     assert str(image) not in serialized
@@ -104,6 +105,22 @@ def test_prompt_only_provider_parses_fenced_json_and_keeps_api_key_out_of_prompt
     assert len(image_items) == 1
     assert "data:image/png;base64," in repr(image_items[0])
     assert "detail" not in image_items[0]["image_url"]
+
+
+def test_explicit_thinking_mode_is_forwarded_via_extra_body():
+    client = FakeClient(valid_json())
+    provider = OpenAICompatibleSemanticProvider(
+        model="qwen3.5-omni-plus",
+        api_key="secret-key",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        client=client,
+        enable_thinking=False,
+    )
+
+    provider.extract_json(request_payload())
+
+    kwargs = client.create_api.calls[0]
+    assert kwargs["extra_body"] == {"enable_thinking": False}
 
 
 def test_explicit_high_detail_is_only_sent_when_requested(tmp_path):
