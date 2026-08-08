@@ -4,7 +4,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .evidence_contract import EvidencePacket, ExtractedFact, ProductIdentity
+from .evidence_contract import (
+    EvidenceContractError,
+    EvidencePacket,
+    ExtractedFact,
+    IdentityMismatchError,
+    ProductIdentity,
+    assert_identity_compatible,
+)
 from .evidence_pipeline import source_policy
 from .evidence_validation import EvidenceValidationError, validate_evidence_packet
 from .extraction_request import build_extraction_request_payload
@@ -39,6 +46,23 @@ class SemanticExtractionResult:
     provider_name: str
     request_payload: dict[str, Any]
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class SemanticPacketValidationResult:
+    """Validated source packet plus facts rejected individually.
+
+    Rejected facts never enter evidence. Keeping valid sibling facts avoids
+    repeating an expensive image/source request just because one model-authored
+    fact violated the same strict grounding rules.
+    """
+
+    packet: EvidencePacket
+    rejected_facts: list[str] = field(default_factory=list)
+
+    @property
+    def rejected_fact_count(self) -> int:
+        return len(self.rejected_facts)
 
 
 GROUNDED_OUTPUT_RULES = (
@@ -244,11 +268,6 @@ def _direct_value_supported(
     if not raw_value:
         return False
 
-    # Exact normalized textual containment covers ordinary dropdown/text values
-    # and most direct numeric/unit strings while ignoring punctuation/case.
-    # Single CJK ideographs (e.g. 无/有/是/否) are also accepted only
-    # when they appear literally; unlike a single Latin letter/digit they cannot
-    # collide accidentally inside unrelated words.
     normalized_value = normalize_key(raw_value)
     normalized_evidence = normalize_key(evidence_text)
     matchable = normalized_value and (
@@ -257,9 +276,6 @@ def _direct_value_supported(
     if matchable and normalized_value in normalized_evidence:
         return True
 
-    # Mechanical equivalence handles safe representation-only differences such
-    # as 3 inch vs 3.0 inches or 1920x1080 vs 1920 × 1080. It intentionally does
-    # not turn marketing labels like 1080P into pixel dimensions.
     target = canonical_scalar_for_field(question.as_semantic_field(), raw_value)
     if target.startswith(("num:", "px:")):
         return target in _candidate_canonical_values(question, evidence_text)
@@ -289,16 +305,6 @@ def _validate_direct_claim_against_evidence(
 
 
 def _direct_attribute_binding_explicit(question: QuestionRecord, evidence_text: str) -> bool:
-    """Prove direct field binding without asking the model to judge itself.
-
-    A literal value is not enough: ``品牌 other`` may be true while answering
-    ``Vehicle Brand`` incorrectly, and one generic ``拍摄角度`` cannot directly
-    authorize both interior/exterior FOV. For direct external evidence, the QA
-    attribute itself must be explicitly named in the evidence. Cross-language,
-    renamed, subset, generic-to-specific and other semantic mappings are kept as
-    useful evidence but quarantined as ``ai_synthesis`` below the autofill floor.
-    """
-
     question_key = normalize_key(question.question)
     evidence_key = normalize_key(evidence_text)
     if not question_key or not evidence_key:
@@ -388,11 +394,8 @@ def validate_grounded_semantic_packet(
             )
 
         question = questions.get(normalize_key(fact.key))
-        if question is None:  # should already be impossible after validation.
+        if question is None:
             raise SemanticGroundingError(f"无法恢复 QA 问题：{fact.key!r}")
-        # Keep the existing hard failure when a direct value is not even present
-        # in its own evidence. Semantic binding quarantine is a separate second
-        # gate and must never excuse a fabricated/transformed direct value.
         _validate_direct_claim_against_evidence(
             question=question,
             value=fact.value,
@@ -409,6 +412,106 @@ def validate_grounded_semantic_packet(
         facts=effective_facts,
         extractor=validated.extractor,
         warnings=warnings,
+    )
+
+
+def _raw_fact_has_value(payload: dict[str, Any]) -> bool:
+    raw = payload.get("value", payload.get("answer"))
+    if raw in (None, ""):
+        return False
+    if isinstance(raw, list):
+        return any(str(item).strip() for item in raw)
+    return bool(str(raw).strip())
+
+
+def validate_grounded_semantic_packet_partial(
+    payload: dict[str, Any] | EvidencePacket,
+    catalog: QuestionCatalog,
+    grounding: GroundingCatalog,
+    *,
+    expected_identity: ProductIdentity = ProductIdentity(),
+) -> SemanticPacketValidationResult:
+    """Fail closed per fact while salvaging independently valid facts.
+
+    Product identity and top-level packet structure remain hard gates. Individual
+    bad facts are never repaired into evidence locally; they are dropped with an
+    audit warning. This keeps the security boundary while avoiding a full
+    re-request of an expensive image because one sibling fact was malformed.
+    """
+
+    if isinstance(payload, EvidencePacket):
+        packet = validate_grounded_semantic_packet(
+            payload,
+            catalog,
+            grounding,
+            expected_identity=expected_identity,
+        )
+        return SemanticPacketValidationResult(packet=packet)
+
+    if not isinstance(payload, dict):
+        raise EvidenceContractError("evidence packet 必须是 JSON object。")
+    raw_facts = payload.get("facts")
+    if not isinstance(raw_facts, list):
+        raise EvidenceContractError("evidence packet 缺少 facts 数组。")
+    raw_warnings = payload.get("warnings") or []
+    if not isinstance(raw_warnings, list):
+        raise EvidenceContractError("warnings 必须是数组。")
+
+    identity = ProductIdentity.from_mapping(payload.get("product_identity"))
+    assert_identity_compatible(expected_identity, identity)
+    extractor = str(payload.get("extractor") or "").strip()
+    warnings = [str(item) for item in raw_warnings]
+    accepted: list[ExtractedFact] = []
+    rejected: list[str] = []
+
+    for index, item in enumerate(raw_facts, start=1):
+        if not isinstance(item, dict):
+            rejected.append(f"facts[{index}]: fact must be an object")
+            continue
+        key = str(item.get("key") or item.get("question") or f"facts[{index}]").strip()
+        if not _raw_fact_has_value(item):
+            warnings.append(f"empty-value fact ignored: {key}")
+            continue
+        try:
+            fact = ExtractedFact.from_mapping(item, index=index)
+            single = EvidencePacket(
+                identity=identity,
+                facts=[fact],
+                extractor=extractor,
+                warnings=[],
+            )
+            validated = validate_grounded_semantic_packet(
+                single,
+                catalog,
+                grounding,
+                expected_identity=expected_identity,
+            )
+            accepted.extend(validated.facts)
+            warnings.extend(validated.warnings)
+        except IdentityMismatchError:
+            raise
+        except EvidenceContractError as exc:
+            rejected.append(f"{key}: {exc}")
+
+    for item in rejected:
+        warnings.append(f"rejected semantic fact ignored: {item}")
+
+    combined = EvidencePacket(
+        identity=identity,
+        facts=accepted,
+        extractor=extractor,
+        warnings=warnings,
+    )
+    # One final canonicalization pass deduplicates facts that survived
+    # independently without weakening any source-level validation above.
+    normalized = validate_evidence_packet(
+        combined,
+        catalog,
+        expected_identity=expected_identity,
+    ).packet
+    return SemanticPacketValidationResult(
+        packet=normalized,
+        rejected_facts=rejected,
     )
 
 
