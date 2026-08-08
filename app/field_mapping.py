@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -29,8 +30,8 @@ from .semantic_grounding import GroundingCatalog
 from .source_bundle import normalize_key
 
 
-FIELD_MAPPING_CONTRACT_VERSION = 3
-FIELD_MAPPING_CACHE_VERSION = 3
+FIELD_MAPPING_CONTRACT_VERSION = 4
+FIELD_MAPPING_CACHE_VERSION = 4
 
 
 MAPPING_SYSTEM_INSTRUCTION = (
@@ -43,15 +44,16 @@ MAPPING_SYSTEM_INSTRUCTION = (
 MAPPING_RULES = [
     "Answer only the supplied target field_id values.",
     "READY requires one strongly supported profile answer, at least one underlying original citation copied from the profile, and one or more profile_fact_ids that directly support this exact target meaning and scope.",
-    "If target_scope is present, at least one cited profile fact must explicitly match that scope. Generic product scope is not enough for packaging, product-with-bracket, exterior-camera or interior-camera targets.",
+    "If target_scope is present, the citations used by READY must come from profile facts that explicitly match that scope. A compatible fact_id cannot authorize citations from an incompatible fact_id.",
     "A profile fact with status=conflict can never authorize READY. Preserve it as CONFLICT/REVIEW, or omit that unresolved subclaim from broad free-text fields.",
+    "Do not embed a candidate value from any unresolved Product Profile conflict inside a deterministic READY free-text answer.",
     "If no profile fact directly supports the target meaning/scope, return REVIEW or MISSING; do not stretch a generic feature into a specialized marketplace field.",
     "The listing is for the selected variant. If a generic supplier/product fact conflicts with a selected_variant fact, never put the generic conflicting value into READY or into READY free-text summaries.",
     "REVIEW means a plausible mapping exists but the profile does not establish the exact target semantics or scope strongly enough for automatic entry.",
     "CONFLICT means the profile contains credible conflicting candidates for the same target scope; preserve at least two cited alternatives and never choose one silently.",
     "MISSING means the profile cannot answer this field. Do not invent a value.",
-    "Never infer No/False/Not included from absence. Negative values need explicit negative evidence in the profile.",
-    "Keep packaging dimensions/weight separate from product-body dimensions/weight; cabin/interior is not rear/back; manual language is not device UI language; product brand is not compatible vehicle brand.",
+    "Never infer No/False/Not included from absence. A negative READY requires citation text that explicitly states the negative claim.",
+    "Keep packaging dimensions/weight separate from product-body dimensions/weight; mount dimensions are not product-body dimensions; cabin/interior is not rear/back; manual language is not device UI language; product brand is not compatible vehicle brand.",
     "Use exact marketplace option text when target options clearly match the cited profile fact.",
     "If multi_value=false, return one string in values. Combine several supported free-text features into one concise string only when every included feature directly belongs to that field meaning and none is unresolved/conflicting.",
     "If qualifier_options exist, put the value/magnitude only in values and the exact unit once in qualifier.",
@@ -88,6 +90,24 @@ MAPPING_JSON_SCHEMA: dict[str, Any] = {
         "model_summary": {"type": "string"},
     },
     "required": ["decisions"],
+}
+
+
+_NEGATIVE_READY_VALUES = {
+    "no",
+    "false",
+    "none",
+    "notincluded",
+    "notavailable",
+    "unsupported",
+    "absent",
+    "否",
+    "无",
+    "没有",
+    "不支持",
+    "不包含",
+    "不含",
+    "不带",
 }
 
 
@@ -152,6 +172,25 @@ def target_scope(field: dict[str, Any]) -> str:
         ),
     ):
         return "interior_camera"
+
+    if _contains_any(
+        text,
+        (
+            "languages supported",
+            "languagessupported",
+            "supported languages",
+            "supportedlanguages",
+            "ui language",
+            "uilanguage",
+            "interface language",
+            "interfacelanguage",
+            "menu language",
+            "menulanguage",
+            "device language",
+            "devicelanguage",
+        ),
+    ):
+        return "device_ui_language"
 
     dimensional = _contains_any(
         text,
@@ -300,13 +339,26 @@ def _scope_compatible(fact_scope: str, required_scope: str) -> bool:
     if required_scope == "packaging":
         return _contains_any(scope, ("packag", "carton", "shipping", "packed"))
     if required_scope == "product_body":
-        return _contains_any(scope, ("product body", "product_body", "productbody", "device body", "device_body", "devicebody", "unit body", "unit_body", "unitbody"))
+        return _contains_any(scope, ("productbody", "devicebody", "unitbody"))
     if required_scope == "product_with_bracket":
-        return _contains_any(scope, ("with bracket", "with_bracket", "withbracket", "including bracket", "includingbracket", "mounted"))
+        return _contains_any(scope, ("withbracket", "includingbracket", "mounted"))
     if required_scope == "exterior_camera":
-        return _contains_any(scope, ("exterior", "outside", "front camera", "front_camera", "frontcamera", "front lens", "front_lens", "frontlens"))
+        return _contains_any(scope, ("exterior", "outside", "frontcamera", "frontlens"))
     if required_scope == "interior_camera":
-        return _contains_any(scope, ("interior", "cabin", "inside", "interior_camera", "interiorcamera", "cabin_camera", "cabincamera"))
+        return _contains_any(scope, ("interior", "cabin", "inside", "interiorcamera", "cabincamera"))
+    if required_scope == "device_ui_language":
+        return _contains_any(
+            scope,
+            (
+                "deviceui",
+                "uilanguage",
+                "interfacelanguage",
+                "menulanguage",
+                "deviceinterface",
+                "device menu",
+                "devicemenu",
+            ),
+        )
     return False
 
 
@@ -335,6 +387,61 @@ def _raw_decision_citations(item: dict[str, Any]) -> set[tuple[str, str]]:
         if reference and evidence:
             output.add(_citation_fingerprint(reference, evidence))
     return output
+
+
+def _raw_decision_evidence_texts(item: dict[str, Any]) -> list[str]:
+    raw = item.get("citations") or []
+    if not isinstance(raw, list):
+        return []
+    return [
+        str(citation.get("evidence_text") or citation.get("evidence") or "").strip()
+        for citation in raw
+        if isinstance(citation, dict)
+        and str(citation.get("evidence_text") or citation.get("evidence") or "").strip()
+    ]
+
+
+def _decision_is_negative(item: dict[str, Any]) -> bool:
+    raw_values = item.get("values") or []
+    if not isinstance(raw_values, list):
+        return False
+    return any(normalize_key(value) in _NEGATIVE_READY_VALUES for value in raw_values)
+
+
+def _has_explicit_negative_evidence(item: dict[str, Any]) -> bool:
+    english = re.compile(
+        r"\b(no|not|none|without|false|absent|unsupported|not\s+included|not\s+available)\b",
+        re.IGNORECASE,
+    )
+    chinese = ("不支持", "不包含", "不含", "不带", "没有", "无", "未", "否")
+    for text in _raw_decision_evidence_texts(item):
+        if english.search(text) or any(token in text for token in chinese):
+            return True
+    return False
+
+
+def _conflict_candidate_tokens(profile: ProductProfile) -> set[str]:
+    tokens: set[str] = set()
+    for fact in profile.facts:
+        if fact.status != PROFILE_CONFLICT:
+            continue
+        for candidate in fact.candidates:
+            for raw in (
+                candidate.value,
+                f"{candidate.value} {candidate.qualifier}".strip(),
+            ):
+                token = normalize_key(raw)
+                if token and (len(token) >= 6 or any(char.isdigit() for char in token)):
+                    tokens.add(token)
+    return tokens
+
+
+def _ready_contains_conflict_candidate(item: dict[str, Any], profile: ProductProfile) -> bool:
+    raw_values = item.get("values") or []
+    if not isinstance(raw_values, list):
+        return False
+    combined = normalize_key(" ".join(str(value) for value in raw_values))
+    return bool(combined) and any(token in combined for token in _conflict_candidate_tokens(profile))
 
 
 def _downgrade_ready(item: dict[str, Any], guard: str) -> None:
@@ -384,9 +491,12 @@ def _enforce_profile_fact_refs(
 
         target = fields.get(str(item.get("field_id") or "").strip())
         required_scope = target_scope(target) if target is not None else ""
-        if required_scope and not any(
-            _scope_compatible(fact.scope, required_scope) for fact in referenced
-        ):
+        compatible = (
+            [fact for fact in referenced if _scope_compatible(fact.scope, required_scope)]
+            if required_scope
+            else referenced
+        )
+        if required_scope and not compatible:
             _downgrade_ready(
                 item,
                 f"READY rejected: cited fact scope does not support target_scope={required_scope}.",
@@ -394,12 +504,28 @@ def _enforce_profile_fact_refs(
             output.append(item)
             continue
 
-        claimed_citations = set().union(*(_fact_citations(fact) for fact in referenced))
+        claimed_citations = set().union(*(_fact_citations(fact) for fact in compatible))
         decision_citations = _raw_decision_citations(item)
         if decision_citations and not decision_citations.issubset(claimed_citations):
             _downgrade_ready(
                 item,
-                "READY rejected: decision citation is not contained in the claimed profile_fact_ids.",
+                "READY rejected: decision citation is not contained in a scope-compatible claimed profile fact.",
+            )
+            output.append(item)
+            continue
+
+        if _decision_is_negative(item) and not _has_explicit_negative_evidence(item):
+            _downgrade_ready(
+                item,
+                "READY rejected: negative answer lacks explicit negative evidence.",
+            )
+            output.append(item)
+            continue
+
+        if _ready_contains_conflict_candidate(item, profile):
+            _downgrade_ready(
+                item,
+                "READY rejected: deterministic text contains a candidate from an unresolved Product Profile conflict.",
             )
         output.append(item)
     return output
