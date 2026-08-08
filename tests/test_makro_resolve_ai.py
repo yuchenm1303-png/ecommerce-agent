@@ -144,7 +144,7 @@ def test_resolver_is_one_local_product_call_browser_free_and_audited(tmp_path, m
     assert captured["config"].model == "vendor-vision-model"
     assert captured["config"].api_key_env == "VENDOR_KEY"
     assert captured["config"].request_timeout_seconds == 75
-    assert captured["config"].structured_mode == "prompt_only"
+    assert captured["config"].structured_mode == "json_object"
 
     run_dir = next(output.iterdir())
     for name in (
@@ -232,7 +232,7 @@ def test_cli_defaults_to_auto_json_and_zero_full_product_repair():
     parser = makro_resolve_ai.build_parser()
     structured = next(item for item in parser._actions if "--structured-mode" in item.option_strings)
     repair = next(item for item in parser._actions if "--max-repair-attempts" in item.option_strings)
-    assert structured.default == "auto"
+    assert structured.default == "json_object"
     assert repair.default == 0
 
 
