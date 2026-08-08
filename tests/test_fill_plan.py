@@ -1,28 +1,75 @@
 from __future__ import annotations
 
-from app.fill_plan import BLOCKED, READY, build_live_fill_plan
-from app.qa_catalog import QuestionCatalog, QuestionRecord
-from app.resolution_engine import ResolutionPolicy
-from app.source_bundle import ProductSourceBundle, normalize_key
+from app.ai_decisions import (
+    CONFLICT,
+    MISSING,
+    READY as AI_READY,
+    REVIEW,
+    AIDecisionPacket,
+    DecisionCitation,
+    FieldDecision,
+    field_id,
+)
+from app.evidence_contract import ProductIdentity
+from app.fill_plan import (
+    BLOCKED,
+    GATE_AI_CONFLICT,
+    GATE_AI_MISSING,
+    GATE_AI_REVIEW,
+    GATE_BUSINESS_LOCKED,
+    GATE_HARD_FIELD_CONSTRAINT,
+    READY,
+    build_live_fill_plan,
+)
+from app.source_bundle import ProductSourceBundle
 
 
-def field(key: str, label: str, *, required: bool = True, section: str = "Product Description"):
+def field(
+    key: str,
+    label: str,
+    *,
+    required: bool = True,
+    section: str = "Product Description",
+    options: tuple[str, ...] = (),
+    multi_value: bool = False,
+):
     return {
         "attribute_key": key,
         "label": label,
         "section_heading": section,
         "required": required,
-        "multi_value": False,
+        "multi_value": multi_value,
+        "options": [{"text": item, "value": item} for item in options],
         "controls": [],
     }
 
 
-def catalog() -> QuestionCatalog:
-    return QuestionCatalog(
-        source_path="qa.xlsx",
-        sheet_name="Sheet1",
-        header_row=3,
-        questions=[QuestionRecord(number="1", question="Model Number")],
+def packet(fields, decisions):
+    return AIDecisionPacket(
+        identity=ProductIdentity(sku="SKU-1"),
+        schema_sha256="",
+        source_manifest_sha256="",
+        decisions=decisions,
+        extractor="fake-ai",
+    )
+
+
+def decision(target, status, values=(), *, evidence="visible proof", confidence=0.9):
+    citations = []
+    if evidence:
+        citations = [
+            DecisionCitation(
+                source_reference="image:001",
+                evidence_text=evidence,
+            )
+        ]
+    return FieldDecision(
+        field_id=field_id(target),
+        status=status,
+        values=list(values),
+        confidence=confidence,
+        citations=citations,
+        reason="AI semantic decision",
     )
 
 
@@ -34,73 +81,134 @@ def add_structured(bundle: ProductSourceBundle, key: str, value: str):
         source_reference=f"products.xlsx:{key}",
         priority=10,
         confidence=1.0,
-    )
-
-
-def add_product_image(bundle: ProductSourceBundle, key: str, value: str):
-    bundle.add_evidence(
-        key=key,
-        value=value,
-        source_type="product_image",
-        source_reference="image:001",
-        priority=30,
-        confidence=0.96,
         evidence_text=f"{key}: {value}",
     )
 
 
-def test_plan_resolves_matched_product_question_and_unmatched_business_field():
+def test_ai_ready_field_goes_directly_to_fill_plan_without_qa_matcher():
+    colour = field("colour", "Colour", options=("Black", "White"))
+    plan = build_live_fill_plan(
+        packet([colour], [decision(colour, AI_READY, ("Black",))]),
+        [colour],
+        ProductSourceBundle(),
+    )
+
+    item = plan.items[0]
+    assert item.action == READY
+    assert item.resolution.answer_values == ["Black"]
+    assert item.resolution.source_type == "ai_decision"
+    assert item.resolution.eligible_for_autofill is True
+    assert "question" not in item.as_dict()
+    assert "match_basis" not in item.as_dict()
+
+
+def test_ai_review_is_previewable_but_not_autofill_ready():
+    camera = field("camera_type", "Camera Type")
+    plan = build_live_fill_plan(
+        packet([camera], [decision(camera, REVIEW, ("Dashboard",), confidence=0.72)]),
+        [camera],
+        ProductSourceBundle(),
+    )
+
+    item = plan.items[0]
+    assert item.action == BLOCKED
+    assert item.resolution.preview_eligible is True
+    assert item.resolution.gate_reason == GATE_AI_REVIEW
+
+
+def test_ai_conflict_and_missing_are_blocked_without_local_semantic_override():
+    resolution = field("recording_resolution", "Recording Resolution")
+    sensor = field("image_sensor", "Image Sensor")
+    plan = build_live_fill_plan(
+        packet(
+            [resolution, sensor],
+            [
+                decision(resolution, CONFLICT, (), evidence=""),
+                decision(sensor, MISSING, (), evidence=""),
+            ],
+        ),
+        [resolution, sensor],
+        ProductSourceBundle(),
+    )
+
+    assert [item.action for item in plan.items] == [BLOCKED, BLOCKED]
+    assert plan.items[0].resolution.gate_reason == GATE_AI_CONFLICT
+    assert plan.items[1].resolution.gate_reason == GATE_AI_MISSING
+
+
+def test_live_option_mismatch_is_a_hard_guard_not_a_semantic_guess():
+    colour = field("colour", "Colour", options=("Black", "White"))
+    plan = build_live_fill_plan(
+        packet([colour], [decision(colour, AI_READY, ("Dark",))]),
+        [colour],
+        ProductSourceBundle(),
+    )
+
+    item = plan.items[0]
+    assert item.action == BLOCKED
+    assert item.resolution.gate_reason == GATE_HARD_FIELD_CONSTRAINT
+    assert "Makro" in item.reason
+
+
+def test_single_value_field_rejects_multiple_ai_values_before_browser_write():
+    colour = field("colour", "Colour", options=("Black", "White"))
+    plan = build_live_fill_plan(
+        packet([colour], [decision(colour, AI_READY, ("Black", "White"))]),
+        [colour],
+        ProductSourceBundle(),
+    )
+
+    assert plan.items[0].action == BLOCKED
+    assert plan.items[0].resolution.gate_reason == GATE_HARD_FIELD_CONSTRAINT
+
+
+def test_business_field_ignores_ai_and_requires_explicit_seller_data():
+    selling = field(
+        "flipkart_selling_price",
+        "Your selling price",
+        section="Price, Stock and Shipping Information",
+    )
+    guessed = decision(selling, AI_READY, ("899",))
+
+    no_business_data = build_live_fill_plan(
+        packet([selling], [guessed]),
+        [selling],
+        ProductSourceBundle(),
+    )
+    assert no_business_data.items[0].action == BLOCKED
+    assert no_business_data.items[0].resolution.gate_reason == GATE_BUSINESS_LOCKED
+
     bundle = ProductSourceBundle()
-    add_structured(bundle, "Model Number", "L11")
     add_structured(bundle, "Selling Price", "899")
-
-    plan = build_live_fill_plan(
-        catalog(),
-        [
-            field("model_number", "Model Number"),
-            field("flipkart_selling_price", "Your selling price"),
-        ],
+    explicit = build_live_fill_plan(
+        packet([selling], [guessed]),
+        [selling],
         bundle,
     )
-
-    assert plan.items[0].action == READY
-    assert plan.items[0].question == "Model Number"
-    assert plan.items[1].action == READY
-    assert plan.items[1].question == ""
-    assert plan.summary()["required_blocked"] == 0
+    assert explicit.items[0].action == READY
+    assert explicit.items[0].resolution.source_type == "structured"
 
 
-def test_missing_required_business_field_blocks_plan():
-    bundle = ProductSourceBundle()
-    add_structured(bundle, "Model Number", "L11")
-
-    plan = build_live_fill_plan(
-        catalog(),
-        [
-            field("model_number", "Model Number"),
-            field("flipkart_selling_price", "Your selling price"),
-        ],
-        bundle,
-        policy=ResolutionPolicy(),
+def test_selling_price_above_mrp_blocks_both_explicit_business_fields():
+    mrp = field("mrp", "Base Price", section="Price, Stock and Shipping Information")
+    selling = field(
+        "flipkart_selling_price",
+        "Your selling price",
+        section="Price, Stock and Shipping Information",
     )
-
-    assert plan.items[1].action == BLOCKED
-    assert plan.items[1].required is True
-    assert plan.summary()["required_blocked"] == 1
-    assert plan.summary()["safe_to_autofill_required_fields"] is False
-
-
-def test_selling_price_above_base_price_blocks_both_fields():
     bundle = ProductSourceBundle()
     add_structured(bundle, "Base Price", "800")
     add_structured(bundle, "Selling Price", "899")
 
     plan = build_live_fill_plan(
-        catalog(),
-        [
-            field("mrp", "Base Price"),
-            field("flipkart_selling_price", "Your selling price"),
-        ],
+        packet(
+            [mrp, selling],
+            [
+                decision(mrp, MISSING, (), evidence=""),
+                decision(selling, MISSING, (), evidence=""),
+            ],
+        ),
+        [mrp, selling],
         bundle,
     )
 
@@ -108,88 +216,32 @@ def test_selling_price_above_base_price_blocks_both_fields():
     assert all("价格关系无效" in item.reason for item in plan.items)
 
 
-def test_minimum_order_quantity_above_maximum_blocks_both_fields():
+def test_minimum_order_quantity_above_maximum_blocks_both_explicit_fields():
+    minimum = field(
+        "minimum_order_quantity",
+        "Minimum Order Quantity (MinOQ)",
+        section="Price, Stock and Shipping Information",
+    )
+    maximum = field(
+        "max_order_quantity_allowed",
+        "Maximum Order Quantity (MaxOQ)",
+        section="Price, Stock and Shipping Information",
+    )
     bundle = ProductSourceBundle()
     add_structured(bundle, "Minimum Order Quantity", "10")
     add_structured(bundle, "Maximum Order Quantity", "5")
 
     plan = build_live_fill_plan(
-        catalog(),
-        [
-            field("minimum_order_quantity", "Minimum Order Quantity (MinOQ)"),
-            field("max_order_quantity_allowed", "Maximum Order Quantity (MaxOQ)"),
-        ],
+        packet(
+            [minimum, maximum],
+            [
+                decision(minimum, MISSING, (), evidence=""),
+                decision(maximum, MISSING, (), evidence=""),
+            ],
+        ),
+        [minimum, maximum],
         bundle,
     )
 
     assert [item.action for item in plan.items] == [BLOCKED, BLOCKED]
     assert all("MOQ 关系无效" in item.reason for item in plan.items)
-
-
-def test_explicit_question_alias_also_resolves_evidence_under_qa_label():
-    qa = QuestionCatalog(
-        source_path="qa.xlsx",
-        sheet_name="Sheet1",
-        header_row=3,
-        questions=[QuestionRecord(number="1", question="Video Resolution")],
-    )
-    bundle = ProductSourceBundle()
-    add_structured(bundle, "Video Resolution", "1920x1080")
-    aliases = {normalize_key("Video Resolution"): ("Image Resolution",)}
-
-    plan = build_live_fill_plan(
-        qa,
-        [field("image_resolution", "Image Resolution")],
-        bundle,
-        aliases=aliases,
-    )
-
-    assert plan.items[0].action == READY
-    assert plan.items[0].question == "Video Resolution"
-    assert plan.items[0].match_basis == "explicit-alias"
-    assert plan.items[0].resolution.answer == "1920x1080"
-    assert plan.items[0].resolution.label == "Image Resolution"
-    assert plan.items[0].resolution.provenance[0]["key"] == "Video Resolution"
-
-
-def test_unmatched_live_field_cannot_autofill_from_semantic_key_collision():
-    bundle = ProductSourceBundle()
-    add_product_image(bundle, "Height", "7")
-
-    plan = build_live_fill_plan(
-        catalog(),
-        [
-            field(
-                "height",
-                "Length",
-                section="Price, Stock and Shipping Information (0/14)",
-            )
-        ],
-        bundle,
-    )
-
-    assert plan.items[0].question == ""
-    assert plan.items[0].action == BLOCKED
-    assert plan.items[0].resolution.eligible_for_autofill is False
-    assert "同名 attribute_key/label 串字段" in plan.items[0].reason
-
-
-def test_unmatched_live_field_may_autofill_from_explicit_structured_input():
-    bundle = ProductSourceBundle()
-    add_structured(bundle, "Height", "7")
-
-    plan = build_live_fill_plan(
-        catalog(),
-        [
-            field(
-                "height",
-                "Length",
-                section="Price, Stock and Shipping Information (0/14)",
-            )
-        ],
-        bundle,
-    )
-
-    assert plan.items[0].question == ""
-    assert plan.items[0].action == READY
-    assert plan.items[0].resolution.source_type == "structured"

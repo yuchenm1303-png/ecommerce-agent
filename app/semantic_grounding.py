@@ -23,12 +23,10 @@ def _sha256_text(text: str) -> str:
 
 @dataclass(slots=True, frozen=True)
 class GroundedSource:
-    """One exact source unit that a semantic extractor is allowed to cite.
+    """One exact source unit the whole-product AI may cite.
 
-    Every source has a content digest. Builder-generated source ids include a
-    digest prefix as well, so a packet created for one captured page/image cannot
-    be silently replayed against changed source content while keeping the same
-    citation id.
+    Long text can be split into citation chunks, but chunking is only a source
+    integrity/detail mechanism. It never determines model execution count.
     """
 
     source_id: str
@@ -38,6 +36,13 @@ class GroundedSource:
     content: str = ""
     image_path: str = ""
     sha256: str = ""
+
+    @property
+    def logical_source_id(self) -> str:
+        marker = ":text:"
+        if self.kind == TEXT_KIND and marker in self.source_id:
+            return self.source_id.split(marker, 1)[0]
+        return self.source_id
 
     def as_request_dict(self) -> dict[str, str]:
         payload = {
@@ -56,6 +61,7 @@ class GroundedSource:
     def as_manifest_dict(self) -> dict[str, str]:
         return {
             "source_id": self.source_id,
+            "logical_source_id": self.logical_source_id,
             "source_type": self.source_type,
             "kind": self.kind,
             "origin": self.origin,
@@ -93,13 +99,18 @@ class GroundingCatalog:
                 return source
         return None
 
+    @property
+    def logical_source_count(self) -> int:
+        return len({source.logical_source_id for source in self.sources})
+
     def as_request_list(self) -> list[dict[str, str]]:
         return [source.as_request_dict() for source in self.sources]
 
     def as_manifest(self) -> dict[str, object]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "source_count": len(self.sources),
+            "logical_source_count": self.logical_source_count,
             "sources": [source.as_manifest_dict() for source in self.sources],
         }
 
@@ -122,7 +133,7 @@ def chunk_text(
     max_chars: int = 3000,
     overlap_chars: int = 250,
 ) -> list[str]:
-    """Deterministically split captured text while retaining small overlap."""
+    """Split long captured text for citation precision, not model batching."""
 
     if max_chars < 500:
         raise ValueError("max_chars 不能小于 500。")
@@ -169,9 +180,7 @@ def _text_source(
 ) -> GroundedSource:
     digest = _sha256_text(content)
     return GroundedSource(
-        source_id=(
-            f"{prefix}:{ordinal:03d}:text:{chunk_index:04d}:{digest[:12]}"
-        ),
+        source_id=f"{prefix}:{ordinal:03d}:text:{chunk_index:04d}:{digest[:12]}",
         source_type=source_type,
         kind=TEXT_KIND,
         origin=origin,
@@ -218,11 +227,11 @@ def build_grounding_catalog(
     max_text_chars: int = 3000,
     overlap_chars: int = 250,
 ) -> GroundingCatalog:
-    """Create the exact source universe visible to a semantic model.
+    """Create the exact source universe visible to the whole-product AI.
 
-    Builder-generated source ids contain a digest prefix. Rebuilding the catalog
-    after a source file changes therefore produces different ids and old model
-    output fails closed instead of being validated against new content.
+    Source ids bind content digests, so stale AI decisions fail closed after any
+    image/page/context change. All resulting sources are submitted in the same
+    normal-path AI request.
     """
 
     sources: list[GroundedSource] = []
@@ -279,9 +288,7 @@ def build_grounding_catalog(
             digest = _sha256_text(chunk)
             sources.append(
                 GroundedSource(
-                    source_id=(
-                        f"customer-text:001:text:{index:04d}:{digest[:12]}"
-                    ),
+                    source_id=f"customer-text:001:text:{index:04d}:{digest[:12]}",
                     source_type="customer_file",
                     kind=TEXT_KIND,
                     origin="supplemental_text",

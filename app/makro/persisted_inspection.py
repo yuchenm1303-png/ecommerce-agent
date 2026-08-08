@@ -1,15 +1,14 @@
 """Persist synthetic Makro section values so the whole listing can be inspected.
 
-This module is intentionally test-only. It dynamically discovers the current
-listing attributes, fills every current empty field, saves each core section so
-Makro allows the next section to be edited, re-opens the saved section to verify
-that the values persisted, then collapses it again. It never clicks Send to QC.
+This module remains test-only for synthetic data generation. The actual
+section lifecycle (Save/Cancel/error detection) is shared with production code
+through ``app.makro.sections`` so there is only one persistence implementation.
+It never clicks Send to QC.
 """
 
 from __future__ import annotations
 
 import re
-import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -23,7 +22,6 @@ from .coverage import (
     _unique_visible_locator,
     _value_controls,
     _write_control,
-    cancel_section,
     exercise_live_field,
     field_shape,
     semantic_field_is_empty,
@@ -31,6 +29,7 @@ from .coverage import (
 )
 from .direct_visual_hold import _listing_fields, _open_section
 from .listing_preflight import CORE_FORM_SECTIONS
+from .sections import cancel_section, save_section, visible_section_errors
 from .visual_hold import _verify_final_hold
 
 ProgressCallback = Callable[[str, CoverageResult, int, int], None]
@@ -54,8 +53,6 @@ class PersistedSectionResult:
 
 
 def _gtin_check_digit(body: str) -> str:
-    """Return the GS1 modulo-10 check digit for a GTIN body without its check digit."""
-
     if not body or not body.isdigit():
         raise ValueError("GTIN body 必须是纯数字。")
     total = 0
@@ -68,8 +65,6 @@ def _gtin_from_body(body: str) -> str:
     return body + _gtin_check_digit(body)
 
 
-# Global fields with cross-field/format constraints get save-safe synthetic
-# overrides. Category field discovery and field counts remain fully dynamic.
 _SAVE_SAFE_VALUES = {
     "listing_status": "Inactive",
     "mrp": "1000",
@@ -77,8 +72,6 @@ _SAVE_SAFE_VALUES = {
     "minimum_order_quantity": "1",
     "max_order_quantity_allowed": "5",
     "shipping_days": "2",
-    # Makro validates EAN as a GTIN, so a generic numeric placeholder such as
-    # "4" is not acceptable. Use a checksum-valid EAN-13 test value.
     "ean": _gtin_from_body("200000000001"),
 }
 
@@ -100,7 +93,6 @@ def _assert_clean_start(adapter: Any) -> None:
 
 def _save_candidate_for(key: str, run_token: str) -> str | None:
     if key == "sku_id":
-        # Deliberately short, alphanumeric and unique enough for a disposable test draft.
         safe = re.sub(r"[^A-Za-z0-9]", "", run_token)[-10:] or "TEST000001"
         return f"COV{safe}"
     return _SAVE_SAFE_VALUES.get(key)
@@ -115,7 +107,7 @@ def _apply_save_safe_overrides(
     run_token: str,
     recheck_wait_ms: int,
 ) -> None:
-    """Normalize format/cross-field constrained values before section Save."""
+    """Normalize synthetic values that have format/cross-field constraints."""
 
     result_by_key = {
         item.attribute_key: item for item in results if item.status == PASS
@@ -133,8 +125,6 @@ def _apply_save_safe_overrides(
         control = values[0]
         locator, selector = _unique_visible_locator(adapter.page, section_path, control)
 
-        # Selects can only use real live options. Fall back to the already-passed
-        # synthetic value if the preferred save-safe option is unavailable.
         if str(control.get("field_kind") or "") == "select":
             options = [
                 str(option.get("text") or option.get("value") or "").strip()
@@ -149,7 +139,10 @@ def _apply_save_safe_overrides(
         adapter.page.wait_for_timeout(recheck_wait_ms)
         locator2, _ = _unique_visible_locator(adapter.page, section_path, control)
         settled = _read_control(locator2, control)
-        if not (_equivalent(candidate, immediate, control) and _equivalent(candidate, settled, control)):
+        if not (
+            _equivalent(candidate, immediate, control)
+            and _equivalent(candidate, settled, control)
+        ):
             raise RuntimeError(
                 f"save-safe override 回读失败：{key} expected={candidate!r}, "
                 f"immediate={immediate!r}, settled={settled!r}"
@@ -171,78 +164,6 @@ def _apply_save_safe_overrides(
         result.detail = "已替换为 save-safe synthetic 值并完成稳定回读。"
 
 
-def _visible_section_errors(adapter: Any, section_path: str) -> list[str]:
-    card = adapter.page.locator(section_path)
-    texts: list[str] = []
-    selectors = ".form-error, [role='alert'], [class*='FormError'], [class*='error' i]"
-    try:
-        for text in card.locator(selectors).all_inner_texts():
-            clean = re.sub(r"\s+", " ", text).strip()
-            if clean and clean not in texts:
-                texts.append(clean)
-    except Exception:
-        pass
-    return texts[:20]
-
-
-def _collapsed_error_badges(adapter: Any, section_title: str) -> list[str]:
-    """Read Makro's collapsed-card validation summary such as ``1 Error``."""
-
-    section = adapter.find_section(section_title)
-    if section is None or not section.get("path"):
-        return []
-    try:
-        text = adapter.page.locator(str(section["path"])).inner_text(timeout=3_000)
-    except Exception:
-        return []
-    return list(dict.fromkeys(re.findall(r"\b\d+\s+Errors?\b", text, flags=re.I)))
-
-
-def save_section(adapter: Any, section_title: str, *, timeout_s: float = 15.0) -> None:
-    """Click the unique Save button, prove collapse, and reject residual UI errors."""
-
-    section = adapter.find_section(section_title)
-    if section is None:
-        raise RuntimeError(f"Save 前找不到 section：{section_title}")
-    if section.get("has_edit"):
-        raise RuntimeError(f"Save 前 section 已折叠：{section_title}")
-    path = str(section.get("path") or "")
-    if not path:
-        raise RuntimeError(f"Save 前 section 缺少 DOM path：{section_title}")
-
-    inline_errors = _visible_section_errors(adapter, path)
-    if inline_errors:
-        raise RuntimeError(
-            f"{section_title} Save 前仍存在 Makro validation error："
-            + " | ".join(inline_errors)
-        )
-
-    card = adapter.page.locator(path)
-    save = card.locator("button").filter(has_text=re.compile(r"^\s*Save\s*$", re.I))
-    if save.count() != 1 or not save.first.is_visible():
-        raise RuntimeError(f"{section_title} 没有唯一可见 Save 按钮。")
-    save.first.scroll_into_view_if_needed()
-    save.first.click()
-
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        adapter.page.wait_for_timeout(250)
-        live = adapter.find_section(section_title)
-        if live is not None and live.get("has_edit"):
-            adapter.page.wait_for_timeout(300)
-            badges = _collapsed_error_badges(adapter, section_title)
-            if badges:
-                raise RuntimeError(
-                    f"{section_title} 保存后仍有 Makro validation error："
-                    + " | ".join(badges)
-                )
-            return
-
-    errors = _visible_section_errors(adapter, path)
-    detail = " | ".join(errors) if errors else "未读取到可见 validation error"
-    raise RuntimeError(f"{section_title} 点击 Save 后未恢复 EDIT：{detail}")
-
-
 def _verify_saved_section(
     adapter: Any,
     section_title: str,
@@ -252,7 +173,7 @@ def _verify_saved_section(
     wait_ms: int,
     max_scroll_steps: int,
 ) -> None:
-    """Reopen the saved section, prove persisted values, then collapse without edits."""
+    """Reopen saved section, prove persisted values, then collapse read-only state."""
 
     section = _open_section(adapter, section_title)
     section_path = str(section["path"])
@@ -271,13 +192,13 @@ def _verify_saved_section(
             f"{section_title} Save 后重新打开复核失败："
             + ", ".join(item.label or item.attribute_key for item in failed[:10])
         )
-    inline_errors = _visible_section_errors(adapter, section_path)
+    inline_errors = visible_section_errors(adapter.page, section_path)
     if inline_errors:
         raise RuntimeError(
             f"{section_title} Save 后重新打开仍有 Makro validation error："
             + " | ".join(inline_errors)
         )
-    cancel_section(adapter, section_title)
+    cancel_section(adapter.page, section_title)
 
 
 def fill_save_and_verify_section(
@@ -332,8 +253,6 @@ def fill_save_and_verify_section(
         if on_result is not None:
             on_result(section_title, result, ordinal, total)
 
-    # Re-discover after all writes, then normalize values with format/cross-field
-    # constraints (price order, MOQ range, inactive status, valid EAN checksum).
     live_fields = _listing_fields(
         adapter,
         section_path,
@@ -365,7 +284,7 @@ def fill_save_and_verify_section(
             f"{summary['passed']}/{summary['empty_field_attempts']}"
         )
 
-    save_section(adapter, section_title)
+    save_section(adapter.page, section_title)
     _verify_saved_section(
         adapter,
         section_title,

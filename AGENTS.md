@@ -1,130 +1,165 @@
 # AGENTS.md
 
-## 项目目标
+## 唯一生产目标
 
-`ecommerce-agent` 是电商卖家后台批量信息采集、匹配、填写与校验自动化工具。
-当前阶段聚焦 Makro Marketplace Seller Center：
+`ecommerce-agent` 当前只认这一条 Makro Step 3 链：
 
-`https://seller.makro.co.za` → `#dashboard/addListings/single`
+`只读 Makro live schema`
+→ `Product Source Pack`
+→ `Product Profile`
+→ `小批 live fields 并行映射`
+→ `unresolved 并行 Web Research`
+→ `一次 text-only Final Resolve`
+→ `Thin Hard Guards`
+→ `只读 Fill Plan`
+→ `真实填写`
+→ `section Save`
+→ `reopen persisted verification`
+→ `Product Photos persistence`
 
-核心流程：
+`Send to QC` 当前绝对禁止自动点击。
 
-读取商品资料 → 打开 Add Listing → 动态抓取页面问题 → 从明确证据解析可靠答案 →
-自动填写 → 二次校验 → 人工/规则安全门 → 保存 → 记录日志
+## AI 主导，本地商品规则极弱
 
-## 当前阶段（重要）
+AI 负责跨语言理解、同义词、计数、商品规格含义、scope 判断、字段语义映射、多来源综合和冲突判断。
 
-### Dynamic Field Discovery 已完成
+禁止恢复 attribute-specific Python 商品规则：颜色别名、双镜头计数、G-Sensor、FOV、Vehicle Brand、SD Card、camera/cabin/rear、bracket、package/product dimension 自然语言规则、QA alias/matcher、deterministic synthesis promotion。
 
-- `makro_probe.py` 已在真实 Makro DOM 上验证：真实 label、mandatory-star、section、
-  内部滚动容器、下拉 options、多值 controls 都可以动态采集。
-- Semantic Field Grouping：DOM controls 按 Makro attribute 聚合成 semantic fields
-  （优先稳定 id，其次 name 去索引，label 兜底）；不得硬编码任何类目的字段列表，
-  多值字段必须只生成一个 semantic field。
-- 已验证不同 vertical 的字段集合会变化、同一 vertical 的 DOM control 数量也可能因
-  已有值/多值槽变化，但 semantic field 可以保持稳定。
-- Probe 默认使用本机 Microsoft Edge（`channel="msedge"`）和独立 persistent profile
-  `browser_profiles/makro-edge/`；`--keep-open` 可复用同一 Edge 会话和登录状态。
-- `--scan-sections` 对所有带 EDIT 的 listing section 统一展开扫描；扫描结束只允许安全
-  Cancel，禁止 Save / Send to QC，禁止上传文件。
+如果需要“理解商品是什么意思”，改 AI profile/mapping/final context，不写本地 `if/else`。
 
-### 当前主线：Answer Resolver + no-save real dry-run
+## Python 只守硬边界和调度
 
-- `app/source_bundle.py` 是商品证据统一入口：
-  - 标准 CSV/XLSX/XLSM 商品表（每行一个 SKU）；
-  - 客户当前 Question/Answer 工作簿；
-  - 图片路径、product_url、supplemental_text 先进入 bundle，但尚未自动提取事实。
-- `app/answer_resolver.py` 输入实时 `semantic_fields`，输出 evidence-grounded
-  `ResolvedAnswer`。不得使用固定类目字段表。
-- Resolver 状态至少保持：`resolved / needs_review / missing / conflict`。
-- Resolver 只能根据 `SourceEvidence` 解析；图片识别、网页提取、知识库、LLM 都必须以后
-  作为显式 evidence provider 接入，LLM 不得绕过证据层凭常识生成商品参数。
-- dropdown/select 只允许规范化后的唯一精确 option match；无唯一匹配必须
-  `needs_review`，不得用模糊相似度强选。
-- multi-value 字段返回数组，一个 semantic field 只解析一次；执行层再映射到多个
-  `_0_value/_1_value/...` controls。
-- value + qualifier（如数值 + Hours/Minutes）必须分别解析，不得把单位硬塞进数字输入框。
-- SKU、Listing Status、Base Price、Selling Price、MOQ、shipping 等经营字段只能来自
-  明确结构化数据/config/rule，禁止 AI 或普通非结构化来源猜测。
-- `app/makro_dryrun.py` 只填写 `resolved` 字段，填完立即 readback 验证。
-- `makro_fill.py` 当前**只允许 no-save dry-run**：扫描全页、解析全页，但一次只填写一个
-  section，停在 Save 前供人工检查。这样在禁止 Save 的阶段不会伪装成“跨 section 已完成”。
-- 当前版本禁止实现真实 Save / Send to QC。未来必须使用新的显式 `--allow-save` /
-  `--allow-submit` 安全门，并在真实环境验证后才允许加入。
+允许的本地逻辑：
 
-## 架构
+- stage scheduling / batching / concurrency / cache；
+- live field/schema/product/source identity；
+- citation provenance；
+- seller-operated business lock；
+- current Makro option/qualifier/multi-value shape；
+- GTIN checksum、numeric min/max、maxlength；
+- Selling Price <= Base Price/MRP、MinOQ <= MaxOQ；
+- DOM 唯一定位、React settled readback；
+- Save/reopen persistence、Product Photos persistence；
+- 禁止 Send to QC。
 
-- `app/`：核心业务代码。
-  - `data_loader.py`：CSV/XLSX 商品表读取。
-  - `source_bundle.py`：`ProductSourceBundle` / `SourceEvidence`，标准商品表与 QA 文件加载。
-  - `answer_resolver.py`：动态 semantic field → evidence-grounded answer；可注入
-    `fallback`（仅确定性 MISSING 时咨询，经营字段永远不允许 fallback，本任务不调用 LLM）。
-  - `makro_dryrun.py`：真实 Makro 安全填写与 readback。
-  - `browser_session.py`：`EdgeHarness` 长期 Edge 会话抽象（localhost CDP 附加、
-    不关闭外部浏览器、确定性页面选择、健康检查/重连）。
-  - `makro/`：Makro 领域适配层（skill layer）。
-    - `listing.py`：页面识别 / vertical 守卫 / 登录等待（只读启发式，不读凭据）。
-    - `sections.py`：section 标题归一化 / 发现 / 安全 EDIT 展开 / 安全 Cancel / 逐 section 扫描。
-    - `fields.py`：确定性 DOM 控件采集、滚动扫描、semantic field 分组（不硬编码类目字段）。
-    - `snapshot.py`：安全 DOM 快照（清洗值/脚本/敏感属性）。
-    - `locators.py`：字段定位策略（name → path → selector candidates）。
-    - `fallback.py`：`SemanticFallback` 协议 + `DeterministicOnlyFallback` 占位。
-    - `domain.py`：`MakroDomainAdapter` 门面，CLI 只保留策略。
-  - `extractor.py`：普通 `<label>` 表单字段提取（mock/通用保守策略）。
-  - `matcher.py`：旧通用字段匹配，只接受精确或明确别名。
-  - `filler.py` / `validator.py`：旧通用填写与读回校验。
-  - `runner.py`：旧 mock 批量执行与 JSONL 日志。
-  - `platforms/`：平台适配器（`base.py`、`mock.py`、`makro.py` 委托 `app.makro`）。
-- `makro_probe.py`：登录后的真实 DOM 动态探测 CLI（只读）。
-- `makro_fill.py`：真实 Makro evidence-grounded no-save dry-run CLI。
-- `mock_site/`：本地 mock 卖家后台。
-- `tests/`：pytest 测试；`-m probe` 是需要 Chromium 的浏览器探测测试。
+机械分批不是商品语义规则。Field/Web batch 只能按 live schema/target 顺序和固定 batch size 切片，不允许建立 camera/storage/dimension 等 Python 分类表。
 
-平台相关 DOM 规则不要塞进通用 `extractor.py`。
+## Stage 1 — Product Profile
 
-## 安全规则（必须遵守）
+`app/product_profile.py` 是唯一允许读取全部 raw images + raw customer/supplier evidence 的 AI 阶段。
 
-永远不要 commit / 硬编码 / 输出：
+它 **不接收 Makro live target fields**，只构建 compact product facts：identity、selected variant、scope、supported facts、conflicts 和原始 citations。
 
-- 邮箱、密码、Cookie、Token、API Key、localStorage/sessionStorage 内容；
-- `browser_profiles/`、`storage_state*.json`、`.auth/`；
-- `logs/makro-probe/`、`logs/makro-fill/` 真实运行产物；
-- 客户原始数据、压缩包、真实图片；
-- Makro 临时 `requestId` 作为固定配置。
+硬边界：
 
-### 防错原则
+- unknown facts 省略；
+- credible same-scope disagreement 保留 conflict candidates；
+- packaging/product-body、cabin/rear、manual/UI language、product/compatible brand 不混 scope；
+- negative fact 必须有明确负面证据；
+- citation 必须回到原始 source id。
 
-宁可不填，也绝对不要填错。以下情况必须阻止自动保存/提交：
+Product Profile cache 不依赖 Makro schema。图片/原始大文本在后续 stages 不再发送。
 
-- 无法确认当前页面；required 字段没有答案；
-- 多个明确来源冲突；
-- dropdown 找不到唯一精确选项；
-- 多值槽数量不足；
-- qualifier 不确定；
-- 填写后二次读取不一致；
-- 页面异常、网络失败、session 失效。
+## Stage 2 — Parallel Field Mapping
 
-AI 不允许凭空生成商品技术规格。经营字段必须来自明确结构化来源。
+`app/field_mapping.py` 只接收 Product Profile + 小批 live fields。
 
-## 开发流程
+默认：
 
-每完成一块：
+- batch size 12；
+- concurrency 4。
 
-1. 写代码；
-2. 写测试；
-3. 运行 `pytest -q`；
-4. 保证原有 mock 测试与 GitHub Actions（`tests` + `mock-e2e`）不被破坏；
-5. 修复错误；
-6. 更新 README；
-7. 真实 Makro 行为只能由用户在本机已登录 Edge 中验证，不能把 fixture/mock 结果写成真实平台已验证。
+每个 batch 独立 cache；单 batch 失败只让对应字段 unresolved，不得重跑整个商品。
 
-## 常用命令
+Business fields 在进入 mapping 前过滤，并由最终 packet validator 强制 `business_locked`。
 
-```powershell
-python -m pytest -q
-python -m pytest -q -m probe
-python makro_probe.py --keep-open --scan-sections
-python makro_fill.py --product private_data/product-qa.xlsx --source-format qa --dry-run
-python makro_fill.py --product private_data/products.xlsx --sku ABC123 --dry-run
-python main.py --dry-run
-```
+## Stage 3 — Parallel Web Research
+
+只有 `MISSING / REVIEW / CONFLICT` 的非经营字段进入 Web Research。
+
+默认：
+
+- web batch size 5；
+- concurrency 3；
+- search model `qwen3.7-max`。
+
+Web Research 只找 evidence，不直接做最终 field decision。URL 必须属于当前 Responses `web_search_call.action.sources`；invented URL 丢弃。
+
+每个 research batch 独立 cache，失败只影响该 batch。
+
+## Stage 4 — Final Resolve
+
+只有实际获得 Web evidence 的 unresolved fields 进入一次 text-only final resolve。
+
+输入只包含 Product Profile、对应 fields、accepted web evidence。禁止重新发送图片，禁止重新回答已 READY 字段。
+
+最终仍输出 `ready / review / conflict / missing / business_locked`。
+
+## 模型职责固定
+
+默认：
+
+- Product Profile / Field Mapping / Final Resolve：`qwen3.7-plus`
+- Responses Web Research：`qwen3.7-max`
+
+不要通过不断切换 Flash/Plus/Omni 掩盖架构问题。若以后换模型，必须有明确 A/B 数据或 provider 能力原因。
+
+本地 Qwen JSON task 使用 JSON mode、thinking=false 和真实 wall-clock deadline。Web Search 不发送与 search tool 不兼容的 JSON response_format；它解析 JSON text，并独立校验真实 search sources。
+
+## Cache
+
+四层 cache：
+
+1. Product Profile cache；
+2. Field batch cache；
+3. Web Research batch cache；
+4. Final Resolve cache。
+
+相同商品热运行应尽量 0 model calls。Makro schema 少量变化只使受影响 field batch 失效，不得迫使 Product Profile 重新看图片。
+
+## Business fields
+
+SKU、Listing Status、Price、Stock、MOQ、Fulfilment、Shipping SLA、Selling Region 等只能来自明确 seller data：`structured / business / config / rule`。图片、supplier、普通 web search、AI 推理都无权生成这些运营值。
+
+## Planner / Browser
+
+`makro_plan_listing.py --scan-live-schema` 只读扫描，不 AI、不填、不 Save。
+
+最终 planner 使用 `--decision-packet` 重建同一 Product Source Pack、strict rebind packet、检查当前 schema，再生成只读 Fill Plan。
+
+`makro_preview_listing.py` 只执行已验证 Fill Plan，不重新解释商品语义。完整 persistence acceptance 使用 `--all-step3 --allow-section-save`。`--image` 只是 evidence；只有 `--upload-image` 上传 Product Photos。
+
+复用长期 Edge/CDP。多 Add Listing tabs、vertical/schema/source/identity 不匹配、已有未保存 section 都 fail closed。CDP 消失不擅自重启 Edge，不关闭长期 Edge，不修改 browser profile，不覆盖已有非-placeholder 用户值。
+
+## 关键代码边界
+
+- `app/product_profile.py`：raw multimodal 商品理解 + profile cache
+- `app/field_mapping.py`：compact profile → mechanical small batches + parallel mapping/cache
+- `app/web_enrichment.py`：parallel evidence research + text-only Final Resolve
+- `app/ai_decisions.py`：decision data/provenance/schema/source validation only
+- `app/product_context.py`：canonical source-pack context
+- `app/business_fields.py`：seller business policy
+- `app/hard_field_validators.py`：纯机械 hard guards
+- `app/fill_plan.py`：AI decisions → executable plan
+- `app/semantic_grounding.py`：raw source/citation manifest
+- `app/providers/openai_compatible.py`：Qwen/compatible JSON transport + wall deadline/progress
+- `app/providers/dashscope_web_search.py`：Responses web_search + source provenance + wall deadline
+- `makro_resolve_ai.py`：唯一 AI orchestration entrypoint
+- `makro_plan_listing.py`：schema scan + read-only final planner
+- `makro_preview_listing.py`：真实 browser acceptance
+
+旧商品语义层和旧超级请求执行器禁止恢复：Answer Resolver、Resolution Engine、semantic-fact runner、QA matcher、alias config、value-normalization product rules、snapshot→semantic-fact mapping、`run_ai_resolution()` whole-product field resolver。
+
+## Secrets / 客户数据
+
+永远不要 commit、硬编码或输出密码、Cookie、Token、API Key、browser profile、真实客户原始文件/图片、临时 requestId。runtime `logs/*` 保持 ignored。
+
+## 开发验收
+
+正式修改后至少：`pytest -q`、GitHub Actions tests、mock-e2e、browser dry-run/probe 全部通过。
+
+真实 M8 验收必须一次性完成：Product Profile → parallel mapping → Web Research → Final Resolve → hot rerun → read-only Fill Plan。报告每个 stage 的 calls、batch count、cache hits、wall time、failed batches、profile conflicts、web URLs/evidence 和最终 coverage。
+
+如果真实 Makro numeric/package fields 仍被 Planner 因 control metadata 阻止，只抓真实 controls/id/name/role/options/qualifier 信息后再修 DOM scanner；不要猜。
+
+真实写入前必须检查 `product-profile.json + ai-decisions.json + read-only Fill Plan`。PR 保持 Draft/unmerged，直到真实商品 coverage、冷/热延迟和 persisted Step 3 acceptance 完成。

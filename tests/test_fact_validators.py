@@ -1,10 +1,18 @@
 from __future__ import annotations
 
-from app.answer_resolver import NEEDS_REVIEW, RESOLVED
-from app.evidence_pipeline import add_fact
-from app.fact_validators import is_valid_gtin
-from app.resolution_engine import resolve_one
-from app.source_bundle import ProductSourceBundle
+from app.hard_field_validators import is_valid_gtin, validate_resolved_answer
+from app.resolution_types import RESOLVED, ResolvedAnswer
+
+
+def answer(value: str) -> ResolvedAnswer:
+    return ResolvedAnswer(
+        attribute_key="test",
+        label="Test",
+        status=RESOLVED,
+        answer=value,
+        answer_values=[value],
+        confidence=1.0,
+    )
 
 
 def test_gtin_checksum_examples():
@@ -13,61 +21,32 @@ def test_gtin_checksum_examples():
     assert is_valid_gtin("4") is False
 
 
-def test_invalid_ean_is_blocked_before_browser_autofill():
-    bundle = ProductSourceBundle()
-    add_fact(
-        bundle,
-        key="EAN",
-        value="4",
-        source_type="structured",
-        source_reference="products.xlsx:ean",
-        confidence=1.0,
-    )
+def test_invalid_ean_is_rejected_by_hard_validator():
     field = {
         "attribute_key": "ean",
         "label": "EAN",
         "controls": [{"field_kind": "input", "type": "text", "name": "ean_0_value"}],
     }
 
-    record = resolve_one(field, bundle)
+    result = validate_resolved_answer(field, answer("4"))
 
-    assert record.status == NEEDS_REVIEW
-    assert record.eligible_for_autofill is False
-    assert "GTIN/EAN" in record.detail
+    assert result.valid is False
+    assert "GTIN/EAN" in result.detail
 
 
-def test_valid_ean_can_pass_validation():
-    bundle = ProductSourceBundle()
-    add_fact(
-        bundle,
-        key="EAN",
-        value="4006381333931",
-        source_type="structured",
-        source_reference="products.xlsx:ean",
-        confidence=1.0,
-    )
+def test_valid_ean_passes_hard_validator():
     field = {
         "attribute_key": "ean",
         "label": "EAN",
         "controls": [{"field_kind": "input", "type": "text", "name": "ean_0_value"}],
     }
 
-    record = resolve_one(field, bundle)
+    result = validate_resolved_answer(field, answer("4006381333931"))
 
-    assert record.status == RESOLVED
-    assert record.eligible_for_autofill is True
+    assert result.valid is True
 
 
-def test_number_outside_live_control_range_is_blocked():
-    bundle = ProductSourceBundle()
-    add_fact(
-        bundle,
-        key="Battery Life",
-        value="99",
-        source_type="structured",
-        source_reference="products.xlsx:battery",
-        confidence=1.0,
-    )
+def test_number_outside_live_control_range_is_rejected():
     field = {
         "attribute_key": "battery_life",
         "label": "Battery Life",
@@ -82,8 +61,46 @@ def test_number_outside_live_control_range_is_blocked():
         ],
     }
 
-    record = resolve_one(field, bundle)
+    result = validate_resolved_answer(field, answer("99"))
 
-    assert record.status == NEEDS_REVIEW
-    assert record.eligible_for_autofill is False
-    assert "最大值" in record.detail
+    assert result.valid is False
+    assert "最大值" in result.detail
+
+
+def test_non_numeric_value_is_rejected_for_numeric_control():
+    field = {
+        "attribute_key": "weight",
+        "label": "Weight",
+        "controls": [
+            {
+                "field_kind": "input",
+                "type": "number",
+                "name": "weight_0_value",
+            }
+        ],
+    }
+
+    result = validate_resolved_answer(field, answer("heavy"))
+
+    assert result.valid is False
+    assert "有限数字" in result.detail
+
+
+def test_maxlength_is_a_hard_marketplace_constraint():
+    field = {
+        "attribute_key": "model_name",
+        "label": "Model Name",
+        "controls": [
+            {
+                "field_kind": "input",
+                "type": "text",
+                "name": "model_name_0_value",
+                "maxlength": 5,
+            }
+        ],
+    }
+
+    result = validate_resolved_answer(field, answer("TOO-LONG"))
+
+    assert result.valid is False
+    assert "maxlength=5" in result.detail

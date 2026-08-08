@@ -1,22 +1,13 @@
-"""Makro domain adapter / skill layer.
-
-The Makro-specific behavior that used to live inside the probe/fill CLIs now
-lives here:
-
-- fields.py    : deterministic DOM control capture + semantic field grouping
-- sections.py  : listing section discovery, safe expand/cancel, title normalization
-- listing.py   : listing-page recognition, vertical guard, authenticated wait
-- snapshot.py  : sanitized DOM snapshot writer (read-only)
-- locators.py  : field locator strategy
-- fallback.py  : deterministic-first / future AI-fallback interfaces
-
-``MakroDomainAdapter`` (domain.py) is imported explicitly by callers; it is not
-re-exported here to avoid a circular import with ``app.makro_dryrun``.
-"""
-
 from __future__ import annotations
 
-from .fallback import DeterministicOnlyFallback, SemanticFallback
+"""Stable public surface for deterministic Makro browser primitives.
+
+This package exposes DOM discovery, listing guards, section lifecycle and the
+browser domain adapter. Product-semantic resolution intentionally lives outside
+this package and is AI-first.
+"""
+
+from .domain import MakroDomainAdapter
 from .fields import (
     build_semantic_fields,
     capture_controls,
@@ -56,9 +47,8 @@ __all__ = [
     "MAKRO_HOME_URL",
     "MAKRO_HOST",
     "MAKRO_SINGLE_LISTING_ROUTE",
+    "MakroDomainAdapter",
     "MakroListingTarget",
-    "SemanticFallback",
-    "DeterministicOnlyFallback",
     "assert_expected_vertical",
     "base_section_title",
     "build_semantic_fields",
