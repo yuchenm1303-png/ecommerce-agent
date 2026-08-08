@@ -110,13 +110,47 @@ def target_scope(field: dict[str, Any]) -> str:
     section = normalize_key(contract["section_heading"])
     text = f"{key} {label}"
 
-    if _contains_any(text, ("with bracket", "with_bracket", "including bracket")):
+    if _contains_any(text, ("with bracket", "with_bracket", "withbracket", "including bracket", "includingbracket")):
         return "product_with_bracket"
 
-    angle_like = _contains_any(text, ("field of view", "field_of_view", "fov", "viewing angle", "viewing_angle"))
-    if angle_like and _contains_any(text, ("exterior", "outside", "front camera", "front_camera", "front lens", "front_lens")):
+    angle_like = _contains_any(
+        text,
+        (
+            "field of view",
+            "field_of_view",
+            "fieldofview",
+            "fov",
+            "viewing angle",
+            "viewing_angle",
+            "viewingangle",
+        ),
+    )
+    if angle_like and _contains_any(
+        text,
+        (
+            "exterior",
+            "outside",
+            "front camera",
+            "front_camera",
+            "frontcamera",
+            "front lens",
+            "front_lens",
+            "frontlens",
+        ),
+    ):
         return "exterior_camera"
-    if angle_like and _contains_any(text, ("interior", "cabin", "inside", "interior_camera", "cabin_camera")):
+    if angle_like and _contains_any(
+        text,
+        (
+            "interior",
+            "cabin",
+            "inside",
+            "interior_camera",
+            "interiorcamera",
+            "cabin_camera",
+            "cabincamera",
+        ),
+    ):
         return "interior_camera"
 
     dimensional = _contains_any(
@@ -134,7 +168,10 @@ def target_scope(field: dict[str, Any]) -> str:
     packaging_marker = _contains_any(
         text,
         ("package", "packaging", "packed", "carton", "shipping"),
-    ) or "price stock and shipping information" in section
+    ) or _contains_any(
+        section,
+        ("price stock and shipping information", "pricestockandshippinginformation"),
+    )
     if dimensional and packaging_marker:
         return "packaging"
     if dimensional:
@@ -263,13 +300,13 @@ def _scope_compatible(fact_scope: str, required_scope: str) -> bool:
     if required_scope == "packaging":
         return _contains_any(scope, ("packag", "carton", "shipping", "packed"))
     if required_scope == "product_body":
-        return _contains_any(scope, ("product body", "product_body", "device body", "device_body", "unit body", "unit_body"))
+        return _contains_any(scope, ("product body", "product_body", "productbody", "device body", "device_body", "devicebody", "unit body", "unit_body", "unitbody"))
     if required_scope == "product_with_bracket":
-        return _contains_any(scope, ("with bracket", "with_bracket", "including bracket", "mounted"))
+        return _contains_any(scope, ("with bracket", "with_bracket", "withbracket", "including bracket", "includingbracket", "mounted"))
     if required_scope == "exterior_camera":
-        return _contains_any(scope, ("exterior", "outside", "front camera", "front_camera", "front lens", "front_lens"))
+        return _contains_any(scope, ("exterior", "outside", "front camera", "front_camera", "frontcamera", "front lens", "front_lens", "frontlens"))
     if required_scope == "interior_camera":
-        return _contains_any(scope, ("interior", "cabin", "inside", "interior_camera", "cabin_camera"))
+        return _contains_any(scope, ("interior", "cabin", "inside", "interior_camera", "interiorcamera", "cabin_camera", "cabincamera"))
     return False
 
 
