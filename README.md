@@ -1,236 +1,311 @@
 # ecommerce-agent
 
-电商卖家后台批量信息采集、匹配、填写与校验自动化原型。
+Makro Marketplace Seller Center 商品信息采集、证据解析、字段匹配、自动填写与持久化校验工具。
 
-项目已经从本地 `mock_site` 进入真实平台适配阶段：**Makro Marketplace Seller Center**。
+当前阶段只认一条完成链：
 
-核心目标：
+**客户商品资料 / QA / 图片 / supplier snapshot → Grounded Evidence → Answer Resolver → 实时 Makro semantic fields → Fill Plan → 浏览器填写 → section Save → 重新打开持久化回读 → Product Photos Save → 完整缺失/冲突/失败报告**
 
-**读取商品资料 → 打开 Add Listing → 动态抓取页面问题 → 从证据中解析可靠答案 → 自动填写 → 二次校验 → 人工/规则安全门 → 保存 → 记录日志**
+任何中间模块单独通过，都不等于 Step 3 完成。
 
-## 当前架构
+## 1. 当前架构
 
-系统刻意分成两层，避免让 AI 直接操作页面或猜经营数据：
+### Source / Evidence
 
-1. **Dynamic Field Discovery / Browser Execution**
-   - Playwright 连接一个长期运行的 Edge/CDP 会话。
-   - 运行时扫描当前 Makro listing 的真实字段、下拉选项、单位、required 状态。
-   - 不写死类目字段总数。
-   - 填写后立即回读 + React settled readback；关键流程还会 Save 后重新打开验证。
+输入可包括：
 
-2. **Evidence-grounded Answer Resolver**
-   - QA Excel 是问题清单，不要求每一行预先有答案。
-   - 每条自动答案必须带来源、source reference、evidence text、confidence 和 provenance。
-   - 来源冲突、低置信度、无精确下拉选项、GTIN/字段约束失败都会被阻止。
-   - SKU、价格、MOQ、履约、发货、区域等经营字段只能来自 structured/business/config/rule，不能由图片/网页/AI 猜测。
-
-## Answer Resolver V2
-
-### 客户 QA 清单
-
-支持 `.csv / .xlsx / .xlsm`，自动在前 50 行寻找真实表头，并保留：
-
-- 编号
-- 问题
-- 问题说明
-- 问题类别
-- 选项
-- 单位
-- 答案
-- 来源工作表/行号
-
-答案为空的行仍然保留为待解析问题。表头检测要求 `Question/问题/字段` 之外至少还有一个 QA companion column，避免把单独写着 `Questions` 的标题行误识别为表头。
-
-### 证据输入
-
-当前确定性管道支持：
-
+- 客户 QA `.xlsx/.xlsm/.csv`
+- QA 表头前的商品上下文：SKU、精确选定变体、supplier URL、客户备注
 - 结构化商品/经营数据表
-- 客户 QA 中已经确认的答案
 - 人工/确定性 `facts.json`
-- 明确 `key: value` 补充文本
-- 严格 `EvidencePacket`（供图片、文档、网页、AI extractor 使用）
-- supplier / official 页面 `SourceSnapshot` 中的显式 table / JSON-LD 参数
+- 商品图片
+- supplier / official `SourceSnapshot`
+- supplemental text
 
-图片/网页/AI 结果不能直接进入 resolver，必须先通过 EvidencePacket 校验：
-
-- 与当前 QA 问题一一对应
-- 不得注入未请求的通用属性
-- 不得提供经营字段
-- 必须有 `source_reference`
-- 必须有 `evidence_text`
-- 必须有 `confidence`
-- 若已有 SKU / Model / Brand 身份锚点，必须匹配当前商品
+QA 表头前的内容不会再被丢弃。它作为客户 source context 进入 grounded source universe；其中若包含命令、prompt、角色说明或“给某模型的指令”，模型必须把它当作**不可信证据文本**，不能执行，只能提取有来源支撑的商品事实。
 
 ### Grounded Semantic Extraction
 
-对于图片、1688/供应商网页中的自由文本等无法靠 table / JSON-LD 直接读取的内容，系统增加了一层独立的 **grounded semantic extraction boundary**。模型不是答案数据库，也不能直接控制 Makro；它只能从本次明确提供的 source universe 中提出候选事实。
+`makro_resolve_ai.py` 把图片、snapshot 和客户上下文绑定成带 digest 的 source id。AI/provider 只能返回候选事实；候选还必须通过：
 
-`app/semantic_grounding.py` 会把每个输入源绑定成稳定、可审计的 source id：
+- 当前 QA 问题约束
+- source id / source reference 校验
+- evidence text 校验
+- 当前商品身份校验
+- business-field lock
+- 冲突检测
+- confidence gate
+- Makro 字段约束
 
-- 图片：读取实际文件 bytes，计算 SHA-256，source id 含 digest prefix。
-- supplier / official snapshot：把已捕获页面文本按固定规则切块，每块计算 SHA-256，source id 含 digest prefix。
-- supplemental text：同样按块绑定 digest。
+历史 `validated-semantic-evidence.json` 在用于真实 Fill Plan 前，会重新绑定到**本次实际传入的图片 / snapshot / 客户上下文**。底层文件变化后，旧 packet 不能静默复用。
 
-因此源文件或网页 snapshot 内容发生变化后，重新生成的 source id 会变化，旧模型输出不能无声复用到新内容。
+### Answer Resolver / Fill Plan
 
-模型返回的每个 semantic fact 还必须同时通过：
+Resolver 保持四种核心状态：
 
-- `fact.key` 必须精确对应当前 QA 中唯一问题；模型不得自己发明 alias。
-- `source_reference` 必须精确等于本次 request 中存在的 source id。
-- 文本 evidence 必须是 cited text chunk 中真实存在的逐字片段。
-- 图片 evidence 必须明确描述支撑答案的可见文字/特征。
-- direct-source answer 必须直接出现在 evidence 中；需要翻译、换算、推理时必须标成 `ai_synthesis`，随后会被低置信度安全门挡到 review。
-- source type 不得冒充更高可信来源。
-- 经营字段无条件排除在 semantic batches 之外。
-- 商品身份不一致时整个 semantic run fail closed。
+- `resolved`
+- `needs_review`
+- `conflict`
+- `missing`
 
-语义问题默认按小批次执行。某个批次输出结构/证据不合法时，该批次所有事实全部丢弃，对应问题继续保持 missing/blocked；其他独立批次可继续。身份冲突和 API/provider 故障不会被静默吞掉。
+`eligible_for_autofill` 与 `preview_eligible` 是两个不同安全级别：
 
-**重要边界：** 普通 `EvidencePacket` 是通用数据交换格式，不等于“已经完成 grounded semantic 验证”。任何未来会驱动真实 Makro 写入的路径，都必须使用本次 source universe 重新校验 semantic packet，或使用由 grounded pipeline 直接产生的受控结果；不能仅因为 JSON 形状合法就授权浏览器写入。
+- `eligible_for_autofill`：满足正式自动填写门槛
+- `preview_eligible`：只允许在显式人工验收 draft 中查看/持久化，不等于生产自动化安全
 
-### Pluggable AI provider layer
+同一条泛化 `ai_synthesis` 证据 + 同一答案不能同时授权多个不同字段。例如一个泛化 `120°` 不能同时填 `Interior Field of View` 和 `Exterior Field of View`。
 
-Resolver 不再把 AI 能力绑定到单一厂商。`makro_resolve_ai.py` 是统一入口，provider 只负责把本次 QA + grounded text/image sources 转换为**未受信任候选 JSON**；后续 EvidencePacket、身份校验、business lock、冲突检测、置信度门槛和 field constraints 完全由项目自己的代码执行。
+### QA → Makro 匹配
 
-当前正式支持两种 adapter：
+只允许：
 
-- `openai`：保留原生 OpenAI Responses API + strict JSON Schema adapter。
-- `openai-compatible`：通用 OpenAI-compatible Chat Completions 多模态 adapter，可接入提供兼容 API 且支持图片输入的第三方/其他厂商模型。
+- exact normalized match
+- 人工审核的 explicit label alias
+- 人工审核的 explicit section override
 
-因此“API 协议兼容”与“模型有视觉能力”缺一不可。仅有文本模型不能完成商品图片解析；非 OpenAI-compatible 的原生 Gemini/Anthropic 等 API 以后只需要新增薄 adapter，不需要修改 Resolver。
+不使用 fuzzy similarity 强行匹配。
 
-API key **只通过环境变量读取**。统一入口没有 `--api-key` 参数，避免 secret 落入 shell history、report 或 Git。默认：
+配置格式：
 
-- `provider=openai` → `OPENAI_API_KEY`
-- `provider=openai-compatible` → `AI_API_KEY`
+```json
+{
+  "schema_version": 1,
+  "vertical": "vehicle_camera_system",
+  "aliases": {},
+  "sections": {
+    "Height": "Additional Description"
+  }
+}
+```
 
-也可以通过 `--api-key-env VENDOR_KEY` 指定任意环境变量名。
+`vehicle_camera_system` 当前配置：
 
-通用 OpenAI-compatible 示例：
+`config/makro_aliases/vehicle_camera_system.json`
+
+该配置解决客户 QA 缺少真实 section metadata 时的 `Height` 跨 section 歧义；Python 代码不写死 SKU 或技术规格。
+
+## 2. 经营字段硬规则
+
+以下 seller-controlled 数据只能来自客户明确的 `structured / business / config / rule` 来源：
+
+- SKU
+- Listing Status
+- Base Price / Selling Price
+- Stock
+- MOQ
+- Fulfilment
+- Shipping SLA
+- Selling Region
+
+AI、图片、supplier 营销页不能猜这些值。
+
+显式命令行 `--sku` 本身就是 seller-controlled 输入，因此会同时作为商品身份守卫和 `SKU` business evidence；价格、库存等未提供字段仍然保持 blocked。
+
+## 3. 浏览器执行层
+
+真实 Makro 使用长期 Edge/CDP，会话与 source capture 浏览器隔离。
+
+已有能力：
+
+- 动态发现 Step 3 semantic fields
+- text / textarea
+- native/custom dropdown
+- number
+- value + qualifier
+- multi-value `+` 动态新增槽位
+- pre-save immediate + React-settled readback
+- exact section Save
+- Save 后重新打开 persisted readback
+- Product Photos file-input staging
+- Product Photos Save 后完成计数验证
+
+正式 multi-value 执行不会只填前几个值。如果页面槽位不够，会先在**该字段自己的 wrapper** 内点击 `+`、重新扫描、直到槽位足够；如果仍不足，则在任何部分值写入前失败。
+
+## 4. Section lifecycle 只有一套实现
+
+`app/makro/sections.py` 是 Step 3 section 生命周期的唯一实现：
+
+- find
+- EDIT
+- validation error detection
+- Cancel
+- Save
+- Save 后 card collapse / error badge 检查
+
+synthetic/test-only 代码不得维护另一套 Save/Cancel 逻辑。
+
+`app/makro_dryrun.py`：
+
+- `fill_resolved_field()` = pre-save 写入 + React settled readback
+- `verify_resolved_field()` = Save 后重新打开的只读 persisted verification
+
+**pre-save `validated` 不等于 persisted。**
+
+## 5. Product Photos
+
+Evidence 图片和 listing 图片严格分开：
+
+- `--image`：只进入 evidence/grounding
+- `--upload-image`：用户明确授权上传到 Makro Product Photos
+
+图片状态也严格分开：
+
+- `staged`：文件已进入当前 Product Photos 编辑事务
+- `persisted_verified`：该卡片 Save 后 `(x/5)` 完成计数按预期增加，并能重新打开检查
+
+不能再因为页面出现预览就宣称图片已保存，也不能在 Save 前等待 `(x/5)` 增长。
+
+## 6. 两种真实运行模式
+
+### 单 section 诊断
+
+```powershell
+python makro_preview_listing.py `
+  --qa <qa.xlsx> `
+  --expected-vertical <vertical> `
+  --section "Product Description" `
+  [evidence options]
+```
+
+特点：
+
+- 只填一个 section
+- 不点 section Save
+- 页面保持打开供人工检查
+- 永不 Send to QC
+
+### 完整 Step 3 持久化验收
+
+```powershell
+python makro_preview_listing.py `
+  --qa <qa.xlsx> `
+  --expected-vertical <vertical> `
+  --alias-config <matching-config.json> `
+  --all-step3 `
+  --allow-section-save `
+  [evidence options] `
+  [--upload-image <listing-image>]
+```
+
+`--all-step3` 没有 `--allow-section-save` 会直接拒绝执行。不存在“全量填完再 Cancel 丢值”的模式。
+
+每个字段 section 按以下事务执行：
+
+1. 从同一个 live Fill Plan 选择候选
+2. 写入
+3. pre-save readback
+4. 截图
+5. 检查 Makro validation
+6. 点击该 section 自己的 Save
+7. 等待 card 折叠回 EDIT
+8. 重新打开
+9. 对本轮写入值做 persisted readback
+10. 截图
+11. Cancel 这次**只读重开事务**使卡片折叠；已保存值不丢失
+
+某个 section 失败会记录错误和截图，并尽量清理该未保存事务后继续其他 section，以便一次验收收集完整问题集合。
+
+Product Photos 最后执行：
+
+1. staging 明确的 `--upload-image`
+2. screenshot
+3. Product Photos Save
+4. 轮询 `(x/5)` 持久化计数
+5. 重新打开并截图
+6. 折叠只读重开事务
+
+永不点击 `Send to QC`。
+
+## 7. 完成状态
+
+完整验收报告必须区分：
+
+- `draft_persisted_complete`
+  - Makro 草稿层的 required field cards / optional card / Product Photos 是否真实 Save 并持久化复核通过
+- `autofill_safe_complete`
+  - 在 draft persisted 基础上，`required_blocked == 0`
+  - 并且没有 review-only 候选被当成正式自动化答案
+
+草稿能 Save 不等于生产自动化已经安全。
+
+`report.json` 同时保存：
+
+- 完整 `Fill Plan`
+- blocked gate reason 汇总
+- 每个字段的 answer/source/confidence/provenance
+- pre-save execution result
+- section Save result
+- persisted verification result
+- Product Photos staging/persistence result
+- screenshots
+- `send_to_qc_clicked=false`
+
+## 8. 推荐当前工作流
+
+### A. 重新生成 grounded semantic evidence
 
 ```powershell
 python makro_resolve_ai.py `
   --provider openai-compatible `
-  --base-url "<vendor OpenAI-compatible API base URL>" `
-  --model "<vendor multimodal model name>" `
-  --api-key-env "VENDOR_API_KEY" `
-  --qa "<qa.xlsx>" `
-  --image "<front.png>" `
-  --image "<composite.png>" `
-  --supplier-snapshot "<source-snapshot.json>"
+  --base-url <provider-base-url> `
+  --model <multimodal-model> `
+  --api-key-env <KEY_ENV> `
+  --qa <qa.xlsx> `
+  --image <evidence-image-1> `
+  --image <evidence-image-2> `
+  --supplier-snapshot <source-snapshot.json>
 ```
 
-默认 `--structured-mode prompt_only`，兼容面更广；服务商明确支持 `response_format={type:json_object}` 时可使用：
-
-```text
---structured-mode json_object
-```
-
-原生 OpenAI 仍可通过统一入口：
-
-```powershell
-python makro_resolve_ai.py --provider openai --model gpt-5.6 --qa <qa.xlsx> --image <front.jpg>
-```
-
-旧的 `makro_resolve_openai.py` 暂时保留作为兼容入口，但新集成优先使用 `makro_resolve_ai.py`。
-
-统一输出：
+输出包括：
 
 - `validated-semantic-evidence.json`
 - `source-manifest.json`
 - `semantic-batches.json`
-- `resolution.json`
-- `resolution.xlsx`
-- `review-queue.json`
-- `review-queue.xlsx`
+- `resolution.json/.xlsx`
+- `review-queue.json/.xlsx`
 - `run-manifest.json`
 
-`run-manifest.json` 记录 provider/model/base URL/API-key 环境变量名等**非 secret 配置**，并明确记录 `makro_browser_opened=false`、`writes_performed=0`、`save_clicked=false`、`send_to_qc_clicked=false`。
-
-### 来源置信度上限
-
-模型自己报 `0.99` 并不能获得 0.99 的系统信任度。每个 source type 有独立 confidence ceiling。例如 `ai_synthesis` 的上限低于默认自动填写阈值，因此 AI 推理可以进入 review，但不能凭自己的置信度直接授权浏览器写入。
-
-### 冲突与值校验
-
-Resolver 会保留真实来源冲突，不按来源优先级强行覆盖。只对机械等价表示做保守归一化，例如：
-
-- `3 inch` == `3.0 inches`
-- `1920 x 1080` == `1920×1080`
-
-但不会擅自认为：
-
-- `1080P` == `1920x1080`
-- `3.0 inch` == `3.16 inch`
-
-写入前还有确定性校验：
-
-- EAN / GTIN checksum
-- 数值字段 min / max
-- maxlength
-- Selling Price <= Base Price/MRP
-- MinOQ <= MaxOQ
-
-### 主要命令
-
-生成 QA 解析报告（不打开 Makro）：
+### B. 只读 live Fill Plan
 
 ```powershell
-python makro_resolve_product.py --qa <qa.xlsx> [evidence options]
+python makro_plan_listing.py `
+  --qa <qa.xlsx> `
+  --sku <sku> `
+  --expected-vertical <vertical> `
+  --evidence-packet <validated-semantic-evidence.json> `
+  --supplier-snapshot <source-snapshot.json> `
+  --image <same-evidence-image-1> `
+  --image <same-evidence-image-2> `
+  --alias-config <matching-config.json>
 ```
 
-输出：
+Grounded packet 会在这里重新绑定到这些当前 source files。
 
-- `resolution.json`
-- `resolution.xlsx`
-- `evidence-manifest.json`
+### C. 完整 Step 3 acceptance
 
-捕获供应商/官方商品页面（使用与 Makro 隔离的独立 source Edge，默认 CDP 9333）：
+在检查 Fill Plan 后，由用户在已登录的长期 Makro Edge 上运行 `--all-step3 --allow-section-save`。
 
-```powershell
-python makro_capture_source.py --url <product-url>
-```
+## 9. 安全不变量
 
-如果页面要求 CAPTCHA / 人机验证，脚本会停止，不做绕过，并保持 source Edge 打开供人工正常处理。
+- 多个 Add Listing tab → fail closed
+- vertical 不一致 → fail closed
+- 已有未保存 section → full acceptance 停止，不擅自 Cancel
+- source identity / digest 不一致 → fail closed
+- 真实 conflict → 不静默覆盖
+- dropdown 无唯一精确 option → 不填
+- multi-value 槽位不足 → 不做部分写入
+- qualifier 不确定/控件缺失 → 不写
+- business field 无客户明确数据 → 不猜
+- React settled readback 不一致 → 不算 validated
+- Save 后 persisted readback 不一致 → 不算 persisted
+- Product Photos staged 不等于 persisted
+- `Send to QC` 当前始终禁止自动点击
 
-把 snapshot 中明确的 table / JSON-LD 参数转成 EvidencePacket：
+## 10. 开发原则
 
-```powershell
-python makro_extract_snapshot.py --qa <qa.xlsx> --snapshot <source-snapshot.json>
-```
-
-生成 grounded semantic request 但不调用模型：
-
-```powershell
-python makro_prepare_grounded_extraction.py --qa <qa.xlsx> [source options]
-```
-
-校验一个外部模型返回的 packet 是否真的绑定到本次 grounded sources：
-
-```powershell
-python makro_validate_semantic_packet.py --qa <qa.xlsx> --packet <packet.json> [same source options]
-```
-
-只读扫描当前 Makro 页面并生成 READY/BLOCKED 填写计划：
-
-```powershell
-python makro_plan_listing.py --qa <qa.xlsx> --expected-vertical <vertical> [evidence options]
-```
-
-该命令不填写、不 Save、不 Send to QC。
-
-## 安全原则
-
-- 宁可漏填，不要错填。
-- 不写死 Makro 类目字段数量。
-- 多个 Add Listing 标签页时 fail closed。
-- 商品身份冲突时 fail closed。
-- 下拉选项只接受唯一精确匹配。
-- 经营字段拒绝 AI / image / web 来源。
-- 模型不得自造 QA alias、source id 或高可信 source type。
-- direct semantic fact 的 answer 必须能在其 evidence 中直接核对；推理只能进 review。
-- 普通 EvidencePacket 不能单独作为真实浏览器写入授权；semantic evidence 必须重新绑定并校验本次 sources。
-- CAPTCHA / 风控只允许人工正常处理，不自动绕过。
-- Makro 长期 Edge 与 source Edge 使用不同 profile / CDP port。
-- 最终 `Send to QC` 始终是独立的高风险提交动作，不与解析/测试隐式绑定。
+- 能改主链，不加 wrapper
+- 能复用 domain primitive，不复制第二套实现
+- 没有真实问题证明需要，不增加 abstraction
+- 不为某个 SKU / vertical 硬编码产品规格
+- synthetic coverage 只用于执行层新回归，不再作为 Step 3 完成标准
+- GitHub CI / mock 全绿只代表代码回归通过；真实 Makro 完成必须由真实商品验收报告证明
