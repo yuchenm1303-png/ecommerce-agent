@@ -1,14 +1,9 @@
-"""One-shot, browser-free product resolution with a pluggable multimodal AI provider.
+"""Resolve the whole Makro product schema with AI in one browser-free pass.
 
-Production semantic extraction is source-first: each logical evidence source is
-shown to the model once against the complete pending question set. Text chunks
-remain separate citation units but never multiply API calls. Validated source
-results are content-addressed and cached, so an interrupted retry does not
-re-run completed image recognition.
-
-The provider is replaceable; the trust boundary is not. Every candidate fact
-still passes grounded evidence, identity, business-field, confidence and
-conflict checks before the Answer Resolver can mark a field eligible.
+The live Makro schema is the target contract. Customer QA, selected variant,
+images and captured supplier/official pages are product evidence. The model is
+the primary semantic resolver; Python only validates identity, citations,
+business locks and the structural decision contract.
 
 This command never opens Makro and never writes listing fields.
 """
@@ -17,15 +12,22 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from app.evidence_contract import bundle_from_evidence_packet
-from app.evidence_io import write_evidence_packet
-from app.evidence_pipeline import merge_bundles
-from app.evidence_validation import is_business_question, validate_evidence_packet
-from app.live_schema import augment_catalog_with_live_fields, load_live_schema
+from app.ai_decisions import (
+    BUSINESS_LOCKED,
+    CONFLICT,
+    MISSING,
+    READY,
+    REVIEW,
+    field_id,
+    run_ai_resolution,
+    write_ai_decision_packet,
+)
+from app.live_schema import load_live_schema
 from app.providers.registry import (
     ProviderConfig,
     ProviderConfigurationError,
@@ -34,143 +36,90 @@ from app.providers.registry import (
     default_api_key_env,
     validate_provider_config,
 )
-from app.qa_catalog import load_question_catalog
-from app.resolution_engine import ResolutionPolicy, resolve_catalog, summarize_resolution
-from app.resolution_report import write_resolution_json, write_resolution_xlsx
+from app.qa_catalog import QuestionCatalog, load_question_catalog
 from app.resolver_inputs import (
     ResolutionInputSpec,
     build_resolution_inputs,
     customer_context_for_resolution,
 )
-from app.review_queue import (
-    build_review_queue,
-    summarize_review_queue,
-    write_review_queue_json,
-    write_review_queue_xlsx,
-)
 from app.semantic_grounding import build_grounding_catalog
-from app.semantic_sources import (
-    build_semantic_pending_catalog,
-    run_grounded_semantic_sources,
-)
+
+
+_TRUSTED_CONTEXT_SOURCE_TYPES = {
+    "structured",
+    "customer_answer",
+    "business",
+    "config",
+    "rule",
+    "customer_file",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "从客户 QA + Makro live schema + 图片 + 已捕获网页 + 结构化资料生成可审计答案报告；"
-            "每个逻辑证据源最多一次正常 AI 调用，支持严格验证后的内容缓存；"
-            "绝不打开或修改 Makro。"
+            "以当前 Makro live schema 为目标，让多模态 AI 一次性综合客户资料、图片和网页快照，"
+            "直接生成字段级 READY/REVIEW/CONFLICT/MISSING 决策；绝不打开或修改 Makro。"
         )
     )
-    parser.add_argument(
-        "--provider",
-        choices=SUPPORTED_PROVIDERS,
-        default="openai-compatible",
-        help="AI provider；默认 openai-compatible，原生 OpenAI 可选 openai。",
-    )
-    parser.add_argument("--model", required=True, help="当前服务商的多模态/视觉模型名")
-    parser.add_argument(
-        "--api-key-env",
-        default=None,
-        help="保存 API key 的环境变量名；默认 openai=>OPENAI_API_KEY，openai-compatible=>AI_API_KEY。",
-    )
-    parser.add_argument(
-        "--base-url",
-        default="",
-        help="OpenAI-compatible API 根地址；provider=openai-compatible 时必填。",
-    )
+    parser.add_argument("--provider", choices=SUPPORTED_PROVIDERS, default="openai-compatible")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--api-key-env", default=None)
+    parser.add_argument("--base-url", default="")
     parser.add_argument(
         "--structured-mode",
         choices=("prompt_only", "json_object"),
         default="prompt_only",
-        help=(
-            "兼容接口的 JSON 输出模式。prompt_only 兼容面最广；"
-            "服务商明确支持 response_format=json_object 时可选 json_object。"
-        ),
     )
     thinking = parser.add_mutually_exclusive_group()
     thinking.add_argument(
         "--enable-thinking",
         dest="enable_thinking",
         action="store_true",
-        help="显式开启兼容模型 thinking；结构化 evidence extraction 通常不需要。",
+        help="显式开启兼容模型 thinking。",
     )
     thinking.add_argument(
         "--disable-thinking",
         dest="enable_thinking",
         action="store_false",
-        help="显式关闭兼容模型 thinking 以降低结构化抽取延迟。",
+        help="显式关闭兼容模型 thinking；Qwen Omni 默认关闭以降低 listing enrichment 延迟。",
     )
     parser.set_defaults(enable_thinking=None)
-    parser.add_argument("--qa", required=True, help="客户 Question/Answer .xlsx/.xlsm/.csv")
+
+    parser.add_argument("--qa", required=True, help="客户 QA/商品上下文文件")
     parser.add_argument(
         "--live-schema",
-        default=None,
-        help="read-only planner 导出的 live-schema.json；用于追加客户 QA 中没有的非经营 Makro 字段。",
+        required=True,
+        help="read-only Makro planner 导出的 live-schema.json；它是 AI 唯一目标字段 schema。",
     )
     parser.add_argument("--sku", default="")
     parser.add_argument("--expected-model", default="")
     parser.add_argument("--expected-brand", default="")
-    parser.add_argument("--product-table", default=None, help="可信结构化商品/经营数据表")
-    parser.add_argument("--facts-json", action="append", default=[], help="可信人工/确定性 facts JSON")
-    parser.add_argument("--image", action="append", default=[], help="商品图片，可重复")
-    parser.add_argument("--supplier-snapshot", action="append", default=[], help="供应商网页 snapshot JSON，可重复")
-    parser.add_argument("--official-snapshot", action="append", default=[], help="官方网页 snapshot JSON，可重复")
+    parser.add_argument("--product-table", default=None)
+    parser.add_argument("--facts-json", action="append", default=[])
+    parser.add_argument("--image", action="append", default=[])
+    parser.add_argument("--supplier-snapshot", action="append", default=[])
+    parser.add_argument("--official-snapshot", action="append", default=[])
     parser.add_argument("--supplemental-text", default="")
     parser.add_argument("--supplemental-text-file", default=None)
-    parser.add_argument(
-        "--image-detail",
-        choices=("auto", "low", "high"),
-        default="auto",
-        help="默认 auto：兼容接口不发送 vendor-specific detail 字段；确认服务商支持时可选 low/high。",
-    )
+    parser.add_argument("--image-detail", choices=("auto", "low", "high"), default="auto")
     parser.add_argument("--max-output-tokens", type=int, default=12000)
-    parser.add_argument(
-        "--request-timeout-seconds",
-        type=float,
-        default=120.0,
-        help="单个 logical source 的 API 请求超时；默认 120 秒，允许范围 10..600。",
-    )
-    parser.add_argument(
-        "--source-concurrency",
-        type=int,
-        choices=(1, 2, 3, 4),
-        default=2,
-        help=(
-            "独立 logical source 的并发数；默认 2。只改变首轮延迟，不改变 evidence 合并顺序。"
-            "使用 --fail-on-source-error 时自动退回串行以保持 fail-fast。"
-        ),
-    )
-    parser.add_argument("--max-text-chars", type=int, default=3000)
+    parser.add_argument("--request-timeout-seconds", type=float, default=120.0)
+    parser.add_argument("--max-text-chars", type=int, default=5000)
     parser.add_argument("--overlap-chars", type=int, default=250)
-    parser.add_argument("--auto-fill-min-confidence", type=float, default=0.85)
-    parser.add_argument("--ai-auto-fill-min-confidence", type=float, default=0.92)
     parser.add_argument(
-        "--max-source-repair-attempts",
+        "--max-repair-attempts",
         type=int,
         choices=(0, 1),
         default=1,
-        help=(
-            "仅当一个 source 返回的候选 fact 全部被严格验证拒绝时允许的额外修复请求次数；"
-            "默认最多 1 次。只要已有部分 fact 合法，就直接保留合法项，不重识整个 source。"
-        ),
-    )
-    parser.add_argument(
-        "--fail-on-source-error",
-        action="store_true",
-        help="任一逻辑证据源失败就终止；默认保留其他已验证 source，并把失败 source 记入报告。",
+        help="仅用于 JSON/contract 结构失败；不会因字段缺失或低置信度反复重识图片。",
     )
     parser.add_argument(
         "--semantic-cache-dir",
         default="logs/semantic-cache",
-        help="严格验证后的 per-source 内容缓存目录；相同 model/schema/source 重跑无需再次调用 AI。",
+        help="整商品 AI decision cache；相同 schema+sources+model 重跑为零模型调用。",
     )
-    parser.add_argument(
-        "--no-semantic-cache",
-        action="store_true",
-        help="禁用 per-source 内容缓存；主要用于诊断。",
-    )
+    parser.add_argument("--no-semantic-cache", action="store_true")
     parser.add_argument("--output-dir", default="logs/ai-resolver")
     return parser
 
@@ -179,10 +128,10 @@ def _read_supplemental_text(args: argparse.Namespace) -> str:
     parts = [args.supplemental_text]
     if args.supplemental_text_file:
         parts.append(Path(args.supplemental_text_file).read_text(encoding="utf-8"))
-    return "\n".join(part for part in parts if part.strip())
+    return "\n".join(part for part in parts if part and part.strip())
 
 
-def _base_input_spec(args: argparse.Namespace, supplemental_text: str) -> ResolutionInputSpec:
+def _input_spec(args: argparse.Namespace, supplemental_text: str) -> ResolutionInputSpec:
     return ResolutionInputSpec(
         sku=args.sku,
         expected_model=args.expected_model,
@@ -194,11 +143,6 @@ def _base_input_spec(args: argparse.Namespace, supplemental_text: str) -> Resolu
         supplemental_text=supplemental_text,
         image_paths=tuple(args.image),
     )
-
-
-def _validate_threshold(name: str, value: float) -> None:
-    if not 0.0 <= value <= 1.0:
-        raise SystemExit(f"--{name} 必须在 0..1")
 
 
 def _provider_config(args: argparse.Namespace) -> ProviderConfig:
@@ -218,86 +162,110 @@ def _provider_config(args: argparse.Namespace) -> ProviderConfig:
     )
 
 
-def _semantic_cache_namespace(config: ProviderConfig) -> str:
-    """Cache only on provider settings that can change semantic output."""
-
+def _cache_namespace(config: ProviderConfig) -> str:
     safe = config.as_safe_dict()
     safe.pop("request_timeout_seconds", None)
     safe.pop("sdk_max_retries", None)
-    return json.dumps(
-        safe,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
+    return json.dumps(safe, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _format_value(value: object) -> str:
+    if isinstance(value, tuple):
+        return " | ".join(str(item) for item in value)
+    return str(value)
+
+
+def _trusted_product_context(
+    customer_catalog: QuestionCatalog,
+    spec: ResolutionInputSpec,
+) -> tuple[str, Any]:
+    """Build product context for AI without invoking old semantic product rules."""
+
+    trusted_spec = replace(
+        spec,
+        supplier_snapshots=(),
+        official_snapshots=(),
+        evidence_packets=(),
+        image_paths=(),
     )
+    trusted = build_resolution_inputs(customer_catalog, trusted_spec)
+    parts: list[str] = []
+    canonical_context = customer_context_for_resolution(customer_catalog, trusted_spec)
+    if canonical_context:
+        parts.append("Customer/product context:\n" + canonical_context)
 
-
-def _print_source_progress(event: dict[str, Any]) -> None:
-    kind = str(event.get("kind") or "")
-    source_id = str(event.get("source_id") or "")
-    index = int(event.get("index") or 0)
-    total = int(event.get("total") or 0)
-    prefix = f"[semantic {index}/{total}] {source_id}"
-    name = event.get("event")
-    if name == "source_start":
-        chunks = int(event.get("chunk_count") or 0)
-        print(f"{prefix} START kind={kind or '?'} chunks={chunks}", flush=True)
-    elif name == "source_cache_hit":
-        print(f"{prefix} CACHE HIT", flush=True)
-    elif name == "source_complete":
-        elapsed = float(event.get("elapsed_seconds") or 0.0)
-        print(
-            f"{prefix} DONE facts={int(event.get('facts') or 0)} "
-            f"rejected={int(event.get('rejected_facts') or 0)} "
-            f"model_calls={int(event.get('model_calls') or 0)} "
-            f"elapsed={elapsed:.1f}s",
-            flush=True,
+    evidence_lines: list[str] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in trusted.bundle.evidence:
+        if item.source_type not in _TRUSTED_CONTEXT_SOURCE_TYPES:
+            continue
+        value = _format_value(item.value).strip()
+        if not value:
+            continue
+        fingerprint = (item.key.strip(), value, item.source_type)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        evidence_lines.append(
+            f"- {item.key}: {value} [source_type={item.source_type}; source={item.source_reference}]"
         )
-    elif name == "source_failed":
-        elapsed = float(event.get("elapsed_seconds") or 0.0)
-        print(f"{prefix} FAILED elapsed={elapsed:.1f}s: {event.get('error')}", flush=True)
+    if evidence_lines:
+        parts.append("Explicit customer/structured facts:\n" + "\n".join(evidence_lines))
+
+    return "\n\n".join(parts).strip(), trusted
+
+
+def _decision_summary(decisions: list[Any]) -> dict[str, int]:
+    counts = {READY: 0, REVIEW: 0, CONFLICT: 0, MISSING: 0, BUSINESS_LOCKED: 0}
+    for decision in decisions:
+        counts[decision.status] = counts.get(decision.status, 0) + 1
+    return counts
+
+
+def _search_requests(decisions: list[Any], fields: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    field_by_id = {field_id(field): field for field in fields}
+    output: list[dict[str, Any]] = []
+    for decision in decisions:
+        if decision.status not in {MISSING, REVIEW} or not decision.search_queries:
+            continue
+        field = field_by_id.get(decision.field_id, {})
+        output.append(
+            {
+                "field_id": decision.field_id,
+                "label": str(field.get("label") or field.get("attribute_key") or ""),
+                "section_heading": str(field.get("section_heading") or ""),
+                "status": decision.status,
+                "reason": decision.reason,
+                "queries": list(decision.search_queries),
+            }
+        )
+    return output
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    _validate_threshold("auto-fill-min-confidence", args.auto_fill_min_confidence)
-    _validate_threshold("ai-auto-fill-min-confidence", args.ai_auto_fill_min_confidence)
     if args.max_text_chars < 500:
         raise SystemExit("--max-text-chars 不能小于 500")
     if args.overlap_chars < 0 or args.overlap_chars >= args.max_text_chars:
         raise SystemExit("--overlap-chars 必须 >=0 且小于 --max-text-chars")
 
-    base_catalog = load_question_catalog(args.qa)
-    catalog = base_catalog
-    live_schema_warnings: list[str] = []
-    if args.live_schema:
-        live_fields = load_live_schema(args.live_schema)
-        catalog, live_schema_warnings = augment_catalog_with_live_fields(
-            base_catalog,
-            live_fields,
-            business_locked=is_business_question,
-        )
-
+    customer_catalog = load_question_catalog(args.qa)
+    live_fields = load_live_schema(args.live_schema)
     supplemental_text = _read_supplemental_text(args)
-    input_spec = _base_input_spec(args, supplemental_text)
-    base_inputs = build_resolution_inputs(catalog, input_spec)
+    spec = _input_spec(args, supplemental_text)
+    product_context, trusted_inputs = _trusted_product_context(customer_catalog, spec)
 
-    # Use the canonical customer source directly, never a merged bundle's
-    # supplemental text. This guarantees resolver extraction and later strict
-    # evidence rebinding hash the exact same source without duplicate preamble.
-    grounded_text = customer_context_for_resolution(catalog, input_spec)
     grounding = build_grounding_catalog(
         image_paths=args.image,
         supplier_snapshots=args.supplier_snapshot,
         official_snapshots=args.official_snapshot,
-        supplemental_text=grounded_text,
+        supplemental_text=product_context,
         max_text_chars=args.max_text_chars,
         overlap_chars=args.overlap_chars,
     )
     if not grounding.sources:
         raise SystemExit(
-            "没有可供语义抽取的 grounded source。请至少提供 --image、"
-            "--supplier-snapshot、--official-snapshot、QA 商品上下文或 supplemental text。"
+            "没有可供 AI 解析的商品资料。请至少提供客户上下文、图片、supplier snapshot 或 official snapshot。"
         )
 
     try:
@@ -315,135 +283,53 @@ def main() -> int:
         encoding="utf-8",
     )
 
-    pending = build_semantic_pending_catalog(catalog)
     cache_dir = None if args.no_semantic_cache else Path(args.semantic_cache_dir)
-    cache_namespace = _semantic_cache_namespace(provider_config)
-
-    print("===== GROUNDED AI SOURCE-FIRST RESOLUTION =====", flush=True)
+    print("===== AI-FIRST PRODUCT RESOLUTION =====", flush=True)
     print(
         f"provider={provider_config.provider}, model={provider_config.model}, "
-        f"thinking={provider_config.enable_thinking}, "
-        f"pending_questions={len(pending.questions)}, logical_sources={grounding.logical_source_count}, "
-        f"citation_chunks={len(grounding.sources)}, source_concurrency={args.source_concurrency}",
+        f"thinking={provider_config.enable_thinking}, live_fields={len(live_fields)}, "
+        f"sources={len(grounding.sources)}, logical_sources={grounding.logical_source_count}",
         flush=True,
     )
-    print(f"output_dir={output_dir.resolve()}", flush=True)
-    print(
-        "cache=disabled" if cache_dir is None else f"cache={cache_dir.resolve()}",
-        flush=True,
-    )
+    print("execution_model=one_multimodal_call_per_product_normal_path", flush=True)
 
-    semantic = run_grounded_semantic_sources(
+    result = run_ai_resolution(
         provider,
-        catalog,
+        live_fields,
         grounding,
-        expected_identity=base_inputs.expected_identity,
-        continue_on_source_error=not args.fail_on_source_error,
-        max_repair_attempts=args.max_source_repair_attempts,
+        expected_identity=trusted_inputs.expected_identity,
         cache_dir=cache_dir,
-        cache_namespace=cache_namespace,
-        source_concurrency=args.source_concurrency,
-        progress=_print_source_progress,
+        cache_namespace=_cache_namespace(provider_config),
+        max_repair_attempts=args.max_repair_attempts,
     )
+    packet_path = write_ai_decision_packet(result.packet, output_dir / "ai-decisions.json")
 
-    semantic_packet = validate_evidence_packet(
-        semantic.packet,
-        catalog,
-        expected_identity=base_inputs.expected_identity,
-    ).packet
-    semantic_bundle = bundle_from_evidence_packet(
-        semantic_packet,
-        expected_identity=base_inputs.expected_identity,
-    )
-    combined_bundle = merge_bundles(base_inputs.bundle, semantic_bundle)
-
-    policy = ResolutionPolicy(
-        auto_fill_min_confidence=args.auto_fill_min_confidence,
-        ai_auto_fill_min_confidence=args.ai_auto_fill_min_confidence,
-    )
-    records = resolve_catalog(catalog, combined_bundle, policy=policy)
-    summary = summarize_resolution(records)
-    review_items = build_review_queue(records)
-    review_summary = summarize_review_queue(review_items)
-
-    packet_path = write_evidence_packet(
-        semantic_packet,
-        output_dir / "validated-semantic-evidence.json",
-    )
-    source_report_path = output_dir / "semantic-sources.json"
-    source_report_path.write_text(
-        json.dumps(
-            {
-                "execution_model": "one_call_per_logical_source_normal_path",
-                "provider_adapter": provider.name,
-                "provider_config": provider_config.as_safe_dict(),
-                "pending_question_count": len(pending.questions),
-                "citation_source_count": len(grounding.sources),
-                "logical_source_count": semantic.total_sources,
-                "source_concurrency": semantic.source_concurrency,
-                "completed_sources": semantic.completed_sources,
-                "failed_sources": semantic.failed_sources,
-                "model_calls": semantic.model_calls,
-                "cache_hits": semantic.cache_hits,
-                "elapsed_seconds": round(semantic.elapsed_seconds, 3),
-                "partial": semantic.partial,
-                "failures": [
-                    {
-                        "source_id": item.source_id,
-                        "source_references": list(item.source_references),
-                        "error": item.error,
-                    }
-                    for item in semantic.failures
-                ],
-                "source_stats": [item.as_dict() for item in semantic.source_stats],
-                "warnings": semantic.warnings,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
+    search_requests = _search_requests(result.packet.decisions, live_fields)
+    search_path = output_dir / "search-requests.json"
+    search_path.write_text(
+        json.dumps(search_requests, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-
-    resolution_json = write_resolution_json(records, output_dir / "resolution.json")
-    resolution_xlsx = write_resolution_xlsx(records, output_dir / "resolution.xlsx")
-    review_json = write_review_queue_json(review_items, output_dir / "review-queue.json")
-    review_xlsx = write_review_queue_xlsx(review_items, output_dir / "review-queue.xlsx")
-
+    summary = _decision_summary(result.packet.decisions)
     run_manifest = output_dir / "run-manifest.json"
-    identity = base_inputs.expected_identity
     run_manifest.write_text(
         json.dumps(
             {
-                "mode": "browser_free_grounded_source_first_ai_resolution",
+                "mode": "browser_free_ai_first_product_resolution",
                 "qa_source": str(Path(args.qa).resolve()),
-                "live_schema": str(Path(args.live_schema).resolve()) if args.live_schema else None,
-                "base_question_count": len(base_catalog.questions),
-                "effective_question_count": len(catalog.questions),
-                "semantic_pending_question_count": len(pending.questions),
-                "live_extra_question_count": len(catalog.questions) - len(base_catalog.questions),
-                "live_schema_warning_count": len(live_schema_warnings),
-                "live_schema_warnings": live_schema_warnings,
-                "identity_guard": {
-                    "sku": identity.sku,
-                    "model_number": identity.model_number,
-                    "brand": identity.brand,
-                },
+                "live_schema": str(Path(args.live_schema).resolve()),
+                "live_field_count": len(live_fields),
                 "provider_adapter": provider.name,
                 "provider_config": provider_config.as_safe_dict(),
-                "grounded_citation_source_count": len(grounding.sources),
+                "grounded_source_count": len(grounding.sources),
                 "grounded_logical_source_count": grounding.logical_source_count,
-                "semantic_source_concurrency": semantic.source_concurrency,
-                "customer_context_chars": len(grounded_text),
-                "semantic_fact_count": len(semantic_packet.facts),
-                "semantic_partial": semantic.partial,
-                "semantic_failed_sources": semantic.failed_sources,
-                "semantic_model_calls": semantic.model_calls,
-                "semantic_cache_hits": semantic.cache_hits,
-                "semantic_elapsed_seconds": round(semantic.elapsed_seconds, 3),
-                "deterministic_warnings": base_inputs.warnings,
-                "resolution_summary": summary,
-                "review_summary": review_summary,
-                "makro_browser_opened": False,
+                "customer_context_chars": len(product_context),
+                "model_calls": result.model_calls,
+                "cache_hit": result.cache_hit,
+                "repair_attempts": result.repair_attempts,
+                "elapsed_seconds": round(result.elapsed_seconds, 3),
+                "decision_summary": summary,
+                "search_request_fields": len(search_requests),
                 "writes_performed": 0,
                 "save_clicked": False,
                 "send_to_qc_clicked": False,
@@ -454,35 +340,18 @@ def main() -> int:
         encoding="utf-8",
     )
 
-    print("\n===== GROUNDED AI RESOLUTION COMPLETE =====")
+    print("\n===== AI-FIRST RESOLUTION COMPLETE =====")
     print(
-        f"questions={summary['total']} (base={len(base_catalog.questions)}, "
-        f"live_extra={len(catalog.questions) - len(base_catalog.questions)}), "
-        f"resolved={summary['resolved']}, needs_review={summary['needs_review']}, "
-        f"conflict={summary['conflict']}, missing={summary['missing']}"
+        f"ready={summary[READY]}, review={summary[REVIEW]}, conflict={summary[CONFLICT]}, "
+        f"missing={summary[MISSING]}, business_locked={summary[BUSINESS_LOCKED]}"
     )
     print(
-        f"eligible_for_autofill={summary['eligible_for_autofill']}, "
-        f"blocked={summary['blocked']}"
+        f"model_calls={result.model_calls}, cache_hit={result.cache_hit}, "
+        f"repair_attempts={result.repair_attempts}, elapsed={result.elapsed_seconds:.1f}s"
     )
-    print(
-        f"semantic_facts={len(semantic_packet.facts)}, sources={semantic.completed_sources}/{semantic.total_sources}, "
-        f"source_concurrency={semantic.source_concurrency}, failed_sources={semantic.failed_sources}, "
-        f"model_calls={semantic.model_calls}, cache_hits={semantic.cache_hits}, "
-        f"elapsed={semantic.elapsed_seconds:.1f}s"
-    )
-    print(
-        f"review_queue={review_summary['total']} "
-        f"(conflict={review_summary['conflict']}, "
-        f"needs_review={review_summary['needs_review']}, missing={review_summary['missing']})"
-    )
-    print(f"Semantic evidence: {packet_path.resolve()}")
+    print(f"AI decisions: {packet_path.resolve()}")
+    print(f"Search requests: {search_path.resolve()}")
     print(f"Source manifest: {source_manifest_path.resolve()}")
-    print(f"Source report: {source_report_path.resolve()}")
-    print(f"Resolution JSON: {resolution_json.resolve()}")
-    print(f"Resolution XLSX: {resolution_xlsx.resolve()}")
-    print(f"Review JSON: {review_json.resolve()}")
-    print(f"Review XLSX: {review_xlsx.resolve()}")
     print(f"Run manifest: {run_manifest.resolve()}")
     print("没有打开 Makro；没有填写字段；没有 Save；没有 Send to QC。")
     return 0
