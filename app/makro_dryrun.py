@@ -67,12 +67,7 @@ def _single_locator(
     control: dict[str, Any],
     section_path: str | None,
 ) -> tuple[Any, str]:
-    """Resolve one control scoped to its section, refusing ambiguous matches.
-
-    A global ``[name=...]`` selector can collide with a duplicate or stale React
-    instance elsewhere in the document; scoping by the section card path keeps
-    the write/read on the visible control the user actually sees.
-    """
+    """Resolve one control scoped to its section, refusing ambiguous matches."""
 
     selector = scoped_selector_for_control(section_path, control)
     all_locator = page.locator(selector)
@@ -139,6 +134,89 @@ def _read_control(
     return locator.input_value(timeout=timeout_ms).strip()
 
 
+def _compare_answer_values(expected: list[str], actual: list[str]) -> bool:
+    return len(expected) == len(actual) and [_norm(item) for item in expected] == [
+        _norm(item) for item in actual
+    ]
+
+
+def verify_resolved_field(
+    page: Page,
+    semantic_field: dict[str, Any],
+    answer: ResolvedAnswer,
+    *,
+    section_path: str | None = None,
+) -> FillVerification:
+    """Read one field without writing and verify it equals a resolved answer.
+
+    This is the persisted-state companion to :func:`fill_resolved_field`. It is
+    used after a section Save/re-open cycle so a successful pre-save DOM write
+    cannot be mistaken for data that Makro actually persisted.
+    """
+
+    values = list(answer.answer_values)
+    controls = _value_controls(semantic_field)
+    if len(values) > len(controls) or not controls:
+        return FillVerification(
+            attribute_key=answer.attribute_key,
+            label=answer.label,
+            status="validation_failed",
+            expected=values,
+            detail=(
+                f"持久化复核时答案有 {len(values)} 个值，但页面只有 {len(controls)} 个 value control。"
+            ),
+        )
+
+    actual: list[str] = []
+    selectors: list[str] = []
+    try:
+        for control in controls[: len(values)]:
+            _, selector = _single_locator(page, control, section_path)
+            selectors.append(selector)
+            actual.append(_read_control(page, control, section_path=section_path, timeout_ms=3_000))
+
+        qualifier_ok = True
+        if answer.qualifier:
+            qualifier_controls = _qualifier_controls(semantic_field)
+            if not qualifier_controls:
+                qualifier_ok = False
+            else:
+                _, selector = _single_locator(page, qualifier_controls[0], section_path)
+                selectors.append(selector)
+                qualifier_actual = _read_control(
+                    page,
+                    qualifier_controls[0],
+                    section_path=section_path,
+                    timeout_ms=3_000,
+                )
+                qualifier_ok = _norm(qualifier_actual) == _norm(answer.qualifier)
+
+        passed = _compare_answer_values(values, actual) and qualifier_ok
+        return FillVerification(
+            attribute_key=answer.attribute_key,
+            label=answer.label,
+            status="persisted_verified" if passed else "validation_failed",
+            expected=values,
+            actual=actual,
+            selectors=selectors,
+            detail=(
+                "Save 后重新打开，字段值与期望一致。"
+                if passed
+                else "Save 后重新打开，字段值/qualifier 与期望不一致。"
+            ),
+        )
+    except Exception as exc:
+        return FillVerification(
+            attribute_key=answer.attribute_key,
+            label=answer.label,
+            status="validation_failed",
+            expected=values,
+            actual=actual,
+            selectors=selectors,
+            detail=f"Save 后重新打开复核失败：{exc}",
+        )
+
+
 def fill_resolved_field(
     page: Page,
     semantic_field: dict[str, Any],
@@ -149,15 +227,9 @@ def fill_resolved_field(
 ) -> FillVerification:
     """Fill one resolved semantic field and verify it survives a render cycle.
 
-    The locator is scoped to the owning listing section card (``section_path``)
-    so a duplicate/hidden React instance can never be written or read instead
-    of the visible control. After the immediate readback we wait one render
-    cycle (``recheck_wait_ms``) and re-read: a controlled React input may accept
-    a native DOM write and report it, then reset on the next render. Only a
-    value that still matches after the wait is reported as ``validated``.
-
-    This function never clicks section Save or Send to QC. It only touches the
-    controls belonging to the supplied semantic field.
+    This proves the visible React form retained the value before Save. It does
+    not prove persistence; callers that Save must subsequently re-open the card
+    and call :func:`verify_resolved_field`.
     """
 
     if answer.status != RESOLVED:
@@ -194,9 +266,7 @@ def fill_resolved_field(
         for control in controls[: len(values)]:
             actual.append(_read_control(page, control, section_path=section_path))
 
-        expected_norm = [_norm(item) for item in values[: len(actual)]]
-        actual_norm = [_norm(item) for item in actual]
-        immediate_passed = expected_norm == actual_norm and len(actual) == len(values)
+        immediate_passed = _compare_answer_values(values, actual)
 
         if len(values) > len(controls):
             return FillVerification(
@@ -212,9 +282,6 @@ def fill_resolved_field(
                 ),
             )
 
-        # Stable re-readback after a render cycle: a controlled React input may
-        # accept a native DOM write and immediately report it, then reset on the
-        # next render (observed on Makro Additional Description fields).
         page.wait_for_timeout(recheck_wait_ms)
         settled: list[str] = []
         try:
@@ -236,8 +303,7 @@ def fill_resolved_field(
                 ),
             )
 
-        settled_norm = [_norm(item) for item in settled]
-        settled_passed = settled_norm == expected_norm and len(settled) == len(values)
+        settled_passed = _compare_answer_values(values, settled)
 
         if immediate_passed and settled_passed:
             passed = True
