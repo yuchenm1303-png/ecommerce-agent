@@ -17,6 +17,11 @@ from .qa_catalog import QuestionCatalog, QuestionRecord
 from .source_bundle import ProductSourceBundle
 
 
+GATE_LOW_CONFIDENCE = "low_confidence"
+GATE_MISSING_SOURCE_REFERENCE = "missing_source_reference"
+GATE_FIELD_CONSTRAINT = "field_constraint"
+
+
 @dataclass(slots=True, frozen=True)
 class ResolutionPolicy:
     auto_fill_min_confidence: float = 0.85
@@ -39,6 +44,8 @@ class ResolutionRecord:
     evidence: str | None
     detail: str
     eligible_for_autofill: bool
+    preview_eligible: bool = False
+    gate_reason: str = ""
     provenance: list[dict[str, Any]] = field(default_factory=list)
     question_number: str = ""
     question_explanation: str = ""
@@ -60,6 +67,8 @@ class ResolutionRecord:
             "evidence": self.evidence,
             "detail": self.detail,
             "eligible_for_autofill": self.eligible_for_autofill,
+            "preview_eligible": self.preview_eligible,
+            "gate_reason": self.gate_reason,
             "provenance": self.provenance,
             "question_number": self.question_number,
             "question_explanation": self.question_explanation,
@@ -97,9 +106,12 @@ def _provenance(field: dict[str, Any], bundle: ProductSourceBundle) -> list[dict
     ]
 
 
-def _confidence_gate(answer: ResolvedAnswer, policy: ResolutionPolicy) -> tuple[str, bool, str]:
+def _confidence_gate(
+    answer: ResolvedAnswer,
+    policy: ResolutionPolicy,
+) -> tuple[str, bool, str, str]:
     if answer.status != RESOLVED:
-        return answer.status, False, answer.detail
+        return answer.status, False, answer.detail, f"resolver_{answer.status}"
 
     threshold = (
         policy.ai_auto_fill_min_confidence
@@ -111,10 +123,16 @@ def _confidence_gate(answer: ResolvedAnswer, policy: ResolutionPolicy) -> tuple[
             NEEDS_REVIEW,
             False,
             f"证据置信度 {answer.confidence:.2f} 低于自动填写阈值 {threshold:.2f}。",
+            GATE_LOW_CONFIDENCE,
         )
     if policy.require_source_reference and not (answer.source_reference or "").strip():
-        return NEEDS_REVIEW, False, "resolved 候选缺少可追溯 source_reference。"
-    return RESOLVED, True, answer.detail
+        return (
+            NEEDS_REVIEW,
+            False,
+            "resolved 候选缺少可追溯 source_reference。",
+            GATE_MISSING_SOURCE_REFERENCE,
+        )
+    return RESOLVED, True, answer.detail, ""
 
 
 def _resolution_field(
@@ -150,14 +168,37 @@ def resolve_one(
     answer = resolve_field(lookup_field, bundle, fallback=fallback)
     # Reports and browser plans must always expose the real live Makro label.
     answer.label = str(semantic_field.get("label") or answer.label)
-    status, eligible, detail = _confidence_gate(answer, policy)
 
-    if status == RESOLVED and policy.validate_field_constraints:
+    constraints_ok = not policy.validate_field_constraints
+    if answer.status == RESOLVED and policy.validate_field_constraints:
         validation = validate_resolved_answer(semantic_field, answer)
+        constraints_ok = validation.valid
         if not validation.valid:
             status = NEEDS_REVIEW
             eligible = False
             detail = validation.detail
+            gate_reason = GATE_FIELD_CONSTRAINT
+        else:
+            status, eligible, detail, gate_reason = _confidence_gate(answer, policy)
+    else:
+        status, eligible, detail, gate_reason = _confidence_gate(answer, policy)
+
+    # Review preview is deliberately narrower than "has an answer". A candidate
+    # is previewable only when the resolver produced a structurally valid
+    # resolved value and the *sole* gate preventing autofill is confidence.
+    # Conflicts, missing evidence, dropdown/field-constraint failures and missing
+    # provenance remain non-previewable. This lets the browser show grounded
+    # candidates for human inspection without weakening the autofill trust gate.
+    preview_eligible = (
+        status == NEEDS_REVIEW
+        and gate_reason == GATE_LOW_CONFIDENCE
+        and constraints_ok
+        and bool(answer.answer_values)
+        and (
+            not policy.require_source_reference
+            or bool((answer.source_reference or "").strip())
+        )
+    )
 
     return ResolutionRecord(
         attribute_key=answer.attribute_key,
@@ -172,6 +213,8 @@ def resolve_one(
         evidence=answer.evidence,
         detail=detail,
         eligible_for_autofill=eligible,
+        preview_eligible=preview_eligible,
+        gate_reason=gate_reason,
         provenance=_provenance(lookup_field, bundle),
         question_number=(
             question.number if question else str(semantic_field.get("question_number") or "")
@@ -231,9 +274,11 @@ def summarize_resolution(records: Iterable[ResolutionRecord]) -> dict[str, Any]:
     items = list(records)
     counts = {RESOLVED: 0, NEEDS_REVIEW: 0, MISSING: 0, CONFLICT: 0}
     eligible = 0
+    preview_eligible = 0
     for item in items:
         counts[item.status] = counts.get(item.status, 0) + 1
         eligible += int(item.eligible_for_autofill)
+        preview_eligible += int(item.preview_eligible)
     return {
         "total": len(items),
         "resolved": counts.get(RESOLVED, 0),
@@ -241,5 +286,6 @@ def summarize_resolution(records: Iterable[ResolutionRecord]) -> dict[str, Any]:
         "missing": counts.get(MISSING, 0),
         "conflict": counts.get(CONFLICT, 0),
         "eligible_for_autofill": eligible,
+        "preview_eligible": preview_eligible,
         "blocked": len(items) - eligible,
     }
