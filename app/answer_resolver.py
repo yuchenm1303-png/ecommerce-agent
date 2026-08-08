@@ -142,16 +142,38 @@ _PRODUCT_DIMENSION_MARKERS = (
     "机身尺寸",
     "机器尺寸",
 )
-_VEHICLE_CONTEXT_MARKERS = (
-    "vehicle",
-    "car brand",
-    "compatible car",
-    "compatible vehicle",
-    "适用车型",
-    "适用车辆",
-    "车辆品牌",
-    "汽车品牌",
-)
+_PRODUCT_DIMENSION_AXIS_MARKERS: dict[str, tuple[str, ...]] = {
+    "width": (
+        "product width",
+        "device width",
+        "camera width",
+        "body width",
+        "产品宽",
+        "设备宽",
+        "机身宽",
+    ),
+    "depth": (
+        "product depth",
+        "device depth",
+        "camera depth",
+        "body depth",
+        "product thickness",
+        "device thickness",
+        "产品深",
+        "设备深",
+        "机身深",
+        "机身厚",
+    ),
+    "height": (
+        "product height",
+        "device height",
+        "camera height",
+        "body height",
+        "产品高",
+        "设备高",
+        "机身高",
+    ),
+}
 _MANUAL_MARKERS = ("manual", "instruction book", "instructions", "说明书", "使用说明")
 _UI_LANGUAGE_MARKERS = (
     "ui",
@@ -214,17 +236,19 @@ _INTERNAL_MEMORY_NONE_MARKERS = (
     "内存容量无",
     "无内置存储",
 )
-_INCLUDED_MARKERS = (
-    "included",
-    "includes",
-    "in the box",
-    "package contains",
-    "package includes",
-    "包装清单",
-    "包装内",
-    "标配",
-    "配件",
-    "内含",
+_EXPLICIT_CARD_NOT_INCLUDED_MARKERS = (
+    "sd card not included",
+    "memory card not included",
+    "tf card not included",
+    "without sd card",
+    "without memory card",
+    "without tf card",
+    "不含sd卡",
+    "不含 sd 卡",
+    "不含内存卡",
+    "不带内存卡",
+    "不含tf卡",
+    "无内存卡",
 )
 _BACK_VALUE_MARKERS = {"back", "rear", "reverse", "后", "后置", "后摄"}
 _CAPACITY_VALUE_RE = re.compile(r"(?<!\w)\d+(?:\.\d+)?\s*(?:gb|mb|tb)?(?!\w)", re.IGNORECASE)
@@ -413,10 +437,7 @@ def _is_explicit_scope_source(candidate: SourceEvidence) -> bool:
 def _is_package_dimension_target(semantic_field: dict[str, Any]) -> bool:
     section = normalize_key(semantic_field.get("section_heading"))
     label = normalize_key(semantic_field.get("label"))
-    return (
-        "pricestockandshipping" in section
-        and label in _PACKAGE_DIMENSION_LABELS
-    )
+    return "pricestockandshipping" in section and label in _PACKAGE_DIMENSION_LABELS
 
 
 def _is_product_dimension_target(semantic_field: dict[str, Any]) -> bool:
@@ -429,8 +450,18 @@ def _is_package_dimension_evidence(candidate: SourceEvidence) -> bool:
     return _contains_any(_evidence_text(candidate), _PACKAGE_EVIDENCE_MARKERS)
 
 
-def _is_product_dimension_evidence(candidate: SourceEvidence) -> bool:
-    return _contains_any(_evidence_text(candidate), _PRODUCT_DIMENSION_MARKERS)
+def _is_product_dimension_evidence(
+    candidate: SourceEvidence,
+    semantic_field: dict[str, Any],
+) -> bool:
+    text = _evidence_text(candidate)
+    if _contains_any(text, _PRODUCT_DIMENSION_MARKERS):
+        return True
+    names = _field_names(semantic_field)
+    for axis, markers in _PRODUCT_DIMENSION_AXIS_MARKERS.items():
+        if axis in names and _contains_any(text, markers):
+            return True
+    return False
 
 
 def _has_storage_capacity_value(candidate: SourceEvidence) -> bool:
@@ -439,9 +470,11 @@ def _has_storage_capacity_value(candidate: SourceEvidence) -> bool:
 
 
 def _is_unscoped_vehicle_brand_evidence(candidate: SourceEvidence) -> bool:
-    if _is_explicit_scope_source(candidate):
-        return False
-    return not _contains_any(_evidence_text(candidate), _VEHICLE_CONTEXT_MARKERS)
+    # Vehicle compatibility is a distinct semantic dimension from product brand.
+    # Free-form image/web evidence can relabel "brand other" as Vehicle Brand in
+    # model-authored prose, so only an explicit customer/structured scope may
+    # authorize this field.
+    return not _is_explicit_scope_source(candidate)
 
 
 def _is_manual_language_only_evidence(candidate: SourceEvidence) -> bool:
@@ -466,9 +499,9 @@ def _is_internal_memory_none_not_card_inclusion(candidate: SourceEvidence) -> bo
     if _is_explicit_scope_source(candidate):
         return False
     text = _evidence_text(candidate)
-    return _contains_any(text, _INTERNAL_MEMORY_NONE_MARKERS) and not _contains_any(
-        text, _INCLUDED_MARKERS
-    )
+    if not _contains_any(text, _INTERNAL_MEMORY_NONE_MARKERS):
+        return False
+    return not _contains_any(text, _EXPLICIT_CARD_NOT_INCLUDED_MARKERS)
 
 
 def _is_generic_fov_evidence(candidate: SourceEvidence, *, interior: bool) -> bool:
@@ -484,7 +517,7 @@ def _camera_position_back_from_cabin_only(candidate: SourceEvidence) -> bool:
         return False
     normalized_values = {normalize_key(item) for item in _candidate_values(candidate)}
     has_back_value = any(
-        any(marker in value for marker in _BACK_VALUE_MARKERS)
+        any(normalize_key(marker) in value for marker in _BACK_VALUE_MARKERS)
         for value in normalized_values
     )
     if not has_back_value:
@@ -527,7 +560,7 @@ def _filter_semantically_incompatible_candidates(
             if _is_explicit_scope_source(item)
             or (
                 not _is_package_dimension_evidence(item)
-                and _is_product_dimension_evidence(item)
+                and _is_product_dimension_evidence(item, semantic_field)
             )
         ]
 
