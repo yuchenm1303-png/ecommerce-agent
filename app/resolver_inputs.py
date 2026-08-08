@@ -13,6 +13,8 @@ from .evidence_pipeline import (
 )
 from .evidence_validation import validate_evidence_packet
 from .qa_catalog import QuestionCatalog
+from .semantic_extraction import validate_grounded_semantic_packet
+from .semantic_grounding import GroundingCatalog, build_grounding_catalog
 from .snapshot_evidence import extract_snapshot_evidence
 from .source_bundle import ProductSourceBundle, bundle_from_product_table, normalize_key
 from .source_snapshot import source_snapshot_from_json
@@ -25,6 +27,12 @@ _TRUSTED_IDENTITY_SOURCE_TYPES = {
     "config",
     "rule",
 }
+_GROUNDED_SOURCE_PREFIXES = (
+    "image:",
+    "supplier:",
+    "official:",
+    "customer-text:",
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -41,6 +49,8 @@ class ResolutionInputSpec:
     supplemental_text_file: str | None = None
     image_paths: tuple[str, ...] = ()
     product_url: str | None = None
+    grounding_max_text_chars: int = 3000
+    grounding_overlap_chars: int = 250
 
     @property
     def expected_identity(self) -> ProductIdentity:
@@ -58,6 +68,7 @@ class ResolutionInputResult:
     warnings: list[str] = field(default_factory=list)
     evidence_packet_files: list[str] = field(default_factory=list)
     source_snapshot_files: list[str] = field(default_factory=list)
+    grounded_packet_files: list[str] = field(default_factory=list)
 
 
 def _trusted_identity_value(
@@ -199,11 +210,37 @@ def _append_snapshot_files(
         snapshot_files.append(str(snapshot_path.resolve()))
 
 
-def _customer_context(catalog: QuestionCatalog, spec: ResolutionInputSpec) -> str:
+def customer_context_for_resolution(
+    catalog: QuestionCatalog,
+    spec: ResolutionInputSpec,
+) -> str:
+    """Return the exact customer text source shared by resolver and grounding."""
+
     parts = [catalog.preamble_text, spec.supplemental_text]
     if spec.supplemental_text_file:
         parts.append(Path(spec.supplemental_text_file).read_text(encoding="utf-8"))
     return "\n".join(part for part in parts if part and part.strip()).strip()
+
+
+def _packet_requires_grounding(packet: EvidencePacket) -> bool:
+    return any(
+        str(fact.source_reference or "").startswith(_GROUNDED_SOURCE_PREFIXES)
+        for fact in packet.facts
+    )
+
+
+def _grounding_for_spec(
+    spec: ResolutionInputSpec,
+    customer_context: str,
+) -> GroundingCatalog:
+    return build_grounding_catalog(
+        image_paths=spec.image_paths,
+        supplier_snapshots=spec.supplier_snapshots,
+        official_snapshots=spec.official_snapshots,
+        supplemental_text=customer_context,
+        max_text_chars=spec.grounding_max_text_chars,
+        overlap_chars=spec.grounding_overlap_chars,
+    )
 
 
 def build_resolution_inputs(
@@ -212,13 +249,15 @@ def build_resolution_inputs(
 ) -> ResolutionInputResult:
     """Load every explicit evidence source through one shared safety boundary.
 
-    The customer workbook preamble is part of the product source bundle, not
-    disposable formatting. It is retained as customer context and conservatively
-    parsed for explicit ``key: value`` facts; narrative context remains available
-    to the grounded semantic extractor without being treated as a fact by itself.
+    Customer workbook preamble is retained as source context. Evidence packets
+    that contain builder-generated grounded source ids are *revalidated against
+    the exact current images/snapshots/customer text* before entering the bundle.
+    This prevents a historically valid semantic packet from being replayed after
+    the underlying product sources changed. Generic packets without grounded
+    source ids continue through the ordinary EvidencePacket validation contract.
     """
 
-    customer_context = _customer_context(catalog, spec)
+    customer_context = customer_context_for_resolution(catalog, spec)
     trusted_bundles: list[ProductSourceBundle] = [
         bundle_from_catalog_answers(
             catalog,
@@ -256,10 +295,25 @@ def build_resolution_inputs(
         warnings.append(f"customer_context_chars={len(customer_context)}")
 
     packet_files: list[str] = []
+    grounded_packet_files: list[str] = []
+    grounding: GroundingCatalog | None = None
     for path in spec.evidence_packets:
         packet_path = Path(path)
         payload = json.loads(packet_path.read_text(encoding="utf-8"))
         packet = EvidencePacket.from_mapping(payload)
+        if _packet_requires_grounding(packet):
+            if grounding is None:
+                grounding = _grounding_for_spec(spec, customer_context)
+            packet = validate_grounded_semantic_packet(
+                packet,
+                catalog,
+                grounding,
+                expected_identity=expected,
+            )
+            grounded_packet_files.append(str(packet_path.resolve()))
+            warnings.append(
+                f"{packet_path.name}: grounded packet rebound to current source universe"
+            )
         _append_validated_packet(
             packet=packet,
             catalog=catalog,
@@ -298,4 +352,5 @@ def build_resolution_inputs(
         warnings=warnings,
         evidence_packet_files=packet_files,
         source_snapshot_files=snapshot_files,
+        grounded_packet_files=grounded_packet_files,
     )
