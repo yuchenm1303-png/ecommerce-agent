@@ -52,7 +52,15 @@ def grounding(tmp_path: Path) -> GroundingCatalog:
                 source_type="supplier_web",
                 kind=TEXT_KIND,
                 origin="https://supplier.test/item",
-                content="Colour: Black\nResolution: 720p\nModel: M8",
+                content=(
+                    "Colour: Black\n"
+                    "Resolution: 720p\n"
+                    "Model: M8\n"
+                    "Button operation\n"
+                    "Package contents: camera, charger, bracket\n"
+                    "Remote Control: No\n"
+                    "Body Length: 86 mm; Body Width: 36 mm; Body Height: 32 mm"
+                ),
                 sha256="b" * 64,
             ),
         ]
@@ -282,3 +290,92 @@ def test_brand_and_model_match_can_authorize_external_ready_without_seller_sku(t
         external_sources={external_ref: external_content},
     )
     assert validated.decisions[0].status == READY
+
+
+def test_negative_ready_requires_explicit_target_specific_negative_evidence(tmp_path):
+    remote = field("remote_control", "Remote Control", options=("Yes", "No"))
+    sources = grounding(tmp_path)
+    packet = AIDecisionPacket(
+        identity=ProductIdentity(sku="SKU-1"),
+        schema_sha256=schema_digest([remote]),
+        source_manifest_sha256=source_manifest_digest(sources),
+        decisions=[
+            FieldDecision(
+                field_id=field_id(remote),
+                status=READY,
+                values=["No"],
+                citations=[
+                    DecisionCitation(
+                        "supplier:001:text:0001:abc",
+                        "Package contents: camera, charger, bracket",
+                    ),
+                    DecisionCitation(
+                        "supplier:001:text:0001:abc",
+                        "Button operation",
+                    ),
+                ],
+            )
+        ],
+    )
+    validated = validate_ai_decision_packet(packet, [remote], sources)
+    assert validated.decisions[0].status == REVIEW
+    assert "explicit target-specific negative evidence" in validated.decisions[0].reason
+
+
+def test_explicit_negative_target_evidence_can_authorize_no(tmp_path):
+    remote = field("remote_control", "Remote Control", options=("Yes", "No"))
+    sources = grounding(tmp_path)
+    packet = AIDecisionPacket(
+        identity=ProductIdentity(sku="SKU-1"),
+        schema_sha256=schema_digest([remote]),
+        source_manifest_sha256=source_manifest_digest(sources),
+        decisions=[
+            FieldDecision(
+                field_id=field_id(remote),
+                status=READY,
+                values=["No"],
+                citations=[DecisionCitation("supplier:001:text:0001:abc", "Remote Control: No")],
+            )
+        ],
+    )
+    validated = validate_ai_decision_packet(packet, [remote], sources)
+    assert validated.decisions[0].status == READY
+
+
+def test_dimension_axis_ready_requires_value_bound_to_same_axis(tmp_path):
+    width = field("width", "Width")
+    sources = grounding(tmp_path)
+    wrong = AIDecisionPacket(
+        identity=ProductIdentity(sku="SKU-1"),
+        schema_sha256=schema_digest([width]),
+        source_manifest_sha256=source_manifest_digest(sources),
+        decisions=[
+            FieldDecision(
+                field_id=field_id(width),
+                status=READY,
+                values=["86"],
+                qualifier="mm",
+                citations=[DecisionCitation("supplier:001:text:0001:abc", "Body Length: 86 mm")],
+            )
+        ],
+    )
+    validated_wrong = validate_ai_decision_packet(wrong, [width], sources)
+    assert validated_wrong.decisions[0].status == REVIEW
+    assert "target axis" in validated_wrong.decisions[0].reason
+
+    correct = AIDecisionPacket(
+        identity=ProductIdentity(sku="SKU-1"),
+        schema_sha256=schema_digest([width]),
+        source_manifest_sha256=source_manifest_digest(sources),
+        decisions=[
+            FieldDecision(
+                field_id=field_id(width),
+                status=READY,
+                values=["36"],
+                qualifier="mm",
+                citations=[DecisionCitation("supplier:001:text:0001:abc", "Body Width: 36 mm")],
+            )
+        ],
+    )
+    validated_correct = validate_ai_decision_packet(correct, [width], sources)
+    assert validated_correct.decisions[0].status == READY
