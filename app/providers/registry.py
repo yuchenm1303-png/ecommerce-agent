@@ -17,6 +17,7 @@ class ProviderConfigurationError(ValueError):
 
 
 SUPPORTED_PROVIDERS = ("openai", "openai-compatible")
+SUPPORTED_STRUCTURED_MODES = ("auto", "prompt_only", "json_object")
 
 
 def _validated_base_url(value: str) -> str:
@@ -30,8 +31,6 @@ def _validated_base_url(value: str) -> str:
 
 
 def _safe_base_url(value: str) -> str:
-    """Strip credentials/query/fragment before writing provider metadata to logs."""
-
     if not value:
         return ""
     parsed = urlsplit(value)
@@ -50,9 +49,24 @@ def _effective_compat_profile(provider: str, model: str, requested: str) -> str:
     return requested
 
 
+def _effective_structured_mode(
+    provider: str,
+    compat_profile: str,
+    requested: str,
+) -> str:
+    if requested != "auto":
+        return requested
+    if provider == "openai-compatible" and compat_profile == "qwen-omni":
+        return "json_object"
+    if provider == "openai-compatible":
+        return "prompt_only"
+    return "auto"
+
+
 def _effective_thinking(
     provider: str,
     compat_profile: str,
+    structured_mode: str,
     requested: bool | None,
 ) -> bool | None:
     if provider != "openai-compatible":
@@ -61,11 +75,14 @@ def _effective_thinking(
                 "thinking 开关当前仅用于 openai-compatible provider。"
             )
         return None
+
+    if structured_mode == "json_object" and requested is True:
+        raise ProviderConfigurationError(
+            "JSON mode 为保证结构化输出稳定，必须关闭 thinking；请使用 --disable-thinking "
+            "或改用 --structured-mode prompt_only。"
+        )
     if requested is not None:
         return bool(requested)
-    # Qwen3.5 hybrid-thinking models default to thinking on at the service.
-    # Semantic extraction is constrained information extraction, not open-ended
-    # reasoning, so qwen-omni defaults to thinking off for predictable latency.
     if compat_profile == "qwen-omni":
         return False
     return None
@@ -79,28 +96,27 @@ class ProviderConfig:
     base_url: str = ""
     image_detail: str = "auto"
     max_output_tokens: int = 12000
-    structured_mode: str = "prompt_only"
+    structured_mode: str = "auto"
     compat_profile: str = "generic"
     request_timeout_seconds: float = 120.0
     enable_thinking: bool | None = None
 
     def as_safe_dict(self) -> dict[str, Any]:
-        """Return audit metadata without exposing secret values."""
-
         return {
             "provider": self.provider,
             "model": self.model,
             "api_key_env": self.api_key_env,
             "base_url": _safe_base_url(self.base_url),
             "image_detail": self.image_detail,
-            "max_output_tokens": self.max_output_tokens,
+            # JSON mode intentionally ignores max_output_tokens so output cannot
+            # be truncated mid-object.
+            "max_output_tokens": (
+                None if self.structured_mode == "json_object" else self.max_output_tokens
+            ),
             "structured_mode": self.structured_mode,
             "compat_profile": self.compat_profile,
             "request_timeout_seconds": self.request_timeout_seconds,
             "enable_thinking": self.enable_thinking,
-            # Production-created SDK clients use max_retries=0. Retries are
-            # explicit at the semantic source layer so latency/reporting stays
-            # observable instead of being multiplied invisibly inside the SDK.
             "sdk_max_retries": 0,
         }
 
@@ -148,9 +164,9 @@ def validate_provider_config(config: ProviderConfig) -> ProviderConfig:
         raise ProviderConfigurationError("--image-detail 必须是 auto/low/high。")
     if config.max_output_tokens < 1000:
         raise ProviderConfigurationError("--max-output-tokens 不能小于 1000。")
-    if config.structured_mode not in {"prompt_only", "json_object"}:
+    if config.structured_mode not in SUPPORTED_STRUCTURED_MODES:
         raise ProviderConfigurationError(
-            "--structured-mode 必须是 prompt_only/json_object。"
+            "--structured-mode 必须是 " + "/".join(SUPPORTED_STRUCTURED_MODES) + "。"
         )
     if config.compat_profile not in SUPPORTED_COMPAT_PROFILES:
         raise ProviderConfigurationError(
@@ -166,13 +182,17 @@ def validate_provider_config(config: ProviderConfig) -> ProviderConfig:
         raise ProviderConfigurationError("--request-timeout-seconds 必须是数字。") from exc
     if not 10.0 <= timeout <= 600.0:
         raise ProviderConfigurationError(
-            "--request-timeout-seconds 必须在 10..600 秒；避免单个 source 无限等待。"
+            "--request-timeout-seconds 必须在 10..600 秒。"
         )
 
     effective_profile = _effective_compat_profile(provider, model, config.compat_profile)
+    effective_structured_mode = _effective_structured_mode(
+        provider, effective_profile, config.structured_mode
+    )
     effective_thinking = _effective_thinking(
         provider,
         effective_profile,
+        effective_structured_mode,
         config.enable_thinking,
     )
     return ProviderConfig(
@@ -182,7 +202,7 @@ def validate_provider_config(config: ProviderConfig) -> ProviderConfig:
         base_url=base_url,
         image_detail=config.image_detail,
         max_output_tokens=int(config.max_output_tokens),
-        structured_mode=config.structured_mode,
+        structured_mode=effective_structured_mode,
         compat_profile=effective_profile,
         request_timeout_seconds=timeout,
         enable_thinking=effective_thinking,
@@ -215,7 +235,7 @@ def build_semantic_provider(
     if client is None:
         try:
             from openai import OpenAI
-        except ImportError as exc:  # pragma: no cover - environment dependent
+        except ImportError as exc:  # pragma: no cover
             raise ProviderConfigurationError(
                 "缺少 openai Python SDK。请先安装 requirements.txt。"
             ) from exc
