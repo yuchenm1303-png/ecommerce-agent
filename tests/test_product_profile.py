@@ -87,6 +87,9 @@ def test_product_profile_uses_all_raw_sources_once_and_preserves_conflict(tmp_pa
     assert request["task"] == "understand_product_from_local_evidence"
     assert request["target_fields"] == []
     assert len(request["grounded_sources"]) == 2
+    assert request["source_index"]["images"][0]["source_id"] == "image:001"
+    assert request["source_index"]["texts"][0]["source_id"] == "supplier:001:text:0001:abc"
+    assert "image source_id" in request["prompt_instruction"]
     assert result.profile.facts[0].status == PROFILE_CONFLICT
     assert len(result.profile.facts[0].candidates) == 2
 
