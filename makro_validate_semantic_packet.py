@@ -1,8 +1,9 @@
 """Validate a semantic EvidencePacket against the exact current source universe.
 
 The packet is untrusted until every grounded citation is reproduced from the
-current QA customer context, images and captured snapshots. This command never
-opens or modifies Makro.
+current QA customer context, images and captured snapshots. When a live schema
+is provided the same conservative QA augmentation used by the AI resolver and
+browser runner is applied here too. This command never opens or modifies Makro.
 """
 
 from __future__ import annotations
@@ -13,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 
 from app.evidence_contract import ProductIdentity
+from app.evidence_validation import is_business_question
+from app.live_schema import augment_catalog_with_live_fields, load_live_schema
 from app.qa_catalog import load_question_catalog
 from app.resolver_inputs import ResolutionInputSpec, customer_context_for_resolution
 from app.semantic_extraction import validate_grounded_semantic_packet
@@ -21,9 +24,10 @@ from app.semantic_grounding import build_grounding_catalog
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="校验模型输出是否真正引用本次 QA/图片/网页证据；不修改 Makro。"
+        description="校验模型输出是否真正引用本次 QA/live schema/图片/网页证据；不修改 Makro。"
     )
     parser.add_argument("--qa", required=True)
+    parser.add_argument("--live-schema", default=None)
     parser.add_argument("--packet", required=True, help="模型返回的 EvidencePacket JSON")
     parser.add_argument("--sku", default="")
     parser.add_argument("--model", default="")
@@ -66,7 +70,17 @@ def _packet_dict(packet) -> dict[str, object]:
 
 def main() -> int:
     args = build_parser().parse_args()
-    catalog = load_question_catalog(args.qa)
+    base_catalog = load_question_catalog(args.qa)
+    catalog = base_catalog
+    live_schema_warnings: list[str] = []
+    if args.live_schema:
+        live_fields = load_live_schema(args.live_schema)
+        catalog, live_schema_warnings = augment_catalog_with_live_fields(
+            base_catalog,
+            live_fields,
+            business_locked=is_business_question,
+        )
+
     spec = ResolutionInputSpec(
         sku=args.sku,
         expected_model=args.model,
@@ -110,13 +124,29 @@ def main() -> int:
         encoding="utf-8",
     )
     manifest_path.write_text(
-        json.dumps(grounding.as_manifest(), ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                **grounding.as_manifest(),
+                "qa_source": str(Path(args.qa).resolve()),
+                "live_schema": str(Path(args.live_schema).resolve()) if args.live_schema else None,
+                "base_question_count": len(base_catalog.questions),
+                "effective_question_count": len(catalog.questions),
+                "live_extra_question_count": len(catalog.questions) - len(base_catalog.questions),
+                "live_schema_warnings": live_schema_warnings,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
     print("===== SEMANTIC EVIDENCE VALIDATED =====")
     print(f"facts={len(packet.facts)}")
     print(f"grounded_sources={len(grounding.sources)}")
+    print(
+        f"questions={len(catalog.questions)} "
+        f"(base={len(base_catalog.questions)}, live_extra={len(catalog.questions) - len(base_catalog.questions)})"
+    )
     print(f"customer_context_chars={len(customer_context)}")
     print(f"validated_packet={validated_path.resolve()}")
     print(f"manifest={manifest_path.resolve()}")
