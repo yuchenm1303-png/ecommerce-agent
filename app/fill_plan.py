@@ -53,6 +53,20 @@ class LiveFillPlanItem:
     reason: str
     resolution: ResolutionRecord
 
+    # The legacy browser report still reads these names. They are deliberately
+    # computed, never stored/serialized, and have no matching or semantic role.
+    @property
+    def question_number(self) -> str:
+        return ""
+
+    @property
+    def question(self) -> str:
+        return self.label
+
+    @property
+    def match_basis(self) -> str:
+        return "ai-field-id"
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "attribute_key": self.attribute_key,
@@ -92,9 +106,7 @@ class LiveFillPlan:
 
     @property
     def required_preview_eligible_count(self) -> int:
-        return sum(
-            item.required and item.resolution.preview_eligible for item in self.items
-        )
+        return sum(item.required and item.resolution.preview_eligible for item in self.items)
 
     def summary(self) -> dict[str, Any]:
         gate_counts: dict[str, int] = {}
@@ -121,58 +133,6 @@ class LiveFillPlan:
         }
 
 
-def _decimal_answer(item: LiveFillPlanItem) -> Decimal | None:
-    if not item.resolution.answer_values:
-        return None
-    try:
-        return Decimal(item.resolution.answer_values[0].strip())
-    except (InvalidOperation, AttributeError):
-        return None
-
-
-def _block_items(items: list[LiveFillPlanItem], keys: tuple[str, ...], detail: str) -> None:
-    for item in items:
-        if item.attribute_key not in keys:
-            continue
-        item.action = BLOCKED
-        item.reason = detail
-        item.resolution.status = NEEDS_REVIEW
-        item.resolution.eligible_for_autofill = False
-        item.resolution.preview_eligible = False
-        item.resolution.gate_reason = GATE_CROSS_FIELD_RULE
-        item.resolution.detail = detail
-
-
-def _apply_cross_field_business_rules(items: list[LiveFillPlanItem]) -> None:
-    """Apply only deterministic seller-operating invariants."""
-
-    by_key = {item.attribute_key: item for item in items}
-
-    mrp = by_key.get("mrp")
-    selling = by_key.get("flipkart_selling_price")
-    if mrp and selling and mrp.action == READY and selling.action == READY:
-        mrp_value = _decimal_answer(mrp)
-        selling_value = _decimal_answer(selling)
-        if mrp_value is not None and selling_value is not None and selling_value > mrp_value:
-            _block_items(
-                items,
-                ("mrp", "flipkart_selling_price"),
-                f"价格关系无效：Selling Price={selling_value} 高于 Base Price/MRP={mrp_value}。",
-            )
-
-    minimum = by_key.get("minimum_order_quantity")
-    maximum = by_key.get("max_order_quantity_allowed")
-    if minimum and maximum and minimum.action == READY and maximum.action == READY:
-        min_value = _decimal_answer(minimum)
-        max_value = _decimal_answer(maximum)
-        if min_value is not None and max_value is not None and min_value > max_value:
-            _block_items(
-                items,
-                ("minimum_order_quantity", "max_order_quantity_allowed"),
-                f"MOQ 关系无效：MinOQ={min_value} 高于 MaxOQ={max_value}。",
-            )
-
-
 def _exact_option(value: str, options: list[str]) -> str | None:
     wanted = normalize_key(value)
     matches = [option for option in options if normalize_key(option) == wanted]
@@ -180,16 +140,14 @@ def _exact_option(value: str, options: list[str]) -> str | None:
 
 
 def _hard_guard_values(
-    field: dict[str, Any],
+    live_field: dict[str, Any],
     decision: FieldDecision,
 ) -> tuple[list[str], str, str | None]:
-    """Validate marketplace control shape without interpreting product semantics."""
-
     values = list(decision.values)
-    if not bool(field.get("multi_value")) and len(values) > 1:
+    if not bool(live_field.get("multi_value")) and len(values) > 1:
         return values, decision.qualifier, "单值 Makro 字段收到多个 values。"
 
-    options = field_options(field)
+    options = field_options(live_field)
     if options:
         canonical: list[str] = []
         for value in values:
@@ -202,11 +160,11 @@ def _hard_guard_values(
         values = canonical
 
     qualifier = decision.qualifier.strip()
-    qualifier_options = field_qualifier_options(field)
+    qualifiers = field_qualifier_options(live_field)
     if qualifier:
-        if not qualifier_options:
+        if not qualifiers:
             return values, qualifier, "返回了 qualifier，但当前 Makro 字段没有 qualifier 控件。"
-        matched = _exact_option(qualifier, qualifier_options)
+        matched = _exact_option(qualifier, qualifiers)
         if matched is None:
             return values, qualifier, (
                 f"qualifier={qualifier!r} 不等于当前 Makro 的唯一有效单位。"
@@ -218,7 +176,7 @@ def _hard_guard_values(
     return values, qualifier, None
 
 
-def _citation_provenance(decision: FieldDecision) -> list[dict[str, Any]]:
+def _provenance(decision: FieldDecision) -> list[dict[str, Any]]:
     return [
         {
             "source_reference": citation.source_reference,
@@ -230,11 +188,21 @@ def _citation_provenance(decision: FieldDecision) -> list[dict[str, Any]]:
     ]
 
 
-def _apply_hard_field_validation(field: dict[str, Any], record: ResolutionRecord) -> None:
+def _record_base(live_field: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "attribute_key": str(live_field.get("attribute_key") or ""),
+        "label": str(live_field.get("label") or live_field.get("attribute_key") or ""),
+        "question_category": str(live_field.get("section_heading") or ""),
+        "question_unit": " | ".join(field_qualifier_options(live_field)),
+        "question_options": field_options(live_field),
+    }
+
+
+def _apply_hard_field_validation(live_field: dict[str, Any], record: ResolutionRecord) -> None:
     if record.status != RESOLVED or not record.eligible_for_autofill:
         return
-    validation = validate_resolved_answer(
-        field,
+    result = validate_resolved_answer(
+        live_field,
         ResolvedAnswer(
             attribute_key=record.attribute_key,
             label=record.label,
@@ -249,20 +217,19 @@ def _apply_hard_field_validation(field: dict[str, Any], record: ResolutionRecord
             detail=record.detail,
         ),
     )
-    if validation.valid:
+    if result.valid:
         return
     record.status = NEEDS_REVIEW
     record.eligible_for_autofill = False
     record.preview_eligible = False
     record.gate_reason = GATE_HARD_FIELD_CONSTRAINT
-    record.detail = validation.detail
+    record.detail = result.detail
 
 
-def _decision_record(field: dict[str, Any], decision: FieldDecision) -> ResolutionRecord:
-    values, qualifier, hard_error = _hard_guard_values(field, decision)
-    label = str(field.get("label") or field.get("attribute_key") or "")
-    attribute_key = str(field.get("attribute_key") or "")
-    first_reference = decision.citations[0].source_reference if decision.citations else None
+def _decision_record(live_field: dict[str, Any], decision: FieldDecision) -> ResolutionRecord:
+    values, qualifier, hard_error = _hard_guard_values(live_field, decision)
+    base = _record_base(live_field)
+    source_reference = decision.citations[0].source_reference if decision.citations else None
     evidence = " | ".join(citation.evidence_text for citation in decision.citations)
 
     if decision.status == AI_READY:
@@ -287,59 +254,43 @@ def _decision_record(field: dict[str, Any], decision: FieldDecision) -> Resoluti
         gate = GATE_AI_MISSING
 
     record = ResolutionRecord(
-        attribute_key=attribute_key,
-        label=label,
+        **base,
         status=status,
         answer=" + ".join(values) if values else None,
         answer_values=values,
         qualifier=qualifier or None,
         confidence=decision.confidence,
         source_type="ai_decision",
-        source_reference=first_reference,
+        source_reference=source_reference,
         evidence=evidence or None,
         detail=hard_error or decision.reason,
         eligible_for_autofill=eligible,
         preview_eligible=preview,
         gate_reason=gate,
-        provenance=_citation_provenance(decision),
-        question_category=str(field.get("section_heading") or ""),
-        question_unit=" | ".join(field_qualifier_options(field)),
-        question_options=field_options(field),
+        provenance=_provenance(decision),
     )
-    _apply_hard_field_validation(field, record)
+    _apply_hard_field_validation(live_field, record)
     return record
 
 
-def _is_business_field(field: dict[str, Any]) -> bool:
-    return is_business_question(str(field.get("attribute_key") or "")) or is_business_question(
-        str(field.get("label") or "")
+def _is_business_field(live_field: dict[str, Any]) -> bool:
+    return is_business_question(str(live_field.get("attribute_key") or "")) or is_business_question(
+        str(live_field.get("label") or "")
     )
 
 
-def _raw_business_values(candidate: SourceEvidence) -> list[str]:
+def _business_values(candidate: SourceEvidence) -> list[str]:
     if isinstance(candidate.value, tuple):
         return [str(value).strip() for value in candidate.value if str(value).strip()]
     value = str(candidate.value).strip()
     return [value] if value else []
 
 
-def _record_base(field: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "attribute_key": str(field.get("attribute_key") or ""),
-        "label": str(field.get("label") or field.get("attribute_key") or ""),
-        "question_category": str(field.get("section_heading") or ""),
-        "question_unit": " | ".join(field_qualifier_options(field)),
-        "question_options": field_options(field),
-    }
-
-
 def _business_record(
-    field: dict[str, Any],
+    live_field: dict[str, Any],
     business_bundle: ProductSourceBundle,
 ) -> ResolutionRecord:
-    """Resolve seller-operated fields only from explicit trusted seller data."""
-
-    base = _record_base(field)
+    base = _record_base(live_field)
     attribute_key = base["attribute_key"]
     label = base["label"]
     keys = [attribute_key, label, *BUSINESS_ATTRIBUTE_ALIASES.get(attribute_key, ())]
@@ -348,7 +299,6 @@ def _business_record(
         for candidate in business_bundle.candidates(keys)
         if candidate.source_type in BUSINESS_ALLOWED_SOURCE_TYPES
     ]
-
     if not candidates:
         return ResolutionRecord(
             **base,
@@ -368,7 +318,7 @@ def _business_record(
 
     grouped: dict[tuple[str, ...], list[SourceEvidence]] = {}
     for candidate in candidates:
-        values = _raw_business_values(candidate)
+        values = _business_values(candidate)
         fingerprint = tuple(normalize_key(value) for value in values)
         if fingerprint:
             grouped.setdefault(fingerprint, []).append(candidate)
@@ -408,7 +358,7 @@ def _business_record(
             provenance=[
                 {
                     "key": candidate.key,
-                    "value": _raw_business_values(candidate),
+                    "value": _business_values(candidate),
                     "source_type": candidate.source_type,
                     "source_reference": candidate.source_reference,
                     "confidence": candidate.confidence,
@@ -428,12 +378,12 @@ def _business_record(
         ),
     )[0]
     structural = FieldDecision(
-        field_id=field_id(field),
+        field_id=field_id(live_field),
         status=AI_READY,
-        values=_raw_business_values(selected),
+        values=_business_values(selected),
         confidence=selected.confidence,
     )
-    values, qualifier, hard_error = _hard_guard_values(field, structural)
+    values, qualifier, hard_error = _hard_guard_values(live_field, structural)
     record = ResolutionRecord(
         **base,
         status=RESOLVED if hard_error is None else NEEDS_REVIEW,
@@ -451,7 +401,7 @@ def _business_record(
         provenance=[
             {
                 "key": candidate.key,
-                "value": _raw_business_values(candidate),
+                "value": _business_values(candidate),
                 "source_type": candidate.source_type,
                 "source_reference": candidate.source_reference,
                 "confidence": candidate.confidence,
@@ -460,8 +410,55 @@ def _business_record(
             for candidate in agreeing
         ],
     )
-    _apply_hard_field_validation(field, record)
+    _apply_hard_field_validation(live_field, record)
     return record
+
+
+def _decimal_answer(item: LiveFillPlanItem) -> Decimal | None:
+    if not item.resolution.answer_values:
+        return None
+    try:
+        return Decimal(item.resolution.answer_values[0].strip())
+    except (InvalidOperation, AttributeError):
+        return None
+
+
+def _block(items: list[LiveFillPlanItem], keys: tuple[str, ...], detail: str) -> None:
+    for item in items:
+        if item.attribute_key not in keys:
+            continue
+        item.action = BLOCKED
+        item.reason = detail
+        item.resolution.status = NEEDS_REVIEW
+        item.resolution.eligible_for_autofill = False
+        item.resolution.preview_eligible = False
+        item.resolution.gate_reason = GATE_CROSS_FIELD_RULE
+        item.resolution.detail = detail
+
+
+def _apply_business_relations(items: list[LiveFillPlanItem]) -> None:
+    by_key = {item.attribute_key: item for item in items}
+    mrp = by_key.get("mrp")
+    selling = by_key.get("flipkart_selling_price")
+    if mrp and selling and mrp.action == READY and selling.action == READY:
+        mrp_value, selling_value = _decimal_answer(mrp), _decimal_answer(selling)
+        if mrp_value is not None and selling_value is not None and selling_value > mrp_value:
+            _block(
+                items,
+                ("mrp", "flipkart_selling_price"),
+                f"价格关系无效：Selling Price={selling_value} 高于 Base Price/MRP={mrp_value}。",
+            )
+
+    minimum = by_key.get("minimum_order_quantity")
+    maximum = by_key.get("max_order_quantity_allowed")
+    if minimum and maximum and minimum.action == READY and maximum.action == READY:
+        min_value, max_value = _decimal_answer(minimum), _decimal_answer(maximum)
+        if min_value is not None and max_value is not None and min_value > max_value:
+            _block(
+                items,
+                ("minimum_order_quantity", "max_order_quantity_allowed"),
+                f"MOQ 关系无效：MinOQ={min_value} 高于 MaxOQ={max_value}。",
+            )
 
 
 def build_live_fill_plan(
@@ -469,27 +466,22 @@ def build_live_fill_plan(
     semantic_fields: Iterable[dict[str, Any]],
     business_bundle: ProductSourceBundle,
 ) -> LiveFillPlan:
-    """Convert AI field decisions into executable browser work.
-
-    AI owns product semantics. Local code only protects seller-operated fields,
-    validates live-control shape, and enforces deterministic operating invariants.
-    """
+    """Turn AI decisions into browser work without locally re-solving product meaning."""
 
     fields = list(semantic_fields)
     decisions = {decision.field_id: decision for decision in decision_packet.decisions}
-    items: list[LiveFillPlanItem] = []
     warnings = list(decision_packet.warnings)
+    items: list[LiveFillPlanItem] = []
 
-    for field in fields:
-        identifier = field_id(field)
-        label = str(field.get("label") or field.get("attribute_key") or "")
-        attribute_key = str(field.get("attribute_key") or "")
-        section = str(field.get("section_heading") or "")
-        required = bool(field.get("required"))
-        business_field = _is_business_field(field)
+    for live_field in fields:
+        identifier = field_id(live_field)
+        label = str(live_field.get("label") or live_field.get("attribute_key") or "")
+        attribute_key = str(live_field.get("attribute_key") or "")
+        section = str(live_field.get("section_heading") or "")
+        required = bool(live_field.get("required"))
 
-        if business_field:
-            resolution = _business_record(field, business_bundle)
+        if _is_business_field(live_field):
+            resolution = _business_record(live_field, business_bundle)
             action = READY if resolution.eligible_for_autofill else BLOCKED
             reason = (
                 "显式 seller/business 数据通过硬约束。"
@@ -505,7 +497,7 @@ def build_live_fill_plan(
                     reason="decision packet 缺少该 live field",
                 )
                 warnings.append(f"missing decision for field_id={identifier}")
-            resolution = _decision_record(field, decision)
+            resolution = _decision_record(live_field, decision)
             action = READY if resolution.eligible_for_autofill else BLOCKED
             if action == READY:
                 reason = "AI 字段决策、grounded citations 与 Makro 硬约束均通过。"
@@ -526,5 +518,5 @@ def build_live_fill_plan(
             )
         )
 
-    _apply_cross_field_business_rules(items)
+    _apply_business_relations(items)
     return LiveFillPlan(items=items, warnings=warnings)
