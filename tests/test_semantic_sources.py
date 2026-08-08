@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from app.answer_resolver import CONFLICT
-from app.evidence_contract import IdentityMismatchError, ProductIdentity, bundle_from_evidence_packet
+from app.evidence_contract import EvidenceContractError, IdentityMismatchError, ProductIdentity, bundle_from_evidence_packet
 from app.qa_catalog import QuestionCatalog, QuestionRecord
 from app.resolution_engine import resolve_one
 from app.semantic_grounding import GroundedSource, GroundingCatalog, IMAGE_KIND, TEXT_KIND
@@ -369,3 +371,67 @@ def test_cache_is_bound_to_expected_product_identity(tmp_path):
             cache_namespace="model=qwen-test",
         )
     assert second_provider.calls == 1
+
+
+class ConcurrentProbeProvider:
+    name = "concurrent-probe-stub"
+
+    def __init__(self):
+        self.barrier = threading.Barrier(2)
+        self.lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+        self.calls = 0
+
+    def extract_json(self, request_payload):
+        with self.lock:
+            self.calls += 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            self.barrier.wait(timeout=2)
+        finally:
+            with self.lock:
+                self.active -= 1
+        return {
+            "extractor": self.name,
+            "product_identity": {"model_number": "L11"},
+            "facts": [],
+            "warnings": [],
+        }
+
+
+def test_independent_logical_sources_can_run_with_bounded_concurrency():
+    provider = ConcurrentProbeProvider()
+    result = run_grounded_semantic_sources(
+        provider,
+        catalog(),
+        grounding(),
+        expected_identity=ProductIdentity(model_number="L11"),
+        max_repair_attempts=0,
+        cache_dir=None,
+        source_concurrency=2,
+    )
+
+    assert provider.calls == 2
+    assert provider.max_active == 2
+    assert result.source_concurrency == 2
+    assert result.completed_sources == 2
+    assert result.model_calls == 2
+    assert [item.source_id for item in result.source_stats] == ["supplier:001", "image:001"]
+
+
+def test_fail_fast_mode_forces_serial_even_when_higher_concurrency_requested():
+    provider = TransportFailureProvider()
+    with pytest.raises(EvidenceContractError, match="network timeout"):
+        run_grounded_semantic_sources(
+            provider,
+            catalog(),
+            grounding(),
+            expected_identity=ProductIdentity(model_number="L11"),
+            max_repair_attempts=0,
+            cache_dir=None,
+            source_concurrency=4,
+            continue_on_source_error=False,
+        )
+    assert provider.calls == 1
