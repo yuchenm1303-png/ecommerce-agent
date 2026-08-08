@@ -31,7 +31,7 @@ def test_qa_catalog_keeps_product_context_before_header(tmp_path):
     assert len(catalog.questions) == 1
 
 
-def test_resolution_inputs_keep_preamble_and_explicit_sku(tmp_path):
+def test_resolution_inputs_keep_preamble_once_and_explicit_sku_as_business_data(tmp_path):
     path = tmp_path / "qa.xlsx"
     _write_customer_qa(path)
     catalog = load_question_catalog(path)
@@ -41,7 +41,8 @@ def test_resolution_inputs_keep_preamble_and_explicit_sku(tmp_path):
         ResolutionInputSpec(sku="237581229555"),
     )
 
-    assert "选定变体: M8 双录 + 64GB 内存卡" in result.bundle.supplemental_text
+    assert result.bundle.supplemental_text.count("SKU: 237581229555") == 1
+    assert result.bundle.supplemental_text.count("选定变体: M8 双录 + 64GB 内存卡") == 1
     assert any(item.startswith("customer_context_chars=") for item in result.warnings)
 
     sku_facts = result.bundle.candidates(("SKU",))
@@ -51,7 +52,6 @@ def test_resolution_inputs_keep_preamble_and_explicit_sku(tmp_path):
         and fact.value == "237581229555"
         for fact in sku_facts
     )
-    assert any(
-        fact.source_type == "customer_file" and fact.value == "237581229555"
-        for fact in sku_facts
-    )
+    # Preamble text is intentionally not reparsed into a second customer_file
+    # pseudo-fact; the multimodal AI reads the canonical raw context directly.
+    assert not any(fact.source_type == "customer_file" for fact in sku_facts)
