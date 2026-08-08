@@ -11,7 +11,7 @@ def test_live_planner_requires_expected_vertical():
     assert args.expected_vertical == "vehicle_camera_system"
 
 
-def test_live_planner_accepts_snapshot_and_alias_inputs():
+def test_live_planner_accepts_snapshot_alias_and_live_schema_inputs():
     parser = makro_plan_listing.build_parser()
     args = parser.parse_args(
         [
@@ -25,11 +25,14 @@ def test_live_planner_accepts_snapshot_and_alias_inputs():
             "official.json",
             "--alias-config",
             "aliases.json",
+            "--live-schema",
+            "live-schema.json",
         ]
     )
     assert args.supplier_snapshot == ["supplier.json"]
     assert args.official_snapshot == ["official.json"]
     assert args.alias_config == "aliases.json"
+    assert args.live_schema == "live-schema.json"
 
 
 def test_input_spec_forwards_all_external_evidence_inputs():
@@ -61,6 +64,8 @@ def test_live_planner_contains_no_browser_fill_or_save_path():
     assert 'get_by_text("Save"' not in source
     assert 'get_by_text("Send to QC"' not in source
     assert "save_section(" not in source
+    assert "write_live_schema(" in source
+    assert "assert_live_schema_matches(" in source
 
 
 def test_live_planner_blocks_unsaved_expanded_section():
