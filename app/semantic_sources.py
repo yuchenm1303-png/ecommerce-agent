@@ -25,7 +25,7 @@ from .semantic_extraction import (
 from .semantic_grounding import GroundedSource, GroundingCatalog
 
 
-SOURCE_CACHE_VERSION = 1
+SOURCE_CACHE_VERSION = 2
 DEFAULT_MAX_REPAIR_ATTEMPTS = 1
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -154,11 +154,17 @@ def _cache_key(
     catalog: QuestionCatalog,
     source_id: str,
     grounding: GroundingCatalog,
+    expected_identity: ProductIdentity,
 ) -> str:
     payload = {
         "cache_version": SOURCE_CACHE_VERSION,
         "provider": provider.name,
         "cache_namespace": cache_namespace,
+        "identity": {
+            "sku": expected_identity.sku,
+            "model_number": expected_identity.model_number,
+            "brand": expected_identity.brand,
+        },
         "source_id": source_id,
         "sources": [
             {
@@ -328,7 +334,14 @@ def run_grounded_semantic_sources(
             },
         )
 
-        key = _cache_key(provider, cache_namespace, pending, source_id, group)
+        key = _cache_key(
+            provider,
+            cache_namespace,
+            pending,
+            source_id,
+            group,
+            expected_identity,
+        )
         path = _cache_path(cache_root, key)
         packet: EvidencePacket | None = None
         rejected_count = 0
@@ -361,8 +374,6 @@ def run_grounded_semantic_sources(
                 group,
                 identity=expected_identity,
             )
-            # Keep one transport field for current providers/logs, but it now
-            # identifies a source pass rather than a question batch.
             request["batch_id"] = f"source-{index:03d}:{source_id}"
             request["source_pass_id"] = source_id
 
