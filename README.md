@@ -4,69 +4,130 @@ Makro Marketplace Seller Center 的 AI-first 商品资料补全、字段决策�
 
 当前唯一生产链：
 
-**Makro live schema → Product Source Pack → 一次整商品 AI 本地填空 → 必要时一次有来源联网补空 → Thin Hard Guards → Fill Plan → 浏览器填写 → Save → reopen persisted verify → Product Photos persistence**
+**Makro live schema → Product Source Pack → Product Profile → 小批字段并行映射 → unresolved 并行 Web Research → 一次 text-only Final Resolve → Thin Hard Guards → Fill Plan → Browser → Save/reopen verify → Product Photos persistence**
 
 `Send to QC` 当前始终禁止自动点击。
 
 ## 核心原则
 
-AI 负责商品语言理解、翻译、同义词、计数、规格含义、字段映射、来源综合、冲突判断；本地 Python 不维护颜色、双镜头、G-Sensor、FOV、Vehicle Brand、SD Card、Camera Type 等商品语义规则，也不恢复 QA matcher / alias / deterministic synthesis。
+AI 负责商品理解、翻译、同义词、计数、规格语义、字段映射、多来源综合和冲突判断。本地 Python 不维护颜色、双镜头、G-Sensor、FOV、Vehicle Brand、SD Card、Camera Type、cabin/rear、包装尺寸等商品语义规则，也不恢复 QA matcher / alias / deterministic synthesis。
 
-Python 只保留机械边界：live schema / field id / product identity / source provenance、seller-operated business field lock、Makro option / qualifier / multi-value 控件形态、GTIN checksum、numeric min/max、maxlength、Selling Price <= Base Price/MRP、MinOQ <= MaxOQ、DOM 唯一定位、React readback、Save/reopen persistence，以及禁止自动 `Send to QC`。
+Python 只负责机械边界：调度/并发/cache、live schema / field id / product identity / source provenance、seller-operated business lock、Makro option / qualifier / multi-value 控件形态、GTIN checksum、numeric min/max、maxlength、Selling Price <= Base Price/MRP、MinOQ <= MaxOQ、DOM 唯一定位、React readback、Save/reopen persistence，以及禁止自动 `Send to QC`。
 
-## 唯一目标 Schema 与 Source Pack
+## 为什么不再一次回答 77 个字段
 
-Makro 当前页面发现的 live schema 是 AI 唯一目标字段集合。客户 Excel/QA 是商品资料来源，不再是另一套待匹配问题 schema。
+旧架构把原始图片、客户资料、supplier snapshot 和全部 Makro live fields 塞进一个巨大 multimodal JSON 请求。真实 M8 已证明这个形态不稳定：快模型能完成但语义质量下降，强模型可能超过 120 秒仍无法完成完整 JSON。
 
-第一遍 AI 一次看到客户 workbook/context、selected variant / SKU、explicit facts/product table、商品图片、supplier/official snapshot，以及当前 Makro live fields/options/units/required/section。图片和网页资料不再先转换为本地 semantic facts；AI直接理解原始 grounded sources。
+当前架构不再优化“调用次数最少”，而优化 **wall time、可局部重试、cache 粒度和语义质量**：
 
-## 本地 AI 填空
+1. 图片/原始资料只理解一次；
+2. 字段映射只读取 compact Product Profile；
+3. live fields 按顺序机械切成小 batch 并行处理；
+4. Web 只处理 unresolved；
+5. Web 先找证据，最终决策再由 text-only resolver 完成；
+6. 任意 field/web batch 失败只影响该 batch，不重跑整商品。
 
-`makro_resolve_ai.py` 是唯一生产 AI Resolver。
+## Stage 1 — Product Profile
 
-正常路径：**一个商品 + 全部本地资料 + 全部 live fields = 一次 multimodal model call**。
+`app/product_profile.py` 用一次 multimodal 请求阅读客户 workbook/context、selected variant / SKU、explicit facts、商品图片、supplier/official snapshot。
 
-Qwen3.5 Omni 生产配置自动使用：
+这一阶段 **完全看不到 Makro 77 个目标字段**。它只生成 compact 商品事实，例如 identity、selected variant、产品/包装 scope、规格、功能和多来源 conflict。
 
-- OpenAI-compatible streaming profile；
-- `response_format={"type":"json_object"}`；
-- thinking disabled；
-- JSON mode 不设置 `max_tokens`，避免完整 JSON 被输出上限截断；
-- 默认 `--max-repair-attempts 0`，结构输出失败不会自动把整商品和图片再发一遍；
-- `--request-timeout-seconds` 是整个阶段的 wall-clock deadline，而不只是底层 read timeout；
-- 每 15 秒打印进度，并报告 connection / first output / complete 时间。
+要求：
 
-模型输出 contract 已压缩。模型仍对每个 live target 给出一个简短 decision，以保证完整覆盖，但不再回显 product identity、schema digest、source manifest digest、contract metadata 或本地 warnings。这些由 Python 自己附回最终 packet。正常 READY 只需要 value + 最小 citation；只有冲突才需要 alternatives，只有值得外查时才需要 search_queries。
+- unknown fact 直接省略；
+- 同一属性/同一 scope 的可信来源冲突必须保留多个 candidates；
+- packaging 与 product body、cabin/interior 与 rear/back、manual language 与 UI language、产品 brand 与兼容 vehicle brand 分开；
+- No/False/Not included 必须有显式负面证据；
+- citation 必须回到原始 source id。
 
-最终持久化 decision packet 状态只有 `ready / review / conflict / missing / business_locked`。
+Product Profile cache 只依赖商品资料、identity、模型和 profile contract，**不依赖 Makro schema**。因此 Makro 增删字段不会迫使系统重新看图片。
 
-## 联网补空
+## Stage 2 — Parallel Field Mapping
 
-第一遍本地资料不足时，AI可以给 unresolved 字段生成少量 `search_queries`。使用 DashScope Qwen 时，系统最多追加一次 sourced web enrichment，所有需要研究的字段一起处理。
+`app/field_mapping.py` 只接收 compact Product Profile 和 live Makro fields，不再接收图片或原始大文本。
 
-联网阶段复用 `DASHSCOPE_API_KEY`，使用 `search_strategy=agent`、`enable_source=true` 和 JSON mode，并受同样 wall-clock deadline 限制。READY 和 seller business fields 冻结；web URL 必须真实出现在本次 DashScope search sources 中，编造 URL 不能授权 READY。联网失败保留第一遍有效本地结果，不进入 Agent 循环。
+非经营字段按 live schema 顺序机械分组，默认：
 
-正常调用预算：本地资料足够为 1 call；需要联网为 1 local + 1 web；相同输入 hot cache 可 0 call。
+- `--field-batch-size 12`
+- `--field-concurrency 4`
+
+这只是负载调度，不包含“camera/storage/dimension”之类本地语义分类。
+
+多个小 batch 并行请求。单个 batch 失败时，该 batch 字段保持 MISSING/REVIEW，其他 batch 正常继续。每个 batch 独立 content-addressed cache。
+
+## Stage 3 — Parallel Web Research
+
+只有 `MISSING / REVIEW / CONFLICT` 的非经营字段进入 Web。
+
+默认：
+
+- `--web-batch-size 5`
+- `--web-concurrency 3`
+- `--web-search-model qwen3.7-max`
+
+Web 使用 OpenAI-compatible Responses API `web_search`。这一阶段只收集 evidence，不直接决定 READY。URL 只有真实存在于本次 `web_search_call.action.sources` 才能进入 evidence；模型编造 URL 会被丢弃。
+
+每个 research batch 独立 cache，某批搜索失败不会破坏 local decisions。
+
+## Stage 4 — Final Resolve
+
+只有实际获得 Web evidence 的 unresolved fields 才进入一次 text-only Final Resolve。
+
+输入只有：
+
+- Product Profile；
+- 这些 unresolved fields；
+- 已验证 Web evidence。
+
+不会重新发送图片，不会重新回答已 READY 字段。最终状态仍只有：
+
+`ready / review / conflict / missing / business_locked`
+
+## 模型
+
+默认本地商品理解、字段映射和 Final Resolve 使用：
+
+`qwen3.7-plus`
+
+默认 Web Research 使用：
+
+`qwen3.7-max`
+
+本地 JSON task 使用 `json_object`、thinking disabled、真实 wall-clock deadline。Web Search 不强行发送与 search tool 不兼容的 `response_format=json_object`，而是解析 Responses 输出的 JSON text，并独立校验 search sources。
+
+模型职责固定，不通过不断换模型掩盖架构问题。
+
+## Cache
+
+现在有四层独立 cache：
+
+1. Product Profile cache；
+2. Field batch cache；
+3. Web research batch cache；
+4. Final Resolve cache。
+
+相同商品热运行应尽量达到 0 model calls。若只变更少量 live fields，只需重跑受影响 field batch；原始图片不重传。
 
 ## Hard Guards / Fill Plan
 
-`app/fill_plan.py` 不解释商品含义，只把 AI decisions 转成可执行计划。
+`app/ai_decisions.py` 现在只保存 decision 数据结构、field/schema/source digest、citation validation 和 packet I/O，不再包含模型执行器。
+
+`app/fill_plan.py` 不解释商品含义，只把 AI decisions 转成执行计划：
 
 - AI READY + hard guards pass → `READY`
-- AI REVIEW → blocked，可在明确人工 review 模式下作为 preview candidate
-- AI CONFLICT → blocked
-- AI MISSING → blocked
+- AI REVIEW / CONFLICT / MISSING → blocked
 - business field → 只接受 explicit seller data
 
-Price、Stock、MOQ、Fulfilment、Shipping 等不允许图片、供应商网页、普通 web search 或 AI 推理生成。
+Price、Stock、MOQ、Fulfilment、Shipping 等不允许图片、supplier、普通 web search 或 AI 推理生成。
 
 ## 浏览器执行层
 
-浏览器层保留 live field discovery、text/textarea/dropdown/number/qualifier/multi-value、React settled readback、section Save、Save 后 reopen persisted verification、Product Photos persistence、schema/source/identity drift fail closed，以及禁止自动 Send to QC。
+浏览器层保持不变：live field discovery、text/textarea/dropdown/number/qualifier/multi-value、React settled readback、section Save、Save 后 reopen persisted verification、Product Photos persistence、schema/source/identity drift fail closed，以及禁止自动 Send to QC。
 
 ## 运行顺序
 
-### 1. 只读扫描 live schema
+### 1. 扫描 live schema
 
 ```powershell
 python makro_plan_listing.py `
@@ -74,13 +135,14 @@ python makro_plan_listing.py `
   --expected-vertical vehicle_camera_system
 ```
 
-### 2. AI 本地填空 + 可选联网补空
+### 2. 四阶段 AI Resolver
 
 ```powershell
 python makro_resolve_ai.py `
   --provider openai-compatible `
   --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 `
-  --model qwen3.5-omni-plus `
+  --model qwen3.7-plus `
+  --web-search-model qwen3.7-max `
   --api-key-env DASHSCOPE_API_KEY `
   --qa <qa.xlsx> `
   --live-schema <live-schema.json> `
@@ -93,7 +155,18 @@ python makro_resolve_ai.py `
   --request-timeout-seconds 120
 ```
 
-Qwen Omni 在 `--structured-mode auto` 下自动使用 JSON mode。主要输出：`ai-decisions.json`、触发 web 时的 `ai-decisions.local.json`、`search-requests.json`、`web-search-sources.json`、`source-manifest.json`、`run-manifest.json`。
+主要输出：
+
+- `product-profile.json`
+- `ai-decisions.local.json`
+- `search-requests.json`
+- `web-evidence.json`
+- `web-search-sources.json`
+- `ai-decisions.json`
+- `source-manifest.json`
+- `run-manifest.json`
+
+`run-manifest.json` 分别记录 Product Profile、field mapping、Web Research、Final Resolve 的 calls / cache hits / batch count / elapsed。
 
 ### 3. 最终只读 Fill Plan
 
@@ -109,7 +182,7 @@ python makro_plan_listing.py `
   --expected-vertical vehicle_camera_system
 ```
 
-### 4. 人工检查后再执行真实 Step 3 persistence acceptance
+### 4. 人工检查后再进入真实 persistence acceptance
 
 ```powershell
 python makro_preview_listing.py `
@@ -132,28 +205,37 @@ python makro_preview_listing.py `
 
 复用已登录长期 Edge/CDP；多 Add Listing tabs、vertical/schema/source/identity 不一致、已有用户未保存 section 都 fail closed；不覆盖当前非-placeholder 用户值；option/qualifier/slot 不满足时写入前失败；React readback 不一致不算 validated；Save 后 reopen 不一致不算 persisted；Product Photos staged 不等于 persisted；`Send to QC` 始终禁止。
 
-## 当前真实验证边界
-
-旧的 AI-first 实机版本曾在真实 M8 上出现：两个本地模型调用合计约 509 秒，并最终因为模型响应不是可解析 JSON 而失败。当前版本针对这个失败已经改为 Qwen 原生 JSON mode、JSON mode 无 `max_tokens`、默认无整商品 repair、真正 wall-clock deadline、15 秒进度输出和 compact model contract。
-
-这些修复已经通过自动化回归，但真实 Qwen 冷运行耗时和最终 coverage 仍必须重新在用户本机验收；在此之前不能声称真实性能已经通过。
-
 ## 关键文件
 
-- `app/ai_decisions.py`：compact AI field-decision contract、provenance validation、whole-product cache
+- `app/product_profile.py`：一次 raw multimodal 商品理解 + profile cache
+- `app/field_mapping.py`：compact profile → 小批 live fields 并行映射 + batch cache
+- `app/web_enrichment.py`：unresolved 并行 Web Research + text-only Final Resolve
+- `app/ai_decisions.py`：decision 数据/provenance/schema/source validation
 - `app/product_context.py`：canonical Product Source Pack context
-- `app/business_fields.py`：seller-operated field policy
+- `app/business_fields.py`：seller business policy
 - `app/hard_field_validators.py`：纯机械 hard guards
 - `app/fill_plan.py`：AI decisions → executable Fill Plan
-- `app/semantic_grounding.py`：原始 image/text source manifest/citations
+- `app/semantic_grounding.py`：raw source/citation manifest
 - `app/providers/openai_compatible.py`：Qwen/compatible JSON transport + wall deadline/progress
-- `app/providers/dashscope_web_search.py`：一次有来源 web enrichment + wall deadline
-- `makro_plan_listing.py`：live-schema scan + final read-only Fill Plan
-- `makro_resolve_ai.py`：唯一生产 AI Resolver
-- `makro_preview_listing.py`：真实 Step 3 browser acceptance
+- `app/providers/dashscope_web_search.py`：Responses web_search + source provenance + wall deadline
+- `makro_resolve_ai.py`：唯一 AI orchestration entrypoint
+- `makro_plan_listing.py`：schema scan + read-only planner
+- `makro_preview_listing.py`：真实 browser acceptance
 
-旧本地商品语义主链已经删除：Answer Resolver、Resolution Engine、semantic-fact runner、QA matcher、alias config、attribute-specific deterministic synthesis、snapshot→semantic-fact mapping。不要恢复兼容 wrapper。
+旧本地商品语义主链和旧超级请求执行器已经删除：Answer Resolver、Resolution Engine、semantic-fact runner、QA matcher、alias config、attribute-specific deterministic synthesis、snapshot→semantic-fact mapping、`run_ai_resolution()` whole-product field resolver。不要恢复兼容 wrapper。
 
-## 开发验收
+## 验收
 
-修改后至少要求 `pytest -q`、GitHub Actions tests、mock-e2e、browser dry-run/probe 全部通过。真实 Makro/Qwen 最终由用户本机环境验证；真实写入前必须先检查 AI Decisions + read-only Fill Plan；PR 保持 Draft，直到真实商品 coverage、冷/热延迟和 persisted Step 3 acceptance 完成。
+修改后至少要求 `pytest -q`、GitHub Actions tests、mock-e2e、browser dry-run/probe 全部通过。
+
+真实 M8 下一轮重点不再验证“一个 77-field call 能否撑住”，而验证：
+
+- Product Profile 是否一次正确理解原始资料；
+- 3.0/3.16、720p/1080p 是否在 profile 阶段保留 conflict；
+- front+cabin、package/product scope、negative evidence 是否正确；
+- field batches 并行 wall time；
+- unresolved Web Research 是否返回真实 URL/evidence；
+- hot run 四层 cache 是否接近 0 calls；
+- 最终 read-only Fill Plan coverage/安全性。
+
+真实写入前必须先检查 `product-profile.json + ai-decisions.json + Fill Plan`。PR 保持 Draft，直到真实商品 coverage、冷/热延迟和 persisted Step 3 acceptance 完成。
