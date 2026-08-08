@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 import makro_plan_listing
 
 
-def _base_args():
+def _plan_args():
     return [
         "--qa",
         "qa.xlsx",
@@ -18,18 +20,61 @@ def _base_args():
     ]
 
 
-def test_live_planner_requires_decision_schema_and_expected_vertical():
+def test_planner_has_explicit_live_schema_scan_mode_without_ai_inputs():
     parser = makro_plan_listing.build_parser()
-    args = parser.parse_args(_base_args())
+    args = parser.parse_args(
+        [
+            "--scan-live-schema",
+            "--expected-vertical",
+            "vehicle_camera_system",
+        ]
+    )
+    makro_plan_listing._validate_mode(args)
+    assert args.scan_live_schema is True
+    assert args.decision_packet is None
+    assert args.qa is None
+    assert args.live_schema is None
+
+
+def test_final_plan_mode_requires_qa_and_existing_live_schema():
+    parser = makro_plan_listing.build_parser()
+    args = parser.parse_args(_plan_args())
+    makro_plan_listing._validate_mode(args)
     assert args.decision_packet == "ai-decisions.json"
     assert args.live_schema == "live-schema.json"
     assert args.expected_vertical == "vehicle_camera_system"
+
+    missing_qa = parser.parse_args(
+        [
+            "--decision-packet",
+            "ai-decisions.json",
+            "--live-schema",
+            "live-schema.json",
+            "--expected-vertical",
+            "vehicle_camera_system",
+        ]
+    )
+    with pytest.raises(SystemExit, match="--qa"):
+        makro_plan_listing._validate_mode(missing_qa)
+
+    missing_schema = parser.parse_args(
+        [
+            "--decision-packet",
+            "ai-decisions.json",
+            "--qa",
+            "qa.xlsx",
+            "--expected-vertical",
+            "vehicle_camera_system",
+        ]
+    )
+    with pytest.raises(SystemExit, match="--live-schema"):
+        makro_plan_listing._validate_mode(missing_schema)
 
 
 def test_live_planner_rebuilds_same_product_source_pack_for_strict_rebind():
     parser = makro_plan_listing.build_parser()
     args = parser.parse_args(
-        _base_args()
+        _plan_args()
         + [
             "--supplier-snapshot",
             "supplier.json",
@@ -52,6 +97,7 @@ def test_planner_has_no_alias_confidence_or_legacy_evidence_packet_controls():
         for action in parser._actions
         for option in action.option_strings
     }
+    assert "--scan-live-schema" in options
     assert "--decision-packet" in options
     assert "--alias-config" not in options
     assert "--auto-fill-min-confidence" not in options
