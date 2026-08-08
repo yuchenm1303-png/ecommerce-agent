@@ -5,7 +5,7 @@ Owns all Makro-specific behavior used by the fill CLI:
 - listing-page recognition and vertical guard;
 - section title normalization, discovery, open/cancel/save lifecycle;
 - semantic field discovery and field locator strategy;
-- product photo upload through the listing's own file input;
+- product photo staging and post-Save persistence verification;
 - pre-save and post-save field readback verification.
 
 The CLI keeps policy/orchestration only. No category field lists are hard-coded;
@@ -29,7 +29,12 @@ from .listing import (
     wait_for_authenticated_listing,
 )
 from .locators import selector_for_control
-from .photos import PhotoUploadResult, inspect_product_photos, upload_product_photos
+from .photos import (
+    PhotoUploadResult,
+    inspect_product_photos,
+    upload_product_photos,
+    verify_persisted_photo_count,
+)
 from .sections import (
     base_section_title,
     cancel_section,
@@ -159,6 +164,18 @@ class MakroDomainAdapter:
             timeout_ms=timeout_ms,
         )
 
+    def verify_persisted_photo_count(
+        self,
+        *,
+        initial_count: int | None,
+        expected_added: int,
+    ) -> dict[str, Any]:
+        return verify_persisted_photo_count(
+            self.page,
+            initial_count=initial_count,
+            expected_added=expected_added,
+        )
+
     def build_semantic_fields(self, controls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return build_semantic_fields(controls)
 
@@ -188,7 +205,6 @@ class MakroDomainAdapter:
         *,
         section_path: str | None = None,
     ) -> FillVerification:
-        """Read-only verification used after Save/re-open."""
         return verify_resolved_field(
             self.page,
             semantic_field,
