@@ -165,6 +165,7 @@ def test_provider_neutral_resolver_is_source_first_browser_free_and_audited(tmp_
     source_report = json.loads((run_dir / "semantic-sources.json").read_text(encoding="utf-8"))
     assert source_report["execution_model"] == "one_call_per_logical_source_normal_path"
     assert source_report["logical_source_count"] == 2
+    assert source_report["source_concurrency"] == 2
     assert source_report["completed_sources"] == 2
     assert source_report["model_calls"] == 2
     assert source_report["cache_hits"] == 0
@@ -183,6 +184,7 @@ def test_provider_neutral_resolver_is_source_first_browser_free_and_audited(tmp_
     assert manifest["live_extra_question_count"] == 1
     assert manifest["live_schema"] == str(live_schema.resolve())
     assert manifest["grounded_logical_source_count"] == 2
+    assert manifest["semantic_source_concurrency"] == 2
     assert manifest["semantic_model_calls"] == 2
     assert manifest["makro_browser_opened"] is False
     assert manifest["writes_performed"] == 0
@@ -224,6 +226,11 @@ def test_generic_cli_never_accepts_raw_api_key_or_obsolete_batch_controls():
     assert "--max-source-repair-attempts" in option_strings
     assert "--semantic-cache-dir" in option_strings
     assert "--request-timeout-seconds" in option_strings
+    assert "--source-concurrency" in option_strings
+    action = next(
+        item for item in parser._actions if "--source-concurrency" in item.option_strings
+    )
+    assert action.default == 2
 
 
 def test_generic_cli_contains_no_makro_browser_or_fill_path():
