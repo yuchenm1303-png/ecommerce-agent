@@ -15,7 +15,7 @@ def _qa_file(tmp_path):
     workbook = Workbook()
     sheet = workbook.active
     sheet.append(["Vehicle Camera System"])
-    sheet.append(["Questions"])
+    sheet.append(["Selected variant | M8 WiFi"])
     sheet.append(["编号", "问题", "问题说明", "问题类别", "选项", "单位", "答案"])
     sheet.append([1, "Screen Size", "", "DISPLAY", "", "inch", ""])
     sheet.append([2, "Warranty Summary", "", "WARRANTY", "", "", "1 year"])
@@ -64,42 +64,63 @@ class FakeProvider:
 
     def __init__(self):
         self.calls = 0
+        self.requests = []
 
     def extract_json(self, request_payload):
         self.calls += 1
+        self.requests.append(request_payload)
         image_source = next(
-            (
-                source
-                for source in request_payload["grounded_sources"]
-                if source["kind"] == "image"
-            ),
-            None,
+            source
+            for source in request_payload["grounded_sources"]
+            if source["kind"] == "image"
         )
-        facts = []
-        if image_source is not None and any(
-            item["question"] == "Screen Size" for item in request_payload["questions"]
-        ):
-            facts.append(
-                {
-                    "key": "Screen Size",
-                    "aliases": [],
-                    "value": ["3.0 inch"],
-                    "source_type": "product_image",
-                    "source_reference": image_source["source_id"],
-                    "confidence": 0.92,
-                    "evidence_text": "Visible printed specification: Screen Size 3.0 inch.",
-                    "note": "",
-                }
-            )
+        decisions = []
+        for target in request_payload["target_fields"]:
+            if target["label"] == "Screen Size":
+                decisions.append(
+                    {
+                        "field_id": target["field_id"],
+                        "status": "ready",
+                        "values": ["3.0"],
+                        "qualifier": "inch",
+                        "confidence": 0.94,
+                        "citations": [
+                            {
+                                "source_reference": image_source["source_id"],
+                                "evidence_text": "Visible printed specification: Screen Size 3.0 inch.",
+                            }
+                        ],
+                        "alternatives": [],
+                        "reason": "visible product specification",
+                        "search_queries": [],
+                    }
+                )
+            else:
+                decisions.append(
+                    {
+                        "field_id": target["field_id"],
+                        "status": "missing",
+                        "values": [],
+                        "qualifier": "",
+                        "confidence": 0.0,
+                        "citations": [],
+                        "alternatives": [],
+                        "reason": "not in supplied evidence",
+                        "search_queries": ["M8 WiFi package dimensions"],
+                    }
+                )
         return {
-            "extractor": self.name,
-            "product_identity": {"sku": "", "model_number": "", "brand": ""},
-            "facts": facts,
+            "contract_version": 1,
+            "product_identity": request_payload["product_identity"],
+            "schema_sha256": request_payload["schema_sha256"],
+            "source_manifest_sha256": request_payload["source_manifest_sha256"],
+            "decisions": decisions,
+            "model_summary": "resolved live schema",
             "warnings": [],
         }
 
 
-def test_provider_neutral_resolver_is_source_first_browser_free_and_audited(tmp_path, monkeypatch):
+def test_resolver_is_one_product_call_browser_free_and_audited(tmp_path, monkeypatch):
     qa = _qa_file(tmp_path)
     live_schema = _live_schema_file(tmp_path)
     image = tmp_path / "front.jpg"
@@ -141,9 +162,11 @@ def test_provider_neutral_resolver_is_source_first_browser_free_and_audited(tmp_
     )
 
     assert makro_resolve_ai.main() == 0
-    # The workbook preamble is a real customer-context source in addition to
-    # the image. Source-first means one call to each, not one call total.
-    assert provider.calls == 2
+    assert provider.calls == 1
+    request = provider.requests[0]
+    assert request["task"] == "resolve_all_live_marketplace_fields_from_product_sources"
+    assert len(request["target_fields"]) == 2
+    assert len(request["grounded_sources"]) == 2  # image + canonical customer context
     assert captured["config"].provider == "openai-compatible"
     assert captured["config"].model == "vendor-vision-model"
     assert captured["config"].api_key_env == "VENDOR_KEY"
@@ -151,54 +174,47 @@ def test_provider_neutral_resolver_is_source_first_browser_free_and_audited(tmp_
 
     run_dir = next(output.iterdir())
     for name in (
-        "validated-semantic-evidence.json",
+        "ai-decisions.json",
+        "search-requests.json",
         "source-manifest.json",
-        "semantic-sources.json",
-        "resolution.json",
-        "resolution.xlsx",
-        "review-queue.json",
-        "review-queue.xlsx",
         "run-manifest.json",
     ):
         assert (run_dir / name).exists(), name
 
-    source_report = json.loads((run_dir / "semantic-sources.json").read_text(encoding="utf-8"))
-    assert source_report["execution_model"] == "one_call_per_logical_source_normal_path"
-    assert source_report["logical_source_count"] == 2
-    assert source_report["source_concurrency"] == 2
-    assert source_report["completed_sources"] == 2
-    assert source_report["model_calls"] == 2
-    assert source_report["cache_hits"] == 0
-    assert source_report["provider_config"]["request_timeout_seconds"] == 75
-    assert all(item["model_calls"] == 1 for item in source_report["source_stats"])
+    decisions = json.loads((run_dir / "ai-decisions.json").read_text(encoding="utf-8"))
+    assert len(decisions["decisions"]) == 2
+    assert [item["status"] for item in decisions["decisions"]] == ["ready", "missing"]
+
+    search = json.loads((run_dir / "search-requests.json").read_text(encoding="utf-8"))
+    assert len(search) == 1
+    assert search[0]["label"] == "Length"
 
     manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["mode"] == "browser_free_ai_first_product_resolution"
     assert manifest["provider_config"]["provider"] == "openai-compatible"
     assert manifest["provider_config"]["api_key_env"] == "VENDOR_KEY"
     assert manifest["provider_config"]["request_timeout_seconds"] == 75
     assert "api_key" not in manifest["provider_config"]
     assert manifest["customer_context_chars"] > 0
-    assert manifest["base_question_count"] == 2
-    assert manifest["effective_question_count"] == 3
-    assert manifest["semantic_pending_question_count"] == 2
-    assert manifest["live_extra_question_count"] == 1
-    assert manifest["live_schema"] == str(live_schema.resolve())
+    assert manifest["live_field_count"] == 2
     assert manifest["grounded_logical_source_count"] == 2
-    assert manifest["semantic_source_concurrency"] == 2
-    assert manifest["semantic_model_calls"] == 2
-    assert manifest["makro_browser_opened"] is False
+    assert manifest["model_calls"] == 1
+    assert manifest["cache_hit"] is False
+    assert manifest["decision_summary"]["ready"] == 1
+    assert manifest["decision_summary"]["missing"] == 1
     assert manifest["writes_performed"] == 0
     assert manifest["save_clicked"] is False
     assert manifest["send_to_qc_clicked"] is False
 
 
-def test_semantic_cache_namespace_ignores_transport_only_timeout():
+def test_cache_namespace_ignores_transport_only_timeout_but_keeps_semantic_config():
     base = ProviderConfig(
         provider="openai-compatible",
         model="vision-model",
         api_key_env="KEY",
         base_url="https://api.vendor.test/v1",
         request_timeout_seconds=30,
+        enable_thinking=False,
     )
     slower = ProviderConfig(
         provider="openai-compatible",
@@ -206,11 +222,21 @@ def test_semantic_cache_namespace_ignores_transport_only_timeout():
         api_key_env="KEY",
         base_url="https://api.vendor.test/v1",
         request_timeout_seconds=180,
+        enable_thinking=False,
     )
-    assert makro_resolve_ai._semantic_cache_namespace(base) == makro_resolve_ai._semantic_cache_namespace(slower)
+    thinking = ProviderConfig(
+        provider="openai-compatible",
+        model="vision-model",
+        api_key_env="KEY",
+        base_url="https://api.vendor.test/v1",
+        request_timeout_seconds=30,
+        enable_thinking=True,
+    )
+    assert makro_resolve_ai._cache_namespace(base) == makro_resolve_ai._cache_namespace(slower)
+    assert makro_resolve_ai._cache_namespace(base) != makro_resolve_ai._cache_namespace(thinking)
 
 
-def test_generic_cli_never_accepts_raw_api_key_or_obsolete_batch_controls():
+def test_cli_has_no_legacy_batch_confidence_or_semantic_fact_controls():
     parser = makro_resolve_ai.build_parser()
     option_strings = {
         option
@@ -222,20 +248,24 @@ def test_generic_cli_never_accepts_raw_api_key_or_obsolete_batch_controls():
     assert "--api-key-env" in option_strings
     assert "--live-schema" in option_strings
     assert "--batch-size" not in option_strings
-    assert "--fail-on-batch-error" not in option_strings
-    assert "--max-source-repair-attempts" in option_strings
+    assert "--source-concurrency" not in option_strings
+    assert "--max-source-repair-attempts" not in option_strings
+    assert "--auto-fill-min-confidence" not in option_strings
+    assert "--ai-auto-fill-min-confidence" not in option_strings
+    assert "--max-repair-attempts" in option_strings
     assert "--semantic-cache-dir" in option_strings
     assert "--request-timeout-seconds" in option_strings
-    assert "--source-concurrency" in option_strings
-    action = next(
-        item for item in parser._actions if "--source-concurrency" in item.option_strings
-    )
-    assert action.default == 2
+    assert "--disable-thinking" in option_strings
+    live_action = next(item for item in parser._actions if "--live-schema" in item.option_strings)
+    assert live_action.required is True
 
 
-def test_generic_cli_contains_no_makro_browser_or_fill_path():
+def test_cli_contains_no_makro_browser_or_local_semantic_resolver_path():
     source = inspect.getsource(makro_resolve_ai)
     assert "sync_playwright" not in source
     assert "EdgeHarness" not in source
+    assert "resolve_catalog" not in source
+    assert "run_grounded_semantic_sources" not in source
+    assert "question_matcher" not in source
     assert "fill_resolved_field" not in source
     assert "send_to_qc_clicked" in source
