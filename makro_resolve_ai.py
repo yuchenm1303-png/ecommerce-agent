@@ -56,19 +56,19 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--provider", choices=SUPPORTED_PROVIDERS, default="openai-compatible")
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--model", default="qwen3.6-plus", help="本地商品解析模型；默认 qwen3.6-plus。")
     parser.add_argument("--api-key-env", default=None)
     parser.add_argument("--base-url", default="")
     parser.add_argument(
         "--structured-mode",
         choices=("auto", "prompt_only", "json_object"),
-        default="auto",
-        help="auto: Qwen Omni 自动使用原生 JSON mode；其他 compatible provider 保持兼容模式。",
+        default="json_object",
+        help="本地 Qwen3.6 默认使用原生 JSON mode；需要兼容旧服务时可显式改为 prompt_only。",
     )
     thinking = parser.add_mutually_exclusive_group()
     thinking.add_argument("--enable-thinking", dest="enable_thinking", action="store_true")
     thinking.add_argument("--disable-thinking", dest="enable_thinking", action="store_false")
-    parser.set_defaults(enable_thinking=None)
+    parser.set_defaults(enable_thinking=False)
 
     parser.add_argument("--qa", required=True, help="客户 QA/商品上下文文件")
     parser.add_argument(
@@ -118,15 +118,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "off"),
         default="auto",
         help=(
-            "auto: 仅当第一遍 AI 对 unresolved 字段给出 search_queries 且使用 DashScope Qwen 时，"
-            "追加一次带来源联网搜索；off: 完全不联网。"
+            "auto: 对第一遍仍 unresolved 的非经营字段追加最多一次带来源联网研究；off: 完全不联网。"
         ),
     )
     parser.add_argument("--web-search-model", default="", help="联网阶段模型；默认复用 --model。")
     parser.add_argument(
-        "--web-native-base-url",
-        default="https://dashscope.aliyuncs.com/api/v1",
-        help="DashScope 原生 API base URL，用于返回真实 search sources。",
+        "--web-base-url",
+        default="",
+        help="Responses API base URL；默认复用 --base-url。",
     )
 
     parser.add_argument(
@@ -195,7 +194,7 @@ def _search_requests(decisions: list[Any], fields: list[dict[str, Any]]) -> list
     field_by_id = {field_id(item): item for item in fields}
     output: list[dict[str, Any]] = []
     for decision in decisions:
-        if decision.status not in {MISSING, REVIEW, CONFLICT} or not decision.search_queries:
+        if decision.status not in {MISSING, REVIEW, CONFLICT}:
             continue
         item = field_by_id.get(decision.field_id, {})
         output.append(
@@ -228,7 +227,7 @@ def _dashscope_web_provider(
         DashScopeWebSearchProvider(
             model=args.web_search_model.strip() or config.model,
             api_key=api_key,
-            native_base_url=args.web_native_base_url,
+            base_url=args.web_base_url.strip() or config.base_url,
             request_timeout_seconds=args.request_timeout_seconds,
         ),
         "available",

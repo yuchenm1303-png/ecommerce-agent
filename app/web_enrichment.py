@@ -106,7 +106,7 @@ def _target_decisions(
         field = by_id.get(decision.field_id)
         if field is None or _field_is_business(field):
             continue
-        if decision.status in WEB_UPDATABLE_STATUSES and decision.search_queries:
+        if decision.status in WEB_UPDATABLE_STATUSES:
             output.append((field, decision))
     return output
 
@@ -147,7 +147,7 @@ def _web_prompt(
         "rules": [
             "Use web search only for these target fields; never change fields that were already READY.",
             "Preserve exact product and selected-variant identity; generic model names require extra caution.",
-            "Use each target's search_queries as the research starting point and combine searches when efficient.",
+            "Use each target's search_queries when present; otherwise derive a focused query from exact product identity plus that field. Combine searches when efficient.",
             "READY means web research supports one best answer for the exact current product/variant.",
             "REVIEW means a plausible answer exists but identity, scope or evidence is not strong enough for automatic entry.",
             "If credible explicit web/local values disagree for the same attribute and scope and neither clearly supersedes the other, status MUST be CONFLICT; preserve cited alternatives and never silently choose one.",
