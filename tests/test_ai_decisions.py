@@ -224,3 +224,61 @@ def test_omitted_field_becomes_missing_without_local_semantic_guess(tmp_path):
     )
     validated = validate_ai_decision_packet(packet, [colour, model], sources)
     assert [item.status for item in validated.decisions] == [READY, MISSING]
+
+
+def test_generic_web_model_page_cannot_authorize_ready_for_strong_sku(tmp_path):
+    mic = field("built_in_mic", "Built in Mic")
+    sources = grounding(tmp_path)
+    external_ref = "web-search:generic-m8"
+    external_content = "Search result title: M8 dash cam manual\nSearch evidence: Built in Mic: Yes"
+    packet = AIDecisionPacket(
+        identity=ProductIdentity(sku="237581229555", model_number="M8", brand="other"),
+        schema_sha256=schema_digest([mic]),
+        source_manifest_sha256=source_manifest_digest(sources),
+        decisions=[
+            FieldDecision(
+                field_id=field_id(mic),
+                status=READY,
+                values=["Yes"],
+                citations=[DecisionCitation(external_ref, "Built in Mic: Yes")],
+            )
+        ],
+    )
+    validated = validate_ai_decision_packet(
+        packet,
+        [mic],
+        sources,
+        expected_identity=ProductIdentity(sku="237581229555", model_number="M8", brand="other"),
+        external_sources={external_ref: external_content},
+    )
+    assert validated.decisions[0].status == REVIEW
+    assert "web source identity insufficient" in validated.decisions[0].reason
+
+
+def test_brand_and_model_match_can_authorize_external_ready_without_seller_sku(tmp_path):
+    mic = field("built_in_mic", "Built in Mic")
+    sources = grounding(tmp_path)
+    external_ref = "web-search:exact-product"
+    external_content = "Search result title: ACME ZX900 official manual\nSearch evidence: Built in Mic: Yes"
+    identity = ProductIdentity(sku="237581229555", model_number="ZX900", brand="ACME")
+    packet = AIDecisionPacket(
+        identity=identity,
+        schema_sha256=schema_digest([mic]),
+        source_manifest_sha256=source_manifest_digest(sources),
+        decisions=[
+            FieldDecision(
+                field_id=field_id(mic),
+                status=READY,
+                values=["Yes"],
+                citations=[DecisionCitation(external_ref, "Built in Mic: Yes")],
+            )
+        ],
+    )
+    validated = validate_ai_decision_packet(
+        packet,
+        [mic],
+        sources,
+        expected_identity=identity,
+        external_sources={external_ref: external_content},
+    )
+    assert validated.decisions[0].status == READY
