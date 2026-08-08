@@ -144,19 +144,27 @@ def _gate_unmatched_live_resolution(
 ) -> str | None:
     if question is not None:
         return None
-    if not resolution.eligible_for_autofill and not resolution.preview_eligible:
-        return None
 
     source_type = str(resolution.source_type or "")
-    if source_type in UNMATCHED_LIVE_AUTOFILL_SOURCE_TYPES:
+    # A genuinely explicit seller/config value may authorize an unmatched live
+    # field. Every other unmatched field remains under the unmatched-field gate,
+    # even if semantic scope filtering already reduced a colliding candidate to
+    # MISSING. This preserves the real reason the browser may not use it.
+    if (
+        (resolution.eligible_for_autofill or resolution.preview_eligible)
+        and source_type in UNMATCHED_LIVE_AUTOFILL_SOURCE_TYPES
+    ):
         return None
 
+    prior_detail = str(resolution.detail or "").strip()
     detail = (
-        "实时 Makro 字段未匹配 QA，且候选证据来自 "
-        f"source_type={source_type or 'unknown'}；为避免同名 attribute_key/label 串字段，"
-        "未匹配 live field 只允许 structured/business/config/rule 明确输入自动填写或预览。"
+        "实时 Makro 字段未匹配 QA；为避免同名 attribute_key/label 串字段，"
+        "只允许 structured/business/config/rule 明确输入授权该字段。"
     )
-    resolution.status = NEEDS_REVIEW
+    if source_type:
+        detail += f" 当前候选 source_type={source_type}。"
+    if prior_detail:
+        detail += " " + prior_detail
     resolution.eligible_for_autofill = False
     resolution.preview_eligible = False
     resolution.gate_reason = GATE_UNMATCHED_LIVE_FIELD
