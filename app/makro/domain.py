@@ -5,15 +5,17 @@ Owns all Makro-specific behavior used by the fill CLI:
 - listing-page recognition and vertical guard;
 - section title normalization, discovery, safe open/cancel;
 - semantic field discovery and field locator strategy;
+- product photo upload through the listing's own file input;
 - page validation/readback after filling.
 
-The CLI keeps only policy (which section to fill, dry-run only). No category
-field lists are hard-coded; everything is discovered from the live DOM.
+The CLI keeps policy/orchestration only. No category field lists are hard-coded;
+everything is discovered from the live DOM.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterable
 
 from playwright.sync_api import Page
 
@@ -27,6 +29,7 @@ from .listing import (
     wait_for_authenticated_listing,
 )
 from .locators import selector_for_control
+from .photos import PhotoUploadResult, inspect_product_photos, upload_product_photos
 from .sections import (
     base_section_title,
     find_section,
@@ -137,6 +140,25 @@ class MakroDomainAdapter:
             open_dropdowns=open_dropdowns,
             wait_ms=wait_ms,
             max_scroll_steps=max_scroll_steps,
+        )
+
+    # -- product photos ---------------------------------------------------
+
+    def inspect_product_photos(self) -> dict[str, Any]:
+        """Return non-sensitive DOM metadata for the Product Photos uploader."""
+        return inspect_product_photos(self.page)
+
+    def upload_product_photos(
+        self,
+        image_paths: Iterable[str | Path],
+        *,
+        timeout_ms: int = 30_000,
+    ) -> PhotoUploadResult:
+        """Upload only the exact listing images supplied by the caller."""
+        return upload_product_photos(
+            self.page,
+            image_paths,
+            timeout_ms=timeout_ms,
         )
 
     # -- semantic field discovery / locator / execution -------------------
