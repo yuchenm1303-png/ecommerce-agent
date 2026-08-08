@@ -27,14 +27,16 @@ class FakeProvider:
 
     def extract_json(self, request_payload):
         image_source = next(
-            source
-            for source in request_payload["grounded_sources"]
-            if source["kind"] == "image"
+            (
+                source
+                for source in request_payload["grounded_sources"]
+                if source["kind"] == "image"
+            ),
+            None,
         )
-        return {
-            "extractor": self.name,
-            "product_identity": {"sku": "", "model_number": "", "brand": ""},
-            "facts": [
+        facts = []
+        if image_source is not None:
+            facts.append(
                 {
                     "key": "Screen Size",
                     "aliases": [],
@@ -45,7 +47,11 @@ class FakeProvider:
                     "evidence_text": "Visible printed specification: 3.0 inch.",
                     "note": "",
                 }
-            ],
+            )
+        return {
+            "extractor": self.name,
+            "product_identity": {"sku": "", "model_number": "", "brand": ""},
+            "facts": facts,
             "warnings": [],
         }
 
@@ -108,6 +114,7 @@ def test_provider_neutral_resolver_writes_same_audit_outputs(tmp_path, monkeypat
     assert manifest["provider_config"]["provider"] == "openai-compatible"
     assert manifest["provider_config"]["api_key_env"] == "VENDOR_KEY"
     assert "api_key" not in manifest["provider_config"]
+    assert manifest["customer_context_chars"] > 0
     assert manifest["makro_browser_opened"] is False
     assert manifest["writes_performed"] == 0
     assert manifest["save_clicked"] is False
