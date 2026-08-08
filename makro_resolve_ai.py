@@ -89,6 +89,20 @@ def build_parser() -> argparse.ArgumentParser:
             "服务商明确支持 response_format=json_object 时可选 json_object。"
         ),
     )
+    thinking = parser.add_mutually_exclusive_group()
+    thinking.add_argument(
+        "--enable-thinking",
+        dest="enable_thinking",
+        action="store_true",
+        help="显式开启兼容模型 thinking；结构化 evidence extraction 通常不需要。",
+    )
+    thinking.add_argument(
+        "--disable-thinking",
+        dest="enable_thinking",
+        action="store_false",
+        help="显式关闭兼容模型 thinking 以降低结构化抽取延迟。",
+    )
+    parser.set_defaults(enable_thinking=None)
     parser.add_argument("--qa", required=True, help="客户 Question/Answer .xlsx/.xlsm/.csv")
     parser.add_argument(
         "--live-schema",
@@ -199,6 +213,7 @@ def _provider_config(args: argparse.Namespace) -> ProviderConfig:
             max_output_tokens=args.max_output_tokens,
             structured_mode=args.structured_mode,
             request_timeout_seconds=args.request_timeout_seconds,
+            enable_thinking=args.enable_thinking,
         )
     )
 
@@ -307,6 +322,7 @@ def main() -> int:
     print("===== GROUNDED AI SOURCE-FIRST RESOLUTION =====", flush=True)
     print(
         f"provider={provider_config.provider}, model={provider_config.model}, "
+        f"thinking={provider_config.enable_thinking}, "
         f"pending_questions={len(pending.questions)}, logical_sources={grounding.logical_source_count}, "
         f"citation_chunks={len(grounding.sources)}, source_concurrency={args.source_concurrency}",
         flush=True,
