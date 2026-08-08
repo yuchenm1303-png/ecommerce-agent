@@ -18,34 +18,34 @@ from .ai_decisions import (
     validate_ai_decision_packet,
 )
 from .business_fields import is_business_question
-from .evidence_contract import ProductIdentity
-from .product_profile import JSONTaskProvider, ProductProfile, profile_digest
+from .product_profile import JSONTaskProvider, ProductFact, ProductProfile, profile_digest
 from .semantic_grounding import GroundingCatalog
 
 
-FIELD_MAPPING_CONTRACT_VERSION = 1
-FIELD_MAPPING_CACHE_VERSION = 1
+FIELD_MAPPING_CONTRACT_VERSION = 2
+FIELD_MAPPING_CACHE_VERSION = 2
 
 
 MAPPING_SYSTEM_INSTRUCTION = (
     "You map a compact, already-grounded product profile into marketplace fields. "
-    "Do not reinterpret raw images or browse the web. Product semantics, translation, synonym matching, "
-    "counting, option matching and scope judgment are your job. Preserve conflicts from the profile. "
+    "Do not invent, rename or reclassify product facts. Use only facts explicitly present in PRODUCT_PROFILE. "
+    "Translation, synonym matching and marketplace option matching are allowed, but scope must remain unchanged. "
     "Return compact JSON only."
 )
 
 MAPPING_RULES = [
     "Answer only the supplied target field_id values.",
-    "READY requires one strongly supported profile answer and at least one underlying original citation copied from the profile.",
-    "REVIEW means a plausible candidate exists but product identity, scope or evidence is insufficient for automatic entry.",
+    "READY requires one strongly supported profile answer, at least one underlying original citation copied from the profile, and one or more profile_fact_ids that directly support this exact target meaning and scope.",
+    "If no profile fact directly supports the target meaning/scope, return REVIEW or MISSING; do not stretch a generic feature into a specialized marketplace field.",
+    "REVIEW means a plausible mapping exists but the profile does not establish the exact target semantics or scope strongly enough for automatic entry.",
     "CONFLICT means the profile contains credible conflicting candidates for the same target scope; preserve at least two cited alternatives and never choose one silently.",
     "MISSING means the profile cannot answer this field. Do not invent a value.",
     "Never infer No/False/Not included from absence. Negative values need explicit negative evidence in the profile.",
     "Keep packaging dimensions/weight separate from product-body dimensions/weight; cabin/interior is not rear/back; manual language is not device UI language; product brand is not compatible vehicle brand.",
-    "Use exact marketplace option text when target options clearly match the profile fact.",
-    "If multi_value=false, return one string in values. Combine several supported free-text features into one concise string only when the field itself is a free-text summary.",
+    "Use exact marketplace option text when target options clearly match the cited profile fact.",
+    "If multi_value=false, return one string in values. Combine several supported free-text features into one concise string only when every included feature directly belongs to that field meaning.",
     "If qualifier_options exist, put the value/magnitude only in values and the exact unit once in qualifier.",
-    "Citations must use the underlying original source_reference values embedded inside the product profile, never the derived profile source_id.",
+    "Citations must use the underlying original source_reference values embedded inside the cited profile facts, never the derived profile source_id.",
     "Do not use external web knowledge.",
 ]
 
@@ -71,6 +71,7 @@ MAPPING_JSON_SCHEMA: dict[str, Any] = {
                     "alternatives": {"type": "array"},
                     "reason": {"type": "string"},
                     "search_queries": {"type": "array", "items": {"type": "string"}},
+                    "profile_fact_ids": {"type": "array", "items": {"type": "string"}},
                 },
             },
         },
@@ -82,7 +83,9 @@ MAPPING_JSON_SCHEMA: dict[str, Any] = {
 
 def _field_is_business(field: dict[str, Any]) -> bool:
     contract = field_contract(field)
-    return is_business_question(contract["attribute_key"]) or is_business_question(contract["label"])
+    return is_business_question(contract["attribute_key"]) or is_business_question(
+        contract["label"]
+    )
 
 
 def _target_payload(field: dict[str, Any]) -> dict[str, Any]:
@@ -104,6 +107,23 @@ def _target_payload(field: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def profile_fact_id(fact: ProductFact) -> str:
+    raw = json.dumps(
+        fact.as_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "pf_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _profile_facts(profile: ProductProfile) -> list[dict[str, Any]]:
+    return [
+        {"fact_id": profile_fact_id(fact), **fact.as_dict()}
+        for fact in profile.facts
+    ]
+
+
 def _profile_source(profile: ProductProfile) -> dict[str, Any]:
     return {
         "source_id": "product-profile:derived",
@@ -113,7 +133,7 @@ def _profile_source(profile: ProductProfile) -> dict[str, Any]:
         "content": json.dumps(
             {
                 "summary": profile.summary,
-                "facts": [fact.as_dict() for fact in profile.facts],
+                "facts": _profile_facts(profile),
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -130,7 +150,8 @@ def build_field_mapping_request(
         "task": "map_product_profile_to_marketplace_fields",
         "system_instruction": MAPPING_SYSTEM_INSTRUCTION,
         "prompt_instruction": (
-            "Map this small target-field batch from the compact product profile. "
+            "Map this small target-field batch from PRODUCT_PROFILE only. "
+            "For every READY decision include profile_fact_ids copied exactly from PRODUCT_PROFILE. "
             "Return one decision for each target field and no prose outside JSON."
         ),
         "product_identity": {
@@ -178,6 +199,35 @@ def _cache_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _enforce_profile_fact_refs(
+    raw_decisions: list[Any],
+    profile: ProductProfile,
+) -> list[dict[str, Any]]:
+    allowed = {profile_fact_id(fact) for fact in profile.facts}
+    output: list[dict[str, Any]] = []
+    for raw in raw_decisions:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        if str(item.get("status") or "").strip().casefold() == "ready":
+            raw_ids = item.get("profile_fact_ids") or []
+            ids = (
+                [str(value).strip() for value in raw_ids if str(value).strip()]
+                if isinstance(raw_ids, list)
+                else []
+            )
+            if not ids or any(value not in allowed for value in ids):
+                item["status"] = "review"
+                reason = str(item.get("reason") or "").strip()
+                guard = (
+                    "READY rejected: missing or invalid profile_fact_ids; "
+                    "local mapping may only use explicit Product Profile facts."
+                )
+                item["reason"] = f"{reason} | {guard}".strip(" |")
+        output.append(item)
+    return output
+
+
 @dataclass(slots=True)
 class _BatchRun:
     index: int
@@ -201,7 +251,9 @@ def _run_batch(
     cache_path = cache_dir / f"field-map-{key}.json" if cache_dir is not None else None
     if cache_path is not None and cache_path.is_file():
         try:
-            cached = AIDecisionPacket.from_mapping(json.loads(cache_path.read_text(encoding="utf-8")))
+            cached = AIDecisionPacket.from_mapping(
+                json.loads(cache_path.read_text(encoding="utf-8"))
+            )
             validated = validate_ai_decision_packet(
                 cached,
                 batch_fields,
@@ -217,14 +269,14 @@ def _run_batch(
         raw_decisions = raw.get("decisions") if isinstance(raw, dict) else None
         if not isinstance(raw_decisions, list):
             raise ValueError("field mapping AI output 缺少 decisions 数组")
+        guarded = _enforce_profile_fact_refs(raw_decisions, profile)
         packet = AIDecisionPacket(
             identity=profile.identity,
             schema_sha256=schema_digest(batch_fields),
             source_manifest_sha256=source_manifest_digest(grounding),
             decisions=[
                 FieldDecision.from_mapping(item, index=index)
-                for index, item in enumerate(raw_decisions, start=1)
-                if isinstance(item, dict)
+                for index, item in enumerate(guarded, start=1)
             ],
             model_summary=str(raw.get("model_summary") or "").strip(),
             warnings=[],
@@ -248,13 +300,22 @@ def _run_batch(
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        temp.write_text(json.dumps(validated.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.write_text(
+            json.dumps(validated.as_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         temp.replace(cache_path)
     return _BatchRun(batch_index, validated.decisions, 1, False)
 
 
-def _mechanical_batches(fields: list[dict[str, Any]], batch_size: int) -> list[list[dict[str, Any]]]:
-    return [fields[index : index + batch_size] for index in range(0, len(fields), batch_size)]
+def _mechanical_batches(
+    fields: list[dict[str, Any]],
+    batch_size: int,
+) -> list[list[dict[str, Any]]]:
+    return [
+        fields[index : index + batch_size]
+        for index in range(0, len(fields), batch_size)
+    ]
 
 
 @dataclass(slots=True)
@@ -292,7 +353,10 @@ def run_field_mapping(
     runs: list[_BatchRun] = []
     if batches:
         workers = min(int(concurrency), len(batches))
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="field-map") as executor:
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="field-map",
+        ) as executor:
             futures = {
                 executor.submit(
                     _run_batch,
@@ -322,7 +386,7 @@ def run_field_mapping(
         schema_sha256=schema_digest(field_list),
         source_manifest_sha256=source_manifest_digest(grounding),
         decisions=decisions,
-        model_summary="Mapped Makro live fields from cached compact product profile.",
+        model_summary="Mapped Makro live fields from compact Product Profile facts.",
         warnings=warnings,
         extractor=f"{profile.extractor}+parallel-field-mapping".strip("+"),
     )
