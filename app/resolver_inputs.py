@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .evidence_contract import EvidencePacket, ProductIdentity, bundle_from_evidence_packet
 from .evidence_pipeline import (
+    add_fact,
     bundle_from_catalog_answers,
     bundle_from_facts_json,
     bundle_from_key_value_text,
@@ -249,12 +250,11 @@ def build_resolution_inputs(
 ) -> ResolutionInputResult:
     """Load every explicit evidence source through one shared safety boundary.
 
-    Customer workbook preamble is retained as source context. Evidence packets
-    that contain builder-generated grounded source ids are *revalidated against
-    the exact current images/snapshots/customer text* before entering the bundle.
-    This prevents a historically valid semantic packet from being replayed after
-    the underlying product sources changed. Generic packets without grounded
-    source ids continue through the ordinary EvidencePacket validation contract.
+    Customer workbook preamble is retained as source context. Explicit ``sku``
+    is seller-controlled input, so it becomes structured business evidence for
+    the live SKU field as well as an identity guard. Evidence packets containing
+    grounded source ids are rebound to the exact current source universe before
+    they are allowed into a browser Fill Plan.
     """
 
     customer_context = customer_context_for_resolution(catalog, spec)
@@ -268,6 +268,20 @@ def build_resolution_inputs(
         )
     ]
     warnings: list[str] = []
+
+    if spec.sku.strip():
+        explicit_sku = ProductSourceBundle(sku=spec.sku.strip())
+        add_fact(
+            explicit_sku,
+            key="SKU",
+            value=spec.sku.strip(),
+            source_type="business",
+            source_reference="runtime:--sku",
+            confidence=1.0,
+            evidence_text=f"SKU={spec.sku.strip()}",
+            note="explicit seller-controlled SKU supplied to the resolver command",
+        )
+        trusted_bundles.append(explicit_sku)
 
     if spec.product_table:
         trusted_bundles.append(
