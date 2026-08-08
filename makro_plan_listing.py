@@ -1,9 +1,13 @@
-"""Build a read-only Makro Fill Plan from an AI field-decision packet.
+"""Read-only Makro live-schema scanner and AI-decision Fill Plan builder.
 
-The model already resolved product semantics. This planner only rebinds the
-packet to the exact current product sources, verifies live-schema stability and
-applies deterministic marketplace/browser constraints. It never fills, saves or
-submits the listing.
+One CLI owns both read-only phases:
+
+- ``--scan-live-schema`` discovers the current live Makro fields before AI runs.
+- ``--decision-packet`` rebinds a completed AI decision packet to the same source
+  pack, verifies the current page still matches ``--live-schema``, and writes the
+  final Fill Plan.
+
+Neither mode fills, saves, uploads or submits the listing.
 """
 
 from __future__ import annotations
@@ -33,11 +37,22 @@ from app.semantic_grounding import build_grounding_catalog
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="只读扫描当前 Makro listing，验证 AI decisions 并生成真实字段级 Fill Plan。"
+        description=(
+            "只读 Makro planner：首次扫描 live schema，或验证 AI decisions 并生成 Fill Plan。"
+        )
     )
-    parser.add_argument("--qa", required=True)
-    parser.add_argument("--decision-packet", required=True, help="makro_resolve_ai.py 生成的 ai-decisions.json")
-    parser.add_argument("--live-schema", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--scan-live-schema",
+        action="store_true",
+        help="首次只读扫描当前 Makro 页面并导出 live-schema.json。",
+    )
+    mode.add_argument(
+        "--decision-packet",
+        help="makro_resolve_ai.py 生成的 ai-decisions.json；用于最终只读 Fill Plan。",
+    )
+    parser.add_argument("--qa", default=None, help="最终 Fill Plan/rebind 模式必填；scan 模式不需要。")
+    parser.add_argument("--live-schema", default=None, help="最终 Fill Plan 模式必填。")
     parser.add_argument("--sku", default="")
     parser.add_argument("--expected-model", default="")
     parser.add_argument("--expected-brand", default="")
@@ -58,6 +73,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overlap-chars", type=int, default=250)
     parser.add_argument("--output-dir", default="logs/makro-fill-plan")
     return parser
+
+
+def _validate_mode(args: argparse.Namespace) -> None:
+    if args.scan_live_schema:
+        if args.live_schema:
+            raise SystemExit("--scan-live-schema 不接受 --live-schema；它本身就是生成 live schema。")
+        return
+    if not args.qa:
+        raise SystemExit("最终 Fill Plan 模式必须提供 --qa。")
+    if not args.live_schema:
+        raise SystemExit("最终 Fill Plan 模式必须提供 --live-schema。")
 
 
 def _input_spec(args: argparse.Namespace) -> ResolutionInputSpec:
@@ -102,31 +128,54 @@ def _assert_no_unsaved_section(adapter: MakroDomainAdapter) -> None:
         )
 
 
+def _scan_live_fields(
+    adapter: MakroDomainAdapter,
+    *,
+    wait_ms: int,
+    max_scroll_steps: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], int]:
+    sections_payload, flat_controls, scan_stats = adapter.scan_sections(
+        include_values=False,
+        wait_ms=wait_ms,
+        max_scroll_steps=max_scroll_steps,
+    )
+    all_semantic_fields = adapter.build_semantic_fields(flat_controls)
+    semantic_fields = [
+        field for field in all_semantic_fields if is_listing_attribute_field(field)
+    ]
+    return semantic_fields, sections_payload, scan_stats, len(all_semantic_fields)
+
+
 def main() -> int:
     args = build_parser().parse_args()
+    _validate_mode(args)
     if args.max_text_chars < 500:
         raise SystemExit("--max-text-chars 不能小于 500")
     if args.overlap_chars < 0 or args.overlap_chars >= args.max_text_chars:
         raise SystemExit("--overlap-chars 必须 >=0 且小于 --max-text-chars")
 
-    customer_catalog = load_question_catalog(args.qa)
-    planned_live_fields = load_live_schema(args.live_schema)
-    spec = _input_spec(args)
-    product_context = build_ai_product_context(customer_catalog, spec)
-    grounding = build_grounding_catalog(
-        image_paths=args.image,
-        supplier_snapshots=args.supplier_snapshot,
-        official_snapshots=args.official_snapshot,
-        supplemental_text=product_context.text,
-        max_text_chars=args.max_text_chars,
-        overlap_chars=args.overlap_chars,
-    )
-    decision_packet = load_ai_decision_packet(
-        args.decision_packet,
-        planned_live_fields,
-        grounding,
-        expected_identity=product_context.trusted_inputs.expected_identity,
-    )
+    decision_packet = None
+    product_context = None
+    planned_live_fields: list[dict[str, Any]] | None = None
+    if not args.scan_live_schema:
+        customer_catalog = load_question_catalog(args.qa)
+        planned_live_fields = load_live_schema(args.live_schema)
+        spec = _input_spec(args)
+        product_context = build_ai_product_context(customer_catalog, spec)
+        grounding = build_grounding_catalog(
+            image_paths=args.image,
+            supplier_snapshots=args.supplier_snapshot,
+            official_snapshots=args.official_snapshot,
+            supplemental_text=product_context.text,
+            max_text_chars=args.max_text_chars,
+            overlap_chars=args.overlap_chars,
+        )
+        decision_packet = load_ai_decision_packet(
+            args.decision_packet,
+            planned_live_fields,
+            grounding,
+            expected_identity=product_context.trusted_inputs.expected_identity,
+        )
 
     with sync_playwright() as playwright:
         harness = EdgeHarness(
@@ -152,27 +201,59 @@ def main() -> int:
         adapter.assert_expected_vertical(args.expected_vertical)
         _assert_no_unsaved_section(adapter)
 
-        sections_payload, flat_controls, scan_stats = adapter.scan_sections(
-            include_values=False,
+        semantic_fields, sections_payload, scan_stats, all_field_count = _scan_live_fields(
+            adapter,
             wait_ms=args.scroll_wait_ms,
             max_scroll_steps=args.max_scroll_steps,
         )
-        all_semantic_fields = adapter.build_semantic_fields(flat_controls)
-        semantic_fields = [
-            field for field in all_semantic_fields if is_listing_attribute_field(field)
-        ]
-        assert_live_schema_matches(planned_live_fields, semantic_fields)
 
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        output_dir = Path(args.output_dir) / (
+            f"live-scan-{stamp}" if args.scan_live_schema else f"plan-{stamp}"
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        live_schema_path = write_live_schema(semantic_fields, output_dir / "live-schema.json")
+
+        if args.scan_live_schema:
+            manifest = output_dir / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "mode": "read_only_live_schema_scan",
+                        "page_url": page.url,
+                        "expected_vertical": args.expected_vertical,
+                        "live_schema": str(live_schema_path.resolve()),
+                        "semantic_fields_before_filter": all_field_count,
+                        "listing_attribute_fields": len(semantic_fields),
+                        "scan": scan_stats,
+                        "sections": [item.get("title") for item in sections_payload],
+                        "writes_performed": 0,
+                        "save_clicked": False,
+                        "send_to_qc_clicked": False,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            print("===== MAKRO LIVE SCHEMA SCAN =====")
+            print(f"page={page.url}")
+            print(f"live_fields={len(semantic_fields)}")
+            print(f"Live schema={live_schema_path.resolve()}")
+            print(f"Manifest={manifest.resolve()}")
+            print("只读完成：没有 AI、没有填写字段、没有 Save、没有 Send to QC。")
+            return 0
+
+        assert planned_live_fields is not None
+        assert decision_packet is not None
+        assert product_context is not None
+        assert_live_schema_matches(planned_live_fields, semantic_fields)
         plan = build_live_fill_plan(
             decision_packet,
             semantic_fields,
             product_context.trusted_inputs.bundle,
         )
 
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        output_dir = Path(args.output_dir) / f"plan-{stamp}"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        live_schema_path = write_live_schema(semantic_fields, output_dir / "live-schema.json")
         json_path = write_fill_plan_json(plan, output_dir / "fill-plan.json")
         xlsx_path = write_fill_plan_xlsx(plan, output_dir / "fill-plan.xlsx")
         manifest = output_dir / "manifest.json"
@@ -187,7 +268,7 @@ def main() -> int:
                     "input_live_schema": str(Path(args.live_schema).resolve()),
                     "output_live_schema": str(live_schema_path.resolve()),
                     "live_schema_verified": True,
-                    "semantic_fields_before_filter": len(all_semantic_fields),
+                    "semantic_fields_before_filter": all_field_count,
                     "listing_attribute_fields": len(semantic_fields),
                     "scan": scan_stats,
                     "sections": [item.get("title") for item in sections_payload],
