@@ -6,8 +6,18 @@ import mimetypes
 from pathlib import Path
 from typing import Any
 
+from .errors import JSONTaskProviderError, JSONTaskResponseError, JSONTaskTransportError
 
-class OpenAICompatibleProviderError(RuntimeError):
+
+class OpenAICompatibleProviderError(JSONTaskProviderError):
+    pass
+
+
+class OpenAICompatibleTransportError(JSONTaskTransportError, OpenAICompatibleProviderError):
+    pass
+
+
+class OpenAICompatibleResponseError(JSONTaskResponseError, OpenAICompatibleProviderError):
     pass
 
 
@@ -105,10 +115,10 @@ def _message_content(request_payload: dict[str, Any], *, image_detail: str) -> l
 def _extract_message_text(response: Any) -> str:
     choices = getattr(response, "choices", None)
     if not choices:
-        raise OpenAICompatibleProviderError("OpenAI-compatible API 没有返回 choices。")
+        raise OpenAICompatibleResponseError("OpenAI-compatible API 没有返回 choices。")
     message = getattr(choices[0], "message", None)
     if message is None:
-        raise OpenAICompatibleProviderError("OpenAI-compatible API choice 缺少 message。")
+        raise OpenAICompatibleResponseError("OpenAI-compatible API choice 缺少 message。")
     content = getattr(message, "content", "")
     if isinstance(content, str):
         return content.strip()
@@ -145,7 +155,7 @@ def _extract_stream_text(stream: Any) -> str:
 def _parse_json_object(text: str) -> dict[str, Any]:
     raw = text.strip()
     if not raw:
-        raise OpenAICompatibleProviderError("OpenAI-compatible API 返回空文本。")
+        raise OpenAICompatibleResponseError("OpenAI-compatible API 返回空文本。")
     candidates = [raw]
     if raw.startswith("```") and raw.endswith("```"):
         lines = raw.splitlines()
@@ -161,7 +171,7 @@ def _parse_json_object(text: str) -> dict[str, Any]:
             continue
         if isinstance(payload, dict):
             return payload
-    raise OpenAICompatibleProviderError("OpenAI-compatible API 未返回可解析的 JSON object。")
+    raise OpenAICompatibleResponseError("OpenAI-compatible API 未返回可解析的 JSON object。")
 
 
 class OpenAICompatibleSemanticProvider:
@@ -232,7 +242,10 @@ class OpenAICompatibleSemanticProvider:
             "messages": [
                 {
                     "role": "system",
-                    "content": str(request_payload.get("system_instruction") or "You execute the supplied JSON task."),
+                    "content": str(
+                        request_payload.get("system_instruction")
+                        or "You execute the supplied JSON task."
+                    ),
                 },
                 {
                     "role": "user",
@@ -255,7 +268,9 @@ class OpenAICompatibleSemanticProvider:
         try:
             response = self.client.chat.completions.create(**kwargs)
         except Exception as exc:
-            raise OpenAICompatibleProviderError(f"OpenAI-compatible JSON task 调用失败：{exc}") from exc
+            raise OpenAICompatibleTransportError(
+                f"OpenAI-compatible JSON task 调用失败：{exc}"
+            ) from exc
 
         output_text = _extract_stream_text(response) if streaming else _extract_message_text(response)
         payload = _parse_json_object(output_text)
