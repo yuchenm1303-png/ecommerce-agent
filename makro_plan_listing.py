@@ -1,9 +1,10 @@
 """Build a live Makro fill plan without writing any field.
 
-The command joins three separated layers:
-1. current Makro DOM discovery,
-2. customer QA -> live-field deterministic matching,
-3. evidence-grounded answer resolution.
+The command joins four layers:
+1. current Makro DOM discovery and live-schema contract,
+2. customer QA + extra non-business live fields,
+3. evidence-grounded answer resolution,
+4. deterministic QA/live matching.
 
 It produces a field-by-field READY/BLOCKED report and never fills, saves or
 submits the listing. This is the final audit boundary before real browser writes.
@@ -21,8 +22,15 @@ from playwright.sync_api import sync_playwright
 
 from app.alias_config import load_alias_config
 from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness
+from app.evidence_validation import is_business_question
 from app.fill_plan import build_live_fill_plan
 from app.fill_plan_report import write_fill_plan_json, write_fill_plan_xlsx
+from app.live_schema import (
+    assert_live_schema_matches,
+    augment_catalog_with_live_fields,
+    load_live_schema,
+    write_live_schema,
+)
 from app.makro import MAKRO_HOME_URL, is_listing_url
 from app.makro.direct_visual_hold import is_listing_attribute_field
 from app.makro.domain import MakroDomainAdapter
@@ -34,7 +42,7 @@ from app.resolver_inputs import ResolutionInputSpec, build_resolution_inputs
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="只读扫描当前 Makro listing，生成真实字段级 READY/BLOCKED 填写计划。"
+        description="只读扫描当前 Makro listing，生成 live schema 与真实字段级 READY/BLOCKED 填写计划。"
     )
     parser.add_argument("--qa", required=True)
     parser.add_argument("--sku", default="")
@@ -50,6 +58,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image", action="append", default=[])
     parser.add_argument("--product-url", default=None)
     parser.add_argument("--expected-vertical", required=True)
+    parser.add_argument(
+        "--live-schema",
+        default=None,
+        help=(
+            "可选：前一次只读 planner 导出的 live-schema.json。提供后会先把 QA 扩展到"
+            "缺失的非经营 live fields，并在本轮扫描后校验页面 schema 没有漂移。"
+        ),
+    )
     parser.add_argument(
         "--alias-config",
         default=None,
@@ -122,6 +138,16 @@ def main() -> int:
             raise SystemExit(f"--{name} 必须在 0..1")
 
     catalog = load_question_catalog(args.qa)
+    schema_warnings: list[str] = []
+    planned_live_fields: list[dict[str, Any]] | None = None
+    if args.live_schema:
+        planned_live_fields = load_live_schema(args.live_schema)
+        catalog, schema_warnings = augment_catalog_with_live_fields(
+            catalog,
+            planned_live_fields,
+            business_locked=is_business_question,
+        )
+
     input_result = build_resolution_inputs(catalog, _input_spec(args))
     policy = ResolutionPolicy(
         auto_fill_min_confidence=args.auto_fill_min_confidence,
@@ -167,6 +193,9 @@ def main() -> int:
             field for field in all_semantic_fields if is_listing_attribute_field(field)
         ]
 
+        if planned_live_fields is not None:
+            assert_live_schema_matches(planned_live_fields, semantic_fields)
+
         plan = build_live_fill_plan(
             catalog,
             semantic_fields,
@@ -179,6 +208,7 @@ def main() -> int:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         output_dir = Path(args.output_dir) / f"plan-{stamp}"
         output_dir.mkdir(parents=True, exist_ok=True)
+        live_schema_path = write_live_schema(semantic_fields, output_dir / "live-schema.json")
         json_path = write_fill_plan_json(plan, output_dir / "fill-plan.json")
         xlsx_path = write_fill_plan_xlsx(plan, output_dir / "fill-plan.xlsx")
         manifest = output_dir / "manifest.json"
@@ -189,6 +219,11 @@ def main() -> int:
                     "page_url": page.url,
                     "expected_vertical": args.expected_vertical,
                     "qa_source": str(Path(args.qa).resolve()),
+                    "input_live_schema": str(Path(args.live_schema).resolve()) if args.live_schema else None,
+                    "output_live_schema": str(live_schema_path.resolve()),
+                    "live_schema_verified": planned_live_fields is not None,
+                    "live_schema_warnings": schema_warnings,
+                    "effective_question_count": len(catalog.questions),
                     "alias_config": alias_config.source_path if alias_config else None,
                     "alias_count": len(alias_config.aliases) if alias_config else 0,
                     "section_override_count": len(alias_config.sections) if alias_config else 0,
@@ -214,6 +249,7 @@ def main() -> int:
         summary = plan.summary()
         print("===== MAKRO LIVE FILL PLAN =====")
         print(f"page={page.url}")
+        print(f"effective_questions={len(catalog.questions)}")
         print(
             f"live_fields={summary['live_field_count']}, ready={summary['ready']}, "
             f"preview_eligible={summary['preview_eligible']}, blocked={summary['blocked']}"
@@ -232,6 +268,7 @@ def main() -> int:
                 f"alias_config={alias_config.source_path} "
                 f"aliases={len(alias_config.aliases)} sections={len(alias_config.sections)}"
             )
+        print(f"Live schema={live_schema_path.resolve()}")
         print(f"JSON={json_path.resolve()}")
         print(f"XLSX={xlsx_path.resolve()}")
         print(f"Manifest={manifest.resolve()}")
