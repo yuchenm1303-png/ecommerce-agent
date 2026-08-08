@@ -5,6 +5,11 @@ untrusted candidate JSON which must pass the same grounded evidence, identity,
 business-field, confidence and conflict checks before the Answer Resolver can
 mark a field eligible for autofill.
 
+When ``--live-schema`` is supplied, the customer QA is conservatively augmented
+with uniquely addressable non-business fields discovered from the real Makro
+page. This closes the gap where Makro-required package/product fields were not
+present in the customer's spreadsheet.
+
 This command never opens Makro and never writes listing fields.
 """
 
@@ -18,7 +23,8 @@ from pathlib import Path
 from app.evidence_contract import bundle_from_evidence_packet
 from app.evidence_io import write_evidence_packet
 from app.evidence_pipeline import merge_bundles
-from app.evidence_validation import validate_evidence_packet
+from app.evidence_validation import is_business_question, validate_evidence_packet
+from app.live_schema import augment_catalog_with_live_fields, load_live_schema
 from app.providers.registry import (
     ProviderConfig,
     ProviderConfigurationError,
@@ -43,7 +49,7 @@ from app.semantic_grounding import build_grounding_catalog
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "从客户 QA + 图片 + 已捕获网页 + 结构化资料生成可审计答案报告；"
+            "从客户 QA + Makro live schema + 图片 + 已捕获网页 + 结构化资料生成可审计答案报告；"
             "AI provider 可替换，但统一经过 EvidencePacket/Resolver 安全门；"
             "绝不打开或修改 Makro。"
         )
@@ -75,6 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--qa", required=True, help="客户 Question/Answer .xlsx/.xlsm/.csv")
+    parser.add_argument(
+        "--live-schema",
+        default=None,
+        help="read-only planner 导出的 live-schema.json；用于追加客户 QA 中没有的非经营 Makro 字段。",
+    )
     parser.add_argument("--sku", default="")
     parser.add_argument("--expected-model", default="")
     parser.add_argument("--expected-brand", default="")
@@ -156,19 +167,27 @@ def main() -> int:
     if args.overlap_chars < 0 or args.overlap_chars >= args.max_text_chars:
         raise SystemExit("--overlap-chars 必须 >=0 且小于 --max-text-chars")
 
-    catalog = load_question_catalog(args.qa)
-    supplemental_text = _read_supplemental_text(args)
+    base_catalog = load_question_catalog(args.qa)
+    catalog = base_catalog
+    live_schema_warnings: list[str] = []
+    live_fields: list[dict] = []
+    if args.live_schema:
+        live_fields = load_live_schema(args.live_schema)
+        catalog, live_schema_warnings = augment_catalog_with_live_fields(
+            base_catalog,
+            live_fields,
+            business_locked=is_business_question,
+        )
 
+    supplemental_text = _read_supplemental_text(args)
     base_inputs = build_resolution_inputs(
         catalog,
         _base_input_spec(args, supplemental_text),
     )
 
-    # The QA workbook preamble is real customer source context (often exact SKU,
-    # selected variant, memory-card option, supplier URL and instructions). The
-    # shared resolver-input loader retains it in bundle.supplemental_text, so the
-    # semantic model must receive that same source universe rather than silently
-    # seeing only command-line supplemental text.
+    # The workbook preamble is customer source context (SKU, exact selected
+    # variant, supplier URL, notes). The live schema only adds questions; it does
+    # not become product evidence itself.
     grounded_text = base_inputs.bundle.supplemental_text
     grounding = build_grounding_catalog(
         image_paths=args.image,
@@ -270,6 +289,12 @@ def main() -> int:
             {
                 "mode": "browser_free_grounded_pluggable_ai_resolution",
                 "qa_source": str(Path(args.qa).resolve()),
+                "live_schema": str(Path(args.live_schema).resolve()) if args.live_schema else None,
+                "base_question_count": len(base_catalog.questions),
+                "effective_question_count": len(catalog.questions),
+                "live_extra_question_count": len(catalog.questions) - len(base_catalog.questions),
+                "live_schema_warning_count": len(live_schema_warnings),
+                "live_schema_warnings": live_schema_warnings,
                 "identity_guard": {
                     "sku": identity.sku,
                     "model_number": identity.model_number,
@@ -302,9 +327,10 @@ def main() -> int:
         f"api_key_env={provider_config.api_key_env}"
     )
     print(
-        f"questions={summary['total']}, resolved={summary['resolved']}, "
-        f"needs_review={summary['needs_review']}, conflict={summary['conflict']}, "
-        f"missing={summary['missing']}"
+        f"questions={summary['total']} (base={len(base_catalog.questions)}, "
+        f"live_extra={len(catalog.questions) - len(base_catalog.questions)}), "
+        f"resolved={summary['resolved']}, needs_review={summary['needs_review']}, "
+        f"conflict={summary['conflict']}, missing={summary['missing']}"
     )
     print(
         f"eligible_for_autofill={summary['eligible_for_autofill']}, "
