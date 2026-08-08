@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from app.ai_decisions import AIDecisionError, build_ai_resolution_request, run_ai_resolution
+from app.ai_decisions import AIDecisionError, run_ai_resolution
 from app.evidence_contract import ProductIdentity
 from app.providers.errors import JSONTaskResponseError, JSONTaskTransportError
 from app.semantic_grounding import GroundedSource, GroundingCatalog, TEXT_KIND
@@ -61,30 +61,19 @@ class RepairableResponseProvider:
             raise JSONTaskResponseError("invalid JSON envelope")
         target = request_payload["target_fields"][0]
         return {
-            "contract_version": 1,
-            "product_identity": request_payload["product_identity"],
-            "schema_sha256": request_payload["schema_sha256"],
-            "source_manifest_sha256": request_payload["source_manifest_sha256"],
             "decisions": [
                 {
                     "field_id": target["field_id"],
                     "status": "ready",
                     "values": ["Black"],
-                    "qualifier": "",
-                    "confidence": 0.95,
                     "citations": [
                         {
                             "source_reference": "supplier:001:text:0001:test",
                             "evidence_text": "Colour: Black",
                         }
                     ],
-                    "alternatives": [],
-                    "reason": "supported",
-                    "search_queries": [],
                 }
-            ],
-            "model_summary": "ok",
-            "warnings": [],
+            ]
         }
 
 
@@ -101,7 +90,19 @@ def test_transport_failure_never_triggers_semantic_repair(tmp_path):
     assert provider.calls == 1
 
 
-def test_received_invalid_response_may_receive_one_structural_repair(tmp_path):
+def test_invalid_response_does_not_rerun_whole_product_by_default(tmp_path):
+    provider = RepairableResponseProvider()
+    with pytest.raises(AIDecisionError, match="structural validation"):
+        run_ai_resolution(
+            provider,
+            [_field()],
+            _grounding(tmp_path),
+            expected_identity=ProductIdentity(sku="SKU-1"),
+        )
+    assert provider.calls == 1
+
+
+def test_explicit_diagnostic_mode_may_receive_one_structural_repair(tmp_path):
     provider = RepairableResponseProvider()
     result = run_ai_resolution(
         provider,
