@@ -83,6 +83,18 @@ _STORAGE_CAPACITY_FIELD_NAMES = {
     "memorycapacitygb",
 }
 _PRODUCT_DIMENSION_FIELD_NAMES = {"width", "depth", "height"}
+_VEHICLE_BRAND_FIELD_NAMES = {"vehiclebrand", "compatiblevehiclebrand"}
+_LANGUAGES_SUPPORTED_FIELD_NAMES = {
+    "languagessupported",
+    "supportedlanguages",
+    "language",
+}
+_CAMERA_TYPE_FIELD_NAMES = {"cameratype", "camerausage", "typeofcamera"}
+_SD_CARD_INCLUDED_FIELD_NAMES = {
+    "sdcardincluded",
+    "memorycardincluded",
+    "tfcardincluded",
+}
 _PACKAGE_EVIDENCE_MARKERS = (
     "package",
     "packaging",
@@ -93,6 +105,66 @@ _PACKAGE_EVIDENCE_MARKERS = (
     "包装",
     "包装尺寸",
     "包装规格",
+)
+_VEHICLE_CONTEXT_MARKERS = (
+    "vehicle",
+    "car brand",
+    "compatible car",
+    "compatible vehicle",
+    "适用车型",
+    "适用车辆",
+    "车辆品牌",
+    "汽车品牌",
+)
+_MANUAL_MARKERS = ("manual", "instruction book", "instructions", "说明书", "使用说明")
+_UI_LANGUAGE_MARKERS = (
+    "ui",
+    "user interface",
+    "menu language",
+    "system language",
+    "device language",
+    "界面",
+    "菜单语言",
+    "系统语言",
+    "设备语言",
+)
+_REVERSE_FUNCTION_MARKERS = (
+    "reverse assist",
+    "reversing image",
+    "reverse image",
+    "倒车影像",
+    "倒车辅助",
+)
+_EXPLICIT_REAR_CAMERA_MARKERS = (
+    "rear camera",
+    "rear-facing camera",
+    "reverse camera",
+    "back camera",
+    "rear lens",
+    "后摄",
+    "后置摄像头",
+    "后镜头",
+    "倒车摄像头",
+)
+_INTERNAL_MEMORY_NONE_MARKERS = (
+    "memory capacity none",
+    "internal memory none",
+    "no internal memory",
+    "内存容量 无",
+    "内存容量无",
+    "无内置存储",
+)
+_INCLUDED_MARKERS = (
+    "included",
+    "includes",
+    "in the box",
+    "package contains",
+    "package includes",
+    "包装清单",
+    "包装内",
+    "标配",
+    "配件",
+    "内含",
 )
 _CAPACITY_VALUE_RE = re.compile(r"(?<!\w)\d+(?:\.\d+)?\s*(?:gb|mb|tb)?(?!\w)", re.IGNORECASE)
 _EXACT_COUNT_RE = re.compile(r"^\s*(\d+)\s*(?:cameras?|lenses?|镜头|摄像头)?\s*$", re.IGNORECASE)
@@ -262,9 +334,12 @@ def _evidence_text(candidate: SourceEvidence) -> str:
     ).casefold()
 
 
+def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in text for marker in markers)
+
+
 def _is_package_dimension_evidence(candidate: SourceEvidence) -> bool:
-    text = _evidence_text(candidate)
-    return any(marker in text for marker in _PACKAGE_EVIDENCE_MARKERS)
+    return _contains_any(_evidence_text(candidate), _PACKAGE_EVIDENCE_MARKERS)
 
 
 def _has_storage_capacity_value(candidate: SourceEvidence) -> bool:
@@ -272,15 +347,50 @@ def _has_storage_capacity_value(candidate: SourceEvidence) -> bool:
     return any(_CAPACITY_VALUE_RE.search(str(value)) for value in values)
 
 
+def _is_generic_product_brand_evidence(candidate: SourceEvidence) -> bool:
+    if candidate.source_type != "ai_synthesis":
+        return False
+    text = _evidence_text(candidate)
+    return not _contains_any(text, _VEHICLE_CONTEXT_MARKERS)
+
+
+def _is_manual_language_only_evidence(candidate: SourceEvidence) -> bool:
+    if candidate.source_type != "ai_synthesis":
+        return False
+    text = _evidence_text(candidate)
+    return _contains_any(text, _MANUAL_MARKERS) and not _contains_any(
+        text, _UI_LANGUAGE_MARKERS
+    )
+
+
+def _is_reverse_feature_without_camera_evidence(candidate: SourceEvidence) -> bool:
+    if candidate.source_type != "ai_synthesis":
+        return False
+    text = _evidence_text(candidate)
+    return _contains_any(text, _REVERSE_FUNCTION_MARKERS) and not _contains_any(
+        text, _EXPLICIT_REAR_CAMERA_MARKERS
+    )
+
+
+def _is_internal_memory_none_not_card_inclusion(candidate: SourceEvidence) -> bool:
+    if candidate.source_type != "ai_synthesis":
+        return False
+    text = _evidence_text(candidate)
+    return _contains_any(text, _INTERNAL_MEMORY_NONE_MARKERS) and not _contains_any(
+        text, _INCLUDED_MARKERS
+    )
+
+
 def _filter_semantically_incompatible_candidates(
     candidates: list[SourceEvidence],
     semantic_field: dict[str, Any],
 ) -> list[SourceEvidence]:
-    """Drop evidence that is clearly about a different attribute dimension.
+    """Drop evidence mechanically proven to describe a different attribute.
 
-    This is deliberately narrow: it only rejects mechanically distinguishable
-    category errors. It never chooses between two competing values of the same
-    semantic attribute.
+    These gates never choose between competing values of the same semantic
+    attribute. They only remove cross-dimension mappings such as package size
+    answering product size, manual language answering UI language, or a reverse
+    assist feature being treated as an included rear camera.
     """
 
     names = _field_names(semantic_field)
@@ -291,6 +401,22 @@ def _filter_semantically_incompatible_candidates(
 
     if names & _PRODUCT_DIMENSION_FIELD_NAMES:
         filtered = [item for item in filtered if not _is_package_dimension_evidence(item)]
+
+    if names & _VEHICLE_BRAND_FIELD_NAMES:
+        filtered = [item for item in filtered if not _is_generic_product_brand_evidence(item)]
+
+    if names & _LANGUAGES_SUPPORTED_FIELD_NAMES:
+        filtered = [item for item in filtered if not _is_manual_language_only_evidence(item)]
+
+    if names & _CAMERA_TYPE_FIELD_NAMES:
+        filtered = [
+            item for item in filtered if not _is_reverse_feature_without_camera_evidence(item)
+        ]
+
+    if names & _SD_CARD_INCLUDED_FIELD_NAMES:
+        filtered = [
+            item for item in filtered if not _is_internal_memory_none_not_card_inclusion(item)
+        ]
 
     return filtered
 
@@ -307,7 +433,16 @@ def _candidate_exact_count(candidate: SourceEvidence) -> int | None:
     if match:
         return int(match.group(1))
     compact = normalize_key(text)
-    if compact in {"dual", "dualcamera", "dualcameras", "duallens", "twin", "双镜头", "双摄", "双摄像头"}:
+    if compact in {
+        "dual",
+        "dualcamera",
+        "dualcameras",
+        "duallens",
+        "twin",
+        "双镜头",
+        "双摄",
+        "双摄像头",
+    }:
         return 2
     return None
 
@@ -316,7 +451,12 @@ def _candidate_count_lower_bound(candidate: SourceEvidence) -> int | None:
     exact = _candidate_exact_count(candidate)
     if exact is not None:
         return exact
-    compact = normalize_key(candidate.value[0] if isinstance(candidate.value, tuple) and candidate.value else candidate.value)
+    raw = (
+        candidate.value[0]
+        if isinstance(candidate.value, tuple) and candidate.value
+        else candidate.value
+    )
+    compact = normalize_key(raw)
     if compact in {
         "multi",
         "multiple",
@@ -338,7 +478,11 @@ def _select_precise_count_candidate(
 ) -> SourceEvidence | None:
     if not (_field_names(semantic_field) & _COUNT_FIELD_NAMES):
         return None
-    exact = [(value, item) for item in candidates if (value := _candidate_exact_count(item)) is not None]
+    exact = [
+        (value, item)
+        for item in candidates
+        if (value := _candidate_exact_count(item)) is not None
+    ]
     exact_values = {value for value, _ in exact}
     if len(exact_values) != 1:
         return None
@@ -348,7 +492,9 @@ def _select_precise_count_candidate(
         if lower is None or lower > exact_value:
             return None
     compatible_exact = [item for value, item in exact if value == exact_value]
-    compatible_exact.sort(key=lambda item: (item.priority, -item.confidence, item.source_reference))
+    compatible_exact.sort(
+        key=lambda item: (item.priority, -item.confidence, item.source_reference)
+    )
     return compatible_exact[0]
 
 
@@ -429,7 +575,10 @@ def _select_evidence(
             f"{item.source_type}:{item.source_reference}={item.value}" for item in candidates
         )
         return None, details
-    candidates = sorted(candidates, key=lambda item: (item.priority, -item.confidence, item.source_reference))
+    candidates = sorted(
+        candidates,
+        key=lambda item: (item.priority, -item.confidence, item.source_reference),
+    )
     return candidates[0], None
 
 
@@ -494,7 +643,9 @@ def resolve_field(
             "没有找到与 attribute_key/label 精确对应的语义兼容明确证据。",
         )
 
-    values = _raw_values(chosen.value, multi_value=bool(semantic_field.get("multi_value")))
+    values = _raw_values(
+        chosen.value, multi_value=bool(semantic_field.get("multi_value"))
+    )
     qualifier_options = _qualifier_options(semantic_field)
     values, qualifier, qualifier_match = _extract_qualifier(values, qualifier_options)
     if not values:
