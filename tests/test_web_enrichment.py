@@ -109,6 +109,36 @@ class FakeWebProvider:
         )
 
 
+class DynamicWebProvider:
+    name = "dynamic-sourced-web"
+    model = "qwen3.7-max"
+
+    def __init__(self):
+        self.calls = 0
+
+    def search_json(self, prompt):
+        self.calls += 1
+        payload = json.loads(prompt.split("\n\n", 1)[1])
+        url = f"https://example.test/batch-{self.calls}"
+        evidence = [
+            {
+                "field_id": target["field_id"],
+                "items": [
+                    {
+                        "source_url": url,
+                        "evidence_text": f"Image sensor: GC2053 for {target['field_id']}",
+                    }
+                ],
+            }
+            for target in payload["target_fields"]
+        ]
+        return WebSearchJSONResult(
+            payload={"evidence": evidence},
+            sources=[WebSearchSource(index="1", title="M8", url=url)],
+            request_id=f"req-web-{self.calls}",
+        )
+
+
 class FailingWebProvider:
     name = "failing-web"
     model = "qwen3.7-max"
@@ -200,12 +230,58 @@ def test_unresolved_fields_are_researched_then_finalized_without_touching_ready(
     assert final.calls == 1
     assert result.search_model_calls == 1
     assert result.final_model_calls == 1
+    assert result.final_batch_count == 1
     assert result.target_field_count == 1
     assert result.packet.decisions[0].values == ["Black"]
     assert result.packet.decisions[1].status == READY
     assert result.packet.decisions[1].values == ["GC2053"]
     assert len(result.web_sources) == 1
     assert field_id(colour) not in search.prompts[0]
+
+
+def test_final_resolution_is_small_parallel_batches_and_hot_cached(tmp_path):
+    fields = [field(f"field_{index}", f"Field {index}") for index in range(5)]
+    initial = packet(
+        fields,
+        [FieldDecision(field_id=field_id(item), status=MISSING) for item in fields],
+    )
+    search = DynamicWebProvider()
+    final = FakeFinalProvider()
+    cache = tmp_path / "cache"
+
+    first = run_web_enrichment(
+        search,
+        final,
+        initial,
+        fields,
+        grounding(),
+        profile(),
+        batch_size=2,
+        concurrency=3,
+        cache_dir=cache,
+        final_cache_namespace="model",
+    )
+    second = run_web_enrichment(
+        search,
+        final,
+        initial,
+        fields,
+        grounding(),
+        profile(),
+        batch_size=2,
+        concurrency=3,
+        cache_dir=cache,
+        final_cache_namespace="model",
+    )
+
+    assert first.search_batch_count == 3
+    assert first.final_batch_count == 3
+    assert first.final_model_calls == 3
+    assert all(len(request["target_fields"]) <= 2 for request in final.requests)
+    assert second.search_model_calls == 0
+    assert second.final_model_calls == 0
+    assert second.final_cache_hits == 3
+    assert second.final_cache_hit is True
 
 
 def test_invented_web_url_is_dropped_before_final_resolve():
