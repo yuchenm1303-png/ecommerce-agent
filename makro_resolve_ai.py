@@ -37,7 +37,11 @@ from app.providers.registry import (
 from app.qa_catalog import load_question_catalog
 from app.resolution_engine import ResolutionPolicy, resolve_catalog, summarize_resolution
 from app.resolution_report import write_resolution_json, write_resolution_xlsx
-from app.resolver_inputs import ResolutionInputSpec, build_resolution_inputs
+from app.resolver_inputs import (
+    ResolutionInputSpec,
+    build_resolution_inputs,
+    customer_context_for_resolution,
+)
 from app.review_queue import (
     build_review_queue,
     summarize_review_queue,
@@ -113,6 +117,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=120.0,
         help="单个 logical source 的 API 请求超时；默认 120 秒，允许范围 10..600。",
+    )
+    parser.add_argument(
+        "--source-concurrency",
+        type=int,
+        choices=(1, 2, 3, 4),
+        default=2,
+        help=(
+            "独立 logical source 的并发数；默认 2。只改变首轮延迟，不改变 evidence 合并顺序。"
+            "使用 --fail-on-source-error 时自动退回串行以保持 fail-fast。"
+        ),
     )
     parser.add_argument("--max-text-chars", type=int, default=3000)
     parser.add_argument("--overlap-chars", type=int, default=250)
@@ -190,12 +204,7 @@ def _provider_config(args: argparse.Namespace) -> ProviderConfig:
 
 
 def _semantic_cache_namespace(config: ProviderConfig) -> str:
-    """Cache only on provider settings that can change semantic output.
-
-    Transport timeout/retry policy changes latency, not the meaning of an
-    already validated packet, so changing it must not force expensive images to
-    be recognized again.
-    """
+    """Cache only on provider settings that can change semantic output."""
 
     safe = config.as_safe_dict()
     safe.pop("request_timeout_seconds", None)
@@ -255,12 +264,13 @@ def main() -> int:
         )
 
     supplemental_text = _read_supplemental_text(args)
-    base_inputs = build_resolution_inputs(
-        catalog,
-        _base_input_spec(args, supplemental_text),
-    )
+    input_spec = _base_input_spec(args, supplemental_text)
+    base_inputs = build_resolution_inputs(catalog, input_spec)
 
-    grounded_text = base_inputs.bundle.supplemental_text
+    # Use the canonical customer source directly, never a merged bundle's
+    # supplemental text. This guarantees resolver extraction and later strict
+    # evidence rebinding hash the exact same source without duplicate preamble.
+    grounded_text = customer_context_for_resolution(catalog, input_spec)
     grounding = build_grounding_catalog(
         image_paths=args.image,
         supplier_snapshots=args.supplier_snapshot,
@@ -298,7 +308,7 @@ def main() -> int:
     print(
         f"provider={provider_config.provider}, model={provider_config.model}, "
         f"pending_questions={len(pending.questions)}, logical_sources={grounding.logical_source_count}, "
-        f"citation_chunks={len(grounding.sources)}",
+        f"citation_chunks={len(grounding.sources)}, source_concurrency={args.source_concurrency}",
         flush=True,
     )
     print(f"output_dir={output_dir.resolve()}", flush=True)
@@ -316,6 +326,7 @@ def main() -> int:
         max_repair_attempts=args.max_source_repair_attempts,
         cache_dir=cache_dir,
         cache_namespace=cache_namespace,
+        source_concurrency=args.source_concurrency,
         progress=_print_source_progress,
     )
 
@@ -353,6 +364,7 @@ def main() -> int:
                 "pending_question_count": len(pending.questions),
                 "citation_source_count": len(grounding.sources),
                 "logical_source_count": semantic.total_sources,
+                "source_concurrency": semantic.source_concurrency,
                 "completed_sources": semantic.completed_sources,
                 "failed_sources": semantic.failed_sources,
                 "model_calls": semantic.model_calls,
@@ -404,6 +416,7 @@ def main() -> int:
                 "provider_config": provider_config.as_safe_dict(),
                 "grounded_citation_source_count": len(grounding.sources),
                 "grounded_logical_source_count": grounding.logical_source_count,
+                "semantic_source_concurrency": semantic.source_concurrency,
                 "customer_context_chars": len(grounded_text),
                 "semantic_fact_count": len(semantic_packet.facts),
                 "semantic_partial": semantic.partial,
@@ -438,8 +451,9 @@ def main() -> int:
     )
     print(
         f"semantic_facts={len(semantic_packet.facts)}, sources={semantic.completed_sources}/{semantic.total_sources}, "
-        f"failed_sources={semantic.failed_sources}, model_calls={semantic.model_calls}, "
-        f"cache_hits={semantic.cache_hits}, elapsed={semantic.elapsed_seconds:.1f}s"
+        f"source_concurrency={semantic.source_concurrency}, failed_sources={semantic.failed_sources}, "
+        f"model_calls={semantic.model_calls}, cache_hits={semantic.cache_hits}, "
+        f"elapsed={semantic.elapsed_seconds:.1f}s"
     )
     print(
         f"review_queue={review_summary['total']} "
