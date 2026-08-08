@@ -15,12 +15,18 @@ PRODUCT_PHOTOS_SECTION = "Product Photos"
 
 @dataclass(slots=True)
 class PhotoUploadResult:
+    """State of files staged into the open Product Photos editor.
+
+    ``staged`` is intentionally not called persisted/uploaded: Makro keeps the
+    card in an unsaved edit transaction until its section Save is clicked.
+    """
+
     status: str
     initial_count: int | None = None
     final_count: int | None = None
     capacity: int | None = None
     attempted: int = 0
-    uploaded: int = 0
+    staged: int = 0
     accept: str = ""
     multiple: bool = False
     items: list[dict[str, Any]] = field(default_factory=list)
@@ -33,7 +39,7 @@ class PhotoUploadResult:
             "final_count": self.final_count,
             "capacity": self.capacity,
             "attempted": self.attempted,
-            "uploaded": self.uploaded,
+            "staged": self.staged,
             "accept": self.accept,
             "multiple": self.multiple,
             "items": self.items,
@@ -73,8 +79,10 @@ def _photo_state(page: Page, section_path: str) -> dict[str, Any]:
               accept: clean(input.getAttribute('accept')),
               multiple: input.multiple === true || input.hasAttribute('multiple'),
               disabled: input.disabled === true || input.hasAttribute('disabled'),
+              files: input.files ? input.files.length : 0,
             })),
             visible_image_count: images.length,
+            visible_image_sources: images.map(img => clean(img.getAttribute('src'))).filter(Boolean),
           };
         }"""
     )
@@ -107,11 +115,10 @@ def _select_file_input(page: Page, section_path: str):
     return None
 
 
-def _wait_for_upload_progress(
+def _wait_for_staged_signal(
     page: Page,
     section_path: str,
     *,
-    before_count: int | None,
     before_images: int,
     timeout_ms: int,
 ) -> dict[str, Any]:
@@ -119,13 +126,14 @@ def _wait_for_upload_progress(
     latest = _photo_state(page, section_path)
     while time.monotonic() < deadline:
         latest = _photo_state(page, section_path)
-        count = latest.get("completion_count")
+        file_count = max(
+            [int(item.get("files") or 0) for item in latest.get("file_inputs") or []]
+            or [0]
+        )
         images = int(latest.get("visible_image_count") or 0)
-        if before_count is not None and count is not None and int(count) > before_count:
+        if file_count > 0 or images > before_images:
             return latest
-        if images > before_images:
-            return latest
-        page.wait_for_timeout(250)
+        page.wait_for_timeout(200)
     return latest
 
 
@@ -133,13 +141,12 @@ def upload_product_photos(
     page: Page,
     image_paths: Iterable[str | Path],
     *,
-    timeout_ms: int = 30_000,
+    timeout_ms: int = 8_000,
 ) -> PhotoUploadResult:
-    """Upload explicit listing images through the live Product Photos file input.
+    """Stage explicit listing images into Product Photos; never Save the card.
 
-    This is a browser execution primitive only. It never chooses images from
-    evidence automatically and never clicks section Save / Cancel / Send to QC.
-    Callers must pass the exact files intended for the listing.
+    Persistence is a separate transaction. A caller must subsequently invoke the
+    section Save primitive and verify the completion counter after re-open.
     """
 
     resolved_paths: list[Path] = []
@@ -162,23 +169,17 @@ def upload_product_photos(
 
     section = find_section(page, PRODUCT_PHOTOS_SECTION)
     if section is None:
-        return PhotoUploadResult(
-            status="not_found",
-            detail="当前页面找不到 Product Photos section。",
-        )
+        return PhotoUploadResult(status="not_found", detail="当前页面找不到 Product Photos section。")
     open_section_for_edit(page, section)
     section = find_section(page, PRODUCT_PHOTOS_SECTION) or section
     section_path = str(section.get("path") or "")
     if not section_path:
-        return PhotoUploadResult(
-            status="not_found",
-            detail="Product Photos section 缺少稳定 DOM path。",
-        )
+        return PhotoUploadResult(status="not_found", detail="Product Photos section 缺少稳定 DOM path。")
 
     state = _photo_state(page, section_path)
     initial_count = state.get("completion_count")
     capacity = state.get("capacity")
-    initial_images = int(state.get("visible_image_count") or 0)
+    current_images = int(state.get("visible_image_count") or 0)
     input_meta = list(state.get("file_inputs") or [])
     if not input_meta:
         return PhotoUploadResult(
@@ -188,7 +189,7 @@ def upload_product_photos(
             capacity=capacity,
             detail=(
                 "Product Photos 已展开，但卡片内没有 input[type=file]；"
-                "拒绝猜测其它按钮。需要用真实 DOM 补充该上传控件定位。"
+                "拒绝猜测其它按钮。需要真实 DOM 更新定位。"
             ),
         )
 
@@ -202,18 +203,17 @@ def upload_product_photos(
         multiple=bool(first_meta.get("multiple")),
     )
 
-    current_count = initial_count
-    current_images = initial_images
     for path in resolved_paths:
-        if capacity is not None and current_count is not None and current_count >= capacity:
-            result.items.append(
-                {
-                    "path": str(path),
-                    "status": "skipped_full",
-                    "detail": f"Product Photos 已达到容量 {capacity}。",
-                }
-            )
-            continue
+        if capacity is not None and initial_count is not None:
+            if initial_count + result.staged >= capacity:
+                result.items.append(
+                    {
+                        "path": str(path),
+                        "status": "skipped_full",
+                        "detail": f"Product Photos 最多 {capacity} 张。",
+                    }
+                )
+                continue
 
         file_input = _select_file_input(page, section_path)
         if file_input is None:
@@ -227,45 +227,46 @@ def upload_product_photos(
             continue
 
         result.attempted += 1
-        before_count = current_count
         before_images = current_images
         try:
             file_input.set_input_files(str(path))
-            settled = _wait_for_upload_progress(
+            try:
+                immediate_files = int(
+                    file_input.evaluate("el => el.files ? el.files.length : 0") or 0
+                )
+            except Exception:
+                immediate_files = 0
+            settled = _wait_for_staged_signal(
                 page,
                 section_path,
-                before_count=before_count,
                 before_images=before_images,
                 timeout_ms=timeout_ms,
             )
-            current_count = settled.get("completion_count")
             current_images = int(settled.get("visible_image_count") or 0)
-            progressed = (
-                before_count is not None
-                and current_count is not None
-                and int(current_count) > before_count
-            ) or current_images > before_images
-            if progressed:
-                result.uploaded += 1
+            staged = immediate_files > 0 or current_images > before_images
+            if staged:
+                result.staged += 1
                 result.items.append(
                     {
                         "path": str(path),
-                        "status": "validated",
-                        "before_count": before_count,
-                        "after_count": current_count,
-                        "detail": "文件选择后 Product Photos 计数或可见缩略图增加。",
+                        "status": "staged",
+                        "input_files": immediate_files,
+                        "before_visible_images": before_images,
+                        "after_visible_images": current_images,
+                        "detail": "文件已进入 Product Photos 编辑事务；尚未宣称持久化。",
                     }
                 )
             else:
                 result.items.append(
                     {
                         "path": str(path),
-                        "status": "validation_failed",
-                        "before_count": before_count,
-                        "after_count": current_count,
+                        "status": "staging_unconfirmed",
+                        "input_files": immediate_files,
+                        "before_visible_images": before_images,
+                        "after_visible_images": current_images,
                         "detail": (
-                            f"set_input_files 已执行，但 {timeout_ms}ms 内未观察到"
-                            "图片计数或缩略图增加。"
+                            "set_input_files 未报错，但未观察到 files/预览变化；"
+                            "不能把它当成已上传或已保存。"
                         ),
                     }
                 )
@@ -280,16 +281,56 @@ def upload_product_photos(
 
     final_state = _photo_state(page, section_path)
     result.final_count = final_state.get("completion_count")
-    if result.uploaded == result.attempted and result.attempted > 0:
-        result.status = "validated"
-        result.detail = "所有尝试上传的图片均观察到页面进度变化。"
-    elif result.uploaded > 0:
-        result.status = "partial"
-        result.detail = "部分图片上传已验证，部分失败或无法确认。"
+    if result.staged == result.attempted and result.attempted > 0:
+        result.status = "staged"
+        result.detail = "所有尝试文件都已进入未保存的 Product Photos 编辑事务。"
+    elif result.staged > 0:
+        result.status = "partial_staged"
+        result.detail = "部分文件已进入编辑事务，部分无法确认。"
     elif result.attempted == 0:
         result.status = "skipped"
-        result.detail = "没有实际执行图片上传。"
+        result.detail = "没有实际执行图片 staging。"
     else:
-        result.status = "validation_failed"
-        result.detail = "已执行图片选择，但没有任何图片通过页面进度验证。"
+        result.status = "staging_unconfirmed"
+        result.detail = "已执行文件选择，但没有任何文件得到 staging 信号。"
     return result
+
+
+def verify_persisted_photo_count(
+    page: Page,
+    *,
+    initial_count: int | None,
+    expected_added: int,
+) -> dict[str, Any]:
+    """Verify Product Photos only after the section Save transaction finished."""
+
+    state = inspect_product_photos(page)
+    final_count = state.get("completion_count")
+    if expected_added <= 0:
+        return {
+            "status": "skipped",
+            "initial_count": initial_count,
+            "final_count": final_count,
+            "expected_added": expected_added,
+            "detail": "没有 staged 图片需要持久化复核。",
+        }
+    if initial_count is None or final_count is None:
+        return {
+            "status": "validation_failed",
+            "initial_count": initial_count,
+            "final_count": final_count,
+            "expected_added": expected_added,
+            "detail": "Save 后无法读取 Product Photos 完成计数，不能证明图片已持久化。",
+        }
+    passed = int(final_count) >= int(initial_count) + expected_added
+    return {
+        "status": "persisted_verified" if passed else "validation_failed",
+        "initial_count": initial_count,
+        "final_count": final_count,
+        "expected_added": expected_added,
+        "detail": (
+            "Product Photos Save 后完成计数按预期增加。"
+            if passed
+            else "Product Photos Save 后完成计数没有按 staged 图片数量增加。"
+        ),
+    }
