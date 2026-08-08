@@ -60,6 +60,7 @@ class ProviderConfig:
     max_output_tokens: int = 12000
     structured_mode: str = "prompt_only"
     compat_profile: str = "generic"
+    request_timeout_seconds: float = 120.0
 
     def as_safe_dict(self) -> dict[str, Any]:
         """Return audit metadata without exposing secret values."""
@@ -73,6 +74,11 @@ class ProviderConfig:
             "max_output_tokens": self.max_output_tokens,
             "structured_mode": self.structured_mode,
             "compat_profile": self.compat_profile,
+            "request_timeout_seconds": self.request_timeout_seconds,
+            # Production-created SDK clients use max_retries=0. Retries are
+            # explicit at the semantic source layer so latency/reporting stays
+            # observable instead of being multiplied invisibly inside the SDK.
+            "sdk_max_retries": 0,
         }
 
 
@@ -131,6 +137,14 @@ def validate_provider_config(config: ProviderConfig) -> ProviderConfig:
         raise ProviderConfigurationError(
             "--compat-profile 仅用于 openai-compatible provider；原生 OpenAI 请使用 generic。"
         )
+    try:
+        timeout = float(config.request_timeout_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ProviderConfigurationError("--request-timeout-seconds 必须是数字。") from exc
+    if not 10.0 <= timeout <= 600.0:
+        raise ProviderConfigurationError(
+            "--request-timeout-seconds 必须在 10..600 秒；避免单个 source 无限等待。"
+        )
 
     effective_profile = _effective_compat_profile(provider, model, config.compat_profile)
     return ProviderConfig(
@@ -142,6 +156,7 @@ def validate_provider_config(config: ProviderConfig) -> ProviderConfig:
         max_output_tokens=int(config.max_output_tokens),
         structured_mode=config.structured_mode,
         compat_profile=effective_profile,
+        request_timeout_seconds=timeout,
     )
 
 
@@ -164,6 +179,7 @@ def build_semantic_provider(
             max_output_tokens=normalized.max_output_tokens,
             structured_mode=normalized.structured_mode,
             compat_profile=normalized.compat_profile,
+            request_timeout_seconds=normalized.request_timeout_seconds,
         )
 
     if client is None:
@@ -173,10 +189,15 @@ def build_semantic_provider(
             raise ProviderConfigurationError(
                 "缺少 openai Python SDK。请先安装 requirements.txt。"
             ) from exc
-        client = OpenAI(api_key=api_key)
+        client = OpenAI(
+            api_key=api_key,
+            timeout=normalized.request_timeout_seconds,
+            max_retries=0,
+        )
     return OpenAISemanticProvider(
         model=normalized.model,
         client=client,
         image_detail=normalized.image_detail,
         max_output_tokens=normalized.max_output_tokens,
+        request_timeout_seconds=normalized.request_timeout_seconds,
     )
