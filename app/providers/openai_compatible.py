@@ -13,7 +13,7 @@ class OpenAICompatibleProviderError(RuntimeError):
     pass
 
 
-_JSON_CONTRACT = {
+_DEFAULT_JSON_CONTRACT = {
     "type": "object",
     "required": ["product_identity", "facts", "warnings"],
     "properties": {
@@ -71,19 +71,23 @@ def _image_data_uri(path_value: str) -> str:
 
 
 def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
-    """Build the vendor-neutral grounded prompt without leaking local file paths."""
+    """Build a task-generic prompt payload without leaking local file paths."""
 
     payload = {
         "task": request_payload.get("task"),
-        "batch_id": request_payload.get("batch_id", ""),
         "product_identity": request_payload.get("product_identity") or {},
+        "schema_sha256": request_payload.get("schema_sha256", ""),
+        "source_manifest_sha256": request_payload.get("source_manifest_sha256", ""),
+        "target_fields": request_payload.get("target_fields") or [],
+        # Legacy semantic-fact requests remain accepted while the production
+        # path migrates to target_fields decisions.
         "questions": request_payload.get("questions") or [],
         "business_locked_questions": request_payload.get("business_locked_questions") or [],
         "rules": request_payload.get("rules") or [],
         "source_reference_rule": request_payload.get("source_reference_rule", ""),
         "required_output_shape": request_payload.get("required_output_shape") or {},
         "grounded_sources": [],
-        "json_contract": _JSON_CONTRACT,
+        "json_contract": request_payload.get("json_contract") or _DEFAULT_JSON_CONTRACT,
     }
     for source in request_payload.get("grounded_sources") or []:
         if not isinstance(source, dict):
@@ -101,15 +105,39 @@ def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _task_instruction(request_payload: dict[str, Any]) -> str:
+    prompt_instruction = str(request_payload.get("prompt_instruction") or "").strip()
+    validation_error = str(request_payload.get("validation_error") or "").strip()
+    if request_payload.get("target_fields"):
+        parts = [prompt_instruction]
+        if validation_error:
+            parts.append(
+                "CORRECTION REQUIRED: the prior JSON failed structural validation: "
+                + validation_error
+            )
+        parts.append(
+            "Return exactly one JSON object and no markdown. Follow json_contract. "
+            "Never invent unsupported product facts."
+        )
+        return "\n\n".join(part for part in parts if part)
+
+    # Legacy fact-extraction requests keep their original strict prompt until the
+    # old non-production path is removed with its tests.
+    return (
+        GROUNDED_OUTPUT_RULES
+        + validation_error_instruction(request_payload)
+        + "\n\nReturn exactly one JSON object and no markdown. Follow the supplied json_contract. "
+        "Never invent a fact when evidence is absent or ambiguous."
+    )
+
+
 def _message_content(request_payload: dict[str, Any], *, image_detail: str) -> list[dict[str, Any]]:
     content: list[dict[str, Any]] = [
         {
             "type": "text",
             "text": (
-                GROUNDED_OUTPUT_RULES
-                + validation_error_instruction(request_payload)
-                + "\n\nReturn exactly one JSON object and no markdown. Follow the supplied json_contract. "
-                "Never invent a fact when evidence is absent or ambiguous.\n\n"
+                _task_instruction(request_payload)
+                + "\n\n"
                 + json.dumps(_prompt_payload(request_payload), ensure_ascii=False)
             ),
         }
@@ -123,7 +151,7 @@ def _message_content(request_payload: dict[str, Any], *, image_detail: str) -> l
                 "type": "text",
                 "text": (
                     f"The immediately following image is grounded source_id={source_id}. "
-                    "Any fact citing this image must use exactly that source_reference."
+                    "Any citation to this image must use exactly that source_reference."
                 ),
             }
         )
@@ -160,8 +188,6 @@ def _extract_message_text(response: Any) -> str:
 
 
 def _extract_stream_text(stream: Any) -> str:
-    """Collect text deltas from OpenAI-compatible streaming Chat Completions."""
-
     parts: list[str] = []
     for chunk in stream:
         choices = getattr(chunk, "choices", None)
@@ -214,13 +240,7 @@ def _parse_json_object(text: str) -> dict[str, Any]:
 
 
 class OpenAICompatibleSemanticProvider:
-    """Generic multimodal adapter for OpenAI-compatible Chat Completions APIs.
-
-    The optional compatibility profile only changes transport quirks. It never
-    weakens grounding or trust checks. `qwen-omni` follows Alibaba Bailian's
-    Qwen-Omni requirement to use streaming Chat Completions and text-only output
-    modalities while still accepting image_url inputs.
-    """
+    """Generic multimodal JSON adapter for OpenAI-compatible Chat Completions."""
 
     name = "openai-compatible-chat-semantic"
 
@@ -289,9 +309,12 @@ class OpenAICompatibleSemanticProvider:
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You extract auditable product facts only from supplied grounded sources. "
-                        "Do not use unstated knowledge. Return no fact rather than guessing."
+                    "content": str(
+                        request_payload.get("system_instruction")
+                        or (
+                            "You extract auditable product facts only from supplied grounded sources. "
+                            "Do not use unstated knowledge. Return no fact rather than guessing."
+                        )
                     ),
                 },
                 {
@@ -308,9 +331,6 @@ class OpenAICompatibleSemanticProvider:
         if self.structured_mode == "json_object":
             kwargs["response_format"] = {"type": "json_object"}
         if self.enable_thinking is not None:
-            # DashScope/OpenAI-compatible hybrid-thinking models expose this as
-            # a non-standard body parameter. The OpenAI Python SDK forwards it
-            # through extra_body without changing generic transport behavior.
             kwargs["extra_body"] = {"enable_thinking": self.enable_thinking}
 
         streaming = self.compat_profile == "qwen-omni"
@@ -323,7 +343,7 @@ class OpenAICompatibleSemanticProvider:
             response = self.client.chat.completions.create(**kwargs)
         except Exception as exc:
             raise OpenAICompatibleProviderError(
-                f"OpenAI-compatible semantic extraction 调用失败：{exc}"
+                f"OpenAI-compatible JSON task 调用失败：{exc}"
             ) from exc
 
         output_text = _extract_stream_text(response) if streaming else _extract_message_text(response)
