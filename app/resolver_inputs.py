@@ -8,7 +8,6 @@ from .evidence_pipeline import (
     add_fact,
     bundle_from_catalog_answers,
     bundle_from_facts_json,
-    bundle_from_key_value_text,
     merge_bundles,
 )
 from .qa_catalog import QuestionCatalog
@@ -159,9 +158,10 @@ def build_resolution_inputs(
     """Load explicit seller/customer data without interpreting product semantics.
 
     Customer Answer cells, explicit SKU, product tables and manual facts remain
-    trusted structured inputs. Supplier/official snapshots and images are *not*
-    converted to local product facts here; they are consumed as raw grounded
-    sources by the AI decision layer.
+    trusted structured inputs. Supplier/official snapshots and images are not
+    converted to local product facts; they are raw AI sources. Workbook preamble
+    stays as one canonical text source and is not locally re-parsed into a second
+    set of pseudo-facts.
     """
 
     customer_context = customer_context_for_resolution(catalog, spec)
@@ -203,22 +203,11 @@ def build_resolution_inputs(
 
     trusted_bundle = merge_bundles(*trusted_bundles)
     expected = _derive_expected_identity(spec, trusted_bundle)
-
     if customer_context:
-        context_facts = bundle_from_key_value_text(
-            customer_context,
-            source_reference=f"{Path(catalog.source_path).name}:customer-context",
-            source_type="customer_file",
-        )
-        # The canonical text already lives on the catalog-answer bundle. Expose
-        # only conservative key/value rows here so merging cannot duplicate the
-        # source text and change its hash.
-        context_facts.supplemental_text = ""
-        trusted_bundles.append(context_facts)
         warnings.append(f"customer_context_chars={len(customer_context)}")
 
     return ResolutionInputResult(
-        bundle=merge_bundles(*trusted_bundles),
+        bundle=trusted_bundle,
         expected_identity=expected,
         warnings=warnings,
     )
