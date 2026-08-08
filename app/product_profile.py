@@ -15,7 +15,7 @@ from .source_bundle import normalize_key
 
 
 PROFILE_CONTRACT_VERSION = 1
-PROFILE_CACHE_VERSION = 2
+PROFILE_CACHE_VERSION = 3
 PROFILE_SUPPORTED = "supported"
 PROFILE_CONFLICT = "conflict"
 PROFILE_STATUSES = (PROFILE_SUPPORTED, PROFILE_CONFLICT)
@@ -244,21 +244,41 @@ PROFILE_SYSTEM_INSTRUCTION = (
     "You are the product-understanding stage of a marketplace listing pipeline. "
     "Read all local customer, supplier and image evidence jointly and build a compact factual product profile. "
     "Do not map facts to marketplace fields. Preserve source disagreements instead of choosing a winner. "
+    "Source provenance is part of the answer: visually read facts must cite image source IDs, and text-read facts must cite exact text source IDs. "
     "Return JSON only."
 )
 
 PROFILE_RULES = [
     "Extract only facts supported by the supplied sources; omit unknown facts entirely.",
     "A supported fact normally has one cited candidate. A real disagreement for the same attribute and scope must use status=conflict with at least two cited candidates.",
-    "Keep scope explicit when it matters: selected variant, product body, packaging, manual/documentation, compatibility, seller/business, or another precise scope.",
+    "Keep scope explicit when it matters: selected_variant, product_body, packaging, manual/documentation, compatibility, seller/business, camera/lens scope, or another precise scope.",
     "Preserve the selected variant exactly. Never turn cabin/interior into rear/back, manual language into device UI language, packaging dimensions into product dimensions, or product brand into compatible vehicle brand.",
     "Never infer No/False/Not included from absence. Negative facts require explicit negative evidence.",
     "For text citations, source_reference must be the exact text source_id whose content contains the quoted evidence_text.",
     "For image-derived facts, source_reference must be the exact image source_id that visibly contains the evidence; describe that visible evidence in evidence_text. Never attach an image-derived fact to a text source merely because it is nearby or related.",
-    "For dimensions and weight, explicitly distinguish packaging from product body and preserve axis labels/order exactly as shown by the evidence.",
+    "Inspect every supplied image for explicit printed dimensions, weight, resolution/display markings, included items and selected-variant labels; do not omit a clearly visible fact merely because no text source repeats it.",
+    "When dimensions or weight are shown, determine from the visual/text context whether they describe packaging/carton/gross shipping data or the product body. Emit separate packaging and product-body facts; never merge the scopes.",
+    "If a visible dimension/weight belongs to packaging, use scope=packaging. If it belongs to the device itself, use scope=product_body. If scope is genuinely unclear, do not silently choose one.",
+    "Before returning JSON, verify every citation source_reference against SOURCE_INDEX: image-read evidence must point to an image ID and text-read evidence must point to a text ID.",
     "Prefer compact semantic facts over prose. Do not repeat the same fact under synonyms.",
     "Do not use web knowledge in this stage.",
 ]
+
+
+def _source_index(grounding: GroundingCatalog) -> dict[str, list[dict[str, str]]]:
+    images: list[dict[str, str]] = []
+    texts: list[dict[str, str]] = []
+    for source in grounding.sources:
+        item = {
+            "source_id": source.source_id,
+            "source_type": source.source_type,
+            "origin": source.origin,
+        }
+        if source.kind == IMAGE_KIND:
+            images.append(item)
+        elif source.kind == TEXT_KIND:
+            texts.append(item)
+    return {"images": images, "texts": texts}
 
 
 def build_product_profile_request(
@@ -271,6 +291,7 @@ def build_product_profile_request(
         "system_instruction": PROFILE_SYSTEM_INSTRUCTION,
         "prompt_instruction": (
             "Read the complete local evidence once and return a compact product profile. "
+            "Pay particular attention to explicit facts printed in images and cite the exact image source_id for those facts. "
             "Do not answer marketplace fields and do not explain your reasoning outside JSON."
         ),
         "product_identity": {
@@ -279,6 +300,7 @@ def build_product_profile_request(
             "brand": identity.brand,
         },
         "target_fields": [],
+        "source_index": _source_index(grounding),
         "rules": list(PROFILE_RULES),
         "grounded_sources": grounding.as_request_list(),
         "json_contract": PROFILE_JSON_SCHEMA,
