@@ -17,6 +17,7 @@ from .evidence_contract import (
     assert_identity_compatible,
 )
 from .evidence_validation import is_business_question
+from .extraction_request import EXTRACTION_RULES
 from .qa_catalog import QuestionCatalog, QuestionRecord
 from .semantic_extraction import (
     GROUNDED_OUTPUT_RULES,
@@ -28,7 +29,7 @@ from .semantic_extraction import (
 from .semantic_grounding import GroundedSource, GroundingCatalog
 
 
-SOURCE_CACHE_VERSION = 3
+SOURCE_CACHE_VERSION = 4
 DEFAULT_MAX_REPAIR_ATTEMPTS = 1
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -156,7 +157,12 @@ def _source_digest(source: GroundedSource) -> str:
 
 
 def _grounding_contract_digest() -> str:
-    return hashlib.sha256(GROUNDED_OUTPUT_RULES.encode("utf-8")).hexdigest()
+    payload = {
+        "grounded_output_rules": GROUNDED_OUTPUT_RULES,
+        "extraction_rules": list(EXTRACTION_RULES),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _cache_key(
@@ -234,6 +240,8 @@ def _load_cached_packet(
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("cache_version") != SOURCE_CACHE_VERSION:
         raise ValueError("semantic source cache version 不匹配。")
+    if payload.get("grounding_contract_sha256") != _grounding_contract_digest():
+        raise ValueError("semantic source cache extraction contract 已变化。")
     packet_payload = payload.get("packet")
     if not isinstance(packet_payload, dict):
         raise ValueError("semantic source cache 缺少 packet。")
