@@ -15,13 +15,21 @@ from .ai_decisions import (
     field_options,
     field_qualifier_options,
 )
-from .answer_resolver import CONFLICT as RESOLVER_CONFLICT
-from .answer_resolver import MISSING as RESOLVER_MISSING
-from .answer_resolver import NEEDS_REVIEW, RESOLVED, ResolvedAnswer
-from .evidence_validation import is_business_question
+from .business_fields import (
+    BUSINESS_ALLOWED_SOURCE_TYPES,
+    BUSINESS_ATTRIBUTE_ALIASES,
+    is_business_question,
+)
 from .fact_validators import validate_resolved_answer
-from .resolution_engine import ResolutionPolicy, ResolutionRecord, resolve_one
-from .source_bundle import ProductSourceBundle, normalize_key
+from .resolution_types import (
+    CONFLICT as RESOLVER_CONFLICT,
+    MISSING as RESOLVER_MISSING,
+    NEEDS_REVIEW,
+    RESOLVED,
+    ResolvedAnswer,
+    ResolutionRecord,
+)
+from .source_bundle import ProductSourceBundle, SourceEvidence, normalize_key
 
 
 READY = "ready"
@@ -32,6 +40,7 @@ GATE_AI_MISSING = "ai_missing"
 GATE_BUSINESS_LOCKED = "business_locked"
 GATE_HARD_FIELD_CONSTRAINT = "hard_field_constraint"
 GATE_CROSS_FIELD_RULE = "cross_field_business_rule"
+GATE_BUSINESS_CONFLICT = "business_conflict"
 
 
 @dataclass(slots=True)
@@ -184,7 +193,7 @@ def _hard_guard_values(
 
     values = list(decision.values)
     if not bool(field.get("multi_value")) and len(values) > 1:
-        return values, decision.qualifier, "单值 Makro 字段收到多个 AI values。"
+        return values, decision.qualifier, "单值 Makro 字段收到多个 values。"
 
     options = field_options(field)
     if options:
@@ -193,7 +202,7 @@ def _hard_guard_values(
             matched = _exact_option(value, options)
             if matched is None:
                 return values, decision.qualifier, (
-                    f"AI value={value!r} 不等于当前 Makro 的唯一有效 option。"
+                    f"value={value!r} 不等于当前 Makro 的唯一有效 option。"
                 )
             canonical.append(matched)
         values = canonical
@@ -202,16 +211,16 @@ def _hard_guard_values(
     qualifier_options = field_qualifier_options(field)
     if qualifier:
         if not qualifier_options:
-            return values, qualifier, "AI 返回 qualifier，但当前 Makro 字段没有 qualifier 控件。"
+            return values, qualifier, "返回了 qualifier，但当前 Makro 字段没有 qualifier 控件。"
         canonical_qualifier = _exact_option(qualifier, qualifier_options)
         if canonical_qualifier is None:
             return values, qualifier, (
-                f"AI qualifier={qualifier!r} 不等于当前 Makro 的唯一有效单位。"
+                f"qualifier={qualifier!r} 不等于当前 Makro 的唯一有效单位。"
             )
         qualifier = canonical_qualifier
 
     if decision.status in {AI_READY, REVIEW} and not values:
-        return values, qualifier, "AI 决策没有可执行 value。"
+        return values, qualifier, "决策没有可执行 value。"
     return values, qualifier, None
 
 
@@ -225,6 +234,31 @@ def _citation_provenance(decision: FieldDecision) -> list[dict[str, Any]]:
         }
         for citation in decision.citations
     ]
+
+
+def _apply_hard_field_validation(field: dict[str, Any], record: ResolutionRecord) -> None:
+    if record.status != RESOLVED or not record.eligible_for_autofill:
+        return
+    execution_answer = ResolvedAnswer(
+        attribute_key=record.attribute_key,
+        label=record.label,
+        status=RESOLVED,
+        answer=record.answer,
+        answer_values=list(record.answer_values),
+        qualifier=record.qualifier,
+        source_type=record.source_type,
+        source_reference=record.source_reference,
+        evidence=record.evidence,
+        confidence=record.confidence,
+        detail=record.detail,
+    )
+    validation = validate_resolved_answer(field, execution_answer)
+    if not validation.valid:
+        record.status = NEEDS_REVIEW
+        record.eligible_for_autofill = False
+        record.preview_eligible = False
+        record.gate_reason = GATE_HARD_FIELD_CONSTRAINT
+        record.detail = validation.detail
 
 
 def _decision_record(
@@ -276,34 +310,11 @@ def _decision_record(
         preview_eligible=preview,
         gate_reason=gate,
         provenance=_citation_provenance(decision),
-        question_number="",
-        question_explanation="",
         question_category=str(field.get("section_heading") or ""),
         question_unit=" | ".join(field_qualifier_options(field)),
         question_options=field_options(field),
     )
-
-    if record.status == RESOLVED and record.eligible_for_autofill:
-        execution_answer = ResolvedAnswer(
-            attribute_key=record.attribute_key,
-            label=record.label,
-            status=RESOLVED,
-            answer=record.answer,
-            answer_values=list(record.answer_values),
-            qualifier=record.qualifier,
-            source_type=record.source_type,
-            source_reference=record.source_reference,
-            evidence=record.evidence,
-            confidence=record.confidence,
-            detail=record.detail,
-        )
-        validation = validate_resolved_answer(field, execution_answer)
-        if not validation.valid:
-            record.status = NEEDS_REVIEW
-            record.eligible_for_autofill = False
-            record.preview_eligible = False
-            record.gate_reason = GATE_HARD_FIELD_CONSTRAINT
-            record.detail = validation.detail
+    _apply_hard_field_validation(field, record)
     return record
 
 
@@ -313,18 +324,145 @@ def _is_business_field(field: dict[str, Any]) -> bool:
     )
 
 
+def _raw_business_values(candidate: SourceEvidence) -> list[str]:
+    if isinstance(candidate.value, tuple):
+        return [str(value).strip() for value in candidate.value if str(value).strip()]
+    value = str(candidate.value).strip()
+    return [value] if value else []
+
+
 def _business_record(
     field: dict[str, Any],
     business_bundle: ProductSourceBundle,
 ) -> ResolutionRecord:
-    """Resolve seller-operated fields only from explicit deterministic inputs."""
+    """Resolve seller-operated fields from explicit data only, without semantic inference."""
 
-    return resolve_one(
-        field,
-        business_bundle,
-        policy=ResolutionPolicy(),
-        question=None,
+    attribute_key = str(field.get("attribute_key") or "")
+    label = str(field.get("label") or attribute_key)
+    keys = [attribute_key, label, *BUSINESS_ATTRIBUTE_ALIASES.get(attribute_key, ())]
+    candidates = [
+        candidate
+        for candidate in business_bundle.candidates(keys)
+        if candidate.source_type in BUSINESS_ALLOWED_SOURCE_TYPES
+    ]
+    base = dict(
+        attribute_key=attribute_key,
+        label=label,
+        qualifier=None,
+        question_category=str(field.get("section_heading") or ""),
+        question_unit=" | ".join(field_qualifier_options(field)),
+        question_options=field_options(field),
     )
+    if not candidates:
+        return ResolutionRecord(
+            **base,
+            status=RESOLVER_MISSING,
+            answer=None,
+            answer_values=[],
+            confidence=0.0,
+            source_type=None,
+            source_reference=None,
+            evidence=None,
+            detail="经营字段没有 structured/business/config/rule 明确输入。",
+            eligible_for_autofill=False,
+            preview_eligible=False,
+            gate_reason=GATE_BUSINESS_LOCKED,
+        )
+
+    grouped: dict[tuple[str, ...], list[SourceEvidence]] = {}
+    for candidate in candidates:
+        values = _raw_business_values(candidate)
+        fingerprint = tuple(normalize_key(value) for value in values)
+        if fingerprint:
+            grouped.setdefault(fingerprint, []).append(candidate)
+    if not grouped:
+        return ResolutionRecord(
+            **base,
+            status=RESOLVER_MISSING,
+            answer=None,
+            answer_values=[],
+            confidence=0.0,
+            source_type=None,
+            source_reference=None,
+            evidence=None,
+            detail="经营字段显式输入为空。",
+            eligible_for_autofill=False,
+            preview_eligible=False,
+            gate_reason=GATE_BUSINESS_LOCKED,
+        )
+    if len(grouped) > 1:
+        provenance = [
+            {
+                "key": candidate.key,
+                "value": _raw_business_values(candidate),
+                "source_type": candidate.source_type,
+                "source_reference": candidate.source_reference,
+                "confidence": candidate.confidence,
+                "evidence_text": candidate.evidence_text,
+            }
+            for candidate in candidates
+        ]
+        return ResolutionRecord(
+            **base,
+            status=RESOLVER_CONFLICT,
+            answer=None,
+            answer_values=[],
+            confidence=max(candidate.confidence for candidate in candidates),
+            source_type=None,
+            source_reference=None,
+            evidence=None,
+            detail="多个显式 seller/business 输入互相冲突；禁止自动选择。",
+            eligible_for_autofill=False,
+            preview_eligible=False,
+            gate_reason=GATE_BUSINESS_CONFLICT,
+            provenance=provenance,
+        )
+
+    agreeing = next(iter(grouped.values()))
+    selected = sorted(
+        agreeing,
+        key=lambda candidate: (
+            candidate.priority,
+            -candidate.confidence,
+            candidate.source_reference,
+        ),
+    )[0]
+    raw_values = _raw_business_values(selected)
+    structural = FieldDecision(
+        field_id=field_id(field),
+        status=AI_READY,
+        values=raw_values,
+        confidence=selected.confidence,
+    )
+    values, qualifier, hard_error = _hard_guard_values(field, structural)
+    record = ResolutionRecord(
+        **base,
+        status=RESOLVED if hard_error is None else NEEDS_REVIEW,
+        answer=" + ".join(values) if values else None,
+        answer_values=values,
+        qualifier=qualifier or None,
+        confidence=selected.confidence,
+        source_type=selected.source_type,
+        source_reference=selected.source_reference,
+        evidence=selected.evidence_text or None,
+        detail=hard_error or "explicit seller/business input",
+        eligible_for_autofill=hard_error is None,
+        preview_eligible=False,
+        gate_reason="" if hard_error is None else GATE_HARD_FIELD_CONSTRAINT,
+        provenance=[
+            {
+                "key": candidate.key,
+                "value": _raw_business_values(candidate),
+                "source_type": candidate.source_type,
+                "source_reference": candidate.source_reference,
+                "confidence": candidate.confidence,
+                "evidence_text": candidate.evidence_text,
+            }
+            for candidate in agreeing
+        ],
+    )
+    _apply_hard_field_validation(field, record)
+    return record
 
 
 def build_live_fill_plan(
@@ -354,15 +492,11 @@ def build_live_fill_plan(
         if _is_business_field(field):
             resolution = _business_record(field, business_bundle)
             action = READY if resolution.eligible_for_autofill else BLOCKED
-            if action == READY:
-                reason = "显式 seller/business 数据通过硬约束。"
-            else:
-                resolution.preview_eligible = False
-                resolution.gate_reason = GATE_BUSINESS_LOCKED
-                reason = (
-                    "经营字段禁止 AI 推断；需要 structured/business/config/rule 明确数据。 "
-                    + (resolution.detail or "")
-                ).strip()
+            reason = (
+                "显式 seller/business 数据通过硬约束。"
+                if action == READY
+                else resolution.detail
+            )
         else:
             decision = decisions.get(identifier)
             if decision is None:
