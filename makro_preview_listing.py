@@ -1,19 +1,16 @@
 """Execute grounded real-product data against Makro Step 3.
 
-Modes are intentionally different and explicit:
+There are only two execution modes:
 
-- ``--section``: diagnostic preview of one field section. It never saves and
-  leaves the section open for human inspection.
-- ``--all-step3 --allow-section-save``: real Step 3 acceptance. Each field card
-  is filled, section-Saved, re-opened and read back before the runner proceeds;
-  Product Photos is staged, Saved, then verified by its persisted completion
-  counter. Save failures are collected, safely Cancelled, and the run continues
-  so one execution exposes the complete defect set.
+- ``--section``: one-card diagnostic preview. It never saves and leaves the card
+  open for human inspection.
+- ``--all-step3 --allow-section-save``: persisted Step 3 acceptance. It fills
+  each core card from the same live Fill Plan used by the read-only planner,
+  saves that card, re-opens it and verifies persisted values. Product Photos is
+  staged, saved and verified separately. Failures are collected across cards.
 
-Neither mode ever clicks Send to QC. Evidence images (``--image``) are separate
-from listing images (``--upload-image``); no evidence screenshot is uploaded
-implicitly. Draft persistence and production autofill safety are reported as two
-separate outcomes so a successful Save can never masquerade as safe automation.
+This command never clicks Send to QC. Evidence images (``--image``) and listing
+upload images (``--upload-image``) are deliberately separate.
 """
 
 from __future__ import annotations
@@ -27,9 +24,9 @@ from typing import Any
 
 from playwright.sync_api import sync_playwright
 
-from app.alias_config import load_alias_config
+from app.alias_config import AliasConfig, load_alias_config
 from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness, is_cdp_ready
-from app.fill_plan import LiveFillPlan, LiveFillPlanItem, build_live_fill_plan
+from app.fill_plan import BLOCKED, LiveFillPlan, LiveFillPlanItem, build_live_fill_plan
 from app.makro import MAKRO_HOME_URL, base_section_title, is_listing_url
 from app.makro.direct_visual_hold import is_listing_attribute_field
 from app.makro.domain import MakroDomainAdapter
@@ -75,32 +72,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--product-url", default=None)
     parser.add_argument("--expected-vertical", required=True)
+    parser.add_argument(
+        "--alias-config",
+        default=None,
+        help=(
+            "人工审核过的 QA -> Makro label alias / section override JSON；"
+            "vertical 必须与 --expected-vertical 一致。"
+        ),
+    )
 
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--section", help="只预览一个字段 section；不 Save。")
     target.add_argument(
         "--all-step3",
         action="store_true",
-        help="执行完整 Step 3 acceptance；必须同时传 --allow-section-save。",
+        help="执行完整 Step 3 persistence acceptance；必须同时传 --allow-section-save。",
     )
     parser.add_argument(
         "--allow-section-save",
         action="store_true",
-        help=(
-            "显式允许保存 Step 3 各卡片的 listing draft。"
-            "只对 --all-step3 有效；仍绝不点击 Send to QC。"
-        ),
+        help="允许保存 Step 3 草稿卡片；只对 --all-step3 有效，不允许 Send to QC。",
     )
-
-    parser.add_argument("--alias-config", default=None)
     parser.add_argument("--auto-fill-min-confidence", type=float, default=0.85)
     parser.add_argument("--ai-auto-fill-min-confidence", type=float, default=0.92)
     parser.add_argument(
         "--include-review-candidates",
         action="store_true",
         help=(
-            "显式把 preview_eligible 的 needs_review 候选放进当前 draft。"
-            "它们仍不等于生产环境 autofill-safe。"
+            "显式把 preview_eligible 的 needs_review 候选放进当前人工验收 draft；"
+            "它们仍不是 autofill-safe。"
         ),
     )
     parser.add_argument("--profile-dir", default="browser_profiles/makro-edge")
@@ -127,6 +127,15 @@ def _input_spec(args: argparse.Namespace) -> ResolutionInputSpec:
         supplemental_text_file=args.supplemental_text_file,
         image_paths=tuple(args.image),
         product_url=args.product_url,
+    )
+
+
+def _load_matching_config(args: argparse.Namespace) -> AliasConfig | None:
+    if not args.alias_config:
+        return None
+    return load_alias_config(
+        args.alias_config,
+        expected_vertical=args.expected_vertical,
     )
 
 
@@ -231,7 +240,9 @@ def _live_fields(
     ]
 
 
-def _fields_by_identity(fields: list[dict[str, Any]]) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
+def _fields_by_identity(
+    fields: list[dict[str, Any]],
+) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
     output: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for field in fields:
         output.setdefault(_field_identity(field), []).append(field)
@@ -239,24 +250,50 @@ def _fields_by_identity(fields: list[dict[str, Any]]) -> dict[tuple[str, str, st
 
 
 def _base_result_payload(item: LiveFillPlanItem, mode: str | None) -> dict[str, Any]:
+    record = item.resolution
     return {
         "attribute_key": item.attribute_key,
         "label": item.label,
         "question_number": item.question_number,
         "question": item.question,
+        "match_basis": item.match_basis,
         "preview_mode": mode,
-        "original_status": item.resolution.status,
-        "eligible_for_autofill": item.resolution.eligible_for_autofill,
-        "preview_eligible": item.resolution.preview_eligible,
-        "gate_reason": item.resolution.gate_reason,
-        "answer": item.resolution.answer,
-        "answer_values": item.resolution.answer_values,
-        "qualifier": item.resolution.qualifier,
-        "confidence": item.resolution.confidence,
-        "source_type": item.resolution.source_type,
-        "source_reference": item.resolution.source_reference,
-        "evidence": item.resolution.evidence,
+        "original_status": record.status,
+        "eligible_for_autofill": record.eligible_for_autofill,
+        "preview_eligible": record.preview_eligible,
+        "gate_reason": record.gate_reason,
+        "answer": record.answer,
+        "answer_values": record.answer_values,
+        "qualifier": record.qualifier,
+        "confidence": record.confidence,
+        "source_type": record.source_type,
+        "source_reference": record.source_reference,
+        "evidence": record.evidence,
     }
+
+
+def _open_and_index_section(
+    adapter: MakroDomainAdapter,
+    section_title: str,
+    *,
+    wait_ms: int,
+    max_scroll_steps: int,
+) -> tuple[str, dict[tuple[str, str, str], list[dict[str, Any]]]]:
+    section = adapter.find_section(section_title)
+    if section is None:
+        raise RuntimeError(f"当前页面找不到 section：{section_title}")
+    adapter.open_section_for_edit(section)
+    section = adapter.find_section(section_title) or section
+    section_path = str(section.get("path") or "")
+    if not section_path:
+        raise RuntimeError(f"section {section_title!r} 缺少稳定 DOM path。")
+    fields = _live_fields(
+        adapter,
+        section_path,
+        wait_ms=wait_ms,
+        max_scroll_steps=max_scroll_steps,
+    )
+    return section_path, _fields_by_identity(fields)
 
 
 def _verify_saved_values(
@@ -269,22 +306,11 @@ def _verify_saved_values(
     wait_ms: int,
     max_scroll_steps: int,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    section = adapter.find_section(section_title)
-    if section is None:
-        return [], ["Save 后找不到 section。"]
-    adapter.open_section_for_edit(section)
-    section = adapter.find_section(section_title) or section
-    section_path = str(section.get("path") or "")
-    if not section_path:
-        return [], ["Save 后 section 缺少 DOM path。"]
-
-    live = _fields_by_identity(
-        _live_fields(
-            adapter,
-            section_path,
-            wait_ms=wait_ms,
-            max_scroll_steps=max_scroll_steps,
-        )
+    section_path, live = _open_and_index_section(
+        adapter,
+        section_title,
+        wait_ms=wait_ms,
+        max_scroll_steps=max_scroll_steps,
     )
     verifications: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -292,11 +318,11 @@ def _verify_saved_values(
         identity = _item_identity(item)
         if identity not in validated_identities:
             continue
-        matches = live.get(identity, [])
         mode = preview_mode_for_item(
             item,
             include_review_candidates=include_review_candidates,
         )
+        matches = live.get(identity, [])
         if len(matches) != 1:
             errors.append(
                 f"{item.label}: Save 后 live field 匹配数={len(matches)}，期望 1。"
@@ -362,27 +388,19 @@ def _fill_one_section(
         report["status"] = "no_candidates"
         return report
 
-    section = adapter.find_section(section_title)
-    if section is None:
-        report["status"] = "section_not_found"
-        return report
-    adapter.open_section_for_edit(section)
-    section = adapter.find_section(section_title) or section
-    section_path = str(section.get("path") or "")
-    if not section_path:
-        report["status"] = "section_path_missing"
-        return report
-
-    live = _fields_by_identity(
-        _live_fields(
+    try:
+        section_path, live = _open_and_index_section(
             adapter,
-            section_path,
+            section_title,
             wait_ms=scroll_wait_ms,
             max_scroll_steps=max_scroll_steps,
         )
-    )
-    validated_identities: set[tuple[str, str, str]] = set()
+    except Exception as exc:
+        report["status"] = "section_error"
+        report["detail"] = str(exc)
+        return report
 
+    validated_identities: set[tuple[str, str, str]] = set()
     for item in candidates:
         mode = preview_mode_for_item(
             item,
@@ -479,6 +497,8 @@ def _fill_one_section(
         adapter.page.screenshot(path=str(after_save), full_page=True)
         report["screenshot_after_save"] = str(after_save.resolve())
 
+        # Re-open verification is read-only; Cancel only collapses that read-only
+        # edit transaction. The already-saved values remain persisted.
         adapter.cancel_section(section_title)
         execution_incomplete = bool(
             report["validation_failed"]
@@ -598,7 +618,7 @@ def _totals(section_reports: list[dict[str, Any]]) -> dict[str, int]:
 def _blocked_reason_summary(plan: LiveFillPlan) -> dict[str, int]:
     output: dict[str, int] = {}
     for item in plan.items:
-        if item.action != "blocked":
+        if item.action != BLOCKED:
             continue
         reason = item.resolution.gate_reason or f"resolver_{item.resolution.status}"
         output[reason] = output.get(reason, 0) + 1
@@ -677,11 +697,7 @@ def main() -> int:
         auto_fill_min_confidence=args.auto_fill_min_confidence,
         ai_auto_fill_min_confidence=args.ai_auto_fill_min_confidence,
     )
-    alias_config = (
-        load_alias_config(args.alias_config, expected_vertical=args.expected_vertical)
-        if args.alias_config
-        else None
-    )
+    match_config = _load_matching_config(args)
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = Path(args.output_dir) / f"preview-{stamp}"
@@ -730,16 +746,26 @@ def main() -> int:
             semantic_fields,
             input_result.bundle,
             policy=policy,
-            aliases=alias_config.aliases if alias_config else None,
+            aliases=match_config.aliases if match_config else None,
+            sections=match_config.sections if match_config else None,
         )
 
-        print("===== MAKRO STEP 3 ACCEPTANCE =====" if args.all_step3 else "===== MAKRO SECTION PREVIEW =====")
-        print(f"page={page.url}")
         summary = plan.summary()
+        print(
+            "===== MAKRO STEP 3 ACCEPTANCE ====="
+            if args.all_step3
+            else "===== MAKRO SECTION PREVIEW ====="
+        )
+        print(f"page={page.url}")
         print(
             f"ready={summary['ready']}, preview_eligible={summary['preview_eligible']}, "
             f"blocked={summary['blocked']}, required_blocked={summary['required_blocked']}"
         )
+        if match_config:
+            print(
+                f"matching_config={match_config.source_path} "
+                f"aliases={len(match_config.aliases)} sections={len(match_config.sections)}"
+            )
         print(
             "section Save 已显式授权；绝不 Send to QC。"
             if args.all_step3
@@ -815,6 +841,7 @@ def main() -> int:
             "expected_vertical": args.expected_vertical,
             "include_review_candidates": args.include_review_candidates,
             "allow_section_save": args.allow_section_save,
+            "matching_config": match_config.source_path if match_config else None,
             "plan_summary": summary,
             "blocked_reason_summary": _blocked_reason_summary(plan),
             "fill_plan": plan.as_dict(),
@@ -842,7 +869,11 @@ def main() -> int:
             encoding="utf-8",
         )
 
-        print("\n===== ACCEPTANCE COMPLETE =====" if args.all_step3 else "\n===== PREVIEW READY =====")
+        print(
+            "\n===== ACCEPTANCE COMPLETE ====="
+            if args.all_step3
+            else "\n===== PREVIEW READY ====="
+        )
         print(
             f"field candidate={totals['candidate_count']}, attempted={totals['writes_attempted']}, "
             f"validated={totals['validated']}, persisted={totals['persisted_verified']}, "
