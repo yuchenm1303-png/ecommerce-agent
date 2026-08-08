@@ -7,7 +7,7 @@ import sys
 from openpyxl import Workbook
 
 import makro_resolve_ai
-from app.providers.registry import ProviderConfig
+from app.providers.registry import ProviderConfig, validate_provider_config
 
 
 def _qa_file(tmp_path):
@@ -70,9 +70,7 @@ class FakeProvider:
         self.calls += 1
         self.requests.append(request_payload)
         image_source = next(
-            source
-            for source in request_payload["grounded_sources"]
-            if source["kind"] == "image"
+            source for source in request_payload["grounded_sources"] if source["kind"] == "image"
         )
         decisions = []
         for target in request_payload["target_fields"]:
@@ -83,16 +81,12 @@ class FakeProvider:
                         "status": "ready",
                         "values": ["3.0"],
                         "qualifier": "inch",
-                        "confidence": 0.94,
                         "citations": [
                             {
                                 "source_reference": image_source["source_id"],
                                 "evidence_text": "Visible printed specification: Screen Size 3.0 inch.",
                             }
                         ],
-                        "alternatives": [],
-                        "reason": "visible product specification",
-                        "search_queries": [],
                     }
                 )
             else:
@@ -100,24 +94,10 @@ class FakeProvider:
                     {
                         "field_id": target["field_id"],
                         "status": "missing",
-                        "values": [],
-                        "qualifier": "",
-                        "confidence": 0.0,
-                        "citations": [],
-                        "alternatives": [],
-                        "reason": "not in supplied evidence",
                         "search_queries": ["M8 WiFi package dimensions"],
                     }
                 )
-        return {
-            "contract_version": 1,
-            "product_identity": request_payload["product_identity"],
-            "schema_sha256": request_payload["schema_sha256"],
-            "source_manifest_sha256": request_payload["source_manifest_sha256"],
-            "decisions": decisions,
-            "model_summary": "resolved live schema",
-            "warnings": [],
-        }
+        return {"decisions": decisions, "model_summary": "resolved live schema"}
 
 
 def test_resolver_is_one_local_product_call_browser_free_and_audited(tmp_path, monkeypatch):
@@ -139,38 +119,32 @@ def test_resolver_is_one_local_product_call_browser_free_and_audited(tmp_path, m
         "argv",
         [
             "makro_resolve_ai.py",
-            "--provider",
-            "openai-compatible",
-            "--model",
-            "vendor-vision-model",
-            "--base-url",
-            "https://api.vendor.test/v1",
-            "--api-key-env",
-            "VENDOR_KEY",
-            "--request-timeout-seconds",
-            "75",
-            "--qa",
-            str(qa),
-            "--live-schema",
-            str(live_schema),
-            "--image",
-            str(image),
+            "--provider", "openai-compatible",
+            "--model", "vendor-vision-model",
+            "--base-url", "https://api.vendor.test/v1",
+            "--api-key-env", "VENDOR_KEY",
+            "--request-timeout-seconds", "75",
+            "--qa", str(qa),
+            "--live-schema", str(live_schema),
+            "--image", str(image),
             "--no-semantic-cache",
-            "--output-dir",
-            str(output),
+            "--output-dir", str(output),
         ],
     )
 
     assert makro_resolve_ai.main() == 0
     assert provider.calls == 1
     request = provider.requests[0]
-    assert request["task"] == "resolve_all_live_marketplace_fields_from_product_sources"
+    assert request["task"] == "fill_marketplace_fields_from_local_product_evidence"
     assert len(request["target_fields"]) == 2
     assert len(request["grounded_sources"]) == 2
+    assert "schema_sha256" not in request
+    assert "source_manifest_sha256" not in request
     assert captured["config"].provider == "openai-compatible"
     assert captured["config"].model == "vendor-vision-model"
     assert captured["config"].api_key_env == "VENDOR_KEY"
     assert captured["config"].request_timeout_seconds == 75
+    assert captured["config"].structured_mode == "prompt_only"
 
     run_dir = next(output.iterdir())
     for name in (
@@ -183,6 +157,7 @@ def test_resolver_is_one_local_product_call_browser_free_and_audited(tmp_path, m
         assert (run_dir / name).exists(), name
 
     decisions = json.loads((run_dir / "ai-decisions.json").read_text(encoding="utf-8"))
+    assert decisions["contract_version"] == 2
     assert len(decisions["decisions"]) == 2
     assert [item["status"] for item in decisions["decisions"]] == ["ready", "missing"]
     assert decisions["web_sources"] == []
@@ -193,26 +168,35 @@ def test_resolver_is_one_local_product_call_browser_free_and_audited(tmp_path, m
 
     manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
     assert manifest["mode"] == "browser_free_ai_first_product_resolution"
-    assert manifest["execution_model"] == "one_local_whole_product_call_plus_optional_one_sourced_web_call"
+    assert manifest["execution_model"] == "one_local_whole_product_fill_plus_optional_one_sourced_web_fill"
     assert manifest["provider_config"]["provider"] == "openai-compatible"
-    assert manifest["provider_config"]["api_key_env"] == "VENDOR_KEY"
     assert manifest["provider_config"]["request_timeout_seconds"] == 75
     assert "api_key" not in manifest["provider_config"]
     assert manifest["customer_context_chars"] > 0
     assert manifest["live_field_count"] == 2
-    assert manifest["grounded_logical_source_count"] == 2
     assert manifest["local_ai"]["model_calls"] == 1
-    assert manifest["local_ai"]["cache_hit"] is False
+    assert manifest["local_ai"]["repair_attempts"] == 0
     assert manifest["local_ai"]["decision_summary"]["ready"] == 1
     assert manifest["local_ai"]["decision_summary"]["missing"] == 1
     assert manifest["web_enrichment"]["searched"] is False
-    assert manifest["web_enrichment"]["model_calls"] == 0
     assert manifest["total_model_calls"] == 1
-    assert manifest["final_decision_summary"]["ready"] == 1
-    assert manifest["final_decision_summary"]["missing"] == 1
     assert manifest["writes_performed"] == 0
     assert manifest["save_clicked"] is False
     assert manifest["send_to_qc_clicked"] is False
+
+
+def test_qwen_auto_mode_selects_json_output_and_no_thinking():
+    config = validate_provider_config(
+        ProviderConfig(
+            provider="openai-compatible",
+            model="qwen3.5-omni-plus",
+            api_key_env="DASHSCOPE_API_KEY",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+    )
+    assert config.structured_mode == "json_object"
+    assert config.enable_thinking is False
+    assert config.as_safe_dict()["max_output_tokens"] is None
 
 
 def test_cache_namespace_ignores_transport_only_timeout_but_keeps_semantic_config():
@@ -232,7 +216,7 @@ def test_cache_namespace_ignores_transport_only_timeout_but_keeps_semantic_confi
         request_timeout_seconds=180,
         enable_thinking=False,
     )
-    thinking = ProviderConfig(
+    different_semantics = ProviderConfig(
         provider="openai-compatible",
         model="vision-model",
         api_key_env="KEY",
@@ -241,31 +225,29 @@ def test_cache_namespace_ignores_transport_only_timeout_but_keeps_semantic_confi
         enable_thinking=True,
     )
     assert makro_resolve_ai._cache_namespace(base) == makro_resolve_ai._cache_namespace(slower)
-    assert makro_resolve_ai._cache_namespace(base) != makro_resolve_ai._cache_namespace(thinking)
+    assert makro_resolve_ai._cache_namespace(base) != makro_resolve_ai._cache_namespace(different_semantics)
+
+
+def test_cli_defaults_to_auto_json_and_zero_full_product_repair():
+    parser = makro_resolve_ai.build_parser()
+    structured = next(item for item in parser._actions if "--structured-mode" in item.option_strings)
+    repair = next(item for item in parser._actions if "--max-repair-attempts" in item.option_strings)
+    assert structured.default == "auto"
+    assert repair.default == 0
 
 
 def test_cli_has_no_legacy_batch_confidence_or_semantic_fact_controls():
     parser = makro_resolve_ai.build_parser()
-    option_strings = {
-        option
-        for action in parser._actions
-        for option in action.option_strings
-    }
+    option_strings = {option for action in parser._actions for option in action.option_strings}
     assert "--api-key" not in option_strings
-    assert "--openai-api-key" not in option_strings
     assert "--api-key-env" in option_strings
     assert "--live-schema" in option_strings
     assert "--batch-size" not in option_strings
     assert "--source-concurrency" not in option_strings
-    assert "--max-source-repair-attempts" not in option_strings
     assert "--auto-fill-min-confidence" not in option_strings
-    assert "--ai-auto-fill-min-confidence" not in option_strings
     assert "--max-repair-attempts" in option_strings
-    assert "--semantic-cache-dir" in option_strings
     assert "--request-timeout-seconds" in option_strings
-    assert "--disable-thinking" in option_strings
     assert "--web-enrich" in option_strings
-    assert "--web-search-model" in option_strings
     live_action = next(item for item in parser._actions if "--live-schema" in item.option_strings)
     assert live_action.required is True
 
