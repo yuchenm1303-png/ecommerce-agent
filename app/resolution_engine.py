@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from .answer_resolver import (
+    BUSINESS_ALLOWED_SOURCE_TYPES,
     BUSINESS_ATTRIBUTE_ALIASES,
     CONFLICT,
     MISSING,
@@ -12,6 +13,7 @@ from .answer_resolver import (
     ResolvedAnswer,
     resolve_field,
 )
+from .evidence_validation import is_business_question
 from .fact_validators import validate_resolved_answer
 from .qa_catalog import QuestionCatalog, QuestionRecord
 from .source_bundle import ProductSourceBundle
@@ -20,6 +22,7 @@ from .source_bundle import ProductSourceBundle
 GATE_LOW_CONFIDENCE = "low_confidence"
 GATE_MISSING_SOURCE_REFERENCE = "missing_source_reference"
 GATE_FIELD_CONSTRAINT = "field_constraint"
+GATE_BUSINESS_SOURCE = "business_source"
 
 
 @dataclass(slots=True, frozen=True)
@@ -139,20 +142,26 @@ def _resolution_field(
     semantic_field: dict[str, Any],
     question: QuestionRecord | None,
 ) -> dict[str, Any]:
-    """Expose a deterministically matched QA label as an evidence lookup key.
-
-    When the QA-to-Makro matcher used an explicit alias, evidence is naturally
-    stored under the QA question label while the live control keeps its Makro
-    label. Reusing the question as the temporary resolver label makes both the
-    question label and the stable attribute_key candidates without fuzzy search.
-    The real Makro label is restored on the returned ResolutionRecord.
-    """
+    """Expose a deterministically matched QA label as an evidence lookup key."""
 
     if question is None or question.question == str(semantic_field.get("label") or ""):
         return semantic_field
     enriched = dict(semantic_field)
     enriched["label"] = question.question
     return enriched
+
+
+def _is_business_field(
+    semantic_field: dict[str, Any],
+    question: QuestionRecord | None,
+) -> bool:
+    names = [
+        str(semantic_field.get("attribute_key") or ""),
+        str(semantic_field.get("label") or ""),
+    ]
+    if question is not None:
+        names.append(question.question)
+    return any(is_business_question(name) for name in names if name)
 
 
 def resolve_one(
@@ -169,8 +178,23 @@ def resolve_one(
     # Reports and browser plans must always expose the real live Makro label.
     answer.label = str(semantic_field.get("label") or answer.label)
 
+    business_source_rejected = (
+        _is_business_field(semantic_field, question)
+        and answer.status == RESOLVED
+        and answer.source_type not in BUSINESS_ALLOWED_SOURCE_TYPES
+    )
+
     constraints_ok = not policy.validate_field_constraints
-    if answer.status == RESOLVED and policy.validate_field_constraints:
+    if business_source_rejected:
+        status = NEEDS_REVIEW
+        eligible = False
+        constraints_ok = False
+        detail = (
+            "经营字段只能来自 structured/business/config/rule；"
+            f"当前来源 {answer.source_type or 'unknown'} 不允许驱动真实填写。"
+        )
+        gate_reason = GATE_BUSINESS_SOURCE
+    elif answer.status == RESOLVED and policy.validate_field_constraints:
         validation = validate_resolved_answer(semantic_field, answer)
         constraints_ok = validation.valid
         if not validation.valid:
@@ -186,9 +210,6 @@ def resolve_one(
     # Review preview is deliberately narrower than "has an answer". A candidate
     # is previewable only when the resolver produced a structurally valid
     # resolved value and the *sole* gate preventing autofill is confidence.
-    # Conflicts, missing evidence, dropdown/field-constraint failures and missing
-    # provenance remain non-previewable. This lets the browser show grounded
-    # candidates for human inspection without weakening the autofill trust gate.
     preview_eligible = (
         status == NEEDS_REVIEW
         and gate_reason == GATE_LOW_CONFIDENCE
