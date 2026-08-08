@@ -16,7 +16,7 @@ from .answer_resolver import (
 from .evidence_validation import is_business_question
 from .fact_validators import validate_resolved_answer
 from .qa_catalog import QuestionCatalog, QuestionRecord
-from .source_bundle import ProductSourceBundle
+from .source_bundle import ProductSourceBundle, normalize_key
 
 
 GATE_LOW_CONFIDENCE = "low_confidence"
@@ -81,7 +81,7 @@ class ResolutionRecord:
         }
 
 
-def _candidate_keys(field: dict[str, Any]) -> list[str]:
+def _default_candidate_keys(field: dict[str, Any]) -> list[str]:
     key = str(field.get("attribute_key") or "")
     label = str(field.get("label") or "")
     values = [key, label]
@@ -89,8 +89,47 @@ def _candidate_keys(field: dict[str, Any]) -> list[str]:
     return [item for item in values if item]
 
 
-def _provenance(field: dict[str, Any], bundle: ProductSourceBundle) -> list[dict[str, Any]]:
-    candidates = bundle.candidates(_candidate_keys(field))
+def _matched_evidence_keys(
+    semantic_field: dict[str, Any],
+    question: QuestionRecord | None,
+) -> list[str]:
+    """Use the deterministic QA match as the evidence namespace.
+
+    Once matcher has selected one QA question for a live field, a reused/broken
+    DOM attribute_key must not pull in evidence from a different question. Real
+    Makro has exposed label=Length with attribute_key=height; using both keys
+    made Height evidence contaminate Length. Business fields retain their
+    reviewed aliases because those aliases represent explicit seller inputs.
+    """
+
+    if question is None:
+        return _default_candidate_keys(semantic_field)
+
+    values = [question.question]
+    attribute_key = str(semantic_field.get("attribute_key") or "")
+    if attribute_key in BUSINESS_ATTRIBUTE_ALIASES:
+        values.append(attribute_key)
+        values.extend(BUSINESS_ATTRIBUTE_ALIASES[attribute_key])
+
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = normalize_key(value)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        output.append(value)
+    return output
+
+
+def _provenance(
+    field: dict[str, Any],
+    bundle: ProductSourceBundle,
+    *,
+    evidence_keys: Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
+    keys = list(evidence_keys) if evidence_keys is not None else _default_candidate_keys(field)
+    candidates = bundle.candidates(keys)
     return [
         {
             "key": item.key,
@@ -142,12 +181,22 @@ def _resolution_field(
     semantic_field: dict[str, Any],
     question: QuestionRecord | None,
 ) -> dict[str, Any]:
-    """Expose a deterministically matched QA label as an evidence lookup key."""
+    """Expose the deterministic QA identity without trusting a reused DOM key."""
 
-    if question is None or question.question == str(semantic_field.get("label") or ""):
+    if question is None:
         return semantic_field
+
     enriched = dict(semantic_field)
     enriched["label"] = question.question
+    live_key = str(semantic_field.get("attribute_key") or "")
+    if (
+        live_key not in BUSINESS_ATTRIBUTE_ALIASES
+        and normalize_key(live_key) != normalize_key(question.question)
+    ):
+        # Resolver-only copy: field constraints/section stay from the real live
+        # field, but semantic scope follows the matched QA instead of a bogus DOM
+        # key such as Length -> height.
+        enriched["attribute_key"] = question.question
     return enriched
 
 
@@ -174,8 +223,15 @@ def resolve_one(
 ) -> ResolutionRecord:
     policy = policy or ResolutionPolicy()
     lookup_field = _resolution_field(semantic_field, question)
-    answer = resolve_field(lookup_field, bundle, fallback=fallback)
-    # Reports and browser plans must always expose the real live Makro label.
+    evidence_keys = _matched_evidence_keys(semantic_field, question)
+    answer = resolve_field(
+        lookup_field,
+        bundle,
+        fallback=fallback,
+        evidence_keys=evidence_keys,
+    )
+    # Reports and browser plans must always expose the real live Makro identity.
+    answer.attribute_key = str(semantic_field.get("attribute_key") or answer.attribute_key)
     answer.label = str(semantic_field.get("label") or answer.label)
 
     business_source_rejected = (
@@ -236,7 +292,7 @@ def resolve_one(
         eligible_for_autofill=eligible,
         preview_eligible=preview_eligible,
         gate_reason=gate_reason,
-        provenance=_provenance(lookup_field, bundle),
+        provenance=_provenance(lookup_field, bundle, evidence_keys=evidence_keys),
         question_number=(
             question.number if question else str(semantic_field.get("question_number") or "")
         ),
