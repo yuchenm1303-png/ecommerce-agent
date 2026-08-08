@@ -1,0 +1,110 @@
+name: ai-minfix-once
+
+on:
+  push:
+    branches: [feat/review-preview-gate]
+    paths:
+      - .github/workflows/ai-minfix-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/review-preview-gate
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Apply minimal AI output-contract fixes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, got {count}")
+              return text.replace(old, new, 1)
+
+          path = Path("app/ai_decisions.py")
+          text = path.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              '    "CONFLICT: credible sources disagree on the same attribute; include at least two cited alternatives and do not silently choose.",',
+              '    "Before READY, compare all grounded sources for the same attribute and scope. If two credible explicit values disagree and neither clearly supersedes the other, status MUST be CONFLICT, never READY or REVIEW.",\n'
+              '    "CONFLICT: include at least two cited alternatives and do not silently choose one conflicting value.",',
+              "local conflict rule",
+          )
+          text = replace_once(
+              text,
+              '    "Do not infer No/False/Not included from absence of mention. Keep package dimensions distinct from product dimensions, manual language from device UI language, product brand from compatible vehicle brand, and cabin camera from rear camera unless evidence establishes the relationship.",',
+              '    "Never infer No/False/Not included from absence; a negative value requires explicit negative evidence. Package/packaging dimensions and weight may answer only packaging fields, never product-body Width/Height/Depth/Weight. Manual language is not device UI language; product brand is not compatible vehicle brand; cabin/interior camera is not rear/back camera unless explicit evidence establishes it.",',
+              "local scope rule",
+          )
+          text = replace_once(
+              text,
+              '    "If target options are supplied, return the exact marketplace option text when one clearly matches.",',
+              '    "If target options are supplied, return the exact marketplace option text when one clearly matches.",\n'
+              '    "If multi_value=false, return exactly one string in values. For a free-text single-value field that summarizes several supported features, combine them into one concise string instead of multiple array elements.",\n'
+              '    "If qualifier_options are supplied, put the magnitude/value only in values and put the exact unit once in qualifier; never return the unit as a second value or append it to a numeric value.",\n'
+              '    "Do not invent warranty or service terms; READY for warranty fields requires explicit warranty evidence.",',
+              "local shape rules",
+          )
+          text = replace_once(
+              text,
+              '        "field_id": field_id(item),\n        "label": contract["label"],',
+              '        "field_id": field_id(item),\n        "attribute_key": contract["attribute_key"],\n        "label": contract["label"],',
+              "attribute key payload",
+          )
+          path.write_text(text, encoding="utf-8")
+
+          path = Path("app/web_enrichment.py")
+          text = path.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              '            "CONFLICT means credible web/local evidence remains materially incompatible; preserve alternatives.",',
+              '            "If credible explicit web/local values disagree for the same attribute and scope and neither clearly supersedes the other, status MUST be CONFLICT; preserve cited alternatives and never silently choose one.",',
+              "web conflict rule",
+          )
+          text = replace_once(
+              text,
+              '            "Do not invent URLs and do not treat lack of mention as No/False/Not included.",',
+              '            "Do not invent URLs. Never treat lack of mention as No/False/Not included; a negative value requires explicit negative evidence. Keep packaging dimensions/weight separate from product-body dimensions/weight.",',
+              "web scope rule",
+          )
+          text = replace_once(
+              text,
+              '            "When target options are supplied, return exact marketplace option text when one clearly matches.",',
+              '            "When target options are supplied, return exact marketplace option text when one clearly matches.",\n'
+              '            "If multi_value=false, return exactly one string in values; combine supported free-text features into one concise string when appropriate.",\n'
+              '            "If qualifier_options are supplied, put only the magnitude/value in values and put the exact unit once in qualifier; never return the unit as a separate value.",\n'
+              '            "Do not invent warranty or service terms; READY for warranty fields requires explicit warranty evidence.",',
+              "web shape rules",
+          )
+          path.write_text(text, encoding="utf-8")
+
+          Path("tests/test_ai_prompt_contract.py").write_text('''from app.ai_decisions import build_ai_resolution_request\nfrom app.semantic_grounding import GroundingCatalog\n\n\ndef test_ai_prompt_keeps_field_identity_and_hard_output_shape_in_ai():\n    field = {\n        "attribute_key": "package_breadth",\n        "label": "Length",\n        "section_heading": "Price, Stock and Shipping Information",\n        "required": False,\n        "multi_value": False,\n        "options": [],\n        "qualifier_options": ["cm", "mm"],\n        "controls": [],\n        "help_text": "",\n    }\n    request = build_ai_resolution_request([field], GroundingCatalog(sources=[]))\n    target = request["target_fields"][0]\n    rules = "\\n".join(request["rules"])\n\n    assert target["attribute_key"] == "package_breadth"\n    assert target["label"] == "Length"\n    assert target["qualifier_options"] == ["cm", "mm"]\n    assert "MUST be CONFLICT" in rules\n    assert "multi_value=false" in rules\n    assert "qualifier_options" in rules\n    assert "Package/packaging dimensions" in rules\n    assert "explicit negative evidence" in rules\n''', encoding="utf-8")
+          PY
+
+      - name: Install and test
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pytest -q
+
+      - name: Commit patched production files
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/ai-minfix-once.yml
+          git add app/ai_decisions.py app/web_enrichment.py tests/test_ai_prompt_contract.py
+          git commit -m "fix: tighten AI field semantics and output shape"
+          git push origin HEAD:feat/review-preview-gate
