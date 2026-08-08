@@ -38,3 +38,6 @@ def test_cli_defaults_target_plus_json_mode_and_responses_web_endpoint():
     assert args.enable_thinking is False
     assert args.web_enrich == "auto"
     assert args.web_base_url == ""
+    options = {option for action in parser._actions for option in action.option_strings}
+    assert "--web-base-url" in options
+    assert "--web-native-base-url" not in options
