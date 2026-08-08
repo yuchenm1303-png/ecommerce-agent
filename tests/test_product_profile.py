@@ -141,3 +141,56 @@ def test_profile_drops_ungrounded_candidate_instead_of_trusting_it(tmp_path):
 
     result = run_product_profile(BadProvider(), grounding(tmp_path))
     assert result.profile.facts == []
+
+
+def test_profile_rebinds_wrong_text_chunk_only_within_same_source_document():
+    sources = GroundingCatalog(
+        sources=[
+            GroundedSource(
+                source_id="supplier:001:text:0001:a",
+                source_type="supplier_web",
+                kind=TEXT_KIND,
+                origin="supplier-snapshot.json",
+                content="Model M8",
+                sha256="a" * 64,
+            ),
+            GroundedSource(
+                source_id="supplier:001:text:0002:b",
+                source_type="supplier_web",
+                kind=TEXT_KIND,
+                origin="supplier-snapshot.json",
+                content="Package 16 x 11 x 7 cm; 285 g",
+                sha256="b" * 64,
+            ),
+        ]
+    )
+
+    class WrongChunkProvider:
+        name = "wrong-chunk"
+
+        def extract_json(self, request):
+            return {
+                "facts": [
+                    {
+                        "name": "packaging_dimensions",
+                        "scope": "packaging",
+                        "status": "supported",
+                        "candidates": [
+                            {
+                                "value": "16 x 11 x 7 cm",
+                                "citations": [
+                                    {
+                                        "source_reference": "supplier:001:text:0001:a",
+                                        "evidence_text": "Package 16 x 11 x 7 cm",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+
+    result = run_product_profile(WrongChunkProvider(), sources)
+    citation = result.profile.facts[0].candidates[0].citations[0]
+    assert citation.source_reference == "supplier:001:text:0002:b"
+    assert any("citation rebound" in item for item in result.profile.warnings)
