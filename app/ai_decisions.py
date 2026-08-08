@@ -3,14 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable
 
 from .business_fields import is_business_question
 from .evidence_contract import ProductIdentity, assert_identity_compatible
-from .providers.errors import JSONTaskResponseError
 from .semantic_grounding import GroundedSource, GroundingCatalog, IMAGE_KIND, TEXT_KIND
 from .source_bundle import normalize_key
 
@@ -22,18 +20,10 @@ MISSING = "missing"
 BUSINESS_LOCKED = "business_locked"
 DECISION_STATUSES = (READY, REVIEW, CONFLICT, MISSING, BUSINESS_LOCKED)
 DECISION_CONTRACT_VERSION = 2
-AI_DECISION_CACHE_VERSION = 2
 
 
 class AIDecisionError(ValueError):
     pass
-
-
-class JSONDecisionProvider(Protocol):
-    name: str
-
-    def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
-        ...
 
 
 def _stable_section(value: object) -> str:
@@ -331,118 +321,6 @@ class AIDecisionPacket:
         )
 
 
-# Compact model-output contract. Packet identity/digests are attached locally;
-# the model no longer wastes output tokens echoing data that Python already knows.
-AI_DECISION_JSON_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "decisions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["field_id", "status"],
-                "properties": {
-                    "field_id": {"type": "string"},
-                    "status": {"type": "string", "enum": list(DECISION_STATUSES)},
-                    "values": {"type": "array", "items": {"type": "string"}},
-                    "qualifier": {"type": "string"},
-                    "citations": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["source_reference", "evidence_text"],
-                            "properties": {
-                                "source_reference": {"type": "string"},
-                                "evidence_text": {"type": "string"},
-                            },
-                        },
-                    },
-                    "alternatives": {"type": "array"},
-                    "reason": {"type": "string"},
-                    "search_queries": {"type": "array", "items": {"type": "string"}},
-                },
-            },
-        },
-        "model_summary": {"type": "string"},
-    },
-    "required": ["decisions"],
-}
-
-
-AI_RESOLUTION_SYSTEM_INSTRUCTION = (
-    "You are the product-listing resolver. Read all supplied product evidence jointly and fill the "
-    "marketplace fields semantically. Translation, synonyms, counting, option matching, specification "
-    "interpretation and conflict judgment are your job. Never invent unsupported product facts. "
-    "Preserve the exact selected product/variant. Return compact JSON only."
-)
-
-AI_RESOLUTION_RULES = [
-    "Return one compact decision for every target field_id; never invent a field_id.",
-    "READY: one answer is strongly supported. Include values and the smallest useful citations.",
-    "REVIEW: a plausible answer exists but identity/scope/evidence is insufficient for automatic entry; include candidate values/citations when available.",
-    "Before READY, compare all grounded sources for the same attribute and scope. If two credible explicit values disagree and neither clearly supersedes the other, status MUST be CONFLICT, never READY or REVIEW.",
-    "CONFLICT: include at least two cited alternatives and do not silently choose one conflicting value.",
-    "MISSING: current evidence cannot answer. Leave values empty; add at most two focused search_queries if normal web research could answer it.",
-    "For REVIEW or CONFLICT, also add search_queries when web research could resolve the uncertainty.",
-    "BUSINESS_LOCKED: seller-operated price, stock, MOQ, fulfilment, shipping or listing status. Never infer these from product content.",
-    "Citations may use only supplied source_id values. For text quote the short supporting excerpt; for images describe the exact visible evidence.",
-    "Never infer No/False/Not included from absence; a negative value requires explicit negative evidence. Package/packaging dimensions and weight may answer only packaging fields, never product-body Width/Height/Depth/Weight. Manual language is not device UI language; product brand is not compatible vehicle brand; cabin/interior camera is not rear/back camera unless explicit evidence establishes it.",
-    "If target options are supplied, return the exact marketplace option text when one clearly matches.",
-    "If multi_value=false, return exactly one string in values. For a free-text single-value field that summarizes several supported features, combine them into one concise string instead of multiple array elements.",
-    "If qualifier_options are supplied, put the magnitude/value only in values and put the exact unit once in qualifier; never return the unit as a second value or append it to a numeric value.",
-    "Do not invent warranty or service terms; READY for warranty fields requires explicit warranty evidence.",
-    "Do not use external web knowledge in this local pass.",
-    "Omit confidence and reason when they add no value; omit alternatives except for conflicts; omit search_queries when no research is needed.",
-]
-
-
-def _target_field_payload(item: dict[str, Any]) -> dict[str, Any]:
-    contract = field_contract(item)
-    locked = is_business_question(contract["attribute_key"]) or is_business_question(contract["label"])
-    payload: dict[str, Any] = {
-        "field_id": field_id(item),
-        "attribute_key": contract["attribute_key"],
-        "label": contract["label"],
-        "section_heading": contract["section_heading"],
-        "required": contract["required"],
-        "multi_value": contract["multi_value"],
-        "business_locked": locked,
-    }
-    if contract["options"]:
-        payload["options"] = contract["options"]
-    if contract["qualifier_options"]:
-        payload["qualifier_options"] = contract["qualifier_options"]
-    if contract["help_text"]:
-        payload["help_text"] = contract["help_text"]
-    return payload
-
-
-def build_ai_resolution_request(
-    fields: Iterable[dict[str, Any]],
-    grounding: GroundingCatalog,
-    *,
-    identity: ProductIdentity = ProductIdentity(),
-) -> dict[str, Any]:
-    field_list = list(fields)
-    return {
-        "task": "fill_marketplace_fields_from_local_product_evidence",
-        "system_instruction": AI_RESOLUTION_SYSTEM_INSTRUCTION,
-        "prompt_instruction": (
-            "Fill the target fields from the complete local product evidence in one pass. "
-            "Keep the JSON compact: output decisions, not an explanation of your process."
-        ),
-        "product_identity": {
-            "sku": identity.sku,
-            "model_number": identity.model_number,
-            "brand": identity.brand,
-        },
-        "target_fields": [_target_field_payload(item) for item in field_list],
-        "rules": list(AI_RESOLUTION_RULES),
-        "grounded_sources": grounding.as_request_list(),
-        "json_contract": AI_DECISION_JSON_SCHEMA,
-    }
-
-
 def _normalize_ws(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().casefold()
 
@@ -495,7 +373,7 @@ def validate_ai_decision_packet(
     expected_identity: ProductIdentity = ProductIdentity(),
     external_sources: dict[str, str] | None = None,
 ) -> AIDecisionPacket:
-    """Validate only structural/provenance boundaries; product semantics stay with AI."""
+    """Validate structural/provenance boundaries only; product semantics stay with AI."""
 
     field_list = list(fields)
     by_id = indexed_fields(field_list)
@@ -589,9 +467,9 @@ def validate_ai_decision_packet(
         observed[identifier] = FieldDecision(
             field_id=identifier,
             status=status,
-            reason="seller-operated field" if locked else "model omitted this target field",
+            reason="seller-operated field" if locked else "AI stage omitted this target field",
         )
-        warnings.append(f"model omitted field_id={identifier}; synthesized status={status}")
+        warnings.append(f"AI stage omitted field_id={identifier}; synthesized status={status}")
 
     return AIDecisionPacket(
         identity=packet.identity,
@@ -602,180 +480,6 @@ def validate_ai_decision_packet(
         warnings=warnings,
         extractor=packet.extractor,
     )
-
-
-def decision_contract_digest() -> str:
-    payload = {
-        "contract_version": DECISION_CONTRACT_VERSION,
-        "system": AI_RESOLUTION_SYSTEM_INSTRUCTION,
-        "rules": AI_RESOLUTION_RULES,
-        "schema": AI_DECISION_JSON_SCHEMA,
-    }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _cache_key(
-    provider: JSONDecisionProvider,
-    cache_namespace: str,
-    fields: list[dict[str, Any]],
-    grounding: GroundingCatalog,
-    identity: ProductIdentity,
-) -> str:
-    payload = {
-        "cache_version": AI_DECISION_CACHE_VERSION,
-        "decision_contract_sha256": decision_contract_digest(),
-        "provider": provider.name,
-        "cache_namespace": cache_namespace,
-        "identity": {
-            "sku": identity.sku,
-            "model_number": identity.model_number,
-            "brand": identity.brand,
-        },
-        "schema_sha256": schema_digest(fields),
-        "source_manifest_sha256": source_manifest_digest(grounding),
-    }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-@dataclass(slots=True)
-class AIResolutionRunResult:
-    packet: AIDecisionPacket
-    model_calls: int
-    cache_hit: bool
-    repair_attempts: int
-    elapsed_seconds: float
-
-
-def _validate_model_response(
-    raw: dict[str, Any],
-    *,
-    provider_name: str,
-    fields: list[dict[str, Any]],
-    grounding: GroundingCatalog,
-    expected_identity: ProductIdentity,
-) -> AIDecisionPacket:
-    if not isinstance(raw, dict):
-        raise AIDecisionError("AI model output 顶层必须是 JSON object。")
-    raw_decisions = raw.get("decisions")
-    if not isinstance(raw_decisions, list):
-        raise AIDecisionError("AI model output 缺少 decisions 数组。")
-    packet = AIDecisionPacket(
-        identity=expected_identity,
-        schema_sha256=schema_digest(fields),
-        source_manifest_sha256=source_manifest_digest(grounding),
-        decisions=[
-            FieldDecision.from_mapping(item, index=index)
-            for index, item in enumerate(raw_decisions, start=1)
-            if isinstance(item, dict)
-        ],
-        model_summary=str(raw.get("model_summary") or "").strip(),
-        warnings=[],
-        extractor=str(raw.get("extractor") or provider_name).strip() or provider_name,
-    )
-    return validate_ai_decision_packet(
-        packet,
-        fields,
-        grounding,
-        expected_identity=expected_identity,
-    )
-
-
-def _repair_instruction(request: dict[str, Any], error: Exception) -> dict[str, Any]:
-    repaired = dict(request)
-    repaired["validation_error"] = str(error)
-    repaired["prompt_instruction"] = (
-        str(request.get("prompt_instruction") or "")
-        + "\nThe previous JSON response failed the structural contract. Return one corrected compact JSON object."
-    )
-    return repaired
-
-
-def run_ai_resolution(
-    provider: JSONDecisionProvider,
-    fields: Iterable[dict[str, Any]],
-    grounding: GroundingCatalog,
-    *,
-    expected_identity: ProductIdentity = ProductIdentity(),
-    cache_dir: str | Path | None = None,
-    cache_namespace: str = "",
-    max_repair_attempts: int = 0,
-) -> AIResolutionRunResult:
-    """Resolve one whole product. Default path is one call and no automatic full rerun."""
-
-    if max_repair_attempts not in {0, 1}:
-        raise ValueError("max_repair_attempts 必须是 0 或 1。")
-    field_list = list(fields)
-    indexed_fields(field_list)
-    started = time.monotonic()
-    cache_root = Path(cache_dir) if cache_dir is not None else None
-    key = _cache_key(provider, cache_namespace, field_list, grounding, expected_identity)
-    cache_path = cache_root / f"ai-decision-{key}.json" if cache_root is not None else None
-
-    if cache_path is not None and cache_path.is_file():
-        try:
-            cached = AIDecisionPacket.from_mapping(json.loads(cache_path.read_text(encoding="utf-8")))
-            validated = validate_ai_decision_packet(
-                cached, field_list, grounding, expected_identity=expected_identity
-            )
-            return AIResolutionRunResult(
-                packet=validated,
-                model_calls=0,
-                cache_hit=True,
-                repair_attempts=0,
-                elapsed_seconds=time.monotonic() - started,
-            )
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            pass
-
-    request = build_ai_resolution_request(field_list, grounding, identity=expected_identity)
-    calls = 0
-    repairs = 0
-    last_error: Exception | None = None
-    for attempt in range(max_repair_attempts + 1):
-        try:
-            calls += 1
-            raw = provider.extract_json(request)
-        except JSONTaskResponseError as exc:
-            last_error = exc
-        except Exception as exc:
-            raise AIDecisionError(
-                f"AI provider failed before a usable response; no semantic repair attempted: {exc}"
-            ) from exc
-        else:
-            try:
-                validated = _validate_model_response(
-                    raw,
-                    provider_name=provider.name,
-                    fields=field_list,
-                    grounding=grounding,
-                    expected_identity=expected_identity,
-                )
-            except (AIDecisionError, ValueError, TypeError) as exc:
-                last_error = exc
-            else:
-                if cache_path is not None:
-                    cache_path.parent.mkdir(parents=True, exist_ok=True)
-                    temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-                    temp.write_text(
-                        json.dumps(validated.as_dict(), ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-                    temp.replace(cache_path)
-                return AIResolutionRunResult(
-                    packet=validated,
-                    model_calls=calls,
-                    cache_hit=False,
-                    repair_attempts=repairs,
-                    elapsed_seconds=time.monotonic() - started,
-                )
-        if attempt >= max_repair_attempts:
-            break
-        repairs += 1
-        request = _repair_instruction(request, last_error or AIDecisionError("invalid response"))
-
-    raise AIDecisionError(f"AI product resolution failed after structural validation: {last_error}")
 
 
 def write_ai_decision_packet(packet: AIDecisionPacket, path: str | Path) -> Path:
