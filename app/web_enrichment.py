@@ -26,10 +26,10 @@ from .semantic_grounding import GroundingCatalog
 from .source_bundle import normalize_key
 
 
-WEB_RESEARCH_CONTRACT_VERSION = 2
-WEB_RESEARCH_CACHE_VERSION = 2
-WEB_FINAL_CONTRACT_VERSION = 2
-WEB_FINAL_CACHE_VERSION = 2
+WEB_RESEARCH_CONTRACT_VERSION = 3
+WEB_RESEARCH_CACHE_VERSION = 3
+WEB_FINAL_CONTRACT_VERSION = 3
+WEB_FINAL_CACHE_VERSION = 3
 WEB_UPDATABLE_STATUSES = {MISSING, REVIEW, CONFLICT}
 
 
@@ -175,13 +175,14 @@ def _research_prompt(
             for field, decision in targets
         ],
         "rules": [
-            "Research only these unresolved fields for the exact current product/selected variant.",
-            "This stage gathers evidence only; do not decide READY/REVIEW/CONFLICT/MISSING.",
-            "Use model-authored search_queries when useful; otherwise derive focused queries from exact product identity plus the field.",
-            "Prefer exact manufacturer/manual/current supplier evidence. Generic model-name pages require strong identity matching.",
+            "Research only these unresolved fields for the current product and selected variant.",
+            "This stage only finds source evidence; it does not decide final field status.",
+            "Use the Product Profile, supplier offer identifiers/URLs, selected-variant wording, model and other source facts to identify the product. A seller or marketplace SKU may be internal and does not need to appear on public web pages.",
+            "Use model-authored search_queries when useful; otherwise derive focused queries from the strongest real product identifiers in the Product Profile plus the field.",
+            "Prefer manufacturer manuals, the current supplier/offer, exact product pages and other sources that clearly describe the same product or variant.",
             "Never research seller-operated price, stock, MOQ, fulfilment, shipping or listing status.",
             "Return only evidence from pages actually returned by this search call. Do not invent URLs.",
-            "If evidence is ambiguous, still return the exact evidence and let the field resolver judge it.",
+            "If a source is ambiguous or only generic, return the exact evidence and source; the final AI resolver will decide whether it is enough.",
             "Return JSON only.",
         ],
         "json_contract": {
@@ -200,8 +201,8 @@ def _research_prompt(
         },
     }
     return (
-        "You are the bounded web-research stage of a product-listing pipeline. "
-        "Gather evidence for this small batch and return one JSON object only.\n\n"
+        "You are the web-research step of a product-listing workflow. "
+        "Find useful evidence for this small unresolved batch and return one JSON object only.\n\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
 
@@ -454,12 +455,15 @@ def _final_prompt_request(
     return {
         "task": "finalize_small_marketplace_field_batch_from_profile_and_web_evidence",
         "system_instruction": (
-            "You are a text-only field resolver. Resolve only this small marketplace field batch "
-            "from the grounded Product Profile and the web evidence returned for these exact fields. "
-            "Preserve genuine conflicts and never invent product facts. Return compact JSON only."
+            "You are the final product-semantic authority for this small marketplace field batch. "
+            "Use the grounded local Product Profile plus the web evidence found for these exact fields. "
+            "Decide the final field values yourself; Python will only verify citations and mechanical "
+            "marketplace constraints, not reinterpret product meaning. Preserve genuine conflicts and "
+            "never invent facts. Return compact JSON only."
         ),
         "prompt_instruction": (
-            "Resolve only these target fields. Do not change any other field. "
+            "Resolve only these target fields. Decide READY when the combined evidence is genuinely "
+            "sufficient for the current product/selected variant; otherwise use REVIEW/CONFLICT/MISSING. "
             "Return one decision per target field and no prose outside JSON."
         ),
         "product_identity": {
@@ -476,13 +480,15 @@ def _final_prompt_request(
             for field in batch_fields
         ],
         "rules": [
-            "READY requires strong exact-product evidence and citations.",
-            "If credible local/web evidence disagrees for the same attribute and scope and neither clearly supersedes the other, return CONFLICT with cited alternatives.",
-            "Never infer negative values from absence. Keep packaging scope, product-body scope, cabin/rear, manual/UI language and compatibility scope distinct.",
-            "For web citations use only source_reference values present in WEB_EVIDENCE. For local citations use only underlying source_reference values present in PRODUCT_PROFILE.",
-            "Do not stretch generic evidence into a more specialized marketplace field.",
-            "If multi_value=false return one value string. If qualifier_options exist, keep the unit only in qualifier.",
-            "MISSING is valid when research still does not establish the exact value.",
+            "Judge product identity from the complete evidence context. A seller/marketplace SKU may be internal and does not need to appear on a public source; use supplier offer IDs/URLs, model, title, selected-variant wording and other real identifiers as appropriate.",
+            "READY requires grounded evidence that is sufficient for this exact field and current selected variant, but do not demand redundant duplicate proof when one reliable source is enough.",
+            "If credible local/web evidence genuinely disagrees for the same attribute and neither clearly supersedes the other, return CONFLICT with cited alternatives.",
+            "Never infer No/False/Unsupported/Not included from absence; a negative value must be stated or otherwise directly established by the evidence.",
+            "Preserve dimension axes and scope exactly. Do not swap length/width/height/depth, packaging/body/mount, cabin/rear, manual/UI language, or product/vehicle compatibility.",
+            "For web citations use only source_reference values present in WEB_EVIDENCE. For local citations use only underlying original source_reference values present in PRODUCT_PROFILE.",
+            "Do not stretch generic product-family evidence into a specialized field unless you judge the source clearly applies to the current product/variant.",
+            "If multi_value=false return one value string. If qualifier_options exist, keep the magnitude in values and the unit only in qualifier.",
+            "MISSING is correct when the available local and web evidence still does not establish the exact value.",
         ],
         "grounded_sources": [
             {
@@ -747,7 +753,7 @@ def _run_final_resolution(
         decisions=[updates.get(item.field_id, item) for item in initial.decisions],
         model_summary=(
             initial.model_summary
-            + "\nParallel web-evidence field resolution completed."
+            + "\nWeb evidence was resolved by the final AI semantic pass."
         ).strip(),
         warnings=warnings,
         extractor=(initial.extractor + "+parallel-web-final").strip("+"),
