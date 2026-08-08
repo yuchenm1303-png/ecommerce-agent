@@ -4,7 +4,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .evidence_contract import EvidencePacket, ProductIdentity
+from .evidence_contract import EvidencePacket, ExtractedFact, ProductIdentity
+from .evidence_pipeline import source_policy
 from .evidence_validation import EvidenceValidationError, validate_evidence_packet
 from .extraction_request import build_extraction_request_payload
 from .qa_catalog import QuestionCatalog, QuestionRecord
@@ -50,13 +51,20 @@ GROUNDED_OUTPUT_RULES = (
     "4. Image sources: evidence_text must describe only the exact visible text/structure in that image.\n"
     "5. Direct facts: value must be written exactly as in the source and must literally appear inside "
     "evidence_text (e.g. source \"黑色\" => value \"黑色\", never \"Black\").\n"
-    "6. If the answer is NOT literally written in the source and requires inference, counting, unit "
-    "conversion, or language translation (e.g. \"双镜头\" => \"2\", \"黑色\" => \"Black\"), set "
+    "6. Direct facts also require DIRECT ATTRIBUTE BINDING: the cited evidence must explicitly name the "
+    "same QA attribute/question. If you map a differently named source label to the QA field, translate "
+    "the attribute name, select a subset from a generic feature list, or assign a generic specification "
+    "to a more specific field, fact.source_type MUST be \"ai_synthesis\". Examples: \"拍摄角度 120°\" "
+    "cannot be a direct Exterior Field of View or Interior Field of View fact; \"品牌 other\" cannot be "
+    "a direct Vehicle Brand fact; \"规格尺寸 ...\" cannot be a direct Vehicle Model Name fact.\n"
+    "7. If the answer is NOT literally written in the source and requires inference, counting, unit "
+    "conversion, language translation, or semantic attribute mapping (e.g. \"双镜头\" => \"2\", "
+    "\"黑色\" => \"Black\", \"数据传输接口 USB\" => QA field \"USB Type Supported\"), set "
     "fact.source_type=\"ai_synthesis\" instead of the source's own type, keep source_reference on the "
-    "real source, and still provide a literal excerpt as evidence_text. Inferred or translated values "
-    "are never direct facts.\n"
-    "7. Never answer a business_locked question. Never invent a fact. If evidence is absent or "
-    "ambiguous, omit the fact entirely.\n"
+    "real source, and still provide a literal excerpt as evidence_text. Inferred, translated, or "
+    "semantically remapped values are never direct facts.\n"
+    "8. Never answer a business_locked question. Never invent a fact. If evidence is absent or "
+    "ambiguous, omit the fact entirely. Absence of a mention is not evidence for a value such as No.\n"
     "Worked example: a source row reads \"颜色分类  黑色\". If the required answer for \"Colour\" must "
     "be \"Black\", emit value=[\"Black\"], source_type=\"ai_synthesis\", the real source_reference, and "
     "evidence_text=\"颜色分类  黑色\". Never emit value=[\"Black\"] with source_type=\"supplier_web\"."
@@ -79,6 +87,13 @@ def validation_error_instruction(payload: dict[str, Any]) -> str:
 _RESOLUTION_IN_TEXT = re.compile(r"\d{2,5}\s*[x×*]\s*\d{2,5}", re.IGNORECASE)
 _NUMBER_IN_TEXT = re.compile(
     r"(?<![\w.])([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:\s*[a-zA-Z°%]+(?:\s+[a-zA-Z]+)?)?)(?![\w.])",
+    re.IGNORECASE,
+)
+_INFERENCE_NOTE_RE = re.compile(
+    r"\b(?:assum(?:e|ed|ing)|infer(?:red|ence|ring)?|impli(?:ed|es|cation)|"
+    r"map(?:ped|ping)?|appl(?:ied|ying)|default(?:ed|ing)?|selected?|"
+    r"equivalent|remaining|corresponds?|not\s+explicit(?:ly)?|no\s+explicit|"
+    r"source\s+does\s+not|no\s+distinction)\b|推断|假设|映射|未明确|未区分",
     re.IGNORECASE,
 )
 
@@ -121,8 +136,9 @@ def build_grounded_semantic_request(
             "For text sources, evidence_text must be a short literal excerpt copied from the cited source content.",
             "For image sources, evidence_text must be a concise description of the exact visible feature/text that supports the answer.",
             "For direct source facts, every returned value must be explicitly present in evidence_text; if the answer requires inference or conversion, use ai_synthesis instead.",
+            "A direct source fact also requires explicit attribute binding: evidence must name the same QA attribute. Mapping a differently named/translated/generic source attribute to the QA field is ai_synthesis.",
             "fact.source_type must equal the cited source source_type, unless the answer requires inference; inferred answers must use ai_synthesis.",
-            "Do not create a fact when evidence is ambiguous, partially visible, inferred from product category, or merely plausible.",
+            "Do not create a fact when evidence is ambiguous, partially visible, inferred from product category, merely plausible, or based only on absence of a mention.",
             "Do not silently normalize conflicting values into one answer; emit separate facts with separate source_reference values.",
             "Do not answer any business_locked question under any circumstance.",
             "Do not cite a source id that is absent from grounded_sources.",
@@ -272,6 +288,63 @@ def _validate_direct_claim_against_evidence(
         )
 
 
+def _direct_attribute_binding_explicit(question: QuestionRecord, evidence_text: str) -> bool:
+    """Prove direct field binding without asking the model to judge itself.
+
+    A literal value is not enough: ``品牌 other`` may be true while answering
+    ``Vehicle Brand`` incorrectly, and one generic ``拍摄角度`` cannot directly
+    authorize both interior/exterior FOV. For direct external evidence, the QA
+    attribute itself must be explicitly named in the evidence. Cross-language,
+    renamed, subset, generic-to-specific and other semantic mappings are kept as
+    useful evidence but quarantined as ``ai_synthesis`` below the autofill floor.
+    """
+
+    question_key = normalize_key(question.question)
+    evidence_key = normalize_key(evidence_text)
+    if not question_key or not evidence_key:
+        return False
+    return question_key in evidence_key
+
+
+def _quarantine_semantically_unbound_direct_fact(
+    fact: ExtractedFact,
+    question: QuestionRecord,
+) -> tuple[ExtractedFact, str | None]:
+    if fact.source_type == "ai_synthesis":
+        return fact, None
+
+    binding_explicit = _direct_attribute_binding_explicit(question, fact.evidence_text)
+    note_admits_inference = bool(_INFERENCE_NOTE_RE.search(fact.note or ""))
+    if binding_explicit and not note_admits_inference:
+        return fact, None
+
+    reasons: list[str] = []
+    if not binding_explicit:
+        reasons.append("evidence does not explicitly name the same QA attribute")
+    if note_admits_inference:
+        reasons.append("extractor note admits inference/assumption/mapping")
+    reason = "; ".join(reasons)
+    ai_ceiling = source_policy("ai_synthesis").max_confidence
+    quarantine_note = (
+        "semantic binding quarantine: direct source value was retained for review but cannot "
+        f"authorize autofill because {reason}"
+    )
+    effective_note = " | ".join(item for item in (fact.note, quarantine_note) if item)
+    return (
+        ExtractedFact(
+            key=fact.key,
+            value=fact.value,
+            source_type="ai_synthesis",
+            source_reference=fact.source_reference,
+            confidence=min(fact.confidence, ai_ceiling),
+            evidence_text=fact.evidence_text,
+            aliases=fact.aliases,
+            note=effective_note,
+        ),
+        f"semantic binding quarantined: {fact.key} @ {fact.source_reference} ({reason})",
+    )
+
+
 def validate_grounded_semantic_packet(
     payload: dict[str, Any] | EvidencePacket,
     catalog: QuestionCatalog,
@@ -289,6 +362,8 @@ def validate_grounded_semantic_packet(
         expected_identity=expected_identity,
     ).packet
     questions = _question_lookup(catalog)
+    effective_facts: list[ExtractedFact] = []
+    warnings = list(validated.warnings)
 
     for fact in validated.facts:
         source = grounding.by_id(fact.source_reference)
@@ -315,14 +390,26 @@ def validate_grounded_semantic_packet(
         question = questions.get(normalize_key(fact.key))
         if question is None:  # should already be impossible after validation.
             raise SemanticGroundingError(f"无法恢复 QA 问题：{fact.key!r}")
+        # Keep the existing hard failure when a direct value is not even present
+        # in its own evidence. Semantic binding quarantine is a separate second
+        # gate and must never excuse a fabricated/transformed direct value.
         _validate_direct_claim_against_evidence(
             question=question,
             value=fact.value,
             source_type=fact.source_type,
             evidence_text=fact.evidence_text,
         )
+        effective, warning = _quarantine_semantically_unbound_direct_fact(fact, question)
+        effective_facts.append(effective)
+        if warning:
+            warnings.append(warning)
 
-    return validated
+    return EvidencePacket(
+        identity=validated.identity,
+        facts=effective_facts,
+        extractor=validated.extractor,
+        warnings=warnings,
+    )
 
 
 def run_grounded_semantic_extraction(
