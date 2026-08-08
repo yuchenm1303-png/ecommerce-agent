@@ -219,7 +219,7 @@ def test_unmatched_live_field_may_autofill_from_explicit_structured_input():
     assert plan.items[0].resolution.source_type == "structured"
 
 
-def test_same_ai_synthesis_source_value_cannot_preview_two_different_fields():
+def test_same_ai_synthesis_source_value_cannot_preview_two_different_fields_even_with_different_prose():
     qa = QuestionCatalog(
         source_path="qa.xlsx",
         sheet_name="Sheet1",
@@ -230,14 +230,20 @@ def test_same_ai_synthesis_source_value_cannot_preview_two_different_fields():
         ],
     )
     bundle = ProductSourceBundle()
-    for question in ("Interior Field of View", "Exterior Field of View"):
-        add_ai_synthesis(
-            bundle,
-            question,
-            "120",
-            reference="image:attributes",
-            evidence="拍摄角度: 120°",
-        )
+    add_ai_synthesis(
+        bundle,
+        "Interior Field of View",
+        "120",
+        reference="image:attributes",
+        evidence="generic 120 degree angle interpreted for interior view",
+    )
+    add_ai_synthesis(
+        bundle,
+        "Exterior Field of View",
+        "120",
+        reference="image:attributes",
+        evidence="same generic 120 degree angle interpreted for exterior view",
+    )
 
     plan = build_live_fill_plan(
         qa,
@@ -245,7 +251,7 @@ def test_same_ai_synthesis_source_value_cannot_preview_two_different_fields():
             field("interior_field_of_view", "Interior Field of View"),
             field("exterior_field_of_view", "Exterior Field of View"),
         ],
-    bundle,
+        bundle,
     )
 
     assert plan.summary()["preview_eligible"] == 0
