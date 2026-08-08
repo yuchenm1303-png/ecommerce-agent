@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .answer_resolver import BUSINESS_ATTRIBUTE_ALIASES
+from .business_fields import is_business_question
 from .evidence_contract import (
     EvidenceContractError,
     EvidencePacket,
@@ -14,9 +14,8 @@ from .qa_catalog import QuestionCatalog, QuestionRecord
 from .source_bundle import normalize_key
 
 
-# These are the only source labels an image/web/AI extractor may emit. Seller
-# operating data such as price, MOQ, fulfilment or shipping must enter through
-# structured/business/config/rule sources instead of an extractor packet.
+# Legacy evidence-packet validation remains available for non-production tools,
+# but seller-operated data can never enter through an image/web/AI packet.
 EXTERNAL_EVIDENCE_SOURCE_TYPES = {
     "manufacturer_doc",
     "supplier_doc",
@@ -29,23 +28,6 @@ EXTERNAL_EVIDENCE_SOURCE_TYPES = {
     "ai_synthesis",
 }
 
-_BUSINESS_QUESTION_NAMES = {
-    normalize_key(name)
-    for attribute_key, aliases in BUSINESS_ATTRIBUTE_ALIASES.items()
-    for name in (attribute_key, *aliases)
-}
-_BUSINESS_QUESTION_NAMES.update(
-    normalize_key(name)
-    for name in (
-        "stock",
-        "stock quantity",
-        "available stock",
-        "inventory",
-        "inventory quantity",
-        "quantity in stock",
-    )
-)
-
 
 class EvidenceValidationError(EvidenceContractError):
     pass
@@ -56,10 +38,6 @@ class EvidenceValidationResult:
     packet: EvidencePacket
     warnings: list[str] = field(default_factory=list)
     normalized_fact_count: int = 0
-
-
-def is_business_question(question: str) -> bool:
-    return normalize_key(question) in _BUSINESS_QUESTION_NAMES
 
 
 def _question_index(catalog: QuestionCatalog) -> dict[str, list[QuestionRecord]]:
@@ -113,13 +91,7 @@ def validate_evidence_packet(
     *,
     expected_identity: ProductIdentity | None = None,
 ) -> EvidenceValidationResult:
-    """Validate and canonicalize an extractor packet before it reaches resolver.
-
-    This is deliberately stricter than :class:`EvidencePacket` parsing. The
-    packet contract proves that each fact is traceable; this function also proves
-    that the fact was actually requested for the current product and that an
-    image/web/AI extractor has not attempted to supply seller operating data.
-    """
+    """Validate and canonicalize a legacy extractor packet."""
 
     if expected_identity is not None:
         assert_identity_compatible(expected_identity, packet.identity)
