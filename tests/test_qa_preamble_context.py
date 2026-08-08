@@ -31,7 +31,7 @@ def test_qa_catalog_keeps_product_context_before_header(tmp_path):
     assert len(catalog.questions) == 1
 
 
-def test_resolution_inputs_keep_preamble_as_grounded_customer_context(tmp_path):
+def test_resolution_inputs_keep_preamble_and_explicit_sku(tmp_path):
     path = tmp_path / "qa.xlsx"
     _write_customer_qa(path)
     catalog = load_question_catalog(path)
@@ -45,6 +45,12 @@ def test_resolution_inputs_keep_preamble_as_grounded_customer_context(tmp_path):
     assert any(item.startswith("customer_context_chars=") for item in result.warnings)
 
     sku_facts = result.bundle.candidates(("SKU",))
+    assert any(
+        fact.source_type == "business"
+        and fact.source_reference == "runtime:--sku"
+        and fact.value == "237581229555"
+        for fact in sku_facts
+    )
     assert any(
         fact.source_type == "customer_file" and fact.value == "237581229555"
         for fact in sku_facts
