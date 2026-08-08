@@ -234,13 +234,20 @@ def test_omitted_field_becomes_missing_without_local_semantic_guess(tmp_path):
     assert [item.status for item in validated.decisions] == [READY, MISSING]
 
 
-def test_generic_web_model_page_cannot_authorize_ready_for_strong_sku(tmp_path):
+def test_grounded_web_ready_is_not_reinterpreted_by_seller_sku(tmp_path):
     mic = field("built_in_mic", "Built in Mic")
     sources = grounding(tmp_path)
     external_ref = "web-search:generic-m8"
-    external_content = "Search result title: M8 dash cam manual\nSearch evidence: Built in Mic: Yes"
+    external_content = (
+        "Search result title: M8 dash cam manual\n"
+        "Search evidence: Built in Mic: Yes"
+    )
     packet = AIDecisionPacket(
-        identity=ProductIdentity(sku="237581229555", model_number="M8", brand="other"),
+        identity=ProductIdentity(
+            sku="237581229555",
+            model_number="M8",
+            brand="other",
+        ),
         schema_sha256=schema_digest([mic]),
         source_manifest_sha256=source_manifest_digest(sources),
         decisions=[
@@ -256,48 +263,23 @@ def test_generic_web_model_page_cannot_authorize_ready_for_strong_sku(tmp_path):
         packet,
         [mic],
         sources,
-        expected_identity=ProductIdentity(sku="237581229555", model_number="M8", brand="other"),
-        external_sources={external_ref: external_content},
-    )
-    assert validated.decisions[0].status == REVIEW
-    assert "web source identity insufficient" in validated.decisions[0].reason
-
-
-def test_brand_and_model_match_can_authorize_external_ready_without_seller_sku(tmp_path):
-    mic = field("built_in_mic", "Built in Mic")
-    sources = grounding(tmp_path)
-    external_ref = "web-search:exact-product"
-    external_content = "Search result title: ACME ZX900 official manual\nSearch evidence: Built in Mic: Yes"
-    identity = ProductIdentity(sku="237581229555", model_number="ZX900", brand="ACME")
-    packet = AIDecisionPacket(
-        identity=identity,
-        schema_sha256=schema_digest([mic]),
-        source_manifest_sha256=source_manifest_digest(sources),
-        decisions=[
-            FieldDecision(
-                field_id=field_id(mic),
-                status=READY,
-                values=["Yes"],
-                citations=[DecisionCitation(external_ref, "Built in Mic: Yes")],
-            )
-        ],
-    )
-    validated = validate_ai_decision_packet(
-        packet,
-        [mic],
-        sources,
-        expected_identity=identity,
+        expected_identity=ProductIdentity(
+            sku="237581229555",
+            model_number="M8",
+            brand="other",
+        ),
         external_sources={external_ref: external_content},
     )
     assert validated.decisions[0].status == READY
 
 
-def test_negative_ready_requires_explicit_target_specific_negative_evidence(tmp_path):
+def test_python_validator_does_not_reinterpret_negative_or_dimension_semantics(tmp_path):
     remote = field("remote_control", "Remote Control", options=("Yes", "No"))
+    width = field("width", "Width")
     sources = grounding(tmp_path)
     packet = AIDecisionPacket(
         identity=ProductIdentity(sku="SKU-1"),
-        schema_sha256=schema_digest([remote]),
+        schema_sha256=schema_digest([remote, width]),
         source_manifest_sha256=source_manifest_digest(sources),
         decisions=[
             FieldDecision(
@@ -308,74 +290,22 @@ def test_negative_ready_requires_explicit_target_specific_negative_evidence(tmp_
                     DecisionCitation(
                         "supplier:001:text:0001:abc",
                         "Package contents: camera, charger, bracket",
-                    ),
-                    DecisionCitation(
-                        "supplier:001:text:0001:abc",
-                        "Button operation",
-                    ),
+                    )
                 ],
-            )
-        ],
-    )
-    validated = validate_ai_decision_packet(packet, [remote], sources)
-    assert validated.decisions[0].status == REVIEW
-    assert "explicit target-specific negative evidence" in validated.decisions[0].reason
-
-
-def test_explicit_negative_target_evidence_can_authorize_no(tmp_path):
-    remote = field("remote_control", "Remote Control", options=("Yes", "No"))
-    sources = grounding(tmp_path)
-    packet = AIDecisionPacket(
-        identity=ProductIdentity(sku="SKU-1"),
-        schema_sha256=schema_digest([remote]),
-        source_manifest_sha256=source_manifest_digest(sources),
-        decisions=[
-            FieldDecision(
-                field_id=field_id(remote),
-                status=READY,
-                values=["No"],
-                citations=[DecisionCitation("supplier:001:text:0001:abc", "Remote Control: No")],
-            )
-        ],
-    )
-    validated = validate_ai_decision_packet(packet, [remote], sources)
-    assert validated.decisions[0].status == READY
-
-
-def test_dimension_axis_ready_requires_value_bound_to_same_axis(tmp_path):
-    width = field("width", "Width")
-    sources = grounding(tmp_path)
-    wrong = AIDecisionPacket(
-        identity=ProductIdentity(sku="SKU-1"),
-        schema_sha256=schema_digest([width]),
-        source_manifest_sha256=source_manifest_digest(sources),
-        decisions=[
+            ),
             FieldDecision(
                 field_id=field_id(width),
                 status=READY,
                 values=["86"],
                 qualifier="mm",
-                citations=[DecisionCitation("supplier:001:text:0001:abc", "Body Length: 86 mm")],
-            )
+                citations=[
+                    DecisionCitation(
+                        "supplier:001:text:0001:abc",
+                        "Body Length: 86 mm",
+                    )
+                ],
+            ),
         ],
     )
-    validated_wrong = validate_ai_decision_packet(wrong, [width], sources)
-    assert validated_wrong.decisions[0].status == REVIEW
-    assert "target axis" in validated_wrong.decisions[0].reason
-
-    correct = AIDecisionPacket(
-        identity=ProductIdentity(sku="SKU-1"),
-        schema_sha256=schema_digest([width]),
-        source_manifest_sha256=source_manifest_digest(sources),
-        decisions=[
-            FieldDecision(
-                field_id=field_id(width),
-                status=READY,
-                values=["36"],
-                qualifier="mm",
-                citations=[DecisionCitation("supplier:001:text:0001:abc", "Body Width: 36 mm")],
-            )
-        ],
-    )
-    validated_correct = validate_ai_decision_packet(correct, [width], sources)
-    assert validated_correct.decisions[0].status == READY
+    validated = validate_ai_decision_packet(packet, [remote, width], sources)
+    assert [item.status for item in validated.decisions] == [READY, READY]
