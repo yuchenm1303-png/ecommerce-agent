@@ -6,55 +6,10 @@ import mimetypes
 from pathlib import Path
 from typing import Any
 
-from ..semantic_extraction import GROUNDED_OUTPUT_RULES, validation_error_instruction
-
 
 class OpenAICompatibleProviderError(RuntimeError):
     pass
 
-
-_DEFAULT_JSON_CONTRACT = {
-    "type": "object",
-    "required": ["product_identity", "facts", "warnings"],
-    "properties": {
-        "product_identity": {
-            "type": "object",
-            "required": ["sku", "model_number", "brand"],
-            "properties": {
-                "sku": {"type": "string"},
-                "model_number": {"type": "string"},
-                "brand": {"type": "string"},
-            },
-        },
-        "facts": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": [
-                    "key",
-                    "aliases",
-                    "value",
-                    "source_type",
-                    "source_reference",
-                    "confidence",
-                    "evidence_text",
-                    "note",
-                ],
-                "properties": {
-                    "key": {"type": "string"},
-                    "aliases": {"type": "array", "items": {"type": "string"}},
-                    "value": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                    "source_type": {"type": "string"},
-                    "source_reference": {"type": "string"},
-                    "confidence": {"type": "number"},
-                    "evidence_text": {"type": "string"},
-                    "note": {"type": "string"},
-                },
-            },
-        },
-        "warnings": {"type": "array", "items": {"type": "string"}},
-    },
-}
 
 SUPPORTED_COMPAT_PROFILES = ("generic", "qwen-omni")
 
@@ -71,7 +26,7 @@ def _image_data_uri(path_value: str) -> str:
 
 
 def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
-    """Build a task-generic prompt payload without leaking local file paths."""
+    """Serialize the AI task without leaking local image paths."""
 
     payload = {
         "task": request_payload.get("task"),
@@ -79,15 +34,9 @@ def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
         "schema_sha256": request_payload.get("schema_sha256", ""),
         "source_manifest_sha256": request_payload.get("source_manifest_sha256", ""),
         "target_fields": request_payload.get("target_fields") or [],
-        # Legacy semantic-fact requests remain accepted while the production
-        # path migrates to target_fields decisions.
-        "questions": request_payload.get("questions") or [],
-        "business_locked_questions": request_payload.get("business_locked_questions") or [],
         "rules": request_payload.get("rules") or [],
-        "source_reference_rule": request_payload.get("source_reference_rule", ""),
-        "required_output_shape": request_payload.get("required_output_shape") or {},
         "grounded_sources": [],
-        "json_contract": request_payload.get("json_contract") or _DEFAULT_JSON_CONTRACT,
+        "json_contract": request_payload.get("json_contract") or {},
     }
     for source in request_payload.get("grounded_sources") or []:
         if not isinstance(source, dict):
@@ -106,29 +55,18 @@ def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _task_instruction(request_payload: dict[str, Any]) -> str:
-    prompt_instruction = str(request_payload.get("prompt_instruction") or "").strip()
+    parts = [str(request_payload.get("prompt_instruction") or "").strip()]
     validation_error = str(request_payload.get("validation_error") or "").strip()
-    if request_payload.get("target_fields"):
-        parts = [prompt_instruction]
-        if validation_error:
-            parts.append(
-                "CORRECTION REQUIRED: the prior JSON failed structural validation: "
-                + validation_error
-            )
+    if validation_error:
         parts.append(
-            "Return exactly one JSON object and no markdown. Follow json_contract. "
-            "Never invent unsupported product facts."
+            "CORRECTION REQUIRED: the prior JSON failed the structural contract: "
+            + validation_error
         )
-        return "\n\n".join(part for part in parts if part)
-
-    # Legacy fact-extraction requests keep their original strict prompt until the
-    # old non-production path is removed with its tests.
-    return (
-        GROUNDED_OUTPUT_RULES
-        + validation_error_instruction(request_payload)
-        + "\n\nReturn exactly one JSON object and no markdown. Follow the supplied json_contract. "
-        "Never invent a fact when evidence is absent or ambiguous."
+    parts.append(
+        "Return exactly one JSON object and no markdown. Follow json_contract. "
+        "Never invent unsupported product facts."
     )
+    return "\n\n".join(part for part in parts if part)
 
 
 def _message_content(request_payload: dict[str, Any], *, image_detail: str) -> list[dict[str, Any]]:
@@ -177,10 +115,7 @@ def _extract_message_text(response: Any) -> str:
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
-            if isinstance(item, dict):
-                text = item.get("text")
-            else:
-                text = getattr(item, "text", None)
+            text = item.get("text") if isinstance(item, dict) else getattr(item, "text", None)
             if text:
                 parts.append(str(text))
         return "\n".join(parts).strip()
@@ -199,13 +134,9 @@ def _extract_stream_text(stream: Any) -> str:
         content = getattr(delta, "content", None)
         if isinstance(content, str):
             parts.append(content)
-            continue
-        if isinstance(content, list):
+        elif isinstance(content, list):
             for item in content:
-                if isinstance(item, dict):
-                    text = item.get("text")
-                else:
-                    text = getattr(item, "text", None)
+                text = item.get("text") if isinstance(item, dict) else getattr(item, "text", None)
                 if text:
                     parts.append(str(text))
     return "".join(parts).strip()
@@ -215,17 +146,14 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     raw = text.strip()
     if not raw:
         raise OpenAICompatibleProviderError("OpenAI-compatible API 返回空文本。")
-
     candidates = [raw]
     if raw.startswith("```") and raw.endswith("```"):
         lines = raw.splitlines()
         if len(lines) >= 3:
             candidates.append("\n".join(lines[1:-1]).strip())
-    first = raw.find("{")
-    last = raw.rfind("}")
+    first, last = raw.find("{"), raw.rfind("}")
     if 0 <= first < last:
         candidates.append(raw[first : last + 1])
-
     for candidate in candidates:
         try:
             payload = json.loads(candidate)
@@ -233,14 +161,11 @@ def _parse_json_object(text: str) -> dict[str, Any]:
             continue
         if isinstance(payload, dict):
             return payload
-    raise OpenAICompatibleProviderError(
-        "OpenAI-compatible API 未返回可解析的 JSON object；可尝试 --structured-mode json_object，"
-        "或确认该模型支持按指令输出 JSON。"
-    )
+    raise OpenAICompatibleProviderError("OpenAI-compatible API 未返回可解析的 JSON object。")
 
 
 class OpenAICompatibleSemanticProvider:
-    """Generic multimodal JSON adapter for OpenAI-compatible Chat Completions."""
+    """Generic multimodal JSON-task adapter for OpenAI-compatible APIs."""
 
     name = "openai-compatible-chat-semantic"
 
@@ -271,9 +196,7 @@ class OpenAICompatibleSemanticProvider:
         if structured_mode not in {"prompt_only", "json_object"}:
             raise ValueError("structured_mode 必须是 prompt_only/json_object。")
         if compat_profile not in SUPPORTED_COMPAT_PROFILES:
-            raise ValueError(
-                "compat_profile 必须是 " + "/".join(SUPPORTED_COMPAT_PROFILES) + "。"
-            )
+            raise ValueError("compat_profile 必须是 " + "/".join(SUPPORTED_COMPAT_PROFILES) + "。")
         if not 10.0 <= float(request_timeout_seconds) <= 600.0:
             raise ValueError("request_timeout_seconds 必须在 10..600 秒。")
         if enable_thinking not in {None, True, False}:
@@ -282,10 +205,8 @@ class OpenAICompatibleSemanticProvider:
         if client is None:
             try:
                 from openai import OpenAI
-            except ImportError as exc:  # pragma: no cover - environment dependent
-                raise OpenAICompatibleProviderError(
-                    "缺少 openai Python SDK。请先安装 requirements.txt。"
-                ) from exc
+            except ImportError as exc:  # pragma: no cover
+                raise OpenAICompatibleProviderError("缺少 openai Python SDK。") from exc
             client = OpenAI(
                 api_key=api_key,
                 base_url=base_url,
@@ -304,25 +225,18 @@ class OpenAICompatibleSemanticProvider:
         self.enable_thinking = enable_thinking
 
     def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
+        if not request_payload.get("json_contract"):
+            raise OpenAICompatibleProviderError("JSON task 缺少 json_contract。")
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {
                     "role": "system",
-                    "content": str(
-                        request_payload.get("system_instruction")
-                        or (
-                            "You extract auditable product facts only from supplied grounded sources. "
-                            "Do not use unstated knowledge. Return no fact rather than guessing."
-                        )
-                    ),
+                    "content": str(request_payload.get("system_instruction") or "You execute the supplied JSON task."),
                 },
                 {
                     "role": "user",
-                    "content": _message_content(
-                        request_payload,
-                        image_detail=self.image_detail,
-                    ),
+                    "content": _message_content(request_payload, image_detail=self.image_detail),
                 },
             ],
             "max_tokens": self.max_output_tokens,
@@ -338,13 +252,10 @@ class OpenAICompatibleSemanticProvider:
             kwargs["stream"] = True
             kwargs["stream_options"] = {"include_usage": True}
             kwargs["modalities"] = ["text"]
-
         try:
             response = self.client.chat.completions.create(**kwargs)
         except Exception as exc:
-            raise OpenAICompatibleProviderError(
-                f"OpenAI-compatible JSON task 调用失败：{exc}"
-            ) from exc
+            raise OpenAICompatibleProviderError(f"OpenAI-compatible JSON task 调用失败：{exc}") from exc
 
         output_text = _extract_stream_text(response) if streaming else _extract_message_text(response)
         payload = _parse_json_object(output_text)
