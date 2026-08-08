@@ -7,7 +7,11 @@ import pytest
 from app.evidence_contract import IdentityMismatchError
 from app.evidence_validation import EvidenceValidationError
 from app.qa_catalog import QuestionCatalog, QuestionRecord
-from app.resolver_inputs import ResolutionInputSpec, build_resolution_inputs
+from app.resolver_inputs import (
+    ResolutionInputSpec,
+    build_resolution_inputs,
+    customer_context_for_resolution,
+)
 
 
 def catalog() -> QuestionCatalog:
@@ -138,3 +142,29 @@ def test_explicit_identity_conflicting_with_trusted_qa_is_rejected():
             catalog_with_identity(),
             ResolutionInputSpec(expected_model="L99"),
         )
+
+
+def test_customer_context_is_retained_exactly_once_for_grounding_and_rebind():
+    preamble = (
+        "Selected Variant: M8 dual camera + 64GB card\n"
+        "Supplier URL: https://supplier.test/item/850845635717"
+    )
+    qa = QuestionCatalog(
+        source_path="qa.xlsx",
+        sheet_name="Sheet1",
+        header_row=4,
+        preamble_text=preamble,
+        questions=[QuestionRecord(number="1", question="Image Resolution")],
+    )
+    spec = ResolutionInputSpec()
+
+    result = build_resolution_inputs(qa, spec)
+    canonical = customer_context_for_resolution(qa, spec)
+
+    assert canonical == preamble
+    assert result.bundle.supplemental_text == canonical
+    assert result.bundle.supplemental_text.count("Selected Variant") == 1
+    assert result.bundle.supplemental_text.count("Supplier URL") == 1
+    # Key/value parsing may add deterministic evidence, but must never append a
+    # second copy of the same customer source and therefore change its hash.
+    assert result.bundle.candidates(["Selected Variant"])[0].value == "M8 dual camera + 64GB card"
