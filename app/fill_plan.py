@@ -5,7 +5,6 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
 from .ai_decisions import (
-    BUSINESS_LOCKED,
     CONFLICT,
     MISSING,
     READY as AI_READY,
@@ -232,62 +231,7 @@ def _decision_record(
     field: dict[str, Any],
     decision: FieldDecision,
 ) -> ResolutionRecord:
-    values, qualifier, hard_error = _hard_guard_values(field, decision)
-    label = str(field.get("label") or field.get("attribute_key") or "")
-    attribute_key = str(field.get("attribute_key") or "")
-    first_reference = decision.citations[0].source_reference if decision.citations else None
-    evidence = " | ".join(citation.evidence_text for citation in decision.citations)
-
-    if decision.status == AI_READY:
-        status = RESOLVED
-        eligible = hard_error is None
-        preview = False
-        gate = "" if eligible else GATE_HARD_FIELD_CONSTRAINT
-    elif decision.status == REVIEW:
-        status = NEEDS_REVIEW
-        eligible = False
-        preview = hard_error is None and bool(values) and bool(decision.citations)
-        gate = GATE_AI_REVIEW if hard_error is None else GATE_HARD_FIELD_CONSTRAINT
-    elif decision.status == CONFLICT:
-        status = RESOLVER_CONFLICT
-        eligible = False
-        preview = False
-        gate = GATE_AI_CONFLICT
-    else:
-        status = RESOLVER_MISSING
-        eligible = False
-        preview = False
-        gate = GATE_AI_MISSING
-
-    detail = hard_error or decision.reason
-    record = ResolutionRecord(
-        attribute_key=attribute_key,
-        label=label,
-        status=status,
-        answer=" + ".join(values) if values else None,
-        answer_values=values,
-        qualifier=qualifier or None,
-        confidence=decision.confidence,
-        source_type="ai_decision",
-        source_reference=first_reference,
-        evidence=evidence or None,
-        detail=detail,
-        eligible_for_autofill=eligible,
-        preview_eligible=preview,
-        gate_reason=gate,
-        provenance=_citation_provenance(decision),
-        question=label if False else None,
-    )
-    # ResolutionRecord has no `question` field; the dummy expression above is
-    # intentionally avoided by constructing only declared fields below.
-    return record
-
-
-def _decision_record_safe(
-    field: dict[str, Any],
-    decision: FieldDecision,
-) -> ResolutionRecord:
-    """Construct the AI record and apply numeric/GTIN/maxlength hard guards."""
+    """Convert one AI decision and apply only hard marketplace validators."""
 
     values, qualifier, hard_error = _hard_guard_values(field, decision)
     label = str(field.get("label") or field.get("attribute_key") or "")
@@ -428,7 +372,7 @@ def build_live_fill_plan(
                     reason="decision packet 缺少该 live field",
                 )
                 warnings.append(f"missing decision for field_id={identifier}")
-            resolution = _decision_record_safe(field, decision)
+            resolution = _decision_record(field, decision)
             action = READY if resolution.eligible_for_autofill else BLOCKED
             if action == READY:
                 reason = "AI 字段决策、grounded citations 与 Makro 硬约束均通过。"
