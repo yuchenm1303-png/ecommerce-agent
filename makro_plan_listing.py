@@ -1,13 +1,12 @@
 """Build a live Makro fill plan without writing any field.
 
-The command joins three already-separated layers:
+The command joins three separated layers:
 1. current Makro DOM discovery,
 2. customer QA -> live-field deterministic matching,
 3. evidence-grounded answer resolution.
 
 It produces a field-by-field READY/BLOCKED report and never fills, saves or
-submits the listing. This is the final audit boundary before enabling real data
-writes in the browser layer.
+submits the listing. This is the final audit boundary before real browser writes.
 """
 
 from __future__ import annotations
@@ -55,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--alias-config",
         default=None,
         help=(
-            "可选 JSON：经过人工审核的 QA question -> Makro label 显式别名。"
+            "可选 JSON：经过人工审核的 QA question -> Makro label alias / section override。"
             "配置必须声明与 --expected-vertical 相同的 vertical。"
         ),
     )
@@ -102,6 +101,9 @@ def _assert_no_unsaved_section(adapter: MakroDomainAdapter) -> None:
         section = adapter.find_section(title)
         if section is not None and not section.get("has_edit"):
             expanded.append(title)
+    photo = adapter.find_section("Product Photos")
+    if photo is not None and not photo.get("has_edit"):
+        expanded.append("Product Photos")
     if expanded:
         raise RuntimeError(
             "检测到仍处于编辑状态的 section："
@@ -171,6 +173,7 @@ def main() -> int:
             input_result.bundle,
             policy=policy,
             aliases=alias_config.aliases if alias_config else None,
+            sections=alias_config.sections if alias_config else None,
         )
 
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -187,6 +190,8 @@ def main() -> int:
                     "expected_vertical": args.expected_vertical,
                     "qa_source": str(Path(args.qa).resolve()),
                     "alias_config": alias_config.source_path if alias_config else None,
+                    "alias_count": len(alias_config.aliases) if alias_config else 0,
+                    "section_override_count": len(alias_config.sections) if alias_config else 0,
                     "semantic_fields_before_filter": len(all_semantic_fields),
                     "listing_attribute_fields": len(semantic_fields),
                     "scan": scan_stats,
@@ -223,13 +228,15 @@ def main() -> int:
             f"qa_ambiguous={summary['qa_ambiguous']}"
         )
         if alias_config:
-            print(f"alias_config={alias_config.source_path}")
+            print(
+                f"alias_config={alias_config.source_path} "
+                f"aliases={len(alias_config.aliases)} sections={len(alias_config.sections)}"
+            )
         print(f"JSON={json_path.resolve()}")
         print(f"XLSX={xlsx_path.resolve()}")
         print(f"Manifest={manifest.resolve()}")
         print("只读完成：没有填写字段，没有 Save，没有 Send to QC。")
 
-        # Edge is the external long-lived browser. Do not close browser/context.
     return 0
 
 
