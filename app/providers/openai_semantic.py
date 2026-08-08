@@ -6,8 +6,18 @@ import mimetypes
 from pathlib import Path
 from typing import Any
 
+from .errors import JSONTaskProviderError, JSONTaskResponseError, JSONTaskTransportError
 
-class OpenAIProviderError(RuntimeError):
+
+class OpenAIProviderError(JSONTaskProviderError):
+    pass
+
+
+class OpenAITransportError(JSONTaskTransportError, OpenAIProviderError):
+    pass
+
+
+class OpenAIResponseError(JSONTaskResponseError, OpenAIProviderError):
     pass
 
 
@@ -165,22 +175,22 @@ class OpenAISemanticProvider:
                 timeout=self.request_timeout_seconds,
             )
         except Exception as exc:
-            raise OpenAIProviderError(f"OpenAI JSON task 调用失败：{exc}") from exc
+            raise OpenAITransportError(f"OpenAI JSON task 调用失败：{exc}") from exc
 
         status = str(getattr(response, "status", "") or "")
         if status and status != "completed":
-            raise OpenAIProviderError(
+            raise OpenAIResponseError(
                 f"OpenAI JSON task 未完整完成：status={status}, "
                 f"details={getattr(response, 'incomplete_details', None)}"
             )
         output_text = str(getattr(response, "output_text", "") or "").strip()
         if not output_text:
-            raise OpenAIProviderError("OpenAI JSON task 返回空 output_text。")
+            raise OpenAIResponseError("OpenAI JSON task 返回空 output_text。")
         try:
             payload = json.loads(output_text)
         except json.JSONDecodeError as exc:
-            raise OpenAIProviderError("OpenAI structured output 不是有效 JSON。") from exc
+            raise OpenAIResponseError("OpenAI structured output 不是有效 JSON。") from exc
         if not isinstance(payload, dict):
-            raise OpenAIProviderError("OpenAI structured output 顶层必须是 JSON object。")
+            raise OpenAIResponseError("OpenAI structured output 顶层必须是 JSON object。")
         payload["extractor"] = self.name
         return payload
