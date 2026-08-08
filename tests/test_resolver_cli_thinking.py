@@ -15,7 +15,7 @@ def test_resolver_cli_exposes_explicit_thinking_switches():
     assert "--disable-thinking" in options
 
 
-def test_qwen_thinking_mode_changes_semantic_cache_namespace():
+def test_qwen_thinking_mode_changes_whole_product_cache_namespace():
     base = dict(
         provider="openai-compatible",
         model="qwen3.5-omni-plus",
@@ -27,4 +27,4 @@ def test_qwen_thinking_mode_changes_semantic_cache_namespace():
 
     assert fast.enable_thinking is False
     assert thinking.enable_thinking is True
-    assert makro_resolve_ai._semantic_cache_namespace(fast) != makro_resolve_ai._semantic_cache_namespace(thinking)
+    assert makro_resolve_ai._cache_namespace(fast) != makro_resolve_ai._cache_namespace(thinking)
