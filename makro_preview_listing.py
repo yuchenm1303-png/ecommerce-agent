@@ -1,18 +1,18 @@
-"""Execute grounded real-product data against Makro Step 3.
+"""Execute validated AI field decisions against Makro Step 3.
 
 There are only two execution modes:
 
 - ``--section``: one-card diagnostic preview. It never saves and leaves the card
   open for human inspection.
-- ``--all-step3 --allow-section-save --live-schema``: persisted Step 3
-  acceptance. It uses the exact read-only-planned live schema, fills each core
-  card from the resulting Fill Plan, saves that card, re-opens it and verifies
-  persisted values. Product Photos is staged, saved and verified separately.
+- ``--all-step3 --allow-section-save``: persisted Step 3 acceptance. It uses the
+  exact read-only-planned live schema and AI decision packet, fills each core
+  card, saves it, re-opens it and verifies persisted values. Product Photos is
+  staged, saved and verified separately.
 
-The full persisted mode fails before any browser write when the current Makro
-schema differs from the supplied planning schema. This command never clicks Send
-to QC. Evidence images (``--image``) and listing upload images
-(``--upload-image``) are deliberately separate.
+Before any browser write, the decision packet is rebound to the exact current
+product sources and the current Makro schema must match the planning schema.
+This command never clicks Send to QC. Evidence images (``--image``) and listing
+upload images (``--upload-image``) remain deliberately separate.
 """
 
 from __future__ import annotations
@@ -26,23 +26,19 @@ from typing import Any
 
 from playwright.sync_api import sync_playwright
 
-from app.alias_config import AliasConfig, load_alias_config
+from app.ai_decisions import load_ai_decision_packet
 from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness, is_cdp_ready
-from app.evidence_validation import is_business_question
 from app.fill_plan import BLOCKED, LiveFillPlan, LiveFillPlanItem, build_live_fill_plan
-from app.live_schema import (
-    assert_live_schema_matches,
-    augment_catalog_with_live_fields,
-    load_live_schema,
-)
+from app.live_schema import assert_live_schema_matches, load_live_schema
 from app.makro import MAKRO_HOME_URL, base_section_title, is_listing_url
 from app.makro.direct_visual_hold import is_listing_attribute_field
 from app.makro.domain import MakroDomainAdapter
 from app.makro.listing_preflight import CORE_FORM_SECTIONS
+from app.product_context import build_ai_product_context
 from app.qa_catalog import load_question_catalog
-from app.resolution_engine import ResolutionPolicy
-from app.resolver_inputs import ResolutionInputSpec, build_resolution_inputs
+from app.resolver_inputs import ResolutionInputSpec
 from app.review_preview import execution_answer_for_item, preview_mode_for_item
+from app.semantic_grounding import build_grounding_catalog
 from app.source_bundle import normalize_key
 
 PRODUCT_PHOTOS = "Product Photos"
@@ -51,18 +47,19 @@ PRODUCT_PHOTOS = "Product Photos"
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "使用真实 Evidence 检查/持久化 Makro Step 3；"
-            "单 section 为 no-save 预览，全量模式必须显式授权 section Save 并绑定 live schema；"
+            "使用已验证 AI field decisions 检查/持久化 Makro Step 3；"
+            "单 section 为 no-save 预览，全量模式必须显式授权 section Save；"
             "永不 Send to QC。"
         )
     )
     parser.add_argument("--qa", required=True)
+    parser.add_argument("--decision-packet", required=True, help="makro_resolve_ai.py 生成的 ai-decisions.json")
+    parser.add_argument("--live-schema", required=True, help="生成该 decision packet 时使用的 live-schema.json")
     parser.add_argument("--sku", default="")
     parser.add_argument("--expected-model", default="")
     parser.add_argument("--expected-brand", default="")
     parser.add_argument("--product-table", default=None)
     parser.add_argument("--facts-json", action="append", default=[])
-    parser.add_argument("--evidence-packet", action="append", default=[])
     parser.add_argument("--supplier-snapshot", action="append", default=[])
     parser.add_argument("--official-snapshot", action="append", default=[])
     parser.add_argument("--supplemental-text", default="")
@@ -71,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--image",
         action="append",
         default=[],
-        help="Resolver evidence image；不会自动上传到 Makro。",
+        help="AI evidence image；只用于 decision packet rebind，不会自动上传到 Makro。",
     )
     parser.add_argument(
         "--upload-image",
@@ -81,45 +78,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--product-url", default=None)
     parser.add_argument("--expected-vertical", required=True)
-    parser.add_argument(
-        "--live-schema",
-        default=None,
-        help=(
-            "read-only planner 导出的 live-schema.json。完整 --all-step3 必填；"
-            "用于追加 QA 外非经营字段，并在任何写入前验证当前页面 schema 未漂移。"
-        ),
-    )
-    parser.add_argument(
-        "--alias-config",
-        default=None,
-        help=(
-            "人工审核过的 QA -> Makro label alias / section override JSON；"
-            "vertical 必须与 --expected-vertical 一致。"
-        ),
-    )
 
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--section", help="只预览一个字段 section；不 Save。")
     target.add_argument(
         "--all-step3",
         action="store_true",
-        help=(
-            "执行完整 Step 3 persistence acceptance；必须同时传 --allow-section-save "
-            "和 --live-schema。"
-        ),
+        help="执行完整 Step 3 persistence acceptance；必须同时传 --allow-section-save。",
     )
     parser.add_argument(
         "--allow-section-save",
         action="store_true",
         help="允许保存 Step 3 草稿卡片；只对 --all-step3 有效，不允许 Send to QC。",
     )
-    parser.add_argument("--auto-fill-min-confidence", type=float, default=0.85)
-    parser.add_argument("--ai-auto-fill-min-confidence", type=float, default=0.92)
     parser.add_argument(
         "--include-review-candidates",
         action="store_true",
         help=(
-            "显式把 preview_eligible 的 needs_review 候选放进当前人工验收 draft；"
+            "显式把 AI 标记 REVIEW 且通过硬控件约束的候选放进当前人工验收 draft；"
             "它们仍不是 autofill-safe。"
         ),
     )
@@ -129,6 +105,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-scroll-steps", type=int, default=200)
     parser.add_argument("--recheck-wait-ms", type=int, default=800)
     parser.add_argument("--upload-timeout-ms", type=int, default=8_000)
+    parser.add_argument("--max-text-chars", type=int, default=5000)
+    parser.add_argument("--overlap-chars", type=int, default=250)
     parser.add_argument("--output-dir", default="logs/makro-review-preview")
     return parser
 
@@ -140,22 +118,12 @@ def _input_spec(args: argparse.Namespace) -> ResolutionInputSpec:
         expected_brand=args.expected_brand,
         product_table=args.product_table,
         facts_json=tuple(args.facts_json),
-        evidence_packets=tuple(args.evidence_packet),
         supplier_snapshots=tuple(args.supplier_snapshot),
         official_snapshots=tuple(args.official_snapshot),
         supplemental_text=args.supplemental_text,
         supplemental_text_file=args.supplemental_text_file,
         image_paths=tuple(args.image),
         product_url=args.product_url,
-    )
-
-
-def _load_matching_config(args: argparse.Namespace) -> AliasConfig | None:
-    if not args.alias_config:
-        return None
-    return load_alias_config(
-        args.alias_config,
-        expected_vertical=args.expected_vertical,
     )
 
 
@@ -695,45 +663,38 @@ def main() -> int:
             "--all-step3 是真实持久化验收，必须显式同时传 --allow-section-save；"
             "不再提供会自动 Cancel 丢值的假全量模式。"
         )
-    if args.all_step3 and not args.live_schema:
-        raise SystemExit(
-            "--all-step3 必须显式传 read-only planner 导出的 --live-schema；"
-            "拒绝在没有字段合同的情况下持久化 Step 3。"
-        )
     if args.section and args.allow_section_save:
         raise SystemExit("--allow-section-save 只允许与 --all-step3 一起使用。")
-    for name, value in (
-        ("auto-fill-min-confidence", args.auto_fill_min_confidence),
-        ("ai-auto-fill-min-confidence", args.ai_auto_fill_min_confidence),
-    ):
-        if not 0.0 <= value <= 1.0:
-            raise SystemExit(f"--{name} 必须在 0..1")
     if args.upload_timeout_ms <= 0:
         raise SystemExit("--upload-timeout-ms 必须大于 0")
+    if args.max_text_chars < 500:
+        raise SystemExit("--max-text-chars 不能小于 500")
+    if args.overlap_chars < 0 or args.overlap_chars >= args.max_text_chars:
+        raise SystemExit("--overlap-chars 必须 >=0 且小于 --max-text-chars")
     if not is_cdp_ready(args.cdp_port):
         raise RuntimeError(
             f"长期 Makro Edge 的 CDP 127.0.0.1:{args.cdp_port} 不可达；"
             "不会自动启动、关闭或重启 Edge。"
         )
 
-    base_catalog = load_question_catalog(args.qa)
-    catalog = base_catalog
-    planned_live_fields: list[dict[str, Any]] | None = None
-    live_schema_warnings: list[str] = []
-    if args.live_schema:
-        planned_live_fields = load_live_schema(args.live_schema)
-        catalog, live_schema_warnings = augment_catalog_with_live_fields(
-            base_catalog,
-            planned_live_fields,
-            business_locked=is_business_question,
-        )
-
-    input_result = build_resolution_inputs(catalog, _input_spec(args))
-    policy = ResolutionPolicy(
-        auto_fill_min_confidence=args.auto_fill_min_confidence,
-        ai_auto_fill_min_confidence=args.ai_auto_fill_min_confidence,
+    customer_catalog = load_question_catalog(args.qa)
+    planned_live_fields = load_live_schema(args.live_schema)
+    spec = _input_spec(args)
+    product_context = build_ai_product_context(customer_catalog, spec)
+    grounding = build_grounding_catalog(
+        image_paths=args.image,
+        supplier_snapshots=args.supplier_snapshot,
+        official_snapshots=args.official_snapshot,
+        supplemental_text=product_context.text,
+        max_text_chars=args.max_text_chars,
+        overlap_chars=args.overlap_chars,
     )
-    match_config = _load_matching_config(args)
+    decision_packet = load_ai_decision_packet(
+        args.decision_packet,
+        planned_live_fields,
+        grounding,
+        expected_identity=product_context.trusted_inputs.expected_identity,
+    )
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = Path(args.output_dir) / f"preview-{stamp}"
@@ -778,18 +739,13 @@ def main() -> int:
             if is_listing_attribute_field(field)
         ]
 
-        # This is the last pre-write boundary. Full persisted acceptance cannot
-        # reuse evidence made for an older/different question contract.
-        if planned_live_fields is not None:
-            assert_live_schema_matches(planned_live_fields, semantic_fields)
-
+        # Last pre-write boundary: the page must still be the exact schema the AI
+        # saw. No stale decision packet can reach a field write.
+        assert_live_schema_matches(planned_live_fields, semantic_fields)
         plan = build_live_fill_plan(
-            catalog,
+            decision_packet,
             semantic_fields,
-            input_result.bundle,
-            policy=policy,
-            aliases=match_config.aliases if match_config else None,
-            sections=match_config.sections if match_config else None,
+            product_context.trusted_inputs.bundle,
         )
 
         summary = plan.summary()
@@ -800,20 +756,12 @@ def main() -> int:
         )
         print(f"page={page.url}")
         print(
-            f"questions={len(catalog.questions)} "
-            f"(base={len(base_catalog.questions)}, live_extra={len(catalog.questions) - len(base_catalog.questions)})"
+            f"live_fields={summary['live_field_count']}, ready={summary['ready']}, "
+            f"preview_eligible={summary['preview_eligible']}, blocked={summary['blocked']}, "
+            f"required_blocked={summary['required_blocked']}"
         )
-        print(
-            f"ready={summary['ready']}, preview_eligible={summary['preview_eligible']}, "
-            f"blocked={summary['blocked']}, required_blocked={summary['required_blocked']}"
-        )
-        if args.live_schema:
-            print(f"live_schema={Path(args.live_schema).resolve()} verified=True")
-        if match_config:
-            print(
-                f"matching_config={match_config.source_path} "
-                f"aliases={len(match_config.aliases)} sections={len(match_config.sections)}"
-            )
+        print(f"live_schema={Path(args.live_schema).resolve()} verified=True")
+        print(f"decision_packet={Path(args.decision_packet).resolve()} rebound=True")
         print(
             "section Save 已显式授权；绝不 Send to QC。"
             if args.all_step3
@@ -888,15 +836,12 @@ def main() -> int:
             "page_url": page.url,
             "expected_vertical": args.expected_vertical,
             "qa_source": str(Path(args.qa).resolve()),
-            "live_schema": str(Path(args.live_schema).resolve()) if args.live_schema else None,
-            "live_schema_verified": planned_live_fields is not None,
-            "live_schema_warnings": live_schema_warnings,
-            "base_question_count": len(base_catalog.questions),
-            "effective_question_count": len(catalog.questions),
-            "live_extra_question_count": len(catalog.questions) - len(base_catalog.questions),
+            "decision_packet": str(Path(args.decision_packet).resolve()),
+            "live_schema": str(Path(args.live_schema).resolve()),
+            "live_schema_verified": True,
+            "decision_packet_rebound": True,
             "include_review_candidates": args.include_review_candidates,
             "allow_section_save": args.allow_section_save,
-            "matching_config": match_config.source_path if match_config else None,
             "plan_summary": summary,
             "blocked_reason_summary": _blocked_reason_summary(plan),
             "fill_plan": plan.as_dict(),
@@ -906,8 +851,9 @@ def main() -> int:
             "field_totals": totals,
             "photo_upload": photo_report,
             "completion": completion,
-            "evidence_items": len(input_result.bundle.evidence),
-            "evidence_warnings": input_result.warnings,
+            "trusted_input_items": len(product_context.trusted_inputs.bundle.evidence),
+            "grounded_source_count": len(grounding.sources),
+            "decision_warnings": decision_packet.warnings,
             "section_save_attempted": sum(
                 1 for item in section_reports if item.get("save_attempted")
             ) + int(bool(photo_report and photo_report.get("save_attempted"))),
