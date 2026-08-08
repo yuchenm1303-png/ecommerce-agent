@@ -94,18 +94,11 @@ def _question_keys(question: QuestionRecord, aliases: dict[str, tuple[str, ...]]
 
 
 def _section_key(value: object) -> str:
-    """Normalize a QA category/live heading while removing UI-only counters."""
-
     text = str(value or "").strip()
     text = re.sub(r"\([^)]*\)", " ", text)
     return normalize_key(text)
 
 
-# Real customer QA sheets use the column named ``问题类别`` for the *answer
-# form*, not the Makro section. These values must never be compared with live
-# section headings. Keep the recognition deliberately narrow: unknown non-empty
-# category text remains authoritative section metadata (fail closed), preserving
-# the previous protection against cross-section collisions.
 _ANSWER_FORM_CATEGORY_PATTERNS = (
     re.compile(r"^(?:单项|多项)?(?:填空|选择|输入)$"),
     re.compile(r"^(?:单选|多选|文本|数字|数值|下拉|下拉选择|自由文本)$"),
@@ -125,20 +118,32 @@ def _question_category_is_section(question: QuestionRecord) -> bool:
     return bool(_section_key(question.category)) and not _is_answer_form_category(question.category)
 
 
-def _filter_candidates_by_question_section(
+def _wanted_section(
     question: QuestionRecord,
+    section_overrides: dict[str, str],
+) -> tuple[str, str]:
+    """Return normalized section plus its audit basis.
+
+    Explicit reviewed config has precedence over workbook category metadata. The
+    latter is used only when it is not one of the known answer-form categories.
+    """
+
+    question_key = normalize_key(question.question)
+    override = section_overrides.get(question_key, "")
+    if override:
+        return _section_key(override), "explicit-section"
+    if _question_category_is_section(question):
+        return _section_key(question.category), "qa-category-section"
+    return "", ""
+
+
+def _filter_candidates_by_section(
     candidates: list[int],
     fields: list[dict[str, Any]],
+    wanted: str,
 ) -> list[int]:
-    if not candidates or not _question_category_is_section(question):
+    if not candidates or not wanted:
         return candidates
-    wanted = _section_key(question.category)
-
-    # Unknown/non-answer-form category metadata is treated as an authoritative
-    # section even when that section is absent from the current candidate set.
-    # This preserves fail-closed behavior: a field with the same generic key in
-    # another section must not be accepted merely because the expected section
-    # is currently missing from the scan.
     candidates_with_section = [
         index
         for index in candidates
@@ -158,23 +163,25 @@ def match_questions_to_fields(
     semantic_fields: Iterable[dict[str, Any]],
     *,
     aliases: dict[str, tuple[str, ...]] | None = None,
+    sections: dict[str, str] | None = None,
 ) -> MatchAudit:
-    """One-to-one deterministic matcher between customer questions and live Makro fields.
+    """One-to-one deterministic matcher between customer QA and live Makro fields.
 
-    No fuzzy similarity is used. A question matches only an exact normalized
-    label/attribute key or an explicit alias supplied by configuration. Non-empty
-    QA category metadata constrains section matching unless it is explicitly
-    recognized as an answer-form value such as 单项填空/多项选择. This keeps the
-    cross-section fail-closed guard while supporting the client's real workbook.
+    No fuzzy similarity is used. Matching accepts only exact normalized
+    label/attribute keys or explicit configured aliases. A reviewed section
+    override can disambiguate duplicate generic labels; otherwise genuine
+    ambiguity remains fail-closed.
     """
 
     alias_map = aliases or {}
+    section_map = sections or {}
     fields = list(semantic_fields)
     keys_by_index = [_field_keys(field) for field in fields]
     used: set[int] = set()
     matches: list[QuestionFieldMatch] = []
 
     for question in catalog.questions:
+        wanted_section, section_basis = _wanted_section(question, section_map)
         resolved: list[tuple[int, str]] = []
         for key, basis in _question_keys(question, alias_map):
             candidates = [
@@ -182,18 +189,24 @@ def match_questions_to_fields(
                 for index, field_keys in enumerate(keys_by_index)
                 if index not in used and key in field_keys
             ]
-            candidates = _filter_candidates_by_question_section(question, candidates, fields)
+            candidates = _filter_candidates_by_section(
+                candidates,
+                fields,
+                wanted_section,
+            )
             if candidates:
-                resolved.extend((index, basis) for index in candidates)
-                # Direct exact-normalized match has precedence over aliases.
+                effective_basis = (
+                    f"{basis}+{section_basis}" if section_basis else basis
+                )
+                resolved.extend((index, effective_basis) for index in candidates)
                 if basis == "exact-normalized":
                     break
 
         unique_indexes = sorted({index for index, _ in resolved})
         if not unique_indexes:
             section_detail = (
-                f" QA category={question.category!r} 作为 section 元数据，必须与 live section 一致。"
-                if _question_category_is_section(question)
+                f" 期望 live section={wanted_section!r}（{section_basis}）。"
+                if wanted_section
                 else ""
             )
             matches.append(
