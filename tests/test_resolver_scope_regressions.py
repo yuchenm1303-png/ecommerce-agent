@@ -49,11 +49,23 @@ def add(
 
 def test_supplier_product_brand_other_cannot_answer_vehicle_brand():
     bundle = ProductSourceBundle()
+    add(bundle, "Vehicle Brand", "other", evidence="Brand: other")
+
+    answer = resolve_field(field("vehicle_brand", "Vehicle Brand"), bundle)
+
+    assert answer.status == MISSING
+
+
+def test_model_authored_vehicle_brand_prose_cannot_self_authorize_external_source():
+    bundle = ProductSourceBundle()
     add(
         bundle,
         "Vehicle Brand",
         "other",
-        evidence="Brand: other",
+        source_type="ai_synthesis",
+        reference="image:001:abc",
+        evidence="Vehicle Brand: other, inferred from visible product brand 'other'",
+        confidence=0.84,
     )
 
     answer = resolve_field(field("vehicle_brand", "Vehicle Brand"), bundle)
@@ -63,11 +75,33 @@ def test_supplier_product_brand_other_cannot_answer_vehicle_brand():
 
 def test_supplier_internal_memory_none_cannot_answer_sd_card_included_no():
     bundle = ProductSourceBundle()
+    add(bundle, "SD Card Included", "No", evidence="内存容量 无")
+    add(
+        bundle,
+        "SD Card Included",
+        "Yes",
+        source_type="customer_answer",
+        reference="qa.xlsx:row=12",
+        evidence="SD Card Included=Yes",
+        confidence=1.0,
+    )
+
+    answer = resolve_field(field("sd_card_included", "SD Card Included"), bundle)
+
+    assert answer.status == RESOLVED
+    assert answer.answer_values == ["Yes"]
+
+
+def test_internal_memory_none_cannot_hide_behind_model_authored_included_label():
+    bundle = ProductSourceBundle()
     add(
         bundle,
         "SD Card Included",
         "No",
-        evidence="内存容量 无",
+        source_type="ai_synthesis",
+        reference="image:001:abc",
+        evidence="SD Card Included: No; source visibly says 内存容量 无",
+        confidence=0.84,
     )
     add(
         bundle,
@@ -184,6 +218,24 @@ def test_product_dimensions_require_product_scope_and_ignore_packaging_scope():
         reference="image:002:abc",
         evidence="Product dimensions: width 86 mm, depth 35 mm, height 36 mm",
         confidence=0.84,
+    )
+
+    answer = resolve_field(field("width", "Width"), bundle)
+
+    assert answer.status == RESOLVED
+    assert answer.answer_values == ["86 mm"]
+
+
+def test_axis_specific_product_dimension_evidence_is_accepted():
+    bundle = ProductSourceBundle()
+    add(
+        bundle,
+        "Width",
+        "86 mm",
+        source_type="product_image",
+        reference="image:002:abc",
+        evidence="Product width 86 mm",
+        confidence=0.92,
     )
 
     answer = resolve_field(field("width", "Width"), bundle)
