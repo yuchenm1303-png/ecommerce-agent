@@ -120,7 +120,7 @@ class FakeProvider:
         }
 
 
-def test_resolver_is_one_product_call_browser_free_and_audited(tmp_path, monkeypatch):
+def test_resolver_is_one_local_product_call_browser_free_and_audited(tmp_path, monkeypatch):
     qa = _qa_file(tmp_path)
     live_schema = _live_schema_file(tmp_path)
     image = tmp_path / "front.jpg"
@@ -166,7 +166,7 @@ def test_resolver_is_one_product_call_browser_free_and_audited(tmp_path, monkeyp
     request = provider.requests[0]
     assert request["task"] == "resolve_all_live_marketplace_fields_from_product_sources"
     assert len(request["target_fields"]) == 2
-    assert len(request["grounded_sources"]) == 2  # image + canonical customer context
+    assert len(request["grounded_sources"]) == 2
     assert captured["config"].provider == "openai-compatible"
     assert captured["config"].model == "vendor-vision-model"
     assert captured["config"].api_key_env == "VENDOR_KEY"
@@ -176,6 +176,7 @@ def test_resolver_is_one_product_call_browser_free_and_audited(tmp_path, monkeyp
     for name in (
         "ai-decisions.json",
         "search-requests.json",
+        "web-search-sources.json",
         "source-manifest.json",
         "run-manifest.json",
     ):
@@ -184,6 +185,7 @@ def test_resolver_is_one_product_call_browser_free_and_audited(tmp_path, monkeyp
     decisions = json.loads((run_dir / "ai-decisions.json").read_text(encoding="utf-8"))
     assert len(decisions["decisions"]) == 2
     assert [item["status"] for item in decisions["decisions"]] == ["ready", "missing"]
+    assert decisions["web_sources"] == []
 
     search = json.loads((run_dir / "search-requests.json").read_text(encoding="utf-8"))
     assert len(search) == 1
@@ -191,6 +193,7 @@ def test_resolver_is_one_product_call_browser_free_and_audited(tmp_path, monkeyp
 
     manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
     assert manifest["mode"] == "browser_free_ai_first_product_resolution"
+    assert manifest["execution_model"] == "one_local_whole_product_call_plus_optional_one_sourced_web_call"
     assert manifest["provider_config"]["provider"] == "openai-compatible"
     assert manifest["provider_config"]["api_key_env"] == "VENDOR_KEY"
     assert manifest["provider_config"]["request_timeout_seconds"] == 75
@@ -198,10 +201,15 @@ def test_resolver_is_one_product_call_browser_free_and_audited(tmp_path, monkeyp
     assert manifest["customer_context_chars"] > 0
     assert manifest["live_field_count"] == 2
     assert manifest["grounded_logical_source_count"] == 2
-    assert manifest["model_calls"] == 1
-    assert manifest["cache_hit"] is False
-    assert manifest["decision_summary"]["ready"] == 1
-    assert manifest["decision_summary"]["missing"] == 1
+    assert manifest["local_ai"]["model_calls"] == 1
+    assert manifest["local_ai"]["cache_hit"] is False
+    assert manifest["local_ai"]["decision_summary"]["ready"] == 1
+    assert manifest["local_ai"]["decision_summary"]["missing"] == 1
+    assert manifest["web_enrichment"]["searched"] is False
+    assert manifest["web_enrichment"]["model_calls"] == 0
+    assert manifest["total_model_calls"] == 1
+    assert manifest["final_decision_summary"]["ready"] == 1
+    assert manifest["final_decision_summary"]["missing"] == 1
     assert manifest["writes_performed"] == 0
     assert manifest["save_clicked"] is False
     assert manifest["send_to_qc_clicked"] is False
@@ -256,6 +264,8 @@ def test_cli_has_no_legacy_batch_confidence_or_semantic_fact_controls():
     assert "--semantic-cache-dir" in option_strings
     assert "--request-timeout-seconds" in option_strings
     assert "--disable-thinking" in option_strings
+    assert "--web-enrich" in option_strings
+    assert "--web-search-model" in option_strings
     live_action = next(item for item in parser._actions if "--live-schema" in item.option_strings)
     assert live_action.required is True
 
