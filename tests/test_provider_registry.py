@@ -85,6 +85,7 @@ def test_safe_config_does_not_log_url_credentials_or_query_tokens():
 
     assert safe["base_url"] == "https://api.vendor.test/v1"
     assert safe["request_timeout_seconds"] == 90
+    assert safe["enable_thinking"] is None
     assert safe["sdk_max_retries"] == 0
     assert "pass" not in repr(safe)
     assert "secret" not in repr(safe)
@@ -111,9 +112,10 @@ def test_registry_builds_compatible_provider_from_arbitrary_env_name():
     assert provider.structured_mode == "json_object"
     assert provider.compat_profile == "generic"
     assert provider.request_timeout_seconds == 75
+    assert provider.enable_thinking is None
 
 
-def test_qwen_omni_model_auto_selects_streaming_compat_profile():
+def test_qwen_omni_model_auto_selects_streaming_profile_and_disables_thinking():
     config = ProviderConfig(
         provider="openai-compatible",
         model="qwen3.5-omni-plus-2026-03-15",
@@ -122,7 +124,9 @@ def test_qwen_omni_model_auto_selects_streaming_compat_profile():
     )
     normalized = validate_provider_config(config)
     assert normalized.compat_profile == "qwen-omni"
+    assert normalized.enable_thinking is False
     assert normalized.as_safe_dict()["compat_profile"] == "qwen-omni"
+    assert normalized.as_safe_dict()["enable_thinking"] is False
 
     provider = build_semantic_provider(
         config,
@@ -130,6 +134,33 @@ def test_qwen_omni_model_auto_selects_streaming_compat_profile():
         client=DummyClient(),
     )
     assert provider.compat_profile == "qwen-omni"
+    assert provider.enable_thinking is False
+
+
+def test_qwen_thinking_can_be_explicitly_reenabled():
+    normalized = validate_provider_config(
+        ProviderConfig(
+            provider="openai-compatible",
+            model="qwen3.5-omni-plus",
+            api_key_env="DASHSCOPE_API_KEY",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            enable_thinking=True,
+        )
+    )
+    assert normalized.compat_profile == "qwen-omni"
+    assert normalized.enable_thinking is True
+
+
+def test_native_openai_rejects_compatible_thinking_switch():
+    with pytest.raises(ProviderConfigurationError, match="thinking"):
+        validate_provider_config(
+            ProviderConfig(
+                provider="openai",
+                model="gpt-5.6",
+                api_key_env="OPENAI_API_KEY",
+                enable_thinking=False,
+            )
+        )
 
 
 def test_registry_keeps_native_openai_adapter_available():
