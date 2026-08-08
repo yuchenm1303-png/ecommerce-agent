@@ -7,6 +7,7 @@ import sys
 from openpyxl import Workbook
 
 import makro_resolve_ai
+from app.providers.registry import ProviderConfig
 
 
 def _qa_file(tmp_path):
@@ -125,6 +126,8 @@ def test_provider_neutral_resolver_is_source_first_browser_free_and_audited(tmp_
             "https://api.vendor.test/v1",
             "--api-key-env",
             "VENDOR_KEY",
+            "--request-timeout-seconds",
+            "75",
             "--qa",
             str(qa),
             "--live-schema",
@@ -144,6 +147,7 @@ def test_provider_neutral_resolver_is_source_first_browser_free_and_audited(tmp_
     assert captured["config"].provider == "openai-compatible"
     assert captured["config"].model == "vendor-vision-model"
     assert captured["config"].api_key_env == "VENDOR_KEY"
+    assert captured["config"].request_timeout_seconds == 75
 
     run_dir = next(output.iterdir())
     for name in (
@@ -164,11 +168,13 @@ def test_provider_neutral_resolver_is_source_first_browser_free_and_audited(tmp_
     assert source_report["completed_sources"] == 2
     assert source_report["model_calls"] == 2
     assert source_report["cache_hits"] == 0
+    assert source_report["provider_config"]["request_timeout_seconds"] == 75
     assert all(item["model_calls"] == 1 for item in source_report["source_stats"])
 
     manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
     assert manifest["provider_config"]["provider"] == "openai-compatible"
     assert manifest["provider_config"]["api_key_env"] == "VENDOR_KEY"
+    assert manifest["provider_config"]["request_timeout_seconds"] == 75
     assert "api_key" not in manifest["provider_config"]
     assert manifest["customer_context_chars"] > 0
     assert manifest["base_question_count"] == 2
@@ -182,6 +188,24 @@ def test_provider_neutral_resolver_is_source_first_browser_free_and_audited(tmp_
     assert manifest["writes_performed"] == 0
     assert manifest["save_clicked"] is False
     assert manifest["send_to_qc_clicked"] is False
+
+
+def test_semantic_cache_namespace_ignores_transport_only_timeout():
+    base = ProviderConfig(
+        provider="openai-compatible",
+        model="vision-model",
+        api_key_env="KEY",
+        base_url="https://api.vendor.test/v1",
+        request_timeout_seconds=30,
+    )
+    slower = ProviderConfig(
+        provider="openai-compatible",
+        model="vision-model",
+        api_key_env="KEY",
+        base_url="https://api.vendor.test/v1",
+        request_timeout_seconds=180,
+    )
+    assert makro_resolve_ai._semantic_cache_namespace(base) == makro_resolve_ai._semantic_cache_namespace(slower)
 
 
 def test_generic_cli_never_accepts_raw_api_key_or_obsolete_batch_controls():
@@ -199,6 +223,7 @@ def test_generic_cli_never_accepts_raw_api_key_or_obsolete_batch_controls():
     assert "--fail-on-batch-error" not in option_strings
     assert "--max-source-repair-attempts" in option_strings
     assert "--semantic-cache-dir" in option_strings
+    assert "--request-timeout-seconds" in option_strings
 
 
 def test_generic_cli_contains_no_makro_browser_or_fill_path():
