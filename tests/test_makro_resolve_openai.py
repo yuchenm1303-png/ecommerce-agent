@@ -47,7 +47,10 @@ class FakeProvider:
                     "source_type": "product_image",
                     "source_reference": image_source["source_id"],
                     "confidence": 0.92,
-                    "evidence_text": "Visible printed specification: 3.0 inch.",
+                    # This CLI smoke test is about report generation, not semantic
+                    # quarantine. Make the fake visual evidence explicitly bind
+                    # the value to the QA attribute so it remains a direct fact.
+                    "evidence_text": "Visible label reads Screen Size: 3.0 inch.",
                     "note": "",
                 }
             ],
