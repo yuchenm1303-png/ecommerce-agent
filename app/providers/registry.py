@@ -50,6 +50,27 @@ def _effective_compat_profile(provider: str, model: str, requested: str) -> str:
     return requested
 
 
+def _effective_thinking(
+    provider: str,
+    compat_profile: str,
+    requested: bool | None,
+) -> bool | None:
+    if provider != "openai-compatible":
+        if requested is not None:
+            raise ProviderConfigurationError(
+                "thinking 开关当前仅用于 openai-compatible provider。"
+            )
+        return None
+    if requested is not None:
+        return bool(requested)
+    # Qwen3.5 hybrid-thinking models default to thinking on at the service.
+    # Semantic extraction is constrained information extraction, not open-ended
+    # reasoning, so qwen-omni defaults to thinking off for predictable latency.
+    if compat_profile == "qwen-omni":
+        return False
+    return None
+
+
 @dataclass(slots=True, frozen=True)
 class ProviderConfig:
     provider: str
@@ -61,6 +82,7 @@ class ProviderConfig:
     structured_mode: str = "prompt_only"
     compat_profile: str = "generic"
     request_timeout_seconds: float = 120.0
+    enable_thinking: bool | None = None
 
     def as_safe_dict(self) -> dict[str, Any]:
         """Return audit metadata without exposing secret values."""
@@ -75,6 +97,7 @@ class ProviderConfig:
             "structured_mode": self.structured_mode,
             "compat_profile": self.compat_profile,
             "request_timeout_seconds": self.request_timeout_seconds,
+            "enable_thinking": self.enable_thinking,
             # Production-created SDK clients use max_retries=0. Retries are
             # explicit at the semantic source layer so latency/reporting stays
             # observable instead of being multiplied invisibly inside the SDK.
@@ -147,6 +170,11 @@ def validate_provider_config(config: ProviderConfig) -> ProviderConfig:
         )
 
     effective_profile = _effective_compat_profile(provider, model, config.compat_profile)
+    effective_thinking = _effective_thinking(
+        provider,
+        effective_profile,
+        config.enable_thinking,
+    )
     return ProviderConfig(
         provider=provider,
         model=model,
@@ -157,6 +185,7 @@ def validate_provider_config(config: ProviderConfig) -> ProviderConfig:
         structured_mode=config.structured_mode,
         compat_profile=effective_profile,
         request_timeout_seconds=timeout,
+        enable_thinking=effective_thinking,
     )
 
 
@@ -180,6 +209,7 @@ def build_semantic_provider(
             structured_mode=normalized.structured_mode,
             compat_profile=normalized.compat_profile,
             request_timeout_seconds=normalized.request_timeout_seconds,
+            enable_thinking=normalized.enable_thinking,
         )
 
     if client is None:
