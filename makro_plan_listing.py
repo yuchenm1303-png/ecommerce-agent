@@ -211,10 +211,11 @@ def main() -> int:
         print(f"page={page.url}")
         print(
             f"live_fields={summary['live_field_count']}, ready={summary['ready']}, "
-            f"blocked={summary['blocked']}"
+            f"preview_eligible={summary['preview_eligible']}, blocked={summary['blocked']}"
         )
         print(
             f"required_ready={summary['required_ready']}, "
+            f"required_preview_eligible={summary['required_preview_eligible']}, "
             f"required_blocked={summary['required_blocked']}"
         )
         print(
