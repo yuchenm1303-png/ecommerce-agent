@@ -9,7 +9,6 @@ from app.ai_decisions import (
     READY,
     REVIEW,
     AIDecisionPacket,
-    DecisionAlternative,
     DecisionCitation,
     FieldDecision,
     build_ai_resolution_request,
@@ -78,17 +77,12 @@ def decision_payload(request, *, conflict=False):
                     "field_id": target["field_id"],
                     "status": "ready",
                     "values": ["999"],
-                    "qualifier": "",
-                    "confidence": 0.99,
                     "citations": [
                         {
                             "source_reference": "supplier:001:text:0001:abc",
                             "evidence_text": "Colour: Black",
                         }
                     ],
-                    "alternatives": [],
-                    "reason": "model incorrectly tried business guess",
-                    "search_queries": [],
                 }
             )
             continue
@@ -97,14 +91,9 @@ def decision_payload(request, *, conflict=False):
                 {
                     "field_id": target["field_id"],
                     "status": "conflict",
-                    "values": [],
-                    "qualifier": "",
-                    "confidence": 0.8,
-                    "citations": [],
                     "alternatives": [
                         {
                             "values": ["720p"],
-                            "qualifier": "",
                             "citations": [
                                 {
                                     "source_reference": "supplier:001:text:0001:abc",
@@ -115,7 +104,6 @@ def decision_payload(request, *, conflict=False):
                         },
                         {
                             "values": ["1080p"],
-                            "qualifier": "",
                             "citations": [
                                 {
                                     "source_reference": "image:001",
@@ -125,8 +113,6 @@ def decision_payload(request, *, conflict=False):
                             "reason": "image value",
                         },
                     ],
-                    "reason": "credible sources disagree",
-                    "search_queries": [],
                 }
             )
             continue
@@ -135,28 +121,15 @@ def decision_payload(request, *, conflict=False):
                 "field_id": target["field_id"],
                 "status": "ready",
                 "values": ["Black"],
-                "qualifier": "",
-                "confidence": 0.94,
                 "citations": [
                     {
                         "source_reference": "supplier:001:text:0001:abc",
                         "evidence_text": "Colour: Black",
                     }
                 ],
-                "alternatives": [],
-                "reason": "directly supported",
-                "search_queries": [],
             }
         )
-    return {
-        "contract_version": 1,
-        "product_identity": request["product_identity"],
-        "schema_sha256": request["schema_sha256"],
-        "source_manifest_sha256": request["source_manifest_sha256"],
-        "decisions": decisions,
-        "model_summary": "resolved product",
-        "warnings": [],
-    }
+    return {"decisions": decisions, "model_summary": "resolved product"}
 
 
 class FakeProvider:
@@ -173,7 +146,7 @@ class FakeProvider:
         return decision_payload(request_payload, conflict=self.conflict)
 
 
-def test_request_gives_ai_all_fields_and_all_sources_in_one_product_task(tmp_path):
+def test_request_gives_ai_all_fields_and_all_sources_in_one_compact_product_task(tmp_path):
     fields = [
         field("colour", "Colour", options=("Black", "White")),
         field("recording_resolution", "Recording Resolution"),
@@ -185,13 +158,16 @@ def test_request_gives_ai_all_fields_and_all_sources_in_one_product_task(tmp_pat
         identity=ProductIdentity(sku="SKU-1"),
     )
 
-    assert request["task"] == "resolve_all_live_marketplace_fields_from_product_sources"
+    assert request["task"] == "fill_marketplace_fields_from_local_product_evidence"
     assert len(request["target_fields"]) == 2
     assert len(request["grounded_sources"]) == 3
-    assert request["schema_sha256"] == schema_digest(fields)
-    assert request["source_manifest_sha256"] == source_manifest_digest(sources)
-    assert "Natural-language translation" in request["system_instruction"]
-    assert all("field_id" in item for item in request["target_fields"])
+    assert "schema_sha256" not in request
+    assert "source_manifest_sha256" not in request
+    assert request["json_contract"]["required"] == ["decisions"]
+    assert "product_identity" not in request["json_contract"].get("properties", {})
+    assert "field_id" in request["target_fields"][0]
+    assert "options" in request["target_fields"][0]
+    assert "options" not in request["target_fields"][1]
 
 
 def test_normal_path_is_exactly_one_model_call_for_many_sources(tmp_path):
@@ -210,8 +186,10 @@ def test_normal_path_is_exactly_one_model_call_for_many_sources(tmp_path):
 
     assert provider.calls == 1
     assert result.model_calls == 1
+    assert result.repair_attempts == 0
     assert result.cache_hit is False
     assert len(result.packet.decisions) == 2
+    assert result.packet.schema_sha256 == schema_digest(fields)
 
 
 def test_whole_product_cache_replays_with_zero_model_calls(tmp_path):
@@ -332,20 +310,20 @@ def test_business_field_is_forced_locked_even_if_model_returns_ready(tmp_path):
         section="Price, Stock and Shipping Information",
     )
     sources = grounding(tmp_path)
-    request = build_ai_resolution_request(
-        [selling],
-        sources,
-        identity=ProductIdentity(sku="SKU-1"),
+    raw = decision_payload(
+        build_ai_resolution_request(
+            [selling],
+            sources,
+            identity=ProductIdentity(sku="SKU-1"),
+        )
     )
-    raw = decision_payload(request)
-    validated = validate_ai_decision_packet(
-        AIDecisionPacket.from_mapping(raw),
+    result = run_ai_resolution(
+        type("Provider", (), {"name": "fake", "extract_json": lambda self, _: raw})(),
         [selling],
         sources,
         expected_identity=ProductIdentity(sku="SKU-1"),
     )
-
-    decision = validated.decisions[0]
+    decision = result.packet.decisions[0]
     assert decision.status == BUSINESS_LOCKED
     assert decision.values == []
     assert decision.citations == []
@@ -353,12 +331,11 @@ def test_business_field_is_forced_locked_even_if_model_returns_ready(tmp_path):
 
 def test_real_cross_source_conflict_is_preserved_for_ai_to_express(tmp_path):
     resolution = field("recording_resolution", "Recording Resolution")
-    sources = grounding(tmp_path)
     provider = FakeProvider(conflict=True)
     result = run_ai_resolution(
         provider,
         [resolution],
-        sources,
+        grounding(tmp_path),
         expected_identity=ProductIdentity(sku="SKU-1"),
     )
 
@@ -381,7 +358,6 @@ def test_model_omitted_field_becomes_missing_instead_of_local_guess(tmp_path):
                 field_id=field_id(colour),
                 status=READY,
                 values=["Black"],
-                confidence=0.95,
                 citations=[
                     DecisionCitation(
                         source_reference="supplier:001:text:0001:abc",
