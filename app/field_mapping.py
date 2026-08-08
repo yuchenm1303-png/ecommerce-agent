@@ -41,7 +41,7 @@ MAPPING_RULES = [
     "Use MISSING when the local profile does not establish the value; include focused search_queries when web research could reasonably help.",
     "Treat the selected variant as the listing target. Do not silently replace selected-variant facts with generic product-family facts.",
     "Do not infer No/False/Unsupported/Not included from absence. A negative value needs evidence that actually states that negative claim.",
-    "Preserve the meaning of dimensions and scopes exactly as written in the evidence. Do not swap length/width/height/depth, packaging/body/mount, cabin/rear, manual/UI language, or product/vehicle compatibility.",
+    "Keep packaging dimensions/weight separate from product-body dimensions/weight and mount dimensions; preserve dimension axes exactly as written. Do not swap length/width/height/depth, cabin/rear, manual/UI language, or product/vehicle compatibility.",
     "If the field has marketplace options, use the exact option text only when it matches the supported meaning.",
     "If multi_value=false, return one value. If qualifier_options exist, put the magnitude in values and the unit in qualifier.",
     "Citations must use underlying original source_reference values present inside PRODUCT_PROFILE facts, never the derived product-profile source id.",
