@@ -17,7 +17,6 @@ _TRUSTED_CONTEXT_SOURCE_TYPES = {
     "business",
     "config",
     "rule",
-    "customer_file",
 }
 
 
@@ -39,10 +38,9 @@ def build_ai_product_context(
 ) -> AIProductContext:
     """Build the canonical customer/structured source seen by the AI resolver.
 
-    This function deliberately contains no product-attribute semantics. It only
-    serializes explicit customer answers, SKU/structured facts and workbook
-    context. Images and supplier/official snapshots stay separate grounded
-    sources so citations remain auditable.
+    Raw workbook context appears exactly once. Explicit Answer cells, SKU and
+    other structured seller/customer facts are listed separately because they
+    carry stronger provenance. No product meaning is inferred here.
     """
 
     trusted_spec = replace(
