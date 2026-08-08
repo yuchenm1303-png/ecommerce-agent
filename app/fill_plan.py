@@ -8,20 +8,15 @@ from .answer_resolver import NEEDS_REVIEW
 from .qa_catalog import QuestionCatalog, QuestionRecord
 from .question_matcher import AMBIGUOUS, MATCHED, UNMATCHED, MatchAudit, match_questions_to_fields
 from .resolution_engine import ResolutionPolicy, ResolutionRecord, resolve_one
-from .source_bundle import ProductSourceBundle
+from .source_bundle import ProductSourceBundle, normalize_key
 
 
 READY = "ready"
 BLOCKED = "blocked"
 GATE_UNMATCHED_LIVE_FIELD = "unmatched_live_field"
 GATE_CROSS_FIELD_RULE = "cross_field_business_rule"
+GATE_SHARED_SYNTHESIS_BINDING = "ambiguous_shared_synthesis_binding"
 
-# A live Makro field that is not matched to a customer QA row has no semantic
-# question binding. It may still be a legitimate seller/business field, but only
-# explicit structured/config/rule inputs are allowed to authorize an autofill.
-# Image/web/AI/customer-QA evidence must never spill into an unmatched live field
-# merely because its attribute_key happens to share a generic name such as
-# height, brand, model or status.
 UNMATCHED_LIVE_AUTOFILL_SOURCE_TYPES = {"structured", "business", "config", "rule"}
 
 
@@ -73,22 +68,16 @@ class LiveFillPlan:
 
     @property
     def required_blocked_count(self) -> int:
-        return sum(
-            1 for item in self.items if item.required and item.action == BLOCKED
-        )
+        return sum(1 for item in self.items if item.required and item.action == BLOCKED)
 
     @property
     def required_ready_count(self) -> int:
-        return sum(
-            1 for item in self.items if item.required and item.action == READY
-        )
+        return sum(1 for item in self.items if item.required and item.action == READY)
 
     @property
     def required_preview_eligible_count(self) -> int:
         return sum(
-            1
-            for item in self.items
-            if item.required and item.resolution.preview_eligible
+            1 for item in self.items if item.required and item.resolution.preview_eligible
         )
 
     def summary(self) -> dict[str, Any]:
@@ -153,13 +142,6 @@ def _gate_unmatched_live_resolution(
     *,
     question: QuestionRecord | None,
 ) -> str | None:
-    """Prevent evidence-key collisions from authorizing unrelated live fields.
-
-    This gate applies to both real autofill and review-preview candidates. A
-    low-confidence semantic value must not become previewable on an unmatched
-    live field merely because it shares a generic key such as ``height``.
-    """
-
     if question is not None:
         return None
     if not resolution.eligible_for_autofill and not resolution.preview_eligible:
@@ -210,6 +192,59 @@ def _apply_cross_field_business_rules(items: list[LiveFillPlanItem]) -> None:
             )
 
 
+def _synthesis_fingerprint(item: LiveFillPlanItem) -> tuple[str, str, tuple[str, ...]] | None:
+    """Return the source/value fingerprint for a low-confidence AI binding.
+
+    The same generic cited statement must not authorize several different QA/live
+    fields merely because a model can map it to each one. This is the exact class
+    of error seen when one generic ``120°`` specification was assigned to both
+    Interior and Exterior Field of View.
+    """
+
+    record = item.resolution
+    if not record.preview_eligible or record.source_type != "ai_synthesis":
+        return None
+    reference = str(record.source_reference or "").strip()
+    evidence = normalize_key(record.evidence or "")
+    values = tuple(normalize_key(value) for value in record.answer_values)
+    if not reference or not evidence or not values:
+        return None
+    return reference, evidence, values
+
+
+def _block_ambiguous_shared_synthesis(items: list[LiveFillPlanItem]) -> None:
+    groups: dict[tuple[str, str, tuple[str, ...]], list[LiveFillPlanItem]] = {}
+    for item in items:
+        fingerprint = _synthesis_fingerprint(item)
+        if fingerprint is not None:
+            groups.setdefault(fingerprint, []).append(item)
+
+    for group in groups.values():
+        distinct_targets = {
+            (
+                normalize_key(item.question or item.label),
+                normalize_key(item.section_heading),
+                normalize_key(item.attribute_key),
+            )
+            for item in group
+        }
+        if len(distinct_targets) <= 1:
+            continue
+        labels = ", ".join(item.question or item.label or item.attribute_key for item in group)
+        detail = (
+            "同一条 ai_synthesis 证据和同一答案被绑定到多个不同字段："
+            f"{labels}。字段归属不唯一，禁止进入 preview/persist；需更精确证据。"
+        )
+        for item in group:
+            item.action = BLOCKED
+            item.reason = detail
+            item.resolution.status = NEEDS_REVIEW
+            item.resolution.eligible_for_autofill = False
+            item.resolution.preview_eligible = False
+            item.resolution.gate_reason = GATE_SHARED_SYNTHESIS_BINDING
+            item.resolution.detail = detail
+
+
 def build_live_fill_plan(
     catalog: QuestionCatalog,
     semantic_fields: Iterable[dict[str, Any]],
@@ -218,13 +253,7 @@ def build_live_fill_plan(
     policy: ResolutionPolicy | None = None,
     aliases: dict[str, tuple[str, ...]] | None = None,
 ) -> LiveFillPlan:
-    """Plan every live Makro field, not merely the questions in the QA sheet.
-
-    QA matching contributes question metadata to product attributes. Live fields
-    that are not in the customer QA sheet are still resolved from explicit
-    structured/business/config/rule evidence; semantic image/web/AI evidence is
-    never allowed to leak into them by a generic key collision.
-    """
+    """Plan every live Makro field with fail-closed question/evidence binding."""
 
     fields = list(semantic_fields)
     audit = match_questions_to_fields(catalog, fields, aliases=aliases)
@@ -253,11 +282,11 @@ def build_live_fill_plan(
             reason = unmatched_gate_detail
         elif resolution.preview_eligible:
             reason = (
-                "候选值已通过字段结构、选项/单位和 provenance 检查，但仅因置信度门槛未达到自动填写标准；"
-                "可在显式 review-preview 模式中临时填入供人工检查，禁止据此自动 Save。"
+                "候选值通过字段结构、选项/单位和 provenance 检查，但仅因置信度门槛未达到自动填写标准；"
+                "仅允许在显式人工 review 模式中使用。"
             )
         elif question is None:
-            reason = "实时 Makro 字段未匹配 QA；仅在显式结构化证据可解析时才允许自动填写。"
+            reason = "实时 Makro 字段未匹配 QA；仅显式结构化证据可授权自动填写。"
             if resolution.detail:
                 reason += " " + resolution.detail
         else:
@@ -279,6 +308,7 @@ def build_live_fill_plan(
         )
 
     _apply_cross_field_business_rules(items)
+    _block_ambiguous_shared_synthesis(items)
 
     unmatched_questions = []
     for match in audit.matches:
