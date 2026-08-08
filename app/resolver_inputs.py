@@ -199,24 +199,33 @@ def _append_snapshot_files(
         snapshot_files.append(str(snapshot_path.resolve()))
 
 
+def _customer_context(catalog: QuestionCatalog, spec: ResolutionInputSpec) -> str:
+    parts = [catalog.preamble_text, spec.supplemental_text]
+    if spec.supplemental_text_file:
+        parts.append(Path(spec.supplemental_text_file).read_text(encoding="utf-8"))
+    return "\n".join(part for part in parts if part and part.strip()).strip()
+
+
 def build_resolution_inputs(
     catalog: QuestionCatalog,
     spec: ResolutionInputSpec,
 ) -> ResolutionInputResult:
     """Load every explicit evidence source through one shared safety boundary.
 
-    Explicit trusted inputs establish product identity first. External image/web/
-    AI evidence is then question-scoped and identity-checked before entering the
-    resolver. Deterministic source snapshots take the same validated packet path.
+    The customer workbook preamble is part of the product source bundle, not
+    disposable formatting. It is retained as customer context and conservatively
+    parsed for explicit ``key: value`` facts; narrative context remains available
+    to the grounded semantic extractor without being treated as a fact by itself.
     """
 
+    customer_context = _customer_context(catalog, spec)
     trusted_bundles: list[ProductSourceBundle] = [
         bundle_from_catalog_answers(
             catalog,
             sku=spec.sku,
             image_paths=spec.image_paths,
             product_url=spec.product_url,
-            supplemental_text=spec.supplemental_text,
+            supplemental_text=customer_context,
         )
     ]
     warnings: list[str] = []
@@ -235,6 +244,16 @@ def build_resolution_inputs(
     trusted_bundle = merge_bundles(*trusted_bundles)
     expected = _derive_expected_identity(spec, trusted_bundle)
     bundles = list(trusted_bundles)
+
+    if customer_context:
+        bundles.append(
+            bundle_from_key_value_text(
+                customer_context,
+                source_reference=f"{Path(catalog.source_path).name}:customer-context",
+                source_type="customer_file",
+            )
+        )
+        warnings.append(f"customer_context_chars={len(customer_context)}")
 
     packet_files: list[str] = []
     for path in spec.evidence_packets:
@@ -272,20 +291,6 @@ def build_resolution_inputs(
         warnings=warnings,
         snapshot_files=snapshot_files,
     )
-
-    text_parts = [spec.supplemental_text]
-    if spec.supplemental_text_file:
-        text_parts.append(
-            Path(spec.supplemental_text_file).read_text(encoding="utf-8")
-        )
-    explicit_text = "\n".join(part for part in text_parts if part.strip())
-    if explicit_text:
-        bundles.append(
-            bundle_from_key_value_text(
-                explicit_text,
-                source_reference=spec.supplemental_text_file or "--supplemental-text",
-            )
-        )
 
     return ResolutionInputResult(
         bundle=merge_bundles(*bundles),
