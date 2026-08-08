@@ -138,7 +138,9 @@ def test_provider_neutral_resolver_is_source_first_browser_free_and_audited(tmp_
     )
 
     assert makro_resolve_ai.main() == 0
-    assert provider.calls == 1
+    # The workbook preamble is a real customer-context source in addition to
+    # the image. Source-first means one call to each, not one call total.
+    assert provider.calls == 2
     assert captured["config"].provider == "openai-compatible"
     assert captured["config"].model == "vendor-vision-model"
     assert captured["config"].api_key_env == "VENDOR_KEY"
@@ -158,10 +160,11 @@ def test_provider_neutral_resolver_is_source_first_browser_free_and_audited(tmp_
 
     source_report = json.loads((run_dir / "semantic-sources.json").read_text(encoding="utf-8"))
     assert source_report["execution_model"] == "one_call_per_logical_source_normal_path"
-    assert source_report["logical_source_count"] == 1
-    assert source_report["completed_sources"] == 1
-    assert source_report["model_calls"] == 1
+    assert source_report["logical_source_count"] == 2
+    assert source_report["completed_sources"] == 2
+    assert source_report["model_calls"] == 2
     assert source_report["cache_hits"] == 0
+    assert all(item["model_calls"] == 1 for item in source_report["source_stats"])
 
     manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
     assert manifest["provider_config"]["provider"] == "openai-compatible"
@@ -173,8 +176,8 @@ def test_provider_neutral_resolver_is_source_first_browser_free_and_audited(tmp_
     assert manifest["semantic_pending_question_count"] == 2
     assert manifest["live_extra_question_count"] == 1
     assert manifest["live_schema"] == str(live_schema.resolve())
-    assert manifest["grounded_logical_source_count"] == 1
-    assert manifest["semantic_model_calls"] == 1
+    assert manifest["grounded_logical_source_count"] == 2
+    assert manifest["semantic_model_calls"] == 2
     assert manifest["makro_browser_opened"] is False
     assert manifest["writes_performed"] == 0
     assert manifest["save_clicked"] is False
