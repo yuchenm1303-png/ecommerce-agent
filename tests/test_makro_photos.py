@@ -18,7 +18,7 @@ def test_photo_upload_rejects_missing_file_before_touching_page(tmp_path: Path):
 
     assert result.status == "invalid_input"
     assert result.attempted == 0
-    assert result.uploaded == 0
+    assert result.staged == 0
     assert str(missing) in result.detail
 
 
@@ -27,4 +27,4 @@ def test_photo_upload_with_no_explicit_files_is_a_noop():
 
     assert result.status == "skipped"
     assert result.attempted == 0
-    assert result.uploaded == 0
+    assert result.staged == 0
