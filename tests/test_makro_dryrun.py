@@ -158,12 +158,14 @@ def test_multi_value_maps_each_value_to_its_own_slot():
     assert result.actual == ["Camera", "Cable", "Manual"]
 
 
-def test_more_values_than_slots_never_invents_or_overwrites():
+def test_more_values_than_slots_fails_before_any_partial_write():
     controls = [control("ports_0_value"), control("ports_1_value")]
+    first = FakeLocator()
+    second = FakeLocator()
     page = FakePage(
         {
-            '[name="ports_0_value"]': FakeLocator(),
-            '[name="ports_1_value"]': FakeLocator(),
+            '[name="ports_0_value"]': first,
+            '[name="ports_1_value"]': second,
         }
     )
 
@@ -174,8 +176,26 @@ def test_more_values_than_slots_never_invents_or_overwrites():
     )
 
     assert result.status == "validation_failed"
-    assert result.actual == ["USB-C", "HDMI"]
-    assert "3" in result.detail
+    assert result.actual == []
+    assert first.value == ""
+    assert second.value == ""
+    assert "未执行任何部分写入" in result.detail
+
+
+def test_qualifier_answer_fails_before_value_write_if_qualifier_control_missing():
+    c = control("battery_life_0_value")
+    locator = FakeLocator()
+    page = FakePage({'[name="battery_life_0_value"]': locator})
+
+    result = fill_resolved_field(
+        page,
+        semantic("battery_life", [c]),
+        resolved("battery_life", ["60"], qualifier="min"),
+    )
+
+    assert result.status == "validation_failed"
+    assert locator.value == ""
+    assert "qualifier" in result.detail
 
 
 def test_select_fill_reads_selected_label():
@@ -199,7 +219,6 @@ def test_non_resolved_answer_is_skipped_without_touching_page():
 
 
 def test_duplicate_same_name_control_anywhere_is_refused():
-    """Regression: a global [name=...] matching >1 DOM instance must never write/read."""
     c = control("warranty_service_type_0_value")
     loc = FakeLocator()
     loc._count = 2
@@ -247,7 +266,6 @@ def test_section_path_scopes_selector_for_fill_and_readback():
 
 
 def test_react_rerender_reset_is_not_reported_validated():
-    """Regression: immediate readback OK + value reset after render cycle => not validated."""
     c = control("warranty_service_type_0_value")
     loc = FakeLocator()
 
