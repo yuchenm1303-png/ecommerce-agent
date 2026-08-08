@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -92,6 +93,46 @@ def _question_keys(question: QuestionRecord, aliases: dict[str, tuple[str, ...]]
     return output
 
 
+def _section_key(value: object) -> str:
+    """Normalize a QA category/live heading while removing UI-only counters.
+
+    Makro headings contain decorations such as ``(Optional)`` and ``(0/46)``.
+    Customer QA categories normally contain only the semantic section name.
+    These decorations must not turn an otherwise exact section match into an
+    ambiguity with fields from Price/Stock/Shipping or another section.
+    """
+
+    text = str(value or "").strip()
+    text = re.sub(r"\([^)]*\)", " ", text)
+    return normalize_key(text)
+
+
+def _filter_candidates_by_question_section(
+    question: QuestionRecord,
+    candidates: list[int],
+    fields: list[dict[str, Any]],
+) -> list[int]:
+    wanted = _section_key(question.category)
+    if not wanted or not candidates:
+        return candidates
+
+    # A non-empty QA category is authoritative metadata. If live candidates
+    # expose section headings, never fall back to a same-named field in another
+    # section merely because its label/attribute_key matches.
+    candidates_with_section = [
+        index
+        for index in candidates
+        if _section_key(fields[index].get("section_heading"))
+    ]
+    if not candidates_with_section:
+        return candidates
+    return [
+        index
+        for index in candidates_with_section
+        if _section_key(fields[index].get("section_heading")) == wanted
+    ]
+
+
 def match_questions_to_fields(
     catalog: QuestionCatalog,
     semantic_fields: Iterable[dict[str, Any]],
@@ -101,8 +142,10 @@ def match_questions_to_fields(
     """One-to-one deterministic matcher between customer questions and live Makro fields.
 
     No fuzzy similarity is used. A question matches only an exact normalized
-    label/attribute key or an explicit alias supplied by configuration. This
-    prevents a semantically plausible but wrong field from being auto-filled.
+    label/attribute key or an explicit alias supplied by configuration. When the
+    QA row carries a category/section, candidates must also belong to that live
+    section. This prevents generic names such as Height/Length from crossing
+    Product/Additional Description into Price, Stock and Shipping fields.
     """
 
     alias_map = aliases or {}
@@ -119,6 +162,7 @@ def match_questions_to_fields(
                 for index, field_keys in enumerate(keys_by_index)
                 if index not in used and key in field_keys
             ]
+            candidates = _filter_candidates_by_question_section(question, candidates, fields)
             if candidates:
                 resolved.extend((index, basis) for index in candidates)
                 # Direct exact-normalized match has precedence over aliases.
@@ -127,16 +171,32 @@ def match_questions_to_fields(
 
         unique_indexes = sorted({index for index, _ in resolved})
         if not unique_indexes:
+            section_detail = (
+                f" QA category={question.category!r} 也必须与 live section 一致。"
+                if question.category
+                else ""
+            )
             matches.append(
                 QuestionFieldMatch(
                     question=question,
                     status=UNMATCHED,
-                    detail="没有找到 exact-normalized 或 explicit-alias 的唯一 Makro 字段。",
+                    detail=(
+                        "没有找到 exact-normalized 或 explicit-alias 的唯一 Makro 字段。"
+                        + section_detail
+                    ),
                 )
             )
             continue
         if len(unique_indexes) > 1:
-            labels = [str(fields[index].get("label") or fields[index].get("attribute_key") or "") for index in unique_indexes]
+            labels = [
+                str(fields[index].get("label") or fields[index].get("attribute_key") or "")
+                + (
+                    f" [{fields[index].get('section_heading')}]"
+                    if fields[index].get("section_heading")
+                    else ""
+                )
+                for index in unique_indexes
+            ]
             matches.append(
                 QuestionFieldMatch(
                     question=question,
