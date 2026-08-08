@@ -16,9 +16,6 @@ PLAN_COLUMNS = (
     "Makro Label",
     "Required",
     "Action",
-    "Question No.",
-    "QA Question",
-    "Match Basis",
     "Answer",
     "Resolution Status",
     "Auto Fill Eligible",
@@ -64,9 +61,6 @@ def write_fill_plan_xlsx(plan: LiveFillPlan, path: str | Path) -> Path:
                 item.label,
                 "YES" if item.required else "NO",
                 item.action,
-                item.question_number,
-                item.question,
-                item.match_basis,
                 resolution.answer or "",
                 resolution.status,
                 "YES" if resolution.eligible_for_autofill else "NO",
@@ -90,20 +84,17 @@ def write_fill_plan_xlsx(plan: LiveFillPlan, path: str | Path) -> Path:
         3: 32,
         4: 10,
         5: 12,
-        6: 12,
-        7: 32,
-        8: 18,
-        9: 28,
-        10: 18,
-        11: 16,
-        12: 22,
-        13: 28,
-        14: 12,
-        15: 20,
-        16: 54,
-        17: 38,
-        18: 58,
-        19: 72,
+        6: 30,
+        7: 18,
+        8: 16,
+        9: 22,
+        10: 28,
+        11: 12,
+        12: 20,
+        13: 54,
+        14: 48,
+        15: 58,
+        16: 72,
     }
     for index, width in widths.items():
         sheet.column_dimensions[get_column_letter(index)].width = width
@@ -113,22 +104,19 @@ def write_fill_plan_xlsx(plan: LiveFillPlan, path: str | Path) -> Path:
     summary["A1"].font = Font(bold=True)
     summary["B1"].font = Font(bold=True)
     for key, value in plan.summary().items():
-        summary.append([key, value])
-    summary.column_dimensions["A"].width = 38
-    summary.column_dimensions["B"].width = 18
-
-    unmatched = workbook.create_sheet("Unmatched QA")
-    unmatched.append(["No.", "Question", "Status", "Detail"])
-    for cell in unmatched[1]:
-        cell.font = Font(bold=True)
-    for item in plan.unmatched_questions:
-        unmatched.append(
-            [item["number"], item["question"], item["status"], item["detail"]]
+        summary.append(
+            [key, json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else value]
         )
-    unmatched.column_dimensions["A"].width = 10
-    unmatched.column_dimensions["B"].width = 36
-    unmatched.column_dimensions["C"].width = 16
-    unmatched.column_dimensions["D"].width = 70
+    summary.column_dimensions["A"].width = 38
+    summary.column_dimensions["B"].width = 48
+
+    if plan.warnings:
+        warnings = workbook.create_sheet("Warnings")
+        warnings.append(["Warning"])
+        warnings["A1"].font = Font(bold=True)
+        for warning in plan.warnings:
+            warnings.append([warning])
+        warnings.column_dimensions["A"].width = 100
 
     workbook.save(target)
     return target
