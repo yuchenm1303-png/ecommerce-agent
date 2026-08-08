@@ -91,7 +91,14 @@ def _fill_control(
     locator.wait_for(state="visible")
     kind = str(control.get("field_kind") or "input")
 
-    if kind in {"input", "textarea", "contenteditable", "custom_textbox", "custom_spinbutton"}:
+    if kind in {
+        "input",
+        "textarea",
+        "contenteditable",
+        "custom_textbox",
+        "custom_searchbox",
+        "custom_spinbutton",
+    }:
         locator.fill(value)
         return selector
     if kind == "select":
@@ -140,6 +147,28 @@ def _compare_answer_values(expected: list[str], actual: list[str]) -> bool:
     ]
 
 
+def _preflight_answer_capacity(
+    semantic_field: dict[str, Any],
+    answer: ResolvedAnswer,
+) -> str | None:
+    """Return an error before any write when the rendered control shape is insufficient."""
+
+    values = list(answer.answer_values)
+    controls = _value_controls(semantic_field)
+    if not values:
+        return "resolved answer 没有可写 answer_values。"
+    if not controls:
+        return "semantic field 中没有可填写 value control。"
+    if len(values) > len(controls):
+        return (
+            f"答案有 {len(values)} 个值，但当前页面只有 {len(controls)} 个 value control；"
+            "未执行任何部分写入。"
+        )
+    if answer.qualifier and not _qualifier_controls(semantic_field):
+        return "答案包含 qualifier，但当前 semantic field 没有 qualifier control；未执行写入。"
+    return None
+
+
 def verify_resolved_field(
     page: Page,
     semantic_field: dict[str, Any],
@@ -147,12 +176,7 @@ def verify_resolved_field(
     *,
     section_path: str | None = None,
 ) -> FillVerification:
-    """Read one field without writing and verify it equals a resolved answer.
-
-    This is the persisted-state companion to :func:`fill_resolved_field`. It is
-    used after a section Save/re-open cycle so a successful pre-save DOM write
-    cannot be mistaken for data that Makro actually persisted.
-    """
+    """Read one field without writing and verify it equals a resolved answer."""
 
     values = list(answer.answer_values)
     controls = _value_controls(semantic_field)
@@ -173,7 +197,14 @@ def verify_resolved_field(
         for control in controls[: len(values)]:
             _, selector = _single_locator(page, control, section_path)
             selectors.append(selector)
-            actual.append(_read_control(page, control, section_path=section_path, timeout_ms=3_000))
+            actual.append(
+                _read_control(
+                    page,
+                    control,
+                    section_path=section_path,
+                    timeout_ms=3_000,
+                )
+            )
 
         qualifier_ok = True
         if answer.qualifier:
@@ -227,9 +258,10 @@ def fill_resolved_field(
 ) -> FillVerification:
     """Fill one resolved semantic field and verify it survives a render cycle.
 
-    This proves the visible React form retained the value before Save. It does
-    not prove persistence; callers that Save must subsequently re-open the card
-    and call :func:`verify_resolved_field`.
+    Multi-value slot expansion happens in ``MakroDomainAdapter`` before this
+    primitive is called. This function refuses to write even a partial answer if
+    the live control shape still cannot represent the complete resolved value.
+    Persistence is verified separately after section Save/re-open.
     """
 
     if answer.status != RESOLVED:
@@ -241,53 +273,50 @@ def fill_resolved_field(
         )
 
     values = list(answer.answer_values)
-    controls = _value_controls(semantic_field)
-    if not controls:
+    preflight_error = _preflight_answer_capacity(semantic_field, answer)
+    if preflight_error:
         return FillVerification(
             attribute_key=answer.attribute_key,
             label=answer.label,
-            status="fill_error",
+            status="validation_failed",
             expected=values,
-            detail="semantic field 中没有可填写 value control。",
+            detail=preflight_error,
         )
 
+    controls = _value_controls(semantic_field)
+    qualifier_controls = _qualifier_controls(semantic_field)
     selectors: list[str] = []
     actual: list[str] = []
     try:
         for control, value in zip(controls, values):
-            selectors.append(_fill_control(page, control, value, section_path=section_path))
+            selectors.append(
+                _fill_control(page, control, value, section_path=section_path)
+            )
         if answer.qualifier:
-            qualifier_controls = _qualifier_controls(semantic_field)
-            if qualifier_controls:
-                selectors.append(
-                    _fill_control(page, qualifier_controls[0], answer.qualifier, section_path=section_path)
+            selectors.append(
+                _fill_control(
+                    page,
+                    qualifier_controls[0],
+                    answer.qualifier,
+                    section_path=section_path,
                 )
+            )
 
         for control in controls[: len(values)]:
             actual.append(_read_control(page, control, section_path=section_path))
 
         immediate_passed = _compare_answer_values(values, actual)
-
-        if len(values) > len(controls):
-            return FillVerification(
-                attribute_key=answer.attribute_key,
-                label=answer.label,
-                status="validation_failed",
-                expected=values,
-                actual=actual,
-                selectors=selectors,
-                detail=(
-                    f"答案有 {len(values)} 个值，但当前页面只有 {len(controls)} 个 value control；"
-                    "已只填写当前可用槽位。"
-                ),
-            )
-
         page.wait_for_timeout(recheck_wait_ms)
         settled: list[str] = []
         try:
             for control in controls[: len(values)]:
                 settled.append(
-                    _read_control(page, control, section_path=section_path, timeout_ms=3_000)
+                    _read_control(
+                        page,
+                        control,
+                        section_path=section_path,
+                        timeout_ms=3_000,
+                    )
                 )
         except Exception as exc:
             return FillVerification(
@@ -304,11 +333,10 @@ def fill_resolved_field(
             )
 
         settled_passed = _compare_answer_values(values, settled)
-
         if immediate_passed and settled_passed:
             passed = True
             detail = "填写后回读一致，且等待 React 渲染周期后再次回读一致。"
-        elif immediate_passed and not settled_passed:
+        elif immediate_passed:
             passed = False
             detail = (
                 f"填写后立即回读一致，但等待 {recheck_wait_ms}ms 后值被重置为 {settled!r}；"
