@@ -6,12 +6,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.ai_decisions import AI_DECISION_JSON_SCHEMA
 from app.providers.openai_compatible import (
     OpenAICompatibleProviderError,
     OpenAICompatibleSemanticProvider,
     OpenAICompatibleTransportError,
 )
+
+
+TASK_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {"decisions": {"type": "array"}},
+    "required": ["decisions"],
+}
 
 
 class FakeCreate:
@@ -73,24 +79,14 @@ def request_payload(image_path: str | None = None):
             }
         )
     return {
-        "task": "fill_marketplace_fields_from_local_product_evidence",
-        "system_instruction": "You are the product-listing resolver.",
-        "prompt_instruction": "Fill target fields from local product evidence.",
+        "task": "generic_json_task",
+        "system_instruction": "Execute the supplied JSON task.",
+        "prompt_instruction": "Return structured decisions.",
         "product_identity": {"sku": "SKU-1", "model_number": "M8", "brand": ""},
-        "target_fields": [
-            {
-                "field_id": "mf_colour",
-                "label": "Colour",
-                "section_heading": "Product Description",
-                "required": True,
-                "multi_value": False,
-                "options": ["Black", "White"],
-                "business_locked": False,
-            }
-        ],
+        "target_fields": [{"field_id": "mf_colour", "label": "Colour"}],
         "rules": ["Do not invent unsupported product facts."],
         "grounded_sources": sources,
-        "json_contract": AI_DECISION_JSON_SCHEMA,
+        "json_contract": TASK_JSON_SCHEMA,
     }
 
 
@@ -102,12 +98,6 @@ def valid_json():
                     "field_id": "mf_colour",
                     "status": "ready",
                     "values": ["Black"],
-                    "citations": [
-                        {
-                            "source_reference": "supplier:001:text:0001",
-                            "evidence_text": "Colour: Black.",
-                        }
-                    ],
                 }
             ]
         }
@@ -126,9 +116,7 @@ def test_prompt_only_provider_parses_json_and_keeps_api_key_and_paths_out_of_pro
         structured_mode="prompt_only",
         request_timeout_seconds=80,
     )
-
     payload = provider.extract_json(request_payload(str(image)))
-
     assert payload["extractor"] == provider.name
     assert payload["decisions"][0]["values"] == ["Black"]
     kwargs = client.create_api.calls[0]
@@ -157,7 +145,6 @@ def test_explicit_thinking_mode_is_forwarded_via_extra_body():
         client=client,
         enable_thinking=False,
     )
-
     provider.extract_json(request_payload())
     assert client.create_api.calls[0]["extra_body"] == {"enable_thinking": False}
 
@@ -173,7 +160,6 @@ def test_explicit_high_detail_is_only_sent_when_requested(tmp_path):
         client=client,
         image_detail="high",
     )
-
     provider.extract_json(request_payload(str(image)))
     user_content = client.create_api.calls[0]["messages"][1]["content"]
     image_item = next(item for item in user_content if item.get("type") == "image_url")
@@ -189,7 +175,6 @@ def test_json_object_mode_requests_native_json_and_does_not_set_max_tokens():
         client=client,
         structured_mode="json_object",
     )
-
     provider.extract_json(request_payload())
     kwargs = client.create_api.calls[0]
     assert kwargs["response_format"] == {"type": "json_object"}
@@ -206,16 +191,11 @@ def test_whole_request_wall_clock_deadline_stops_hanging_request_quickly():
         client=client,
         request_timeout_seconds=10,
     )
-    # Constructor keeps production bounds. Shorten only this unit instance so
-    # the test proves wall-clock behavior without waiting 10 seconds.
     provider.request_timeout_seconds = 0.05
-
     started = time.monotonic()
     with pytest.raises(OpenAICompatibleTransportError, match="wall-clock deadline"):
         provider.extract_json(request_payload())
-    elapsed = time.monotonic() - started
-
-    assert elapsed < 0.5
+    assert time.monotonic() - started < 0.5
     assert len(client.create_api.calls) == 1
 
 
@@ -243,7 +223,7 @@ def test_missing_image_is_rejected_before_api_call(tmp_path):
     assert not client.create_api.calls
 
 
-def test_provider_prompt_is_compact_and_omits_local_packet_digests():
+def test_provider_prompt_is_generic_and_omits_local_packet_digests():
     client = FakeClient(valid_json())
     provider = OpenAICompatibleSemanticProvider(
         model="vision-model",
@@ -252,9 +232,8 @@ def test_provider_prompt_is_compact_and_omits_local_packet_digests():
         client=client,
     )
     provider.extract_json(request_payload())
-
     user_text = client.create_api.calls[0]["messages"][1]["content"][0]["text"]
-    assert "Fill target fields" in user_text
+    assert "Return structured decisions" in user_text
     assert '"target_fields"' in user_text
     assert '"json_contract"' in user_text
     assert "schema_sha256" not in user_text
