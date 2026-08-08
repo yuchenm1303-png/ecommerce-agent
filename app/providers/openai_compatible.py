@@ -6,6 +6,8 @@ import mimetypes
 from pathlib import Path
 from typing import Any
 
+from ..semantic_extraction import GROUNDED_OUTPUT_RULES, validation_error_instruction
+
 
 class OpenAICompatibleProviderError(RuntimeError):
     pass
@@ -41,7 +43,7 @@ _JSON_CONTRACT = {
                 "properties": {
                     "key": {"type": "string"},
                     "aliases": {"type": "array", "items": {"type": "string"}},
-                    "value": {"type": "array", "items": {"type": "string"}},
+                    "value": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                     "source_type": {"type": "string"},
                     "source_reference": {"type": "string"},
                     "confidence": {"type": "number"},
@@ -104,7 +106,9 @@ def _message_content(request_payload: dict[str, Any], *, image_detail: str) -> l
         {
             "type": "text",
             "text": (
-                "Return exactly one JSON object and no markdown. Follow the supplied json_contract. "
+                GROUNDED_OUTPUT_RULES
+                + validation_error_instruction(request_payload)
+                + "\n\nReturn exactly one JSON object and no markdown. Follow the supplied json_contract. "
                 "Never invent a fact when evidence is absent or ambiguous.\n\n"
                 + json.dumps(_prompt_payload(request_payload), ensure_ascii=False)
             ),

@@ -165,3 +165,21 @@ def test_missing_image_is_rejected_before_api_call(tmp_path):
     with pytest.raises(OpenAICompatibleProviderError, match="找不到图片"):
         provider.extract_json(request_payload(str(tmp_path / "missing.png")))
     assert not client.create_api.calls
+
+
+def test_prompt_foregrounds_grounding_rules_in_user_message():
+    client = FakeClient(valid_json())
+    provider = OpenAICompatibleSemanticProvider(
+        model="vision-model",
+        api_key="secret-key",
+        base_url="https://api.vendor.test/v1",
+        client=client,
+    )
+
+    provider.extract_json(request_payload())
+
+    user_text = client.create_api.calls[0]["messages"][1]["content"][0]["text"]
+    assert "GROUNDED OUTPUT RULES" in user_text
+    assert 'source_type="ai_synthesis"' in user_text
+    assert "character-for-character" in user_text
+    assert "source_reference" in user_text

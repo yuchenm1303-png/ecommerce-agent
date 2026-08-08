@@ -122,3 +122,20 @@ def test_openai_provider_rejects_non_json_output(tmp_path):
 
     with pytest.raises(OpenAIProviderError, match="不是有效 JSON"):
         provider.extract_json(request(tmp_path))
+
+
+def test_openai_provider_foregrounds_grounding_rules(tmp_path):
+    response = SimpleNamespace(
+        status="completed",
+        output_text=json.dumps(valid_output()),
+        incomplete_details=None,
+    )
+    client = FakeClient(response)
+    provider = OpenAISemanticProvider(client=client, model="gpt-5.6")
+
+    provider.extract_json(request(tmp_path))
+
+    prompt_text = client.responses.calls[0]["input"][1]["content"][0]["text"]
+    assert "GROUNDED OUTPUT RULES" in prompt_text
+    assert 'source_type="ai_synthesis"' in prompt_text
+    assert "character-for-character" in prompt_text

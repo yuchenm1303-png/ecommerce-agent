@@ -291,3 +291,54 @@ def test_provider_output_is_validated_before_returning():
     )
     assert result.provider_name == "stub-provider"
     assert result.packet.facts[0].value == "3.0 inch"
+
+
+def _cjk_catalog(question_name: str) -> QuestionCatalog:
+    return QuestionCatalog(
+        source_path="qa.xlsx",
+        sheet_name="Sheet1",
+        header_row=3,
+        questions=[QuestionRecord(number="1", question=question_name)],
+    )
+
+
+def _cjk_grounding() -> GroundingCatalog:
+    return GroundingCatalog(
+        sources=[
+            GroundedSource(
+                source_id="supplier:001:text:0001",
+                source_type="supplier_web",
+                kind=TEXT_KIND,
+                origin="https://supplier.test/item",
+                content="内存容量\t\n无",
+            )
+        ]
+    )
+
+
+def test_single_cjk_character_direct_value_is_accepted():
+    validated = validate_grounded_semantic_packet(
+        packet(
+            key="Storage Capacity",
+            value="无",
+            evidence="内存容量\t\n无",
+        ),
+        _cjk_catalog("Storage Capacity"),
+        _cjk_grounding(),
+        expected_identity=ProductIdentity(model_number="L11"),
+    )
+    assert validated.facts[0].value == "无"
+
+
+def test_single_cjk_character_direct_value_is_rejected_when_absent():
+    with pytest.raises(SemanticGroundingError, match="未机械出现在"):
+        validate_grounded_semantic_packet(
+            packet(
+                key="Storage Capacity",
+                value="有",
+                evidence="内存容量\t\n无",
+            ),
+            _cjk_catalog("Storage Capacity"),
+            _cjk_grounding(),
+            expected_identity=ProductIdentity(model_number="L11"),
+        )

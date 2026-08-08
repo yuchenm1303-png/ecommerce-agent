@@ -68,3 +68,35 @@ def test_packet_converts_to_bundle_with_provenance():
     assert evidence[0].source_reference == "image:front:crop=spec-table"
     assert evidence[0].evidence_text == "1080P"
     assert evidence[0].note == "printed on packaging"
+
+
+def test_empty_value_placeholder_fact_is_treated_as_omitted():
+    packet = EvidencePacket.from_mapping(
+        {
+            "extractor": "stub",
+            "product_identity": {"model_number": "L11"},
+            "facts": [
+                {
+                    "key": "Screen Size",
+                    "aliases": [],
+                    "value": "3.0 inch",
+                    "source_type": "supplier_web",
+                    "source_reference": "supplier:001:text:0001",
+                    "confidence": 0.88,
+                    "evidence_text": "Screen Size: 3.0 inch.",
+                },
+                {
+                    "key": "Display Resolution",
+                    "aliases": [],
+                    "value": [],
+                    "source_type": "",
+                    "source_reference": "",
+                    "confidence": 0.0,
+                    "evidence_text": "",
+                },
+            ],
+        }
+    )
+
+    assert [fact.key for fact in packet.facts] == ["Screen Size"]
+    assert any("empty-value fact ignored: Display Resolution" in w for w in packet.warnings)

@@ -91,6 +91,15 @@ class ExtractedFact:
         )
 
 
+def _fact_has_value(payload: dict[str, Any]) -> bool:
+    raw = payload.get("value", payload.get("answer"))
+    if raw in (None, ""):
+        return False
+    if isinstance(raw, list):
+        return any(str(item).strip() for item in raw)
+    return bool(str(raw).strip())
+
+
 @dataclass(slots=True)
 class EvidencePacket:
     identity: ProductIdentity
@@ -105,21 +114,32 @@ class EvidencePacket:
         raw_facts = payload.get("facts")
         if not isinstance(raw_facts, list):
             raise EvidenceContractError("evidence packet 缺少 facts 数组。")
-        facts = [
-            ExtractedFact.from_mapping(item, index=index)
-            for index, item in enumerate(raw_facts, start=1)
-            if isinstance(item, dict)
-        ]
-        if len(facts) != len(raw_facts):
+        facts: list[ExtractedFact] = []
+        dropped: list[str] = []
+        for index, item in enumerate(raw_facts, start=1):
+            if not isinstance(item, dict):
+                continue
+            if not _fact_has_value(item):
+                # Models sometimes emit an empty placeholder fact for a question
+                # they could not ground. It carries no value and no provenance,
+                # so it cannot become evidence; treat it exactly like an omitted
+                # fact (missing) and record it in the audit warnings.
+                key = str(item.get("key") or item.get("question") or "").strip()
+                dropped.append(key or f"facts[{index}]")
+                continue
+            facts.append(ExtractedFact.from_mapping(item, index=index))
+        if len(facts) + len(dropped) != len(raw_facts):
             raise EvidenceContractError("facts 数组只能包含 object。")
         warnings = payload.get("warnings") or []
         if not isinstance(warnings, list):
             raise EvidenceContractError("warnings 必须是数组。")
+        warnings = [str(item) for item in warnings]
+        warnings.extend(f"empty-value fact ignored: {key}" for key in dropped)
         return cls(
             identity=ProductIdentity.from_mapping(payload.get("product_identity")),
             facts=facts,
             extractor=str(payload.get("extractor") or "").strip(),
-            warnings=[str(item) for item in warnings],
+            warnings=warnings,
         )
 
 

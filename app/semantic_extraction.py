@@ -40,6 +40,42 @@ class SemanticExtractionResult:
     warnings: list[str] = field(default_factory=list)
 
 
+GROUNDED_OUTPUT_RULES = (
+    "GROUNDED OUTPUT RULES - follow these before answering:\n"
+    "1. fact.key must exactly equal one question string from \"questions\". Never invent keys.\n"
+    "2. Every fact MUST include source_reference, and it must exactly equal one grounded_sources[].source_id.\n"
+    "3. Text sources: evidence_text must be ONE single contiguous run of characters copied "
+    "character-for-character from the cited source content, trimmed only at the edges. Never "
+    "paraphrase, translate, reorder, merge multiple fragments, or insert colons/ellipsis/labels.\n"
+    "4. Image sources: evidence_text must describe only the exact visible text/structure in that image.\n"
+    "5. Direct facts: value must be written exactly as in the source and must literally appear inside "
+    "evidence_text (e.g. source \"黑色\" => value \"黑色\", never \"Black\").\n"
+    "6. If the answer is NOT literally written in the source and requires inference, counting, unit "
+    "conversion, or language translation (e.g. \"双镜头\" => \"2\", \"黑色\" => \"Black\"), set "
+    "fact.source_type=\"ai_synthesis\" instead of the source's own type, keep source_reference on the "
+    "real source, and still provide a literal excerpt as evidence_text. Inferred or translated values "
+    "are never direct facts.\n"
+    "7. Never answer a business_locked question. Never invent a fact. If evidence is absent or "
+    "ambiguous, omit the fact entirely.\n"
+    "Worked example: a source row reads \"颜色分类  黑色\". If the required answer for \"Colour\" must "
+    "be \"Black\", emit value=[\"Black\"], source_type=\"ai_synthesis\", the real source_reference, and "
+    "evidence_text=\"颜色分类  黑色\". Never emit value=[\"Black\"] with source_type=\"supplier_web\"."
+)
+
+
+def validation_error_instruction(payload: dict[str, Any]) -> str:
+    """Build a corrective re-prompt fragment after one rejected model output."""
+    error = str(payload.get("validation_error") or "").strip()
+    if not error:
+        return ""
+    return (
+        "\n\nCORRECTION REQUIRED - your previous output was rejected by the validator:\n"
+        + error
+        + "\nReturn a complete corrected JSON object that satisfies every rule. "
+        "Remove any fact you cannot fully ground instead of leaving empty fields."
+    )
+
+
 _RESOLUTION_IN_TEXT = re.compile(r"\d{2,5}\s*[x×*]\s*\d{2,5}", re.IGNORECASE)
 _NUMBER_IN_TEXT = re.compile(
     r"(?<![\w.])([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:\s*[a-zA-Z°%]+(?:\s+[a-zA-Z]+)?)?)(?![\w.])",
@@ -179,6 +215,10 @@ def _candidate_canonical_values(question: QuestionRecord, evidence_text: str) ->
     return candidates
 
 
+def _is_single_cjk_ideograph(text: str) -> bool:
+    return len(text) == 1 and "\u4e00" <= text <= "\u9fff"
+
+
 def _direct_value_supported(
     question: QuestionRecord,
     value: str,
@@ -190,9 +230,15 @@ def _direct_value_supported(
 
     # Exact normalized textual containment covers ordinary dropdown/text values
     # and most direct numeric/unit strings while ignoring punctuation/case.
+    # Single CJK ideographs (e.g. 无/有/是/否) are also accepted only
+    # when they appear literally; unlike a single Latin letter/digit they cannot
+    # collide accidentally inside unrelated words.
     normalized_value = normalize_key(raw_value)
     normalized_evidence = normalize_key(evidence_text)
-    if len(normalized_value) >= 2 and normalized_value in normalized_evidence:
+    matchable = normalized_value and (
+        len(normalized_value) >= 2 or _is_single_cjk_ideograph(normalized_value)
+    )
+    if matchable and normalized_value in normalized_evidence:
         return True
 
     # Mechanical equivalence handles safe representation-only differences such

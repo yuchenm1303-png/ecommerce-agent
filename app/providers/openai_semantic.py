@@ -6,6 +6,8 @@ import mimetypes
 from pathlib import Path
 from typing import Any
 
+from ..semantic_extraction import GROUNDED_OUTPUT_RULES, validation_error_instruction
+
 
 class OpenAIProviderError(RuntimeError):
     pass
@@ -120,7 +122,12 @@ def _input_content(request_payload: dict[str, Any], *, image_detail: str) -> lis
     content: list[dict[str, Any]] = [
         {
             "type": "input_text",
-            "text": json.dumps(_prompt_payload(request_payload), ensure_ascii=False),
+            "text": (
+                GROUNDED_OUTPUT_RULES
+                + validation_error_instruction(request_payload)
+                + "\n\n"
+                + json.dumps(_prompt_payload(request_payload), ensure_ascii=False)
+            ),
         }
     ]
     for source in request_payload.get("grounded_sources") or []:
