@@ -1,17 +1,19 @@
-"""Resolve the whole Makro product schema with AI in one browser-free pass.
+"""Resolve the current Makro product schema without opening Makro.
 
-The live Makro schema is the target contract. Customer QA, selected variant,
-images and captured supplier/official pages are product evidence. The model is
-the primary semantic resolver; Python only validates identity, citations,
-business locks and the structural decision contract.
+Normal production model:
+1) one whole-product multimodal AI call over the complete local source pack;
+2) only when that AI explicitly requests research for unresolved fields, at most
+   one sourced DashScope web-search call for all such fields together.
 
-This command never opens Makro and never writes listing fields.
+AI owns product semantics. Python only enforces provenance, seller business
+locks, live-schema identity and marketplace control constraints downstream.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,7 @@ from app.ai_decisions import (
 )
 from app.live_schema import load_live_schema
 from app.product_context import build_ai_product_context
+from app.providers.dashscope_web_search import DashScopeWebSearchProvider
 from app.providers.registry import (
     ProviderConfig,
     ProviderConfigurationError,
@@ -39,13 +42,18 @@ from app.providers.registry import (
 from app.qa_catalog import load_question_catalog
 from app.resolver_inputs import ResolutionInputSpec
 from app.semantic_grounding import build_grounding_catalog
+from app.web_enrichment import (
+    WebEnrichmentResult,
+    run_web_enrichment,
+    write_enriched_ai_decision_packet,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "以当前 Makro live schema 为目标，让多模态 AI 一次性综合客户资料、图片和网页快照，"
-            "直接生成字段级 READY/REVIEW/CONFLICT/MISSING 决策；绝不打开或修改 Makro。"
+            "以当前 Makro live schema 为唯一目标，让 AI 综合整个商品资料包直接生成字段级决策；"
+            "必要时仅追加一次带来源的联网补全。绝不打开或修改 Makro。"
         )
     )
     parser.add_argument("--provider", choices=SUPPORTED_PROVIDERS, default="openai-compatible")
@@ -58,25 +66,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="prompt_only",
     )
     thinking = parser.add_mutually_exclusive_group()
-    thinking.add_argument(
-        "--enable-thinking",
-        dest="enable_thinking",
-        action="store_true",
-        help="显式开启兼容模型 thinking。",
-    )
-    thinking.add_argument(
-        "--disable-thinking",
-        dest="enable_thinking",
-        action="store_false",
-        help="显式关闭兼容模型 thinking；Qwen Omni 默认关闭以降低 listing enrichment 延迟。",
-    )
+    thinking.add_argument("--enable-thinking", dest="enable_thinking", action="store_true")
+    thinking.add_argument("--disable-thinking", dest="enable_thinking", action="store_false")
     parser.set_defaults(enable_thinking=None)
 
     parser.add_argument("--qa", required=True, help="客户 QA/商品上下文文件")
     parser.add_argument(
         "--live-schema",
         required=True,
-        help="read-only Makro planner 导出的 live-schema.json；它是 AI 唯一目标字段 schema。",
+        help="read-only Makro planner 导出的 live-schema.json；AI 只回答这里的字段。",
     )
     parser.add_argument("--sku", default="")
     parser.add_argument("--expected-model", default="")
@@ -88,6 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--official-snapshot", action="append", default=[])
     parser.add_argument("--supplemental-text", default="")
     parser.add_argument("--supplemental-text-file", default=None)
+
     parser.add_argument("--image-detail", choices=("auto", "low", "high"), default="auto")
     parser.add_argument("--max-output-tokens", type=int, default=12000)
     parser.add_argument("--request-timeout-seconds", type=float, default=120.0)
@@ -98,12 +97,33 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         choices=(0, 1),
         default=1,
-        help="仅用于 JSON/contract 结构失败；不会因字段缺失或低置信度反复重识图片。",
+        help="只允许模型已返回但 JSON/decision contract 无效时做一次结构修复；网络/API错误不重试。",
     )
+
+    parser.add_argument(
+        "--web-enrich",
+        choices=("auto", "off"),
+        default="auto",
+        help=(
+            "auto: 仅当第一遍 AI 对 unresolved 字段主动给出 search_queries 且当前使用 DashScope Qwen 时，"
+            "追加一次带来源联网搜索；off: 完全不联网。"
+        ),
+    )
+    parser.add_argument(
+        "--web-search-model",
+        default="",
+        help="联网阶段模型；默认复用 --model。",
+    )
+    parser.add_argument(
+        "--web-native-base-url",
+        default="https://dashscope.aliyuncs.com/api/v1",
+        help="DashScope 原生 API base URL，用于返回真实 search sources。",
+    )
+
     parser.add_argument(
         "--semantic-cache-dir",
         default="logs/semantic-cache",
-        help="整商品 AI decision cache；相同 schema+sources+model 重跑为零模型调用。",
+        help="本地整商品决策和联网补全共用的 content-addressed cache 根目录。",
     )
     parser.add_argument("--no-semantic-cache", action="store_true")
     parser.add_argument("--output-dir", default="logs/ai-resolver")
@@ -166,7 +186,7 @@ def _search_requests(decisions: list[Any], fields: list[dict[str, Any]]) -> list
     field_by_id = {field_id(field): field for field in fields}
     output: list[dict[str, Any]] = []
     for decision in decisions:
-        if decision.status not in {MISSING, REVIEW} or not decision.search_queries:
+        if decision.status not in {MISSING, REVIEW, CONFLICT} or not decision.search_queries:
             continue
         field = field_by_id.get(decision.field_id, {})
         output.append(
@@ -182,6 +202,34 @@ def _search_requests(decisions: list[Any], fields: list[dict[str, Any]]) -> list
     return output
 
 
+def _dashscope_web_provider(
+    args: argparse.Namespace,
+    config: ProviderConfig,
+) -> tuple[DashScopeWebSearchProvider | None, str]:
+    if args.web_enrich == "off":
+        return None, "disabled"
+    if config.provider != "openai-compatible":
+        return None, "current provider is not DashScope OpenAI-compatible"
+    base_url = config.base_url.casefold()
+    if "dashscope.aliyuncs.com" not in base_url:
+        return None, "current compatible endpoint is not dashscope.aliyuncs.com"
+    api_key = os.getenv(config.api_key_env, "").strip()
+    if not api_key:
+        return None, f"missing API key env {config.api_key_env}"
+    return (
+        DashScopeWebSearchProvider(
+            model=args.web_search_model.strip() or config.model,
+            api_key=api_key,
+            native_base_url=args.web_native_base_url,
+        ),
+        "available",
+    )
+
+
+def _empty_web_result(packet: Any, reason: str = "") -> WebEnrichmentResult:
+    return WebEnrichmentResult(packet=packet, warning=reason)
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if args.max_text_chars < 500:
@@ -191,10 +239,8 @@ def main() -> int:
 
     customer_catalog = load_question_catalog(args.qa)
     live_fields = load_live_schema(args.live_schema)
-    supplemental_text = _read_supplemental_text(args)
-    spec = _input_spec(args, supplemental_text)
+    spec = _input_spec(args, _read_supplemental_text(args))
     product_context = build_ai_product_context(customer_catalog, spec)
-
     grounding = build_grounding_catalog(
         image_paths=args.image,
         supplier_snapshots=args.supplier_snapshot,
@@ -222,18 +268,18 @@ def main() -> int:
         json.dumps(grounding.as_manifest(), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-
     cache_dir = None if args.no_semantic_cache else Path(args.semantic_cache_dir)
+
     print("===== AI-FIRST PRODUCT RESOLUTION =====", flush=True)
     print(
         f"provider={provider_config.provider}, model={provider_config.model}, "
         f"thinking={provider_config.enable_thinking}, live_fields={len(live_fields)}, "
-        f"sources={len(grounding.sources)}, logical_sources={grounding.logical_source_count}",
+        f"citation_sources={len(grounding.sources)}, logical_sources={grounding.logical_source_count}",
         flush=True,
     )
-    print("execution_model=one_multimodal_call_per_product_normal_path", flush=True)
+    print("execution_model=1 local whole-product call + optional 1 sourced web call", flush=True)
 
-    result = run_ai_resolution(
+    local_result = run_ai_resolution(
         provider,
         live_fields,
         grounding,
@@ -242,20 +288,70 @@ def main() -> int:
         cache_namespace=_cache_namespace(provider_config),
         max_repair_attempts=args.max_repair_attempts,
     )
-    packet_path = write_ai_decision_packet(result.packet, output_dir / "ai-decisions.json")
-
-    search_requests = _search_requests(result.packet.decisions, live_fields)
+    local_summary = _decision_summary(local_result.packet.decisions)
+    search_requests = _search_requests(local_result.packet.decisions, live_fields)
     search_path = output_dir / "search-requests.json"
     search_path.write_text(
         json.dumps(search_requests, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    summary = _decision_summary(result.packet.decisions)
+
+    web_provider, web_availability = _dashscope_web_provider(args, provider_config)
+    if search_requests and web_provider is not None:
+        print(
+            f"web_enrichment=START targets={len(search_requests)} model={web_provider.model}",
+            flush=True,
+        )
+        web_result = run_web_enrichment(
+            web_provider,
+            local_result.packet,
+            live_fields,
+            grounding,
+            cache_dir=cache_dir,
+        )
+        print(
+            f"web_enrichment=DONE calls={web_result.model_calls} cache_hit={web_result.cache_hit} "
+            f"targets={web_result.target_field_count} elapsed={web_result.elapsed_seconds:.3f}s",
+            flush=True,
+        )
+        if web_result.warning:
+            print(f"web_enrichment_warning={web_result.warning}", flush=True)
+    else:
+        reason = (
+            "no unresolved field requested web research"
+            if not search_requests
+            else web_availability
+        )
+        web_result = _empty_web_result(local_result.packet, reason)
+        print(f"web_enrichment=SKIP reason={reason}", flush=True)
+
+    if web_result.searched:
+        write_ai_decision_packet(local_result.packet, output_dir / "ai-decisions.local.json")
+
+    packet_path = write_enriched_ai_decision_packet(
+        web_result.packet,
+        web_result.web_sources,
+        output_dir / "ai-decisions.json",
+    )
+    web_sources_path = output_dir / "web-search-sources.json"
+    web_sources_path.write_text(
+        json.dumps(
+            [source.as_dict() for source in web_result.web_sources],
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    final_summary = _decision_summary(web_result.packet.decisions)
+    total_model_calls = local_result.model_calls + web_result.model_calls
+    total_elapsed = local_result.elapsed_seconds + web_result.elapsed_seconds
     run_manifest = output_dir / "run-manifest.json"
     run_manifest.write_text(
         json.dumps(
             {
                 "mode": "browser_free_ai_first_product_resolution",
+                "execution_model": "one_local_whole_product_call_plus_optional_one_sourced_web_call",
                 "qa_source": str(Path(args.qa).resolve()),
                 "live_schema": str(Path(args.live_schema).resolve()),
                 "live_field_count": len(live_fields),
@@ -264,12 +360,28 @@ def main() -> int:
                 "grounded_source_count": len(grounding.sources),
                 "grounded_logical_source_count": grounding.logical_source_count,
                 "customer_context_chars": len(product_context.text),
-                "model_calls": result.model_calls,
-                "cache_hit": result.cache_hit,
-                "repair_attempts": result.repair_attempts,
-                "elapsed_seconds": round(result.elapsed_seconds, 3),
-                "decision_summary": summary,
-                "search_request_fields": len(search_requests),
+                "local_ai": {
+                    "model_calls": local_result.model_calls,
+                    "cache_hit": local_result.cache_hit,
+                    "repair_attempts": local_result.repair_attempts,
+                    "elapsed_seconds": round(local_result.elapsed_seconds, 3),
+                    "decision_summary": local_summary,
+                },
+                "web_enrichment": {
+                    "mode": args.web_enrich,
+                    "availability": web_availability,
+                    "requested_fields": len(search_requests),
+                    "searched": web_result.searched,
+                    "model_calls": web_result.model_calls,
+                    "cache_hit": web_result.cache_hit,
+                    "target_field_count": web_result.target_field_count,
+                    "returned_source_count": len(web_result.web_sources),
+                    "elapsed_seconds": round(web_result.elapsed_seconds, 3),
+                    "warning": web_result.warning,
+                },
+                "total_model_calls": total_model_calls,
+                "total_ai_elapsed_seconds": round(total_elapsed, 3),
+                "final_decision_summary": final_summary,
                 "writes_performed": 0,
                 "save_clicked": False,
                 "send_to_qc_clicked": False,
@@ -282,15 +394,18 @@ def main() -> int:
 
     print("\n===== AI-FIRST RESOLUTION COMPLETE =====")
     print(
-        f"ready={summary[READY]}, review={summary[REVIEW]}, conflict={summary[CONFLICT]}, "
-        f"missing={summary[MISSING]}, business_locked={summary[BUSINESS_LOCKED]}"
+        f"ready={final_summary[READY]}, review={final_summary[REVIEW]}, "
+        f"conflict={final_summary[CONFLICT]}, missing={final_summary[MISSING]}, "
+        f"business_locked={final_summary[BUSINESS_LOCKED]}"
     )
     print(
-        f"model_calls={result.model_calls}, cache_hit={result.cache_hit}, "
-        f"repair_attempts={result.repair_attempts}, elapsed={result.elapsed_seconds:.1f}s"
+        f"local_calls={local_result.model_calls}, web_calls={web_result.model_calls}, "
+        f"total_calls={total_model_calls}, local_cache={local_result.cache_hit}, "
+        f"web_cache={web_result.cache_hit}, total_ai_elapsed={total_elapsed:.1f}s"
     )
     print(f"AI decisions: {packet_path.resolve()}")
     print(f"Search requests: {search_path.resolve()}")
+    print(f"Web sources: {web_sources_path.resolve()}")
     print(f"Source manifest: {source_manifest_path.resolve()}")
     print(f"Run manifest: {run_manifest.resolve()}")
     print("没有打开 Makro；没有填写字段；没有 Save；没有 Send to QC。")
