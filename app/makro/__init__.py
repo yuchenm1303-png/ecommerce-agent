@@ -13,7 +13,6 @@ from .listing import (
     MakroListingTarget,
     assert_expected_vertical,
     is_listing_url,
-    listing_vertical,
     parse_makro_listing_url,
     wait_for_authenticated_listing,
 )
@@ -28,7 +27,6 @@ __all__ = [
     "build_semantic_fields",
     "derive_attribute_key",
     "is_listing_url",
-    "listing_vertical",
     "parse_makro_listing_url",
     "wait_for_authenticated_listing",
 ]
