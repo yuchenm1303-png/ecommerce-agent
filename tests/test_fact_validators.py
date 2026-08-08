@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.fact_validators import is_valid_gtin, validate_resolved_answer
+from app.hard_field_validators import is_valid_gtin, validate_resolved_answer
 from app.resolution_types import RESOLVED, ResolvedAnswer
 
 
