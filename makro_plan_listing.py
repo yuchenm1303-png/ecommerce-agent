@@ -1,13 +1,9 @@
-"""Build a live Makro fill plan without writing any field.
+"""Build a read-only Makro Fill Plan from an AI field-decision packet.
 
-The command joins four layers:
-1. current Makro DOM discovery and live-schema contract,
-2. customer QA + extra non-business live fields,
-3. evidence-grounded answer resolution,
-4. deterministic QA/live matching.
-
-It produces a field-by-field READY/BLOCKED report and never fills, saves or
-submits the listing. This is the final audit boundary before real browser writes.
+The model already resolved product semantics. This planner only rebinds the
+packet to the exact current product sources, verifies live-schema stability and
+applies deterministic marketplace/browser constraints. It never fills, saves or
+submits the listing.
 """
 
 from __future__ import annotations
@@ -20,37 +16,33 @@ from typing import Any
 
 from playwright.sync_api import sync_playwright
 
-from app.alias_config import load_alias_config
+from app.ai_decisions import load_ai_decision_packet
 from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness
-from app.evidence_validation import is_business_question
 from app.fill_plan import build_live_fill_plan
 from app.fill_plan_report import write_fill_plan_json, write_fill_plan_xlsx
-from app.live_schema import (
-    assert_live_schema_matches,
-    augment_catalog_with_live_fields,
-    load_live_schema,
-    write_live_schema,
-)
+from app.live_schema import assert_live_schema_matches, load_live_schema, write_live_schema
 from app.makro import MAKRO_HOME_URL, is_listing_url
 from app.makro.direct_visual_hold import is_listing_attribute_field
 from app.makro.domain import MakroDomainAdapter
 from app.makro.listing_preflight import CORE_FORM_SECTIONS
+from app.product_context import build_ai_product_context
 from app.qa_catalog import load_question_catalog
-from app.resolution_engine import ResolutionPolicy
-from app.resolver_inputs import ResolutionInputSpec, build_resolution_inputs
+from app.resolver_inputs import ResolutionInputSpec
+from app.semantic_grounding import build_grounding_catalog
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="只读扫描当前 Makro listing，生成 live schema 与真实字段级 READY/BLOCKED 填写计划。"
+        description="只读扫描当前 Makro listing，验证 AI decisions 并生成真实字段级 Fill Plan。"
     )
     parser.add_argument("--qa", required=True)
+    parser.add_argument("--decision-packet", required=True, help="makro_resolve_ai.py 生成的 ai-decisions.json")
+    parser.add_argument("--live-schema", required=True)
     parser.add_argument("--sku", default="")
     parser.add_argument("--expected-model", default="")
     parser.add_argument("--expected-brand", default="")
     parser.add_argument("--product-table", default=None)
     parser.add_argument("--facts-json", action="append", default=[])
-    parser.add_argument("--evidence-packet", action="append", default=[])
     parser.add_argument("--supplier-snapshot", action="append", default=[])
     parser.add_argument("--official-snapshot", action="append", default=[])
     parser.add_argument("--supplemental-text", default="")
@@ -58,28 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image", action="append", default=[])
     parser.add_argument("--product-url", default=None)
     parser.add_argument("--expected-vertical", required=True)
-    parser.add_argument(
-        "--live-schema",
-        default=None,
-        help=(
-            "可选：前一次只读 planner 导出的 live-schema.json。提供后会先把 QA 扩展到"
-            "缺失的非经营 live fields，并在本轮扫描后校验页面 schema 没有漂移。"
-        ),
-    )
-    parser.add_argument(
-        "--alias-config",
-        default=None,
-        help=(
-            "可选 JSON：经过人工审核的 QA question -> Makro label alias / section override。"
-            "配置必须声明与 --expected-vertical 相同的 vertical。"
-        ),
-    )
-    parser.add_argument("--auto-fill-min-confidence", type=float, default=0.85)
-    parser.add_argument("--ai-auto-fill-min-confidence", type=float, default=0.92)
     parser.add_argument("--profile-dir", default="browser_profiles/makro-edge")
     parser.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT)
     parser.add_argument("--scroll-wait-ms", type=int, default=250)
     parser.add_argument("--max-scroll-steps", type=int, default=200)
+    parser.add_argument("--max-text-chars", type=int, default=5000)
+    parser.add_argument("--overlap-chars", type=int, default=250)
     parser.add_argument("--output-dir", default="logs/makro-fill-plan")
     return parser
 
@@ -91,7 +67,6 @@ def _input_spec(args: argparse.Namespace) -> ResolutionInputSpec:
         expected_brand=args.expected_brand,
         product_table=args.product_table,
         facts_json=tuple(args.facts_json),
-        evidence_packets=tuple(args.evidence_packet),
         supplier_snapshots=tuple(args.supplier_snapshot),
         official_snapshots=tuple(args.official_snapshot),
         supplemental_text=args.supplemental_text,
@@ -106,8 +81,7 @@ def _assert_single_listing_tab(context: Any) -> None:
     if len(listing_pages) <= 1:
         return
     raise RuntimeError(
-        "检测到多个 Add a Single Listing 标签页；只读 planner 也拒绝猜目标页面。"
-        "请只保留一个 listing 标签页后重试。"
+        "检测到多个 Add a Single Listing 标签页；只读 planner 拒绝猜目标页面。"
     )
 
 
@@ -124,39 +98,34 @@ def _assert_no_unsaved_section(adapter: MakroDomainAdapter) -> None:
         raise RuntimeError(
             "检测到仍处于编辑状态的 section："
             + " | ".join(expanded)
-            + "。为避免扫描时 Cancel 掉人工未保存内容，planner 已停止。"
+            + "。为避免扫描影响人工未保存内容，planner 已停止。"
         )
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    for name, value in (
-        ("auto-fill-min-confidence", args.auto_fill_min_confidence),
-        ("ai-auto-fill-min-confidence", args.ai_auto_fill_min_confidence),
-    ):
-        if not 0.0 <= value <= 1.0:
-            raise SystemExit(f"--{name} 必须在 0..1")
+    if args.max_text_chars < 500:
+        raise SystemExit("--max-text-chars 不能小于 500")
+    if args.overlap_chars < 0 or args.overlap_chars >= args.max_text_chars:
+        raise SystemExit("--overlap-chars 必须 >=0 且小于 --max-text-chars")
 
-    catalog = load_question_catalog(args.qa)
-    schema_warnings: list[str] = []
-    planned_live_fields: list[dict[str, Any]] | None = None
-    if args.live_schema:
-        planned_live_fields = load_live_schema(args.live_schema)
-        catalog, schema_warnings = augment_catalog_with_live_fields(
-            catalog,
-            planned_live_fields,
-            business_locked=is_business_question,
-        )
-
-    input_result = build_resolution_inputs(catalog, _input_spec(args))
-    policy = ResolutionPolicy(
-        auto_fill_min_confidence=args.auto_fill_min_confidence,
-        ai_auto_fill_min_confidence=args.ai_auto_fill_min_confidence,
+    customer_catalog = load_question_catalog(args.qa)
+    planned_live_fields = load_live_schema(args.live_schema)
+    spec = _input_spec(args)
+    product_context = build_ai_product_context(customer_catalog, spec)
+    grounding = build_grounding_catalog(
+        image_paths=args.image,
+        supplier_snapshots=args.supplier_snapshot,
+        official_snapshots=args.official_snapshot,
+        supplemental_text=product_context.text,
+        max_text_chars=args.max_text_chars,
+        overlap_chars=args.overlap_chars,
     )
-    alias_config = (
-        load_alias_config(args.alias_config, expected_vertical=args.expected_vertical)
-        if args.alias_config
-        else None
+    decision_packet = load_ai_decision_packet(
+        args.decision_packet,
+        planned_live_fields,
+        grounding,
+        expected_identity=product_context.trusted_inputs.expected_identity,
     )
 
     with sync_playwright() as playwright:
@@ -192,17 +161,12 @@ def main() -> int:
         semantic_fields = [
             field for field in all_semantic_fields if is_listing_attribute_field(field)
         ]
-
-        if planned_live_fields is not None:
-            assert_live_schema_matches(planned_live_fields, semantic_fields)
+        assert_live_schema_matches(planned_live_fields, semantic_fields)
 
         plan = build_live_fill_plan(
-            catalog,
+            decision_packet,
             semantic_fields,
-            input_result.bundle,
-            policy=policy,
-            aliases=alias_config.aliases if alias_config else None,
-            sections=alias_config.sections if alias_config else None,
+            product_context.trusted_inputs.bundle,
         )
 
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -215,26 +179,19 @@ def main() -> int:
         manifest.write_text(
             json.dumps(
                 {
-                    "mode": "read_only_fill_plan",
+                    "mode": "read_only_ai_decision_fill_plan",
                     "page_url": page.url,
                     "expected_vertical": args.expected_vertical,
                     "qa_source": str(Path(args.qa).resolve()),
-                    "input_live_schema": str(Path(args.live_schema).resolve()) if args.live_schema else None,
+                    "decision_packet": str(Path(args.decision_packet).resolve()),
+                    "input_live_schema": str(Path(args.live_schema).resolve()),
                     "output_live_schema": str(live_schema_path.resolve()),
-                    "live_schema_verified": planned_live_fields is not None,
-                    "live_schema_warnings": schema_warnings,
-                    "effective_question_count": len(catalog.questions),
-                    "alias_config": alias_config.source_path if alias_config else None,
-                    "alias_count": len(alias_config.aliases) if alias_config else 0,
-                    "section_override_count": len(alias_config.sections) if alias_config else 0,
+                    "live_schema_verified": True,
                     "semantic_fields_before_filter": len(all_semantic_fields),
                     "listing_attribute_fields": len(semantic_fields),
                     "scan": scan_stats,
                     "sections": [item.get("title") for item in sections_payload],
-                    "evidence_items": len(input_result.bundle.evidence),
-                    "evidence_packet_files": input_result.evidence_packet_files,
-                    "source_snapshot_files": input_result.source_snapshot_files,
-                    "evidence_warnings": input_result.warnings,
+                    "decision_warnings": decision_packet.warnings,
                     "plan_summary": plan.summary(),
                     "writes_performed": 0,
                     "save_clicked": False,
@@ -247,9 +204,8 @@ def main() -> int:
         )
 
         summary = plan.summary()
-        print("===== MAKRO LIVE FILL PLAN =====")
+        print("===== MAKRO AI-DECISION FILL PLAN =====")
         print(f"page={page.url}")
-        print(f"effective_questions={len(catalog.questions)}")
         print(
             f"live_fields={summary['live_field_count']}, ready={summary['ready']}, "
             f"preview_eligible={summary['preview_eligible']}, blocked={summary['blocked']}"
@@ -259,15 +215,7 @@ def main() -> int:
             f"required_preview_eligible={summary['required_preview_eligible']}, "
             f"required_blocked={summary['required_blocked']}"
         )
-        print(
-            f"qa_matched={summary['qa_matched']}, qa_unmatched={summary['qa_unmatched']}, "
-            f"qa_ambiguous={summary['qa_ambiguous']}"
-        )
-        if alias_config:
-            print(
-                f"alias_config={alias_config.source_path} "
-                f"aliases={len(alias_config.aliases)} sections={len(alias_config.sections)}"
-            )
+        print(f"gate_counts={summary['gate_counts']}")
         print(f"Live schema={live_schema_path.resolve()}")
         print(f"JSON={json_path.resolve()}")
         print(f"XLSX={xlsx_path.resolve()}")
