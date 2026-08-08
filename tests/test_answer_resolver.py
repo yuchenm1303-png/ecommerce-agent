@@ -216,3 +216,150 @@ def test_value_plus_qualifier_is_parsed_from_allowed_qualifier():
     assert answer.status == RESOLVED
     assert answer.answer_values == ["3"]
     assert answer.qualifier == "Hours"
+
+
+def test_generic_multi_camera_category_does_not_conflict_with_exact_count_two():
+    bundle = ProductSourceBundle()
+    bundle.add_evidence(
+        key="Number of Cameras",
+        value="多镜头",
+        source_type="product_image",
+        source_reference="image:001",
+        priority=30,
+        evidence_text="镜头数量 多镜头",
+    )
+    bundle.add_evidence(
+        key="Number of Cameras",
+        value="2",
+        source_type="ai_synthesis",
+        source_reference="customer-text:001:text:0001:abc",
+        priority=90,
+        confidence=0.84,
+        evidence_text="front + cabin dual recording",
+    )
+
+    answer = resolve_field(field("number_of_cameras", "Number of Cameras"), bundle)
+
+    assert answer.status == RESOLVED
+    assert answer.answer_values == ["2"]
+
+
+def test_storage_expandability_text_is_not_a_capacity_value():
+    bundle = ProductSourceBundle()
+    bundle.add_evidence(
+        key="Storage Capacity",
+        value="Expandable via TF Card",
+        source_type="ai_synthesis",
+        source_reference="image:001",
+        priority=90,
+        confidence=0.84,
+        evidence_text="存储卡 TF卡",
+    )
+    bundle.add_evidence(
+        key="Storage Capacity",
+        value="64",
+        source_type="customer_file",
+        source_reference="customer-text:001:text:0001:abc",
+        priority=60,
+        confidence=0.9,
+        evidence_text="64GB memory card",
+    )
+
+    answer = resolve_field(field("storage_capacity", "Storage Capacity"), bundle)
+
+    assert answer.status == RESOLVED
+    assert answer.answer_values == ["64"]
+
+
+def test_product_dimension_ignores_explicit_packaging_dimension_evidence():
+    bundle = ProductSourceBundle()
+    bundle.add_evidence(
+        key="Width",
+        value="11 cm",
+        source_type="supplier_web",
+        source_reference="supplier:001:text:0001:abc",
+        priority=55,
+        evidence_text="Packaging dimensions 16 x 11 x 7 cm",
+    )
+    bundle.add_evidence(
+        key="Width",
+        value="86 mm",
+        source_type="product_image",
+        source_reference="image:002",
+        priority=30,
+        evidence_text="Product width 86 mm",
+    )
+
+    answer = resolve_field(field("width", "Width"), bundle)
+
+    assert answer.status == RESOLVED
+    assert answer.answer_values == ["86 mm"]
+
+
+def test_set_like_field_accepts_existing_superset_but_does_not_synthesize_union():
+    bundle = ProductSourceBundle()
+    bundle.add_evidence(
+        key="Technology Used",
+        value="G-Sensor|Loop Recording",
+        source_type="product_image",
+        source_reference="image:002",
+        priority=30,
+        evidence_text="G-Sensor, Loop Recording",
+    )
+    bundle.add_evidence(
+        key="Technology Used",
+        value="G-Sensor",
+        source_type="supplier_web",
+        source_reference="supplier:001:text:0001:abc",
+        priority=55,
+        evidence_text="G-Sensor",
+    )
+
+    answer = resolve_field(field("technology_used", "Technology Used", multi_value=True), bundle)
+
+    assert answer.status == RESOLVED
+    assert answer.answer_values == ["G-Sensor", "Loop Recording"]
+
+
+def test_set_like_field_with_divergent_non_subset_values_remains_conflict():
+    bundle = ProductSourceBundle()
+    bundle.add_evidence(
+        key="Technology Used",
+        value="G-Sensor|Loop Recording",
+        source_type="product_image",
+        source_reference="image:002",
+        priority=30,
+    )
+    bundle.add_evidence(
+        key="Technology Used",
+        value="G-Sensor|HDR",
+        source_type="supplier_web",
+        source_reference="supplier:001:text:0001:abc",
+        priority=55,
+    )
+
+    answer = resolve_field(field("technology_used", "Technology Used", multi_value=True), bundle)
+
+    assert answer.status == CONFLICT
+
+
+def test_true_recording_resolution_disagreement_remains_conflict():
+    bundle = ProductSourceBundle()
+    bundle.add_evidence(
+        key="Recording Resolution",
+        value="720p",
+        source_type="supplier_web",
+        source_reference="supplier:001:text:0001:abc",
+        priority=55,
+    )
+    bundle.add_evidence(
+        key="Recording Resolution",
+        value="1080p",
+        source_type="product_image",
+        source_reference="image:002",
+        priority=30,
+    )
+
+    answer = resolve_field(field("recording_resolution", "Recording Resolution"), bundle)
+
+    assert answer.status == CONFLICT
