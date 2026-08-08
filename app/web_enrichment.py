@@ -222,7 +222,7 @@ def _source_lookup(items: Iterable[WebSearchSource]) -> dict[str, WebSearchSourc
     return output
 
 
-def _mechanical_batches[T](items: list[T], batch_size: int) -> list[list[T]]:
+def _mechanical_batches(items: list[Any], batch_size: int) -> list[list[Any]]:
     return [items[index : index + batch_size] for index in range(0, len(items), batch_size)]
 
 
@@ -420,21 +420,18 @@ def _final_prompt_request(
     evidence_by_field: dict[str, list[WebEvidence]] = {}
     for item in evidence:
         evidence_by_field.setdefault(item.field_id, []).append(item)
-    field_by_id = {field_id(field): field for field in fields}
     prior_by_id = {decision.field_id: decision for decision in initial.decisions}
-    target_ids = {
+    target_id_set = {
         identifier
         for identifier in evidence_by_field
-        if identifier in field_by_id
-        and identifier in prior_by_id
-        and prior_by_id[identifier].status in WEB_UPDATABLE_STATUSES
+        if identifier in prior_by_id and prior_by_id[identifier].status in WEB_UPDATABLE_STATUSES
     }
-    target_fields = [field_by_id[identifier] for identifier in target_ids]
+    target_fields = [field for field in fields if field_id(field) in target_id_set]
     profile_text = json.dumps(_profile_payload(profile), ensure_ascii=False, separators=(",", ":"))
     web_text = json.dumps(
         {
-            identifier: [item.as_dict() for item in evidence_by_field[identifier]]
-            for identifier in target_ids
+            field_id(field): [item.as_dict() for item in evidence_by_field[field_id(field)]]
+            for field in target_fields
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -515,7 +512,7 @@ def _final_prompt_request(
             "required": ["decisions"],
         },
     }
-    return request, target_ids
+    return request, target_id_set
 
 
 def _packet_fingerprint(packet: AIDecisionPacket) -> str:
