@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from makro_preview_listing import _has_existing_value
+from makro_preview_listing import _has_existing_value, build_parser
 
 
 def test_review_preview_detects_existing_text_value():
@@ -44,3 +44,24 @@ def test_review_preview_detects_non_placeholder_selected_option():
     }
 
     assert _has_existing_value(field) is True
+
+
+def test_full_step3_mode_keeps_evidence_images_separate_from_upload_images():
+    args = build_parser().parse_args(
+        [
+            "--qa",
+            "qa.xlsx",
+            "--expected-vertical",
+            "vehicle_camera_system",
+            "--all-step3",
+            "--image",
+            "evidence.png",
+            "--upload-image",
+            "listing.png",
+        ]
+    )
+
+    assert args.all_step3 is True
+    assert args.section is None
+    assert args.image == ["evidence.png"]
+    assert args.upload_image == ["listing.png"]
