@@ -4,8 +4,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from .source_bundle import ProductSourceBundle, SourceEvidence
-from .value_normalization import canonical_evidence_value_for_field
+from .source_bundle import ProductSourceBundle, SourceEvidence, normalize_key
+from .value_normalization import canonical_evidence_value_for_field, canonical_scalar_for_field
 
 
 RESOLVED = "resolved"
@@ -57,6 +57,45 @@ BUSINESS_ATTRIBUTE_ALIASES: dict[str, tuple[str, ...]] = {
     ),
 }
 BUSINESS_ALLOWED_SOURCE_TYPES = {"structured", "business", "config", "rule"}
+
+_SET_LIKE_FIELD_NAMES = {
+    "salespackage",
+    "technologyused",
+    "otherfeatures",
+    "otherconveniencefeatures",
+    "otherimageandvideofeatures",
+    "otherstoragefeatures",
+    "otherconnectivityfeatures",
+    "recordingmodes",
+    "videoformats",
+}
+_COUNT_FIELD_NAMES = {
+    "numberofcameras",
+    "numberofcamera",
+    "cameracount",
+    "numberoflenses",
+    "lenscount",
+}
+_STORAGE_CAPACITY_FIELD_NAMES = {
+    "storagecapacity",
+    "memorycapacity",
+    "storagecapacitygb",
+    "memorycapacitygb",
+}
+_PRODUCT_DIMENSION_FIELD_NAMES = {"width", "depth", "height"}
+_PACKAGE_EVIDENCE_MARKERS = (
+    "package",
+    "packaging",
+    "packing size",
+    "package size",
+    "carton",
+    "outer box",
+    "包装",
+    "包装尺寸",
+    "包装规格",
+)
+_CAPACITY_VALUE_RE = re.compile(r"(?<!\w)\d+(?:\.\d+)?\s*(?:gb|mb|tb)?(?!\w)", re.IGNORECASE)
+_EXACT_COUNT_RE = re.compile(r"^\s*(\d+)\s*(?:cameras?|lenses?|镜头|摄像头)?\s*$", re.IGNORECASE)
 
 
 @dataclass(slots=True)
@@ -206,8 +245,160 @@ def _candidate_keys(semantic_field: dict[str, Any]) -> list[str]:
     return [key for key in keys if key]
 
 
+def _field_names(semantic_field: dict[str, Any]) -> set[str]:
+    return {
+        normalize_key(semantic_field.get("attribute_key")),
+        normalize_key(semantic_field.get("label")),
+    } - {""}
+
+
 def _is_business_field(attribute_key: str) -> bool:
     return attribute_key in BUSINESS_ATTRIBUTE_ALIASES
+
+
+def _evidence_text(candidate: SourceEvidence) -> str:
+    return "\n".join(
+        part for part in (candidate.evidence_text, candidate.note) if part
+    ).casefold()
+
+
+def _is_package_dimension_evidence(candidate: SourceEvidence) -> bool:
+    text = _evidence_text(candidate)
+    return any(marker in text for marker in _PACKAGE_EVIDENCE_MARKERS)
+
+
+def _has_storage_capacity_value(candidate: SourceEvidence) -> bool:
+    values = candidate.value if isinstance(candidate.value, tuple) else (candidate.value,)
+    return any(_CAPACITY_VALUE_RE.search(str(value)) for value in values)
+
+
+def _filter_semantically_incompatible_candidates(
+    candidates: list[SourceEvidence],
+    semantic_field: dict[str, Any],
+) -> list[SourceEvidence]:
+    """Drop evidence that is clearly about a different attribute dimension.
+
+    This is deliberately narrow: it only rejects mechanically distinguishable
+    category errors. It never chooses between two competing values of the same
+    semantic attribute.
+    """
+
+    names = _field_names(semantic_field)
+    filtered = list(candidates)
+
+    if names & _STORAGE_CAPACITY_FIELD_NAMES:
+        filtered = [item for item in filtered if _has_storage_capacity_value(item)]
+
+    if names & _PRODUCT_DIMENSION_FIELD_NAMES:
+        filtered = [item for item in filtered if not _is_package_dimension_evidence(item)]
+
+    return filtered
+
+
+def _candidate_exact_count(candidate: SourceEvidence) -> int | None:
+    if isinstance(candidate.value, tuple):
+        if len(candidate.value) != 1:
+            return None
+        raw = candidate.value[0]
+    else:
+        raw = candidate.value
+    text = str(raw).strip().casefold()
+    match = _EXACT_COUNT_RE.match(text)
+    if match:
+        return int(match.group(1))
+    compact = normalize_key(text)
+    if compact in {"dual", "dualcamera", "dualcameras", "duallens", "twin", "双镜头", "双摄", "双摄像头"}:
+        return 2
+    return None
+
+
+def _candidate_count_lower_bound(candidate: SourceEvidence) -> int | None:
+    exact = _candidate_exact_count(candidate)
+    if exact is not None:
+        return exact
+    compact = normalize_key(candidate.value[0] if isinstance(candidate.value, tuple) and candidate.value else candidate.value)
+    if compact in {
+        "multi",
+        "multiple",
+        "multicamera",
+        "multiplecameras",
+        "multilens",
+        "multiplelenses",
+        "多镜头",
+        "多摄",
+        "多摄像头",
+    }:
+        return 2
+    return None
+
+
+def _select_precise_count_candidate(
+    candidates: list[SourceEvidence],
+    semantic_field: dict[str, Any],
+) -> SourceEvidence | None:
+    if not (_field_names(semantic_field) & _COUNT_FIELD_NAMES):
+        return None
+    exact = [(value, item) for item in candidates if (value := _candidate_exact_count(item)) is not None]
+    exact_values = {value for value, _ in exact}
+    if len(exact_values) != 1:
+        return None
+    exact_value = next(iter(exact_values))
+    for item in candidates:
+        lower = _candidate_count_lower_bound(item)
+        if lower is None or lower > exact_value:
+            return None
+    compatible_exact = [item for value, item in exact if value == exact_value]
+    compatible_exact.sort(key=lambda item: (item.priority, -item.confidence, item.source_reference))
+    return compatible_exact[0]
+
+
+def _is_set_like_field(semantic_field: dict[str, Any]) -> bool:
+    return bool(semantic_field.get("multi_value")) or bool(
+        _field_names(semantic_field) & _SET_LIKE_FIELD_NAMES
+    )
+
+
+def _candidate_value_set(
+    candidate: SourceEvidence,
+    semantic_field: dict[str, Any],
+) -> frozenset[str]:
+    values = _raw_values(candidate.value, multi_value=True)
+    return frozenset(
+        canonical_scalar_for_field(semantic_field, value)
+        for value in values
+        if value.strip()
+    )
+
+
+def _select_existing_superset_candidate(
+    candidates: list[SourceEvidence],
+    semantic_field: dict[str, Any],
+) -> SourceEvidence | None:
+    """Use an existing superset only when every other source is its subset.
+
+    No new feature/package value is synthesized here. If two sources each add a
+    different item, neither contains the other and the field remains conflict.
+    """
+
+    if not _is_set_like_field(semantic_field):
+        return None
+    sets = [(item, _candidate_value_set(item, semantic_field)) for item in candidates]
+    if not sets or any(not values for _, values in sets):
+        return None
+    maximal = [
+        (item, values)
+        for item, values in sets
+        if not any(values < other_values for _, other_values in sets)
+    ]
+    distinct_maximal = {values for _, values in maximal}
+    if len(distinct_maximal) != 1:
+        return None
+    target = next(iter(distinct_maximal))
+    if not all(values <= target for _, values in sets):
+        return None
+    choices = [item for item, values in maximal if values == target]
+    choices.sort(key=lambda item: (item.priority, -item.confidence, item.source_reference))
+    return choices[0] if choices else None
 
 
 def _select_evidence(
@@ -216,6 +407,19 @@ def _select_evidence(
 ) -> tuple[SourceEvidence | None, str | None]:
     if not candidates:
         return None, None
+
+    candidates = _filter_semantically_incompatible_candidates(candidates, semantic_field)
+    if not candidates:
+        return None, None
+
+    precise_count = _select_precise_count_candidate(candidates, semantic_field)
+    if precise_count is not None:
+        return precise_count, None
+
+    superset = _select_existing_superset_candidate(candidates, semantic_field)
+    if superset is not None:
+        return superset, None
+
     canonical_values = {
         canonical_evidence_value_for_field(semantic_field, item.value)
         for item in candidates
@@ -225,7 +429,7 @@ def _select_evidence(
             f"{item.source_type}:{item.source_reference}={item.value}" for item in candidates
         )
         return None, details
-    candidates = sorted(candidates, key=lambda item: (item.priority, -item.confidence))
+    candidates = sorted(candidates, key=lambda item: (item.priority, -item.confidence, item.source_reference))
     return candidates[0], None
 
 
@@ -287,7 +491,7 @@ def resolve_field(
             semantic_field,
             bundle,
             fallback,
-            "没有找到与 attribute_key/label 精确对应的明确证据。",
+            "没有找到与 attribute_key/label 精确对应的语义兼容明确证据。",
         )
 
     values = _raw_values(chosen.value, multi_value=bool(semantic_field.get("multi_value")))
@@ -332,7 +536,7 @@ def resolve_field(
         evidence=_evidence_display(chosen),
         confidence=chosen.confidence,
         option_match=option_matches,
-        detail="仅使用明确证据解析；未调用无依据 AI 猜测。",
+        detail="仅使用明确且语义兼容的证据解析；未按优先级覆盖真实冲突。",
     )
 
 
