@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ from app.ai_decisions import AI_DECISION_JSON_SCHEMA
 from app.providers.openai_compatible import (
     OpenAICompatibleProviderError,
     OpenAICompatibleSemanticProvider,
+    OpenAICompatibleTransportError,
 )
 
 
@@ -27,6 +29,25 @@ class FakeCreate:
 class FakeClient:
     def __init__(self, content: str):
         self.create_api = FakeCreate(content)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create_api.create))
+
+
+class SlowCreate:
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        time.sleep(self.seconds)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=valid_json()))]
+        )
+
+
+class SlowClient:
+    def __init__(self, seconds: float):
+        self.create_api = SlowCreate(seconds)
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create_api.create))
 
 
@@ -52,23 +73,18 @@ def request_payload(image_path: str | None = None):
             }
         )
     return {
-        "task": "resolve_all_live_marketplace_fields_from_product_sources",
-        "system_instruction": "You are the primary product-listing resolver.",
-        "prompt_instruction": "Resolve every target field from grounded sources.",
+        "task": "fill_marketplace_fields_from_local_product_evidence",
+        "system_instruction": "You are the product-listing resolver.",
+        "prompt_instruction": "Fill target fields from local product evidence.",
         "product_identity": {"sku": "SKU-1", "model_number": "M8", "brand": ""},
-        "schema_sha256": "schema-digest",
-        "source_manifest_sha256": "source-digest",
         "target_fields": [
             {
                 "field_id": "mf_colour",
-                "attribute_key": "colour",
                 "label": "Colour",
                 "section_heading": "Product Description",
                 "required": True,
                 "multi_value": False,
                 "options": ["Black", "White"],
-                "qualifier_options": [],
-                "help_text": "",
                 "business_locked": False,
             }
         ],
@@ -81,30 +97,19 @@ def request_payload(image_path: str | None = None):
 def valid_json():
     return json.dumps(
         {
-            "contract_version": 1,
-            "product_identity": {"sku": "SKU-1", "model_number": "M8", "brand": ""},
-            "schema_sha256": "schema-digest",
-            "source_manifest_sha256": "source-digest",
             "decisions": [
                 {
                     "field_id": "mf_colour",
                     "status": "ready",
                     "values": ["Black"],
-                    "qualifier": "",
-                    "confidence": 0.95,
                     "citations": [
                         {
                             "source_reference": "supplier:001:text:0001",
                             "evidence_text": "Colour: Black.",
                         }
                     ],
-                    "alternatives": [],
-                    "reason": "supported by supplier source",
-                    "search_queries": [],
                 }
-            ],
-            "model_summary": "resolved product",
-            "warnings": [],
+            ]
         }
     )
 
@@ -129,6 +134,7 @@ def test_prompt_only_provider_parses_json_and_keeps_api_key_and_paths_out_of_pro
     kwargs = client.create_api.calls[0]
     assert kwargs["model"] == "vision-model"
     assert kwargs["timeout"] == 80
+    assert kwargs["max_tokens"] == 12000
     assert "response_format" not in kwargs
     assert "temperature" not in kwargs
     assert "extra_body" not in kwargs
@@ -174,7 +180,7 @@ def test_explicit_high_detail_is_only_sent_when_requested(tmp_path):
     assert image_item["image_url"]["detail"] == "high"
 
 
-def test_json_object_mode_requests_common_compat_response_format():
+def test_json_object_mode_requests_native_json_and_does_not_set_max_tokens():
     client = FakeClient(valid_json())
     provider = OpenAICompatibleSemanticProvider(
         model="vision-model",
@@ -187,17 +193,40 @@ def test_json_object_mode_requests_common_compat_response_format():
     provider.extract_json(request_payload())
     kwargs = client.create_api.calls[0]
     assert kwargs["response_format"] == {"type": "json_object"}
+    assert "max_tokens" not in kwargs
     assert provider.base_url == "https://api.vendor.test/v1"
 
 
-def test_non_json_provider_output_fails_closed():
+def test_whole_request_wall_clock_deadline_stops_hanging_request_quickly():
+    client = SlowClient(1.0)
+    provider = OpenAICompatibleSemanticProvider(
+        model="vision-model",
+        api_key="secret-key",
+        base_url="https://api.vendor.test/v1",
+        client=client,
+        request_timeout_seconds=10,
+    )
+    # Constructor keeps production bounds. Shorten only this unit instance so
+    # the test proves wall-clock behavior without waiting 10 seconds.
+    provider.request_timeout_seconds = 0.05
+
+    started = time.monotonic()
+    with pytest.raises(OpenAICompatibleTransportError, match="wall-clock deadline"):
+        provider.extract_json(request_payload())
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert len(client.create_api.calls) == 1
+
+
+def test_non_json_provider_output_fails_closed_with_response_prefix():
     provider = OpenAICompatibleSemanticProvider(
         model="vision-model",
         api_key="secret-key",
         base_url="https://api.vendor.test/v1",
         client=FakeClient("not-json"),
     )
-    with pytest.raises(OpenAICompatibleProviderError, match="JSON object"):
+    with pytest.raises(OpenAICompatibleProviderError, match="response_prefix"):
         provider.extract_json(request_payload())
 
 
@@ -214,7 +243,7 @@ def test_missing_image_is_rejected_before_api_call(tmp_path):
     assert not client.create_api.calls
 
 
-def test_provider_prompt_contains_ai_first_contract_and_no_legacy_fact_rules():
+def test_provider_prompt_is_compact_and_omits_local_packet_digests():
     client = FakeClient(valid_json())
     provider = OpenAICompatibleSemanticProvider(
         model="vision-model",
@@ -225,10 +254,11 @@ def test_provider_prompt_contains_ai_first_contract_and_no_legacy_fact_rules():
     provider.extract_json(request_payload())
 
     user_text = client.create_api.calls[0]["messages"][1]["content"][0]["text"]
-    assert "Resolve every target field" in user_text
+    assert "Fill target fields" in user_text
     assert '"target_fields"' in user_text
     assert '"json_contract"' in user_text
-    assert "GROUNDED OUTPUT RULES" not in user_text
+    assert "schema_sha256" not in user_text
+    assert "source_manifest_sha256" not in user_text
     assert "ai_synthesis" not in user_text
 
 
