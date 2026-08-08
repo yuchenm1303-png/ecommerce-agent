@@ -236,6 +236,7 @@ class OpenAICompatibleSemanticProvider:
         structured_mode: str = "prompt_only",
         compat_profile: str = "generic",
         request_timeout_seconds: float = 120.0,
+        enable_thinking: bool | None = None,
     ) -> None:
         if not model.strip():
             raise ValueError("model 不能为空。")
@@ -255,6 +256,8 @@ class OpenAICompatibleSemanticProvider:
             )
         if not 10.0 <= float(request_timeout_seconds) <= 600.0:
             raise ValueError("request_timeout_seconds 必须在 10..600 秒。")
+        if enable_thinking not in {None, True, False}:
+            raise ValueError("enable_thinking 必须是 bool 或 None。")
 
         if client is None:
             try:
@@ -278,6 +281,7 @@ class OpenAICompatibleSemanticProvider:
         self.structured_mode = structured_mode
         self.compat_profile = compat_profile
         self.request_timeout_seconds = float(request_timeout_seconds)
+        self.enable_thinking = enable_thinking
 
     def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -303,6 +307,11 @@ class OpenAICompatibleSemanticProvider:
         }
         if self.structured_mode == "json_object":
             kwargs["response_format"] = {"type": "json_object"}
+        if self.enable_thinking is not None:
+            # DashScope/OpenAI-compatible hybrid-thinking models expose this as
+            # a non-standard body parameter. The OpenAI Python SDK forwards it
+            # through extra_body without changing generic transport behavior.
+            kwargs["extra_body"] = {"enable_thinking": self.enable_thinking}
 
         streaming = self.compat_profile == "qwen-omni"
         if streaming:
