@@ -12,7 +12,8 @@ Modes are intentionally different and explicit:
 
 Neither mode ever clicks Send to QC. Evidence images (``--image``) are separate
 from listing images (``--upload-image``); no evidence screenshot is uploaded
-implicitly.
+implicitly. Draft persistence and production autofill safety are reported as two
+separate outcomes so a successful Save can never masquerade as safe automation.
 """
 
 from __future__ import annotations
@@ -292,6 +293,10 @@ def _verify_saved_values(
         if identity not in validated_identities:
             continue
         matches = live.get(identity, [])
+        mode = preview_mode_for_item(
+            item,
+            include_review_candidates=include_review_candidates,
+        )
         if len(matches) != 1:
             errors.append(
                 f"{item.label}: Save 后 live field 匹配数={len(matches)}，期望 1。"
@@ -306,7 +311,11 @@ def _verify_saved_values(
             answer,
             section_path=section_path,
         )
-        verifications.append(verification.as_dict())
+        payload = verification.as_dict()
+        payload["preview_mode"] = mode
+        payload["question_number"] = item.question_number
+        payload["question"] = item.question
+        verifications.append(payload)
         if verification.status != "persisted_verified":
             errors.append(f"{item.label}: {verification.detail}")
 
@@ -335,6 +344,7 @@ def _fill_one_section(
         "section": section_title,
         "candidate_count": len(candidates),
         "writes_attempted": 0,
+        "review_candidates_attempted": 0,
         "validated": 0,
         "validation_failed": 0,
         "fill_error": 0,
@@ -343,6 +353,7 @@ def _fill_one_section(
         "save_attempted": False,
         "saved": False,
         "persisted_verified": 0,
+        "review_candidates_persisted": 0,
         "persisted_validation_failed": 0,
         "results": [],
         "persisted_verifications": [],
@@ -407,6 +418,8 @@ def _fill_one_section(
             include_review_candidates=include_review_candidates,
         )
         report["writes_attempted"] += 1
+        if mode == "review":
+            report["review_candidates_attempted"] += 1
         verification = adapter.fill_resolved_field(
             semantic_field,
             answer,
@@ -453,6 +466,12 @@ def _fill_one_section(
         report["persisted_verified"] = sum(
             1 for item in persisted if item.get("status") == "persisted_verified"
         )
+        report["review_candidates_persisted"] = sum(
+            1
+            for item in persisted
+            if item.get("status") == "persisted_verified"
+            and item.get("preview_mode") == "review"
+        )
         report["persisted_validation_failed"] = len(persisted) - report["persisted_verified"]
         report["post_save_errors"] = errors
 
@@ -460,10 +479,16 @@ def _fill_one_section(
         adapter.page.screenshot(path=str(after_save), full_page=True)
         report["screenshot_after_save"] = str(after_save.resolve())
 
-        # Re-open was read-only. Cancel simply collapses the card; saved values remain.
         adapter.cancel_section(section_title)
+        execution_incomplete = bool(
+            report["validation_failed"]
+            or report["fill_error"]
+            or report["skipped_live_match"]
+        )
         if errors or report["persisted_validation_failed"]:
             report["status"] = "persisted_validation_failed"
+        elif execution_incomplete:
+            report["status"] = "partial_persisted"
         else:
             report["status"] = "persisted_verified"
     except Exception as exc:
@@ -521,7 +546,6 @@ def _run_photos(
         report["persistence"] = persistence
         report["status"] = persistence["status"]
 
-        # Re-open once so the final screenshot proves the saved photo remains.
         section = adapter.find_section(PRODUCT_PHOTOS)
         if section is not None:
             adapter.open_section_for_edit(section)
@@ -555,12 +579,14 @@ def _totals(section_reports: list[dict[str, Any]]) -> dict[str, int]:
     keys = (
         "candidate_count",
         "writes_attempted",
+        "review_candidates_attempted",
         "validated",
         "validation_failed",
         "fill_error",
         "skipped_existing",
         "skipped_live_match",
         "persisted_verified",
+        "review_candidates_persisted",
         "persisted_validation_failed",
     )
     return {
@@ -569,9 +595,20 @@ def _totals(section_reports: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+def _blocked_reason_summary(plan: LiveFillPlan) -> dict[str, int]:
+    output: dict[str, int] = {}
+    for item in plan.items:
+        if item.action != "blocked":
+            continue
+        reason = item.resolution.gate_reason or f"resolver_{item.resolution.status}"
+        output[reason] = output.get(reason, 0) + 1
+    return dict(sorted(output.items()))
+
+
 def _completion_summary(
     section_reports: list[dict[str, Any]],
     photo_report: dict[str, Any] | None,
+    plan_summary: dict[str, Any],
 ) -> dict[str, Any]:
     by_section = {str(item.get("section") or ""): item for item in section_reports}
     required_cards = (
@@ -589,11 +626,24 @@ def _completion_summary(
         and photo_report.get("status") == "persisted_verified"
         and int((photo_report.get("persistence") or {}).get("final_count") or 0) >= 1
     )
+    draft_persisted_complete = required_persisted and additional_ok and photos_ok
+    review_persisted = sum(
+        int(report.get("review_candidates_persisted") or 0)
+        for report in section_reports
+    )
+    required_blocked = int(plan_summary.get("required_blocked") or 0)
     return {
         "required_field_cards_persisted": required_persisted,
         "additional_description_ok": additional_ok,
         "photos_persisted": photos_ok,
-        "step3_persisted_complete": required_persisted and additional_ok and photos_ok,
+        "review_candidates_persisted": review_persisted,
+        "required_blocked": required_blocked,
+        "draft_persisted_complete": draft_persisted_complete,
+        "autofill_safe_complete": (
+            draft_persisted_complete
+            and review_persisted == 0
+            and required_blocked == 0
+        ),
         "send_to_qc_allowed_by_this_runner": False,
     }
 
@@ -752,7 +802,11 @@ def main() -> int:
                 )
 
         totals = _totals(section_reports)
-        completion = _completion_summary(section_reports, photo_report) if args.all_step3 else None
+        completion = (
+            _completion_summary(section_reports, photo_report, summary)
+            if args.all_step3
+            else None
+        )
         final_screenshot = run_dir / "step3-final.png"
         page.screenshot(path=str(final_screenshot), full_page=True)
         payload = {
@@ -762,6 +816,8 @@ def main() -> int:
             "include_review_candidates": args.include_review_candidates,
             "allow_section_save": args.allow_section_save,
             "plan_summary": summary,
+            "blocked_reason_summary": _blocked_reason_summary(plan),
+            "fill_plan": plan.as_dict(),
             "scan": scan_stats,
             "sections": [item.get("title") for item in sections_payload],
             "section_reports": section_reports,
@@ -770,8 +826,12 @@ def main() -> int:
             "completion": completion,
             "evidence_items": len(input_result.bundle.evidence),
             "evidence_warnings": input_result.warnings,
-            "section_save_clicked": sum(1 for item in section_reports if item.get("save_attempted"))
-            + int(bool(photo_report and photo_report.get("save_attempted"))),
+            "section_save_attempted": sum(
+                1 for item in section_reports if item.get("save_attempted")
+            ) + int(bool(photo_report and photo_report.get("save_attempted"))),
+            "section_saved": sum(
+                1 for item in section_reports if item.get("saved")
+            ) + int(bool(photo_report and photo_report.get("saved"))),
             "send_to_qc_clicked": False,
             "browser_closed": False,
             "final_screenshot": str(final_screenshot.resolve()),
@@ -786,6 +846,7 @@ def main() -> int:
         print(
             f"field candidate={totals['candidate_count']}, attempted={totals['writes_attempted']}, "
             f"validated={totals['validated']}, persisted={totals['persisted_verified']}, "
+            f"review_persisted={totals['review_candidates_persisted']}, "
             f"validation_failed={totals['validation_failed'] + totals['persisted_validation_failed']}, "
             f"fill_error={totals['fill_error']}"
         )
@@ -796,7 +857,8 @@ def main() -> int:
                 f"staged={photo_report.get('staged', 0)} saved={photo_report.get('saved', False)}"
             )
         if completion is not None:
-            print(f"step3_persisted_complete={completion['step3_persisted_complete']}")
+            print(f"draft_persisted_complete={completion['draft_persisted_complete']}")
+            print(f"autofill_safe_complete={completion['autofill_safe_complete']}")
         print("Send to QC=False。")
         print(f"报告：{report_path.resolve()}")
         print(f"最终截图：{final_screenshot.resolve()}")
