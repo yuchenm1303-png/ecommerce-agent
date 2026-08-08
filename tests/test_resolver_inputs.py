@@ -82,7 +82,9 @@ def test_customer_context_is_retained_exactly_once_for_ai_grounding_and_rebind()
     assert result.bundle.supplemental_text == canonical
     assert result.bundle.supplemental_text.count("Selected Variant") == 1
     assert result.bundle.supplemental_text.count("Supplier URL") == 1
-    assert result.bundle.candidates(["Selected Variant"])[0].value == "M8 dual camera + 64GB card"
+    # AI owns interpretation of the raw preamble. Local code must not create a
+    # second pseudo-fact such as Selected Variant -> parsed value.
+    assert result.bundle.candidates(["Selected Variant"]) == []
 
 
 def test_supplier_and_image_inputs_are_not_locally_interpreted_into_product_facts():
@@ -94,6 +96,4 @@ def test_supplier_and_image_inputs_are_not_locally_interpreted_into_product_fact
         ),
     )
 
-    # The explicit QA identity remains, but supplier/image semantics are owned by
-    # the AI source pack and therefore never become local Image Resolution facts.
     assert result.bundle.candidates(["Image Resolution"]) == []
