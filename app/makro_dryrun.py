@@ -6,8 +6,8 @@ from typing import Any
 
 from playwright.sync_api import Page
 
-from .answer_resolver import RESOLVED, ResolvedAnswer
 from .makro.locators import scoped_selector_for_control, selector_for_control  # noqa: F401
+from .resolution_types import RESOLVED, ResolvedAnswer
 
 
 @dataclass(slots=True)
@@ -67,8 +67,6 @@ def _single_locator(
     control: dict[str, Any],
     section_path: str | None,
 ) -> tuple[Any, str]:
-    """Resolve one control scoped to its section, refusing ambiguous matches."""
-
     selector = scoped_selector_for_control(section_path, control)
     all_locator = page.locator(selector)
     if all_locator.count() != 1:
@@ -151,8 +149,6 @@ def _preflight_answer_capacity(
     semantic_field: dict[str, Any],
     answer: ResolvedAnswer,
 ) -> str | None:
-    """Return an error before any write when the rendered control shape is insufficient."""
-
     values = list(answer.answer_values)
     controls = _value_controls(semantic_field)
     if not values:
@@ -176,8 +172,6 @@ def verify_resolved_field(
     *,
     section_path: str | None = None,
 ) -> FillVerification:
-    """Read one field without writing and verify it equals a resolved answer."""
-
     values = list(answer.answer_values)
     controls = _value_controls(semantic_field)
     if len(values) > len(controls) or not controls:
@@ -256,20 +250,12 @@ def fill_resolved_field(
     section_path: str | None = None,
     recheck_wait_ms: int = 800,
 ) -> FillVerification:
-    """Fill one resolved semantic field and verify it survives a render cycle.
-
-    Multi-value slot expansion happens in ``MakroDomainAdapter`` before this
-    primitive is called. This function refuses to write even a partial answer if
-    the live control shape still cannot represent the complete resolved value.
-    Persistence is verified separately after section Save/re-open.
-    """
-
     if answer.status != RESOLVED:
         return FillVerification(
             attribute_key=answer.attribute_key,
             label=answer.label,
             status="skipped",
-            detail=f"resolver status={answer.status}",
+            detail=f"resolution status={answer.status}",
         )
 
     values = list(answer.answer_values)
