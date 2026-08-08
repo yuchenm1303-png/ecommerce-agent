@@ -380,13 +380,17 @@ AI_RESOLUTION_RULES = [
     "Return one compact decision for every target field_id; never invent a field_id.",
     "READY: one answer is strongly supported. Include values and the smallest useful citations.",
     "REVIEW: a plausible answer exists but identity/scope/evidence is insufficient for automatic entry; include candidate values/citations when available.",
-    "CONFLICT: credible sources disagree on the same attribute; include at least two cited alternatives and do not silently choose.",
+    "Before READY, compare all grounded sources for the same attribute and scope. If two credible explicit values disagree and neither clearly supersedes the other, status MUST be CONFLICT, never READY or REVIEW.",
+    "CONFLICT: include at least two cited alternatives and do not silently choose one conflicting value.",
     "MISSING: current evidence cannot answer. Leave values empty; add at most two focused search_queries if normal web research could answer it.",
     "For REVIEW or CONFLICT, also add search_queries when web research could resolve the uncertainty.",
     "BUSINESS_LOCKED: seller-operated price, stock, MOQ, fulfilment, shipping or listing status. Never infer these from product content.",
     "Citations may use only supplied source_id values. For text quote the short supporting excerpt; for images describe the exact visible evidence.",
-    "Do not infer No/False/Not included from absence of mention. Keep package dimensions distinct from product dimensions, manual language from device UI language, product brand from compatible vehicle brand, and cabin camera from rear camera unless evidence establishes the relationship.",
+    "Never infer No/False/Not included from absence; a negative value requires explicit negative evidence. Package/packaging dimensions and weight may answer only packaging fields, never product-body Width/Height/Depth/Weight. Manual language is not device UI language; product brand is not compatible vehicle brand; cabin/interior camera is not rear/back camera unless explicit evidence establishes it.",
     "If target options are supplied, return the exact marketplace option text when one clearly matches.",
+    "If multi_value=false, return exactly one string in values. For a free-text single-value field that summarizes several supported features, combine them into one concise string instead of multiple array elements.",
+    "If qualifier_options are supplied, put the magnitude/value only in values and put the exact unit once in qualifier; never return the unit as a second value or append it to a numeric value.",
+    "Do not invent warranty or service terms; READY for warranty fields requires explicit warranty evidence.",
     "Do not use external web knowledge in this local pass.",
     "Omit confidence and reason when they add no value; omit alternatives except for conflicts; omit search_queries when no research is needed.",
 ]
@@ -397,6 +401,7 @@ def _target_field_payload(item: dict[str, Any]) -> dict[str, Any]:
     locked = is_business_question(contract["attribute_key"]) or is_business_question(contract["label"])
     payload: dict[str, Any] = {
         "field_id": field_id(item),
+        "attribute_key": contract["attribute_key"],
         "label": contract["label"],
         "section_heading": contract["section_heading"],
         "required": contract["required"],
