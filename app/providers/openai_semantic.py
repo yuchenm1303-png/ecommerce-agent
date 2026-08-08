@@ -6,59 +6,9 @@ import mimetypes
 from pathlib import Path
 from typing import Any
 
-from ..semantic_extraction import GROUNDED_OUTPUT_RULES, validation_error_instruction
-
 
 class OpenAIProviderError(RuntimeError):
     pass
-
-
-_DEFAULT_EVIDENCE_PACKET_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "extractor": {"type": "string"},
-        "product_identity": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "sku": {"type": "string"},
-                "model_number": {"type": "string"},
-                "brand": {"type": "string"},
-            },
-            "required": ["sku", "model_number", "brand"],
-        },
-        "facts": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "key": {"type": "string"},
-                    "aliases": {"type": "array", "items": {"type": "string"}},
-                    "value": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                    "source_type": {"type": "string"},
-                    "source_reference": {"type": "string"},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    "evidence_text": {"type": "string"},
-                    "note": {"type": "string"},
-                },
-                "required": [
-                    "key",
-                    "aliases",
-                    "value",
-                    "source_type",
-                    "source_reference",
-                    "confidence",
-                    "evidence_text",
-                    "note",
-                ],
-            },
-        },
-        "warnings": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["extractor", "product_identity", "facts", "warnings"],
-}
 
 
 def _image_data_uri(path_value: str) -> str:
@@ -79,10 +29,7 @@ def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
         "schema_sha256": request_payload.get("schema_sha256", ""),
         "source_manifest_sha256": request_payload.get("source_manifest_sha256", ""),
         "target_fields": request_payload.get("target_fields") or [],
-        "questions": request_payload.get("questions") or [],
-        "business_locked_questions": request_payload.get("business_locked_questions") or [],
         "rules": request_payload.get("rules") or [],
-        "source_reference_rule": request_payload.get("source_reference_rule", ""),
         "grounded_sources": [],
     }
     for source in request_payload.get("grounded_sources") or []:
@@ -102,16 +49,15 @@ def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _task_instruction(request_payload: dict[str, Any]) -> str:
-    if request_payload.get("target_fields"):
-        parts = [str(request_payload.get("prompt_instruction") or "").strip()]
-        validation_error = str(request_payload.get("validation_error") or "").strip()
-        if validation_error:
-            parts.append(
-                "CORRECTION REQUIRED: the prior JSON failed structural validation: "
-                + validation_error
-            )
-        return "\n\n".join(part for part in parts if part)
-    return GROUNDED_OUTPUT_RULES + validation_error_instruction(request_payload)
+    parts = [str(request_payload.get("prompt_instruction") or "").strip()]
+    validation_error = str(request_payload.get("validation_error") or "").strip()
+    if validation_error:
+        parts.append(
+            "CORRECTION REQUIRED: the prior JSON failed the structural contract: "
+            + validation_error
+        )
+    parts.append("Return one JSON object satisfying the supplied strict schema.")
+    return "\n\n".join(part for part in parts if part)
 
 
 def _input_content(request_payload: dict[str, Any], *, image_detail: str) -> list[dict[str, Any]]:
@@ -129,21 +75,21 @@ def _input_content(request_payload: dict[str, Any], *, image_detail: str) -> lis
         if not isinstance(source, dict) or source.get("kind") != "image":
             continue
         source_id = str(source.get("source_id") or "")
-        content.append(
-            {
-                "type": "input_text",
-                "text": (
-                    f"The immediately following image is grounded source_id={source_id}. "
-                    "Any citation to this image must use exactly that source_reference."
-                ),
-            }
-        )
-        content.append(
-            {
-                "type": "input_image",
-                "image_url": _image_data_uri(str(source.get("image_path") or "")),
-                "detail": image_detail,
-            }
+        content.extend(
+            [
+                {
+                    "type": "input_text",
+                    "text": (
+                        f"The immediately following image is grounded source_id={source_id}. "
+                        "Any citation to this image must use exactly that source_reference."
+                    ),
+                },
+                {
+                    "type": "input_image",
+                    "image_url": _image_data_uri(str(source.get("image_path") or "")),
+                    "detail": image_detail,
+                },
+            ]
         )
     return content
 
@@ -174,14 +120,9 @@ class OpenAISemanticProvider:
         if client is None:
             try:
                 from openai import OpenAI
-            except ImportError as exc:  # pragma: no cover - environment dependent
-                raise OpenAIProviderError(
-                    "缺少 openai Python SDK。请先安装 requirements.txt。"
-                ) from exc
-            client = OpenAI(
-                timeout=float(request_timeout_seconds),
-                max_retries=0,
-            )
+            except ImportError as exc:  # pragma: no cover
+                raise OpenAIProviderError("缺少 openai Python SDK。") from exc
+            client = OpenAI(timeout=float(request_timeout_seconds), max_retries=0)
 
         self.client = client
         self.model = model.strip()
@@ -190,13 +131,9 @@ class OpenAISemanticProvider:
         self.request_timeout_seconds = float(request_timeout_seconds)
 
     def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
-        content = _input_content(request_payload, image_detail=self.image_detail)
-        schema = request_payload.get("json_contract") or _DEFAULT_EVIDENCE_PACKET_SCHEMA
-        name = (
-            "makro_ai_field_decisions"
-            if request_payload.get("target_fields")
-            else "makro_grounded_evidence_packet"
-        )
+        schema = request_payload.get("json_contract")
+        if not isinstance(schema, dict) or not schema:
+            raise OpenAIProviderError("JSON task 缺少 json_contract。")
         try:
             response = self.client.responses.create(
                 model=self.model,
@@ -205,18 +142,21 @@ class OpenAISemanticProvider:
                         "role": "system",
                         "content": str(
                             request_payload.get("system_instruction")
-                            or (
-                                "You extract auditable product facts from only the supplied grounded sources. "
-                                "Never use unstated knowledge. Return no fact rather than guessing."
-                            )
+                            or "You execute the supplied grounded JSON task."
                         ),
                     },
-                    {"role": "user", "content": content},
+                    {
+                        "role": "user",
+                        "content": _input_content(
+                            request_payload,
+                            image_detail=self.image_detail,
+                        ),
+                    },
                 ],
                 text={
                     "format": {
                         "type": "json_schema",
-                        "name": name,
+                        "name": "makro_ai_field_decisions",
                         "strict": True,
                         "schema": schema,
                     }
@@ -229,11 +169,10 @@ class OpenAISemanticProvider:
 
         status = str(getattr(response, "status", "") or "")
         if status and status != "completed":
-            details = getattr(response, "incomplete_details", None)
             raise OpenAIProviderError(
-                f"OpenAI JSON task 未完整完成：status={status}, details={details}"
+                f"OpenAI JSON task 未完整完成：status={status}, "
+                f"details={getattr(response, 'incomplete_details', None)}"
             )
-
         output_text = str(getattr(response, "output_text", "") or "").strip()
         if not output_text:
             raise OpenAIProviderError("OpenAI JSON task 返回空 output_text。")
@@ -243,6 +182,5 @@ class OpenAISemanticProvider:
             raise OpenAIProviderError("OpenAI structured output 不是有效 JSON。") from exc
         if not isinstance(payload, dict):
             raise OpenAIProviderError("OpenAI structured output 顶层必须是 JSON object。")
-
         payload["extractor"] = self.name
         return payload
