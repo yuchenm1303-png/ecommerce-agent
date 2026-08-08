@@ -5,7 +5,7 @@ from pathlib import Path
 
 from app.ai_decisions import BUSINESS_LOCKED, MISSING, READY, REVIEW, field_id
 from app.evidence_contract import ProductIdentity
-from app.field_mapping import run_field_mapping
+from app.field_mapping import run_field_mapping, target_scope
 from app.product_profile import ProductFact, ProductProfile, ProfileCandidate
 from app.ai_decisions import DecisionCitation, source_manifest_digest
 from app.semantic_grounding import GroundedSource, GroundingCatalog, TEXT_KIND
@@ -40,7 +40,7 @@ def grounding() -> GroundingCatalog:
     )
 
 
-def profile() -> ProductProfile:
+def profile(*, scope: str = "product", status: str = "supported") -> ProductProfile:
     sources = grounding()
     return ProductProfile(
         identity=ProductIdentity(sku="SKU-1"),
@@ -48,8 +48,8 @@ def profile() -> ProductProfile:
         facts=[
             ProductFact(
                 name="known_fact",
-                scope="product",
-                status="supported",
+                scope=scope,
+                status=status,
                 candidates=(
                     ProfileCandidate(
                         value="known",
@@ -136,6 +136,56 @@ def test_mapping_ready_without_profile_fact_id_is_blocked_to_review():
     )
     assert result.packet.decisions[0].status == REVIEW
     assert "profile_fact_ids" in result.packet.decisions[0].reason
+
+
+def test_mapping_blocks_product_body_fact_from_packaging_dimension():
+    target = field(1)
+    target.update(
+        attribute_key="package_length",
+        label="Length",
+        section_heading="Price, Stock and Shipping Information",
+        qualifier_options=["mm", "cm"],
+    )
+    assert target_scope(target) == "packaging"
+    result = run_field_mapping(
+        FakeMapProvider(),
+        [target],
+        profile(scope="product_body"),
+        grounding(),
+    )
+    assert result.packet.decisions[0].status == REVIEW
+    assert "target_scope=packaging" in result.packet.decisions[0].reason
+
+
+def test_mapping_blocks_generic_viewing_angle_from_exterior_fov():
+    target = field(1)
+    target.update(
+        attribute_key="exterior_field_of_view",
+        label="Exterior Field of View",
+        qualifier_options=["degree"],
+    )
+    assert target_scope(target) == "exterior_camera"
+    result = run_field_mapping(
+        FakeMapProvider(),
+        [target],
+        profile(scope="product"),
+        grounding(),
+    )
+    assert result.packet.decisions[0].status == REVIEW
+    assert "target_scope=exterior_camera" in result.packet.decisions[0].reason
+
+
+def test_mapping_conflict_fact_cannot_authorize_ready_description():
+    target = field(1)
+    target.update(attribute_key="description", label="Description")
+    result = run_field_mapping(
+        FakeMapProvider(),
+        [target],
+        profile(scope="product", status="conflict"),
+        grounding(),
+    )
+    assert result.packet.decisions[0].status == REVIEW
+    assert "unresolved conflict" in result.packet.decisions[0].reason
 
 
 def test_mapping_batch_failure_only_leaves_that_batch_unresolved():
