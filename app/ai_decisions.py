@@ -21,8 +21,8 @@ CONFLICT = "conflict"
 MISSING = "missing"
 BUSINESS_LOCKED = "business_locked"
 DECISION_STATUSES = (READY, REVIEW, CONFLICT, MISSING, BUSINESS_LOCKED)
-DECISION_CONTRACT_VERSION = 1
-AI_DECISION_CACHE_VERSION = 1
+DECISION_CONTRACT_VERSION = 2
+AI_DECISION_CACHE_VERSION = 2
 
 
 class AIDecisionError(ValueError):
@@ -106,19 +106,19 @@ def field_id(field: dict[str, Any]) -> str:
 
 def indexed_fields(fields: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     output: dict[str, dict[str, Any]] = {}
-    for field in fields:
-        identifier = field_id(field)
+    for item in fields:
+        identifier = field_id(item)
         if identifier in output:
             raise AIDecisionError(
                 "live schema 中存在完全相同且无法唯一寻址的字段；拒绝让 AI 猜目标："
-                f" {field.get('section_heading')} / {field.get('label')}"
+                f" {item.get('section_heading')} / {item.get('label')}"
             )
-        output[identifier] = field
+        output[identifier] = item
     return output
 
 
 def schema_digest(fields: Iterable[dict[str, Any]]) -> str:
-    contracts = [{"field_id": field_id(field), **field_contract(field)} for field in fields]
+    contracts = [{"field_id": field_id(item), **field_contract(item)} for item in fields]
     contracts.sort(key=lambda item: item["field_id"])
     raw = json.dumps(contracts, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -210,18 +210,23 @@ class FieldDecision:
             raise AIDecisionError(f"decisions[{index}] 缺少 field_id。")
         if status not in DECISION_STATUSES:
             raise AIDecisionError(f"decisions[{index}].status={status!r}；必须是 {DECISION_STATUSES}。")
+
         raw_values = payload.get("values") or []
         raw_citations = payload.get("citations") or []
         raw_alternatives = payload.get("alternatives") or []
         raw_queries = payload.get("search_queries") or []
         if not all(isinstance(item, list) for item in (raw_values, raw_citations, raw_alternatives, raw_queries)):
-            raise AIDecisionError(f"decisions[{index}] 的 values/citations/alternatives/search_queries 必须是数组。")
+            raise AIDecisionError(
+                f"decisions[{index}] 的 values/citations/alternatives/search_queries 必须是数组。"
+            )
+
         try:
             confidence = float(payload.get("confidence", 0.0))
         except (TypeError, ValueError) as exc:
             raise AIDecisionError(f"decisions[{index}].confidence 不是有效数字。") from exc
         if not 0.0 <= confidence <= 1.0:
             raise AIDecisionError(f"decisions[{index}].confidence 必须在 0..1。")
+
         queries: list[str] = []
         seen_queries: set[str] = set()
         for query in raw_queries:
@@ -230,6 +235,7 @@ class FieldDecision:
             if value and key not in seen_queries:
                 seen_queries.add(key)
                 queries.append(value[:300])
+
         return cls(
             field_id=identifier,
             status=status,
@@ -237,17 +243,23 @@ class FieldDecision:
             qualifier=str(payload.get("qualifier") or "").strip(),
             confidence=confidence,
             citations=[
-                DecisionCitation.from_mapping(item, where=f"decisions[{index}].citations[{citation_index}]")
+                DecisionCitation.from_mapping(
+                    item,
+                    where=f"decisions[{index}].citations[{citation_index}]",
+                )
                 for citation_index, item in enumerate(raw_citations, start=1)
                 if isinstance(item, dict)
             ],
             alternatives=[
-                DecisionAlternative.from_mapping(item, where=f"decisions[{index}].alternatives[{alt_index}]")
+                DecisionAlternative.from_mapping(
+                    item,
+                    where=f"decisions[{index}].alternatives[{alt_index}]",
+                )
                 for alt_index, item in enumerate(raw_alternatives, start=1)
                 if isinstance(item, dict)
             ],
             reason=str(payload.get("reason") or "").strip(),
-            search_queries=queries[:3],
+            search_queries=queries[:2],
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -319,118 +331,85 @@ class AIDecisionPacket:
         )
 
 
+# Compact model-output contract. Packet identity/digests are attached locally;
+# the model no longer wastes output tokens echoing data that Python already knows.
 AI_DECISION_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "additionalProperties": False,
     "properties": {
-        "contract_version": {"type": "integer", "enum": [DECISION_CONTRACT_VERSION]},
-        "product_identity": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "sku": {"type": "string"},
-                "model_number": {"type": "string"},
-                "brand": {"type": "string"},
-            },
-            "required": ["sku", "model_number", "brand"],
-        },
-        "schema_sha256": {"type": "string"},
-        "source_manifest_sha256": {"type": "string"},
         "decisions": {
             "type": "array",
             "items": {
                 "type": "object",
-                "additionalProperties": False,
+                "required": ["field_id", "status"],
                 "properties": {
                     "field_id": {"type": "string"},
                     "status": {"type": "string", "enum": list(DECISION_STATUSES)},
                     "values": {"type": "array", "items": {"type": "string"}},
                     "qualifier": {"type": "string"},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                     "citations": {
                         "type": "array",
                         "items": {
                             "type": "object",
-                            "additionalProperties": False,
+                            "required": ["source_reference", "evidence_text"],
                             "properties": {
                                 "source_reference": {"type": "string"},
                                 "evidence_text": {"type": "string"},
                             },
-                            "required": ["source_reference", "evidence_text"],
                         },
                     },
-                    "alternatives": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "values": {"type": "array", "items": {"type": "string"}},
-                                "qualifier": {"type": "string"},
-                                "citations": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "additionalProperties": False,
-                                        "properties": {
-                                            "source_reference": {"type": "string"},
-                                            "evidence_text": {"type": "string"},
-                                        },
-                                        "required": ["source_reference", "evidence_text"],
-                                    },
-                                },
-                                "reason": {"type": "string"},
-                            },
-                            "required": ["values", "qualifier", "citations", "reason"],
-                        },
-                    },
+                    "alternatives": {"type": "array"},
                     "reason": {"type": "string"},
                     "search_queries": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": [
-                    "field_id", "status", "values", "qualifier", "confidence",
-                    "citations", "alternatives", "reason", "search_queries",
-                ],
             },
         },
         "model_summary": {"type": "string"},
-        "warnings": {"type": "array", "items": {"type": "string"}},
     },
-    "required": [
-        "contract_version", "product_identity", "schema_sha256",
-        "source_manifest_sha256", "decisions", "model_summary", "warnings",
-    ],
+    "required": ["decisions"],
 }
 
 
 AI_RESOLUTION_SYSTEM_INSTRUCTION = (
-    "You are the primary product-listing resolver. Understand the product semantically and decide "
-    "the best answer for every target marketplace field from the supplied sources. Natural-language "
-    "translation, synonym understanding, counting, straightforward unit interpretation and mapping a "
-    "source specification to the marketplace field are your job, not local Python rules. Never invent "
-    "a product fact that is unsupported by the supplied sources. Preserve exact variant identity."
+    "You are the product-listing resolver. Read all supplied product evidence jointly and fill the "
+    "marketplace fields semantically. Translation, synonyms, counting, option matching, specification "
+    "interpretation and conflict judgment are your job. Never invent unsupported product facts. "
+    "Preserve the exact selected product/variant. Return compact JSON only."
 )
 
 AI_RESOLUTION_RULES = [
-    "Return exactly one decision for every target field_id and never invent a field_id.",
-    "Use all grounded sources jointly. You may combine agreeing sources and reason across languages.",
-    "READY means the supplied evidence supports one best answer strongly enough for automatic listing entry.",
-    "REVIEW means there is a plausible answer but evidence, scope, identity or interpretation is not strong enough for automatic entry.",
-    "CONFLICT means credible supplied sources support materially incompatible answers for the same target field. Preserve the competing alternatives and their citations instead of choosing silently.",
-    "MISSING means the supplied sources do not contain enough evidence. Suggest up to three focused web search queries when normal product research could reasonably answer it.",
-    "BUSINESS_LOCKED is mandatory for seller-operated fields such as price, stock, MOQ, fulfilment, shipping or listing status. Never infer those from product content.",
-    "For READY, REVIEW and CONFLICT, cite only supplied source ids. Text citations should quote the smallest useful source excerpt; image citations should describe the exact visible evidence.",
-    "Do not treat lack of mention as evidence for No/False/Not included.",
-    "Do not confuse packaging dimensions with product dimensions, manual language with device UI language, product brand with compatible vehicle brand, or cabin camera with rear camera unless the sources actually establish that relationship.",
-    "When an option list is supplied, return the marketplace option text exactly when one option clearly matches the evidence.",
-    "Do not use unstated web knowledge in this pass. If external research is needed, mark MISSING or REVIEW and emit focused search_queries.",
+    "Return one compact decision for every target field_id; never invent a field_id.",
+    "READY: one answer is strongly supported. Include values and the smallest useful citations.",
+    "REVIEW: a plausible answer exists but identity/scope/evidence is insufficient for automatic entry; include candidate values/citations when available.",
+    "CONFLICT: credible sources disagree on the same attribute; include at least two cited alternatives and do not silently choose.",
+    "MISSING: current evidence cannot answer. Leave values empty; add at most two focused search_queries if normal web research could answer it.",
+    "For REVIEW or CONFLICT, also add search_queries when web research could resolve the uncertainty.",
+    "BUSINESS_LOCKED: seller-operated price, stock, MOQ, fulfilment, shipping or listing status. Never infer these from product content.",
+    "Citations may use only supplied source_id values. For text quote the short supporting excerpt; for images describe the exact visible evidence.",
+    "Do not infer No/False/Not included from absence of mention. Keep package dimensions distinct from product dimensions, manual language from device UI language, product brand from compatible vehicle brand, and cabin camera from rear camera unless evidence establishes the relationship.",
+    "If target options are supplied, return the exact marketplace option text when one clearly matches.",
+    "Do not use external web knowledge in this local pass.",
+    "Omit confidence and reason when they add no value; omit alternatives except for conflicts; omit search_queries when no research is needed.",
 ]
 
 
-def _target_field_payload(field: dict[str, Any]) -> dict[str, Any]:
-    contract = field_contract(field)
+def _target_field_payload(item: dict[str, Any]) -> dict[str, Any]:
+    contract = field_contract(item)
     locked = is_business_question(contract["attribute_key"]) or is_business_question(contract["label"])
-    return {"field_id": field_id(field), **contract, "business_locked": locked}
+    payload: dict[str, Any] = {
+        "field_id": field_id(item),
+        "label": contract["label"],
+        "section_heading": contract["section_heading"],
+        "required": contract["required"],
+        "multi_value": contract["multi_value"],
+        "business_locked": locked,
+    }
+    if contract["options"]:
+        payload["options"] = contract["options"]
+    if contract["qualifier_options"]:
+        payload["qualifier_options"] = contract["qualifier_options"]
+    if contract["help_text"]:
+        payload["help_text"] = contract["help_text"]
+    return payload
 
 
 def build_ai_resolution_request(
@@ -441,20 +420,18 @@ def build_ai_resolution_request(
 ) -> dict[str, Any]:
     field_list = list(fields)
     return {
-        "task": "resolve_all_live_marketplace_fields_from_product_sources",
+        "task": "fill_marketplace_fields_from_local_product_evidence",
         "system_instruction": AI_RESOLUTION_SYSTEM_INSTRUCTION,
         "prompt_instruction": (
-            "Resolve the whole product in one pass. Semantic interpretation belongs to you; local code "
-            "will only verify structural safety, citations and marketplace control constraints."
+            "Fill the target fields from the complete local product evidence in one pass. "
+            "Keep the JSON compact: output decisions, not an explanation of your process."
         ),
         "product_identity": {
             "sku": identity.sku,
             "model_number": identity.model_number,
             "brand": identity.brand,
         },
-        "schema_sha256": schema_digest(field_list),
-        "source_manifest_sha256": source_manifest_digest(grounding),
-        "target_fields": [_target_field_payload(field) for field in field_list],
+        "target_fields": [_target_field_payload(item) for item in field_list],
         "rules": list(AI_RESOLUTION_RULES),
         "grounded_sources": grounding.as_request_list(),
         "json_contract": AI_DECISION_JSON_SCHEMA,
@@ -513,7 +490,7 @@ def validate_ai_decision_packet(
     expected_identity: ProductIdentity = ProductIdentity(),
     external_sources: dict[str, str] | None = None,
 ) -> AIDecisionPacket:
-    """Validate structural/provenance boundaries only; product semantics stay with AI."""
+    """Validate only structural/provenance boundaries; product semantics stay with AI."""
 
     field_list = list(fields)
     by_id = indexed_fields(field_list)
@@ -615,7 +592,7 @@ def validate_ai_decision_packet(
         identity=packet.identity,
         schema_sha256=expected_schema,
         source_manifest_sha256=expected_sources,
-        decisions=[observed[field_id(field)] for field in field_list],
+        decisions=[observed[field_id(item)] for item in field_list],
         model_summary=packet.model_summary,
         warnings=warnings,
         extractor=packet.extractor,
@@ -674,8 +651,24 @@ def _validate_model_response(
     grounding: GroundingCatalog,
     expected_identity: ProductIdentity,
 ) -> AIDecisionPacket:
-    packet = AIDecisionPacket.from_mapping(raw)
-    packet.extractor = packet.extractor or provider_name
+    if not isinstance(raw, dict):
+        raise AIDecisionError("AI model output 顶层必须是 JSON object。")
+    raw_decisions = raw.get("decisions")
+    if not isinstance(raw_decisions, list):
+        raise AIDecisionError("AI model output 缺少 decisions 数组。")
+    packet = AIDecisionPacket(
+        identity=expected_identity,
+        schema_sha256=schema_digest(fields),
+        source_manifest_sha256=source_manifest_digest(grounding),
+        decisions=[
+            FieldDecision.from_mapping(item, index=index)
+            for index, item in enumerate(raw_decisions, start=1)
+            if isinstance(item, dict)
+        ],
+        model_summary=str(raw.get("model_summary") or "").strip(),
+        warnings=[],
+        extractor=str(raw.get("extractor") or provider_name).strip() or provider_name,
+    )
     return validate_ai_decision_packet(
         packet,
         fields,
@@ -689,8 +682,7 @@ def _repair_instruction(request: dict[str, Any], error: Exception) -> dict[str, 
     repaired["validation_error"] = str(error)
     repaired["prompt_instruction"] = (
         str(request.get("prompt_instruction") or "")
-        + "\nYour prior response was received but failed the JSON/decision structural safety contract. "
-        "Return one corrected complete packet; do not add unsupported product facts."
+        + "\nThe previous JSON response failed the structural contract. Return one corrected compact JSON object."
     )
     return repaired
 
@@ -703,9 +695,9 @@ def run_ai_resolution(
     expected_identity: ProductIdentity = ProductIdentity(),
     cache_dir: str | Path | None = None,
     cache_namespace: str = "",
-    max_repair_attempts: int = 1,
+    max_repair_attempts: int = 0,
 ) -> AIResolutionRunResult:
-    """Resolve one whole product; transport/API failures are never semantic-retried."""
+    """Resolve one whole product. Default path is one call and no automatic full rerun."""
 
     if max_repair_attempts not in {0, 1}:
         raise ValueError("max_repair_attempts 必须是 0 或 1。")
