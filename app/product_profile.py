@@ -15,7 +15,7 @@ from .source_bundle import normalize_key
 
 
 PROFILE_CONTRACT_VERSION = 1
-PROFILE_CACHE_VERSION = 1
+PROFILE_CACHE_VERSION = 2
 PROFILE_SUPPORTED = "supported"
 PROFILE_CONFLICT = "conflict"
 PROFILE_STATUSES = (PROFILE_SUPPORTED, PROFILE_CONFLICT)
@@ -36,13 +36,35 @@ def _normalize_ws(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().casefold()
 
 
-def _citation_grounded(citation: DecisionCitation, source: GroundedSource) -> bool:
-    if source.kind == IMAGE_KIND:
-        return bool(citation.evidence_text.strip())
-    if source.kind != TEXT_KIND:
-        return False
-    wanted = _normalize_ws(citation.evidence_text)
+def _text_contains(source: GroundedSource, evidence_text: str) -> bool:
+    wanted = _normalize_ws(evidence_text)
     return bool(wanted) and wanted in _normalize_ws(source.content)
+
+
+def _resolved_citation(
+    citation: DecisionCitation,
+    grounding: GroundingCatalog,
+) -> DecisionCitation | None:
+    """Validate provenance and repair only a wrong text chunk inside the same source document."""
+    source = grounding.by_id(citation.source_reference)
+    if source is None:
+        return None
+    if source.kind == IMAGE_KIND:
+        return citation if citation.evidence_text.strip() else None
+    if source.kind != TEXT_KIND:
+        return None
+    if _text_contains(source, citation.evidence_text):
+        return citation
+
+    for sibling in grounding.sources:
+        if (
+            sibling.kind == TEXT_KIND
+            and sibling.source_type == source.source_type
+            and sibling.origin == source.origin
+            and _text_contains(sibling, citation.evidence_text)
+        ):
+            return DecisionCitation(sibling.source_id, citation.evidence_text)
+    return None
 
 
 @dataclass(slots=True, frozen=True)
@@ -98,7 +120,10 @@ class ProductFact:
         if not isinstance(raw_candidates, list):
             raise ProductProfileError(f"facts[{index}].candidates 必须是数组。")
         candidates = tuple(
-            ProfileCandidate.from_mapping(item, where=f"facts[{index}].candidates[{candidate_index}]")
+            ProfileCandidate.from_mapping(
+                item,
+                where=f"facts[{index}].candidates[{candidate_index}]",
+            )
             for candidate_index, item in enumerate(raw_candidates, start=1)
             if isinstance(item, dict)
         )
@@ -228,7 +253,9 @@ PROFILE_RULES = [
     "Keep scope explicit when it matters: selected variant, product body, packaging, manual/documentation, compatibility, seller/business, or another precise scope.",
     "Preserve the selected variant exactly. Never turn cabin/interior into rear/back, manual language into device UI language, packaging dimensions into product dimensions, or product brand into compatible vehicle brand.",
     "Never infer No/False/Not included from absence. Negative facts require explicit negative evidence.",
-    "For text citations quote the smallest exact supporting excerpt. For images describe the exact visible evidence. Use only supplied source_id values.",
+    "For text citations, source_reference must be the exact text source_id whose content contains the quoted evidence_text.",
+    "For image-derived facts, source_reference must be the exact image source_id that visibly contains the evidence; describe that visible evidence in evidence_text. Never attach an image-derived fact to a text source merely because it is nearby or related.",
+    "For dimensions and weight, explicitly distinguish packaging from product body and preserve axis labels/order exactly as shown by the evidence.",
     "Prefer compact semantic facts over prose. Do not repeat the same fact under synonyms.",
     "Do not use web knowledge in this stage.",
 ]
@@ -275,17 +302,26 @@ def _validate_profile(
             citations: list[DecisionCitation] = []
             seen_citations: set[tuple[str, str]] = set()
             for citation in candidate.citations:
-                source = grounding.by_id(citation.source_reference)
-                if source is None or not _citation_grounded(citation, source):
+                resolved = _resolved_citation(citation, grounding)
+                if resolved is None:
                     warnings.append(
-                        f"profile fact {fact.name!r}: ungrounded citation {citation.source_reference!r} dropped"
+                        f"profile fact {fact.name!r}: ungrounded citation "
+                        f"{citation.source_reference!r} dropped"
                     )
                     continue
-                fingerprint = (citation.source_reference, _normalize_ws(citation.evidence_text))
+                if resolved.source_reference != citation.source_reference:
+                    warnings.append(
+                        f"profile fact {fact.name!r}: citation rebound from "
+                        f"{citation.source_reference!r} to {resolved.source_reference!r}"
+                    )
+                fingerprint = (
+                    resolved.source_reference,
+                    _normalize_ws(resolved.evidence_text),
+                )
                 if fingerprint in seen_citations:
                     continue
                 seen_citations.add(fingerprint)
-                citations.append(citation)
+                citations.append(resolved)
             if not citations:
                 warnings.append(f"profile fact {fact.name!r}: uncited candidate dropped")
                 continue
@@ -327,7 +363,12 @@ def _validate_profile(
 
 
 def profile_digest(profile: ProductProfile) -> str:
-    raw = json.dumps(profile.as_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    raw = json.dumps(
+        profile.as_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -391,9 +432,15 @@ def run_product_profile(
 
     if cache_path is not None and cache_path.is_file():
         try:
-            cached = ProductProfile.from_mapping(json.loads(cache_path.read_text(encoding="utf-8")))
+            cached = ProductProfile.from_mapping(
+                json.loads(cache_path.read_text(encoding="utf-8"))
+            )
             if cached.source_manifest_sha256 == source_manifest_digest(grounding):
-                validated = _validate_profile(cached, grounding, expected_identity=expected_identity)
+                validated = _validate_profile(
+                    cached,
+                    grounding,
+                    expected_identity=expected_identity,
+                )
                 return ProductProfileRunResult(
                     profile=validated,
                     model_calls=0,
@@ -420,12 +467,19 @@ def run_product_profile(
         warnings=[],
         extractor=str(raw.get("extractor") or provider.name).strip() or provider.name,
     )
-    validated = _validate_profile(candidate, grounding, expected_identity=expected_identity)
+    validated = _validate_profile(
+        candidate,
+        grounding,
+        expected_identity=expected_identity,
+    )
 
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        temp.write_text(json.dumps(validated.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.write_text(
+            json.dumps(validated.as_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         temp.replace(cache_path)
 
     return ProductProfileRunResult(
@@ -439,5 +493,8 @@ def run_product_profile(
 def write_product_profile(profile: ProductProfile, path: str | Path) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(profile.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    target.write_text(
+        json.dumps(profile.as_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return target
