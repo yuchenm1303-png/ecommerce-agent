@@ -3,7 +3,7 @@
 Owns all Makro-specific behavior used by the fill CLI:
 
 - listing-page recognition and vertical guard;
-- section title normalization, discovery, safe open/cancel;
+- section title normalization, discovery, open/cancel/save lifecycle;
 - semantic field discovery and field locator strategy;
 - product photo upload through the listing's own file input;
 - page validation/readback after filling.
@@ -32,11 +32,14 @@ from .locators import selector_for_control
 from .photos import PhotoUploadResult, inspect_product_photos, upload_product_photos
 from .sections import (
     base_section_title,
+    cancel_section,
     find_section,
     find_sections,
     open_section_for_edit,
+    save_section,
     scan_section_fields,
     scan_sections,
+    visible_section_errors,
 )
 
 
@@ -80,7 +83,7 @@ class MakroDomainAdapter:
             navigate_first=navigate_first,
         )
 
-    # -- section semantics ------------------------------------------------
+    # -- section semantics / persistence ---------------------------------
 
     def base_section_title(self, title: str) -> str:
         """Normalize a UI section title to its stable semantic identity."""
@@ -93,8 +96,19 @@ class MakroDomainAdapter:
         return find_section(self.page, wanted)
 
     def open_section_for_edit(self, section: dict[str, Any]) -> None:
-        """Click only the safe EDIT control of a collapsed section."""
+        """Click only the EDIT control of a collapsed section."""
         open_section_for_edit(self.page, section)
+
+    def cancel_section(self, section_title: str, *, wait_ms: int = 450) -> None:
+        """Discard one section's current edits and prove it collapsed."""
+        cancel_section(self.page, section_title, wait_ms=wait_ms)
+
+    def save_section(self, section_title: str, *, timeout_s: float = 15.0) -> None:
+        """Persist one section and prove Makro accepted the Save operation."""
+        save_section(self.page, section_title, timeout_s=timeout_s)
+
+    def visible_section_errors(self, section_path: str) -> list[str]:
+        return visible_section_errors(self.page, section_path)
 
     def scan_sections(
         self,
@@ -154,7 +168,7 @@ class MakroDomainAdapter:
         *,
         timeout_ms: int = 30_000,
     ) -> PhotoUploadResult:
-        """Upload only the exact listing images supplied by the caller."""
+        """Stage only the exact listing images supplied by the caller."""
         return upload_product_photos(
             self.page,
             image_paths,
@@ -178,8 +192,11 @@ class MakroDomainAdapter:
         section_path: str | None = None,
         recheck_wait_ms: int = 800,
     ) -> FillVerification:
-        """Fill only a resolved answer, scoped to its section card, and verify it
-        survives a render cycle. Never Save / Send to QC."""
+        """Fill one resolved answer and prove it survives a render cycle.
+
+        This method does not persist the section. Call :meth:`save_section`
+        explicitly when the workflow is authorized to persist the draft.
+        """
         return fill_resolved_field(
             self.page,
             semantic_field,
