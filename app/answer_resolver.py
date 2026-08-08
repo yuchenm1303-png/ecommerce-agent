@@ -57,6 +57,7 @@ BUSINESS_ATTRIBUTE_ALIASES: dict[str, tuple[str, ...]] = {
     ),
 }
 BUSINESS_ALLOWED_SOURCE_TYPES = {"structured", "business", "config", "rule"}
+_EXPLICIT_SCOPE_SOURCE_TYPES = BUSINESS_ALLOWED_SOURCE_TYPES | {"customer_answer"}
 
 _SET_LIKE_FIELD_NAMES = {
     "salespackage",
@@ -90,21 +91,56 @@ _LANGUAGES_SUPPORTED_FIELD_NAMES = {
     "language",
 }
 _CAMERA_TYPE_FIELD_NAMES = {"cameratype", "camerausage", "typeofcamera"}
+_CAMERA_POSITION_FIELD_NAMES = {"cameraposition", "cameralocation", "cameraplacement"}
 _SD_CARD_INCLUDED_FIELD_NAMES = {
     "sdcardincluded",
     "memorycardincluded",
     "tfcardincluded",
 }
+_EXTERIOR_FOV_FIELD_NAMES = {
+    "exteriorfieldofview",
+    "exteriorfov",
+    "frontfieldofview",
+    "frontfov",
+}
+_INTERIOR_FOV_FIELD_NAMES = {
+    "interiorfieldofview",
+    "interiorfov",
+    "cabinfieldofview",
+    "cabinfov",
+}
+_PACKAGE_DIMENSION_LABELS = {"length", "breadth", "width", "depth", "height", "weight"}
+
 _PACKAGE_EVIDENCE_MARKERS = (
     "package",
     "packaging",
     "packing size",
     "package size",
+    "shipping size",
     "carton",
     "outer box",
     "包装",
     "包装尺寸",
     "包装规格",
+    "包装重量",
+    "包裹",
+)
+_PRODUCT_DIMENSION_MARKERS = (
+    "product dimensions",
+    "product dimension",
+    "product size",
+    "device dimensions",
+    "device dimension",
+    "device size",
+    "camera dimensions",
+    "camera dimension",
+    "camera size",
+    "body dimensions",
+    "body size",
+    "产品尺寸",
+    "设备尺寸",
+    "机身尺寸",
+    "机器尺寸",
 )
 _VEHICLE_CONTEXT_MARKERS = (
     "vehicle",
@@ -146,6 +182,30 @@ _EXPLICIT_REAR_CAMERA_MARKERS = (
     "后镜头",
     "倒车摄像头",
 )
+_CABIN_CAMERA_MARKERS = (
+    "cabin",
+    "interior",
+    "in-car",
+    "inside camera",
+    "inside lens",
+    "车内",
+    "内摄",
+    "舱内",
+    "车厢",
+)
+_FRONT_CAMERA_MARKERS = (
+    "front camera",
+    "front-facing",
+    "front lens",
+    "forward camera",
+    "road-facing",
+    "exterior",
+    "前摄",
+    "前置摄像头",
+    "前镜头",
+    "车前",
+    "道路",
+)
 _INTERNAL_MEMORY_NONE_MARKERS = (
     "memory capacity none",
     "internal memory none",
@@ -166,6 +226,7 @@ _INCLUDED_MARKERS = (
     "配件",
     "内含",
 )
+_BACK_VALUE_MARKERS = {"back", "rear", "reverse", "后", "后置", "后摄"}
 _CAPACITY_VALUE_RE = re.compile(r"(?<!\w)\d+(?:\.\d+)?\s*(?:gb|mb|tb)?(?!\w)", re.IGNORECASE)
 _EXACT_COUNT_RE = re.compile(r"^\s*(\d+)\s*(?:cameras?|lenses?|镜头|摄像头)?\s*$", re.IGNORECASE)
 
@@ -338,8 +399,38 @@ def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
     return any(marker in text for marker in markers)
 
 
+def _candidate_values(candidate: SourceEvidence) -> tuple[str, ...]:
+    if isinstance(candidate.value, tuple):
+        return tuple(str(item).strip() for item in candidate.value if str(item).strip())
+    value = str(candidate.value).strip()
+    return (value,) if value else ()
+
+
+def _is_explicit_scope_source(candidate: SourceEvidence) -> bool:
+    return candidate.source_type in _EXPLICIT_SCOPE_SOURCE_TYPES
+
+
+def _is_package_dimension_target(semantic_field: dict[str, Any]) -> bool:
+    section = normalize_key(semantic_field.get("section_heading"))
+    label = normalize_key(semantic_field.get("label"))
+    return (
+        "pricestockandshipping" in section
+        and label in _PACKAGE_DIMENSION_LABELS
+    )
+
+
+def _is_product_dimension_target(semantic_field: dict[str, Any]) -> bool:
+    return bool(_field_names(semantic_field) & _PRODUCT_DIMENSION_FIELD_NAMES) and not _is_package_dimension_target(
+        semantic_field
+    )
+
+
 def _is_package_dimension_evidence(candidate: SourceEvidence) -> bool:
     return _contains_any(_evidence_text(candidate), _PACKAGE_EVIDENCE_MARKERS)
+
+
+def _is_product_dimension_evidence(candidate: SourceEvidence) -> bool:
+    return _contains_any(_evidence_text(candidate), _PRODUCT_DIMENSION_MARKERS)
 
 
 def _has_storage_capacity_value(candidate: SourceEvidence) -> bool:
@@ -347,15 +438,14 @@ def _has_storage_capacity_value(candidate: SourceEvidence) -> bool:
     return any(_CAPACITY_VALUE_RE.search(str(value)) for value in values)
 
 
-def _is_generic_product_brand_evidence(candidate: SourceEvidence) -> bool:
-    if candidate.source_type != "ai_synthesis":
+def _is_unscoped_vehicle_brand_evidence(candidate: SourceEvidence) -> bool:
+    if _is_explicit_scope_source(candidate):
         return False
-    text = _evidence_text(candidate)
-    return not _contains_any(text, _VEHICLE_CONTEXT_MARKERS)
+    return not _contains_any(_evidence_text(candidate), _VEHICLE_CONTEXT_MARKERS)
 
 
 def _is_manual_language_only_evidence(candidate: SourceEvidence) -> bool:
-    if candidate.source_type != "ai_synthesis":
+    if _is_explicit_scope_source(candidate):
         return False
     text = _evidence_text(candidate)
     return _contains_any(text, _MANUAL_MARKERS) and not _contains_any(
@@ -364,7 +454,7 @@ def _is_manual_language_only_evidence(candidate: SourceEvidence) -> bool:
 
 
 def _is_reverse_feature_without_camera_evidence(candidate: SourceEvidence) -> bool:
-    if candidate.source_type != "ai_synthesis":
+    if _is_explicit_scope_source(candidate):
         return False
     text = _evidence_text(candidate)
     return _contains_any(text, _REVERSE_FUNCTION_MARKERS) and not _contains_any(
@@ -373,7 +463,7 @@ def _is_reverse_feature_without_camera_evidence(candidate: SourceEvidence) -> bo
 
 
 def _is_internal_memory_none_not_card_inclusion(candidate: SourceEvidence) -> bool:
-    if candidate.source_type != "ai_synthesis":
+    if _is_explicit_scope_source(candidate):
         return False
     text = _evidence_text(candidate)
     return _contains_any(text, _INTERNAL_MEMORY_NONE_MARKERS) and not _contains_any(
@@ -381,16 +471,41 @@ def _is_internal_memory_none_not_card_inclusion(candidate: SourceEvidence) -> bo
     )
 
 
+def _is_generic_fov_evidence(candidate: SourceEvidence, *, interior: bool) -> bool:
+    if _is_explicit_scope_source(candidate):
+        return False
+    text = _evidence_text(candidate)
+    required = _CABIN_CAMERA_MARKERS if interior else _FRONT_CAMERA_MARKERS
+    return not _contains_any(text, required)
+
+
+def _camera_position_back_from_cabin_only(candidate: SourceEvidence) -> bool:
+    if _is_explicit_scope_source(candidate):
+        return False
+    normalized_values = {normalize_key(item) for item in _candidate_values(candidate)}
+    has_back_value = any(
+        any(marker in value for marker in _BACK_VALUE_MARKERS)
+        for value in normalized_values
+    )
+    if not has_back_value:
+        return False
+    text = _evidence_text(candidate)
+    return _contains_any(text, _CABIN_CAMERA_MARKERS) and not _contains_any(
+        text, _EXPLICIT_REAR_CAMERA_MARKERS
+    )
+
+
 def _filter_semantically_incompatible_candidates(
     candidates: list[SourceEvidence],
     semantic_field: dict[str, Any],
 ) -> list[SourceEvidence]:
-    """Drop evidence mechanically proven to describe a different attribute.
+    """Drop evidence mechanically proven to describe a different attribute scope.
 
     These gates never choose between competing values of the same semantic
     attribute. They only remove cross-dimension mappings such as package size
-    answering product size, manual language answering UI language, or a reverse
-    assist feature being treated as an included rear camera.
+    answering product size, manual language answering UI language, a generic
+    viewing angle answering both camera FOVs, or reverse-assist being treated as
+    proof that a rear camera is included.
     """
 
     names = _field_names(semantic_field)
@@ -399,11 +514,25 @@ def _filter_semantically_incompatible_candidates(
     if names & _STORAGE_CAPACITY_FIELD_NAMES:
         filtered = [item for item in filtered if _has_storage_capacity_value(item)]
 
-    if names & _PRODUCT_DIMENSION_FIELD_NAMES:
-        filtered = [item for item in filtered if not _is_package_dimension_evidence(item)]
+    if _is_package_dimension_target(semantic_field):
+        filtered = [
+            item
+            for item in filtered
+            if _is_explicit_scope_source(item) or _is_package_dimension_evidence(item)
+        ]
+    elif _is_product_dimension_target(semantic_field):
+        filtered = [
+            item
+            for item in filtered
+            if _is_explicit_scope_source(item)
+            or (
+                not _is_package_dimension_evidence(item)
+                and _is_product_dimension_evidence(item)
+            )
+        ]
 
     if names & _VEHICLE_BRAND_FIELD_NAMES:
-        filtered = [item for item in filtered if not _is_generic_product_brand_evidence(item)]
+        filtered = [item for item in filtered if not _is_unscoped_vehicle_brand_evidence(item)]
 
     if names & _LANGUAGES_SUPPORTED_FIELD_NAMES:
         filtered = [item for item in filtered if not _is_manual_language_only_evidence(item)]
@@ -413,10 +542,19 @@ def _filter_semantically_incompatible_candidates(
             item for item in filtered if not _is_reverse_feature_without_camera_evidence(item)
         ]
 
+    if names & _CAMERA_POSITION_FIELD_NAMES:
+        filtered = [item for item in filtered if not _camera_position_back_from_cabin_only(item)]
+
     if names & _SD_CARD_INCLUDED_FIELD_NAMES:
         filtered = [
             item for item in filtered if not _is_internal_memory_none_not_card_inclusion(item)
         ]
+
+    if names & _INTERIOR_FOV_FIELD_NAMES:
+        filtered = [item for item in filtered if not _is_generic_fov_evidence(item, interior=True)]
+
+    if names & _EXTERIOR_FOV_FIELD_NAMES:
+        filtered = [item for item in filtered if not _is_generic_fov_evidence(item, interior=False)]
 
     return filtered
 
@@ -610,10 +748,13 @@ def resolve_field(
     semantic_field: dict[str, Any],
     bundle: ProductSourceBundle,
     fallback: Any | None = None,
+    *,
+    evidence_keys: Iterable[str] | None = None,
 ) -> ResolvedAnswer:
     attribute_key = str(semantic_field.get("attribute_key") or "")
     label = str(semantic_field.get("label") or attribute_key)
-    candidates = bundle.candidates(_candidate_keys(semantic_field))
+    lookup_keys = list(evidence_keys) if evidence_keys is not None else _candidate_keys(semantic_field)
+    candidates = bundle.candidates(lookup_keys)
 
     if _is_business_field(attribute_key):
         candidates = [
@@ -640,7 +781,7 @@ def resolve_field(
             semantic_field,
             bundle,
             fallback,
-            "没有找到与 attribute_key/label 精确对应的语义兼容明确证据。",
+            "没有找到与当前字段精确对应且作用域兼容的明确证据。",
         )
 
     values = _raw_values(
@@ -687,7 +828,7 @@ def resolve_field(
         evidence=_evidence_display(chosen),
         confidence=chosen.confidence,
         option_match=option_matches,
-        detail="仅使用明确且语义兼容的证据解析；未按优先级覆盖真实冲突。",
+        detail="仅使用明确且字段作用域兼容的证据解析；未按优先级覆盖真实冲突。",
     )
 
 
