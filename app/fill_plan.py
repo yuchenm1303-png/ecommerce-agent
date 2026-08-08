@@ -78,35 +78,35 @@ class LiveFillPlan:
 
     @property
     def ready_count(self) -> int:
-        return sum(1 for item in self.items if item.action == READY)
+        return sum(item.action == READY for item in self.items)
 
     @property
     def blocked_count(self) -> int:
-        return sum(1 for item in self.items if item.action == BLOCKED)
+        return sum(item.action == BLOCKED for item in self.items)
 
     @property
     def preview_eligible_count(self) -> int:
-        return sum(1 for item in self.items if item.resolution.preview_eligible)
+        return sum(item.resolution.preview_eligible for item in self.items)
 
     @property
     def required_blocked_count(self) -> int:
-        return sum(1 for item in self.items if item.required and item.action == BLOCKED)
+        return sum(item.required and item.action == BLOCKED for item in self.items)
 
     @property
     def required_ready_count(self) -> int:
-        return sum(1 for item in self.items if item.required and item.action == READY)
+        return sum(item.required and item.action == READY for item in self.items)
 
     @property
     def required_preview_eligible_count(self) -> int:
         return sum(
-            1 for item in self.items if item.required and item.resolution.preview_eligible
+            item.required and item.resolution.preview_eligible for item in self.items
         )
 
     def summary(self) -> dict[str, Any]:
         gate_counts: dict[str, int] = {}
         for item in self.items:
-            key = item.resolution.gate_reason or "ready"
-            gate_counts[key] = gate_counts.get(key, 0) + 1
+            gate = item.resolution.gate_reason or "ready"
+            gate_counts[gate] = gate_counts.get(gate, 0) + 1
         return {
             "live_field_count": len(self.items),
             "ready": self.ready_count,
@@ -128,11 +128,10 @@ class LiveFillPlan:
 
 
 def _decimal_answer(item: LiveFillPlanItem) -> Decimal | None:
-    values = item.resolution.answer_values
-    if not values:
+    if not item.resolution.answer_values:
         return None
     try:
-        return Decimal(values[0].strip())
+        return Decimal(item.resolution.answer_values[0].strip())
     except (InvalidOperation, AttributeError):
         return None
 
@@ -151,9 +150,10 @@ def _block_items(items: list[LiveFillPlanItem], keys: tuple[str, ...], detail: s
 
 
 def _apply_cross_field_business_rules(items: list[LiveFillPlanItem]) -> None:
-    """Keep only deterministic seller-operating invariants in local code."""
+    """Apply only deterministic seller-operating invariants."""
 
     by_key = {item.attribute_key: item for item in items}
+
     mrp = by_key.get("mrp")
     selling = by_key.get("flipkart_selling_price")
     if mrp and selling and mrp.action == READY and selling.action == READY:
@@ -189,7 +189,7 @@ def _hard_guard_values(
     field: dict[str, Any],
     decision: FieldDecision,
 ) -> tuple[list[str], str, str | None]:
-    """Validate only marketplace control shape, never product semantics."""
+    """Validate marketplace control shape without interpreting product semantics."""
 
     values = list(decision.values)
     if not bool(field.get("multi_value")) and len(values) > 1:
@@ -212,12 +212,12 @@ def _hard_guard_values(
     if qualifier:
         if not qualifier_options:
             return values, qualifier, "返回了 qualifier，但当前 Makro 字段没有 qualifier 控件。"
-        canonical_qualifier = _exact_option(qualifier, qualifier_options)
-        if canonical_qualifier is None:
+        matched = _exact_option(qualifier, qualifier_options)
+        if matched is None:
             return values, qualifier, (
                 f"qualifier={qualifier!r} 不等于当前 Makro 的唯一有效单位。"
             )
-        qualifier = canonical_qualifier
+        qualifier = matched
 
     if decision.status in {AI_READY, REVIEW} and not values:
         return values, qualifier, "决策没有可执行 value。"
@@ -239,34 +239,32 @@ def _citation_provenance(decision: FieldDecision) -> list[dict[str, Any]]:
 def _apply_hard_field_validation(field: dict[str, Any], record: ResolutionRecord) -> None:
     if record.status != RESOLVED or not record.eligible_for_autofill:
         return
-    execution_answer = ResolvedAnswer(
-        attribute_key=record.attribute_key,
-        label=record.label,
-        status=RESOLVED,
-        answer=record.answer,
-        answer_values=list(record.answer_values),
-        qualifier=record.qualifier,
-        source_type=record.source_type,
-        source_reference=record.source_reference,
-        evidence=record.evidence,
-        confidence=record.confidence,
-        detail=record.detail,
+    validation = validate_resolved_answer(
+        field,
+        ResolvedAnswer(
+            attribute_key=record.attribute_key,
+            label=record.label,
+            status=RESOLVED,
+            answer=record.answer,
+            answer_values=list(record.answer_values),
+            qualifier=record.qualifier,
+            source_type=record.source_type,
+            source_reference=record.source_reference,
+            evidence=record.evidence,
+            confidence=record.confidence,
+            detail=record.detail,
+        ),
     )
-    validation = validate_resolved_answer(field, execution_answer)
-    if not validation.valid:
-        record.status = NEEDS_REVIEW
-        record.eligible_for_autofill = False
-        record.preview_eligible = False
-        record.gate_reason = GATE_HARD_FIELD_CONSTRAINT
-        record.detail = validation.detail
+    if validation.valid:
+        return
+    record.status = NEEDS_REVIEW
+    record.eligible_for_autofill = False
+    record.preview_eligible = False
+    record.gate_reason = GATE_HARD_FIELD_CONSTRAINT
+    record.detail = validation.detail
 
 
-def _decision_record(
-    field: dict[str, Any],
-    decision: FieldDecision,
-) -> ResolutionRecord:
-    """Convert one AI decision and apply only hard marketplace validators."""
-
+def _decision_record(field: dict[str, Any], decision: FieldDecision) -> ResolutionRecord:
     values, qualifier, hard_error = _hard_guard_values(field, decision)
     label = str(field.get("label") or field.get("attribute_key") or "")
     attribute_key = str(field.get("attribute_key") or "")
@@ -331,34 +329,39 @@ def _raw_business_values(candidate: SourceEvidence) -> list[str]:
     return [value] if value else []
 
 
+def _record_base(field: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "attribute_key": str(field.get("attribute_key") or ""),
+        "label": str(field.get("label") or field.get("attribute_key") or ""),
+        "question_category": str(field.get("section_heading") or ""),
+        "question_unit": " | ".join(field_qualifier_options(field)),
+        "question_options": field_options(field),
+    }
+
+
 def _business_record(
     field: dict[str, Any],
     business_bundle: ProductSourceBundle,
 ) -> ResolutionRecord:
-    """Resolve seller-operated fields from explicit data only, without semantic inference."""
+    """Resolve seller-operated fields only from explicit trusted seller data."""
 
-    attribute_key = str(field.get("attribute_key") or "")
-    label = str(field.get("label") or attribute_key)
+    base = _record_base(field)
+    attribute_key = base["attribute_key"]
+    label = base["label"]
     keys = [attribute_key, label, *BUSINESS_ATTRIBUTE_ALIASES.get(attribute_key, ())]
     candidates = [
         candidate
         for candidate in business_bundle.candidates(keys)
         if candidate.source_type in BUSINESS_ALLOWED_SOURCE_TYPES
     ]
-    base = dict(
-        attribute_key=attribute_key,
-        label=label,
-        qualifier=None,
-        question_category=str(field.get("section_heading") or ""),
-        question_unit=" | ".join(field_qualifier_options(field)),
-        question_options=field_options(field),
-    )
+
     if not candidates:
         return ResolutionRecord(
             **base,
             status=RESOLVER_MISSING,
             answer=None,
             answer_values=[],
+            qualifier=None,
             confidence=0.0,
             source_type=None,
             source_reference=None,
@@ -375,12 +378,14 @@ def _business_record(
         fingerprint = tuple(normalize_key(value) for value in values)
         if fingerprint:
             grouped.setdefault(fingerprint, []).append(candidate)
+
     if not grouped:
         return ResolutionRecord(
             **base,
             status=RESOLVER_MISSING,
             answer=None,
             answer_values=[],
+            qualifier=None,
             confidence=0.0,
             source_type=None,
             source_reference=None,
@@ -390,23 +395,14 @@ def _business_record(
             preview_eligible=False,
             gate_reason=GATE_BUSINESS_LOCKED,
         )
+
     if len(grouped) > 1:
-        provenance = [
-            {
-                "key": candidate.key,
-                "value": _raw_business_values(candidate),
-                "source_type": candidate.source_type,
-                "source_reference": candidate.source_reference,
-                "confidence": candidate.confidence,
-                "evidence_text": candidate.evidence_text,
-            }
-            for candidate in candidates
-        ]
         return ResolutionRecord(
             **base,
             status=RESOLVER_CONFLICT,
             answer=None,
             answer_values=[],
+            qualifier=None,
             confidence=max(candidate.confidence for candidate in candidates),
             source_type=None,
             source_reference=None,
@@ -415,7 +411,17 @@ def _business_record(
             eligible_for_autofill=False,
             preview_eligible=False,
             gate_reason=GATE_BUSINESS_CONFLICT,
-            provenance=provenance,
+            provenance=[
+                {
+                    "key": candidate.key,
+                    "value": _raw_business_values(candidate),
+                    "source_type": candidate.source_type,
+                    "source_reference": candidate.source_reference,
+                    "confidence": candidate.confidence,
+                    "evidence_text": candidate.evidence_text,
+                }
+                for candidate in candidates
+            ],
         )
 
     agreeing = next(iter(grouped.values()))
@@ -427,11 +433,10 @@ def _business_record(
             candidate.source_reference,
         ),
     )[0]
-    raw_values = _raw_business_values(selected)
     structural = FieldDecision(
         field_id=field_id(field),
         status=AI_READY,
-        values=raw_values,
+        values=_raw_business_values(selected),
         confidence=selected.confidence,
     )
     values, qualifier, hard_error = _hard_guard_values(field, structural)
@@ -470,11 +475,10 @@ def build_live_fill_plan(
     semantic_fields: Iterable[dict[str, Any]],
     business_bundle: ProductSourceBundle,
 ) -> LiveFillPlan:
-    """Build the executable plan from AI decisions plus thin hard guards.
+    """Convert AI field decisions into executable browser work.
 
-    Product semantics are not re-interpreted here. AI owns product understanding;
-    local code owns only seller-operated fields, live control shape and deterministic
-    cross-field operating invariants.
+    AI owns product semantics. Local code only protects seller-operated fields,
+    validates live-control shape, and enforces deterministic operating invariants.
     """
 
     fields = list(semantic_fields)
@@ -488,8 +492,9 @@ def build_live_fill_plan(
         attribute_key = str(field.get("attribute_key") or "")
         section = str(field.get("section_heading") or "")
         required = bool(field.get("required"))
+        business_field = _is_business_field(field)
 
-        if _is_business_field(field):
+        if business_field:
             resolution = _business_record(field, business_bundle)
             action = READY if resolution.eligible_for_autofill else BLOCKED
             reason = (
@@ -525,7 +530,7 @@ def build_live_fill_plan(
                 reason=reason,
                 resolution=resolution,
                 question=label,
-                match_basis="ai-field-id" if not _is_business_field(field) else "business-explicit",
+                match_basis="business-explicit" if business_field else "ai-field-id",
             )
         )
 
