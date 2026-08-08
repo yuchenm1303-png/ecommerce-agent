@@ -6,175 +6,89 @@ Makro Marketplace Seller Center 商品信息采集、证据解析、字段匹配
 
 **客户商品资料 / QA / 图片 / supplier snapshot → Grounded Evidence → Answer Resolver → 实时 Makro semantic fields → Fill Plan → 浏览器填写 → section Save → 重新打开持久化回读 → Product Photos Save → 完整缺失/冲突/失败报告**
 
-任何中间模块单独通过，都不等于 Step 3 完成。
+任何中间模块单独通过，都不等于 Step 3 完成。`Send to QC` 仍是后续独立高风险提交动作，当前 runner 永远不点击。
 
-## 1. 当前架构
+## 1. Source / Evidence
 
-### Source / Evidence
+输入可包括：客户 QA、QA 表头前商品上下文、结构化商品/经营表、`facts.json`、商品图片、supplier/official snapshot、supplemental text。
 
-输入可包括：
+QA 表头前的 SKU、精确选定变体、supplier URL、客户备注不会再被丢弃。source 内出现的 prompt、命令、角色说明只是不可信证据文本，模型不得执行，只能提取有来源支持的商品事实。
 
-- 客户 QA `.xlsx/.xlsm/.csv`
-- QA 表头前的商品上下文：SKU、精确选定变体、supplier URL、客户备注
-- 结构化商品/经营数据表
-- 人工/确定性 `facts.json`
-- 商品图片
-- supplier / official `SourceSnapshot`
-- supplemental text
+`makro_resolve_ai.py` 将图片、snapshot、客户上下文绑定为带 digest 的 source id。AI/provider 只生成候选事实；候选仍需通过 QA 范围、source/evidence、商品身份、business lock、冲突、confidence 和字段约束。
 
-QA 表头前的内容不会再被丢弃。它作为客户 source context 进入 grounded source universe；其中若包含命令、prompt、角色说明或“给某模型的指令”，模型必须把它当作**不可信证据文本**，不能执行，只能提取有来源支撑的商品事实。
+历史 semantic packet 若引用 `image:/supplier:/official:/customer-text:` source id，在真实 Fill Plan 前必须重新绑定本次实际 source universe；图片/snapshot/客户上下文变化后旧 packet 会 fail closed。
 
-### Grounded Semantic Extraction
+## 2. Resolver / Fill Plan
 
-`makro_resolve_ai.py` 把图片、snapshot 和客户上下文绑定成带 digest 的 source id。AI/provider 只能返回候选事实；候选还必须通过：
+核心状态：`resolved / needs_review / conflict / missing`。
 
-- 当前 QA 问题约束
-- source id / source reference 校验
-- evidence text 校验
-- 当前商品身份校验
-- business-field lock
-- 冲突检测
-- confidence gate
-- Makro 字段约束
+- `eligible_for_autofill`：达到正式自动填写门槛。
+- `preview_eligible`：只允许显式进入人工验收 draft，不等于生产自动化安全。
 
-历史 `validated-semantic-evidence.json` 在用于真实 Fill Plan 前，会重新绑定到**本次实际传入的图片 / snapshot / 客户上下文**。底层文件变化后，旧 packet 不能静默复用。
+真实来源冲突不静默覆盖。同一条泛化 `ai_synthesis` 证据 + 同一答案不能同时授权多个不同字段，例如一个泛化 `120°` 不能同时填 Interior/Exterior FOV。
 
-### Answer Resolver / Fill Plan
+QA → live field 只允许 exact-normalized、人工审核 alias、人工审核 section override；不使用 fuzzy 强行匹配。
 
-Resolver 保持四种核心状态：
+`config/makro_aliases/vehicle_camera_system.json` 当前通过 section override 解决 Q59 `Height` 跨 section 歧义，不在 Python 中硬编码 SKU/规格。
 
-- `resolved`
-- `needs_review`
-- `conflict`
-- `missing`
+## 3. 经营字段
 
-`eligible_for_autofill` 与 `preview_eligible` 是两个不同安全级别：
+SKU、Listing Status、Base/Selling Price、Stock、MOQ、Fulfilment、Shipping SLA、Selling Region 只能来自客户明确的 `structured/business/config/rule`。
 
-- `eligible_for_autofill`：满足正式自动填写门槛
-- `preview_eligible`：只允许在显式人工验收 draft 中查看/持久化，不等于生产自动化安全
+显式 `--sku` 同时是 identity guard 和 `SKU` business evidence。价格、库存等未提供值继续 blocked，AI/图片/supplier 页面不得猜。
 
-同一条泛化 `ai_synthesis` 证据 + 同一答案不能同时授权多个不同字段。例如一个泛化 `120°` 不能同时填 `Interior Field of View` 和 `Exterior Field of View`。
+## 4. 浏览器执行
 
-### QA → Makro 匹配
+长期 Edge/CDP 运行时动态发现 Step 3 semantic fields，不写死类目字段总数。
 
-只允许：
+已接入：
 
-- exact normalized match
-- 人工审核的 explicit label alias
-- 人工审核的 explicit section override
-
-不使用 fuzzy similarity 强行匹配。
-
-配置格式：
-
-```json
-{
-  "schema_version": 1,
-  "vertical": "vehicle_camera_system",
-  "aliases": {},
-  "sections": {
-    "Height": "Additional Description"
-  }
-}
-```
-
-`vehicle_camera_system` 当前配置：
-
-`config/makro_aliases/vehicle_camera_system.json`
-
-该配置解决客户 QA 缺少真实 section metadata 时的 `Height` 跨 section 歧义；Python 代码不写死 SKU 或技术规格。
-
-## 2. 经营字段硬规则
-
-以下 seller-controlled 数据只能来自客户明确的 `structured / business / config / rule` 来源：
-
-- SKU
-- Listing Status
-- Base Price / Selling Price
-- Stock
-- MOQ
-- Fulfilment
-- Shipping SLA
-- Selling Region
-
-AI、图片、supplier 营销页不能猜这些值。
-
-显式命令行 `--sku` 本身就是 seller-controlled 输入，因此会同时作为商品身份守卫和 `SKU` business evidence；价格、库存等未提供字段仍然保持 blocked。
-
-## 3. 浏览器执行层
-
-真实 Makro 使用长期 Edge/CDP，会话与 source capture 浏览器隔离。
-
-已有能力：
-
-- 动态发现 Step 3 semantic fields
 - text / textarea
 - native/custom dropdown
 - number
 - value + qualifier
-- multi-value `+` 动态新增槽位
+- multi-value `+` 动态扩槽
 - pre-save immediate + React-settled readback
-- exact section Save
+- section Save
 - Save 后重新打开 persisted readback
-- Product Photos file-input staging
-- Product Photos Save 后完成计数验证
+- Product Photos staging + Save + completion-count persistence check
 
-正式 multi-value 执行不会只填前几个值。如果页面槽位不够，会先在**该字段自己的 wrapper** 内点击 `+`、重新扫描、直到槽位足够；如果仍不足，则在任何部分值写入前失败。
+multi-value 如果答案值数量超过当前槽位，executor 只在该字段自己的 wrapper 内点击 `+` 并重新扫描；仍不足则在任何部分答案写入前失败。qualifier control 缺失也在写主值前失败。
 
-## 4. Section lifecycle 只有一套实现
+## 5. Section lifecycle
 
-`app/makro/sections.py` 是 Step 3 section 生命周期的唯一实现：
-
-- find
-- EDIT
-- validation error detection
-- Cancel
-- Save
-- Save 后 card collapse / error badge 检查
-
-synthetic/test-only 代码不得维护另一套 Save/Cancel 逻辑。
+`app/makro/sections.py` 是唯一 section lifecycle 实现：find、EDIT、validation errors、Cancel、Save、Save 后折叠/error badge 检查。
 
 `app/makro_dryrun.py`：
 
-- `fill_resolved_field()` = pre-save 写入 + React settled readback
-- `verify_resolved_field()` = Save 后重新打开的只读 persisted verification
+- `fill_resolved_field()` = pre-save write + React settled readback
+- `verify_resolved_field()` = Save 后重新打开 persisted verification
 
-**pre-save `validated` 不等于 persisted。**
+pre-save `validated` 不等于 persisted。
 
-## 5. Product Photos
+## 6. Product Photos
 
-Evidence 图片和 listing 图片严格分开：
+- `--image`：evidence/grounding only
+- `--upload-image`：明确上传到 Makro 的 listing image
 
-- `--image`：只进入 evidence/grounding
-- `--upload-image`：用户明确授权上传到 Makro Product Photos
+状态：
 
-图片状态也严格分开：
+- `staged`：文件进入 Product Photos 编辑事务
+- `persisted_verified`：卡片 Save 后 `(x/5)` 计数增加，并可重新打开检查
 
-- `staged`：文件已进入当前 Product Photos 编辑事务
-- `persisted_verified`：该卡片 Save 后 `(x/5)` 完成计数按预期增加，并能重新打开检查
+页面出现图片预览不再被误报成“已经保存”；反过来也不会在 Save 前等待 `(x/5)` 增长。
 
-不能再因为页面出现预览就宣称图片已保存，也不能在 Save 前等待 `(x/5)` 增长。
+## 7. 运行模式
 
-## 6. 两种真实运行模式
-
-### 单 section 诊断
+单 section 诊断：
 
 ```powershell
-python makro_preview_listing.py `
-  --qa <qa.xlsx> `
-  --expected-vertical <vertical> `
-  --section "Product Description" `
-  [evidence options]
+python makro_preview_listing.py --qa <qa.xlsx> --expected-vertical <vertical> --section "Product Description" [evidence options]
 ```
 
-特点：
+不 Save，页面保持打开供人工检查。
 
-- 只填一个 section
-- 不点 section Save
-- 页面保持打开供人工检查
-- 永不 Send to QC
-
-### 完整 Step 3 持久化验收
+完整 Step 3 持久化验收：
 
 ```powershell
 python makro_preview_listing.py `
@@ -187,85 +101,34 @@ python makro_preview_listing.py `
   [--upload-image <listing-image>]
 ```
 
-`--all-step3` 没有 `--allow-section-save` 会直接拒绝执行。不存在“全量填完再 Cancel 丢值”的模式。
+`--all-step3` 没有 `--allow-section-save` 会拒绝执行；不再存在“全量填写后 Cancel 丢值”的模式。
 
-每个字段 section 按以下事务执行：
+每个字段 card：Fill Plan → 写入 → pre-save readback → screenshot → validation → Save → collapse → reopen → persisted readback → screenshot → 折叠只读重开事务。
 
-1. 从同一个 live Fill Plan 选择候选
-2. 写入
-3. pre-save readback
-4. 截图
-5. 检查 Makro validation
-6. 点击该 section 自己的 Save
-7. 等待 card 折叠回 EDIT
-8. 重新打开
-9. 对本轮写入值做 persisted readback
-10. 截图
-11. Cancel 这次**只读重开事务**使卡片折叠；已保存值不丢失
+某个 card 失败会记录错误/截图并尽量清理未保存事务后继续，目的是一次暴露整页问题而不是逐个磨。
 
-某个 section 失败会记录错误和截图，并尽量清理该未保存事务后继续其他 section，以便一次验收收集完整问题集合。
+Product Photos：stage → screenshot → Save → poll `(x/5)` → reopen → screenshot → collapse。
 
-Product Photos 最后执行：
+始终 `Send to QC=False`。
 
-1. staging 明确的 `--upload-image`
-2. screenshot
-3. Product Photos Save
-4. 轮询 `(x/5)` 持久化计数
-5. 重新打开并截图
-6. 折叠只读重开事务
+## 8. 完成状态
 
-永不点击 `Send to QC`。
+报告必须分别给出：
 
-## 7. 完成状态
+- `draft_persisted_complete`：Makro 草稿卡片和图片是否真正 Save + reopen 验证通过。
+- `autofill_safe_complete`：draft persisted 基础上 `required_blocked == 0` 且没有 review-only 候选被当正式自动化答案。
 
-完整验收报告必须区分：
+`report.json` 保存完整 Fill Plan、blocked reasons、字段 source/confidence/provenance、pre-save 结果、Save 结果、persisted result、photo result、screenshots。
 
-- `draft_persisted_complete`
-  - Makro 草稿层的 required field cards / optional card / Product Photos 是否真实 Save 并持久化复核通过
-- `autofill_safe_complete`
-  - 在 draft persisted 基础上，`required_blocked == 0`
-  - 并且没有 review-only 候选被当成正式自动化答案
+## 9. 当前推荐链
 
-草稿能 Save 不等于生产自动化已经安全。
-
-`report.json` 同时保存：
-
-- 完整 `Fill Plan`
-- blocked gate reason 汇总
-- 每个字段的 answer/source/confidence/provenance
-- pre-save execution result
-- section Save result
-- persisted verification result
-- Product Photos staging/persistence result
-- screenshots
-- `send_to_qc_clicked=false`
-
-## 8. 推荐当前工作流
-
-### A. 重新生成 grounded semantic evidence
+A. Grounded AI evidence：
 
 ```powershell
-python makro_resolve_ai.py `
-  --provider openai-compatible `
-  --base-url <provider-base-url> `
-  --model <multimodal-model> `
-  --api-key-env <KEY_ENV> `
-  --qa <qa.xlsx> `
-  --image <evidence-image-1> `
-  --image <evidence-image-2> `
-  --supplier-snapshot <source-snapshot.json>
+python makro_resolve_ai.py --provider openai-compatible --base-url <base> --model <vision-model> --api-key-env <KEY_ENV> --qa <qa.xlsx> --image <img1> --image <img2> --supplier-snapshot <snapshot.json>
 ```
 
-输出包括：
-
-- `validated-semantic-evidence.json`
-- `source-manifest.json`
-- `semantic-batches.json`
-- `resolution.json/.xlsx`
-- `review-queue.json/.xlsx`
-- `run-manifest.json`
-
-### B. 只读 live Fill Plan
+B. Read-only live Fill Plan：
 
 ```powershell
 python makro_plan_listing.py `
@@ -273,39 +136,29 @@ python makro_plan_listing.py `
   --sku <sku> `
   --expected-vertical <vertical> `
   --evidence-packet <validated-semantic-evidence.json> `
-  --supplier-snapshot <source-snapshot.json> `
-  --image <same-evidence-image-1> `
-  --image <same-evidence-image-2> `
+  --supplier-snapshot <snapshot.json> `
+  --image <same-img1> `
+  --image <same-img2> `
   --alias-config <matching-config.json>
 ```
 
-Grounded packet 会在这里重新绑定到这些当前 source files。
+C. 人工检查 Fill Plan 后，再运行完整 Step 3 persisted acceptance。
 
-### C. 完整 Step 3 acceptance
+## 10. 安全不变量
 
-在检查 Fill Plan 后，由用户在已登录的长期 Makro Edge 上运行 `--all-step3 --allow-section-save`。
-
-## 9. 安全不变量
-
-- 多个 Add Listing tab → fail closed
+- 多 listing tabs → fail closed
 - vertical 不一致 → fail closed
-- 已有未保存 section → full acceptance 停止，不擅自 Cancel
-- source identity / digest 不一致 → fail closed
-- 真实 conflict → 不静默覆盖
+- 已有未保存 section → full acceptance 停止
+- source digest/identity 不一致 → fail closed
+- conflict → 不覆盖
 - dropdown 无唯一精确 option → 不填
-- multi-value 槽位不足 → 不做部分写入
-- qualifier 不确定/控件缺失 → 不写
+- multi-value/qualifier shape 不足 → 不做部分写入
 - business field 无客户明确数据 → 不猜
 - React settled readback 不一致 → 不算 validated
-- Save 后 persisted readback 不一致 → 不算 persisted
-- Product Photos staged 不等于 persisted
-- `Send to QC` 当前始终禁止自动点击
+- Save 后 readback 不一致 → 不算 persisted
+- photo staged 不等于 persisted
+- `Send to QC` 当前始终禁止
 
-## 10. 开发原则
+## 11. 开发原则
 
-- 能改主链，不加 wrapper
-- 能复用 domain primitive，不复制第二套实现
-- 没有真实问题证明需要，不增加 abstraction
-- 不为某个 SKU / vertical 硬编码产品规格
-- synthetic coverage 只用于执行层新回归，不再作为 Step 3 完成标准
-- GitHub CI / mock 全绿只代表代码回归通过；真实 Makro 完成必须由真实商品验收报告证明
+能改主链不加 wrapper；能复用 domain primitive 不复制第二套实现；没有真实问题证明需要不增加 abstraction；不为单个 SKU/vertical 硬编码产品规格；synthetic coverage 只用于执行层回归，不再作为 Step 3 完成标准。
