@@ -10,18 +10,18 @@ def _args(**overrides):
     values = {
         "web_enrich": "auto",
         "web_search_model": "",
-        "web_native_base_url": "https://dashscope.aliyuncs.com/api/v1",
+        "web_base_url": "",
         "request_timeout_seconds": 90.0,
     }
     values.update(overrides)
     return Namespace(**values)
 
 
-def test_auto_web_enrichment_reuses_dashscope_key_model_and_deadline(monkeypatch):
+def test_auto_web_enrichment_reuses_dashscope_key_model_endpoint_and_deadline(monkeypatch):
     monkeypatch.setenv("DASHSCOPE_API_KEY", "secret")
     config = ProviderConfig(
         provider="openai-compatible",
-        model="qwen3.5-omni-plus",
+        model="qwen3.6-plus",
         api_key_env="DASHSCOPE_API_KEY",
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
@@ -30,8 +30,8 @@ def test_auto_web_enrichment_reuses_dashscope_key_model_and_deadline(monkeypatch
 
     assert reason == "available"
     assert provider is not None
-    assert provider.model == "qwen3.5-omni-plus"
-    assert provider.native_base_url == "https://dashscope.aliyuncs.com/api/v1"
+    assert provider.model == "qwen3.6-plus"
+    assert provider.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
     assert provider.request_timeout_seconds == 90.0
 
 
@@ -39,7 +39,7 @@ def test_auto_web_enrichment_does_not_attach_to_other_compatible_endpoints(monke
     monkeypatch.setenv("VENDOR_KEY", "secret")
     config = ProviderConfig(
         provider="openai-compatible",
-        model="qwen3.5-omni-plus",
+        model="qwen3.6-plus",
         api_key_env="VENDOR_KEY",
         base_url="https://api.vendor.test/v1",
     )
@@ -54,7 +54,7 @@ def test_web_enrichment_can_be_explicitly_disabled(monkeypatch):
     monkeypatch.setenv("DASHSCOPE_API_KEY", "secret")
     config = ProviderConfig(
         provider="openai-compatible",
-        model="qwen3.5-omni-plus",
+        model="qwen3.6-plus",
         api_key_env="DASHSCOPE_API_KEY",
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
