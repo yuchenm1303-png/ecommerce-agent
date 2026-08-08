@@ -4,13 +4,15 @@ There are only two execution modes:
 
 - ``--section``: one-card diagnostic preview. It never saves and leaves the card
   open for human inspection.
-- ``--all-step3 --allow-section-save``: persisted Step 3 acceptance. It fills
-  each core card from the same live Fill Plan used by the read-only planner,
-  saves that card, re-opens it and verifies persisted values. Product Photos is
-  staged, saved and verified separately. Failures are collected across cards.
+- ``--all-step3 --allow-section-save --live-schema``: persisted Step 3
+  acceptance. It uses the exact read-only-planned live schema, fills each core
+  card from the resulting Fill Plan, saves that card, re-opens it and verifies
+  persisted values. Product Photos is staged, saved and verified separately.
 
-This command never clicks Send to QC. Evidence images (``--image``) and listing
-upload images (``--upload-image``) are deliberately separate.
+The full persisted mode fails before any browser write when the current Makro
+schema differs from the supplied planning schema. This command never clicks Send
+to QC. Evidence images (``--image``) and listing upload images
+(``--upload-image``) are deliberately separate.
 """
 
 from __future__ import annotations
@@ -26,7 +28,13 @@ from playwright.sync_api import sync_playwright
 
 from app.alias_config import AliasConfig, load_alias_config
 from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness, is_cdp_ready
+from app.evidence_validation import is_business_question
 from app.fill_plan import BLOCKED, LiveFillPlan, LiveFillPlanItem, build_live_fill_plan
+from app.live_schema import (
+    assert_live_schema_matches,
+    augment_catalog_with_live_fields,
+    load_live_schema,
+)
 from app.makro import MAKRO_HOME_URL, base_section_title, is_listing_url
 from app.makro.direct_visual_hold import is_listing_attribute_field
 from app.makro.domain import MakroDomainAdapter
@@ -44,7 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "使用真实 Evidence 检查/持久化 Makro Step 3；"
-            "单 section 为 no-save 预览，全量模式必须显式授权 section Save；永不 Send to QC。"
+            "单 section 为 no-save 预览，全量模式必须显式授权 section Save 并绑定 live schema；"
+            "永不 Send to QC。"
         )
     )
     parser.add_argument("--qa", required=True)
@@ -73,6 +82,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--product-url", default=None)
     parser.add_argument("--expected-vertical", required=True)
     parser.add_argument(
+        "--live-schema",
+        default=None,
+        help=(
+            "read-only planner 导出的 live-schema.json。完整 --all-step3 必填；"
+            "用于追加 QA 外非经营字段，并在任何写入前验证当前页面 schema 未漂移。"
+        ),
+    )
+    parser.add_argument(
         "--alias-config",
         default=None,
         help=(
@@ -86,7 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
     target.add_argument(
         "--all-step3",
         action="store_true",
-        help="执行完整 Step 3 persistence acceptance；必须同时传 --allow-section-save。",
+        help=(
+            "执行完整 Step 3 persistence acceptance；必须同时传 --allow-section-save "
+            "和 --live-schema。"
+        ),
     )
     parser.add_argument(
         "--allow-section-save",
@@ -675,6 +695,11 @@ def main() -> int:
             "--all-step3 是真实持久化验收，必须显式同时传 --allow-section-save；"
             "不再提供会自动 Cancel 丢值的假全量模式。"
         )
+    if args.all_step3 and not args.live_schema:
+        raise SystemExit(
+            "--all-step3 必须显式传 read-only planner 导出的 --live-schema；"
+            "拒绝在没有字段合同的情况下持久化 Step 3。"
+        )
     if args.section and args.allow_section_save:
         raise SystemExit("--allow-section-save 只允许与 --all-step3 一起使用。")
     for name, value in (
@@ -691,7 +716,18 @@ def main() -> int:
             "不会自动启动、关闭或重启 Edge。"
         )
 
-    catalog = load_question_catalog(args.qa)
+    base_catalog = load_question_catalog(args.qa)
+    catalog = base_catalog
+    planned_live_fields: list[dict[str, Any]] | None = None
+    live_schema_warnings: list[str] = []
+    if args.live_schema:
+        planned_live_fields = load_live_schema(args.live_schema)
+        catalog, live_schema_warnings = augment_catalog_with_live_fields(
+            base_catalog,
+            planned_live_fields,
+            business_locked=is_business_question,
+        )
+
     input_result = build_resolution_inputs(catalog, _input_spec(args))
     policy = ResolutionPolicy(
         auto_fill_min_confidence=args.auto_fill_min_confidence,
@@ -741,6 +777,12 @@ def main() -> int:
             for field in adapter.build_semantic_fields(flat_controls)
             if is_listing_attribute_field(field)
         ]
+
+        # This is the last pre-write boundary. Full persisted acceptance cannot
+        # reuse evidence made for an older/different question contract.
+        if planned_live_fields is not None:
+            assert_live_schema_matches(planned_live_fields, semantic_fields)
+
         plan = build_live_fill_plan(
             catalog,
             semantic_fields,
@@ -758,9 +800,15 @@ def main() -> int:
         )
         print(f"page={page.url}")
         print(
+            f"questions={len(catalog.questions)} "
+            f"(base={len(base_catalog.questions)}, live_extra={len(catalog.questions) - len(base_catalog.questions)})"
+        )
+        print(
             f"ready={summary['ready']}, preview_eligible={summary['preview_eligible']}, "
             f"blocked={summary['blocked']}, required_blocked={summary['required_blocked']}"
         )
+        if args.live_schema:
+            print(f"live_schema={Path(args.live_schema).resolve()} verified=True")
         if match_config:
             print(
                 f"matching_config={match_config.source_path} "
@@ -839,6 +887,13 @@ def main() -> int:
             "mode": "all_step3_persisted_acceptance" if args.all_step3 else "single_section_review",
             "page_url": page.url,
             "expected_vertical": args.expected_vertical,
+            "qa_source": str(Path(args.qa).resolve()),
+            "live_schema": str(Path(args.live_schema).resolve()) if args.live_schema else None,
+            "live_schema_verified": planned_live_fields is not None,
+            "live_schema_warnings": live_schema_warnings,
+            "base_question_count": len(base_catalog.questions),
+            "effective_question_count": len(catalog.questions),
+            "live_extra_question_count": len(catalog.questions) - len(base_catalog.questions),
             "include_review_candidates": args.include_review_candidates,
             "allow_section_save": args.allow_section_save,
             "matching_config": match_config.source_path if match_config else None,
