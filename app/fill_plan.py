@@ -13,6 +13,8 @@ from .source_bundle import ProductSourceBundle
 
 READY = "ready"
 BLOCKED = "blocked"
+GATE_UNMATCHED_LIVE_FIELD = "unmatched_live_field"
+GATE_CROSS_FIELD_RULE = "cross_field_business_rule"
 
 # A live Makro field that is not matched to a customer QA row has no semantic
 # question binding. It may still be a legitimate seller/business field, but only
@@ -66,6 +68,10 @@ class LiveFillPlan:
         return sum(1 for item in self.items if item.action == BLOCKED)
 
     @property
+    def preview_eligible_count(self) -> int:
+        return sum(1 for item in self.items if item.resolution.preview_eligible)
+
+    @property
     def required_blocked_count(self) -> int:
         return sum(
             1 for item in self.items if item.required and item.action == BLOCKED
@@ -77,13 +83,23 @@ class LiveFillPlan:
             1 for item in self.items if item.required and item.action == READY
         )
 
+    @property
+    def required_preview_eligible_count(self) -> int:
+        return sum(
+            1
+            for item in self.items
+            if item.required and item.resolution.preview_eligible
+        )
+
     def summary(self) -> dict[str, Any]:
         return {
             "live_field_count": len(self.items),
             "ready": self.ready_count,
             "blocked": self.blocked_count,
+            "preview_eligible": self.preview_eligible_count,
             "required_ready": self.required_ready_count,
             "required_blocked": self.required_blocked_count,
+            "required_preview_eligible": self.required_preview_eligible_count,
             "qa_matched": self.match_audit.matched_count,
             "qa_ambiguous": self.match_audit.ambiguous_count,
             "qa_unmatched": self.match_audit.unmatched_question_count,
@@ -127,6 +143,8 @@ def _block_items(items: list[LiveFillPlanItem], keys: tuple[str, ...], detail: s
         item.reason = detail
         item.resolution.status = NEEDS_REVIEW
         item.resolution.eligible_for_autofill = False
+        item.resolution.preview_eligible = False
+        item.resolution.gate_reason = GATE_CROSS_FIELD_RULE
         item.resolution.detail = detail
 
 
@@ -135,10 +153,18 @@ def _gate_unmatched_live_resolution(
     *,
     question: QuestionRecord | None,
 ) -> str | None:
-    """Prevent evidence-key collisions from authorizing unrelated live fields."""
+    """Prevent evidence-key collisions from authorizing unrelated live fields.
 
-    if question is not None or not resolution.eligible_for_autofill:
+    This gate applies to both real autofill and review-preview candidates. A
+    low-confidence semantic value must not become previewable on an unmatched
+    live field merely because it shares a generic key such as ``height``.
+    """
+
+    if question is not None:
         return None
+    if not resolution.eligible_for_autofill and not resolution.preview_eligible:
+        return None
+
     source_type = str(resolution.source_type or "")
     if source_type in UNMATCHED_LIVE_AUTOFILL_SOURCE_TYPES:
         return None
@@ -146,10 +172,12 @@ def _gate_unmatched_live_resolution(
     detail = (
         "实时 Makro 字段未匹配 QA，且候选证据来自 "
         f"source_type={source_type or 'unknown'}；为避免同名 attribute_key/label 串字段，"
-        "未匹配 live field 只允许 structured/business/config/rule 明确输入自动填写。"
+        "未匹配 live field 只允许 structured/business/config/rule 明确输入自动填写或预览。"
     )
     resolution.status = NEEDS_REVIEW
     resolution.eligible_for_autofill = False
+    resolution.preview_eligible = False
+    resolution.gate_reason = GATE_UNMATCHED_LIVE_FIELD
     resolution.detail = detail
     return detail
 
@@ -223,6 +251,11 @@ def build_live_fill_plan(
             reason = "证据、置信度和字段约束均通过，可进入浏览器填写层。"
         elif unmatched_gate_detail:
             reason = unmatched_gate_detail
+        elif resolution.preview_eligible:
+            reason = (
+                "候选值已通过字段结构、选项/单位和 provenance 检查，但仅因置信度门槛未达到自动填写标准；"
+                "可在显式 review-preview 模式中临时填入供人工检查，禁止据此自动 Save。"
+            )
         elif question is None:
             reason = "实时 Makro 字段未匹配 QA；仅在显式结构化证据可解析时才允许自动填写。"
             if resolution.detail:
