@@ -130,9 +130,6 @@ def _message_content(request_payload: dict[str, Any], *, image_detail: str) -> l
         image_url: dict[str, Any] = {
             "url": _image_data_uri(str(source.get("image_path") or "")),
         }
-        # `detail` is not universal across OpenAI-compatible providers. In auto
-        # mode we omit it entirely; callers may request low/high only when their
-        # vendor documents support this extension.
         if image_detail in {"low", "high"}:
             image_url["detail"] = image_detail
         content.append({"type": "image_url", "image_url": image_url})
@@ -238,6 +235,7 @@ class OpenAICompatibleSemanticProvider:
         max_output_tokens: int = 12000,
         structured_mode: str = "prompt_only",
         compat_profile: str = "generic",
+        request_timeout_seconds: float = 120.0,
     ) -> None:
         if not model.strip():
             raise ValueError("model 不能为空。")
@@ -255,6 +253,8 @@ class OpenAICompatibleSemanticProvider:
             raise ValueError(
                 "compat_profile 必须是 " + "/".join(SUPPORTED_COMPAT_PROFILES) + "。"
             )
+        if not 10.0 <= float(request_timeout_seconds) <= 600.0:
+            raise ValueError("request_timeout_seconds 必须在 10..600 秒。")
 
         if client is None:
             try:
@@ -263,7 +263,12 @@ class OpenAICompatibleSemanticProvider:
                 raise OpenAICompatibleProviderError(
                     "缺少 openai Python SDK。请先安装 requirements.txt。"
                 ) from exc
-            client = OpenAI(api_key=api_key, base_url=base_url)
+            client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=float(request_timeout_seconds),
+                max_retries=0,
+            )
 
         self.client = client
         self.model = model.strip()
@@ -272,6 +277,7 @@ class OpenAICompatibleSemanticProvider:
         self.max_output_tokens = int(max_output_tokens)
         self.structured_mode = structured_mode
         self.compat_profile = compat_profile
+        self.request_timeout_seconds = float(request_timeout_seconds)
 
     def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -293,6 +299,7 @@ class OpenAICompatibleSemanticProvider:
                 },
             ],
             "max_tokens": self.max_output_tokens,
+            "timeout": self.request_timeout_seconds,
         }
         if self.structured_mode == "json_object":
             kwargs["response_format"] = {"type": "json_object"}
