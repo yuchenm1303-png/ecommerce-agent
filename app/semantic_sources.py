@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable
 
 from .evidence_contract import (
@@ -77,6 +79,7 @@ class SemanticSourceRunResult:
     warnings: list[str] = field(default_factory=list)
     source_stats: list[SemanticSourceStat] = field(default_factory=list)
     elapsed_seconds: float = 0.0
+    source_concurrency: int = 1
 
     @property
     def failed_sources(self) -> int:
@@ -93,6 +96,14 @@ class SemanticSourceRunResult:
     @property
     def cache_hits(self) -> int:
         return sum(1 for item in self.source_stats if item.cache_hit)
+
+
+@dataclass(slots=True)
+class _SourceOutcome:
+    stat: SemanticSourceStat
+    packet: EvidencePacket | None
+    failure: SemanticSourceFailure | None
+    warnings: list[str] = field(default_factory=list)
 
 
 def build_semantic_pending_catalog(catalog: QuestionCatalog) -> QuestionCatalog:
@@ -257,6 +268,176 @@ def _group_metadata(group: GroundingCatalog) -> tuple[str, str]:
     return ",".join(source_types), ",".join(kinds)
 
 
+def _process_source(
+    *,
+    provider: SemanticExtractionProvider,
+    pending: QuestionCatalog,
+    source_id: str,
+    group: GroundingCatalog,
+    index: int,
+    total_sources: int,
+    expected_identity: ProductIdentity,
+    max_repair_attempts: int,
+    cache_root: Path | None,
+    cache_namespace: str,
+    progress: ProgressCallback | None,
+) -> _SourceOutcome:
+    source_type, kind = _group_metadata(group)
+    source_refs = tuple(item.source_id for item in group.sources)
+    stat = SemanticSourceStat(
+        source_id=source_id,
+        source_type=source_type,
+        kind=kind,
+        source_references=source_refs,
+        chunk_count=len(group.sources),
+    )
+    started = time.monotonic()
+    _emit(
+        progress,
+        {
+            "event": "source_start",
+            "index": index,
+            "total": total_sources,
+            "source_id": source_id,
+            "source_type": source_type,
+            "kind": kind,
+            "chunk_count": len(group.sources),
+        },
+    )
+
+    local_warnings: list[str] = []
+    key = _cache_key(
+        provider,
+        cache_namespace,
+        pending,
+        source_id,
+        group,
+        expected_identity,
+    )
+    path = _cache_path(cache_root, key)
+    packet: EvidencePacket | None = None
+    rejected_count = 0
+
+    if path is not None and path.is_file():
+        try:
+            packet = _load_cached_packet(
+                path,
+                pending,
+                group,
+                expected_identity=expected_identity,
+            )
+            stat.cache_hit = True
+            _emit(
+                progress,
+                {
+                    "event": "source_cache_hit",
+                    "index": index,
+                    "total": total_sources,
+                    "source_id": source_id,
+                },
+            )
+        except (OSError, ValueError, EvidenceContractError, json.JSONDecodeError) as exc:
+            local_warnings.append(f"semantic cache ignored for {source_id}: {exc}")
+
+    failure_error = ""
+    if packet is None:
+        request = build_grounded_semantic_request(
+            pending,
+            group,
+            identity=expected_identity,
+        )
+        request["source_pass_id"] = source_id
+
+        for attempt_index in range(max_repair_attempts + 1):
+            if attempt_index:
+                stat.repair_attempts += 1
+            stat.model_calls += 1
+            try:
+                raw = provider.extract_json(request)
+                if not isinstance(raw, dict):
+                    raise EvidenceContractError(
+                        f"semantic provider {provider.name!r} 未返回 JSON object。"
+                    )
+                validation = validate_grounded_semantic_packet_partial(
+                    raw,
+                    pending,
+                    group,
+                    expected_identity=expected_identity,
+                )
+            except IdentityMismatchError:
+                raise
+            except Exception as exc:
+                failure_error = str(exc)
+                break
+
+            rejected_count = validation.rejected_fact_count
+            if validation.packet.facts or rejected_count == 0:
+                packet = validation.packet
+                break
+
+            failure_error = "; ".join(validation.rejected_facts)
+            if attempt_index >= max_repair_attempts:
+                break
+            request["validation_error"] = (
+                "All candidate facts from this source were rejected individually: "
+                + failure_error
+                + ". Return only facts you can fully ground; omit everything else."
+            )
+
+    if packet is None:
+        stat.rejected_fact_count = rejected_count
+        stat.elapsed_seconds = time.monotonic() - started
+        failure = SemanticSourceFailure(
+            source_id=source_id,
+            source_references=source_refs,
+            error=failure_error or "source extraction returned no valid packet",
+        )
+        _emit(
+            progress,
+            {
+                "event": "source_failed",
+                "index": index,
+                "total": total_sources,
+                "source_id": source_id,
+                "elapsed_seconds": stat.elapsed_seconds,
+                "error": failure.error,
+            },
+        )
+        return _SourceOutcome(
+            stat=stat,
+            packet=None,
+            failure=failure,
+            warnings=local_warnings,
+        )
+
+    if path is not None and not stat.cache_hit:
+        _write_cached_packet(path, packet)
+
+    stat.fact_count = len(packet.facts)
+    stat.rejected_fact_count = rejected_count
+    stat.elapsed_seconds = time.monotonic() - started
+    _emit(
+        progress,
+        {
+            "event": "source_complete",
+            "index": index,
+            "total": total_sources,
+            "source_id": source_id,
+            "cache_hit": stat.cache_hit,
+            "model_calls": stat.model_calls,
+            "facts": stat.fact_count,
+            "rejected_facts": stat.rejected_fact_count,
+            "elapsed_seconds": stat.elapsed_seconds,
+        },
+    )
+    return _SourceOutcome(
+        stat=stat,
+        packet=packet,
+        failure=None,
+        warnings=local_warnings,
+    )
+
+
 def run_grounded_semantic_sources(
     provider: SemanticExtractionProvider,
     catalog: QuestionCatalog,
@@ -267,23 +448,103 @@ def run_grounded_semantic_sources(
     max_repair_attempts: int = DEFAULT_MAX_REPAIR_ATTEMPTS,
     cache_dir: str | Path | None = None,
     cache_namespace: str = "",
+    source_concurrency: int = 1,
     progress: ProgressCallback | None = None,
 ) -> SemanticSourceRunResult:
-    """Extract every logical grounded source at most once in the normal path.
+    """Extract each independent logical source once in the normal path.
 
-    Each image is seen once; all citation chunks from one original text source
-    are sent together once against the complete pending question set. One bad
-    sibling fact is dropped fail-closed instead of forcing the source to rerun.
+    Citation chunks from one original source stay in one request. Independent
+    sources may run concurrently; final packet merging remains in original source
+    order so concurrency changes latency only, never evidence precedence or
+    conflict semantics. Fail-fast mode intentionally forces concurrency=1.
     """
 
     if max_repair_attempts < 0 or max_repair_attempts > 1:
         raise ValueError("max_repair_attempts 必须是 0 或 1。")
+    if source_concurrency < 1 or source_concurrency > 4:
+        raise ValueError("source_concurrency 必须在 1..4。")
 
     pending = build_semantic_pending_catalog(catalog)
     groups = grounding.logical_groups()
     total_sources = len(groups)
     start_all = time.monotonic()
     cache_root = Path(cache_dir) if cache_dir is not None else None
+    effective_concurrency = min(source_concurrency, max(total_sources, 1))
+    if not continue_on_source_error:
+        effective_concurrency = 1
+
+    if not pending.questions:
+        return SemanticSourceRunResult(
+            packet=EvidencePacket(
+                identity=expected_identity,
+                facts=[],
+                extractor=f"semantic-source-first:{provider.name}",
+                warnings=[],
+            ),
+            total_sources=total_sources,
+            completed_sources=0,
+            elapsed_seconds=time.monotonic() - start_all,
+            source_concurrency=effective_concurrency,
+        )
+
+    progress_lock = Lock()
+
+    def safe_progress(payload: dict[str, Any]) -> None:
+        if progress is None:
+            return
+        with progress_lock:
+            progress(payload)
+
+    jobs = [
+        (index, source_id, group)
+        for index, (source_id, group) in enumerate(groups, start=1)
+    ]
+    outcomes: list[_SourceOutcome | None] = [None] * len(jobs)
+
+    if effective_concurrency == 1:
+        for index, source_id, group in jobs:
+            outcome = _process_source(
+                provider=provider,
+                pending=pending,
+                source_id=source_id,
+                group=group,
+                index=index,
+                total_sources=total_sources,
+                expected_identity=expected_identity,
+                max_repair_attempts=max_repair_attempts,
+                cache_root=cache_root,
+                cache_namespace=cache_namespace,
+                progress=safe_progress,
+            )
+            outcomes[index - 1] = outcome
+            if outcome.failure is not None and not continue_on_source_error:
+                raise EvidenceContractError(
+                    f"semantic source {source_id} failed: {outcome.failure.error}"
+                )
+    else:
+        with ThreadPoolExecutor(
+            max_workers=effective_concurrency,
+            thread_name_prefix="semantic-source",
+        ) as executor:
+            future_to_index = {
+                executor.submit(
+                    _process_source,
+                    provider=provider,
+                    pending=pending,
+                    source_id=source_id,
+                    group=group,
+                    index=index,
+                    total_sources=total_sources,
+                    expected_identity=expected_identity,
+                    max_repair_attempts=max_repair_attempts,
+                    cache_root=cache_root,
+                    cache_namespace=cache_namespace,
+                    progress=safe_progress,
+                ): index - 1
+                for index, source_id, group in jobs
+            }
+            for future in as_completed(future_to_index):
+                outcomes[future_to_index[future]] = future.result()
 
     all_facts = []
     warnings: list[str] = []
@@ -292,172 +553,20 @@ def run_grounded_semantic_sources(
     observed_identity = expected_identity
     completed = 0
 
-    if not pending.questions:
-        return SemanticSourceRunResult(
-            packet=EvidencePacket(
-                identity=observed_identity,
-                facts=[],
-                extractor=f"semantic-source-first:{provider.name}",
-                warnings=[],
-            ),
-            total_sources=total_sources,
-            completed_sources=0,
-            elapsed_seconds=time.monotonic() - start_all,
-        )
-
-    for index, (source_id, group) in enumerate(groups, start=1):
-        source_type, kind = _group_metadata(group)
-        source_refs = tuple(item.source_id for item in group.sources)
-        stat = SemanticSourceStat(
-            source_id=source_id,
-            source_type=source_type,
-            kind=kind,
-            source_references=source_refs,
-            chunk_count=len(group.sources),
-        )
-        stats.append(stat)
-        started = time.monotonic()
-        _emit(
-            progress,
-            {
-                "event": "source_start",
-                "index": index,
-                "total": total_sources,
-                "source_id": source_id,
-                "source_type": source_type,
-                "kind": kind,
-                "chunk_count": len(group.sources),
-            },
-        )
-
-        key = _cache_key(
-            provider,
-            cache_namespace,
-            pending,
-            source_id,
-            group,
-            expected_identity,
-        )
-        path = _cache_path(cache_root, key)
-        packet: EvidencePacket | None = None
-        rejected_count = 0
-
-        if path is not None and path.is_file():
-            try:
-                packet = _load_cached_packet(
-                    path,
-                    pending,
-                    group,
-                    expected_identity=expected_identity,
-                )
-                stat.cache_hit = True
-                _emit(
-                    progress,
-                    {
-                        "event": "source_cache_hit",
-                        "index": index,
-                        "total": total_sources,
-                        "source_id": source_id,
-                    },
-                )
-            except (OSError, ValueError, EvidenceContractError, json.JSONDecodeError) as exc:
-                warnings.append(f"semantic cache ignored for {source_id}: {exc}")
-
-        failure_error = ""
-        if packet is None:
-            request = build_grounded_semantic_request(
-                pending,
-                group,
-                identity=expected_identity,
-            )
-            request["source_pass_id"] = source_id
-
-            for attempt_index in range(max_repair_attempts + 1):
-                if attempt_index:
-                    stat.repair_attempts += 1
-                stat.model_calls += 1
-                try:
-                    raw = provider.extract_json(request)
-                    if not isinstance(raw, dict):
-                        raise EvidenceContractError(
-                            f"semantic provider {provider.name!r} 未返回 JSON object。"
-                        )
-                    validation = validate_grounded_semantic_packet_partial(
-                        raw,
-                        pending,
-                        group,
-                        expected_identity=expected_identity,
-                    )
-                except IdentityMismatchError:
-                    raise
-                except Exception as exc:
-                    failure_error = str(exc)
-                    break
-
-                rejected_count = validation.rejected_fact_count
-                if validation.packet.facts or rejected_count == 0:
-                    packet = validation.packet
-                    break
-
-                failure_error = "; ".join(validation.rejected_facts)
-                if attempt_index >= max_repair_attempts:
-                    break
-                request["validation_error"] = (
-                    "All candidate facts from this source were rejected individually: "
-                    + failure_error
-                    + ". Return only facts you can fully ground; omit everything else."
-                )
-
-        if packet is None:
-            stat.rejected_fact_count = rejected_count
-            stat.elapsed_seconds = time.monotonic() - started
-            failure = SemanticSourceFailure(
-                source_id=source_id,
-                source_references=source_refs,
-                error=failure_error or "source extraction returned no valid packet",
-            )
-            failures.append(failure)
-            _emit(
-                progress,
-                {
-                    "event": "source_failed",
-                    "index": index,
-                    "total": total_sources,
-                    "source_id": source_id,
-                    "elapsed_seconds": stat.elapsed_seconds,
-                    "error": failure.error,
-                },
-            )
-            if not continue_on_source_error:
-                raise EvidenceContractError(
-                    f"semantic source {source_id} failed: {failure.error}"
-                )
+    for outcome in outcomes:
+        if outcome is None:  # pragma: no cover - executor contract guard
+            raise RuntimeError("semantic source executor returned an incomplete outcome set")
+        stats.append(outcome.stat)
+        warnings.extend(outcome.warnings)
+        if outcome.failure is not None:
+            failures.append(outcome.failure)
             continue
-
-        if path is not None and not stat.cache_hit:
-            _write_cached_packet(path, packet)
-
-        observed_identity = _merge_observed_identity(observed_identity, packet.identity)
+        if outcome.packet is None:  # pragma: no cover - dataclass invariant guard
+            raise RuntimeError("successful semantic source outcome is missing packet")
+        observed_identity = _merge_observed_identity(observed_identity, outcome.packet.identity)
         completed += 1
-        all_facts.extend(packet.facts)
-        warnings.extend(packet.warnings)
-        stat.fact_count = len(packet.facts)
-        stat.rejected_fact_count = rejected_count
-        stat.elapsed_seconds = time.monotonic() - started
-        _emit(
-            progress,
-            {
-                "event": "source_complete",
-                "index": index,
-                "total": total_sources,
-                "source_id": source_id,
-                "cache_hit": stat.cache_hit,
-                "model_calls": stat.model_calls,
-                "facts": stat.fact_count,
-                "rejected_facts": stat.rejected_fact_count,
-                "elapsed_seconds": stat.elapsed_seconds,
-            },
-        )
+        all_facts.extend(outcome.packet.facts)
+        warnings.extend(outcome.packet.warnings)
 
     if failures:
         warnings.extend(
@@ -478,4 +587,5 @@ def run_grounded_semantic_sources(
         warnings=warnings,
         source_stats=stats,
         elapsed_seconds=time.monotonic() - start_all,
+        source_concurrency=effective_concurrency,
     )
