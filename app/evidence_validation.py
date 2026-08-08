@@ -84,24 +84,17 @@ def _match_fact_to_question(
 
     if not matched:
         raise EvidenceValidationError(
-            f"抽取事实 {fact.key!r} 不属于当前 QA 问题清单；禁止把未请求的通用商品属性混入本商品。"
+            f"抽取事实 {fact.key!r} 无法唯一对应当前 QA/实时问题；禁止把未请求的通用商品属性混入本商品。"
         )
     if len(matched) > 1:
         labels = ", ".join(sorted({item.question for item in matched.values()}))
         raise EvidenceValidationError(
-            f"抽取事实 {fact.key!r} 同时匹配多个 QA 问题：{labels}；必须使用更精确的 key。"
+            f"抽取事实 {fact.key!r} 无法唯一对应当前 QA/实时问题；同时匹配：{labels}。"
         )
     return next(iter(matched.values()))
 
 
 def _normalize_fact(fact: ExtractedFact, question: QuestionRecord) -> ExtractedFact:
-    aliases = tuple(
-        dict.fromkeys(
-            item
-            for item in (fact.key, *fact.aliases)
-            if item and normalize_key(item) != question.normalized_question
-        )
-    )
     return ExtractedFact(
         key=question.question,
         value=fact.value,
@@ -109,7 +102,7 @@ def _normalize_fact(fact: ExtractedFact, question: QuestionRecord) -> ExtractedF
         source_reference=fact.source_reference,
         confidence=fact.confidence,
         evidence_text=fact.evidence_text,
-        aliases=aliases,
+        aliases=(),
         note=fact.note,
     )
 
