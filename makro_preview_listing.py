@@ -12,7 +12,9 @@ execution layer. It intentionally keeps the autofill trust gate unchanged:
 - existing non-empty controls are never overwritten;
 - only one section is opened per run;
 - Save and Send to QC are never clicked, and the section is deliberately left
-  open so the user can inspect the real values in the long-lived Edge window.
+  open so the user can inspect the real values in the long-lived Edge window;
+- the command requires an already-running CDP Edge and never launches/restarts
+  the browser itself.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from typing import Any
 from playwright.sync_api import sync_playwright
 
 from app.alias_config import load_alias_config
-from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness
+from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness, is_cdp_ready
 from app.fill_plan import build_live_fill_plan
 from app.makro import MAKRO_HOME_URL, base_section_title, is_listing_url
 from app.makro.direct_visual_hold import is_listing_attribute_field
@@ -171,6 +173,14 @@ def main() -> int:
         if not 0.0 <= value <= 1.0:
             raise SystemExit(f"--{name} 必须在 0..1")
 
+    # Real preview must attach to the already authenticated long-lived Edge.
+    # Never create a browser/profile/session as an implicit fallback.
+    if not is_cdp_ready(args.cdp_port):
+        raise RuntimeError(
+            f"长期 Makro Edge 的 CDP 127.0.0.1:{args.cdp_port} 不可达；"
+            "review preview 已停止，不会自动启动、关闭或重启 Edge。"
+        )
+
     catalog = load_question_catalog(args.qa)
     input_result = build_resolution_inputs(catalog, _input_spec(args))
     policy = ResolutionPolicy(
@@ -195,6 +205,14 @@ def main() -> int:
             port=args.cdp_port,
             start_url=MAKRO_HOME_URL,
         )
+        if harness.launched_now:
+            # Defensive race guard. The pre-check above should make this
+            # impossible unless CDP disappears between the two operations.
+            raise RuntimeError(
+                "CDP 在连接前消失，EdgeHarness 进入启动路径；"
+                "review preview 已中止，不继续页面操作。"
+            )
+
         page = harness.page
         page.set_default_timeout(15_000)
         adapter = MakroDomainAdapter(page)
@@ -203,7 +221,7 @@ def main() -> int:
             adapter.wait_for_authenticated_listing(
                 MAKRO_HOME_URL,
                 headless=False,
-                navigate_first=harness.launched_now,
+                navigate_first=False,
             )
 
         page = harness.ensure_page()
@@ -254,7 +272,9 @@ def main() -> int:
                 "section_left_open": False,
             }
             report_path = run_dir / "report.json"
-            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            report_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
             print("没有符合当前 preview policy 的候选字段；页面未修改。")
             print(f"报告：{report_path.resolve()}")
             return 0
@@ -393,14 +413,18 @@ def main() -> int:
             "screenshot": str(screenshot.resolve()),
         }
         report_path = run_dir / "report.json"
-        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
         print("\n===== REVIEW PREVIEW READY =====")
         print(
             f"candidate={len(candidates)}, attempted={writes_attempted}, "
             f"validated={validated}, existing={skipped_existing}."
         )
-        print("页面未 Save / Send to QC，当前 section 保持展开。请直接去 Edge 检查真实填写内容。")
+        print(
+            "页面未 Save / Send to QC，当前 section 保持展开。请直接去 Edge 检查真实填写内容。"
+        )
         print(f"报告：{report_path.resolve()}")
         print(f"截图：{screenshot.resolve()}")
 
