@@ -188,6 +188,192 @@ def test_mapping_conflict_fact_cannot_authorize_ready_description():
     assert "unresolved conflict" in result.packet.decisions[0].reason
 
 
+def test_mapping_manual_language_cannot_authorize_device_languages_supported():
+    target = field(1)
+    target.update(attribute_key="languages_supported", label="Languages Supported")
+    assert target_scope(target) == "device_ui_language"
+    result = run_field_mapping(
+        FakeMapProvider(),
+        [target],
+        profile(scope="manual_documentation"),
+        grounding(),
+    )
+    assert result.packet.decisions[0].status == REVIEW
+    assert "target_scope=device_ui_language" in result.packet.decisions[0].reason
+
+
+def test_mapping_negative_ready_requires_explicit_negative_evidence():
+    class NegativeProvider(FakeMapProvider):
+        def extract_json(self, request):
+            self.calls += 1
+            profile_payload = json.loads(request["grounded_sources"][0]["content"])
+            fact_id = profile_payload["facts"][0]["fact_id"]
+            target = request["target_fields"][0]
+            return {
+                "decisions": [
+                    {
+                        "field_id": target["field_id"],
+                        "status": "ready",
+                        "values": ["No"],
+                        "citations": [
+                            {
+                                "source_reference": "supplier:001:text:0001:abc",
+                                "evidence_text": "Value: known",
+                            }
+                        ],
+                        "profile_fact_ids": [fact_id],
+                    }
+                ]
+            }
+
+    target = field(1)
+    target.update(attribute_key="remote_control", label="Remote Control")
+    result = run_field_mapping(NegativeProvider(), [target], profile(), grounding())
+    assert result.packet.decisions[0].status == REVIEW
+    assert "explicit negative evidence" in result.packet.decisions[0].reason
+
+
+def test_mapping_scope_compatible_fact_cannot_launder_mount_citation_into_body_width():
+    sources = GroundingCatalog(
+        sources=[
+            GroundedSource(
+                source_id="supplier:body",
+                source_type="supplier_web",
+                kind=TEXT_KIND,
+                origin="supplier",
+                content="Body width 86 mm",
+                sha256="b" * 64,
+            ),
+            GroundedSource(
+                source_id="supplier:mount",
+                source_type="supplier_web",
+                kind=TEXT_KIND,
+                origin="supplier",
+                content="Mount width 52 mm",
+                sha256="c" * 64,
+            ),
+        ]
+    )
+    product = ProductProfile(
+        identity=ProductIdentity(sku="SKU-1"),
+        source_manifest_sha256=source_manifest_digest(sources),
+        facts=[
+            ProductFact(
+                name="body_dimensions",
+                scope="product_body",
+                status="supported",
+                candidates=(
+                    ProfileCandidate(
+                        value="86 mm",
+                        citations=(DecisionCitation("supplier:body", "Body width 86 mm"),),
+                    ),
+                ),
+            ),
+            ProductFact(
+                name="mount_dimensions",
+                scope="mount",
+                status="supported",
+                candidates=(
+                    ProfileCandidate(
+                        value="52 mm",
+                        citations=(DecisionCitation("supplier:mount", "Mount width 52 mm"),),
+                    ),
+                ),
+            ),
+        ],
+        extractor="profile-ai",
+    )
+
+    class LaunderedScopeProvider:
+        name = "laundered-scope"
+
+        def extract_json(self, request):
+            payload = json.loads(request["grounded_sources"][0]["content"])
+            ids = [item["fact_id"] for item in payload["facts"]]
+            target = request["target_fields"][0]
+            return {
+                "decisions": [
+                    {
+                        "field_id": target["field_id"],
+                        "status": "ready",
+                        "values": ["52"],
+                        "qualifier": "mm",
+                        "citations": [
+                            {
+                                "source_reference": "supplier:mount",
+                                "evidence_text": "Mount width 52 mm",
+                            }
+                        ],
+                        "profile_fact_ids": ids,
+                    }
+                ]
+            }
+
+    target = field(1)
+    target.update(attribute_key="width", label="Width", qualifier_options=["mm"])
+    assert target_scope(target) == "product_body"
+    result = run_field_mapping(LaunderedScopeProvider(), [target], product, sources)
+    assert result.packet.decisions[0].status == REVIEW
+    assert "scope-compatible claimed profile fact" in result.packet.decisions[0].reason
+
+
+def test_mapping_ready_free_text_cannot_embed_unresolved_conflict_candidate():
+    sources = grounding()
+    citation = DecisionCitation("supplier:001:text:0001:abc", "Value: known")
+    product = ProductProfile(
+        identity=ProductIdentity(sku="SKU-1"),
+        source_manifest_sha256=source_manifest_digest(sources),
+        facts=[
+            ProductFact(
+                name="package_contents",
+                scope="packaging",
+                status="supported",
+                candidates=(ProfileCandidate(value="dash cam", citations=(citation,)),),
+            ),
+            ProductFact(
+                name="recording_resolution",
+                scope="product",
+                status="conflict",
+                candidates=(
+                    ProfileCandidate(value="720p", citations=(citation,)),
+                    ProfileCandidate(value="1080p", citations=(citation,)),
+                ),
+            ),
+        ],
+        extractor="profile-ai",
+    )
+
+    class ConflictTextProvider:
+        name = "conflict-text"
+
+        def extract_json(self, request):
+            payload = json.loads(request["grounded_sources"][0]["content"])
+            package_fact_id = payload["facts"][0]["fact_id"]
+            target = request["target_fields"][0]
+            return {
+                "decisions": [
+                    {
+                        "field_id": target["field_id"],
+                        "status": "ready",
+                        "values": ["1080P Dual Dash Cam"],
+                        "citations": [
+                            {
+                                "source_reference": "supplier:001:text:0001:abc",
+                                "evidence_text": "Value: known",
+                            }
+                        ],
+                        "profile_fact_ids": [package_fact_id],
+                    }
+                ]
+            }
+
+    target = field(1)
+    target.update(attribute_key="sales_package", label="Sales Package")
+    result = run_field_mapping(ConflictTextProvider(), [target], product, sources)
+    assert result.packet.decisions[0].status == REVIEW
+    assert "unresolved Product Profile conflict" in result.packet.decisions[0].reason
+
+
 def test_mapping_batch_failure_only_leaves_that_batch_unresolved():
     fields = [field(index) for index in range(4)]
     provider = FakeMapProvider(fail_call=1)
