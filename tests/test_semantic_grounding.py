@@ -21,7 +21,7 @@ def test_chunk_text_is_bounded_and_overlapped():
     assert set(chunks[0].split()) & set(chunks[1].split())
 
 
-def test_text_chunks_share_one_logical_source_but_keep_exact_citation_ids():
+def test_text_chunks_keep_logical_identity_without_execution_grouping_api():
     catalog = GroundingCatalog(
         sources=[
             GroundedSource(
@@ -48,13 +48,13 @@ def test_text_chunks_share_one_logical_source_but_keep_exact_citation_ids():
         ]
     )
 
-    groups = catalog.logical_groups()
     assert catalog.logical_source_count == 2
-    assert [key for key, _ in groups] == ["supplier:001", "image:001:ccc"]
-    assert [item.source_id for item in groups[0][1].sources] == [
-        "supplier:001:text:0001:aaa",
-        "supplier:001:text:0002:bbb",
+    assert [item.logical_source_id for item in catalog.sources] == [
+        "supplier:001",
+        "supplier:001",
+        "image:001:ccc",
     ]
+    assert not hasattr(catalog, "logical_groups")
 
 
 def test_grounding_catalog_builds_content_bound_image_and_snapshot_sources(tmp_path):
