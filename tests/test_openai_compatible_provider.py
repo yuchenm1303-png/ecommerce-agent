@@ -53,7 +53,7 @@ def request_payload(image_path: str | None = None):
         )
     return {
         "task": "extract_only_source_grounded_answers_for_current_qa",
-        "batch_id": "batch-001",
+        "batch_id": "source-001",
         "product_identity": {"sku": "", "model_number": "L11", "brand": ""},
         "questions": [{"question": "Screen Size", "business_locked": False}],
         "business_locked_questions": [],
@@ -84,6 +84,7 @@ def test_prompt_only_provider_parses_fenced_json_and_keeps_api_key_out_of_prompt
         base_url="https://api.vendor.test/v1",
         client=client,
         structured_mode="prompt_only",
+        request_timeout_seconds=80,
     )
 
     payload = provider.extract_json(request_payload(str(image)))
@@ -92,6 +93,7 @@ def test_prompt_only_provider_parses_fenced_json_and_keeps_api_key_out_of_prompt
     assert payload["facts"][0]["value"] == ["3.0 inch"]
     kwargs = client.create_api.calls[0]
     assert kwargs["model"] == "vision-model"
+    assert kwargs["timeout"] == 80
     assert "response_format" not in kwargs
     assert "temperature" not in kwargs
     serialized = repr(kwargs)
