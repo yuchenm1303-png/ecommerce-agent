@@ -205,7 +205,10 @@ class FieldDecision:
         raw_citations = payload.get("citations") or []
         raw_alternatives = payload.get("alternatives") or []
         raw_queries = payload.get("search_queries") or []
-        if not all(isinstance(item, list) for item in (raw_values, raw_citations, raw_alternatives, raw_queries)):
+        if not all(
+            isinstance(item, list)
+            for item in (raw_values, raw_citations, raw_alternatives, raw_queries)
+        ):
             raise AIDecisionError(
                 f"decisions[{index}] 的 values/citations/alternatives/search_queries 必须是数组。"
             )
@@ -354,7 +357,8 @@ def _validated_citations(
             valid = bool(wanted) and wanted in _normalize_ws(external_content)
         if not valid:
             warnings.append(
-                f"{field_identifier}: unknown/ungrounded citation {citation.source_reference!r} dropped"
+                f"{field_identifier}: unknown/ungrounded citation "
+                f"{citation.source_reference!r} dropped"
             )
             continue
         fingerprint = (citation.source_reference, _normalize_ws(citation.evidence_text))
@@ -365,192 +369,6 @@ def _validated_citations(
     return output
 
 
-_GENERIC_IDENTITY_VALUES = {
-    "",
-    "other",
-    "unknown",
-    "generic",
-    "none",
-    "na",
-    "n/a",
-    "not specified",
-    "not applicable",
-}
-_NEGATIVE_READY_VALUES = {
-    "no",
-    "false",
-    "none",
-    "notincluded",
-    "notavailable",
-    "unsupported",
-    "absent",
-    "否",
-    "无",
-    "没有",
-    "不支持",
-    "不包含",
-    "不含",
-    "不带",
-}
-_NEGATIVE_ABSENCE_HINTS = (
-    "not listed",
-    "not mentioned",
-    "not shown",
-    "not visible",
-    "not found",
-    "not specified",
-    "no mention",
-    "no listing",
-    "package contents",
-    "packing list",
-    "包装清单",
-    "未列出",
-    "未提及",
-    "未显示",
-)
-_AXIS_MARKERS = {
-    "length": ("length", "长度"),
-    "width": ("width", "宽度"),
-    "breadth": ("breadth", "幅宽"),
-    "height": ("height", "高度"),
-    "depth": ("depth", "深度"),
-}
-_FIELD_WORD_STOP = {
-    "built",
-    "supported",
-    "available",
-    "included",
-    "include",
-    "feature",
-    "features",
-    "other",
-    "used",
-    "using",
-    "with",
-    "without",
-    "has",
-    "have",
-    "the",
-    "and",
-}
-
-
-def _identity_token(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", value.casefold())
-
-
-def _meaningful_identity(value: str) -> str:
-    raw = str(value or "").strip()
-    if raw.casefold() in _GENERIC_IDENTITY_VALUES:
-        return ""
-    return _identity_token(raw)
-
-
-def _external_identity_sufficient(
-    citations: Iterable[DecisionCitation],
-    external_sources: dict[str, str],
-    identity: ProductIdentity,
-) -> bool:
-    """Fail closed only when the product has a strong identity anchor that generic web pages do not match."""
-    refs = {
-        citation.source_reference
-        for citation in citations
-        if citation.source_reference in external_sources
-    }
-    if not refs:
-        return True
-
-    combined = _identity_token("\n".join(external_sources[ref] for ref in refs))
-    sku = _meaningful_identity(identity.sku)
-    model = _meaningful_identity(identity.model_number)
-    brand = _meaningful_identity(identity.brand)
-
-    strong_sku = bool(sku) and len(sku) >= 8 and any(char.isdigit() for char in sku)
-    if strong_sku and sku in combined:
-        return True
-    if brand and model and brand in combined and model in combined:
-        return True
-    if not strong_sku and not (brand and model):
-        return True
-    return False
-
-
-def _decision_is_negative(decision: FieldDecision) -> bool:
-    return any(normalize_key(value) in _NEGATIVE_READY_VALUES for value in decision.values)
-
-
-def _target_anchor(target: dict[str, Any]) -> str:
-    contract = field_contract(target)
-    for source in (contract["label"], contract["attribute_key"]):
-        words = re.findall(r"[a-z0-9]+", source.casefold().replace("_", " "))
-        for word in words:
-            if len(word) >= 3 and word not in _FIELD_WORD_STOP:
-                return word
-    return ""
-
-
-def _has_explicit_negative_evidence(decision: FieldDecision, target: dict[str, Any]) -> bool:
-    anchor = _target_anchor(target)
-    english_negative = re.compile(
-        r"\b(no|none|without|false|absent|unsupported|not\s+supported|not\s+available|not\s+included|does\s+not\s+have|doesn't\s+have)\b",
-        re.IGNORECASE,
-    )
-    chinese_negative = ("不支持", "不包含", "不含", "不带", "没有", "无", "否")
-    for citation in decision.citations:
-        text = citation.evidence_text.strip()
-        lowered = text.casefold()
-        if any(hint in lowered for hint in _NEGATIVE_ABSENCE_HINTS):
-            continue
-        if anchor and anchor not in lowered:
-            continue
-        if english_negative.search(text) or any(token in text for token in chinese_negative):
-            return True
-    return False
-
-
-def _target_axis(target: dict[str, Any]) -> str:
-    contract = field_contract(target)
-    key = normalize_key(contract["attribute_key"])
-    label = normalize_key(contract["label"])
-    for axis in ("length", "width", "breadth", "height", "depth"):
-        if key == axis or label == axis or key.endswith(axis) or label.endswith(axis):
-            return axis
-    return ""
-
-
-def _axis_value_supported(decision: FieldDecision, target: dict[str, Any]) -> bool:
-    axis = _target_axis(target)
-    if not axis:
-        return True
-    numbers = [
-        match.group(0).lstrip("+")
-        for value in decision.values
-        for match in re.finditer(r"[-+]?\d+(?:\.\d+)?", str(value))
-    ]
-    if not numbers:
-        return False
-    markers = _AXIS_MARKERS[axis]
-    for citation in decision.citations:
-        segments = re.split(r"[;,|\n，；]+", citation.evidence_text)
-        for segment in segments:
-            lowered = segment.casefold()
-            if not any(marker in lowered for marker in markers):
-                continue
-            segment_numbers = {
-                match.group(0).lstrip("+")
-                for match in re.finditer(r"[-+]?\d+(?:\.\d+)?", segment)
-            }
-            if any(number in segment_numbers for number in numbers):
-                return True
-    return False
-
-
-def _downgrade_ready(decision: FieldDecision, warnings: list[str], message: str, reason: str) -> None:
-    warnings.append(f"{decision.field_id}: {message}")
-    decision.status = REVIEW
-    decision.reason = f"{decision.reason} | {reason}".strip(" |")
-
-
 def validate_ai_decision_packet(
     packet: AIDecisionPacket,
     fields: Iterable[dict[str, Any]],
@@ -559,7 +377,13 @@ def validate_ai_decision_packet(
     expected_identity: ProductIdentity = ProductIdentity(),
     external_sources: dict[str, str] | None = None,
 ) -> AIDecisionPacket:
-    """Validate structural/provenance boundaries only; product semantics stay with AI."""
+    """Validate only deterministic execution boundaries.
+
+    Product identity interpretation, evidence sufficiency, negative claims,
+    dimensional axes, scope and other product semantics belong to the AI
+    resolver. Python only checks schema/source identity, grounded citations,
+    business locks and structural completeness.
+    """
 
     field_list = list(fields)
     by_id = indexed_fields(field_list)
@@ -574,6 +398,7 @@ def validate_ai_decision_packet(
     external = external_sources or {}
     warnings = list(packet.warnings)
     observed: dict[str, FieldDecision] = {}
+
     for decision in packet.decisions:
         if decision.field_id not in by_id:
             warnings.append(f"unknown field_id ignored: {decision.field_id}")
@@ -582,9 +407,9 @@ def validate_ai_decision_packet(
             raise AIDecisionError(f"AI decision field_id 重复：{decision.field_id}")
 
         target = by_id[decision.field_id]
-        locked = is_business_question(str(target.get("attribute_key") or "")) or is_business_question(
-            str(target.get("label") or "")
-        )
+        locked = is_business_question(
+            str(target.get("attribute_key") or "")
+        ) or is_business_question(str(target.get("label") or ""))
         if locked:
             decision.status = BUSINESS_LOCKED
             decision.values = []
@@ -592,7 +417,10 @@ def validate_ai_decision_packet(
             decision.citations = []
             decision.alternatives = []
             decision.search_queries = []
-            decision.reason = decision.reason or "seller-operated field; requires explicit business data"
+            decision.reason = (
+                decision.reason
+                or "seller-operated field; requires explicit business data"
+            )
             observed[decision.field_id] = decision
             continue
 
@@ -603,6 +431,7 @@ def validate_ai_decision_packet(
             warnings=warnings,
             field_identifier=decision.field_id,
         )
+
         validated_alternatives: list[DecisionAlternative] = []
         for alternative in decision.alternatives:
             citations = _validated_citations(
@@ -622,37 +451,10 @@ def validate_ai_decision_packet(
             )
         decision.alternatives = validated_alternatives
 
-        if decision.status == READY and not _external_identity_sufficient(
-            decision.citations,
-            external,
-            expected_identity,
-        ):
-            _downgrade_ready(
-                decision,
-                warnings,
-                "external-web READY downgraded to REVIEW because source identity does not match the strong SKU or a brand+model pair",
-                "web source identity insufficient for exact-product automatic entry",
-            )
-
-        if decision.status == READY and _decision_is_negative(decision) and not _has_explicit_negative_evidence(decision, target):
-            _downgrade_ready(
-                decision,
-                warnings,
-                "negative READY downgraded to REVIEW because citations do not explicitly negate the target attribute",
-                "negative answer requires explicit target-specific negative evidence",
-            )
-
-        if decision.status == READY and not _axis_value_supported(decision, target):
-            _downgrade_ready(
-                decision,
-                warnings,
-                "axis-specific READY downgraded to REVIEW because cited evidence does not bind the value to the target axis",
-                "dimension value is not explicitly tied to the target axis in cited evidence",
-            )
-
         if decision.status == READY and (not decision.values or not decision.citations):
             warnings.append(
-                f"{decision.field_id}: READY downgraded to REVIEW because value/citation is missing"
+                f"{decision.field_id}: READY downgraded to REVIEW because "
+                "value/citation is missing"
             )
             decision.status = REVIEW
         elif decision.status == CONFLICT:
@@ -662,28 +464,33 @@ def validate_ai_decision_packet(
                 for alternative in usable
             }
             if len(distinct) < 2:
-                warnings.append(f"{decision.field_id}: malformed CONFLICT downgraded to REVIEW")
+                warnings.append(
+                    f"{decision.field_id}: malformed CONFLICT downgraded to REVIEW"
+                )
                 decision.status = REVIEW
         elif decision.status == MISSING:
             decision.values = []
             decision.qualifier = ""
             decision.citations = []
             decision.alternatives = []
+
         observed[decision.field_id] = decision
 
     for identifier, target in by_id.items():
         if identifier in observed:
             continue
-        locked = is_business_question(str(target.get("attribute_key") or "")) or is_business_question(
-            str(target.get("label") or "")
-        )
+        locked = is_business_question(
+            str(target.get("attribute_key") or "")
+        ) or is_business_question(str(target.get("label") or ""))
         status = BUSINESS_LOCKED if locked else MISSING
         observed[identifier] = FieldDecision(
             field_id=identifier,
             status=status,
             reason="seller-operated field" if locked else "AI stage omitted this target field",
         )
-        warnings.append(f"AI stage omitted field_id={identifier}; synthesized status={status}")
+        warnings.append(
+            f"AI stage omitted field_id={identifier}; synthesized status={status}"
+        )
 
     return AIDecisionPacket(
         identity=packet.identity,
@@ -699,7 +506,10 @@ def validate_ai_decision_packet(
 def write_ai_decision_packet(packet: AIDecisionPacket, path: str | Path) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(packet.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    target.write_text(
+        json.dumps(packet.as_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return target
 
 
