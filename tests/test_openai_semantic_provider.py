@@ -5,8 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.ai_decisions import AI_DECISION_JSON_SCHEMA
 from app.providers.openai_semantic import OpenAIProviderError, OpenAISemanticProvider
+
+
+TASK_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {"decisions": {"type": "array"}},
+    "required": ["decisions"],
+}
 
 
 class FakeResponses:
@@ -26,30 +32,13 @@ class FakeClient:
 
 def valid_output():
     return {
-        "contract_version": 1,
-        "product_identity": {"sku": "SKU-1", "model_number": "M8", "brand": ""},
-        "schema_sha256": "schema-digest",
-        "source_manifest_sha256": "source-digest",
         "decisions": [
             {
                 "field_id": "mf_colour",
                 "status": "ready",
                 "values": ["Black"],
-                "qualifier": "",
-                "confidence": 0.95,
-                "citations": [
-                    {
-                        "source_reference": "supplier:001:text:0001",
-                        "evidence_text": "Colour: Black.",
-                    }
-                ],
-                "alternatives": [],
-                "reason": "supported by supplier source",
-                "search_queries": [],
             }
-        ],
-        "model_summary": "resolved product",
-        "warnings": [],
+        ]
     }
 
 
@@ -57,26 +46,11 @@ def request(tmp_path):
     image = tmp_path / "front.jpg"
     image.write_bytes(b"fake-jpeg")
     return {
-        "task": "resolve_all_live_marketplace_fields_from_product_sources",
-        "system_instruction": "You are the primary product-listing resolver.",
-        "prompt_instruction": "Resolve every target field from grounded sources.",
+        "task": "generic_json_task",
+        "system_instruction": "You execute the supplied JSON task.",
+        "prompt_instruction": "Return structured decisions.",
         "product_identity": {"sku": "SKU-1", "model_number": "M8", "brand": ""},
-        "schema_sha256": "schema-digest",
-        "source_manifest_sha256": "source-digest",
-        "target_fields": [
-            {
-                "field_id": "mf_colour",
-                "attribute_key": "colour",
-                "label": "Colour",
-                "section_heading": "Product Description",
-                "required": True,
-                "multi_value": False,
-                "options": ["Black", "White"],
-                "qualifier_options": [],
-                "help_text": "",
-                "business_locked": False,
-            }
-        ],
+        "target_fields": [{"field_id": "mf_colour", "label": "Colour"}],
         "rules": ["Do not invent unsupported product facts."],
         "grounded_sources": [
             {
@@ -96,11 +70,11 @@ def request(tmp_path):
                 "image_path": str(image),
             },
         ],
-        "json_contract": AI_DECISION_JSON_SCHEMA,
+        "json_contract": TASK_JSON_SCHEMA,
     }
 
 
-def test_openai_provider_uses_strict_schema_and_image_data_uri(tmp_path):
+def test_openai_provider_uses_task_schema_and_image_data_uri(tmp_path):
     response = SimpleNamespace(
         status="completed",
         output_text=json.dumps(valid_output()),
@@ -108,17 +82,14 @@ def test_openai_provider_uses_strict_schema_and_image_data_uri(tmp_path):
     )
     client = FakeClient(response)
     provider = OpenAISemanticProvider(client=client, model="gpt-5.6", image_detail="high")
-
     payload = provider.extract_json(request(tmp_path))
-
     assert payload["extractor"] == "openai-responses-semantic"
     assert payload["decisions"][0]["values"] == ["Black"]
     call = client.responses.calls[0]
     assert call["model"] == "gpt-5.6"
     assert call["text"]["format"]["type"] == "json_schema"
     assert call["text"]["format"]["strict"] is True
-    assert call["text"]["format"]["schema"] == AI_DECISION_JSON_SCHEMA
-
+    assert call["text"]["format"]["schema"] == TASK_JSON_SCHEMA
     user_content = call["input"][1]["content"]
     image_parts = [item for item in user_content if item["type"] == "input_image"]
     assert len(image_parts) == 1
@@ -146,7 +117,7 @@ def test_openai_provider_rejects_non_json_output(tmp_path):
         provider.extract_json(request(tmp_path))
 
 
-def test_openai_provider_uses_ai_first_instruction_not_legacy_fact_prompt(tmp_path):
+def test_openai_provider_forwards_task_instructions_without_legacy_fact_prompt(tmp_path):
     response = SimpleNamespace(
         status="completed",
         output_text=json.dumps(valid_output()),
@@ -155,11 +126,10 @@ def test_openai_provider_uses_ai_first_instruction_not_legacy_fact_prompt(tmp_pa
     client = FakeClient(response)
     provider = OpenAISemanticProvider(client=client, model="gpt-5.6")
     provider.extract_json(request(tmp_path))
-
     system_text = client.responses.calls[0]["input"][0]["content"]
     prompt_text = client.responses.calls[0]["input"][1]["content"][0]["text"]
-    assert "primary product-listing resolver" in system_text
-    assert "Resolve every target field" in prompt_text
+    assert "supplied JSON task" in system_text
+    assert "Return structured decisions" in prompt_text
     assert "GROUNDED OUTPUT RULES" not in prompt_text
     assert "ai_synthesis" not in prompt_text
 
