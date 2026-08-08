@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.qa_catalog import QuestionCatalog, QuestionRecord
 from app.question_matcher import AMBIGUOUS, MATCHED, UNMATCHED, match_questions_to_fields
+from app.source_bundle import normalize_key
 
 
 def _catalog(*questions: str) -> QuestionCatalog:
@@ -178,4 +179,67 @@ def test_answer_form_category_keeps_cross_section_same_key_ambiguous():
     audit = match_questions_to_fields(qa, fields)
 
     assert audit.matches[0].status == AMBIGUOUS
+    assert audit.matched_count == 0
+
+
+def test_explicit_section_override_resolves_height_without_vertical_hardcode():
+    qa = QuestionCatalog(
+        source_path="qa.xlsx",
+        sheet_name="Sheet1",
+        header_row=3,
+        questions=[
+            QuestionRecord(
+                number="59",
+                question="Height",
+                category="单项填空",
+            )
+        ],
+    )
+    fields = [
+        {
+            "attribute_key": "height",
+            "label": "Height",
+            "section_heading": "Additional Description (Optional) (0/46)",
+        },
+        {
+            "attribute_key": "height",
+            "label": "Length",
+            "section_heading": "Price, Stock and Shipping Information (0/14)",
+        },
+    ]
+
+    audit = match_questions_to_fields(
+        qa,
+        fields,
+        sections={normalize_key("Height"): "Additional Description"},
+    )
+
+    assert audit.matches[0].status == MATCHED
+    assert audit.matches[0].semantic_field is fields[0]
+    assert audit.matches[0].match_basis == "exact-normalized+explicit-section"
+    assert audit.ambiguous_count == 0
+
+
+def test_explicit_section_override_fails_closed_if_target_section_absent():
+    qa = QuestionCatalog(
+        source_path="qa.xlsx",
+        sheet_name="Sheet1",
+        header_row=3,
+        questions=[QuestionRecord(number="59", question="Height", category="单项填空")],
+    )
+    fields = [
+        {
+            "attribute_key": "height",
+            "label": "Length",
+            "section_heading": "Price, Stock and Shipping Information (0/14)",
+        }
+    ]
+
+    audit = match_questions_to_fields(
+        qa,
+        fields,
+        sections={normalize_key("Height"): "Additional Description"},
+    )
+
+    assert audit.matches[0].status == UNMATCHED
     assert audit.matched_count == 0
