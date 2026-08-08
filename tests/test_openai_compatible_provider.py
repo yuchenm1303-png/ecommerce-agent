@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
+from app.ai_decisions import AI_DECISION_JSON_SCHEMA
 from app.providers.openai_compatible import (
     OpenAICompatibleProviderError,
     OpenAICompatibleSemanticProvider,
@@ -25,9 +27,7 @@ class FakeCreate:
 class FakeClient:
     def __init__(self, content: str):
         self.create_api = FakeCreate(content)
-        self.chat = SimpleNamespace(
-            completions=SimpleNamespace(create=self.create_api.create)
-        )
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create_api.create))
 
 
 def request_payload(image_path: str | None = None):
@@ -38,7 +38,7 @@ def request_payload(image_path: str | None = None):
             "kind": "text",
             "sha256": "abc",
             "origin": "https://supplier.test/item",
-            "content": "Screen Size: 3.0 inch.",
+            "content": "Colour: Black.",
         }
     ]
     if image_path:
@@ -52,29 +52,64 @@ def request_payload(image_path: str | None = None):
             }
         )
     return {
-        "task": "extract_only_source_grounded_answers_for_current_qa",
-        "batch_id": "source-001",
-        "product_identity": {"sku": "", "model_number": "L11", "brand": ""},
-        "questions": [{"question": "Screen Size", "business_locked": False}],
-        "business_locked_questions": [],
-        "rules": ["Do not guess."],
-        "source_reference_rule": "Use exact source id.",
-        "required_output_shape": {},
+        "task": "resolve_all_live_marketplace_fields_from_product_sources",
+        "system_instruction": "You are the primary product-listing resolver.",
+        "prompt_instruction": "Resolve every target field from grounded sources.",
+        "product_identity": {"sku": "SKU-1", "model_number": "M8", "brand": ""},
+        "schema_sha256": "schema-digest",
+        "source_manifest_sha256": "source-digest",
+        "target_fields": [
+            {
+                "field_id": "mf_colour",
+                "attribute_key": "colour",
+                "label": "Colour",
+                "section_heading": "Product Description",
+                "required": True,
+                "multi_value": False,
+                "options": ["Black", "White"],
+                "qualifier_options": [],
+                "help_text": "",
+                "business_locked": False,
+            }
+        ],
+        "rules": ["Do not invent unsupported product facts."],
         "grounded_sources": sources,
+        "json_contract": AI_DECISION_JSON_SCHEMA,
     }
 
 
 def valid_json():
-    return (
-        '{"product_identity":{"sku":"","model_number":"L11","brand":""},'
-        '"facts":[{"key":"Screen Size","aliases":[],"value":["3.0 inch"],'
-        '"source_type":"supplier_web","source_reference":"supplier:001:text:0001",'
-        '"confidence":0.88,"evidence_text":"Screen Size: 3.0 inch.","note":""}],'
-        '"warnings":[]}'
+    return json.dumps(
+        {
+            "contract_version": 1,
+            "product_identity": {"sku": "SKU-1", "model_number": "M8", "brand": ""},
+            "schema_sha256": "schema-digest",
+            "source_manifest_sha256": "source-digest",
+            "decisions": [
+                {
+                    "field_id": "mf_colour",
+                    "status": "ready",
+                    "values": ["Black"],
+                    "qualifier": "",
+                    "confidence": 0.95,
+                    "citations": [
+                        {
+                            "source_reference": "supplier:001:text:0001",
+                            "evidence_text": "Colour: Black.",
+                        }
+                    ],
+                    "alternatives": [],
+                    "reason": "supported by supplier source",
+                    "search_queries": [],
+                }
+            ],
+            "model_summary": "resolved product",
+            "warnings": [],
+        }
     )
 
 
-def test_prompt_only_provider_parses_fenced_json_and_keeps_api_key_out_of_prompt(tmp_path):
+def test_prompt_only_provider_parses_json_and_keeps_api_key_and_paths_out_of_prompt(tmp_path):
     image = tmp_path / "front.png"
     image.write_bytes(b"not-a-real-png-but-local-bytes")
     client = FakeClient(f"```json\n{valid_json()}\n```")
@@ -90,7 +125,7 @@ def test_prompt_only_provider_parses_fenced_json_and_keeps_api_key_out_of_prompt
     payload = provider.extract_json(request_payload(str(image)))
 
     assert payload["extractor"] == provider.name
-    assert payload["facts"][0]["value"] == ["3.0 inch"]
+    assert payload["decisions"][0]["values"] == ["Black"]
     kwargs = client.create_api.calls[0]
     assert kwargs["model"] == "vision-model"
     assert kwargs["timeout"] == 80
@@ -118,9 +153,7 @@ def test_explicit_thinking_mode_is_forwarded_via_extra_body():
     )
 
     provider.extract_json(request_payload())
-
-    kwargs = client.create_api.calls[0]
-    assert kwargs["extra_body"] == {"enable_thinking": False}
+    assert client.create_api.calls[0]["extra_body"] == {"enable_thinking": False}
 
 
 def test_explicit_high_detail_is_only_sent_when_requested(tmp_path):
@@ -136,7 +169,6 @@ def test_explicit_high_detail_is_only_sent_when_requested(tmp_path):
     )
 
     provider.extract_json(request_payload(str(image)))
-
     user_content = client.create_api.calls[0]["messages"][1]["content"]
     image_item = next(item for item in user_content if item.get("type") == "image_url")
     assert image_item["image_url"]["detail"] == "high"
@@ -153,21 +185,18 @@ def test_json_object_mode_requests_common_compat_response_format():
     )
 
     provider.extract_json(request_payload())
-
     kwargs = client.create_api.calls[0]
     assert kwargs["response_format"] == {"type": "json_object"}
     assert provider.base_url == "https://api.vendor.test/v1"
 
 
 def test_non_json_provider_output_fails_closed():
-    client = FakeClient("I think the screen is three inches.")
     provider = OpenAICompatibleSemanticProvider(
         model="vision-model",
         api_key="secret-key",
         base_url="https://api.vendor.test/v1",
-        client=client,
+        client=FakeClient("not-json"),
     )
-
     with pytest.raises(OpenAICompatibleProviderError, match="JSON object"):
         provider.extract_json(request_payload())
 
@@ -180,13 +209,12 @@ def test_missing_image_is_rejected_before_api_call(tmp_path):
         base_url="https://api.vendor.test/v1",
         client=client,
     )
-
     with pytest.raises(OpenAICompatibleProviderError, match="找不到图片"):
         provider.extract_json(request_payload(str(tmp_path / "missing.png")))
     assert not client.create_api.calls
 
 
-def test_prompt_foregrounds_grounding_rules_in_user_message():
+def test_provider_prompt_contains_ai_first_contract_and_no_legacy_fact_rules():
     client = FakeClient(valid_json())
     provider = OpenAICompatibleSemanticProvider(
         model="vision-model",
@@ -194,11 +222,24 @@ def test_prompt_foregrounds_grounding_rules_in_user_message():
         base_url="https://api.vendor.test/v1",
         client=client,
     )
-
     provider.extract_json(request_payload())
 
     user_text = client.create_api.calls[0]["messages"][1]["content"][0]["text"]
-    assert "GROUNDED OUTPUT RULES" in user_text
-    assert 'source_type="ai_synthesis"' in user_text
-    assert "character-for-character" in user_text
-    assert "source_reference" in user_text
+    assert "Resolve every target field" in user_text
+    assert '"target_fields"' in user_text
+    assert '"json_contract"' in user_text
+    assert "GROUNDED OUTPUT RULES" not in user_text
+    assert "ai_synthesis" not in user_text
+
+
+def test_provider_requires_task_json_contract():
+    provider = OpenAICompatibleSemanticProvider(
+        model="vision-model",
+        api_key="secret-key",
+        base_url="https://api.vendor.test/v1",
+        client=FakeClient(valid_json()),
+    )
+    payload = request_payload()
+    payload.pop("json_contract")
+    with pytest.raises(OpenAICompatibleProviderError, match="json_contract"):
+        provider.extract_json(payload)
