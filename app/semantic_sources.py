@@ -17,6 +17,7 @@ from .evidence_contract import (
 from .evidence_validation import is_business_question
 from .qa_catalog import QuestionCatalog, QuestionRecord
 from .semantic_extraction import (
+    GROUNDED_OUTPUT_RULES,
     SemanticExtractionProvider,
     build_grounded_semantic_request,
     validate_grounded_semantic_packet,
@@ -25,7 +26,7 @@ from .semantic_extraction import (
 from .semantic_grounding import GroundedSource, GroundingCatalog
 
 
-SOURCE_CACHE_VERSION = 2
+SOURCE_CACHE_VERSION = 3
 DEFAULT_MAX_REPAIR_ATTEMPTS = 1
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -95,12 +96,7 @@ class SemanticSourceRunResult:
 
 
 def build_semantic_pending_catalog(catalog: QuestionCatalog) -> QuestionCatalog:
-    """Return only questions that semantic extraction is allowed to answer.
-
-    Customer-provided answers are already grounded and should not consume model
-    time. Seller-controlled business questions stay locked out regardless of
-    source content.
-    """
+    """Return only questions that semantic extraction is allowed to answer."""
 
     pending = [
         question
@@ -148,6 +144,10 @@ def _source_digest(source: GroundedSource) -> str:
     ).hexdigest()
 
 
+def _grounding_contract_digest() -> str:
+    return hashlib.sha256(GROUNDED_OUTPUT_RULES.encode("utf-8")).hexdigest()
+
+
 def _cache_key(
     provider: SemanticExtractionProvider,
     cache_namespace: str,
@@ -158,6 +158,7 @@ def _cache_key(
 ) -> str:
     payload = {
         "cache_version": SOURCE_CACHE_VERSION,
+        "grounding_contract_sha256": _grounding_contract_digest(),
         "provider": provider.name,
         "cache_namespace": cache_namespace,
         "identity": {
@@ -237,6 +238,7 @@ def _write_cached_packet(path: Path, packet: EvidencePacket) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "cache_version": SOURCE_CACHE_VERSION,
+        "grounding_contract_sha256": _grounding_contract_digest(),
         "packet": _packet_mapping(packet),
     }
     temp = path.with_suffix(path.suffix + ".tmp")
@@ -269,15 +271,9 @@ def run_grounded_semantic_sources(
 ) -> SemanticSourceRunResult:
     """Extract every logical grounded source at most once in the normal path.
 
-    The old implementation multiplied calls by ``question_batch × source_chunk``.
-    Production extraction is source-first instead: each image is seen once and
-    all text chunks from one original page/file are sent together once, against
-    the complete pending question set.
-
-    A validated content-addressed cache makes identical retries zero-call. One
-    optional repair is reserved for a source response whose candidates are all
-    rejected by strict validation. If some facts validate, invalid siblings are
-    dropped fail-closed and the source is *not* re-run.
+    Each image is seen once; all citation chunks from one original text source
+    are sent together once against the complete pending question set. One bad
+    sibling fact is dropped fail-closed instead of forcing the source to rerun.
     """
 
     if max_repair_attempts < 0 or max_repair_attempts > 1:
@@ -374,7 +370,6 @@ def run_grounded_semantic_sources(
                 group,
                 identity=expected_identity,
             )
-            request["batch_id"] = f"source-{index:03d}:{source_id}"
             request["source_pass_id"] = source_id
 
             for attempt_index in range(max_repair_attempts + 1):
