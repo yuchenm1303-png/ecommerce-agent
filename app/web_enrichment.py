@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, Iterable, Protocol
 
 from .ai_decisions import (
-    BUSINESS_LOCKED,
     CONFLICT,
     MISSING,
     READY,
@@ -20,13 +19,13 @@ from .ai_decisions import (
     FieldDecision,
     field_contract,
     field_id,
-    source_manifest_digest,
+    load_ai_decision_packet,
     validate_ai_decision_packet,
 )
 from .business_fields import is_business_question
 from .evidence_contract import ProductIdentity
 from .providers.dashscope_web_search import WebSearchJSONResult, WebSearchSource
-from .semantic_grounding import GroundedSource, GroundingCatalog, TEXT_KIND
+from .semantic_grounding import GroundingCatalog
 from .source_bundle import normalize_key
 
 
@@ -78,17 +77,6 @@ class PersistedWebSource:
             request_id=str(payload.get("request_id") or "").strip(),
         )
 
-    def grounded_source(self) -> GroundedSource:
-        digest = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
-        return GroundedSource(
-            source_id=self.source_reference,
-            source_type="dashscope_web_search",
-            kind=TEXT_KIND,
-            origin=self.url,
-            content=self.content,
-            sha256=digest,
-        )
-
 
 @dataclass(slots=True)
 class WebEnrichmentResult:
@@ -100,14 +88,6 @@ class WebEnrichmentResult:
     searched: bool = False
     elapsed_seconds: float = 0.0
     warning: str = ""
-
-
-def _identity_payload(identity: ProductIdentity) -> dict[str, str]:
-    return {
-        "sku": identity.sku,
-        "model_number": identity.model_number,
-        "brand": identity.brand,
-    }
 
 
 def _field_is_business(field: dict[str, Any]) -> bool:
@@ -126,11 +106,8 @@ def _target_decisions(
         field = by_id.get(decision.field_id)
         if field is None or _field_is_business(field):
             continue
-        if decision.status not in WEB_UPDATABLE_STATUSES:
-            continue
-        if not decision.search_queries:
-            continue
-        output.append((field, decision))
+        if decision.status in WEB_UPDATABLE_STATUSES and decision.search_queries:
+            output.append((field, decision))
     return output
 
 
@@ -153,7 +130,11 @@ def _web_prompt(
 ) -> str:
     payload = {
         "task": "research_and_resolve_only_the_unresolved_marketplace_fields",
-        "product_identity": _identity_payload(packet.identity),
+        "product_identity": {
+            "sku": packet.identity.sku,
+            "model_number": packet.identity.model_number,
+            "brand": packet.identity.brand,
+        },
         "model_summary": packet.model_summary,
         "target_fields": [
             {
@@ -164,17 +145,17 @@ def _web_prompt(
             for field, decision in targets
         ],
         "rules": [
-            "Use web search only for these target fields; do not discuss or change other fields.",
-            "Preserve exact product and selected-variant identity. Generic model names require extra caution.",
-            "Use the provided search_queries as the starting research plan and combine queries when efficient.",
-            "READY means web research now supports one best answer for the exact current product/variant.",
-            "REVIEW means there is a plausible answer but identity, scope or evidence is still not strong enough for automatic entry.",
-            "CONFLICT means credible sources still support materially incompatible answers. Preserve alternatives.",
-            "MISSING means normal web research did not establish the value.",
+            "Use web search only for these target fields; never change fields that were already READY.",
+            "Preserve exact product and selected-variant identity; generic model names require extra caution.",
+            "Use each target's search_queries as the research starting point and combine searches when efficient.",
+            "READY means web research supports one best answer for the exact current product/variant.",
+            "REVIEW means a plausible answer exists but identity, scope or evidence is not strong enough for automatic entry.",
+            "CONFLICT means credible web/local evidence remains materially incompatible; preserve alternatives.",
+            "MISSING means bounded normal web research did not establish the value.",
             "Never infer seller-operated price, stock, MOQ, fulfilment, shipping or listing status.",
-            "Every READY/REVIEW citation and every CONFLICT alternative citation must use the exact source_url of a page actually found by this web-search call.",
-            "Do not invent source URLs. Do not treat lack of mention as No/False/Not included.",
-            "When target options are supplied, output exact marketplace option text when clearly supported.",
+            "Every READY/REVIEW citation and every CONFLICT alternative citation must use the exact source_url of a page actually returned by this search call.",
+            "Do not invent URLs and do not treat lack of mention as No/False/Not included.",
+            "When target options are supplied, return exact marketplace option text when one clearly matches.",
             "Return exactly one JSON object and no markdown.",
         ],
         "json_contract": {
@@ -187,8 +168,8 @@ def _web_prompt(
                     "confidence": "0..1",
                     "citations": [
                         {
-                            "source_url": "exact URL from web search",
-                            "evidence_text": "concise evidence the searched page/result supports",
+                            "source_url": "exact URL returned by web search",
+                            "evidence_text": "concise evidence supporting the field",
                         }
                     ],
                     "alternatives": [
@@ -197,7 +178,7 @@ def _web_prompt(
                             "qualifier": "string",
                             "citations": [
                                 {
-                                    "source_url": "exact URL from web search",
+                                    "source_url": "exact URL returned by web search",
                                     "evidence_text": "concise evidence",
                                 }
                             ],
@@ -211,8 +192,8 @@ def _web_prompt(
         },
     }
     return (
-        "You are the web-research phase of an AI-first product listing resolver. "
-        "Research the unresolved fields in one bounded pass and return JSON only.\n\n"
+        "You are the single bounded web-research phase of an AI-first product listing resolver. "
+        "Research all unresolved targets in this one call and return JSON only.\n\n"
         + json.dumps(payload, ensure_ascii=False)
     )
 
@@ -235,20 +216,18 @@ def _source_lookup(items: Iterable[WebSearchSource]) -> dict[str, WebSearchSourc
     return output
 
 
-def _raw_citations(payload: Any) -> list[dict[str, Any]]:
-    if not isinstance(payload, list):
-        return []
-    return [item for item in payload if isinstance(item, dict)]
-
-
 def _convert_citations(
     payload: Any,
     source_lookup: dict[str, WebSearchSource],
     evidence_by_url: dict[str, list[str]],
 ) -> list[DecisionCitation]:
+    if not isinstance(payload, list):
+        return []
     output: list[DecisionCitation] = []
     seen: set[tuple[str, str]] = set()
-    for item in _raw_citations(payload):
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
         url = str(item.get("source_url") or "").strip()
         evidence = str(item.get("evidence_text") or "").strip()
         source = source_lookup.get(_normalize_url(url))
@@ -259,12 +238,7 @@ def _convert_citations(
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
-        output.append(
-            DecisionCitation(
-                source_reference=reference,
-                evidence_text=evidence,
-            )
-        )
+        output.append(DecisionCitation(reference, evidence))
         evidence_by_url.setdefault(_normalize_url(source.url), []).append(evidence)
     return output
 
@@ -281,19 +255,18 @@ def _convert_alternatives(
         if not isinstance(item, dict):
             continue
         raw_values = item.get("values") or []
-        values = tuple(
-            str(value).strip()
-            for value in raw_values
-            if str(value).strip()
-        ) if isinstance(raw_values, list) else ()
-        citations = _convert_citations(
-            item.get("citations"), source_lookup, evidence_by_url
+        values = (
+            tuple(str(value).strip() for value in raw_values if str(value).strip())
+            if isinstance(raw_values, list)
+            else ()
         )
         output.append(
             DecisionAlternative(
                 values=values,
                 qualifier=str(item.get("qualifier") or "").strip(),
-                citations=tuple(citations),
+                citations=tuple(
+                    _convert_citations(item.get("citations"), source_lookup, evidence_by_url)
+                ),
                 reason=str(item.get("reason") or "").strip(),
             )
         )
@@ -302,10 +275,9 @@ def _convert_alternatives(
 
 def _float_confidence(value: Any) -> float:
     try:
-        parsed = float(value)
+        return max(0.0, min(1.0, float(value)))
     except (TypeError, ValueError):
         return 0.0
-    return max(0.0, min(1.0, parsed))
 
 
 def _parse_web_updates(
@@ -323,7 +295,7 @@ def _parse_web_updates(
     if not isinstance(raw_decisions, list):
         raise AIDecisionError("web enrichment 响应缺少 decisions 数组。")
 
-    for index, item in enumerate(raw_decisions, start=1):
+    for item in raw_decisions:
         if not isinstance(item, dict):
             continue
         identifier = str(item.get("field_id") or "").strip()
@@ -337,12 +309,10 @@ def _parse_web_updates(
             warnings.append(f"web update {identifier}: invalid status={status!r}; kept prior")
             continue
         raw_values = item.get("values") or []
-        values = [str(value).strip() for value in raw_values if str(value).strip()] if isinstance(raw_values, list) else []
-        citations = _convert_citations(
-            item.get("citations"), source_lookup, evidence_by_url
-        )
-        alternatives = _convert_alternatives(
-            item.get("alternatives"), source_lookup, evidence_by_url
+        values = (
+            [str(value).strip() for value in raw_values if str(value).strip()]
+            if isinstance(raw_values, list)
+            else []
         )
         updates[identifier] = FieldDecision(
             field_id=identifier,
@@ -350,8 +320,12 @@ def _parse_web_updates(
             values=values,
             qualifier=str(item.get("qualifier") or "").strip(),
             confidence=_float_confidence(item.get("confidence")),
-            citations=citations,
-            alternatives=alternatives,
+            citations=_convert_citations(
+                item.get("citations"), source_lookup, evidence_by_url
+            ),
+            alternatives=_convert_alternatives(
+                item.get("alternatives"), source_lookup, evidence_by_url
+            ),
             reason=str(item.get("reason") or "").strip(),
             search_queries=[],
         )
@@ -363,16 +337,18 @@ def _parse_web_updates(
         seen: set[str] = set()
         for evidence in evidence_items:
             key = normalize_key(evidence)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            unique_evidence.append(evidence)
-        content_parts = [
-            f"Search result title: {source.title}" if source.title else "",
-            f"Search result URL: {source.url}",
-            *[f"Search-model evidence: {item}" for item in unique_evidence],
-        ]
-        content = "\n".join(part for part in content_parts if part).strip()
+            if key and key not in seen:
+                seen.add(key)
+                unique_evidence.append(evidence)
+        content = "\n".join(
+            part
+            for part in [
+                f"Search result title: {source.title}" if source.title else "",
+                f"Search result URL: {source.url}",
+                *[f"Search-model evidence: {item}" for item in unique_evidence],
+            ]
+            if part
+        ).strip()
         persisted.append(
             PersistedWebSource(
                 source_reference=_web_source_reference(source.url),
@@ -386,16 +362,15 @@ def _parse_web_updates(
     return updates, persisted, warnings
 
 
-def _augmented_grounding(
-    local_grounding: GroundingCatalog,
-    web_sources: Iterable[PersistedWebSource],
-) -> GroundingCatalog:
-    return GroundingCatalog(
-        sources=[
-            *local_grounding.sources,
-            *(source.grounded_source() for source in web_sources),
-        ]
-    )
+def _external_source_map(web_sources: Iterable[PersistedWebSource]) -> dict[str, str]:
+    output: dict[str, str] = {}
+    for source in web_sources:
+        if source.source_reference in output:
+            raise AIDecisionError(
+                f"web source_reference 重复：{source.source_reference}"
+            )
+        output[source.source_reference] = source.content
+    return output
 
 
 def _merge_packet(
@@ -407,13 +382,13 @@ def _merge_packet(
     warnings: list[str],
     summary: str,
 ) -> AIDecisionPacket:
-    grounding = _augmented_grounding(local_grounding, web_sources)
-    decisions = [updates.get(item.field_id, item) for item in initial.decisions]
     candidate = AIDecisionPacket(
         identity=initial.identity,
         schema_sha256=initial.schema_sha256,
-        source_manifest_sha256=source_manifest_digest(grounding),
-        decisions=decisions,
+        # Web evidence is embedded separately. This digest continues to bind the
+        # exact original customer/images/supplier source pack.
+        source_manifest_sha256=initial.source_manifest_sha256,
+        decisions=[updates.get(item.field_id, item) for item in initial.decisions],
         model_summary=(
             initial.model_summary
             + ("\nWeb enrichment: " + summary if summary else "\nWeb enrichment completed.")
@@ -424,8 +399,9 @@ def _merge_packet(
     return validate_ai_decision_packet(
         candidate,
         fields,
-        grounding,
+        local_grounding,
         expected_identity=initial.identity,
+        external_sources=_external_source_map(web_sources),
     )
 
 
@@ -475,11 +451,7 @@ def write_enriched_ai_decision_packet(
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
-        json.dumps(
-            enriched_packet_payload(packet, web_sources),
-            ensure_ascii=False,
-            indent=2,
-        ),
+        json.dumps(enriched_packet_payload(packet, web_sources), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return target
@@ -492,21 +464,11 @@ def load_enriched_ai_decision_packet(
     *,
     expected_identity: ProductIdentity = ProductIdentity(),
 ) -> AIDecisionPacket:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    raw_sources = payload.get("web_sources") or []
-    if not isinstance(raw_sources, list):
-        raise AIDecisionError("web_sources 必须是数组。")
-    web_sources = [
-        PersistedWebSource.from_mapping(item)
-        for item in raw_sources
-        if isinstance(item, dict)
-    ]
-    grounding = _augmented_grounding(local_grounding, web_sources)
-    packet = AIDecisionPacket.from_mapping(payload)
-    return validate_ai_decision_packet(
-        packet,
+    # Unified loader already understands optional embedded web_sources.
+    return load_ai_decision_packet(
+        path,
         fields,
-        grounding,
+        local_grounding,
         expected_identity=expected_identity,
     )
 
@@ -519,10 +481,11 @@ def run_web_enrichment(
     *,
     cache_dir: str | Path | None = None,
 ) -> WebEnrichmentResult:
-    """Optionally research all AI-requested gaps in one sourced web call.
+    """Research all AI-requested gaps in at most one sourced web call.
 
-    Existing READY and business fields are immutable. Failure of the optional
-    search phase keeps the valid local decision packet instead of destroying it.
+    Existing READY and business fields are immutable. Optional search failure
+    preserves the valid local decision packet. Repeated identical research can
+    replay from cache with zero web model calls.
     """
 
     started = time.monotonic()
@@ -531,14 +494,14 @@ def run_web_enrichment(
     if not targets:
         return WebEnrichmentResult(
             packet=initial,
-            target_field_count=0,
-            searched=False,
             elapsed_seconds=time.monotonic() - started,
         )
 
     cache_path: Path | None = None
     if cache_dir is not None:
-        cache_path = Path(cache_dir) / f"web-enrichment-{_web_cache_key(provider, initial, targets)}.json"
+        cache_path = Path(cache_dir) / (
+            f"web-enrichment-{_web_cache_key(provider, initial, targets)}.json"
+        )
         if cache_path.is_file():
             try:
                 payload = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -548,13 +511,12 @@ def run_web_enrichment(
                     for item in raw_sources
                     if isinstance(item, dict)
                 ]
-                packet = AIDecisionPacket.from_mapping(payload)
-                grounding = _augmented_grounding(local_grounding, web_sources)
                 packet = validate_ai_decision_packet(
-                    packet,
+                    AIDecisionPacket.from_mapping(payload),
                     field_list,
-                    grounding,
+                    local_grounding,
                     expected_identity=initial.identity,
+                    external_sources=_external_source_map(web_sources),
                 )
                 return WebEnrichmentResult(
                     packet=packet,
@@ -588,7 +550,6 @@ def run_web_enrichment(
         return WebEnrichmentResult(
             packet=initial,
             model_calls=1,
-            cache_hit=False,
             target_field_count=len(targets),
             searched=True,
             elapsed_seconds=time.monotonic() - started,
@@ -599,7 +560,11 @@ def run_web_enrichment(
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
         temp.write_text(
-            json.dumps(enriched_packet_payload(packet, web_sources), ensure_ascii=False, indent=2),
+            json.dumps(
+                enriched_packet_payload(packet, web_sources),
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
         temp.replace(cache_path)
@@ -608,7 +573,6 @@ def run_web_enrichment(
         packet=packet,
         web_sources=web_sources,
         model_calls=1,
-        cache_hit=False,
         target_field_count=len(targets),
         searched=True,
         elapsed_seconds=time.monotonic() - started,
