@@ -14,6 +14,14 @@ from .source_bundle import ProductSourceBundle
 READY = "ready"
 BLOCKED = "blocked"
 
+# A live Makro field that is not matched to a customer QA row has no semantic
+# question binding. It may still be a legitimate seller/business field, but only
+# explicit structured/config/rule inputs are allowed to authorize an autofill.
+# Image/web/AI/customer-QA evidence must never spill into an unmatched live field
+# merely because its attribute_key happens to share a generic name such as
+# height, brand, model or status.
+UNMATCHED_LIVE_AUTOFILL_SOURCE_TYPES = {"structured", "business", "config", "rule"}
+
 
 @dataclass(slots=True)
 class LiveFillPlanItem:
@@ -122,6 +130,30 @@ def _block_items(items: list[LiveFillPlanItem], keys: tuple[str, ...], detail: s
         item.resolution.detail = detail
 
 
+def _gate_unmatched_live_resolution(
+    resolution: ResolutionRecord,
+    *,
+    question: QuestionRecord | None,
+) -> str | None:
+    """Prevent evidence-key collisions from authorizing unrelated live fields."""
+
+    if question is not None or not resolution.eligible_for_autofill:
+        return None
+    source_type = str(resolution.source_type or "")
+    if source_type in UNMATCHED_LIVE_AUTOFILL_SOURCE_TYPES:
+        return None
+
+    detail = (
+        "实时 Makro 字段未匹配 QA，且候选证据来自 "
+        f"source_type={source_type or 'unknown'}；为避免同名 attribute_key/label 串字段，"
+        "未匹配 live field 只允许 structured/business/config/rule 明确输入自动填写。"
+    )
+    resolution.status = NEEDS_REVIEW
+    resolution.eligible_for_autofill = False
+    resolution.detail = detail
+    return detail
+
+
 def _apply_cross_field_business_rules(items: list[LiveFillPlanItem]) -> None:
     by_key = {item.attribute_key: item for item in items}
 
@@ -161,9 +193,9 @@ def build_live_fill_plan(
     """Plan every live Makro field, not merely the questions in the QA sheet.
 
     QA matching contributes question metadata to product attributes. Live fields
-    that are not in the customer QA sheet are still resolved directly from the
-    evidence bundle; this is essential for seller/business fields such as SKU,
-    price, MOQ, fulfilment and shipping configuration.
+    that are not in the customer QA sheet are still resolved from explicit
+    structured/business/config/rule evidence; semantic image/web/AI evidence is
+    never allowed to leak into them by a generic key collision.
     """
 
     fields = list(semantic_fields)
@@ -182,9 +214,15 @@ def build_live_fill_plan(
             policy=effective_policy,
             question=question,
         )
+        unmatched_gate_detail = _gate_unmatched_live_resolution(
+            resolution,
+            question=question,
+        )
         action = READY if resolution.eligible_for_autofill else BLOCKED
         if action == READY:
             reason = "证据、置信度和字段约束均通过，可进入浏览器填写层。"
+        elif unmatched_gate_detail:
+            reason = unmatched_gate_detail
         elif question is None:
             reason = "实时 Makro 字段未匹配 QA；仅在显式结构化证据可解析时才允许自动填写。"
             if resolution.detail:
