@@ -42,7 +42,7 @@ class PhotoUploadResult:
 
 
 def parse_completion_counter(title: str) -> tuple[int, int] | None:
-    match = re.search(r"\((\d+)\s*/\s*(\d+)\)\s*$", str(title or ""))
+    match = re.search(r"\(\s*(\d+)\s*/\s*(\d+)\s*\)\s*$", str(title or ""))
     if not match:
         return None
     return int(match.group(1)), int(match.group(2))
@@ -54,7 +54,7 @@ def _photo_state(page: Page, section_path: str) -> dict[str, Any]:
         return {"found": False, "detail": f"section path 匹配 {card.count()} 个节点"}
 
     payload = card.evaluate(
-        """card => {
+        r"""card => {
           const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
           const titleEl = card.querySelector(
             '[class*="styles__Title-"], [class*="Title-ef7o31"], [class*="Title-"]'
