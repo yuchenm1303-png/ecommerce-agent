@@ -6,8 +6,33 @@ from typing import Any, Iterable
 from .evidence_contract import EvidencePacket, ExtractedFact, ProductIdentity
 from .evidence_validation import EXTERNAL_EVIDENCE_SOURCE_TYPES, is_business_question
 from .qa_catalog import QuestionCatalog, QuestionRecord
-from .source_snapshot import SourceSnapshot, SnapshotTableRow
+from .source_snapshot import SourceSnapshot
 from .source_bundle import normalize_key
+
+
+_SCOPE_AMBIGUOUS_DIMENSION_KEYS = {
+    "width",
+    "depth",
+    "height",
+    "length",
+    "breadth",
+    "weight",
+}
+_SCOPE_QUALIFIED_DIMENSION_MARKERS = (
+    "product",
+    "device",
+    "camera",
+    "body",
+    "package",
+    "packaging",
+    "shipping",
+    "carton",
+    "产品",
+    "设备",
+    "机身",
+    "包装",
+    "包裹",
+)
 
 
 @dataclass(slots=True)
@@ -101,6 +126,25 @@ def _jsonld_pairs(snapshot: SourceSnapshot) -> list[tuple[str, str, str]]:
     return pairs
 
 
+def _scope_ambiguous_dimension_key(raw_key: str, question: QuestionRecord) -> bool:
+    """Generic dimension rows lack enough context for deterministic binding.
+
+    A captured table row such as ``Width: 11`` does not tell us whether 11 is
+    product width or package width. The semantic extractor sees the surrounding
+    source text and can recover a scoped fact; the deterministic exact-key path
+    must not silently choose one scope.
+    """
+
+    raw_norm = normalize_key(raw_key)
+    if raw_norm not in _SCOPE_AMBIGUOUS_DIMENSION_KEYS:
+        return False
+    question_norm = question.normalized_question
+    if question_norm != raw_norm:
+        return False
+    lowered = raw_key.casefold()
+    return not any(marker in lowered for marker in _SCOPE_QUALIFIED_DIMENSION_MARKERS)
+
+
 def extract_snapshot_evidence(
     snapshot: SourceSnapshot,
     catalog: QuestionCatalog,
@@ -111,9 +155,9 @@ def extract_snapshot_evidence(
     """Extract deterministic facts from explicit table/JSON-LD key-value pairs.
 
     Visible prose is intentionally not parsed here. A key must exactly normalize
-    to one unique current QA question. Free-text interpretation is reserved for a
-    later evidence-grounded model extractor and uses the stricter EvidencePacket
-    contract.
+    to one unique current QA question. Scope-ambiguous generic dimensions are
+    quarantined because an exact key alone cannot distinguish product size from
+    packaging size; semantic grounded extraction handles those with context.
     """
 
     if source_type not in EXTERNAL_EVIDENCE_SOURCE_TYPES or source_type == "ai_synthesis":
@@ -146,6 +190,12 @@ def extract_snapshot_evidence(
             ignored += 1
             warnings.append(
                 f"business field ignored from snapshot: {question.question} @ {reference}"
+            )
+            continue
+        if _scope_ambiguous_dimension_key(raw_key, question):
+            ignored += 1
+            warnings.append(
+                f"scope-ambiguous dimension ignored from snapshot: {raw_key}={value} @ {reference}"
             )
             continue
 
