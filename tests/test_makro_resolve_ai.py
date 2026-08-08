@@ -70,7 +70,10 @@ class FakeProvider:
         self.calls += 1
         self.requests.append(request)
         if request["task"] == "understand_product_from_local_evidence":
-            image_source = next(source for source in request["grounded_sources"] if source["kind"] == "image")
+            image_source = next(
+                source for source in request["grounded_sources"]
+                if source["kind"] == "image"
+            )
             return {
                 "facts": [
                     {
@@ -106,16 +109,23 @@ class FakeProvider:
                             "values": ["3.0"],
                             "qualifier": "inch",
                             "citations": [profile_citation],
-                            "profile_fact_ids": [profile_fact["fact_id"]],
                         }
                     )
                 else:
-                    decisions.append({"field_id": target["field_id"], "status": "missing"})
+                    decisions.append(
+                        {
+                            "field_id": target["field_id"],
+                            "status": "missing",
+                        }
+                    )
             return {"decisions": decisions}
         raise AssertionError(f"unexpected task: {request['task']}")
 
 
-def test_resolver_builds_profile_once_then_maps_small_batches_without_browser(tmp_path, monkeypatch):
+def test_resolver_builds_profile_once_then_maps_small_batches_without_browser(
+    tmp_path,
+    monkeypatch,
+):
     qa = _qa_file(tmp_path)
     live_schema = _live_schema_file(tmp_path)
     image = tmp_path / "front.jpg"
@@ -151,12 +161,15 @@ def test_resolver_builds_profile_once_then_maps_small_batches_without_browser(tm
     )
 
     assert makro_resolve_ai.main() == 0
-    assert provider.calls == 3  # 1 profile + 2 one-field mapping batches
+    assert provider.calls == 3
     profile_request = provider.requests[0]
     mapping_requests = provider.requests[1:]
     assert profile_request["task"] == "understand_product_from_local_evidence"
     assert any(source["kind"] == "image" for source in profile_request["grounded_sources"])
-    assert all(request["task"] == "map_product_profile_to_marketplace_fields" for request in mapping_requests)
+    assert all(
+        request["task"] == "map_product_profile_to_marketplace_fields"
+        for request in mapping_requests
+    )
     assert all(len(request["target_fields"]) == 1 for request in mapping_requests)
     assert all(
         request["grounded_sources"][0]["source_type"] == "derived_product_profile"
@@ -223,7 +236,11 @@ def test_cache_namespace_ignores_transport_timeout_but_keeps_semantic_config():
 
 def test_cli_has_staged_batch_controls_and_no_whole_product_repair_switch():
     parser = makro_resolve_ai.build_parser()
-    option_strings = {option for action in parser._actions for option in action.option_strings}
+    option_strings = {
+        option
+        for action in parser._actions
+        for option in action.option_strings
+    }
     assert "--api-key" not in option_strings
     assert "--api-key-env" in option_strings
     assert "--live-schema" in option_strings
