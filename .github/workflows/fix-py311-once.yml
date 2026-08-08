@@ -1,0 +1,33 @@
+name: fix-py311-once
+on:
+  push:
+    branches: [feat/review-preview-gate]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.event.head_commit.message == 'chore: apply py311 batching syntax fix'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/review-preview-gate
+          fetch-depth: 0
+      - name: Patch Python 3.11 syntax
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('app/web_enrichment.py')
+          s = p.read_text(encoding='utf-8')
+          old = 'def _mechanical_batches[T](items: list[T], batch_size: int) -> list[list[T]]:'
+          new = 'def _mechanical_batches(items: list[Any], batch_size: int) -> list[list[Any]]:'
+          if old not in s:
+              raise SystemExit('target syntax not found')
+          p.write_text(s.replace(old, new), encoding='utf-8')
+          PY
+          rm .github/workflows/fix-py311-once.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m 'fix: keep web batching Python 3.11 compatible'
+          git push origin HEAD:feat/review-preview-gate
