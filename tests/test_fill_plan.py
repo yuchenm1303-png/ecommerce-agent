@@ -6,11 +6,11 @@ from app.resolution_engine import ResolutionPolicy
 from app.source_bundle import ProductSourceBundle, normalize_key
 
 
-def field(key: str, label: str, *, required: bool = True):
+def field(key: str, label: str, *, required: bool = True, section: str = "Product Description"):
     return {
         "attribute_key": key,
         "label": label,
-        "section_heading": "Product Description",
+        "section_heading": section,
         "required": required,
         "multi_value": False,
         "controls": [],
@@ -34,6 +34,18 @@ def add_structured(bundle: ProductSourceBundle, key: str, value: str):
         source_reference=f"products.xlsx:{key}",
         priority=10,
         confidence=1.0,
+    )
+
+
+def add_product_image(bundle: ProductSourceBundle, key: str, value: str):
+    bundle.add_evidence(
+        key=key,
+        value=value,
+        source_type="product_image",
+        source_reference="image:001",
+        priority=30,
+        confidence=0.96,
+        evidence_text=f"{key}: {value}",
     )
 
 
@@ -138,3 +150,46 @@ def test_explicit_question_alias_also_resolves_evidence_under_qa_label():
     assert plan.items[0].resolution.answer == "1920x1080"
     assert plan.items[0].resolution.label == "Image Resolution"
     assert plan.items[0].resolution.provenance[0]["key"] == "Video Resolution"
+
+
+def test_unmatched_live_field_cannot_autofill_from_semantic_key_collision():
+    bundle = ProductSourceBundle()
+    add_product_image(bundle, "Height", "7")
+
+    plan = build_live_fill_plan(
+        catalog(),
+        [
+            field(
+                "height",
+                "Length",
+                section="Price, Stock and Shipping Information (0/14)",
+            )
+        ],
+        bundle,
+    )
+
+    assert plan.items[0].question == ""
+    assert plan.items[0].action == BLOCKED
+    assert plan.items[0].resolution.eligible_for_autofill is False
+    assert "同名 attribute_key/label 串字段" in plan.items[0].reason
+
+
+def test_unmatched_live_field_may_autofill_from_explicit_structured_input():
+    bundle = ProductSourceBundle()
+    add_structured(bundle, "Height", "7")
+
+    plan = build_live_fill_plan(
+        catalog(),
+        [
+            field(
+                "height",
+                "Length",
+                section="Price, Stock and Shipping Information (0/14)",
+            )
+        ],
+        bundle,
+    )
+
+    assert plan.items[0].question == ""
+    assert plan.items[0].action == READY
+    assert plan.items[0].resolution.source_type == "structured"
