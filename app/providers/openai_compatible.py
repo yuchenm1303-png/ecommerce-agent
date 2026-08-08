@@ -3,8 +3,11 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+import queue
+import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .errors import JSONTaskProviderError, JSONTaskResponseError, JSONTaskTransportError
 
@@ -22,6 +25,7 @@ class OpenAICompatibleResponseError(JSONTaskResponseError, OpenAICompatibleProvi
 
 
 SUPPORTED_COMPAT_PROFILES = ("generic", "qwen-omni")
+_PROGRESS_INTERVAL_SECONDS = 15.0
 
 
 def _image_data_uri(path_value: str) -> str:
@@ -36,13 +40,11 @@ def _image_data_uri(path_value: str) -> str:
 
 
 def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
-    """Serialize the AI task without leaking local image paths."""
+    """Serialize only model-relevant task data; local paths/digests stay local."""
 
     payload = {
         "task": request_payload.get("task"),
         "product_identity": request_payload.get("product_identity") or {},
-        "schema_sha256": request_payload.get("schema_sha256", ""),
-        "source_manifest_sha256": request_payload.get("source_manifest_sha256", ""),
         "target_fields": request_payload.get("target_fields") or [],
         "rules": request_payload.get("rules") or [],
         "grounded_sources": [],
@@ -55,7 +57,6 @@ def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
             "source_id": source.get("source_id", ""),
             "source_type": source.get("source_type", ""),
             "kind": source.get("kind", ""),
-            "sha256": source.get("sha256", ""),
         }
         if source.get("kind") == "text":
             item["origin"] = source.get("origin", "")
@@ -73,8 +74,8 @@ def _task_instruction(request_payload: dict[str, Any]) -> str:
             + validation_error
         )
     parts.append(
-        "Return exactly one JSON object and no markdown. Follow json_contract. "
-        "Never invent unsupported product facts."
+        "Return exactly one valid JSON object and no markdown or prose outside JSON. "
+        "Follow json_contract. Never invent unsupported product facts."
     )
     return "\n\n".join(part for part in parts if part)
 
@@ -86,7 +87,7 @@ def _message_content(request_payload: dict[str, Any], *, image_detail: str) -> l
             "text": (
                 _task_instruction(request_payload)
                 + "\n\n"
-                + json.dumps(_prompt_payload(request_payload), ensure_ascii=False)
+                + json.dumps(_prompt_payload(request_payload), ensure_ascii=False, separators=(",", ":"))
             ),
         }
     ]
@@ -98,14 +99,12 @@ def _message_content(request_payload: dict[str, Any], *, image_detail: str) -> l
             {
                 "type": "text",
                 "text": (
-                    f"The immediately following image is grounded source_id={source_id}. "
-                    "Any citation to this image must use exactly that source_reference."
+                    f"The immediately following image is source_id={source_id}. "
+                    "Citations to it must use exactly this source_reference."
                 ),
             }
         )
-        image_url: dict[str, Any] = {
-            "url": _image_data_uri(str(source.get("image_path") or "")),
-        }
+        image_url: dict[str, Any] = {"url": _image_data_uri(str(source.get("image_path") or ""))}
         if image_detail in {"low", "high"}:
             image_url["detail"] = image_detail
         content.append({"type": "image_url", "image_url": image_url})
@@ -132,8 +131,14 @@ def _extract_message_text(response: Any) -> str:
     return str(content or "").strip()
 
 
-def _extract_stream_text(stream: Any) -> str:
+def _extract_stream_text(
+    stream: Any,
+    *,
+    started: float,
+    progress: Callable[[str], None] | None = None,
+) -> str:
     parts: list[str] = []
+    first_output_reported = False
     for chunk in stream:
         choices = getattr(chunk, "choices", None)
         if not choices:
@@ -142,13 +147,19 @@ def _extract_stream_text(stream: Any) -> str:
         if delta is None:
             continue
         content = getattr(delta, "content", None)
+        texts: list[str] = []
         if isinstance(content, str):
-            parts.append(content)
+            texts.append(content)
         elif isinstance(content, list):
             for item in content:
                 text = item.get("text") if isinstance(item, dict) else getattr(item, "text", None)
                 if text:
-                    parts.append(str(text))
+                    texts.append(str(text))
+        if texts:
+            parts.extend(texts)
+            if not first_output_reported and progress is not None:
+                first_output_reported = True
+                progress(f"AI first output received at {time.monotonic() - started:.1f}s")
     return "".join(parts).strip()
 
 
@@ -171,11 +182,24 @@ def _parse_json_object(text: str) -> dict[str, Any]:
             continue
         if isinstance(payload, dict):
             return payload
-    raise OpenAICompatibleResponseError("OpenAI-compatible API 未返回可解析的 JSON object。")
+    preview = raw[:300].replace("\n", " ")
+    raise OpenAICompatibleResponseError(
+        "OpenAI-compatible API 未返回可解析的 JSON object。"
+        + (f" response_prefix={preview!r}" if preview else "")
+    )
+
+
+def _close_response(response: Any) -> None:
+    close = getattr(response, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
 
 
 class OpenAICompatibleSemanticProvider:
-    """Generic multimodal JSON-task adapter for OpenAI-compatible APIs."""
+    """Generic multimodal JSON-task adapter with a real wall-clock deadline."""
 
     name = "openai-compatible-chat-semantic"
 
@@ -233,10 +257,81 @@ class OpenAICompatibleSemanticProvider:
         self.compat_profile = compat_profile
         self.request_timeout_seconds = float(request_timeout_seconds)
         self.enable_thinking = enable_thinking
+        self.progress_callback: Callable[[str], None] | None = None
+
+    def set_progress_callback(self, callback: Callable[[str], None] | None) -> None:
+        self.progress_callback = callback
+
+    def _progress(self, message: str) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(message)
+
+    def _network_text(self, kwargs: dict[str, Any], *, streaming: bool) -> str:
+        started = time.monotonic()
+        result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+        holder: dict[str, Any] = {}
+
+        def worker() -> None:
+            try:
+                response = self.client.chat.completions.create(**kwargs)
+                holder["response"] = response
+                self._progress(f"AI connection established at {time.monotonic() - started:.1f}s")
+                text = (
+                    _extract_stream_text(response, started=started, progress=self._progress)
+                    if streaming
+                    else _extract_message_text(response)
+                )
+                result_queue.put_nowait(("ok", text))
+            except BaseException as exc:  # daemon worker reports exact failure to caller
+                try:
+                    result_queue.put_nowait(("error", exc))
+                except queue.Full:
+                    pass
+
+        thread = threading.Thread(target=worker, name="ai-json-request", daemon=True)
+        thread.start()
+        deadline = started + self.request_timeout_seconds
+        next_progress = started + _PROGRESS_INTERVAL_SECONDS
+        self._progress(
+            f"AI request started; wall-clock deadline={self.request_timeout_seconds:.0f}s"
+        )
+
+        while True:
+            now = time.monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                _close_response(holder.get("response"))
+                raise OpenAICompatibleTransportError(
+                    f"AI whole-request wall-clock deadline exceeded: "
+                    f"{self.request_timeout_seconds:.0f}s"
+                )
+            wait = min(remaining, max(0.05, next_progress - now))
+            try:
+                kind, value = result_queue.get(timeout=wait)
+            except queue.Empty:
+                now = time.monotonic()
+                if now >= next_progress:
+                    self._progress(
+                        f"AI still running: elapsed={now - started:.1f}s / "
+                        f"deadline={self.request_timeout_seconds:.0f}s"
+                    )
+                    next_progress = now + _PROGRESS_INTERVAL_SECONDS
+                continue
+
+            _close_response(holder.get("response"))
+            if kind == "ok":
+                self._progress(f"AI response complete at {time.monotonic() - started:.1f}s")
+                return str(value)
+            if isinstance(value, OpenAICompatibleProviderError):
+                raise value
+            raise OpenAICompatibleTransportError(
+                f"OpenAI-compatible JSON task 调用失败：{value}"
+            ) from value
 
     def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
         if not request_payload.get("json_contract"):
             raise OpenAICompatibleProviderError("JSON task 缺少 json_contract。")
+
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": [
@@ -252,11 +347,14 @@ class OpenAICompatibleSemanticProvider:
                     "content": _message_content(request_payload, image_detail=self.image_detail),
                 },
             ],
-            "max_tokens": self.max_output_tokens,
             "timeout": self.request_timeout_seconds,
         }
         if self.structured_mode == "json_object":
             kwargs["response_format"] = {"type": "json_object"}
+            # Alibaba Cloud explicitly recommends not setting max_tokens in JSON
+            # mode because truncation produces invalid JSON.
+        else:
+            kwargs["max_tokens"] = self.max_output_tokens
         if self.enable_thinking is not None:
             kwargs["extra_body"] = {"enable_thinking": self.enable_thinking}
 
@@ -265,14 +363,8 @@ class OpenAICompatibleSemanticProvider:
             kwargs["stream"] = True
             kwargs["stream_options"] = {"include_usage": True}
             kwargs["modalities"] = ["text"]
-        try:
-            response = self.client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            raise OpenAICompatibleTransportError(
-                f"OpenAI-compatible JSON task 调用失败：{exc}"
-            ) from exc
 
-        output_text = _extract_stream_text(response) if streaming else _extract_message_text(response)
+        output_text = self._network_text(kwargs, streaming=streaming)
         payload = _parse_json_object(output_text)
         payload["extractor"] = self.name
         return payload
