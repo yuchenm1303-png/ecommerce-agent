@@ -1,10 +1,12 @@
 name: final-ai-web-minfix
-on: [push]
+on:
+  push:
+    branches:
+      - feat/review-preview-gate
 permissions:
   contents: write
 jobs:
   patch:
-    if: github.event.head_commit.message == 'chore: apply final AI/web minfix'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -12,6 +14,7 @@ jobs:
           ref: feat/review-preview-gate
           fetch-depth: 0
       - name: Apply minimal production fixes
+        shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -33,15 +36,16 @@ jobs:
           s = s.replace('"Use each target\'s search_queries as the research starting point and combine searches when efficient.",', '"Use each target\'s search_queries when present; otherwise derive a focused query from exact product identity plus that field. Combine searches when efficient.",')
           p.write_text(s)
 
-          # One focused regression: unresolved fields without model-authored queries still go to web.
           p = Path('tests/test_ai_prompt_contract.py')
           s = p.read_text()
-          s += '''\n\ndef test_cli_defaults_target_plus_and_json_mode():\n    from makro_resolve_ai import build_parser\n    parser = build_parser()\n    args = parser.parse_args([\"--qa\", \"q.xlsx\", \"--live-schema\", \"live.json\"])\n    assert args.model == \"qwen3.6-plus\"\n    assert args.structured_mode == \"json_object\"\n    assert args.enable_thinking is False\n'''
+          marker = 'def test_cli_defaults_target_plus_and_json_mode():'
+          if marker not in s:
+              s += '''\n\ndef test_cli_defaults_target_plus_and_json_mode():\n    from makro_resolve_ai import build_parser\n    parser = build_parser()\n    args = parser.parse_args([\"--qa\", \"q.xlsx\", \"--live-schema\", \"live.json\"])\n    assert args.model == \"qwen3.6-plus\"\n    assert args.structured_mode == \"json_object\"\n    assert args.enable_thinking is False\n'''
           p.write_text(s)
           PY
           rm .github/workflows/final-ai-web-minfix.yml
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
-          git commit -m "fix: use Qwen Plus and Responses web search"
+          git commit -m 'fix: use Qwen Plus and Responses web search'
           git push origin HEAD:feat/review-preview-gate
