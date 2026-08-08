@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from app.answer_resolver import ResolvedAnswer
 from app.makro_dryrun import fill_resolved_field, selector_for_control
+from app.resolution_types import ResolvedAnswer
 
 
 class FakeSelectedOption:
@@ -120,16 +120,17 @@ def test_selector_prefers_unique_name_over_duplicate_id():
         "path": "body > input:nth-child(3)",
         "selector_candidates": ["#sales_package"],
     }
-
     assert selector_for_control(item) == '[name="sales_package_2_value"]'
 
 
 def test_single_input_fill_and_readback_passes():
     c = control("model_number_0_value")
     page = FakePage({'[name="model_number_0_value"]': FakeLocator()})
-
-    result = fill_resolved_field(page, semantic("model_number", [c]), resolved("model_number", ["L11"]))
-
+    result = fill_resolved_field(
+        page,
+        semantic("model_number", [c]),
+        resolved("model_number", ["L11"]),
+    )
     assert result.status == "validated"
     assert result.actual == ["L11"]
 
@@ -147,13 +148,11 @@ def test_multi_value_maps_each_value_to_its_own_slot():
             '[name="sales_package_2_value"]': FakeLocator(),
         }
     )
-
     result = fill_resolved_field(
         page,
         semantic("sales_package", controls, multi_value=True),
         resolved("sales_package", ["Camera", "Cable", "Manual"]),
     )
-
     assert result.status == "validated"
     assert result.actual == ["Camera", "Cable", "Manual"]
 
@@ -168,13 +167,11 @@ def test_more_values_than_slots_fails_before_any_partial_write():
             '[name="ports_1_value"]': second,
         }
     )
-
     result = fill_resolved_field(
         page,
         semantic("ports", controls, multi_value=True),
         resolved("ports", ["USB-C", "HDMI", "AV"]),
     )
-
     assert result.status == "validation_failed"
     assert result.actual == []
     assert first.value == ""
@@ -186,13 +183,11 @@ def test_qualifier_answer_fails_before_value_write_if_qualifier_control_missing(
     c = control("battery_life_0_value")
     locator = FakeLocator()
     page = FakePage({'[name="battery_life_0_value"]': locator})
-
     result = fill_resolved_field(
         page,
         semantic("battery_life", [c]),
         resolved("battery_life", ["60"], qualifier="min"),
     )
-
     assert result.status == "validation_failed"
     assert locator.value == ""
     assert "qualifier" in result.detail
@@ -201,9 +196,11 @@ def test_qualifier_answer_fails_before_value_write_if_qualifier_control_missing(
 def test_select_fill_reads_selected_label():
     c = control("colour_0_value", kind="select")
     page = FakePage({'[name="colour_0_value"]': FakeLocator()})
-
-    result = fill_resolved_field(page, semantic("colour", [c]), resolved("colour", ["Black"]))
-
+    result = fill_resolved_field(
+        page,
+        semantic("colour", [c]),
+        resolved("colour", ["Black"]),
+    )
     assert result.status == "validated"
     assert result.actual == ["Black"]
 
@@ -211,10 +208,12 @@ def test_select_fill_reads_selected_label():
 def test_non_resolved_answer_is_skipped_without_touching_page():
     c = control("model_number_0_value")
     page = FakePage({})
-    answer = ResolvedAnswer(attribute_key="model_number", label="Model Number", status="missing")
-
+    answer = ResolvedAnswer(
+        attribute_key="model_number",
+        label="Model Number",
+        status="missing",
+    )
     result = fill_resolved_field(page, semantic("model_number", [c]), answer)
-
     assert result.status == "skipped"
 
 
@@ -223,11 +222,11 @@ def test_duplicate_same_name_control_anywhere_is_refused():
     loc = FakeLocator()
     loc._count = 2
     page = FakePage({'[name="warranty_service_type_0_value"]': loc})
-
     result = fill_resolved_field(
-        page, semantic("warranty_service_type", [c]), resolved("warranty_service_type", ["Standard"])
+        page,
+        semantic("warranty_service_type", [c]),
+        resolved("warranty_service_type", ["Standard"]),
     )
-
     assert result.status == "fill_error"
     assert "2" in result.detail
     assert loc.value == ""
@@ -238,11 +237,11 @@ def test_invisible_control_is_refused():
     loc = FakeLocator()
     loc.visible = False
     page = FakePage({'[name="warranty_service_type_0_value"]': loc})
-
     result = fill_resolved_field(
-        page, semantic("warranty_service_type", [c]), resolved("warranty_service_type", ["Standard"])
+        page,
+        semantic("warranty_service_type", [c]),
+        resolved("warranty_service_type", ["Standard"]),
     )
-
     assert result.status == "fill_error"
     assert '[name="warranty_service_type_0_value"]' in result.detail
     assert loc.value == ""
@@ -251,14 +250,12 @@ def test_invisible_control_is_refused():
 def test_section_path_scopes_selector_for_fill_and_readback():
     c = control("warranty_summary_0_value")
     page = FakePage({'[name="warranty_summary_0_value"]': FakeLocator()})
-
     result = fill_resolved_field(
         page,
         semantic("warranty_summary", [c]),
         resolved("warranty_summary", ["24 months"]),
         section_path="body > div#additional-description-card",
     )
-
     assert result.status == "validated"
     scoped = 'body > div#additional-description-card >> [name="warranty_summary_0_value"]'
     assert scoped in page.used_selectors
@@ -276,11 +273,11 @@ def test_react_rerender_reset_is_not_reported_validated():
         {'[name="warranty_service_type_0_value"]': loc},
         on_wait_timeout=reset_on_render_cycle,
     )
-
     result = fill_resolved_field(
-        page, semantic("warranty_service_type", [c]), resolved("warranty_service_type", ["Standard"])
+        page,
+        semantic("warranty_service_type", [c]),
+        resolved("warranty_service_type", ["Standard"]),
     )
-
     assert result.status == "validation_failed"
     assert result.actual == ["Standard"]
     assert "React" in result.detail
@@ -297,10 +294,10 @@ def test_control_that_vanishes_after_render_cycle_is_not_validated():
         {'[name="warranty_summary_0_value"]': loc},
         on_wait_timeout=vanish,
     )
-
     result = fill_resolved_field(
-        page, semantic("warranty_summary", [c]), resolved("warranty_summary", ["24 months"])
+        page,
+        semantic("warranty_summary", [c]),
+        resolved("warranty_summary", ["24 months"]),
     )
-
     assert result.status == "validation_failed"
     assert "React" in result.detail
