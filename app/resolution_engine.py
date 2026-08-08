@@ -14,7 +14,7 @@ from .answer_resolver import (
     resolve_field,
 )
 from .evidence_validation import is_business_question
-from .fact_validators import validate_resolved_answer
+from .fact_validators import validate_resolved_answer, verify_deterministic_synthesis
 from .qa_catalog import QuestionCatalog, QuestionRecord
 from .source_bundle import ProductSourceBundle, normalize_key
 
@@ -23,6 +23,7 @@ GATE_LOW_CONFIDENCE = "low_confidence"
 GATE_MISSING_SOURCE_REFERENCE = "missing_source_reference"
 GATE_FIELD_CONSTRAINT = "field_constraint"
 GATE_BUSINESS_SOURCE = "business_source"
+GATE_DETERMINISTIC_SYNTHESIS = "deterministic_synthesis_verified"
 
 
 @dataclass(slots=True, frozen=True)
@@ -151,9 +152,18 @@ def _provenance(
 def _confidence_gate(
     answer: ResolvedAnswer,
     policy: ResolutionPolicy,
+    semantic_field: dict[str, Any],
 ) -> tuple[str, bool, str, str]:
     if answer.status != RESOLVED:
         return answer.status, False, answer.detail, f"resolver_{answer.status}"
+
+    if policy.require_source_reference and not (answer.source_reference or "").strip():
+        return (
+            NEEDS_REVIEW,
+            False,
+            "resolved 候选缺少可追溯 source_reference。",
+            GATE_MISSING_SOURCE_REFERENCE,
+        )
 
     threshold = (
         policy.ai_auto_fill_min_confidence
@@ -161,18 +171,17 @@ def _confidence_gate(
         else policy.auto_fill_min_confidence
     )
     if answer.confidence < threshold:
+        verification = verify_deterministic_synthesis(semantic_field, answer)
+        if verification.verified:
+            detail = " | ".join(
+                item for item in (answer.detail, verification.detail) if item
+            )
+            return RESOLVED, True, detail, GATE_DETERMINISTIC_SYNTHESIS
         return (
             NEEDS_REVIEW,
             False,
             f"证据置信度 {answer.confidence:.2f} 低于自动填写阈值 {threshold:.2f}。",
             GATE_LOW_CONFIDENCE,
-        )
-    if policy.require_source_reference and not (answer.source_reference or "").strip():
-        return (
-            NEEDS_REVIEW,
-            False,
-            "resolved 候选缺少可追溯 source_reference。",
-            GATE_MISSING_SOURCE_REFERENCE,
         )
     return RESOLVED, True, answer.detail, ""
 
@@ -259,9 +268,17 @@ def resolve_one(
             detail = validation.detail
             gate_reason = GATE_FIELD_CONSTRAINT
         else:
-            status, eligible, detail, gate_reason = _confidence_gate(answer, policy)
+            status, eligible, detail, gate_reason = _confidence_gate(
+                answer,
+                policy,
+                semantic_field,
+            )
     else:
-        status, eligible, detail, gate_reason = _confidence_gate(answer, policy)
+        status, eligible, detail, gate_reason = _confidence_gate(
+            answer,
+            policy,
+            semantic_field,
+        )
 
     # Review preview is deliberately narrower than "has an answer". A candidate
     # is previewable only when the resolver produced a structurally valid
