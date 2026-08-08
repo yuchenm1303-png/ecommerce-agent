@@ -363,3 +363,91 @@ def test_true_recording_resolution_disagreement_remains_conflict():
     answer = resolve_field(field("recording_resolution", "Recording Resolution"), bundle)
 
     assert answer.status == CONFLICT
+
+
+def test_generic_product_brand_cannot_answer_vehicle_brand():
+    bundle = ProductSourceBundle()
+    bundle.add_evidence(
+        key="Vehicle Brand",
+        value="other",
+        source_type="ai_synthesis",
+        source_reference="image:001",
+        priority=90,
+        confidence=0.84,
+        evidence_text="品牌 other",
+    )
+
+    answer = resolve_field(field("vehicle_brand", "Vehicle Brand"), bundle)
+
+    assert answer.status == MISSING
+
+
+def test_manual_languages_cannot_answer_device_languages_supported():
+    bundle = ProductSourceBundle()
+    bundle.add_evidence(
+        key="Languages Supported",
+        value="English|German",
+        source_type="ai_synthesis",
+        source_reference="customer-text:001:text:0001:abc",
+        priority=90,
+        confidence=0.84,
+        evidence_text="English + German manual included",
+    )
+
+    answer = resolve_field(field("languages_supported", "Languages Supported", multi_value=True), bundle)
+
+    assert answer.status == MISSING
+
+
+def test_reverse_assist_feature_cannot_prove_reverse_camera_type():
+    bundle = ProductSourceBundle()
+    bundle.add_evidence(
+        key="Camera Type",
+        value="Dashboard + Reverse Assist",
+        source_type="ai_synthesis",
+        source_reference="image:001",
+        priority=90,
+        confidence=0.84,
+        evidence_text="功能 倒车影像, 循环录像, 碰撞感应",
+    )
+    bundle.add_evidence(
+        key="Camera Type",
+        value="Dashboard + In-Car",
+        source_type="ai_synthesis",
+        source_reference="image:002",
+        priority=90,
+        confidence=0.84,
+        evidence_text="Front + cabin dual lens dash cam",
+    )
+
+    answer = resolve_field(field("camera_type", "Camera Type"), bundle)
+
+    assert answer.status == RESOLVED
+    assert answer.answer_values == ["Dashboard + In-Car"]
+
+
+def test_no_internal_memory_cannot_prove_sd_card_not_included():
+    bundle = ProductSourceBundle()
+    bundle.add_evidence(
+        key="SD Card Included",
+        value="No",
+        source_type="ai_synthesis",
+        source_reference="image:001",
+        priority=90,
+        confidence=0.84,
+        evidence_text="内存容量 无",
+    )
+    bundle.add_evidence(
+        key="SD Card Included",
+        value="Yes",
+        source_type="customer_file",
+        source_reference="customer-text:001:text:0001:abc",
+        priority=60,
+        confidence=0.99,
+        evidence_text="64GB memory card included",
+    )
+
+    answer = resolve_field(field("sd_card_included", "SD Card Included"), bundle)
+
+    assert answer.status == RESOLVED
+    assert answer.answer_values == ["Yes"]
