@@ -32,6 +32,7 @@ from app.providers.registry import (
     SUPPORTED_PROVIDERS,
     build_semantic_provider,
     default_api_key_env,
+    validate_provider_config,
 )
 from app.qa_catalog import load_question_catalog
 from app.resolution_engine import ResolutionPolicy, resolve_catalog, summarize_resolution
@@ -168,14 +169,16 @@ def _validate_threshold(name: str, value: float) -> None:
 
 def _provider_config(args: argparse.Namespace) -> ProviderConfig:
     api_key_env = args.api_key_env or default_api_key_env(args.provider)
-    return ProviderConfig(
-        provider=args.provider,
-        model=args.model,
-        api_key_env=api_key_env,
-        base_url=args.base_url,
-        image_detail=args.image_detail,
-        max_output_tokens=args.max_output_tokens,
-        structured_mode=args.structured_mode,
+    return validate_provider_config(
+        ProviderConfig(
+            provider=args.provider,
+            model=args.model,
+            api_key_env=api_key_env,
+            base_url=args.base_url,
+            image_detail=args.image_detail,
+            max_output_tokens=args.max_output_tokens,
+            structured_mode=args.structured_mode,
+        )
     )
 
 
@@ -246,8 +249,8 @@ def main() -> int:
             "--supplier-snapshot、--official-snapshot、QA 商品上下文或 supplemental text。"
         )
 
-    provider_config = _provider_config(args)
     try:
+        provider_config = _provider_config(args)
         provider = build_semantic_provider(provider_config)
     except ProviderConfigurationError as exc:
         raise SystemExit(str(exc)) from exc
