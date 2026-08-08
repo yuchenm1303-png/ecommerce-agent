@@ -20,7 +20,7 @@ from .business_fields import (
     BUSINESS_ATTRIBUTE_ALIASES,
     is_business_question,
 )
-from .fact_validators import validate_resolved_answer
+from .hard_field_validators import validate_resolved_answer
 from .resolution_types import (
     CONFLICT as RESOLVER_CONFLICT,
     MISSING as RESOLVER_MISSING,
@@ -52,9 +52,6 @@ class LiveFillPlanItem:
     action: str
     reason: str
     resolution: ResolutionRecord
-    question_number: str = ""
-    question: str = ""
-    match_basis: str = "ai-field-id"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -64,9 +61,6 @@ class LiveFillPlanItem:
             "required": self.required,
             "action": self.action,
             "reason": self.reason,
-            "question_number": self.question_number,
-            "question": self.question,
-            "match_basis": self.match_basis,
             "resolution": self.resolution.as_dict(),
         }
 
@@ -529,8 +523,6 @@ def build_live_fill_plan(
                 action=action,
                 reason=reason,
                 resolution=resolution,
-                question=label,
-                match_basis="business-explicit" if business_field else "ai-field-id",
             )
         )
 
