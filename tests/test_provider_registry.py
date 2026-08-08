@@ -60,16 +60,32 @@ def test_invalid_base_url_is_rejected():
         )
 
 
+def test_provider_timeout_is_bounded():
+    with pytest.raises(ProviderConfigurationError, match="10..600"):
+        validate_provider_config(
+            ProviderConfig(
+                provider="openai-compatible",
+                model="vision-model",
+                api_key_env="VENDOR_KEY",
+                base_url="https://api.vendor.test/v1",
+                request_timeout_seconds=5,
+            )
+        )
+
+
 def test_safe_config_does_not_log_url_credentials_or_query_tokens():
     config = ProviderConfig(
         provider="openai-compatible",
         model="vision-model",
         api_key_env="VENDOR_KEY",
         base_url="https://user:pass@api.vendor.test/v1?token=secret#fragment",
+        request_timeout_seconds=90,
     )
     safe = config.as_safe_dict()
 
     assert safe["base_url"] == "https://api.vendor.test/v1"
+    assert safe["request_timeout_seconds"] == 90
+    assert safe["sdk_max_retries"] == 0
     assert "pass" not in repr(safe)
     assert "secret" not in repr(safe)
 
@@ -81,6 +97,7 @@ def test_registry_builds_compatible_provider_from_arbitrary_env_name():
         api_key_env="MY_VENDOR_API_KEY",
         base_url="https://api.vendor.test/v1",
         structured_mode="json_object",
+        request_timeout_seconds=75,
     )
     provider = build_semantic_provider(
         config,
@@ -93,6 +110,7 @@ def test_registry_builds_compatible_provider_from_arbitrary_env_name():
     assert provider.base_url == "https://api.vendor.test/v1"
     assert provider.structured_mode == "json_object"
     assert provider.compat_profile == "generic"
+    assert provider.request_timeout_seconds == 75
 
 
 def test_qwen_omni_model_auto_selects_streaming_compat_profile():
@@ -104,6 +122,7 @@ def test_qwen_omni_model_auto_selects_streaming_compat_profile():
     )
     normalized = validate_provider_config(config)
     assert normalized.compat_profile == "qwen-omni"
+    assert normalized.as_safe_dict()["compat_profile"] == "qwen-omni"
 
     provider = build_semantic_provider(
         config,
@@ -118,6 +137,7 @@ def test_registry_keeps_native_openai_adapter_available():
         provider="openai",
         model="gpt-5.6",
         api_key_env="CUSTOM_OPENAI_KEY",
+        request_timeout_seconds=45,
     )
     provider = build_semantic_provider(
         config,
@@ -127,6 +147,7 @@ def test_registry_keeps_native_openai_adapter_available():
 
     assert isinstance(provider, OpenAISemanticProvider)
     assert provider.model == "gpt-5.6"
+    assert provider.request_timeout_seconds == 45
 
 
 def test_unknown_provider_fails_closed():
