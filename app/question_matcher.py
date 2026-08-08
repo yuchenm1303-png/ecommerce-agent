@@ -94,33 +94,35 @@ def _question_keys(question: QuestionRecord, aliases: dict[str, tuple[str, ...]]
 
 
 def _section_key(value: object) -> str:
-    """Normalize a QA category/live heading while removing UI-only counters.
-
-    Makro headings contain decorations such as ``(Optional)`` and ``(0/46)``.
-    Customer QA categories may contain a real section name *or* an answer-form
-    type such as ``单项填空`` / ``多项选择``. Only a category that actually equals
-    one of the current live section headings is allowed to constrain matching.
-    """
+    """Normalize a QA category/live heading while removing UI-only counters."""
 
     text = str(value or "").strip()
     text = re.sub(r"\([^)]*\)", " ", text)
     return normalize_key(text)
 
 
-def _live_section_keys(fields: list[dict[str, Any]]) -> set[str]:
-    return {
-        key
-        for field in fields
-        if (key := _section_key(field.get("section_heading")))
-    }
+# Real customer QA sheets use the column named ``问题类别`` for the *answer
+# form*, not the Makro section. These values must never be compared with live
+# section headings. Keep the recognition deliberately narrow: unknown non-empty
+# category text remains authoritative section metadata (fail closed), preserving
+# the previous protection against cross-section collisions.
+_ANSWER_FORM_CATEGORY_PATTERNS = (
+    re.compile(r"^(?:单项|多项)?(?:填空|选择|输入)$"),
+    re.compile(r"^(?:单选|多选|文本|数字|数值|下拉|下拉选择|自由文本)$"),
+    re.compile(r"^(?:single|multi|multiple)?(?:choice|select|selection|input|text|number|numeric)$"),
+    re.compile(r"^(?:singlechoice|multiplechoice|multichoice|singleselect|multiselect|textinput|numberinput|numericinput)$"),
+)
 
 
-def _question_category_is_live_section(
-    question: QuestionRecord,
-    fields: list[dict[str, Any]],
-) -> bool:
-    wanted = _section_key(question.category)
-    return bool(wanted and wanted in _live_section_keys(fields))
+def _is_answer_form_category(value: object) -> bool:
+    key = _section_key(value)
+    if not key:
+        return False
+    return any(pattern.fullmatch(key) for pattern in _ANSWER_FORM_CATEGORY_PATTERNS)
+
+
+def _question_category_is_section(question: QuestionRecord) -> bool:
+    return bool(_section_key(question.category)) and not _is_answer_form_category(question.category)
 
 
 def _filter_candidates_by_question_section(
@@ -128,13 +130,15 @@ def _filter_candidates_by_question_section(
     candidates: list[int],
     fields: list[dict[str, Any]],
 ) -> list[int]:
-    if not candidates or not _question_category_is_live_section(question, fields):
+    if not candidates or not _question_category_is_section(question):
         return candidates
     wanted = _section_key(question.category)
 
-    # A QA category that is proven to be a current Makro section is
-    # authoritative metadata. Answer-form categories carry no section meaning
-    # and therefore never enter this branch.
+    # Unknown/non-answer-form category metadata is treated as an authoritative
+    # section even when that section is absent from the current candidate set.
+    # This preserves fail-closed behavior: a field with the same generic key in
+    # another section must not be accepted merely because the expected section
+    # is currently missing from the scan.
     candidates_with_section = [
         index
         for index in candidates
@@ -158,11 +162,10 @@ def match_questions_to_fields(
     """One-to-one deterministic matcher between customer questions and live Makro fields.
 
     No fuzzy similarity is used. A question matches only an exact normalized
-    label/attribute key or an explicit alias supplied by configuration. A QA
-    category constrains section matching only when it exactly names one of the
-    current live Makro sections; answer-form metadata such as 单项填空/多项选择 is
-    ignored for section purposes. This prevents both cross-section spillover and
-    the real-world regression where every QA row became unmatched.
+    label/attribute key or an explicit alias supplied by configuration. Non-empty
+    QA category metadata constrains section matching unless it is explicitly
+    recognized as an answer-form value such as 单项填空/多项选择. This keeps the
+    cross-section fail-closed guard while supporting the client's real workbook.
     """
 
     alias_map = aliases or {}
@@ -189,8 +192,8 @@ def match_questions_to_fields(
         unique_indexes = sorted({index for index, _ in resolved})
         if not unique_indexes:
             section_detail = (
-                f" QA category={question.category!r} 已识别为 live Makro section，必须与字段 section 一致。"
-                if _question_category_is_live_section(question, fields)
+                f" QA category={question.category!r} 作为 section 元数据，必须与 live section 一致。"
+                if _question_category_is_section(question)
                 else ""
             )
             matches.append(
