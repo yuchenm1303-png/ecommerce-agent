@@ -299,13 +299,17 @@ def build_resolution_inputs(
     bundles = list(trusted_bundles)
 
     if customer_context:
-        bundles.append(
-            bundle_from_key_value_text(
-                customer_context,
-                source_reference=f"{Path(catalog.source_path).name}:customer-context",
-                source_type="customer_file",
-            )
+        context_facts = bundle_from_key_value_text(
+            customer_context,
+            source_reference=f"{Path(catalog.source_path).name}:customer-context",
+            source_type="customer_file",
         )
+        # The catalog-answer bundle above already owns the exact canonical
+        # supplemental text. This bundle exists only to expose conservative
+        # key/value facts. Keeping the same text here as well would make
+        # merge_bundles duplicate the customer source and change its hash.
+        context_facts.supplemental_text = ""
+        bundles.append(context_facts)
         warnings.append(f"customer_context_chars={len(customer_context)}")
 
     packet_files: list[str] = []
