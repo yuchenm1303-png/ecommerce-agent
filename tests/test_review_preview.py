@@ -11,7 +11,6 @@ from app.ai_decisions import (
     FieldDecision,
     field_id,
 )
-from app.answer_resolver import NEEDS_REVIEW, RESOLVED
 from app.evidence_contract import ProductIdentity
 from app.fill_plan import (
     BLOCKED,
@@ -20,6 +19,7 @@ from app.fill_plan import (
     GATE_HARD_FIELD_CONSTRAINT,
     build_live_fill_plan,
 )
+from app.resolution_types import NEEDS_REVIEW, RESOLVED
 from app.review_preview import ReviewPreviewBlocked, execution_answer_for_item
 from app.source_bundle import ProductSourceBundle
 
