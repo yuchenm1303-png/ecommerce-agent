@@ -42,26 +42,10 @@ def _get(value: Any, key: str, default: Any = None) -> Any:
     return getattr(value, key, default)
 
 
-def _message_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text") or item.get("content")
-            else:
-                text = getattr(item, "text", None) or getattr(item, "content", None)
-            if text:
-                parts.append(str(text))
-        return "".join(parts)
-    return str(content or "")
-
-
 def _parse_json_object(text: str) -> dict[str, Any]:
     raw = text.strip()
     if not raw:
-        raise JSONTaskResponseError("DashScope web search 返回空文本。")
+        raise JSONTaskResponseError("DashScope Responses web search 返回空文本。")
     candidates = [raw]
     if raw.startswith("```") and raw.endswith("```"):
         lines = raw.splitlines()
@@ -79,51 +63,56 @@ def _parse_json_object(text: str) -> dict[str, Any]:
             return payload
     preview = raw[:300].replace("\n", " ")
     raise JSONTaskResponseError(
-        "DashScope web search 未返回可解析 JSON object。"
+        "DashScope Responses web search 未返回可解析 JSON object。"
         + (f" response_prefix={preview!r}" if preview else "")
     )
 
 
-def _search_sources(chunk: Any) -> list[WebSearchSource]:
-    output = _get(chunk, "output")
-    search_info = _get(output, "search_info")
-    if not search_info:
-        return []
-    raw_results = _get(search_info, "search_results", []) or []
-    sources: list[WebSearchSource] = []
-    for item in raw_results:
-        url = str(_get(item, "url", "") or "").strip()
-        if not url:
+def _response_text(response: Any) -> str:
+    direct = _get(response, "output_text", "")
+    if direct:
+        return str(direct)
+    parts: list[str] = []
+    for item in _get(response, "output", []) or []:
+        if str(_get(item, "type", "")) != "message":
             continue
-        sources.append(
-            WebSearchSource(
-                index=str(_get(item, "index", "") or "").strip(),
-                title=str(_get(item, "title", "") or "").strip(),
-                url=url,
-                site_name=str(
-                    _get(item, "site_name", "")
-                    or _get(item, "siteName", "")
-                    or ""
-                ).strip(),
+        for content in _get(item, "content", []) or []:
+            ctype = str(_get(content, "type", ""))
+            if ctype in {"output_text", "text"}:
+                text = _get(content, "text", "")
+                if text:
+                    parts.append(str(text))
+    return "".join(parts)
+
+
+def _response_sources(response: Any) -> list[WebSearchSource]:
+    sources: list[WebSearchSource] = []
+    index = 0
+    for item in _get(response, "output", []) or []:
+        if str(_get(item, "type", "")) != "web_search_call":
+            continue
+        action = _get(item, "action") or {}
+        for raw in _get(action, "sources", []) or []:
+            url = str(_get(raw, "url", "") or "").strip()
+            if not url:
+                continue
+            index += 1
+            sources.append(
+                WebSearchSource(
+                    index=str(index),
+                    title=str(_get(raw, "title", "") or "").strip(),
+                    url=url,
+                    site_name=str(_get(raw, "site_name", "") or "").strip(),
+                )
             )
-        )
-    return sources
-
-
-def _chunk_text(chunk: Any) -> str:
-    output = _get(chunk, "output")
-    choices = _get(output, "choices", []) or []
-    if not choices:
-        return ""
-    message = _get(choices[0], "message")
-    return _message_text(_get(message, "content", ""))
+    return _dedupe_sources(sources)
 
 
 def _dedupe_sources(items: Iterable[WebSearchSource]) -> list[WebSearchSource]:
     output: list[WebSearchSource] = []
     seen: set[str] = set()
     for item in items:
-        key = item.url.strip()
+        key = item.url.strip().rstrip("/")
         if key and key not in seen:
             seen.add(key)
             output.append(item)
@@ -131,16 +120,23 @@ def _dedupe_sources(items: Iterable[WebSearchSource]) -> list[WebSearchSource]:
 
 
 class DashScopeWebSearchProvider:
-    """One sourced web-search call with a real wall-clock deadline."""
+    """One bounded Qwen Responses API call with built-in sourced web search.
 
-    name = "dashscope-qwen-web-search"
+    Qwen3.6 Plus/Flash web search is supported through the OpenAI-compatible
+    Responses API. We intentionally do not send response_format here because
+    DashScope rejects JSON response_format together with the search tool for
+    these models. The model is instructed to emit JSON text and we parse it
+    locally; provenance comes only from web_search_call.action.sources.
+    """
+
+    name = "dashscope-qwen-responses-web-search"
 
     def __init__(
         self,
         *,
         model: str,
         api_key: str,
-        native_base_url: str = "https://dashscope.aliyuncs.com/api/v1",
+        base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
         request_timeout_seconds: float = 120.0,
         call_fn: Callable[..., Any] | None = None,
     ) -> None:
@@ -152,7 +148,7 @@ class DashScopeWebSearchProvider:
             raise ValueError("request_timeout_seconds 必须在 10..600 秒。")
         self.model = model.strip()
         self.api_key = api_key
-        self.native_base_url = native_base_url.rstrip("/")
+        self.base_url = base_url.rstrip("/")
         self.request_timeout_seconds = float(request_timeout_seconds)
         self._call_fn = call_fn
         self.progress_callback: Callable[[str], None] | None = None
@@ -168,59 +164,35 @@ class DashScopeWebSearchProvider:
         if self._call_fn is not None:
             return self._call_fn(**kwargs)
         try:
-            import dashscope
+            from openai import OpenAI
         except ImportError as exc:  # pragma: no cover
-            raise JSONTaskTransportError("缺少 dashscope Python SDK。") from exc
-        dashscope.base_http_api_url = self.native_base_url
+            raise JSONTaskTransportError("缺少 openai Python SDK。") from exc
         try:
-            return dashscope.MultiModalConversation.call(**kwargs)
+            client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.request_timeout_seconds,
+                max_retries=0,
+            )
+            return client.responses.create(**kwargs)
         except Exception as exc:
-            raise JSONTaskTransportError(f"DashScope web search 调用失败：{exc}") from exc
+            raise JSONTaskTransportError(f"DashScope Responses web search 调用失败：{exc}") from exc
 
     def _search_worker(self, prompt: str) -> WebSearchJSONResult:
-        response = self._call(
-            api_key=self.api_key,
-            model=self.model,
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            enable_search=True,
-            search_options={
-                "search_strategy": "agent",
-                "enable_source": True,
-            },
-            response_format={"type": "json_object"},
-            stream=True,
-            incremental_output=True,
-            result_format="message",
-        )
-
-        text_parts: list[str] = []
-        sources: list[WebSearchSource] = []
-        request_id = ""
-        first_output = False
         started = time.monotonic()
-        for chunk in response:
-            status_code = _get(chunk, "status_code")
-            if status_code not in (None, 200):
-                raise JSONTaskTransportError(
-                    "DashScope web search 请求失败："
-                    f"status={status_code}, code={_get(chunk, 'code', '')}, "
-                    f"message={_get(chunk, 'message', '')}"
-                )
-            request_id = request_id or str(_get(chunk, "request_id", "") or "")
-            sources.extend(_search_sources(chunk))
-            text = _chunk_text(chunk)
-            if text:
-                text_parts.append(text)
-                if not first_output:
-                    first_output = True
-                    self._progress(
-                        f"Web AI first output received at {time.monotonic() - started:.1f}s"
-                    )
-
+        response = self._call(
+            model=self.model,
+            input=prompt,
+            tools=[{"type": "web_search"}],
+            extra_body={"enable_thinking": False},
+            store=False,
+        )
+        self._progress(f"Web AI response received at {time.monotonic() - started:.1f}s")
+        text = _response_text(response)
         return WebSearchJSONResult(
-            payload=_parse_json_object("".join(text_parts)),
-            sources=_dedupe_sources(sources),
-            request_id=request_id,
+            payload=_parse_json_object(text),
+            sources=_response_sources(response),
+            request_id=str(_get(response, "id", "") or ""),
         )
 
     def search_json(self, prompt: str) -> WebSearchJSONResult:
@@ -236,7 +208,7 @@ class DashScopeWebSearchProvider:
                 except queue.Full:
                     pass
 
-        threading.Thread(target=worker, name="dashscope-web-search", daemon=True).start()
+        threading.Thread(target=worker, name="dashscope-responses-web-search", daemon=True).start()
         deadline = started + self.request_timeout_seconds
         next_progress = started + _PROGRESS_INTERVAL_SECONDS
         self._progress(
@@ -248,7 +220,7 @@ class DashScopeWebSearchProvider:
             remaining = deadline - now
             if remaining <= 0:
                 raise JSONTaskTransportError(
-                    f"DashScope web search wall-clock deadline exceeded: "
+                    "DashScope Responses web search wall-clock deadline exceeded: "
                     f"{self.request_timeout_seconds:.0f}s"
                 )
             wait = min(remaining, max(0.05, next_progress - now))
@@ -269,4 +241,4 @@ class DashScopeWebSearchProvider:
                 return value
             if isinstance(value, (JSONTaskTransportError, JSONTaskResponseError)):
                 raise value
-            raise JSONTaskTransportError(f"DashScope web search 调用失败：{value}") from value
+            raise JSONTaskTransportError(f"DashScope Responses web search 调用失败：{value}") from value
