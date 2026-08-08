@@ -11,7 +11,6 @@ from typing import Any, Iterable, Protocol
 from .ai_decisions import (
     CONFLICT,
     MISSING,
-    READY,
     REVIEW,
     AIDecisionPacket,
     FieldDecision,
@@ -29,8 +28,8 @@ from .source_bundle import normalize_key
 
 WEB_RESEARCH_CONTRACT_VERSION = 2
 WEB_RESEARCH_CACHE_VERSION = 2
-WEB_FINAL_CONTRACT_VERSION = 1
-WEB_FINAL_CACHE_VERSION = 1
+WEB_FINAL_CONTRACT_VERSION = 2
+WEB_FINAL_CACHE_VERSION = 2
 WEB_UPDATABLE_STATUSES = {MISSING, REVIEW, CONFLICT}
 
 
@@ -88,7 +87,10 @@ class WebEnrichmentResult:
     search_model_calls: int = 0
     search_cache_hits: int = 0
     search_failed_batches: int = 0
+    final_batch_count: int = 0
     final_model_calls: int = 0
+    final_cache_hits: int = 0
+    final_failed_batches: int = 0
     final_cache_hit: bool = False
     searched: bool = False
     search_elapsed_seconds: float = 0.0
@@ -179,7 +181,7 @@ def _research_prompt(
             "Prefer exact manufacturer/manual/current supplier evidence. Generic model-name pages require strong identity matching.",
             "Never research seller-operated price, stock, MOQ, fulfilment, shipping or listing status.",
             "Return only evidence from pages actually returned by this search call. Do not invent URLs.",
-            "If evidence is ambiguous, still return the exact evidence and let the final resolver judge it.",
+            "If evidence is ambiguous, still return the exact evidence and let the field resolver judge it.",
             "Return JSON only.",
         ],
         "json_contract": {
@@ -223,7 +225,10 @@ def _source_lookup(items: Iterable[WebSearchSource]) -> dict[str, WebSearchSourc
 
 
 def _mechanical_batches(items: list[Any], batch_size: int) -> list[list[Any]]:
-    return [items[index : index + batch_size] for index in range(0, len(items), batch_size)]
+    return [
+        items[index : index + batch_size]
+        for index in range(0, len(items), batch_size)
+    ]
 
 
 def _research_cache_key(
@@ -296,7 +301,9 @@ def _run_research_batch(
     cache_path = cache_dir / f"web-research-{key}.json" if cache_dir is not None else None
     if cache_path is not None and cache_path.is_file():
         try:
-            cached = _deserialize_search_result(json.loads(cache_path.read_text(encoding="utf-8")))
+            cached = _deserialize_search_result(
+                json.loads(cache_path.read_text(encoding="utf-8"))
+            )
             return _ResearchBatchRun(batch_index, cached, 0, True)
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
@@ -411,40 +418,48 @@ def _external_source_map(items: Iterable[PersistedWebSource]) -> dict[str, str]:
     return {item.source_reference: item.content for item in items}
 
 
+def _evidence_for_fields(
+    evidence: list[WebEvidence],
+    identifiers: set[str],
+) -> list[WebEvidence]:
+    return [item for item in evidence if item.field_id in identifiers]
+
+
 def _final_prompt_request(
     profile: ProductProfile,
     initial: AIDecisionPacket,
-    fields: list[dict[str, Any]],
+    batch_fields: list[dict[str, Any]],
     evidence: list[WebEvidence],
-) -> tuple[dict[str, Any], set[str]]:
+) -> dict[str, Any]:
     evidence_by_field: dict[str, list[WebEvidence]] = {}
     for item in evidence:
         evidence_by_field.setdefault(item.field_id, []).append(item)
     prior_by_id = {decision.field_id: decision for decision in initial.decisions}
-    target_id_set = {
-        identifier
-        for identifier in evidence_by_field
-        if identifier in prior_by_id and prior_by_id[identifier].status in WEB_UPDATABLE_STATUSES
-    }
-    target_fields = [field for field in fields if field_id(field) in target_id_set]
-    profile_text = json.dumps(_profile_payload(profile), ensure_ascii=False, separators=(",", ":"))
+    profile_text = json.dumps(
+        _profile_payload(profile),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     web_text = json.dumps(
         {
-            field_id(field): [item.as_dict() for item in evidence_by_field[field_id(field)]]
-            for field in target_fields
+            field_id(field): [
+                item.as_dict()
+                for item in evidence_by_field.get(field_id(field), [])
+            ]
+            for field in batch_fields
         },
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    request = {
-        "task": "finalize_unresolved_marketplace_fields_from_profile_and_web_evidence",
+    return {
+        "task": "finalize_small_marketplace_field_batch_from_profile_and_web_evidence",
         "system_instruction": (
-            "You are the final text-only resolver. Use the grounded product profile plus returned web evidence "
-            "to update only unresolved marketplace fields. Preserve genuine conflicts and never invent product facts. "
-            "Return compact JSON only."
+            "You are a text-only field resolver. Resolve only this small marketplace field batch "
+            "from the grounded Product Profile and the web evidence returned for these exact fields. "
+            "Preserve genuine conflicts and never invent product facts. Return compact JSON only."
         ),
         "prompt_instruction": (
-            "Resolve only this small unresolved set. Do not change any field that was already READY. "
+            "Resolve only these target fields. Do not change any other field. "
             "Return one decision per target field and no prose outside JSON."
         ),
         "product_identity": {
@@ -458,15 +473,16 @@ def _final_prompt_request(
                 **field_contract(field),
                 "prior_decision": _prior_payload(prior_by_id[field_id(field)]),
             }
-            for field in target_fields
+            for field in batch_fields
         ],
         "rules": [
             "READY requires strong exact-product evidence and citations.",
             "If credible local/web evidence disagrees for the same attribute and scope and neither clearly supersedes the other, return CONFLICT with cited alternatives.",
             "Never infer negative values from absence. Keep packaging scope, product-body scope, cabin/rear, manual/UI language and compatibility scope distinct.",
             "For web citations use only source_reference values present in WEB_EVIDENCE. For local citations use only underlying source_reference values present in PRODUCT_PROFILE.",
+            "Do not stretch generic evidence into a more specialized marketplace field.",
             "If multi_value=false return one value string. If qualifier_options exist, keep the unit only in qualifier.",
-            "MISSING is valid when research still does not establish the value.",
+            "MISSING is valid when research still does not establish the exact value.",
         ],
         "grounded_sources": [
             {
@@ -512,11 +528,15 @@ def _final_prompt_request(
             "required": ["decisions"],
         },
     }
-    return request, target_id_set
 
 
 def _packet_fingerprint(packet: AIDecisionPacket) -> str:
-    raw = json.dumps(packet.as_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    raw = json.dumps(
+        packet.as_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -525,7 +545,7 @@ def _final_cache_key(
     cache_namespace: str,
     profile: ProductProfile,
     initial: AIDecisionPacket,
-    fields: list[dict[str, Any]],
+    batch_fields: list[dict[str, Any]],
     evidence: list[WebEvidence],
 ) -> str:
     payload = {
@@ -535,11 +555,126 @@ def _final_cache_key(
         "cache_namespace": cache_namespace,
         "profile_sha256": profile_digest(profile),
         "initial_packet_sha256": _packet_fingerprint(initial),
-        "schema_sha256": schema_digest(fields),
+        "batch_schema_sha256": schema_digest(batch_fields),
         "evidence": [item.as_dict() for item in evidence],
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@dataclass(slots=True)
+class _FinalBatchRun:
+    index: int
+    decisions: list[FieldDecision]
+    model_calls: int
+    cache_hit: bool
+    warnings: list[str] = field(default_factory=list)
+
+
+def _run_final_batch(
+    provider: JSONTaskProvider,
+    profile: ProductProfile,
+    initial: AIDecisionPacket,
+    batch_index: int,
+    batch_fields: list[dict[str, Any]],
+    grounding: GroundingCatalog,
+    evidence: list[WebEvidence],
+    external: dict[str, str],
+    *,
+    cache_dir: Path | None,
+    cache_namespace: str,
+) -> _FinalBatchRun:
+    key = _final_cache_key(
+        provider,
+        cache_namespace,
+        profile,
+        initial,
+        batch_fields,
+        evidence,
+    )
+    cache_path = cache_dir / f"web-final-{key}.json" if cache_dir is not None else None
+    if cache_path is not None and cache_path.is_file():
+        try:
+            cached = AIDecisionPacket.from_mapping(
+                json.loads(cache_path.read_text(encoding="utf-8"))
+            )
+            validated = validate_ai_decision_packet(
+                cached,
+                batch_fields,
+                grounding,
+                expected_identity=profile.identity,
+                external_sources=external,
+            )
+            return _FinalBatchRun(
+                batch_index,
+                validated.decisions,
+                0,
+                True,
+                list(validated.warnings),
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    try:
+        raw = provider.extract_json(
+            _final_prompt_request(profile, initial, batch_fields, evidence)
+        )
+        raw_decisions = raw.get("decisions") if isinstance(raw, dict) else None
+        if not isinstance(raw_decisions, list):
+            raise ValueError("final web resolve batch 缺少 decisions 数组")
+        raw_ids = {
+            str(item.get("field_id") or "").strip()
+            for item in raw_decisions
+            if isinstance(item, dict)
+        }
+        candidate = AIDecisionPacket(
+            identity=profile.identity,
+            schema_sha256=schema_digest(batch_fields),
+            source_manifest_sha256=initial.source_manifest_sha256,
+            decisions=[
+                FieldDecision.from_mapping(item, index=index)
+                for index, item in enumerate(raw_decisions, start=1)
+                if isinstance(item, dict)
+            ],
+            model_summary=str(raw.get("model_summary") or "").strip(),
+            warnings=[],
+            extractor=str(raw.get("extractor") or provider.name).strip() or provider.name,
+        )
+        validated = validate_ai_decision_packet(
+            candidate,
+            batch_fields,
+            grounding,
+            expected_identity=profile.identity,
+            external_sources=external,
+        )
+        decisions = [
+            item for item in validated.decisions
+            if item.field_id in raw_ids
+        ]
+    except Exception as exc:
+        return _FinalBatchRun(
+            batch_index,
+            [],
+            1,
+            False,
+            [f"final resolve batch {batch_index} failed; local decisions preserved: {exc}"],
+        )
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        temp.write_text(
+            json.dumps(validated.as_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp.replace(cache_path)
+    return _FinalBatchRun(
+        batch_index,
+        decisions,
+        1,
+        False,
+        list(validated.warnings),
+    )
 
 
 def _run_final_resolution(
@@ -551,98 +686,88 @@ def _run_final_resolution(
     evidence: list[WebEvidence],
     web_sources: list[PersistedWebSource],
     *,
+    batch_size: int,
+    concurrency: int,
     cache_dir: Path | None,
     cache_namespace: str,
-) -> tuple[AIDecisionPacket, int, bool, float, list[str]]:
+) -> tuple[AIDecisionPacket, int, int, int, int, float, list[str]]:
     started = time.monotonic()
-    request, target_ids = _final_prompt_request(profile, initial, fields, evidence)
-    if not target_ids:
-        return initial, 0, False, time.monotonic() - started, []
+    evidence_ids = {item.field_id for item in evidence}
+    prior_by_id = {decision.field_id: decision for decision in initial.decisions}
+    target_fields = [
+        item for item in fields
+        if field_id(item) in evidence_ids
+        and field_id(item) in prior_by_id
+        and prior_by_id[field_id(item)].status in WEB_UPDATABLE_STATUSES
+    ]
+    if not target_fields:
+        return initial, 0, 0, 0, 0, time.monotonic() - started, []
 
+    batches = _mechanical_batches(target_fields, int(batch_size))
     external = _external_source_map(web_sources)
-    key = _final_cache_key(provider, cache_namespace, profile, initial, fields, evidence)
-    cache_path = cache_dir / f"web-final-{key}.json" if cache_dir is not None else None
-    if cache_path is not None and cache_path.is_file():
-        try:
-            cached = AIDecisionPacket.from_mapping(json.loads(cache_path.read_text(encoding="utf-8")))
-            validated = validate_ai_decision_packet(
-                cached,
-                fields,
+    runs: list[_FinalBatchRun] = []
+    workers = min(int(concurrency), len(batches))
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="web-final",
+    ) as executor:
+        futures = {}
+        for index, batch in enumerate(batches, start=1):
+            ids = {field_id(item) for item in batch}
+            batch_evidence = _evidence_for_fields(evidence, ids)
+            future = executor.submit(
+                _run_final_batch,
+                provider,
+                profile,
+                initial,
+                index,
+                batch,
                 grounding,
-                expected_identity=profile.identity,
-                external_sources=external,
+                batch_evidence,
+                external,
+                cache_dir=cache_dir,
+                cache_namespace=cache_namespace,
             )
-            return validated, 0, True, time.monotonic() - started, []
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            pass
+            futures[future] = index
+        for future in as_completed(futures):
+            runs.append(future.result())
+    runs.sort(key=lambda item: item.index)
 
-    try:
-        raw = provider.extract_json(request)
-        raw_decisions = raw.get("decisions") if isinstance(raw, dict) else None
-        if not isinstance(raw_decisions, list):
-            raise ValueError("final web resolve 缺少 decisions 数组")
-        raw_ids = {
-            str(item.get("field_id") or "").strip()
-            for item in raw_decisions
-            if isinstance(item, dict)
-        }
-        target_fields = [field for field in fields if field_id(field) in target_ids]
-        candidate_updates = AIDecisionPacket(
-            identity=profile.identity,
-            schema_sha256=schema_digest(target_fields),
-            source_manifest_sha256=initial.source_manifest_sha256,
-            decisions=[
-                FieldDecision.from_mapping(item, index=index)
-                for index, item in enumerate(raw_decisions, start=1)
-                if isinstance(item, dict)
-            ],
-            model_summary=str(raw.get("model_summary") or "").strip(),
-            warnings=[],
-            extractor=str(raw.get("extractor") or provider.name).strip() or provider.name,
-        )
-        validated_updates = validate_ai_decision_packet(
-            candidate_updates,
-            target_fields,
-            grounding,
-            expected_identity=profile.identity,
-            external_sources=external,
-        )
-        updates = {
-            decision.field_id: decision
-            for decision in validated_updates.decisions
-            if decision.field_id in raw_ids
-        }
-        merged = AIDecisionPacket(
-            identity=initial.identity,
-            schema_sha256=initial.schema_sha256,
-            source_manifest_sha256=initial.source_manifest_sha256,
-            decisions=[updates.get(item.field_id, item) for item in initial.decisions],
-            model_summary=(initial.model_summary + "\nFinal web-evidence resolve completed.").strip(),
-            warnings=[*initial.warnings, *validated_updates.warnings],
-            extractor=(initial.extractor + "+web-final").strip("+"),
-        )
-        validated = validate_ai_decision_packet(
-            merged,
-            fields,
-            grounding,
-            expected_identity=profile.identity,
-            external_sources=external,
-        )
-    except Exception as exc:
-        return (
-            initial,
-            1,
-            False,
-            time.monotonic() - started,
-            [f"final web resolve failed; local decisions preserved: {exc}"],
-        )
+    updates: dict[str, FieldDecision] = {}
+    warnings = list(initial.warnings)
+    for run in runs:
+        warnings.extend(run.warnings)
+        for decision in run.decisions:
+            updates[decision.field_id] = decision
 
-    if cache_path is not None:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        temp.write_text(json.dumps(validated.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-        temp.replace(cache_path)
-    return validated, 1, False, time.monotonic() - started, []
+    merged = AIDecisionPacket(
+        identity=initial.identity,
+        schema_sha256=initial.schema_sha256,
+        source_manifest_sha256=initial.source_manifest_sha256,
+        decisions=[updates.get(item.field_id, item) for item in initial.decisions],
+        model_summary=(
+            initial.model_summary
+            + "\nParallel web-evidence field resolution completed."
+        ).strip(),
+        warnings=warnings,
+        extractor=(initial.extractor + "+parallel-web-final").strip("+"),
+    )
+    validated = validate_ai_decision_packet(
+        merged,
+        fields,
+        grounding,
+        expected_identity=profile.identity,
+        external_sources=external,
+    )
+    return (
+        validated,
+        sum(run.model_calls for run in runs),
+        sum(1 for run in runs if run.cache_hit),
+        len(batches),
+        sum(1 for run in runs if run.warnings and not run.decisions),
+        time.monotonic() - started,
+        warnings[len(initial.warnings):],
+    )
 
 
 def run_web_enrichment(
@@ -666,14 +791,21 @@ def run_web_enrichment(
     field_list = list(fields)
     targets = _targets(initial, field_list)
     if not targets:
-        return WebEnrichmentResult(packet=initial, target_field_count=0, searched=False)
+        return WebEnrichmentResult(
+            packet=initial,
+            target_field_count=0,
+            searched=False,
+        )
 
     cache_root = Path(cache_dir) if cache_dir is not None else None
     batches = _mechanical_batches(targets, int(batch_size))
     research_started = time.monotonic()
     runs: list[_ResearchBatchRun] = []
     workers = min(int(concurrency), len(batches))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="web-research") as executor:
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="web-research",
+    ) as executor:
         futures = {
             executor.submit(
                 _run_research_batch,
@@ -692,7 +824,15 @@ def run_web_enrichment(
 
     target_ids = {decision.field_id for _, decision in targets}
     evidence, web_sources, warnings = _accepted_evidence(runs, target_ids)
-    final_packet, final_calls, final_cache_hit, final_elapsed, final_warnings = _run_final_resolution(
+    (
+        final_packet,
+        final_calls,
+        final_cache_hits,
+        final_batch_count,
+        final_failed_batches,
+        final_elapsed,
+        final_warnings,
+    ) = _run_final_resolution(
         final_provider,
         profile,
         initial,
@@ -700,6 +840,8 @@ def run_web_enrichment(
         grounding,
         evidence,
         web_sources,
+        batch_size=int(batch_size),
+        concurrency=int(concurrency),
         cache_dir=cache_root,
         cache_namespace=final_cache_namespace,
     )
@@ -713,8 +855,14 @@ def run_web_enrichment(
         search_model_calls=sum(run.model_calls for run in runs),
         search_cache_hits=sum(1 for run in runs if run.cache_hit),
         search_failed_batches=sum(1 for run in runs if run.warning),
+        final_batch_count=final_batch_count,
         final_model_calls=final_calls,
-        final_cache_hit=final_cache_hit,
+        final_cache_hits=final_cache_hits,
+        final_failed_batches=final_failed_batches,
+        final_cache_hit=(
+            final_batch_count > 0
+            and final_cache_hits == final_batch_count
+        ),
         searched=True,
         search_elapsed_seconds=search_elapsed,
         final_elapsed_seconds=final_elapsed,
@@ -731,5 +879,8 @@ def write_enriched_ai_decision_packet(
     payload["web_sources"] = [item.as_dict() for item in web_sources]
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    target.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return target
