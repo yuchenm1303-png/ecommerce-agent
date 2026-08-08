@@ -192,22 +192,24 @@ def _apply_cross_field_business_rules(items: list[LiveFillPlanItem]) -> None:
             )
 
 
-def _synthesis_fingerprint(item: LiveFillPlanItem) -> tuple[str, str, tuple[str, ...]] | None:
+def _synthesis_fingerprint(item: LiveFillPlanItem) -> tuple[str, tuple[str, ...]] | None:
     record = item.resolution
     if not record.preview_eligible or record.source_type != "ai_synthesis":
         return None
     reference = str(record.source_reference or "").strip()
-    evidence = normalize_key(record.evidence or "")
     values = tuple(normalize_key(value) for value in record.answer_values)
-    if not reference or not evidence or not values:
+    if not reference or not values:
         return None
-    return reference, evidence, values
+    # Do not include model-authored evidence prose here. The same source/value
+    # cannot become field-specific merely because the model paraphrased the
+    # evidence differently for two targets.
+    return reference, values
 
 
 def _block_ambiguous_shared_synthesis(items: list[LiveFillPlanItem]) -> None:
-    """Block one generic synthesis statement being reused for several fields."""
+    """Block one generic synthesis value being reused for several fields."""
 
-    groups: dict[tuple[str, str, tuple[str, ...]], list[LiveFillPlanItem]] = {}
+    groups: dict[tuple[str, tuple[str, ...]], list[LiveFillPlanItem]] = {}
     for item in items:
         fingerprint = _synthesis_fingerprint(item)
         if fingerprint is not None:
@@ -226,8 +228,8 @@ def _block_ambiguous_shared_synthesis(items: list[LiveFillPlanItem]) -> None:
             continue
         labels = ", ".join(item.question or item.label or item.attribute_key for item in group)
         detail = (
-            "同一条 ai_synthesis 证据和同一答案被绑定到多个不同字段："
-            f"{labels}。字段归属不唯一，禁止进入 preview/persist；需更精确证据。"
+            "同一个 source_reference 的同一 ai_synthesis 答案被绑定到多个不同字段："
+            f"{labels}。字段归属不唯一，禁止进入 preview/persist；需目标字段专属证据。"
         )
         for item in group:
             item.action = BLOCKED
