@@ -1,3 +1,4 @@
 playwright>=1.45,<2
 openpyxl>=3.1,<4
 pytest>=8,<9
+openai>=1,<3
