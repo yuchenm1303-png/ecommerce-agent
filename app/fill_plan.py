@@ -193,14 +193,6 @@ def _apply_cross_field_business_rules(items: list[LiveFillPlanItem]) -> None:
 
 
 def _synthesis_fingerprint(item: LiveFillPlanItem) -> tuple[str, str, tuple[str, ...]] | None:
-    """Return the source/value fingerprint for a low-confidence AI binding.
-
-    The same generic cited statement must not authorize several different QA/live
-    fields merely because a model can map it to each one. This is the exact class
-    of error seen when one generic ``120°`` specification was assigned to both
-    Interior and Exterior Field of View.
-    """
-
     record = item.resolution
     if not record.preview_eligible or record.source_type != "ai_synthesis":
         return None
@@ -213,6 +205,8 @@ def _synthesis_fingerprint(item: LiveFillPlanItem) -> tuple[str, str, tuple[str,
 
 
 def _block_ambiguous_shared_synthesis(items: list[LiveFillPlanItem]) -> None:
+    """Block one generic synthesis statement being reused for several fields."""
+
     groups: dict[tuple[str, str, tuple[str, ...]], list[LiveFillPlanItem]] = {}
     for item in items:
         fingerprint = _synthesis_fingerprint(item)
@@ -252,11 +246,17 @@ def build_live_fill_plan(
     *,
     policy: ResolutionPolicy | None = None,
     aliases: dict[str, tuple[str, ...]] | None = None,
+    sections: dict[str, str] | None = None,
 ) -> LiveFillPlan:
     """Plan every live Makro field with fail-closed question/evidence binding."""
 
     fields = list(semantic_fields)
-    audit = match_questions_to_fields(catalog, fields, aliases=aliases)
+    audit = match_questions_to_fields(
+        catalog,
+        fields,
+        aliases=aliases,
+        sections=sections,
+    )
     matched_by_field = _matched_question_by_field_id(audit)
     effective_policy = policy or ResolutionPolicy()
     items: list[LiveFillPlanItem] = []
