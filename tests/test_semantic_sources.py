@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
 from app.answer_resolver import CONFLICT
-from app.evidence_contract import ProductIdentity, bundle_from_evidence_packet
+from app.evidence_contract import IdentityMismatchError, ProductIdentity, bundle_from_evidence_packet
 from app.qa_catalog import QuestionCatalog, QuestionRecord
 from app.resolution_engine import resolve_one
 from app.semantic_grounding import GroundedSource, GroundingCatalog, IMAGE_KIND, TEXT_KIND
@@ -141,7 +143,7 @@ def test_source_first_calls_each_logical_source_once_and_chunks_stay_one_call():
     assert result.failed_sources == 0
     assert result.model_calls == 2
     assert [item[0] for item in provider.calls] == ["supplier:001", "image:001"]
-    assert provider.calls[0][2] == 2  # both supplier chunks in one request
+    assert provider.calls[0][2] == 2
     assert provider.calls[1][2] == 1
     assert all(
         questions == ("Screen Size", "Image Resolution", "Color")
@@ -325,16 +327,14 @@ def test_cache_is_bound_to_expected_product_identity(tmp_path):
     )
 
     second_provider = PartiallyBadProvider()
-    second = run_grounded_semantic_sources(
-        second_provider,
-        catalog(),
-        single,
-        expected_identity=ProductIdentity(model_number="L12"),
-        max_repair_attempts=0,
-        cache_dir=tmp_path,
-        cache_namespace="model=qwen-test",
-    )
-
-    # Different product identity cannot reuse L11 cache. The stub then reports
-    # L11 and correctly triggers the hard identity guard.
+    with pytest.raises(IdentityMismatchError):
+        run_grounded_semantic_sources(
+            second_provider,
+            catalog(),
+            single,
+            expected_identity=ProductIdentity(model_number="L12"),
+            max_repair_attempts=0,
+            cache_dir=tmp_path,
+            cache_namespace="model=qwen-test",
+        )
     assert second_provider.calls == 1
