@@ -6,7 +6,7 @@ from pathlib import Path
 import makro_plan_listing
 import makro_preview_listing
 import makro_resolve_ai
-from app import ai_decisions, fill_plan, hard_field_validators, web_enrichment
+from app import ai_decisions, field_mapping, fill_plan, hard_field_validators, product_profile, web_enrichment
 from app.providers import openai_compatible, openai_semantic
 
 
@@ -35,6 +35,8 @@ def test_production_path_has_no_legacy_semantic_import_or_rule_layer():
         makro_preview_listing,
         fill_plan,
         hard_field_validators,
+        product_profile,
+        field_mapping,
         web_enrichment,
         openai_compatible,
         openai_semantic,
@@ -55,28 +57,52 @@ def test_production_path_has_no_legacy_semantic_import_or_rule_layer():
             assert token not in source, f"{module.__name__} reintroduced {token}"
 
 
-def test_ai_resolver_is_one_compact_local_fill_plus_optional_single_web_fill():
+def test_production_resolver_is_staged_profile_mapping_web_final_pipeline():
     source = inspect.getsource(makro_resolve_ai)
-    web_source = inspect.getsource(web_enrichment)
-    decision_source = inspect.getsource(ai_decisions)
-    assert "run_ai_resolution(" in source
+    assert "run_product_profile(" in source
+    assert "run_field_mapping(" in source
     assert "run_web_enrichment(" in source
-    assert "one_local_whole_product_fill_plus_optional_one_sourced_web_fill" in source
-    assert "source_concurrency" not in source
-    assert "batch_size" not in source
-    assert "provider.search_json(" in web_source
-    assert 'max_repair_attempts: int = 0' in decision_source
-    assert '"schema_sha256" not in request' not in source
+    assert "run_ai_resolution(" not in source
+    assert "product_profile_then_parallel_field_mapping_then_parallel_web_research_then_final_text_resolve" in source
+    assert "--field-batch-size" in source
+    assert "--field-concurrency" in source
+    assert "--web-batch-size" in source
+    assert "--web-concurrency" in source
 
 
-def test_model_output_contract_does_not_echo_local_packet_metadata():
-    schema = ai_decisions.AI_DECISION_JSON_SCHEMA
-    properties = schema["properties"]
-    assert schema["required"] == ["decisions"]
-    assert "product_identity" not in properties
-    assert "schema_sha256" not in properties
-    assert "source_manifest_sha256" not in properties
-    assert "warnings" not in properties
+def test_old_whole_product_field_resolution_runner_is_removed():
+    source = inspect.getsource(ai_decisions)
+    assert "run_ai_resolution" not in source
+    assert "build_ai_resolution_request" not in source
+    assert "AI_RESOLUTION_RULES" not in source
+
+
+def test_images_are_used_only_by_product_understanding_not_field_mapping_or_web():
+    profile_source = inspect.getsource(product_profile)
+    mapping_source = inspect.getsource(field_mapping)
+    web_source = inspect.getsource(web_enrichment)
+    assert "grounding.as_request_list()" in profile_source
+    assert '"target_fields": []' in profile_source
+    assert "image_path" not in mapping_source
+    assert "IMAGE_KIND" not in mapping_source
+    assert "image_path" not in web_source
+    assert "IMAGE_KIND" not in web_source
+
+
+def test_field_mapping_batches_are_mechanical_not_category_semantic_tables():
+    source = inspect.getsource(field_mapping)
+    assert "_mechanical_batches" in source
+    forbidden = (
+        "camera_fields",
+        "storage_fields",
+        "dimension_fields",
+        "vehicle_fields",
+        "colour_aliases",
+        "g_sensor",
+    )
+    lowered = source.casefold()
+    for token in forbidden:
+        assert token not in lowered
 
 
 def test_hard_validator_contains_no_product_attribute_marker_tables():
