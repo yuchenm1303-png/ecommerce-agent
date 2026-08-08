@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from .answer_resolver import RESOLVED, ResolvedAnswer
 from .fill_plan import READY, LiveFillPlanItem
+from .resolution_types import RESOLVED, ResolvedAnswer
 
 
 class ReviewPreviewBlocked(ValueError):
@@ -13,14 +13,11 @@ def preview_mode_for_item(
     *,
     include_review_candidates: bool,
 ) -> str | None:
-    """Return the explicit preview mode for an item, or ``None`` when blocked.
+    """Return the explicit execution mode for a plan item, or ``None``.
 
-    ``ready`` items are already eligible for normal autofill. ``review`` items
-    are *not* autofill-safe; they are accepted only when the resolver marked
-    them ``preview_eligible`` because low confidence was the sole blocking gate.
-    Conflicts, missing evidence, unmatched-field collisions, field-constraint
-    failures and missing provenance can never enter review preview through this
-    function.
+    READY items are autofill-safe. REVIEW items enter browser preview only after
+    explicit opt-in. CONFLICT/MISSING/business/hard-constraint failures never
+    pass this boundary.
     """
 
     if item.action == READY and item.resolution.eligible_for_autofill:
@@ -35,14 +32,7 @@ def execution_answer_for_item(
     *,
     include_review_candidates: bool,
 ) -> ResolvedAnswer:
-    """Create the narrow execution view consumed by the browser fill layer.
-
-    The browser executor intentionally accepts only ``ResolvedAnswer(status=resolved)``.
-    Rather than weakening that executor, this boundary performs the explicit
-    review-preview authorization first and then creates a resolved execution
-    copy. The original ``ResolutionRecord`` remains unchanged and still reports
-    ``needs_review`` / ``eligible_for_autofill=False`` for audit purposes.
-    """
+    """Create the narrow, product-semantic-free view consumed by the browser."""
 
     mode = preview_mode_for_item(
         item,
@@ -71,7 +61,7 @@ def execution_answer_for_item(
         evidence=record.evidence,
         confidence=record.confidence,
         detail=(
-            f"browser preview execution copy; mode={mode}; "
+            f"browser execution copy; mode={mode}; "
             f"original_status={record.status}; gate_reason={record.gate_reason or 'none'}"
         ),
     )
