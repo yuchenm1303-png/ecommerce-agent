@@ -97,9 +97,9 @@ def _section_key(value: object) -> str:
     """Normalize a QA category/live heading while removing UI-only counters.
 
     Makro headings contain decorations such as ``(Optional)`` and ``(0/46)``.
-    Customer QA categories normally contain only the semantic section name.
-    These decorations must not turn an otherwise exact section match into an
-    ambiguity with fields from Price/Stock/Shipping or another section.
+    Customer QA categories may contain a real section name *or* an answer-form
+    type such as ``单项填空`` / ``多项选择``. Only a category that actually equals
+    one of the current live section headings is allowed to constrain matching.
     """
 
     text = str(value or "").strip()
@@ -107,18 +107,34 @@ def _section_key(value: object) -> str:
     return normalize_key(text)
 
 
+def _live_section_keys(fields: list[dict[str, Any]]) -> set[str]:
+    return {
+        key
+        for field in fields
+        if (key := _section_key(field.get("section_heading")))
+    }
+
+
+def _question_category_is_live_section(
+    question: QuestionRecord,
+    fields: list[dict[str, Any]],
+) -> bool:
+    wanted = _section_key(question.category)
+    return bool(wanted and wanted in _live_section_keys(fields))
+
+
 def _filter_candidates_by_question_section(
     question: QuestionRecord,
     candidates: list[int],
     fields: list[dict[str, Any]],
 ) -> list[int]:
-    wanted = _section_key(question.category)
-    if not wanted or not candidates:
+    if not candidates or not _question_category_is_live_section(question, fields):
         return candidates
+    wanted = _section_key(question.category)
 
-    # A non-empty QA category is authoritative metadata. If live candidates
-    # expose section headings, never fall back to a same-named field in another
-    # section merely because its label/attribute_key matches.
+    # A QA category that is proven to be a current Makro section is
+    # authoritative metadata. Answer-form categories carry no section meaning
+    # and therefore never enter this branch.
     candidates_with_section = [
         index
         for index in candidates
@@ -142,10 +158,11 @@ def match_questions_to_fields(
     """One-to-one deterministic matcher between customer questions and live Makro fields.
 
     No fuzzy similarity is used. A question matches only an exact normalized
-    label/attribute key or an explicit alias supplied by configuration. When the
-    QA row carries a category/section, candidates must also belong to that live
-    section. This prevents generic names such as Height/Length from crossing
-    Product/Additional Description into Price, Stock and Shipping fields.
+    label/attribute key or an explicit alias supplied by configuration. A QA
+    category constrains section matching only when it exactly names one of the
+    current live Makro sections; answer-form metadata such as 单项填空/多项选择 is
+    ignored for section purposes. This prevents both cross-section spillover and
+    the real-world regression where every QA row became unmatched.
     """
 
     alias_map = aliases or {}
@@ -172,8 +189,8 @@ def match_questions_to_fields(
         unique_indexes = sorted({index for index, _ in resolved})
         if not unique_indexes:
             section_detail = (
-                f" QA category={question.category!r} 也必须与 live section 一致。"
-                if question.category
+                f" QA category={question.category!r} 已识别为 live Makro section，必须与字段 section 一致。"
+                if _question_category_is_live_section(question, fields)
                 else ""
             )
             matches.append(
