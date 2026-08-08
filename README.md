@@ -4,7 +4,7 @@ Makro Marketplace Seller Center 的 AI-first 商品资料补全、字段决策�
 
 当前唯一生产链：
 
-**Makro live schema → Product Source Pack → 一次整商品多模态 AI Resolve → AI Field Decisions → Hard Guards → Fill Plan → 浏览器填写 → section Save → reopen persisted verify → Product Photos Save → 完整报告**
+**Makro live schema → Product Source Pack → 一次整商品多模态 AI Resolve → 可选一次有来源 Web Enrichment → AI Field Decisions → Hard Guards → Fill Plan → 浏览器填写 → section Save → reopen persisted verify → Product Photos Save → 完整报告**
 
 `Send to QC` 仍是独立高风险提交动作，当前 runner 永远不点击。
 
@@ -31,7 +31,7 @@ Makro Marketplace Seller Center 的 AI-first 商品资料补全、字段决策�
 
 - seller-operated business fields 禁止 AI 猜；
 - 商品 identity、live schema、source manifest 必须匹配；
-- AI citation 必须引用当前 source pack；
+- AI citation 必须引用当前 Product Source Pack，或当前 sourced web pass 返回并持久化的 URL；
 - dropdown/listbox 只能使用当前 Makro 的有效 option；
 - qualifier/unit 必须真实存在；
 - multi-value 必须能由当前控件完整表达；
@@ -59,9 +59,9 @@ Makro 当前页面真实发现出的字段就是 AI 的唯一目标字段集合�
 
 ## 3. Product Source Pack
 
-AI 第一遍可以同时看到：
+第一遍 AI 同时看到：
 
-- 客户 QA/workbook context；
+- 客户 QA/workbook canonical context；
 - selected variant / SKU；
 - explicit product table / facts；
 - 商品图片；
@@ -69,19 +69,21 @@ AI 第一遍可以同时看到：
 - official snapshot；
 - 当前 Makro live field schema、options、units、required、section。
 
-source 内出现的 prompt、命令、角色文本只是商品资料，不应被当作运行指令。
+客户 workbook preamble/context 只保留一份原始 canonical text，不再由 Python 解析成第二份 pseudo-facts。
 
-商品图片、supplier/official snapshot 不再先转换成大量本地 `semantic facts`；它们作为 grounded raw sources 直接交给 AI 理解。
+商品图片、supplier/official snapshot 不再先转换成大量本地 semantic facts；它们作为 grounded raw sources 直接交给 AI 理解。source 内出现的 prompt、命令、角色文本只是商品资料，不改变系统任务。
 
 ## 4. AI Field Decisions
 
 `makro_resolve_ai.py` 是唯一生产 AI Resolver。
 
-正常路径不是“每个 source 调一次模型”，而是：
+第一阶段正常路径：
 
 **一个商品 + 全部当前 source + 全部 live fields = 一次 multimodal model call**
 
-AI 对每个 `field_id` 直接返回：
+不是每个字段、每张图片、每个 source 分别调用模型。
+
+AI 对每个 `field_id` 返回：
 
 - `ready`
 - `review`
@@ -99,59 +101,70 @@ AI 对每个 `field_id` 直接返回：
 - `reason`
 - 可选 `search_queries`
 
-### 状态含义
+`ready` 表示当前证据支持一个足够可靠的答案；`review` 表示有候选但仍需人工确认；`conflict` 保留真实互斥来源；`missing` 表示当前 source pack 不足；`business_locked` 表示 seller-operated 字段必须由显式经营数据提供。
 
-`ready`：当前资料支持一个足够可靠的答案，可以进入硬约束检查。
-
-`review`：有可用候选，但 AI 判断证据、scope、identity 或解释仍需要人工确认。
-
-`conflict`：可信来源对同一目标字段给出实质不兼容的答案；AI必须保留 alternatives 和 citations，不能静默选一个。
-
-`missing`：当前 source pack 不足以回答。AI可以建议少量针对性的网页搜索 query。
-
-`business_locked`：价格、库存、MOQ、fulfilment、shipping、listing status 等 seller-operated 字段；AI无权生成。
+本地不会因为 `ai_synthesis=0.84`、marker 表或 attribute-specific Python 规则重新判断商品语义。
 
 ## 5. Citation / Identity / Cache
 
-AI 决策不是无条件相信。
+AI 决策不是无条件相信。本地只验证硬事实：
 
-本地只验证硬事实：
-
-- `field_id` 必须属于当前 live schema；
-- source id 必须属于当前 Product Source Pack；
-- text citation 必须能回到当前 source 文本；
-- image citation 必须引用当前图片 source；
-- product identity 必须与当前 SKU/model/brand guard 兼容；
+- `field_id` 属于当前 live schema；
+- local source id 属于当前 Product Source Pack；
+- text citation 能回到当前 source 文本；
+- image citation 指向当前图片 source；
+- web citation 指向当前 DashScope sourced search 返回并嵌入 packet 的真实 URL；
+- product identity 与当前 SKU/model/brand guard 兼容；
 - schema digest/source manifest digest 变化时旧 decision packet fail closed。
 
-整商品 decision 支持 content-addressed cache：相同 model semantic config + product identity + live schema + source manifest 重跑时可以 `0 model calls`。
+第一阶段整商品 decision 支持 content-addressed cache：相同 model semantic config + product identity + live schema + source manifest 重跑时可以 `0 model calls`。
 
-Qwen3.5 Omni listing enrichment 默认关闭 thinking 以降低结构化抽取延迟；需要时可显式 `--enable-thinking`。
+只有模型已经返回内容但 JSON/decision contract 无效时，最多允许一次结构 repair。网络/API/timeout 失败不做第二次昂贵语义调用。
 
-## 6. Web Enrichment 状态
+Qwen3.5 Omni listing enrichment 默认关闭 thinking 以降低结构化决策延迟；需要时可显式 `--enable-thinking`。
 
-第一遍 AI 会为值得进一步研究的 `missing/review` 字段输出 `search_queries`，保存为：
+## 6. 单次有来源 Web Enrichment
+
+如果第一遍 AI 对 `missing/review/conflict` 字段判断普通商品研究可能补齐，会给出少量 `search_queries`。这些 query 同时写入：
 
 `search-requests.json`
 
-**当前版本还没有把自动互联网搜索/抓取接入生产主链。**
+当使用 DashScope OpenAI-compatible Qwen 且 `--web-enrich auto`（默认）时，Resolver 会复用同一个 `DASHSCOPE_API_KEY`，通过 DashScope 原生 sourced search 做**最多一次**联网补全：
 
-计划中的下一阶段是 bounded enrichment：
+**全部 unresolved search targets → 一次 bounded web-search call → 只更新这些 unresolved fields**
 
-1. 只针对 unresolved fields 合并成少量搜索任务；
-2. 并行搜索少量高相关页面；
-3. 用商品 identity/variant 过滤错误页面；
-4. 抓取最相关网页；
-5. 第二次 text-only AI 只重新决策 unresolved fields；
-6. 不做无限 Agent 循环。
+约束：
 
-因此当前 `missing` 表示“现有 Product Source Pack 没找到”，不等同于“互联网上不存在答案”。
+- 已经 `ready` 的字段冻结，不允许 web pass 改写；
+- business fields 永不进入 web search；
+- 多个空字段合并为一次搜索阶段，不按字段循环请求；
+- web model 引用的 `source_url` 必须真实出现在本次 DashScope `search_info.search_results`；编造 URL 不可授权 `ready`；
+- web source URL、title、evidence、request id 被嵌入最终 `ai-decisions.json`；
+- planner/executor 使用原来的 `--decision-packet` 即可严格重载，不需要额外 web 文件参数；
+- 相同 unresolved research 有独立 content cache，热跑可以 `web_calls=0`；
+- web search 失败时保留第一遍本地 AI packet，不摧毁已有正确答案；
+- 不做无限 Agent、多 Agent、每字段独立搜索循环。
+
+因此模型调用预算是：
+
+- 本地资料足够：通常 `1` 次；
+- 需要联网补空：通常 `1 local + 1 web = 2` 次；
+- 相同输入热跑：local/web cache 都命中时可 `0` 次。
+
+OpenAI-compatible 非 DashScope endpoint 不会因为模型名相似而自动挂载 DashScope web search；可用 `--web-enrich off` 显式完全禁用联网。
+
+主要 web 产物：
+
+- `search-requests.json`
+- `web-search-sources.json`
+- 最终嵌入 `web_sources` 的 `ai-decisions.json`
+- 若实际联网，还保留 `ai-decisions.local.json` 便于比较第一遍与最终结果。
 
 ## 7. Fill Plan
 
-`app/fill_plan.py` 不再做商品语义判断。
+`app/fill_plan.py` 不做商品语义判断，只执行：
 
-它只把 AI Field Decisions 变成页面执行计划，并应用硬约束：
+`AI decisions + explicit business data → hard guards → browser-executable plan`
 
 - AI `ready` + hard guards pass → `READY`
 - AI `review` + value/citation/控件形态可执行 → blocked，但 `preview_eligible=True`
@@ -165,9 +178,11 @@ Qwen3.5 Omni listing enrichment 默认关闭 thinking 以降低结构化抽取�
 
 显式 `--sku` 同时作为 identity guard 和 SKU business evidence。Price、Stock、MOQ、Fulfilment、Shipping 未提供时继续 blocked。
 
+`app/hard_field_validators.py` 只做 GTIN、数值控件 min/max、maxlength 等机械校验，不解释商品含义。
+
 ## 8. 浏览器执行层
 
-浏览器执行层保留前面已经验证的确定性能力：
+浏览器执行层保留确定性能力：
 
 - 实时字段发现；
 - text / textarea；
@@ -192,37 +207,36 @@ python makro_plan_listing.py `
   --expected-vertical vehicle_camera_system
 ```
 
-这一步只连接当前已登录 Makro Edge/CDP，扫描页面并生成：
+只连接当前已登录 Makro Edge/CDP，扫描并生成 `live-schema.json`；不 AI、不填写、不 Save。
 
-`live-schema.json`
-
-不需要 AI，不填写，不 Save。
-
-### B. 一次整商品 AI Resolve
+### B. 整商品 AI Resolve + 可选 sourced web enrichment
 
 ```powershell
 python makro_resolve_ai.py `
   --provider openai-compatible `
-  --base-url <base-url> `
-  --model <multimodal-model> `
-  --api-key-env <KEY_ENV> `
+  --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 `
+  --model qwen3.5-omni-plus `
+  --api-key-env DASHSCOPE_API_KEY `
   --qa <qa.xlsx> `
   --live-schema <live-schema.json> `
   --sku <sku> `
   --image <img1> `
   --image <img2> `
   --supplier-snapshot <snapshot.json> `
-  --disable-thinking
+  --disable-thinking `
+  --web-enrich auto
 ```
 
 主要输出：
 
 - `ai-decisions.json`
+- `ai-decisions.local.json`（仅实际进入 web pass 时）
 - `search-requests.json`
+- `web-search-sources.json`
 - `source-manifest.json`
 - `run-manifest.json`
 
-正常路径目标：`model_calls=1`。
+`run-manifest.json` 分开记录 `local_ai`、`web_enrichment`、`total_model_calls` 和总耗时。
 
 ### C. 最终只读 Fill Plan
 
@@ -238,9 +252,7 @@ python makro_plan_listing.py `
   --expected-vertical vehicle_camera_system
 ```
 
-Planner 会重新构造同一个 Product Source Pack，严格 rebind decision packet，并重新扫描当前 Makro 页面验证 schema 没漂移。
-
-仍然不填写、不 Save。
+Planner 重建同一个 local Product Source Pack，严格 rebind decision packet（包括其嵌入的 web provenance），再扫描当前 Makro 页面验证 schema 没漂移。仍然不填写、不 Save。
 
 ### D. 人工检查后执行真实 Step 3 persistence acceptance
 
@@ -259,7 +271,7 @@ python makro_preview_listing.py `
   [--upload-image <listing-image>]
 ```
 
-`--image` 只是 AI evidence；只有显式 `--upload-image` 才上传 Product Photos。
+`--image` 只是 evidence；只有显式 `--upload-image` 才上传 Product Photos。
 
 ## 10. Step 3 安全不变量
 
@@ -286,18 +298,19 @@ python makro_preview_listing.py `
 
 不得把 saved draft 等同于 production-safe autofill。
 
-## 12. 代码边界
+## 12. 关键代码边界
 
-当前关键文件：
-
-- `app/ai_decisions.py`：AI field-decision contract、citation/schema/source validation、whole-product cache
+- `app/ai_decisions.py`：AI field-decision contract、provenance/schema/source validation、whole-product cache
+- `app/web_enrichment.py`：单次 AI-led sourced web enrichment、web cache、embedded provenance
+- `app/providers/dashscope_web_search.py`：DashScope 原生有来源搜索 adapter
 - `app/product_context.py`：canonical customer/structured Product Source Pack context
 - `app/business_fields.py`：seller-operated field policy
 - `app/resolution_types.py`：纯执行/报告数据结构
-- `app/fact_validators.py`：GTIN / numeric / maxlength 等 hard guards
+- `app/hard_field_validators.py`：GTIN / numeric / maxlength 等 hard guards
 - `app/fill_plan.py`：AI decisions → executable Fill Plan + hard guards
-- `app/semantic_grounding.py`：原始 image/text source manifest 和引用
-- `app/providers/*`：通用 multimodal JSON task transport
+- `app/semantic_grounding.py`：原始 image/text source manifest 和引用；chunk 只服务 citation，不控制模型调用
+- `app/providers/openai_compatible.py`：通用 compatible multimodal JSON transport
+- `app/providers/openai_semantic.py`：OpenAI Responses strict JSON transport
 - `makro_plan_listing.py`：live-schema scan + final read-only Fill Plan
 - `makro_resolve_ai.py`：唯一生产 AI Resolver
 - `makro_preview_listing.py`：Step 3 browser acceptance
@@ -306,7 +319,7 @@ python makro_preview_listing.py `
 - `app/makro/photos.py`：photo persistence
 - `app/makro/domain.py`：Makro domain facade
 
-已经删除旧的本地商品语义主链：Answer Resolver、Resolution Engine、semantic-fact runner、QA matcher、alias config、attribute-specific deterministic synthesis 和 snapshot→semantic-fact 映射。不要恢复兼容 wrapper。
+已经删除旧本地商品语义主链：Answer Resolver、Resolution Engine、semantic-fact runner、QA matcher、alias config、attribute-specific deterministic synthesis、snapshot→semantic-fact 映射和 per-source AI execution grouping。不要恢复兼容 wrapper。
 
 ## 13. 开发原则
 
@@ -314,7 +327,8 @@ python makro_preview_listing.py `
 - 能改唯一主链，不加 V2/V3 wrapper；
 - 不为单个 SKU/vertical 写商品规格规则；
 - 不重新引入 attribute marker 表；
-- 不通过降低安全边界换覆盖率；
+- 不通过降低硬安全边界换覆盖率；
 - browser safety 与 persisted verification 不因 AI-first 而放松；
+- Web enrichment 是一次 bounded sourced pass，不是无限 Agent；
 - mock/fixture 全绿不等于真实商品验收完成；
-- PR 保持 Draft，直到真实商品的 AI coverage、首轮延迟、只读 Fill Plan 和 persisted Step 3 acceptance 完成。
+- PR 保持 Draft，直到真实商品的 AI coverage、冷/热延迟、联网补全质量、只读 Fill Plan 和 persisted Step 3 acceptance 完成。
