@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from app.ai_decisions import BUSINESS_LOCKED, MISSING, READY, field_id
+from app.ai_decisions import BUSINESS_LOCKED, MISSING, READY, REVIEW, field_id
 from app.evidence_contract import ProductIdentity
 from app.field_mapping import run_field_mapping
 from app.product_profile import ProductFact, ProductProfile, ProfileCandidate
@@ -70,31 +71,35 @@ def profile() -> ProductProfile:
 class FakeMapProvider:
     name = "fake-map"
 
-    def __init__(self, fail_call: int | None = None):
+    def __init__(self, fail_call: int | None = None, *, include_fact_ids: bool = True):
         self.calls = 0
         self.requests = []
         self.fail_call = fail_call
+        self.include_fact_ids = include_fact_ids
 
     def extract_json(self, request):
         self.calls += 1
         self.requests.append(request)
         if self.fail_call == self.calls:
             raise RuntimeError("batch failed")
+        profile_payload = json.loads(request["grounded_sources"][0]["content"])
+        fact_id = profile_payload["facts"][0]["fact_id"]
         decisions = []
         for target in request["target_fields"]:
-            decisions.append(
-                {
-                    "field_id": target["field_id"],
-                    "status": "ready",
-                    "values": ["known"],
-                    "citations": [
-                        {
-                            "source_reference": "supplier:001:text:0001:abc",
-                            "evidence_text": "Value: known",
-                        }
-                    ],
-                }
-            )
+            item = {
+                "field_id": target["field_id"],
+                "status": "ready",
+                "values": ["known"],
+                "citations": [
+                    {
+                        "source_reference": "supplier:001:text:0001:abc",
+                        "evidence_text": "Value: known",
+                    }
+                ],
+            }
+            if self.include_fact_ids:
+                item["profile_fact_ids"] = [fact_id]
+            decisions.append(item)
         return {"decisions": decisions}
 
 
@@ -119,6 +124,18 @@ def test_mapping_mechanically_batches_non_business_fields_without_images():
     )
     assert result.packet.decisions[-1].status == BUSINESS_LOCKED
     assert all(item.status == READY for item in result.packet.decisions[:-1])
+
+
+def test_mapping_ready_without_profile_fact_id_is_blocked_to_review():
+    target = field(1)
+    result = run_field_mapping(
+        FakeMapProvider(include_fact_ids=False),
+        [target],
+        profile(),
+        grounding(),
+    )
+    assert result.packet.decisions[0].status == REVIEW
+    assert "profile_fact_ids" in result.packet.decisions[0].reason
 
 
 def test_mapping_batch_failure_only_leaves_that_batch_unresolved():
