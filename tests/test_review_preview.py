@@ -2,10 +2,24 @@ from __future__ import annotations
 
 import pytest
 
-from app.answer_resolver import CONFLICT, NEEDS_REVIEW, RESOLVED
-from app.fill_plan import BLOCKED, build_live_fill_plan
-from app.qa_catalog import QuestionCatalog, QuestionRecord
-from app.resolution_engine import GATE_FIELD_CONSTRAINT, GATE_LOW_CONFIDENCE, resolve_one
+from app.ai_decisions import (
+    CONFLICT,
+    READY as AI_READY,
+    REVIEW,
+    AIDecisionPacket,
+    DecisionCitation,
+    FieldDecision,
+    field_id,
+)
+from app.answer_resolver import NEEDS_REVIEW, RESOLVED
+from app.evidence_contract import ProductIdentity
+from app.fill_plan import (
+    BLOCKED,
+    GATE_AI_CONFLICT,
+    GATE_AI_REVIEW,
+    GATE_HARD_FIELD_CONSTRAINT,
+    build_live_fill_plan,
+)
 from app.review_preview import ReviewPreviewBlocked, execution_answer_for_item
 from app.source_bundle import ProductSourceBundle
 
@@ -23,6 +37,7 @@ def field(
         "section_heading": section,
         "required": False,
         "multi_value": False,
+        "options": [],
         "controls": [
             control
             or {
@@ -34,44 +49,36 @@ def field(
     }
 
 
-def catalog(question: str = "Model Name") -> QuestionCatalog:
-    return QuestionCatalog(
-        source_path="qa.xlsx",
-        sheet_name="Sheet1",
-        header_row=3,
-        questions=[QuestionRecord(number="1", question=question)],
+def decision(target, status, value="M8"):
+    return FieldDecision(
+        field_id=field_id(target),
+        status=status,
+        values=[value] if value else [],
+        confidence=0.72 if status == REVIEW else 0.95,
+        citations=(
+            [DecisionCitation(source_reference="image:001", evidence_text="visible evidence")]
+            if value
+            else []
+        ),
+        reason="AI decision",
     )
 
 
-def add_evidence(
-    bundle: ProductSourceBundle,
-    *,
-    key: str,
-    value: str,
-    source_type: str = "ai_synthesis",
-    reference: str = "image:001",
-    priority: int = 90,
-    confidence: float = 0.84,
-):
-    bundle.add_evidence(
-        key=key,
-        value=value,
-        source_type=source_type,
-        source_reference=reference,
-        priority=priority,
-        confidence=confidence,
-        evidence_text=f"{key}: {value}",
+def packet(decisions):
+    return AIDecisionPacket(
+        identity=ProductIdentity(sku="SKU-1"),
+        schema_sha256="",
+        source_manifest_sha256="",
+        decisions=decisions,
     )
 
 
-def test_low_confidence_is_previewable_but_not_autofillable():
-    bundle = ProductSourceBundle()
-    add_evidence(bundle, key="Model Name", value="M8")
-
+def test_ai_review_is_previewable_but_not_autofillable():
+    target = field("model_name", "Model Name")
     plan = build_live_fill_plan(
-        catalog(),
-        [field("model_name", "Model Name")],
-        bundle,
+        packet([decision(target, REVIEW)]),
+        [target],
+        ProductSourceBundle(),
     )
     item = plan.items[0]
 
@@ -79,7 +86,7 @@ def test_low_confidence_is_previewable_but_not_autofillable():
     assert item.resolution.status == NEEDS_REVIEW
     assert item.resolution.eligible_for_autofill is False
     assert item.resolution.preview_eligible is True
-    assert item.resolution.gate_reason == GATE_LOW_CONFIDENCE
+    assert item.resolution.gate_reason == GATE_AI_REVIEW
     assert plan.summary()["preview_eligible"] == 1
 
     execution = execution_answer_for_item(
@@ -92,12 +99,11 @@ def test_low_confidence_is_previewable_but_not_autofillable():
 
 
 def test_review_candidate_requires_explicit_preview_opt_in():
-    bundle = ProductSourceBundle()
-    add_evidence(bundle, key="Model Name", value="M8")
+    target = field("model_name", "Model Name")
     item = build_live_fill_plan(
-        catalog(),
-        [field("model_name", "Model Name")],
-        bundle,
+        packet([decision(target, REVIEW)]),
+        [target],
+        ProductSourceBundle(),
     ).items[0]
 
     with pytest.raises(ReviewPreviewBlocked):
@@ -107,25 +113,21 @@ def test_review_candidate_requires_explicit_preview_opt_in():
         )
 
 
-def test_conflict_never_becomes_preview_eligible():
-    bundle = ProductSourceBundle()
-    add_evidence(bundle, key="Model Name", value="M8", reference="image:001")
-    add_evidence(bundle, key="Model Name", value="M9", reference="supplier:001")
+def test_ai_conflict_never_becomes_preview_eligible():
+    target = field("model_name", "Model Name")
+    conflict = decision(target, CONFLICT, value="")
+    item = build_live_fill_plan(
+        packet([conflict]),
+        [target],
+        ProductSourceBundle(),
+    ).items[0]
 
-    record = resolve_one(
-        field("model_name", "Model Name"),
-        bundle,
-        question=QuestionRecord(number="1", question="Model Name"),
-    )
-
-    assert record.status == CONFLICT
-    assert record.eligible_for_autofill is False
-    assert record.preview_eligible is False
+    assert item.action == BLOCKED
+    assert item.resolution.preview_eligible is False
+    assert item.resolution.gate_reason == GATE_AI_CONFLICT
 
 
-def test_field_constraint_failure_never_becomes_preview_eligible():
-    bundle = ProductSourceBundle()
-    add_evidence(bundle, key="Lens Size", value="20")
+def test_hard_numeric_constraint_failure_never_becomes_preview_eligible():
     numeric = {
         "name": "lens_size_0_value",
         "field_kind": "input",
@@ -133,37 +135,15 @@ def test_field_constraint_failure_never_becomes_preview_eligible():
         "min": "0",
         "max": "10",
     }
+    target = field("lens_size", "Lens Size", control=numeric)
+    item = build_live_fill_plan(
+        packet([decision(target, AI_READY, value="20")]),
+        [target],
+        ProductSourceBundle(),
+    ).items[0]
 
-    record = resolve_one(
-        field("lens_size", "Lens Size", control=numeric),
-        bundle,
-        question=QuestionRecord(number="1", question="Lens Size"),
-    )
-
-    assert record.status == NEEDS_REVIEW
-    assert record.gate_reason == GATE_FIELD_CONSTRAINT
-    assert record.preview_eligible is False
-    assert "最大值" in record.detail
-
-
-def test_unmatched_semantic_collision_cannot_enter_review_preview():
-    bundle = ProductSourceBundle()
-    add_evidence(bundle, key="Height", value="7")
-
-    plan = build_live_fill_plan(
-        catalog("Model Name"),
-        [
-            field(
-                "height",
-                "Length",
-                section="Price, Stock and Shipping Information",
-            )
-        ],
-        bundle,
-    )
-    item = plan.items[0]
-
-    assert item.question == ""
     assert item.action == BLOCKED
+    assert item.resolution.status == NEEDS_REVIEW
+    assert item.resolution.gate_reason == GATE_HARD_FIELD_CONSTRAINT
     assert item.resolution.preview_eligible is False
-    assert item.resolution.gate_reason == "unmatched_live_field"
+    assert "最大值" in item.resolution.detail
