@@ -55,6 +55,8 @@ def packet(
     source_reference="supplier:001:text:0001",
     source_type="supplier_web",
     evidence="Screen Size: 3.0 inch.",
+    confidence=0.88,
+    note="",
 ):
     return {
         "extractor": "stub-model",
@@ -66,8 +68,9 @@ def packet(
                 "value": value,
                 "source_type": source_type,
                 "source_reference": source_reference,
-                "confidence": 0.88,
+                "confidence": confidence,
                 "evidence_text": evidence,
+                "note": note,
             }
         ],
     }
@@ -86,6 +89,7 @@ def test_request_exposes_exact_source_ids_and_business_lock():
     assert "exactly equal" in payload["source_reference_rule"]
     assert payload["required_output_shape"]["facts"][0]["aliases"] == []
     assert any("every returned value" in rule for rule in payload["rules"])
+    assert any("explicit attribute binding" in rule for rule in payload["rules"])
 
 
 def test_literal_text_evidence_is_accepted():
@@ -99,6 +103,7 @@ def test_literal_text_evidence_is_accepted():
     assert len(validated.facts) == 1
     assert validated.facts[0].key == "Screen Size"
     assert validated.facts[0].source_reference == "supplier:001:text:0001"
+    assert validated.facts[0].source_type == "supplier_web"
 
 
 def test_direct_value_representation_change_is_rejected_fail_closed():
@@ -212,6 +217,7 @@ def test_image_fact_requires_precise_visual_evidence_description():
                 "source_reference": "image:001",
                 "confidence": 0.92,
                 "evidence_text": "The product label visibly reads '1080P'.",
+                "note": "",
             }
         ],
     }
@@ -222,6 +228,10 @@ def test_image_fact_requires_precise_visual_evidence_description():
         expected_identity=ProductIdentity(model_number="L11"),
     )
     assert validated.facts[0].source_reference == "image:001"
+    # The value is visibly grounded, but the evidence does not explicitly name
+    # the QA attribute. Preserve it for review, never direct-autofill it.
+    assert validated.facts[0].source_type == "ai_synthesis"
+    assert validated.facts[0].confidence <= 0.84
 
 
 def test_image_direct_answer_must_match_visual_evidence_description():
@@ -237,6 +247,7 @@ def test_image_direct_answer_must_match_visual_evidence_description():
                 "source_reference": "image:001",
                 "confidence": 0.92,
                 "evidence_text": "The product label visibly reads '1080P'.",
+                "note": "",
             }
         ],
     }
@@ -262,6 +273,7 @@ def test_business_question_is_rejected_even_with_real_source():
                 "source_reference": "supplier:001:text:0001",
                 "confidence": 0.9,
                 "evidence_text": "Screen Size: 3.0 inch.",
+                "note": "",
             }
         ],
     }
@@ -316,7 +328,7 @@ def _cjk_grounding() -> GroundingCatalog:
     )
 
 
-def test_single_cjk_character_direct_value_is_accepted():
+def test_single_cjk_character_direct_value_is_accepted_but_cross_language_binding_is_quarantined():
     validated = validate_grounded_semantic_packet(
         packet(
             key="Storage Capacity",
@@ -328,6 +340,8 @@ def test_single_cjk_character_direct_value_is_accepted():
         expected_identity=ProductIdentity(model_number="L11"),
     )
     assert validated.facts[0].value == "无"
+    assert validated.facts[0].source_type == "ai_synthesis"
+    assert validated.facts[0].confidence <= 0.84
 
 
 def test_single_cjk_character_direct_value_is_rejected_when_absent():
@@ -342,3 +356,79 @@ def test_single_cjk_character_direct_value_is_rejected_when_absent():
             _cjk_grounding(),
             expected_identity=ProductIdentity(model_number="L11"),
         )
+
+
+def test_different_source_attribute_cannot_directly_authorize_more_specific_qa_field():
+    qa = QuestionCatalog(
+        source_path="qa.xlsx",
+        sheet_name="Sheet1",
+        header_row=3,
+        questions=[QuestionRecord(number="1", question="Vehicle Brand")],
+    )
+    sources = GroundingCatalog(
+        sources=[
+            GroundedSource(
+                source_id="supplier:brand",
+                source_type="supplier_web",
+                kind=TEXT_KIND,
+                origin="https://supplier.test/item",
+                content="Brand: other",
+            )
+        ]
+    )
+    validated = validate_grounded_semantic_packet(
+        packet(
+            key="Vehicle Brand",
+            value="other",
+            source_reference="supplier:brand",
+            evidence="Brand: other",
+            confidence=0.9,
+            note="Source explicitly lists brand as other.",
+        ),
+        qa,
+        sources,
+        expected_identity=ProductIdentity(model_number="L11"),
+    )
+
+    fact = validated.facts[0]
+    assert fact.value == "other"
+    assert fact.source_type == "ai_synthesis"
+    assert fact.confidence <= 0.84
+    assert "semantic binding quarantine" in fact.note
+    assert any("semantic binding quarantined" in item for item in validated.warnings)
+
+
+def test_note_admitting_assumption_forces_quarantine_even_when_attribute_name_is_present():
+    qa = QuestionCatalog(
+        source_path="qa.xlsx",
+        sheet_name="Sheet1",
+        header_row=3,
+        questions=[QuestionRecord(number="1", question="Exterior Field of View")],
+    )
+    sources = GroundingCatalog(
+        sources=[
+            GroundedSource(
+                source_id="supplier:fov",
+                source_type="supplier_web",
+                kind=TEXT_KIND,
+                origin="https://supplier.test/item",
+                content="Exterior Field of View: 120°",
+            )
+        ]
+    )
+    validated = validate_grounded_semantic_packet(
+        packet(
+            key="Exterior Field of View",
+            value="120",
+            source_reference="supplier:fov",
+            evidence="Exterior Field of View: 120°",
+            confidence=0.9,
+            note="Assumed exterior FOV from a generic angle specification.",
+        ),
+        qa,
+        sources,
+        expected_identity=ProductIdentity(model_number="L11"),
+    )
+
+    assert validated.facts[0].source_type == "ai_synthesis"
+    assert validated.facts[0].confidence <= 0.84
