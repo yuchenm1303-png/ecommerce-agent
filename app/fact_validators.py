@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,6 +12,12 @@ from .source_bundle import normalize_key
 @dataclass(slots=True, frozen=True)
 class FieldValidationResult:
     valid: bool
+    detail: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class SynthesisVerificationResult:
+    verified: bool
     detail: str = ""
 
 
@@ -126,3 +133,179 @@ def validate_resolved_answer(
             return result
 
     return FieldValidationResult(True)
+
+
+# The rules below are deliberately much narrower than general language/model
+# inference. They exist so a low-confidence ai_synthesis answer can be promoted
+# only when ordinary code can recompute the same mapping from its grounded
+# evidence. Anything outside this allowlist remains under the AI confidence gate.
+_COLOUR_ALIASES: dict[str, tuple[str, ...]] = {
+    "black": ("black", "黑色"),
+    "white": ("white", "白色"),
+    "red": ("red", "红色"),
+    "blue": ("blue", "蓝色"),
+    "green": ("green", "绿色"),
+    "gray": ("gray", "grey", "灰色"),
+    "grey": ("gray", "grey", "灰色"),
+    "silver": ("silver", "银色"),
+    "gold": ("gold", "金色"),
+}
+_DUAL_CAMERA_MARKERS = (
+    "dual lens",
+    "dual camera",
+    "dual cameras",
+    "front + cabin",
+    "front and cabin",
+    "front+cabin",
+    "双镜头",
+    "双摄",
+    "双摄像头",
+)
+_INCLUDED_MARKERS = (
+    "included",
+    "includes",
+    "in the box",
+    "package includes",
+    "package contains",
+    "标配",
+    "包装清单",
+    "配件清单",
+    "内含",
+)
+_BRACKET_MARKERS = ("bracket", "mounting bracket", "mount", "支架")
+_DUAL_RECORDING_MARKERS = (
+    "dual recording",
+    "dual record",
+    "front + cabin",
+    "front and cabin",
+    "front+cabin",
+    "双录",
+    "前后录像",
+    "前后录",
+)
+_G_SENSOR_MARKERS = ("g-sensor", "g sensor", "碰撞感应", "重力感应")
+_LITERAL_VALUE_FIELDS = {
+    "otherconnectivityfeatures",
+    "usbtypesupported",
+    "framerate",
+    "videoformats",
+}
+
+
+def _field_names(semantic_field: dict[str, Any]) -> set[str]:
+    return {
+        normalize_key(semantic_field.get("attribute_key")),
+        normalize_key(semantic_field.get("label")),
+    } - {""}
+
+
+def _evidence_text(answer: ResolvedAnswer) -> str:
+    return str(answer.evidence or "").casefold()
+
+
+def _all_values_literal(answer: ResolvedAnswer, evidence: str) -> bool:
+    normalized_evidence = normalize_key(evidence)
+    if not normalized_evidence:
+        return False
+    for value in answer.answer_values:
+        normalized = normalize_key(value)
+        if not normalized or normalized not in normalized_evidence:
+            return False
+    return True
+
+
+def _yes(answer: ResolvedAnswer) -> bool:
+    return len(answer.answer_values) == 1 and normalize_key(answer.answer_values[0]) in {
+        "yes",
+        "true",
+        "1",
+    }
+
+
+def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in text for marker in markers)
+
+
+def verify_deterministic_synthesis(
+    semantic_field: dict[str, Any],
+    answer: ResolvedAnswer,
+) -> SynthesisVerificationResult:
+    """Verify a tiny allowlist of source-grounded semantic transforms.
+
+    This does *not* raise the trust of arbitrary AI synthesis. It only recognizes
+    transformations with a deterministic inverse check. The original
+    ``source_type=ai_synthesis``, confidence and provenance remain unchanged for
+    auditability.
+    """
+
+    if answer.status != RESOLVED or answer.source_type != "ai_synthesis":
+        return SynthesisVerificationResult(False)
+    if not answer.answer_values or not (answer.source_reference or "").strip():
+        return SynthesisVerificationResult(False)
+
+    names = _field_names(semantic_field)
+    evidence = _evidence_text(answer)
+    if not evidence:
+        return SynthesisVerificationResult(False)
+
+    if names & {"numberofcameras", "numberofcamera", "cameracount"}:
+        if (
+            len(answer.answer_values) == 1
+            and normalize_key(answer.answer_values[0]) == "2"
+            and _contains_any(evidence, _DUAL_CAMERA_MARKERS)
+        ):
+            return SynthesisVerificationResult(
+                True,
+                "deterministic transform verified: explicit dual-camera evidence => camera count 2",
+            )
+
+    if names & {"packof", "packsize", "packquantity"}:
+        if (
+            len(answer.answer_values) == 1
+            and normalize_key(answer.answer_values[0]) == "1"
+            and re.search(r"(?<!\d)1\s*[×xX*](?!\d)", evidence)
+        ):
+            return SynthesisVerificationResult(
+                True,
+                "deterministic transform verified: explicit 1× selected pack => Pack of 1",
+            )
+
+    if names & {"colour", "color"} and len(answer.answer_values) == 1:
+        wanted = normalize_key(answer.answer_values[0])
+        aliases = _COLOUR_ALIASES.get(wanted, ())
+        if aliases and any(alias.casefold() in evidence for alias in aliases):
+            return SynthesisVerificationResult(
+                True,
+                "deterministic transform verified: reviewed colour synonym maps to the selected enum",
+            )
+
+    if names & _LITERAL_VALUE_FIELDS and _all_values_literal(answer, evidence):
+        return SynthesisVerificationResult(
+            True,
+            "deterministic transform verified: every answer value is literally present in scoped evidence",
+        )
+
+    if names & {"mountingbracketincluded", "bracketincluded"} and _yes(answer):
+        if _contains_any(evidence, _BRACKET_MARKERS) and _contains_any(
+            evidence, _INCLUDED_MARKERS
+        ):
+            return SynthesisVerificationResult(
+                True,
+                "deterministic transform verified: package evidence explicitly includes a mounting bracket",
+            )
+
+    if names & {"dualrecording", "dualrecord", "simultaneousrecording"} and _yes(answer):
+        if _contains_any(evidence, _DUAL_RECORDING_MARKERS):
+            return SynthesisVerificationResult(
+                True,
+                "deterministic transform verified: evidence explicitly states dual recording",
+            )
+
+    if names & {"gsensor", "gsensorincluded", "collisionsensor"} and _yes(answer):
+        if _contains_any(evidence, _G_SENSOR_MARKERS):
+            return SynthesisVerificationResult(
+                True,
+                "deterministic transform verified: evidence explicitly states G-Sensor/collision sensing",
+            )
+
+    return SynthesisVerificationResult(False)
