@@ -3,11 +3,9 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Iterable
 
-from .qa_catalog import QuestionCatalog, QuestionRecord
 from .source_bundle import normalize_key
 
 SCHEMA_VERSION = 1
@@ -15,8 +13,8 @@ SCHEMA_VERSION = 1
 
 def _stable_section(value: object) -> str:
     text = str(value or "").strip()
-    # Makro completion counters and '(Optional)' are presentation state, not
-    # schema identity. Ignore them so (0/14) -> (5/14) after Save is not drift.
+    # Completion counters and '(Optional)' are presentation state, not schema
+    # identity. Ignore them so Save/reopen does not create false drift.
     text = re.sub(r"\([^)]*\)", " ", text)
     return normalize_key(text)
 
@@ -41,8 +39,7 @@ def _field_options(field: dict[str, Any]) -> tuple[str, ...]:
     output = list(_clean_options(field.get("options") or []))
     seen = {normalize_key(item) for item in output}
     for control in field.get("controls") or []:
-        name = str(control.get("name") or "")
-        if name.endswith("_qualifier"):
+        if str(control.get("name") or "").endswith("_qualifier"):
             continue
         for item in _clean_options(control.get("options") or []):
             key = normalize_key(item)
@@ -53,9 +50,6 @@ def _field_options(field: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _qualifier_options(field: dict[str, Any]) -> tuple[str, ...]:
-    # Serialized live-schema fields already carry qualifier_options at top
-    # level. Start with them so a save/load round trip compares equal to the
-    # current DOM controls instead of producing false schema drift.
     output = list(_clean_options(field.get("qualifier_options") or []))
     seen = {normalize_key(item) for item in output}
     for control in field.get("controls") or []:
@@ -83,7 +77,7 @@ def _schema_field(field: dict[str, Any]) -> dict[str, Any]:
 
 
 def live_schema_payload(semantic_fields: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    """Serialize the live Makro question shape without values or sensitive state."""
+    """Serialize the live Makro field contract without values or sensitive state."""
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -130,11 +124,10 @@ def assert_live_schema_matches(
     planned_fields: Iterable[dict[str, Any]],
     current_fields: Iterable[dict[str, Any]],
 ) -> None:
-    """Fail closed when the page question contract changed after planning.
+    """Fail closed when the current page contract changed after AI planning.
 
-    DOM paths, current values, completion counters and image/render state are
-    deliberately ignored. Field identity, requiredness, multiplicity and option
-    contracts must remain the same.
+    DOM paths, current values, completion counters and render state are ignored.
+    Field identity, requiredness, multiplicity and option contracts must match.
     """
 
     planned = Counter(_drift_signature(field) for field in planned_fields)
@@ -148,114 +141,3 @@ def assert_live_schema_matches(
         "live schema 与当前 Makro 页面不一致；拒绝使用旧答案写入。"
         f" removed={removed[:8]!r}; added={added[:8]!r}"
     )
-
-
-def augment_catalog_with_live_fields(
-    catalog: QuestionCatalog,
-    live_fields: Iterable[dict[str, Any]],
-    *,
-    business_locked: Callable[[str], bool],
-) -> tuple[QuestionCatalog, list[str]]:
-    """Add uniquely addressable non-business live fields missing from customer QA.
-
-    Label is preferred because it represents the visible Makro question. A
-    unique attribute_key is used only when the label collides with an existing
-    QA question. A generic/reused attribute_key must never suppress a distinct
-    visible label (real Makro has exhibited e.g. label=Length with key=height).
-    """
-
-    fields = list(live_fields)
-    existing = {normalize_key(item.question) for item in catalog.questions}
-    label_counts: Counter[str] = Counter(
-        normalize_key(field.get("label")) for field in fields if normalize_key(field.get("label"))
-    )
-    key_counts: Counter[str] = Counter(
-        normalize_key(field.get("attribute_key"))
-        for field in fields
-        if normalize_key(field.get("attribute_key"))
-    )
-
-    additions: list[QuestionRecord] = []
-    warnings: list[str] = []
-    seen_added: set[str] = set()
-
-    for index, field in enumerate(fields, start=1):
-        label = str(field.get("label") or "").strip()
-        attribute_key = str(field.get("attribute_key") or "").strip()
-        section = str(field.get("section_heading") or "").strip()
-        label_key = normalize_key(label)
-        attr_key = normalize_key(attribute_key)
-
-        if business_locked(label) or business_locked(attribute_key):
-            warnings.append(f"business_locked:{section}:{label or attribute_key}")
-            continue
-
-        # A visible label already present in customer QA is considered covered.
-        # Do NOT let a reused generic attribute_key hide a different live label.
-        if label_key and label_key in existing:
-            if not (
-                attr_key
-                and attr_key not in existing
-                and key_counts.get(attr_key, 0) == 1
-                and attr_key not in seen_added
-            ):
-                continue
-
-        question = ""
-        basis = ""
-        if (
-            label_key
-            and label_key not in existing
-            and label_counts.get(label_key, 0) == 1
-            and label_key not in seen_added
-        ):
-            question = label
-            basis = "unique-live-label"
-        elif (
-            attr_key
-            and attr_key not in existing
-            and key_counts.get(attr_key, 0) == 1
-            and attr_key not in seen_added
-        ):
-            question = attribute_key
-            basis = "unique-live-attribute-key"
-
-        if not question:
-            warnings.append(f"no_unique_evidence_key:{section}:{label or attribute_key}")
-            continue
-
-        question_key = normalize_key(question)
-        seen_added.add(question_key)
-        options = _field_options(field)
-        qualifier_options = _qualifier_options(field)
-        explanation = (
-            "Live Makro field not present in customer QA. "
-            f"attribute_key={attribute_key}; label={label}; section={section}; "
-            f"required={bool(field.get('required'))}; multi_value={bool(field.get('multi_value'))}. "
-            "Answer only from exact product/package evidence; do not infer seller-controlled data."
-        )
-        additions.append(
-            QuestionRecord(
-                number=f"LIVE-{index}",
-                question=question,
-                explanation=explanation,
-                category=section,
-                options=options,
-                unit=" | ".join(qualifier_options),
-                source_reference=(
-                    f"live-schema:section={_stable_section(section)}:"
-                    f"attribute={attr_key or label_key}"
-                ),
-                row_number=-index,
-                extra={
-                    "origin": "live_makro_schema",
-                    "attribute_key": attribute_key,
-                    "live_label": label,
-                    "match_basis": basis,
-                },
-            )
-        )
-
-    if not additions:
-        return catalog, warnings
-    return replace(catalog, questions=[*catalog.questions, *additions]), warnings
