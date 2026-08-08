@@ -61,7 +61,11 @@ def _live_schema_file(tmp_path):
 class FakeProvider:
     name = "fake-pluggable-provider"
 
+    def __init__(self):
+        self.calls = 0
+
     def extract_json(self, request_payload):
+        self.calls += 1
         image_source = next(
             (
                 source
@@ -94,17 +98,18 @@ class FakeProvider:
         }
 
 
-def test_provider_neutral_resolver_writes_same_audit_outputs_and_uses_live_schema(tmp_path, monkeypatch):
+def test_provider_neutral_resolver_is_source_first_browser_free_and_audited(tmp_path, monkeypatch):
     qa = _qa_file(tmp_path)
     live_schema = _live_schema_file(tmp_path)
     image = tmp_path / "front.jpg"
     image.write_bytes(b"fake-product-image")
     output = tmp_path / "out"
     captured = {}
+    provider = FakeProvider()
 
     def fake_builder(config):
         captured["config"] = config
-        return FakeProvider()
+        return provider
 
     monkeypatch.setattr(makro_resolve_ai, "build_semantic_provider", fake_builder)
     monkeypatch.setattr(
@@ -126,14 +131,14 @@ def test_provider_neutral_resolver_writes_same_audit_outputs_and_uses_live_schem
             str(live_schema),
             "--image",
             str(image),
+            "--no-semantic-cache",
             "--output-dir",
             str(output),
-            "--batch-size",
-            "10",
         ],
     )
 
     assert makro_resolve_ai.main() == 0
+    assert provider.calls == 1
     assert captured["config"].provider == "openai-compatible"
     assert captured["config"].model == "vendor-vision-model"
     assert captured["config"].api_key_env == "VENDOR_KEY"
@@ -142,7 +147,7 @@ def test_provider_neutral_resolver_writes_same_audit_outputs_and_uses_live_schem
     for name in (
         "validated-semantic-evidence.json",
         "source-manifest.json",
-        "semantic-batches.json",
+        "semantic-sources.json",
         "resolution.json",
         "resolution.xlsx",
         "review-queue.json",
@@ -151,6 +156,13 @@ def test_provider_neutral_resolver_writes_same_audit_outputs_and_uses_live_schem
     ):
         assert (run_dir / name).exists(), name
 
+    source_report = json.loads((run_dir / "semantic-sources.json").read_text(encoding="utf-8"))
+    assert source_report["execution_model"] == "one_call_per_logical_source_normal_path"
+    assert source_report["logical_source_count"] == 1
+    assert source_report["completed_sources"] == 1
+    assert source_report["model_calls"] == 1
+    assert source_report["cache_hits"] == 0
+
     manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
     assert manifest["provider_config"]["provider"] == "openai-compatible"
     assert manifest["provider_config"]["api_key_env"] == "VENDOR_KEY"
@@ -158,15 +170,18 @@ def test_provider_neutral_resolver_writes_same_audit_outputs_and_uses_live_schem
     assert manifest["customer_context_chars"] > 0
     assert manifest["base_question_count"] == 2
     assert manifest["effective_question_count"] == 3
+    assert manifest["semantic_pending_question_count"] == 2
     assert manifest["live_extra_question_count"] == 1
     assert manifest["live_schema"] == str(live_schema.resolve())
+    assert manifest["grounded_logical_source_count"] == 1
+    assert manifest["semantic_model_calls"] == 1
     assert manifest["makro_browser_opened"] is False
     assert manifest["writes_performed"] == 0
     assert manifest["save_clicked"] is False
     assert manifest["send_to_qc_clicked"] is False
 
 
-def test_generic_cli_never_accepts_raw_api_key():
+def test_generic_cli_never_accepts_raw_api_key_or_obsolete_batch_controls():
     parser = makro_resolve_ai.build_parser()
     option_strings = {
         option
@@ -177,6 +192,10 @@ def test_generic_cli_never_accepts_raw_api_key():
     assert "--openai-api-key" not in option_strings
     assert "--api-key-env" in option_strings
     assert "--live-schema" in option_strings
+    assert "--batch-size" not in option_strings
+    assert "--fail-on-batch-error" not in option_strings
+    assert "--max-source-repair-attempts" in option_strings
+    assert "--semantic-cache-dir" in option_strings
 
 
 def test_generic_cli_contains_no_makro_browser_or_fill_path():
