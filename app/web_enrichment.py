@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Protocol
@@ -12,25 +13,24 @@ from .ai_decisions import (
     MISSING,
     READY,
     REVIEW,
-    AIDecisionError,
     AIDecisionPacket,
-    DecisionAlternative,
-    DecisionCitation,
     FieldDecision,
     field_contract,
     field_id,
-    load_ai_decision_packet,
+    schema_digest,
     validate_ai_decision_packet,
 )
 from .business_fields import is_business_question
-from .evidence_contract import ProductIdentity
+from .product_profile import JSONTaskProvider, ProductProfile, profile_digest
 from .providers.dashscope_web_search import WebSearchJSONResult, WebSearchSource
 from .semantic_grounding import GroundingCatalog
 from .source_bundle import normalize_key
 
 
-WEB_ENRICHMENT_CONTRACT_VERSION = 1
-WEB_ENRICHMENT_CACHE_VERSION = 1
+WEB_RESEARCH_CONTRACT_VERSION = 2
+WEB_RESEARCH_CACHE_VERSION = 2
+WEB_FINAL_CONTRACT_VERSION = 1
+WEB_FINAL_CACHE_VERSION = 1
 WEB_UPDATABLE_STATUSES = {MISSING, REVIEW, CONFLICT}
 
 
@@ -61,33 +61,55 @@ class PersistedWebSource:
             "request_id": self.request_id,
         }
 
-    @classmethod
-    def from_mapping(cls, payload: dict[str, Any]) -> "PersistedWebSource":
-        reference = str(payload.get("source_reference") or "").strip()
-        url = str(payload.get("url") or "").strip()
-        content = str(payload.get("content") or "").strip()
-        if not reference or not url or not content:
-            raise AIDecisionError("persisted web source 缺少 source_reference/url/content。")
-        return cls(
-            source_reference=reference,
-            url=url,
-            title=str(payload.get("title") or "").strip(),
-            site_name=str(payload.get("site_name") or "").strip(),
-            content=content,
-            request_id=str(payload.get("request_id") or "").strip(),
-        )
+
+@dataclass(slots=True, frozen=True)
+class WebEvidence:
+    field_id: str
+    source_reference: str
+    source_url: str
+    evidence_text: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "field_id": self.field_id,
+            "source_reference": self.source_reference,
+            "source_url": self.source_url,
+            "evidence_text": self.evidence_text,
+        }
 
 
 @dataclass(slots=True)
 class WebEnrichmentResult:
     packet: AIDecisionPacket
     web_sources: list[PersistedWebSource] = field(default_factory=list)
-    model_calls: int = 0
-    cache_hit: bool = False
+    evidence: list[WebEvidence] = field(default_factory=list)
     target_field_count: int = 0
+    search_batch_count: int = 0
+    search_model_calls: int = 0
+    search_cache_hits: int = 0
+    search_failed_batches: int = 0
+    final_model_calls: int = 0
+    final_cache_hit: bool = False
     searched: bool = False
-    elapsed_seconds: float = 0.0
-    warning: str = ""
+    search_elapsed_seconds: float = 0.0
+    final_elapsed_seconds: float = 0.0
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def model_calls(self) -> int:
+        return self.search_model_calls + self.final_model_calls
+
+    @property
+    def cache_hit(self) -> bool:
+        return self.searched and self.search_model_calls == 0 and self.final_model_calls == 0
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return self.search_elapsed_seconds + self.final_elapsed_seconds
+
+    @property
+    def warning(self) -> str:
+        return " | ".join(self.warnings)
 
 
 def _field_is_business(field: dict[str, Any]) -> bool:
@@ -96,7 +118,7 @@ def _field_is_business(field: dict[str, Any]) -> bool:
     )
 
 
-def _target_decisions(
+def _targets(
     packet: AIDecisionPacket,
     fields: Iterable[dict[str, Any]],
 ) -> list[tuple[dict[str, Any], FieldDecision]]:
@@ -111,12 +133,11 @@ def _target_decisions(
     return output
 
 
-def _prior_decision_payload(decision: FieldDecision) -> dict[str, Any]:
+def _prior_payload(decision: FieldDecision) -> dict[str, Any]:
     return {
         "status": decision.status,
         "values": list(decision.values),
         "qualifier": decision.qualifier,
-        "confidence": decision.confidence,
         "citations": [item.as_dict() for item in decision.citations],
         "alternatives": [item.as_dict() for item in decision.alternatives],
         "reason": decision.reason,
@@ -124,80 +145,62 @@ def _prior_decision_payload(decision: FieldDecision) -> dict[str, Any]:
     }
 
 
-def _web_prompt(
-    packet: AIDecisionPacket,
+def _profile_payload(profile: ProductProfile) -> dict[str, Any]:
+    return {
+        "product_identity": {
+            "sku": profile.identity.sku,
+            "model_number": profile.identity.model_number,
+            "brand": profile.identity.brand,
+        },
+        "summary": profile.summary,
+        "facts": [fact.as_dict() for fact in profile.facts],
+    }
+
+
+def _research_prompt(
+    profile: ProductProfile,
     targets: list[tuple[dict[str, Any], FieldDecision]],
 ) -> str:
     payload = {
-        "task": "research_and_resolve_only_the_unresolved_marketplace_fields",
-        "product_identity": {
-            "sku": packet.identity.sku,
-            "model_number": packet.identity.model_number,
-            "brand": packet.identity.brand,
-        },
-        "model_summary": packet.model_summary,
+        "task": "research_evidence_for_unresolved_marketplace_fields",
+        "product_profile": _profile_payload(profile),
         "target_fields": [
             {
                 "field_id": decision.field_id,
                 **field_contract(field),
-                "prior_decision": _prior_decision_payload(decision),
+                "prior_decision": _prior_payload(decision),
             }
             for field, decision in targets
         ],
         "rules": [
-            "Use web search only for these target fields; never change fields that were already READY.",
-            "Preserve exact product and selected-variant identity; generic model names require extra caution.",
-            "Use each target's search_queries when present; otherwise derive a focused query from exact product identity plus that field. Combine searches when efficient.",
-            "READY means web research supports one best answer for the exact current product/variant.",
-            "REVIEW means a plausible answer exists but identity, scope or evidence is not strong enough for automatic entry.",
-            "If credible explicit web/local values disagree for the same attribute and scope and neither clearly supersedes the other, status MUST be CONFLICT; preserve cited alternatives and never silently choose one.",
-            "MISSING means bounded normal web research did not establish the value.",
-            "Never infer seller-operated price, stock, MOQ, fulfilment, shipping or listing status.",
-            "Every READY/REVIEW citation and every CONFLICT alternative citation must use the exact source_url of a page actually returned by this search call.",
-            "Do not invent URLs. Never treat lack of mention as No/False/Not included; a negative value requires explicit negative evidence. Keep packaging dimensions/weight separate from product-body dimensions/weight.",
-            "When target options are supplied, return exact marketplace option text when one clearly matches.",
-            "If multi_value=false, return exactly one string in values; combine supported free-text features into one concise string when appropriate.",
-            "If qualifier_options are supplied, put only the magnitude/value in values and put the exact unit once in qualifier; never return the unit as a separate value.",
-            "Do not invent warranty or service terms; READY for warranty fields requires explicit warranty evidence.",
-            "Return exactly one JSON object and no markdown.",
+            "Research only these unresolved fields for the exact current product/selected variant.",
+            "This stage gathers evidence only; do not decide READY/REVIEW/CONFLICT/MISSING.",
+            "Use model-authored search_queries when useful; otherwise derive focused queries from exact product identity plus the field.",
+            "Prefer exact manufacturer/manual/current supplier evidence. Generic model-name pages require strong identity matching.",
+            "Never research seller-operated price, stock, MOQ, fulfilment, shipping or listing status.",
+            "Return only evidence from pages actually returned by this search call. Do not invent URLs.",
+            "If evidence is ambiguous, still return the exact evidence and let the final resolver judge it.",
+            "Return JSON only.",
         ],
         "json_contract": {
-            "decisions": [
+            "evidence": [
                 {
                     "field_id": "exact target field_id",
-                    "status": "ready|review|conflict|missing",
-                    "values": ["strings"],
-                    "qualifier": "string",
-                    "confidence": "0..1",
-                    "citations": [
+                    "items": [
                         {
                             "source_url": "exact URL returned by web search",
-                            "evidence_text": "concise evidence supporting the field",
+                            "evidence_text": "concise evidence relevant to this field",
                         }
                     ],
-                    "alternatives": [
-                        {
-                            "values": ["strings"],
-                            "qualifier": "string",
-                            "citations": [
-                                {
-                                    "source_url": "exact URL returned by web search",
-                                    "evidence_text": "concise evidence",
-                                }
-                            ],
-                            "reason": "string",
-                        }
-                    ],
-                    "reason": "string",
                 }
             ],
             "summary": "string",
         },
     }
     return (
-        "You are the single bounded web-research phase of an AI-first product listing resolver. "
-        "Research all unresolved targets in this one call and return JSON only.\n\n"
-        + json.dumps(payload, ensure_ascii=False)
+        "You are the bounded web-research stage of a product-listing pipeline. "
+        "Gather evidence for this small batch and return one JSON object only.\n\n"
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
 
 
@@ -219,216 +222,26 @@ def _source_lookup(items: Iterable[WebSearchSource]) -> dict[str, WebSearchSourc
     return output
 
 
-def _convert_citations(
-    payload: Any,
-    source_lookup: dict[str, WebSearchSource],
-    evidence_by_url: dict[str, list[str]],
-) -> list[DecisionCitation]:
-    if not isinstance(payload, list):
-        return []
-    output: list[DecisionCitation] = []
-    seen: set[tuple[str, str]] = set()
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        url = str(item.get("source_url") or "").strip()
-        evidence = str(item.get("evidence_text") or "").strip()
-        source = source_lookup.get(_normalize_url(url))
-        if source is None or not evidence:
-            continue
-        reference = _web_source_reference(source.url)
-        fingerprint = (reference, normalize_key(evidence))
-        if fingerprint in seen:
-            continue
-        seen.add(fingerprint)
-        output.append(DecisionCitation(reference, evidence))
-        evidence_by_url.setdefault(_normalize_url(source.url), []).append(evidence)
-    return output
+def _mechanical_batches[T](items: list[T], batch_size: int) -> list[list[T]]:
+    return [items[index : index + batch_size] for index in range(0, len(items), batch_size)]
 
 
-def _convert_alternatives(
-    payload: Any,
-    source_lookup: dict[str, WebSearchSource],
-    evidence_by_url: dict[str, list[str]],
-) -> list[DecisionAlternative]:
-    if not isinstance(payload, list):
-        return []
-    output: list[DecisionAlternative] = []
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        raw_values = item.get("values") or []
-        values = (
-            tuple(str(value).strip() for value in raw_values if str(value).strip())
-            if isinstance(raw_values, list)
-            else ()
-        )
-        output.append(
-            DecisionAlternative(
-                values=values,
-                qualifier=str(item.get("qualifier") or "").strip(),
-                citations=tuple(
-                    _convert_citations(item.get("citations"), source_lookup, evidence_by_url)
-                ),
-                reason=str(item.get("reason") or "").strip(),
-            )
-        )
-    return output
-
-
-def _float_confidence(value: Any) -> float:
-    try:
-        return max(0.0, min(1.0, float(value)))
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _parse_web_updates(
-    payload: dict[str, Any],
-    targets: list[tuple[dict[str, Any], FieldDecision]],
-    search_result: WebSearchJSONResult,
-) -> tuple[dict[str, FieldDecision], list[PersistedWebSource], list[str]]:
-    target_ids = {decision.field_id for _, decision in targets}
-    source_lookup = _source_lookup(search_result.sources)
-    evidence_by_url: dict[str, list[str]] = {}
-    warnings: list[str] = []
-    updates: dict[str, FieldDecision] = {}
-
-    raw_decisions = payload.get("decisions") or []
-    if not isinstance(raw_decisions, list):
-        raise AIDecisionError("web enrichment 响应缺少 decisions 数组。")
-
-    for item in raw_decisions:
-        if not isinstance(item, dict):
-            continue
-        identifier = str(item.get("field_id") or "").strip()
-        if identifier not in target_ids:
-            warnings.append(f"web update ignored unknown/non-target field_id={identifier!r}")
-            continue
-        if identifier in updates:
-            raise AIDecisionError(f"web enrichment field_id 重复：{identifier}")
-        status = str(item.get("status") or "").strip().casefold()
-        if status not in WEB_UPDATABLE_STATUSES | {READY}:
-            warnings.append(f"web update {identifier}: invalid status={status!r}; kept prior")
-            continue
-        raw_values = item.get("values") or []
-        values = (
-            [str(value).strip() for value in raw_values if str(value).strip()]
-            if isinstance(raw_values, list)
-            else []
-        )
-        updates[identifier] = FieldDecision(
-            field_id=identifier,
-            status=status,
-            values=values,
-            qualifier=str(item.get("qualifier") or "").strip(),
-            confidence=_float_confidence(item.get("confidence")),
-            citations=_convert_citations(
-                item.get("citations"), source_lookup, evidence_by_url
-            ),
-            alternatives=_convert_alternatives(
-                item.get("alternatives"), source_lookup, evidence_by_url
-            ),
-            reason=str(item.get("reason") or "").strip(),
-            search_queries=[],
-        )
-
-    persisted: list[PersistedWebSource] = []
-    for normalized_url, evidence_items in evidence_by_url.items():
-        source = source_lookup[normalized_url]
-        unique_evidence: list[str] = []
-        seen: set[str] = set()
-        for evidence in evidence_items:
-            key = normalize_key(evidence)
-            if key and key not in seen:
-                seen.add(key)
-                unique_evidence.append(evidence)
-        content = "\n".join(
-            part
-            for part in [
-                f"Search result title: {source.title}" if source.title else "",
-                f"Search result URL: {source.url}",
-                *[f"Search-model evidence: {item}" for item in unique_evidence],
-            ]
-            if part
-        ).strip()
-        persisted.append(
-            PersistedWebSource(
-                source_reference=_web_source_reference(source.url),
-                url=source.url,
-                title=source.title,
-                site_name=source.site_name,
-                content=content,
-                request_id=search_result.request_id,
-            )
-        )
-    return updates, persisted, warnings
-
-
-def _external_source_map(web_sources: Iterable[PersistedWebSource]) -> dict[str, str]:
-    output: dict[str, str] = {}
-    for source in web_sources:
-        if source.source_reference in output:
-            raise AIDecisionError(
-                f"web source_reference 重复：{source.source_reference}"
-            )
-        output[source.source_reference] = source.content
-    return output
-
-
-def _merge_packet(
-    initial: AIDecisionPacket,
-    updates: dict[str, FieldDecision],
-    web_sources: list[PersistedWebSource],
-    local_grounding: GroundingCatalog,
-    fields: list[dict[str, Any]],
-    warnings: list[str],
-    summary: str,
-) -> AIDecisionPacket:
-    candidate = AIDecisionPacket(
-        identity=initial.identity,
-        schema_sha256=initial.schema_sha256,
-        # Web evidence is embedded separately. This digest continues to bind the
-        # exact original customer/images/supplier source pack.
-        source_manifest_sha256=initial.source_manifest_sha256,
-        decisions=[updates.get(item.field_id, item) for item in initial.decisions],
-        model_summary=(
-            initial.model_summary
-            + ("\nWeb enrichment: " + summary if summary else "\nWeb enrichment completed.")
-        ).strip(),
-        warnings=[*initial.warnings, *warnings],
-        extractor=(initial.extractor + "+dashscope-web-search").strip("+"),
-    )
-    return validate_ai_decision_packet(
-        candidate,
-        fields,
-        local_grounding,
-        expected_identity=initial.identity,
-        external_sources=_external_source_map(web_sources),
-    )
-
-
-def _packet_fingerprint(packet: AIDecisionPacket) -> str:
-    raw = json.dumps(packet.as_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _web_cache_key(
+def _research_cache_key(
     provider: SourcedWebSearchProvider,
-    initial: AIDecisionPacket,
+    profile: ProductProfile,
     targets: list[tuple[dict[str, Any], FieldDecision]],
 ) -> str:
     payload = {
-        "cache_version": WEB_ENRICHMENT_CACHE_VERSION,
-        "contract_version": WEB_ENRICHMENT_CONTRACT_VERSION,
+        "cache_version": WEB_RESEARCH_CACHE_VERSION,
+        "contract_version": WEB_RESEARCH_CONTRACT_VERSION,
         "provider": provider.name,
         "model": provider.model,
-        "initial_packet_sha256": _packet_fingerprint(initial),
+        "profile_sha256": profile_digest(profile),
         "targets": [
             {
                 "field_id": decision.field_id,
-                "search_queries": decision.search_queries,
-                "contract": field_contract(field),
+                "field": field_contract(field),
+                "prior": _prior_payload(decision),
             }
             for field, decision in targets
         ],
@@ -437,13 +250,479 @@ def _web_cache_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def enriched_packet_payload(
-    packet: AIDecisionPacket,
-    web_sources: Iterable[PersistedWebSource],
-) -> dict[str, Any]:
-    payload = packet.as_dict()
-    payload["web_sources"] = [source.as_dict() for source in web_sources]
-    return payload
+def _serialize_search_result(result: WebSearchJSONResult) -> dict[str, Any]:
+    return {
+        "payload": result.payload,
+        "sources": [item.as_dict() for item in result.sources],
+        "request_id": result.request_id,
+    }
+
+
+def _deserialize_search_result(payload: dict[str, Any]) -> WebSearchJSONResult:
+    return WebSearchJSONResult(
+        payload=dict(payload.get("payload") or {}),
+        sources=[
+            WebSearchSource(
+                index=str(item.get("index") or ""),
+                title=str(item.get("title") or ""),
+                url=str(item.get("url") or ""),
+                site_name=str(item.get("site_name") or ""),
+            )
+            for item in payload.get("sources") or []
+            if isinstance(item, dict) and str(item.get("url") or "").strip()
+        ],
+        request_id=str(payload.get("request_id") or ""),
+    )
+
+
+@dataclass(slots=True)
+class _ResearchBatchRun:
+    index: int
+    result: WebSearchJSONResult | None
+    model_calls: int
+    cache_hit: bool
+    warning: str = ""
+
+
+def _run_research_batch(
+    provider: SourcedWebSearchProvider,
+    profile: ProductProfile,
+    batch_index: int,
+    batch_targets: list[tuple[dict[str, Any], FieldDecision]],
+    *,
+    cache_dir: Path | None,
+) -> _ResearchBatchRun:
+    key = _research_cache_key(provider, profile, batch_targets)
+    cache_path = cache_dir / f"web-research-{key}.json" if cache_dir is not None else None
+    if cache_path is not None and cache_path.is_file():
+        try:
+            cached = _deserialize_search_result(json.loads(cache_path.read_text(encoding="utf-8")))
+            return _ResearchBatchRun(batch_index, cached, 0, True)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    try:
+        result = provider.search_json(_research_prompt(profile, batch_targets))
+    except Exception as exc:
+        return _ResearchBatchRun(
+            batch_index,
+            None,
+            1,
+            False,
+            warning=f"web research batch {batch_index} failed: {exc}",
+        )
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        temp.write_text(
+            json.dumps(_serialize_search_result(result), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp.replace(cache_path)
+    return _ResearchBatchRun(batch_index, result, 1, False)
+
+
+def _accepted_evidence(
+    runs: list[_ResearchBatchRun],
+    target_ids: set[str],
+) -> tuple[list[WebEvidence], list[PersistedWebSource], list[str]]:
+    evidence: list[WebEvidence] = []
+    warnings: list[str] = []
+    source_meta: dict[str, WebSearchSource] = {}
+    source_request: dict[str, str] = {}
+    evidence_by_url: dict[str, list[str]] = {}
+    seen_evidence: set[tuple[str, str, str]] = set()
+
+    for run in runs:
+        if run.warning:
+            warnings.append(run.warning)
+        if run.result is None:
+            continue
+        source_lookup = _source_lookup(run.result.sources)
+        for url_key, source in source_lookup.items():
+            source_meta.setdefault(url_key, source)
+            source_request.setdefault(url_key, run.result.request_id)
+        raw_evidence = run.result.payload.get("evidence") or []
+        if not isinstance(raw_evidence, list):
+            warnings.append(f"web research batch {run.index}: response missing evidence array")
+            continue
+        for group in raw_evidence:
+            if not isinstance(group, dict):
+                continue
+            identifier = str(group.get("field_id") or "").strip()
+            if identifier not in target_ids:
+                continue
+            items = group.get("items") or []
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("source_url") or "").strip()
+                text = str(item.get("evidence_text") or "").strip()
+                source = source_lookup.get(_normalize_url(url))
+                if source is None or not text:
+                    continue
+                reference = _web_source_reference(source.url)
+                fingerprint = (identifier, reference, normalize_key(text))
+                if fingerprint in seen_evidence:
+                    continue
+                seen_evidence.add(fingerprint)
+                evidence.append(
+                    WebEvidence(
+                        field_id=identifier,
+                        source_reference=reference,
+                        source_url=source.url,
+                        evidence_text=text,
+                    )
+                )
+                evidence_by_url.setdefault(_normalize_url(source.url), []).append(text)
+
+    persisted: list[PersistedWebSource] = []
+    for url_key, evidence_items in evidence_by_url.items():
+        source = source_meta[url_key]
+        unique: list[str] = []
+        seen: set[str] = set()
+        for text in evidence_items:
+            key = normalize_key(text)
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(text)
+        content = "\n".join(
+            [
+                *([f"Search result title: {source.title}"] if source.title else []),
+                f"Search result URL: {source.url}",
+                *[f"Search evidence: {text}" for text in unique],
+            ]
+        )
+        persisted.append(
+            PersistedWebSource(
+                source_reference=_web_source_reference(source.url),
+                url=source.url,
+                title=source.title,
+                site_name=source.site_name,
+                content=content,
+                request_id=source_request.get(url_key, ""),
+            )
+        )
+    return evidence, persisted, warnings
+
+
+def _external_source_map(items: Iterable[PersistedWebSource]) -> dict[str, str]:
+    return {item.source_reference: item.content for item in items}
+
+
+def _final_prompt_request(
+    profile: ProductProfile,
+    initial: AIDecisionPacket,
+    fields: list[dict[str, Any]],
+    evidence: list[WebEvidence],
+) -> tuple[dict[str, Any], set[str]]:
+    evidence_by_field: dict[str, list[WebEvidence]] = {}
+    for item in evidence:
+        evidence_by_field.setdefault(item.field_id, []).append(item)
+    field_by_id = {field_id(field): field for field in fields}
+    prior_by_id = {decision.field_id: decision for decision in initial.decisions}
+    target_ids = {
+        identifier
+        for identifier in evidence_by_field
+        if identifier in field_by_id
+        and identifier in prior_by_id
+        and prior_by_id[identifier].status in WEB_UPDATABLE_STATUSES
+    }
+    target_fields = [field_by_id[identifier] for identifier in target_ids]
+    profile_text = json.dumps(_profile_payload(profile), ensure_ascii=False, separators=(",", ":"))
+    web_text = json.dumps(
+        {
+            identifier: [item.as_dict() for item in evidence_by_field[identifier]]
+            for identifier in target_ids
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    request = {
+        "task": "finalize_unresolved_marketplace_fields_from_profile_and_web_evidence",
+        "system_instruction": (
+            "You are the final text-only resolver. Use the grounded product profile plus returned web evidence "
+            "to update only unresolved marketplace fields. Preserve genuine conflicts and never invent product facts. "
+            "Return compact JSON only."
+        ),
+        "prompt_instruction": (
+            "Resolve only this small unresolved set. Do not change any field that was already READY. "
+            "Return one decision per target field and no prose outside JSON."
+        ),
+        "product_identity": {
+            "sku": profile.identity.sku,
+            "model_number": profile.identity.model_number,
+            "brand": profile.identity.brand,
+        },
+        "target_fields": [
+            {
+                "field_id": field_id(field),
+                **field_contract(field),
+                "prior_decision": _prior_payload(prior_by_id[field_id(field)]),
+            }
+            for field in target_fields
+        ],
+        "rules": [
+            "READY requires strong exact-product evidence and citations.",
+            "If credible local/web evidence disagrees for the same attribute and scope and neither clearly supersedes the other, return CONFLICT with cited alternatives.",
+            "Never infer negative values from absence. Keep packaging scope, product-body scope, cabin/rear, manual/UI language and compatibility scope distinct.",
+            "For web citations use only source_reference values present in WEB_EVIDENCE. For local citations use only underlying source_reference values present in PRODUCT_PROFILE.",
+            "If multi_value=false return one value string. If qualifier_options exist, keep the unit only in qualifier.",
+            "MISSING is valid when research still does not establish the value.",
+        ],
+        "grounded_sources": [
+            {
+                "source_id": "product-profile:derived",
+                "source_type": "derived_product_profile",
+                "kind": "text",
+                "origin": "product-profile.json",
+                "content": profile_text,
+            },
+            {
+                "source_id": "web-research:derived",
+                "source_type": "derived_web_research",
+                "kind": "text",
+                "origin": "web-research.json",
+                "content": web_text,
+            },
+        ],
+        "json_contract": {
+            "type": "object",
+            "properties": {
+                "decisions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["field_id", "status"],
+                        "properties": {
+                            "field_id": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["ready", "review", "conflict", "missing"],
+                            },
+                            "values": {"type": "array", "items": {"type": "string"}},
+                            "qualifier": {"type": "string"},
+                            "confidence": {"type": "number"},
+                            "citations": {"type": "array"},
+                            "alternatives": {"type": "array"},
+                            "reason": {"type": "string"},
+                        },
+                    },
+                },
+                "model_summary": {"type": "string"},
+            },
+            "required": ["decisions"],
+        },
+    }
+    return request, target_ids
+
+
+def _packet_fingerprint(packet: AIDecisionPacket) -> str:
+    raw = json.dumps(packet.as_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _final_cache_key(
+    provider: JSONTaskProvider,
+    cache_namespace: str,
+    profile: ProductProfile,
+    initial: AIDecisionPacket,
+    fields: list[dict[str, Any]],
+    evidence: list[WebEvidence],
+) -> str:
+    payload = {
+        "cache_version": WEB_FINAL_CACHE_VERSION,
+        "contract_version": WEB_FINAL_CONTRACT_VERSION,
+        "provider": provider.name,
+        "cache_namespace": cache_namespace,
+        "profile_sha256": profile_digest(profile),
+        "initial_packet_sha256": _packet_fingerprint(initial),
+        "schema_sha256": schema_digest(fields),
+        "evidence": [item.as_dict() for item in evidence],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _run_final_resolution(
+    provider: JSONTaskProvider,
+    profile: ProductProfile,
+    initial: AIDecisionPacket,
+    fields: list[dict[str, Any]],
+    grounding: GroundingCatalog,
+    evidence: list[WebEvidence],
+    web_sources: list[PersistedWebSource],
+    *,
+    cache_dir: Path | None,
+    cache_namespace: str,
+) -> tuple[AIDecisionPacket, int, bool, float, list[str]]:
+    started = time.monotonic()
+    request, target_ids = _final_prompt_request(profile, initial, fields, evidence)
+    if not target_ids:
+        return initial, 0, False, time.monotonic() - started, []
+
+    external = _external_source_map(web_sources)
+    key = _final_cache_key(provider, cache_namespace, profile, initial, fields, evidence)
+    cache_path = cache_dir / f"web-final-{key}.json" if cache_dir is not None else None
+    if cache_path is not None and cache_path.is_file():
+        try:
+            cached = AIDecisionPacket.from_mapping(json.loads(cache_path.read_text(encoding="utf-8")))
+            validated = validate_ai_decision_packet(
+                cached,
+                fields,
+                grounding,
+                expected_identity=profile.identity,
+                external_sources=external,
+            )
+            return validated, 0, True, time.monotonic() - started, []
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    try:
+        raw = provider.extract_json(request)
+        raw_decisions = raw.get("decisions") if isinstance(raw, dict) else None
+        if not isinstance(raw_decisions, list):
+            raise ValueError("final web resolve 缺少 decisions 数组")
+        raw_ids = {
+            str(item.get("field_id") or "").strip()
+            for item in raw_decisions
+            if isinstance(item, dict)
+        }
+        target_fields = [field for field in fields if field_id(field) in target_ids]
+        candidate_updates = AIDecisionPacket(
+            identity=profile.identity,
+            schema_sha256=schema_digest(target_fields),
+            source_manifest_sha256=initial.source_manifest_sha256,
+            decisions=[
+                FieldDecision.from_mapping(item, index=index)
+                for index, item in enumerate(raw_decisions, start=1)
+                if isinstance(item, dict)
+            ],
+            model_summary=str(raw.get("model_summary") or "").strip(),
+            warnings=[],
+            extractor=str(raw.get("extractor") or provider.name).strip() or provider.name,
+        )
+        validated_updates = validate_ai_decision_packet(
+            candidate_updates,
+            target_fields,
+            grounding,
+            expected_identity=profile.identity,
+            external_sources=external,
+        )
+        updates = {
+            decision.field_id: decision
+            for decision in validated_updates.decisions
+            if decision.field_id in raw_ids
+        }
+        merged = AIDecisionPacket(
+            identity=initial.identity,
+            schema_sha256=initial.schema_sha256,
+            source_manifest_sha256=initial.source_manifest_sha256,
+            decisions=[updates.get(item.field_id, item) for item in initial.decisions],
+            model_summary=(initial.model_summary + "\nFinal web-evidence resolve completed.").strip(),
+            warnings=[*initial.warnings, *validated_updates.warnings],
+            extractor=(initial.extractor + "+web-final").strip("+"),
+        )
+        validated = validate_ai_decision_packet(
+            merged,
+            fields,
+            grounding,
+            expected_identity=profile.identity,
+            external_sources=external,
+        )
+    except Exception as exc:
+        return (
+            initial,
+            1,
+            False,
+            time.monotonic() - started,
+            [f"final web resolve failed; local decisions preserved: {exc}"],
+        )
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        temp.write_text(json.dumps(validated.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(cache_path)
+    return validated, 1, False, time.monotonic() - started, []
+
+
+def run_web_enrichment(
+    search_provider: SourcedWebSearchProvider,
+    final_provider: JSONTaskProvider,
+    initial: AIDecisionPacket,
+    fields: Iterable[dict[str, Any]],
+    grounding: GroundingCatalog,
+    profile: ProductProfile,
+    *,
+    batch_size: int = 5,
+    concurrency: int = 3,
+    cache_dir: str | Path | None = None,
+    final_cache_namespace: str = "",
+) -> WebEnrichmentResult:
+    if not 1 <= int(batch_size) <= 12:
+        raise ValueError("web batch_size 必须在 1..12。")
+    if not 1 <= int(concurrency) <= 8:
+        raise ValueError("web concurrency 必须在 1..8。")
+
+    field_list = list(fields)
+    targets = _targets(initial, field_list)
+    if not targets:
+        return WebEnrichmentResult(packet=initial, target_field_count=0, searched=False)
+
+    cache_root = Path(cache_dir) if cache_dir is not None else None
+    batches = _mechanical_batches(targets, int(batch_size))
+    research_started = time.monotonic()
+    runs: list[_ResearchBatchRun] = []
+    workers = min(int(concurrency), len(batches))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="web-research") as executor:
+        futures = {
+            executor.submit(
+                _run_research_batch,
+                search_provider,
+                profile,
+                index,
+                batch,
+                cache_dir=cache_root,
+            ): index
+            for index, batch in enumerate(batches, start=1)
+        }
+        for future in as_completed(futures):
+            runs.append(future.result())
+    runs.sort(key=lambda item: item.index)
+    search_elapsed = time.monotonic() - research_started
+
+    target_ids = {decision.field_id for _, decision in targets}
+    evidence, web_sources, warnings = _accepted_evidence(runs, target_ids)
+    final_packet, final_calls, final_cache_hit, final_elapsed, final_warnings = _run_final_resolution(
+        final_provider,
+        profile,
+        initial,
+        field_list,
+        grounding,
+        evidence,
+        web_sources,
+        cache_dir=cache_root,
+        cache_namespace=final_cache_namespace,
+    )
+    warnings.extend(final_warnings)
+    return WebEnrichmentResult(
+        packet=final_packet,
+        web_sources=web_sources,
+        evidence=evidence,
+        target_field_count=len(targets),
+        search_batch_count=len(batches),
+        search_model_calls=sum(run.model_calls for run in runs),
+        search_cache_hits=sum(1 for run in runs if run.cache_hit),
+        search_failed_batches=sum(1 for run in runs if run.warning),
+        final_model_calls=final_calls,
+        final_cache_hit=final_cache_hit,
+        searched=True,
+        search_elapsed_seconds=search_elapsed,
+        final_elapsed_seconds=final_elapsed,
+        warnings=warnings,
+    )
 
 
 def write_enriched_ai_decision_packet(
@@ -451,132 +730,9 @@ def write_enriched_ai_decision_packet(
     web_sources: Iterable[PersistedWebSource],
     path: str | Path,
 ) -> Path:
+    payload = packet.as_dict()
+    payload["web_sources"] = [item.as_dict() for item in web_sources]
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(enriched_packet_payload(packet, web_sources), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return target
-
-
-def load_enriched_ai_decision_packet(
-    path: str | Path,
-    fields: Iterable[dict[str, Any]],
-    local_grounding: GroundingCatalog,
-    *,
-    expected_identity: ProductIdentity = ProductIdentity(),
-) -> AIDecisionPacket:
-    # Unified loader already understands optional embedded web_sources.
-    return load_ai_decision_packet(
-        path,
-        fields,
-        local_grounding,
-        expected_identity=expected_identity,
-    )
-
-
-def run_web_enrichment(
-    provider: SourcedWebSearchProvider,
-    initial: AIDecisionPacket,
-    fields: Iterable[dict[str, Any]],
-    local_grounding: GroundingCatalog,
-    *,
-    cache_dir: str | Path | None = None,
-) -> WebEnrichmentResult:
-    """Research all AI-requested gaps in at most one sourced web call.
-
-    Existing READY and business fields are immutable. Optional search failure
-    preserves the valid local decision packet. Repeated identical research can
-    replay from cache with zero web model calls.
-    """
-
-    started = time.monotonic()
-    field_list = list(fields)
-    targets = _target_decisions(initial, field_list)
-    if not targets:
-        return WebEnrichmentResult(
-            packet=initial,
-            elapsed_seconds=time.monotonic() - started,
-        )
-
-    cache_path: Path | None = None
-    if cache_dir is not None:
-        cache_path = Path(cache_dir) / (
-            f"web-enrichment-{_web_cache_key(provider, initial, targets)}.json"
-        )
-        if cache_path.is_file():
-            try:
-                payload = json.loads(cache_path.read_text(encoding="utf-8"))
-                raw_sources = payload.get("web_sources") or []
-                web_sources = [
-                    PersistedWebSource.from_mapping(item)
-                    for item in raw_sources
-                    if isinstance(item, dict)
-                ]
-                packet = validate_ai_decision_packet(
-                    AIDecisionPacket.from_mapping(payload),
-                    field_list,
-                    local_grounding,
-                    expected_identity=initial.identity,
-                    external_sources=_external_source_map(web_sources),
-                )
-                return WebEnrichmentResult(
-                    packet=packet,
-                    web_sources=web_sources,
-                    model_calls=0,
-                    cache_hit=True,
-                    target_field_count=len(targets),
-                    searched=True,
-                    elapsed_seconds=time.monotonic() - started,
-                )
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                pass
-
-    try:
-        search_result = provider.search_json(_web_prompt(initial, targets))
-        updates, web_sources, warnings = _parse_web_updates(
-            search_result.payload,
-            targets,
-            search_result,
-        )
-        packet = _merge_packet(
-            initial,
-            updates,
-            web_sources,
-            local_grounding,
-            field_list,
-            warnings,
-            str(search_result.payload.get("summary") or "").strip(),
-        )
-    except Exception as exc:
-        return WebEnrichmentResult(
-            packet=initial,
-            model_calls=1,
-            target_field_count=len(targets),
-            searched=True,
-            elapsed_seconds=time.monotonic() - started,
-            warning=f"web enrichment failed; local decisions preserved: {exc}",
-        )
-
-    if cache_path is not None:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        temp.write_text(
-            json.dumps(
-                enriched_packet_payload(packet, web_sources),
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        temp.replace(cache_path)
-
-    return WebEnrichmentResult(
-        packet=packet,
-        web_sources=web_sources,
-        model_calls=1,
-        target_field_count=len(targets),
-        searched=True,
-        elapsed_seconds=time.monotonic() - started,
-    )
