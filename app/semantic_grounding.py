@@ -23,11 +23,10 @@ def _sha256_text(text: str) -> str:
 
 @dataclass(slots=True, frozen=True)
 class GroundedSource:
-    """One exact source unit that a semantic extractor is allowed to cite.
+    """One exact source unit the whole-product AI may cite.
 
-    Text can be split into several chunks for precise citation/validation, but
-    chunks belonging to one original file/page are still one *logical source*
-    for AI execution. This prevents chunking from multiplying model calls.
+    Long text can be split into citation chunks, but chunking is only a source
+    integrity/detail mechanism. It never determines model execution count.
     """
 
     source_id: str
@@ -40,15 +39,6 @@ class GroundedSource:
 
     @property
     def logical_source_id(self) -> str:
-        """Stable execution identity shared by chunks from the same source.
-
-        Builder-generated text ids look like ``supplier:001:text:0001:<sha>``
-        or ``customer-text:001:text:0001:<sha>``. Everything before ``:text:``
-        identifies the original source. Images are already one source per id.
-        Unknown externally constructed ids remain isolated rather than being
-        guessed into a group.
-        """
-
         marker = ":text:"
         if self.kind == TEXT_KIND and marker in self.source_id:
             return self.source_id.split(marker, 1)[0]
@@ -109,24 +99,6 @@ class GroundingCatalog:
                 return source
         return None
 
-    def logical_groups(self) -> list[tuple[str, "GroundingCatalog"]]:
-        """Return source groups in first-seen order for one-call-per-source AI.
-
-        A long supplier page may be represented by many citation chunks, but all
-        of those chunks are passed to the model together in one request. A
-        product image always remains its own logical group.
-        """
-
-        order: list[str] = []
-        grouped: dict[str, list[GroundedSource]] = {}
-        for source in self.sources:
-            key = source.logical_source_id
-            if key not in grouped:
-                grouped[key] = []
-                order.append(key)
-            grouped[key].append(source)
-        return [(key, GroundingCatalog(sources=grouped[key])) for key in order]
-
     @property
     def logical_source_count(self) -> int:
         return len({source.logical_source_id for source in self.sources})
@@ -161,11 +133,7 @@ def chunk_text(
     max_chars: int = 3000,
     overlap_chars: int = 250,
 ) -> list[str]:
-    """Deterministically split captured text while retaining small overlap.
-
-    Chunking is a citation/validation detail only. It no longer controls how
-    many model requests are made.
-    """
+    """Split long captured text for citation precision, not model batching."""
 
     if max_chars < 500:
         raise ValueError("max_chars 不能小于 500。")
@@ -212,9 +180,7 @@ def _text_source(
 ) -> GroundedSource:
     digest = _sha256_text(content)
     return GroundedSource(
-        source_id=(
-            f"{prefix}:{ordinal:03d}:text:{chunk_index:04d}:{digest[:12]}"
-        ),
+        source_id=f"{prefix}:{ordinal:03d}:text:{chunk_index:04d}:{digest[:12]}",
         source_type=source_type,
         kind=TEXT_KIND,
         origin=origin,
@@ -261,11 +227,11 @@ def build_grounding_catalog(
     max_text_chars: int = 3000,
     overlap_chars: int = 250,
 ) -> GroundingCatalog:
-    """Create the exact source universe visible to a semantic model.
+    """Create the exact source universe visible to the whole-product AI.
 
-    Builder-generated source ids contain a digest prefix. Rebuilding the catalog
-    after a source file changes therefore produces different ids and old model
-    output fails closed instead of being validated against new content.
+    Source ids bind content digests, so stale AI decisions fail closed after any
+    image/page/context change. All resulting sources are submitted in the same
+    normal-path AI request.
     """
 
     sources: list[GroundedSource] = []
@@ -322,9 +288,7 @@ def build_grounding_catalog(
             digest = _sha256_text(chunk)
             sources.append(
                 GroundedSource(
-                    source_id=(
-                        f"customer-text:001:text:{index:04d}:{digest[:12]}"
-                    ),
+                    source_id=f"customer-text:001:text:{index:04d}:{digest[:12]}",
                     source_type="customer_file",
                     kind=TEXT_KIND,
                     origin="supplemental_text",
