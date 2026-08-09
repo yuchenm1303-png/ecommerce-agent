@@ -280,9 +280,20 @@ def _create_new_listing_content(page: Page) -> bool:
 
 def _create_new_listing_button(page: Page):
     pattern = re.compile(r"^\s*create\s+new\s+listing\s*$", re.IGNORECASE)
-    button = _first_visible(page.get_by_role("button", name=pattern))
+    button = None
+    get_by_role = getattr(page, "get_by_role", None)
+    if callable(get_by_role):
+        try:
+            button = _first_visible(get_by_role("button", name=pattern))
+        except Exception:
+            button = None
     if button is None:
-        button = _first_visible(page.get_by_text(pattern))
+        get_by_text = getattr(page, "get_by_text", None)
+        if callable(get_by_text):
+            try:
+                button = _first_visible(get_by_text(pattern))
+            except Exception:
+                button = None
     return button
 
 
