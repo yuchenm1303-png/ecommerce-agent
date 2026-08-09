@@ -80,6 +80,17 @@ def test_native_shell_is_single_window_tree_and_native_pixel_sized() -> None:
     assert "createWindowContainer" not in SHELL + NATIVE
 
 
+def test_native_shell_bridges_keyboard_focus_deterministically() -> None:
+    assert "def _focus_native_child" in SHELL
+    assert "user32.SetFocus" in SHELL
+    assert "user32.GetFocus" in SHELL
+    assert "QEvent.Type.WindowActivate" in SHELL
+    assert "QEvent.Type.FocusIn" in SHELL
+    assert "QEvent.Type.MouseButtonPress" in SHELL
+    assert "self._last_focus_widget" in SHELL
+    assert "target.setFocus(Qt.FocusReason.ActiveWindowFocusReason)" in SHELL
+
+
 def test_runner_keeps_baseline_business_and_effect_controllers() -> None:
     assert "from gui.console_window import MainWindow" in RUNNER
     assert "install_buffered_logs(window)" in RUNNER
