@@ -58,12 +58,13 @@ class SourceSnapshot:
     table_rows: list[SnapshotTableRow] = field(default_factory=list)
     json_ld: list[Any] = field(default_factory=list)
     embedded_data: list[str] = field(default_factory=list)
+    image_urls: list[str] = field(default_factory=list)
     meta: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "requested_url": self.requested_url,
             "final_url": self.final_url,
             "title": self.title,
@@ -80,6 +81,7 @@ class SourceSnapshot:
             ],
             "json_ld": self.json_ld,
             "embedded_data": list(self.embedded_data),
+            "image_urls": list(self.image_urls),
             "meta": self.meta,
             "warnings": self.warnings,
         }
@@ -103,6 +105,11 @@ class SourceSnapshot:
             embedded_data=[
                 str(item).strip()
                 for item in payload.get("embedded_data") or []
+                if str(item).strip()
+            ],
+            image_urls=[
+                str(item).strip()
+                for item in payload.get("image_urls") or []
                 if str(item).strip()
             ],
             meta={str(k): _clean_text(v) for k, v in (payload.get("meta") or {}).items()},
@@ -160,12 +167,7 @@ def capture_page_snapshot(
     requested_url: str,
     max_visible_text_chars: int = 120_000,
 ) -> SourceSnapshot:
-    """Read an already-loaded browser page without attempting risk-control bypass.
-
-    This collector deliberately does not decide what any product fact means.  It
-    records rendered text, explicit key/value rows, JSON-LD and bounded raw page
-    state around variant/SKU/spec controls so the AI can do the interpretation.
-    """
+    """Mechanically capture raw product-page evidence without interpreting it."""
 
     payload = page.evaluate(
         r"""() => {
@@ -177,13 +179,22 @@ def capture_page_snapshot(
               && rect.width > 0 && rect.height > 0;
           };
           const rows = [];
+          const rowSeen = new Set();
+          const pushRow = (key, value, tableIndex, rowIndex) => {
+            key = clean(key);
+            value = clean(value);
+            if (!key || !value || key.length > 160 || value.length > 1200) return;
+            const fingerprint = `${key}\u0000${value}`;
+            if (rowSeen.has(fingerprint)) return;
+            rowSeen.add(fingerprint);
+            rows.push({key, value, table_index: tableIndex, row_index: rowIndex});
+          };
+
           [...document.querySelectorAll('table')].forEach((table, tableIndex) => {
             [...table.querySelectorAll('tr')].forEach((tr, rowIndex) => {
               if (!visible(tr)) return;
               const cells = [...tr.querySelectorAll('th,td')].map((cell) => clean(cell.innerText || cell.textContent));
-              if (cells.length >= 2 && cells[0] && cells.slice(1).join(' ').trim()) {
-                rows.push({key: cells[0], value: cells.slice(1).join(' | '), table_index: tableIndex + 1, row_index: rowIndex + 1});
-              }
+              if (cells.length >= 2) pushRow(cells[0], cells.slice(1).join(' | '), tableIndex + 1, rowIndex + 1);
             });
           });
 
@@ -192,10 +203,18 @@ def capture_page_snapshot(
             dts.forEach((dt, rowIndex) => {
               const dd = dt.nextElementSibling;
               if (!dd || dd.tagName.toLowerCase() !== 'dd' || !visible(dt) || !visible(dd)) return;
-              const key = clean(dt.innerText || dt.textContent);
-              const value = clean(dd.innerText || dd.textContent);
-              if (key && value) rows.push({key, value, table_index: 1000 + tableIndex + 1, row_index: rowIndex + 1});
+              pushRow(dt.innerText || dt.textContent, dd.innerText || dd.textContent, 1000 + tableIndex + 1, rowIndex + 1);
             });
+          });
+
+          // Marketplace attribute panels frequently use simple <li><p>key</p><p>value</p></li>
+          // structures. Capture only exact two-child rows; no semantic guessing is performed.
+          [...document.querySelectorAll('li')].forEach((li, rowIndex) => {
+            if (!visible(li)) return;
+            const direct = [...li.children]
+              .map((child) => clean(child.innerText || child.textContent))
+              .filter(Boolean);
+            if (direct.length === 2) pushRow(direct[0], direct[1], 2001, rowIndex + 1);
           });
 
           const jsonLd = [];
@@ -209,7 +228,6 @@ def capture_page_snapshot(
             if (text && text.length <= 6000 && embedded.length < 160) embedded.push(text);
           };
 
-          // Capture option/variant DOM mechanically.  No value is selected or interpreted here.
           const variantSelectors = [
             '[data-sku-id]', '[data-skuid]', '[data-sku]', '[data-spec-id]', '[data-specid]',
             '[role="option"]', '[role="radio"]', 'input[type="radio"]',
@@ -224,15 +242,10 @@ def capture_page_snapshot(
               }
             });
             const text = clean(el.innerText || el.textContent || el.value || '');
-            if (text || Object.keys(attrs).length) {
-              pushEmbedded(JSON.stringify({tag: el.tagName, text, attrs}));
-            }
+            if (text || Object.keys(attrs).length) pushEmbedded(JSON.stringify({tag: el.tagName, text, attrs}));
           });
 
-          // Many marketplaces keep the complete variant matrix in inline page state rather
-          // than visible DOM.  Keep bounded raw snippets around those identifiers; AI decides
-          // what they mean later.
-          const marker = /(skuId|sku2|skuMap|skuProps|specId|specs|offerId)/ig;
+          const marker = /(skuId|sku2|skuMap|skuProps|specId|specs|offerId|length|width|height|weight)/ig;
           [...document.scripts].forEach((script) => {
             if (script.type === 'application/ld+json') return;
             const raw = String(script.textContent || '');
@@ -240,12 +253,32 @@ def capture_page_snapshot(
             marker.lastIndex = 0;
             let match;
             let perScript = 0;
-            while ((match = marker.exec(raw)) && perScript < 8 && embedded.length < 160) {
+            while ((match = marker.exec(raw)) && perScript < 10 && embedded.length < 160) {
               const start = Math.max(0, match.index - 1400);
               const end = Math.min(raw.length, match.index + 2600);
               pushEmbedded(raw.slice(start, end));
               perScript += 1;
             }
+          });
+
+          const imageUrls = [];
+          const imageSeen = new Set();
+          const pushImage = (raw) => {
+            const value = clean(raw);
+            if (!value || value.startsWith('data:') || value.startsWith('blob:')) return;
+            try {
+              const absolute = new URL(value, document.baseURI).href;
+              if (!/^https?:/i.test(absolute) || imageSeen.has(absolute)) return;
+              imageSeen.add(absolute);
+              imageUrls.push(absolute);
+            } catch (_) {}
+          };
+          [...document.images].forEach((img) => {
+            if (!visible(img)) return;
+            const nw = Number(img.naturalWidth || 0);
+            const nh = Number(img.naturalHeight || 0);
+            if (Math.max(nw, nh) < 280) return;
+            pushImage(img.currentSrc || img.src || img.getAttribute('data-src') || img.getAttribute('data-lazy-src'));
           });
 
           const meta = {};
@@ -265,6 +298,7 @@ def capture_page_snapshot(
             table_rows: rows,
             json_ld: jsonLd,
             embedded_data: embedded,
+            image_urls: imageUrls.slice(0, 24),
             meta,
           };
         }"""
@@ -289,6 +323,14 @@ def capture_page_snapshot(
         warnings.append("embedded_data truncated to 80000 chars")
 
     rows = [SnapshotTableRow.from_mapping(item) for item in payload.get("table_rows") or []]
+    image_urls = []
+    seen_urls: set[str] = set()
+    for item in payload.get("image_urls") or []:
+        value = str(item or "").strip()
+        if value and value not in seen_urls:
+            seen_urls.add(value)
+            image_urls.append(value)
+
     return SourceSnapshot(
         requested_url=requested_url,
         final_url=str(page.url),
@@ -298,6 +340,7 @@ def capture_page_snapshot(
         table_rows=rows,
         json_ld=list(payload.get("json_ld") or []),
         embedded_data=embedded_data,
+        image_urls=image_urls[:24],
         meta={str(k): _clean_text(v) for k, v in (payload.get("meta") or {}).items()},
         warnings=warnings,
     )
