@@ -1,13 +1,15 @@
-"""Resolve the current Makro product schema without touching Makro.
+"""Resolve Makro product fields from one exact supplier product URL.
 
 Production pipeline:
-1) optionally capture the exact supplier product URL + selected SKU context;
-2) AI fills Makro fields directly from that exact local evidence in mechanical batches;
+1) capture the exact supplier page mechanically, including rendered text, tables,
+   page screenshot and bounded embedded variant/SKU/spec data;
+2) AI directly fills Makro fields from those raw sources in mechanical batches;
 3) web-search only fields still unresolved and fill those blanks directly.
 
-There is one Makro field table throughout. There is no intermediate Product Profile and no
-Final Resolve model. Python only collects sources, batches work, preserves provenance,
-locks seller-business fields, checks mechanical schema constraints and keeps browser writes off.
+There is one Makro field table throughout.  No customer SKU, old QA answers,
+Product Profile or Final Resolve participates in product identity.  Python only
+collects sources, schedules work, preserves provenance, locks seller-business
+fields and keeps browser writes off.
 """
 
 from __future__ import annotations
@@ -29,9 +31,10 @@ from app.ai_decisions import (
     field_id,
     write_ai_decision_packet,
 )
+from app.business_fields import generate_listing_sku
+from app.evidence_contract import ProductIdentity
 from app.field_mapping import run_field_mapping
 from app.live_schema import load_live_schema
-from app.product_context import build_ai_product_context
 from app.providers.dashscope_web_search import DashScopeWebSearchProvider
 from app.providers.registry import (
     ProviderConfig,
@@ -41,21 +44,19 @@ from app.providers.registry import (
     default_api_key_env,
     validate_provider_config,
 )
-from app.qa_catalog import load_question_catalog
-from app.resolver_inputs import ResolutionInputSpec
 from app.semantic_grounding import build_grounding_catalog
 from app.source_capture import DEFAULT_SOURCE_CDP_PORT, SourceAccessBlocked, capture_product_source
 from app.web_enrichment import WebEnrichmentResult, run_web_enrichment, write_enriched_ai_decision_packet
 
 
-EXECUTION_MODEL = "exact_product_source_then_parallel_local_fill_then_unresolved_web_fill"
+EXECUTION_MODEL = "product_url_capture_then_parallel_local_fill_then_unresolved_web_fill"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "从确定商品资料直接填写 Makro live schema：可从商品链接自动采集当前页面，"
-            "AI直接填字段，只对仍为空的字段联网补充。不会打开或修改 Makro。"
+            "只给一个供应商商品链接：自动采集页面，AI直接填 Makro live fields，"
+            "只对仍为空的字段联网补充。不会打开或修改 Makro。"
         )
     )
     parser.add_argument("--provider", choices=SUPPORTED_PROVIDERS, default="openai-compatible")
@@ -73,16 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
     thinking.add_argument("--disable-thinking", dest="enable_thinking", action="store_false")
     parser.set_defaults(enable_thinking=False)
 
-    parser.add_argument("--qa", required=True, help="Makro 问题模板/客户已有答案文件")
     parser.add_argument("--live-schema", required=True, help="read-only Makro planner 导出的 live-schema.json")
-    parser.add_argument("--sku", default="")
-    parser.add_argument("--expected-model", default="")
-    parser.add_argument("--expected-brand", default="")
-
     parser.add_argument(
         "--product-url",
-        default="",
-        help="当前商品的供应商链接；提供后会用独立 source Edge 自动滚动采集文本、参数和整页图片。",
+        required=True,
+        help="唯一商品输入：当前 1688/供应商商品链接。",
     )
     parser.add_argument("--source-profile-dir", default="browser_profiles/source-edge")
     parser.add_argument("--source-cdp-port", type=int, default=DEFAULT_SOURCE_CDP_PORT)
@@ -96,14 +92,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="source Edge 已人工完成合法登录/验证后，不重新导航，直接采集当前页。",
     )
 
-    # Optional extra evidence remains supported, but is not required by the new primary flow.
-    parser.add_argument("--product-table", default=None)
-    parser.add_argument("--facts-json", action="append", default=[])
+    # Optional diagnostics/evidence may be appended, but no old QA/SKU/product-table
+    # input is part of the product identity path.
     parser.add_argument("--image", action="append", default=[])
     parser.add_argument("--supplier-snapshot", action="append", default=[])
     parser.add_argument("--official-snapshot", action="append", default=[])
-    parser.add_argument("--supplemental-text", default="")
-    parser.add_argument("--supplemental-text-file", default=None)
 
     parser.add_argument("--image-detail", choices=("auto", "low", "high"), default="auto")
     parser.add_argument("--max-output-tokens", type=int, default=12000)
@@ -128,35 +121,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-semantic-cache", action="store_true")
     parser.add_argument("--output-dir", default="logs/ai-resolver")
     return parser
-
-
-def _read_supplemental_text(args: argparse.Namespace) -> str:
-    parts = [args.supplemental_text]
-    if args.supplemental_text_file:
-        parts.append(Path(args.supplemental_text_file).read_text(encoding="utf-8"))
-    return "\n".join(part for part in parts if part and part.strip())
-
-
-def _input_spec(
-    args: argparse.Namespace,
-    supplemental_text: str,
-    *,
-    image_paths: list[str],
-    supplier_snapshots: list[str],
-    product_url: str,
-) -> ResolutionInputSpec:
-    return ResolutionInputSpec(
-        sku=args.sku,
-        expected_model=args.expected_model,
-        expected_brand=args.expected_brand,
-        product_table=args.product_table,
-        facts_json=tuple(args.facts_json),
-        supplier_snapshots=tuple(supplier_snapshots),
-        official_snapshots=tuple(args.official_snapshot),
-        supplemental_text=supplemental_text,
-        image_paths=tuple(image_paths),
-        product_url=product_url or None,
-    )
 
 
 def _provider_config(args: argparse.Namespace) -> ProviderConfig:
@@ -257,71 +221,64 @@ def main() -> int:
     output_dir = Path(args.output_dir) / f"resolve-ai-{stamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    product_url = args.product_url.strip()
     image_paths = list(args.image)
     supplier_snapshots = list(args.supplier_snapshot)
-    product_url = args.product_url.strip()
-    capture_info: dict[str, Any] = {"requested": bool(product_url)}
 
-    if product_url:
-        print("===== PRIMARY PRODUCT SOURCE CAPTURE =====", flush=True)
-        try:
-            captured = capture_product_source(
-                product_url,
-                output_dir=output_dir / "primary-source",
-                profile_dir=args.source_profile_dir,
-                cdp_port=args.source_cdp_port,
-                initial_wait_ms=args.source_wait_ms,
-                scroll_wait_ms=args.source_scroll_wait_ms,
-                max_scroll_steps=args.source_max_scroll_steps,
-                max_visible_text_chars=args.source_max_visible_text_chars,
-                use_current_page=args.source_use_current_page,
-            )
-        except SourceAccessBlocked as exc:
-            print(str(exc), flush=True)
-            print(
-                f"source Edge 保持打开在 127.0.0.1:{args.source_cdp_port}；"
-                "人工完成合法验证后加 --source-use-current-page 重试。",
-                flush=True,
-            )
-            return 2
-        supplier_snapshots.insert(0, str(captured.snapshot_path))
-        image_paths.insert(0, str(captured.screenshot_path))
-        product_url = captured.snapshot.final_url or product_url
-        capture_info = {
-            "requested": True,
-            "final_url": product_url,
-            "snapshot": str(captured.snapshot_path.resolve()),
-            "screenshot": str(captured.screenshot_path.resolve()),
-            "table_rows": len(captured.snapshot.table_rows),
-            "visible_text_chars": len(captured.snapshot.visible_text),
-            "source_edge": "new" if captured.launched_now else "reused",
-        }
+    print("===== PRIMARY PRODUCT SOURCE CAPTURE =====", flush=True)
+    try:
+        captured = capture_product_source(
+            product_url,
+            output_dir=output_dir / "primary-source",
+            profile_dir=args.source_profile_dir,
+            cdp_port=args.source_cdp_port,
+            initial_wait_ms=args.source_wait_ms,
+            scroll_wait_ms=args.source_scroll_wait_ms,
+            max_scroll_steps=args.source_max_scroll_steps,
+            max_visible_text_chars=args.source_max_visible_text_chars,
+            use_current_page=args.source_use_current_page,
+        )
+    except SourceAccessBlocked as exc:
+        print(str(exc), flush=True)
         print(
-            f"captured exact product page: table_rows={capture_info['table_rows']}, "
-            f"visible_text_chars={capture_info['visible_text_chars']}",
+            f"source Edge 保持打开在 127.0.0.1:{args.source_cdp_port}；"
+            "人工完成合法验证后加 --source-use-current-page 重试。",
             flush=True,
         )
+        return 2
 
-    customer_catalog = load_question_catalog(args.qa)
-    live_fields = load_live_schema(args.live_schema)
-    spec = _input_spec(
-        args,
-        _read_supplemental_text(args),
-        image_paths=image_paths,
-        supplier_snapshots=supplier_snapshots,
-        product_url=product_url,
+    supplier_snapshots.insert(0, str(captured.snapshot_path))
+    image_paths.insert(0, str(captured.screenshot_path))
+    product_url = captured.snapshot.final_url or product_url
+    generated_sku = generate_listing_sku(product_url)
+    capture_info: dict[str, Any] = {
+        "requested": True,
+        "final_url": product_url,
+        "snapshot": str(captured.snapshot_path.resolve()),
+        "screenshot": str(captured.screenshot_path.resolve()),
+        "table_rows": len(captured.snapshot.table_rows),
+        "visible_text_chars": len(captured.snapshot.visible_text),
+        "json_ld_items": len(captured.snapshot.json_ld),
+        "embedded_data_items": len(captured.snapshot.embedded_data),
+        "source_edge": "new" if captured.launched_now else "reused",
+    }
+    print(
+        f"captured exact product page: table_rows={capture_info['table_rows']}, "
+        f"visible_text_chars={capture_info['visible_text_chars']}, "
+        f"embedded_data_items={capture_info['embedded_data_items']}",
+        flush=True,
     )
-    product_context = build_ai_product_context(customer_catalog, spec)
+
+    live_fields = load_live_schema(args.live_schema)
     grounding = build_grounding_catalog(
         image_paths=image_paths,
         supplier_snapshots=supplier_snapshots,
         official_snapshots=args.official_snapshot,
-        supplemental_text=product_context.text,
         max_text_chars=args.max_text_chars,
         overlap_chars=args.overlap_chars,
     )
     if not grounding.sources:
-        raise SystemExit("没有可供 AI 解析的商品资料。请提供 --product-url 或其他商品资料。")
+        raise SystemExit("商品链接没有形成可供 AI 使用的证据。")
 
     try:
         provider_config = _provider_config(args)
@@ -336,15 +293,16 @@ def main() -> int:
     )
     cache_dir = None if args.no_semantic_cache else Path(args.semantic_cache_dir)
     namespace = _cache_namespace(provider_config)
-    expected_identity = product_context.trusted_inputs.expected_identity
+    expected_identity = ProductIdentity()
 
     print("===== DIRECT PRODUCT RESOLUTION =====", flush=True)
     print(
         f"provider={provider_config.provider}, model={provider_config.model}, "
-        f"live_fields={len(live_fields)}, citation_sources={len(grounding.sources)}, "
-        f"product_url={'yes' if product_url else 'no'}",
+        f"live_fields={len(live_fields)}, citation_sources={len(grounding.sources)}",
         flush=True,
     )
+    print(f"product_url={product_url}", flush=True)
+    print(f"generated_listing_sku={generated_sku}", flush=True)
     print(f"execution_model={EXECUTION_MODEL}", flush=True)
 
     _set_progress(provider, "LOCAL")
@@ -423,18 +381,17 @@ def main() -> int:
     run_manifest.write_text(
         json.dumps(
             {
-                "mode": "exact_source_direct_ai_resolution",
+                "mode": "single_product_url_direct_ai_resolution",
                 "execution_model": EXECUTION_MODEL,
-                "qa_source": str(Path(args.qa).resolve()),
                 "live_schema": str(Path(args.live_schema).resolve()),
                 "live_field_count": len(live_fields),
                 "provider_adapter": provider.name,
                 "provider_config": provider_config.as_safe_dict(),
                 "web_search_model": args.web_search_model,
                 "primary_product_url": product_url,
+                "generated_listing_sku": generated_sku,
                 "source_capture": capture_info,
                 "grounded_source_count": len(grounding.sources),
-                "customer_context_chars": len(product_context.text),
                 "local_fill": {
                     "batch_size": args.field_batch_size,
                     "concurrency": args.field_concurrency,
@@ -474,6 +431,8 @@ def main() -> int:
                     "web_sources": str(web_sources_path.resolve()),
                     "web_evidence": str(web_evidence_path.resolve()),
                     "source_manifest": str(source_manifest_path.resolve()),
+                    "primary_source_snapshot": str(captured.snapshot_path.resolve()),
+                    "primary_source_screenshot": str(captured.screenshot_path.resolve()),
                 },
             },
             ensure_ascii=False,
