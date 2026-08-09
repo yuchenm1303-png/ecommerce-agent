@@ -16,8 +16,8 @@ def main() -> int:
         )
         return 2
 
+    from gui.console_window import MainWindow
     from gui.log_presenter import install_buffered_logs
-    from gui.main_window import MainWindow
     from gui.nekro_card_fx import install_nekro_card_fx
     from gui.nekro_effects import install_nekro_effects
     from gui.visual_style import install_visual_style
