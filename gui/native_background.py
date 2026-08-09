@@ -327,9 +327,6 @@ Window {{
     Item {{
         id: glassMaskSource
         anchors.fill: parent
-        visible: false
-        layer.enabled: true
-        layer.smooth: true
 
         Repeater {{
             model: glassCardModel
@@ -354,11 +351,20 @@ Window {{
         }}
     }}
 
+    ShaderEffectSource {{
+        id: glassMaskTexture
+        anchors.fill: parent
+        sourceItem: glassMaskSource
+        hideSource: true
+        live: true
+        smooth: true
+    }}
+
     MultiEffect {{
         anchors.fill: parent
         source: blurSource
         maskEnabled: true
-        maskSource: glassMaskSource
+        maskSource: glassMaskTexture
         autoPaddingEnabled: false
     }}
 
