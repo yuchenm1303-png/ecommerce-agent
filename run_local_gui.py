@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+
+# The native QQuickWindow background owns wallpaper presentation. Set the render
+# loop before importing Qt so FrameAnimation follows the scene-graph cadence.
+os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
 
 
 def main() -> int:
