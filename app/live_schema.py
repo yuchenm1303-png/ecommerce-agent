@@ -64,14 +64,37 @@ def _qualifier_options(field: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _field_context(field: dict[str, Any]) -> str:
-    direct = str(field.get("context_text") or "").strip()
-    if direct:
-        return direct
+    """Keep nearby rendered wording without treating it as stable schema identity.
+
+    Makro sometimes renders a fixed unit beside a numeric input without a separate
+    qualifier control. Preserve all compact live wording that may carry that unit
+    instead of returning only the first context fragment.
+    """
+
+    parts: list[str] = []
+    seen: set[str] = set()
+
+    def push(value: object) -> None:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            parts.append(text)
+
+    push(field.get("context_text"))
+    push(field.get("help_text"))
     for control in field.get("controls") or []:
-        value = str(control.get("context_text") or "").strip()
-        if value:
-            return value
-    return ""
+        if not isinstance(control, dict):
+            continue
+        for key in (
+            "context_text",
+            "help_text",
+            "placeholder",
+            "aria_label",
+            "label",
+        ):
+            push(control.get(key))
+    return " | ".join(parts)
 
 
 def _schema_field(field: dict[str, Any]) -> dict[str, Any]:
