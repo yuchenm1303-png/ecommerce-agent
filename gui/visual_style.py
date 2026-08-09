@@ -8,6 +8,7 @@ from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, Qt, QTimer,
 from PySide6.QtGui import (
     QColor,
     QCursor,
+    QImage,
     QPainter,
     QPainterPath,
     QPixmap,
@@ -270,18 +271,35 @@ QSplitter::handle {
 
 
 def _load_wallpaper() -> QPixmap:
-    """Decode the bundled Fuji/sakura wallpaper once at GUI startup."""
+    """Decode and validate the bundled Fuji/sakura wallpaper once at startup."""
 
-    pixmap = QPixmap()
     try:
         encoded = _WALLPAPER_ASSET.read_text(encoding="ascii")
         compact = "".join(encoded.split())
         data = base64.b64decode(compact, validate=True)
-    except (OSError, ValueError):
-        return pixmap
+    except OSError as exc:
+        raise RuntimeError(f"Wallpaper asset cannot be read: {_WALLPAPER_ASSET}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"Wallpaper asset is not valid base64: {_WALLPAPER_ASSET}") from exc
 
-    if not pixmap.loadFromData(data, "JPG"):
-        return QPixmap()
+    if len(data) <= 100_000 or not data.startswith(b"\xff\xd8\xff") or not data.endswith(b"\xff\xd9"):
+        raise RuntimeError(
+            "Wallpaper asset is not a complete JPEG: "
+            f"path={_WALLPAPER_ASSET}, bytes={len(data)}"
+        )
+
+    # Let Qt inspect the bytes instead of forcing a decoder name. This avoids
+    # platform/plugin alias differences such as JPG vs JPEG on Windows.
+    image = QImage.fromData(data)
+    if image.isNull():
+        raise RuntimeError(
+            "Qt could not decode the bundled wallpaper image: "
+            f"path={_WALLPAPER_ASSET}, bytes={len(data)}"
+        )
+
+    pixmap = QPixmap.fromImage(image)
+    if pixmap.isNull():
+        raise RuntimeError(f"Qt could not create a wallpaper pixmap: {_WALLPAPER_ASSET}")
     return pixmap
 
 
@@ -319,11 +337,9 @@ class BackgroundLayer(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setFocusPolicy(Qt.NoFocus)
 
+        # A missing/corrupt wallpaper is a configuration error. Do not silently
+        # replace it with a blue fake-success background.
         self._source = _load_wallpaper()
-        if self._source.isNull():
-            self._source = QPixmap(1280, 720)
-            self._source.fill(QColor("#7EB8E8"))
-
         self._cover = QPixmap()
         self._blurred = QPixmap()
         self._rebuild_timer = QTimer(self)
@@ -338,7 +354,10 @@ class BackgroundLayer(QWidget):
         self.setGeometry(central.rect())
         self.lower()
         self.show()
-        self._rebuild_timer.start()
+        if self._cover.isNull():
+            self._rebuild()
+        else:
+            self._rebuild_timer.start()
 
     def _rebuild(self) -> None:
         if self.width() <= 0 or self.height() <= 0:
@@ -363,7 +382,7 @@ class BackgroundLayer(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         rect = self.rect()
-        painter.fillRect(rect, QColor("#7EB8E8"))
+        painter.fillRect(rect, QColor("#17263A"))
         if not self._cover.isNull():
             painter.drawPixmap(rect, self._cover)
 
