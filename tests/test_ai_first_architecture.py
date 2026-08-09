@@ -6,7 +6,7 @@ from pathlib import Path
 import makro_plan_listing
 import makro_preview_listing
 import makro_resolve_ai
-from app import ai_decisions, field_mapping, fill_plan, hard_field_validators, product_profile, web_enrichment
+from app import ai_decisions, field_mapping, fill_plan, hard_field_validators, web_enrichment
 from app.providers import openai_compatible, openai_semantic
 
 
@@ -28,14 +28,13 @@ def test_legacy_product_semantic_modules_are_not_in_repository():
     assert [path for path in LEGACY_PRODUCT_SEMANTIC_MODULES if (root / path).exists()] == []
 
 
-def test_production_path_has_no_legacy_semantic_import_or_rule_layer():
+def test_production_path_has_no_legacy_semantic_rule_layer():
     modules = (
         makro_resolve_ai,
         makro_plan_listing,
         makro_preview_listing,
         fill_plan,
         hard_field_validators,
-        product_profile,
         field_mapping,
         web_enrichment,
         openai_compatible,
@@ -57,41 +56,26 @@ def test_production_path_has_no_legacy_semantic_import_or_rule_layer():
             assert token not in source, f"{module.__name__} reintroduced {token}"
 
 
-def test_production_resolver_is_profile_local_fill_then_web_fill_only():
+def test_production_resolver_is_exact_source_local_fill_then_unresolved_web_only():
     source = inspect.getsource(makro_resolve_ai)
     web_source = inspect.getsource(web_enrichment)
-    assert "run_product_profile(" in source
+    assert "capture_product_source(" in source
     assert "run_field_mapping(" in source
     assert "run_web_enrichment(" in source
-    assert "run_ai_resolution(" not in source
-    assert "product_profile_then_parallel_local_fill_then_parallel_web_fill" in source
+    assert "run_product_profile(" not in source
+    assert "product-profile.json" not in source
+    assert "exact_product_source_then_parallel_local_fill_then_unresolved_web_fill" in source
     assert "final_resolve" not in source
     assert "final_provider" not in web_source
     assert "_run_final_resolution" not in web_source
-    assert "_run_final_batch" not in web_source
-    assert "--field-batch-size" in source
-    assert "--field-concurrency" in source
-    assert "--web-batch-size" in source
-    assert "--web-concurrency" in source
 
 
-def test_old_whole_product_field_resolution_runner_is_removed():
-    source = inspect.getsource(ai_decisions)
-    assert "run_ai_resolution" not in source
-    assert "build_ai_resolution_request" not in source
-    assert "AI_RESOLUTION_RULES" not in source
-
-
-def test_images_are_used_only_by_product_understanding_not_field_mapping_or_web():
-    profile_source = inspect.getsource(product_profile)
-    mapping_source = inspect.getsource(field_mapping)
-    web_source = inspect.getsource(web_enrichment)
-    assert "grounding.as_request_list()" in profile_source
-    assert '"target_fields": []' in profile_source
-    assert "image_path" not in mapping_source
-    assert "IMAGE_KIND" not in mapping_source
-    assert "image_path" not in web_source
-    assert "IMAGE_KIND" not in web_source
+def test_local_fill_reads_original_sources_directly_including_images():
+    source = inspect.getsource(field_mapping)
+    assert "grounding.as_request_list()" in source
+    assert "fill_marketplace_fields_from_exact_product_evidence" in source
+    assert "derived_product_profile" not in source
+    assert "image_path" not in source  # provider owns image transport; mapper only passes source catalog
 
 
 def test_field_mapping_batches_are_mechanical_not_category_semantic_tables():
@@ -108,6 +92,14 @@ def test_field_mapping_batches_are_mechanical_not_category_semantic_tables():
     lowered = source.casefold()
     for token in forbidden:
         assert token not in lowered
+
+
+def test_web_is_only_fill_the_blanks_and_uses_source_url_anchor():
+    source = inspect.getsource(web_enrichment)
+    assert "WEB_FILLABLE_STATUSES = {MISSING, REVIEW}" in source
+    assert "source_product_url" in source
+    assert "known_local_fields" in source
+    assert "Local" not in source or "frozen" in source
 
 
 def test_hard_validator_contains_no_product_attribute_marker_tables():
