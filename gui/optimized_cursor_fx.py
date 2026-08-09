@@ -127,12 +127,10 @@ class OptimizedNekroCursorOverlay(QWidget):
         painter = QPainter(self)
         painter.setClipRegion(event.region())
 
-        # WA_NoSystemBackground avoids a full-surface clear. Explicitly clear
-        # only the invalidated cursor rectangles so the old follower never
-        # leaves trails while retaining the small dirty-region repaint cost.
+        # WA_NoSystemBackground avoids clearing the whole transparent widget.
+        # Clear only the clipped dirty region so the old follower disappears.
         painter.setCompositionMode(QPainter.CompositionMode_Source)
-        for rect in event.region():
-            painter.fillRect(rect, QColor(0, 0, 0, 0))
+        painter.fillRect(event.rect(), QColor(0, 0, 0, 0))
         painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
 
         if self.visible_cursor and self.current is not None:
