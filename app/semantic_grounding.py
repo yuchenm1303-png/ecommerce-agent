@@ -112,25 +112,47 @@ class GroundingCatalog:
         }
 
 
-def _snapshot_text(snapshot: SourceSnapshot) -> str:
+def _snapshot_parts(snapshot: SourceSnapshot) -> list[str]:
+    """Keep raw source structures separate instead of flattening them together."""
+
     parts: list[str] = []
+    identity: list[str] = []
     if snapshot.title:
-        parts.append(f"Title: {snapshot.title}")
+        identity.append(f"Title: {snapshot.title}")
     for key, value in snapshot.meta.items():
         if value:
-            parts.append(f"Meta {key}: {value}")
+            identity.append(f"Meta {key}: {value}")
+    if identity:
+        parts.append("Page identity/meta:\n" + "\n".join(identity))
+
     if snapshot.table_rows:
-        parts.append(
-            "Structured page rows:\n"
-            + "\n".join(f"- {row.key}: {row.value}" for row in snapshot.table_rows if row.key and row.value)
-        )
+        rows = [
+            json.dumps(
+                {"key": row.key, "value": row.value},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            for row in snapshot.table_rows
+            if row.key and row.value
+        ]
+        if rows:
+            parts.append(
+                "Structured page rows. Preserve every key/value label and axis exactly:\n"
+                + "\n".join(rows)
+            )
+
     if snapshot.json_ld:
-        parts.append("Page JSON-LD:\n" + json.dumps(snapshot.json_ld, ensure_ascii=False, separators=(",", ":")))
+        parts.append(
+            "Page JSON-LD:\n"
+            + json.dumps(snapshot.json_ld, ensure_ascii=False, separators=(",", ":"))
+        )
     if snapshot.embedded_data:
         parts.append("Embedded page/variant data:\n" + "\n".join(snapshot.embedded_data))
+    if snapshot.image_urls:
+        parts.append("Large image URLs exposed by this exact page:\n" + "\n".join(snapshot.image_urls))
     if snapshot.visible_text.strip():
         parts.append("Rendered page text:\n" + snapshot.visible_text.strip())
-    return "\n".join(part for part in parts if part.strip()).strip()
+    return [part for part in parts if part.strip()]
 
 
 def chunk_text(
@@ -208,20 +230,24 @@ def _sources_from_snapshot(
     if not path.is_file():
         raise FileNotFoundError(f"source snapshot 不存在：{path}")
     snapshot = source_snapshot_from_json(path)
-    text = _snapshot_text(snapshot)
-    chunks = chunk_text(text, max_chars=max_chars, overlap_chars=overlap_chars)
     origin = snapshot.final_url or snapshot.requested_url or str(path.resolve())
-    return [
-        _text_source(
-            prefix=prefix,
-            source_type=source_type,
-            ordinal=ordinal,
-            chunk_index=index,
-            origin=origin,
-            content=chunk,
-        )
-        for index, chunk in enumerate(chunks, start=1)
-    ]
+
+    sources: list[GroundedSource] = []
+    chunk_index = 1
+    for part in _snapshot_parts(snapshot):
+        for chunk in chunk_text(part, max_chars=max_chars, overlap_chars=overlap_chars):
+            sources.append(
+                _text_source(
+                    prefix=prefix,
+                    source_type=source_type,
+                    ordinal=ordinal,
+                    chunk_index=chunk_index,
+                    origin=origin,
+                    content=chunk,
+                )
+            )
+            chunk_index += 1
+    return sources
 
 
 def build_grounding_catalog(
@@ -233,7 +259,7 @@ def build_grounding_catalog(
     max_text_chars: int = 3000,
     overlap_chars: int = 250,
 ) -> GroundingCatalog:
-    """Create the exact source universe visible to the field-filling AI."""
+    """Create the exact raw source universe visible to the field-filling AI."""
 
     sources: list[GroundedSource] = []
 
