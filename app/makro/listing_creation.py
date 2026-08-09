@@ -252,7 +252,7 @@ def _brand_input(page: Page):
 
 def _visible_text_candidates(page: Page, *, limit: int = 160) -> list[str]:
     raw = page.evaluate(
-        """(limit) => {
+        r"""(limit) => {
           const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
           const visible = (el) => {
             const style = getComputedStyle(el);
