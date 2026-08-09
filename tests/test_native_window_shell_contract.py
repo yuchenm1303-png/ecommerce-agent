@@ -34,19 +34,24 @@ def test_widget_gui_is_a_layered_native_child_not_second_top_level() -> None:
     assert "SetParent" in SHELL
     assert "GetParent" in SHELL
     assert "setTransientParent" not in SHELL
-    assert "_GWLP_HWNDPARENT" not in SHELL
     assert "WindowTransparentForInput" not in SHELL
     assert "WA_TransparentForMouseEvents" not in SHELL
 
 
-def test_overlay_geometry_is_client_local_and_dpi_independent() -> None:
-    assert "QRect(0, 0, width, height)" in SHELL
-    assert "handle.setPosition(QPoint(0, 0))" in SHELL
-    assert "owner.widthChanged.connect(self._sync_overlay_geometry)" in SHELL
-    assert "owner.heightChanged.connect(self._sync_overlay_geometry)" in SHELL
-    assert "GetClientRect" not in SHELL
+def test_overlay_geometry_uses_one_native_pixel_boundary() -> None:
+    assert "_fit_child_to_owner_client" in SHELL
+    assert "GetClientRect" in SHELL
+    assert "SetWindowPos" in SHELL
+    assert "width = max(1, int(rect.right - rect.left))" in SHELL
+    assert "height = max(1, int(rect.bottom - rect.top))" in SHELL
+
+    fit_body = SHELL.split("def _fit_native_child", 1)[1].split("def eventFilter", 1)[0]
+    assert "overlay.setGeometry" not in fit_body
+    assert "handle.resize" not in fit_body
+    assert "handle.setPosition" not in fit_body
+    assert "owner.width()" not in fit_body
+    assert "owner.height()" not in fit_body
     assert "ClientToScreen" not in SHELL
-    assert "_client_geometry" not in SHELL
     assert "_stack_owner_directly_behind" not in SHELL
     assert "setInterval(50)" not in SHELL
     assert "_Z_GUARD_MS" not in SHELL
