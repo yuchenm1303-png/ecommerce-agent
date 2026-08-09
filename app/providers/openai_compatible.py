@@ -46,6 +46,7 @@ def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
         "task": request_payload.get("task"),
         "product_identity": request_payload.get("product_identity") or {},
         "target_fields": request_payload.get("target_fields") or [],
+        "all_marketplace_fields": request_payload.get("all_marketplace_fields") or [],
         "rules": request_payload.get("rules") or [],
         "grounded_sources": [],
         "json_contract": request_payload.get("json_contract") or {},
