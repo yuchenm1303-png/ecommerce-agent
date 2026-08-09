@@ -37,6 +37,20 @@ class _POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
 
+def _enum_int(value: Any) -> int:
+    """Convert PySide6 enums/QFlags robustly across Qt minor versions."""
+
+    raw = getattr(value, "value", value)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        index = getattr(value, "__index__", None)
+        if callable(index):
+            return int(index())
+        text = str(value)
+        raise TypeError(f"Cannot convert Qt enum/flags value to int: {text}")
+
+
 def _rect_tuple(rect: Any) -> list[int]:
     return [int(rect.x()), int(rect.y()), int(rect.width()), int(rect.height())]
 
@@ -72,8 +86,8 @@ def _qwindow_snapshot(window: Any) -> dict[str, Any]:
         "visible": bool(window.isVisible()),
         "exposed": bool(window.isExposed()),
         "active": bool(window.isActive()),
-        "state": int(window.windowState()),
-        "flags": int(window.flags()),
+        "state": _enum_int(window.windowState()),
+        "flags": _enum_int(window.flags()),
         "dpr": float(window.devicePixelRatio()),
         "frame_margins": [
             int(frame_margins.left()),
@@ -106,8 +120,8 @@ def _qwidget_snapshot(widget: QWidget) -> dict[str, Any]:
         "active": bool(widget.isActiveWindow()),
         "minimized": bool(widget.isMinimized()),
         "maximized": bool(widget.isMaximized()),
-        "window_state": int(widget.windowState()),
-        "flags": int(widget.windowFlags()),
+        "window_state": _enum_int(widget.windowState()),
+        "flags": _enum_int(widget.windowFlags()),
         "dpr": float(widget.devicePixelRatioF()),
         "handle": _qwindow_snapshot(handle),
         "screen": None
@@ -419,7 +433,7 @@ class WindowDiagnostics(QObject):
                 QEvent.Type.Expose,
                 QEvent.Type.ZOrderChange,
             }:
-                name = getattr(event_type, "name", str(int(event_type)))
+                name = getattr(event_type, "name", str(_enum_int(event_type)))
                 who = "overlay" if watched is self.overlay else "quick"
                 self._queue_event_snapshot(f"{who}:{name}")
         return False
