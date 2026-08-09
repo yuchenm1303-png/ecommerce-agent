@@ -240,6 +240,37 @@ STATUS_COLORS = {
 }
 
 
+class _SmoothWheelMixin:
+    """Mixin: turn wheel notches into continuous per-pixel scrolls.
+
+    PySide6 does not expose QAbstractScrollArea.setVerticalScrollMode() on
+    QScrollArea / QPlainTextEdit, so continuous scrolling needs a manual
+    wheelEvent mapping instead. Ctrl+wheel still falls through to the base
+    widget (e.g. text zoom).
+    """
+
+    _PIXELS_PER_NOTCH = 96
+
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        delta = event.angleDelta().y()
+        if delta and not (event.modifiers() & Qt.ControlModifier):
+            bar = self.verticalScrollBar()
+            bar.setValue(bar.value() - round(delta / 120 * self._PIXELS_PER_NOTCH))
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+
+class SmoothScrollArea(_SmoothWheelMixin, QScrollArea):
+    """QScrollArea variant with continuous wheel scrolling."""
+
+
+class SmoothLogView(_SmoothWheelMixin, QPlainTextEdit):
+    """Log pane variant with continuous wheel scrolling."""
+
+    _PIXELS_PER_NOTCH = 48
+
+
 class AtmosphereWidget(QWidget):
     """Cheap procedural backdrop inspired by the earlier dreamy glass homepage.
 
@@ -531,11 +562,13 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.Stretch)
         header.setSectionResizeMode(4, QHeaderView.Stretch)
+        self.field_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.field_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         layout.addWidget(self.field_table, 1)
         return card
 
     def _build_side_panel(self) -> QWidget:
-        scroll = QScrollArea()
+        scroll = SmoothScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         host = QWidget()
@@ -602,6 +635,8 @@ class MainWindow(QMainWindow):
         self.web_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.web_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.web_table.setMinimumHeight(176)
+        self.web_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.web_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         layout.addWidget(self.web_table)
         return card
 
@@ -657,7 +692,7 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         row.addWidget(clear_button, 0, Qt.AlignBottom)
         layout.addLayout(row)
-        self.log_view = QPlainTextEdit()
+        self.log_view = SmoothLogView()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(8000)
         self.log_view.setMinimumHeight(165)

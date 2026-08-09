@@ -26,6 +26,12 @@ def main() -> int:
     app.setApplicationName("ecommerce-agent Read-only Lab")
     app.setOrganizationName("ecommerce-agent")
 
+    # One global filter gives every scrollable surface continuous per-pixel
+    # wheel scrolling (see gui/smooth_scroll.py).
+    from gui.smooth_scroll import SmoothWheelFilter
+
+    app.installEventFilter(SmoothWheelFilter(app))
+
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_visual_style(window)
     install_nekro_card_fx(window, visual)
