@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 
 from PySide6.QtCore import QEvent, QObject, QPointF, QRect, QRectF, Qt, QTimer
-from PySide6.QtGui import QPainter, QPixmap, QRegion
+from PySide6.QtGui import QColor, QPainter, QPixmap, QRegion
 from PySide6.QtWidgets import QMainWindow, QWidget
 
 
@@ -164,6 +164,12 @@ class NekroSakuraOverlay(QWidget):
     def paintEvent(self, event) -> None:  # type: ignore[override]
         painter = QPainter(self)
         painter.setClipRegion(event.region())
+
+        # WA_NoSystemBackground avoids a full transparent-surface clear. Erase
+        # only the QRegion that contains old/new petal bounds, then redraw.
+        painter.setCompositionMode(QPainter.CompositionMode_Source)
+        painter.fillRect(event.rect(), QColor(0, 0, 0, 0))
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
 
         for particle in self.particles:
