@@ -23,14 +23,18 @@ def test_wallpaper_uses_native_quick_scene_graph_frame_cadence() -> None:
 
 def test_real_glass_is_one_global_mask_over_preblurred_wallpaper() -> None:
     assert "def _blur_wallpaper" in NATIVE
-    assert "ShaderEffect" in NATIVE
-    assert "property variant blurTex: blurHost" in NATIVE
-    assert "property variant maskTex: maskImg" in NATIVE
-    assert "blur.a * mask.a" in NATIVE
+    assert "import QtQuick.Effects" in NATIVE
+    assert "MultiEffect" in NATIVE
+    assert "source: blurSource" in NATIVE
+    assert "maskEnabled: true" in NATIVE
+    assert "maskSource: maskImg" in NATIVE
+    assert "autoPaddingEnabled: false" in NATIVE
+    assert "visible: false" in NATIVE.split("id: blurSource", 1)[1].split("Image {{", 1)[0]
     assert "root.imageX" in NATIVE
     assert "root.imageY" in NATIVE
     assert "wallpaper_blurred.jpg" in NATIVE
-    assert "ShaderEffectSource" not in NATIVE
+    assert "fragmentShader:" not in NATIVE
+    assert "ShaderEffect {{" not in NATIVE
     assert "QGraphicsBlurEffect" not in VISUAL
 
 
@@ -45,8 +49,23 @@ def test_glass_mask_comes_from_live_widget_geometry_not_hardcoded_cards() -> Non
     assert "GLASS_CARDS = [" not in NATIVE
 
 
+def test_mouse_parallax_does_not_rebuild_blur_or_mask() -> None:
+    mouse = NATIVE.split("if isinstance(event, QMouseEvent):", 1)[1].split("return False", 1)[0]
+    assert "_set_animation_target" in mouse
+    assert "schedule_mask_update" not in mouse
+    assert "_blur_wallpaper" not in mouse
+
+
+def test_native_background_is_restacked_directly_behind_main_window() -> None:
+    assert "SetWindowPos" in NATIVE
+    assert "_stack_native_window_behind" in NATIVE
+    assert "int(quick.winId()), int(self.window.winId())" in NATIVE
+    assert "QEvent.Type.WindowActivate" in NATIVE
+    assert "QEvent.Type.ZOrderChange" in NATIVE
+
+
 def test_card_hover_keeps_local_tint_layer_without_per_card_blur() -> None:
-    glass = VISUAL.split("class GlassBackdrop", 1)[1].split("class VisualStyleController", 1)[0]
+    glass = VISUAL.split("class GlassBackdrop", 1)[1].split("class WindowFrameOverlay", 1)[0]
     assert "painter.drawRoundedRect" in glass
     assert "_overlay_alpha" in glass
     assert "QGraphicsBlurEffect" not in glass
@@ -54,9 +73,17 @@ def test_card_hover_keeps_local_tint_layer_without_per_card_blur() -> None:
     assert "background.transform_changed" not in glass
 
 
+def test_required_frameless_shell_has_visible_frame_overlay() -> None:
+    assert "FramelessWindowHint" in VISUAL
+    frame = VISUAL.split("class WindowFrameOverlay", 1)[1].split("class VisualStyleController", 1)[0]
+    assert "painter.drawRect" in frame
+    assert "WA_TransparentForMouseEvents" in frame
+    assert "self.window_frame = WindowFrameOverlay(window)" in VISUAL
+
+
 def test_legacy_qwidget_background_paint_is_suppressed_without_layout_rewrite() -> None:
     assert "watched is self.central and event.type() == QEvent.Type.Paint" in VISUAL
-    assert "return True" in VISUAL.split("watched is self.central", 1)[1].split("if isinstance(watched, QFrame)", 1)[0]
+    assert "return True" in VISUAL.split("watched is self.central", 1)[1].split("if watched is self.window", 1)[0]
 
 
 def test_native_background_has_explicit_shutdown_contract() -> None:
