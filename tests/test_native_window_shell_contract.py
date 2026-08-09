@@ -38,13 +38,15 @@ def test_only_child_content_is_translucent_and_native() -> None:
     assert "WS_EX_TRANSPARENT" not in SHELL
 
 
-def test_quick_and_widget_layers_are_children_of_one_native_host() -> None:
-    assert "self.quick_window.setParent(host_window)" in NATIVE
-    assert "Qt.WindowType.SubWindow" in NATIVE
+def test_quick_uses_qt_supported_native_window_container() -> None:
+    assert "QWidget.createWindowContainer" in NATIVE
+    assert "self.quick_window.setParent(host_window)" not in NATIVE
+    assert "self.quick_container.setGeometry(surface_host.rect())" in NATIVE
+    assert "self.quick_container.stackUnder(self.content_layer)" in NATIVE
     assert "_assert_same_native_parent" in NATIVE
     assert "_place_child_behind" in NATIVE
-    assert "self.content_layer.raise_()" in NATIVE
     assert "Qt.WindowType.Tool" not in NATIVE
+    assert "QQuickWidget" not in NATIVE
 
 
 def test_no_desktop_z_order_guard_or_custom_chrome_remains() -> None:
@@ -58,6 +60,7 @@ def test_no_desktop_z_order_guard_or_custom_chrome_remains() -> None:
 
 def test_quick_is_input_transparent_but_business_content_is_not() -> None:
     assert "Qt.WindowType.WindowTransparentForInput" in NATIVE
+    assert "self.quick_container.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)" in NATIVE
     assert "WindowTransparentForInput" not in SHELL
     assert "WA_TransparentForMouseEvents" not in SHELL
 
