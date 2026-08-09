@@ -1,6 +1,6 @@
-# Windows Local Read-only GUI
+# Windows Local Acceptance GUI
 
-This GUI is a development shell around the existing production read-only acceptance chain. It does **not** replace or reinterpret product parsing logic.
+This GUI is a development shell around the existing ecommerce-agent acceptance and Makro execution chains. It does **not** replace or reinterpret product parsing, Resolver, Fill Plan, browser-write, persistence-verification, or safety logic.
 
 ## Branch / worktree safety
 
@@ -51,7 +51,32 @@ PySide6 is intentionally isolated in `requirements-gui.txt`; the core runtime de
 python run_local_gui.py
 ```
 
-The GUI is intentionally **not** packaged into a single-file EXE during active development. Editing Python files and restarting the launcher is enough.
+The GUI is intentionally **not** packaged into a single-file EXE during active development.
+
+## Presentation architecture
+
+The active desktop shell uses **one native Qt Quick `ApplicationWindow` / `QQuickWindow` scene graph**. The previous QWidget / QOpenGLWidget presentation experiment has been removed from the runtime path and the legacy presentation files have been deleted.
+
+On Windows the launcher selects:
+
+- `QSG_RENDER_LOOP=threaded`
+- Qt Quick `Direct3D11` graphics API
+
+The continuously animated visual surface is therefore one retained scene graph rather than a QWidget backing-store plus OpenGL/FBO composition stack.
+
+The scene graph contains:
+
+- the sharp Fuji/sakura wallpaper;
+- one pre-blurred companion image generated once at startup;
+- fractional cursor parallax driven by `FrameAnimation` and real frame time;
+- one full-window glass-mask layer shared by every card;
+- one `MultiEffect` mask composition for all live glass regions;
+- card-local translucent tint / hover / press feedback;
+- exactly three sakura particles and the cursor follower in the same scene graph overlay.
+
+Cards do **not** create their own wallpaper capture/FBO. Every card contributes only rounded geometry to the shared glass mask. Ancestor clipping is carried into the global mask so scroll-view/list-view cards do not leave blur outside their visible viewport.
+
+The wallpaper, blur image, glass mask, sakura, cursor follower, controls, tables and logs all belong to the same QQuickWindow presentation system. Do not reintroduce a QQuickWidget, QOpenGLWidget, QWidget animation surface, per-card ShaderEffectSource, short-interval animation QTimer, or a second presentation shell.
 
 ## What “只读测试” runs
 
@@ -73,50 +98,75 @@ and its own temporary caches:
 
 The cold resolver uses `--refresh-source`. The hot resolver reuses the exact run-local source and semantic caches, so cache behavior is visible without depending on older unrelated tests.
 
+## Gated real browser acceptance
+
+Real execution remains locked until the current read-only four-stage acceptance has completed and produced a usable final Fill Plan.
+
+When explicitly authorized, the GUI delegates to the canonical:
+
+`makro_execute_listing.py`
+
+It reuses the completed run's live schema, hot Resolver decision packet, supplier snapshot/screenshot and product evidence. The GUI does not implement a second browser-write path.
+
+Permissions remain independent and explicit:
+
+- Single section real fill defaults to no Save.
+- Single section Save + reopen verification is opt-in.
+- Full Step 3 is a persisted acceptance and therefore requires explicit Save authorization.
+- Product Photos upload is opt-in and requires explicitly selected local files.
+- `Send to QC` is permanently policy-locked and is never requested by the GUI.
+
 ## Makro browser safety
 
-The GUI checks `http://127.0.0.1:9222/json/version` before starting.
+The read-only chain checks the configured Makro CDP endpoint before starting. If the long-lived Makro CDP endpoint is absent, the workflow stops; the GUI does not intentionally start/restart the Makro Edge profile.
 
-If the Makro CDP endpoint is absent, the GUI stops. It does not intentionally start/restart the long-lived Makro Edge profile.
-
-Source capture remains on the existing independent source CDP port (default `9333`). If the supplier site requires legitimate manual verification/login, enable:
+Source capture remains on the independent source CDP port (default `9333`). If the supplier site requires legitimate manual verification/login, enable:
 
 `Source Edge 已人工验证：采集当前页`
 
-then retry after completing the verification in the source browser.
+then retry after completing verification in the source browser.
 
 ## Safety indicators
 
-The UI reads the existing manifests and displays:
+The UI surfaces the current workflow safety state, including:
 
 - Makro Write count
-- Save clicked
-- Send to QC clicked
+- Save state/count
+- Send to QC state
 
-The GUI runner never invokes `makro_execute_listing.py`.
-
-Expected result for every GUI read-only run:
+For read-only runs the required state remains:
 
 - `writes_performed = 0`
 - `save_clicked = false`
 - `send_to_qc_clicked = false`
 
+For explicitly authorized real execution, writes and Save may occur according to the selected scope and permissions, while `Send to QC` must remain false.
+
 ## UI result sources
 
 The GUI displays:
 
-- READY count from the final Fill Plan
-- MISSING / CONFLICT from the hot final AI decision packet
-- BLOCKED count and reasons from the final Fill Plan
-- field name / AI result / final status / blocked reason / source
-- cold/hot Local batch counts, model calls, cache hits and failures
-- cold/hot source cache and Web cache hits
-- Web candidate `same_product / different_product / uncertain` judgments
-- realtime subprocess log
-- direct open of the current result/log directory
+- READY count from the final Fill Plan;
+- MISSING / CONFLICT from the hot final AI decision packet;
+- BLOCKED count and reasons from the final Fill Plan;
+- field name / AI result / final status / blocked reason / source / field ID;
+- cold/hot Local and Web Resolver telemetry;
+- source and Web cache behavior;
+- Web candidate `same_product / different_product / uncertain` judgments;
+- realtime read-only subprocess logs;
+- realtime real-execution command/output/progress;
+- real per-field execution and persistence results;
+- final real execution report JSON;
+- direct open of the current result directory.
 
-Web candidate judgments are read from this GUI run's isolated `web-product-research-*.json` semantic cache. This only surfaces the existing `app/web_enrichment.py` model output; it does not add a second product-matching layer.
+Web candidate judgments are read from the current run's isolated semantic cache. This only surfaces the existing model output; it does not add a second product-matching layer.
 
-## Visual style
+## CI contracts
 
-The first version deliberately favors test usability over animation. It uses a modern glass-card shell inspired by the earlier `nekro.top`-style personal homepage: large atmospheric background, translucent rounded panels, soft pink/lilac accents, and clear status cards. It does not use the later Win98/pixel homepage style.
+CI now validates three independent layers:
+
+1. repository unit/contract tests;
+2. a real offscreen QML load smoke test that constructs the Qt Quick shell;
+3. the existing mock browser end-to-end probe.
+
+Architecture tests also lock the active presentation path to the single Qt Quick scene graph and reject the former mixed-widget rendering design.
