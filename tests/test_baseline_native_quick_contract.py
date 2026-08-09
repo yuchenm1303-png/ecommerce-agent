@@ -44,7 +44,11 @@ def test_glass_pixels_are_composed_once_in_quick() -> None:
     assert "id: glassMaskSource" in NATIVE
     assert "model: glassCardModel" in NATIVE
     assert "cardAlpha / 255.0" in NATIVE
-    assert "maskSource: glassMaskSource" in NATIVE
+    assert "ShaderEffectSource" in NATIVE
+    assert "id: glassMaskTexture" in NATIVE
+    assert "sourceItem: glassMaskSource" in NATIVE
+    assert "hideSource: true" in NATIVE
+    assert "maskSource: glassMaskTexture" in NATIVE
     assert "maskUrl" not in NATIVE
     assert "glass_mask_" not in NATIVE
 
