@@ -56,18 +56,32 @@ def test_production_path_has_no_legacy_semantic_rule_layer():
             assert token not in source, f"{module.__name__} reintroduced {token}"
 
 
-def test_production_resolver_is_exact_source_local_fill_then_unresolved_web_only():
+def test_production_resolver_is_product_url_local_fill_then_unresolved_web_only():
     source = inspect.getsource(makro_resolve_ai)
     web_source = inspect.getsource(web_enrichment)
     assert "capture_product_source(" in source
     assert "run_field_mapping(" in source
     assert "run_web_enrichment(" in source
+    assert "build_ai_product_context" not in source
+    assert "ResolutionInputSpec" not in source
     assert "run_product_profile(" not in source
     assert "product-profile.json" not in source
-    assert "exact_product_source_then_parallel_local_fill_then_unresolved_web_fill" in source
+    assert "product_url_capture_then_parallel_local_fill_then_unresolved_web_fill" in source
     assert "final_resolve" not in source
     assert "final_provider" not in web_source
     assert "_run_final_resolution" not in web_source
+
+
+def test_resolver_has_no_manual_product_identity_inputs():
+    parser = makro_resolve_ai.build_parser()
+    options = {option for action in parser._actions for option in action.option_strings}
+    assert "--product-url" in options
+    assert "--sku" not in options
+    assert "--qa" not in options
+    assert "--expected-model" not in options
+    assert "--expected-brand" not in options
+    assert "--product-table" not in options
+    assert "--facts-json" not in options
 
 
 def test_local_fill_reads_original_sources_directly_including_images():
@@ -75,7 +89,7 @@ def test_local_fill_reads_original_sources_directly_including_images():
     assert "grounding.as_request_list()" in source
     assert "fill_marketplace_fields_from_exact_product_evidence" in source
     assert "derived_product_profile" not in source
-    assert "image_path" not in source  # provider owns image transport; mapper only passes source catalog
+    assert "image_path" not in source
 
 
 def test_field_mapping_batches_are_mechanical_not_category_semantic_tables():
