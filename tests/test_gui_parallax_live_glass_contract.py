@@ -66,13 +66,26 @@ def test_quick_is_the_framed_application_window_not_a_container() -> None:
     assert "Qt.WindowType.Tool" not in NATIVE
 
 
-def test_card_hover_keeps_local_tint_layer_without_per_card_blur() -> None:
+def test_card_hover_and_press_use_only_local_tint_surface() -> None:
     glass = VISUAL.split("class GlassBackdrop", 1)[1].split("class VisualStyleController", 1)[0]
+    controller = VISUAL.split("class VisualStyleController", 1)[1]
     assert "painter.drawRoundedRect" in glass
     assert "_overlay_alpha" in glass
+    assert "set_interaction" in glass
+    assert "_CARD_IDLE" in VISUAL
+    assert "_CARD_HOVER" in VISUAL
+    assert "_CARD_PRESSED" in VISUAL
+    assert "QEvent.Type.Enter" in controller
+    assert "QEvent.Type.Leave" in controller
+    assert "QEvent.Type.MouseButtonPress" in controller
+    assert "QEvent.Type.MouseButtonRelease" in controller
+    assert "_set_hovered_card" in controller
+    assert "_set_pressed_card" in controller
     assert "QGraphicsBlurEffect" not in glass
     assert "drawPixmap" not in glass
     assert "background.transform_changed" not in glass
+    interaction = controller.split("def _refresh_card", 1)[1].split("def eventFilter", 1)[0]
+    assert "schedule_mask_update" not in interaction
 
 
 def test_visual_style_has_no_custom_window_chrome() -> None:
@@ -82,8 +95,8 @@ def test_visual_style_has_no_custom_window_chrome() -> None:
 
 
 def test_legacy_qwidget_background_paint_is_suppressed_without_layout_rewrite() -> None:
-    assert "watched is self.central and event.type() == QEvent.Type.Paint" in VISUAL
-    paint_block = VISUAL.split("watched is self.central and event.type() == QEvent.Type.Paint", 1)[1]
+    assert "watched is self.central and event_type == QEvent.Type.Paint" in VISUAL
+    paint_block = VISUAL.split("watched is self.central and event_type == QEvent.Type.Paint", 1)[1]
     assert "return True" in paint_block.split("if isinstance(watched, QFrame)", 1)[0]
 
 
