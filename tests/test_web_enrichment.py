@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 
 from app.ai_decisions import (
+    CONFLICT,
     MISSING,
     READY,
-    REVIEW,
     AIDecisionPacket,
+    DecisionAlternative,
     DecisionCitation,
     FieldDecision,
     field_id,
@@ -84,8 +85,8 @@ def packet(fields, decisions):
         schema_sha256=schema_digest(fields),
         source_manifest_sha256=source_manifest_digest(sources),
         decisions=decisions,
-        model_summary="local mapping",
-        extractor="field-map",
+        model_summary="local fill",
+        extractor="local-fill",
     )
 
 
@@ -120,10 +121,12 @@ class DynamicWebProvider:
         self.calls += 1
         payload = json.loads(prompt.split("\n\n", 1)[1])
         url = f"https://example.test/batch-{self.calls}"
-        evidence = [
+        decisions = [
             {
                 "field_id": target["field_id"],
-                "items": [
+                "status": "ready",
+                "values": ["GC2053"],
+                "citations": [
                     {
                         "source_url": url,
                         "evidence_text": f"Image sensor: GC2053 for {target['field_id']}",
@@ -133,7 +136,7 @@ class DynamicWebProvider:
             for target in payload["target_fields"]
         ]
         return WebSearchJSONResult(
-            payload={"evidence": evidence},
+            payload={"decisions": decisions},
             sources=[WebSearchSource(index="1", title="M8", url=url)],
             request_id=f"req-web-{self.calls}",
         )
@@ -151,37 +154,7 @@ class FailingWebProvider:
         raise RuntimeError("network unavailable")
 
 
-class FakeFinalProvider:
-    name = "fake-final"
-
-    def __init__(self):
-        self.calls = 0
-        self.requests = []
-
-    def extract_json(self, request):
-        self.calls += 1
-        self.requests.append(request)
-        web_payload = json.loads(request["grounded_sources"][1]["content"])
-        decisions = []
-        for target in request["target_fields"]:
-            evidence = web_payload[target["field_id"]][0]
-            decisions.append(
-                {
-                    "field_id": target["field_id"],
-                    "status": "ready",
-                    "values": ["GC2053"],
-                    "citations": [
-                        {
-                            "source_reference": evidence["source_reference"],
-                            "evidence_text": evidence["evidence_text"],
-                        }
-                    ],
-                }
-            )
-        return {"decisions": decisions}
-
-
-def test_unresolved_fields_are_researched_then_finalized_without_touching_ready(tmp_path):
+def test_missing_field_is_searched_and_directly_filled_without_touching_ready(tmp_path):
     colour = field("colour", "Colour")
     sensor = field("image_sensor", "Image Sensor")
     fields = [colour, sensor]
@@ -205,20 +178,22 @@ def test_unresolved_fields_are_researched_then_finalized_without_touching_ready(
     url = "https://example.test/m8-manual"
     search = FakeWebProvider(
         {
-            "evidence": [
+            "decisions": [
                 {
                     "field_id": field_id(sensor),
-                    "items": [{"source_url": url, "evidence_text": "Image sensor: GC2053"}],
+                    "status": "ready",
+                    "values": ["GC2053"],
+                    "citations": [
+                        {"source_url": url, "evidence_text": "Image sensor: GC2053"}
+                    ],
                 }
             ]
         },
         [WebSearchSource(index="1", title="M8 manual", url=url)],
     )
-    final = FakeFinalProvider()
 
     result = run_web_enrichment(
         search,
-        final,
         initial,
         fields,
         grounding(),
@@ -227,10 +202,7 @@ def test_unresolved_fields_are_researched_then_finalized_without_touching_ready(
     )
 
     assert search.calls == 1
-    assert final.calls == 1
     assert result.search_model_calls == 1
-    assert result.final_model_calls == 1
-    assert result.final_batch_count == 1
     assert result.target_field_count == 1
     assert result.packet.decisions[0].values == ["Black"]
     assert result.packet.decisions[1].status == READY
@@ -239,19 +211,58 @@ def test_unresolved_fields_are_researched_then_finalized_without_touching_ready(
     assert field_id(colour) not in search.prompts[0]
 
 
-def test_final_resolution_is_small_parallel_batches_and_hot_cached(tmp_path):
+def test_local_conflict_is_frozen_and_never_sent_to_web():
+    resolution = field("recording_resolution", "Recording Resolution")
+    sensor = field("image_sensor", "Image Sensor")
+    fields = [resolution, sensor]
+    citation = DecisionCitation(
+        "customer-text:001:text:0001:abc",
+        "Selected variant: M8 WiFi dual camera 64GB",
+    )
+    initial = packet(
+        fields,
+        [
+            FieldDecision(
+                field_id=field_id(resolution),
+                status=CONFLICT,
+                alternatives=[
+                    DecisionAlternative(values=("720p",), citations=(citation,)),
+                    DecisionAlternative(values=("1080p",), citations=(citation,)),
+                ],
+            ),
+            FieldDecision(field_id=field_id(sensor), status=MISSING),
+        ],
+    )
+    url = "https://example.test/m8"
+    search = FakeWebProvider(
+        {
+            "decisions": [
+                {
+                    "field_id": field_id(sensor),
+                    "status": "ready",
+                    "values": ["GC2053"],
+                    "citations": [{"source_url": url, "evidence_text": "Image sensor: GC2053"}],
+                }
+            ]
+        },
+        [WebSearchSource(index="1", title="M8", url=url)],
+    )
+    result = run_web_enrichment(search, initial, fields, grounding(), profile())
+    assert result.packet.decisions[0].status == CONFLICT
+    assert field_id(resolution) not in search.prompts[0]
+
+
+def test_web_fill_is_small_parallel_batches_and_hot_cached(tmp_path):
     fields = [field(f"field_{index}", f"Field {index}") for index in range(5)]
     initial = packet(
         fields,
         [FieldDecision(field_id=field_id(item), status=MISSING) for item in fields],
     )
     search = DynamicWebProvider()
-    final = FakeFinalProvider()
     cache = tmp_path / "cache"
 
     first = run_web_enrichment(
         search,
-        final,
         initial,
         fields,
         grounding(),
@@ -259,11 +270,9 @@ def test_final_resolution_is_small_parallel_batches_and_hot_cached(tmp_path):
         batch_size=2,
         concurrency=3,
         cache_dir=cache,
-        final_cache_namespace="model",
     )
     second = run_web_enrichment(
         search,
-        final,
         initial,
         fields,
         grounding(),
@@ -271,29 +280,29 @@ def test_final_resolution_is_small_parallel_batches_and_hot_cached(tmp_path):
         batch_size=2,
         concurrency=3,
         cache_dir=cache,
-        final_cache_namespace="model",
     )
 
     assert first.search_batch_count == 3
-    assert first.final_batch_count == 3
-    assert first.final_model_calls == 3
-    assert all(len(request["target_fields"]) <= 2 for request in final.requests)
+    assert first.search_model_calls == 3
     assert second.search_model_calls == 0
-    assert second.final_model_calls == 0
-    assert second.final_cache_hits == 3
-    assert second.final_cache_hit is True
+    assert second.search_cache_hits == 3
+    assert second.cache_hit is True
+    assert search.calls == 3
+    assert all(item.status == READY for item in second.packet.decisions)
 
 
-def test_invented_web_url_is_dropped_before_final_resolve():
+def test_invented_web_url_cannot_replace_local_missing():
     sensor = field("image_sensor", "Image Sensor")
     fields = [sensor]
     initial = packet(fields, [FieldDecision(field_id=field_id(sensor), status=MISSING)])
     search = FakeWebProvider(
         {
-            "evidence": [
+            "decisions": [
                 {
                     "field_id": field_id(sensor),
-                    "items": [
+                    "status": "ready",
+                    "values": ["GC2053"],
+                    "citations": [
                         {
                             "source_url": "https://invented.test/not-returned",
                             "evidence_text": "Image sensor: GC2053",
@@ -304,70 +313,18 @@ def test_invented_web_url_is_dropped_before_final_resolve():
         },
         [WebSearchSource(index="1", title="Real", url="https://example.test/real")],
     )
-    final = FakeFinalProvider()
-    result = run_web_enrichment(search, final, initial, fields, grounding(), profile())
-    assert result.evidence == []
+    result = run_web_enrichment(search, initial, fields, grounding(), profile())
     assert result.web_sources == []
-    assert final.calls == 0
     assert result.packet.decisions[0].status == MISSING
 
 
-def test_parallel_web_batch_cache_and_final_cache_replay_with_zero_calls(tmp_path):
-    sensor = field("image_sensor", "Image Sensor")
-    fields = [sensor]
-    initial = packet(fields, [FieldDecision(field_id=field_id(sensor), status=MISSING)])
-    url = "https://example.test/m8"
-    search = FakeWebProvider(
-        {
-            "evidence": [
-                {
-                    "field_id": field_id(sensor),
-                    "items": [{"source_url": url, "evidence_text": "Image sensor: GC2053"}],
-                }
-            ]
-        },
-        [WebSearchSource(index="1", title="M8", url=url)],
-    )
-    final = FakeFinalProvider()
-    cache = tmp_path / "cache"
-    first = run_web_enrichment(
-        search,
-        final,
-        initial,
-        fields,
-        grounding(),
-        profile(),
-        cache_dir=cache,
-        final_cache_namespace="model",
-    )
-    second = run_web_enrichment(
-        search,
-        final,
-        initial,
-        fields,
-        grounding(),
-        profile(),
-        cache_dir=cache,
-        final_cache_namespace="model",
-    )
-    assert first.search_model_calls == 1
-    assert first.final_model_calls == 1
-    assert second.search_model_calls == 0
-    assert second.final_model_calls == 0
-    assert second.cache_hit is True
-    assert search.calls == 1
-    assert final.calls == 1
-
-
-def test_search_failure_preserves_local_packet_and_does_not_call_final():
+def test_search_failure_preserves_local_packet():
     sensor = field("image_sensor", "Image Sensor")
     fields = [sensor]
     initial = packet(fields, [FieldDecision(field_id=field_id(sensor), status=MISSING)])
     search = FailingWebProvider()
-    final = FakeFinalProvider()
-    result = run_web_enrichment(search, final, initial, fields, grounding(), profile())
+    result = run_web_enrichment(search, initial, fields, grounding(), profile())
     assert search.calls == 1
-    assert final.calls == 0
     assert result.packet.decisions[0].status == MISSING
     assert result.search_failed_batches == 1
     assert result.warnings
@@ -380,23 +337,18 @@ def test_embedded_web_sources_reload_through_unified_decision_loader(tmp_path):
     url = "https://example.test/m8"
     search = FakeWebProvider(
         {
-            "evidence": [
+            "decisions": [
                 {
                     "field_id": field_id(sensor),
-                    "items": [{"source_url": url, "evidence_text": "Image sensor: GC2053"}],
+                    "status": "ready",
+                    "values": ["GC2053"],
+                    "citations": [{"source_url": url, "evidence_text": "Image sensor: GC2053"}],
                 }
             ]
         },
         [WebSearchSource(index="1", title="M8", url=url)],
     )
-    result = run_web_enrichment(
-        search,
-        FakeFinalProvider(),
-        initial,
-        fields,
-        grounding(),
-        profile(),
-    )
+    result = run_web_enrichment(search, initial, fields, grounding(), profile())
     path = write_enriched_ai_decision_packet(
         result.packet,
         result.web_sources,
