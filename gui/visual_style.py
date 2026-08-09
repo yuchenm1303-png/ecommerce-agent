@@ -6,7 +6,8 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QCursor, QImage, QPainter, QPainterPath, QPixmap, QRadialGradient, QRegion
+from PySide6.QtGui import QColor, QCursor, QImage, QPainter, QPainterPath, QPixmap, QRadialGradient
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -15,7 +16,6 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QMainWindow,
     QScrollBar,
-    QWidget,
 )
 
 
@@ -338,13 +338,13 @@ class GlassBackdrop:
         self.scene.update_frame(self.frame)
 
 
-class VisualSceneLayer(QWidget):
-    """Single raster scene for wallpaper + every glass surface.
+class VisualSceneLayer(QOpenGLWidget):
+    """GPU-backed wallpaper + glass compositor.
 
-    Runtime parallax is one 1:1 wallpaper crop plus glass samples from one
-    pre-blurred copy of the same overscan image. Card geometry and rounded paths
-    are cached outside the animation path, so a background frame does not call
-    mapToGlobal/mapFromGlobal or allocate painter paths.
+    Wallpaper motion changes only texture source coordinates. The sharp and
+    pre-blurred overscan pixmaps are rebuilt only after a resize, then remain
+    stable GPU texture sources throughout mouse parallax. No QWidget raster
+    backing-store or per-frame blur/copy path participates in animation.
     """
 
     _OVERSCAN = 1.065
@@ -358,9 +358,11 @@ class VisualSceneLayer(QWidget):
         super().__init__(central)
         self.window = window
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
-        self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setFocusPolicy(Qt.NoFocus)
+        self.setAutoFillBackground(False)
+        # The whole visual scene changes when parallax moves. A single fresh FBO
+        # frame is cheaper and simpler than preserving/repairing partial buffers.
+        self.setUpdateBehavior(QOpenGLWidget.UpdateBehavior.NoPartialUpdate)
 
         self._source = _load_wallpaper()
         self._render = QPixmap()
@@ -369,7 +371,6 @@ class VisualSceneLayer(QWidget):
 
         self.surfaces: dict[QFrame, GlassBackdrop] = {}
         self._geometry_cache: dict[QFrame, tuple[QRect, QPainterPath]] = {}
-        self._glass_region = QRegion()
 
         self._offset = QPointF(0.0, 0.0)
         self._target = QPointF(0.0, 0.0)
@@ -441,7 +442,6 @@ class VisualSceneLayer(QWidget):
 
     def _refresh_geometry(self) -> None:
         cache: dict[QFrame, tuple[QRect, QPainterPath]] = {}
-        region = QRegion()
         for frame in self.surfaces:
             rect = self._visible_frame_rect(frame)
             if rect.isEmpty():
@@ -449,13 +449,8 @@ class VisualSceneLayer(QWidget):
             path = QPainterPath()
             path.addRoundedRect(QRectF(rect), 6.0, 6.0)
             cache[frame] = (rect, path)
-            region = region.united(QRegion(rect.adjusted(-1, -1, 1, 1)))
-        old_region = self._glass_region
         self._geometry_cache = cache
-        self._glass_region = region
-        dirty = old_region.united(region)
-        if not dirty.isEmpty():
-            self.update(dirty)
+        self.update()
 
     def _rebuild(self) -> None:
         if self.width() <= 0 or self.height() <= 0:
@@ -507,6 +502,8 @@ class VisualSceneLayer(QWidget):
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
         if event_type == QEvent.MouseMove and hasattr(event, "globalPosition"):
+            # High-polling mice only replace one pending point. Actual scene
+            # updates stay capped by the 60 fps motion timer.
             self._pending_pointer = event.globalPosition().toPoint()
             self._ensure_motion_timer()
         elif watched is self.window and event_type == QEvent.Leave:
@@ -556,8 +553,8 @@ class VisualSceneLayer(QWidget):
         next_rect = self._rect_for_offset(self._offset)
         if next_rect != self._source_rect:
             self._source_rect = next_rect
-            # One update now repaints wallpaper and glass in the same backing
-            # store pass. There is no second QWidget/signal/composite step.
+            # QOpenGLWidget repaints one GPU FBO. The pixmaps remain stable
+            # texture sources; only source coordinates change per frame.
             self.update()
 
         remaining = math.hypot(self._target.x() - self._offset.x(), self._target.y() - self._offset.y())
@@ -570,20 +567,20 @@ class VisualSceneLayer(QWidget):
             self._motion_timer.stop()
 
     def update_frame(self, frame: QFrame) -> None:
-        geometry = self._geometry_cache.get(frame)
-        if geometry is None:
+        if frame not in self._geometry_cache:
             self.request_geometry_refresh()
             return
-        rect, _path = geometry
-        self.update(rect.adjusted(-2, -2, 2, 2))
+        # Card interaction changes only a small alpha parameter. The GPU scene
+        # is cheap enough to redraw as one coherent frame, avoiding dirty-region
+        # bookkeeping and backing-store copies on the CPU.
+        self.update()
 
-    def paintEvent(self, event) -> None:  # type: ignore[override]
+    def paintGL(self) -> None:  # noqa: N802
         if self._render.isNull() or self._source_rect.isEmpty():
             return
 
         painter = QPainter(self)
-        # One full-scene draw call. QBackingStore already clips it to the paint
-        # event region, so iterating dirty rectangles in Python only adds calls.
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
         painter.drawPixmap(self.rect(), self._render, self._source_rect)
 
         if not self._geometry_cache or self._blurred.isNull():
@@ -591,12 +588,9 @@ class VisualSceneLayer(QWidget):
             return
 
         painter.setRenderHint(QPainter.Antialiasing, True)
-        event_region = event.region() if event is not None else QRegion(self.rect())
         src = self._source_rect
 
         for frame, (rect, cached_path) in self._geometry_cache.items():
-            if not event_region.intersects(rect):
-                continue
             surface = self.surfaces.get(frame)
             if surface is None:
                 continue
@@ -637,7 +631,7 @@ class VisualSceneLayer(QWidget):
 
 
 class VisualStyleController(QObject):
-    """Own the single visual scene and the static white-dot cursor."""
+    """Own the GPU visual scene and the static white-dot cursor."""
 
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
@@ -656,8 +650,8 @@ class VisualStyleController(QObject):
         window.installEventFilter(self)
         self._install_cursor()
 
-        # Scrolling only invalidates cached card geometry; expensive coordinate
-        # mapping is capped at 60Hz and never runs on wallpaper motion frames.
+        # Scrolling only invalidates cached card geometry; coordinate mapping is
+        # capped at 60Hz and never runs on wallpaper motion frames.
         for bar in window.findChildren(QScrollBar):
             bar.valueChanged.connect(self.scene.request_geometry_refresh)
 
