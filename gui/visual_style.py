@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import base64
 import math
+from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QCursor,
-    QLinearGradient,
     QPainter,
     QPainterPath,
     QPixmap,
@@ -24,9 +25,10 @@ from PySide6.QtWidgets import (
 
 
 # Static presentation layer only.
-# Visual rules mirror the MIT-licensed imsyy/home / nekro.top design language,
-# while the wallpaper itself is local to ecommerce-agent.
+# Visual rules mirror the MIT-licensed imsyy/home / nekro.top design language.
+# The wallpaper is a fixed local asset bundled with ecommerce-agent.
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
+_WALLPAPER_ASSET = Path(__file__).resolve().parent / "assets" / "fuji_sakura_wallpaper.jpg.b64"
 
 
 NEKRO_STYLE = r"""
@@ -267,64 +269,19 @@ QSplitter::handle {
 """
 
 
-def _radial_fill(
-    painter: QPainter,
-    canvas: QPixmap,
-    x: float,
-    y: float,
-    radius: float,
-    center: QColor,
-) -> None:
-    gradient = QRadialGradient(
-        QPointF(canvas.width() * x, canvas.height() * y),
-        max(canvas.width(), canvas.height()) * radius,
-    )
-    gradient.setColorAt(0.0, center)
-    fade = QColor(center)
-    fade.setAlpha(0)
-    gradient.setColorAt(1.0, fade)
-    painter.fillRect(canvas.rect(), gradient)
+def _load_wallpaper() -> QPixmap:
+    """Decode the bundled Fuji/sakura wallpaper once at GUI startup."""
 
+    pixmap = QPixmap()
+    try:
+        encoded = _WALLPAPER_ASSET.read_text(encoding="ascii")
+        data = base64.b64decode(encoded, validate=True)
+    except (OSError, ValueError):
+        return pixmap
 
-def build_wallpaper(width: int = 1920, height: int = 1080) -> QPixmap:
-    """Build the local mist-blue / lilac / pink scene once."""
-
-    width = max(1280, int(width))
-    height = max(720, int(height))
-    canvas = QPixmap(width, height)
-    canvas.fill(QColor("#9FB5E7"))
-
-    painter = QPainter(canvas)
-    painter.setRenderHint(QPainter.Antialiasing, True)
-
-    base = QLinearGradient(0, 0, width, height)
-    base.setColorAt(0.00, QColor("#7798CF"))
-    base.setColorAt(0.28, QColor("#9A9FD1"))
-    base.setColorAt(0.56, QColor("#C39FC7"))
-    base.setColorAt(0.80, QColor("#E2ABC0"))
-    base.setColorAt(1.00, QColor("#E8B9B0"))
-    painter.fillRect(canvas.rect(), base)
-
-    _radial_fill(painter, canvas, 0.14, 0.16, 0.43, QColor(184, 218, 255, 170))
-    _radial_fill(painter, canvas, 0.76, 0.12, 0.34, QColor(229, 205, 255, 128))
-    _radial_fill(painter, canvas, 0.90, 0.68, 0.38, QColor(255, 190, 206, 128))
-    _radial_fill(painter, canvas, 0.18, 0.88, 0.34, QColor(177, 232, 225, 72))
-    _radial_fill(painter, canvas, 0.50, 0.48, 0.42, QColor(244, 224, 239, 58))
-
-    veil = QLinearGradient(width * 0.22, 0, width * 0.78, 0)
-    veil.setColorAt(0.0, QColor(255, 255, 255, 0))
-    veil.setColorAt(0.45, QColor(245, 238, 250, 28))
-    veil.setColorAt(0.55, QColor(245, 238, 250, 28))
-    veil.setColorAt(1.0, QColor(255, 255, 255, 0))
-    painter.fillRect(canvas.rect(), veil)
-
-    horizon = QLinearGradient(0, height * 0.52, 0, height)
-    horizon.setColorAt(0.0, QColor(255, 255, 255, 0))
-    horizon.setColorAt(0.72, QColor(255, 224, 232, 18))
-    horizon.setColorAt(1.0, QColor(243, 207, 218, 38))
-    painter.fillRect(canvas.rect(), horizon)
-    painter.end()
-    return canvas
+    if not pixmap.loadFromData(data, "JPG"):
+        return QPixmap()
+    return pixmap
 
 
 def _blur_pixmap(source: QPixmap, radius: float = 10.0) -> QPixmap:
@@ -361,7 +318,11 @@ class BackgroundLayer(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setFocusPolicy(Qt.NoFocus)
 
-        self._source = build_wallpaper()
+        self._source = _load_wallpaper()
+        if self._source.isNull():
+            self._source = QPixmap(1280, 720)
+            self._source.fill(QColor("#7EB8E8"))
+
         self._cover = QPixmap()
         self._blurred = QPixmap()
         self._rebuild_timer = QTimer(self)
@@ -401,21 +362,18 @@ class BackgroundLayer(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         rect = self.rect()
-        painter.fillRect(rect, QColor("#8FA4D0"))
+        painter.fillRect(rect, QColor("#7EB8E8"))
         if not self._cover.isNull():
             painter.drawPixmap(rect, self._cover)
 
+        # Keep only a restrained edge vignette so white UI text remains readable
+        # without changing the wallpaper composition itself.
         center = QPointF(rect.center())
         radius = max(1.0, math.hypot(rect.width() / 2.0, rect.height() / 2.0))
         outer = QRadialGradient(center, radius)
         outer.setColorAt(0.0, QColor(0, 0, 0, 0))
-        outer.setColorAt(1.0, QColor(0, 0, 0, 128))
+        outer.setColorAt(1.0, QColor(0, 0, 0, 92))
         painter.fillRect(rect, outer)
-
-        inner = QRadialGradient(center, radius * 1.66)
-        inner.setColorAt(0.33, QColor(0, 0, 0, 0))
-        inner.setColorAt(1.0, QColor(0, 0, 0, 76))
-        painter.fillRect(rect, inner)
         painter.end()
 
 
