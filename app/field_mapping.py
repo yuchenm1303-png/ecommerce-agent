@@ -32,35 +32,40 @@ class JSONTaskProvider(Protocol):
         ...
 
 
-FIELD_MAPPING_CONTRACT_VERSION = 10
-FIELD_MAPPING_CACHE_VERSION = 10
+FIELD_MAPPING_CONTRACT_VERSION = 11
+FIELD_MAPPING_CACHE_VERSION = 11
 
 
 MAPPING_SYSTEM_INSTRUCTION = (
     "You directly fill marketplace fields from the supplied exact supplier-page evidence. "
     "There is no intermediate product profile, review model, or Python semantic resolver. "
     "Read structured page rows, embedded variant data, rendered page text, the full-page screenshot "
-    "and captured product/detail images yourself. Preserve real source conflicts and leave unsupported "
-    "fields missing. The response shape is schema-constrained: classify each target into exactly one "
-    "of ready, conflicts, or missing."
+    "and captured product/detail images yourself. For every target, audit all supplied evidence before "
+    "choosing READY so real source conflicts are preserved. Leave unsupported fields missing. The response "
+    "shape is schema-constrained: classify each target into exactly one of ready, conflicts, or missing."
 )
 
 
 MAPPING_RULES = [
     "Place every supplied target field_id exactly once in ready, conflicts, or missing.",
-    "ready is for a single supported field value and requires at least one existing source_reference citation.",
-    "conflicts is for genuine different values that each answer the same exact target field and requires at least two cited alternatives.",
-    "Every READY value and every CONFLICT alternative must be supported by direct target-specific evidence. Do not use evidence for one attribute as the value of another attribute; unit conversion and exact option mapping are the only mechanical transformations allowed.",
+    "For EACH target field, scan all grounded text rows and all supplied images for direct values that answer that exact field BEFORE choosing READY or MISSING.",
+    "ready is allowed only when one supported value remains after that full evidence scan and requires at least one existing source_reference citation.",
+    "conflicts is mandatory when two or more different directly supported values answer the same exact target field; do not suppress a real conflict merely because one value comes from a structured row and another from a product/detail image.",
+    "Every READY value and every CONFLICT alternative must be supported by direct target-specific evidence. Do not use evidence for one attribute as the value of another attribute; unit conversion, literal decomposition of explicitly ordered dimensions, and exact option mapping are the only mechanical transformations allowed.",
     "missing is only for a value not established by the supplied exact-page evidence; do not guess from typical products, nearby facts, absence, class conventions, or general knowledge.",
     "Treat attribute_key, label, section_heading, help_text, context_text, options and qualifier_options together as the Makro field meaning. Do not invent a second taxonomy.",
     "Keep scope exact: packaging vs product body vs mount; cabin/interior vs rear/back; manual/documentation language vs device UI language; product brand vs compatible vehicle brand.",
     "For structured key/value rows, preserve the row key as the attribute identity. A value from a differently named row must not be reassigned merely because it is adjacent or numerically plausible.",
+    "Packaging Length/Breadth/Height/Weight fields use packaging/shipping evidence only. If an exact package-dimensions source explicitly gives L×W×H, Length×Width×Height, or 长×宽×高, split that tuple in the literal stated order; package/gross weight maps to Packaging Weight only when the source labels it as package/gross/shipping weight.",
+    "A generic Length/Width/Breadth/Height field outside a packaging/shipping scope means the product/body dimension unless that target contract explicitly says packaging. Never reuse a package dimension as product/body Height, Width, Breadth, or Length.",
     "Preserve dimension axes literally. Source length maps to Makro Length; source width/breadth maps to Makro Breadth; source height maps to Makro Height. Never swap or rotate axes to make values fit.",
-    "Before declaring CONFLICT, verify all alternatives have the same semantic/quantity type as the target field; nearby facts of another type are not conflicting alternatives.",
-    "Generated Description/Keywords/Sales Package may use only supported, non-conflicting facts.",
-    "Never infer No/False/Unsupported/Not included from absence. A negative value requires explicit evidence.",
+    "Keep display size, display pixel resolution, recording/video resolution, and still-image resolution separate. A 720p/1080p/2K/4K camera or recording claim is not Display Resolution unless the evidence explicitly says screen/display resolution. If two source claims both refer to recording/video resolution and disagree, return CONFLICT rather than assigning one to another resolution field.",
+    "Before declaring CONFLICT, verify all alternatives have the same semantic/quantity type as the target field; nearby facts of another type are not conflicting alternatives. 1080P is a resolution value, never a frame-rate alternative.",
+    "Generated Description/Keywords/Sales Package may use only supported, non-conflicting facts. If a fact is in CONFLICT, omit that fact from generated descriptive text instead of choosing one side.",
+    "Never infer No/False/Unsupported/Not included from absence. A negative value requires explicit target-specific evidence.",
+    "Manual/documentation language does not establish device UI Languages Supported. TF/memory-card support does not establish that a card is included. Package dimensions do not establish Packaging Type=Box. One listing/product page does not establish Pack of=1. Front+cabin/interior does not establish rear/back Camera Position. Remote Control=No requires explicit remote-control evidence.",
     "If options exist, return exact option text only when evidence supports it. If multi_value=false return one value.",
-    "If qualifier_options exist, put the magnitude in values and an exact allowed unit in qualifier. If qualifier_options are empty, qualifier MUST be empty. Use a fixed unit shown in context_text/help_text by converting the magnitude to that unit; if no fixed unit is established, classify the field as missing.",
+    "If qualifier_options exist, put the magnitude in values and an exact allowed unit in qualifier. If qualifier_options are empty, qualifier MUST be empty. When context_text/help_text shows a fixed rendered unit, convert the magnitude to that fixed unit but keep qualifier empty because there is no separate unit control. If no fixed unit is established, classify the field as missing.",
     "Embedded variant matrices may contain several options. Do not mix facts from different variants unless the page itself establishes they apply to the current product generally.",
     "Do not use external web knowledge in this local pass. Seller-operated price, stock, MOQ, fulfilment, shipping and listing-status fields are not product research questions.",
 ]
@@ -171,10 +176,9 @@ def build_field_mapping_request(
         "task": "fill_marketplace_fields_from_exact_product_evidence",
         "system_instruction": MAPPING_SYSTEM_INSTRUCTION,
         "prompt_instruction": (
-            "Read the supplied exact product-page evidence and classify this Makro field batch directly into the "
-            "schema-defined ready/conflicts/missing collections. Treat each target field definition independently. "
-            "Use atomic structured rows and images before missing; preserve genuine conflicts only when both values "
-            "directly answer the same target field."
+            "For every supplied Makro target: first audit all grounded text rows and all images for facts that "
+            "directly answer that target, then classify it. Do not choose READY until you have checked for a second "
+            "different direct value for the same target. Preserve packaging/body scope and literal dimension axes."
         ),
         "product_identity": {"source_product_url": product_url.strip()},
         "target_fields": [_target_payload(field) for field in fields],
