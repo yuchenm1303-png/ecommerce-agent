@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QCursor, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QCursor, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QFrame, QMainWindow, QWidget
 
 from .native_background import NativeQuickBackground
 
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
+_CARD_IDLE = (1.0, 64.0)
+_CARD_HOVER = (0.988, 48.0)
+_CARD_PRESSED = (0.970, 88.0)
 
 NEKRO_STYLE = r"""
 QWidget#root {
@@ -307,8 +310,10 @@ class VisualStyleController(QObject):
         self.window = window
         self._glass: dict[QFrame, GlassBackdrop] = {}
         self._cursor_installed = False
+        self._hovered_card: QFrame | None = None
+        self._pressed_card: QFrame | None = None
 
-        # Only this owned QWidget overlay is translucent/frameless. The actual
+        # Only this QWidget overlay is translucent/frameless. The actual
         # application frame belongs to NativeQuickBackground.quick_window.
         window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         window.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
@@ -324,6 +329,8 @@ class VisualStyleController(QObject):
         for frame in window.findChildren(QFrame):
             if frame.objectName() in _GLASS_NAMES:
                 frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+                frame.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+                frame.setMouseTracking(True)
                 self._glass[frame] = GlassBackdrop(frame)
 
         self.background = NativeQuickBackground(window)
@@ -354,20 +361,101 @@ class VisualStyleController(QObject):
             backdrop.sync_geometry()
         self.background.schedule_mask_update()
 
+    def _card_for_widget(self, watched: QObject) -> QFrame | None:
+        if not isinstance(watched, QWidget):
+            return None
+        current: QWidget | None = watched
+        while current is not None:
+            if isinstance(current, QFrame) and current in self._glass:
+                return current
+            if current is self.window:
+                break
+            current = current.parentWidget()
+        return None
+
+    def _refresh_card(self, frame: QFrame | None) -> None:
+        if frame is None:
+            return
+        surface = self._glass.get(frame)
+        if surface is None:
+            return
+        if frame is self._pressed_card:
+            scale, alpha = _CARD_PRESSED
+        elif frame is self._hovered_card:
+            scale, alpha = _CARD_HOVER
+        else:
+            scale, alpha = _CARD_IDLE
+        surface.set_interaction(scale=scale, overlay_alpha=alpha)
+
+    def _set_hovered_card(self, frame: QFrame | None) -> None:
+        if frame is self._hovered_card:
+            return
+        previous = self._hovered_card
+        self._hovered_card = frame
+        self._refresh_card(previous)
+        self._refresh_card(frame)
+
+    def _set_pressed_card(self, frame: QFrame | None) -> None:
+        if frame is self._pressed_card:
+            return
+        previous = self._pressed_card
+        self._pressed_card = frame
+        self._refresh_card(previous)
+        self._refresh_card(frame)
+
+    def _release_pressed_card(self) -> None:
+        pressed = self._pressed_card
+        if pressed is None:
+            return
+        self._pressed_card = None
+        local = pressed.mapFromGlobal(QCursor.pos())
+        self._set_hovered_card(pressed if pressed.rect().contains(local) else None)
+        self._refresh_card(pressed)
+
+    def _reset_interactions(self) -> None:
+        touched = {card for card in (self._hovered_card, self._pressed_card) if card is not None}
+        self._hovered_card = None
+        self._pressed_card = None
+        for frame in touched:
+            self._refresh_card(frame)
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        event_type = event.type()
+
         # Suppress only the legacy AtmosphereWidget wallpaper paint. Children
         # continue painting and receiving input exactly as before.
-        if watched is self.central and event.type() == QEvent.Type.Paint:
+        if watched is self.central and event_type == QEvent.Type.Paint:
             return True
+
         if isinstance(watched, QFrame) and watched in self._glass:
-            if event.type() in {QEvent.Type.Resize, QEvent.Type.Show}:
+            if event_type in {QEvent.Type.Resize, QEvent.Type.Show}:
                 QTimer.singleShot(0, self._glass[watched].sync_geometry)
+            if event_type == QEvent.Type.Enter:
+                self._set_hovered_card(watched)
+            elif event_type in {QEvent.Type.Leave, QEvent.Type.Hide}:
+                if watched is self._hovered_card:
+                    self._set_hovered_card(None)
+                if watched is self._pressed_card and event_type == QEvent.Type.Hide:
+                    self._set_pressed_card(None)
+
+        card = self._card_for_widget(watched)
+        if event_type == QEvent.Type.MouseButtonPress and card is not None:
+            if isinstance(event, QMouseEvent) and event.button() == Qt.MouseButton.LeftButton:
+                self._set_hovered_card(card)
+                self._set_pressed_card(card)
+        elif event_type == QEvent.Type.MouseButtonRelease and self._pressed_card is not None:
+            if not isinstance(event, QMouseEvent) or event.button() == Qt.MouseButton.LeftButton:
+                self._release_pressed_card()
+        elif event_type in {QEvent.Type.WindowDeactivate, QEvent.Type.ApplicationDeactivate}:
+            self._reset_interactions()
+
         return False
 
     def _cleanup(self) -> None:
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
+        self._reset_interactions()
         self.background.shutdown()
         if self._cursor_installed:
             QApplication.restoreOverrideCursor()
