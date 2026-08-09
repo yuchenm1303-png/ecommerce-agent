@@ -66,7 +66,7 @@ QLabel#phaseBadge {
     min-height: 32px;
     padding: 0 13px;
     color: rgba(255,255,255,225);
-    background-color: rgba(4,10,18,118);
+    background-color: rgba(0,0,0,76);
     border: 1px solid rgba(255,255,255,22);
     border-radius: 7px;
     font-size: 11px;
@@ -79,7 +79,7 @@ QComboBox {
     min-height: 36px;
     padding: 0 11px;
     color: #ffffff;
-    background-color: rgba(4,10,18,132);
+    background-color: rgba(0,0,0,76);
     border: 1px solid rgba(255,255,255,28);
     border-radius: 7px;
     selection-background-color: rgba(255,255,255,58);
@@ -89,14 +89,14 @@ QComboBox {
 QLineEdit:hover,
 QSpinBox:hover,
 QComboBox:hover {
-    background-color: rgba(5,12,21,154);
+    background-color: rgba(0,0,0,88);
     border-color: rgba(255,255,255,46);
 }
 
 QLineEdit:focus,
 QSpinBox:focus,
 QComboBox:focus {
-    background-color: rgba(5,12,21,176);
+    background-color: rgba(0,0,0,98);
     border-color: rgba(255,255,255,92);
 }
 
@@ -114,11 +114,11 @@ QComboBox::drop-down {
 
 QComboBox QAbstractItemView {
     color: #ffffff;
-    background-color: rgb(15,22,31);
-    border: 1px solid rgba(255,255,255,28);
+    background-color: rgb(55,55,58);
+    border: 1px solid rgba(255,255,255,30);
     border-radius: 7px;
     outline: 0;
-    selection-background-color: rgb(54,64,76);
+    selection-background-color: rgb(82,82,86);
     selection-color: #ffffff;
     padding: 5px;
 }
@@ -127,18 +127,18 @@ QPushButton {
     min-height: 36px;
     padding: 0 15px;
     border-radius: 7px;
-    background-color: rgba(4,10,18,126);
+    background-color: rgba(0,0,0,72);
     border: 1px solid rgba(255,255,255,18);
     font-weight: 650;
 }
 
 QPushButton:hover {
-    background-color: rgba(18,27,38,166);
+    background-color: rgba(0,0,0,104);
     border-color: rgba(255,255,255,34);
 }
 
 QPushButton:pressed {
-    background-color: rgba(3,8,15,180);
+    background-color: rgba(0,0,0,82);
 }
 
 QPushButton#primaryButton {
@@ -161,7 +161,7 @@ QCheckBox {
 QCheckBox::indicator {
     width: 15px;
     height: 15px;
-    background-color: rgba(4,10,18,136);
+    background-color: rgba(0,0,0,76);
     border: 1px solid rgba(255,255,255,64);
     border-radius: 4px;
 }
@@ -173,8 +173,8 @@ QCheckBox::indicator:checked {
 
 QTableWidget {
     color: rgba(255,255,255,232);
-    background-color: rgba(3,8,14,158);
-    alternate-background-color: rgba(255,255,255,8);
+    background-color: rgba(0,0,0,62);
+    alternate-background-color: rgba(255,255,255,9);
     border: 1px solid rgba(255,255,255,18);
     border-radius: 8px;
     gridline-color: transparent;
@@ -196,7 +196,7 @@ QHeaderView::section {
     min-height: 42px;
     padding: 0 11px;
     color: rgba(255,255,255,220);
-    background-color: rgba(13,21,31,212);
+    background-color: rgba(255,255,255,30);
     border: 0;
     border-bottom: 1px solid rgba(255,255,255,22);
     font-size: 11px;
@@ -205,7 +205,7 @@ QHeaderView::section {
 
 QPlainTextEdit {
     color: rgba(255,255,255,224);
-    background-color: rgba(2,7,13,174);
+    background-color: rgba(0,0,0,78);
     border: 1px solid rgba(255,255,255,16);
     border-radius: 8px;
     padding: 10px 11px;
@@ -264,7 +264,7 @@ QFrame#acceptanceConsole {
 }
 
 QFrame#consolePhaseUnit {
-    background-color: rgba(3,8,14,128);
+    background-color: rgba(0,0,0,52);
     border: 1px solid rgba(255,255,255,16);
     border-radius: 8px;
 }
@@ -292,7 +292,7 @@ QProgressBar {
     max-height: 18px;
     border: 1px solid rgba(255,255,255,14);
     border-radius: 6px;
-    background-color: rgba(3,8,14,152);
+    background-color: rgba(0,0,0,64);
     color: rgba(255,255,255,220);
     text-align: center;
     font-size: 9px;
@@ -307,13 +307,13 @@ QProgressBar::chunk {
 QTabWidget::pane {
     border: 1px solid rgba(255,255,255,16);
     border-radius: 8px;
-    background-color: rgba(2,7,13,118);
+    background-color: rgba(0,0,0,44);
     top: -1px;
 }
 
 QTabBar::tab {
     color: rgba(255,255,255,150);
-    background: rgba(2,7,13,92);
+    background: rgba(0,0,0,38);
     border: 0;
     padding: 8px 14px;
     margin-right: 3px;
@@ -325,27 +325,27 @@ QTabBar::tab {
 
 QTabBar::tab:selected {
     color: #ffffff;
-    background: rgba(18,27,38,178);
+    background: rgba(0,0,0,78);
 }
 
 QTabBar::tab:hover {
     color: #ffffff;
-    background: rgba(18,27,38,138);
+    background: rgba(0,0,0,58);
 }
 
 QTableWidget#consoleTable {
-    background-color: rgba(1,5,10,174);
-    alternate-background-color: rgba(255,255,255,7);
+    background-color: rgba(0,0,0,66);
+    alternate-background-color: rgba(255,255,255,8);
     border: 0;
     border-radius: 6px;
 }
 
 QTableWidget#consoleTable QHeaderView::section {
-    background-color: rgba(14,22,32,220);
+    background-color: rgba(255,255,255,28);
 }
 
 QPlainTextEdit#consoleText {
-    background-color: rgba(1,5,10,188);
+    background-color: rgba(0,0,0,82);
     border: 0;
     border-radius: 6px;
     padding: 10px;
