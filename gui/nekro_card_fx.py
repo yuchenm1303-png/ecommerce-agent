@@ -114,15 +114,6 @@ class NekroCardInteractionController(QObject):
         window.destroyed.connect(self._cleanup)
 
     def _card_from_widget(self, widget: QWidget | None) -> QFrame | None:
-        """Resolve a card directly from the QWidget receiving the mouse event.
-
-        This is the primary path for the native Quick shell. The baseline QWidget
-        tree is embedded as a native child surface, so QApplication.widgetAt()
-        may no longer reliably resolve it through the desktop-level window stack.
-        Walking the actual event receiver's parentWidget() chain preserves the
-        exact baseline interaction semantics without any extra rendering work.
-        """
-
         current = widget
         while current is not None:
             if isinstance(current, QFrame) and current in self.states:
@@ -131,10 +122,19 @@ class NekroCardInteractionController(QObject):
         return None
 
     def _card_at_global(self, point: QPointF) -> QFrame | None:
-        """Fallback hit test matching the original baseline implementation."""
+        """Hit-test inside the baseline QWidget tree before desktop widgetAt().
 
-        widget = QApplication.widgetAt(point.toPoint())
-        return self._card_from_widget(widget)
+        The QWidget tree is now a native child of QQuickWindow. window.childAt()
+        stays in Qt's own logical client coordinates and remains reliable there,
+        while QApplication.widgetAt() can miss the dynamically reparented HWND.
+        """
+
+        local = self.window.mapFromGlobal(point.toPoint())
+        if self.window.rect().contains(local):
+            card = self._card_from_widget(self.window.childAt(local))
+            if card is not None:
+                return card
+        return self._card_from_widget(QApplication.widgetAt(point.toPoint()))
 
     def _ensure_timer(self) -> None:
         if any(state.animating for state in self.states.values()) and not self.timer.isActive():
@@ -204,8 +204,6 @@ class NekroCardInteractionController(QObject):
         event_type = event.type()
 
         if isinstance(event, QMouseEvent):
-            # Prefer the real QWidget event receiver. This remains reliable after
-            # the baseline QWidget tree becomes a native child of QQuickWindow.
             card = self._card_from_widget(watched if isinstance(watched, QWidget) else None)
             if card is None:
                 card = self._card_at_global(event.globalPosition())
@@ -217,6 +215,13 @@ class NekroCardInteractionController(QObject):
                 self._press(card)
             elif event_type == QEvent.MouseButtonRelease:
                 self._release(card)
+
+        # Enter is not a QMouseEvent in Qt 6. Resolve it through the same Qt-local
+        # widget tree so a card responds immediately when the pointer crosses in.
+        if event_type == QEvent.Enter and isinstance(watched, QWidget):
+            card = self._card_from_widget(watched)
+            if card is not None:
+                self._set_hovered(card)
 
         if watched is self.window and event_type == QEvent.Leave:
             pressed = self.pressed
