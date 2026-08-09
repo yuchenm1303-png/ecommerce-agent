@@ -57,12 +57,13 @@ class SourceSnapshot:
     visible_text: str = ""
     table_rows: list[SnapshotTableRow] = field(default_factory=list)
     json_ld: list[Any] = field(default_factory=list)
+    embedded_data: list[str] = field(default_factory=list)
     meta: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "requested_url": self.requested_url,
             "final_url": self.final_url,
             "title": self.title,
@@ -78,6 +79,7 @@ class SourceSnapshot:
                 for row in self.table_rows
             ],
             "json_ld": self.json_ld,
+            "embedded_data": list(self.embedded_data),
             "meta": self.meta,
             "warnings": self.warnings,
         }
@@ -98,6 +100,11 @@ class SourceSnapshot:
                 if isinstance(item, dict)
             ],
             json_ld=list(payload.get("json_ld") or []),
+            embedded_data=[
+                str(item).strip()
+                for item in payload.get("embedded_data") or []
+                if str(item).strip()
+            ],
             meta={str(k): _clean_text(v) for k, v in (payload.get("meta") or {}).items()},
             warnings=[str(item) for item in payload.get("warnings") or []],
         )
@@ -126,6 +133,27 @@ def _detect_access_block(text: str) -> str | None:
     return None
 
 
+def _bounded_embedded_data(items: list[object], *, max_chars: int = 80_000) -> tuple[list[str], bool]:
+    output: list[str] = []
+    seen: set[str] = set()
+    used = 0
+    truncated = False
+    for raw in items:
+        value = str(raw or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        if used + len(value) > max_chars:
+            remaining = max_chars - used
+            if remaining > 200:
+                output.append(value[:remaining])
+            truncated = True
+            break
+        output.append(value)
+        used += len(value)
+    return output, truncated
+
+
 def capture_page_snapshot(
     page: Any,
     *,
@@ -134,9 +162,9 @@ def capture_page_snapshot(
 ) -> SourceSnapshot:
     """Read an already-loaded browser page without attempting risk-control bypass.
 
-    The caller owns navigation and any legitimate manual login. If the rendered
-    page appears to be a CAPTCHA/security-verification screen, capture stops and
-    requires manual handling instead of trying to automate around it.
+    This collector deliberately does not decide what any product fact means.  It
+    records rendered text, explicit key/value rows, JSON-LD and bounded raw page
+    state around variant/SKU/spec controls so the AI can do the interpretation.
     """
 
     payload = page.evaluate(
@@ -159,8 +187,6 @@ def capture_page_snapshot(
             });
           });
 
-          // Many marketplace parameter panels use div/dl structures instead of
-          // semantic tables. Capture explicit dt/dd pairs as table-like facts.
           [...document.querySelectorAll('dl')].forEach((dl, tableIndex) => {
             const dts = [...dl.querySelectorAll(':scope > dt')];
             dts.forEach((dt, rowIndex) => {
@@ -176,6 +202,52 @@ def capture_page_snapshot(
           [...document.querySelectorAll('script[type="application/ld+json"]')].forEach((script) => {
             try { jsonLd.push(JSON.parse(script.textContent || '')); } catch (_) {}
           });
+
+          const embedded = [];
+          const pushEmbedded = (value) => {
+            const text = clean(value);
+            if (text && text.length <= 6000 && embedded.length < 160) embedded.push(text);
+          };
+
+          // Capture option/variant DOM mechanically.  No value is selected or interpreted here.
+          const variantSelectors = [
+            '[data-sku-id]', '[data-skuid]', '[data-sku]', '[data-spec-id]', '[data-specid]',
+            '[role="option"]', '[role="radio"]', 'input[type="radio"]',
+            '[class*="sku"]', '[class*="Sku"]', '[class*="spec"]', '[class*="Spec"]'
+          ].join(',');
+          [...document.querySelectorAll(variantSelectors)].slice(0, 400).forEach((el) => {
+            const attrs = {};
+            [...(el.attributes || [])].forEach((attr) => {
+              if ((attr.name.startsWith('data-') || ['value', 'title', 'aria-label', 'aria-checked'].includes(attr.name))
+                  && String(attr.value || '').length <= 1000) {
+                attrs[attr.name] = attr.value;
+              }
+            });
+            const text = clean(el.innerText || el.textContent || el.value || '');
+            if (text || Object.keys(attrs).length) {
+              pushEmbedded(JSON.stringify({tag: el.tagName, text, attrs}));
+            }
+          });
+
+          // Many marketplaces keep the complete variant matrix in inline page state rather
+          // than visible DOM.  Keep bounded raw snippets around those identifiers; AI decides
+          // what they mean later.
+          const marker = /(skuId|sku2|skuMap|skuProps|specId|specs|offerId)/ig;
+          [...document.scripts].forEach((script) => {
+            if (script.type === 'application/ld+json') return;
+            const raw = String(script.textContent || '');
+            if (!raw || raw.length < 2) return;
+            marker.lastIndex = 0;
+            let match;
+            let perScript = 0;
+            while ((match = marker.exec(raw)) && perScript < 8 && embedded.length < 160) {
+              const start = Math.max(0, match.index - 1400);
+              const end = Math.min(raw.length, match.index + 2600);
+              pushEmbedded(raw.slice(start, end));
+              perScript += 1;
+            }
+          });
+
           const meta = {};
           for (const selector of [
             ['description', 'meta[name="description"]'],
@@ -192,6 +264,7 @@ def capture_page_snapshot(
             visible_text: String(document.body?.innerText || ''),
             table_rows: rows,
             json_ld: jsonLd,
+            embedded_data: embedded,
             meta,
           };
         }"""
@@ -211,6 +284,10 @@ def capture_page_snapshot(
         )
         visible_text = visible_text[:max_visible_text_chars]
 
+    embedded_data, embedded_truncated = _bounded_embedded_data(list(payload.get("embedded_data") or []))
+    if embedded_truncated:
+        warnings.append("embedded_data truncated to 80000 chars")
+
     rows = [SnapshotTableRow.from_mapping(item) for item in payload.get("table_rows") or []]
     return SourceSnapshot(
         requested_url=requested_url,
@@ -220,6 +297,7 @@ def capture_page_snapshot(
         visible_text=visible_text,
         table_rows=rows,
         json_ld=list(payload.get("json_ld") or []),
+        embedded_data=embedded_data,
         meta={str(k): _clean_text(v) for k, v in (payload.get("meta") or {}).items()},
         warnings=warnings,
     )
