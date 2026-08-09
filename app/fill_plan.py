@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
@@ -53,8 +54,6 @@ class LiveFillPlanItem:
     reason: str
     resolution: ResolutionRecord
 
-    # The legacy browser report still reads these names. They are deliberately
-    # computed, never stored/serialized, and have no matching or semantic role.
     @property
     def question_number(self) -> str:
         return ""
@@ -139,6 +138,25 @@ def _exact_option(value: str, options: list[str]) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def _fixed_qualifier_rendered(live_field: dict[str, Any], qualifier: str) -> bool:
+    """Return True only when the exact unit token is visibly fixed in the live field context."""
+
+    token = qualifier.strip()
+    if not token:
+        return False
+    texts = [
+        str(live_field.get("context_text") or ""),
+        str(live_field.get("help_text") or ""),
+        *[
+            str(control.get("context_text") or "")
+            for control in live_field.get("controls") or []
+            if isinstance(control, dict)
+        ],
+    ]
+    pattern = re.compile(rf"(?<![0-9A-Za-z_]){re.escape(token)}(?![0-9A-Za-z_])", re.IGNORECASE)
+    return any(pattern.search(text) for text in texts if text)
+
+
 def _hard_guard_values(
     live_field: dict[str, Any],
     decision: FieldDecision,
@@ -163,13 +181,17 @@ def _hard_guard_values(
     qualifiers = field_qualifier_options(live_field)
     if qualifier:
         if not qualifiers:
-            return values, qualifier, "返回了 qualifier，但当前 Makro 字段没有 qualifier 控件。"
-        matched = _exact_option(qualifier, qualifiers)
-        if matched is None:
-            return values, qualifier, (
-                f"qualifier={qualifier!r} 不等于当前 Makro 的唯一有效单位。"
-            )
-        qualifier = matched
+            if _fixed_qualifier_rendered(live_field, qualifier):
+                qualifier = ""
+            else:
+                return values, qualifier, "返回了 qualifier，但当前 Makro 字段既没有 qualifier 控件，也没有显示相同的固定单位。"
+        else:
+            matched = _exact_option(qualifier, qualifiers)
+            if matched is None:
+                return values, qualifier, (
+                    f"qualifier={qualifier!r} 不等于当前 Makro 的唯一有效单位。"
+                )
+            qualifier = matched
 
     if decision.status in {AI_READY, REVIEW} and not values:
         return values, qualifier, "决策没有可执行 value。"
