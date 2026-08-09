@@ -6,8 +6,8 @@ from PySide6.QtWidgets import QMainWindow, QPlainTextEdit
 
 
 _LOG_FLUSH_MS = 70
-_MAX_VISIBLE_LOG_BLOCKS = 4500
-_MAX_BATCH_LINES = 250
+_MAX_VISIBLE_LOG_BLOCKS = 12000
+_MAX_BATCH_LINES = 400
 
 
 class BufferedLogPresenter(QObject):
