@@ -17,8 +17,8 @@ _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
 _FRAME_MS = 16
 
 _NORMAL_ALPHA = 64.0
-_HOVER_ALPHA = 82.0   # subtle darkening for every card
-_ACTIVE_ALPHA = 96.0  # slightly deeper press feedback, still no subtree scale
+_HOVER_ALPHA = 82.0
+_ACTIVE_ALPHA = 96.0
 
 _HOVER_SECONDS = 0.12
 _PRESS_SECONDS = 0.08
@@ -69,8 +69,6 @@ class _CardState:
             self.surface.set_interaction(scale=1.0, overlay_alpha=alpha)
             return False
 
-        # Interrupted hover/press/release transitions continue from the exact
-        # currently visible opacity, so feedback never snaps between states.
         self.start_alpha = self.current_alpha
         self.target_alpha = alpha
         self.started_at = time.monotonic()
@@ -97,18 +95,18 @@ class NekroCardInteractionController(QObject):
             if surface is not None:
                 self.states[frame] = _CardState(frame=frame, surface=surface)
 
-        # Ensure MouseMove keeps arriving over labels, buttons, table viewports,
-        # scroll-area viewports and other child widgets.
-        window.setMouseTracking(True)
-        for widget in window.findChildren(QWidget):
+        # ui_polish has already run before this controller is installed, so the
+        # widget tree is stable. Cache card ownership once instead of repeating
+        # parent walks / QApplication.widgetAt() on every mouse sample.
+        self._watched_widgets = [window, *window.findChildren(QWidget)]
+        self._widget_cards: dict[QWidget, QFrame | None] = {}
+        for widget in self._watched_widgets:
             widget.setMouseTracking(True)
-
-        app = QApplication.instance()
-        if app is not None:
-            app.installEventFilter(self)
+            self._widget_cards[widget] = self._card_from_widget(widget)
+            widget.installEventFilter(self)
 
         self.timer = QTimer(self)
-        self.timer.setTimerType(Qt.PreciseTimer)
+        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.setInterval(_FRAME_MS)
         self.timer.timeout.connect(self._tick)
         window.destroyed.connect(self._cleanup)
@@ -122,19 +120,17 @@ class NekroCardInteractionController(QObject):
         return None
 
     def _card_at_global(self, point: QPointF) -> QFrame | None:
-        """Hit-test inside the baseline QWidget tree before desktop widgetAt().
-
-        The QWidget tree is now a native child of QQuickWindow. window.childAt()
-        stays in Qt's own logical client coordinates and remains reliable there,
-        while QApplication.widgetAt() can miss the dynamically reparented HWND.
-        """
-
         local = self.window.mapFromGlobal(point.toPoint())
         if self.window.rect().contains(local):
             card = self._card_from_widget(self.window.childAt(local))
             if card is not None:
                 return card
         return self._card_from_widget(QApplication.widgetAt(point.toPoint()))
+
+    def _card_for_event(self, watched: QObject, point: QPointF) -> QFrame | None:
+        if isinstance(watched, QWidget) and watched in self._widget_cards:
+            return self._widget_cards[watched]
+        return self._card_at_global(point)
 
     def _ensure_timer(self) -> None:
         if any(state.animating for state in self.states.values()) and not self.timer.isActive():
@@ -191,7 +187,6 @@ class NekroCardInteractionController(QObject):
                 ) * eased
                 any_animating = True
 
-            # Native-size cached glass repaint only; never scale a card subtree.
             state.surface.set_interaction(
                 scale=1.0,
                 overlay_alpha=state.current_alpha,
@@ -204,26 +199,19 @@ class NekroCardInteractionController(QObject):
         event_type = event.type()
 
         if isinstance(event, QMouseEvent):
-            card = self._card_from_widget(watched if isinstance(watched, QWidget) else None)
-            if card is None:
-                card = self._card_at_global(event.globalPosition())
-
-            if event_type == QEvent.MouseMove:
+            card = self._card_for_event(watched, event.globalPosition())
+            if event_type == QEvent.Type.MouseMove:
                 self._set_hovered(card)
-            elif event_type == QEvent.MouseButtonPress:
+            elif event_type == QEvent.Type.MouseButtonPress:
                 self._set_hovered(card)
                 self._press(card)
-            elif event_type == QEvent.MouseButtonRelease:
+            elif event_type == QEvent.Type.MouseButtonRelease:
                 self._release(card)
 
-        # Enter is not a QMouseEvent in Qt 6. Resolve it through the same Qt-local
-        # widget tree so a card responds immediately when the pointer crosses in.
-        if event_type == QEvent.Enter and isinstance(watched, QWidget):
-            card = self._card_from_widget(watched)
-            if card is not None:
-                self._set_hovered(card)
+        if event_type == QEvent.Type.Enter and isinstance(watched, QWidget):
+            self._set_hovered(self._widget_cards.get(watched))
 
-        if watched is self.window and event_type == QEvent.Leave:
+        if watched is self.window and event_type == QEvent.Type.Leave:
             pressed = self.pressed
             self.pressed = None
             self._set_hovered(None)
@@ -233,10 +221,12 @@ class NekroCardInteractionController(QObject):
         return False
 
     def _cleanup(self) -> None:
-        app = QApplication.instance()
-        if app is not None:
-            app.removeEventFilter(self)
         self.timer.stop()
+        for widget in self._watched_widgets:
+            try:
+                widget.removeEventFilter(self)
+            except RuntimeError:
+                pass
         for state in self.states.values():
             state.surface.set_interaction(scale=1.0, overlay_alpha=_NORMAL_ALPHA)
 
