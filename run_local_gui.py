@@ -17,12 +17,14 @@ def main() -> int:
         return 2
 
     from gui.main_window import MainWindow
+    from gui.nekro_visual_fx import install_nekro_visual_fx
 
     app = QApplication(sys.argv)
     app.setApplicationName("ecommerce-agent Read-only Lab")
     app.setOrganizationName("ecommerce-agent")
     window = MainWindow(Path(__file__).resolve().parent)
     window.show()
+    install_nekro_visual_fx(window)
     return app.exec()
 
 
