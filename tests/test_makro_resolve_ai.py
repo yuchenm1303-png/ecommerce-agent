@@ -95,7 +95,7 @@ class FakeProvider:
                 ],
                 "summary": "M8 compact profile",
             }
-        if request["task"] == "map_product_profile_to_marketplace_fields":
+        if request["task"] == "fill_marketplace_fields_from_local_product_profile":
             decisions = []
             profile_payload = json.loads(request["grounded_sources"][0]["content"])
             profile_fact = profile_payload["facts"][0]
@@ -112,17 +112,12 @@ class FakeProvider:
                         }
                     )
                 else:
-                    decisions.append(
-                        {
-                            "field_id": target["field_id"],
-                            "status": "missing",
-                        }
-                    )
+                    decisions.append({"field_id": target["field_id"], "status": "missing"})
             return {"decisions": decisions}
         raise AssertionError(f"unexpected task: {request['task']}")
 
 
-def test_resolver_builds_profile_once_then_maps_small_batches_without_browser(
+def test_resolver_builds_profile_once_then_fills_local_batches_without_browser(
     tmp_path,
     monkeypatch,
 ):
@@ -167,7 +162,7 @@ def test_resolver_builds_profile_once_then_maps_small_batches_without_browser(
     assert profile_request["task"] == "understand_product_from_local_evidence"
     assert any(source["kind"] == "image" for source in profile_request["grounded_sources"])
     assert all(
-        request["task"] == "map_product_profile_to_marketplace_fields"
+        request["task"] == "fill_marketplace_fields_from_local_product_profile"
         for request in mapping_requests
     )
     assert all(len(request["target_fields"]) == 1 for request in mapping_requests)
@@ -196,9 +191,9 @@ def test_resolver_builds_profile_once_then_maps_small_batches_without_browser(
     manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
     assert manifest["execution_model"] == makro_resolve_ai.EXECUTION_MODEL
     assert manifest["product_profile"]["model_calls"] == 1
-    assert manifest["field_mapping"]["batch_count"] == 2
-    assert manifest["field_mapping"]["model_calls"] == 2
-    assert manifest["web_enrichment"]["searched"] is False
+    assert manifest["local_fill"]["batch_count"] == 2
+    assert manifest["local_fill"]["model_calls"] == 2
+    assert manifest["web_fill"]["searched"] is False
     assert manifest["total_model_calls"] == 3
     assert manifest["writes_performed"] == 0
     assert manifest["save_clicked"] is False
@@ -234,13 +229,9 @@ def test_cache_namespace_ignores_transport_timeout_but_keeps_semantic_config():
     assert makro_resolve_ai._cache_namespace(base) != makro_resolve_ai._cache_namespace(different)
 
 
-def test_cli_has_staged_batch_controls_and_no_whole_product_repair_switch():
+def test_cli_has_simple_batch_controls_and_no_repair_switches():
     parser = makro_resolve_ai.build_parser()
-    option_strings = {
-        option
-        for action in parser._actions
-        for option in action.option_strings
-    }
+    option_strings = {option for action in parser._actions for option in action.option_strings}
     assert "--api-key" not in option_strings
     assert "--api-key-env" in option_strings
     assert "--live-schema" in option_strings
@@ -253,7 +244,7 @@ def test_cli_has_staged_batch_controls_and_no_whole_product_repair_switch():
     assert "--auto-fill-min-confidence" not in option_strings
 
 
-def test_cli_contains_no_browser_or_legacy_local_semantic_resolver_path():
+def test_cli_contains_no_browser_or_legacy_semantic_resolver_path():
     source = inspect.getsource(makro_resolve_ai)
     assert "sync_playwright" not in source
     assert "EdgeHarness" not in source
@@ -262,4 +253,5 @@ def test_cli_contains_no_browser_or_legacy_local_semantic_resolver_path():
     assert "run_ai_resolution" not in source
     assert "question_matcher" not in source
     assert "fill_resolved_field" not in source
+    assert "final_resolve" not in source
     assert "send_to_qc_clicked" in source
