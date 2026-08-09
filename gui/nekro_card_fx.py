@@ -3,17 +3,19 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, QObject, QRect, QTimer
-from PySide6.QtGui import QMouseEvent
-from PySide6.QtWidgets import QApplication, QFrame, QMainWindow, QWidget
+from PySide6.QtCore import QEvent, QObject, QRectF, Qt, QTimer
+from PySide6.QtGui import QMouseEvent, QPainter
+from PySide6.QtWidgets import QApplication, QFrame, QGraphicsEffect, QMainWindow, QWidget
 
 
-# Direct behavioral port of the captured nekro.top / imsyy-home .cards states:
+# Direct behavioral port of the captured nekro.top / imsyy-home card states:
 #   scale(1) -> hover scale(1.01) -> active scale(.98), transition .3s.
 #
-# Performance note: unlike the previous implementation, there is no permanent
-# 16 ms timer and no full scan of every card on each mouse move. The timer runs
-# only while one of the short 0.3 s transitions is actually active.
+# QWidget geometry is deliberately never animated. Mutating geometry inside a
+# layout makes Qt relayout the same card while the animation is trying to resize
+# it, which causes visible stepping and unnecessary work. A lightweight graphics
+# effect scales only the final card rendering while layout/hit-testing stays
+# stable. One precise 60-fps timer runs only while a transition is active.
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
 _NORMAL_SCALE = 1.0
@@ -24,7 +26,7 @@ _FRAME_MS = 16
 
 
 def _css_ease(progress: float) -> float:
-    """Approximate CSS default ease cubic-bezier(.25,.1,.25,1)."""
+    """CSS default ease cubic-bezier(.25,.1,.25,1)."""
 
     p = min(1.0, max(0.0, progress))
     x1, y1, x2, y2 = 0.25, 0.10, 0.25, 1.00
@@ -43,21 +45,51 @@ def _css_ease(progress: float) -> float:
     return cubic((lo + hi) * 0.5, y1, y2)
 
 
-def _scaled_rect(rect: QRect, scale: float) -> QRect:
-    if abs(scale - 1.0) < 0.0001:
-        return QRect(rect)
-    center = rect.center()
-    width = max(1, round(rect.width() * scale))
-    height = max(1, round(rect.height() * scale))
-    result = QRect(0, 0, width, height)
-    result.moveCenter(center)
-    return result
+class CardScaleEffect(QGraphicsEffect):
+    """Scale the rendered card around its center without changing geometry."""
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._scale = 1.0
+
+    @property
+    def scale(self) -> float:
+        return self._scale
+
+    def set_scale(self, value: float) -> None:
+        value = float(value)
+        if abs(value - self._scale) < 0.0001:
+            return
+        self._scale = value
+        self.updateBoundingRect()
+        self.update()
+
+    def boundingRectFor(self, source_rect: QRectF) -> QRectF:  # noqa: N802
+        if self._scale <= 1.0:
+            return QRectF(source_rect)
+        extra_x = source_rect.width() * (self._scale - 1.0) * 0.5
+        extra_y = source_rect.height() * (self._scale - 1.0) * 0.5
+        return source_rect.adjusted(-extra_x, -extra_y, extra_x, extra_y)
+
+    def draw(self, painter: QPainter) -> None:
+        if abs(self._scale - 1.0) < 0.0001:
+            self.drawSource(painter)
+            return
+
+        rect = self.sourceBoundingRect(Qt.LogicalCoordinates)
+        center = rect.center()
+        painter.save()
+        painter.translate(center)
+        painter.scale(self._scale, self._scale)
+        painter.translate(-center)
+        self.drawSource(painter)
+        painter.restore()
 
 
 @dataclass(slots=True)
 class _CardState:
     frame: QFrame
-    base_geometry: QRect
+    effect: CardScaleEffect
     current_scale: float = 1.0
     start_scale: float = 1.0
     target_scale: float = 1.0
@@ -65,13 +97,20 @@ class _CardState:
     animating: bool = False
 
     def begin(self, target: float) -> bool:
+        target = float(target)
         if abs(target - self.target_scale) < 0.0001 and self.animating:
             return False
         if abs(target - self.current_scale) < 0.0001:
             self.current_scale = target
+            self.start_scale = target
             self.target_scale = target
             self.animating = False
+            self.effect.set_scale(target)
             return False
+
+        # Every state change starts from the exact scale currently on screen.
+        # Pressing/releasing midway through another transition therefore remains
+        # continuous instead of snapping to the previous target.
         self.start_scale = self.current_scale
         self.target_scale = target
         self.started_at = time.monotonic()
@@ -80,7 +119,7 @@ class _CardState:
 
 
 class NekroCardInteractionController(QObject):
-    """Source card interactions with idle-zero animation work."""
+    """Original card hover/press semantics with stable layout and 60-fps paint."""
 
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
@@ -88,11 +127,13 @@ class NekroCardInteractionController(QObject):
         self.states: dict[QFrame, _CardState] = {}
         self.hovered: QFrame | None = None
         self.pressed: QFrame | None = None
-        self._capture_scheduled = False
 
         for frame in window.findChildren(QFrame):
-            if frame.objectName() in _GLASS_NAMES:
-                self.states[frame] = _CardState(frame=frame, base_geometry=QRect(frame.geometry()))
+            if frame.objectName() not in _GLASS_NAMES:
+                continue
+            effect = CardScaleEffect(frame)
+            frame.setGraphicsEffect(effect)
+            self.states[frame] = _CardState(frame=frame, effect=effect)
 
         window.setMouseTracking(True)
         for widget in window.findChildren(QWidget):
@@ -103,31 +144,12 @@ class NekroCardInteractionController(QObject):
             app.installEventFilter(self)
 
         self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.setInterval(_FRAME_MS)
         self.timer.timeout.connect(self._tick)
-        # Deliberately not started here.
+        # Idle means zero animation timer work.
 
         window.destroyed.connect(self._cleanup)
-        self._schedule_capture()
-
-    def _schedule_capture(self) -> None:
-        if self._capture_scheduled:
-            return
-        self._capture_scheduled = True
-        QTimer.singleShot(0, self._capture_layout_geometries)
-
-    def _capture_layout_geometries(self) -> None:
-        self._capture_scheduled = False
-        if self.hovered is not None or self.pressed is not None or self.timer.isActive():
-            return
-        for frame, state in self.states.items():
-            if not frame.isVisible():
-                continue
-            state.base_geometry = QRect(frame.geometry())
-            state.current_scale = 1.0
-            state.start_scale = 1.0
-            state.target_scale = 1.0
-            state.animating = False
 
     def _card_from_widget(self, watched: QObject) -> QFrame | None:
         widget = watched if isinstance(watched, QWidget) else None
@@ -144,18 +166,16 @@ class NekroCardInteractionController(QObject):
     def _set_hovered(self, frame: QFrame | None) -> None:
         if frame is self.hovered:
             return
+
         previous = self.hovered
         self.hovered = frame
 
         if previous is not None and previous is not self.pressed:
             self.states[previous].begin(_NORMAL_SCALE)
 
-        if frame is not None:
-            state = self.states[frame]
-            if abs(state.current_scale - 1.0) < 0.0001 and not state.animating:
-                state.base_geometry = QRect(frame.geometry())
-            if frame is not self.pressed:
-                state.begin(_HOVER_SCALE)
+        if frame is not None and frame is not self.pressed:
+            self.states[frame].begin(_HOVER_SCALE)
+
         self._ensure_timer()
 
     def _press(self, frame: QFrame | None) -> None:
@@ -168,6 +188,7 @@ class NekroCardInteractionController(QObject):
         pressed = self.pressed
         self.pressed = None
         self._set_hovered(frame_under_pointer)
+
         if pressed is not None:
             self.states[pressed].begin(
                 _HOVER_SCALE if pressed is frame_under_pointer else _NORMAL_SCALE
@@ -176,7 +197,7 @@ class NekroCardInteractionController(QObject):
 
     def _tick(self) -> None:
         now = time.monotonic()
-        still_animating = False
+        any_animating = False
 
         for state in self.states.values():
             if not state.animating:
@@ -191,23 +212,15 @@ class NekroCardInteractionController(QObject):
                 state.current_scale = state.start_scale + (
                     state.target_scale - state.start_scale
                 ) * eased
-                still_animating = True
+                any_animating = True
 
-            desired = _scaled_rect(state.base_geometry, state.current_scale)
-            if state.frame.geometry() != desired:
-                state.frame.setGeometry(desired)
+            state.effect.set_scale(state.current_scale)
 
-        if not still_animating and not any(state.animating for state in self.states.values()):
+        if not any_animating and not any(state.animating for state in self.states.values()):
             self.timer.stop()
-            if self.hovered is None and self.pressed is None:
-                self._schedule_capture()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
-
-        if watched is self.window and event_type in (QEvent.Resize, QEvent.Show):
-            if self.hovered is None and self.pressed is None and not self.timer.isActive():
-                self._schedule_capture()
 
         if isinstance(event, QMouseEvent):
             frame = self._card_from_widget(watched)
@@ -220,8 +233,12 @@ class NekroCardInteractionController(QObject):
                 self._release(frame)
 
         if watched is self.window and event_type == QEvent.Leave:
+            pressed = self.pressed
             self.pressed = None
             self._set_hovered(None)
+            if pressed is not None:
+                self.states[pressed].begin(_NORMAL_SCALE)
+                self._ensure_timer()
 
         return False
 
@@ -230,6 +247,8 @@ class NekroCardInteractionController(QObject):
         if app is not None:
             app.removeEventFilter(self)
         self.timer.stop()
+        for state in self.states.values():
+            state.effect.set_scale(1.0)
 
 
 def install_nekro_card_fx(window: QMainWindow) -> NekroCardInteractionController:
