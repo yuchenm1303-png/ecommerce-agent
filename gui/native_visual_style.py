@@ -12,13 +12,7 @@ _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
 
 
 class NativeGlassProxy(QObject):
-    """Baseline GlassBackdrop API with all glass pixels rendered in Quick.
-
-    The baseline card FX controller keeps driving set_interaction() with the
-    original timings/easing. This proxy forwards only the alpha value to the
-    Quick card model, so there is no second QWidget glass/tint layer and no
-    mismatched rounded edge around the GPU glass surface.
-    """
+    """Baseline GlassBackdrop API with all glass pixels rendered in Quick."""
 
     def __init__(self, frame: QFrame, background: NativeQuickBackground) -> None:
         super().__init__(frame)
@@ -71,6 +65,9 @@ class NativeVisualStyleController(QObject):
         if self.central is not None:
             self.central.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
             self.central.setAutoFillBackground(False)
+            # This filter only suppresses AtmosphereWidget's legacy wallpaper
+            # paint. Installing it globally made every Qt event cross Python.
+            self.central.installEventFilter(self)
 
         # Reuse baseline style constants verbatim. No replacement card border,
         # tint or hover CSS is introduced here.
@@ -83,9 +80,6 @@ class NativeVisualStyleController(QObject):
                 self._glass[frame] = NativeGlassProxy(frame, self.background)
 
         self._install_cursor()
-        app = QApplication.instance()
-        if app is not None:
-            app.installEventFilter(self)
         window.destroyed.connect(self._cleanup)
         QTimer.singleShot(0, self._sync_glass)
 
@@ -115,9 +109,11 @@ class NativeVisualStyleController(QObject):
         return False
 
     def _cleanup(self) -> None:
-        app = QApplication.instance()
-        if app is not None:
-            app.removeEventFilter(self)
+        if self.central is not None:
+            try:
+                self.central.removeEventFilter(self)
+            except RuntimeError:
+                pass
         self.background.shutdown()
         if self._cursor_installed:
             QApplication.restoreOverrideCursor()
