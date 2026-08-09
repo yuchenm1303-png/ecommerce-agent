@@ -126,6 +126,8 @@ def _snapshot_text(snapshot: SourceSnapshot) -> str:
         )
     if snapshot.json_ld:
         parts.append("Page JSON-LD:\n" + json.dumps(snapshot.json_ld, ensure_ascii=False, separators=(",", ":")))
+    if snapshot.embedded_data:
+        parts.append("Embedded page/variant data:\n" + "\n".join(snapshot.embedded_data))
     if snapshot.visible_text.strip():
         parts.append("Rendered page text:\n" + snapshot.visible_text.strip())
     return "\n".join(part for part in parts if part.strip()).strip()
