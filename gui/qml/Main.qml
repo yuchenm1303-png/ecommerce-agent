@@ -154,6 +154,7 @@ ApplicationWindow {
     SceneBackground {
         id: scene
         anchors.fill: parent
+        z: -1
     }
 
     ColumnLayout {
@@ -212,7 +213,7 @@ ApplicationWindow {
             id: inputCard
             Layout.fillWidth: true
             Layout.preferredHeight: 224
-            blurScene: scene.blurScene
+            maskLayer: scene.glassMaskLayer
             sceneX: {
                 app.layoutEpoch
                 return inputCard.mapToItem(app.contentItem, 0, 0).x
@@ -376,7 +377,7 @@ ApplicationWindow {
                 id: readyCard
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                blurScene: scene.blurScene
+                maskLayer: scene.glassMaskLayer
                 sceneX: { app.layoutEpoch; return readyCard.mapToItem(app.contentItem, 0, 0).x }
                 sceneY: { app.layoutEpoch; return readyCard.mapToItem(app.contentItem, 0, 0).y }
                 titleText: "READY"
@@ -388,7 +389,7 @@ ApplicationWindow {
                 id: missingCard
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                blurScene: scene.blurScene
+                maskLayer: scene.glassMaskLayer
                 sceneX: { app.layoutEpoch; return missingCard.mapToItem(app.contentItem, 0, 0).x }
                 sceneY: { app.layoutEpoch; return missingCard.mapToItem(app.contentItem, 0, 0).y }
                 titleText: "MISSING"
@@ -400,7 +401,7 @@ ApplicationWindow {
                 id: conflictCard
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                blurScene: scene.blurScene
+                maskLayer: scene.glassMaskLayer
                 sceneX: { app.layoutEpoch; return conflictCard.mapToItem(app.contentItem, 0, 0).x }
                 sceneY: { app.layoutEpoch; return conflictCard.mapToItem(app.contentItem, 0, 0).y }
                 titleText: "CONFLICT"
@@ -412,7 +413,7 @@ ApplicationWindow {
                 id: blockedCard
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                blurScene: scene.blurScene
+                maskLayer: scene.glassMaskLayer
                 sceneX: { app.layoutEpoch; return blockedCard.mapToItem(app.contentItem, 0, 0).x }
                 sceneY: { app.layoutEpoch; return blockedCard.mapToItem(app.contentItem, 0, 0).y }
                 titleText: "BLOCKED"
@@ -433,7 +434,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 Layout.minimumWidth: 720
-                blurScene: scene.blurScene
+                maskLayer: scene.glassMaskLayer
                 sceneX: { app.layoutEpoch; return fieldsCard.mapToItem(app.contentItem, 0, 0).x }
                 sceneY: { app.layoutEpoch; return fieldsCard.mapToItem(app.contentItem, 0, 0).y }
 
@@ -515,7 +516,7 @@ ApplicationWindow {
                         id: telemetryCard
                         width: sideColumn.width
                         height: 222
-                        blurScene: scene.blurScene
+                        maskLayer: scene.glassMaskLayer
                         sceneX: {
                             app.layoutEpoch
                             if (sideScroll.contentItem) sideScroll.contentItem.contentY
@@ -546,7 +547,7 @@ ApplicationWindow {
                         id: webCard
                         width: sideColumn.width
                         height: 230
-                        blurScene: scene.blurScene
+                        maskLayer: scene.glassMaskLayer
                         sceneX: {
                             app.layoutEpoch
                             if (sideScroll.contentItem) sideScroll.contentItem.contentY
@@ -619,7 +620,7 @@ ApplicationWindow {
                         id: safetyCard
                         width: sideColumn.width
                         height: 132
-                        blurScene: scene.blurScene
+                        maskLayer: scene.glassMaskLayer
                         sceneX: {
                             app.layoutEpoch
                             if (sideScroll.contentItem) sideScroll.contentItem.contentY
@@ -662,7 +663,7 @@ ApplicationWindow {
             Layout.fillWidth: true
             Layout.preferredHeight: 258
             Layout.minimumHeight: 190
-            blurScene: scene.blurScene
+            maskLayer: scene.glassMaskLayer
             sceneX: { app.layoutEpoch; return consoleCard.mapToItem(app.contentItem, 0, 0).x }
             sceneY: { app.layoutEpoch; return consoleCard.mapToItem(app.contentItem, 0, 0).y }
 
@@ -815,6 +816,11 @@ ApplicationWindow {
                 }
             }
         }
+    }
+
+    SceneEffects {
+        anchors.fill: parent
+        z: 1000
     }
 
     FileDialog {
