@@ -299,101 +299,48 @@ class GlassBackdrop(QWidget):
         painter.end()
 
 
-class WindowFrameOverlay(QWidget):
-    """Visible in-client frame for the translucent frameless Windows shell."""
-
-    _NORMAL_EDGE = 4
-    _MAXIMIZED_EDGE = 1
-
-    def __init__(self, window: QMainWindow) -> None:
-        super().__init__(window)
-        self.window = window
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.sync_geometry()
-
-    def sync_geometry(self) -> None:
-        self.setGeometry(self.window.rect())
-        self.raise_()
-        self.show()
-        self.update()
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        del event
-        if self.width() <= 2 or self.height() <= 2:
-            return
-
-        maximized = self.window.isMaximized()
-        edge = self._MAXIMIZED_EDGE if maximized else self._NORMAL_EDGE
-        active = self.window.isActiveWindow()
-
-        # Dark outer edge provides a stable silhouette against both the bright
-        # Fuji sky and a dark desktop. Everything is drawn inside the client
-        # rect, so it does not affect layout geometry or the Quick background.
-        outer = QColor(10, 18, 30, 210 if active else 150)
-        highlight = QColor(255, 255, 255, 125 if active else 72)
-        inner_shadow = QColor(0, 0, 0, 72 if active else 46)
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        rect = self.rect()
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(outer)
-        painter.drawRect(0, 0, rect.width(), edge)
-        painter.drawRect(0, rect.height() - edge, rect.width(), edge)
-        painter.drawRect(0, 0, edge, rect.height())
-        painter.drawRect(rect.width() - edge, 0, edge, rect.height())
-
-        if not maximized and rect.width() > 8 and rect.height() > 8:
-            # One bright keyline and one soft inner line make the edge readable
-            # without introducing a title bar or moving the existing business UI.
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(highlight, 1.0))
-            painter.drawRect(rect.adjusted(edge - 1, edge - 1, -edge, -edge))
-            painter.setPen(QPen(inner_shadow, 1.0))
-            painter.drawRect(rect.adjusted(edge, edge, -edge - 1, -edge - 1))
-
-        painter.end()
-
-
 class VisualStyleController(QObject):
-    """Static QWidget presentation plus one native Quick background surface."""
+    """Static QWidget presentation over the child QQuick background surface."""
 
-    def __init__(self, window: QMainWindow) -> None:
+    def __init__(
+        self,
+        window: QMainWindow,
+        *,
+        content_root: QWidget,
+        surface_host: QWidget,
+    ) -> None:
         super().__init__(window)
         self.window = window
+        self.central = content_root
+        self.surface_host = surface_host
         self._glass: dict[QFrame, GlassBackdrop] = {}
         self._cursor_installed = False
 
-        # Qt requires FramelessWindowHint for per-pixel translucent QWidget
-        # top-levels on Windows. Keep the business widget tree unchanged and
-        # restore a visible in-client edge instead of rewriting the layout.
-        window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        window.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        window.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
-        self.central = window.centralWidget()
-        central = self.central
-        if central is not None:
-            central.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-            central.setAutoFillBackground(False)
-            central.setProperty("nativeQuickBackground", True)
+        # Only the native child containing the business QWidget tree is alpha
+        # composited. The top-level QMainWindow deliberately remains an ordinary
+        # framed Windows application window.
+        content_root.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        content_root.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        content_root.setAutoFillBackground(False)
+        content_root.setProperty("nativeQuickBackground", True)
 
         window.setStyleSheet(window.styleSheet() + "\n" + NEKRO_STYLE)
-        for frame in window.findChildren(QFrame):
+        for frame in content_root.findChildren(QFrame):
             if frame.objectName() in _GLASS_NAMES:
                 frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
                 self._glass[frame] = GlassBackdrop(frame)
 
-        self.background = NativeQuickBackground(window)
-        self.window_frame = WindowFrameOverlay(window)
+        self.background = NativeQuickBackground(
+            window,
+            surface_host=surface_host,
+            content_layer=content_root,
+        )
         self._install_cursor()
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
         window.destroyed.connect(self._cleanup)
-        QTimer.singleShot(0, self._sync_visual_layers)
+        QTimer.singleShot(0, self._sync_glass)
 
     def surface_for(self, frame: QFrame) -> GlassBackdrop | None:
         return self._glass.get(frame)
@@ -410,25 +357,16 @@ class VisualStyleController(QObject):
         QApplication.setOverrideCursor(QCursor(pixmap, 4, 4))
         self._cursor_installed = True
 
-    def _sync_visual_layers(self) -> None:
+    def _sync_glass(self) -> None:
         for backdrop in self._glass.values():
             backdrop.sync_geometry()
         self.background.schedule_mask_update()
-        self.window_frame.sync_geometry()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        # Suppress only the legacy AtmosphereWidget background paint. Child
-        # widgets keep receiving their own paint events and stay unchanged.
+        # Suppress only the legacy AtmosphereWidget wallpaper paint. Its child
+        # business widgets continue painting and receiving input normally.
         if watched is self.central and event.type() == QEvent.Type.Paint:
             return True
-        if watched is self.window and event.type() in {
-            QEvent.Type.Resize,
-            QEvent.Type.Show,
-            QEvent.Type.WindowActivate,
-            QEvent.Type.WindowDeactivate,
-            QEvent.Type.WindowStateChange,
-        }:
-            QTimer.singleShot(0, self.window_frame.sync_geometry)
         if isinstance(watched, QFrame) and watched in self._glass:
             if event.type() in {QEvent.Type.Resize, QEvent.Type.Show}:
                 QTimer.singleShot(0, self._glass[watched].sync_geometry)
@@ -444,7 +382,16 @@ class VisualStyleController(QObject):
             self._cursor_installed = False
 
 
-def install_visual_style(window: QMainWindow) -> VisualStyleController:
-    controller = VisualStyleController(window)
+def install_visual_style(
+    window: QMainWindow,
+    *,
+    content_root: QWidget,
+    surface_host: QWidget,
+) -> VisualStyleController:
+    controller = VisualStyleController(
+        window,
+        content_root=content_root,
+        surface_host=surface_host,
+    )
     window._visual_style = controller  # type: ignore[attr-defined]
     return controller
