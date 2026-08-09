@@ -25,9 +25,21 @@ from .semantic_grounding import GroundingCatalog, TEXT_KIND
 from .source_bundle import normalize_key
 
 
-WEB_SEARCH_CONTRACT_VERSION = 8
-WEB_SEARCH_CACHE_VERSION = 8
+WEB_SEARCH_CONTRACT_VERSION = 9
+WEB_SEARCH_CACHE_VERSION = 9
 WEB_FILLABLE_STATUSES = {MISSING}
+STRONG_IDENTITY_BASES = {
+    "canonical_offer_or_url",
+    "exact_variant_identifier",
+    "manufacturer_identifier",
+    "global_trade_identifier",
+    "explicit_cross_reference",
+}
+IDENTITY_BASES = {
+    *STRONG_IDENTITY_BASES,
+    "generic_model_or_similarity",
+    "none",
+}
 
 
 class SourcedWebSearchProvider(Protocol):
@@ -79,6 +91,7 @@ class WebSourceMatch:
     source_url: str
     match: str
     reason: str = ""
+    identity_basis: str = "none"
     identity_evidence: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
@@ -86,6 +99,7 @@ class WebSourceMatch:
             "source_url": self.source_url,
             "match": self.match,
             "reason": self.reason,
+            "identity_basis": self.identity_basis,
             "identity_evidence": list(self.identity_evidence),
         }
 
@@ -229,22 +243,24 @@ def _research_prompt(
         "workflow": [
             "Treat the canonical supplier product above as the only product identity to enrich.",
             "Use web search to discover candidate pages for this product as a whole, not one independent search per field.",
-            "For every external candidate page you intend to use, first classify it as same_product, different_product, or uncertain by comparing the whole available product evidence.",
-            "A shared generic model token, category name, or visual resemblance alone is not proof of same_product.",
-            "Only pages classified same_product may provide field values. different_product and uncertain pages are forbidden as field evidence.",
+            "For every external candidate page, classify identity first and state identity_basis using the allowed identity basis vocabulary.",
+            "same_product requires a strong identity anchor, not a similarity judgment. A generic model token, similar dimensions/specifications, category, appearance or marketing photo is weak similarity and must be uncertain.",
+            "Only accepted same_product pages may provide field values. different_product and uncertain pages are forbidden as field evidence.",
             "After entity matching, fill all supplied missing target fields from the accepted same-product source set in this same research session.",
         ],
         "rules": [
             "Locally READY and CONFLICT fields are frozen and must never be rewritten.",
-            "Prefer the exact canonical supplier URL, manufacturer/brand sources, manuals, official product pages and clearly identified same-product distributor pages over generic marketplace matches.",
-            "Do not borrow specifications from another product merely because it shares a model token or category name.",
-            "If no external page can be established as the same physical product/variant, leave the target field missing.",
+            "Allowed strong identity_basis values are canonical_offer_or_url, exact_variant_identifier, manufacturer_identifier, global_trade_identifier, explicit_cross_reference. generic_model_or_similarity and none are not strong enough for same_product.",
+            "canonical_offer_or_url means the candidate explicitly carries or mirrors the exact canonical supplier URL/offer identity; exact_variant_identifier means the exact supplier variant/SKU identifier matches; manufacturer_identifier means an explicit MPN/part number present on both sides matches; global_trade_identifier means an explicit GTIN/EAN/UPC matches; explicit_cross_reference means one source explicitly cross-references the other exact product identity.",
+            "M8 plus similar dimensions, M8 plus similar camera count, similar photos, same category, or a collection of nearby specifications is generic_model_or_similarity and MUST be uncertain, never same_product.",
+            "If no external page has a strong identity anchor to the canonical product, leave all Web-only fields MISSING rather than borrowing from a likely-looking item.",
             "same_product establishes source identity only; it does NOT make every fact or inference on that page valid for every target field.",
             "A READY value requires direct target-specific evidence from an accepted same-product source. If reaching the value requires deriving one field from another field, interpreting absence, assuming a default, or making a category-level inference, return MISSING instead.",
-            "Unit conversion and exact mapping to a supplied option are the only allowed mechanical transformations of a directly stated value.",
+            "Unit conversion, literal decomposition of explicitly ordered dimensions, and exact mapping to a supplied option are the only allowed mechanical transformations of a directly stated value.",
             "A CONFLICT requires two or more directly supported values that each answer the same exact target field. Values of another semantic or quantity type are not conflict alternatives.",
             "Every READY citation and every CONFLICT alternative citation must use a source_url actually returned by this same web-search call and describe the exact target-specific evidence.",
-            "Do not rotate dimension axes or mix packaging/body/mount, cabin/rear, documentation/device-interface language, product/vehicle compatibility, or other neighboring field scopes.",
+            "Do not rotate dimension axes or mix packaging/body/mount, cabin/rear, documentation/device-interface language, product/vehicle compatibility, display resolution/recording resolution, or other neighboring field scopes.",
+            "Manual/documentation language does not establish device UI Languages Supported. Absence does not establish Remote Control=No. Package dimensions do not establish Packaging Type=Box. One listing does not establish Pack of=1. Front+cabin/interior does not establish Back/rear Camera Position. A 1080P camera/video claim does not answer Display Resolution unless it explicitly refers to the display.",
             "If multi_value=false return one value. If qualifier_options exist, use an exact allowed qualifier; if qualifier_options are empty, qualifier must be empty.",
             "Never research seller-operated price, stock, MOQ, fulfilment, shipping policy or listing-status fields.",
             "Return one JSON object only.",
@@ -254,8 +270,9 @@ def _research_prompt(
                 {
                     "source_url": "exact URL returned by this web search",
                     "match": "same_product | different_product | uncertain",
+                    "identity_basis": "canonical_offer_or_url | exact_variant_identifier | manufacturer_identifier | global_trade_identifier | explicit_cross_reference | generic_model_or_similarity | none",
                     "reason": "short identity judgment",
-                    "identity_evidence": ["concrete whole-product evidence used for the judgment"],
+                    "identity_evidence": ["concrete evidence for the declared identity basis"],
                 }
             ],
             "decisions": [
@@ -267,7 +284,7 @@ def _research_prompt(
                     "confidence": 0.0,
                     "citations": [
                         {
-                            "source_url": "URL classified same_product above",
+                            "source_url": "URL accepted as same_product above",
                             "evidence_text": "direct evidence for this exact target field",
                         }
                     ],
@@ -277,7 +294,7 @@ def _research_prompt(
                             "qualifier": "optional qualifier",
                             "citations": [
                                 {
-                                    "source_url": "URL classified same_product above",
+                                    "source_url": "URL accepted as same_product above",
                                     "evidence_text": "direct evidence for this exact target field alternative",
                                 }
                             ],
@@ -291,8 +308,8 @@ def _research_prompt(
     }
     return (
         "You are performing one bounded product-level web research session for one exact supplier item. "
-        "Search for the product, explicitly resolve candidate identity, then enrich all remaining fields only from "
-        "direct target-specific facts on sources you classified as the same product. Return JSON only.\n\n"
+        "Identity is fail-closed: similar model/specification pages are not the same product without a strong exact "
+        "identity anchor. Enrich remaining fields only from direct target-specific facts on accepted sources. Return JSON only.\n\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
 
@@ -438,27 +455,38 @@ def _parse_source_matches(
         if source is None or not key or key in seen:
             continue
         seen.add(key)
-        match = str(item.get("match") or "").strip().casefold()
-        if match not in {"same_product", "different_product", "uncertain"}:
+        reported_match = str(item.get("match") or "").strip().casefold()
+        if reported_match not in {"same_product", "different_product", "uncertain"}:
             warnings.append(f"web source match ignored invalid status for {url}")
             continue
+        basis = str(item.get("identity_basis") or "none").strip().casefold()
+        if basis not in IDENTITY_BASES:
+            warnings.append(f"web source match used invalid identity_basis for {url}; downgraded to uncertain")
+            basis = "none"
         identity_evidence = tuple(
             str(value).strip()
             for value in item.get("identity_evidence") or []
             if str(value).strip()
         )
+
+        effective_match = reported_match
+        if reported_match == "same_product" and (basis not in STRONG_IDENTITY_BASES or not identity_evidence):
+            effective_match = "uncertain"
+            warnings.append(
+                f"web source same_product lacked a strong identity anchor and was downgraded to uncertain: {url}"
+            )
+
         matches.append(
             WebSourceMatch(
                 source_url=source.url,
-                match=match,
+                match=effective_match,
                 reason=str(item.get("reason") or "").strip(),
+                identity_basis=basis,
                 identity_evidence=identity_evidence,
             )
         )
-        if match == "same_product" and identity_evidence:
+        if effective_match == "same_product":
             accepted[key] = source
-        elif match == "same_product":
-            warnings.append(f"web source same_product lacked identity evidence and was not accepted: {url}")
     return matches, accepted, warnings
 
 
