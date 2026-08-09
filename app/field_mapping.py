@@ -18,38 +18,35 @@ from .ai_decisions import (
     validate_ai_decision_packet,
 )
 from .business_fields import is_business_question
-from .product_profile import JSONTaskProvider, ProductProfile, profile_digest
+from .evidence_contract import ProductIdentity
+from .product_profile import JSONTaskProvider
 from .semantic_grounding import GroundingCatalog
 
 
-FIELD_MAPPING_CONTRACT_VERSION = 6
-FIELD_MAPPING_CACHE_VERSION = 6
+FIELD_MAPPING_CONTRACT_VERSION = 7
+FIELD_MAPPING_CACHE_VERSION = 7
 
 
 MAPPING_SYSTEM_INSTRUCTION = (
-    "You are the local fill-table step of a marketplace listing workflow. "
-    "Read the grounded PRODUCT_PROFILE and answer the supplied Makro fields directly. "
-    "This is not an audit or a review layer. For each field, either provide the locally "
-    "supported answer, preserve a real source conflict, or mark it missing so web search "
-    "can fill it later. Product semantics belong to you, not to Python. Return JSON only."
+    "You directly fill marketplace fields from the supplied exact product evidence. "
+    "There is no intermediate product-profile or review layer. Read the supplier page, "
+    "customer material and images yourself, answer only the requested Makro fields, preserve "
+    "real source conflicts, and leave unsupported fields missing. Return JSON only."
 )
+
 
 MAPPING_RULES = [
     "Answer every supplied target field_id exactly once.",
-    "Use READY when the local Product Profile directly supports the exact Makro field for the selected variant. READY must include at least one underlying original citation from PRODUCT_PROFILE.",
-    "Use CONFLICT only when local sources genuinely give different values for the same exact field; include at least two alternatives, and each alternative must carry its own original citation.",
-    "Use MISSING when the local Product Profile cannot establish the exact field value. Do not use REVIEW in this local pass; uncertainty means MISSING so Web can search it.",
-    "Treat attribute_key as the authoritative field identity when label text is generic or duplicated. Use section_heading as additional context.",
-    "For package_length/package_breadth/package_width/package_height/package_weight and shipping-section package dimensions/weight, use packaging facts only. Never substitute product-body or mount dimensions.",
-    "For product-body length/width/breadth/height/depth/weight fields, use product_body facts only and preserve the stated axis exactly. Never reorder 86 x 36 x 32 into a different axis assignment.",
-    "Keep cabin/interior distinct from rear/back. Keep manual/documentation language distinct from device UI Languages Supported. Keep product brand distinct from compatible vehicle brand.",
-    "Other Storage Features must contain storage-specific capabilities only; do not put loop recording, G-sensor, motion detection, HDR, night vision or other generic camera features into a storage field unless the evidence explicitly describes them as storage behavior.",
-    "Never infer No/False/Unsupported/Not included from absence. A negative value needs evidence that actually states the negative claim.",
-    "Treat the selected variant as the listing target. Do not replace selected-variant facts with conflicting generic product-family facts.",
-    "If the field has marketplace options, use the exact option text only when it matches the supported meaning.",
-    "If multi_value=false, return one value. If qualifier_options exist, put the magnitude in values and the unit in qualifier.",
-    "Citations must use underlying original source_reference values present inside PRODUCT_PROFILE facts, never the derived product-profile source id.",
-    "Do not use external web knowledge in this local pass.",
+    "Use READY only when the supplied evidence supports that exact Makro field for the selected product/variant. Cite the exact original text or image source.",
+    "Use CONFLICT when supplied sources genuinely give different values for the same exact field; every alternative needs its own original citation.",
+    "Use MISSING when the value is not established. Do not guess from typical products, nearby facts, absence, or general knowledge.",
+    "Treat attribute_key, label, section_heading, help_text, options and qualifier_options together as the field meaning. Do not create a separate semantic taxonomy.",
+    "Keep source scope exact: packaging vs product body vs mount; cabin/interior vs rear/back; manual/documentation language vs device UI language; product brand vs compatible vehicle brand.",
+    "Preserve explicit dimension axes exactly as stated by the source. If the source says length/width/height, map those named axes directly and never rotate them to make values fit.",
+    "Do not turn a conflict into a confident statement elsewhere. Generated Description/Keywords/Sales Package may use only non-conflicting supported facts and must not introduce rear/front, resolution, language, compatibility or included-item claims that are not established.",
+    "Never infer No/False/Unsupported/Not included from absence. Negative values need explicit supporting evidence.",
+    "If marketplace options exist, use exact option text only when the evidence supports that meaning. If multi_value=false return one value. If qualifier_options exist, put magnitude in values and unit in qualifier.",
+    "Do not use external web knowledge in this local pass. Seller-operated price, stock, MOQ, fulfilment, shipping and listing-status fields are not product research questions.",
 ]
 
 
@@ -63,10 +60,7 @@ MAPPING_JSON_SCHEMA: dict[str, Any] = {
                 "required": ["field_id", "status"],
                 "properties": {
                     "field_id": {"type": "string"},
-                    "status": {
-                        "type": "string",
-                        "enum": ["ready", "conflict", "missing"],
-                    },
+                    "status": {"type": "string", "enum": ["ready", "conflict", "missing"]},
                     "values": {"type": "array", "items": {"type": "string"}},
                     "qualifier": {"type": "string"},
                     "confidence": {"type": "number"},
@@ -85,9 +79,7 @@ MAPPING_JSON_SCHEMA: dict[str, Any] = {
 
 def _field_is_business(field: dict[str, Any]) -> bool:
     contract = field_contract(field)
-    return is_business_question(contract["attribute_key"]) or is_business_question(
-        contract["label"]
-    )
+    return is_business_question(contract["attribute_key"]) or is_business_question(contract["label"])
 
 
 def _target_payload(field: dict[str, Any]) -> dict[str, Any]:
@@ -109,45 +101,31 @@ def _target_payload(field: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _profile_source(profile: ProductProfile) -> dict[str, Any]:
-    return {
-        "source_id": "product-profile:derived",
-        "source_type": "derived_product_profile",
-        "kind": "text",
-        "origin": "product-profile.json",
-        "content": json.dumps(
-            {
-                "summary": profile.summary,
-                "facts": [fact.as_dict() for fact in profile.facts],
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
-    }
-
-
 def build_field_mapping_request(
     batch_fields: Iterable[dict[str, Any]],
-    profile: ProductProfile,
+    grounding: GroundingCatalog,
+    *,
+    expected_identity: ProductIdentity = ProductIdentity(),
+    product_url: str = "",
 ) -> dict[str, Any]:
     fields = list(batch_fields)
     return {
-        "task": "fill_marketplace_fields_from_local_product_profile",
+        "task": "fill_marketplace_fields_from_exact_product_evidence",
         "system_instruction": MAPPING_SYSTEM_INSTRUCTION,
         "prompt_instruction": (
-            "Fill this small Makro field batch from the local Product Profile. "
-            "If a field is not actually established by local evidence, mark it MISSING "
-            "so the next step can search the web. Preserve genuine local conflicts. "
-            "Return one decision for every target field and no prose outside JSON."
+            "Read the supplied exact product evidence and fill this small Makro field batch directly. "
+            "Do not build another product profile and do not review fields outside this batch. "
+            "If evidence does not actually establish a value, return MISSING so Web can search later."
         ),
         "product_identity": {
-            "sku": profile.identity.sku,
-            "model_number": profile.identity.model_number,
-            "brand": profile.identity.brand,
+            "sku": expected_identity.sku,
+            "model_number": expected_identity.model_number,
+            "brand": expected_identity.brand,
+            "source_product_url": product_url.strip(),
         },
         "target_fields": [_target_payload(field) for field in fields],
         "rules": list(MAPPING_RULES),
-        "grounded_sources": [_profile_source(profile)],
+        "grounded_sources": grounding.as_request_list(),
         "json_contract": MAPPING_JSON_SCHEMA,
     }
 
@@ -171,14 +149,22 @@ def _cache_key(
     provider: JSONTaskProvider,
     cache_namespace: str,
     batch_fields: list[dict[str, Any]],
-    profile: ProductProfile,
+    grounding: GroundingCatalog,
+    expected_identity: ProductIdentity,
+    product_url: str,
 ) -> str:
     payload = {
         "cache_version": FIELD_MAPPING_CACHE_VERSION,
         "contract_sha256": mapping_contract_digest(),
         "provider": provider.name,
         "cache_namespace": cache_namespace,
-        "profile_sha256": profile_digest(profile),
+        "source_manifest_sha256": source_manifest_digest(grounding),
+        "identity": {
+            "sku": expected_identity.sku,
+            "model_number": expected_identity.model_number,
+            "brand": expected_identity.brand,
+        },
+        "product_url": product_url.strip(),
         "batch_schema_sha256": schema_digest(batch_fields),
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -198,36 +184,49 @@ def _run_batch(
     provider: JSONTaskProvider,
     batch_index: int,
     batch_fields: list[dict[str, Any]],
-    profile: ProductProfile,
     grounding: GroundingCatalog,
+    expected_identity: ProductIdentity,
+    product_url: str,
     *,
     cache_dir: Path | None,
     cache_namespace: str,
 ) -> _BatchRun:
-    key = _cache_key(provider, cache_namespace, batch_fields, profile)
+    key = _cache_key(
+        provider,
+        cache_namespace,
+        batch_fields,
+        grounding,
+        expected_identity,
+        product_url,
+    )
     cache_path = cache_dir / f"field-map-{key}.json" if cache_dir is not None else None
     if cache_path is not None and cache_path.is_file():
         try:
-            cached = AIDecisionPacket.from_mapping(
-                json.loads(cache_path.read_text(encoding="utf-8"))
-            )
+            cached = AIDecisionPacket.from_mapping(json.loads(cache_path.read_text(encoding="utf-8")))
             validated = validate_ai_decision_packet(
                 cached,
                 batch_fields,
                 grounding,
-                expected_identity=profile.identity,
+                expected_identity=expected_identity,
             )
             return _BatchRun(batch_index, validated.decisions, 0, True)
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
 
     try:
-        raw = provider.extract_json(build_field_mapping_request(batch_fields, profile))
+        raw = provider.extract_json(
+            build_field_mapping_request(
+                batch_fields,
+                grounding,
+                expected_identity=expected_identity,
+                product_url=product_url,
+            )
+        )
         raw_decisions = raw.get("decisions") if isinstance(raw, dict) else None
         if not isinstance(raw_decisions, list):
             raise ValueError("local field fill AI output 缺少 decisions 数组")
         packet = AIDecisionPacket(
-            identity=profile.identity,
+            identity=expected_identity,
             schema_sha256=schema_digest(batch_fields),
             source_manifest_sha256=source_manifest_digest(grounding),
             decisions=[
@@ -243,7 +242,7 @@ def _run_batch(
             packet,
             batch_fields,
             grounding,
-            expected_identity=profile.identity,
+            expected_identity=expected_identity,
         )
     except Exception as exc:
         return _BatchRun(
@@ -257,22 +256,13 @@ def _run_batch(
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        temp.write_text(
-            json.dumps(validated.as_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        temp.write_text(json.dumps(validated.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(cache_path)
     return _BatchRun(batch_index, validated.decisions, 1, False)
 
 
-def _mechanical_batches(
-    fields: list[dict[str, Any]],
-    batch_size: int,
-) -> list[list[dict[str, Any]]]:
-    return [
-        fields[index : index + batch_size]
-        for index in range(0, len(fields), batch_size)
-    ]
+def _mechanical_batches(fields: list[dict[str, Any]], batch_size: int) -> list[list[dict[str, Any]]]:
+    return [fields[index : index + batch_size] for index in range(0, len(fields), batch_size)]
 
 
 @dataclass(slots=True)
@@ -288,9 +278,10 @@ class FieldMappingRunResult:
 def run_field_mapping(
     provider: JSONTaskProvider,
     fields: Iterable[dict[str, Any]],
-    profile: ProductProfile,
     grounding: GroundingCatalog,
     *,
+    expected_identity: ProductIdentity = ProductIdentity(),
+    product_url: str = "",
     batch_size: int = 12,
     concurrency: int = 4,
     cache_dir: str | Path | None = None,
@@ -310,18 +301,16 @@ def run_field_mapping(
     runs: list[_BatchRun] = []
     if batches:
         workers = min(int(concurrency), len(batches))
-        with ThreadPoolExecutor(
-            max_workers=workers,
-            thread_name_prefix="local-field",
-        ) as executor:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="local-field") as executor:
             futures = {
                 executor.submit(
                     _run_batch,
                     provider,
                     index,
                     batch,
-                    profile,
                     grounding,
+                    expected_identity,
+                    product_url,
                     cache_dir=cache_root,
                     cache_namespace=cache_namespace,
                 ): index
@@ -339,19 +328,19 @@ def run_field_mapping(
             warnings.append(run.warning)
 
     candidate = AIDecisionPacket(
-        identity=profile.identity,
+        identity=expected_identity,
         schema_sha256=schema_digest(field_list),
         source_manifest_sha256=source_manifest_digest(grounding),
         decisions=decisions,
-        model_summary="Local Product Profile filled the first-pass Makro field table.",
+        model_summary="Exact local product evidence directly filled the first-pass Makro field table.",
         warnings=warnings,
-        extractor=f"{profile.extractor}+parallel-local-fill".strip("+"),
+        extractor=f"{provider.name}+parallel-local-fill".strip("+"),
     )
     validated = validate_ai_decision_packet(
         candidate,
         field_list,
         grounding,
-        expected_identity=profile.identity,
+        expected_identity=expected_identity,
     )
     return FieldMappingRunResult(
         packet=validated,
