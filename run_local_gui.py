@@ -20,6 +20,7 @@ def main() -> int:
     from gui.nekro_card_fx import install_nekro_card_fx
     from gui.nekro_sakura import install_nekro_sakura
     from gui.nekro_visual_fx import NekroOverlay, install_nekro_visual_fx
+    from gui.pastel_background import install_pastel_background
 
     app = QApplication(sys.argv)
     app.setApplicationName("ecommerce-agent Read-only Lab")
@@ -31,6 +32,10 @@ def main() -> int:
     # port of nekro.top's production canvas_sakura motion model below.
     NekroOverlay.PETAL_COUNT = 0
     visual_fx = install_nekro_visual_fx(window)
+
+    # Use our own non-black wallpaper while preserving the original nekro/imsyy
+    # glass sampling, cursor and card interaction behavior.
+    install_pastel_background(visual_fx.background)
 
     # Source .cards behavior: scale(1) -> hover scale(1.01) -> active scale(.98),
     # with the original 0.3s CSS-style transition. Layout remains our test GUI.
