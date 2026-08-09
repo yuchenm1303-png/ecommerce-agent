@@ -113,19 +113,28 @@ class NekroCardInteractionController(QObject):
         self.timer.timeout.connect(self._tick)
         window.destroyed.connect(self._cleanup)
 
-    def _card_at_global(self, point: QPointF) -> QFrame | None:
-        """Resolve from the actual widget under the pointer, not event receiver.
+    def _card_from_widget(self, widget: QWidget | None) -> QFrame | None:
+        """Resolve a card directly from the QWidget receiving the mouse event.
 
-        This makes hover behavior identical over plain labels, QTableWidget
-        viewports, scroll areas, buttons and nested controls.
+        This is the primary path for the native Quick shell. The baseline QWidget
+        tree is embedded as a native child surface, so QApplication.widgetAt()
+        may no longer reliably resolve it through the desktop-level window stack.
+        Walking the actual event receiver's parentWidget() chain preserves the
+        exact baseline interaction semantics without any extra rendering work.
         """
 
-        widget = QApplication.widgetAt(point.toPoint())
-        while widget is not None:
-            if isinstance(widget, QFrame) and widget in self.states:
-                return widget
-            widget = widget.parentWidget()
+        current = widget
+        while current is not None:
+            if isinstance(current, QFrame) and current in self.states:
+                return current
+            current = current.parentWidget()
         return None
+
+    def _card_at_global(self, point: QPointF) -> QFrame | None:
+        """Fallback hit test matching the original baseline implementation."""
+
+        widget = QApplication.widgetAt(point.toPoint())
+        return self._card_from_widget(widget)
 
     def _ensure_timer(self) -> None:
         if any(state.animating for state in self.states.values()) and not self.timer.isActive():
@@ -195,7 +204,12 @@ class NekroCardInteractionController(QObject):
         event_type = event.type()
 
         if isinstance(event, QMouseEvent):
-            card = self._card_at_global(event.globalPosition())
+            # Prefer the real QWidget event receiver. This remains reliable after
+            # the baseline QWidget tree becomes a native child of QQuickWindow.
+            card = self._card_from_widget(watched if isinstance(watched, QWidget) else None)
+            if card is None:
+                card = self._card_at_global(event.globalPosition())
+
             if event_type == QEvent.MouseMove:
                 self._set_hovered(card)
             elif event_type == QEvent.MouseButtonPress:
