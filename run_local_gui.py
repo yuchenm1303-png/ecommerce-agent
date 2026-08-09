@@ -5,8 +5,8 @@ import sys
 from pathlib import Path
 
 
-# The native QQuickWindow background owns wallpaper presentation. Set the render
-# loop before importing Qt so FrameAnimation follows the scene-graph cadence.
+# The child QQuickWindow owns wallpaper presentation. Set the render loop before
+# importing Qt so FrameAnimation follows the scene-graph cadence.
 os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
 
 
@@ -40,13 +40,17 @@ def main() -> int:
     app.installEventFilter(SmoothWheelFilter(app))
 
     window = MainWindow(Path(__file__).resolve().parent)
-    visual = install_visual_style(window)
-    quick_window = getattr(visual.background, "quick_window", None)
-    install_native_window_shell(
+
+    # Preserve one ordinary top-level Windows window with its native caption,
+    # resize frame, Snap/taskbar/Alt+Tab semantics. The business QWidget tree and
+    # QQuick scene graph become child surfaces inside that native client area.
+    shell = install_native_window_shell(window)
+    visual = install_visual_style(
         window,
-        quick_window,
-        legacy_frame=getattr(visual, "window_frame", None),
+        content_root=shell.content_widget,
+        surface_host=shell.host_widget,
     )
+
     install_nekro_card_fx(window, visual)
     install_buffered_logs(window)
     effects = install_nekro_effects(window, sakura_count=3)
