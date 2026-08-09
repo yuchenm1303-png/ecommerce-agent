@@ -39,6 +39,7 @@ class PhaseStats:
     web_model_calls: int = 0
     web_cache_hits: int = 0
     web_failed_batches: int = 0
+    elapsed_seconds: float = 0.0
 
 
 @dataclass(slots=True)
@@ -59,18 +60,24 @@ class SafetyState:
 @dataclass(slots=True)
 class RunResult:
     run_dir: Path
+    workflow_mode: str = ""
+    workflow_status: str = ""
+    vertical: str = ""
+    brand: str = ""
     ready: int = 0
     missing: int = 0
     conflict: int = 0
     blocked: int = 0
     cold: PhaseStats = field(default_factory=PhaseStats)
     hot: PhaseStats = field(default_factory=PhaseStats)
+    resolver: dict[str, Any] = field(default_factory=dict)
     safety: SafetyState = field(default_factory=SafetyState)
     fields: list[FieldRow] = field(default_factory=list)
     web_candidates: list[WebCandidate] = field(default_factory=list)
     product_url: str = ""
     live_field_count: int = 0
     plan_summary: dict[str, Any] = field(default_factory=dict)
+    executor_report: dict[str, Any] = field(default_factory=dict)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -78,6 +85,16 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object: {path}")
     return payload
+
+
+def _workflow_manifest(run_dir: Path) -> dict[str, Any]:
+    path = run_dir / "run-manifest.json"
+    return _read_json(path) if path.is_file() else {}
+
+
+def _path(value: Any) -> Path | None:
+    text = str(value or "").strip()
+    return Path(text) if text else None
 
 
 def _latest_file(root: Path, pattern: str) -> Path | None:
@@ -88,18 +105,35 @@ def _latest_file(root: Path, pattern: str) -> Path | None:
 
 
 def latest_live_schema(run_dir: Path) -> Path | None:
+    manifest = _workflow_manifest(run_dir)
+    direct = _path(manifest.get("live_schema"))
+    if direct is not None and direct.is_file():
+        return direct
     return _latest_file(run_dir / "01-live-schema", "live-scan-*/live-schema.json")
 
 
 def latest_resolver_manifest(run_dir: Path, phase_dir: str) -> Path | None:
+    manifest = _workflow_manifest(run_dir)
+    key = "cold_resolver_manifest" if "cold" in phase_dir else "resolver_manifest"
+    direct = _path(manifest.get(key))
+    if direct is not None and direct.is_file():
+        return direct
     return _latest_file(run_dir / phase_dir, "resolve-ai-*/run-manifest.json")
 
 
 def latest_fill_plan(run_dir: Path) -> Path | None:
+    manifest = _workflow_manifest(run_dir)
+    direct = _path(manifest.get("fill_plan"))
+    if direct is not None and direct.is_file():
+        return direct
     return _latest_file(run_dir / "04-fill-plan", "plan-*/fill-plan.json")
 
 
 def latest_plan_manifest(run_dir: Path) -> Path | None:
+    manifest = _workflow_manifest(run_dir)
+    direct = _path(manifest.get("fill_plan_manifest"))
+    if direct is not None and direct.is_file():
+        return direct
     return _latest_file(run_dir / "04-fill-plan", "plan-*/manifest.json")
 
 
@@ -113,24 +147,36 @@ def _path_from_manifest(manifest: dict[str, Any], dotted: str) -> Path | None:
         if not isinstance(value, dict):
             return None
         value = value.get(key)
-    text = str(value or "").strip()
-    return Path(text) if text else None
+    return _path(value)
 
 
 def _phase_stats(manifest: dict[str, Any]) -> PhaseStats:
-    local = manifest.get("local_fill") or {}
+    facts = manifest.get("product_facts") or {}
+    inference = manifest.get("best_effort_inference") or {}
     web = manifest.get("web_fill") or {}
     source = manifest.get("source_capture") or {}
+
+    # Compatibility with pre-one-link GUI artifacts is intentionally read-only:
+    # it lets old saved runs remain inspectable, but new executions no longer
+    # produce or depend on local_fill.
+    legacy_local = manifest.get("local_fill") or {}
+    if legacy_local and not facts:
+        facts = legacy_local
+
+    inference_requested = int(inference.get("requested_fields") or 0)
+    inference_cache_hit = int(bool(inference.get("cache_hit"))) if inference_requested else 0
+    inference_failed = int(bool(inference.get("failed"))) if inference_requested else 0
     return PhaseStats(
-        batch_count=int(local.get("batch_count") or 0),
-        model_calls=int(local.get("model_calls") or 0),
-        cache_hits=int(local.get("cache_hits") or 0),
-        failed_batches=int(local.get("failed_batches") or 0),
+        batch_count=int(facts.get("batch_count") or 0),
+        model_calls=int(facts.get("model_calls") or 0) + int(inference.get("model_calls") or 0),
+        cache_hits=int(facts.get("cache_hits") or 0) + inference_cache_hit,
+        failed_batches=int(facts.get("failed_batches") or 0) + inference_failed,
         source_cache_hit=bool(source.get("source_cache_hit")),
         web_batch_count=int(web.get("batch_count") or 0),
         web_model_calls=int(web.get("model_calls") or 0),
         web_cache_hits=int(web.get("cache_hits") or 0),
         web_failed_batches=int(web.get("failed_batches") or 0),
+        elapsed_seconds=float(manifest.get("wall_elapsed_seconds") or 0.0),
     )
 
 
@@ -146,51 +192,65 @@ def _decision_text(decision: dict[str, Any]) -> str:
     status = str(decision.get("status") or "").casefold()
     values = [str(value) for value in decision.get("values") or [] if str(value).strip()]
     qualifier = str(decision.get("qualifier") or "").strip()
-    if status == "ready":
-        text = " + ".join(values) if values else "—"
+    if status in {"ready", "review"}:
+        text = " + ".join(values) if values else status.upper()
         return f"{text} {qualifier}".strip()
     if status == "conflict":
         alternatives: list[str] = []
         for alternative in decision.get("alternatives") or []:
             if not isinstance(alternative, dict):
                 continue
-            alt_values = [str(value) for value in alternative.get("values") or [] if str(value).strip()]
+            alt_values = [
+                str(value)
+                for value in alternative.get("values") or []
+                if str(value).strip()
+            ]
             alt_qualifier = str(alternative.get("qualifier") or "").strip()
-            text = " + ".join(alt_values)
-            alternatives.append(f"{text} {alt_qualifier}".strip())
+            alternatives.append(
+                (" + ".join(alt_values) + " " + alt_qualifier).strip()
+            )
         return " ↔ ".join(value for value in alternatives if value) or "CONFLICT"
     if status == "missing":
         return "MISSING"
     if status == "business_locked":
         return "BUSINESS LOCKED"
-    if status == "review":
-        text = " + ".join(values) if values else "REVIEW"
-        return f"{text} {qualifier}".strip()
     return "—"
 
 
 def _decision_sources(decision: dict[str, Any], web_by_ref: dict[str, str]) -> str:
     refs: list[str] = []
-    for citation in decision.get("citations") or []:
-        if isinstance(citation, dict):
+    payloads = [decision]
+    payloads.extend(
+        item for item in decision.get("alternatives") or [] if isinstance(item, dict)
+    )
+    for payload in payloads:
+        for citation in payload.get("citations") or []:
+            if not isinstance(citation, dict):
+                continue
             ref = str(citation.get("source_reference") or "").strip()
             if ref:
                 refs.append(web_by_ref.get(ref, ref))
-    for alternative in decision.get("alternatives") or []:
-        if not isinstance(alternative, dict):
-            continue
-        for citation in alternative.get("citations") or []:
-            if isinstance(citation, dict):
-                ref = str(citation.get("source_reference") or "").strip()
-                if ref:
-                    refs.append(web_by_ref.get(ref, ref))
-    unique: list[str] = []
-    seen: set[str] = set()
-    for ref in refs:
-        if ref not in seen:
-            seen.add(ref)
-            unique.append(ref)
-    return " | ".join(unique)
+    return " | ".join(dict.fromkeys(refs))
+
+
+def _load_web_reference_map(
+    decisions_payload: dict[str, Any],
+    resolver_manifest: dict[str, Any],
+) -> dict[str, str]:
+    raw_sources = decisions_payload.get("web_sources") or []
+    if not raw_sources:
+        source_path = _path_from_manifest(resolver_manifest, "outputs.web_sources")
+        if source_path is not None and source_path.is_file():
+            try:
+                loaded = json.loads(source_path.read_text(encoding="utf-8"))
+                raw_sources = loaded if isinstance(loaded, list) else []
+            except (OSError, json.JSONDecodeError):
+                raw_sources = []
+    return {
+        str(item.get("source_reference") or ""): str(item.get("url") or "")
+        for item in raw_sources
+        if isinstance(item, dict)
+    }
 
 
 def _web_candidates(run_dir: Path) -> list[WebCandidate]:
@@ -240,7 +300,15 @@ def _web_candidates(run_dir: Path) -> list[WebCandidate]:
 
 def load_run_result(run_dir: str | Path) -> RunResult:
     root = Path(run_dir).resolve()
-    result = RunResult(run_dir=root)
+    workflow = _workflow_manifest(root)
+    result = RunResult(
+        run_dir=root,
+        workflow_mode=str(workflow.get("mode") or ""),
+        workflow_status=str(workflow.get("status") or ""),
+        vertical=str(workflow.get("vertical") or ""),
+        brand=str(workflow.get("brand") or ""),
+        product_url=str(workflow.get("product_url") or ""),
+    )
 
     cold_manifest_path = latest_resolver_manifest(root, "02-cold-resolver")
     hot_manifest_path = latest_resolver_manifest(root, "03-hot-resolver")
@@ -256,42 +324,58 @@ def load_run_result(run_dir: str | Path) -> RunResult:
 
     result.cold = _phase_stats(cold_manifest)
     result.hot = _phase_stats(hot_manifest)
+    result.resolver = hot_manifest
     result.product_url = str(
         hot_manifest.get("primary_product_url")
         or cold_manifest.get("primary_product_url")
-        or plan_manifest.get("product_url")
-        or ""
+        or result.product_url
     )
 
-    safety_inputs = [item for item in (scan_manifest, cold_manifest, hot_manifest, plan_manifest) if item]
+    safety_inputs = [
+        item
+        for item in (workflow, scan_manifest, cold_manifest, hot_manifest, plan_manifest)
+        if item
+    ]
     result.safety = _safety_from_manifests(safety_inputs)
 
     decisions_payload: dict[str, Any] = {}
     decision_path = _path_from_manifest(hot_manifest, "outputs.final_decisions")
-    if decision_path and decision_path.is_file():
+    if decision_path is not None and decision_path.is_file():
         decisions_payload = _read_json(decision_path)
     elif hot_manifest_path:
         fallback = hot_manifest_path.parent / "ai-decisions.json"
         if fallback.is_file():
             decisions_payload = _read_json(fallback)
 
-    decisions = [item for item in decisions_payload.get("decisions") or [] if isinstance(item, dict)]
-    decisions_by_id = {str(item.get("field_id") or ""): item for item in decisions}
-    result.missing = sum(str(item.get("status") or "").casefold() == "missing" for item in decisions)
-    result.conflict = sum(str(item.get("status") or "").casefold() == "conflict" for item in decisions)
-
-    web_by_ref = {
-        str(item.get("source_reference") or ""): str(item.get("url") or "")
-        for item in decisions_payload.get("web_sources") or []
-        if isinstance(item, dict)
+    decisions = [
+        item for item in decisions_payload.get("decisions") or [] if isinstance(item, dict)
+    ]
+    decisions_by_id = {
+        str(item.get("field_id") or ""): item for item in decisions
     }
+    final_summary = hot_manifest.get("final_decision_summary") or {}
+    result.missing = int(final_summary.get("missing") or 0)
+    result.conflict = int(final_summary.get("conflict") or 0)
+    if not final_summary:
+        result.missing = sum(
+            str(item.get("status") or "").casefold() == "missing" for item in decisions
+        )
+        result.conflict = sum(
+            str(item.get("status") or "").casefold() == "conflict" for item in decisions
+        )
+
+    web_by_ref = _load_web_reference_map(decisions_payload, hot_manifest)
 
     plan_payload = _read_json(plan_path) if plan_path else {}
-    result.plan_summary = dict(plan_payload.get("summary") or {})
+    result.plan_summary = dict(
+        plan_payload.get("summary") or workflow.get("fill_plan_summary") or {}
+    )
     result.ready = int(result.plan_summary.get("ready") or 0)
     result.blocked = int(result.plan_summary.get("blocked") or 0)
 
-    plan_items = [item for item in plan_payload.get("items") or [] if isinstance(item, dict)]
+    plan_items = [
+        item for item in plan_payload.get("items") or [] if isinstance(item, dict)
+    ]
     plan_by_key = {
         (
             str(item.get("attribute_key") or ""),
@@ -302,13 +386,16 @@ def load_run_result(run_dir: str | Path) -> RunResult:
     }
 
     live_fields: list[dict[str, Any]] = []
-    if live_schema_path and live_schema_path.is_file():
-        live_payload = json.loads(live_schema_path.read_text(encoding="utf-8"))
-        if isinstance(live_payload, list):
-            live_fields = [item for item in live_payload if isinstance(item, dict)]
-        elif isinstance(live_payload, dict):
-            raw = live_payload.get("fields") or live_payload.get("items") or []
+    if live_schema_path is not None and live_schema_path.is_file():
+        raw = json.loads(live_schema_path.read_text(encoding="utf-8"))
+        if isinstance(raw, list):
             live_fields = [item for item in raw if isinstance(item, dict)]
+        elif isinstance(raw, dict):
+            live_fields = [
+                item
+                for item in (raw.get("fields") or raw.get("items") or [])
+                if isinstance(item, dict)
+            ]
     result.live_field_count = len(live_fields)
 
     for field in live_fields:
@@ -323,11 +410,19 @@ def load_run_result(run_dir: str | Path) -> RunResult:
         resolution = plan_item.get("resolution") or {}
         action = str(plan_item.get("action") or "").casefold()
         ai_status = str(decision.get("status") or "").upper() or "—"
-        final_status = "READY" if action == "ready" else "BLOCKED" if action == "blocked" else "—"
+        final_status = (
+            "READY"
+            if action == "ready"
+            else "BLOCKED"
+            if action == "blocked"
+            else "—"
+        )
         blocked_reason = ""
         if final_status == "BLOCKED":
             gate = str(resolution.get("gate_reason") or "").strip()
-            detail = str(resolution.get("detail") or plan_item.get("reason") or "").strip()
+            detail = str(
+                resolution.get("detail") or plan_item.get("reason") or ""
+            ).strip()
             blocked_reason = " · ".join(value for value in (gate, detail) if value)
         source = _decision_sources(decision, web_by_ref)
         if not source:
@@ -345,5 +440,8 @@ def load_run_result(run_dir: str | Path) -> RunResult:
             )
         )
 
+    report_path = _path(workflow.get("executor_report"))
+    if report_path is not None and report_path.is_file():
+        result.executor_report = _read_json(report_path)
     result.web_candidates = _web_candidates(root)
     return result

@@ -130,6 +130,23 @@ def find_sections(page: Page) -> list[dict[str, Any]]:
     return page.evaluate(_FIND_SECTIONS_SCRIPT)
 
 
+def _await_section_cards(
+    page: Page, *, wait_ms: int = 500, timeout_s: float = 30.0
+) -> list[dict[str, Any]]:
+    """Poll until at least one Step 3 section card is rendered.
+
+    The section cards and their attribute fields load asynchronously after the
+    listing draft / vertical attribute schema is ready. Scanning before that
+    would find zero fields, so wait for the first card to appear.
+    """
+    sections = find_sections(page)
+    deadline = time.monotonic() + timeout_s
+    while not sections and time.monotonic() < deadline:
+        page.wait_for_timeout(int(wait_ms))
+        sections = find_sections(page)
+    return sections
+
+
 def scan_section_fields(
     page: Page,
     section_path: str,
@@ -180,7 +197,7 @@ def scan_sections(
     fill/persist workflows use :func:`save_section` explicitly instead.
     """
 
-    sections = find_sections(page)
+    sections = _await_section_cards(page)
     stats: dict[str, Any] = {
         "sections_found": len(sections),
         "sections_expanded_by_scan": 0,

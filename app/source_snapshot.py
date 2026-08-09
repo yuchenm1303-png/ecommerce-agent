@@ -245,20 +245,27 @@ def capture_page_snapshot(
             if (text || Object.keys(attrs).length) pushEmbedded(JSON.stringify({tag: el.tagName, text, attrs}));
           });
 
-          const marker = /(skuId|sku2|skuMap|skuProps|specId|specs|offerId|length|width|height|weight)/ig;
+          // Only product identity, variant and detail-document structures belong
+          // here. Generic words such as length/width occur throughout JavaScript
+          // libraries and previously pulled tens of thousands of noise chars.
+          const marker = /(skuId|sku2|skuMap|skuProps|specId|offerId|detailUrl)/ig;
           [...document.scripts].forEach((script) => {
             if (script.type === 'application/ld+json') return;
             const raw = String(script.textContent || '');
             if (!raw || raw.length < 2) return;
             marker.lastIndex = 0;
             let match;
-            let perScript = 0;
-            while ((match = marker.exec(raw)) && perScript < 10 && embedded.length < 160) {
-              const start = Math.max(0, match.index - 1400);
-              const end = Math.min(raw.length, match.index + 2600);
-              pushEmbedded(raw.slice(start, end));
-              perScript += 1;
+            const ranges = [];
+            while ((match = marker.exec(raw)) && ranges.length < 40) {
+              const next = {
+                start: Math.max(0, match.index - 1400),
+                end: Math.min(raw.length, match.index + 2600),
+              };
+              const previous = ranges[ranges.length - 1];
+              if (previous && next.start <= previous.end) previous.end = Math.max(previous.end, next.end);
+              else ranges.push(next);
             }
+            ranges.slice(0, 10).forEach((range) => pushEmbedded(raw.slice(range.start, range.end)));
           });
 
           const imageUrls = [];

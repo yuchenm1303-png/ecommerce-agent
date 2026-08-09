@@ -3,11 +3,13 @@
 Production pipeline:
 1) capture the exact supplier page mechanically, including structured rows,
    embedded variant/SKU data, full-page screenshot and discovered product images;
-2) AI directly fills Makro fields from those raw sources in mechanical batches;
-3) web-search only fields still MISSING and fill those blanks directly.
+2) cached image batches produce short scoped facts;
+3) one global product-fact pass resolves supported Makro semantics and conflicts;
+4) web-search only fields still unresolved;
+5) one small text-only pass makes best-effort estimates for anything still missing.
 
 There is one Makro field table throughout. No customer SKU, old QA answers,
-Product Profile or Final Resolve participates in product identity. Python only
+There is no Final Resolve and no product-category Python semantics. Python only
 collects sources, schedules/caches work, preserves provenance, locks seller
 business fields and keeps browser writes off.
 """
@@ -18,6 +20,7 @@ import argparse
 import json
 import os
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -32,8 +35,9 @@ from app.ai_decisions import (
     write_ai_decision_packet,
 )
 from app.business_fields import generate_listing_sku
-from app.evidence_contract import ProductIdentity
-from app.field_mapping import run_field_mapping
+from app.best_effort_inference import run_best_effort_inference
+from app.compact_evidence import build_compact_evidence, write_compact_evidence
+from app.image_evidence import run_image_evidence, write_image_observations
 from app.live_schema import load_live_schema
 from app.providers.dashscope_web_search import DashScopeWebSearchProvider
 from app.providers.registry import (
@@ -44,12 +48,21 @@ from app.providers.registry import (
     default_api_key_env,
     validate_provider_config,
 )
+from app.product_facts import run_product_facts
 from app.semantic_grounding import build_grounding_catalog
 from app.source_capture import DEFAULT_SOURCE_CDP_PORT, SourceAccessBlocked, capture_product_source
-from app.web_enrichment import WebEnrichmentResult, run_web_enrichment, write_enriched_ai_decision_packet
+from app.web_enrichment import (
+    WebEnrichmentResult,
+    build_product_fingerprint,
+    run_web_enrichment,
+    write_enriched_ai_decision_packet,
+)
 
 
-EXECUTION_MODEL = "product_url_capture_then_parallel_local_fill_then_unresolved_web_fill"
+EXECUTION_MODEL = (
+    "product_url_capture_then_compact_product_facts_then_unresolved_web_fill_"
+    "then_text_only_best_effort_inference"
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--provider", choices=SUPPORTED_PROVIDERS, default="openai-compatible")
     parser.add_argument("--model", default="qwen3.7-plus", help="本地商品字段填写模型。")
+    parser.add_argument(
+        "--fact-model",
+        default="qwen3.7-max",
+        help="只处理 compact text 的全局事实模型；不接收图片。",
+    )
     parser.add_argument("--api-key-env", default=None)
     parser.add_argument("--base-url", default="")
     parser.add_argument(
@@ -120,8 +138,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-text-chars", type=int, default=5000)
     parser.add_argument("--overlap-chars", type=int, default=250)
 
-    parser.add_argument("--field-batch-size", type=int, default=12)
-    parser.add_argument("--field-concurrency", type=int, default=4)
+    parser.add_argument("--image-batch-size", type=int, default=3)
+    parser.add_argument("--image-concurrency", type=int, default=4)
+    parser.add_argument("--local-batch-size", type=int, default=12)
+    parser.add_argument("--local-concurrency", type=int, default=4)
 
     parser.add_argument("--web-enrich", choices=("auto", "off"), default="auto")
     parser.add_argument("--web-search-model", default="qwen3.7-max")
@@ -235,6 +255,15 @@ def main() -> int:
     if args.source_cache_ttl_seconds < 0:
         raise SystemExit("--source-cache-ttl-seconds 不能为负数")
 
+    if not 1 <= args.image_batch_size <= 8:
+        raise SystemExit("--image-batch-size must be in 1..8")
+    if not 1 <= args.image_concurrency <= 12:
+        raise SystemExit("--image-concurrency must be in 1..12")
+    if not 1 <= args.local_batch_size <= 32:
+        raise SystemExit("--local-batch-size must be in 1..32")
+    if not 1 <= args.local_concurrency <= 12:
+        raise SystemExit("--local-concurrency must be in 1..12")
+
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = Path(args.output_dir) / f"resolve-ai-{stamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -269,7 +298,7 @@ def main() -> int:
         return 2
 
     product_images = [str(path) for path in getattr(captured, "product_image_paths", ())]
-    image_paths = [str(captured.screenshot_path), *product_images, *extra_images]
+    image_paths = [*(product_images or [str(captured.screenshot_path)]), *extra_images]
     supplier_snapshots.insert(0, str(captured.snapshot_path))
     product_url = captured.snapshot.final_url or product_url
     generated_sku = generate_listing_sku(product_url)
@@ -282,9 +311,12 @@ def main() -> int:
         "visible_text_chars": len(captured.snapshot.visible_text),
         "json_ld_items": len(captured.snapshot.json_ld),
         "embedded_data_items": len(captured.snapshot.embedded_data),
+        "raw_embedded_chars": sum(len(item) for item in captured.snapshot.embedded_data),
+        "raw_visible_text_chars": len(captured.snapshot.visible_text),
         "product_image_urls": len(getattr(captured.snapshot, "image_urls", [])),
         "product_images_downloaded": len(product_images),
         "product_images": [str(Path(path).resolve()) for path in product_images],
+        "semantic_images_used": len(image_paths),
         "source_cache_hit": bool(getattr(captured, "cache_hit", False)),
         "source_edge": "new" if captured.launched_now else "reused",
     }
@@ -307,10 +339,12 @@ def main() -> int:
     )
     if not grounding.sources:
         raise SystemExit("商品链接没有形成可供 AI 使用的证据。")
-
     try:
         provider_config = _provider_config(args)
         provider = build_semantic_provider(provider_config)
+        fact_provider_config = replace(provider_config, model=args.fact_model or provider_config.model)
+        validate_provider_config(fact_provider_config)
+        fact_provider = build_semantic_provider(fact_provider_config)
     except ProviderConfigurationError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -321,11 +355,12 @@ def main() -> int:
     )
     cache_dir = None if args.no_semantic_cache else Path(args.semantic_cache_dir)
     namespace = _cache_namespace(provider_config)
-    expected_identity = ProductIdentity()
+    fact_namespace = _cache_namespace(fact_provider_config)
 
     print("===== DIRECT PRODUCT RESOLUTION =====", flush=True)
     print(
         f"provider={provider_config.provider}, model={provider_config.model}, "
+        f"fact_model={fact_provider_config.model}, "
         f"live_fields={len(live_fields)}, citation_sources={len(grounding.sources)}",
         flush=True,
     )
@@ -333,28 +368,62 @@ def main() -> int:
     print(f"generated_listing_sku={generated_sku}", flush=True)
     print(f"execution_model={EXECUTION_MODEL}", flush=True)
 
-    _set_progress(provider, "LOCAL")
-    mapping_result = run_field_mapping(
+    _set_progress(provider, "IMAGE")
+    image_result = run_image_evidence(
         provider,
-        live_fields,
-        grounding,
-        expected_identity=expected_identity,
-        product_url=product_url,
-        batch_size=args.field_batch_size,
-        concurrency=args.field_concurrency,
+        grounding.sources,
+        batch_size=args.image_batch_size,
+        concurrency=args.image_concurrency,
         cache_dir=cache_dir,
         cache_namespace=namespace,
     )
-    local_packet = mapping_result.packet
+    image_observations_path = write_image_observations(
+        image_result.observations,
+        output_dir / "image-observations.json",
+    )
+    print(
+        f"image_evidence=DONE images={len(image_result.observations)} "
+        f"batches={image_result.batch_count} calls={image_result.model_calls} "
+        f"cache_hits={image_result.cache_hits} failed_batches={image_result.failed_batches} "
+        f"elapsed={image_result.elapsed_seconds:.3f}s",
+        flush=True,
+    )
+
+    compact_evidence = build_compact_evidence(grounding, image_result.observations)
+    compact_evidence_path = write_compact_evidence(
+        compact_evidence,
+        output_dir / "compact-evidence.json",
+    )
+    print(
+        f"compact_evidence=DONE chars={compact_evidence.chars} "
+        f"text_sources={compact_evidence.text_source_count} "
+        f"images={compact_evidence.image_count} facts={compact_evidence.image_fact_count}",
+        flush=True,
+    )
+
+    _set_progress(fact_provider, "LOCAL")
+    fact_result = run_product_facts(
+        fact_provider,
+        live_fields,
+        grounding,
+        compact_evidence,
+        product_url=product_url,
+        batch_size=args.local_batch_size,
+        concurrency=args.local_concurrency,
+        cache_dir=cache_dir,
+        cache_namespace=fact_namespace,
+    )
+    local_packet = fact_result.packet
     local_packet_path = write_ai_decision_packet(local_packet, output_dir / "ai-decisions.local.json")
     local_summary = _decision_summary(local_packet.decisions)
     search_requests = _search_requests(local_packet.decisions, live_fields)
     search_path = output_dir / "search-requests.json"
     search_path.write_text(json.dumps(search_requests, ensure_ascii=False, indent=2), encoding="utf-8")
     print(
-        f"local_fill=DONE batches={mapping_result.batch_count} calls={mapping_result.model_calls} "
-        f"cache_hits={mapping_result.cache_hits} failed_batches={mapping_result.failed_batches} "
-        f"elapsed={mapping_result.elapsed_seconds:.3f}s blanks_for_web={len(search_requests)}",
+        f"product_facts=DONE facts={fact_result.fact_count} batches={fact_result.batch_count} "
+        f"calls={fact_result.model_calls} cache_hits={fact_result.cache_hits} "
+        f"failed_batches={fact_result.failed_batches} cache_hit={fact_result.cache_hit} failed={fact_result.failed} "
+        f"elapsed={fact_result.elapsed_seconds:.3f}s blanks_for_web={len(search_requests)}",
         flush=True,
     )
 
@@ -371,11 +440,14 @@ def main() -> int:
             batch_size=args.web_batch_size,
             concurrency=args.web_concurrency,
             cache_dir=cache_dir,
+            compact_evidence=compact_evidence,
         )
         print(
             f"web_fill=DONE batches={web_result.search_batch_count} calls={web_result.search_model_calls} "
             f"cache_hits={web_result.search_cache_hits} failed_batches={web_result.search_failed_batches} "
-            f"evidence={len(web_result.evidence)} sources={len(web_result.web_sources)} "
+            f"queries={web_result.reported_query_count} inspected_sources={web_result.inspected_source_count} "
+            f"source_facts={web_result.researched_fact_count} evidence={len(web_result.evidence)} "
+            f"sources={len(web_result.web_sources)} "
             f"elapsed={web_result.search_elapsed_seconds:.3f}s",
             flush=True,
         )
@@ -386,9 +458,45 @@ def main() -> int:
         web_result = _empty_web_result(local_packet, reason)
         print(f"web_fill=SKIP reason={reason}", flush=True)
 
-    packet_path = write_enriched_ai_decision_packet(
+    web_packet_path = write_enriched_ai_decision_packet(
         web_result.packet,
         web_result.web_sources,
+        output_dir / "ai-decisions.web.json",
+    )
+    product_fingerprint = build_product_fingerprint(
+        web_result.packet,
+        live_fields,
+        grounding,
+        compact_evidence=compact_evidence,
+    )
+    _set_progress(fact_provider, "INFERENCE")
+    inference_result = run_best_effort_inference(
+        fact_provider,
+        web_result.packet,
+        live_fields,
+        grounding,
+        product_fingerprint=product_fingerprint,
+        web_sources=web_result.web_sources,
+        web_evidence=web_result.evidence,
+        cache_dir=cache_dir,
+        cache_namespace=fact_namespace,
+    )
+    print(
+        f"best_effort_inference=DONE targets={inference_result.target_count} "
+        f"ready={inference_result.ready_count} missing={inference_result.missing_count} "
+        f"calls={inference_result.model_calls} cache_hit={inference_result.cache_hit} "
+        f"failed={inference_result.failed} elapsed={inference_result.elapsed_seconds:.3f}s",
+        flush=True,
+    )
+    if inference_result.warning:
+        print(f"inference_warning={inference_result.warning}", flush=True)
+    final_sources = [*web_result.web_sources]
+    if inference_result.target_count and not inference_result.failed:
+        final_sources.append(inference_result.inference_source)
+
+    packet_path = write_enriched_ai_decision_packet(
+        inference_result.packet,
+        final_sources,
         output_dir / "ai-decisions.json",
     )
     web_sources_path = output_dir / "web-search-sources.json"
@@ -402,8 +510,13 @@ def main() -> int:
         encoding="utf-8",
     )
 
-    final_summary = _decision_summary(web_result.packet.decisions)
-    total_model_calls = mapping_result.model_calls + web_result.search_model_calls
+    final_summary = _decision_summary(inference_result.packet.decisions)
+    total_model_calls = (
+        image_result.model_calls
+        + fact_result.model_calls
+        + web_result.search_model_calls
+        + inference_result.model_calls
+    )
     total_elapsed = time.monotonic() - started
     run_manifest = output_dir / "run-manifest.json"
     run_manifest.write_text(
@@ -415,19 +528,41 @@ def main() -> int:
                 "live_field_count": len(live_fields),
                 "provider_adapter": provider.name,
                 "provider_config": provider_config.as_safe_dict(),
+                "fact_provider_config": fact_provider_config.as_safe_dict(),
                 "web_search_model": args.web_search_model,
                 "primary_product_url": product_url,
                 "generated_listing_sku": generated_sku,
                 "source_capture": capture_info,
                 "grounded_source_count": len(grounding.sources),
-                "local_fill": {
-                    "batch_size": args.field_batch_size,
-                    "concurrency": args.field_concurrency,
-                    "batch_count": mapping_result.batch_count,
-                    "model_calls": mapping_result.model_calls,
-                    "cache_hits": mapping_result.cache_hits,
-                    "failed_batches": mapping_result.failed_batches,
-                    "elapsed_seconds": round(mapping_result.elapsed_seconds, 3),
+                "image_evidence": {
+                    "batch_size": args.image_batch_size,
+                    "concurrency": args.image_concurrency,
+                    "image_count": len(image_result.observations),
+                    "batch_count": image_result.batch_count,
+                    "model_calls": image_result.model_calls,
+                    "cache_hits": image_result.cache_hits,
+                    "failed_batches": image_result.failed_batches,
+                    "elapsed_seconds": round(image_result.elapsed_seconds, 3),
+                },
+                "compact_evidence": {
+                    "sha256": compact_evidence.sha256,
+                    "chars": compact_evidence.chars,
+                    "text_source_count": compact_evidence.text_source_count,
+                    "image_count": compact_evidence.image_count,
+                    "image_fact_count": compact_evidence.image_fact_count,
+                },
+                "product_facts": {
+                    "batch_size": args.local_batch_size,
+                    "concurrency": args.local_concurrency,
+                    "batch_count": fact_result.batch_count,
+                    "fact_count": fact_result.fact_count,
+                    "model_calls": fact_result.model_calls,
+                    "cache_hits": fact_result.cache_hits,
+                    "failed_batches": fact_result.failed_batches,
+                    "cache_hit": fact_result.cache_hit,
+                    "failed": fact_result.failed,
+                    "elapsed_seconds": round(fact_result.elapsed_seconds, 3),
+                    "warning": fact_result.warning,
                     "decision_summary": local_summary,
                 },
                 "web_fill": {
@@ -442,9 +577,22 @@ def main() -> int:
                     "cache_hits": web_result.search_cache_hits,
                     "failed_batches": web_result.search_failed_batches,
                     "evidence_count": len(web_result.evidence),
+                    "researched_fact_count": web_result.researched_fact_count,
+                    "reported_query_count": web_result.reported_query_count,
+                    "inspected_source_count": web_result.inspected_source_count,
                     "source_count": len(web_result.web_sources),
                     "elapsed_seconds": round(web_result.search_elapsed_seconds, 3),
                     "warnings": list(web_result.warnings),
+                },
+                "best_effort_inference": {
+                    "requested_fields": inference_result.target_count,
+                    "ready": inference_result.ready_count,
+                    "missing": inference_result.missing_count,
+                    "model_calls": inference_result.model_calls,
+                    "cache_hit": inference_result.cache_hit,
+                    "failed": inference_result.failed,
+                    "elapsed_seconds": round(inference_result.elapsed_seconds, 3),
+                    "warning": inference_result.warning,
                 },
                 "final_decision_summary": final_summary,
                 "total_model_calls": total_model_calls,
@@ -454,6 +602,7 @@ def main() -> int:
                 "send_to_qc_clicked": False,
                 "outputs": {
                     "local_decisions": str(local_packet_path.resolve()),
+                    "web_decisions": str(web_packet_path.resolve()),
                     "final_decisions": str(packet_path.resolve()),
                     "search_requests": str(search_path.resolve()),
                     "web_sources": str(web_sources_path.resolve()),
@@ -462,6 +611,8 @@ def main() -> int:
                     "primary_source_snapshot": str(captured.snapshot_path.resolve()),
                     "primary_source_screenshot": str(captured.screenshot_path.resolve()),
                     "primary_source_product_images": [str(Path(path).resolve()) for path in product_images],
+                    "compact_evidence": str(compact_evidence_path.resolve()),
+                    "image_observations": str(image_observations_path.resolve()),
                 },
             },
             ensure_ascii=False,
@@ -477,7 +628,8 @@ def main() -> int:
         flush=True,
     )
     print(
-        f"local_fill_calls={mapping_result.model_calls}, web_fill_calls={web_result.search_model_calls}, "
+        f"product_fact_calls={fact_result.model_calls}, web_fill_calls={web_result.search_model_calls}, "
+        f"inference_calls={inference_result.model_calls}, "
         f"total_calls={total_model_calls}, wall={total_elapsed:.3f}s",
         flush=True,
     )

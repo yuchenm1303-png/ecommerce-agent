@@ -6,8 +6,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GUI_SOURCES = [
     PROJECT_ROOT / "run_local_gui.py",
+    PROJECT_ROOT / "makro_gui_workflow.py",
     PROJECT_ROOT / "gui" / "main_window.py",
     PROJECT_ROOT / "gui" / "console_window.py",
+    PROJECT_ROOT / "gui" / "workflow_console_window.py",
     PROJECT_ROOT / "gui" / "acceptance_console.py",
     PROJECT_ROOT / "gui" / "readonly_runner.py",
     PROJECT_ROOT / "gui" / "real_execution.py",

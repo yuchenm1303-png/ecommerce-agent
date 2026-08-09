@@ -45,7 +45,9 @@ def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
     payload = {
         "task": request_payload.get("task"),
         "product_identity": request_payload.get("product_identity") or {},
+        "context": request_payload.get("context") or {},
         "target_fields": request_payload.get("target_fields") or [],
+        "all_marketplace_fields": request_payload.get("all_marketplace_fields") or [],
         "rules": request_payload.get("rules") or [],
         "grounded_sources": [],
         "json_contract": request_payload.get("json_contract") or {},
@@ -73,9 +75,17 @@ def _task_instruction(request_payload: dict[str, Any]) -> str:
             "CORRECTION REQUIRED: the prior JSON failed the structural contract: "
             + validation_error
         )
+    evidence_policy = str(request_payload.get("evidence_policy") or "grounded").strip().casefold()
+    if evidence_policy == "best_effort":
+        parts.append(
+            "This task explicitly permits clearly identified best-effort estimates from the supplied "
+            "product context and ordinary category knowledge. Do not invent unique identifiers, legal "
+            "entities, seller promises, or values that contradict an existing conflict."
+        )
+    else:
+        parts.append("Never invent unsupported product facts.")
     parts.append(
-        "Return exactly one valid JSON object and no markdown or prose outside JSON. "
-        "Follow json_contract. Never invent unsupported product facts."
+        "Return exactly one valid JSON object and no markdown or prose outside JSON. Follow json_contract."
     )
     return "\n\n".join(part for part in parts if part)
 

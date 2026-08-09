@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -9,51 +10,55 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 from urllib.parse import urlparse
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
-from .result_loader import (
-    latest_live_schema,
-    latest_resolver_manifest,
-    load_run_result,
-)
+from .result_loader import load_run_result
 
 
 @dataclass(slots=True)
 class RunnerConfig:
     product_url: str
-    expected_vertical: str = "vehicle_camera_system"
+    expected_vertical: str = ""
     makro_cdp_port: int = 9222
     source_cdp_port: int = 9333
     source_use_current_page: bool = False
     provider: str = "openai-compatible"
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     local_model: str = "qwen3.7-plus"
+    fact_model: str = "qwen3.7-max"
     web_model: str = "qwen3.7-max"
-    api_key_env: str = "DASHSCOPE_API_KEY"
+    api_key_env: str = "AI_API_KEY"
 
 
 _PHASE_META = {
-    "scan": (1, "Fresh Makro live schema"),
-    "cold": (2, "Cold Resolver"),
-    "hot": (3, "Hot Resolver / cache verification"),
-    "plan": (4, "Read-only Fill Plan"),
+    "scan": (1, "Source Capture"),
+    "cold": (2, "Step 1 · Vertical"),
+    "hot": (3, "Step 2 · Brand"),
+    "plan": (4, "Step 3 · Resolve / Fill Plan"),
 }
+_MODE_PHASES = {
+    "step1": ("scan", "cold"),
+    "step2": ("scan", "hot"),
+    "step3": ("scan", "plan"),
+    "full": ("scan", "cold", "hot", "plan"),
+}
+_PHASE_LINE = re.compile(
+    r"^GUI_PHASE\s+(scan|cold|hot|plan)\s+(START|COMPLETE|FAILED|SKIPPED)"
+    r"(?:\s+detail=(.*))?$"
+)
 
 
 class ReadOnlyRunner(QObject):
+    """GUI bridge to the current staged one-link acceptance workflow."""
+
     log = Signal(str)
     phase_changed = Signal(str)
     running_changed = Signal(bool)
     result_updated = Signal(object)
     completed = Signal(object)
     failed = Signal(str)
-
-    # Structured telemetry for the GUI console. Progress advances only when a
-    # deterministic phase exits successfully; there is no fabricated intra-step
-    # percentage.
     progress_changed = Signal(int, str)
     phase_event = Signal(object)
     command_started = Signal(object)
@@ -64,54 +69,95 @@ class ReadOnlyRunner(QObject):
         self.process: QProcess | None = None
         self.config: RunnerConfig | None = None
         self.run_dir: Path | None = None
+        self.mode = "full"
         self.current_phase = "idle"
         self._stopping = False
-        self._phase_started_monotonic: float | None = None
-        self._phase_started_wall = ""
-        self._phase_output_dir = ""
-        self._phase_terminal_emitted = False
         self._stdout_tail = ""
+        self._phase_started: dict[str, tuple[float, str]] = {}
+        self._completed_active: set[str] = set()
 
     @property
     def is_running(self) -> bool:
         return self.process is not None and self.process.state() != QProcess.NotRunning
 
-    def start(self, config: RunnerConfig) -> None:
+    def start(self, config: RunnerConfig, *, mode: str = "full") -> None:
         if self.is_running:
-            raise RuntimeError("A read-only test is already running.")
+            raise RuntimeError("Makro workflow 已在运行。")
+        if mode not in _MODE_PHASES:
+            raise ValueError(f"未知 workflow mode={mode!r}")
         self._validate_config(config)
         self._assert_makro_cdp_available(config.makro_cdp_port)
 
         self.config = config
-        self._stopping = False
+        self.mode = mode
         self.current_phase = "idle"
-        self._phase_started_monotonic = None
-        self._phase_terminal_emitted = False
+        self._stopping = False
         self._stdout_tail = ""
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.run_dir = self.project_root / "logs" / "gui-runs" / f"readonly-{stamp}"
-        self.run_dir.mkdir(parents=True, exist_ok=False)
-        (self.run_dir / "_cache" / "source").mkdir(parents=True, exist_ok=True)
-        (self.run_dir / "_cache" / "semantic").mkdir(parents=True, exist_ok=True)
-        self._write_metadata(status="running")
+        self._phase_started.clear()
+        self._completed_active.clear()
 
-        self.progress_changed.emit(0, "0/4 · preparing")
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        self.run_dir = self.project_root / "logs" / "gui-runs" / f"workflow-{mode}-{stamp}"
+        self.run_dir.mkdir(parents=True, exist_ok=False)
+        source_cache = self.run_dir / "_cache" / "source"
+        semantic_cache = self.run_dir / "_cache" / "semantic"
+        source_cache.mkdir(parents=True, exist_ok=True)
+        semantic_cache.mkdir(parents=True, exist_ok=True)
+
+        args = [
+            "makro_gui_workflow.py",
+            "--mode",
+            mode,
+            "--product-url",
+            config.product_url,
+            "--provider",
+            config.provider,
+            "--base-url",
+            config.base_url,
+            "--model",
+            config.local_model,
+            "--fact-model",
+            config.fact_model,
+            "--web-search-model",
+            config.web_model,
+            "--api-key-env",
+            config.api_key_env,
+            "--structured-mode",
+            "json_object",
+            "--disable-thinking",
+            "--cdp-port",
+            str(config.makro_cdp_port),
+            "--source-cdp-port",
+            str(config.source_cdp_port),
+            "--source-cache-dir",
+            str(source_cache),
+            "--semantic-cache-dir",
+            str(semantic_cache),
+            "--output-dir",
+            str(self.run_dir),
+        ]
+        if config.source_use_current_page:
+            args.append("--source-use-current-page")
+
         self.running_changed.emit(True)
-        self._emit_log("===== GUI READ-ONLY TEST =====")
+        self.progress_changed.emit(0, f"{mode} · preparing")
+        self._emit_log("===== GUI CURRENT MAKRO WORKFLOW =====")
+        self._emit_log(f"mode={mode}")
         self._emit_log(f"run_dir={self.run_dir}")
         self._emit_log(f"product_url={config.product_url}")
-        self._emit_log("Pipeline: 4 deterministic read-only stages; progress advances only after a stage succeeds.")
-        self._emit_log("Safety contract: read-only scan + resolver + read-only Fill Plan only.")
-        self._emit_log("makro_execute_listing.py is not invoked by this GUI.")
-        self._start_scan()
+        self._emit_log(
+            "Backend: current one-link Step 1/2 + current Resolver cold/hot + current read-only Fill Plan."
+        )
+        self._emit_log("Safety: Step 3 writes=0 · Save=False · Send to QC=False.")
+        self._start_process(args)
 
     def stop(self) -> None:
         if self.process is None or self.process.state() == QProcess.NotRunning:
             return
         self._stopping = True
-        self._emit_log("Stop requested. Terminating current subprocess...")
+        self._emit_log("Stop requested. Terminating current workflow subprocess...")
         self.process.terminate()
-        if not self.process.waitForFinished(2000):
+        if not self.process.waitForFinished(2500):
             self.process.kill()
 
     def _validate_config(self, config: RunnerConfig) -> None:
@@ -126,212 +172,22 @@ class ReadOnlyRunner(QObject):
             raise ValueError("Makro CDP 端口无效。")
         if not (1 <= int(config.source_cdp_port) <= 65535):
             raise ValueError("Source CDP 端口无效。")
-        if not config.expected_vertical.strip():
-            raise ValueError("expected vertical 不能为空。")
 
     def _assert_makro_cdp_available(self, port: int) -> None:
-        url = f"http://127.0.0.1:{port}/json/version"
         try:
-            with urllib.request.urlopen(url, timeout=1.2) as response:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/version", timeout=1.2
+            ) as response:
                 if response.status != 200:
                     raise RuntimeError(f"HTTP {response.status}")
         except Exception as exc:
             raise RuntimeError(
-                f"Makro Edge CDP 127.0.0.1:{port} 不可用。为保护长期 Makro profile，"
-                "GUI 不会自动启动或重启 Makro Edge；请先按现有方式启动后再测试。"
+                f"Makro Edge CDP 127.0.0.1:{port} 不可用。GUI 不会自动启动、重启或关闭长期 Makro Edge。"
             ) from exc
-
-    def _begin_phase(self, phase: str, output_dir: Path) -> None:
-        index, label = _PHASE_META[phase]
-        self.current_phase = phase
-        self._phase_started_monotonic = time.monotonic()
-        self._phase_started_wall = datetime.now().astimezone().isoformat(timespec="seconds")
-        self._phase_output_dir = str(output_dir)
-        self._phase_terminal_emitted = False
-        self.phase_changed.emit(f"{index}/4  {label}")
-        self.progress_changed.emit((index - 1) * 25, f"{index}/4 · {label} · running")
-        self.phase_event.emit(
-            {
-                "phase": phase,
-                "index": index,
-                "label": label,
-                "status": "running",
-                "started_at": self._phase_started_wall,
-                "output_dir": self._phase_output_dir,
-            }
-        )
-        self._emit_log("")
-        self._emit_log(f"===== PHASE {index}/4 START · {label} =====")
-        self._emit_log(f"phase_output={self._phase_output_dir}")
-
-    def _finish_phase_event(
-        self,
-        status: str,
-        *,
-        exit_code: int | None = None,
-        error: str = "",
-    ) -> None:
-        if self.current_phase not in _PHASE_META or self._phase_terminal_emitted:
-            return
-        index, label = _PHASE_META[self.current_phase]
-        elapsed = (
-            max(0.0, time.monotonic() - self._phase_started_monotonic)
-            if self._phase_started_monotonic is not None
-            else 0.0
-        )
-        payload: dict[str, Any] = {
-            "phase": self.current_phase,
-            "index": index,
-            "label": label,
-            "status": status,
-            "started_at": self._phase_started_wall,
-            "elapsed_s": elapsed,
-            "exit_code": exit_code,
-            "output_dir": self._phase_output_dir,
-        }
-        if error:
-            payload["error"] = error
-        self.phase_event.emit(payload)
-        self._phase_terminal_emitted = True
-
-        if status == "completed":
-            self.progress_changed.emit(index * 25, f"{index}/4 · {label} · complete")
-        else:
-            self.progress_changed.emit((index - 1) * 25, f"{index}/4 · {label} · {status}")
-
-        exit_text = "—" if exit_code is None else str(exit_code)
-        self._emit_log(
-            f"===== PHASE {index}/4 {status.upper()} · elapsed={elapsed:.3f}s · exit={exit_text} ====="
-        )
-
-    def _start_scan(self) -> None:
-        assert self.config is not None and self.run_dir is not None
-        output = self.run_dir / "01-live-schema"
-        self._begin_phase("scan", output)
-        args = [
-            "makro_plan_listing.py",
-            "--scan-live-schema",
-            "--expected-vertical",
-            self.config.expected_vertical,
-            "--cdp-port",
-            str(self.config.makro_cdp_port),
-            "--output-dir",
-            str(output),
-        ]
-        self._start_process(args)
-
-    def _start_cold(self) -> None:
-        assert self.config is not None and self.run_dir is not None
-        live_schema = latest_live_schema(self.run_dir)
-        if live_schema is None:
-            raise RuntimeError("fresh live-schema.json 未生成。")
-        output = self.run_dir / "02-cold-resolver"
-        self._begin_phase("cold", output)
-        args = self._resolver_args(
-            live_schema,
-            output_dir=output,
-            refresh_source=True,
-        )
-        self._start_process(args)
-
-    def _start_hot(self) -> None:
-        assert self.run_dir is not None
-        live_schema = latest_live_schema(self.run_dir)
-        if live_schema is None:
-            raise RuntimeError("live-schema.json 不存在。")
-        output = self.run_dir / "03-hot-resolver"
-        self._begin_phase("hot", output)
-        args = self._resolver_args(
-            live_schema,
-            output_dir=output,
-            refresh_source=False,
-        )
-        self._start_process(args)
-
-    def _resolver_args(self, live_schema: Path, *, output_dir: Path, refresh_source: bool) -> list[str]:
-        assert self.config is not None and self.run_dir is not None
-        args = [
-            "makro_resolve_ai.py",
-            "--provider",
-            self.config.provider,
-            "--base-url",
-            self.config.base_url,
-            "--model",
-            self.config.local_model,
-            "--web-search-model",
-            self.config.web_model,
-            "--api-key-env",
-            self.config.api_key_env,
-            "--live-schema",
-            str(live_schema),
-            "--product-url",
-            self.config.product_url,
-            "--disable-thinking",
-            "--web-enrich",
-            "auto",
-            "--source-cdp-port",
-            str(self.config.source_cdp_port),
-            "--source-cache-dir",
-            str(self.run_dir / "_cache" / "source"),
-            "--semantic-cache-dir",
-            str(self.run_dir / "_cache" / "semantic"),
-            "--output-dir",
-            str(output_dir),
-        ]
-        if refresh_source:
-            args.append("--refresh-source")
-        if self.config.source_use_current_page:
-            args.append("--source-use-current-page")
-        return args
-
-    def _start_plan(self) -> None:
-        assert self.config is not None and self.run_dir is not None
-        live_schema = latest_live_schema(self.run_dir)
-        hot_manifest_path = latest_resolver_manifest(self.run_dir, "03-hot-resolver")
-        if live_schema is None or hot_manifest_path is None:
-            raise RuntimeError("Hot Resolver 产物不完整，无法 strict rebind Fill Plan。")
-        manifest = json.loads(hot_manifest_path.read_text(encoding="utf-8"))
-        outputs = manifest.get("outputs") or {}
-        decision_packet = Path(str(outputs.get("final_decisions") or ""))
-        snapshot = Path(str(outputs.get("primary_source_snapshot") or ""))
-        screenshot = Path(str(outputs.get("primary_source_screenshot") or ""))
-        images = [Path(str(value)) for value in outputs.get("primary_source_product_images") or []]
-        product_url = str(manifest.get("primary_product_url") or self.config.product_url)
-        required_paths = [decision_packet, snapshot, screenshot]
-        missing = [str(path) for path in required_paths if not path.is_file()]
-        if missing:
-            raise RuntimeError("Hot Resolver strict-rebind 文件缺失：" + " | ".join(missing))
-
-        output = self.run_dir / "04-fill-plan"
-        self._begin_phase("plan", output)
-        args = [
-            "makro_plan_listing.py",
-            "--decision-packet",
-            str(decision_packet),
-            "--live-schema",
-            str(live_schema),
-            "--product-url",
-            product_url,
-            "--supplier-snapshot",
-            str(snapshot),
-            "--image",
-            str(screenshot),
-            "--expected-vertical",
-            self.config.expected_vertical,
-            "--cdp-port",
-            str(self.config.makro_cdp_port),
-            "--output-dir",
-            str(output),
-        ]
-        for image in images:
-            if image.is_file():
-                args.extend(["--image", str(image)])
-        self._start_process(args)
 
     def _start_process(self, args: list[str]) -> None:
         process = QProcess(self)
         self.process = process
-        self._stdout_tail = ""
         process.setWorkingDirectory(str(self.project_root))
         process.setProcessChannelMode(QProcess.MergedChannels)
         environment = QProcessEnvironment.systemEnvironment()
@@ -344,23 +200,17 @@ class ReadOnlyRunner(QObject):
 
         full_argv = [sys.executable, *args]
         command = subprocess.list2cmdline(full_argv)
-        output_dir = ""
-        if "--output-dir" in args:
-            index = args.index("--output-dir")
-            if index + 1 < len(args):
-                output_dir = args[index + 1]
-        event = {
-            "phase": self.current_phase,
-            "command": command,
-            "cwd": str(self.project_root),
-            "output_dir": output_dir,
-            "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        }
-        self.command_started.emit(event)
+        self.command_started.emit(
+            {
+                "phase": "workflow",
+                "command": command,
+                "cwd": str(self.project_root),
+                "output_dir": str(self.run_dir or ""),
+                "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+        )
         self._emit_log("$ " + command)
         self._emit_log(f"cwd={self.project_root}")
-        if output_dir:
-            self._emit_log(f"output_dir={output_dir}")
         process.start(sys.executable, args)
 
     def _read_output(self) -> None:
@@ -371,118 +221,136 @@ class ReadOnlyRunner(QObject):
             return
         text = self._stdout_tail + raw.decode("utf-8", errors="replace")
         self._stdout_tail = ""
-        parts = text.splitlines(keepends=True)
-        for part in parts:
+        for part in text.splitlines(keepends=True):
             if part.endswith(("\n", "\r")):
-                self._emit_log(part.rstrip("\r\n"))
+                line = part.rstrip("\r\n")
+                self._emit_log(line)
+                self._observe_phase(line)
             else:
                 self._stdout_tail = part
 
-    def _flush_output_tail(self) -> None:
+    def _flush_tail(self) -> None:
         if self._stdout_tail:
-            self._emit_log(self._stdout_tail)
+            line = self._stdout_tail
             self._stdout_tail = ""
+            self._emit_log(line)
+            self._observe_phase(line)
 
-    def _process_finished(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
-        phase = self.current_phase
+    def _observe_phase(self, line: str) -> None:
+        match = _PHASE_LINE.match(line.strip())
+        if match is None:
+            return
+        phase, state, detail = match.groups()
+        state = state.casefold()
+        detail = (detail or "").strip()
+        index, label = _PHASE_META[phase]
+        now_wall = datetime.now().astimezone().isoformat(timespec="seconds")
+
+        if state == "start":
+            self.current_phase = phase
+            self._phase_started[phase] = (time.monotonic(), now_wall)
+            self.phase_changed.emit(f"{label} · running")
+            self.phase_event.emit(
+                {
+                    "phase": phase,
+                    "index": index,
+                    "label": label,
+                    "status": "running",
+                    "started_at": now_wall,
+                    "output_dir": str(self.run_dir or ""),
+                }
+            )
+            self._emit_progress(label)
+            return
+
+        started_mono, started_wall = self._phase_started.get(
+            phase, (time.monotonic(), now_wall)
+        )
+        elapsed = max(0.0, time.monotonic() - started_mono)
+        status = {
+            "complete": "completed",
+            "failed": "failed",
+            "skipped": "skipped",
+        }[state]
+        if status == "completed" and phase in _MODE_PHASES[self.mode]:
+            self._completed_active.add(phase)
+        self.phase_event.emit(
+            {
+                "phase": phase,
+                "index": index,
+                "label": label,
+                "status": status,
+                "started_at": started_wall,
+                "elapsed_s": elapsed,
+                "error": detail if status == "failed" else "",
+                "output_dir": str(self.run_dir or ""),
+            }
+        )
+        if status == "failed":
+            self.phase_changed.emit(f"{label} · failed")
+        self._emit_progress(detail or label)
+
+    def _emit_progress(self, detail: str) -> None:
+        active = _MODE_PHASES[self.mode]
+        percent = round(100 * len(self._completed_active) / max(1, len(active)))
+        self.progress_changed.emit(percent, f"{self.mode} · {len(self._completed_active)}/{len(active)} · {detail}")
+
+    def _process_finished(
+        self, exit_code: int, _exit_status: QProcess.ExitStatus
+    ) -> None:
         self._read_output()
-        self._flush_output_tail()
+        self._flush_tail()
         self.process = None
-
         if self._stopping:
-            self._finish_phase_event("cancelled", exit_code=exit_code)
-            self._finish_failure("测试已由用户停止。")
-            return
-        if exit_code != 0:
-            message = f"{phase} 阶段退出码={exit_code}。请查看实时日志。"
-            self._finish_phase_event("failed", exit_code=exit_code, error=message)
-            self._finish_failure(message)
+            self.running_changed.emit(False)
+            self.phase_changed.emit("已停止")
+            self.failed.emit("测试已由用户停止；浏览器现场保留。")
             return
 
-        self._finish_phase_event("completed", exit_code=exit_code)
+        if exit_code != 0:
+            message = self._manifest_error() or f"{self.mode} workflow 退出码={exit_code}。请查看 Live Console。"
+            self.running_changed.emit(False)
+            self.phase_changed.emit("失败")
+            self.failed.emit(message)
+            return
+
         try:
-            if self.run_dir is not None:
-                self.result_updated.emit(load_run_result(self.run_dir))
-            if phase == "scan":
-                self._start_cold()
-            elif phase == "cold":
-                self._start_hot()
-            elif phase == "hot":
-                self._start_plan()
-            elif phase == "plan":
-                self._finish_success()
-            else:
-                self._finish_failure(f"未知运行阶段：{phase}")
+            if self.run_dir is None:
+                raise RuntimeError("workflow run_dir 未初始化")
+            result = load_run_result(self.run_dir)
         except Exception as exc:
-            self._finish_failure(str(exc))
+            self.running_changed.emit(False)
+            self.failed.emit(f"workflow 已结束，但读取结果失败：{exc}")
+            return
+
+        self.progress_changed.emit(100, f"{self.mode} · complete")
+        self.phase_changed.emit(f"完成 · {self.mode}")
+        self.result_updated.emit(result)
+        self.running_changed.emit(False)
+        self.completed.emit(result)
+
+    def _manifest_error(self) -> str:
+        if self.run_dir is None:
+            return ""
+        path = self.run_dir / "run-manifest.json"
+        if not path.is_file():
+            return ""
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        return str(payload.get("error") or "").strip()
 
     def _process_error(self, error: QProcess.ProcessError) -> None:
         if self._stopping:
             return
         if error == QProcess.FailedToStart:
-            message = "Python 子进程启动失败。"
-            self._finish_phase_event("failed", error=message)
-            self._finish_failure(message)
-
-    def _finish_success(self) -> None:
-        assert self.run_dir is not None
-        result = load_run_result(self.run_dir)
-        self.progress_changed.emit(100, "4/4 · acceptance complete")
-        self.phase_changed.emit("完成 · Read-only acceptance")
-        self._emit_log("")
-        self._emit_log("===== GUI READ-ONLY ACCEPTANCE COMPLETE =====")
-        self._emit_log(
-            f"READY={result.ready} MISSING={result.missing} CONFLICT={result.conflict} BLOCKED={result.blocked}"
-        )
-        self._emit_log(
-            "Makro safety: "
-            f"writes={result.safety.writes_performed}, "
-            f"save={result.safety.save_clicked}, send_to_qc={result.safety.send_to_qc_clicked}"
-        )
-        self._write_metadata(status="completed")
-        self.running_changed.emit(False)
-        self.result_updated.emit(result)
-        self.completed.emit(result)
-
-    def _finish_failure(self, message: str) -> None:
-        if not self._phase_terminal_emitted and self.current_phase in _PHASE_META:
-            self._finish_phase_event("failed", error=message)
-        self._emit_log("")
-        self._emit_log("ERROR: " + message)
-        self.phase_changed.emit("失败")
-        self._write_metadata(status="failed", error=message)
-        self.running_changed.emit(False)
-        self.failed.emit(message)
+            self.process = None
+            self.running_changed.emit(False)
+            self.failed.emit("GUI workflow Python 子进程启动失败。")
 
     def _emit_log(self, line: str) -> None:
         self.log.emit(line)
-        if self.run_dir is None:
-            return
-        log_path = self.run_dir / "gui-run.log"
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
-
-    def _write_metadata(self, *, status: str, error: str = "") -> None:
-        if self.run_dir is None or self.config is None:
-            return
-        payload: dict[str, Any] = {
-            "mode": "windows_local_development_read_only_gui",
-            "status": status,
-            "product_url": self.config.product_url,
-            "expected_vertical": self.config.expected_vertical,
-            "makro_cdp_port": self.config.makro_cdp_port,
-            "source_cdp_port": self.config.source_cdp_port,
-            "source_use_current_page": self.config.source_use_current_page,
-            "provider": self.config.provider,
-            "local_model": self.config.local_model,
-            "web_model": self.config.web_model,
-            "api_key_env": self.config.api_key_env,
-            "current_phase": self.current_phase,
-            "core_write_runner_invoked": False,
-        }
-        if error:
-            payload["error"] = error
-        (self.run_dir / "gui-run.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        if self.run_dir is not None:
+            with (self.run_dir / "gui-workflow.log").open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")

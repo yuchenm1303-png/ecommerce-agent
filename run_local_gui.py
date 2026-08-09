@@ -22,7 +22,10 @@ def main() -> int:
         )
         return 2
 
+    # Keep the baseline import contract for visual tests, then layer the current
+    # business workflow over that preserved QWidget shell.
     from gui.console_window import MainWindow
+    from gui.workflow_console_window import WorkflowMainWindow
     from gui.log_presenter import install_buffered_logs
     from gui.native_visual_style import install_native_visual_style
     from gui.native_window_shell import install_native_window_shell
@@ -30,8 +33,10 @@ def main() -> int:
     from gui.nekro_effects import install_nekro_effects
     from gui.ui_polish import install_ui_polish
 
+    MainWindow = WorkflowMainWindow
+
     app = QApplication(sys.argv)
-    app.setApplicationName("ecommerce-agent Read-only Lab")
+    app.setApplicationName("ecommerce-agent Current Workflow")
     app.setOrganizationName("ecommerce-agent")
 
     # Preserve the baseline global smooth-scroll behavior unchanged.

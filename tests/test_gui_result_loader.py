@@ -13,7 +13,8 @@ def _write(path: Path, payload: object) -> Path:
     return path
 
 
-def test_gui_result_loader_combines_decisions_plan_cache_and_safety(tmp_path: Path) -> None:
+def test_result_loader_reads_current_workflow_resolver_and_fill_plan(tmp_path: Path) -> None:
+    run = tmp_path / "workflow-step3"
     field = {
         "attribute_key": "Camera Type",
         "label": "Camera Type",
@@ -26,18 +27,12 @@ def test_gui_result_loader_combines_decisions_plan_cache_and_safety(tmp_path: Pa
         "context_text": "",
     }
     fid = field_id(field)
-    run = tmp_path / "readonly-run"
     live = _write(
-        run / "01-live-schema" / "live-scan-1" / "live-schema.json",
+        run / "01-live-schema" / "live-scan-current" / "live-schema.json",
         {"schema_version": 1, "fields": [field]},
     )
-    _write(
-        live.parent / "manifest.json",
-        {"writes_performed": 0, "save_clicked": False, "send_to_qc_clicked": False},
-    )
-
     decisions = _write(
-        run / "03-hot-resolver" / "resolve-ai-1" / "ai-decisions.json",
+        run / "03-hot-resolver" / "resolve-ai-hot" / "ai-decisions.json",
         {
             "decisions": [
                 {
@@ -46,54 +41,90 @@ def test_gui_result_loader_combines_decisions_plan_cache_and_safety(tmp_path: Pa
                     "values": ["Dash Camera"],
                     "qualifier": "",
                     "citations": [
-                        {"source_reference": "supplier:test", "evidence_text": "Dash Camera"}
+                        {
+                            "source_reference": "supplier:test",
+                            "evidence_text": "Dash Camera",
+                        }
                     ],
                     "alternatives": [],
                 }
-            ],
-            "web_sources": [],
+            ]
         },
     )
-    hot_manifest = {
-        "primary_product_url": "https://example.test/item",
-        "source_capture": {"source_cache_hit": True},
-        "local_fill": {
-            "batch_count": 1,
-            "model_calls": 0,
-            "cache_hits": 1,
-            "failed_batches": 0,
+    cold_manifest = _write(
+        run / "02-cold-resolver" / "resolve-ai-cold" / "run-manifest.json",
+        {
+            "primary_product_url": "https://example.test/item",
+            "source_capture": {"source_cache_hit": True},
+            "product_facts": {
+                "batch_count": 2,
+                "model_calls": 2,
+                "cache_hits": 0,
+                "failed_batches": 0,
+            },
+            "web_fill": {
+                "batch_count": 1,
+                "model_calls": 1,
+                "cache_hits": 0,
+                "failed_batches": 0,
+            },
+            "best_effort_inference": {
+                "requested_fields": 1,
+                "model_calls": 1,
+                "cache_hit": False,
+                "failed": False,
+            },
+            "final_decision_summary": {
+                "ready": 1,
+                "review": 0,
+                "conflict": 0,
+                "missing": 0,
+                "business_locked": 0,
+            },
+            "writes_performed": 0,
+            "save_clicked": False,
+            "send_to_qc_clicked": False,
+            "outputs": {"final_decisions": str(decisions)},
         },
-        "web_fill": {
-            "batch_count": 1,
-            "model_calls": 0,
-            "cache_hits": 1,
-            "failed_batches": 0,
+    )
+    hot_manifest = _write(
+        run / "03-hot-resolver" / "resolve-ai-hot" / "run-manifest.json",
+        {
+            "primary_product_url": "https://example.test/item",
+            "source_capture": {"source_cache_hit": True},
+            "product_facts": {
+                "batch_count": 2,
+                "model_calls": 0,
+                "cache_hits": 2,
+                "failed_batches": 0,
+            },
+            "web_fill": {
+                "batch_count": 1,
+                "model_calls": 0,
+                "cache_hits": 1,
+                "failed_batches": 0,
+            },
+            "best_effort_inference": {
+                "requested_fields": 1,
+                "model_calls": 0,
+                "cache_hit": True,
+                "failed": False,
+            },
+            "final_decision_summary": {
+                "ready": 1,
+                "review": 0,
+                "conflict": 0,
+                "missing": 0,
+                "business_locked": 0,
+            },
+            "writes_performed": 0,
+            "save_clicked": False,
+            "send_to_qc_clicked": False,
+            "outputs": {"final_decisions": str(decisions)},
         },
-        "writes_performed": 0,
-        "save_clicked": False,
-        "send_to_qc_clicked": False,
-        "outputs": {"final_decisions": str(decisions)},
-    }
-    _write(run / "03-hot-resolver" / "resolve-ai-1" / "run-manifest.json", hot_manifest)
-    cold_manifest = dict(hot_manifest)
-    cold_manifest["source_capture"] = {"source_cache_hit": False}
-    cold_manifest["local_fill"] = {
-        "batch_count": 1,
-        "model_calls": 1,
-        "cache_hits": 0,
-        "failed_batches": 0,
-    }
-    cold_manifest["web_fill"] = {
-        "batch_count": 1,
-        "model_calls": 1,
-        "cache_hits": 0,
-        "failed_batches": 0,
-    }
-    _write(run / "02-cold-resolver" / "resolve-ai-1" / "run-manifest.json", cold_manifest)
-
-    plan_dir = run / "04-fill-plan" / "plan-1"
-    _write(
-        plan_dir / "fill-plan.json",
+    )
+    fill_plan = _write(
+        run / "04-fill-plan" / "plan-current" / "fill-plan.json",
         {
             "summary": {"ready": 1, "blocked": 0},
             "items": [
@@ -101,63 +132,86 @@ def test_gui_result_loader_combines_decisions_plan_cache_and_safety(tmp_path: Pa
                     "attribute_key": "Camera Type",
                     "label": "Camera Type",
                     "section_heading": "Product Details",
-                    "required": True,
                     "action": "ready",
-                    "reason": "",
                     "resolution": {
-                        "status": "resolved",
                         "source_reference": "supplier:test",
                         "gate_reason": "",
                         "detail": "",
                     },
                 }
             ],
-            "warnings": [],
+        },
+    )
+    fill_plan_manifest = _write(
+        run / "04-fill-plan" / "plan-current" / "manifest.json",
+        {
+            "writes_performed": 0,
+            "save_clicked": False,
+            "send_to_qc_clicked": False,
         },
     )
     _write(
-        plan_dir / "manifest.json",
-        {"writes_performed": 0, "save_clicked": False, "send_to_qc_clicked": False},
-    )
-
-    _write(
-        run / "_cache" / "semantic" / "web-product-research-test.json",
+        run / "run-manifest.json",
         {
-            "payload": {
-                "source_matches": [
-                    {
-                        "source_url": "https://manufacturer.test/m8",
-                        "match": "same_product",
-                        "reason": "matching variant anchors",
-                        "identity_evidence": ["dual camera", "WiFi"],
-                    }
-                ]
-            },
-            "sources": [
-                {
-                    "url": "https://manufacturer.test/m8",
-                    "title": "M8 product page",
-                    "site_name": "manufacturer",
-                }
-            ],
-            "request_id": "req-1",
+            "mode": "step3",
+            "status": "prepare_complete",
+            "product_url": "https://example.test/item",
+            "vertical": "Vehicle Camera System",
+            "brand": "Unbranded",
+            "live_schema": str(live),
+            "cold_resolver_manifest": str(cold_manifest),
+            "resolver_manifest": str(hot_manifest),
+            "fill_plan": str(fill_plan),
+            "fill_plan_manifest": str(fill_plan_manifest),
+            "fill_plan_summary": {"ready": 1, "blocked": 0},
+            "writes_performed": 0,
+            "save_clicked": False,
+            "send_to_qc_clicked": False,
         },
     )
 
     result = load_run_result(run)
 
+    assert result.workflow_mode == "step3"
+    assert result.workflow_status == "prepare_complete"
+    assert result.vertical == "Vehicle Camera System"
+    assert result.brand == "Unbranded"
     assert result.ready == 1
+    assert result.blocked == 0
     assert result.missing == 0
     assert result.conflict == 0
-    assert result.blocked == 0
-    assert result.cold.model_calls == 1
-    assert result.cold.cache_hits == 0
+    assert result.cold.model_calls == 3
     assert result.hot.model_calls == 0
-    assert result.hot.cache_hits == 1
-    assert result.hot.source_cache_hit is True
+    assert result.hot.cache_hits == 3
+    assert result.hot.web_cache_hits == 1
     assert result.safety.safe is True
-    assert result.fields[0].field_name == "Camera Type"
     assert result.fields[0].ai_result == "Dash Camera"
     assert result.fields[0].final_status == "READY"
-    assert result.web_candidates[0].match == "same_product"
-    assert result.web_candidates[0].title == "M8 product page"
+
+
+def test_result_loader_accepts_step1_partial_result_without_fake_step3_data(tmp_path: Path) -> None:
+    run = tmp_path / "workflow-step1"
+    _write(
+        run / "run-manifest.json",
+        {
+            "mode": "step1",
+            "status": "step1_complete",
+            "product_url": "https://example.test/item",
+            "vertical": "Vehicle Camera System",
+            "brand": "",
+            "writes_performed": 0,
+            "save_clicked": False,
+            "send_to_qc_clicked": False,
+        },
+    )
+
+    result = load_run_result(run)
+
+    assert result.workflow_mode == "step1"
+    assert result.vertical == "Vehicle Camera System"
+    assert result.brand == ""
+    assert result.live_field_count == 0
+    assert result.plan_summary == {}
+    assert result.ready == 0
+    assert result.fields == []
+    assert result.safety.safe is True

@@ -352,6 +352,10 @@ def _validated_citations(
     seen: set[tuple[str, str]] = set()
     for citation in citations:
         reference = citation.source_reference.strip()
+        # Models often copy the visual ``[source-id]`` delimiter from compact
+        # evidence.  Brackets are presentation, not part of the provenance ID.
+        if reference.startswith("[") and reference.endswith("]"):
+            reference = reference[1:-1].strip()
         valid = grounding.by_id(reference) is not None or reference in external_sources
         if not valid:
             warnings.append(
@@ -362,7 +366,12 @@ def _validated_citations(
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
-        output.append(citation)
+        output.append(
+            DecisionCitation(
+                source_reference=reference,
+                evidence_text=citation.evidence_text,
+            )
+        )
     return output
 
 
@@ -459,7 +468,11 @@ def validate_ai_decision_packet(
         decision.alternatives = validated_alternatives
 
         if decision.status == READY:
-            if not decision.values or not decision.citations:
+            meaningful_values = bool(decision.values) and all(
+                re.search(r"[\w\d]", value, flags=re.UNICODE)
+                for value in decision.values
+            )
+            if not meaningful_values or not decision.citations:
                 warnings.append(
                     f"{decision.field_id}: malformed READY converted to MISSING because value/citation is absent"
                 )
@@ -476,9 +489,11 @@ def validate_ai_decision_packet(
                 )
                 _set_missing(decision, decision.reason or "CONFLICT lacked two grounded alternatives")
         elif decision.status == REVIEW:
-            # REVIEW is retained only for backwards-compatible packet parsing.
-            # The clean production path has no review stage: unresolved goes to Web.
-            _set_missing(decision, decision.reason or "legacy REVIEW normalized to MISSING")
+            if not decision.values or not decision.citations:
+                warnings.append(
+                    f"{decision.field_id}: malformed REVIEW converted to MISSING because value/citation is absent"
+                )
+                _set_missing(decision, decision.reason or "REVIEW lacked candidate value/provenance")
         elif decision.status == MISSING:
             _set_missing(decision, decision.reason)
 

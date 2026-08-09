@@ -112,10 +112,147 @@ class GroundingCatalog:
         }
 
 
-def _snapshot_non_row_parts(snapshot: SourceSnapshot) -> list[str]:
-    """Keep non-row raw source structures separate instead of flattening them together."""
+_PRODUCT_DATA_ANCHOR = re.compile(
+    r"\b(?:offerId|offerLoginId|skuId|sku2|skuMap|skuProps|specId|detailUrl)\b",
+    re.IGNORECASE,
+)
 
-    parts: list[str] = []
+
+def _structured_assignments(value: str) -> list[str]:
+    """Extract exact scalar/object assignments for known supplier transport keys."""
+
+    output: list[str] = []
+    for match in re.finditer(
+        r'''(?P<key>["']?(?:offerId|offerLoginId|skuId|sku2|skuMap|skuProps|specId|detailUrl)["']?)\s*[:=]\s*''',
+        value,
+        flags=re.IGNORECASE,
+    ):
+        start = match.start("key")
+        cursor = match.end()
+        if cursor >= len(value):
+            continue
+        opening = value[cursor]
+        end = cursor
+        if opening in {'"', "'"}:
+            quote = opening
+            end += 1
+            escaped = False
+            while end < len(value):
+                char = value[end]
+                end += 1
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    break
+            else:
+                continue
+        elif opening in "[{":
+            pairs = {"[": "]", "{": "}"}
+            stack = [pairs[opening]]
+            end += 1
+            quote = ""
+            escaped = False
+            while end < len(value) and stack:
+                char = value[end]
+                end += 1
+                if quote:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == quote:
+                        quote = ""
+                    continue
+                if char in {'"', "'"}:
+                    quote = char
+                elif char in pairs:
+                    stack.append(pairs[char])
+                elif char == stack[-1]:
+                    stack.pop()
+            if stack:
+                continue
+        else:
+            token = re.match(r"[^,;\s)}\]]+", value[cursor:])
+            if token is None:
+                continue
+            end = cursor + token.end()
+        exact = value[start:end].strip()
+        if exact:
+            output.append(exact)
+    return output
+
+
+def _compact_embedded_data(items: Iterable[str]) -> list[str]:
+    """Keep exact product/variant records while discarding generic page scripts.
+
+    Source snapshots remain untouched on disk. This function only builds the
+    compact, citable text view sent to AI. It deliberately uses structural page
+    markers rather than product-category or marketplace-field semantics.
+    """
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        value = re.sub(r"\s+", " ", str(raw or "")).strip()
+        if not value:
+            continue
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = None
+        is_dom_record = bool(
+            isinstance(parsed, dict)
+            and set(parsed).issubset({"tag", "text", "attrs"})
+            and (str(parsed.get("text") or "").strip() or parsed.get("attrs"))
+        )
+        extracted = [value] if is_dom_record else _structured_assignments(value)
+        for exact in extracted:
+            fingerprint = exact.casefold()
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            candidates.append(exact)
+
+    # Capture currently emits overlapping windows around nearby structured-data
+    # markers. Keeping only the longest exact container is lossless and prevents
+    # the same page JSON from being sent repeatedly.
+    kept: list[str] = []
+    kept_folded: list[str] = []
+    for value in sorted(candidates, key=len, reverse=True):
+        folded = value.casefold()
+        if any(folded in existing for existing in kept_folded):
+            continue
+        kept.append(value)
+        kept_folded.append(folded)
+    kept.reverse()
+    return kept
+
+
+def _compact_visible_text(value: str) -> str:
+    """Remove session-only storefront chrome from otherwise citable page text."""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    # Delivery destinations depend on the signed-in browser/session, not the
+    # product. Preserve the surrounding labels while dropping the address.
+    text = re.sub(r"(?m)(^|\n)送至\s*\n[^\n]*(?=\n预计)", r"\1送至\n预计", text)
+    # Marketplace price explanations are generic legal boilerplate and the
+    # captured tail can end at a different character while the page is loading.
+    for marker in ("【平台活动下价格】", "【非平台活动下价格】"):
+        index = text.find(marker)
+        if index >= 0:
+            text = text[:index].rstrip()
+            break
+    return text
+
+
+def _snapshot_non_row_parts(snapshot: SourceSnapshot) -> list[tuple[str, str]]:
+    """Build a compact citable view while the full snapshot stays unchanged."""
+
+    parts: list[tuple[str, str]] = []
     identity: list[str] = []
     if snapshot.title:
         identity.append(f"Title: {snapshot.title}")
@@ -123,20 +260,23 @@ def _snapshot_non_row_parts(snapshot: SourceSnapshot) -> list[str]:
         if value:
             identity.append(f"Meta {key}: {value}")
     if identity:
-        parts.append("Page identity/meta:\n" + "\n".join(identity))
+        parts.append(("identity", "Page identity/meta:\n" + "\n".join(identity)))
 
     if snapshot.json_ld:
         parts.append(
-            "Page JSON-LD:\n"
-            + json.dumps(snapshot.json_ld, ensure_ascii=False, separators=(",", ":"))
+            (
+                "json-ld",
+                "Page JSON-LD:\n"
+                + json.dumps(snapshot.json_ld, ensure_ascii=False, separators=(",", ":")),
+            )
         )
-    if snapshot.embedded_data:
-        parts.append("Embedded page/variant data:\n" + "\n".join(snapshot.embedded_data))
-    if snapshot.image_urls:
-        parts.append("Large image URLs exposed by this exact page:\n" + "\n".join(snapshot.image_urls))
-    if snapshot.visible_text.strip():
-        parts.append("Rendered page text:\n" + snapshot.visible_text.strip())
-    return [part for part in parts if part.strip()]
+    embedded = _compact_embedded_data(snapshot.embedded_data)
+    if embedded:
+        parts.append(("embedded", "Embedded page/variant data:\n" + "\n".join(embedded)))
+    visible_text = _compact_visible_text(snapshot.visible_text)
+    if visible_text:
+        parts.append(("visible-text", "Rendered page text:\n" + visible_text))
+    return [(kind, part) for kind, part in parts if part.strip()]
 
 
 def chunk_text(
@@ -257,7 +397,7 @@ def _sources_from_snapshot(
 
     non_row_parts = _snapshot_non_row_parts(snapshot)
     if non_row_parts:
-        first = non_row_parts.pop(0)
+        part_kind, first = non_row_parts.pop(0)
         for chunk in chunk_text(first, max_chars=max_chars, overlap_chars=overlap_chars):
             sources.append(
                 _text_source(
@@ -265,7 +405,7 @@ def _sources_from_snapshot(
                     source_type=source_type,
                     ordinal=ordinal,
                     chunk_index=chunk_index,
-                    origin=origin,
+                    origin=f"{origin}#evidence={part_kind}",
                     content=chunk,
                 )
             )
@@ -288,7 +428,7 @@ def _sources_from_snapshot(
             )
         )
 
-    for part in non_row_parts:
+    for part_kind, part in non_row_parts:
         for chunk in chunk_text(part, max_chars=max_chars, overlap_chars=overlap_chars):
             sources.append(
                 _text_source(
@@ -296,7 +436,7 @@ def _sources_from_snapshot(
                     source_type=source_type,
                     ordinal=ordinal,
                     chunk_index=chunk_index,
-                    origin=origin,
+                    origin=f"{origin}#evidence={part_kind}",
                     content=chunk,
                 )
             )

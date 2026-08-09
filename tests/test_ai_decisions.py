@@ -118,6 +118,53 @@ def test_unknown_source_reference_cannot_authorize_ready(tmp_path):
     assert validated.decisions[0].citations == []
 
 
+def test_visual_brackets_around_a_real_source_id_are_transport_only(tmp_path):
+    colour = field("colour", "Colour", options=("Black", "White"))
+    sources = grounding(tmp_path)
+    packet = AIDecisionPacket(
+        identity=ProductIdentity(),
+        schema_sha256=schema_digest([colour]),
+        source_manifest_sha256=source_manifest_digest(sources),
+        decisions=[
+            FieldDecision(
+                field_id=field_id(colour),
+                status=READY,
+                values=["Black"],
+                citations=[
+                    DecisionCitation("[supplier:001:text:0001:abc]", "Colour: Black")
+                ],
+            )
+        ],
+    )
+
+    validated = validate_ai_decision_packet(packet, [colour], sources)
+
+    assert validated.decisions[0].status == READY
+    assert validated.decisions[0].citations[0].source_reference == "supplier:001:text:0001:abc"
+
+
+def test_punctuation_only_ready_value_is_not_executable(tmp_path):
+    colour = field("colour", "Colour")
+    sources = grounding(tmp_path)
+    packet = AIDecisionPacket(
+        identity=ProductIdentity(),
+        schema_sha256=schema_digest([colour]),
+        source_manifest_sha256=source_manifest_digest(sources),
+        decisions=[
+            FieldDecision(
+                field_id=field_id(colour),
+                status=READY,
+                values=["'],"],
+                citations=[DecisionCitation("supplier:001:text:0001:abc", "Colour: Black")],
+            )
+        ],
+    )
+
+    validated = validate_ai_decision_packet(packet, [colour], sources)
+
+    assert validated.decisions[0].status == MISSING
+
+
 def test_business_field_is_forced_locked_even_if_ai_returns_ready(tmp_path):
     selling = field(
         "flipkart_selling_price",
