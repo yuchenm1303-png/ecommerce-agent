@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 
 def main() -> int:
     try:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QColor, QCursor, QPainter, QPixmap
+        from PySide6.QtQml import QQmlApplicationEngine
+        from PySide6.QtQuick import QQuickWindow, QSGRendererInterface
         from PySide6.QtWidgets import QApplication
     except ImportError:
         print(
@@ -16,31 +21,49 @@ def main() -> int:
         )
         return 2
 
-    from gui.console_window import MainWindow
-    from gui.log_presenter import install_buffered_logs
-    from gui.nekro_card_fx import install_nekro_card_fx
-    from gui.nekro_effects import install_nekro_effects
-    from gui.visual_style import install_visual_style
+    # The production Windows GUI now has one rendering system only: Qt Quick's
+    # retained scene graph. Do not embed QQuickWidget/QOpenGLWidget into QWidget.
+    os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
+    if sys.platform.startswith("win"):
+        QQuickWindow.setGraphicsApi(QSGRendererInterface.GraphicsApi.Direct3D11)
+
+    from gui.quick_bridge import QuickBridge, WallpaperProvider
 
     app = QApplication(sys.argv)
-    app.setApplicationName("ecommerce-agent Read-only Lab")
+    app.setApplicationName("ecommerce-agent Acceptance Control Console")
     app.setOrganizationName("ecommerce-agent")
 
-    # One global filter gives every scrollable surface continuous per-pixel
-    # wheel scrolling (see gui/smooth_scroll.py).
-    from gui.smooth_scroll import SmoothWheelFilter
+    # Preserve the exact small white-dot cursor; the larger follower circle is
+    # rendered in the same Qt Quick scene as the wallpaper and sakura.
+    cursor_pixmap = QPixmap(10, 10)
+    cursor_pixmap.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(cursor_pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setPen(QColor(0, 0, 0, 0))
+    painter.setBrush(QColor(255, 255, 255, 255))
+    painter.drawEllipse(1, 1, 8, 8)
+    painter.end()
+    QApplication.setOverrideCursor(QCursor(cursor_pixmap, 4, 4))
 
-    app.installEventFilter(SmoothWheelFilter(app))
+    project_root = Path(__file__).resolve().parent
+    bridge = QuickBridge(project_root)
+    engine = QQmlApplicationEngine()
+    engine.addImageProvider("wallpaper", WallpaperProvider())
+    engine.rootContext().setContextProperty("bridge", bridge)
 
-    window = MainWindow(Path(__file__).resolve().parent)
-    visual = install_visual_style(window)
-    install_nekro_card_fx(window, visual)
-    install_buffered_logs(window)
-    effects = install_nekro_effects(window, sakura_count=3)
+    qml_path = project_root / "gui" / "qml" / "Main.qml"
+    engine.load(QUrl.fromLocalFile(str(qml_path)))
+    if not engine.rootObjects():
+        print(f"Qt Quick GUI failed to load: {qml_path}", file=sys.stderr)
+        return 3
 
-    window.show()
-    effects.raise_()
-    return app.exec()
+    # Keep Python-owned QObjects alive for the full QML engine lifetime.
+    app._gui_bridge = bridge  # type: ignore[attr-defined]
+    app._qml_engine = engine  # type: ignore[attr-defined]
+    try:
+        return app.exec()
+    finally:
+        QApplication.restoreOverrideCursor()
 
 
 if __name__ == "__main__":
