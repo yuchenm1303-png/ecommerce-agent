@@ -2,12 +2,12 @@
 
 Production pipeline:
 1) understand the complete local product once (images are used only here);
-2) map the compact product profile into small live-field batches in parallel;
-3) research only unresolved fields in bounded parallel web batches;
-4) run one text-only final resolve over fields that received web evidence.
+2) fill Makro fields from that local Product Profile in small parallel batches;
+3) web-search only fields still unresolved after the local pass, and fill them directly.
 
-AI owns product semantics. Python owns scheduling, provenance, seller-business locks,
-schema identity, hard marketplace constraints and browser safety downstream.
+There is one field table throughout the workflow. Local READY/CONFLICT values are frozen;
+web search only fills blanks. Python owns scheduling, provenance, seller-business locks,
+schema identity, mechanical marketplace constraints and browser safety downstream.
 """
 
 from __future__ import annotations
@@ -48,23 +48,21 @@ from app.semantic_grounding import build_grounding_catalog
 from app.web_enrichment import WebEnrichmentResult, run_web_enrichment, write_enriched_ai_decision_packet
 
 
-EXECUTION_MODEL = (
-    "product_profile_then_parallel_field_mapping_then_parallel_web_research_then_final_text_resolve"
-)
+EXECUTION_MODEL = "product_profile_then_parallel_local_fill_then_parallel_web_fill"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "以 Makro live schema 为目标：图片/原始资料只做一次商品理解，再用 compact profile 并行映射字段，"
-            "仅对 unresolved 字段并行联网研究，最后做一次 text-only 补全。全程不打开或修改 Makro。"
+            "以 Makro live schema 为目标：图片/原始资料只理解一次，本地资料先填字段，"
+            "只对仍为空的字段并行联网搜索并直接补入同一张字段表。全程不打开或修改 Makro。"
         )
     )
     parser.add_argument("--provider", choices=SUPPORTED_PROVIDERS, default="openai-compatible")
     parser.add_argument(
         "--model",
         default="qwen3.7-plus",
-        help="商品理解、字段映射和最终 text-only resolve 模型；默认 qwen3.7-plus。",
+        help="商品理解和本地字段填写模型；默认 qwen3.7-plus。",
     )
     parser.add_argument("--api-key-env", default=None)
     parser.add_argument("--base-url", default="")
@@ -116,20 +114,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--field-batch-size",
         type=int,
         default=12,
-        help="字段映射机械分批大小；只按 live schema 顺序切片，不按商品语义分组。",
+        help="本地字段填写机械分批大小；只按 live schema 顺序切片。",
     )
     parser.add_argument(
         "--field-concurrency",
         type=int,
         default=4,
-        help="字段映射最大并发请求数。",
+        help="本地字段填写最大并发请求数。",
     )
 
     parser.add_argument("--web-enrich", choices=("auto", "off"), default="auto")
     parser.add_argument(
         "--web-search-model",
         default="qwen3.7-max",
-        help="Responses web_search 研究模型；默认 qwen3.7-max。",
+        help="联网补空字段的 Responses web_search 模型；默认 qwen3.7-max。",
     )
     parser.add_argument(
         "--web-base-url",
@@ -142,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--semantic-cache-dir",
         default="logs/semantic-cache",
-        help="Product Profile、字段 batch、Web Research、Final Resolve 的 content-addressed cache 根目录。",
+        help="Product Profile、本地字段 batch、Web Fill batch 的 content-addressed cache 根目录。",
     )
     parser.add_argument("--no-semantic-cache", action="store_true")
     parser.add_argument("--output-dir", default="logs/ai-resolver")
@@ -205,7 +203,7 @@ def _search_requests(decisions: list[Any], fields: list[dict[str, Any]]) -> list
     field_by_id = {field_id(item): item for item in fields}
     output: list[dict[str, Any]] = []
     for decision in decisions:
-        if decision.status not in {MISSING, REVIEW, CONFLICT}:
+        if decision.status not in {MISSING, REVIEW}:
             continue
         item = field_by_id.get(decision.field_id, {})
         output.append(
@@ -307,7 +305,7 @@ def main() -> int:
     )
     print(f"execution_model={EXECUTION_MODEL}", flush=True)
     print(
-        f"field_batches=size:{args.field_batch_size},concurrency:{args.field_concurrency}; "
+        f"local_batches=size:{args.field_batch_size},concurrency:{args.field_concurrency}; "
         f"web_batches=size:{args.web_batch_size},concurrency:{args.web_concurrency}",
         flush=True,
     )
@@ -327,7 +325,7 @@ def main() -> int:
         flush=True,
     )
 
-    _set_progress(provider, "MAP")
+    _set_progress(provider, "LOCAL")
     mapping_result = run_field_mapping(
         provider,
         live_fields,
@@ -345,23 +343,21 @@ def main() -> int:
     search_path = output_dir / "search-requests.json"
     search_path.write_text(json.dumps(search_requests, ensure_ascii=False, indent=2), encoding="utf-8")
     print(
-        f"mapping=DONE batches={mapping_result.batch_count} calls={mapping_result.model_calls} "
+        f"local_fill=DONE batches={mapping_result.batch_count} calls={mapping_result.model_calls} "
         f"cache_hits={mapping_result.cache_hits} failed_batches={mapping_result.failed_batches} "
-        f"elapsed={mapping_result.elapsed_seconds:.3f}s unresolved={len(search_requests)}",
+        f"elapsed={mapping_result.elapsed_seconds:.3f}s blanks_for_web={len(search_requests)}",
         flush=True,
     )
 
     web_provider, web_availability = _dashscope_web_provider(args, provider_config)
     if search_requests and web_provider is not None:
         _set_progress(web_provider, "WEB")
-        _set_progress(provider, "FINAL")
         print(
-            f"web_research=START targets={len(search_requests)} model={web_provider.model}",
+            f"web_fill=START targets={len(search_requests)} model={web_provider.model}",
             flush=True,
         )
         web_result = run_web_enrichment(
             web_provider,
-            provider,
             local_packet,
             live_fields,
             grounding,
@@ -369,18 +365,12 @@ def main() -> int:
             batch_size=args.web_batch_size,
             concurrency=args.web_concurrency,
             cache_dir=cache_dir,
-            final_cache_namespace=namespace,
         )
         print(
-            f"web_research=DONE batches={web_result.search_batch_count} calls={web_result.search_model_calls} "
+            f"web_fill=DONE batches={web_result.search_batch_count} calls={web_result.search_model_calls} "
             f"cache_hits={web_result.search_cache_hits} failed_batches={web_result.search_failed_batches} "
             f"evidence={len(web_result.evidence)} sources={len(web_result.web_sources)} "
             f"elapsed={web_result.search_elapsed_seconds:.3f}s",
-            flush=True,
-        )
-        print(
-            f"final_resolve=DONE calls={web_result.final_model_calls} cache_hit={web_result.final_cache_hit} "
-            f"elapsed={web_result.final_elapsed_seconds:.3f}s",
             flush=True,
         )
         for warning in web_result.warnings:
@@ -388,7 +378,7 @@ def main() -> int:
     else:
         reason = "no unresolved non-business fields" if not search_requests else web_availability
         web_result = _empty_web_result(local_packet, reason)
-        print(f"web_research=SKIP reason={reason}", flush=True)
+        print(f"web_fill=SKIP reason={reason}", flush=True)
 
     packet_path = write_enriched_ai_decision_packet(
         web_result.packet,
@@ -411,7 +401,6 @@ def main() -> int:
         profile_result.model_calls
         + mapping_result.model_calls
         + web_result.search_model_calls
-        + web_result.final_model_calls
     )
     total_elapsed = time.monotonic() - started
     run_manifest = output_dir / "run-manifest.json"
@@ -434,7 +423,7 @@ def main() -> int:
                     "fact_count": len(profile_result.profile.facts),
                     "elapsed_seconds": round(profile_result.elapsed_seconds, 3),
                 },
-                "field_mapping": {
+                "local_fill": {
                     "batch_size": args.field_batch_size,
                     "concurrency": args.field_concurrency,
                     "batch_count": mapping_result.batch_count,
@@ -444,23 +433,20 @@ def main() -> int:
                     "elapsed_seconds": round(mapping_result.elapsed_seconds, 3),
                     "decision_summary": local_summary,
                 },
-                "web_enrichment": {
+                "web_fill": {
                     "mode": args.web_enrich,
                     "availability": web_availability,
                     "requested_fields": len(search_requests),
                     "searched": web_result.searched,
                     "batch_size": args.web_batch_size,
                     "concurrency": args.web_concurrency,
-                    "search_batch_count": web_result.search_batch_count,
-                    "search_model_calls": web_result.search_model_calls,
-                    "search_cache_hits": web_result.search_cache_hits,
-                    "search_failed_batches": web_result.search_failed_batches,
+                    "batch_count": web_result.search_batch_count,
+                    "model_calls": web_result.search_model_calls,
+                    "cache_hits": web_result.search_cache_hits,
+                    "failed_batches": web_result.search_failed_batches,
                     "evidence_count": len(web_result.evidence),
                     "source_count": len(web_result.web_sources),
-                    "search_elapsed_seconds": round(web_result.search_elapsed_seconds, 3),
-                    "final_model_calls": web_result.final_model_calls,
-                    "final_cache_hit": web_result.final_cache_hit,
-                    "final_elapsed_seconds": round(web_result.final_elapsed_seconds, 3),
+                    "elapsed_seconds": round(web_result.search_elapsed_seconds, 3),
                     "warnings": list(web_result.warnings),
                 },
                 "final_decision_summary": final_summary,
@@ -492,9 +478,9 @@ def main() -> int:
         flush=True,
     )
     print(
-        f"profile_calls={profile_result.model_calls}, mapping_calls={mapping_result.model_calls}, "
-        f"web_search_calls={web_result.search_model_calls}, final_calls={web_result.final_model_calls}, "
-        f"total_calls={total_model_calls}, wall={total_elapsed:.3f}s",
+        f"profile_calls={profile_result.model_calls}, local_fill_calls={mapping_result.model_calls}, "
+        f"web_fill_calls={web_result.search_model_calls}, total_calls={total_model_calls}, "
+        f"wall={total_elapsed:.3f}s",
         flush=True,
     )
     print(f"Product profile: {profile_path}", flush=True)
