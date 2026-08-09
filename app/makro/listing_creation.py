@@ -273,6 +273,30 @@ def is_brand_selected_confirmation(page: Page, selected_brand: str) -> bool:
     )
 
 
+def _create_new_listing_content(page: Page) -> bool:
+    text = normalize_label(_body_text(page))
+    return normalize_label("You can start selling under this brand") in text
+
+
+def _create_new_listing_button(page: Page):
+    pattern = re.compile(r"^\s*create\s+new\s+listing\s*$", re.IGNORECASE)
+    button = _first_visible(page.get_by_role("button", name=pattern))
+    if button is None:
+        button = _first_visible(page.get_by_text(pattern))
+    return button
+
+
+def is_brand_ready_to_create_listing(page: Page, selected_brand: str) -> bool:
+    text = normalize_label(_body_text(page))
+    selected = normalize_label(selected_brand)
+    return bool(
+        selected
+        and selected in text
+        and _create_new_listing_content(page)
+        and _create_new_listing_button(page) is not None
+    )
+
+
 def _wait_for(predicate, page: Page, *, timeout_s: float = 15.0, poll_s: float = 0.2) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -523,20 +547,49 @@ def _advance_vertical_confirmation(page: Page, selected: str) -> None:
         )
 
 
+def _click_create_new_listing(page: Page, selected: str) -> None:
+    text = normalize_label(_body_text(page))
+    if normalize_label(selected) not in text:
+        raise RuntimeError(
+            f"Makro Step 2 create-listing confirmation mismatch: selected={selected!r}"
+        )
+    if not _create_new_listing_content(page):
+        raise RuntimeError(
+            "Makro Step 2 exposed Create New Listing without the expected brand-ready confirmation text"
+        )
+    button = _create_new_listing_button(page)
+    if button is None:
+        raise RuntimeError(
+            "Makro Step 2 brand is ready, but the exact Create New Listing button was not found"
+        )
+    button.click(timeout=5000)
+    if not _wait_for(is_product_info_step, page, timeout_s=15.0):
+        raise RuntimeError(
+            "Makro Step 2 clicked Create New Listing, but Step 3 did not appear"
+        )
+
+
 def _advance_brand_confirmation(page: Page, selected: str) -> None:
     transitioned = _wait_for(
         lambda current: is_product_info_step(current)
         or _brand_confirmation_content(current)
-        or _brand_confirmation_button(current) is not None,
+        or _brand_confirmation_button(current) is not None
+        or _create_new_listing_content(current)
+        or _create_new_listing_button(current) is not None,
         page,
         timeout_s=15.0,
     )
     if not transitioned:
         raise RuntimeError(
-            f"Makro Step 2 selected brand {selected!r}, but neither Step 3 nor the brand confirmation appeared"
+            f"Makro Step 2 selected brand {selected!r}, but no confirmation or create-listing state appeared"
         )
     if is_product_info_step(page):
         return
+
+    if _create_new_listing_content(page) or _create_new_listing_button(page) is not None:
+        _click_create_new_listing(page, selected)
+        return
+
     text = normalize_label(_body_text(page))
     if normalize_label(selected) not in text:
         raise RuntimeError(
@@ -548,10 +601,21 @@ def _advance_brand_confirmation(page: Page, selected: str) -> None:
             "Makro Step 2 brand confirmation appeared, but no exact Select/Confirm/Use Brand button was found"
         )
     button.click(timeout=5000)
-    if not _wait_for(is_product_info_step, page, timeout_s=15.0):
+
+    advanced = _wait_for(
+        lambda current: is_product_info_step(current)
+        or _create_new_listing_content(current)
+        or _create_new_listing_button(current) is not None,
+        page,
+        timeout_s=15.0,
+    )
+    if not advanced:
         raise RuntimeError(
-            "Makro Step 2 clicked the brand confirmation button, but Step 3 did not appear"
+            "Makro Step 2 clicked the brand confirmation button, but neither Step 3 nor Create New Listing appeared"
         )
+    if is_product_info_step(page):
+        return
+    _click_create_new_listing(page, selected)
 
 
 def select_vertical(
@@ -747,6 +811,7 @@ __all__ = [
     "choose_brand_candidate",
     "choose_vertical_candidate",
     "infer_listing_bootstrap",
+    "is_brand_ready_to_create_listing",
     "is_brand_step",
     "is_brand_selected_confirmation",
     "is_product_info_step",
