@@ -44,10 +44,14 @@ def test_trace_tables_have_readable_density_and_compact_header() -> None:
     assert "header_row.addWidget(hint, 0, Qt.AlignmentFlag.AlignBottom)" in POLISH
 
 
-def test_data_surfaces_are_more_opaque_than_wallpaper_glass() -> None:
-    assert "background-color: rgba(3,8,14,158);" in POLISH
-    assert "background-color: rgba(13,21,31,212);" in POLISH
-    assert "background-color: rgba(2,7,13,174);" in POLISH
+def test_polish_keeps_baseline_neutral_glass_palette() -> None:
+    assert "background-color: rgba(0,0,0,62);" in POLISH
+    assert "background-color: rgba(255,255,255,30);" in POLISH
+    assert "background-color: rgba(0,0,0,78);" in POLISH
+    assert "background-color: rgba(0,0,0,66);" in POLISH
+    assert "background-color: rgba(255,255,255,28);" in POLISH
+    assert "rgba(13,21,31,212)" not in POLISH
+    assert "rgba(2,7,13,174)" not in POLISH
     assert "QComboBox QAbstractItemView" in POLISH
     assert "QTabWidget::pane" in POLISH
 
