@@ -7,6 +7,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GUI_SOURCES = [
     PROJECT_ROOT / "run_local_gui.py",
     PROJECT_ROOT / "gui" / "main_window.py",
+    PROJECT_ROOT / "gui" / "console_window.py",
+    PROJECT_ROOT / "gui" / "acceptance_console.py",
     PROJECT_ROOT / "gui" / "readonly_runner.py",
     PROJECT_ROOT / "gui" / "result_loader.py",
     PROJECT_ROOT / "gui" / "visual_style.py",
