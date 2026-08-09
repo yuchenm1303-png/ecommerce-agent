@@ -1,13 +1,8 @@
-"""Read-only Makro live-schema scanner and AI-decision Fill Plan builder.
+"""Read-only Makro live-schema scanner and Fill Plan builder.
 
-One CLI owns both read-only phases:
-
-- ``--scan-live-schema`` discovers the current live Makro fields before AI runs.
-- ``--decision-packet`` rebinds a completed AI decision packet to the same source
-  pack, verifies the current page still matches ``--live-schema``, and writes the
-  final Fill Plan.
-
-Neither mode fills, saves, uploads or submits the listing.
+The final plan rebinds the AI packet only to the exact sources captured from the
+supplier URL.  Old QA answers and manually supplied seller SKU are not product
+identity inputs.  SKU is generated mechanically from the source URL.
 """
 
 from __future__ import annotations
@@ -22,6 +17,8 @@ from playwright.sync_api import sync_playwright
 
 from app.ai_decisions import load_ai_decision_packet
 from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness
+from app.business_fields import generate_listing_sku, generated_business_bundle
+from app.evidence_contract import ProductIdentity
 from app.fill_plan import build_live_fill_plan
 from app.fill_plan_report import write_fill_plan_json, write_fill_plan_xlsx
 from app.live_schema import assert_live_schema_matches, load_live_schema, write_live_schema
@@ -29,16 +26,14 @@ from app.makro import MAKRO_HOME_URL, is_listing_url
 from app.makro.direct_visual_hold import is_listing_attribute_field
 from app.makro.domain import MakroDomainAdapter
 from app.makro.listing_preflight import CORE_FORM_SECTIONS
-from app.product_context import build_ai_product_context
-from app.qa_catalog import load_question_catalog
-from app.resolver_inputs import ResolutionInputSpec
 from app.semantic_grounding import build_grounding_catalog
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "只读 Makro planner：首次扫描 live schema，或验证 AI decisions 并生成 Fill Plan。"
+            "只读 Makro planner：首次扫描 live schema，或把单一商品链接 Resolver 的 "
+            "AI decisions 重新绑定到同一批原始来源后生成 Fill Plan。"
         )
     )
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -51,19 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--decision-packet",
         help="makro_resolve_ai.py 生成的 ai-decisions.json；用于最终只读 Fill Plan。",
     )
-    parser.add_argument("--qa", default=None, help="最终 Fill Plan/rebind 模式必填；scan 模式不需要。")
     parser.add_argument("--live-schema", default=None, help="最终 Fill Plan 模式必填。")
-    parser.add_argument("--sku", default="")
-    parser.add_argument("--expected-model", default="")
-    parser.add_argument("--expected-brand", default="")
-    parser.add_argument("--product-table", default=None)
-    parser.add_argument("--facts-json", action="append", default=[])
+    parser.add_argument("--product-url", default=None, help="最终 Fill Plan 模式必填；必须与 Resolver 使用同一商品链接。")
     parser.add_argument("--supplier-snapshot", action="append", default=[])
     parser.add_argument("--official-snapshot", action="append", default=[])
-    parser.add_argument("--supplemental-text", default="")
-    parser.add_argument("--supplemental-text-file", default=None)
     parser.add_argument("--image", action="append", default=[])
-    parser.add_argument("--product-url", default=None)
     parser.add_argument("--expected-vertical", required=True)
     parser.add_argument("--profile-dir", default="browser_profiles/makro-edge")
     parser.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT)
@@ -80,26 +67,10 @@ def _validate_mode(args: argparse.Namespace) -> None:
         if args.live_schema:
             raise SystemExit("--scan-live-schema 不接受 --live-schema；它本身就是生成 live schema。")
         return
-    if not args.qa:
-        raise SystemExit("最终 Fill Plan 模式必须提供 --qa。")
     if not args.live_schema:
         raise SystemExit("最终 Fill Plan 模式必须提供 --live-schema。")
-
-
-def _input_spec(args: argparse.Namespace) -> ResolutionInputSpec:
-    return ResolutionInputSpec(
-        sku=args.sku,
-        expected_model=args.expected_model,
-        expected_brand=args.expected_brand,
-        product_table=args.product_table,
-        facts_json=tuple(args.facts_json),
-        supplier_snapshots=tuple(args.supplier_snapshot),
-        official_snapshots=tuple(args.official_snapshot),
-        supplemental_text=args.supplemental_text,
-        supplemental_text_file=args.supplemental_text_file,
-        image_paths=tuple(args.image),
-        product_url=args.product_url,
-    )
+    if not str(args.product_url or "").strip():
+        raise SystemExit("最终 Fill Plan 模式必须提供与 Resolver 相同的 --product-url。")
 
 
 def _assert_single_listing_tab(context: Any) -> None:
@@ -155,18 +126,14 @@ def main() -> int:
         raise SystemExit("--overlap-chars 必须 >=0 且小于 --max-text-chars")
 
     decision_packet = None
-    product_context = None
+    business_bundle = None
     planned_live_fields: list[dict[str, Any]] | None = None
     if not args.scan_live_schema:
-        customer_catalog = load_question_catalog(args.qa)
         planned_live_fields = load_live_schema(args.live_schema)
-        spec = _input_spec(args)
-        product_context = build_ai_product_context(customer_catalog, spec)
         grounding = build_grounding_catalog(
             image_paths=args.image,
             supplier_snapshots=args.supplier_snapshot,
             official_snapshots=args.official_snapshot,
-            supplemental_text=product_context.text,
             max_text_chars=args.max_text_chars,
             overlap_chars=args.overlap_chars,
         )
@@ -174,8 +141,9 @@ def main() -> int:
             args.decision_packet,
             planned_live_fields,
             grounding,
-            expected_identity=product_context.trusted_inputs.expected_identity,
+            expected_identity=ProductIdentity(),
         )
+        business_bundle = generated_business_bundle(str(args.product_url))
 
     with sync_playwright() as playwright:
         harness = EdgeHarness(
@@ -246,12 +214,12 @@ def main() -> int:
 
         assert planned_live_fields is not None
         assert decision_packet is not None
-        assert product_context is not None
+        assert business_bundle is not None
         assert_live_schema_matches(planned_live_fields, semantic_fields)
         plan = build_live_fill_plan(
             decision_packet,
             semantic_fields,
-            product_context.trusted_inputs.bundle,
+            business_bundle,
         )
 
         json_path = write_fill_plan_json(plan, output_dir / "fill-plan.json")
@@ -260,10 +228,11 @@ def main() -> int:
         manifest.write_text(
             json.dumps(
                 {
-                    "mode": "read_only_ai_decision_fill_plan",
+                    "mode": "read_only_single_url_ai_decision_fill_plan",
                     "page_url": page.url,
                     "expected_vertical": args.expected_vertical,
-                    "qa_source": str(Path(args.qa).resolve()),
+                    "product_url": str(args.product_url),
+                    "generated_listing_sku": generate_listing_sku(str(args.product_url)),
                     "decision_packet": str(Path(args.decision_packet).resolve()),
                     "input_live_schema": str(Path(args.live_schema).resolve()),
                     "output_live_schema": str(live_schema_path.resolve()),
@@ -287,6 +256,7 @@ def main() -> int:
         summary = plan.summary()
         print("===== MAKRO AI-DECISION FILL PLAN =====")
         print(f"page={page.url}")
+        print(f"generated_listing_sku={generate_listing_sku(str(args.product_url))}")
         print(
             f"live_fields={summary['live_field_count']}, ready={summary['ready']}, "
             f"preview_eligible={summary['preview_eligible']}, blocked={summary['blocked']}"
