@@ -6,14 +6,11 @@ import random
 from dataclasses import dataclass
 
 from PySide6.QtCore import QEvent, QObject, QPointF, QRect, Qt, QTimer
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPixmap, QRegion
+from PySide6.QtGui import QColor, QCursor, QPainter, QPixmap, QRegion
 from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
 
 
 # One and only dynamic presentation surface.
-# Sakura artwork/motion and cursor follower semantics are ported from the
-# captured nekro.top / imsyy-home implementation. The only intentional visual
-# difference is particle count: 12 instead of the source site's 50.
 _FRAME_MS = 16
 _FOLLOW_FACTOR = 0.35
 _CURSOR_RADIUS = 9.0
@@ -74,7 +71,6 @@ class SakuraParticle:
         )
 
     def update(self, width: int, height: int) -> None:
-        # One fixed source step per rendered frame, matching requestAnimationFrame.
         self.x += 0.5 * self.fnx_n - 1.7
         self.y += self.fny_n
         self.r += self.fnr_n
@@ -99,10 +95,10 @@ class NekroEffects(QWidget):
         central = window.centralWidget()
         super().__init__(central)
         self.window = window
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAutoFillBackground(False)
-        self.setFocusPolicy(Qt.NoFocus)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         width = max(1, central.width() if central else window.width())
         height = max(1, central.height() if central else window.height())
@@ -117,8 +113,8 @@ class NekroEffects(QWidget):
             self._sprite_cache[size] = source.scaled(
                 size,
                 size,
-                Qt.IgnoreAspectRatio,
-                Qt.SmoothTransformation,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
             )
 
         self.cursor_target: QPointF | None = None
@@ -126,16 +122,13 @@ class NekroEffects(QWidget):
         self.cursor_visible = False
         self.cursor_pressed = False
 
-        window.setMouseTracking(True)
-        for widget in window.findChildren(QWidget):
-            widget.setMouseTracking(True)
-
-        app = QApplication.instance()
-        if app is not None:
-            app.installEventFilter(self)
+        # Window lifecycle events are sufficient here. Pointer coordinates are
+        # sampled in the existing animation frame, avoiding another global
+        # QApplication event filter and thousands of Python MouseMove callbacks.
+        window.installEventFilter(self)
 
         self.timer = QTimer(self)
-        self.timer.setTimerType(Qt.PreciseTimer)
+        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.setInterval(_FRAME_MS)
         self.timer.timeout.connect(self._frame)
         self.timer.start()
@@ -160,11 +153,17 @@ class NekroEffects(QWidget):
             return None
         return QPointF(local)
 
-    def _set_cursor_target(self, point: QPointF) -> None:
-        self.cursor_target = QPointF(point)
+    def _sample_pointer(self) -> None:
+        local = self._point_in_central(QPointF(QCursor.pos()))
+        if local is None:
+            self.cursor_visible = False
+            self.cursor_pressed = False
+            return
+        self.cursor_target = local
         if self.cursor_current is None:
-            self.cursor_current = QPointF(point)
+            self.cursor_current = QPointF(local)
         self.cursor_visible = True
+        self.cursor_pressed = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
 
     def _frame(self) -> None:
         if not self.isVisible() or self.window.isMinimized():
@@ -172,6 +171,7 @@ class NekroEffects(QWidget):
                 self.timer.stop()
             return
 
+        self._sample_pointer()
         width = max(1, self.width())
         height = max(1, self.height())
         dirty = QRegion()
@@ -204,8 +204,8 @@ class NekroEffects(QWidget):
     def paintEvent(self, event) -> None:  # type: ignore[override]
         painter = QPainter(self)
         painter.setClipRegion(event.region())
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
 
         for particle in self.particles:
             size = max(1, min(40, int(round(40.0 * particle.s))))
@@ -217,7 +217,7 @@ class NekroEffects(QWidget):
             painter.restore()
 
         if self.cursor_visible and self.cursor_current is not None:
-            painter.setPen(Qt.NoPen)
+            painter.setPen(Qt.PenStyle.NoPen)
             radius = _ACTIVE_CURSOR_RADIUS if self.cursor_pressed else _CURSOR_RADIUS
             alpha = 128 if self.cursor_pressed else 64
             painter.setBrush(QColor(255, 255, 255, alpha))
@@ -226,44 +226,31 @@ class NekroEffects(QWidget):
         painter.end()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if watched is not self.window:
+            return False
+
         event_type = event.type()
-
-        if watched is self.window:
-            if event_type in (QEvent.Resize, QEvent.Show):
-                QTimer.singleShot(0, self.sync_geometry)
-                if not self.timer.isActive() and not self.window.isMinimized():
-                    self.timer.start()
-            elif event_type == QEvent.Hide:
+        if event_type in (QEvent.Type.Resize, QEvent.Type.Show):
+            QTimer.singleShot(0, self.sync_geometry)
+            if not self.timer.isActive() and not self.window.isMinimized():
+                self.timer.start()
+        elif event_type == QEvent.Type.Hide:
+            self.timer.stop()
+        elif event_type == QEvent.Type.WindowStateChange:
+            if self.window.isMinimized():
                 self.timer.stop()
-            elif event_type == QEvent.WindowStateChange:
-                if self.window.isMinimized():
-                    self.timer.stop()
-                elif not self.timer.isActive():
-                    self.timer.start()
-            elif event_type == QEvent.Leave:
-                self.cursor_visible = False
-
-        if isinstance(event, QMouseEvent):
-            local = self._point_in_central(event.globalPosition())
-            if local is not None:
-                if event_type == QEvent.MouseMove:
-                    self._set_cursor_target(local)
-                elif event_type == QEvent.MouseButtonPress:
-                    self._set_cursor_target(local)
-                    self.cursor_pressed = True
-                elif event_type == QEvent.MouseButtonRelease:
-                    self._set_cursor_target(local)
-                    self.cursor_pressed = False
-            elif event_type == QEvent.MouseMove:
-                self.cursor_visible = False
-
+            elif not self.timer.isActive():
+                self.timer.start()
+        elif event_type == QEvent.Type.Leave:
+            self.cursor_visible = False
         return False
 
     def _cleanup(self) -> None:
         self.timer.stop()
-        app = QApplication.instance()
-        if app is not None:
-            app.removeEventFilter(self)
+        try:
+            self.window.removeEventFilter(self)
+        except RuntimeError:
+            pass
 
 
 def install_nekro_effects(
