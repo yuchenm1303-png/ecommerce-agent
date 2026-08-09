@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,11 +24,7 @@ def _sha256_text(text: str) -> str:
 
 @dataclass(slots=True, frozen=True)
 class GroundedSource:
-    """One exact source unit the whole-product AI may cite.
-
-    Long text can be split into citation chunks, but chunking is only a source
-    integrity/detail mechanism. It never determines model execution count.
-    """
+    """One exact source unit the AI may cite."""
 
     source_id: str
     source_type: str
@@ -122,9 +119,16 @@ def _snapshot_text(snapshot: SourceSnapshot) -> str:
     for key, value in snapshot.meta.items():
         if value:
             parts.append(f"Meta {key}: {value}")
+    if snapshot.table_rows:
+        parts.append(
+            "Structured page rows:\n"
+            + "\n".join(f"- {row.key}: {row.value}" for row in snapshot.table_rows if row.key and row.value)
+        )
+    if snapshot.json_ld:
+        parts.append("Page JSON-LD:\n" + json.dumps(snapshot.json_ld, ensure_ascii=False, separators=(",", ":")))
     if snapshot.visible_text.strip():
-        parts.append(snapshot.visible_text.strip())
-    return "\n".join(parts).strip()
+        parts.append("Rendered page text:\n" + snapshot.visible_text.strip())
+    return "\n".join(part for part in parts if part.strip()).strip()
 
 
 def chunk_text(
@@ -227,12 +231,7 @@ def build_grounding_catalog(
     max_text_chars: int = 3000,
     overlap_chars: int = 250,
 ) -> GroundingCatalog:
-    """Create the exact source universe visible to the whole-product AI.
-
-    Source ids bind content digests, so stale AI decisions fail closed after any
-    image/page/context change. All resulting sources are submitted in the same
-    normal-path AI request.
-    """
+    """Create the exact source universe visible to the field-filling AI."""
 
     sources: list[GroundedSource] = []
 
