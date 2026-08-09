@@ -27,8 +27,8 @@ from .semantic_grounding import GroundingCatalog, TEXT_KIND
 from .source_bundle import normalize_key
 
 
-WEB_SEARCH_CONTRACT_VERSION = 16
-WEB_SEARCH_CACHE_VERSION = 16
+WEB_SEARCH_CONTRACT_VERSION = 19
+WEB_SEARCH_CACHE_VERSION = 19
 WEB_FILLABLE_STATUSES = {MISSING, REVIEW}
 STRONG_IDENTITY_BASES = {
     "canonical_offer_or_url",
@@ -127,6 +127,9 @@ class WebEnrichmentResult:
     search_failed_batches: int = 0
     searched: bool = False
     search_elapsed_seconds: float = 0.0
+    researched_fact_count: int = 0
+    reported_query_count: int = 0
+    inspected_source_count: int = 0
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -317,15 +320,18 @@ def _research_prompt(
             for field, decision in targets
         ],
         "workflow": [
-            "Actually invoke the built-in Web search tool now. Search for this product, its model family, and genuinely comparable products using a few product-level queries.",
+            "Actually invoke the built-in Web search tool now. Perform 3 to 5 distinct product-level queries covering exact product identity, manufacturer/model, manuals/specification pages, and genuinely comparable products.",
+            "Inspect multiple non-duplicate real pages when available. Read their specification tables and manuals instead of relying only on search-result titles or snippets.",
             "Reuse the real pages returned by the tool across all unresolved fields; do not invent or guess URLs.",
             "Classify returned pages as same_product, same_product_family, similar_product, uncertain, or different_product. Reject only clearly different_product pages.",
-            "Return fields supported by the returned pages. A separate text-only inference stage handles everything still unresolved.",
+            "First extract a compact source_facts catalog containing every useful product specification found on accepted pages, even when no current target uses it.",
+            "Then map the source_facts to every directly supported target field. Do not stop after an arbitrary number of easy fields. A separate text-only inference stage handles everything still unresolved.",
         ],
         "rules": [
             "Locally READY and CONFLICT fields are frozen and must never be rewritten.",
             "Exact product identity is preferred but not required. Similar and uncertain pages may provide evidence; only different_product is unusable.",
             "Every citation URL must be a real URL returned by this Web search call. For inferred values, cite the closest comparable-product evidence and explain the inference.",
+            "A URL merely present in canonical_product or the prompt is identity context, not a returned Web source. Never copy it into source_url unless the search tool actually returned it.",
             "Use READY for direct comparable-product evidence, REVIEW for material uncertainty, and CONFLICT for direct disagreement.",
             "Do not rotate dimension axes or mix packaging/body/mount, cabin/rear, documentation/device-interface language, product/vehicle compatibility, display resolution/recording resolution, or other neighboring field scopes.",
             "If multi_value=false return one value. If qualifier_options exist, use an exact allowed qualifier; if qualifier_options are empty, qualifier must be empty.",
@@ -334,6 +340,10 @@ def _research_prompt(
             "Return one JSON object only.",
         ],
         "json_contract": {
+            "research_summary": {
+                "queries_executed": ["actual product-level query"],
+                "inspected_source_count": 0,
+            },
             "source_matches": [
                 {
                     "source_url": "exact URL returned by this web search",
@@ -341,6 +351,16 @@ def _research_prompt(
                     "identity_basis": "canonical_offer_or_url | exact_variant_identifier | manufacturer_identifier | global_trade_identifier | explicit_cross_reference | generic_model_or_similarity | none",
                     "reason": "short identity judgment",
                     "identity_evidence": ["concrete evidence for the declared identity basis"],
+                }
+            ],
+            "source_facts": [
+                {
+                    "source_url": "exact URL returned by this web search",
+                    "name": "short specification name",
+                    "scope": "product_body | packaging | mount | front_camera | cabin_camera | rear_camera | general",
+                    "value": "exact value found on the page",
+                    "qualifier": "unit when present",
+                    "evidence_text": "direct text from the page supporting this fact",
                 }
             ],
             "decisions": [
@@ -595,6 +615,32 @@ def _parse_web_decisions(
     evidence_by_url: dict[str, list[str]] = {}
     seen_decisions: set[str] = set()
 
+    raw_source_facts = result.payload.get("source_facts") or []
+    if isinstance(raw_source_facts, list):
+        for raw in raw_source_facts:
+            if not isinstance(raw, dict):
+                continue
+            url = str(raw.get("source_url") or "").strip()
+            url_key = _normalize_url(url)
+            source = accepted_sources.get(url_key)
+            name = str(raw.get("name") or "").strip()
+            scope = str(raw.get("scope") or "general").strip()
+            value = str(raw.get("value") or "").strip()
+            qualifier = str(raw.get("qualifier") or "").strip()
+            direct = str(raw.get("evidence_text") or "").strip()
+            if source is None or not name or not value or not direct:
+                continue
+            rendered = f"{name}({scope})={value}{(' ' + qualifier) if qualifier else ''}; evidence: {direct}"
+            evidence_by_url.setdefault(url_key, []).append(rendered)
+            evidence.append(
+                WebEvidence(
+                    field_id="web_product_fact",
+                    source_reference=_web_source_reference(source.url),
+                    source_url=source.url,
+                    evidence_text=rendered,
+                )
+            )
+
     raw_decisions = result.payload.get("decisions") or []
     if not isinstance(raw_decisions, list):
         return [], [], [], ["web product research response missing decisions array"]
@@ -792,6 +838,16 @@ def run_web_enrichment(
         expected_identity=initial.identity,
         external_sources=external,
     )
+    research_summary = result.payload.get("research_summary") or {}
+    reported_queries = (
+        research_summary.get("queries_executed") or []
+        if isinstance(research_summary, dict)
+        else []
+    )
+    try:
+        inspected_source_count = int(research_summary.get("inspected_source_count") or 0)
+    except (TypeError, ValueError, AttributeError):
+        inspected_source_count = 0
 
     return WebEnrichmentResult(
         packet=final_packet,
@@ -805,6 +861,9 @@ def run_web_enrichment(
         search_failed_batches=0,
         searched=True,
         search_elapsed_seconds=time.monotonic() - started,
+        researched_fact_count=sum(item.field_id == "web_product_fact" for item in evidence),
+        reported_query_count=len(reported_queries) if isinstance(reported_queries, list) else 0,
+        inspected_source_count=max(inspected_source_count, len(source_matches)),
         warnings=warnings,
     )
 

@@ -131,12 +131,14 @@ def test_legacy_preview_cli_is_not_the_new_production_entrypoint():
     assert makro_preview_listing is not makro_execute_listing
 
 
-def test_product_facts_resolves_all_fields_globally_without_repeating_images():
+def test_product_facts_mechanically_batches_compact_text_without_repeating_images():
     source = inspect.getsource(product_facts)
     assert "resolve_compact_product_facts" in source
     assert "product_profile" not in source
     assert "image_path" not in source
-    assert "ThreadPoolExecutor" not in source
+    assert "ThreadPoolExecutor" in source
+    assert "batch_size" in source
+    assert "product-facts-batch-" in source
 
 
 def test_web_is_unresolved_only_and_receives_raw_primary_source_identity():

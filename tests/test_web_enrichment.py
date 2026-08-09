@@ -201,6 +201,52 @@ def test_missing_field_is_searched_and_ready_field_is_frozen(tmp_path):
     assert result.source_matches[0].identity_basis == "explicit_cross_reference"
 
 
+def test_product_level_research_preserves_unused_source_facts_for_later_inference():
+    sensor = field("image_sensor", "Image Sensor")
+    fields = [sensor]
+    initial = packet(fields, [FieldDecision(field_id=field_id(sensor), status=MISSING)])
+    url = "https://example.test/m8-specifications"
+    search = FakeWebProvider(
+        {
+            "research_summary": {
+                "queries_executed": ["M8 manual", "M8 dash cam specifications", "M8 sensor"],
+                "inspected_source_count": 4,
+            },
+            "source_matches": [
+                {
+                    "source_url": url,
+                    "match": "similar_product",
+                    "identity_basis": "generic_model_or_similarity",
+                    "reason": "same product family",
+                    "identity_evidence": ["M8 dual dash cam"],
+                }
+            ],
+            "source_facts": [
+                {
+                    "source_url": url,
+                    "name": "Video format",
+                    "scope": "product_body",
+                    "value": "MP4",
+                    "qualifier": "",
+                    "evidence_text": "Video format: MP4",
+                }
+            ],
+            "decisions": [],
+        },
+        [WebSearchSource(index="1", title="M8 specifications", url=url)],
+    )
+
+    result = run_web_enrichment(search, initial, fields, grounding(), product_url=PRODUCT_URL)
+
+    assert result.packet.decisions[0].status == MISSING
+    assert result.reported_query_count == 3
+    assert result.inspected_source_count == 4
+    assert result.researched_fact_count == 1
+    assert len(result.web_sources) == 1
+    assert "Video format(product_body)=MP4" in result.web_sources[0].content
+    assert result.evidence[0].field_id == "web_product_fact"
+
+
 def test_local_conflict_is_frozen_and_never_sent_as_target():
     resolution = field("recording_resolution", "Recording Resolution")
     sensor = field("image_sensor", "Image Sensor")

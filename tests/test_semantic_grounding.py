@@ -143,6 +143,45 @@ def test_snapshot_text_compaction_drops_library_noise_but_preserves_disagreement
     assert raw["image_urls"] == ["https://img.test/detail.jpg"]
 
 
+def test_snapshot_text_compaction_ignores_session_destination_and_incomplete_price_boilerplate(tmp_path):
+    def catalog_text(destination: str, suffix: str) -> str:
+        snapshot = tmp_path / f"supplier-{destination}.json"
+        snapshot.write_text(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "requested_url": "https://supplier.test/item",
+                    "final_url": "https://supplier.test/item/123",
+                    "title": "M8",
+                    "captured_at": "2026-08-09T00:00:00+00:00",
+                    "visible_text": (
+                        "Manufacturer Example Ltd\n送至\n"
+                        + destination
+                        + "\n预计明天发货\nPackage weight 285 g\n"
+                        + "【平台活动下价格】generic marketplace explanation "
+                        + suffix
+                    ),
+                    "table_rows": [],
+                    "json_ld": [],
+                    "embedded_data": [],
+                    "image_urls": [],
+                    "meta": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        catalog = build_grounding_catalog(supplier_snapshots=(str(snapshot),))
+        return "\n".join(item.content for item in catalog.sources if item.kind == TEXT_KIND)
+
+    first = catalog_text("选择收货地址", "truncated")
+    second = catalog_text("四川宜宾", "a different tail")
+    assert first == second
+    assert "Manufacturer Example Ltd" in first
+    assert "Package weight 285 g" in first
+    assert "四川宜宾" not in second
+    assert "平台活动下价格" not in first
+
+
 def test_source_id_changes_when_image_bytes_change(tmp_path):
     image = tmp_path / "front.jpg"
     image.write_bytes(b"image-v1")

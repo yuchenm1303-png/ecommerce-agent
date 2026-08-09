@@ -159,6 +159,53 @@ def test_identical_product_fact_input_hits_one_cache(tmp_path):
     assert provider.calls == 1
 
 
+def test_large_field_set_is_mechanically_batched_and_each_batch_hot_caches(tmp_path):
+    fields = [_field(f"field_{index}", f"Field {index}") for index in range(5)]
+
+    class BatchProvider:
+        name = "batch-provider"
+
+        def __init__(self):
+            self.calls = 0
+
+        def extract_json(self, request):
+            self.calls += 1
+            return {
+                "facts": [
+                    {
+                        "field_id": target["field_id"],
+                        "status": "ready",
+                        "values": [target["attribute_key"]],
+                        "qualifier": "",
+                        "confidence": 1.0,
+                        "citations": [{"source_reference": "s1", "evidence_text": "Length 16 cm"}],
+                        "alternatives": [],
+                    }
+                    for target in request["target_fields"]
+                ],
+                "model_summary": "batch",
+            }
+
+    provider = BatchProvider()
+    kwargs = dict(
+        batch_size=2,
+        concurrency=3,
+        cache_dir=tmp_path / "cache",
+        cache_namespace="test",
+    )
+    first = run_product_facts(provider, fields, _grounding(), _compact(), **kwargs)
+    second = run_product_facts(provider, fields, _grounding(), _compact(), **kwargs)
+
+    assert first.batch_count == 3
+    assert first.model_calls == 3
+    assert first.cache_hits == 0
+    assert first.failed_batches == 0
+    assert second.model_calls == 0
+    assert second.cache_hits == 3
+    assert second.cache_hit is True
+    assert provider.calls == 3
+
+
 def test_unscoped_fov_and_packaging_scoped_product_dimension_are_not_ready():
     fields = [
         _field("exterior_field_of_view", "Exterior Field of View"),
@@ -267,3 +314,42 @@ def test_packaging_axis_is_bound_from_explicit_canonical_evidence_key():
 
     assert by_id[field_id(length)].values == ["16"]
     assert by_id[field_id(breadth)].values == ["11"]
+
+
+def test_compact_aggregate_citation_is_rebound_to_the_exact_underlying_source():
+    target = _field("package_length", "Length")
+
+    class AggregateCitationProvider:
+        name = "aggregate-citation-provider"
+
+        def extract_json(self, request):
+            return {
+                "facts": [
+                    {
+                        "field_id": request["target_fields"][0]["field_id"],
+                        "status": "ready",
+                        "values": ["16"],
+                        "qualifier": "cm",
+                        "confidence": 1.0,
+                        "citations": [
+                            {
+                                "source_reference": "compact:web",
+                                "evidence_text": "Length 16 cm; resolution 720p",
+                            }
+                        ],
+                        "alternatives": [],
+                    }
+                ],
+                "model_summary": "",
+            }
+
+    result = run_product_facts(
+        AggregateCitationProvider(),
+        [target],
+        _grounding(),
+        _compact(),
+    )
+
+    decision = result.packet.decisions[0]
+    assert decision.status == READY
+    assert decision.citations[0].source_reference == "supplier:001:text:0001:abc"

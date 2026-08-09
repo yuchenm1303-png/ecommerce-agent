@@ -49,7 +49,11 @@ def test_dashscope_web_search_uses_responses_api_without_incompatible_json_forma
     kwargs = calls[0]
     assert kwargs["model"] == "qwen3.6-flash"
     assert kwargs["tools"] == [{"type": "web_search"}]
-    assert kwargs["extra_body"] == {"enable_thinking": False}
+    assert kwargs["tool_choice"] == "required"
+    assert kwargs["extra_body"] == {
+        "enable_thinking": False,
+        "search_options": {"forced_search": True},
+    }
     assert kwargs["store"] is False
     assert "response_format" not in kwargs
     assert "enable_search" not in kwargs

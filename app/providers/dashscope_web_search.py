@@ -184,7 +184,11 @@ class DashScopeWebSearchProvider:
             model=self.model,
             input=prompt,
             tools=[{"type": "web_search"}],
-            extra_body={"enable_thinking": False},
+            tool_choice="required",
+            extra_body={
+                "enable_thinking": False,
+                "search_options": {"forced_search": True},
+            },
             store=False,
         )
         self._progress(f"Web AI response received at {time.monotonic() - started:.1f}s")

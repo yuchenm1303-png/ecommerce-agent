@@ -140,6 +140,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--image-batch-size", type=int, default=3)
     parser.add_argument("--image-concurrency", type=int, default=4)
+    parser.add_argument("--local-batch-size", type=int, default=12)
+    parser.add_argument("--local-concurrency", type=int, default=4)
 
     parser.add_argument("--web-enrich", choices=("auto", "off"), default="auto")
     parser.add_argument("--web-search-model", default="qwen3.7-max")
@@ -257,6 +259,10 @@ def main() -> int:
         raise SystemExit("--image-batch-size must be in 1..8")
     if not 1 <= args.image_concurrency <= 12:
         raise SystemExit("--image-concurrency must be in 1..12")
+    if not 1 <= args.local_batch_size <= 32:
+        raise SystemExit("--local-batch-size must be in 1..32")
+    if not 1 <= args.local_concurrency <= 12:
+        raise SystemExit("--local-concurrency must be in 1..12")
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = Path(args.output_dir) / f"resolve-ai-{stamp}"
@@ -402,6 +408,8 @@ def main() -> int:
         grounding,
         compact_evidence,
         product_url=product_url,
+        batch_size=args.local_batch_size,
+        concurrency=args.local_concurrency,
         cache_dir=cache_dir,
         cache_namespace=fact_namespace,
     )
@@ -412,8 +420,9 @@ def main() -> int:
     search_path = output_dir / "search-requests.json"
     search_path.write_text(json.dumps(search_requests, ensure_ascii=False, indent=2), encoding="utf-8")
     print(
-        f"product_facts=DONE facts={fact_result.fact_count} calls={fact_result.model_calls} "
-        f"cache_hit={fact_result.cache_hit} failed={fact_result.failed} "
+        f"product_facts=DONE facts={fact_result.fact_count} batches={fact_result.batch_count} "
+        f"calls={fact_result.model_calls} cache_hits={fact_result.cache_hits} "
+        f"failed_batches={fact_result.failed_batches} cache_hit={fact_result.cache_hit} failed={fact_result.failed} "
         f"elapsed={fact_result.elapsed_seconds:.3f}s blanks_for_web={len(search_requests)}",
         flush=True,
     )
@@ -436,7 +445,9 @@ def main() -> int:
         print(
             f"web_fill=DONE batches={web_result.search_batch_count} calls={web_result.search_model_calls} "
             f"cache_hits={web_result.search_cache_hits} failed_batches={web_result.search_failed_batches} "
-            f"evidence={len(web_result.evidence)} sources={len(web_result.web_sources)} "
+            f"queries={web_result.reported_query_count} inspected_sources={web_result.inspected_source_count} "
+            f"source_facts={web_result.researched_fact_count} evidence={len(web_result.evidence)} "
+            f"sources={len(web_result.web_sources)} "
             f"elapsed={web_result.search_elapsed_seconds:.3f}s",
             flush=True,
         )
@@ -541,8 +552,13 @@ def main() -> int:
                     "image_fact_count": compact_evidence.image_fact_count,
                 },
                 "product_facts": {
+                    "batch_size": args.local_batch_size,
+                    "concurrency": args.local_concurrency,
+                    "batch_count": fact_result.batch_count,
                     "fact_count": fact_result.fact_count,
                     "model_calls": fact_result.model_calls,
+                    "cache_hits": fact_result.cache_hits,
+                    "failed_batches": fact_result.failed_batches,
                     "cache_hit": fact_result.cache_hit,
                     "failed": fact_result.failed,
                     "elapsed_seconds": round(fact_result.elapsed_seconds, 3),
@@ -561,6 +577,9 @@ def main() -> int:
                     "cache_hits": web_result.search_cache_hits,
                     "failed_batches": web_result.search_failed_batches,
                     "evidence_count": len(web_result.evidence),
+                    "researched_fact_count": web_result.researched_fact_count,
+                    "reported_query_count": web_result.reported_query_count,
+                    "inspected_source_count": web_result.inspected_source_count,
                     "source_count": len(web_result.web_sources),
                     "elapsed_seconds": round(web_result.search_elapsed_seconds, 3),
                     "warnings": list(web_result.warnings),

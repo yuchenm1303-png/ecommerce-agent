@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Protocol
@@ -24,10 +25,11 @@ from .business_fields import is_business_question
 from .compact_evidence import CompactEvidence
 from .evidence_contract import ProductIdentity
 from .semantic_grounding import GroundingCatalog
+from .source_bundle import normalize_key
 
 
-PRODUCT_FACT_CONTRACT_VERSION = 1
-PRODUCT_FACT_CACHE_VERSION = 3
+PRODUCT_FACT_CONTRACT_VERSION = 2
+PRODUCT_FACT_CACHE_VERSION = 5
 
 
 class JSONTaskProvider(Protocol):
@@ -200,18 +202,60 @@ def _cache_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _expand_aliases(raw: Any, aliases: dict[str, str]) -> None:
+def _compact_line_index(compact_evidence: CompactEvidence) -> dict[str, list[tuple[str, str]]]:
+    output: dict[str, list[tuple[str, str]]] = {"compact:web": [], "compact:images": []}
+    for aggregate, text in (
+        ("compact:web", compact_evidence.web_text),
+        ("compact:images", compact_evidence.image_facts),
+    ):
+        for line in text.splitlines():
+            match = re.match(r"\[([^\]]+)\]\s*(.+)", line.strip())
+            if match is not None:
+                output[aggregate].append((match.group(1), match.group(2)))
+    return output
+
+
+def _resolve_aggregate_reference(
+    reference: str,
+    evidence_text: str,
+    aliases: dict[str, str],
+    line_index: dict[str, list[tuple[str, str]]],
+) -> str:
+    wanted = normalize_key(evidence_text)
+    if not wanted:
+        return reference
+    matches: list[str] = []
+    for alias, content in line_index.get(reference, []):
+        candidate = normalize_key(content)
+        if wanted in candidate or candidate in wanted:
+            if alias in aliases:
+                matches.append(aliases[alias])
+    return matches[0] if len(set(matches)) == 1 else reference
+
+
+def _expand_aliases(
+    raw: Any,
+    aliases: dict[str, str],
+    line_index: dict[str, list[tuple[str, str]]],
+) -> None:
     if isinstance(raw, dict):
         reference = raw.get("source_reference")
         if isinstance(reference, str):
             normalized = reference.strip().strip("[]").strip()
             if normalized in aliases:
                 raw["source_reference"] = aliases[normalized]
+            elif normalized in line_index:
+                raw["source_reference"] = _resolve_aggregate_reference(
+                    normalized,
+                    str(raw.get("evidence_text") or ""),
+                    aliases,
+                    line_index,
+                )
         for value in raw.values():
-            _expand_aliases(value, aliases)
+            _expand_aliases(value, aliases, line_index)
     elif isinstance(raw, list):
         for value in raw:
-            _expand_aliases(value, aliases)
+            _expand_aliases(value, aliases, line_index)
 
 
 def _packet_from_response(
@@ -223,7 +267,11 @@ def _packet_from_response(
 ) -> AIDecisionPacket:
     if not isinstance(raw, dict) or not isinstance(raw.get("facts"), list):
         raise ValueError("product fact response requires a facts array")
-    _expand_aliases(raw, compact_evidence.citation_aliases)
+    _expand_aliases(
+        raw,
+        compact_evidence.citation_aliases,
+        _compact_line_index(compact_evidence),
+    )
     allowed = {field_id(field) for field in fields if not _is_business(field)}
     packaging_targets = {
         field_contract(field)["attribute_key"]: field_id(field)
@@ -334,6 +382,62 @@ class ProductFactRunResult:
     failed: bool
     elapsed_seconds: float
     warning: str = ""
+    batch_count: int = 0
+    cache_hits: int = 0
+    failed_batches: int = 0
+
+
+@dataclass(slots=True)
+class _BatchResult:
+    index: int
+    packet: AIDecisionPacket | None
+    model_calls: int
+    cache_hit: bool
+    warning: str = ""
+
+
+def _run_batch(
+    provider: JSONTaskProvider,
+    index: int,
+    fields: list[dict[str, Any]],
+    grounding: GroundingCatalog,
+    compact_evidence: CompactEvidence,
+    *,
+    product_url: str,
+    cache_dir: Path | None,
+    cache_namespace: str,
+) -> _BatchResult:
+    key = _cache_key(
+        provider,
+        fields,
+        grounding,
+        compact_evidence,
+        product_url,
+        cache_namespace,
+    )
+    cache_path = cache_dir / f"product-facts-batch-{key}.json" if cache_dir is not None else None
+    if cache_path is not None and cache_path.is_file():
+        try:
+            cached = AIDecisionPacket.from_mapping(json.loads(cache_path.read_text(encoding="utf-8")))
+            packet = validate_ai_decision_packet(cached, fields, grounding)
+            return _BatchResult(index, packet, 0, True)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    try:
+        raw = provider.extract_json(
+            build_product_fact_request(fields, compact_evidence, product_url=product_url)
+        )
+        packet = _packet_from_response(raw, fields, grounding, compact_evidence, provider.name)
+    except Exception as exc:
+        return _BatchResult(index, None, 1, False, str(exc))
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(packet.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(cache_path)
+    return _BatchResult(index, packet, 1, False)
 
 
 def run_product_facts(
@@ -343,54 +447,82 @@ def run_product_facts(
     compact_evidence: CompactEvidence,
     *,
     product_url: str = "",
+    batch_size: int = 12,
+    concurrency: int = 4,
     cache_dir: str | Path | None = None,
     cache_namespace: str = "",
 ) -> ProductFactRunResult:
     started = time.monotonic()
     field_list = list(fields)
-    key = _cache_key(
-        provider,
-        field_list,
-        grounding,
-        compact_evidence,
-        product_url,
-        cache_namespace,
+    if int(batch_size) < 1:
+        raise ValueError("product fact batch_size must be >= 1")
+    if int(concurrency) < 1:
+        raise ValueError("product fact concurrency must be >= 1")
+    target_fields = [field for field in field_list if not _is_business(field)]
+    batches = [
+        target_fields[start : start + int(batch_size)]
+        for start in range(0, len(target_fields), int(batch_size))
+    ]
+    cache_root = Path(cache_dir) if cache_dir is not None else None
+    results: list[_BatchResult] = []
+    if batches:
+        with ThreadPoolExecutor(max_workers=min(int(concurrency), len(batches))) as executor:
+            futures = [
+                executor.submit(
+                    _run_batch,
+                    provider,
+                    index,
+                    batch,
+                    grounding,
+                    compact_evidence,
+                    product_url=product_url,
+                    cache_dir=cache_root,
+                    cache_namespace=cache_namespace,
+                )
+                for index, batch in enumerate(batches)
+            ]
+            for future in as_completed(futures):
+                results.append(future.result())
+    results.sort(key=lambda item: item.index)
+    resolved: list[FieldDecision] = []
+    warnings: list[str] = []
+    for result in results:
+        if result.packet is None:
+            warnings.append(f"product fact batch {result.index + 1} failed: {result.warning}")
+            continue
+        resolved.extend(
+            decision
+            for decision in result.packet.decisions
+            if decision.status in {READY, CONFLICT}
+        )
+        warnings.extend(
+            warning
+            for warning in result.packet.warnings
+            if not warning.startswith("AI stage omitted field_id=")
+        )
+    combined = AIDecisionPacket(
+        identity=ProductIdentity(),
+        schema_sha256=schema_digest(field_list),
+        source_manifest_sha256=source_manifest_digest(grounding),
+        decisions=resolved,
+        model_summary="Mechanically batched compact product evidence mapping.",
+        warnings=warnings,
+        extractor=f"{provider.name}+batched-product-facts",
     )
-    cache_path = Path(cache_dir) / f"product-facts-{key}.json" if cache_dir is not None else None
-    if cache_path is not None and cache_path.is_file():
-        try:
-            cached = AIDecisionPacket.from_mapping(json.loads(cache_path.read_text(encoding="utf-8")))
-            packet = validate_ai_decision_packet(cached, field_list, grounding)
-            count = sum(decision.status in {READY, CONFLICT} for decision in packet.decisions)
-            return ProductFactRunResult(packet, 0, True, count, False, time.monotonic() - started)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            pass
-
-    try:
-        raw = provider.extract_json(
-            build_product_fact_request(field_list, compact_evidence, product_url=product_url)
-        )
-        packet = _packet_from_response(raw, field_list, grounding, compact_evidence, provider.name)
-    except Exception as exc:
-        empty = AIDecisionPacket(
-            identity=ProductIdentity(),
-            schema_sha256=schema_digest(field_list),
-            source_manifest_sha256=source_manifest_digest(grounding),
-            decisions=[],
-            warnings=[f"global product facts failed: {exc}"],
-            extractor=f"{provider.name}+global-product-facts",
-        )
-        packet = validate_ai_decision_packet(empty, field_list, grounding)
-        return ProductFactRunResult(
-            packet, 1, False, 0, True, time.monotonic() - started, str(exc)
-        )
-
-    if cache_path is not None:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        temporary.write_text(json.dumps(packet.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(cache_path)
+    packet = validate_ai_decision_packet(combined, field_list, grounding)
     count = sum(decision.status in {READY, CONFLICT} for decision in packet.decisions)
+    failed_batches = sum(result.packet is None for result in results)
+    model_calls = sum(result.model_calls for result in results)
+    cache_hits = sum(result.cache_hit for result in results)
     return ProductFactRunResult(
-        packet, 1, False, count, False, time.monotonic() - started
+        packet=packet,
+        model_calls=model_calls,
+        cache_hit=bool(results) and cache_hits == len(results),
+        fact_count=count,
+        failed=bool(results) and failed_batches == len(results),
+        elapsed_seconds=time.monotonic() - started,
+        warning=" | ".join(warnings),
+        batch_count=len(batches),
+        cache_hits=cache_hits,
+        failed_batches=failed_batches,
     )

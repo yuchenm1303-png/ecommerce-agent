@@ -230,6 +230,25 @@ def _compact_embedded_data(items: Iterable[str]) -> list[str]:
     return kept
 
 
+def _compact_visible_text(value: str) -> str:
+    """Remove session-only storefront chrome from otherwise citable page text."""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    # Delivery destinations depend on the signed-in browser/session, not the
+    # product. Preserve the surrounding labels while dropping the address.
+    text = re.sub(r"(?m)(^|\n)送至\s*\n[^\n]*(?=\n预计)", r"\1送至\n预计", text)
+    # Marketplace price explanations are generic legal boilerplate and the
+    # captured tail can end at a different character while the page is loading.
+    for marker in ("【平台活动下价格】", "【非平台活动下价格】"):
+        index = text.find(marker)
+        if index >= 0:
+            text = text[:index].rstrip()
+            break
+    return text
+
+
 def _snapshot_non_row_parts(snapshot: SourceSnapshot) -> list[tuple[str, str]]:
     """Build a compact citable view while the full snapshot stays unchanged."""
 
@@ -254,8 +273,9 @@ def _snapshot_non_row_parts(snapshot: SourceSnapshot) -> list[tuple[str, str]]:
     embedded = _compact_embedded_data(snapshot.embedded_data)
     if embedded:
         parts.append(("embedded", "Embedded page/variant data:\n" + "\n".join(embedded)))
-    if snapshot.visible_text.strip():
-        parts.append(("visible-text", "Rendered page text:\n" + snapshot.visible_text.strip()))
+    visible_text = _compact_visible_text(snapshot.visible_text)
+    if visible_text:
+        parts.append(("visible-text", "Rendered page text:\n" + visible_text))
     return [(kind, part) for kind, part in parts if part.strip()]
 
 
