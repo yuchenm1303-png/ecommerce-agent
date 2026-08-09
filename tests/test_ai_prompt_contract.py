@@ -29,6 +29,7 @@ def _field():
         "qualifier_options": ["cm", "mm"],
         "controls": [],
         "help_text": "Package breadth",
+        "context_text": "Breadth cm",
     }
 
 
@@ -59,15 +60,16 @@ def test_local_fill_prompt_reads_original_sources_directly_and_has_no_review_sta
     assert target["attribute_key"] == "package_breadth"
     assert target["label"] == "Breadth"
     assert target["qualifier_options"] == ["cm", "mm"]
+    assert target["context_text"] == "Breadth cm"
     assert request["grounded_sources"][0]["source_type"] == "supplier_web"
-    assert request["product_identity"]["sku"] == ""
-    assert request["product_identity"]["source_product_url"] == PRODUCT_URL
+    assert request["product_identity"] == {"source_product_url": PRODUCT_URL}
     statuses = request["json_contract"]["properties"]["decisions"]["items"]["properties"]["status"]["enum"]
     assert statuses == ["ready", "conflict", "missing"]
     rules = "\n".join(request["rules"])
     assert "dimension axes" in rules
     assert "manual/documentation language" in rules
     assert "Do not turn a conflict" in rules
+    assert "qualifier_options are empty" in rules
 
 
 def test_cli_defaults_to_qwen37_plus_and_single_product_url_input():
@@ -83,11 +85,13 @@ def test_cli_defaults_to_qwen37_plus_and_single_product_url_input():
     assert args.field_concurrency == 4
     assert args.web_batch_size == 5
     assert args.web_concurrency == 3
+    assert args.source_cache_ttl_seconds == 900
     options = {option for action in parser._actions for option in action.option_strings}
     assert "--product-url" in options
     assert "--sku" not in options
     assert "--qa" not in options
     assert "--source-cdp-port" in options
+    assert "--refresh-source" in options
     assert "--max-repair-attempts" not in options
     assert "--field-batch-size" in options
     assert "--web-batch-size" in options
