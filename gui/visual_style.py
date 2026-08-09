@@ -300,7 +300,10 @@ class GlassBackdrop(QWidget):
 
 
 class WindowFrameOverlay(QWidget):
-    """Minimal visible frame for the required translucent frameless window."""
+    """Visible in-client frame for the translucent frameless Windows shell."""
+
+    _NORMAL_EDGE = 4
+    _MAXIMIZED_EDGE = 1
 
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
@@ -318,14 +321,40 @@ class WindowFrameOverlay(QWidget):
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
         del event
-        if self.width() <= 1 or self.height() <= 1:
+        if self.width() <= 2 or self.height() <= 2:
             return
+
+        maximized = self.window.isMaximized()
+        edge = self._MAXIMIZED_EDGE if maximized else self._NORMAL_EDGE
+        active = self.window.isActiveWindow()
+
+        # Dark outer edge provides a stable silhouette against both the bright
+        # Fuji sky and a dark desktop. Everything is drawn inside the client
+        # rect, so it does not affect layout geometry or the Quick background.
+        outer = QColor(10, 18, 30, 210 if active else 150)
+        highlight = QColor(255, 255, 255, 125 if active else 72)
+        inner_shadow = QColor(0, 0, 0, 72 if active else 46)
+
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        alpha = 90 if self.window.isActiveWindow() else 48
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(QColor(255, 255, 255, alpha), 1.0))
-        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        rect = self.rect()
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(outer)
+        painter.drawRect(0, 0, rect.width(), edge)
+        painter.drawRect(0, rect.height() - edge, rect.width(), edge)
+        painter.drawRect(0, 0, edge, rect.height())
+        painter.drawRect(rect.width() - edge, 0, edge, rect.height())
+
+        if not maximized and rect.width() > 8 and rect.height() > 8:
+            # One bright keyline and one soft inner line make the edge readable
+            # without introducing a title bar or moving the existing business UI.
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(highlight, 1.0))
+            painter.drawRect(rect.adjusted(edge - 1, edge - 1, -edge, -edge))
+            painter.setPen(QPen(inner_shadow, 1.0))
+            painter.drawRect(rect.adjusted(edge, edge, -edge - 1, -edge - 1))
+
         painter.end()
 
 
@@ -340,7 +369,7 @@ class VisualStyleController(QObject):
 
         # Qt requires FramelessWindowHint for per-pixel translucent QWidget
         # top-levels on Windows. Keep the business widget tree unchanged and
-        # restore a visible edge with WindowFrameOverlay instead of rewriting UI.
+        # restore a visible in-client edge instead of rewriting the layout.
         window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         window.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         window.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
@@ -397,6 +426,7 @@ class VisualStyleController(QObject):
             QEvent.Type.Show,
             QEvent.Type.WindowActivate,
             QEvent.Type.WindowDeactivate,
+            QEvent.Type.WindowStateChange,
         }:
             QTimer.singleShot(0, self.window_frame.sync_geometry)
         if isinstance(watched, QFrame) and watched in self._glass:
