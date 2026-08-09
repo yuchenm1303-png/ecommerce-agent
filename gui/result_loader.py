@@ -151,6 +151,7 @@ def _path_from_manifest(manifest: dict[str, Any], dotted: str) -> Path | None:
 
 
 def _phase_stats(manifest: dict[str, Any]) -> PhaseStats:
+    images = manifest.get("image_evidence") or {}
     facts = manifest.get("product_facts") or {}
     inference = manifest.get("best_effort_inference") or {}
     web = manifest.get("web_fill") or {}
@@ -167,10 +168,22 @@ def _phase_stats(manifest: dict[str, Any]) -> PhaseStats:
     inference_cache_hit = int(bool(inference.get("cache_hit"))) if inference_requested else 0
     inference_failed = int(bool(inference.get("failed"))) if inference_requested else 0
     return PhaseStats(
-        batch_count=int(facts.get("batch_count") or 0),
-        model_calls=int(facts.get("model_calls") or 0) + int(inference.get("model_calls") or 0),
-        cache_hits=int(facts.get("cache_hits") or 0) + inference_cache_hit,
-        failed_batches=int(facts.get("failed_batches") or 0) + inference_failed,
+        batch_count=int(images.get("batch_count") or 0) + int(facts.get("batch_count") or 0),
+        model_calls=(
+            int(images.get("model_calls") or 0)
+            + int(facts.get("model_calls") or 0)
+            + int(inference.get("model_calls") or 0)
+        ),
+        cache_hits=(
+            int(images.get("cache_hits") or 0)
+            + int(facts.get("cache_hits") or 0)
+            + inference_cache_hit
+        ),
+        failed_batches=(
+            int(images.get("failed_batches") or 0)
+            + int(facts.get("failed_batches") or 0)
+            + inference_failed
+        ),
         source_cache_hit=bool(source.get("source_cache_hit")),
         web_batch_count=int(web.get("batch_count") or 0),
         web_model_calls=int(web.get("model_calls") or 0),

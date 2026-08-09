@@ -56,6 +56,12 @@ def test_result_loader_reads_current_workflow_resolver_and_fill_plan(tmp_path: P
         {
             "primary_product_url": "https://example.test/item",
             "source_capture": {"source_cache_hit": True},
+            "image_evidence": {
+                "batch_count": 1,
+                "model_calls": 1,
+                "cache_hits": 0,
+                "failed_batches": 0,
+            },
             "product_facts": {
                 "batch_count": 2,
                 "model_calls": 2,
@@ -92,6 +98,12 @@ def test_result_loader_reads_current_workflow_resolver_and_fill_plan(tmp_path: P
         {
             "primary_product_url": "https://example.test/item",
             "source_capture": {"source_cache_hit": True},
+            "image_evidence": {
+                "batch_count": 1,
+                "model_calls": 0,
+                "cache_hits": 1,
+                "failed_batches": 0,
+            },
             "product_facts": {
                 "batch_count": 2,
                 "model_calls": 0,
@@ -180,9 +192,9 @@ def test_result_loader_reads_current_workflow_resolver_and_fill_plan(tmp_path: P
     assert result.blocked == 0
     assert result.missing == 0
     assert result.conflict == 0
-    assert result.cold.model_calls == 3
+    assert result.cold.model_calls == 4
     assert result.hot.model_calls == 0
-    assert result.hot.cache_hits == 3
+    assert result.hot.cache_hits == 4
     assert result.hot.web_cache_hits == 1
     assert result.safety.safe is True
     assert result.fields[0].ai_result == "Dash Camera"
