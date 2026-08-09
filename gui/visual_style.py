@@ -249,7 +249,7 @@ QSplitter::handle {
 
 
 class GlassBackdrop(QWidget):
-    """Cheap per-card tint/border only; blur now comes from the global Quick mask."""
+    """Cheap per-card tint/border only; blur comes from the global Quick mask."""
 
     def __init__(self, frame: QFrame) -> None:
         super().__init__(frame)
@@ -299,6 +299,36 @@ class GlassBackdrop(QWidget):
         painter.end()
 
 
+class WindowFrameOverlay(QWidget):
+    """Minimal visible frame for the required translucent frameless window."""
+
+    def __init__(self, window: QMainWindow) -> None:
+        super().__init__(window)
+        self.window = window
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.sync_geometry()
+
+    def sync_geometry(self) -> None:
+        self.setGeometry(self.window.rect())
+        self.raise_()
+        self.show()
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        del event
+        if self.width() <= 1 or self.height() <= 1:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        alpha = 90 if self.window.isActiveWindow() else 48
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(255, 255, 255, alpha), 1.0))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        painter.end()
+
+
 class VisualStyleController(QObject):
     """Static QWidget presentation plus one native Quick background surface."""
 
@@ -308,8 +338,9 @@ class VisualStyleController(QObject):
         self._glass: dict[QFrame, GlassBackdrop] = {}
         self._cursor_installed = False
 
-        # On Windows a translucent QWidget top-level requires a frameless native
-        # shell. The business QWidget tree itself is not rebuilt or moved.
+        # Qt requires FramelessWindowHint for per-pixel translucent QWidget
+        # top-levels on Windows. Keep the business widget tree unchanged and
+        # restore a visible edge with WindowFrameOverlay instead of rewriting UI.
         window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         window.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         window.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
@@ -327,12 +358,13 @@ class VisualStyleController(QObject):
                 self._glass[frame] = GlassBackdrop(frame)
 
         self.background = NativeQuickBackground(window)
+        self.window_frame = WindowFrameOverlay(window)
         self._install_cursor()
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
         window.destroyed.connect(self._cleanup)
-        QTimer.singleShot(0, self._sync_glass)
+        QTimer.singleShot(0, self._sync_visual_layers)
 
     def surface_for(self, frame: QFrame) -> GlassBackdrop | None:
         return self._glass.get(frame)
@@ -349,16 +381,24 @@ class VisualStyleController(QObject):
         QApplication.setOverrideCursor(QCursor(pixmap, 4, 4))
         self._cursor_installed = True
 
-    def _sync_glass(self) -> None:
+    def _sync_visual_layers(self) -> None:
         for backdrop in self._glass.values():
             backdrop.sync_geometry()
         self.background.schedule_mask_update()
+        self.window_frame.sync_geometry()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         # Suppress only the legacy AtmosphereWidget background paint. Child
         # widgets keep receiving their own paint events and stay unchanged.
         if watched is self.central and event.type() == QEvent.Type.Paint:
             return True
+        if watched is self.window and event.type() in {
+            QEvent.Type.Resize,
+            QEvent.Type.Show,
+            QEvent.Type.WindowActivate,
+            QEvent.Type.WindowDeactivate,
+        }:
+            QTimer.singleShot(0, self.window_frame.sync_geometry)
         if isinstance(watched, QFrame) and watched in self._glass:
             if event.type() in {QEvent.Type.Resize, QEvent.Type.Show}:
                 QTimer.singleShot(0, self._glass[watched].sync_geometry)
