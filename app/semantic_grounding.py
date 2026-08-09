@@ -112,8 +112,8 @@ class GroundingCatalog:
         }
 
 
-def _snapshot_parts(snapshot: SourceSnapshot) -> list[str]:
-    """Keep raw source structures separate instead of flattening them together."""
+def _snapshot_non_row_parts(snapshot: SourceSnapshot) -> list[str]:
+    """Keep non-row raw source structures separate instead of flattening them together."""
 
     parts: list[str] = []
     identity: list[str] = []
@@ -124,22 +124,6 @@ def _snapshot_parts(snapshot: SourceSnapshot) -> list[str]:
             identity.append(f"Meta {key}: {value}")
     if identity:
         parts.append("Page identity/meta:\n" + "\n".join(identity))
-
-    if snapshot.table_rows:
-        rows = [
-            json.dumps(
-                {"key": row.key, "value": row.value},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            for row in snapshot.table_rows
-            if row.key and row.value
-        ]
-        if rows:
-            parts.append(
-                "Structured page rows. Preserve every key/value label and axis exactly:\n"
-                + "\n".join(rows)
-            )
 
     if snapshot.json_ld:
         parts.append(
@@ -217,6 +201,42 @@ def _text_source(
     )
 
 
+def _row_source(
+    *,
+    prefix: str,
+    source_type: str,
+    ordinal: int,
+    row_ordinal: int,
+    origin: str,
+    key: str,
+    value: str,
+    table_index: int,
+    row_index: int,
+) -> GroundedSource:
+    content = (
+        "Structured page row; preserve key/value meaning exactly: "
+        + json.dumps(
+            {
+                "key": key,
+                "value": value,
+                "table_index": table_index,
+                "row_index": row_index,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+    digest = _sha256_text(content)
+    return GroundedSource(
+        source_id=f"{prefix}:{ordinal:03d}:text:row-{row_ordinal:04d}:{digest[:12]}",
+        source_type=source_type,
+        kind=TEXT_KIND,
+        origin=f"{origin}#table={table_index}&row={row_index}",
+        content=content,
+        sha256=digest,
+    )
+
+
 def _sources_from_snapshot(
     snapshot_path: str | Path,
     *,
@@ -234,7 +254,41 @@ def _sources_from_snapshot(
 
     sources: list[GroundedSource] = []
     chunk_index = 1
-    for part in _snapshot_parts(snapshot):
+
+    non_row_parts = _snapshot_non_row_parts(snapshot)
+    if non_row_parts:
+        first = non_row_parts.pop(0)
+        for chunk in chunk_text(first, max_chars=max_chars, overlap_chars=overlap_chars):
+            sources.append(
+                _text_source(
+                    prefix=prefix,
+                    source_type=source_type,
+                    ordinal=ordinal,
+                    chunk_index=chunk_index,
+                    origin=origin,
+                    content=chunk,
+                )
+            )
+            chunk_index += 1
+
+    for row_ordinal, row in enumerate(snapshot.table_rows, start=1):
+        if not row.key or not row.value:
+            continue
+        sources.append(
+            _row_source(
+                prefix=prefix,
+                source_type=source_type,
+                ordinal=ordinal,
+                row_ordinal=row_ordinal,
+                origin=origin,
+                key=row.key,
+                value=row.value,
+                table_index=row.table_index,
+                row_index=row.row_index,
+            )
+        )
+
+    for part in non_row_parts:
         for chunk in chunk_text(part, max_chars=max_chars, overlap_chars=overlap_chars):
             sources.append(
                 _text_source(
