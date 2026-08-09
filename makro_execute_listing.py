@@ -1,11 +1,14 @@
 """Execute a validated single-product-URL Fill Plan against Makro Step 3.
 
-This is the production browser entrypoint for the one-link workflow.  It reuses
+This is the production browser entrypoint for the one-link workflow. It reuses
 existing browser fill/Save/reopen helpers, but product rebind comes only from the
-same raw source snapshot/images used by makro_resolve_ai.py.  It never consumes
+same raw source snapshot/images used by makro_resolve_ai.py. It never consumes
 customer QA, a manual seller SKU, expected model/brand or product-table facts.
 
-Send to QC is never clicked.
+Single-section execution may stay as a no-save visual hold or, when
+``--allow-section-save`` is explicitly supplied, persist and reopen-verify that
+one section. Full Step 3 remains a persisted acceptance and therefore requires
+explicit Save authorization. Send to QC is never clicked.
 """
 
 from __future__ import annotations
@@ -68,9 +71,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-vertical", required=True)
 
     target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("--section", help="单 section no-save 诊断预览。")
+    target.add_argument("--section", help="单 section 真实填写；默认 no-save，可显式授权 Save。")
     target.add_argument("--all-step3", action="store_true")
-    parser.add_argument("--allow-section-save", action="store_true")
+    parser.add_argument(
+        "--allow-section-save",
+        action="store_true",
+        help="显式允许 section Save + reopen verification；Full Step 3 必须开启。",
+    )
     parser.add_argument("--include-review-candidates", action="store_true")
 
     parser.add_argument("--profile-dir", default="browser_profiles/makro-edge")
@@ -90,8 +97,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit(
             "--all-step3 是真实持久化验收，必须同时传 --allow-section-save。"
         )
-    if args.section and args.allow_section_save:
-        raise SystemExit("--allow-section-save 只允许与 --all-step3 一起使用。")
     if args.upload_timeout_ms <= 0:
         raise SystemExit("--upload-timeout-ms 必须大于 0")
     if args.max_text_chars < 500:
@@ -204,11 +209,13 @@ def main() -> int:
         )
         summary = plan.summary()
 
-        print(
-            "===== MAKRO STEP 3 DIRECT ACCEPTANCE ====="
-            if args.all_step3
-            else "===== MAKRO DIRECT SECTION PREVIEW ====="
-        )
+        if args.all_step3:
+            banner = "===== MAKRO STEP 3 DIRECT ACCEPTANCE ====="
+        elif args.allow_section_save:
+            banner = "===== MAKRO DIRECT SECTION PERSISTED ACCEPTANCE ====="
+        else:
+            banner = "===== MAKRO DIRECT SECTION PREVIEW ====="
+        print(banner)
         print(f"page={page.url}")
         print(f"product_url={args.product_url}")
         print(f"generated_listing_sku={generated_sku}")
@@ -217,11 +224,10 @@ def main() -> int:
             f"preview_eligible={summary['preview_eligible']}, blocked={summary['blocked']}, "
             f"required_blocked={summary['required_blocked']}"
         )
-        print(
-            "section Save 已显式授权；绝不 Send to QC。"
-            if args.all_step3
-            else "单 section 只预览，不 Save / Send to QC。"
-        )
+        if args.allow_section_save:
+            print("section Save 已显式授权；绝不 Send to QC。")
+        else:
+            print("单 section 只预览，不 Save / Send to QC。")
 
         section_reports: list[dict[str, Any]] = []
         photo_report: dict[str, Any] | None = None
@@ -259,23 +265,28 @@ def main() -> int:
                 photo_report = _run_photos(
                     adapter,
                     list(args.upload_image),
-                    allow_save=False,
+                    allow_save=args.allow_section_save,
                     upload_timeout_ms=args.upload_timeout_ms,
                     run_dir=run_dir,
                 )
             else:
-                section_reports.append(
-                    _fill_one_section(
-                        adapter,
-                        plan,
-                        section_title,
-                        include_review_candidates=args.include_review_candidates,
-                        persist=False,
-                        scroll_wait_ms=args.scroll_wait_ms,
-                        max_scroll_steps=args.max_scroll_steps,
-                        recheck_wait_ms=args.recheck_wait_ms,
-                        run_dir=run_dir,
-                    )
+                report = _fill_one_section(
+                    adapter,
+                    plan,
+                    section_title,
+                    include_review_candidates=args.include_review_candidates,
+                    persist=args.allow_section_save,
+                    scroll_wait_ms=args.scroll_wait_ms,
+                    max_scroll_steps=args.max_scroll_steps,
+                    recheck_wait_ms=args.recheck_wait_ms,
+                    run_dir=run_dir,
+                )
+                section_reports.append(report)
+                print(
+                    f"{section_title}: status={report.get('status')} "
+                    f"attempted={report.get('writes_attempted', 0)} "
+                    f"validated={report.get('validated', 0)} "
+                    f"persisted={report.get('persisted_verified', 0)}"
                 )
 
         totals = _totals(section_reports)
@@ -287,8 +298,15 @@ def main() -> int:
         final_screenshot = run_dir / "step3-final.png"
         page.screenshot(path=str(final_screenshot), full_page=True)
 
+        if args.all_step3:
+            mode = "single_url_all_step3_persisted_acceptance"
+        elif args.allow_section_save:
+            mode = "single_url_section_persisted_acceptance"
+        else:
+            mode = "single_url_section_preview"
+
         payload = {
-            "mode": "single_url_all_step3_persisted_acceptance" if args.all_step3 else "single_url_section_preview",
+            "mode": mode,
             "page_url": page.url,
             "product_url": args.product_url,
             "generated_listing_sku": generated_sku,
@@ -328,7 +346,7 @@ def main() -> int:
 
         print(
             "\n===== ACCEPTANCE COMPLETE ====="
-            if args.all_step3
+            if args.all_step3 or args.allow_section_save
             else "\n===== PREVIEW READY ====="
         )
         print(
