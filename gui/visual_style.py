@@ -6,8 +6,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QCursor, QImage, QPainter, QPainterPath, QPixmap, QRadialGradient
-from PySide6.QtOpenGLWidgets import QOpenGLWidget
+from PySide6.QtGui import QColor, QCursor, QImage, QPainter, QPixmap, QRadialGradient, QRegion
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -16,6 +15,7 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QMainWindow,
     QScrollBar,
+    QWidget,
 )
 
 
@@ -293,7 +293,7 @@ def _load_wallpaper() -> QPixmap:
 
 
 def _blur_pixmap(source: QPixmap, radius: float = 10.0) -> QPixmap:
-    """Blur once per wallpaper rebuild; never blur on an animation frame."""
+    """Build the one blurred companion texture; never called by a motion frame."""
 
     if source.isNull():
         return QPixmap()
@@ -311,8 +311,31 @@ def _blur_pixmap(source: QPixmap, radius: float = 10.0) -> QPixmap:
     return result
 
 
+def _rounded_region(rect: QRect, radius: int = 6) -> QRegion:
+    """Cheap cached integer mask for a small-radius rounded rectangle."""
+
+    if rect.isEmpty():
+        return QRegion()
+    r = max(0, min(int(radius), rect.width() // 2, rect.height() // 2))
+    if r <= 0:
+        return QRegion(rect)
+
+    region = QRegion(rect.adjusted(r, 0, -r, 0))
+    region = region.united(QRegion(rect.adjusted(0, r, 0, -r)))
+    diameter = r * 2
+    corners = (
+        QRect(rect.left(), rect.top(), diameter, diameter),
+        QRect(rect.right() - diameter + 1, rect.top(), diameter, diameter),
+        QRect(rect.left(), rect.bottom() - diameter + 1, diameter, diameter),
+        QRect(rect.right() - diameter + 1, rect.bottom() - diameter + 1, diameter, diameter),
+    )
+    for corner in corners:
+        region = region.united(QRegion(corner, QRegion.Ellipse))
+    return region
+
+
 class GlassBackdrop:
-    """Tiny interaction handle; VisualSceneLayer owns every painted pixel."""
+    """Interaction state only; all glass pixels belong to one global mask."""
 
     def __init__(self, frame: QFrame, scene: "VisualSceneLayer") -> None:
         self.frame = frame
@@ -338,28 +361,31 @@ class GlassBackdrop:
         self.scene.update_frame(self.frame)
 
 
-class VisualSceneLayer(QOpenGLWidget):
-    """GPU-backed wallpaper + glass compositor.
+class VisualSceneLayer(QWidget):
+    """Two-texture global compositor: sharp wallpaper + blurred wallpaper mask.
 
-    Wallpaper motion changes only texture source coordinates. The sharp and
-    pre-blurred overscan pixmaps are rebuilt only after a resize, then remain
-    stable texture sources throughout mouse parallax. Animation is scheduled by
-    completed OpenGL frame swaps instead of a competing wall-clock timer.
+    The expensive blur is created once after startup/resize. During parallax the
+    scene performs exactly one sharp wallpaper draw and one blurred wallpaper
+    draw clipped by one cached global glass region. Individual cards never copy
+    or resample their own backdrop. Their hover state only adds a tiny tint over
+    the affected cached card region.
     """
 
-    _OVERSCAN = 1.065
-    _TRAVEL = 0.82
-    _EASE_TAU = 0.095
-    _SETTLE_PX = 0.35
+    _OVERSCAN = 1.03
+    _MAX_TRAVEL_PX = 12.0
+    _FRAME_MS = 16
+    _EASE_TAU = 0.11
+    _SETTLE_PX = 0.25
+    _BASE_GLASS_ALPHA = 64
 
     def __init__(self, window: QMainWindow) -> None:
         central = window.centralWidget()
         super().__init__(central)
         self.window = window
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setFocusPolicy(Qt.NoFocus)
-        self.setAutoFillBackground(False)
-        self.setUpdateBehavior(QOpenGLWidget.UpdateBehavior.NoPartialUpdate)
 
         self._source = _load_wallpaper()
         self._render = QPixmap()
@@ -367,13 +393,13 @@ class VisualSceneLayer(QOpenGLWidget):
         self._source_rect = QRect()
 
         self.surfaces: dict[QFrame, GlassBackdrop] = {}
-        self._geometry_cache: dict[QFrame, tuple[QRect, QPainterPath]] = {}
+        self._geometry_cache: dict[QFrame, tuple[QRect, QRegion]] = {}
+        self._glass_mask = QRegion()
 
         self._offset = QPointF(0.0, 0.0)
         self._target = QPointF(0.0, 0.0)
         self._pending_pointer: QPoint | None = None
         self._last_tick = 0.0
-        self._motion_active = False
 
         self._rebuild_timer = QTimer(self)
         self._rebuild_timer.setSingleShot(True)
@@ -385,7 +411,10 @@ class VisualSceneLayer(QOpenGLWidget):
         self._geometry_timer.setInterval(16)
         self._geometry_timer.timeout.connect(self._refresh_geometry)
 
-        self.frameSwapped.connect(self._on_frame_swapped)
+        self._motion_timer = QTimer(self)
+        self._motion_timer.setTimerType(Qt.PreciseTimer)
+        self._motion_timer.setInterval(self._FRAME_MS)
+        self._motion_timer.timeout.connect(self._motion_tick)
 
         app = QApplication.instance()
         if app is not None:
@@ -435,23 +464,25 @@ class VisualSceneLayer(QOpenGLWidget):
         return QRect(local_top_left, global_rect.size()).intersected(self.rect())
 
     def _refresh_geometry(self) -> None:
-        cache: dict[QFrame, tuple[QRect, QPainterPath]] = {}
+        cache: dict[QFrame, tuple[QRect, QRegion]] = {}
+        mask = QRegion()
         for frame in self.surfaces:
             rect = self._visible_frame_rect(frame)
             if rect.isEmpty():
                 continue
-            path = QPainterPath()
-            path.addRoundedRect(QRectF(rect), 6.0, 6.0)
-            cache[frame] = (rect, path)
+            region = _rounded_region(rect)
+            cache[frame] = (rect, region)
+            mask = mask.united(region)
         self._geometry_cache = cache
+        self._glass_mask = mask
         self.update()
 
     def _rebuild(self) -> None:
         if self.width() <= 0 or self.height() <= 0:
             return
 
-        cover_w = max(self.width() + 2, round(self.width() * self._OVERSCAN))
-        cover_h = max(self.height() + 2, round(self.height() * self._OVERSCAN))
+        cover_w = max(self.width() + 26, round(self.width() * self._OVERSCAN))
+        cover_h = max(self.height() + 26, round(self.height() * self._OVERSCAN))
         scaled = self._source.scaled(
             QSize(cover_w, cover_h),
             Qt.KeepAspectRatioByExpanding,
@@ -466,7 +497,6 @@ class VisualSceneLayer(QOpenGLWidget):
         self._offset = QPointF(0.0, 0.0)
         self._target = QPointF(0.0, 0.0)
         self._pending_pointer = None
-        self._motion_active = False
         self._source_rect = self._rect_for_offset(self._offset)
         self.request_geometry_refresh()
         self.update()
@@ -490,29 +520,29 @@ class VisualSceneLayer(QOpenGLWidget):
         max_y = max(0, self._render.height() - self.height())
         center_x = max_x / 2.0
         center_y = max_y / 2.0
-        sx = round(max(0.0, min(float(max_x), center_x + offset.x())))
-        sy = round(max(0.0, min(float(max_y), center_y + offset.y())))
+        travel_x = min(self._MAX_TRAVEL_PX, center_x)
+        travel_y = min(self._MAX_TRAVEL_PX, center_y)
+        ox = max(-travel_x, min(travel_x, offset.x()))
+        oy = max(-travel_y, min(travel_y, offset.y()))
+        sx = round(max(0.0, min(float(max_x), center_x + ox)))
+        sy = round(max(0.0, min(float(max_y), center_y + oy)))
         return QRect(sx, sy, self.width(), self.height())
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
         if event_type == QEvent.MouseMove and hasattr(event, "globalPosition"):
-            # High-polling mice only replace this one pending point. The scene
-            # graph advances only when the previous OpenGL frame has presented.
             self._pending_pointer = event.globalPosition().toPoint()
-            self._ensure_motion()
+            self._ensure_motion_timer()
         elif watched is self.window and event_type == QEvent.Leave:
             self._pending_pointer = None
             self._target = QPointF(0.0, 0.0)
-            self._ensure_motion()
+            self._ensure_motion_timer()
         return False
 
-    def _ensure_motion(self) -> None:
-        if self._motion_active:
-            return
-        self._motion_active = True
-        self._last_tick = time.monotonic()
-        self.update()
+    def _ensure_motion_timer(self) -> None:
+        if not self._motion_timer.isActive():
+            self._last_tick = time.monotonic()
+            self._motion_timer.start()
 
     def _update_target(self, global_pos: QPoint) -> None:
         local = self.mapFromGlobal(global_pos)
@@ -525,11 +555,9 @@ class VisualSceneLayer(QOpenGLWidget):
         half_h = max(1.0, rect.height() / 2.0)
         nx = max(-1.0, min(1.0, (local.x() - half_w) / half_w))
         ny = max(-1.0, min(1.0, (local.y() - half_h) / half_h))
-        travel_x = max(0.0, (self._render.width() - rect.width()) / 2.0 * self._TRAVEL)
-        travel_y = max(0.0, (self._render.height() - rect.height()) / 2.0 * self._TRAVEL)
-        self._target = QPointF(-nx * travel_x, -ny * travel_y)
+        self._target = QPointF(-nx * self._MAX_TRAVEL_PX, -ny * self._MAX_TRAVEL_PX)
 
-    def _advance_motion(self) -> None:
+    def _motion_tick(self) -> None:
         now = time.monotonic()
         dt = min(0.050, max(0.001, now - self._last_tick))
         self._last_tick = now
@@ -546,69 +574,70 @@ class VisualSceneLayer(QOpenGLWidget):
             self._offset.x() + dx * alpha,
             self._offset.y() + dy * alpha,
         )
-        self._source_rect = self._rect_for_offset(self._offset)
+
+        next_rect = self._rect_for_offset(self._offset)
+        if next_rect != self._source_rect:
+            self._source_rect = next_rect
+            self.update()
 
         remaining = math.hypot(self._target.x() - self._offset.x(), self._target.y() - self._offset.y())
         if self._pending_pointer is None and remaining <= self._SETTLE_PX:
             self._offset = QPointF(self._target)
-            self._source_rect = self._rect_for_offset(self._offset)
-            self._motion_active = False
-
-    def _on_frame_swapped(self) -> None:
-        if self._motion_active and self.isVisible() and not self.window.isMinimized():
-            self.update()
+            final_rect = self._rect_for_offset(self._offset)
+            if final_rect != self._source_rect:
+                self._source_rect = final_rect
+                self.update()
+            self._motion_timer.stop()
 
     def update_frame(self, frame: QFrame) -> None:
-        if frame not in self._geometry_cache:
+        geometry = self._geometry_cache.get(frame)
+        if geometry is None:
             self.request_geometry_refresh()
             return
-        self.update()
+        _rect, region = geometry
+        self.update(region)
 
-    def paintGL(self) -> None:  # noqa: N802
+    @staticmethod
+    def _extra_tint_alpha(target_alpha: float, base_alpha: int) -> int:
+        target = max(float(base_alpha), min(255.0, float(target_alpha)))
+        if target <= base_alpha + 0.1 or base_alpha >= 255:
+            return 0
+        extra = 255.0 * (target - base_alpha) / (255.0 - base_alpha)
+        return max(0, min(255, int(round(extra))))
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
         if self._render.isNull() or self._source_rect.isEmpty():
             return
 
-        if self._motion_active:
-            self._advance_motion()
-
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+
+        # Pass 1: one sharp wallpaper draw for the whole scene.
         painter.drawPixmap(self.rect(), self._render, self._source_rect)
 
-        if not self._geometry_cache or self._blurred.isNull():
-            painter.end()
-            return
+        # Pass 2: one blurred wallpaper draw through one global cached mask.
+        if not self._glass_mask.isEmpty() and not self._blurred.isNull():
+            painter.save()
+            painter.setClipRegion(self._glass_mask)
+            painter.drawPixmap(self.rect(), self._blurred, self._source_rect)
+            painter.fillRect(self.rect(), QColor(0, 0, 0, self._BASE_GLASS_ALPHA))
+            painter.restore()
 
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        src = self._source_rect
-
-        for frame, (rect, cached_path) in self._geometry_cache.items():
+        # Hover/press only adds a tiny tint over changed cards. It never samples
+        # or redraws a per-card blur backdrop.
+        event_region = event.region() if event is not None else QRegion(self.rect())
+        for frame, (_rect, region) in self._geometry_cache.items():
+            if not event_region.intersects(region):
+                continue
             surface = self.surfaces.get(frame)
             if surface is None:
                 continue
-
-            sample = QRect(
-                src.x() + rect.x(),
-                src.y() + rect.y(),
-                rect.width(),
-                rect.height(),
-            ).intersected(self._blurred.rect())
-            if sample.isEmpty():
+            extra_alpha = self._extra_tint_alpha(surface.overlay_alpha, self._BASE_GLASS_ALPHA)
+            if extra_alpha <= 0:
                 continue
-
-            target = QRectF(rect)
-            path = cached_path
-            if surface.surface_scale < 0.9999:
-                inset_x = target.width() * (1.0 - surface.surface_scale) * 0.5
-                inset_y = target.height() * (1.0 - surface.surface_scale) * 0.5
-                target.adjust(inset_x, inset_y, -inset_x, -inset_y)
-                path = QPainterPath()
-                path.addRoundedRect(target, 6.0, 6.0)
-
             painter.save()
-            painter.setClipPath(path)
-            painter.drawPixmap(target, self._blurred, QRectF(sample))
-            painter.fillPath(path, QColor(0, 0, 0, int(round(surface.overlay_alpha))))
+            painter.setClipRegion(region)
+            painter.fillRect(self.rect(), QColor(0, 0, 0, extra_alpha))
             painter.restore()
 
         painter.end()
@@ -617,13 +646,13 @@ class VisualSceneLayer(QOpenGLWidget):
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
-        self._motion_active = False
+        self._motion_timer.stop()
         self._geometry_timer.stop()
         self._rebuild_timer.stop()
 
 
 class VisualStyleController(QObject):
-    """Own the GPU visual scene and the static white-dot cursor."""
+    """Own the global two-texture visual scene and static white-dot cursor."""
 
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
@@ -642,8 +671,6 @@ class VisualStyleController(QObject):
         window.installEventFilter(self)
         self._install_cursor()
 
-        # Scrolling only invalidates cached card geometry. Mapping never runs on
-        # a wallpaper motion frame.
         for bar in window.findChildren(QScrollBar):
             bar.valueChanged.connect(self.scene.request_geometry_refresh)
 
