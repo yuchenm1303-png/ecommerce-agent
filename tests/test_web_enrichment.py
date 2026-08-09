@@ -111,8 +111,9 @@ class DynamicWebProvider:
                     {
                         "source_url": url,
                         "match": "same_product",
+                        "identity_basis": "explicit_cross_reference",
                         "reason": "same exact product",
-                        "identity_evidence": ["matching variant and hardware"],
+                        "identity_evidence": ["candidate explicitly cross-references the exact supplier item"],
                     }
                 ],
                 "decisions": decisions,
@@ -140,8 +141,9 @@ def same_product_payload(url: str, decisions):
             {
                 "source_url": url,
                 "match": "same_product",
+                "identity_basis": "explicit_cross_reference",
                 "reason": "same exact product",
-                "identity_evidence": ["matching exact variant"],
+                "identity_evidence": ["explicit exact-product cross-reference"],
             }
         ],
         "decisions": decisions,
@@ -195,6 +197,7 @@ def test_missing_field_is_searched_and_ready_field_is_frozen(tmp_path):
     assert PRODUCT_URL in search.prompts[0]
     assert '"known_local_fields"' in search.prompts[0]
     assert result.source_matches[0].match == "same_product"
+    assert result.source_matches[0].identity_basis == "explicit_cross_reference"
 
 
 def test_local_conflict_is_frozen_and_never_sent_as_target():
@@ -284,6 +287,7 @@ def test_same_named_candidate_marked_uncertain_cannot_replace_local_missing():
                 {
                     "source_url": url,
                     "match": "uncertain",
+                    "identity_basis": "generic_model_or_similarity",
                     "reason": "only generic M8 name matches",
                     "identity_evidence": ["model token M8"],
                 }
@@ -303,6 +307,41 @@ def test_same_named_candidate_marked_uncertain_cannot_replace_local_missing():
     assert result.source_matches[0].match == "uncertain"
     assert result.web_sources == []
     assert result.packet.decisions[0].status == MISSING
+
+
+def test_ai_same_product_with_only_model_and_similar_dimensions_is_downgraded():
+    sensor = field("image_sensor", "Image Sensor")
+    fields = [sensor]
+    initial = packet(fields, [FieldDecision(field_id=field_id(sensor), status=MISSING)])
+    url = "https://example.test/lookalike-m8"
+    search = FakeWebProvider(
+        {
+            "source_matches": [
+                {
+                    "source_url": url,
+                    "match": "same_product",
+                    "identity_basis": "generic_model_or_similarity",
+                    "reason": "M8 name and similar dimensions",
+                    "identity_evidence": ["M8; dimensions close to supplier page"],
+                }
+            ],
+            "decisions": [
+                {
+                    "field_id": field_id(sensor),
+                    "status": "ready",
+                    "values": ["GC1054"],
+                    "citations": [{"source_url": url, "evidence_text": "Image sensor GC1054"}],
+                }
+            ],
+        },
+        [WebSearchSource(index="1", title="Lookalike M8", url=url)],
+    )
+    result = run_web_enrichment(search, initial, fields, grounding(), product_url=PRODUCT_URL)
+    assert result.source_matches[0].match == "uncertain"
+    assert result.source_matches[0].identity_basis == "generic_model_or_similarity"
+    assert result.web_sources == []
+    assert result.packet.decisions[0].status == MISSING
+    assert any("strong identity anchor" in warning for warning in result.warnings)
 
 
 def test_invented_web_url_cannot_replace_local_missing():
