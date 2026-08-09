@@ -66,8 +66,9 @@ def test_production_resolver_is_profile_local_fill_then_web_fill_only():
     assert "run_ai_resolution(" not in source
     assert "product_profile_then_parallel_local_fill_then_parallel_web_fill" in source
     assert "final_resolve" not in source
-    assert "Final Resolve" not in web_source
     assert "final_provider" not in web_source
+    assert "_run_final_resolution" not in web_source
+    assert "_run_final_batch" not in web_source
     assert "--field-batch-size" in source
     assert "--field-concurrency" in source
     assert "--web-batch-size" in source
