@@ -349,10 +349,17 @@ class OpenAICompatibleSemanticProvider:
             ],
             "timeout": self.request_timeout_seconds,
         }
-        if self.structured_mode == "json_object":
+        if bool(request_payload.get("strict_json_schema")):
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "semantic_task_result",
+                    "strict": True,
+                    "schema": request_payload["json_contract"],
+                },
+            }
+        elif self.structured_mode == "json_object":
             kwargs["response_format"] = {"type": "json_object"}
-            # Alibaba Cloud explicitly recommends not setting max_tokens in JSON
-            # mode because truncation produces invalid JSON.
         else:
             kwargs["max_tokens"] = self.max_output_tokens
         if self.enable_thinking is not None:
