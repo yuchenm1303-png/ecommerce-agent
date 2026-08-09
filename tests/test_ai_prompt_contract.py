@@ -1,10 +1,19 @@
-from app.ai_decisions import FieldDecision, MISSING, field_id, schema_digest, source_manifest_digest
+from app.ai_decisions import (
+    AIDecisionPacket,
+    CONFLICT,
+    MISSING,
+    DecisionAlternative,
+    DecisionCitation,
+    FieldDecision,
+    field_id,
+    schema_digest,
+    source_manifest_digest,
+)
 from app.evidence_contract import ProductIdentity
 from app.field_mapping import build_field_mapping_request
 from app.product_profile import ProductFact, ProductProfile, ProfileCandidate, build_product_profile_request
 from app.semantic_grounding import GroundedSource, GroundingCatalog, TEXT_KIND
 from app.web_enrichment import _targets
-from app.ai_decisions import AIDecisionPacket, DecisionCitation
 
 
 def _field():
@@ -68,25 +77,27 @@ def test_product_profile_prompt_has_no_marketplace_target_fields():
     assert request["target_fields"] == []
     assert len(request["grounded_sources"]) == 1
     rules = "\n".join(request["rules"])
-    assert "Do not map" not in rules  # instruction lives in system/prompt, not a schema-specific field rule
     assert "packaging dimensions" in rules
     assert "Negative facts" in rules
 
 
-def test_field_mapping_prompt_keeps_stable_field_identity_and_uses_profile_only():
+def test_local_fill_prompt_uses_profile_once_and_has_no_review_status():
     field = _field()
     request = build_field_mapping_request([field], _profile())
     target = request["target_fields"][0]
+    assert request["task"] == "fill_marketplace_fields_from_local_product_profile"
     assert target["attribute_key"] == "package_breadth"
     assert target["label"] == "Length"
     assert target["qualifier_options"] == ["cm", "mm"]
     assert len(request["grounded_sources"]) == 1
     assert request["grounded_sources"][0]["source_type"] == "derived_product_profile"
     assert request["grounded_sources"][0]["kind"] == "text"
+    statuses = request["json_contract"]["properties"]["decisions"]["items"]["properties"]["status"]["enum"]
+    assert statuses == ["ready", "conflict", "missing"]
     rules = "\n".join(request["rules"])
-    assert "CONFLICT" in rules
-    assert "multi_value=false" in rules
-    assert "packaging dimensions/weight" in rules
+    assert "attribute_key" in rules
+    assert "packaging facts only" in rules
+    assert "Other Storage Features" in rules
 
 
 def test_cli_defaults_to_qwen37_plus_and_bounded_parallel_stages():
@@ -108,8 +119,8 @@ def test_cli_defaults_to_qwen37_plus_and_bounded_parallel_stages():
     assert "--web-batch-size" in options
 
 
-def test_missing_field_without_authored_query_still_enters_web_research():
-    field = {
+def test_only_empty_field_enters_web_search_and_local_conflict_stays_frozen():
+    missing_field = {
         "attribute_key": "image_sensor",
         "label": "Image Sensor",
         "section_heading": "Additional Description",
@@ -119,13 +130,28 @@ def test_missing_field_without_authored_query_still_enters_web_research():
         "controls": [],
         "help_text": "",
     }
+    conflict_field = {
+        **missing_field,
+        "attribute_key": "recording_resolution",
+        "label": "Recording Resolution",
+    }
     grounding = GroundingCatalog(sources=[])
+    citation = DecisionCitation("local", "evidence")
     packet = AIDecisionPacket(
         identity=ProductIdentity(model_number="M8"),
-        schema_sha256=schema_digest([field]),
+        schema_sha256=schema_digest([missing_field, conflict_field]),
         source_manifest_sha256=source_manifest_digest(grounding),
-        decisions=[FieldDecision(field_id=field_id(field), status=MISSING, search_queries=[])],
+        decisions=[
+            FieldDecision(field_id=field_id(missing_field), status=MISSING),
+            FieldDecision(
+                field_id=field_id(conflict_field),
+                status=CONFLICT,
+                alternatives=[
+                    DecisionAlternative(values=("720p",), citations=(citation,)),
+                    DecisionAlternative(values=("1080p",), citations=(citation,)),
+                ],
+            ),
+        ],
     )
-    targets = _targets(packet, [field])
-    assert len(targets) == 1
-    assert targets[0][1].field_id == field_id(field)
+    targets = _targets(packet, [missing_field, conflict_field])
+    assert [item[1].field_id for item in targets] == [field_id(missing_field)]
