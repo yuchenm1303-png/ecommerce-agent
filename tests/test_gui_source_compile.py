@@ -9,12 +9,10 @@ GUI_SOURCES = [
     PROJECT_ROOT / "gui" / "main_window.py",
     PROJECT_ROOT / "gui" / "readonly_runner.py",
     PROJECT_ROOT / "gui" / "result_loader.py",
-    PROJECT_ROOT / "gui" / "nekro_visual_fx.py",
-    PROJECT_ROOT / "gui" / "optimized_cursor_fx.py",
+    PROJECT_ROOT / "gui" / "visual_style.py",
     PROJECT_ROOT / "gui" / "nekro_card_fx.py",
-    PROJECT_ROOT / "gui" / "nekro_sakura.py",
-    PROJECT_ROOT / "gui" / "pastel_background.py",
-    PROJECT_ROOT / "gui" / "performance_tuning.py",
+    PROJECT_ROOT / "gui" / "nekro_effects.py",
+    PROJECT_ROOT / "gui" / "log_presenter.py",
 ]
 
 
