@@ -5,22 +5,26 @@ import inspect
 import pytest
 
 import makro_plan_listing
+from app.business_fields import generate_listing_sku
+
+
+PRODUCT_URL = "https://detail.1688.com/offer/850845635717.html"
 
 
 def _plan_args():
     return [
-        "--qa",
-        "qa.xlsx",
         "--decision-packet",
         "ai-decisions.json",
         "--live-schema",
         "live-schema.json",
+        "--product-url",
+        PRODUCT_URL,
         "--expected-vertical",
         "vehicle_camera_system",
     ]
 
 
-def test_planner_has_explicit_live_schema_scan_mode_without_ai_inputs():
+def test_planner_has_explicit_live_schema_scan_mode_without_product_inputs():
     parser = makro_plan_listing.build_parser()
     args = parser.parse_args(
         [
@@ -32,19 +36,20 @@ def test_planner_has_explicit_live_schema_scan_mode_without_ai_inputs():
     makro_plan_listing._validate_mode(args)
     assert args.scan_live_schema is True
     assert args.decision_packet is None
-    assert args.qa is None
     assert args.live_schema is None
+    assert args.product_url is None
 
 
-def test_final_plan_mode_requires_qa_and_existing_live_schema():
+def test_final_plan_mode_requires_live_schema_and_product_url():
     parser = makro_plan_listing.build_parser()
     args = parser.parse_args(_plan_args())
     makro_plan_listing._validate_mode(args)
     assert args.decision_packet == "ai-decisions.json"
     assert args.live_schema == "live-schema.json"
+    assert args.product_url == PRODUCT_URL
     assert args.expected_vertical == "vehicle_camera_system"
 
-    missing_qa = parser.parse_args(
+    missing_url = parser.parse_args(
         [
             "--decision-packet",
             "ai-decisions.json",
@@ -54,15 +59,15 @@ def test_final_plan_mode_requires_qa_and_existing_live_schema():
             "vehicle_camera_system",
         ]
     )
-    with pytest.raises(SystemExit, match="--qa"):
-        makro_plan_listing._validate_mode(missing_qa)
+    with pytest.raises(SystemExit, match="--product-url"):
+        makro_plan_listing._validate_mode(missing_url)
 
     missing_schema = parser.parse_args(
         [
             "--decision-packet",
             "ai-decisions.json",
-            "--qa",
-            "qa.xlsx",
+            "--product-url",
+            PRODUCT_URL,
             "--expected-vertical",
             "vehicle_camera_system",
         ]
@@ -71,7 +76,7 @@ def test_final_plan_mode_requires_qa_and_existing_live_schema():
         makro_plan_listing._validate_mode(missing_schema)
 
 
-def test_live_planner_rebuilds_same_product_source_pack_for_strict_rebind():
+def test_live_planner_accepts_exact_captured_source_paths_for_strict_rebind():
     parser = makro_plan_listing.build_parser()
     args = parser.parse_args(
         _plan_args()
@@ -84,13 +89,13 @@ def test_live_planner_rebuilds_same_product_source_pack_for_strict_rebind():
             "product.png",
         ]
     )
-    spec = makro_plan_listing._input_spec(args)
-    assert spec.supplier_snapshots == ("supplier.json",)
-    assert spec.official_snapshots == ("official.json",)
-    assert spec.image_paths == ("product.png",)
+    assert args.supplier_snapshot == ["supplier.json"]
+    assert args.official_snapshot == ["official.json"]
+    assert args.image == ["product.png"]
+    assert generate_listing_sku(args.product_url).isdigit()
 
 
-def test_planner_has_no_alias_confidence_or_legacy_evidence_packet_controls():
+def test_planner_has_no_manual_sku_qa_or_legacy_controls():
     parser = makro_plan_listing.build_parser()
     options = {
         option
@@ -99,6 +104,9 @@ def test_planner_has_no_alias_confidence_or_legacy_evidence_packet_controls():
     }
     assert "--scan-live-schema" in options
     assert "--decision-packet" in options
+    assert "--product-url" in options
+    assert "--sku" not in options
+    assert "--qa" not in options
     assert "--alias-config" not in options
     assert "--auto-fill-min-confidence" not in options
     assert "--ai-auto-fill-min-confidence" not in options
@@ -115,7 +123,7 @@ def test_live_planner_contains_no_browser_fill_or_save_path():
     assert "write_live_schema(" in source
     assert "load_ai_decision_packet(" in source
     assert "assert_live_schema_matches(" in source
-    assert "build_live_fill_plan(\n            decision_packet" in source
+    assert "generated_business_bundle" in source
 
 
 def test_live_planner_blocks_unsaved_expanded_section():
