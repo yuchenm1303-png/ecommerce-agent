@@ -67,3 +67,23 @@ def test_live_schema_preserves_qualifier_options_after_serialization():
 
     assert planned[0]["qualifier_options"] == ["cm", "mm", "inch"]
     assert_live_schema_matches(planned, [field])
+
+
+def test_live_schema_preserves_nearby_context_for_fixed_unit_inputs():
+    field = {
+        **_field("length", "Length"),
+        "controls": [
+            {
+                "id": "length",
+                "name": "length_0_value",
+                "context_text": "Length * cm",
+            }
+        ],
+    }
+    planned = live_schema_payload([field])["fields"]
+    assert planned[0]["context_text"] == "Length * cm"
+    assert planned[0]["qualifier_options"] == []
+
+    # Context is useful AI input but not stable browser schema identity.
+    current = [{**field, "controls": [{**field["controls"][0], "context_text": "Length cm"}]}]
+    assert_live_schema_matches(planned, current)
