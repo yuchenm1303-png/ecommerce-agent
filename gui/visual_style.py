@@ -4,7 +4,7 @@ import base64
 import math
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QCursor,
@@ -328,7 +328,22 @@ def _blur_pixmap(source: QPixmap, radius: float = 10.0) -> QPixmap:
 
 
 class BackgroundLayer(QWidget):
+    """Full-window wallpaper that parallaxes and subtly zooms with the mouse.
+
+    The cover image is built slightly larger than the widget so it can travel
+    a few percent in the opposite direction of the cursor, with a gentle zoom
+    toward the cursor for a depth feel. An ease timer glides the offset so the
+    motion stays smooth instead of snapping to the pointer. ``scene_changed``
+    fires on wallpaper rebuild; ``offset_changed`` fires (throttled) whenever
+    the visible source region moves, so glass cards can stay in sync.
+    """
+
     scene_changed = Signal()
+
+    _OVERSCAN = 1.06  # cover is this much larger than the widget
+    _TRAVEL = 0.9  # fraction of the available travel actually used
+    _MAX_ZOOM = 0.0  # dynamic zoom disabled: keeps the blit at 1:1 for speed
+    _EASE = 0.12  # fraction of the remaining distance per 16ms tick
 
     def __init__(self, window: QMainWindow) -> None:
         central = window.centralWidget()
@@ -341,11 +356,26 @@ class BackgroundLayer(QWidget):
         # replace it with a blue fake-success background.
         self._source = _load_wallpaper()
         self._cover = QPixmap()
+        self._render = QPixmap()
         self._blurred = QPixmap()
         self._rebuild_timer = QTimer(self)
         self._rebuild_timer.setSingleShot(True)
         self._rebuild_timer.setInterval(140)
         self._rebuild_timer.timeout.connect(self._rebuild)
+
+        # Cursor parallax state: eased offset/zoom driven by the pointer.
+        self._offset = QPointF(0.0, 0.0)
+        self._target = QPointF(0.0, 0.0)
+        self._zoom = 1.0
+        self._zoom_target = 1.0
+        self._parallax_timer = QTimer(self)
+        self._parallax_timer.setInterval(16)
+        self._parallax_timer.timeout.connect(self._parallax_tick)
+        self.window.setMouseTracking(True)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+        self.window.destroyed.connect(self._detach_parallax)
 
     def sync_geometry(self) -> None:
         central = self.window.centralWidget()
@@ -362,38 +392,122 @@ class BackgroundLayer(QWidget):
     def _rebuild(self) -> None:
         if self.width() <= 0 or self.height() <= 0:
             return
+        cover_w = max(1, round(self.width() * self._OVERSCAN))
+        cover_h = max(1, round(self.height() * self._OVERSCAN))
         scaled = self._source.scaled(
-            self.size(),
+            QSize(cover_w, cover_h),
             Qt.KeepAspectRatioByExpanding,
             Qt.SmoothTransformation,
         )
-        x = max(0, (scaled.width() - self.width()) // 2)
-        y = max(0, (scaled.height() - self.height()) // 2)
-        self._cover = scaled.copy(x, y, self.width(), self.height())
+        x = max(0, (scaled.width() - cover_w) // 2)
+        y = max(0, (scaled.height() - cover_h) // 2)
+        self._cover = scaled.copy(x, y, cover_w, cover_h)
+        # Pre-compose the edge vignette into the wallpaper once, so the per-frame
+        # paint is a single fast blit with no gradient work.
+        self._render = self._compose_vignette(self._cover)
         self._blurred = _blur_pixmap(self._cover, 10.0)
+        # Re-center the parallax on a fresh wallpaper.
+        self._offset = QPointF(0.0, 0.0)
+        self._target = QPointF(0.0, 0.0)
+        self._zoom = 1.0
+        self._zoom_target = 1.0
         self.update()
         self.scene_changed.emit()
 
     def blurred_scene(self) -> QPixmap:
         return self._blurred if not self._blurred.isNull() else self._cover
 
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        del event
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        rect = self.rect()
-        painter.fillRect(rect, QColor("#17263A"))
-        if not self._cover.isNull():
-            painter.drawPixmap(rect, self._cover)
+    def parallax_source_rect(self) -> QRect:
+        """Source rect of the oversized cover that is currently visible.
 
-        # Keep only a restrained edge vignette so white UI text remains readable
-        # without changing the wallpaper composition itself.
-        center = QPointF(rect.center())
-        radius = max(1.0, math.hypot(rect.width() / 2.0, rect.height() / 2.0))
+        This is the single place the visible region is computed, so glass card
+        sampling can reproduce exactly what paintEvent draws. Coordinates are
+        integer so the draw stays a plain 1:1 copy — Qt's raster engine skips
+        the slow fractional-coordinate filtering path.
+        """
+        w = self.width()
+        h = self.height()
+        zoom = max(1.0, self._zoom)
+        sw = w / zoom
+        sh = h / zoom
+        cx = self._cover.width() / 2.0 + self._offset.x()
+        cy = self._cover.height() / 2.0 + self._offset.y()
+        sx = max(0.0, min(self._cover.width() - sw, cx - sw / 2.0))
+        sy = max(0.0, min(self._cover.height() - sh, cy - sh / 2.0))
+        return QRect(round(sx), round(sy), round(sw), round(sh))
+
+    def _compose_vignette(self, cover: QPixmap) -> QPixmap:
+        """Return the cover with the readability edge vignette baked in."""
+        composed = cover.copy()
+        painter = QPainter(composed)
+        center = QPointF(composed.width() / 2.0, composed.height() / 2.0)
+        radius = max(1.0, math.hypot(composed.width() / 2.0, composed.height() / 2.0))
         outer = QRadialGradient(center, radius)
         outer.setColorAt(0.0, QColor(0, 0, 0, 0))
         outer.setColorAt(1.0, QColor(0, 0, 0, 92))
-        painter.fillRect(rect, outer)
+        painter.fillRect(composed.rect(), outer)
+        painter.end()
+        return composed
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        del watched
+        if event.type() == QEvent.MouseMove:
+            self._update_target(event.globalPosition().toPoint())
+            if not self._parallax_timer.isActive():
+                self._parallax_timer.start()
+        return False
+
+    def _update_target(self, global_pos) -> None:
+        local = self.mapFromGlobal(global_pos)
+        r = self.rect()
+        if not r.contains(local) or self._cover.isNull():
+            self._target = QPointF(0.0, 0.0)
+            self._zoom_target = 1.0
+            return
+        nx = max(-1.0, min(1.0, (local.x() - r.width() / 2.0) / (r.width() / 2.0)))
+        ny = max(-1.0, min(1.0, (local.y() - r.height() / 2.0) / (r.height() / 2.0)))
+        travel_x = (self._cover.width() - r.width()) / 2.0 * self._TRAVEL
+        travel_y = (self._cover.height() - r.height()) / 2.0 * self._TRAVEL
+        self._target = QPointF(-nx * travel_x, -ny * travel_y)
+        self._zoom_target = 1.0 + min(1.0, math.hypot(nx, ny)) * self._MAX_ZOOM
+
+    def _parallax_tick(self) -> None:
+        ease = self._EASE
+        next_x = round(self._offset.x() + (self._target.x() - self._offset.x()) * ease)
+        next_y = round(self._offset.y() + (self._target.y() - self._offset.y()) * ease)
+        dx = next_x - self._offset.x()
+        dy = next_y - self._offset.y()
+        self._offset = QPointF(float(next_x), float(next_y))
+        if dx or dy:
+            # Shift the already-rendered pixels instead of repainting the whole
+            # screen: only the thin exposed band is invalidated, so the overlay
+            # layers above re-composite a few rows rather than the full window.
+            self.scroll(-dx, -dy)
+        if abs(next_x - self._target.x()) < 1.0 and abs(next_y - self._target.y()) < 1.0:
+            self._parallax_timer.stop()
+
+    def _detach_parallax(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        if self._render.isNull():
+            return
+        painter = QPainter(self)
+        src = self.parallax_source_rect()
+        rects = [self.rect()]
+        region = event.region() if event is not None else None
+        if region is not None and not region.isEmpty():
+            rects = [r for r in region]
+        for r in rects:
+            # Draw only the invalidated band, mapped 1:1 into the oversized
+            # cover, so scroll()-driven parallax repaints a few rows at a time.
+            painter.drawPixmap(
+                r,
+                self._render,
+                QRect(src.x() + r.x(), src.y() + r.y(), r.width(), r.height()),
+            )
         painter.end()
 
 
@@ -453,11 +567,24 @@ class GlassBackdrop(QWidget):
         # global coordinates instead, which only requires a shared window.
         global_top_left = self.frame.mapToGlobal(QPoint(0, 0))
         top_left = self.background.mapFromGlobal(global_top_left)
+
+        # Sample the same oversized-cover region that the parallax paint uses,
+        # so the glass surface always mirrors what the wallpaper currently
+        # shows beneath the card.
+        src = self.background.parallax_source_rect()
+        scale_x = src.width() / max(1, self.background.width())
+        scale_y = src.height() / max(1, self.background.height())
+        sample_w = self.width() * scale_x
+        sample_h = self.height() * scale_y
+        sx = src.x() + top_left.x() * scale_x
+        sy = src.y() + top_left.y() * scale_y
+        sx = max(0.0, min(scene.width() - sample_w, sx))
+        sy = max(0.0, min(scene.height() - sample_h, sy))
         self._surface_cache = scene.copy(
-            int(top_left.x()),
-            int(top_left.y()),
-            int(self.width()),
-            int(self.height()),
+            int(sx),
+            int(sy),
+            int(sample_w),
+            int(sample_h),
         )
         self.update()
 
