@@ -29,29 +29,33 @@ class JSONTaskProvider(Protocol):
         ...
 
 
-FIELD_MAPPING_CONTRACT_VERSION = 7
-FIELD_MAPPING_CACHE_VERSION = 7
+FIELD_MAPPING_CONTRACT_VERSION = 8
+FIELD_MAPPING_CACHE_VERSION = 8
 
 
 MAPPING_SYSTEM_INSTRUCTION = (
-    "You directly fill marketplace fields from the supplied exact product evidence. "
-    "There is no intermediate product-profile or review layer. Read the supplier page, "
-    "customer material and images yourself, answer only the requested Makro fields, preserve "
-    "real source conflicts, and leave unsupported fields missing. Return JSON only."
+    "You directly fill marketplace fields from the supplied exact supplier-page evidence. "
+    "There is no intermediate product profile, review model, or Python semantic resolver. "
+    "Read the structured page rows, embedded variant data, rendered page text, full-page screenshot "
+    "and captured product/detail images yourself. Preserve real source conflicts and leave unsupported "
+    "fields missing. Return JSON only."
 )
 
 
 MAPPING_RULES = [
-    "Answer every supplied target field_id exactly once.",
-    "Use READY only when the supplied evidence supports that exact Makro field for the selected product/variant. Cite the exact original text or image source.",
-    "Use CONFLICT when supplied sources genuinely give different values for the same exact field; every alternative needs its own original citation.",
-    "Use MISSING when the value is not established. Do not guess from typical products, nearby facts, absence, or general knowledge.",
-    "Treat attribute_key, label, section_heading, help_text, options and qualifier_options together as the field meaning. Do not create a separate semantic taxonomy.",
-    "Keep source scope exact: packaging vs product body vs mount; cabin/interior vs rear/back; manual/documentation language vs device UI language; product brand vs compatible vehicle brand.",
-    "Preserve explicit dimension axes exactly as stated by the source. If the source says length/width/height, map those named axes directly and never rotate them to make values fit.",
-    "Do not turn a conflict into a confident statement elsewhere. Generated Description/Keywords/Sales Package may use only non-conflicting supported facts and must not introduce rear/front, resolution, language, compatibility or included-item claims that are not established.",
-    "Never infer No/False/Unsupported/Not included from absence. Negative values need explicit supporting evidence.",
-    "If marketplace options exist, use exact option text only when the evidence supports that meaning. If multi_value=false return one value. If qualifier_options exist, put magnitude in values and unit in qualifier.",
+    "Answer every supplied target field_id exactly once with READY, CONFLICT, or MISSING.",
+    "Use READY only when the supplied exact-page evidence supports that exact Makro field. Cite an existing source_reference; evidence_text may be a concise faithful paraphrase and need not copy the source verbatim.",
+    "Use CONFLICT when supplied text/images genuinely give different values for the same exact field. Inspect all supplied image evidence as well as text; every alternative needs its own source citation.",
+    "Use MISSING when the value is not established. Do not guess from typical products, nearby facts, absence, class conventions, or general knowledge.",
+    "Treat attribute_key, label, section_heading, help_text, context_text, options and qualifier_options together as the Makro field meaning. Do not invent a second taxonomy.",
+    "Keep scope exact: packaging vs product body vs mount; cabin/interior vs rear/back; manual/documentation language vs device UI language; product brand vs compatible vehicle brand.",
+    "Preserve dimension axes literally. Source length maps to Makro Length; source width/breadth maps to Makro Breadth; source height maps to Makro Height. Never swap or rotate axes to make values fit.",
+    "Structured page rows and embedded key/value data are high-signal raw evidence. If they explicitly name length/width/height, preserve those names exactly.",
+    "Do not turn a conflict into a confident statement elsewhere. Generated Description/Keywords/Sales Package may use only supported, non-conflicting facts.",
+    "Never infer No/False/Unsupported/Not included from absence. A negative value requires explicit evidence.",
+    "If options exist, return exact option text only when evidence supports it. If multi_value=false return one value.",
+    "If qualifier_options exist, put the magnitude in values and an exact allowed unit in qualifier. If qualifier_options are empty, qualifier MUST be empty. Use a fixed unit shown in context_text/help_text by converting the magnitude to that unit; if no fixed unit is established, return MISSING rather than inventing a qualifier.",
+    "Embedded variant matrices may contain several options. Do not mix facts from different variants unless the page itself establishes they apply to the current product generally.",
     "Do not use external web knowledge in this local pass. Seller-operated price, stock, MOQ, fulfilment, shipping and listing-status fields are not product research questions.",
 ]
 
@@ -98,12 +102,9 @@ def _target_payload(field: dict[str, Any]) -> dict[str, Any]:
         "required": contract["required"],
         "multi_value": contract["multi_value"],
     }
-    if contract["options"]:
-        payload["options"] = contract["options"]
-    if contract["qualifier_options"]:
-        payload["qualifier_options"] = contract["qualifier_options"]
-    if contract["help_text"]:
-        payload["help_text"] = contract["help_text"]
+    for key in ("options", "qualifier_options", "help_text", "context_text"):
+        if contract.get(key):
+            payload[key] = contract[key]
     return payload
 
 
@@ -119,14 +120,11 @@ def build_field_mapping_request(
         "task": "fill_marketplace_fields_from_exact_product_evidence",
         "system_instruction": MAPPING_SYSTEM_INSTRUCTION,
         "prompt_instruction": (
-            "Read the supplied exact product evidence and fill this small Makro field batch directly. "
-            "Do not build another product profile and do not review fields outside this batch. "
-            "If evidence does not actually establish a value, return MISSING so Web can search later."
+            "Read the supplied exact product-page evidence and fill this small Makro field batch directly. "
+            "Use the raw structured rows and images before resorting to MISSING. Preserve any genuine text/image conflict. "
+            "There is no later local review stage; unsupported values must be MISSING for Web to research."
         ),
         "product_identity": {
-            "sku": expected_identity.sku,
-            "model_number": expected_identity.model_number,
-            "brand": expected_identity.brand,
             "source_product_url": product_url.strip(),
         },
         "target_fields": [_target_payload(field) for field in fields],
@@ -338,7 +336,7 @@ def run_field_mapping(
         schema_sha256=schema_digest(field_list),
         source_manifest_sha256=source_manifest_digest(grounding),
         decisions=decisions,
-        model_summary="Exact local product evidence directly filled the first-pass Makro field table.",
+        model_summary="Exact local product-page evidence directly filled the first-pass Makro field table.",
         warnings=warnings,
         extractor=f"{provider.name}+parallel-local-fill".strip("+"),
     )
