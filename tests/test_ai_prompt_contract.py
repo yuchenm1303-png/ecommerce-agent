@@ -48,7 +48,7 @@ def _grounding():
     )
 
 
-def test_local_fill_prompt_reads_original_sources_directly_and_has_no_review_status():
+def test_local_fill_prompt_reads_original_sources_directly_and_uses_typed_schema():
     request = build_field_mapping_request(
         [_field()],
         _grounding(),
@@ -63,12 +63,14 @@ def test_local_fill_prompt_reads_original_sources_directly_and_has_no_review_sta
     assert target["context_text"] == "Breadth cm"
     assert request["grounded_sources"][0]["source_type"] == "supplier_web"
     assert request["product_identity"] == {"source_product_url": PRODUCT_URL}
-    statuses = request["json_contract"]["properties"]["decisions"]["items"]["properties"]["status"]["enum"]
-    assert statuses == ["ready", "conflict", "missing"]
+    assert request["strict_json_schema"] is True
+    properties = request["json_contract"]["properties"]
+    assert set(properties) == {"ready", "conflicts", "missing", "model_summary"}
+    assert "reason" not in properties["missing"]["items"]["properties"]
     rules = "\n".join(request["rules"])
     assert "dimension axes" in rules
     assert "manual/documentation language" in rules
-    assert "Do not turn a conflict" in rules
+    assert "non-conflicting facts" in rules
     assert "qualifier_options are empty" in rules
 
 
