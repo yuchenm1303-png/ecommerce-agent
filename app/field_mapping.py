@@ -32,8 +32,8 @@ class JSONTaskProvider(Protocol):
         ...
 
 
-FIELD_MAPPING_CONTRACT_VERSION = 9
-FIELD_MAPPING_CACHE_VERSION = 9
+FIELD_MAPPING_CONTRACT_VERSION = 10
+FIELD_MAPPING_CACHE_VERSION = 10
 
 
 MAPPING_SYSTEM_INSTRUCTION = (
@@ -49,12 +49,14 @@ MAPPING_SYSTEM_INSTRUCTION = (
 MAPPING_RULES = [
     "Place every supplied target field_id exactly once in ready, conflicts, or missing.",
     "ready is for a single supported field value and requires at least one existing source_reference citation.",
-    "conflicts is for genuine different values for the same exact field and requires at least two cited alternatives.",
+    "conflicts is for genuine different values that each answer the same exact target field and requires at least two cited alternatives.",
+    "Every READY value and every CONFLICT alternative must be supported by direct target-specific evidence. Do not use evidence for one attribute as the value of another attribute; unit conversion and exact option mapping are the only mechanical transformations allowed.",
     "missing is only for a value not established by the supplied exact-page evidence; do not guess from typical products, nearby facts, absence, class conventions, or general knowledge.",
     "Treat attribute_key, label, section_heading, help_text, context_text, options and qualifier_options together as the Makro field meaning. Do not invent a second taxonomy.",
     "Keep scope exact: packaging vs product body vs mount; cabin/interior vs rear/back; manual/documentation language vs device UI language; product brand vs compatible vehicle brand.",
+    "For structured key/value rows, preserve the row key as the attribute identity. A value from a differently named row must not be reassigned merely because it is adjacent or numerically plausible.",
     "Preserve dimension axes literally. Source length maps to Makro Length; source width/breadth maps to Makro Breadth; source height maps to Makro Height. Never swap or rotate axes to make values fit.",
-    "Structured page rows and embedded key/value data are high-signal raw evidence. If they explicitly name length/width/height, preserve those names exactly.",
+    "Before declaring CONFLICT, verify all alternatives have the same semantic/quantity type as the target field; nearby facts of another type are not conflicting alternatives.",
     "Generated Description/Keywords/Sales Package may use only supported, non-conflicting facts.",
     "Never infer No/False/Unsupported/Not included from absence. A negative value requires explicit evidence.",
     "If options exist, return exact option text only when evidence supports it. If multi_value=false return one value.",
@@ -170,8 +172,9 @@ def build_field_mapping_request(
         "system_instruction": MAPPING_SYSTEM_INSTRUCTION,
         "prompt_instruction": (
             "Read the supplied exact product-page evidence and classify this Makro field batch directly into the "
-            "schema-defined ready/conflicts/missing collections. Use raw structured rows and images before missing; "
-            "preserve genuine text/image conflicts."
+            "schema-defined ready/conflicts/missing collections. Treat each target field definition independently. "
+            "Use atomic structured rows and images before missing; preserve genuine conflicts only when both values "
+            "directly answer the same target field."
         ),
         "product_identity": {"source_product_url": product_url.strip()},
         "target_fields": [_target_payload(field) for field in fields],
@@ -226,6 +229,9 @@ def _cache_key(
 def _typed_decisions(raw: Any) -> list[dict[str, Any]]:
     if not isinstance(raw, dict):
         raise ValueError("local field fill AI output 不是 JSON object")
+    if not all(isinstance(raw.get(key), list) for key in ("ready", "conflicts", "missing")):
+        raise ValueError("local field fill AI output 缺少 ready/conflicts/missing 数组")
+
     output: list[dict[str, Any]] = []
     for item in raw.get("ready") or []:
         if isinstance(item, dict):
@@ -272,9 +278,57 @@ def _typed_decisions(raw: Any) -> list[dict[str, Any]]:
                     "search_queries": list(item.get("search_queries") or []),
                 }
             )
-    if not all(isinstance(raw.get(key), list) for key in ("ready", "conflicts", "missing")):
-        raise ValueError("local field fill AI output 缺少 ready/conflicts/missing 数组")
     return output
+
+
+def _validate_partition(raw_decisions: list[dict[str, Any]], batch_fields: list[dict[str, Any]]) -> None:
+    expected = [field_id(field) for field in batch_fields]
+    expected_set = set(expected)
+    observed = [str(item.get("field_id") or "").strip() for item in raw_decisions]
+    duplicates = sorted({identifier for identifier in observed if identifier and observed.count(identifier) > 1})
+    unknown = sorted({identifier for identifier in observed if identifier and identifier not in expected_set})
+    omitted = [identifier for identifier in expected if identifier not in observed]
+    blank_count = sum(1 for identifier in observed if not identifier)
+    if duplicates or unknown or omitted or blank_count:
+        parts: list[str] = []
+        if duplicates:
+            parts.append("duplicate field_id=" + ",".join(duplicates))
+        if unknown:
+            parts.append("unknown field_id=" + ",".join(unknown))
+        if omitted:
+            parts.append("omitted field_id=" + ",".join(omitted))
+        if blank_count:
+            parts.append(f"blank field_id count={blank_count}")
+        raise ValueError("; ".join(parts))
+
+
+def _validated_model_output(
+    raw: Any,
+    batch_fields: list[dict[str, Any]],
+    grounding: GroundingCatalog,
+    expected_identity: ProductIdentity,
+    provider_name: str,
+) -> AIDecisionPacket:
+    raw_decisions = _typed_decisions(raw)
+    _validate_partition(raw_decisions, batch_fields)
+    packet = AIDecisionPacket(
+        identity=expected_identity,
+        schema_sha256=schema_digest(batch_fields),
+        source_manifest_sha256=source_manifest_digest(grounding),
+        decisions=[
+            FieldDecision.from_mapping(item, index=index)
+            for index, item in enumerate(raw_decisions, start=1)
+        ],
+        model_summary=str(raw.get("model_summary") or "").strip(),
+        warnings=[],
+        extractor=str(raw.get("extractor") or provider_name).strip() or provider_name,
+    )
+    return validate_ai_decision_packet(
+        packet,
+        batch_fields,
+        grounding,
+        expected_identity=expected_identity,
+    )
 
 
 @dataclass(slots=True)
@@ -312,49 +366,67 @@ def _run_batch(
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
 
+    request = build_field_mapping_request(
+        batch_fields,
+        grounding,
+        expected_identity=expected_identity,
+        product_url=product_url,
+    )
+    model_calls = 0
     try:
-        raw = provider.extract_json(
-            build_field_mapping_request(
-                batch_fields,
-                grounding,
-                expected_identity=expected_identity,
-                product_url=product_url,
-            )
-        )
-        raw_decisions = _typed_decisions(raw)
-        packet = AIDecisionPacket(
-            identity=expected_identity,
-            schema_sha256=schema_digest(batch_fields),
-            source_manifest_sha256=source_manifest_digest(grounding),
-            decisions=[
-                FieldDecision.from_mapping(item, index=index)
-                for index, item in enumerate(raw_decisions, start=1)
-            ],
-            model_summary=str(raw.get("model_summary") or "").strip(),
-            warnings=[],
-            extractor=str(raw.get("extractor") or provider.name).strip() or provider.name,
-        )
-        validated = validate_ai_decision_packet(
-            packet,
-            batch_fields,
-            grounding,
-            expected_identity=expected_identity,
-        )
+        raw = provider.extract_json(request)
+        model_calls += 1
     except Exception as exc:
         return _BatchRun(
             batch_index,
             [],
-            1,
+            model_calls or 1,
             False,
             warning=f"local field batch {batch_index} failed: {exc}",
         )
+
+    try:
+        validated = _validated_model_output(
+            raw,
+            batch_fields,
+            grounding,
+            expected_identity,
+            provider.name,
+        )
+    except Exception as first_exc:
+        repair_request = dict(request)
+        repair_request["validation_error"] = (
+            "The previous response did not assign each supplied field_id exactly once. "
+            f"Fix only the response structure and field-to-evidence mapping: {first_exc}"
+        )
+        try:
+            repaired_raw = provider.extract_json(repair_request)
+            model_calls += 1
+            validated = _validated_model_output(
+                repaired_raw,
+                batch_fields,
+                grounding,
+                expected_identity,
+                provider.name,
+            )
+        except Exception as repair_exc:
+            return _BatchRun(
+                batch_index,
+                [],
+                model_calls,
+                False,
+                warning=(
+                    f"local field batch {batch_index} failed after one structural repair: "
+                    f"{repair_exc}"
+                ),
+            )
 
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
         temp.write_text(json.dumps(validated.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(cache_path)
-    return _BatchRun(batch_index, validated.decisions, 1, False)
+    return _BatchRun(batch_index, validated.decisions, model_calls, False)
 
 
 def _mechanical_batches(fields: list[dict[str, Any]], batch_size: int) -> list[list[dict[str, Any]]]:
