@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+import time
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,6 +35,14 @@ class RunnerConfig:
     api_key_env: str = "DASHSCOPE_API_KEY"
 
 
+_PHASE_META = {
+    "scan": (1, "Fresh Makro live schema"),
+    "cold": (2, "Cold Resolver"),
+    "hot": (3, "Hot Resolver / cache verification"),
+    "plan": (4, "Read-only Fill Plan"),
+}
+
+
 class ReadOnlyRunner(QObject):
     log = Signal(str)
     phase_changed = Signal(str)
@@ -40,6 +50,13 @@ class ReadOnlyRunner(QObject):
     result_updated = Signal(object)
     completed = Signal(object)
     failed = Signal(str)
+
+    # Structured telemetry for the GUI console. Progress advances only when a
+    # deterministic phase exits successfully; there is no fabricated intra-step
+    # percentage.
+    progress_changed = Signal(int, str)
+    phase_event = Signal(object)
+    command_started = Signal(object)
 
     def __init__(self, project_root: Path, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -49,6 +66,11 @@ class ReadOnlyRunner(QObject):
         self.run_dir: Path | None = None
         self.current_phase = "idle"
         self._stopping = False
+        self._phase_started_monotonic: float | None = None
+        self._phase_started_wall = ""
+        self._phase_output_dir = ""
+        self._phase_terminal_emitted = False
+        self._stdout_tail = ""
 
     @property
     def is_running(self) -> bool:
@@ -62,6 +84,10 @@ class ReadOnlyRunner(QObject):
 
         self.config = config
         self._stopping = False
+        self.current_phase = "idle"
+        self._phase_started_monotonic = None
+        self._phase_terminal_emitted = False
+        self._stdout_tail = ""
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         self.run_dir = self.project_root / "logs" / "gui-runs" / f"readonly-{stamp}"
         self.run_dir.mkdir(parents=True, exist_ok=False)
@@ -69,10 +95,12 @@ class ReadOnlyRunner(QObject):
         (self.run_dir / "_cache" / "semantic").mkdir(parents=True, exist_ok=True)
         self._write_metadata(status="running")
 
+        self.progress_changed.emit(0, "0/4 · preparing")
         self.running_changed.emit(True)
         self._emit_log("===== GUI READ-ONLY TEST =====")
         self._emit_log(f"run_dir={self.run_dir}")
         self._emit_log(f"product_url={config.product_url}")
+        self._emit_log("Pipeline: 4 deterministic read-only stages; progress advances only after a stage succeeds.")
         self._emit_log("Safety contract: read-only scan + resolver + read-only Fill Plan only.")
         self._emit_log("makro_execute_listing.py is not invoked by this GUI.")
         self._start_scan()
@@ -113,11 +141,73 @@ class ReadOnlyRunner(QObject):
                 "GUI 不会自动启动或重启 Makro Edge；请先按现有方式启动后再测试。"
             ) from exc
 
+    def _begin_phase(self, phase: str, output_dir: Path) -> None:
+        index, label = _PHASE_META[phase]
+        self.current_phase = phase
+        self._phase_started_monotonic = time.monotonic()
+        self._phase_started_wall = datetime.now().astimezone().isoformat(timespec="seconds")
+        self._phase_output_dir = str(output_dir)
+        self._phase_terminal_emitted = False
+        self.phase_changed.emit(f"{index}/4  {label}")
+        self.progress_changed.emit((index - 1) * 25, f"{index}/4 · {label} · running")
+        self.phase_event.emit(
+            {
+                "phase": phase,
+                "index": index,
+                "label": label,
+                "status": "running",
+                "started_at": self._phase_started_wall,
+                "output_dir": self._phase_output_dir,
+            }
+        )
+        self._emit_log("")
+        self._emit_log(f"===== PHASE {index}/4 START · {label} =====")
+        self._emit_log(f"phase_output={self._phase_output_dir}")
+
+    def _finish_phase_event(
+        self,
+        status: str,
+        *,
+        exit_code: int | None = None,
+        error: str = "",
+    ) -> None:
+        if self.current_phase not in _PHASE_META or self._phase_terminal_emitted:
+            return
+        index, label = _PHASE_META[self.current_phase]
+        elapsed = (
+            max(0.0, time.monotonic() - self._phase_started_monotonic)
+            if self._phase_started_monotonic is not None
+            else 0.0
+        )
+        payload: dict[str, Any] = {
+            "phase": self.current_phase,
+            "index": index,
+            "label": label,
+            "status": status,
+            "started_at": self._phase_started_wall,
+            "elapsed_s": elapsed,
+            "exit_code": exit_code,
+            "output_dir": self._phase_output_dir,
+        }
+        if error:
+            payload["error"] = error
+        self.phase_event.emit(payload)
+        self._phase_terminal_emitted = True
+
+        if status == "completed":
+            self.progress_changed.emit(index * 25, f"{index}/4 · {label} · complete")
+        else:
+            self.progress_changed.emit((index - 1) * 25, f"{index}/4 · {label} · {status}")
+
+        exit_text = "—" if exit_code is None else str(exit_code)
+        self._emit_log(
+            f"===== PHASE {index}/4 {status.upper()} · elapsed={elapsed:.3f}s · exit={exit_text} ====="
+        )
+
     def _start_scan(self) -> None:
         assert self.config is not None and self.run_dir is not None
-        self.current_phase = "scan"
-        self.phase_changed.emit("1/4  Fresh Makro live schema")
         output = self.run_dir / "01-live-schema"
+        self._begin_phase("scan", output)
         args = [
             "makro_plan_listing.py",
             "--scan-live-schema",
@@ -135,11 +225,11 @@ class ReadOnlyRunner(QObject):
         live_schema = latest_live_schema(self.run_dir)
         if live_schema is None:
             raise RuntimeError("fresh live-schema.json 未生成。")
-        self.current_phase = "cold"
-        self.phase_changed.emit("2/4  Cold Resolver")
+        output = self.run_dir / "02-cold-resolver"
+        self._begin_phase("cold", output)
         args = self._resolver_args(
             live_schema,
-            output_dir=self.run_dir / "02-cold-resolver",
+            output_dir=output,
             refresh_source=True,
         )
         self._start_process(args)
@@ -149,11 +239,11 @@ class ReadOnlyRunner(QObject):
         live_schema = latest_live_schema(self.run_dir)
         if live_schema is None:
             raise RuntimeError("live-schema.json 不存在。")
-        self.current_phase = "hot"
-        self.phase_changed.emit("3/4  Hot Resolver / cache verification")
+        output = self.run_dir / "03-hot-resolver"
+        self._begin_phase("hot", output)
         args = self._resolver_args(
             live_schema,
-            output_dir=self.run_dir / "03-hot-resolver",
+            output_dir=output,
             refresh_source=False,
         )
         self._start_process(args)
@@ -212,8 +302,8 @@ class ReadOnlyRunner(QObject):
         if missing:
             raise RuntimeError("Hot Resolver strict-rebind 文件缺失：" + " | ".join(missing))
 
-        self.current_phase = "plan"
-        self.phase_changed.emit("4/4  Read-only Fill Plan")
+        output = self.run_dir / "04-fill-plan"
+        self._begin_phase("plan", output)
         args = [
             "makro_plan_listing.py",
             "--decision-packet",
@@ -231,7 +321,7 @@ class ReadOnlyRunner(QObject):
             "--cdp-port",
             str(self.config.makro_cdp_port),
             "--output-dir",
-            str(self.run_dir / "04-fill-plan"),
+            str(output),
         ]
         for image in images:
             if image.is_file():
@@ -241,6 +331,7 @@ class ReadOnlyRunner(QObject):
     def _start_process(self, args: list[str]) -> None:
         process = QProcess(self)
         self.process = process
+        self._stdout_tail = ""
         process.setWorkingDirectory(str(self.project_root))
         process.setProcessChannelMode(QProcess.MergedChannels)
         environment = QProcessEnvironment.systemEnvironment()
@@ -250,28 +341,65 @@ class ReadOnlyRunner(QObject):
         process.readyReadStandardOutput.connect(self._read_output)
         process.finished.connect(self._process_finished)
         process.errorOccurred.connect(self._process_error)
-        self._emit_log("")
-        self._emit_log("$ " + " ".join([sys.executable, *args]))
+
+        full_argv = [sys.executable, *args]
+        command = subprocess.list2cmdline(full_argv)
+        output_dir = ""
+        if "--output-dir" in args:
+            index = args.index("--output-dir")
+            if index + 1 < len(args):
+                output_dir = args[index + 1]
+        event = {
+            "phase": self.current_phase,
+            "command": command,
+            "cwd": str(self.project_root),
+            "output_dir": output_dir,
+            "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        self.command_started.emit(event)
+        self._emit_log("$ " + command)
+        self._emit_log(f"cwd={self.project_root}")
+        if output_dir:
+            self._emit_log(f"output_dir={output_dir}")
         process.start(sys.executable, args)
 
     def _read_output(self) -> None:
         if self.process is None:
             return
         raw = bytes(self.process.readAllStandardOutput())
-        text = raw.decode("utf-8", errors="replace")
-        for line in text.splitlines():
-            self._emit_log(line)
+        if not raw:
+            return
+        text = self._stdout_tail + raw.decode("utf-8", errors="replace")
+        self._stdout_tail = ""
+        parts = text.splitlines(keepends=True)
+        for part in parts:
+            if part.endswith(("\n", "\r")):
+                self._emit_log(part.rstrip("\r\n"))
+            else:
+                self._stdout_tail = part
+
+    def _flush_output_tail(self) -> None:
+        if self._stdout_tail:
+            self._emit_log(self._stdout_tail)
+            self._stdout_tail = ""
 
     def _process_finished(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
         phase = self.current_phase
+        self._read_output()
+        self._flush_output_tail()
         self.process = None
+
         if self._stopping:
+            self._finish_phase_event("cancelled", exit_code=exit_code)
             self._finish_failure("测试已由用户停止。")
             return
         if exit_code != 0:
-            self._finish_failure(f"{phase} 阶段退出码={exit_code}。请查看实时日志。")
+            message = f"{phase} 阶段退出码={exit_code}。请查看实时日志。"
+            self._finish_phase_event("failed", exit_code=exit_code, error=message)
+            self._finish_failure(message)
             return
 
+        self._finish_phase_event("completed", exit_code=exit_code)
         try:
             if self.run_dir is not None:
                 self.result_updated.emit(load_run_result(self.run_dir))
@@ -292,11 +420,14 @@ class ReadOnlyRunner(QObject):
         if self._stopping:
             return
         if error == QProcess.FailedToStart:
-            self._finish_failure("Python 子进程启动失败。")
+            message = "Python 子进程启动失败。"
+            self._finish_phase_event("failed", error=message)
+            self._finish_failure(message)
 
     def _finish_success(self) -> None:
         assert self.run_dir is not None
         result = load_run_result(self.run_dir)
+        self.progress_changed.emit(100, "4/4 · acceptance complete")
         self.phase_changed.emit("完成 · Read-only acceptance")
         self._emit_log("")
         self._emit_log("===== GUI READ-ONLY ACCEPTANCE COMPLETE =====")
@@ -314,6 +445,8 @@ class ReadOnlyRunner(QObject):
         self.completed.emit(result)
 
     def _finish_failure(self, message: str) -> None:
+        if not self._phase_terminal_emitted and self.current_phase in _PHASE_META:
+            self._finish_phase_event("failed", error=message)
         self._emit_log("")
         self._emit_log("ERROR: " + message)
         self.phase_changed.emit("失败")
@@ -344,6 +477,7 @@ class ReadOnlyRunner(QObject):
             "local_model": self.config.local_model,
             "web_model": self.config.web_model,
             "api_key_env": self.config.api_key_env,
+            "current_phase": self.current_phase,
             "core_write_runner_invoked": False,
         }
         if error:
