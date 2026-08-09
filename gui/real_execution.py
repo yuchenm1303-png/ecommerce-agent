@@ -5,11 +5,10 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -43,13 +42,7 @@ class RealExecutionConfig:
 
 
 class RealExecutionRunner(QObject):
-    """Thin QProcess bridge to the canonical production executor.
-
-    The GUI never rebuilds product meaning here. It reuses the hot Resolver
-    decision packet/source evidence and the exact live schema from the completed
-    read-only acceptance run, then delegates browser work to
-    makro_execute_listing.py.
-    """
+    """Thin GUI bridge to the canonical Makro production executor."""
 
     log = Signal(str)
     progress_changed = Signal(int, str)
@@ -77,6 +70,7 @@ class RealExecutionRunner(QObject):
             raise RuntimeError("真实执行已经在运行。")
         self._validate_config(config)
         prepared = self._prepare_inputs(config)
+
         self.config = config
         self.output_root = config.read_only_run_dir.resolve() / "05-real-execution"
         self.output_root.mkdir(parents=True, exist_ok=True)
@@ -107,9 +101,11 @@ class RealExecutionRunner(QObject):
             args.extend(["--image", str(image)])
 
         if config.scope == FULL_STEP3:
-            args.extend(["--all-step3", "--allow-section-save"])
+            args.append("--all-step3")
         else:
             args.extend(["--section", config.scope])
+        if config.allow_save:
+            args.append("--allow-section-save")
 
         for image in config.upload_images:
             args.extend(["--upload-image", str(image)])
@@ -168,8 +164,6 @@ class RealExecutionRunner(QObject):
             raise ValueError("Makro CDP 端口无效。")
         if config.scope == FULL_STEP3 and not config.allow_save:
             raise ValueError("Full Step 3 是持久化验收，必须显式开启 Save。")
-        if config.scope != FULL_STEP3 and config.allow_save:
-            raise ValueError("单 section 真实预览不允许 Save；请选择 Full Step 3 才能授权 Save。")
         for path in config.upload_images:
             if not path.is_file():
                 raise ValueError(f"待上传图片不存在：{path}")
@@ -178,9 +172,11 @@ class RealExecutionRunner(QObject):
         run_dir = config.read_only_run_dir.resolve()
         live_schema = latest_live_schema(run_dir)
         hot_manifest_path = latest_resolver_manifest(run_dir, "03-hot-resolver")
-        plan_candidates = list((run_dir / "04-fill-plan").glob("plan-*/fill-plan.json"))
-        if live_schema is None or hot_manifest_path is None or not plan_candidates:
-            raise RuntimeError("read-only acceptance 产物不完整；必须先完成 fresh schema → cold → hot → Fill Plan。")
+        plans = list((run_dir / "04-fill-plan").glob("plan-*/fill-plan.json"))
+        if live_schema is None or hot_manifest_path is None or not plans:
+            raise RuntimeError(
+                "read-only acceptance 产物不完整；必须先完成 fresh schema → cold → hot → Fill Plan。"
+            )
 
         manifest = json.loads(hot_manifest_path.read_text(encoding="utf-8"))
         outputs = manifest.get("outputs") or {}
@@ -220,8 +216,7 @@ class RealExecutionRunner(QObject):
             return
         text = self._stdout_tail + raw.decode("utf-8", errors="replace")
         self._stdout_tail = ""
-        parts = text.splitlines(keepends=True)
-        for part in parts:
+        for part in text.splitlines(keepends=True):
             if part.endswith(("\n", "\r")):
                 line = part.rstrip("\r\n")
                 self._emit_log(line)
@@ -230,7 +225,14 @@ class RealExecutionRunner(QObject):
                 self._stdout_tail = part
 
     def _observe_progress(self, line: str) -> None:
-        if "MAKRO STEP 3 DIRECT ACCEPTANCE" in line or "MAKRO DIRECT SECTION PREVIEW" in line:
+        if any(
+            marker in line
+            for marker in (
+                "MAKRO STEP 3 DIRECT ACCEPTANCE",
+                "MAKRO DIRECT SECTION PREVIEW",
+                "MAKRO DIRECT SECTION PERSISTED ACCEPTANCE",
+            )
+        ):
             self.progress_changed.emit(15, "pre-write checks passed · browser execution started")
             return
 
@@ -242,10 +244,7 @@ class RealExecutionRunner(QObject):
         for section in sections:
             if line.startswith(section + ":") and section not in self._section_milestones:
                 self._section_milestones.add(section)
-                if self.config is not None and self.config.scope == FULL_STEP3:
-                    value = 20 + len(self._section_milestones) * 20
-                else:
-                    value = 85
+                value = 20 + len(self._section_milestones) * 20 if self.config and self.config.scope == FULL_STEP3 else 85
                 self.progress_changed.emit(value, f"section complete · {section}")
                 return
 
@@ -256,9 +255,10 @@ class RealExecutionRunner(QObject):
 
     def _flush_tail(self) -> None:
         if self._stdout_tail:
-            self._emit_log(self._stdout_tail)
-            self._observe_progress(self._stdout_tail)
+            line = self._stdout_tail
             self._stdout_tail = ""
+            self._emit_log(line)
+            self._observe_progress(line)
 
     def _process_finished(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
         self._read_output()
@@ -303,11 +303,9 @@ class RealExecutionRunner(QObject):
 
     def _emit_log(self, line: str) -> None:
         self.log.emit(line)
-        if self.output_root is None:
-            return
-        log_path = self.output_root / "real-execution-gui.log"
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        if self.output_root is not None:
+            with (self.output_root / "real-execution-gui.log").open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
 
 
 class RealExecutionConsole(QWidget):
@@ -325,7 +323,7 @@ class RealExecutionConsole(QWidget):
         top = QHBoxLayout()
         self.state_label = QLabel("IDLE · waiting for completed read-only acceptance")
         self.state_label.setObjectName("consoleHint")
-        self.safety_label = QLabel("WRITE optional · SAVE optional · IMAGE optional · QC LOCKED")
+        self.safety_label = QLabel("WRITE opt-in · SAVE opt-in · IMAGE opt-in · QC LOCKED")
         self.safety_label.setObjectName("consoleHint")
         top.addWidget(self.state_label)
         top.addStretch(1)
@@ -424,9 +422,8 @@ class RealExecutionConsole(QWidget):
         if not self._pending_logs:
             self.flush_timer.stop()
             return
-        batch = "\n".join(self._pending_logs)
+        self.log_view.appendPlainText("\n".join(self._pending_logs))
         self._pending_logs.clear()
-        self.log_view.appendPlainText(batch)
         bar = self.log_view.verticalScrollBar()
         bar.setValue(bar.maximum())
 
@@ -477,7 +474,8 @@ class RealExecutionConsole(QWidget):
                 attempted=totals.get("writes_attempted", 0),
                 validated=totals.get("validated", 0),
                 persisted=totals.get("persisted_verified", 0),
-                failed=int(totals.get("validation_failed", 0)) + int(totals.get("persisted_validation_failed", 0)),
+                failed=int(totals.get("validation_failed", 0))
+                + int(totals.get("persisted_validation_failed", 0)),
                 errors=totals.get("fill_error", 0),
                 saved=report.get("section_saved", 0),
                 photos=photo.get("staged", 0) if isinstance(photo, dict) else 0,
@@ -518,8 +516,8 @@ class RealExecutionConsole(QWidget):
                 for column, value in enumerate(values):
                     table_item = QTableWidgetItem(value)
                     table_item.setToolTip(value)
-                    status = values[3].casefold()
                     if column == 3:
+                        status = values[3].casefold()
                         if "error" in status or "failed" in status:
                             table_item.setForeground(QColor("#f18da0"))
                         elif "validated" in status or "filled" in status:
