@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 from .business_fields import is_business_question
 from .evidence_contract import ProductIdentity, assert_identity_compatible
-from .semantic_grounding import GroundedSource, GroundingCatalog, IMAGE_KIND, TEXT_KIND
+from .semantic_grounding import GroundingCatalog
 from .source_bundle import normalize_key
 
 
@@ -84,11 +84,15 @@ def field_contract(field: dict[str, Any]) -> dict[str, Any]:
         "options": field_options(field),
         "qualifier_options": field_qualifier_options(field),
         "help_text": str(field.get("help_text") or "").strip(),
+        "context_text": str(field.get("context_text") or "").strip(),
     }
 
 
 def field_id(field: dict[str, Any]) -> str:
+    # Context text is useful to the AI (for fixed units and nearby UI wording),
+    # but it is presentation context rather than the stable field address.
     payload = field_contract(field)
+    payload.pop("context_text", None)
     payload["section_heading"] = _stable_section(payload["section_heading"])
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return "mf_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
@@ -328,15 +332,6 @@ def _normalize_ws(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().casefold()
 
 
-def _citation_is_grounded(citation: DecisionCitation, source: GroundedSource) -> bool:
-    if source.kind == IMAGE_KIND:
-        return bool(citation.evidence_text.strip())
-    if source.kind != TEXT_KIND:
-        return False
-    wanted = _normalize_ws(citation.evidence_text)
-    return bool(wanted) and wanted in _normalize_ws(source.content)
-
-
 def _validated_citations(
     citations: Iterable[DecisionCitation],
     grounding: GroundingCatalog,
@@ -345,28 +340,40 @@ def _validated_citations(
     warnings: list[str],
     field_identifier: str,
 ) -> list[DecisionCitation]:
+    """Validate provenance addresses only; never re-judge AI semantics in Python.
+
+    The AI is responsible for deciding whether a cited source supports a claim.
+    Python only verifies that the cited local source exists, or that a Web source
+    was actually persisted from the current search call.  Paraphrases are valid
+    evidence text and are not required to be a literal substring of source text.
+    """
+
     output: list[DecisionCitation] = []
     seen: set[tuple[str, str]] = set()
     for citation in citations:
-        source = grounding.by_id(citation.source_reference)
-        if source is not None:
-            valid = _citation_is_grounded(citation, source)
-        else:
-            external_content = external_sources.get(citation.source_reference, "")
-            wanted = _normalize_ws(citation.evidence_text)
-            valid = bool(wanted) and wanted in _normalize_ws(external_content)
+        reference = citation.source_reference.strip()
+        valid = grounding.by_id(reference) is not None or reference in external_sources
         if not valid:
             warnings.append(
-                f"{field_identifier}: unknown/ungrounded citation "
-                f"{citation.source_reference!r} dropped"
+                f"{field_identifier}: unknown citation source_reference {reference!r} dropped"
             )
             continue
-        fingerprint = (citation.source_reference, _normalize_ws(citation.evidence_text))
+        fingerprint = (reference, _normalize_ws(citation.evidence_text))
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
         output.append(citation)
     return output
+
+
+def _set_missing(decision: FieldDecision, reason: str) -> None:
+    decision.status = MISSING
+    decision.values = []
+    decision.qualifier = ""
+    decision.citations = []
+    decision.alternatives = []
+    decision.search_queries = list(decision.search_queries)
+    decision.reason = reason
 
 
 def validate_ai_decision_packet(
@@ -380,9 +387,9 @@ def validate_ai_decision_packet(
     """Validate only deterministic execution boundaries.
 
     Product identity interpretation, evidence sufficiency, negative claims,
-    dimensional axes, scope and other product semantics belong to the AI
-    resolver. Python only checks schema/source identity, grounded citations,
-    business locks and structural completeness.
+    dimensional axes, scope and all other product semantics belong to AI.
+    Python checks only schema/source identity, provenance addresses, business
+    locks and structural completeness.
     """
 
     field_list = list(fields)
@@ -451,12 +458,12 @@ def validate_ai_decision_packet(
             )
         decision.alternatives = validated_alternatives
 
-        if decision.status == READY and (not decision.values or not decision.citations):
-            warnings.append(
-                f"{decision.field_id}: READY downgraded to REVIEW because "
-                "value/citation is missing"
-            )
-            decision.status = REVIEW
+        if decision.status == READY:
+            if not decision.values or not decision.citations:
+                warnings.append(
+                    f"{decision.field_id}: malformed READY converted to MISSING because value/citation is absent"
+                )
+                _set_missing(decision, decision.reason or "READY lacked executable value/provenance")
         elif decision.status == CONFLICT:
             usable = [alt for alt in decision.alternatives if alt.values and alt.citations]
             distinct = {
@@ -465,14 +472,15 @@ def validate_ai_decision_packet(
             }
             if len(distinct) < 2:
                 warnings.append(
-                    f"{decision.field_id}: malformed CONFLICT downgraded to REVIEW"
+                    f"{decision.field_id}: malformed CONFLICT converted to MISSING"
                 )
-                decision.status = REVIEW
+                _set_missing(decision, decision.reason or "CONFLICT lacked two grounded alternatives")
+        elif decision.status == REVIEW:
+            # REVIEW is retained only for backwards-compatible packet parsing.
+            # The clean production path has no review stage: unresolved goes to Web.
+            _set_missing(decision, decision.reason or "legacy REVIEW normalized to MISSING")
         elif decision.status == MISSING:
-            decision.values = []
-            decision.qualifier = ""
-            decision.citations = []
-            decision.alternatives = []
+            _set_missing(decision, decision.reason)
 
         observed[decision.field_id] = decision
 
