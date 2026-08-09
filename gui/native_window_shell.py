@@ -78,13 +78,6 @@ def _embed_native_child(overlay_hwnd: int, owner_hwnd: int) -> None:
 
 
 def _fit_child_to_owner_client(overlay_hwnd: int, owner_hwnd: int) -> None:
-    """Keep the child HWND exactly equal to the native owner client rect.
-
-    The boundary is deliberately native-pixel only. Feeding the result back
-    through QWidget/QWindow logical geometry causes a second 150% DPI scale on
-    the real Windows acceptance machine.
-    """
-
     if sys.platform != "win32" or not overlay_hwnd or not owner_hwnd:
         return
 
@@ -124,13 +117,6 @@ def _fit_child_to_owner_client(overlay_hwnd: int, owner_hwnd: int) -> None:
 
 
 def _focus_native_child(overlay_hwnd: int) -> bool:
-    """Give the QWidget child HWND the Win32 keyboard focus.
-
-    Qt still chooses the concrete focusWidget (QLineEdit/QSpinBox/etc.). This
-    only makes the native QWidget surface the recipient of keyboard messages
-    instead of leaving them intermittently on the QQuickWindow owner.
-    """
-
     if sys.platform != "win32" or not overlay_hwnd:
         return True
 
@@ -155,7 +141,6 @@ class NativeWindowShell(QObject):
         self._embedded = False
         self._focus_pending = False
         self._last_focus_widget: QWidget | None = None
-        self._focus_watch: list[QWidget] = []
 
         owner.setTitle(overlay.windowTitle())
         owner.setFlags(
@@ -177,14 +162,20 @@ class NativeWindowShell(QObject):
         owner.widthChanged.connect(self._schedule_native_fit)
         owner.heightChanged.connect(self._schedule_native_fit)
 
-        # Mouse/focus events are delivered to the actual QWidget child control,
-        # not necessarily QMainWindow. Watch the existing baseline widget tree so
-        # every editable control can deterministically bridge native focus back
-        # from QQuickWindow after click, first-show or Alt+Tab activation.
-        self._focus_watch = [overlay, *overlay.findChildren(QWidget)]
+        # Only actual focusable controls need click bridging. Qt's focusChanged
+        # signal covers focus transitions without putting a Python event filter on
+        # every label/container/viewport in the application.
+        self._focus_watch = [
+            widget
+            for widget in overlay.findChildren(QWidget)
+            if widget.focusPolicy() != Qt.FocusPolicy.NoFocus
+        ]
         for widget in self._focus_watch:
-            if widget is not overlay:
-                widget.installEventFilter(self)
+            widget.installEventFilter(self)
+
+        app = QApplication.instance()
+        if app is not None:
+            app.focusChanged.connect(self._on_focus_changed)
 
     def show(self) -> None:
         self.owner.create()
@@ -221,6 +212,11 @@ class NativeWindowShell(QObject):
             current = current.parentWidget()
         return False
 
+    def _on_focus_changed(self, _old: QWidget | None, current: QWidget | None) -> None:
+        if self._belongs_to_overlay(current):
+            self._last_focus_widget = current
+            self._schedule_widget_focus()
+
     def _schedule_widget_focus(self) -> None:
         if self._closing or not self._embedded or self._focus_pending:
             return
@@ -234,9 +230,6 @@ class NativeWindowShell(QObject):
 
         _focus_native_child(int(self.overlay.winId()))
 
-        # Preserve Qt's per-control focus. If activation temporarily cleared it,
-        # restore the last valid editable/control widget instead of hard-coding
-        # the supplier URL field.
         current = QApplication.focusWidget()
         if self._belongs_to_overlay(current):
             self._last_focus_widget = current
@@ -267,17 +260,14 @@ class NativeWindowShell(QObject):
                 self._closing = True
                 self.overlay.close()
 
-        elif isinstance(watched, QWidget) and self._belongs_to_overlay(watched):
-            if event_type == QEvent.Type.FocusIn:
-                self._last_focus_widget = watched
-                self._schedule_widget_focus()
-            elif event_type == QEvent.Type.MouseButtonPress:
-                # Run after Qt processes the click so its normal focus policy
-                # first selects the concrete child control, then bridge the HWND.
-                self._schedule_widget_focus()
-            elif watched is self.overlay and event_type == QEvent.Type.Close and not self._closing:
+        elif watched is self.overlay:
+            if event_type == QEvent.Type.Close and not self._closing:
                 self._closing = True
                 self.owner.close()
+
+        elif isinstance(watched, QWidget) and event_type == QEvent.Type.MouseButtonPress:
+            self._last_focus_widget = watched
+            self._schedule_widget_focus()
 
         return False
 
