@@ -12,7 +12,7 @@ SHELL = (ROOT / "gui" / "native_window_shell.py").read_text(encoding="utf-8")
 RUNNER = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
-def test_baseline_card_animation_contract_is_unchanged() -> None:
+def test_baseline_card_animation_curve_is_preserved() -> None:
     assert "_NORMAL_ALPHA = 64.0" in CARD_FX
     assert "_HOVER_ALPHA = 82.0" in CARD_FX
     assert "_ACTIVE_ALPHA = 96.0" in CARD_FX
@@ -24,44 +24,48 @@ def test_baseline_card_animation_contract_is_unchanged() -> None:
     assert "install_nekro_card_fx(window, visual)" in RUNNER
 
 
-def test_card_hit_testing_survives_native_child_embedding() -> None:
-    assert "def _card_from_widget" in CARD_FX
-    assert "current.parentWidget()" in CARD_FX
-    event_filter = CARD_FX.split("def eventFilter", 1)[1].split("def _cleanup", 1)[0]
-    assert "watched if isinstance(watched, QWidget) else None" in event_filter
-    assert "_card_at_global(event.globalPosition())" in event_filter
+def test_native_child_hit_test_does_not_change_animation_values() -> None:
+    assert "self.window.childAt(local)" in CARD_FX
+    assert "self.window.mapFromGlobal(point.toPoint())" in CARD_FX
+    assert "QApplication.widgetAt(point.toPoint())" in CARD_FX
+    assert "event_type == QEvent.Enter" in CARD_FX
 
 
-def test_native_adapter_reuses_baseline_style_and_does_not_fork_interactions() -> None:
-    assert "from .visual_style import NEKRO_STYLE" in ADAPTER
-    assert "window.setStyleSheet(window.styleSheet() + \"\\n\" + NEKRO_STYLE)" in ADAPTER
-    assert "MouseButtonPress" not in ADAPTER
-    assert "MouseButtonRelease" not in ADAPTER
-    assert "_HOVER_SECONDS" not in ADAPTER
-    assert "_PRESS_SECONDS" not in ADAPTER
-    assert "_RELEASE_SECONDS" not in ADAPTER
+def test_glass_pixels_are_composed_once_in_quick() -> None:
+    assert "class NativeGlassProxy(QObject)" in ADAPTER
+    assert "background.set_card_alpha(self.frame, overlay_alpha)" in ADAPTER
+    assert "paintEvent" not in ADAPTER
+    assert "QPainterPath" not in ADAPTER
+    assert "QColor" not in ADAPTER
     assert "QGraphicsBlurEffect" not in ADAPTER
-    assert "drawPixmap" not in ADAPTER
+
+    assert "class GlassCardModel(QAbstractListModel)" in NATIVE
+    assert 'setContextProperty("glassCardModel", self.card_model)' in NATIVE
+    assert "id: glassMaskSource" in NATIVE
+    assert "model: glassCardModel" in NATIVE
+    assert "cardAlpha / 255.0" in NATIVE
+    assert "maskSource: glassMaskSource" in NATIVE
+    assert "maskUrl" not in NATIVE
+    assert "glass_mask_" not in NATIVE
 
 
-def test_renderer_moves_only_wallpaper_and_blur_to_quick() -> None:
+def test_renderer_moves_wallpaper_blur_and_tint_to_quick() -> None:
     assert "QQuickWindow" in NATIVE
     assert "FrameAnimation" in NATIVE
     assert "import QtQuick.Effects" in NATIVE
     assert "MultiEffect" in NATIVE
     assert "maskEnabled: true" in NATIVE
-    assert "maskSource: maskImg" in NATIVE
     assert "def _blur_wallpaper" in NATIVE
     assert "setInterval(16)" not in NATIVE
     assert "QQuickWidget" not in NATIVE + ADAPTER
     assert "QOpenGLWidget" not in NATIVE + ADAPTER
 
 
-def test_baseline_glass_alpha_api_is_preserved() -> None:
+def test_baseline_style_and_public_glass_api_are_preserved() -> None:
+    assert "from .visual_style import NEKRO_STYLE" in ADAPTER
+    assert 'window.setStyleSheet(window.styleSheet() + "\\n" + NEKRO_STYLE)' in ADAPTER
     assert "def set_interaction(self, *, scale: float, overlay_alpha: float)" in BASE_VISUAL
     assert "def set_interaction(self, *, scale: float, overlay_alpha: float)" in ADAPTER
-    assert "painter.fillRect(target, QColor(0, 0, 0, int(round(self._overlay_alpha))))" in ADAPTER
-    assert "painter.setClipPath(path)" in ADAPTER
 
 
 def test_native_shell_is_single_window_tree_and_native_pixel_sized() -> None:
