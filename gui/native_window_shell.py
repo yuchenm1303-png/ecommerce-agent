@@ -3,137 +3,173 @@ from __future__ import annotations
 import ctypes
 import sys
 
-from PySide6.QtCore import QEvent, QObject, Qt
-from PySide6.QtWidgets import QMainWindow, QWidget
+from PySide6.QtCore import QEvent, QObject, QRect, Qt, QTimer
+from PySide6.QtQuick import QQuickWindow
+from PySide6.QtWidgets import QMainWindow
 
 
-_GWL_STYLE = -16
-_GWL_EXSTYLE = -20
-_WS_CHILD = 0x40000000
-_WS_POPUP = 0x80000000
-_WS_EX_LAYERED = 0x00080000
+_GWLP_HWNDPARENT = -8
 _SWP_NOSIZE = 0x0001
 _SWP_NOMOVE = 0x0002
-_SWP_NOZORDER = 0x0004
 _SWP_NOACTIVATE = 0x0010
-_SWP_FRAMECHANGED = 0x0020
 
 
-def _window_long_functions():
+def _set_native_owner(overlay_hwnd: int, owner_hwnd: int) -> None:
+    if sys.platform != "win32" or not overlay_hwnd or not owner_hwnd:
+        return
     user32 = ctypes.windll.user32
-    get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
     set_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
-    get_long.argtypes = [ctypes.c_void_p, ctypes.c_int]
-    get_long.restype = ctypes.c_ssize_t
     set_long.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
     set_long.restype = ctypes.c_ssize_t
-    return user32, get_long, set_long
+    set_long(ctypes.c_void_p(overlay_hwnd), _GWLP_HWNDPARENT, ctypes.c_ssize_t(owner_hwnd))
 
 
-def _ensure_layered_child(hwnd: int) -> None:
-    """Make the QWidget content a real layered child of the native client host."""
-
+def _client_geometry(hwnd: int) -> QRect:
     if sys.platform != "win32" or not hwnd:
+        return QRect()
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    user32 = ctypes.windll.user32
+    rect = RECT()
+    origin = POINT(0, 0)
+    if not user32.GetClientRect(ctypes.c_void_p(hwnd), ctypes.byref(rect)):
+        return QRect()
+    if not user32.ClientToScreen(ctypes.c_void_p(hwnd), ctypes.byref(origin)):
+        return QRect()
+    return QRect(
+        int(origin.x),
+        int(origin.y),
+        max(1, int(rect.right - rect.left)),
+        max(1, int(rect.bottom - rect.top)),
+    )
+
+
+def _stack_owner_directly_behind(owner_hwnd: int, overlay_hwnd: int) -> None:
+    if sys.platform != "win32" or not owner_hwnd or not overlay_hwnd:
         return
-
-    user32, get_long, set_long = _window_long_functions()
-    handle = ctypes.c_void_p(hwnd)
-
-    style = int(get_long(handle, _GWL_STYLE))
-    style = (style | _WS_CHILD) & ~_WS_POPUP
-    set_long(handle, _GWL_STYLE, style)
-
-    exstyle = int(get_long(handle, _GWL_EXSTYLE))
-    set_long(handle, _GWL_EXSTYLE, exstyle | _WS_EX_LAYERED)
-
-    user32.SetWindowPos(
-        handle,
-        None,
+    ctypes.windll.user32.SetWindowPos(
+        ctypes.c_void_p(owner_hwnd),
+        ctypes.c_void_p(overlay_hwnd),
         0,
         0,
         0,
         0,
-        _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOZORDER | _SWP_NOACTIVATE | _SWP_FRAMECHANGED,
+        _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE,
     )
 
 
 class NativeWindowShell(QObject):
-    """Keep Windows' real frame and move both visual surfaces into its client area.
+    """Native Windows frame on Quick, with the existing QWidget GUI as its owner-bound overlay."""
 
-    The QMainWindow remains one ordinary top-level Windows application window,
-    so DWM owns the title bar, minimize/maximize/close buttons, resizing, Snap,
-    Alt+Tab and taskbar behavior. The existing business QWidget tree becomes a
-    layered native child; the QQuickWindow background is attached later as a
-    second child underneath it. Other applications can therefore never be
-    inserted between the business UI and its wallpaper.
-    """
+    def __init__(self, overlay: QMainWindow, owner: QQuickWindow) -> None:
+        super().__init__(overlay)
+        self.overlay = overlay
+        self.owner = owner
+        self._closing = False
 
-    def __init__(self, window: QMainWindow) -> None:
-        super().__init__(window)
-        self.window = window
-
-        # Explicitly keep the normal Windows non-client frame. The previous
-        # frameless/translucent top-level architecture is intentionally removed.
-        flags = window.windowFlags()
-        flags &= ~Qt.WindowType.FramelessWindowHint
-        flags |= (
+        owner.setTitle("ecommerce-agent · Acceptance Control Console")
+        owner.setFlags(
             Qt.WindowType.Window
             | Qt.WindowType.WindowTitleHint
             | Qt.WindowType.WindowSystemMenuHint
             | Qt.WindowType.WindowMinMaxButtonsHint
             | Qt.WindowType.WindowCloseButtonHint
         )
-        window.setWindowFlags(flags)
-        window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
-        window.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
+        owner.resize(overlay.size())
+        owner.setMinimumSize(overlay.minimumSize())
 
-        content = window.takeCentralWidget()
-        if content is None:
-            raise RuntimeError("Native window shell requires the existing GUI central widget")
+        # The QWidget layer needs per-pixel alpha, so only this owned overlay is
+        # frameless. The actual application window is the framed QQuickWindow.
+        overlay.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        overlay.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        overlay.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
 
-        host = QWidget(window)
-        host.setObjectName("nativeClientHost")
-        host.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-        host.setAutoFillBackground(False)
-        host.setStyleSheet("QWidget#nativeClientHost { background: #17263a; border: 0; }")
-        window.setCentralWidget(host)
+        owner.installEventFilter(self)
+        overlay.installEventFilter(self)
 
-        content.setParent(host)
-        content.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-        content.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        content.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        content.setAutoFillBackground(False)
-        content.setGeometry(host.rect())
+    def show(self) -> None:
+        self.owner.create()
+        self.overlay.winId()
+        overlay_handle = self.overlay.windowHandle()
+        if overlay_handle is None:
+            raise RuntimeError("QWidget overlay has no native window handle")
 
-        # Create both native handles before the Quick child is attached. Windows
-        # 8+ supports WS_EX_LAYERED on child HWNDs, which lets this content layer
-        # preserve its alpha without making the top-level application frameless.
-        host.winId()
-        content.winId()
-        _ensure_layered_child(int(content.winId()))
+        overlay_handle.setTransientParent(self.owner)
+        _set_native_owner(int(self.overlay.winId()), int(self.owner.winId()))
 
-        content.show()
-        content.raise_()
+        self.owner.show()
+        self._sync_overlay_geometry()
+        self.overlay.show()
+        self.overlay.raise_()
+        self._restack_pair()
+        QTimer.singleShot(0, self._sync_overlay_geometry)
 
-        self.host_widget = host
-        self.content_widget = content
-        host.installEventFilter(self)
+    def _sync_overlay_geometry(self) -> None:
+        if self._closing:
+            return
+        rect = _client_geometry(int(self.owner.winId()))
+        if rect.isValid() and self.overlay.geometry() != rect:
+            self.overlay.setGeometry(rect)
 
-    def _sync_content_geometry(self) -> None:
-        self.content_widget.setGeometry(self.host_widget.rect())
-        self.content_widget.raise_()
+        minimized = bool(self.owner.windowState() & Qt.WindowState.WindowMinimized)
+        if minimized:
+            if self.overlay.isVisible():
+                self.overlay.hide()
+        elif self.owner.isVisible() and not self.overlay.isVisible():
+            self.overlay.show()
+            self.overlay.raise_()
+
+    def _restack_pair(self) -> None:
+        if self._closing or not self.owner.isVisible() or not self.overlay.isVisible():
+            return
+        _stack_owner_directly_behind(int(self.owner.winId()), int(self.overlay.winId()))
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if watched is self.host_widget and event.type() in {
-            QEvent.Type.Resize,
-            QEvent.Type.Show,
-            QEvent.Type.LayoutRequest,
-        }:
-            self._sync_content_geometry()
+        event_type = event.type()
+
+        if watched is self.owner:
+            if event_type in {
+                QEvent.Type.Move,
+                QEvent.Type.Resize,
+                QEvent.Type.Show,
+                QEvent.Type.WindowStateChange,
+                QEvent.Type.ActivationChange,
+                QEvent.Type.WindowActivate,
+                QEvent.Type.Expose,
+            }:
+                QTimer.singleShot(0, self._sync_overlay_geometry)
+                QTimer.singleShot(0, self._restack_pair)
+            elif event_type == QEvent.Type.Close and not self._closing:
+                self._closing = True
+                self.overlay.close()
+
+        elif watched is self.overlay:
+            if event_type in {
+                QEvent.Type.Show,
+                QEvent.Type.WindowActivate,
+                QEvent.Type.ActivationChange,
+                QEvent.Type.ZOrderChange,
+            }:
+                QTimer.singleShot(0, self._sync_overlay_geometry)
+                QTimer.singleShot(0, self._restack_pair)
+            elif event_type == QEvent.Type.Close and not self._closing:
+                self._closing = True
+                self.owner.close()
+
         return False
 
 
-def install_native_window_shell(window: QMainWindow) -> NativeWindowShell:
-    shell = NativeWindowShell(window)
-    window._native_window_shell = shell  # type: ignore[attr-defined]
+def install_native_window_shell(overlay: QMainWindow, owner: QQuickWindow) -> NativeWindowShell:
+    shell = NativeWindowShell(overlay, owner)
+    overlay._native_window_shell = shell  # type: ignore[attr-defined]
     return shell
