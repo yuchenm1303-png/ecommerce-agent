@@ -25,8 +25,8 @@ from .semantic_grounding import GroundingCatalog, TEXT_KIND
 from .source_bundle import normalize_key
 
 
-WEB_SEARCH_CONTRACT_VERSION = 7
-WEB_SEARCH_CACHE_VERSION = 7
+WEB_SEARCH_CONTRACT_VERSION = 8
+WEB_SEARCH_CACHE_VERSION = 8
 WEB_FILLABLE_STATUSES = {MISSING}
 
 
@@ -237,11 +237,14 @@ def _research_prompt(
         "rules": [
             "Locally READY and CONFLICT fields are frozen and must never be rewritten.",
             "Prefer the exact canonical supplier URL, manufacturer/brand sources, manuals, official product pages and clearly identified same-product distributor pages over generic marketplace matches.",
-            "Do not borrow specifications from another product merely because it is also named M8, A1, Pro, Mini or another generic model token.",
+            "Do not borrow specifications from another product merely because it shares a model token or category name.",
             "If no external page can be established as the same physical product/variant, leave the target field missing.",
-            "Return READY only when an accepted same-product web source establishes the exact target field. Return CONFLICT for genuine disagreement among accepted same-product sources; otherwise return MISSING.",
-            "Every READY citation and every CONFLICT alternative citation must use a source_url actually returned by this same web-search call.",
-            "Do not guess, extrapolate, infer negatives from absence, rotate dimension axes, or mix packaging/body/mount, cabin/rear, manual/UI language, product/vehicle compatibility, or generic/storage-specific features.",
+            "same_product establishes source identity only; it does NOT make every fact or inference on that page valid for every target field.",
+            "A READY value requires direct target-specific evidence from an accepted same-product source. If reaching the value requires deriving one field from another field, interpreting absence, assuming a default, or making a category-level inference, return MISSING instead.",
+            "Unit conversion and exact mapping to a supplied option are the only allowed mechanical transformations of a directly stated value.",
+            "A CONFLICT requires two or more directly supported values that each answer the same exact target field. Values of another semantic or quantity type are not conflict alternatives.",
+            "Every READY citation and every CONFLICT alternative citation must use a source_url actually returned by this same web-search call and describe the exact target-specific evidence.",
+            "Do not rotate dimension axes or mix packaging/body/mount, cabin/rear, documentation/device-interface language, product/vehicle compatibility, or other neighboring field scopes.",
             "If multi_value=false return one value. If qualifier_options exist, use an exact allowed qualifier; if qualifier_options are empty, qualifier must be empty.",
             "Never research seller-operated price, stock, MOQ, fulfilment, shipping policy or listing-status fields.",
             "Return one JSON object only.",
@@ -265,7 +268,7 @@ def _research_prompt(
                     "citations": [
                         {
                             "source_url": "URL classified same_product above",
-                            "evidence_text": "concise field evidence",
+                            "evidence_text": "direct evidence for this exact target field",
                         }
                     ],
                     "alternatives": [
@@ -275,7 +278,7 @@ def _research_prompt(
                             "citations": [
                                 {
                                     "source_url": "URL classified same_product above",
-                                    "evidence_text": "evidence for this alternative",
+                                    "evidence_text": "direct evidence for this exact target field alternative",
                                 }
                             ],
                         }
@@ -289,7 +292,7 @@ def _research_prompt(
     return (
         "You are performing one bounded product-level web research session for one exact supplier item. "
         "Search for the product, explicitly resolve candidate identity, then enrich all remaining fields only from "
-        "sources you classified as the same product. Return JSON only.\n\n"
+        "direct target-specific facts on sources you classified as the same product. Return JSON only.\n\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
 
@@ -452,8 +455,10 @@ def _parse_source_matches(
                 identity_evidence=identity_evidence,
             )
         )
-        if match == "same_product":
+        if match == "same_product" and identity_evidence:
             accepted[key] = source
+        elif match == "same_product":
+            warnings.append(f"web source same_product lacked identity evidence and was not accepted: {url}")
     return matches, accepted, warnings
 
 
