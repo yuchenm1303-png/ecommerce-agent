@@ -6,6 +6,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SHELL_PATH = ROOT / "gui" / "native_window_shell.py"
 SHELL = SHELL_PATH.read_text(encoding="utf-8")
+NATIVE = (ROOT / "gui" / "native_background.py").read_text(encoding="utf-8")
+VISUAL = (ROOT / "gui" / "visual_style.py").read_text(encoding="utf-8")
 RUNNER = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
@@ -13,43 +15,62 @@ def test_native_window_shell_source_compiles_without_importing_pyside() -> None:
     compile(SHELL, str(SHELL_PATH), "exec")
 
 
-def test_shell_keeps_quick_window_immediately_behind_main_window() -> None:
-    assert "SetWindowPos" in SHELL
-    assert "_stack_immediately_behind" in SHELL
-    assert "_Z_GUARD_MS = 50" in SHELL
-    assert "QEvent.Type.WindowDeactivate" in SHELL
-    assert "QEvent.Type.ZOrderChange" in SHELL
-    assert "_z_guard.timeout.connect(self._guard_z_order)" in SHELL
+def test_top_level_keeps_the_real_windows_non_client_frame() -> None:
+    assert "flags &= ~Qt.WindowType.FramelessWindowHint" in SHELL
+    assert "Qt.WindowType.WindowTitleHint" in SHELL
+    assert "Qt.WindowType.WindowSystemMenuHint" in SHELL
+    assert "Qt.WindowType.WindowMinMaxButtonsHint" in SHELL
+    assert "Qt.WindowType.WindowCloseButtonHint" in SHELL
+    assert "_WindowTitleBar" not in SHELL
+    assert "setMenuWidget" not in SHELL
+    assert "nativeWindowMinimize" not in SHELL
+    assert "nativeWindowMaximize" not in SHELL
+    assert "nativeWindowClose" not in SHELL
 
 
-def test_z_guard_is_not_a_wallpaper_animation_timer() -> None:
-    assert "FrameAnimation" not in SHELL
-    assert "setInterval(16)" not in SHELL
+def test_only_child_content_is_translucent_and_native() -> None:
+    assert "window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)" in SHELL
+    assert "content.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)" in SHELL
+    assert "content.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)" in SHELL
+    assert "_WS_CHILD" in SHELL
+    assert "_WS_EX_LAYERED" in SHELL
+    assert "_ensure_layered_child" in SHELL
+    assert "WS_EX_TRANSPARENT" not in SHELL
 
 
-def test_shell_has_real_caption_controls_and_drag_behavior() -> None:
-    assert "class _WindowTitleBar" in SHELL
-    assert 'self._make_button("—", "nativeWindowMinimize")' in SHELL
-    assert 'self._make_button("□", "nativeWindowMaximize")' in SHELL
-    assert 'self._make_button("×", "nativeWindowClose")' in SHELL
-    assert "self.minimize_button.clicked.connect(window.showMinimized)" in SHELL
-    assert "self.maximize_button.clicked.connect(self._toggle_maximize)" in SHELL
-    assert "self.close_button.clicked.connect(window.close)" in SHELL
-    assert "handle.startSystemMove()" in SHELL
-    assert "mouseDoubleClickEvent" in SHELL
-    assert "window.setMenuWidget(self.title_bar)" in SHELL
+def test_quick_and_widget_layers_are_children_of_one_native_host() -> None:
+    assert "self.quick_window.setParent(host_window)" in NATIVE
+    assert "Qt.WindowType.SubWindow" in NATIVE
+    assert "_assert_same_native_parent" in NATIVE
+    assert "_place_child_behind" in NATIVE
+    assert "self.content_layer.raise_()" in NATIVE
+    assert "Qt.WindowType.Tool" not in NATIVE
 
 
-def test_shell_has_native_and_widget_frame_fallbacks() -> None:
-    assert "DWMWA_BORDER_COLOR" in SHELL
-    assert "DwmSetWindowAttribute" in SHELL
-    assert "class _ClientFrame" in SHELL
-    assert "_EDGE = 5" in SHELL
-    assert "legacy_frame.hide()" in SHELL
+def test_no_desktop_z_order_guard_or_custom_chrome_remains() -> None:
+    assert "_Z_GUARD_MS" not in SHELL + NATIVE
+    assert "setInterval(50)" not in SHELL + NATIVE
+    assert "_stack_immediately_behind" not in SHELL + NATIVE
+    assert "DWMWA_BORDER_COLOR" not in SHELL
+    assert "DwmSetWindowAttribute" not in SHELL
+    assert "class _ClientFrame" not in SHELL
 
 
-def test_runner_installs_shell_after_visual_background_exists() -> None:
-    visual_pos = RUNNER.index("visual = install_visual_style(window)")
-    shell_pos = RUNNER.index("install_native_window_shell(")
-    assert visual_pos < shell_pos
-    assert 'getattr(visual.background, "quick_window", None)' in RUNNER
+def test_quick_is_input_transparent_but_business_content_is_not() -> None:
+    assert "Qt.WindowType.WindowTransparentForInput" in NATIVE
+    assert "WindowTransparentForInput" not in SHELL
+    assert "WA_TransparentForMouseEvents" not in SHELL
+
+
+def test_runner_builds_native_host_before_visual_surfaces() -> None:
+    shell_pos = RUNNER.index("shell = install_native_window_shell(window)")
+    visual_pos = RUNNER.index("visual = install_visual_style(")
+    assert shell_pos < visual_pos
+    assert "content_root=shell.content_widget" in RUNNER
+    assert "surface_host=shell.host_widget" in RUNNER
+
+
+def test_visual_style_does_not_make_top_level_frameless_or_translucent() -> None:
+    assert "window.setWindowFlag(Qt.WindowType.FramelessWindowHint" not in VISUAL
+    assert "window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)" not in VISUAL
+    assert "WindowFrameOverlay" not in VISUAL
