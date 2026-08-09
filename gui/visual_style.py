@@ -469,7 +469,12 @@ class GlassBackdrop(QWidget):
             self.update()
             return
 
-        top_left = self.frame.mapTo(self.background, QPoint(0, 0))
+        # BackgroundLayer and the glass card are siblings under the central
+        # widget, so mapTo(self.background, ...) would fail the Qt parent
+        # hierarchy check and emit a warning on every refresh. Route through
+        # global coordinates instead, which only requires a shared window.
+        global_top_left = self.frame.mapToGlobal(QPoint(0, 0))
+        top_left = self.background.mapFromGlobal(global_top_left)
         self._surface_cache = scene.copy(
             int(top_left.x()),
             int(top_left.y()),
