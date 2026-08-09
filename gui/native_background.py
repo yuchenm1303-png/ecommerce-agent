@@ -252,11 +252,14 @@ class NativeQuickBackground(QObject):
         quick.setProperty("pointerY", ny)
         quick.setProperty("animationRunning", True)
 
-    def _card_path(self, frame: QFrame, origin: QPoint) -> QPainterPath | None:
+    def _card_path(self, frame: QFrame) -> QPainterPath | None:
         if not frame.isVisibleTo(self.overlay) or frame.width() <= 0 or frame.height() <= 0:
             return None
 
-        top_left = frame.mapToGlobal(QPoint(0, 0)) - origin
+        # The QWidget overlay fills the Quick client area one-for-one in Qt
+        # logical coordinates. Map directly to that shared client space instead
+        # of round-tripping through screen/Win32 physical pixels.
+        top_left = frame.mapTo(self.overlay, QPoint(0, 0))
         rect = QRectF(float(top_left.x()), float(top_left.y()), float(frame.width()), float(frame.height()))
         path = QPainterPath()
         path.addRoundedRect(rect, _GLASS_RADIUS, _GLASS_RADIUS)
@@ -265,7 +268,7 @@ class NativeQuickBackground(QObject):
         while ancestor is not None:
             if not ancestor.isVisibleTo(self.overlay):
                 return None
-            ancestor_top_left = ancestor.mapToGlobal(QPoint(0, 0)) - origin
+            ancestor_top_left = ancestor.mapTo(self.overlay, QPoint(0, 0))
             clip_rect = QRectF(
                 float(ancestor_top_left.x()),
                 float(ancestor_top_left.y()),
@@ -300,9 +303,8 @@ class NativeQuickBackground(QObject):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(255, 255, 255, 255))
-        origin = quick.mapToGlobal(QPoint(0, 0))
         for frame in self._cards:
-            path = self._card_path(frame, origin)
+            path = self._card_path(frame)
             if path is not None:
                 painter.drawPath(path)
         painter.end()
