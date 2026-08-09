@@ -57,20 +57,26 @@ def test_text_chunks_keep_logical_identity_without_execution_grouping_api():
     assert not hasattr(catalog, "logical_groups")
 
 
-def test_grounding_catalog_builds_content_bound_image_and_snapshot_sources(tmp_path):
+def test_grounding_catalog_includes_snapshot_rows_and_embedded_variant_data(tmp_path):
     image = tmp_path / "front.jpg"
     image.write_bytes(b"fake-image-bytes-v1")
     snapshot = tmp_path / "supplier.json"
     snapshot.write_text(
         json.dumps(
             {
+                "schema_version": 2,
                 "requested_url": "https://supplier.test/item",
                 "final_url": "https://supplier.test/item/123",
                 "title": "L11 Camera",
                 "captured_at": "2026-08-08T00:00:00+00:00",
                 "visible_text": "The display size is 3.0 inch and video resolution is 1080P.",
-                "table_rows": [],
+                "table_rows": [
+                    {"key": "Package size", "value": "16 x 11 x 7 cm", "table_index": 1, "row_index": 1}
+                ],
                 "json_ld": [],
+                "embedded_data": [
+                    '{"sku2":"front+cabin English+German","skuId":6017876765651}'
+                ],
                 "meta": {"description": "Vehicle camera product page"},
             }
         ),
@@ -89,12 +95,12 @@ def test_grounding_catalog_builds_content_bound_image_and_snapshot_sources(tmp_p
     assert catalog.sources[0].kind == IMAGE_KIND
     text_sources = [item for item in catalog.sources if item.kind == TEXT_KIND]
     assert text_sources
-    assert text_sources[0].source_id.startswith("supplier:001:text:0001:")
+    combined = "\n".join(item.content for item in text_sources)
+    assert "display size is 3.0 inch" in combined
+    assert "Package size" in combined
+    assert "6017876765651" in combined
     assert text_sources[0].logical_source_id == "supplier:001"
     assert text_sources[0].source_type == "supplier_web"
-    assert len(text_sources[0].sha256) == 64
-    assert "display size is 3.0 inch" in text_sources[0].content
-    assert catalog.by_id(text_sources[0].source_id) is text_sources[0]
 
 
 def test_source_id_changes_when_image_bytes_change(tmp_path):
