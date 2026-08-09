@@ -343,13 +343,12 @@ class VisualSceneLayer(QOpenGLWidget):
 
     Wallpaper motion changes only texture source coordinates. The sharp and
     pre-blurred overscan pixmaps are rebuilt only after a resize, then remain
-    stable GPU texture sources throughout mouse parallax. No QWidget raster
-    backing-store or per-frame blur/copy path participates in animation.
+    stable texture sources throughout mouse parallax. Animation is scheduled by
+    completed OpenGL frame swaps instead of a competing wall-clock timer.
     """
 
     _OVERSCAN = 1.065
     _TRAVEL = 0.82
-    _FRAME_MS = 16
     _EASE_TAU = 0.095
     _SETTLE_PX = 0.35
 
@@ -360,8 +359,6 @@ class VisualSceneLayer(QOpenGLWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setFocusPolicy(Qt.NoFocus)
         self.setAutoFillBackground(False)
-        # The whole visual scene changes when parallax moves. A single fresh FBO
-        # frame is cheaper and simpler than preserving/repairing partial buffers.
         self.setUpdateBehavior(QOpenGLWidget.UpdateBehavior.NoPartialUpdate)
 
         self._source = _load_wallpaper()
@@ -376,6 +373,7 @@ class VisualSceneLayer(QOpenGLWidget):
         self._target = QPointF(0.0, 0.0)
         self._pending_pointer: QPoint | None = None
         self._last_tick = 0.0
+        self._motion_active = False
 
         self._rebuild_timer = QTimer(self)
         self._rebuild_timer.setSingleShot(True)
@@ -384,14 +382,10 @@ class VisualSceneLayer(QOpenGLWidget):
 
         self._geometry_timer = QTimer(self)
         self._geometry_timer.setSingleShot(True)
-        self._geometry_timer.setTimerType(Qt.PreciseTimer)
         self._geometry_timer.setInterval(16)
         self._geometry_timer.timeout.connect(self._refresh_geometry)
 
-        self._motion_timer = QTimer(self)
-        self._motion_timer.setTimerType(Qt.PreciseTimer)
-        self._motion_timer.setInterval(self._FRAME_MS)
-        self._motion_timer.timeout.connect(self._motion_tick)
+        self.frameSwapped.connect(self._on_frame_swapped)
 
         app = QApplication.instance()
         if app is not None:
@@ -472,6 +466,7 @@ class VisualSceneLayer(QOpenGLWidget):
         self._offset = QPointF(0.0, 0.0)
         self._target = QPointF(0.0, 0.0)
         self._pending_pointer = None
+        self._motion_active = False
         self._source_rect = self._rect_for_offset(self._offset)
         self.request_geometry_refresh()
         self.update()
@@ -502,20 +497,22 @@ class VisualSceneLayer(QOpenGLWidget):
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
         if event_type == QEvent.MouseMove and hasattr(event, "globalPosition"):
-            # High-polling mice only replace one pending point. Actual scene
-            # updates stay capped by the 60 fps motion timer.
+            # High-polling mice only replace this one pending point. The scene
+            # graph advances only when the previous OpenGL frame has presented.
             self._pending_pointer = event.globalPosition().toPoint()
-            self._ensure_motion_timer()
+            self._ensure_motion()
         elif watched is self.window and event_type == QEvent.Leave:
             self._pending_pointer = None
             self._target = QPointF(0.0, 0.0)
-            self._ensure_motion_timer()
+            self._ensure_motion()
         return False
 
-    def _ensure_motion_timer(self) -> None:
-        if not self._motion_timer.isActive():
-            self._last_tick = time.monotonic()
-            self._motion_timer.start()
+    def _ensure_motion(self) -> None:
+        if self._motion_active:
+            return
+        self._motion_active = True
+        self._last_tick = time.monotonic()
+        self.update()
 
     def _update_target(self, global_pos: QPoint) -> None:
         local = self.mapFromGlobal(global_pos)
@@ -532,7 +529,7 @@ class VisualSceneLayer(QOpenGLWidget):
         travel_y = max(0.0, (self._render.height() - rect.height()) / 2.0 * self._TRAVEL)
         self._target = QPointF(-nx * travel_x, -ny * travel_y)
 
-    def _motion_tick(self) -> None:
+    def _advance_motion(self) -> None:
         now = time.monotonic()
         dt = min(0.050, max(0.001, now - self._last_tick))
         self._last_tick = now
@@ -549,35 +546,30 @@ class VisualSceneLayer(QOpenGLWidget):
             self._offset.x() + dx * alpha,
             self._offset.y() + dy * alpha,
         )
-
-        next_rect = self._rect_for_offset(self._offset)
-        if next_rect != self._source_rect:
-            self._source_rect = next_rect
-            # QOpenGLWidget repaints one GPU FBO. The pixmaps remain stable
-            # texture sources; only source coordinates change per frame.
-            self.update()
+        self._source_rect = self._rect_for_offset(self._offset)
 
         remaining = math.hypot(self._target.x() - self._offset.x(), self._target.y() - self._offset.y())
         if self._pending_pointer is None and remaining <= self._SETTLE_PX:
             self._offset = QPointF(self._target)
-            final_rect = self._rect_for_offset(self._offset)
-            if final_rect != self._source_rect:
-                self._source_rect = final_rect
-                self.update()
-            self._motion_timer.stop()
+            self._source_rect = self._rect_for_offset(self._offset)
+            self._motion_active = False
+
+    def _on_frame_swapped(self) -> None:
+        if self._motion_active and self.isVisible() and not self.window.isMinimized():
+            self.update()
 
     def update_frame(self, frame: QFrame) -> None:
         if frame not in self._geometry_cache:
             self.request_geometry_refresh()
             return
-        # Card interaction changes only a small alpha parameter. The GPU scene
-        # is cheap enough to redraw as one coherent frame, avoiding dirty-region
-        # bookkeeping and backing-store copies on the CPU.
         self.update()
 
     def paintGL(self) -> None:  # noqa: N802
         if self._render.isNull() or self._source_rect.isEmpty():
             return
+
+        if self._motion_active:
+            self._advance_motion()
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
@@ -625,7 +617,7 @@ class VisualSceneLayer(QOpenGLWidget):
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
-        self._motion_timer.stop()
+        self._motion_active = False
         self._geometry_timer.stop()
         self._rebuild_timer.stop()
 
@@ -650,8 +642,8 @@ class VisualStyleController(QObject):
         window.installEventFilter(self)
         self._install_cursor()
 
-        # Scrolling only invalidates cached card geometry; coordinate mapping is
-        # capped at 60Hz and never runs on wallpaper motion frames.
+        # Scrolling only invalidates cached card geometry. Mapping never runs on
+        # a wallpaper motion frame.
         for bar in window.findChildren(QScrollBar):
             bar.valueChanged.connect(self.scene.request_geometry_refresh)
 
