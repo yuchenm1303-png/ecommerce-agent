@@ -103,8 +103,6 @@ def test_direct_executor_has_same_single_url_product_boundary():
 
 
 def test_legacy_preview_cli_is_not_the_new_production_entrypoint():
-    # The mature browser helper module remains for compatibility and is imported
-    # by the direct executor, but new product runs are routed through the direct runner.
     assert makro_preview_listing is not makro_execute_listing
 
 
@@ -132,12 +130,20 @@ def test_field_mapping_batches_are_mechanical_not_category_semantic_tables():
         assert token not in lowered
 
 
-def test_web_is_only_fill_the_blanks_and_uses_source_url_anchor():
+def test_web_is_missing_only_and_receives_raw_primary_source_identity():
     source = inspect.getsource(web_enrichment)
-    assert "WEB_FILLABLE_STATUSES = {MISSING, REVIEW}" in source
+    assert "WEB_FILLABLE_STATUSES = {MISSING}" in source
     assert "source_product_url" in source
+    assert "primary_source_evidence" in source
+    assert "generic model token" in source
     assert "known_local_fields" in source
-    assert "Local" not in source or "frozen" in source
+
+
+def test_python_citation_guard_validates_source_address_not_literal_semantics():
+    source = inspect.getsource(ai_decisions)
+    assert "_citation_is_grounded" not in source
+    assert "wanted in _normalize_ws(source.content)" not in source
+    assert "grounding.by_id(reference) is not None" in source
 
 
 def test_hard_validator_contains_no_product_attribute_marker_tables():
