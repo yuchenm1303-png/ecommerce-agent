@@ -5,6 +5,12 @@ import sys
 from pathlib import Path
 
 
+# Qt chooses its render loop during Qt Quick initialization. Set this before
+# importing QtQuick so the Windows shell cannot silently fall back to the basic
+# GUI-thread render loop.
+os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
+
+
 def main() -> int:
     try:
         from PySide6.QtCore import QUrl
@@ -21,9 +27,8 @@ def main() -> int:
         )
         return 2
 
-    # The production Windows GUI now has one rendering system only: Qt Quick's
-    # retained scene graph. Do not embed QQuickWidget/QOpenGLWidget into QWidget.
-    os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
+    # One rendering system only: a native QQuickWindow scene graph. There is no
+    # QQuickWidget, QOpenGLWidget, QWidget presentation shell, or mixed FBO stack.
     if sys.platform.startswith("win"):
         QQuickWindow.setGraphicsApi(QSGRendererInterface.GraphicsApi.Direct3D11)
 
@@ -33,8 +38,6 @@ def main() -> int:
     app.setApplicationName("ecommerce-agent Acceptance Control Console")
     app.setOrganizationName("ecommerce-agent")
 
-    # Preserve the exact small white-dot cursor; the larger follower circle is
-    # rendered in the same Qt Quick scene as the wallpaper and sakura.
     cursor_pixmap = QPixmap(10, 10)
     cursor_pixmap.fill(QColor(0, 0, 0, 0))
     painter = QPainter(cursor_pixmap)
@@ -57,7 +60,6 @@ def main() -> int:
         print(f"Qt Quick GUI failed to load: {qml_path}", file=sys.stderr)
         return 3
 
-    # Keep Python-owned QObjects alive for the full QML engine lifetime.
     app._gui_bridge = bridge  # type: ignore[attr-defined]
     app._qml_engine = engine  # type: ignore[attr-defined]
     try:
