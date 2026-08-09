@@ -39,7 +39,6 @@ Item {
     }
 
     Image {
-        id: sharpImage
         width: root.overscanWidth
         height: root.overscanHeight
         x: (root.width - width) * 0.5 + root.offsetX
@@ -60,7 +59,6 @@ Item {
     }
 
     FrameAnimation {
-        id: animationClock
         running: root.visible
         onTriggered: {
             var px = hover.hovered ? hover.point.position.x : root.width * 0.5
@@ -70,7 +68,7 @@ Item {
             root.targetX = -nx * root.maxTravelX
             root.targetY = -ny * root.maxTravelY
 
-            // Same 12% / 16ms response as the QWidget baseline, made time-continuous.
+            // Same 12% / 16ms response as the QWidget baseline, but frame-synchronized.
             var tau = -0.016 / Math.log(1.0 - 0.12)
             var dt = Math.max(0, Math.min(0.05, frameTime))
             var alpha = dt > 0 ? 1.0 - Math.exp(-dt / tau) : 0
@@ -78,10 +76,6 @@ Item {
             root.offsetY += (root.targetY - root.offsetY) * alpha
 
             if (hover.hovered) {
-                if (!root.followerVisible) {
-                    root.followerX = px
-                    root.followerY = py
-                }
                 var followAlpha = 1.0 - Math.pow(1.0 - 0.35, Math.max(0.25, dt / 0.016))
                 root.followerX += (px - root.followerX) * followAlpha
                 root.followerY += (py - root.followerY) * followAlpha
@@ -90,23 +84,23 @@ Item {
             for (var i = 0; i < petals.count; ++i) {
                 var p = petals.get(i)
                 var frameScale = dt > 0 ? dt / 0.016 : 1.0
-                var nxp = p.x + (0.5 * p.fnx - 1.7) * frameScale
-                var nyp = p.y + p.fny * frameScale
-                var nr = p.r + p.fnr * frameScale
-                if (nxp > root.width || nxp < 0 || nyp > root.height || nyp < 0) {
+                var nextX = p.px + (0.5 * p.fnx - 1.7) * frameScale
+                var nextY = p.py + p.fny * frameScale
+                var nextR = p.rot + p.fnr * frameScale
+                if (nextX > root.width || nextX < 0 || nextY > root.height || nextY < 0) {
                     if (Math.random() > 0.4) {
-                        nxp = Math.random() * root.width
-                        nyp = 0
+                        nextX = Math.random() * root.width
+                        nextY = 0
                     } else {
-                        nxp = root.width
-                        nyp = Math.random() * root.height
+                        nextX = root.width
+                        nextY = Math.random() * root.height
                     }
-                    petals.setProperty(i, "scale", Math.random())
-                    nr = 6.0 * Math.random()
+                    petals.setProperty(i, "petalScale", Math.random())
+                    nextR = 6.0 * Math.random()
                 }
-                petals.setProperty(i, "x", nxp)
-                petals.setProperty(i, "y", nyp)
-                petals.setProperty(i, "r", nr)
+                petals.setProperty(i, "px", nextX)
+                petals.setProperty(i, "py", nextY)
+                petals.setProperty(i, "rot", nextR)
             }
         }
     }
@@ -116,10 +110,10 @@ Item {
         Component.onCompleted: {
             for (var i = 0; i < 3; ++i) {
                 append({
-                    "x": Math.random() * root.width,
-                    "y": Math.random() * root.height,
-                    "scale": Math.random(),
-                    "r": 6.0 * Math.random(),
+                    "px": Math.random() * root.width,
+                    "py": Math.random() * root.height,
+                    "petalScale": Math.random(),
+                    "rot": 6.0 * Math.random(),
                     "fnx": Math.random() - 0.5,
                     "fny": 1.5 + 0.7 * Math.random(),
                     "fnr": 0.03 * Math.random()
@@ -131,17 +125,13 @@ Item {
     Repeater {
         model: petals
         delegate: Image {
-            required property real x
-            required property real y
-            required property real scale
-            required property real r
-            width: Math.max(1, 40 * scale)
+            width: Math.max(1, 40 * petalScale)
             height: width
             source: "image://wallpaper/sakura"
             smooth: true
-            x: model.x
-            y: model.y
-            rotation: model.r * 180 / Math.PI
+            x: px
+            y: py
+            rotation: rot * 180 / Math.PI
             transformOrigin: Item.Center
         }
     }
