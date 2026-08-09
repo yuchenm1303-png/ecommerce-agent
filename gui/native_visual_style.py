@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QCursor, QPainter, QPainterPath, QPixmap
-from PySide6.QtWidgets import QApplication, QFrame, QMainWindow, QWidget
+from PySide6.QtGui import QCursor, QPainter, QPixmap
+from PySide6.QtWidgets import QApplication, QFrame, QMainWindow
 
 from .native_background import NativeQuickBackground
 from .visual_style import NEKRO_STYLE
@@ -11,23 +11,21 @@ from .visual_style import NEKRO_STYLE
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
 
 
-class NativeGlassBackdrop(QWidget):
-    """Baseline glass tint/interaction surface; blur is composed once in Quick.
+class NativeGlassProxy(QObject):
+    """Baseline GlassBackdrop API with all glass pixels rendered in Quick.
 
-    The public interaction contract intentionally matches baseline GlassBackdrop
-    so gui.nekro_card_fx stays byte-for-byte unchanged.
+    The baseline card FX controller keeps driving set_interaction() with the
+    original timings/easing. This proxy forwards only the alpha value to the
+    Quick card model, so there is no second QWidget glass/tint layer and no
+    mismatched rounded edge around the GPU glass surface.
     """
 
-    def __init__(self, frame: QFrame) -> None:
+    def __init__(self, frame: QFrame, background: NativeQuickBackground) -> None:
         super().__init__(frame)
         self.frame = frame
+        self.background = background
         self._surface_scale = 1.0
         self._overlay_alpha = 64.0
-
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.sync_geometry()
 
     @property
     def surface_scale(self) -> float:
@@ -38,8 +36,8 @@ class NativeGlassBackdrop(QWidget):
         return self._overlay_alpha
 
     def set_interaction(self, *, scale: float, overlay_alpha: float) -> None:
-        # Preserve the exact baseline API. Baseline card FX always supplies
-        # scale=1.0 and animates only overlay alpha.
+        # Baseline card FX supplies scale=1.0 and animates alpha only. Preserve
+        # the public API exactly while keeping the actual pixels in Quick.
         scale = max(0.94, min(1.0, float(scale)))
         overlay_alpha = max(0.0, min(255.0, float(overlay_alpha)))
         if (
@@ -49,46 +47,23 @@ class NativeGlassBackdrop(QWidget):
             return
         self._surface_scale = scale
         self._overlay_alpha = overlay_alpha
-        self.update()
+        self.background.set_card_alpha(self.frame, overlay_alpha)
 
     def sync_geometry(self) -> None:
-        self.setGeometry(self.frame.rect())
-        self.lower()
-        self.show()
-        self.update()
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        del event
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        target = QRectF(self.rect())
-        if self._surface_scale < 0.9999:
-            inset_x = target.width() * (1.0 - self._surface_scale) * 0.5
-            inset_y = target.height() * (1.0 - self._surface_scale) * 0.5
-            target.adjust(inset_x, inset_y, -inset_x, -inset_y)
-
-        # Match the baseline composition exactly: rounded glass clip followed by
-        # the animated black tint. The blurred wallpaper already exists directly
-        # underneath this surface in the single global Quick mask.
-        path = QPainterPath()
-        path.addRoundedRect(target, 6.0, 6.0)
-        painter.setClipPath(path)
-        painter.fillRect(target, QColor(0, 0, 0, int(round(self._overlay_alpha))))
-        painter.end()
+        self.background.schedule_mask_update()
 
 
 class NativeVisualStyleController(QObject):
-    """Performance adapter around the untouched baseline presentation layer."""
+    """Baseline presentation adapter with only wallpaper/glass moved to Quick."""
 
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
         self.window = window
-        self._glass: dict[QFrame, NativeGlassBackdrop] = {}
+        self._glass: dict[QFrame, NativeGlassProxy] = {}
         self._cursor_installed = False
 
-        # The QWidget tree remains the baseline UI. It becomes only a translucent
-        # native client surface so the Quick renderer can present underneath it.
+        # The QWidget tree remains the baseline UI. Only the top-level client
+        # surface is translucent so the native Quick scene can present below it.
         window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         window.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         window.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
@@ -97,27 +72,27 @@ class NativeVisualStyleController(QObject):
             self.central.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
             self.central.setAutoFillBackground(False)
 
-        # Reuse the baseline stylesheet verbatim; do not fork visual constants.
+        # Reuse baseline style constants verbatim. No replacement card border,
+        # tint or hover CSS is introduced here.
         window.setStyleSheet(window.styleSheet() + "\n" + NEKRO_STYLE)
+
+        self.background = NativeQuickBackground(window)
         for frame in window.findChildren(QFrame):
             if frame.objectName() in _GLASS_NAMES:
                 frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-                self._glass[frame] = NativeGlassBackdrop(frame)
+                self._glass[frame] = NativeGlassProxy(frame, self.background)
 
-        self.background = NativeQuickBackground(window)
         self._install_cursor()
-
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
         window.destroyed.connect(self._cleanup)
         QTimer.singleShot(0, self._sync_glass)
 
-    def surface_for(self, frame: QFrame) -> NativeGlassBackdrop | None:
+    def surface_for(self, frame: QFrame) -> NativeGlassProxy | None:
         return self._glass.get(frame)
 
     def _install_cursor(self) -> None:
-        # Byte-for-byte visual equivalent of the baseline white-dot cursor.
         pixmap = QPixmap(10, 10)
         pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)
@@ -130,19 +105,13 @@ class NativeVisualStyleController(QObject):
         self._cursor_installed = True
 
     def _sync_glass(self) -> None:
-        for backdrop in self._glass.values():
-            backdrop.sync_geometry()
         self.background.schedule_mask_update()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        # Prevent only the baseline AtmosphereWidget full-window paint. All child
-        # controls, card FX, petals and business widgets remain baseline code.
+        # Suppress only the baseline AtmosphereWidget wallpaper paint. Card
+        # content/controls remain the original QWidget implementation.
         if watched is self.central and event.type() == QEvent.Type.Paint:
             return True
-
-        if isinstance(watched, QFrame) and watched in self._glass:
-            if event.type() in {QEvent.Type.Resize, QEvent.Type.Show}:
-                QTimer.singleShot(0, self._glass[watched].sync_geometry)
         return False
 
     def _cleanup(self) -> None:
