@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+
+# The only performance-specific process setting. It must be set before Qt is
+# imported so QQuickWindow FrameAnimation follows the threaded scene graph.
+os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
 
 
 def main() -> int:
@@ -18,27 +24,34 @@ def main() -> int:
 
     from gui.console_window import MainWindow
     from gui.log_presenter import install_buffered_logs
+    from gui.native_visual_style import install_native_visual_style
+    from gui.native_window_shell import install_native_window_shell
     from gui.nekro_card_fx import install_nekro_card_fx
     from gui.nekro_effects import install_nekro_effects
-    from gui.visual_style import install_visual_style
 
     app = QApplication(sys.argv)
     app.setApplicationName("ecommerce-agent Read-only Lab")
     app.setOrganizationName("ecommerce-agent")
 
-    # One global filter gives every scrollable surface continuous per-pixel
-    # wheel scrolling (see gui/smooth_scroll.py).
+    # Preserve the baseline global smooth-scroll behavior unchanged.
     from gui.smooth_scroll import SmoothWheelFilter
 
     app.installEventFilter(SmoothWheelFilter(app))
 
     window = MainWindow(Path(__file__).resolve().parent)
-    visual = install_visual_style(window)
+    visual = install_native_visual_style(window)
+    quick_window = visual.background.quick_window
+    if quick_window is None:
+        raise RuntimeError("Native Quick renderer was not created")
+    shell = install_native_window_shell(window, quick_window)
+
+    # These are the baseline controllers, unchanged. In particular the card
+    # hover/press timing and easing remain exactly the d89cbcc implementation.
     install_nekro_card_fx(window, visual)
     install_buffered_logs(window)
     effects = install_nekro_effects(window, sakura_count=3)
 
-    window.show()
+    shell.show()
     effects.raise_()
     return app.exec()
 
