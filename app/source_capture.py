@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -7,7 +10,13 @@ from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
 
 from .browser_session import cdp_endpoint, is_cdp_ready, launch_detached_edge
-from .source_snapshot import SourceAccessBlocked, SourceSnapshot, capture_page_snapshot, write_source_snapshot
+from .source_snapshot import (
+    SourceAccessBlocked,
+    SourceSnapshot,
+    capture_page_snapshot,
+    source_snapshot_from_json,
+    write_source_snapshot,
+)
 
 
 DEFAULT_SOURCE_CDP_PORT = 9333
@@ -19,6 +28,8 @@ class CapturedProductSource:
     screenshot_path: Path
     snapshot: SourceSnapshot
     launched_now: bool
+    product_image_paths: tuple[Path, ...] = ()
+    cache_hit: bool = False
 
 
 def validate_source_url(value: str) -> str:
@@ -27,6 +38,16 @@ def validate_source_url(value: str) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("product URL 必须是完整 http/https URL。")
     return url
+
+
+def _canonical_source_url(value: str) -> str:
+    parsed = urlsplit(validate_source_url(value))
+    path = parsed.path.rstrip("/") or "/"
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+
+
+def _source_cache_key(value: str) -> str:
+    return hashlib.sha256(_canonical_source_url(value).encode("utf-8")).hexdigest()[:24]
 
 
 def _connect_source_edge(playwright, *, profile_dir: Path, port: int, start_url: str):
@@ -74,6 +95,119 @@ def _load_lazy_page(page, *, initial_wait_ms: int, scroll_wait_ms: int, max_scro
         page.wait_for_timeout(scroll_wait_ms)
 
 
+def _image_extension(content_type: str, url: str) -> str:
+    mime = content_type.split(";", 1)[0].strip().casefold()
+    by_mime = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "image/avif": ".avif",
+    }
+    if mime in by_mime:
+        return by_mime[mime]
+    suffix = Path(urlsplit(url).path).suffix.lower()
+    return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"} else ".img"
+
+
+def _download_page_images(context, image_urls: list[str], output_dir: Path, *, max_images: int = 12) -> tuple[Path, ...]:
+    """Download large images already exposed by the exact page; no image semantics here."""
+
+    if not image_urls:
+        return ()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    saved: list[Path] = []
+    seen_hashes: set[str] = set()
+
+    for url in image_urls:
+        if len(saved) >= max_images:
+            break
+        response = None
+        try:
+            response = context.request.get(url, timeout=15_000, fail_on_status_code=False)
+            if not response.ok:
+                continue
+            headers = {str(k).casefold(): str(v) for k, v in response.headers.items()}
+            content_type = headers.get("content-type", "")
+            if content_type and not content_type.casefold().startswith("image/"):
+                continue
+            body = response.body()
+            if len(body) < 4_096:
+                continue
+            digest = hashlib.sha256(body).hexdigest()
+            if digest in seen_hashes:
+                continue
+            seen_hashes.add(digest)
+            ext = _image_extension(content_type, url)
+            path = output_dir / f"source-image-{len(saved) + 1:02d}-{digest[:10]}{ext}"
+            path.write_bytes(body)
+            saved.append(path)
+        except Exception:
+            # Image downloads are supplemental. The snapshot + full-page screenshot
+            # remain valid evidence even when a CDN refuses an individual request.
+            continue
+        finally:
+            if response is not None:
+                try:
+                    response.dispose()
+                except Exception:
+                    pass
+    return tuple(saved)
+
+
+def _cached_capture(
+    source_url: str,
+    *,
+    output_dir: Path,
+    cache_dir: Path | None,
+    cache_ttl_seconds: int,
+) -> CapturedProductSource | None:
+    if cache_dir is None or cache_ttl_seconds <= 0:
+        return None
+    slot = cache_dir / _source_cache_key(source_url)
+    snapshot = slot / "source-snapshot.json"
+    screenshot = slot / "source-page.png"
+    if not snapshot.is_file() or not screenshot.is_file():
+        return None
+    age = time.time() - snapshot.stat().st_mtime
+    if age < 0 or age > cache_ttl_seconds:
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(snapshot, output_dir / snapshot.name)
+    shutil.copy2(screenshot, output_dir / screenshot.name)
+    cached_images = slot / "product-images"
+    if cached_images.is_dir():
+        shutil.copytree(cached_images, output_dir / "product-images", dirs_exist_ok=True)
+
+    output_snapshot = output_dir / "source-snapshot.json"
+    output_screenshot = output_dir / "source-page.png"
+    product_images = tuple(sorted((output_dir / "product-images").glob("*") if (output_dir / "product-images").is_dir() else []))
+    return CapturedProductSource(
+        snapshot_path=output_snapshot,
+        screenshot_path=output_screenshot,
+        snapshot=source_snapshot_from_json(output_snapshot),
+        launched_now=False,
+        product_image_paths=product_images,
+        cache_hit=True,
+    )
+
+
+def _refresh_capture_cache(source_url: str, source_dir: Path, cache_dir: Path | None) -> None:
+    if cache_dir is None:
+        return
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    slot = cache_dir / _source_cache_key(source_url)
+    temp = cache_dir / f".{slot.name}.tmp"
+    if temp.exists():
+        shutil.rmtree(temp)
+    shutil.copytree(source_dir, temp)
+    if slot.exists():
+        shutil.rmtree(slot)
+    temp.replace(slot)
+
+
 def capture_product_source(
     url: str,
     *,
@@ -85,11 +219,16 @@ def capture_product_source(
     max_scroll_steps: int = 120,
     max_visible_text_chars: int = 120_000,
     use_current_page: bool = False,
+    cache_dir: str | Path | None = None,
+    cache_ttl_seconds: int = 900,
+    force_refresh: bool = False,
 ) -> CapturedProductSource:
-    """Capture one exact supplier product page as text/table data plus a full-page image.
+    """Capture one exact supplier page and its automatically discovered large images.
 
-    This is mechanical browser collection only. It never interprets product facts and never
-    touches the Makro browser profile. CAPTCHA/risk controls are not bypassed.
+    A short-lived byte cache makes immediate hot reruns use the exact same source
+    universe, so semantic caches can be meaningfully tested. It is transport
+    caching only, not a product-fact layer. `force_refresh` or `use_current_page`
+    bypasses reuse and performs a fresh capture.
     """
 
     source_url = validate_source_url(url)
@@ -99,12 +238,24 @@ def capture_product_source(
         raise ValueError("max_scroll_steps 必须 >= 1。")
     if max_visible_text_chars < 1_000:
         raise ValueError("max_visible_text_chars 不能小于 1000。")
+    if cache_ttl_seconds < 0:
+        raise ValueError("cache_ttl_seconds 不能为负数。")
 
     target_dir = Path(output_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    cache_root = Path(cache_dir) if cache_dir is not None else None
+    if not force_refresh and not use_current_page:
+        cached = _cached_capture(
+            source_url,
+            output_dir=target_dir,
+            cache_dir=cache_root,
+            cache_ttl_seconds=int(cache_ttl_seconds),
+        )
+        if cached is not None:
+            return cached
 
+    target_dir.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as playwright:
-        _, _, page, launched_now = _connect_source_edge(
+        _, context, page, launched_now = _connect_source_edge(
             playwright,
             profile_dir=Path(profile_dir).resolve(),
             port=int(cdp_port),
@@ -131,12 +282,20 @@ def capture_product_source(
         snapshot_path = write_source_snapshot(snapshot, target_dir / "source-snapshot.json")
         screenshot_path = target_dir / "source-page.png"
         page.screenshot(path=str(screenshot_path), full_page=True)
+        product_images = _download_page_images(
+            context,
+            snapshot.image_urls,
+            target_dir / "product-images",
+        )
 
+    _refresh_capture_cache(source_url, target_dir, cache_root)
     return CapturedProductSource(
         snapshot_path=snapshot_path,
         screenshot_path=screenshot_path,
         snapshot=snapshot,
         launched_now=launched_now,
+        product_image_paths=product_images,
+        cache_hit=False,
     )
 
 
@@ -144,6 +303,7 @@ __all__ = [
     "CapturedProductSource",
     "DEFAULT_SOURCE_CDP_PORT",
     "SourceAccessBlocked",
+    "_source_cache_key",
     "capture_product_source",
     "validate_source_url",
 ]
