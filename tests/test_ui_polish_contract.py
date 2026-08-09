@@ -20,26 +20,28 @@ def test_standard_gui_installs_polish_after_native_visual_layer() -> None:
     )
 
 
-def test_polish_rebalances_workspace_without_business_replacement() -> None:
+def test_polish_rebalances_workspace_without_reimplementing_business() -> None:
     assert 'body = QSplitter(Qt.Orientation.Vertical, root)' in POLISH
     assert 'body.setObjectName("bodySplitter")' in POLISH
-    assert "workspace.setMinimumHeight(310)" in POLISH
+    assert "workspace.setMinimumHeight(300)" in POLISH
     assert "body.setSizes([520, 270])" in POLISH
     assert 'workspace_splitter.setObjectName("workspaceSplitter")' in POLISH
     assert "workspace_splitter.setSizes([1180, 360])" in POLISH
-    assert "Resolver" not in POLISH
-    assert "RealExecutionConfig" not in POLISH
-    assert "Send to QC" not in POLISH
+    assert "from .readonly_runner" not in POLISH
+    assert "from .real_execution" not in POLISH
+    assert "RealExecutionConfig(" not in POLISH
 
 
-def test_trace_tables_have_readable_density_and_widths() -> None:
-    assert "_configure_data_table(table, minimum_height=300)" in POLISH
+def test_trace_tables_have_readable_density_and_compact_header() -> None:
+    assert "_configure_data_table(table, minimum_height=260)" in POLISH
     assert "vertical.setDefaultSectionSize(42)" in POLISH
     assert "vertical.setMinimumSectionSize(40)" in POLISH
     assert "header.setMinimumHeight(42)" in POLISH
     assert "header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)" in POLISH
     assert "header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)" in POLISH
     assert "table.setTextElideMode(Qt.TextElideMode.ElideRight)" in POLISH
+    assert "def _compact_field_header" in POLISH
+    assert "header_row.addWidget(hint, 0, Qt.AlignmentFlag.AlignBottom)" in POLISH
 
 
 def test_data_surfaces_are_more_opaque_than_wallpaper_glass() -> None:
