@@ -32,22 +32,24 @@ class JSONTaskProvider(Protocol):
         ...
 
 
-FIELD_MAPPING_CONTRACT_VERSION = 11
-FIELD_MAPPING_CACHE_VERSION = 11
+FIELD_MAPPING_CONTRACT_VERSION = 12
+FIELD_MAPPING_CACHE_VERSION = 12
 
 
 MAPPING_SYSTEM_INSTRUCTION = (
     "You directly fill marketplace fields from the supplied exact supplier-page evidence. "
     "There is no intermediate product profile, review model, or Python semantic resolver. "
     "Read structured page rows, embedded variant data, rendered page text, the full-page screenshot "
-    "and captured product/detail images yourself. For every target, audit all supplied evidence before "
-    "choosing READY so real source conflicts are preserved. Leave unsupported fields missing. The response "
-    "shape is schema-constrained: classify each target into exactly one of ready, conflicts, or missing."
+    "and captured product/detail images yourself. For every target, audit all supplied evidence and compare "
+    "the target against the complete live marketplace field schema before choosing READY. Preserve real source "
+    "conflicts and leave unsupported fields missing."
 )
 
 
 MAPPING_RULES = [
     "Place every supplied target field_id exactly once in ready, conflicts, or missing.",
+    "target_fields are the only fields you must answer in this batch. all_marketplace_fields is the complete sibling field schema and is reference-only: use it to decide which marketplace field a source fact actually belongs to.",
+    "Before assigning any fact, compare the source fact against ALL sibling field meanings and put it only on the best-matching field. Never use a nearby field merely because its current batch contains the fact while the better sibling field is in another batch.",
     "For EACH target field, scan all grounded text rows and all supplied images for direct values that answer that exact field BEFORE choosing READY or MISSING.",
     "ready is allowed only when one supported value remains after that full evidence scan and requires at least one existing source_reference citation.",
     "conflicts is mandatory when two or more different directly supported values answer the same exact target field; do not suppress a real conflict merely because one value comes from a structured row and another from a product/detail image.",
@@ -56,14 +58,17 @@ MAPPING_RULES = [
     "Treat attribute_key, label, section_heading, help_text, context_text, options and qualifier_options together as the Makro field meaning. Do not invent a second taxonomy.",
     "Keep scope exact: packaging vs product body vs mount; cabin/interior vs rear/back; manual/documentation language vs device UI language; product brand vs compatible vehicle brand.",
     "For structured key/value rows, preserve the row key as the attribute identity. A value from a differently named row must not be reassigned merely because it is adjacent or numerically plausible.",
-    "Packaging Length/Breadth/Height/Weight fields use packaging/shipping evidence only. If an exact package-dimensions source explicitly gives L×W×H, Length×Width×Height, or 长×宽×高, split that tuple in the literal stated order; package/gross weight maps to Packaging Weight only when the source labels it as package/gross/shipping weight.",
+    "Packaging Length/Breadth/Height/Weight fields use packaging/shipping evidence only. For an explicitly ordered package tuple L×W×H, Length×Width×Height, or 长×宽×高, the first number is Length, the second is Width/Breadth, and the third is Height. Never copy the first number into Breadth. Package/gross weight maps to Packaging Weight only when the source labels it as package/gross/shipping weight.",
     "A generic Length/Width/Breadth/Height field outside a packaging/shipping scope means the product/body dimension unless that target contract explicitly says packaging. Never reuse a package dimension as product/body Height, Width, Breadth, or Length.",
     "Preserve dimension axes literally. Source length maps to Makro Length; source width/breadth maps to Makro Breadth; source height maps to Makro Height. Never swap or rotate axes to make values fit.",
-    "Keep display size, display pixel resolution, recording/video resolution, and still-image resolution separate. A 720p/1080p/2K/4K camera or recording claim is not Display Resolution unless the evidence explicitly says screen/display resolution. If two source claims both refer to recording/video resolution and disagree, return CONFLICT rather than assigning one to another resolution field.",
-    "Before declaring CONFLICT, verify all alternatives have the same semantic/quantity type as the target field; nearby facts of another type are not conflicting alternatives. 1080P is a resolution value, never a frame-rate alternative.",
-    "Generated Description/Keywords/Sales Package may use only supported, non-conflicting facts. If a fact is in CONFLICT, omit that fact from generated descriptive text instead of choosing one side.",
+    "Resolution taxonomy is strict: Recording Resolution means camera/video capture resolution such as 720p, 1080p, 2K or 4K. Display Resolution means screen/display pixel resolution only when the source explicitly describes the screen/display. Video Formats means file/container/codec/encoding formats such as MP4, MOV, AVI, H.264 or H.265; 720p/1080p are NEVER Video Formats.",
+    "If supplier text says recording/video resolution 720p while a product/detail image says recording/video resolution 1080p, the Recording Resolution target must be CONFLICT. Do not move either value to Video Formats or Display Resolution to avoid the conflict.",
+    "Display/Screen Size is physical diagonal size in inches. If exact-page evidence gives 3.0 inch and 3.16 inch for the same display size, return CONFLICT for that display-size field and omit both values from generated descriptions.",
+    "Night Vision and Infrared View are capabilities that may coexist. Their simultaneous presence is not a CONFLICT. A conflict requires incompatible answers to the SAME target, for example explicit Yes vs No or two incompatible direct values for that target.",
+    "Camera Position=Back/Rear requires explicit rear/back-camera evidence. Front+cabin/interior means front plus cabin/interior and must never be rewritten as Back/Rear.",
+    "Generated Description/Keywords/Sales Package may use only supported, non-conflicting facts. If any exact-page evidence disagrees on a fact, omit that fact from generated descriptive text instead of choosing one side.",
     "Never infer No/False/Unsupported/Not included from absence. A negative value requires explicit target-specific evidence.",
-    "Manual/documentation language does not establish device UI Languages Supported. TF/memory-card support does not establish that a card is included. Package dimensions do not establish Packaging Type=Box. One listing/product page does not establish Pack of=1. Front+cabin/interior does not establish rear/back Camera Position. Remote Control=No requires explicit remote-control evidence.",
+    "Manual/documentation language does not establish device UI Languages Supported. TF/memory-card support does not establish that a card is included. Package dimensions do not establish Packaging Type=Box. One listing/product page does not establish Pack of=1. Manufacturer identity does not establish Packer Details unless the source explicitly identifies the packer. Remote Control=No requires explicit remote-control evidence.",
     "If options exist, return exact option text only when evidence supports it. If multi_value=false return one value.",
     "If qualifier_options exist, put the magnitude in values and an exact allowed unit in qualifier. If qualifier_options are empty, qualifier MUST be empty. When context_text/help_text shows a fixed rendered unit, convert the magnitude to that fixed unit but keep qualifier empty because there is no separate unit control. If no fixed unit is established, classify the field as missing.",
     "Embedded variant matrices may contain several options. Do not mix facts from different variants unless the page itself establishes they apply to the current product generally.",
@@ -170,18 +175,21 @@ def build_field_mapping_request(
     *,
     expected_identity: ProductIdentity = ProductIdentity(),
     product_url: str = "",
+    all_fields: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     fields = list(batch_fields)
+    reference_fields = list(all_fields) if all_fields is not None else fields
     return {
         "task": "fill_marketplace_fields_from_exact_product_evidence",
         "system_instruction": MAPPING_SYSTEM_INSTRUCTION,
         "prompt_instruction": (
-            "For every supplied Makro target: first audit all grounded text rows and all images for facts that "
-            "directly answer that target, then classify it. Do not choose READY until you have checked for a second "
-            "different direct value for the same target. Preserve packaging/body scope and literal dimension axes."
+            "For every supplied target: first use all_marketplace_fields to identify the correct marketplace meaning, "
+            "then audit all grounded text rows and images for direct evidence for that exact target. Do not choose READY "
+            "until you checked for a second conflicting value and ruled out a better sibling field for the same fact."
         ),
         "product_identity": {"source_product_url": product_url.strip()},
         "target_fields": [_target_payload(field) for field in fields],
+        "all_marketplace_fields": [_target_payload(field) for field in reference_fields],
         "rules": list(MAPPING_RULES),
         "grounded_sources": grounding.as_request_list(),
         "json_contract": MAPPING_JSON_SCHEMA,
@@ -208,6 +216,7 @@ def _cache_key(
     provider: JSONTaskProvider,
     cache_namespace: str,
     batch_fields: list[dict[str, Any]],
+    all_fields: list[dict[str, Any]],
     grounding: GroundingCatalog,
     expected_identity: ProductIdentity,
     product_url: str,
@@ -225,6 +234,7 @@ def _cache_key(
         },
         "product_url": product_url.strip(),
         "batch_schema_sha256": schema_digest(batch_fields),
+        "full_schema_sha256": schema_digest(all_fields),
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -348,6 +358,7 @@ def _run_batch(
     provider: JSONTaskProvider,
     batch_index: int,
     batch_fields: list[dict[str, Any]],
+    all_fields: list[dict[str, Any]],
     grounding: GroundingCatalog,
     expected_identity: ProductIdentity,
     product_url: str,
@@ -355,7 +366,15 @@ def _run_batch(
     cache_dir: Path | None,
     cache_namespace: str,
 ) -> _BatchRun:
-    key = _cache_key(provider, cache_namespace, batch_fields, grounding, expected_identity, product_url)
+    key = _cache_key(
+        provider,
+        cache_namespace,
+        batch_fields,
+        all_fields,
+        grounding,
+        expected_identity,
+        product_url,
+    )
     cache_path = cache_dir / f"field-map-{key}.json" if cache_dir is not None else None
     if cache_path is not None and cache_path.is_file():
         try:
@@ -375,6 +394,7 @@ def _run_batch(
         grounding,
         expected_identity=expected_identity,
         product_url=product_url,
+        all_fields=all_fields,
     )
     model_calls = 0
     try:
@@ -480,6 +500,7 @@ def run_field_mapping(
                     provider,
                     index,
                     batch,
+                    non_business,
                     grounding,
                     expected_identity,
                     product_url,
