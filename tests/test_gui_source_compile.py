@@ -13,6 +13,8 @@ GUI_SOURCES = [
     PROJECT_ROOT / "gui" / "real_execution.py",
     PROJECT_ROOT / "gui" / "result_loader.py",
     PROJECT_ROOT / "gui" / "visual_style.py",
+    PROJECT_ROOT / "gui" / "visual_perf.py",
+    PROJECT_ROOT / "gui" / "visual_perf_hooks.py",
     PROJECT_ROOT / "gui" / "nekro_card_fx.py",
     PROJECT_ROOT / "gui" / "nekro_effects.py",
     PROJECT_ROOT / "gui" / "log_presenter.py",
