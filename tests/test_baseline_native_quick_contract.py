@@ -24,6 +24,14 @@ def test_baseline_card_animation_contract_is_unchanged() -> None:
     assert "install_nekro_card_fx(window, visual)" in RUNNER
 
 
+def test_card_hit_testing_survives_native_child_embedding() -> None:
+    assert "def _card_from_widget" in CARD_FX
+    assert "current.parentWidget()" in CARD_FX
+    event_filter = CARD_FX.split("def eventFilter", 1)[1].split("def _cleanup", 1)[0]
+    assert "watched if isinstance(watched, QWidget) else None" in event_filter
+    assert "_card_at_global(event.globalPosition())" in event_filter
+
+
 def test_native_adapter_reuses_baseline_style_and_does_not_fork_interactions() -> None:
     assert "from .visual_style import NEKRO_STYLE" in ADAPTER
     assert "window.setStyleSheet(window.styleSheet() + \"\\n\" + NEKRO_STYLE)" in ADAPTER
