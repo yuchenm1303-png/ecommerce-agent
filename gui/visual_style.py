@@ -2,18 +2,11 @@ from __future__ import annotations
 
 import base64
 import math
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import (
-    QColor,
-    QCursor,
-    QImage,
-    QPainter,
-    QPainterPath,
-    QPixmap,
-    QRadialGradient,
-)
+from PySide6.QtGui import QColor, QCursor, QImage, QPainter, QPainterPath, QPixmap, QRadialGradient, QRegion
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -21,13 +14,11 @@ from PySide6.QtWidgets import (
     QGraphicsPixmapItem,
     QGraphicsScene,
     QMainWindow,
+    QScrollBar,
     QWidget,
 )
 
 
-# Static presentation layer only.
-# Visual rules mirror the MIT-licensed imsyy/home / nekro.top design language.
-# The wallpaper is a fixed local asset bundled with ecommerce-agent.
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
 _WALLPAPER_ASSET = Path(__file__).resolve().parent / "assets" / "fuji_sakura_wallpaper.jpg.b64"
 
@@ -288,8 +279,6 @@ def _load_wallpaper() -> QPixmap:
             f"path={_WALLPAPER_ASSET}, bytes={len(data)}"
         )
 
-    # Let Qt inspect the bytes instead of forcing a decoder name. This avoids
-    # platform/plugin alias differences such as JPG vs JPEG on Windows.
     image = QImage.fromData(data)
     if image.isNull():
         raise RuntimeError(
@@ -304,9 +293,10 @@ def _load_wallpaper() -> QPixmap:
 
 
 def _blur_pixmap(source: QPixmap, radius: float = 10.0) -> QPixmap:
+    """Blur once per wallpaper rebuild, never during parallax animation."""
+
     if source.isNull():
         return QPixmap()
-
     result = QPixmap(source.size())
     result.fill(Qt.transparent)
     scene = QGraphicsScene()
@@ -315,67 +305,64 @@ def _blur_pixmap(source: QPixmap, radius: float = 10.0) -> QPixmap:
     blur.setBlurRadius(radius)
     item.setGraphicsEffect(blur)
     scene.addItem(item)
-
     painter = QPainter(result)
-    scene.render(
-        painter,
-        QRectF(result.rect()),
-        QRectF(source.rect()),
-        Qt.IgnoreAspectRatio,
-    )
+    scene.render(painter, QRectF(result.rect()), QRectF(source.rect()), Qt.IgnoreAspectRatio)
     painter.end()
     return result
 
 
 class BackgroundLayer(QWidget):
-    """Full-window wallpaper that parallaxes and subtly zooms with the mouse.
+    """One lightweight wallpaper transform shared by the background and glass.
 
-    The cover image is built slightly larger than the widget so it can travel
-    a few percent in the opposite direction of the cursor, with a gentle zoom
-    toward the cursor for a depth feel. An ease timer glides the offset so the
-    motion stays smooth instead of snapping to the pointer. ``scene_changed``
-    fires on wallpaper rebuild; ``offset_changed`` fires (throttled) whenever
-    the visible source region moves, so glass cards can stay in sync.
+    The wallpaper is overscanned and pre-rendered once. Runtime animation is
+    integer 1:1 source cropping only: no per-frame resize, pixmap allocation or
+    blur. Glass consumes the exact same source rect, so it can never drift away
+    from the visible wallpaper.
     """
 
     scene_changed = Signal()
+    transform_changed = Signal()
 
-    _OVERSCAN = 1.06  # cover is this much larger than the widget
-    _TRAVEL = 0.9  # fraction of the available travel actually used
-    _MAX_ZOOM = 0.0  # dynamic zoom disabled: keeps the blit at 1:1 for speed
-    _EASE = 0.12  # fraction of the remaining distance per 16ms tick
+    _OVERSCAN = 1.065
+    _TRAVEL = 0.86
+    _FRAME_MS = 16
+    _EASE_TAU = 0.090
+    _SETTLE_PX = 0.35
 
     def __init__(self, window: QMainWindow) -> None:
         central = window.centralWidget()
         super().__init__(central)
         self.window = window
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setFocusPolicy(Qt.NoFocus)
 
-        # A missing/corrupt wallpaper is a configuration error. Do not silently
-        # replace it with a blue fake-success background.
         self._source = _load_wallpaper()
         self._cover = QPixmap()
         self._render = QPixmap()
         self._blurred = QPixmap()
-        self._rebuild_timer = QTimer(self)
-        self._rebuild_timer.setSingleShot(True)
-        self._rebuild_timer.setInterval(140)
-        self._rebuild_timer.timeout.connect(self._rebuild)
+        self._source_rect = QRect()
 
-        # Cursor parallax state: eased offset/zoom driven by the pointer.
         self._offset = QPointF(0.0, 0.0)
         self._target = QPointF(0.0, 0.0)
-        self._zoom = 1.0
-        self._zoom_target = 1.0
-        self._parallax_timer = QTimer(self)
-        self._parallax_timer.setInterval(16)
-        self._parallax_timer.timeout.connect(self._parallax_tick)
-        self.window.setMouseTracking(True)
+        self._pending_pointer: QPoint | None = None
+        self._last_tick = 0.0
+
+        self._rebuild_timer = QTimer(self)
+        self._rebuild_timer.setSingleShot(True)
+        self._rebuild_timer.setInterval(160)
+        self._rebuild_timer.timeout.connect(self._rebuild)
+
+        self._motion_timer = QTimer(self)
+        self._motion_timer.setTimerType(Qt.PreciseTimer)
+        self._motion_timer.setInterval(self._FRAME_MS)
+        self._motion_timer.timeout.connect(self._motion_tick)
+
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
-        self.window.destroyed.connect(self._detach_parallax)
+        window.destroyed.connect(self._detach)
 
     def sync_geometry(self) -> None:
         central = self.window.centralWidget()
@@ -392,8 +379,9 @@ class BackgroundLayer(QWidget):
     def _rebuild(self) -> None:
         if self.width() <= 0 or self.height() <= 0:
             return
-        cover_w = max(1, round(self.width() * self._OVERSCAN))
-        cover_h = max(1, round(self.height() * self._OVERSCAN))
+
+        cover_w = max(self.width() + 2, round(self.width() * self._OVERSCAN))
+        cover_h = max(self.height() + 2, round(self.height() * self._OVERSCAN))
         scaled = self._source.scaled(
             QSize(cover_w, cover_h),
             Qt.KeepAspectRatioByExpanding,
@@ -402,42 +390,20 @@ class BackgroundLayer(QWidget):
         x = max(0, (scaled.width() - cover_w) // 2)
         y = max(0, (scaled.height() - cover_h) // 2)
         self._cover = scaled.copy(x, y, cover_w, cover_h)
-        # Pre-compose the edge vignette into the wallpaper once, so the per-frame
-        # paint is a single fast blit with no gradient work.
         self._render = self._compose_vignette(self._cover)
-        self._blurred = _blur_pixmap(self._cover, 10.0)
-        # Re-center the parallax on a fresh wallpaper.
+        # Blur the same rendered field used by the wallpaper. This makes glass
+        # tone/vignette and parallax sampling exactly match the visible scene.
+        self._blurred = _blur_pixmap(self._render, 10.0)
+
         self._offset = QPointF(0.0, 0.0)
         self._target = QPointF(0.0, 0.0)
-        self._zoom = 1.0
-        self._zoom_target = 1.0
+        self._pending_pointer = None
+        self._source_rect = self._rect_for_offset(self._offset)
         self.update()
         self.scene_changed.emit()
-
-    def blurred_scene(self) -> QPixmap:
-        return self._blurred if not self._blurred.isNull() else self._cover
-
-    def parallax_source_rect(self) -> QRect:
-        """Source rect of the oversized cover that is currently visible.
-
-        This is the single place the visible region is computed, so glass card
-        sampling can reproduce exactly what paintEvent draws. Coordinates are
-        integer so the draw stays a plain 1:1 copy — Qt's raster engine skips
-        the slow fractional-coordinate filtering path.
-        """
-        w = self.width()
-        h = self.height()
-        zoom = max(1.0, self._zoom)
-        sw = w / zoom
-        sh = h / zoom
-        cx = self._cover.width() / 2.0 + self._offset.x()
-        cy = self._cover.height() / 2.0 + self._offset.y()
-        sx = max(0.0, min(self._cover.width() - sw, cx - sw / 2.0))
-        sy = max(0.0, min(self._cover.height() - sh, cy - sh / 2.0))
-        return QRect(round(sx), round(sy), round(sw), round(sh))
+        self.transform_changed.emit()
 
     def _compose_vignette(self, cover: QPixmap) -> QPixmap:
-        """Return the cover with the readability edge vignette baked in."""
         composed = cover.copy()
         painter = QPainter(composed)
         center = QPointF(composed.width() / 2.0, composed.height() / 2.0)
@@ -449,84 +415,123 @@ class BackgroundLayer(QWidget):
         painter.end()
         return composed
 
-    def eventFilter(self, watched, event) -> bool:  # noqa: N802
-        del watched
-        if event.type() == QEvent.MouseMove:
-            self._update_target(event.globalPosition().toPoint())
-            if not self._parallax_timer.isActive():
-                self._parallax_timer.start()
+    def blurred_scene(self) -> QPixmap:
+        return self._blurred if not self._blurred.isNull() else self._render
+
+    def source_rect(self) -> QRect:
+        return QRect(self._source_rect)
+
+    def _rect_for_offset(self, offset: QPointF) -> QRect:
+        if self._render.isNull() or self.width() <= 0 or self.height() <= 0:
+            return QRect()
+        max_x = max(0, self._render.width() - self.width())
+        max_y = max(0, self._render.height() - self.height())
+        center_x = max_x / 2.0
+        center_y = max_y / 2.0
+        sx = round(max(0.0, min(float(max_x), center_x + offset.x())))
+        sy = round(max(0.0, min(float(max_y), center_y + offset.y())))
+        return QRect(sx, sy, self.width(), self.height())
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        event_type = event.type()
+        if event_type == QEvent.MouseMove and hasattr(event, "globalPosition"):
+            # High-rate mouse events only update one point. Target calculation,
+            # easing and repaint are capped by the single 60fps timer.
+            self._pending_pointer = event.globalPosition().toPoint()
+            self._ensure_motion_timer()
+        elif watched is self.window and event_type == QEvent.Leave:
+            self._pending_pointer = None
+            self._target = QPointF(0.0, 0.0)
+            self._ensure_motion_timer()
         return False
 
-    def _update_target(self, global_pos) -> None:
+    def _ensure_motion_timer(self) -> None:
+        if not self._motion_timer.isActive():
+            self._last_tick = time.monotonic()
+            self._motion_timer.start()
+
+    def _update_target(self, global_pos: QPoint) -> None:
         local = self.mapFromGlobal(global_pos)
-        r = self.rect()
-        if not r.contains(local) or self._cover.isNull():
+        rect = self.rect()
+        if not rect.contains(local) or self._render.isNull():
             self._target = QPointF(0.0, 0.0)
-            self._zoom_target = 1.0
             return
-        nx = max(-1.0, min(1.0, (local.x() - r.width() / 2.0) / (r.width() / 2.0)))
-        ny = max(-1.0, min(1.0, (local.y() - r.height() / 2.0) / (r.height() / 2.0)))
-        travel_x = (self._cover.width() - r.width()) / 2.0 * self._TRAVEL
-        travel_y = (self._cover.height() - r.height()) / 2.0 * self._TRAVEL
+
+        half_w = max(1.0, rect.width() / 2.0)
+        half_h = max(1.0, rect.height() / 2.0)
+        nx = max(-1.0, min(1.0, (local.x() - half_w) / half_w))
+        ny = max(-1.0, min(1.0, (local.y() - half_h) / half_h))
+        travel_x = max(0.0, (self._render.width() - rect.width()) / 2.0 * self._TRAVEL)
+        travel_y = max(0.0, (self._render.height() - rect.height()) / 2.0 * self._TRAVEL)
         self._target = QPointF(-nx * travel_x, -ny * travel_y)
-        self._zoom_target = 1.0 + min(1.0, math.hypot(nx, ny)) * self._MAX_ZOOM
 
-    def _parallax_tick(self) -> None:
-        ease = self._EASE
-        next_x = round(self._offset.x() + (self._target.x() - self._offset.x()) * ease)
-        next_y = round(self._offset.y() + (self._target.y() - self._offset.y()) * ease)
-        dx = next_x - self._offset.x()
-        dy = next_y - self._offset.y()
-        self._offset = QPointF(float(next_x), float(next_y))
-        if dx or dy:
-            # Shift the already-rendered pixels instead of repainting the whole
-            # screen: only the thin exposed band is invalidated, so the overlay
-            # layers above re-composite a few rows rather than the full window.
-            self.scroll(-dx, -dy)
-        if abs(next_x - self._target.x()) < 1.0 and abs(next_y - self._target.y()) < 1.0:
-            self._parallax_timer.stop()
+    def _motion_tick(self) -> None:
+        now = time.monotonic()
+        dt = min(0.050, max(0.001, now - self._last_tick))
+        self._last_tick = now
 
-    def _detach_parallax(self) -> None:
+        if self._pending_pointer is not None:
+            point = self._pending_pointer
+            self._pending_pointer = None
+            self._update_target(point)
+
+        # Time-based exponential easing remains visually stable if one frame is
+        # late; it does not perform a large catch-up jump on the next frame.
+        alpha = 1.0 - math.exp(-dt / self._EASE_TAU)
+        dx = self._target.x() - self._offset.x()
+        dy = self._target.y() - self._offset.y()
+        self._offset = QPointF(
+            self._offset.x() + dx * alpha,
+            self._offset.y() + dy * alpha,
+        )
+
+        next_rect = self._rect_for_offset(self._offset)
+        if next_rect != self._source_rect:
+            self._source_rect = next_rect
+            self.update()
+            self.transform_changed.emit()
+
+        remaining = math.hypot(self._target.x() - self._offset.x(), self._target.y() - self._offset.y())
+        if self._pending_pointer is None and remaining <= self._SETTLE_PX:
+            self._offset = QPointF(self._target)
+            final_rect = self._rect_for_offset(self._offset)
+            if final_rect != self._source_rect:
+                self._source_rect = final_rect
+                self.update()
+                self.transform_changed.emit()
+            self._motion_timer.stop()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        if self._render.isNull() or self._source_rect.isEmpty():
+            return
+        painter = QPainter(self)
+        src = self._source_rect
+        region = event.region() if event is not None else QRegion(self.rect())
+        for target in region:
+            source = QRect(
+                src.x() + target.x(),
+                src.y() + target.y(),
+                target.width(),
+                target.height(),
+            )
+            painter.drawPixmap(target, self._render, source)
+        painter.end()
+
+    def _detach(self) -> None:
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        if self._render.isNull():
-            return
-        painter = QPainter(self)
-        src = self.parallax_source_rect()
-        rects = [self.rect()]
-        region = event.region() if event is not None else None
-        if region is not None and not region.isEmpty():
-            rects = [r for r in region]
-        for r in rects:
-            # Draw only the invalidated band, mapped 1:1 into the oversized
-            # cover, so scroll()-driven parallax repaints a few rows at a time.
-            painter.drawPixmap(
-                r,
-                self._render,
-                QRect(src.x() + r.x(), src.y() + r.y(), r.width(), r.height()),
-            )
-        painter.end()
+        self._motion_timer.stop()
 
 
-class GlassBackdrop(QWidget):
-    """Cached glass surface; interaction animation repaints this widget only."""
+class GlassBackdrop:
+    """Tiny interaction handle; the shared GlassLayer owns all actual painting."""
 
-    def __init__(self, frame: QFrame, background: BackgroundLayer) -> None:
-        super().__init__(frame)
+    def __init__(self, frame: QFrame, layer: "GlassLayer") -> None:
         self.frame = frame
-        self.background = background
-        self._surface_cache = QPixmap()
+        self.layer = layer
         self._surface_scale = 1.0
         self._overlay_alpha = 64.0
-
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setFocusPolicy(Qt.NoFocus)
-        self.background.scene_changed.connect(self.refresh_cache)
-        self.sync_geometry()
 
     @property
     def surface_scale(self) -> float:
@@ -539,85 +544,144 @@ class GlassBackdrop(QWidget):
     def set_interaction(self, *, scale: float, overlay_alpha: float) -> None:
         scale = max(0.94, min(1.0, float(scale)))
         overlay_alpha = max(0.0, min(255.0, float(overlay_alpha)))
-        if (
-            abs(scale - self._surface_scale) < 0.0001
-            and abs(overlay_alpha - self._overlay_alpha) < 0.1
-        ):
+        if abs(scale - self._surface_scale) < 0.0001 and abs(overlay_alpha - self._overlay_alpha) < 0.1:
             return
         self._surface_scale = scale
         self._overlay_alpha = overlay_alpha
-        self.update()
+        self.layer.update_frame(self.frame)
+
+
+class GlassLayer(QWidget):
+    """One shared live backdrop-filter plane for every glass card.
+
+    No card owns a copied background pixmap. Each paint samples the pre-blurred
+    overscan using BackgroundLayer.source_rect(), so parallax and glass always
+    use the identical transform. Background movement updates only the union of
+    card rectangles, not a stack of per-card widgets/caches.
+    """
+
+    def __init__(self, window: QMainWindow, background: BackgroundLayer) -> None:
+        central = window.centralWidget()
+        super().__init__(central)
+        self.window = window
+        self.background = background
+        self.surfaces: dict[QFrame, GlassBackdrop] = {}
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setFocusPolicy(Qt.NoFocus)
+
+        background.scene_changed.connect(self.update_all)
+        background.transform_changed.connect(self.update_transform)
+        self.sync_geometry()
+
+    def add_frame(self, frame: QFrame) -> GlassBackdrop:
+        surface = GlassBackdrop(frame, self)
+        self.surfaces[frame] = surface
+        return surface
 
     def sync_geometry(self) -> None:
-        self.setGeometry(self.frame.rect())
-        self.lower()
-        self.show()
-        self.refresh_cache()
-
-    def refresh_cache(self) -> None:
-        scene = self.background.blurred_scene()
-        if scene.isNull() or self.width() <= 0 or self.height() <= 0:
-            self._surface_cache = QPixmap()
-            self.update()
+        central = self.window.centralWidget()
+        if central is None:
             return
-
-        # BackgroundLayer and the glass card are siblings under the central
-        # widget, so mapTo(self.background, ...) would fail the Qt parent
-        # hierarchy check and emit a warning on every refresh. Route through
-        # global coordinates instead, which only requires a shared window.
-        global_top_left = self.frame.mapToGlobal(QPoint(0, 0))
-        top_left = self.background.mapFromGlobal(global_top_left)
-
-        # Sample the same oversized-cover region that the parallax paint uses,
-        # so the glass surface always mirrors what the wallpaper currently
-        # shows beneath the card.
-        src = self.background.parallax_source_rect()
-        scale_x = src.width() / max(1, self.background.width())
-        scale_y = src.height() / max(1, self.background.height())
-        sample_w = self.width() * scale_x
-        sample_h = self.height() * scale_y
-        sx = src.x() + top_left.x() * scale_x
-        sy = src.y() + top_left.y() * scale_y
-        sx = max(0.0, min(scene.width() - sample_w, sx))
-        sy = max(0.0, min(scene.height() - sample_h, sy))
-        self._surface_cache = scene.copy(
-            int(sx),
-            int(sy),
-            int(sample_w),
-            int(sample_h),
-        )
+        self.setGeometry(central.rect())
+        self.show()
+        # Exact z-order: wallpaper -> shared glass -> normal UI/effects.
+        self.lower()
+        self.background.lower()
         self.update()
 
+    def _visible_frame_rect(self, frame: QFrame) -> QRect:
+        if not frame.isVisible() or frame.width() <= 0 or frame.height() <= 0:
+            return QRect()
+
+        global_rect = QRect(frame.mapToGlobal(QPoint(0, 0)), frame.size())
+        ancestor = frame.parentWidget()
+        central = self.window.centralWidget()
+        while ancestor is not None and ancestor is not central:
+            if not ancestor.isVisible():
+                return QRect()
+            ancestor_rect = QRect(ancestor.mapToGlobal(QPoint(0, 0)), ancestor.size())
+            global_rect = global_rect.intersected(ancestor_rect)
+            if global_rect.isEmpty():
+                return QRect()
+            ancestor = ancestor.parentWidget()
+
+        local_top_left = self.mapFromGlobal(global_rect.topLeft())
+        return QRect(local_top_left, global_rect.size()).intersected(self.rect())
+
+    def _glass_region(self) -> QRegion:
+        region = QRegion()
+        for frame in self.surfaces:
+            rect = self._visible_frame_rect(frame)
+            if not rect.isEmpty():
+                region = region.united(QRegion(rect.adjusted(-1, -1, 1, 1)))
+        return region
+
+    def update_transform(self) -> None:
+        region = self._glass_region()
+        if not region.isEmpty():
+            self.update(region)
+
+    def update_all(self) -> None:
+        self.update()
+
+    def update_frame(self, frame: QFrame) -> None:
+        rect = self._visible_frame_rect(frame)
+        if rect.isEmpty():
+            self.update()
+        else:
+            self.update(rect.adjusted(-2, -2, 2, 2))
+
     def paintEvent(self, event) -> None:  # type: ignore[override]
-        del event
+        scene = self.background.blurred_scene()
+        src = self.background.source_rect()
+        if scene.isNull() or src.isEmpty():
+            return
+
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        event_region = event.region() if event is not None else QRegion(self.rect())
 
-        rect = QRectF(self.rect())
-        if self._surface_scale < 0.9999:
-            inset_x = rect.width() * (1.0 - self._surface_scale) * 0.5
-            inset_y = rect.height() * (1.0 - self._surface_scale) * 0.5
-            rect.adjust(inset_x, inset_y, -inset_x, -inset_y)
+        for frame, surface in self.surfaces.items():
+            rect = self._visible_frame_rect(frame)
+            if rect.isEmpty() or not event_region.intersects(rect):
+                continue
 
-        path = QPainterPath()
-        path.addRoundedRect(rect, 6.0, 6.0)
-        painter.setClipPath(path)
+            sample = QRect(
+                src.x() + rect.x(),
+                src.y() + rect.y(),
+                rect.width(),
+                rect.height(),
+            ).intersected(scene.rect())
+            if sample.isEmpty():
+                continue
 
-        if not self._surface_cache.isNull():
-            painter.drawPixmap(rect, self._surface_cache, QRectF(self._surface_cache.rect()))
+            target = QRectF(rect)
+            if surface.surface_scale < 0.9999:
+                inset_x = target.width() * (1.0 - surface.surface_scale) * 0.5
+                inset_y = target.height() * (1.0 - surface.surface_scale) * 0.5
+                target.adjust(inset_x, inset_y, -inset_x, -inset_y)
 
-        painter.fillRect(rect, QColor(0, 0, 0, int(round(self._overlay_alpha))))
+            path = QPainterPath()
+            path.addRoundedRect(target, 6.0, 6.0)
+            painter.save()
+            painter.setClipPath(path)
+            painter.drawPixmap(target, scene, QRectF(sample))
+            painter.fillPath(path, QColor(0, 0, 0, int(round(surface.overlay_alpha))))
+            painter.restore()
+
         painter.end()
 
 
 class VisualStyleController(QObject):
-    """Own background, glass surfaces and the static white-dot cursor."""
+    """Own one wallpaper transform, one shared glass plane and the dot cursor."""
 
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
         self.window = window
         self.background = BackgroundLayer(window)
+        self.glass_layer = GlassLayer(window, self.background)
         self._glass: dict[QFrame, GlassBackdrop] = {}
         self._cursor_installed = False
 
@@ -625,12 +689,19 @@ class VisualStyleController(QObject):
         for frame in window.findChildren(QFrame):
             if frame.objectName() in _GLASS_NAMES:
                 frame.setAttribute(Qt.WA_StyledBackground, True)
-                self._glass[frame] = GlassBackdrop(frame, self.background)
+                self._glass[frame] = self.glass_layer.add_frame(frame)
 
         self._install_cursor()
+
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+
+        # Side-panel scrolling changes card screen coordinates without resizing
+        # the cards. One shared repaint keeps glass aligned while scrolling.
+        for bar in window.findChildren(QScrollBar):
+            bar.valueChanged.connect(self.glass_layer.update_all)
+
         window.destroyed.connect(self._cleanup)
         QTimer.singleShot(0, self._sync_all)
 
@@ -651,17 +722,16 @@ class VisualStyleController(QObject):
 
     def _sync_all(self) -> None:
         self.background.sync_geometry()
-        for backdrop in self._glass.values():
-            backdrop.sync_geometry()
+        self.glass_layer.sync_geometry()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
         if watched is self.window and event_type in (QEvent.Resize, QEvent.Show):
-            QTimer.singleShot(0, self.background.sync_geometry)
+            QTimer.singleShot(0, self._sync_all)
 
         if isinstance(watched, QFrame) and watched in self._glass:
-            if event_type in (QEvent.Resize, QEvent.Show):
-                QTimer.singleShot(0, self._glass[watched].sync_geometry)
+            if event_type in (QEvent.Resize, QEvent.Move, QEvent.Show, QEvent.Hide):
+                self.glass_layer.update_all()
         return False
 
     def _cleanup(self) -> None:
