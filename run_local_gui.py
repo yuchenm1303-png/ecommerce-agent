@@ -24,6 +24,7 @@ def main() -> int:
 
     from gui.console_window import MainWindow
     from gui.log_presenter import install_buffered_logs
+    from gui.native_window_shell import install_native_window_shell
     from gui.nekro_card_fx import install_nekro_card_fx
     from gui.nekro_effects import install_nekro_effects
     from gui.visual_style import install_visual_style
@@ -40,6 +41,12 @@ def main() -> int:
 
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_visual_style(window)
+    quick_window = getattr(visual.background, "quick_window", None)
+    install_native_window_shell(
+        window,
+        quick_window,
+        legacy_frame=getattr(visual, "window_frame", None),
+    )
     install_nekro_card_fx(window, visual)
     install_buffered_logs(window)
     effects = install_nekro_effects(window, sakura_count=3)
