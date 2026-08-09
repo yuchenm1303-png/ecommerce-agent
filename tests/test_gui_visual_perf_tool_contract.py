@@ -27,24 +27,28 @@ def test_visual_perf_capture_is_opt_in_and_memory_buffered() -> None:
 
 
 def test_visual_perf_records_stutter_and_quantization_signals() -> None:
-    required = (
+    required_literals = (
         "visual.callback_interval_ms",
         "visual.motion_tick_ms",
         "visual.paint_gate_skips",
         "visual.quantized_holds",
         "visual.float_offset_step_px",
         "visual.source_step_px",
-        "visual.paint_ms",
-        "visual.paint_dirty_bbox_pct",
         "visual.repair_region_ms",
         "effects.frame_ms",
-        "effects.paint_ms",
         "card_fx.tick_ms",
         "logs.flush_ms",
         "input.mouse_move_events",
     )
-    for metric in required:
+    for metric in required_literals:
         assert metric in HOOKS
+
+    # visual/effects paint metrics share one formatter instead of duplicating
+    # separate literal strings for each presentation layer.
+    assert 'f"{prefix}.paint_ms"' in HOOKS
+    assert 'f"{prefix}.paint_dirty_bbox_pct"' in HOOKS
+    assert 'self._wrap_paint(cls, scene, "paintEvent", "visual")' in HOOKS
+    assert 'self._wrap_paint(cls, effects, "paintEvent", "effects")' in HOOKS
 
 
 def test_visual_perf_is_wired_after_all_visual_components_exist() -> None:
