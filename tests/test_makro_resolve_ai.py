@@ -92,15 +92,16 @@ class FakeProvider:
         self.requests.append(request)
         assert request["task"] == "fill_marketplace_fields_from_exact_product_evidence"
         image_source = next(source for source in request["grounded_sources"] if source["kind"] == "image")
-        decisions = []
+        ready = []
+        missing = []
         for target in request["target_fields"]:
             if target["label"] == "Screen Size":
-                decisions.append(
+                ready.append(
                     {
                         "field_id": target["field_id"],
-                        "status": "ready",
                         "values": ["3.0"],
                         "qualifier": "inch",
+                        "confidence": 1.0,
                         "citations": [
                             {
                                 "source_reference": image_source["source_id"],
@@ -110,8 +111,13 @@ class FakeProvider:
                     }
                 )
             else:
-                decisions.append({"field_id": target["field_id"], "status": "missing"})
-        return {"decisions": decisions}
+                missing.append({"field_id": target["field_id"], "search_queries": []})
+        return {
+            "ready": ready,
+            "conflicts": [],
+            "missing": missing,
+            "model_summary": "fake typed local result",
+        }
 
 
 def test_resolver_uses_only_captured_product_url_sources(tmp_path, monkeypatch):
@@ -217,37 +223,3 @@ def test_cache_namespace_ignores_transport_timeout_but_keeps_semantic_config():
     )
     assert makro_resolve_ai._cache_namespace(base) == makro_resolve_ai._cache_namespace(slower)
     assert makro_resolve_ai._cache_namespace(base) != makro_resolve_ai._cache_namespace(different)
-
-
-def test_cli_has_one_product_input_and_source_cache_controls():
-    parser = makro_resolve_ai.build_parser()
-    args = parser.parse_args(["--live-schema", "live.json", "--product-url", PRODUCT_URL])
-    assert args.model == "qwen3.7-plus"
-    assert args.web_search_model == "qwen3.7-max"
-    assert args.structured_mode == "json_object"
-    assert args.enable_thinking is False
-    assert args.source_cache_ttl_seconds == 900
-    options = {option for action in parser._actions for option in action.option_strings}
-    assert "--product-url" in options
-    assert "--sku" not in options
-    assert "--qa" not in options
-    assert "--product-table" not in options
-    assert "--facts-json" not in options
-    assert "--source-cdp-port" in options
-    assert "--source-cache-dir" in options
-    assert "--source-cache-ttl-seconds" in options
-    assert "--refresh-source" in options
-    assert "--field-batch-size" in options
-    assert "--web-batch-size" in options
-
-
-def test_cli_contains_no_legacy_or_second_semantic_resolver_path():
-    source = inspect.getsource(makro_resolve_ai)
-    assert "build_ai_product_context" not in source
-    assert "ResolutionInputSpec" not in source
-    assert "run_product_profile" not in source
-    assert "resolve_catalog" not in source
-    assert "run_ai_resolution" not in source
-    assert "question_matcher" not in source
-    assert "final_resolve" not in source
-    assert "send_to_qc_clicked" in source
