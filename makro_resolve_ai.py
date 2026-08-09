@@ -1,13 +1,13 @@
-"""Resolve the current Makro product schema without opening Makro.
+"""Resolve the current Makro product schema without touching Makro.
 
 Production pipeline:
-1) understand the complete local product once (images are used only here);
-2) fill Makro fields from that local Product Profile in small parallel batches;
-3) web-search only fields still unresolved after the local pass, and fill them directly.
+1) optionally capture the exact supplier product URL + selected SKU context;
+2) AI fills Makro fields directly from that exact local evidence in mechanical batches;
+3) web-search only fields still unresolved and fill those blanks directly.
 
-There is one field table throughout the workflow. Local READY/CONFLICT values are frozen;
-web search only fills blanks. Python owns scheduling, provenance, seller-business locks,
-schema identity, mechanical marketplace constraints and browser safety downstream.
+There is one Makro field table throughout. There is no intermediate Product Profile and no
+Final Resolve model. Python only collects sources, batches work, preserves provenance,
+locks seller-business fields, checks mechanical schema constraints and keeps browser writes off.
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ from app.ai_decisions import (
 from app.field_mapping import run_field_mapping
 from app.live_schema import load_live_schema
 from app.product_context import build_ai_product_context
-from app.product_profile import run_product_profile, write_product_profile
 from app.providers.dashscope_web_search import DashScopeWebSearchProvider
 from app.providers.registry import (
     ProviderConfig,
@@ -45,25 +44,22 @@ from app.providers.registry import (
 from app.qa_catalog import load_question_catalog
 from app.resolver_inputs import ResolutionInputSpec
 from app.semantic_grounding import build_grounding_catalog
+from app.source_capture import DEFAULT_SOURCE_CDP_PORT, SourceAccessBlocked, capture_product_source
 from app.web_enrichment import WebEnrichmentResult, run_web_enrichment, write_enriched_ai_decision_packet
 
 
-EXECUTION_MODEL = "product_profile_then_parallel_local_fill_then_parallel_web_fill"
+EXECUTION_MODEL = "exact_product_source_then_parallel_local_fill_then_unresolved_web_fill"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "以 Makro live schema 为目标：图片/原始资料只理解一次，本地资料先填字段，"
-            "只对仍为空的字段并行联网搜索并直接补入同一张字段表。全程不打开或修改 Makro。"
+            "从确定商品资料直接填写 Makro live schema：可从商品链接自动采集当前页面，"
+            "AI直接填字段，只对仍为空的字段联网补充。不会打开或修改 Makro。"
         )
     )
     parser.add_argument("--provider", choices=SUPPORTED_PROVIDERS, default="openai-compatible")
-    parser.add_argument(
-        "--model",
-        default="qwen3.7-plus",
-        help="商品理解和本地字段填写模型；默认 qwen3.7-plus。",
-    )
+    parser.add_argument("--model", default="qwen3.7-plus", help="本地商品字段填写模型。")
     parser.add_argument("--api-key-env", default=None)
     parser.add_argument("--base-url", default="")
     parser.add_argument(
@@ -77,15 +73,30 @@ def build_parser() -> argparse.ArgumentParser:
     thinking.add_argument("--disable-thinking", dest="enable_thinking", action="store_false")
     parser.set_defaults(enable_thinking=False)
 
-    parser.add_argument("--qa", required=True, help="客户 QA/商品上下文文件")
-    parser.add_argument(
-        "--live-schema",
-        required=True,
-        help="read-only Makro planner 导出的 live-schema.json。",
-    )
+    parser.add_argument("--qa", required=True, help="Makro 问题模板/客户已有答案文件")
+    parser.add_argument("--live-schema", required=True, help="read-only Makro planner 导出的 live-schema.json")
     parser.add_argument("--sku", default="")
     parser.add_argument("--expected-model", default="")
     parser.add_argument("--expected-brand", default="")
+
+    parser.add_argument(
+        "--product-url",
+        default="",
+        help="当前商品的供应商链接；提供后会用独立 source Edge 自动滚动采集文本、参数和整页图片。",
+    )
+    parser.add_argument("--source-profile-dir", default="browser_profiles/source-edge")
+    parser.add_argument("--source-cdp-port", type=int, default=DEFAULT_SOURCE_CDP_PORT)
+    parser.add_argument("--source-wait-ms", type=int, default=1800)
+    parser.add_argument("--source-scroll-wait-ms", type=int, default=180)
+    parser.add_argument("--source-max-scroll-steps", type=int, default=120)
+    parser.add_argument("--source-max-visible-text-chars", type=int, default=120_000)
+    parser.add_argument(
+        "--source-use-current-page",
+        action="store_true",
+        help="source Edge 已人工完成合法登录/验证后，不重新导航，直接采集当前页。",
+    )
+
+    # Optional extra evidence remains supported, but is not required by the new primary flow.
     parser.add_argument("--product-table", default=None)
     parser.add_argument("--facts-json", action="append", default=[])
     parser.add_argument("--image", action="append", default=[])
@@ -95,52 +106,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--supplemental-text-file", default=None)
 
     parser.add_argument("--image-detail", choices=("auto", "low", "high"), default="auto")
-    parser.add_argument(
-        "--max-output-tokens",
-        type=int,
-        default=12000,
-        help="仅 prompt_only 模式使用；JSON mode 不设置 max_tokens。",
-    )
-    parser.add_argument(
-        "--request-timeout-seconds",
-        type=float,
-        default=120.0,
-        help="每个 AI 请求的真实 wall-clock deadline。",
-    )
+    parser.add_argument("--max-output-tokens", type=int, default=12000)
+    parser.add_argument("--request-timeout-seconds", type=float, default=120.0)
     parser.add_argument("--max-text-chars", type=int, default=5000)
     parser.add_argument("--overlap-chars", type=int, default=250)
 
-    parser.add_argument(
-        "--field-batch-size",
-        type=int,
-        default=12,
-        help="本地字段填写机械分批大小；只按 live schema 顺序切片。",
-    )
-    parser.add_argument(
-        "--field-concurrency",
-        type=int,
-        default=4,
-        help="本地字段填写最大并发请求数。",
-    )
+    parser.add_argument("--field-batch-size", type=int, default=12)
+    parser.add_argument("--field-concurrency", type=int, default=4)
 
     parser.add_argument("--web-enrich", choices=("auto", "off"), default="auto")
-    parser.add_argument(
-        "--web-search-model",
-        default="qwen3.7-max",
-        help="联网补空字段的 Responses web_search 模型；默认 qwen3.7-max。",
-    )
-    parser.add_argument(
-        "--web-base-url",
-        default="",
-        help="Responses API base URL；默认复用 --base-url。",
-    )
+    parser.add_argument("--web-search-model", default="qwen3.7-max")
+    parser.add_argument("--web-base-url", default="")
     parser.add_argument("--web-batch-size", type=int, default=5)
     parser.add_argument("--web-concurrency", type=int, default=3)
 
     parser.add_argument(
         "--semantic-cache-dir",
         default="logs/semantic-cache",
-        help="Product Profile、本地字段 batch、Web Fill batch 的 content-addressed cache 根目录。",
+        help="本地字段 batch 和 Web Fill batch 的 content-addressed cache。",
     )
     parser.add_argument("--no-semantic-cache", action="store_true")
     parser.add_argument("--output-dir", default="logs/ai-resolver")
@@ -154,17 +137,25 @@ def _read_supplemental_text(args: argparse.Namespace) -> str:
     return "\n".join(part for part in parts if part and part.strip())
 
 
-def _input_spec(args: argparse.Namespace, supplemental_text: str) -> ResolutionInputSpec:
+def _input_spec(
+    args: argparse.Namespace,
+    supplemental_text: str,
+    *,
+    image_paths: list[str],
+    supplier_snapshots: list[str],
+    product_url: str,
+) -> ResolutionInputSpec:
     return ResolutionInputSpec(
         sku=args.sku,
         expected_model=args.expected_model,
         expected_brand=args.expected_brand,
         product_table=args.product_table,
         facts_json=tuple(args.facts_json),
-        supplier_snapshots=tuple(args.supplier_snapshot),
+        supplier_snapshots=tuple(supplier_snapshots),
         official_snapshots=tuple(args.official_snapshot),
         supplemental_text=supplemental_text,
-        image_paths=tuple(args.image),
+        image_paths=tuple(image_paths),
+        product_url=product_url or None,
     )
 
 
@@ -262,20 +253,75 @@ def main() -> int:
     if args.overlap_chars < 0 or args.overlap_chars >= args.max_text_chars:
         raise SystemExit("--overlap-chars 必须 >=0 且小于 --max-text-chars")
 
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_dir = Path(args.output_dir) / f"resolve-ai-{stamp}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    image_paths = list(args.image)
+    supplier_snapshots = list(args.supplier_snapshot)
+    product_url = args.product_url.strip()
+    capture_info: dict[str, Any] = {"requested": bool(product_url)}
+
+    if product_url:
+        print("===== PRIMARY PRODUCT SOURCE CAPTURE =====", flush=True)
+        try:
+            captured = capture_product_source(
+                product_url,
+                output_dir=output_dir / "primary-source",
+                profile_dir=args.source_profile_dir,
+                cdp_port=args.source_cdp_port,
+                initial_wait_ms=args.source_wait_ms,
+                scroll_wait_ms=args.source_scroll_wait_ms,
+                max_scroll_steps=args.source_max_scroll_steps,
+                max_visible_text_chars=args.source_max_visible_text_chars,
+                use_current_page=args.source_use_current_page,
+            )
+        except SourceAccessBlocked as exc:
+            print(str(exc), flush=True)
+            print(
+                f"source Edge 保持打开在 127.0.0.1:{args.source_cdp_port}；"
+                "人工完成合法验证后加 --source-use-current-page 重试。",
+                flush=True,
+            )
+            return 2
+        supplier_snapshots.insert(0, str(captured.snapshot_path))
+        image_paths.insert(0, str(captured.screenshot_path))
+        product_url = captured.snapshot.final_url or product_url
+        capture_info = {
+            "requested": True,
+            "final_url": product_url,
+            "snapshot": str(captured.snapshot_path.resolve()),
+            "screenshot": str(captured.screenshot_path.resolve()),
+            "table_rows": len(captured.snapshot.table_rows),
+            "visible_text_chars": len(captured.snapshot.visible_text),
+            "source_edge": "new" if captured.launched_now else "reused",
+        }
+        print(
+            f"captured exact product page: table_rows={capture_info['table_rows']}, "
+            f"visible_text_chars={capture_info['visible_text_chars']}",
+            flush=True,
+        )
+
     customer_catalog = load_question_catalog(args.qa)
     live_fields = load_live_schema(args.live_schema)
-    spec = _input_spec(args, _read_supplemental_text(args))
+    spec = _input_spec(
+        args,
+        _read_supplemental_text(args),
+        image_paths=image_paths,
+        supplier_snapshots=supplier_snapshots,
+        product_url=product_url,
+    )
     product_context = build_ai_product_context(customer_catalog, spec)
     grounding = build_grounding_catalog(
-        image_paths=args.image,
-        supplier_snapshots=args.supplier_snapshot,
+        image_paths=image_paths,
+        supplier_snapshots=supplier_snapshots,
         official_snapshots=args.official_snapshot,
         supplemental_text=product_context.text,
         max_text_chars=args.max_text_chars,
         overlap_chars=args.overlap_chars,
     )
     if not grounding.sources:
-        raise SystemExit("没有可供 AI 解析的商品资料。")
+        raise SystemExit("没有可供 AI 解析的商品资料。请提供 --product-url 或其他商品资料。")
 
     try:
         provider_config = _provider_config(args)
@@ -283,9 +329,6 @@ def main() -> int:
     except ProviderConfigurationError as exc:
         raise SystemExit(str(exc)) from exc
 
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_dir = Path(args.output_dir) / f"resolve-ai-{stamp}"
-    output_dir.mkdir(parents=True, exist_ok=True)
     source_manifest_path = output_dir / "source-manifest.json"
     source_manifest_path.write_text(
         json.dumps(grounding.as_manifest(), ensure_ascii=False, indent=2),
@@ -295,42 +338,22 @@ def main() -> int:
     namespace = _cache_namespace(provider_config)
     expected_identity = product_context.trusted_inputs.expected_identity
 
-    print("===== AI-FIRST PRODUCT RESOLUTION =====", flush=True)
+    print("===== DIRECT PRODUCT RESOLUTION =====", flush=True)
     print(
         f"provider={provider_config.provider}, model={provider_config.model}, "
-        f"structured_mode={provider_config.structured_mode}, thinking={provider_config.enable_thinking}, "
-        f"wall_deadline={provider_config.request_timeout_seconds:.0f}s, live_fields={len(live_fields)}, "
-        f"citation_sources={len(grounding.sources)}",
+        f"live_fields={len(live_fields)}, citation_sources={len(grounding.sources)}, "
+        f"product_url={'yes' if product_url else 'no'}",
         flush=True,
     )
     print(f"execution_model={EXECUTION_MODEL}", flush=True)
-    print(
-        f"local_batches=size:{args.field_batch_size},concurrency:{args.field_concurrency}; "
-        f"web_batches=size:{args.web_batch_size},concurrency:{args.web_concurrency}",
-        flush=True,
-    )
-
-    _set_progress(provider, "PROFILE")
-    profile_result = run_product_profile(
-        provider,
-        grounding,
-        expected_identity=expected_identity,
-        cache_dir=cache_dir,
-        cache_namespace=namespace,
-    )
-    profile_path = write_product_profile(profile_result.profile, output_dir / "product-profile.json")
-    print(
-        f"profile=DONE calls={profile_result.model_calls} cache_hit={profile_result.cache_hit} "
-        f"facts={len(profile_result.profile.facts)} elapsed={profile_result.elapsed_seconds:.3f}s",
-        flush=True,
-    )
 
     _set_progress(provider, "LOCAL")
     mapping_result = run_field_mapping(
         provider,
         live_fields,
-        profile_result.profile,
         grounding,
+        expected_identity=expected_identity,
+        product_url=product_url,
         batch_size=args.field_batch_size,
         concurrency=args.field_concurrency,
         cache_dir=cache_dir,
@@ -352,16 +375,13 @@ def main() -> int:
     web_provider, web_availability = _dashscope_web_provider(args, provider_config)
     if search_requests and web_provider is not None:
         _set_progress(web_provider, "WEB")
-        print(
-            f"web_fill=START targets={len(search_requests)} model={web_provider.model}",
-            flush=True,
-        )
+        print(f"web_fill=START targets={len(search_requests)} model={web_provider.model}", flush=True)
         web_result = run_web_enrichment(
             web_provider,
             local_packet,
             live_fields,
             grounding,
-            profile_result.profile,
+            product_url=product_url,
             batch_size=args.web_batch_size,
             concurrency=args.web_concurrency,
             cache_dir=cache_dir,
@@ -397,17 +417,13 @@ def main() -> int:
     )
 
     final_summary = _decision_summary(web_result.packet.decisions)
-    total_model_calls = (
-        profile_result.model_calls
-        + mapping_result.model_calls
-        + web_result.search_model_calls
-    )
+    total_model_calls = mapping_result.model_calls + web_result.search_model_calls
     total_elapsed = time.monotonic() - started
     run_manifest = output_dir / "run-manifest.json"
     run_manifest.write_text(
         json.dumps(
             {
-                "mode": "browser_free_ai_first_product_resolution",
+                "mode": "exact_source_direct_ai_resolution",
                 "execution_model": EXECUTION_MODEL,
                 "qa_source": str(Path(args.qa).resolve()),
                 "live_schema": str(Path(args.live_schema).resolve()),
@@ -415,14 +431,10 @@ def main() -> int:
                 "provider_adapter": provider.name,
                 "provider_config": provider_config.as_safe_dict(),
                 "web_search_model": args.web_search_model,
+                "primary_product_url": product_url,
+                "source_capture": capture_info,
                 "grounded_source_count": len(grounding.sources),
                 "customer_context_chars": len(product_context.text),
-                "product_profile": {
-                    "model_calls": profile_result.model_calls,
-                    "cache_hit": profile_result.cache_hit,
-                    "fact_count": len(profile_result.profile.facts),
-                    "elapsed_seconds": round(profile_result.elapsed_seconds, 3),
-                },
                 "local_fill": {
                     "batch_size": args.field_batch_size,
                     "concurrency": args.field_concurrency,
@@ -456,7 +468,6 @@ def main() -> int:
                 "save_clicked": False,
                 "send_to_qc_clicked": False,
                 "outputs": {
-                    "product_profile": str(profile_path.resolve()),
                     "local_decisions": str(local_packet_path.resolve()),
                     "final_decisions": str(packet_path.resolve()),
                     "search_requests": str(search_path.resolve()),
@@ -471,22 +482,20 @@ def main() -> int:
         encoding="utf-8",
     )
 
-    print("\n===== AI-FIRST RESOLUTION COMPLETE =====", flush=True)
+    print("\n===== DIRECT RESOLUTION COMPLETE =====", flush=True)
     print(
         f"ready={final_summary[READY]}, review={final_summary[REVIEW]}, conflict={final_summary[CONFLICT]}, "
         f"missing={final_summary[MISSING]}, business_locked={final_summary[BUSINESS_LOCKED]}",
         flush=True,
     )
     print(
-        f"profile_calls={profile_result.model_calls}, local_fill_calls={mapping_result.model_calls}, "
-        f"web_fill_calls={web_result.search_model_calls}, total_calls={total_model_calls}, "
-        f"wall={total_elapsed:.3f}s",
+        f"local_fill_calls={mapping_result.model_calls}, web_fill_calls={web_result.search_model_calls}, "
+        f"total_calls={total_model_calls}, wall={total_elapsed:.3f}s",
         flush=True,
     )
-    print(f"Product profile: {profile_path}", flush=True)
     print(f"AI decisions: {packet_path}", flush=True)
     print(f"Run manifest: {run_manifest}", flush=True)
-    print("没有打开 Makro；没有填写字段；没有 Save；没有 Send to QC。", flush=True)
+    print("没有打开或修改 Makro；没有填写字段；没有 Save；没有 Send to QC。", flush=True)
     return 0
 
 
