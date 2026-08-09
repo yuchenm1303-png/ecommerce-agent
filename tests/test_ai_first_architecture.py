@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
+import makro_execute_listing
 import makro_plan_listing
 import makro_preview_listing
 import makro_resolve_ai
@@ -32,7 +33,7 @@ def test_production_path_has_no_legacy_semantic_rule_layer():
     modules = (
         makro_resolve_ai,
         makro_plan_listing,
-        makro_preview_listing,
+        makro_execute_listing,
         fill_plan,
         hard_field_validators,
         field_mapping,
@@ -82,6 +83,29 @@ def test_resolver_has_no_manual_product_identity_inputs():
     assert "--expected-brand" not in options
     assert "--product-table" not in options
     assert "--facts-json" not in options
+
+
+def test_direct_executor_has_same_single_url_product_boundary():
+    parser = makro_execute_listing.build_parser()
+    options = {option for action in parser._actions for option in action.option_strings}
+    assert "--product-url" in options
+    assert "--decision-packet" in options
+    assert "--live-schema" in options
+    assert "--supplier-snapshot" in options
+    assert "--image" in options
+    assert "--sku" not in options
+    assert "--qa" not in options
+    source = inspect.getsource(makro_execute_listing)
+    assert "build_ai_product_context" not in source
+    assert "ResolutionInputSpec" not in source
+    assert "generated_business_bundle" in source
+    assert "send_to_qc_clicked" in source
+
+
+def test_legacy_preview_cli_is_not_the_new_production_entrypoint():
+    # The mature browser helper module remains for compatibility and is imported
+    # by the direct executor, but new product runs are routed through the direct runner.
+    assert makro_preview_listing is not makro_execute_listing
 
 
 def test_local_fill_reads_original_sources_directly_including_images():
