@@ -1,10 +1,9 @@
 import QtQuick
-import QtQuick.Effects
 
 Item {
     id: root
 
-    property Item blurScene
+    property Item maskLayer
     property real sceneX: 0
     property real sceneY: 0
     property real radius: 6
@@ -17,41 +16,24 @@ Item {
 
     property real tintAlpha: tap.pressed ? activeAlpha : (hover.hovered ? hoverAlpha : normalAlpha)
 
-    ShaderEffectSource {
-        id: blurSample
-        anchors.fill: parent
-        sourceItem: root.blurScene
-        sourceRect: Qt.rect(root.sceneX, root.sceneY, root.width, root.height)
-        live: true
-        recursive: false
-        hideSource: false
-        smooth: true
-    }
-
+    // Each card contributes geometry only. The entire blurred wallpaper is
+    // composited once by SceneBackground through one shared mask layer.
     Rectangle {
-        id: roundedMask
-        anchors.fill: parent
+        parent: root.maskLayer
+        x: root.sceneX
+        y: root.sceneY
+        width: root.width
+        height: root.height
         radius: root.radius
         color: "white"
-        visible: false
-        layer.enabled: true
-    }
-
-    MultiEffect {
-        anchors.fill: parent
-        source: blurSample
-        autoPaddingEnabled: false
-        maskEnabled: true
-        maskSource: roundedMask
-        maskSpreadAtMin: 0.015
-        maskSpreadAtMax: 0.015
+        visible: root.visible && root.width > 0 && root.height > 0
+        antialiasing: true
     }
 
     Rectangle {
         anchors.fill: parent
         radius: root.radius
         color: Qt.rgba(0, 0, 0, root.tintAlpha / 255.0)
-        border.width: 0
 
         Behavior on color {
             ColorAnimation { duration: tap.pressed ? 80 : 120 }
