@@ -24,6 +24,8 @@ from .listing import MAKRO_HOME_URL, MAKRO_SINGLE_LISTING_ROUTE, parse_makro_lis
 
 
 MAKRO_NEW_LISTING_URL = f"{MAKRO_HOME_URL}#{MAKRO_SINGLE_LISTING_ROUTE}"
+_DISALLOWED_VERTICAL_HINT_TOKENS = {"makro", "marketplace", "listing", "seller", "vertical"}
+_DISALLOWED_VERTICAL_HINT_VALUES = {"category", "product"}
 
 
 class JSONTaskProvider(Protocol):
@@ -69,6 +71,13 @@ def normalize_label(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
 
 
+def _is_usable_vertical_hint(value: str) -> bool:
+    key = normalize_label(value)
+    if not key or key in _DISALLOWED_VERTICAL_HINT_VALUES:
+        return False
+    return not bool(set(key.split()) & _DISALLOWED_VERTICAL_HINT_TOKENS)
+
+
 def _bounded_supplier_evidence(snapshot: SourceSnapshot) -> dict[str, Any]:
     rows = [
         {"key": row.key, "value": row.value}
@@ -97,15 +106,22 @@ def _bounded_supplier_evidence(snapshot: SourceSnapshot) -> dict[str, Any]:
 
 def build_bootstrap_request(snapshot: SourceSnapshot) -> dict[str, Any]:
     return {
-        "task": "infer_makro_listing_bootstrap_hints",
+        "task": "infer_product_listing_bootstrap_hints",
         "system_instruction": (
-            "Infer only conservative search hints for Makro Step 1 and the product brand status "
-            "from exact supplier evidence. JSON only."
+            "Infer concise product-type search phrases and product brand status only from exact "
+            "supplier evidence. Marketplace names and listing UI terminology are not product types. "
+            "JSON only."
         ),
-        "supplier_evidence": _bounded_supplier_evidence(snapshot),
+        "prompt_instruction": (
+            "Use context.supplier_evidence as the sole product evidence. The category phrases will "
+            "later be searched against live marketplace options; do not output marketplace/platform "
+            "names, UI labels, or generic words such as product/category/vertical."
+        ),
+        "context": {"supplier_evidence": _bounded_supplier_evidence(snapshot)},
         "rules": [
-            "Return 1 to 4 concise English product-category search terms, most specific first.",
-            "Search terms are hints only; do not invent an exact Makro vertical name.",
+            "Return 1 to 4 concise English product-type noun phrases, most specific first.",
+            "Search terms are product-type hints only; do not invent an exact marketplace vertical name.",
+            "Never return marketplace/platform names or listing UI words as category search terms.",
             "Treat model numbers, variant names and descriptive words as non-brand unless the source explicitly identifies them as a brand.",
             "brand_status=explicit only when the supplier evidence explicitly identifies a brand.",
             "brand_status=unbranded only when the supplier evidence explicitly indicates neutral/no-brand/OEM/unbranded status.",
@@ -147,14 +163,14 @@ def _parse_bootstrap_response(raw: Any) -> ListingBootstrapHints:
     for item in raw.get("vertical_search_terms") or []:
         value = re.sub(r"\s+", " ", str(item or "")).strip()
         key = normalize_label(value)
-        if len(value) < 2 or not key or key in seen:
+        if len(value) < 2 or not _is_usable_vertical_hint(value) or key in seen:
             continue
         seen.add(key)
         terms.append(value)
         if len(terms) >= 4:
             break
     if not terms:
-        raise ValueError("listing bootstrap produced no usable vertical search terms")
+        raise ValueError("listing bootstrap produced no usable product-type search terms")
 
     status = str(raw.get("brand_status") or "").strip().casefold()
     if status not in {"explicit", "unbranded", "unknown"}:
@@ -313,10 +329,17 @@ def _build_vertical_choice_request(
     allowed = list(dict.fromkeys(candidates))
     return {
         "task": "choose_exact_makro_vertical",
-        "system_instruction": "Choose the best exact Makro vertical from the live candidates. JSON only.",
-        "product_summary": hints.product_summary,
-        "search_term": search_term,
-        "live_candidates": allowed,
+        "system_instruction": "Choose the best exact Makro vertical from the supplied live candidates. JSON only.",
+        "prompt_instruction": (
+            "Use context.product_summary and context.search_term to choose from "
+            "context.live_candidates. Do not choose a broad department when a specific matching "
+            "product type is present."
+        ),
+        "context": {
+            "product_summary": hints.product_summary,
+            "search_term": search_term,
+            "live_candidates": allowed,
+        },
         "rules": [
             "selected_vertical must be copied exactly from live_candidates or be empty.",
             "Choose only when the candidate clearly describes the same product type.",
@@ -457,11 +480,17 @@ def _build_brand_choice_request(
     allowed = list(dict.fromkeys(candidates))
     return {
         "task": "choose_exact_makro_brand",
-        "system_instruction": "Choose an exact Makro brand result from the live candidates. JSON only.",
-        "brand_status": hints.brand_status,
-        "supplier_brand": hints.brand,
-        "search_term": search_term,
-        "live_candidates": allowed,
+        "system_instruction": "Choose an exact Makro brand result from the supplied live candidates. JSON only.",
+        "prompt_instruction": (
+            "Use context.brand_status, context.supplier_brand and context.search_term to choose only "
+            "from context.live_candidates. Never substitute another commercial brand."
+        ),
+        "context": {
+            "brand_status": hints.brand_status,
+            "supplier_brand": hints.brand,
+            "search_term": search_term,
+            "live_candidates": allowed,
+        },
         "rules": [
             "selected_brand must be copied exactly from live_candidates or be empty.",
             "For explicit brand, accept only the same brand with harmless case/punctuation variation.",
