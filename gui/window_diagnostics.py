@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +45,18 @@ def _point_tuple(point: Any) -> list[int]:
     return [int(point.x()), int(point.y())]
 
 
+def _percentile(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    pos = (len(ordered) - 1) * q
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return ordered[lo]
+    return ordered[lo] * (hi - pos) + ordered[hi] * (pos - lo)
+
+
 def _qwindow_snapshot(window: Any) -> dict[str, Any]:
     if window is None:
         return {}
@@ -53,6 +67,7 @@ def _qwindow_snapshot(window: Any) -> dict[str, Any]:
         "geometry": _rect_tuple(window.geometry()),
         "frame_geometry": _rect_tuple(window.frameGeometry()),
         "position": _point_tuple(window.position()),
+        "client_origin_qt": _point_tuple(window.mapToGlobal(QPoint(0, 0))),
         "size": [int(window.width()), int(window.height())],
         "visible": bool(window.isVisible()),
         "exposed": bool(window.isExposed()),
@@ -197,10 +212,14 @@ class WindowDiagnostics(QObject):
         self._event_reasons: set[str] = set()
         self._event_flush_pending = False
         self._last_sample = time.perf_counter()
+        self._frame_count = 0
         self._last_frame_count = 0
+        self._last_frame_swap: float | None = None
+        self._frame_intervals_ms: deque[float] = deque(maxlen=600)
 
-        self.quick.setProperty("diagnosticsEnabled", True)
-        self._last_frame_count = int(self.quick.property("diagFrameCount") or 0)
+        # QQuickWindow emits this after a frame is presented. Counting this signal
+        # avoids modifying the QML/render path merely for diagnostics.
+        self.quick.frameSwapped.connect(self._on_frame_swapped)
 
         app = QApplication.instance()
         if app is not None:
@@ -223,6 +242,8 @@ class WindowDiagnostics(QObject):
                 "qsg_render_loop": os.environ.get("QSG_RENDER_LOOP"),
                 "pid": os.getpid(),
                 "log_path": str(self.path),
+                "shell_type": type(shell).__name__,
+                "background_type": type(background).__name__,
             },
         )
         QTimer.singleShot(500, lambda: self.snapshot("startup_500ms"))
@@ -239,6 +260,15 @@ class WindowDiagnostics(QObject):
             **payload,
         }
         self._stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    def _on_frame_swapped(self) -> None:
+        now = time.perf_counter()
+        if self._last_frame_swap is not None:
+            interval_ms = (now - self._last_frame_swap) * 1000.0
+            if 0.0 < interval_ms < 1000.0:
+                self._frame_intervals_ms.append(interval_ms)
+        self._last_frame_swap = now
+        self._frame_count += 1
 
     def _card_snapshot(self, owner_client: list[int] | None) -> list[dict[str, Any]]:
         cards: list[dict[str, Any]] = []
@@ -278,6 +308,7 @@ class WindowDiagnostics(QObject):
         overlay_win32 = _win32_snapshot(int(self.overlay.winId()))
         owner_client = owner_win32.get("client_rect")
         overlay_window = overlay_win32.get("window_rect")
+        quick_qt_origin = owner_qt.get("client_origin_qt")
 
         quick_props = {
             "pointer_x": float(self.quick.property("pointerX") or 0.0),
@@ -287,10 +318,16 @@ class WindowDiagnostics(QObject):
             "target_x": float(self.quick.property("targetX") or 0.0),
             "target_y": float(self.quick.property("targetY") or 0.0),
             "animation_running": bool(self.quick.property("animationRunning")),
-            "diag_frame_count": int(self.quick.property("diagFrameCount") or 0),
-            "diag_frame_time_ms": float(self.quick.property("diagFrameTimeMs") or 0.0),
+            "frame_swapped_total": self._frame_count,
             "mask_revision": int(getattr(self.background, "_mask_revision", 0)),
         }
+
+        qt_vs_win32_client = None
+        if owner_client and quick_qt_origin:
+            qt_vs_win32_client = [
+                quick_qt_origin[0] - owner_client[0],
+                quick_qt_origin[1] - owner_client[1],
+            ]
 
         self._write(
             "snapshot",
@@ -301,6 +338,7 @@ class WindowDiagnostics(QObject):
                 "owner_win32": owner_win32,
                 "overlay_win32": overlay_win32,
                 "overlay_minus_owner_client": _delta(overlay_window, owner_client),
+                "quick_qt_origin_minus_win32_client_origin": qt_vs_win32_client,
                 "quick": quick_props,
                 "cards": self._card_snapshot(owner_client),
             },
@@ -312,10 +350,15 @@ class WindowDiagnostics(QObject):
         now = time.perf_counter()
         elapsed = max(1e-6, now - self._last_sample)
         ui_timer_lag_ms = (elapsed * 1000.0) - self._SAMPLE_MS
-        frame_count = int(self.quick.property("diagFrameCount") or 0)
-        frame_delta = frame_count - self._last_frame_count
+        frame_delta = self._frame_count - self._last_frame_count
         frame_hz = frame_delta / elapsed
         mouse_hz = self._mouse_moves / elapsed
+        intervals = list(self._frame_intervals_ms)
+        self._frame_intervals_ms.clear()
+
+        p50 = _percentile(intervals, 0.50)
+        p95 = _percentile(intervals, 0.95)
+        p99 = _percentile(intervals, 0.99)
 
         self._write(
             "cadence",
@@ -324,7 +367,10 @@ class WindowDiagnostics(QObject):
                 "ui_timer_lag_ms": round(ui_timer_lag_ms, 3),
                 "quick_frames": frame_delta,
                 "quick_frame_hz": round(frame_hz, 3),
-                "quick_last_frame_ms": round(float(self.quick.property("diagFrameTimeMs") or 0.0), 4),
+                "frame_interval_p50_ms": None if p50 is None else round(p50, 4),
+                "frame_interval_p95_ms": None if p95 is None else round(p95, 4),
+                "frame_interval_p99_ms": None if p99 is None else round(p99, 4),
+                "frame_interval_max_ms": None if not intervals else round(max(intervals), 4),
                 "mouse_moves": self._mouse_moves,
                 "mouse_hz": round(mouse_hz, 3),
                 "animation_running": bool(self.quick.property("animationRunning")),
@@ -339,7 +385,7 @@ class WindowDiagnostics(QObject):
             },
         )
         self._last_sample = now
-        self._last_frame_count = frame_count
+        self._last_frame_count = self._frame_count
         self._mouse_moves = 0
 
     def _queue_event_snapshot(self, reason: str) -> None:
@@ -388,8 +434,8 @@ class WindowDiagnostics(QObject):
         self._closed = True
         self._timer.stop()
         try:
-            self.quick.setProperty("diagnosticsEnabled", False)
-        except RuntimeError:
+            self.quick.frameSwapped.disconnect(self._on_frame_swapped)
+        except (RuntimeError, TypeError):
             pass
         app = QApplication.instance()
         if app is not None:
