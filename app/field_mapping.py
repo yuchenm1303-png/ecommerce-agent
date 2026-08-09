@@ -6,7 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Protocol
 
 from .ai_decisions import (
     AIDecisionPacket,
@@ -19,8 +19,14 @@ from .ai_decisions import (
 )
 from .business_fields import is_business_question
 from .evidence_contract import ProductIdentity
-from .product_profile import JSONTaskProvider
 from .semantic_grounding import GroundingCatalog
+
+
+class JSONTaskProvider(Protocol):
+    name: str
+
+    def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
+        ...
 
 
 FIELD_MAPPING_CONTRACT_VERSION = 7
