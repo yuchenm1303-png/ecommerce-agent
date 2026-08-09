@@ -6,6 +6,7 @@ from app.ai_decisions import (
     CONFLICT,
     MISSING,
     READY,
+    REVIEW,
     AIDecisionPacket,
     DecisionAlternative,
     DecisionCitation,
@@ -195,7 +196,7 @@ def test_missing_field_is_searched_and_ready_field_is_frozen(tmp_path):
     payload = json.loads(search.prompts[0].split("\n\n", 1)[1])
     assert [item["field_id"] for item in payload["target_fields"]] == [field_id(sensor)]
     assert PRODUCT_URL in search.prompts[0]
-    assert '"known_local_fields"' in search.prompts[0]
+    assert '"fingerprint"' in search.prompts[0]
     assert result.source_matches[0].match == "same_product"
     assert result.source_matches[0].identity_basis == "explicit_cross_reference"
 
@@ -276,7 +277,7 @@ def test_web_fill_is_one_product_research_session_and_hot_cached(tmp_path):
     assert all(item.status == READY for item in second.packet.decisions)
 
 
-def test_same_named_candidate_marked_uncertain_cannot_replace_local_missing():
+def test_uncertain_similar_candidate_can_supply_direct_grounded_evidence():
     sensor = field("image_sensor", "Image Sensor")
     fields = [sensor]
     initial = packet(fields, [FieldDecision(field_id=field_id(sensor), status=MISSING)])
@@ -305,11 +306,12 @@ def test_same_named_candidate_marked_uncertain_cannot_replace_local_missing():
     )
     result = run_web_enrichment(search, initial, fields, grounding(), product_url=PRODUCT_URL)
     assert result.source_matches[0].match == "uncertain"
-    assert result.web_sources == []
-    assert result.packet.decisions[0].status == MISSING
+    assert len(result.web_sources) == 1
+    assert result.packet.decisions[0].status == READY
+    assert result.packet.decisions[0].values == ["GC2053"]
 
 
-def test_ai_same_product_with_only_model_and_similar_dimensions_is_downgraded():
+def test_weak_same_product_identity_no_longer_discards_direct_field_evidence():
     sensor = field("image_sensor", "Image Sensor")
     fields = [sensor]
     initial = packet(fields, [FieldDecision(field_id=field_id(sensor), status=MISSING)])
@@ -337,11 +339,81 @@ def test_ai_same_product_with_only_model_and_similar_dimensions_is_downgraded():
         [WebSearchSource(index="1", title="Lookalike M8", url=url)],
     )
     result = run_web_enrichment(search, initial, fields, grounding(), product_url=PRODUCT_URL)
-    assert result.source_matches[0].match == "uncertain"
+    assert result.source_matches[0].match == "same_product"
     assert result.source_matches[0].identity_basis == "generic_model_or_similarity"
+    assert len(result.web_sources) == 1
+    assert result.packet.decisions[0].status == READY
+    assert result.packet.decisions[0].values == ["GC1054"]
+
+
+def test_explicit_different_product_still_cannot_supply_field_evidence():
+    sensor = field("image_sensor", "Image Sensor")
+    fields = [sensor]
+    initial = packet(fields, [FieldDecision(field_id=field_id(sensor), status=MISSING)])
+    url = "https://example.test/different-camera"
+    search = FakeWebProvider(
+        {
+            "source_matches": [
+                {
+                    "source_url": url,
+                    "match": "different_product",
+                    "identity_basis": "generic_model_or_similarity",
+                    "reason": "page identifies an unrelated rear-only camera",
+                    "identity_evidence": ["rear-only camera with a different housing"],
+                }
+            ],
+            "decisions": [
+                {
+                    "field_id": field_id(sensor),
+                    "status": "ready",
+                    "values": ["GC1054"],
+                    "citations": [{"source_url": url, "evidence_text": "Image sensor GC1054"}],
+                }
+            ],
+        },
+        [WebSearchSource(index="1", title="Different camera", url=url)],
+    )
+    result = run_web_enrichment(search, initial, fields, grounding(), product_url=PRODUCT_URL)
+    assert result.source_matches[0].match == "different_product"
     assert result.web_sources == []
     assert result.packet.decisions[0].status == MISSING
-    assert any("strong identity anchor" in warning for warning in result.warnings)
+
+
+def test_same_product_family_can_supply_grounded_review_candidate():
+    sensor = field("image_sensor", "Image Sensor")
+    fields = [sensor]
+    initial = packet(fields, [FieldDecision(field_id=field_id(sensor), status=MISSING)])
+    url = "https://example.test/manufacturer-m8-family"
+    search = FakeWebProvider(
+        {
+            "source_matches": [
+                {
+                    "source_url": url,
+                    "match": "same_product_family",
+                    "identity_basis": "generic_model_or_similarity",
+                    "reason": "manufacturer, M8 model, housing and known dimensions match",
+                    "identity_evidence": [
+                        "same manufacturer and M8 model",
+                        "same distinctive housing and 86 x 36 mm body",
+                    ],
+                }
+            ],
+            "decisions": [
+                {
+                    "field_id": field_id(sensor),
+                    "status": "review",
+                    "values": ["GC2053"],
+                    "citations": [{"source_url": url, "evidence_text": "Image sensor: GC2053"}],
+                }
+            ],
+        },
+        [WebSearchSource(index="1", title="Manufacturer M8 family", url=url)],
+    )
+    result = run_web_enrichment(search, initial, fields, grounding(), product_url=PRODUCT_URL)
+    assert result.source_matches[0].match == "same_product_family"
+    assert result.packet.decisions[0].status == REVIEW
+    assert result.packet.decisions[0].values == ["GC2053"]
+    assert len(result.web_sources) == 1
 
 
 def test_invented_web_url_cannot_replace_local_missing():

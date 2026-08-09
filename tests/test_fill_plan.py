@@ -187,6 +187,25 @@ def test_fixed_rendered_unit_does_not_require_a_qualifier_control():
     assert item.resolution.qualifier is None
 
 
+def test_fixed_kg_field_converts_grams_before_browser_execution():
+    weight = field(
+        "weight",
+        "Weight",
+        section="Price, Stock and Shipping Information",
+        context_text="Weight *KG",
+        controls=({"type": "number", "inputmode": "decimal", "context_text": "Weight *KG"},),
+    )
+    plan = build_live_fill_plan(
+        packet([weight], [decision(weight, AI_READY, ("285",), qualifier="g")]),
+        [weight],
+        ProductSourceBundle(),
+    )
+    item = plan.items[0]
+    assert item.action == READY
+    assert item.resolution.answer_values == ["0.285"]
+    assert item.resolution.qualifier is None
+
+
 def test_unknown_unit_without_control_or_fixed_context_is_blocked():
     length = field("package_length", "Length")
     plan = build_live_fill_plan(

@@ -11,6 +11,7 @@ from .ai_decisions import (
     CONFLICT,
     MISSING,
     READY,
+    REVIEW,
     AIDecisionPacket,
     DecisionCitation,
     FieldDecision,
@@ -19,15 +20,16 @@ from .ai_decisions import (
     schema_digest,
     validate_ai_decision_packet,
 )
+from .compact_evidence import CompactEvidence
 from .business_fields import is_business_question
 from .providers.dashscope_web_search import WebSearchJSONResult, WebSearchSource
 from .semantic_grounding import GroundingCatalog, TEXT_KIND
 from .source_bundle import normalize_key
 
 
-WEB_SEARCH_CONTRACT_VERSION = 9
-WEB_SEARCH_CACHE_VERSION = 9
-WEB_FILLABLE_STATUSES = {MISSING}
+WEB_SEARCH_CONTRACT_VERSION = 16
+WEB_SEARCH_CACHE_VERSION = 16
+WEB_FILLABLE_STATUSES = {MISSING, REVIEW}
 STRONG_IDENTITY_BASES = {
     "canonical_offer_or_url",
     "exact_variant_identifier",
@@ -40,6 +42,14 @@ IDENTITY_BASES = {
     "generic_model_or_similarity",
     "none",
 }
+SOURCE_MATCHES = {
+    "same_product",
+    "same_product_family",
+    "similar_product",
+    "uncertain",
+    "different_product",
+}
+EVIDENCE_USABLE_MATCHES = SOURCE_MATCHES - {"different_product"}
 
 
 class SourcedWebSearchProvider(Protocol):
@@ -166,6 +176,38 @@ def _prior_payload(decision: FieldDecision) -> dict[str, Any]:
     }
 
 
+def _web_field_contract(field: dict[str, Any]) -> dict[str, Any]:
+    """Keep only field metadata that changes Web research or answer shape."""
+
+    contract = field_contract(field)
+    section = contract["section_heading"].casefold()
+    payload: dict[str, Any] = {
+        "key": contract["attribute_key"],
+        "label": contract["label"],
+        "section": (
+            "S"
+            if "price, stock and shipping" in section
+            else "P"
+            if "product description" in section
+            else "A"
+        ),
+    }
+    if contract["multi_value"]:
+        payload["multi_value"] = True
+    if contract["options"]:
+        payload["options"] = contract["options"]
+    if contract["qualifier_options"]:
+        payload["qualifier_options"] = contract["qualifier_options"]
+    return payload
+
+
+def _web_target_payload(field: dict[str, Any], decision: FieldDecision) -> dict[str, Any]:
+    payload = {"field_id": decision.field_id, **_web_field_contract(field)}
+    if decision.status == REVIEW:
+        payload["prior_review"] = _prior_payload(decision)
+    return payload
+
+
 def _local_anchor_payload(initial: AIDecisionPacket, fields: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     by_id = {field_id(field): field for field in fields}
     output: list[dict[str, Any]] = []
@@ -189,32 +231,71 @@ def _local_anchor_payload(initial: AIDecisionPacket, fields: Iterable[dict[str, 
     return output
 
 
-def _primary_source_evidence(
-    grounding: GroundingCatalog,
-    *,
-    max_chars: int = 18_000,
-) -> list[dict[str, str]]:
-    output: list[dict[str, str]] = []
+def _fingerprint_lines(text: str, *, budget: int) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
     used = 0
-    for source in grounding.sources:
-        if source.source_type != "supplier_web" or source.kind != TEXT_KIND:
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and "] " in line:
+            line = line.split("] ", 1)[1]
+        if not line:
             continue
-        content = source.content.strip()
-        if not content:
+        # Long rendered-text lines often begin with the supplier/manufacturer
+        # identity and then continue into page chrome. Keep that useful prefix
+        # instead of dropping the entire line from the compact fingerprint.
+        line = line[:280]
+        key = normalize_key(line)
+        if not key or key in seen:
             continue
-        remaining = max_chars - used
+        remaining = budget - used
         if remaining <= 0:
             break
-        clipped = content[:remaining]
-        output.append(
-            {
-                "source_reference": source.source_id,
-                "origin": source.origin,
-                "content": clipped,
-            }
-        )
-        used += len(clipped)
+        clipped = line[:remaining]
+        output.append(clipped)
+        seen.add(key)
+        used += len(clipped) + 1
     return output
+
+
+def build_product_fingerprint(
+    initial: AIDecisionPacket,
+    fields: Iterable[dict[str, Any]],
+    grounding: GroundingCatalog,
+    *,
+    compact_evidence: CompactEvidence | None = None,
+    max_chars: int = 2_000,
+) -> str:
+    """Build a small search identity, never a second copy of all product evidence."""
+
+    lines: list[str] = []
+    if compact_evidence is not None:
+        lines.extend(_fingerprint_lines(compact_evidence.web_text, budget=1_200))
+        remaining = max(0, 1_600 - sum(len(item) + 1 for item in lines))
+        lines.extend(_fingerprint_lines(compact_evidence.image_facts, budget=remaining))
+    else:
+        supplier_text = "\n".join(
+            source.content
+            for source in grounding.sources
+            if source.source_type == "supplier_web" and source.kind == TEXT_KIND
+        )
+        lines.extend(_fingerprint_lines(supplier_text, budget=1_600))
+
+    for item in _local_anchor_payload(initial, fields):
+        rendered = f"{item['attribute_key']}={item['status']}"
+        if item["status"] == READY:
+            rendered += ":" + ",".join(item.get("values") or [])
+        elif item["status"] == CONFLICT:
+            alternatives = [
+                "/".join(alternative.get("values") or [])
+                for alternative in item.get("alternatives") or []
+            ]
+            rendered += ":" + " vs ".join(alternatives)
+        if rendered not in lines:
+            lines.append(rendered)
+        if sum(len(value) + 1 for value in lines) >= max_chars:
+            break
+    return "\n".join(lines)[:max_chars]
 
 
 def _research_prompt(
@@ -223,53 +304,40 @@ def _research_prompt(
     targets: list[tuple[dict[str, Any], FieldDecision]],
     *,
     product_url: str,
-    primary_source_evidence: list[dict[str, str]],
+    product_fingerprint: str,
 ) -> str:
     payload = {
-        "task": "research_one_exact_product_then_fill_all_missing_fields",
+        "task": "research_product_and_comparable_products_then_fill_all_missing_fields",
         "canonical_product": {
             "source_product_url": product_url.strip(),
-            "primary_source_evidence": primary_source_evidence,
-            "known_local_fields": _local_anchor_payload(initial, all_fields),
+            "fingerprint": product_fingerprint,
         },
         "target_fields": [
-            {
-                "field_id": decision.field_id,
-                **field_contract(field),
-                "prior_decision": _prior_payload(decision),
-            }
+            _web_target_payload(field, decision)
             for field, decision in targets
         ],
         "workflow": [
-            "Treat the canonical supplier product above as the only product identity to enrich.",
-            "Use web search to discover candidate pages for this product as a whole, not one independent search per field.",
-            "For every external candidate page, classify identity first and state identity_basis using the allowed identity basis vocabulary.",
-            "same_product requires a strong identity anchor, not a similarity judgment. A generic model token, similar dimensions/specifications, category, appearance or marketing photo is weak similarity and must be uncertain.",
-            "Only accepted same_product pages may provide field values. different_product and uncertain pages are forbidden as field evidence.",
-            "After entity matching, fill all supplied missing target fields from the accepted same-product source set in this same research session.",
+            "Actually invoke the built-in Web search tool now. Search for this product, its model family, and genuinely comparable products using a few product-level queries.",
+            "Reuse the real pages returned by the tool across all unresolved fields; do not invent or guess URLs.",
+            "Classify returned pages as same_product, same_product_family, similar_product, uncertain, or different_product. Reject only clearly different_product pages.",
+            "Return fields supported by the returned pages. A separate text-only inference stage handles everything still unresolved.",
         ],
         "rules": [
             "Locally READY and CONFLICT fields are frozen and must never be rewritten.",
-            "Allowed strong identity_basis values are canonical_offer_or_url, exact_variant_identifier, manufacturer_identifier, global_trade_identifier, explicit_cross_reference. generic_model_or_similarity and none are not strong enough for same_product.",
-            "canonical_offer_or_url means the candidate explicitly carries or mirrors the exact canonical supplier URL/offer identity; exact_variant_identifier means the exact supplier variant/SKU identifier matches; manufacturer_identifier means an explicit MPN/part number present on both sides matches; global_trade_identifier means an explicit GTIN/EAN/UPC matches; explicit_cross_reference means one source explicitly cross-references the other exact product identity.",
-            "M8 plus similar dimensions, M8 plus similar camera count, similar photos, same category, or a collection of nearby specifications is generic_model_or_similarity and MUST be uncertain, never same_product.",
-            "If no external page has a strong identity anchor to the canonical product, leave all Web-only fields MISSING rather than borrowing from a likely-looking item.",
-            "same_product establishes source identity only; it does NOT make every fact or inference on that page valid for every target field.",
-            "A READY value requires direct target-specific evidence from an accepted same-product source. If reaching the value requires deriving one field from another field, interpreting absence, assuming a default, or making a category-level inference, return MISSING instead.",
-            "Unit conversion, literal decomposition of explicitly ordered dimensions, and exact mapping to a supplied option are the only allowed mechanical transformations of a directly stated value.",
-            "A CONFLICT requires two or more directly supported values that each answer the same exact target field. Values of another semantic or quantity type are not conflict alternatives.",
-            "Every READY citation and every CONFLICT alternative citation must use a source_url actually returned by this same web-search call and describe the exact target-specific evidence.",
+            "Exact product identity is preferred but not required. Similar and uncertain pages may provide evidence; only different_product is unusable.",
+            "Every citation URL must be a real URL returned by this Web search call. For inferred values, cite the closest comparable-product evidence and explain the inference.",
+            "Use READY for direct comparable-product evidence, REVIEW for material uncertainty, and CONFLICT for direct disagreement.",
             "Do not rotate dimension axes or mix packaging/body/mount, cabin/rear, documentation/device-interface language, product/vehicle compatibility, display resolution/recording resolution, or other neighboring field scopes.",
-            "Manual/documentation language does not establish device UI Languages Supported. Absence does not establish Remote Control=No. Package dimensions do not establish Packaging Type=Box. One listing does not establish Pack of=1. Front+cabin/interior does not establish Back/rear Camera Position. A 1080P camera/video claim does not answer Display Resolution unless it explicitly refers to the display.",
             "If multi_value=false return one value. If qualifier_options exist, use an exact allowed qualifier; if qualifier_options are empty, qualifier must be empty.",
             "Never research seller-operated price, stock, MOQ, fulfilment, shipping policy or listing-status fields.",
+            "Return decisions only for fields found in real returned pages. Omit everything else; the separate inference stage will handle it.",
             "Return one JSON object only.",
         ],
         "json_contract": {
             "source_matches": [
                 {
                     "source_url": "exact URL returned by this web search",
-                    "match": "same_product | different_product | uncertain",
+                    "match": "same_product | same_product_family | similar_product | uncertain | different_product",
                     "identity_basis": "canonical_offer_or_url | exact_variant_identifier | manufacturer_identifier | global_trade_identifier | explicit_cross_reference | generic_model_or_similarity | none",
                     "reason": "short identity judgment",
                     "identity_evidence": ["concrete evidence for the declared identity basis"],
@@ -278,13 +346,13 @@ def _research_prompt(
             "decisions": [
                 {
                     "field_id": "exact target field_id",
-                    "status": "ready | conflict | missing",
+                    "status": "ready | review | conflict | missing",
                     "values": ["value for READY"],
                     "qualifier": "optional exact qualifier",
                     "confidence": 0.0,
                     "citations": [
                         {
-                            "source_url": "URL accepted as same_product above",
+                            "source_url": "URL returned by this search and not classified as different_product",
                             "evidence_text": "direct evidence for this exact target field",
                         }
                     ],
@@ -294,7 +362,7 @@ def _research_prompt(
                             "qualifier": "optional qualifier",
                             "citations": [
                                 {
-                                    "source_url": "URL accepted as same_product above",
+                                    "source_url": "URL returned by this search and not classified as different_product",
                                     "evidence_text": "direct evidence for this exact target field alternative",
                                 }
                             ],
@@ -307,9 +375,8 @@ def _research_prompt(
         },
     }
     return (
-        "You are performing one bounded product-level web research session for one exact supplier item. "
-        "Identity is fail-closed: similar model/specification pages are not the same product without a strong exact "
-        "identity anchor. Enrich remaining fields only from direct target-specific facts on accepted sources. Return JSON only.\n\n"
+        "Search the Web now for one product and comparable products, then fill unresolved fields only from real returned pages. "
+        "Exact identity is preferred but not required; reject only clearly different products. Return JSON only.\n\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
 
@@ -338,7 +405,7 @@ def _search_cache_key(
     all_fields: list[dict[str, Any]],
     targets: list[tuple[dict[str, Any], FieldDecision]],
     product_url: str,
-    primary_source_evidence: list[dict[str, str]],
+    product_fingerprint: str,
 ) -> str:
     payload = {
         "cache_version": WEB_SEARCH_CACHE_VERSION,
@@ -347,14 +414,9 @@ def _search_cache_key(
         "model": provider.model,
         "source_manifest_sha256": initial.source_manifest_sha256,
         "product_url": product_url.strip(),
-        "primary_source_evidence": primary_source_evidence,
-        "known_local_fields": _local_anchor_payload(initial, all_fields),
+        "product_fingerprint": product_fingerprint,
         "targets": [
-            {
-                "field_id": decision.field_id,
-                "field": field_contract(field),
-                "prior": _prior_payload(decision),
-            }
+            _web_target_payload(field, decision)
             for field, decision in targets
         ],
     }
@@ -393,7 +455,7 @@ def _run_research(
     all_fields: list[dict[str, Any]],
     targets: list[tuple[dict[str, Any], FieldDecision]],
     product_url: str,
-    primary_source_evidence: list[dict[str, str]],
+    product_fingerprint: str,
     *,
     cache_dir: Path | None,
 ) -> tuple[WebSearchJSONResult | None, int, bool, str]:
@@ -403,7 +465,7 @@ def _run_research(
         all_fields,
         targets,
         product_url,
-        primary_source_evidence,
+        product_fingerprint,
     )
     cache_path = cache_dir / f"web-product-research-{key}.json" if cache_dir is not None else None
     if cache_path is not None and cache_path.is_file():
@@ -420,7 +482,7 @@ def _run_research(
                 all_fields,
                 targets,
                 product_url=product_url,
-                primary_source_evidence=primary_source_evidence,
+                product_fingerprint=product_fingerprint,
             )
         )
     except Exception as exc:
@@ -456,7 +518,7 @@ def _parse_source_matches(
             continue
         seen.add(key)
         reported_match = str(item.get("match") or "").strip().casefold()
-        if reported_match not in {"same_product", "different_product", "uncertain"}:
+        if reported_match not in SOURCE_MATCHES:
             warnings.append(f"web source match ignored invalid status for {url}")
             continue
         basis = str(item.get("identity_basis") or "none").strip().casefold()
@@ -469,23 +531,16 @@ def _parse_source_matches(
             if str(value).strip()
         )
 
-        effective_match = reported_match
-        if reported_match == "same_product" and (basis not in STRONG_IDENTITY_BASES or not identity_evidence):
-            effective_match = "uncertain"
-            warnings.append(
-                f"web source same_product lacked a strong identity anchor and was downgraded to uncertain: {url}"
-            )
-
         matches.append(
             WebSourceMatch(
                 source_url=source.url,
-                match=effective_match,
+                match=reported_match,
                 reason=str(item.get("reason") or "").strip(),
                 identity_basis=basis,
                 identity_evidence=identity_evidence,
             )
         )
-        if effective_match == "same_product":
+        if reported_match in EVIDENCE_USABLE_MATCHES:
             accepted[key] = source
     return matches, accepted, warnings
 
@@ -643,6 +698,7 @@ def run_web_enrichment(
     batch_size: int = 5,
     concurrency: int = 3,
     cache_dir: str | Path | None = None,
+    compact_evidence: CompactEvidence | None = None,
 ) -> WebEnrichmentResult:
     """Run one product-level Web research session, then fill only MISSING fields."""
 
@@ -656,7 +712,12 @@ def run_web_enrichment(
     if not targets:
         return WebEnrichmentResult(packet=initial, target_field_count=0, searched=False)
 
-    primary_evidence = _primary_source_evidence(grounding)
+    product_fingerprint = build_product_fingerprint(
+        initial,
+        field_list,
+        grounding,
+        compact_evidence=compact_evidence,
+    )
     cache_root = Path(cache_dir) if cache_dir is not None else None
     started = time.monotonic()
     result, model_calls, cache_hit, warning = _run_research(
@@ -665,7 +726,7 @@ def run_web_enrichment(
         field_list,
         targets,
         product_url,
-        primary_evidence,
+        product_fingerprint,
         cache_dir=cache_root,
     )
     warnings: list[str] = [warning] if warning else []
@@ -713,14 +774,14 @@ def run_web_enrichment(
     usable_updates = {
         decision.field_id: decision
         for decision in validated_updates.decisions
-        if decision.status in {READY, CONFLICT}
+        if decision.status in {READY, REVIEW, CONFLICT}
     }
     merged = AIDecisionPacket(
         identity=initial.identity,
         schema_sha256=initial.schema_sha256,
         source_manifest_sha256=initial.source_manifest_sha256,
         decisions=[usable_updates.get(item.field_id, item) for item in initial.decisions],
-        model_summary=(initial.model_summary + "\nWeb product research filled only previously MISSING fields.").strip(),
+        model_summary=(initial.model_summary + "\nWeb product research resolved or proposed candidates only for previously unresolved fields.").strip(),
         warnings=[*initial.warnings, *warnings, *validated_updates.warnings],
         extractor=(initial.extractor + "+product-research").strip("+"),
     )

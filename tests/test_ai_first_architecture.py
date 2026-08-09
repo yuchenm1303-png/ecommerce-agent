@@ -7,7 +7,7 @@ import makro_execute_listing
 import makro_plan_listing
 import makro_preview_listing
 import makro_resolve_ai
-from app import ai_decisions, field_mapping, fill_plan, hard_field_validators, web_enrichment
+from app import ai_decisions, compact_evidence, fill_plan, hard_field_validators, image_evidence, product_facts, web_enrichment
 from app.providers import openai_compatible, openai_semantic
 
 
@@ -36,7 +36,9 @@ def test_production_path_has_no_legacy_semantic_rule_layer():
         makro_execute_listing,
         fill_plan,
         hard_field_validators,
-        field_mapping,
+        product_facts,
+        image_evidence,
+        compact_evidence,
         web_enrichment,
         openai_compatible,
         openai_semantic,
@@ -57,17 +59,20 @@ def test_production_path_has_no_legacy_semantic_rule_layer():
             assert token not in source, f"{module.__name__} reintroduced {token}"
 
 
-def test_production_resolver_is_product_url_local_fill_then_unresolved_web_only():
+def test_production_resolver_is_product_url_compact_facts_then_unresolved_web_only():
     source = inspect.getsource(makro_resolve_ai)
     web_source = inspect.getsource(web_enrichment)
     assert "capture_product_source(" in source
-    assert "run_field_mapping(" in source
+    assert "run_product_facts(" in source
+    assert "run_image_evidence(" in source
     assert "run_web_enrichment(" in source
     assert "build_ai_product_context" not in source
     assert "ResolutionInputSpec" not in source
     assert "run_product_profile(" not in source
     assert "product-profile.json" not in source
-    assert "product_url_capture_then_parallel_local_fill_then_unresolved_web_fill" in source
+    assert "compact-evidence.json" in source
+    assert "image-observations.json" in source
+    assert "product_url_capture_then_compact_product_facts_then_unresolved_web_fill" in source
     assert "final_resolve" not in source
     assert "final_provider" not in web_source
     assert "_run_final_resolution" not in web_source
@@ -83,6 +88,26 @@ def test_resolver_has_no_manual_product_identity_inputs():
     assert "--expected-brand" not in options
     assert "--product-table" not in options
     assert "--facts-json" not in options
+    assert "--image-batch-size" in options
+    assert "--image-concurrency" in options
+    assert "--text-batch-chars" not in options
+    assert "--text-concurrency" not in options
+
+
+def test_image_evidence_batching_is_mechanical_and_has_no_product_field_rules():
+    source = inspect.getsource(image_evidence).casefold()
+    assert "batch_size" in source
+    assert "image_sha256" in source
+    for token in ("gps", "fov", "camera_position", "packaging_type", "vehicle_brand"):
+        assert token not in source
+
+
+def test_compact_evidence_contains_no_product_field_rules():
+    source = inspect.getsource(compact_evidence).casefold()
+    assert "image_fact_count" in source
+    assert "text_source_count" in source
+    for token in ("gps", "fov", "camera_position", "packaging_type", "vehicle_brand"):
+        assert token not in source
 
 
 def test_direct_executor_has_same_single_url_product_boundary():
@@ -106,37 +131,22 @@ def test_legacy_preview_cli_is_not_the_new_production_entrypoint():
     assert makro_preview_listing is not makro_execute_listing
 
 
-def test_local_fill_reads_original_sources_directly_including_images():
-    source = inspect.getsource(field_mapping)
-    assert "grounding.as_request_list()" in source
-    assert "fill_marketplace_fields_from_exact_product_evidence" in source
-    assert "derived_product_profile" not in source
+def test_product_facts_resolves_all_fields_globally_without_repeating_images():
+    source = inspect.getsource(product_facts)
+    assert "resolve_compact_product_facts" in source
+    assert "product_profile" not in source
     assert "image_path" not in source
+    assert "ThreadPoolExecutor" not in source
 
 
-def test_field_mapping_batches_are_mechanical_not_category_semantic_tables():
-    source = inspect.getsource(field_mapping)
-    assert "_mechanical_batches" in source
-    forbidden = (
-        "camera_fields",
-        "storage_fields",
-        "dimension_fields",
-        "vehicle_fields",
-        "colour_aliases",
-        "g_sensor",
-    )
-    lowered = source.casefold()
-    for token in forbidden:
-        assert token not in lowered
-
-
-def test_web_is_missing_only_and_receives_raw_primary_source_identity():
+def test_web_is_unresolved_only_and_receives_raw_primary_source_identity():
     source = inspect.getsource(web_enrichment)
-    assert "WEB_FILLABLE_STATUSES = {MISSING}" in source
+    assert "WEB_FILLABLE_STATUSES = {MISSING, REVIEW}" in source
     assert "source_product_url" in source
-    assert "primary_source_evidence" in source
-    assert "generic model token" in source
-    assert "known_local_fields" in source
+    assert "product_fingerprint" in source
+    assert "similar_product" in source
+    assert "Actually invoke the built-in Web search tool now" in source
+    assert "separate text-only inference stage" in source
 
 
 def test_python_citation_guard_validates_source_address_not_literal_semantics():

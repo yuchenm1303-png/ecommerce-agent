@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import html
+import json
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -20,6 +23,16 @@ from .source_snapshot import (
 
 
 DEFAULT_SOURCE_CDP_PORT = 9333
+SOURCE_CAPTURE_CACHE_VERSION = 4
+
+_DETAIL_DOCUMENT_PATTERN = re.compile(
+    r"detail(?:Url|_url)[^h]{0,48}(https?://[^\\\"'<>\s]+)",
+    re.IGNORECASE,
+)
+_IMAGE_URL_PATTERN = re.compile(
+    r"(?:(?:https?:)?\\?/\\?/)[^\\\"'<>\s]+?\.(?:jpe?g|png|webp|gif|avif)(?:\?[^\\\"'<>\s]*)?",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -47,7 +60,94 @@ def _canonical_source_url(value: str) -> str:
 
 
 def _source_cache_key(value: str) -> str:
-    return hashlib.sha256(_canonical_source_url(value).encode("utf-8")).hexdigest()[:24]
+    payload = f"v{SOURCE_CAPTURE_CACHE_VERSION}|{_canonical_source_url(value)}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def _unescape_embedded(value: str) -> str:
+    return html.unescape(value).replace(r"\/", "/")
+
+
+def _detail_document_urls(snapshot: SourceSnapshot, *, max_urls: int = 4) -> list[str]:
+    """Extract bounded, exact-page detail documents exposed by embedded page data."""
+
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw in snapshot.embedded_data:
+        text = _unescape_embedded(raw)
+        for match in _DETAIL_DOCUMENT_PATTERN.finditer(text):
+            url = match.group(1).rstrip("\\")
+            try:
+                url = validate_source_url(url)
+            except ValueError:
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            output.append(url)
+            if len(output) >= max_urls:
+                return output
+    return output
+
+
+def _detail_image_urls_from_text(value: str, *, max_urls: int = 32) -> list[str]:
+    """Extract image assets from one supplier detail document without interpreting them."""
+
+    text = _unescape_embedded(value)
+    output: list[str] = []
+    seen: set[str] = set()
+    for match in _IMAGE_URL_PATTERN.finditer(text):
+        url = match.group(0).replace(r"\/", "/")
+        if url.startswith("//"):
+            url = "https:" + url
+        try:
+            url = validate_source_url(url)
+        except ValueError:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        output.append(url)
+        if len(output) >= max_urls:
+            break
+    return output
+
+
+def _discover_detail_images(
+    context,
+    snapshot: SourceSnapshot,
+    *,
+    max_documents: int = 4,
+    max_images: int = 32,
+) -> tuple[list[str], list[str]]:
+    """Fetch supplier-declared detail documents and return their exact image URLs."""
+
+    documents = _detail_document_urls(snapshot, max_urls=max_documents)
+    images: list[str] = []
+    seen: set[str] = set()
+    for document_url in documents:
+        response = None
+        try:
+            response = context.request.get(document_url, timeout=15_000, fail_on_status_code=False)
+            if not response.ok:
+                continue
+            body = response.text()
+            for image_url in _detail_image_urls_from_text(body, max_urls=max_images):
+                if image_url in seen:
+                    continue
+                seen.add(image_url)
+                images.append(image_url)
+                if len(images) >= max_images:
+                    return documents, images
+        except Exception:
+            continue
+        finally:
+            if response is not None:
+                try:
+                    response.dispose()
+                except Exception:
+                    pass
+    return documents, images
 
 
 def _connect_source_edge(playwright, *, profile_dir: Path, port: int, start_url: str):
@@ -111,7 +211,7 @@ def _image_extension(content_type: str, url: str) -> str:
     return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"} else ".img"
 
 
-def _download_page_images(context, image_urls: list[str], output_dir: Path, *, max_images: int = 12) -> tuple[Path, ...]:
+def _download_page_images(context, image_urls: list[str], output_dir: Path, *, max_images: int = 32) -> tuple[Path, ...]:
     """Download large images already exposed by the exact page; no image semantics here."""
 
     if not image_urls:
@@ -279,6 +379,24 @@ def capture_product_source(
             requested_url=source_url,
             max_visible_text_chars=int(max_visible_text_chars),
         )
+        detail_documents, detail_images = _discover_detail_images(context, snapshot)
+        combined_images: list[str] = []
+        seen_images: set[str] = set()
+        # Detail-document images are the dense specification/evidence set. Keep
+        # them first so the semantic stage can avoid resending duplicate gallery
+        # thumbnails and the giant rendered-page screenshot.
+        for image_url in [*detail_images, *snapshot.image_urls]:
+            if image_url and image_url not in seen_images:
+                seen_images.add(image_url)
+                combined_images.append(image_url)
+        snapshot.image_urls = combined_images
+        if detail_documents:
+            snapshot.meta["detail_document_urls"] = json.dumps(
+                detail_documents,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            snapshot.meta["detail_image_count"] = str(len(detail_images))
         snapshot_path = write_source_snapshot(snapshot, target_dir / "source-snapshot.json")
         screenshot_path = target_dir / "source-page.png"
         page.screenshot(path=str(screenshot_path), full_page=True)
@@ -303,6 +421,9 @@ __all__ = [
     "CapturedProductSource",
     "DEFAULT_SOURCE_CDP_PORT",
     "SourceAccessBlocked",
+    "SOURCE_CAPTURE_CACHE_VERSION",
+    "_detail_document_urls",
+    "_detail_image_urls_from_text",
     "_source_cache_key",
     "capture_product_source",
     "validate_source_url",

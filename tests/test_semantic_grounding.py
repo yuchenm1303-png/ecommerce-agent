@@ -55,7 +55,7 @@ def test_text_chunks_keep_logical_identity_without_execution_grouping_api():
     assert not hasattr(catalog, "logical_groups")
 
 
-def test_grounding_catalog_includes_structured_rows_variant_data_and_image_urls(tmp_path):
+def test_grounding_catalog_includes_structured_rows_and_variant_data_without_image_url_noise(tmp_path):
     image = tmp_path / "front.jpg"
     image.write_bytes(b"fake-image-bytes-v1")
     snapshot = tmp_path / "supplier.json"
@@ -96,9 +96,51 @@ def test_grounding_catalog_includes_structured_rows_variant_data_and_image_urls(
     assert '"key":"width","value":"11"' in combined
     assert '"key":"height","value":"7"' in combined
     assert "6017876765651" in combined
-    assert "https://img.test/m8.jpg" in combined
+    assert "https://img.test/m8.jpg" not in combined
+    assert any("#evidence=embedded" in item.origin for item in text_sources)
     assert all(item.logical_source_id == "supplier:001" for item in text_sources)
     assert all(item.source_type == "supplier_web" for item in text_sources)
+
+
+def test_snapshot_text_compaction_drops_library_noise_but_preserves_disagreements(tmp_path):
+    snapshot = tmp_path / "supplier.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "requested_url": "https://supplier.test/item",
+                "final_url": "https://supplier.test/item/123",
+                "title": "M8",
+                "captured_at": "2026-08-09T00:00:00+00:00",
+                "visible_text": "Supplier text says recording resolution 720p.",
+                "table_rows": [],
+                "json_ld": [],
+                "embedded_data": [
+                    "function library(value) { return value.length + value.width; }",
+                    json.dumps({"tag": "DIV", "text": "Recording resolution 1080p", "attrs": {}}),
+                    json.dumps({"tag": "DIV", "text": "Recording resolution 720p", "attrs": {}}),
+                    'window.context={"offerId":123,"skuId":456}',
+                    'prefix window.context={"offerId":123,"skuId":456} suffix',
+                ],
+                "image_urls": ["https://img.test/detail.jpg"],
+                "meta": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    catalog = build_grounding_catalog(supplier_snapshots=(str(snapshot),))
+    combined = "\n".join(item.content for item in catalog.sources if item.kind == TEXT_KIND)
+
+    assert "value.length" not in combined
+    assert "Recording resolution 720p" in combined
+    assert "Recording resolution 1080p" in combined
+    assert combined.count('"offerId":123') == 1
+    assert combined.count('"skuId":456') == 1
+    assert "https://img.test/detail.jpg" not in combined
+    raw = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert "value.length" in raw["embedded_data"][0]
+    assert raw["image_urls"] == ["https://img.test/detail.jpg"]
 
 
 def test_source_id_changes_when_image_bytes_change(tmp_path):

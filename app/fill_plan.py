@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
@@ -157,6 +158,40 @@ def _fixed_qualifier_rendered(live_field: dict[str, Any], qualifier: str) -> boo
     return any(pattern.search(text) for text in texts if text)
 
 
+_UNIT_SCALE: dict[str, tuple[str, Decimal]] = {
+    "mg": ("mass", Decimal("0.001")),
+    "g": ("mass", Decimal("1")),
+    "kg": ("mass", Decimal("1000")),
+    "oz": ("mass", Decimal("28.349523125")),
+    "lbs": ("mass", Decimal("453.59237")),
+    "mm": ("length", Decimal("1")),
+    "cm": ("length", Decimal("10")),
+    "m": ("length", Decimal("1000")),
+    "inch": ("length", Decimal("25.4")),
+}
+
+
+def _fixed_rendered_unit(live_field: dict[str, Any]) -> str:
+    matches = [unit for unit in _UNIT_SCALE if _fixed_qualifier_rendered(live_field, unit)]
+    return matches[0] if len(matches) == 1 else ""
+
+
+def _convert_unit_values(values: list[str], source: str, target: str) -> list[str] | None:
+    source_kind, source_scale = _UNIT_SCALE[source]
+    target_kind, target_scale = _UNIT_SCALE[target]
+    if source_kind != target_kind:
+        return None
+    output: list[str] = []
+    for value in values:
+        try:
+            converted = Decimal(value.strip()) * source_scale / target_scale
+        except (InvalidOperation, ValueError):
+            return None
+        rendered = format(converted.normalize(), "f")
+        output.append(rendered.rstrip("0").rstrip(".") if "." in rendered else rendered)
+    return output
+
+
 def _hard_guard_values(
     live_field: dict[str, Any],
     decision: FieldDecision,
@@ -184,7 +219,17 @@ def _hard_guard_values(
             if _fixed_qualifier_rendered(live_field, qualifier):
                 qualifier = ""
             else:
-                return values, qualifier, "返回了 qualifier，但当前 Makro 字段既没有 qualifier 控件，也没有显示相同的固定单位。"
+                source_unit = qualifier.casefold()
+                target_unit = _fixed_rendered_unit(live_field)
+                if source_unit in _UNIT_SCALE and target_unit:
+                    converted = _convert_unit_values(values, source_unit, target_unit)
+                    if converted is not None:
+                        values = converted
+                        qualifier = ""
+                    else:
+                        return values, qualifier, "qualifier 与 Makro 固定单位不兼容。"
+                else:
+                    return values, qualifier, "返回了 qualifier，但当前 Makro 字段既没有 qualifier 控件，也没有显示相同的固定单位。"
         else:
             matched = _exact_option(qualifier, qualifiers)
             if matched is None:

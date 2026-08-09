@@ -149,6 +149,24 @@ def test_explicit_thinking_mode_is_forwarded_via_extra_body():
     assert client.create_api.calls[0]["extra_body"] == {"enable_thinking": False}
 
 
+def test_best_effort_context_reaches_model_without_grounded_only_instruction():
+    client = FakeClient(valid_json())
+    provider = OpenAICompatibleSemanticProvider(
+        model="text-model",
+        api_key="secret-key",
+        base_url="https://api.vendor.test/v1",
+        client=client,
+    )
+    request = request_payload()
+    request["evidence_policy"] = "best_effort"
+    request["context"] = {"product_fingerprint": "M8 dual dash camera"}
+    provider.extract_json(request)
+    text = client.create_api.calls[0]["messages"][1]["content"][0]["text"]
+    assert "M8 dual dash camera" in text
+    assert "explicitly permits clearly identified best-effort estimates" in text
+    assert "Never invent unsupported product facts." not in text
+
+
 def test_explicit_high_detail_is_only_sent_when_requested(tmp_path):
     image = tmp_path / "front.png"
     image.write_bytes(b"image-bytes")

@@ -9,8 +9,9 @@ from app.ai_decisions import (
     schema_digest,
     source_manifest_digest,
 )
+from app.compact_evidence import CompactEvidence
 from app.evidence_contract import ProductIdentity
-from app.field_mapping import build_field_mapping_request
+from app.product_facts import build_product_fact_request
 from app.semantic_grounding import GroundedSource, GroundingCatalog, TEXT_KIND
 from app.web_enrichment import _targets
 
@@ -49,29 +50,34 @@ def _grounding():
 
 
 def test_local_fill_prompt_reads_original_sources_directly_and_uses_typed_schema():
-    request = build_field_mapping_request(
+    evidence = CompactEvidence(
+        web_text="[s1] Package length 16 cm, width 11 cm, height 7 cm",
+        image_facts="",
+        text_source_count=1,
+        image_count=0,
+        image_fact_count=0,
+        citation_aliases={"s1": "supplier:001:text:0001:abc"},
+        sha256="c" * 64,
+    )
+    request = build_product_fact_request(
         [_field()],
-        _grounding(),
-        expected_identity=ProductIdentity(),
+        evidence,
         product_url=PRODUCT_URL,
     )
     target = request["target_fields"][0]
-    assert request["task"] == "fill_marketplace_fields_from_exact_product_evidence"
+    assert request["task"] == "resolve_compact_product_facts"
     assert target["attribute_key"] == "package_breadth"
     assert target["label"] == "Breadth"
     assert target["qualifier_options"] == ["cm", "mm"]
     assert target["context_text"] == "Breadth cm"
-    assert request["grounded_sources"][0]["source_type"] == "supplier_web"
+    assert request["grounded_sources"][0]["source_type"] == "compact_supplier_evidence"
     assert request["product_identity"] == {"source_product_url": PRODUCT_URL}
     assert request["strict_json_schema"] is True
     properties = request["json_contract"]["properties"]
-    assert set(properties) == {"ready", "conflicts", "missing", "model_summary"}
-    assert "reason" not in properties["missing"]["items"]["properties"]
+    assert set(properties) == {"facts", "model_summary"}
     rules = "\n".join(request["rules"])
-    assert "dimension axes" in rules
-    assert "manual/documentation language" in rules
-    assert "non-conflicting facts" in rules
-    assert "qualifier_options are empty" in rules
+    assert "physical scope" in rules
+    assert "CONFLICT" in rules
 
 
 def test_cli_defaults_to_qwen37_plus_and_single_product_url_input():
@@ -83,8 +89,6 @@ def test_cli_defaults_to_qwen37_plus_and_single_product_url_input():
     assert args.web_search_model == "qwen3.7-max"
     assert args.structured_mode == "json_object"
     assert args.enable_thinking is False
-    assert args.field_batch_size == 12
-    assert args.field_concurrency == 4
     assert args.web_batch_size == 5
     assert args.web_concurrency == 3
     assert args.source_cache_ttl_seconds == 900
@@ -95,7 +99,7 @@ def test_cli_defaults_to_qwen37_plus_and_single_product_url_input():
     assert "--source-cdp-port" in options
     assert "--refresh-source" in options
     assert "--max-repair-attempts" not in options
-    assert "--field-batch-size" in options
+    assert "--field-batch-size" not in options
     assert "--web-batch-size" in options
 
 

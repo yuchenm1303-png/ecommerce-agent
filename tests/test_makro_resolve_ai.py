@@ -90,32 +90,63 @@ class FakeProvider:
     def extract_json(self, request):
         self.calls += 1
         self.requests.append(request)
-        assert request["task"] == "fill_marketplace_fields_from_exact_product_evidence"
-        image_source = next(source for source in request["grounded_sources"] if source["kind"] == "image")
-        ready = []
-        missing = []
-        for target in request["target_fields"]:
-            if target["label"] == "Screen Size":
-                ready.append(
+        if request["task"] == "extract_independent_product_image_evidence":
+            self.image_source_id = request["image_ids"][0]
+            return {
+                "images": {
+                    self.image_source_id: {
+                        "visible_text": "3.0 inch",
+                        "facts": [
+                            {
+                                "name": "screen size",
+                                "scope": "product_body",
+                                "value": "3.0",
+                                "qualifier": "inch",
+                                "evidence_text": "visible screen size 3.0 inch",
+                            }
+                        ],
+                        "notes": "",
+                    }
+                },
+                "summary": "image read",
+            }
+        if request["task"] == "best_effort_infer_remaining_marketplace_fields":
+            return {
+                "decisions": [
                     {
                         "field_id": target["field_id"],
+                        "status": "missing",
+                        "values": [],
+                        "qualifier": "",
+                        "confidence": 0.0,
+                        "reason": "fake provider leaves package length unknown",
+                    }
+                    for target in request["target_fields"]
+                ],
+                "summary": "fake inference result",
+            }
+        assert request["task"] == "resolve_compact_product_facts"
+        facts = []
+        for target in request["target_fields"]:
+            if target["label"] == "Screen Size":
+                facts.append(
+                    {
+                        "field_id": target["field_id"],
+                        "status": "ready",
                         "values": ["3.0"],
                         "qualifier": "inch",
                         "confidence": 1.0,
                         "citations": [
                             {
-                                "source_reference": image_source["source_id"],
+                                "source_reference": "i1",
                                 "evidence_text": "visible screen size 3.0 inch",
                             }
                         ],
+                        "alternatives": [],
                     }
                 )
-            else:
-                missing.append({"field_id": target["field_id"], "search_queries": []})
         return {
-            "ready": ready,
-            "conflicts": [],
-            "missing": missing,
+            "facts": facts,
             "model_summary": "fake typed local result",
         }
 
@@ -145,8 +176,6 @@ def test_resolver_uses_only_captured_product_url_sources(tmp_path, monkeypatch):
             "--request-timeout-seconds", "75",
             "--live-schema", str(live_schema),
             "--product-url", PRODUCT_URL,
-            "--field-batch-size", "1",
-            "--field-concurrency", "2",
             "--web-enrich", "off",
             "--no-semantic-cache",
             "--output-dir", str(output),
@@ -154,14 +183,14 @@ def test_resolver_uses_only_captured_product_url_sources(tmp_path, monkeypatch):
     )
 
     assert makro_resolve_ai.main() == 0
-    assert provider.calls == 2
-    assert all(request["task"] == "fill_marketplace_fields_from_exact_product_evidence" for request in provider.requests)
-    assert all(request["product_identity"] == {"source_product_url": PRODUCT_URL} for request in provider.requests)
-    assert all(sum(source["kind"] == "image" for source in request["grounded_sources"]) == 2 for request in provider.requests)
-    assert all(
-        any("6017876765651" in source.get("content", "") for source in request["grounded_sources"])
-        for request in provider.requests
-    )
+    assert provider.calls == 3
+    assert provider.requests[0]["task"] == "extract_independent_product_image_evidence"
+    fact_request = provider.requests[1]
+    assert fact_request["task"] == "resolve_compact_product_facts"
+    assert fact_request["product_identity"] == {"source_product_url": PRODUCT_URL}
+    assert sum(source["kind"] == "image" for source in fact_request["grounded_sources"]) == 0
+    assert {source["source_id"] for source in fact_request["grounded_sources"]} == {"compact:web", "compact:images"}
+    assert provider.requests[2]["task"] == "best_effort_infer_remaining_marketplace_fields"
     assert captured_config["config"].structured_mode == "json_object"
 
     run_dir = next(output.iterdir())
@@ -172,10 +201,11 @@ def test_resolver_uses_only_captured_product_url_sources(tmp_path, monkeypatch):
         "web-search-sources.json",
         "web-evidence.json",
         "source-manifest.json",
+        "image-observations.json",
+        "compact-evidence.json",
         "run-manifest.json",
     ):
         assert (run_dir / name).exists(), name
-    assert not (run_dir / "product-profile.json").exists()
 
     manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
     assert manifest["execution_model"] == makro_resolve_ai.EXECUTION_MODEL
@@ -187,10 +217,14 @@ def test_resolver_uses_only_captured_product_url_sources(tmp_path, monkeypatch):
     assert manifest["source_capture"]["product_image_urls"] == 1
     assert manifest["source_capture"]["product_images_downloaded"] == 1
     assert manifest["source_capture"]["source_cache_hit"] is True
-    assert manifest["local_fill"]["batch_count"] == 2
-    assert manifest["local_fill"]["model_calls"] == 2
+    assert manifest["product_facts"]["fact_count"] == 1
+    assert manifest["product_facts"]["model_calls"] == 1
+    assert manifest["image_evidence"]["model_calls"] == 1
+    assert manifest["compact_evidence"]["chars"] > 0
+    assert manifest["compact_evidence"]["image_fact_count"] == 1
     assert manifest["web_fill"]["searched"] is False
-    assert manifest["total_model_calls"] == 2
+    assert manifest["best_effort_inference"]["model_calls"] == 1
+    assert manifest["total_model_calls"] == 3
     assert manifest["writes_performed"] == 0
     assert manifest["save_clicked"] is False
     assert manifest["send_to_qc_clicked"] is False

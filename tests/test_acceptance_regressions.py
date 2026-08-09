@@ -4,7 +4,6 @@ import json
 
 from app.ai_decisions import MISSING, READY, AIDecisionPacket, FieldDecision, field_id, schema_digest, source_manifest_digest
 from app.evidence_contract import ProductIdentity
-from app.field_mapping import run_field_mapping
 from app.providers.dashscope_web_search import WebSearchJSONResult, WebSearchSource
 from app.semantic_grounding import GroundedSource, GroundingCatalog, TEXT_KIND, build_grounding_catalog
 from app.web_enrichment import run_web_enrichment
@@ -43,98 +42,6 @@ def _grounding() -> GroundingCatalog:
     )
 
 
-class RepairingProvider:
-    name = "repairing-provider"
-
-    def __init__(self):
-        self.calls = 0
-        self.requests = []
-
-    def extract_json(self, request):
-        self.calls += 1
-        self.requests.append(request)
-        first = request["target_fields"][0]["field_id"]
-        second = request["target_fields"][1]["field_id"]
-        if self.calls == 1:
-            return {
-                "ready": [
-                    {
-                        "field_id": first,
-                        "values": ["Black"],
-                        "qualifier": "",
-                        "confidence": 1.0,
-                        "citations": [
-                            {
-                                "source_reference": "supplier:001:text:0001:abc",
-                                "evidence_text": "Colour: Black",
-                            }
-                        ],
-                    }
-                ],
-                "conflicts": [],
-                "missing": [
-                    {"field_id": first, "search_queries": []},
-                    {"field_id": second, "search_queries": []},
-                ],
-                "model_summary": "duplicate first response",
-            }
-        return {
-            "ready": [
-                {
-                    "field_id": first,
-                    "values": ["Black"],
-                    "qualifier": "",
-                    "confidence": 1.0,
-                    "citations": [
-                        {
-                            "source_reference": "supplier:001:text:0001:abc",
-                            "evidence_text": "Colour: Black",
-                        }
-                    ],
-                }
-            ],
-            "conflicts": [],
-            "missing": [{"field_id": second, "search_queries": []}],
-            "model_summary": "repaired response",
-        }
-
-
-def test_duplicate_field_id_gets_one_structural_repair_and_then_caches(tmp_path):
-    fields = [_field("colour", "Colour"), _field("sensor", "Image Sensor")]
-    provider = RepairingProvider()
-    cache = tmp_path / "cache"
-
-    first = run_field_mapping(
-        provider,
-        fields,
-        _grounding(),
-        product_url=PRODUCT_URL,
-        batch_size=2,
-        concurrency=1,
-        cache_dir=cache,
-        cache_namespace="test",
-    )
-    second = run_field_mapping(
-        provider,
-        fields,
-        _grounding(),
-        product_url=PRODUCT_URL,
-        batch_size=2,
-        concurrency=1,
-        cache_dir=cache,
-        cache_namespace="test",
-    )
-
-    assert first.failed_batches == 0
-    assert first.model_calls == 2
-    assert first.packet.decisions[0].status == READY
-    assert first.packet.decisions[1].status == MISSING
-    assert "validation_error" in provider.requests[1]
-    assert second.model_calls == 0
-    assert second.cache_hits == 1
-    assert provider.calls == 2
-
-
 def test_structured_dimension_rows_are_atomic_evidence_units(tmp_path):
     snapshot = tmp_path / "supplier.json"
     snapshot.write_text(
@@ -169,7 +76,7 @@ def test_structured_dimension_rows_are_atomic_evidence_units(tmp_path):
     assert all(row.logical_source_id == "supplier:001" for row in rows)
 
 
-class UnsafeInferenceWebProvider:
+class SimilarProductWebProvider:
     name = "unsafe-inference-web"
     model = "qwen3.7-max"
 
@@ -188,9 +95,10 @@ class UnsafeInferenceWebProvider:
                 "source_matches": [
                     {
                         "source_url": url,
-                        "match": "same_product",
-                        "reason": "same product",
-                        "identity_evidence": [],
+                        "match": "similar_product",
+                        "identity_basis": "generic_model_or_similarity",
+                        "reason": "same product type and compatible design",
+                        "identity_evidence": ["same dash-camera form factor and vehicle compatibility"],
                     }
                 ],
                 "decisions": [
@@ -201,7 +109,7 @@ class UnsafeInferenceWebProvider:
                         "citations": [
                             {
                                 "source_url": url,
-                                "evidence_text": "No vehicle restriction was listed",
+                                "evidence_text": "Compatible vehicle model: Universal",
                             }
                         ],
                     }
@@ -212,7 +120,7 @@ class UnsafeInferenceWebProvider:
         )
 
 
-def test_same_product_without_identity_evidence_cannot_supply_field_value():
+def test_similar_product_can_supply_direct_field_value_without_exact_identity():
     target = _field("vehicle_model", "Vehicle Model")
     grounding = _grounding()
     initial = AIDecisionPacket(
@@ -223,7 +131,7 @@ def test_same_product_without_identity_evidence_cannot_supply_field_value():
         model_summary="local",
         extractor="local",
     )
-    provider = UnsafeInferenceWebProvider()
+    provider = SimilarProductWebProvider()
     result = run_web_enrichment(
         provider,
         initial,
@@ -232,6 +140,7 @@ def test_same_product_without_identity_evidence_cannot_supply_field_value():
         product_url=PRODUCT_URL,
     )
 
-    assert result.packet.decisions[0].status == MISSING
-    assert result.web_sources == []
-    assert "direct target-specific evidence" in provider.prompt
+    assert result.packet.decisions[0].status == READY
+    assert result.packet.decisions[0].values == ["Universal"]
+    assert len(result.web_sources) == 1
+    assert "real returned pages" in provider.prompt
