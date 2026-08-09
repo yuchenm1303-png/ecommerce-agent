@@ -4,8 +4,6 @@ from PySide6.QtCore import QObject, QTimer
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QMainWindow, QPlainTextEdit
 
-from .optimized_cursor_fx import install_optimized_cursor_fx
-
 
 _LOG_FLUSH_MS = 70
 _MAX_VISIBLE_LOG_BLOCKS = 4500
@@ -26,8 +24,6 @@ class BufferedLogPresenter(QObject):
         self.view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.view.document().setMaximumBlockCount(_MAX_VISIBLE_LOG_BLOCKS)
 
-        # Replace per-line appendPlainText + per-line scrollbar movement with a
-        # single document insertion every ~70 ms.
         try:
             self.runner.log.disconnect(window._append_log)  # type: ignore[attr-defined]
         except (RuntimeError, TypeError):
@@ -69,25 +65,24 @@ class BufferedLogPresenter(QObject):
 
 
 class GuiPerformanceController(QObject):
+    """Keep only non-visual performance tuning.
+
+    Animated effects are now merged into a single 60-fps overlay. Creating a
+    second cursor/sakura widget here would bring back the Windows composition
+    overhead that caused the previous jank and black surface.
+    """
+
     def __init__(self, window: QMainWindow, visual_fx) -> None:
         super().__init__(window)
         self.window = window
         self.visual_fx = visual_fx
 
-        # The legacy follower overlay repainted the whole application at 60 fps
-        # even after its petal count was set to zero. Keep its native white-dot
-        # cursor installation, but stop/hide that expensive paint layer.
         legacy_overlay = visual_fx.overlay
         legacy_overlay.timer.stop()
         legacy_overlay.hide()
 
-        self.cursor = install_optimized_cursor_fx(window)
         self.logs = BufferedLogPresenter(window)
-
         window.destroyed.connect(self._cleanup)
-
-    def raise_cursor(self) -> None:
-        self.cursor.raise_()
 
     def _cleanup(self) -> None:
         self.logs.flush()
