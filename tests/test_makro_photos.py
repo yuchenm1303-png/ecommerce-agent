@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.makro.photos import (
+    _stage_accepted,
     parse_completion_counter,
     upload_product_photos,
     verify_persisted_photo_count,
@@ -32,6 +33,51 @@ def test_photo_upload_with_no_explicit_files_is_a_noop():
     assert result.status == "skipped"
     assert result.attempted == 0
     assert result.staged == 0
+
+
+def test_file_input_files_alone_do_not_count_as_makro_acceptance():
+    state = {
+        "file_inputs": [{"files": 1}],
+        "visible_image_count": 0,
+        "visible_image_sources": [],
+        "completion_count": 0,
+    }
+    assert not _stage_accepted(
+        state,
+        before_images=0,
+        before_sources=set(),
+        before_completion=0,
+    )
+
+
+def test_new_preview_source_counts_as_makro_acceptance_even_if_img_count_is_same():
+    state = {
+        "file_inputs": [{"files": 1}],
+        "visible_image_count": 1,
+        "visible_image_sources": ["blob:new-product-photo"],
+        "completion_count": 0,
+    }
+    assert _stage_accepted(
+        state,
+        before_images=1,
+        before_sources={"/static/photo-placeholder.svg"},
+        before_completion=0,
+    )
+
+
+def test_counter_growth_counts_as_makro_acceptance():
+    state = {
+        "file_inputs": [{"files": 0}],
+        "visible_image_count": 0,
+        "visible_image_sources": [],
+        "completion_count": 1,
+    }
+    assert _stage_accepted(
+        state,
+        before_images=0,
+        before_sources=set(),
+        before_completion=0,
+    )
 
 
 class FakeWaitPage:
