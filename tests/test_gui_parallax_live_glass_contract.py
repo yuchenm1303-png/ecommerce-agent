@@ -56,12 +56,11 @@ def test_mouse_parallax_does_not_rebuild_blur_or_mask() -> None:
     assert "_blur_wallpaper" not in mouse
 
 
-def test_quick_background_is_a_child_not_a_second_desktop_window() -> None:
-    assert "self.quick_window.setParent(host_window)" in NATIVE
-    assert "Qt.WindowType.SubWindow" in NATIVE
+def test_quick_background_is_embedded_not_a_second_desktop_window() -> None:
+    assert "QWidget.createWindowContainer" in NATIVE
+    assert "self.quick_window.setParent(host_window)" not in NATIVE
     assert "Qt.WindowType.Tool" not in NATIVE
-    assert "_assert_same_native_parent" in NATIVE
-    assert "_place_child_behind" in NATIVE
+    assert "self.quick_container.stackUnder(self.content_layer)" in NATIVE
     assert "int(self.window.winId())" not in NATIVE
     assert "QEvent.Type.ZOrderChange" not in NATIVE
 
@@ -91,10 +90,9 @@ def test_legacy_qwidget_background_paint_is_suppressed_without_layout_rewrite() 
 def test_native_background_has_explicit_shutdown_contract() -> None:
     shutdown = NATIVE.split("def shutdown(self)", 1)[1]
     assert 'setProperty("animationRunning", False)' in shutdown
-    assert "quick.hide()" in shutdown
     assert "quick.releaseResources()" in shutdown
-    assert "quick.close()" in shutdown
-    assert "quick.deleteLater()" in shutdown
+    assert "self.quick_container.hide()" in shutdown
+    assert "self.quick_container.deleteLater()" in shutdown
     assert "self.engine.clearComponentCache()" in shutdown
     assert "self.engine.deleteLater()" in shutdown
     assert "self._temp.cleanup()" in shutdown
