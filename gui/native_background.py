@@ -18,41 +18,40 @@ _WALLPAPER_ASSET = Path(__file__).resolve().parent / "assets" / "fuji_sakura_wal
 _OVERSCAN = 1.06
 _TRAVEL = 0.90
 _GLASS_RADIUS = 6.0
-
-
-# Win32 SetWindowPos flags. The background window must stay immediately behind
-# the translucent QWidget top-level; otherwise unrelated application windows can
-# slip between the two native surfaces and become visible through the GUI.
 _SWP_NOSIZE = 0x0001
 _SWP_NOMOVE = 0x0002
 _SWP_NOACTIVATE = 0x0010
-_SWP_NOSENDCHANGING = 0x0400
 
 
-def _stack_native_window_behind(background_wid: int, foreground_wid: int) -> None:
-    if sys.platform != "win32" or not background_wid or not foreground_wid:
+def _place_child_behind(background_wid: int, content_wid: int) -> None:
+    """Keep the two child HWNDs adjacent inside one native application window."""
+
+    if sys.platform != "win32" or not background_wid or not content_wid:
         return
-
     user32 = ctypes.windll.user32
-    user32.SetWindowPos.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_uint,
-    ]
-    user32.SetWindowPos.restype = ctypes.c_int
     user32.SetWindowPos(
         ctypes.c_void_p(background_wid),
-        ctypes.c_void_p(foreground_wid),
+        ctypes.c_void_p(content_wid),
         0,
         0,
         0,
         0,
-        _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE | _SWP_NOSENDCHANGING,
+        _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE,
     )
+
+
+def _assert_same_native_parent(background_wid: int, content_wid: int) -> None:
+    if sys.platform != "win32" or not background_wid or not content_wid:
+        return
+    user32 = ctypes.windll.user32
+    user32.GetParent.argtypes = [ctypes.c_void_p]
+    user32.GetParent.restype = ctypes.c_void_p
+    background_parent = int(user32.GetParent(ctypes.c_void_p(background_wid)) or 0)
+    content_parent = int(user32.GetParent(ctypes.c_void_p(content_wid)) or 0)
+    if not background_parent or background_parent != content_parent:
+        raise RuntimeError(
+            "Quick background and QWidget content are not children of the same native host"
+        )
 
 
 def _decode_wallpaper() -> bytes:
@@ -123,7 +122,6 @@ Window {{
     readonly property real imageX: (width - width * {_OVERSCAN}) * 0.5 + offsetX
     readonly property real imageY: (height - height * {_OVERSCAN}) * 0.5 + offsetY
 
-    // Sharp wallpaper is the only full-window visible wallpaper layer.
     Image {{
         id: sharpImg
         width: root.width * {_OVERSCAN}
@@ -136,8 +134,6 @@ Window {{
         cache: true
     }}
 
-    // Hidden, root-sized texture source. Its child uses the exact same floating
-    // transform as sharpImg. The blur itself was generated once by Python.
     Item {{
         id: blurSource
         anchors.fill: parent
@@ -159,7 +155,6 @@ Window {{
         }}
     }}
 
-    // Global alpha mask generated from the live QWidget card geometry.
     Image {{
         id: maskImg
         anchors.fill: parent
@@ -169,9 +164,6 @@ Window {{
         asynchronous: false
     }}
 
-    // QtQuick.Effects owns its precompiled shaders internally. This is a
-    // mask-only pass over the already blurred texture: no runtime Gaussian blur,
-    // no inline GLSL, and no per-card ShaderEffectSource.
     MultiEffect {{
         anchors.fill: parent
         source: blurSource
@@ -201,28 +193,35 @@ Window {{
 
 
 class NativeQuickBackground(QObject):
-    """Native QQuickWindow scene-graph background underneath the QWidget GUI."""
+    """QQuick scene graph hosted as a native child below the QWidget content."""
 
-    def __init__(self, window: QMainWindow) -> None:
+    def __init__(
+        self,
+        window: QMainWindow,
+        *,
+        surface_host: QWidget,
+        content_layer: QWidget,
+    ) -> None:
         super().__init__(window)
         self.window = window
+        self.surface_host = surface_host
+        self.content_layer = content_layer
         self._shutting_down = False
         self._mask_pending = False
         self._mask_revision = 0
-        self._restack_pending = False
         self._temp = tempfile.TemporaryDirectory(prefix="ecommerce-agent-bg-")
         self._temp_dir = Path(self._temp.name)
         self._cards = [
             frame
-            for frame in window.findChildren(QFrame)
+            for frame in content_layer.findChildren(QFrame)
             if frame.objectName() in _GLASS_NAMES
         ]
-        self._geometry_watch: set[QObject] = {window}
+        self._geometry_watch: set[QObject] = {window, surface_host, content_layer}
         for frame in self._cards:
             current: QWidget | None = frame
             while current is not None:
                 self._geometry_watch.add(current)
-                if current is window:
+                if current is content_layer:
                     break
                 current = current.parentWidget()
 
@@ -235,15 +234,20 @@ class NativeQuickBackground(QObject):
         roots = self.engine.rootObjects()
         if not roots or not isinstance(roots[0], QQuickWindow):
             raise RuntimeError("Native QQuickWindow background failed to load")
+
         self.quick_window: QQuickWindow | None = roots[0]
-        flags = (
-            self.quick_window.flags()
+        surface_host.winId()
+        host_window = surface_host.windowHandle()
+        if host_window is None:
+            raise RuntimeError("Native client host has no QWindow handle")
+
+        self.quick_window.setParent(host_window)
+        self.quick_window.setFlags(
+            Qt.WindowType.SubWindow
             | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.Tool
             | Qt.WindowType.WindowTransparentForInput
             | Qt.WindowType.WindowDoesNotAcceptFocus
         )
-        self.quick_window.setFlags(flags)
         self.quick_window.setProperty("sharpUrl", QUrl.fromLocalFile(str(self._sharp_path)))
         self.quick_window.setProperty("blurUrl", QUrl.fromLocalFile(str(self._blur_path)))
         self.quick_window.setPersistentGraphics(False)
@@ -254,7 +258,7 @@ class NativeQuickBackground(QObject):
             app.installEventFilter(self)
             app.aboutToQuit.connect(self.shutdown)
 
-        for area in window.findChildren(QAbstractScrollArea):
+        for area in content_layer.findChildren(QAbstractScrollArea):
             area.verticalScrollBar().valueChanged.connect(self.schedule_mask_update)
             area.horizontalScrollBar().valueChanged.connect(self.schedule_mask_update)
 
@@ -276,54 +280,54 @@ class NativeQuickBackground(QObject):
 
     def _set_animation_target(self, point: QPointF | None) -> None:
         quick = self.quick_window
+        host = self.surface_host
         if quick is None:
             return
-        if point is None or self.window.width() <= 0 or self.window.height() <= 0:
+        if point is None or host.width() <= 0 or host.height() <= 0:
             nx = 0.0
             ny = 0.0
         else:
-            local = self.window.mapFromGlobal(point.toPoint())
-            if not self.window.rect().contains(local):
+            local = host.mapFromGlobal(point.toPoint())
+            if not host.rect().contains(local):
                 nx = 0.0
                 ny = 0.0
             else:
-                nx = max(-1.0, min(1.0, (local.x() / max(1.0, float(self.window.width())) - 0.5) * 2.0))
-                ny = max(-1.0, min(1.0, (local.y() / max(1.0, float(self.window.height())) - 0.5) * 2.0))
+                nx = max(-1.0, min(1.0, (local.x() / max(1.0, float(host.width())) - 0.5) * 2.0))
+                ny = max(-1.0, min(1.0, (local.y() / max(1.0, float(host.height())) - 0.5) * 2.0))
         quick.setProperty("pointerX", nx)
         quick.setProperty("pointerY", ny)
         quick.setProperty("animationRunning", True)
 
-    def _schedule_restack(self) -> None:
-        if self._shutting_down or self._restack_pending:
-            return
-        self._restack_pending = True
-        QTimer.singleShot(0, self._restack_behind_main)
-
-    def _restack_behind_main(self) -> None:
-        self._restack_pending = False
+    def _restack_children(self) -> None:
         quick = self.quick_window
         if self._shutting_down or quick is None or not quick.isVisible():
             return
-        _stack_native_window_behind(int(quick.winId()), int(self.window.winId()))
+        background_wid = int(quick.winId())
+        content_wid = int(self.content_layer.winId())
+        _assert_same_native_parent(background_wid, content_wid)
+        _place_child_behind(background_wid, content_wid)
+        self.content_layer.raise_()
 
     def _sync_window(self) -> None:
         quick = self.quick_window
         if self._shutting_down or quick is None:
             return
-        frame = self.window.frameGeometry()
-        quick.setPosition(frame.topLeft())
-        quick.resize(frame.size())
-        if self.window.isVisible() and not self.window.isMinimized():
+
+        host = self.surface_host
+        quick.setPosition(QPoint(0, 0))
+        quick.resize(host.size())
+
+        if self.window.isVisible() and host.isVisible() and not self.window.isMinimized():
             if not quick.isVisible():
                 quick.show()
             quick.setProperty("animationRunning", True)
-            self._schedule_restack()
+            QTimer.singleShot(0, self._restack_children)
         else:
             quick.setProperty("animationRunning", False)
             quick.hide()
 
     def _card_path(self, frame: QFrame, origin: QPoint) -> QPainterPath | None:
-        if not frame.isVisibleTo(self.window) or frame.width() <= 0 or frame.height() <= 0:
+        if not frame.isVisibleTo(self.content_layer) or frame.width() <= 0 or frame.height() <= 0:
             return None
 
         top_left = frame.mapToGlobal(QPoint(0, 0)) - origin
@@ -333,7 +337,7 @@ class NativeQuickBackground(QObject):
 
         ancestor = frame.parentWidget()
         while ancestor is not None:
-            if not ancestor.isVisibleTo(self.window):
+            if not ancestor.isVisibleTo(self.content_layer):
                 return None
             ancestor_top_left = ancestor.mapToGlobal(QPoint(0, 0)) - origin
             clip_rect = QRectF(
@@ -345,7 +349,7 @@ class NativeQuickBackground(QObject):
             clip_path = QPainterPath()
             clip_path.addRect(clip_rect)
             path = path.intersected(clip_path)
-            if path.isEmpty() or ancestor is self.window:
+            if path.isEmpty() or ancestor is self.content_layer:
                 break
             ancestor = ancestor.parentWidget()
         return None if path.isEmpty() else path
@@ -361,6 +365,7 @@ class NativeQuickBackground(QObject):
         quick = self.quick_window
         if self._shutting_down or quick is None:
             return
+
         width = max(1, int(quick.width()))
         height = max(1, int(quick.height()))
         image = QImage(width, height, QImage.Format.Format_ARGB32)
@@ -369,7 +374,7 @@ class NativeQuickBackground(QObject):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(255, 255, 255, 255))
-        origin = quick.position()
+        origin = self.surface_host.mapToGlobal(QPoint(0, 0))
         for frame in self._cards:
             path = self._card_path(frame, origin)
             if path is not None:
@@ -382,45 +387,13 @@ class NativeQuickBackground(QObject):
             raise RuntimeError("Failed to update the global glass mask")
         quick.setProperty("maskUrl", QUrl.fromLocalFile(str(mask_path)))
 
-    def _resize_edges(self, global_point: QPointF) -> Qt.Edge:
-        local = self.window.mapFromGlobal(global_point.toPoint())
-        margin = 6
-        edges = Qt.Edge(0)
-        if local.x() <= margin:
-            edges |= Qt.Edge.LeftEdge
-        elif local.x() >= self.window.width() - margin:
-            edges |= Qt.Edge.RightEdge
-        if local.y() <= margin:
-            edges |= Qt.Edge.TopEdge
-        elif local.y() >= self.window.height() - margin:
-            edges |= Qt.Edge.BottomEdge
-        return edges
-
-    def _is_drag_surface(self, watched: QObject) -> bool:
-        if not isinstance(watched, QWidget):
-            return False
-        return watched.objectName() in {"brandMark", "appTitle", "subtle"}
-
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
 
         if watched is self.window:
-            if event_type in {
-                QEvent.Type.Move,
-                QEvent.Type.Resize,
-                QEvent.Type.Show,
-                QEvent.Type.WindowStateChange,
-            }:
+            if event_type in {QEvent.Type.Show, QEvent.Type.WindowStateChange}:
                 self._sync_window()
                 self.schedule_mask_update()
-            if event_type in {
-                QEvent.Type.Show,
-                QEvent.Type.WindowActivate,
-                QEvent.Type.ActivationChange,
-                QEvent.Type.ZOrderChange,
-                QEvent.Type.WindowStateChange,
-            }:
-                self._schedule_restack()
             elif event_type == QEvent.Type.Hide:
                 quick = self.quick_window
                 if quick is not None:
@@ -428,8 +401,14 @@ class NativeQuickBackground(QObject):
                     quick.hide()
             elif event_type == QEvent.Type.Close:
                 self.shutdown()
-            elif event_type == QEvent.Type.Leave:
-                self._set_animation_target(None)
+
+        if watched is self.surface_host and event_type in {
+            QEvent.Type.Resize,
+            QEvent.Type.Show,
+            QEvent.Type.LayoutRequest,
+        }:
+            self._sync_window()
+            self.schedule_mask_update()
 
         if watched in self._geometry_watch and event_type in {
             QEvent.Type.Move,
@@ -441,22 +420,10 @@ class NativeQuickBackground(QObject):
         }:
             self.schedule_mask_update()
 
-        if isinstance(event, QMouseEvent):
-            if event_type == QEvent.Type.MouseMove:
-                self._set_animation_target(event.globalPosition())
-            elif event_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
-                edges = self._resize_edges(event.globalPosition())
-                handle = self.window.windowHandle()
-                if edges and handle is not None and handle.startSystemResize(edges):
-                    return True
-                if self._is_drag_surface(watched) and handle is not None and handle.startSystemMove():
-                    return True
-            elif event_type == QEvent.Type.MouseButtonDblClick and self._is_drag_surface(watched):
-                if self.window.isMaximized():
-                    self.window.showNormal()
-                else:
-                    self.window.showMaximized()
-                return True
+        if isinstance(event, QMouseEvent) and event_type == QEvent.Type.MouseMove:
+            self._set_animation_target(event.globalPosition())
+        elif watched is self.content_layer and event_type == QEvent.Type.Leave:
+            self._set_animation_target(None)
 
         return False
 
