@@ -32,6 +32,9 @@ def field(
     section: str = "Product Description",
     options: tuple[str, ...] = (),
     multi_value: bool = False,
+    qualifier_options: tuple[str, ...] = (),
+    context_text: str = "",
+    controls=(),
 ):
     return {
         "attribute_key": key,
@@ -40,7 +43,9 @@ def field(
         "required": required,
         "multi_value": multi_value,
         "options": [{"text": item, "value": item} for item in options],
-        "controls": [],
+        "qualifier_options": list(qualifier_options),
+        "context_text": context_text,
+        "controls": list(controls),
     }
 
 
@@ -54,7 +59,7 @@ def packet(fields, decisions):
     )
 
 
-def decision(target, status, values=(), *, evidence="visible proof", confidence=0.9):
+def decision(target, status, values=(), *, evidence="visible proof", confidence=0.9, qualifier=""):
     citations = []
     if evidence:
         citations = [
@@ -67,6 +72,7 @@ def decision(target, status, values=(), *, evidence="visible proof", confidence=
         field_id=field_id(target),
         status=status,
         values=list(values),
+        qualifier=qualifier,
         confidence=confidence,
         citations=citations,
         reason="AI semantic decision",
@@ -158,6 +164,36 @@ def test_single_value_field_rejects_multiple_ai_values_before_browser_write():
         ProductSourceBundle(),
     )
 
+    assert plan.items[0].action == BLOCKED
+    assert plan.items[0].resolution.gate_reason == GATE_HARD_FIELD_CONSTRAINT
+
+
+def test_fixed_rendered_unit_does_not_require_a_qualifier_control():
+    length = field(
+        "package_length",
+        "Length",
+        section="Price, Stock and Shipping Information",
+        context_text="Length cm",
+        controls=({"type": "number", "inputmode": "decimal", "context_text": "Length cm"},),
+    )
+    plan = build_live_fill_plan(
+        packet([length], [decision(length, AI_READY, ("16",), qualifier="cm")]),
+        [length],
+        ProductSourceBundle(),
+    )
+    item = plan.items[0]
+    assert item.action == READY
+    assert item.resolution.answer_values == ["16"]
+    assert item.resolution.qualifier is None
+
+
+def test_unknown_unit_without_control_or_fixed_context_is_blocked():
+    length = field("package_length", "Length")
+    plan = build_live_fill_plan(
+        packet([length], [decision(length, AI_READY, ("16",), qualifier="cm")]),
+        [length],
+        ProductSourceBundle(),
+    )
     assert plan.items[0].action == BLOCKED
     assert plan.items[0].resolution.gate_reason == GATE_HARD_FIELD_CONSTRAINT
 
