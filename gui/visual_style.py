@@ -420,20 +420,62 @@ class BackgroundLayer(QWidget):
 
 
 class GlassBackdrop(QWidget):
+    """Cached glass surface; interaction animation repaints this widget only."""
+
     def __init__(self, frame: QFrame, background: BackgroundLayer) -> None:
         super().__init__(frame)
         self.frame = frame
         self.background = background
+        self._surface_cache = QPixmap()
+        self._surface_scale = 1.0
+        self._overlay_alpha = 64.0
+
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setFocusPolicy(Qt.NoFocus)
-        self.background.scene_changed.connect(self.update)
+        self.background.scene_changed.connect(self.refresh_cache)
         self.sync_geometry()
+
+    @property
+    def surface_scale(self) -> float:
+        return self._surface_scale
+
+    @property
+    def overlay_alpha(self) -> float:
+        return self._overlay_alpha
+
+    def set_interaction(self, *, scale: float, overlay_alpha: float) -> None:
+        scale = max(0.94, min(1.0, float(scale)))
+        overlay_alpha = max(0.0, min(255.0, float(overlay_alpha)))
+        if (
+            abs(scale - self._surface_scale) < 0.0001
+            and abs(overlay_alpha - self._overlay_alpha) < 0.1
+        ):
+            return
+        self._surface_scale = scale
+        self._overlay_alpha = overlay_alpha
+        self.update()
 
     def sync_geometry(self) -> None:
         self.setGeometry(self.frame.rect())
         self.lower()
         self.show()
+        self.refresh_cache()
+
+    def refresh_cache(self) -> None:
+        scene = self.background.blurred_scene()
+        if scene.isNull() or self.width() <= 0 or self.height() <= 0:
+            self._surface_cache = QPixmap()
+            self.update()
+            return
+
+        top_left = self.frame.mapTo(self.background, QPoint(0, 0))
+        self._surface_cache = scene.copy(
+            int(top_left.x()),
+            int(top_left.y()),
+            int(self.width()),
+            int(self.height()),
+        )
         self.update()
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
@@ -442,25 +484,20 @@ class GlassBackdrop(QWidget):
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
 
+        rect = QRectF(self.rect())
+        if self._surface_scale < 0.9999:
+            inset_x = rect.width() * (1.0 - self._surface_scale) * 0.5
+            inset_y = rect.height() * (1.0 - self._surface_scale) * 0.5
+            rect.adjust(inset_x, inset_y, -inset_x, -inset_y)
+
         path = QPainterPath()
-        path.addRoundedRect(QRectF(self.rect()), 6.0, 6.0)
+        path.addRoundedRect(rect, 6.0, 6.0)
         painter.setClipPath(path)
 
-        scene = self.background.blurred_scene()
-        if not scene.isNull():
-            top_left = self.frame.mapTo(self.background, QPoint(0, 0))
-            painter.drawPixmap(
-                QRectF(self.rect()),
-                scene,
-                QRectF(
-                    float(top_left.x()),
-                    float(top_left.y()),
-                    float(self.width()),
-                    float(self.height()),
-                ),
-            )
+        if not self._surface_cache.isNull():
+            painter.drawPixmap(rect, self._surface_cache, QRectF(self._surface_cache.rect()))
 
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 64))
+        painter.fillRect(rect, QColor(0, 0, 0, int(round(self._overlay_alpha))))
         painter.end()
 
 
@@ -486,6 +523,9 @@ class VisualStyleController(QObject):
             app.installEventFilter(self)
         window.destroyed.connect(self._cleanup)
         QTimer.singleShot(0, self._sync_all)
+
+    def surface_for(self, frame: QFrame) -> GlassBackdrop | None:
+        return self._glass.get(frame)
 
     def _install_cursor(self) -> None:
         pixmap = QPixmap(10, 10)
