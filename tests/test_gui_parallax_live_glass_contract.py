@@ -53,3 +53,12 @@ def test_glass_mask_rebuild_is_geometry_driven_not_motion_driven() -> None:
     assert "self.background.set_glass_mask(image)" in controller
     background = SOURCE.split("class BackgroundLayer", 1)[1].split("class GlassBackdrop", 1)[0]
     assert "_schedule_mask_rebuild" not in background
+
+
+def test_gpu_glass_mask_preserves_widget_ancestor_clipping() -> None:
+    controller = SOURCE.split("class VisualStyleController", 1)[1]
+    rebuild = controller.split("def _rebuild_mask(self)", 1)[1].split("def eventFilter", 1)[0]
+    assert "ancestor = frame.parentWidget()" in rebuild
+    assert "ancestor.mapTo(central" in rebuild
+    assert "visible_clip = visible_clip.intersected(ancestor_rect)" in rebuild
+    assert "painter.setClipRect(visible_clip)" in rebuild
