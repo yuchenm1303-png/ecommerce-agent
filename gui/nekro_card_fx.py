@@ -3,35 +3,29 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QTimer
+from PySide6.QtCore import QEvent, QObject, QRect, QTimer
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication, QFrame, QMainWindow, QWidget
 
 
 # Direct behavioral port of the captured nekro.top / imsyy-home .cards states:
+#   scale(1) -> hover scale(1.01) -> active scale(.98), transition .3s.
 #
-# .cards {
-#   transform: scale(1);
-#   transition: backdrop-filter .3s, transform .3s;
-# }
-# .cards:hover  { transform: scale(1.01); }
-# .cards:active { transform: scale(.98); }
-#
-# Qt Style Sheets do not implement CSS transforms, so this controller applies
-# the same scale states to the actual QWidget geometry without changing any
-# ecommerce-agent business or result logic.
+# Performance note: unlike the previous implementation, there is no permanent
+# 16 ms timer and no full scan of every card on each mouse move. The timer runs
+# only while one of the short 0.3 s transitions is actually active.
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
 _NORMAL_SCALE = 1.0
 _HOVER_SCALE = 1.01
 _ACTIVE_SCALE = 0.98
 _TRANSITION_SECONDS = 0.300
+_FRAME_MS = 16
 
 
 def _css_ease(progress: float) -> float:
-    """Approximate CSS's default `ease` cubic-bezier(.25,.1,.25,1)."""
+    """Approximate CSS default ease cubic-bezier(.25,.1,.25,1)."""
 
-    # Solve x(t)=progress for the CSS cubic Bezier, then return y(t).
     p = min(1.0, max(0.0, progress))
     x1, y1, x2, y2 = 0.25, 0.10, 0.25, 1.00
 
@@ -40,7 +34,7 @@ def _css_ease(progress: float) -> float:
         return 3.0 * omt * omt * t * a + 3.0 * omt * t * t * b + t * t * t
 
     lo, hi = 0.0, 1.0
-    for _ in range(12):
+    for _ in range(10):
         mid = (lo + hi) * 0.5
         if cubic(mid, x1, x2) < p:
             lo = mid
@@ -50,7 +44,7 @@ def _css_ease(progress: float) -> float:
 
 
 def _scaled_rect(rect: QRect, scale: float) -> QRect:
-    if scale == 1.0:
+    if abs(scale - 1.0) < 0.0001:
         return QRect(rect)
     center = rect.center()
     width = max(1, round(rect.width() * scale))
@@ -70,19 +64,23 @@ class _CardState:
     started_at: float = 0.0
     animating: bool = False
 
-    def begin(self, target: float) -> None:
+    def begin(self, target: float) -> bool:
+        if abs(target - self.target_scale) < 0.0001 and self.animating:
+            return False
         if abs(target - self.current_scale) < 0.0001:
+            self.current_scale = target
             self.target_scale = target
             self.animating = False
-            return
+            return False
         self.start_scale = self.current_scale
         self.target_scale = target
         self.started_at = time.monotonic()
         self.animating = True
+        return True
 
 
 class NekroCardInteractionController(QObject):
-    """Apply the source site's exact card hover/active scale semantics."""
+    """Source card interactions with idle-zero animation work."""
 
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
@@ -90,15 +88,12 @@ class NekroCardInteractionController(QObject):
         self.states: dict[QFrame, _CardState] = {}
         self.hovered: QFrame | None = None
         self.pressed: QFrame | None = None
-        self._internal_geometry_write = False
+        self._capture_scheduled = False
 
         for frame in window.findChildren(QFrame):
             if frame.objectName() in _GLASS_NAMES:
                 self.states[frame] = _CardState(frame=frame, base_geometry=QRect(frame.geometry()))
 
-        # MouseMove is disabled by default on many QWidget subclasses. The web
-        # source receives pointer movement continuously, so enable equivalent
-        # tracking throughout the GUI presentation tree.
         window.setMouseTracking(True)
         for widget in window.findChildren(QWidget):
             widget.setMouseTracking(True)
@@ -108,115 +103,121 @@ class NekroCardInteractionController(QObject):
             app.installEventFilter(self)
 
         self.timer = QTimer(self)
-        self.timer.setInterval(16)
+        self.timer.setInterval(_FRAME_MS)
         self.timer.timeout.connect(self._tick)
-        self.timer.start()
+        # Deliberately not started here.
 
         window.destroyed.connect(self._cleanup)
+        self._schedule_capture()
+
+    def _schedule_capture(self) -> None:
+        if self._capture_scheduled:
+            return
+        self._capture_scheduled = True
         QTimer.singleShot(0, self._capture_layout_geometries)
 
     def _capture_layout_geometries(self) -> None:
-        if self.hovered is not None or self.pressed is not None:
+        self._capture_scheduled = False
+        if self.hovered is not None or self.pressed is not None or self.timer.isActive():
             return
         for frame, state in self.states.items():
-            if frame.isVisible():
-                state.base_geometry = QRect(frame.geometry())
-                state.current_scale = 1.0
-                state.start_scale = 1.0
-                state.target_scale = 1.0
-                state.animating = False
+            if not frame.isVisible():
+                continue
+            state.base_geometry = QRect(frame.geometry())
+            state.current_scale = 1.0
+            state.start_scale = 1.0
+            state.target_scale = 1.0
+            state.animating = False
 
-    def _global_rect(self, frame: QFrame) -> QRect:
-        top_left = frame.mapToGlobal(QPoint(0, 0))
-        return QRect(top_left, frame.size())
+    def _card_from_widget(self, watched: QObject) -> QFrame | None:
+        widget = watched if isinstance(watched, QWidget) else None
+        while widget is not None:
+            if isinstance(widget, QFrame) and widget in self.states:
+                return widget
+            widget = widget.parentWidget()
+        return None
 
-    def _card_at(self, global_point: QPoint) -> QFrame | None:
-        matches: list[QFrame] = []
-        for frame in self.states:
-            if frame.isVisible() and self._global_rect(frame).contains(global_point):
-                matches.append(frame)
-        if not matches:
-            return None
-        # If cards ever nest, the smallest visible surface is the user's target.
-        return min(matches, key=lambda frame: frame.width() * frame.height())
+    def _ensure_timer(self) -> None:
+        if any(state.animating for state in self.states.values()) and not self.timer.isActive():
+            self.timer.start()
 
     def _set_hovered(self, frame: QFrame | None) -> None:
         if frame is self.hovered:
             return
-
         previous = self.hovered
         self.hovered = frame
 
-        if previous is not None and previous in self.states and previous is not self.pressed:
+        if previous is not None and previous is not self.pressed:
             self.states[previous].begin(_NORMAL_SCALE)
 
-        if frame is not None and frame in self.states:
+        if frame is not None:
             state = self.states[frame]
-            # Capture the layout-owned rectangle only when entering from normal
-            # state. This prevents the 1.01 geometry from becoming the new base.
             if abs(state.current_scale - 1.0) < 0.0001 and not state.animating:
                 state.base_geometry = QRect(frame.geometry())
             if frame is not self.pressed:
                 state.begin(_HOVER_SCALE)
+        self._ensure_timer()
 
     def _press(self, frame: QFrame | None) -> None:
         self.pressed = frame
-        if frame is not None and frame in self.states:
+        if frame is not None:
             self.states[frame].begin(_ACTIVE_SCALE)
+            self._ensure_timer()
 
-    def _release(self, global_point: QPoint) -> None:
+    def _release(self, frame_under_pointer: QFrame | None) -> None:
         pressed = self.pressed
         self.pressed = None
-        under_pointer = self._card_at(global_point)
-        self._set_hovered(under_pointer)
-        if pressed is not None and pressed in self.states:
-            self.states[pressed].begin(_HOVER_SCALE if pressed is under_pointer else _NORMAL_SCALE)
+        self._set_hovered(frame_under_pointer)
+        if pressed is not None:
+            self.states[pressed].begin(
+                _HOVER_SCALE if pressed is frame_under_pointer else _NORMAL_SCALE
+            )
+            self._ensure_timer()
 
     def _tick(self) -> None:
         now = time.monotonic()
-        any_animating = False
-        self._internal_geometry_write = True
-        try:
-            for state in self.states.values():
-                if state.animating:
-                    raw = (now - state.started_at) / _TRANSITION_SECONDS
-                    if raw >= 1.0:
-                        state.current_scale = state.target_scale
-                        state.animating = False
-                    else:
-                        eased = _css_ease(raw)
-                        state.current_scale = state.start_scale + (
-                            state.target_scale - state.start_scale
-                        ) * eased
-                        any_animating = True
+        still_animating = False
 
-                desired = _scaled_rect(state.base_geometry, state.current_scale)
-                if state.frame.geometry() != desired:
-                    state.frame.setGeometry(desired)
-        finally:
-            self._internal_geometry_write = False
+        for state in self.states.values():
+            if not state.animating:
+                continue
 
-        # Keep exact base rectangles after everything returns to scale(1).
-        if not any_animating and self.hovered is None and self.pressed is None:
-            QTimer.singleShot(0, self._capture_layout_geometries)
+            raw = (now - state.started_at) / _TRANSITION_SECONDS
+            if raw >= 1.0:
+                state.current_scale = state.target_scale
+                state.animating = False
+            else:
+                eased = _css_ease(raw)
+                state.current_scale = state.start_scale + (
+                    state.target_scale - state.start_scale
+                ) * eased
+                still_animating = True
+
+            desired = _scaled_rect(state.base_geometry, state.current_scale)
+            if state.frame.geometry() != desired:
+                state.frame.setGeometry(desired)
+
+        if not still_animating and not any(state.animating for state in self.states.values()):
+            self.timer.stop()
+            if self.hovered is None and self.pressed is None:
+                self._schedule_capture()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
 
         if watched is self.window and event_type in (QEvent.Resize, QEvent.Show):
-            if self.hovered is None and self.pressed is None:
-                QTimer.singleShot(0, self._capture_layout_geometries)
+            if self.hovered is None and self.pressed is None and not self.timer.isActive():
+                self._schedule_capture()
 
         if isinstance(event, QMouseEvent):
-            global_point = event.globalPosition().toPoint()
+            frame = self._card_from_widget(watched)
             if event_type == QEvent.MouseMove:
-                self._set_hovered(self._card_at(global_point))
+                self._set_hovered(frame)
             elif event_type == QEvent.MouseButtonPress:
-                frame = self._card_at(global_point)
                 self._set_hovered(frame)
                 self._press(frame)
             elif event_type == QEvent.MouseButtonRelease:
-                self._release(global_point)
+                self._release(frame)
 
         if watched is self.window and event_type == QEvent.Leave:
             self.pressed = None
@@ -229,13 +230,6 @@ class NekroCardInteractionController(QObject):
         if app is not None:
             app.removeEventFilter(self)
         self.timer.stop()
-        self._internal_geometry_write = True
-        try:
-            for state in self.states.values():
-                if state.frame:
-                    state.frame.setGeometry(state.base_geometry)
-        finally:
-            self._internal_geometry_write = False
 
 
 def install_nekro_card_fx(window: QMainWindow) -> NekroCardInteractionController:
