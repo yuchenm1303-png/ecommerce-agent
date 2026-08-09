@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.ai_decisions import BUSINESS_LOCKED, MISSING, READY
+from app.ai_decisions import BUSINESS_LOCKED, CONFLICT, MISSING, READY
 from app.evidence_contract import ProductIdentity
 from app.field_mapping import build_field_mapping_request, run_field_mapping
 from app.semantic_grounding import GroundedSource, GroundingCatalog, IMAGE_KIND, TEXT_KIND
@@ -57,11 +57,12 @@ class FakeMapProvider:
         if self.fail_call == self.calls:
             raise RuntimeError("batch failed")
         return {
-            "decisions": [
+            "ready": [
                 {
                     "field_id": target["field_id"],
-                    "status": "ready",
                     "values": ["known"],
+                    "qualifier": "",
+                    "confidence": 0.95,
                     "citations": [
                         {
                             "source_reference": "supplier:001:text:0001:abc",
@@ -70,7 +71,10 @@ class FakeMapProvider:
                     ],
                 }
                 for target in request["target_fields"]
-            ]
+            ],
+            "conflicts": [],
+            "missing": [],
+            "model_summary": "",
         }
 
 
@@ -107,6 +111,11 @@ def test_mapping_request_is_direct_and_contains_no_intermediate_profile():
     target = request["target_fields"][0]
     assert request["task"] == "fill_marketplace_fields_from_exact_product_evidence"
     assert request["product_identity"]["source_product_url"].startswith("https://detail.1688.com/")
+    assert request["strict_json_schema"] is True
+    assert set(request["json_contract"]["properties"]) == {"ready", "conflicts", "missing", "model_summary"}
+    missing_properties = request["json_contract"]["properties"]["missing"]["items"]["properties"]
+    assert set(missing_properties) == {"field_id", "search_queries"}
+    assert "reason" not in missing_properties
     assert "target_scope" not in target
     assert any(source["source_type"] == "supplier_web" for source in request["grounded_sources"])
     assert all(source["source_type"] != "derived_product_profile" for source in request["grounded_sources"])
@@ -118,11 +127,12 @@ def test_mapping_preserves_ai_semantic_ready_when_citation_is_grounded():
             self.calls += 1
             target = request["target_fields"][0]
             return {
-                "decisions": [
+                "ready": [
                     {
                         "field_id": target["field_id"],
-                        "status": "ready",
                         "values": ["No"],
+                        "qualifier": "",
+                        "confidence": 0.9,
                         "citations": [
                             {
                                 "source_reference": "supplier:001:text:0001:abc",
@@ -130,7 +140,10 @@ def test_mapping_preserves_ai_semantic_ready_when_citation_is_grounded():
                             }
                         ],
                     }
-                ]
+                ],
+                "conflicts": [],
+                "missing": [],
+                "model_summary": "",
             }
 
     target = field(1)
@@ -142,6 +155,50 @@ def test_mapping_preserves_ai_semantic_ready_when_citation_is_grounded():
         expected_identity=ProductIdentity(sku="SKU-1"),
     )
     assert result.packet.decisions[0].status == READY
+
+
+def test_mapping_typed_conflict_cannot_fall_back_to_missing_reason():
+    class ConflictProvider(FakeMapProvider):
+        def extract_json(self, request):
+            target = request["target_fields"][0]
+            return {
+                "ready": [],
+                "conflicts": [
+                    {
+                        "field_id": target["field_id"],
+                        "confidence": 0.9,
+                        "alternatives": [
+                            {
+                                "values": ["720p"],
+                                "qualifier": "",
+                                "citations": [
+                                    {
+                                        "source_reference": "supplier:001:text:0001:abc",
+                                        "evidence_text": "720p",
+                                    }
+                                ],
+                            },
+                            {
+                                "values": ["1080p"],
+                                "qualifier": "",
+                                "citations": [
+                                    {
+                                        "source_reference": "image:001:def",
+                                        "evidence_text": "1080p",
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                ],
+                "missing": [],
+                "model_summary": "",
+            }
+
+    target = field(1)
+    result = run_field_mapping(ConflictProvider(), [target], grounding())
+    assert result.packet.decisions[0].status == CONFLICT
+    assert [alt.values[0] for alt in result.packet.decisions[0].alternatives] == ["720p", "1080p"]
 
 
 def test_mapping_batch_failure_only_leaves_that_batch_unresolved():
