@@ -275,7 +275,8 @@ def _load_wallpaper() -> QPixmap:
     pixmap = QPixmap()
     try:
         encoded = _WALLPAPER_ASSET.read_text(encoding="ascii")
-        data = base64.b64decode(encoded, validate=True)
+        compact = "".join(encoded.split())
+        data = base64.b64decode(compact, validate=True)
     except (OSError, ValueError):
         return pixmap
 
