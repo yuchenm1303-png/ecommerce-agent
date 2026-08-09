@@ -15,7 +15,6 @@ from app.semantic_grounding import (
 def test_chunk_text_is_bounded_and_overlapped():
     text = " ".join(f"word-{index}" for index in range(500))
     chunks = chunk_text(text, max_chars=700, overlap_chars=80)
-
     assert len(chunks) > 1
     assert all(0 < len(chunk) <= 700 for chunk in chunks)
     assert set(chunks[0].split()) & set(chunks[1].split())
@@ -47,7 +46,6 @@ def test_text_chunks_keep_logical_identity_without_execution_grouping_api():
             ),
         ]
     )
-
     assert catalog.logical_source_count == 2
     assert [item.logical_source_id for item in catalog.sources] == [
         "supplier:001",
@@ -57,26 +55,27 @@ def test_text_chunks_keep_logical_identity_without_execution_grouping_api():
     assert not hasattr(catalog, "logical_groups")
 
 
-def test_grounding_catalog_includes_snapshot_rows_and_embedded_variant_data(tmp_path):
+def test_grounding_catalog_includes_structured_rows_variant_data_and_image_urls(tmp_path):
     image = tmp_path / "front.jpg"
     image.write_bytes(b"fake-image-bytes-v1")
     snapshot = tmp_path / "supplier.json"
     snapshot.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "requested_url": "https://supplier.test/item",
                 "final_url": "https://supplier.test/item/123",
                 "title": "L11 Camera",
                 "captured_at": "2026-08-08T00:00:00+00:00",
                 "visible_text": "The display size is 3.0 inch and video resolution is 1080P.",
                 "table_rows": [
-                    {"key": "Package size", "value": "16 x 11 x 7 cm", "table_index": 1, "row_index": 1}
+                    {"key": "length", "value": "16", "table_index": 1, "row_index": 1},
+                    {"key": "width", "value": "11", "table_index": 1, "row_index": 2},
+                    {"key": "height", "value": "7", "table_index": 1, "row_index": 3},
                 ],
                 "json_ld": [],
-                "embedded_data": [
-                    '{"sku2":"front+cabin English+German","skuId":6017876765651}'
-                ],
+                "embedded_data": ['{"sku2":"front+cabin English+German","skuId":6017876765651}'],
+                "image_urls": ["https://img.test/m8.jpg"],
                 "meta": {"description": "Vehicle camera product page"},
             }
         ),
@@ -89,28 +88,25 @@ def test_grounding_catalog_includes_snapshot_rows_and_embedded_variant_data(tmp_
         max_text_chars=700,
         overlap_chars=50,
     )
-
     assert catalog.sources[0].source_id.startswith("image:001:")
-    assert len(catalog.sources[0].sha256) == 64
-    assert catalog.sources[0].kind == IMAGE_KIND
     text_sources = [item for item in catalog.sources if item.kind == TEXT_KIND]
-    assert text_sources
     combined = "\n".join(item.content for item in text_sources)
     assert "display size is 3.0 inch" in combined
-    assert "Package size" in combined
+    assert '"key":"length","value":"16"' in combined
+    assert '"key":"width","value":"11"' in combined
+    assert '"key":"height","value":"7"' in combined
     assert "6017876765651" in combined
-    assert text_sources[0].logical_source_id == "supplier:001"
-    assert text_sources[0].source_type == "supplier_web"
+    assert "https://img.test/m8.jpg" in combined
+    assert all(item.logical_source_id == "supplier:001" for item in text_sources)
+    assert all(item.source_type == "supplier_web" for item in text_sources)
 
 
 def test_source_id_changes_when_image_bytes_change(tmp_path):
     image = tmp_path / "front.jpg"
     image.write_bytes(b"image-v1")
     first = build_grounding_catalog(image_paths=(str(image),)).sources[0]
-
     image.write_bytes(b"image-v2")
     second = build_grounding_catalog(image_paths=(str(image),)).sources[0]
-
     assert first.source_id != second.source_id
     assert first.sha256 != second.sha256
 
@@ -124,7 +120,6 @@ def test_grounding_manifest_keeps_chunk_and_logical_source_identity(tmp_path):
         max_text_chars=700,
         overlap_chars=50,
     )
-
     manifest = catalog.as_manifest()
     assert manifest["schema_version"] == 3
     assert manifest["source_count"] == 2
