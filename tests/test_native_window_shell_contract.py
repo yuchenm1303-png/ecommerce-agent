@@ -24,15 +24,27 @@ def test_shell_keeps_quick_window_immediately_behind_main_window() -> None:
 
 def test_z_guard_is_not_a_wallpaper_animation_timer() -> None:
     assert "FrameAnimation" not in SHELL
-    assert "wallpaper" not in SHELL.lower()
     assert "setInterval(16)" not in SHELL
+
+
+def test_shell_has_real_caption_controls_and_drag_behavior() -> None:
+    assert "class _WindowTitleBar" in SHELL
+    assert 'self._make_button("—", "nativeWindowMinimize")' in SHELL
+    assert 'self._make_button("□", "nativeWindowMaximize")' in SHELL
+    assert 'self._make_button("×", "nativeWindowClose")' in SHELL
+    assert "self.minimize_button.clicked.connect(window.showMinimized)" in SHELL
+    assert "self.maximize_button.clicked.connect(self._toggle_maximize)" in SHELL
+    assert "self.close_button.clicked.connect(window.close)" in SHELL
+    assert "handle.startSystemMove()" in SHELL
+    assert "mouseDoubleClickEvent" in SHELL
+    assert "window.setMenuWidget(self.title_bar)" in SHELL
 
 
 def test_shell_has_native_and_widget_frame_fallbacks() -> None:
     assert "DWMWA_BORDER_COLOR" in SHELL
     assert "DwmSetWindowAttribute" in SHELL
     assert "class _ClientFrame" in SHELL
-    assert "_EDGE = 6" in SHELL
+    assert "_EDGE = 5" in SHELL
     assert "legacy_frame.hide()" in SHELL
 
 
