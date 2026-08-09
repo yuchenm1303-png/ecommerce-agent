@@ -300,41 +300,33 @@ class GlassBackdrop(QWidget):
 
 
 class VisualStyleController(QObject):
-    """Static QWidget presentation over the child QQuick background surface."""
+    """Existing QWidget business UI as a translucent overlay over native Quick."""
 
-    def __init__(
-        self,
-        window: QMainWindow,
-        *,
-        content_root: QWidget,
-        surface_host: QWidget,
-    ) -> None:
+    def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
         self.window = window
-        self.central = content_root
-        self.surface_host = surface_host
         self._glass: dict[QFrame, GlassBackdrop] = {}
         self._cursor_installed = False
 
-        # Only the native child containing the business QWidget tree is alpha
-        # composited. The top-level QMainWindow deliberately remains an ordinary
-        # framed Windows application window.
-        content_root.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        content_root.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        content_root.setAutoFillBackground(False)
-        content_root.setProperty("nativeQuickBackground", True)
+        # Only this owned QWidget overlay is translucent/frameless. The actual
+        # application frame belongs to NativeQuickBackground.quick_window.
+        window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        window.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        window.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.central = window.centralWidget()
+        central = self.central
+        if central is not None:
+            central.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            central.setAutoFillBackground(False)
+            central.setProperty("nativeQuickBackground", True)
 
         window.setStyleSheet(window.styleSheet() + "\n" + NEKRO_STYLE)
-        for frame in content_root.findChildren(QFrame):
+        for frame in window.findChildren(QFrame):
             if frame.objectName() in _GLASS_NAMES:
                 frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
                 self._glass[frame] = GlassBackdrop(frame)
 
-        self.background = NativeQuickBackground(
-            window,
-            surface_host=surface_host,
-            content_layer=content_root,
-        )
+        self.background = NativeQuickBackground(window)
         self._install_cursor()
         app = QApplication.instance()
         if app is not None:
@@ -363,8 +355,8 @@ class VisualStyleController(QObject):
         self.background.schedule_mask_update()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        # Suppress only the legacy AtmosphereWidget wallpaper paint. Its child
-        # business widgets continue painting and receiving input normally.
+        # Suppress only the legacy AtmosphereWidget wallpaper paint. Children
+        # continue painting and receiving input exactly as before.
         if watched is self.central and event.type() == QEvent.Type.Paint:
             return True
         if isinstance(watched, QFrame) and watched in self._glass:
@@ -382,16 +374,7 @@ class VisualStyleController(QObject):
             self._cursor_installed = False
 
 
-def install_visual_style(
-    window: QMainWindow,
-    *,
-    content_root: QWidget,
-    surface_host: QWidget,
-) -> VisualStyleController:
-    controller = VisualStyleController(
-        window,
-        content_root=content_root,
-        surface_host=surface_host,
-    )
+def install_visual_style(window: QMainWindow) -> VisualStyleController:
+    controller = VisualStyleController(window)
     window._visual_style = controller  # type: ignore[attr-defined]
     return controller
