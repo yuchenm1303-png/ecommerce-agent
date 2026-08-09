@@ -23,7 +23,7 @@ class BufferedLogPresenter(QObject):
         self.pending: list[str] = []
 
         self.view.setUndoRedoEnabled(False)
-        self.view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.view.document().setMaximumBlockCount(_MAX_VISIBLE_LOG_BLOCKS)
 
         # Replace per-line appendPlainText + per-line scrollbar movement with a
@@ -58,7 +58,7 @@ class BufferedLogPresenter(QObject):
         was_at_bottom = bar.value() >= bar.maximum() - 6
 
         cursor = self.view.textCursor()
-        cursor.movePosition(QTextCursor.End)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         if not self.view.document().isEmpty():
             cursor.insertText("\n")
         cursor.insertText("\n".join(lines))
