@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-import html
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtCore import QPointF, QRectF, Qt, QUrl
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QLinearGradient,
+    QPainter,
+    QRadialGradient,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -33,151 +38,183 @@ from .result_loader import PhaseStats, RunResult
 
 APP_STYLE = r"""
 QWidget#root {
-    color: #f7f2fa;
+    color: #fff7fb;
     font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
     font-size: 13px;
-    background: qradialgradient(
-        cx:0.18, cy:0.10, radius:1.05,
-        fx:0.18, fy:0.10,
-        stop:0 rgba(163, 90, 139, 255),
-        stop:0.30 rgba(80, 68, 104, 255),
-        stop:0.66 rgba(30, 34, 49, 255),
-        stop:1 rgba(14, 18, 27, 255)
-    );
+    background: transparent;
+}
+QWidget#workspaceHost,
+QWidget#sideHost {
+    background: transparent;
 }
 QFrame#glassCard {
-    background-color: rgba(18, 22, 31, 208);
-    border: 1px solid rgba(255, 255, 255, 36);
-    border-radius: 16px;
+    background-color: rgba(86, 53, 78, 142);
+    border: 1px solid rgba(255, 238, 248, 40);
+    border-radius: 18px;
+}
+QFrame#heroCard {
+    background-color: rgba(96, 58, 88, 120);
+    border: 1px solid rgba(255, 239, 249, 42);
+    border-radius: 22px;
 }
 QFrame#statusCard {
-    background-color: rgba(22, 26, 36, 218);
-    border: 1px solid rgba(255, 255, 255, 30);
+    background-color: rgba(104, 66, 94, 128);
+    border: 1px solid rgba(255, 241, 249, 38);
+    border-radius: 17px;
+}
+QFrame#microCard {
+    background-color: rgba(54, 40, 61, 112);
+    border: 1px solid rgba(255, 242, 249, 28);
     border-radius: 14px;
 }
+QLabel#brandMark {
+    color: rgba(255,255,255,188);
+    font-size: 12px;
+    font-weight: 650;
+    letter-spacing: 2px;
+}
 QLabel#appTitle {
-    font-size: 25px;
-    font-weight: 700;
-    color: #ffffff;
+    font-size: 33px;
+    font-weight: 760;
+    color: #fffdfd;
 }
 QLabel#subtle, QLabel#cardHint {
-    color: rgba(242, 231, 246, 165);
+    color: rgba(255, 237, 247, 178);
 }
 QLabel#cardTitle {
     font-size: 14px;
-    font-weight: 650;
-    color: #ffffff;
+    font-weight: 680;
+    color: #fffafb;
+}
+QLabel#sectionEyebrow {
+    color: rgba(255, 226, 241, 166);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
 }
 QLabel#phaseBadge {
-    padding: 7px 12px;
-    border-radius: 12px;
-    background-color: rgba(224, 166, 205, 30);
-    border: 1px solid rgba(238, 195, 224, 70);
-    color: #f4dce9;
+    padding: 9px 14px;
+    border-radius: 13px;
+    background-color: rgba(116, 76, 105, 132);
+    border: 1px solid rgba(255, 231, 244, 58);
+    color: #fff1f8;
+    font-weight: 650;
 }
 QLineEdit, QSpinBox {
-    min-height: 38px;
-    padding: 0 11px;
-    color: #ffffff;
-    background-color: rgba(255, 255, 255, 15);
-    border: 1px solid rgba(255, 255, 255, 40);
-    border-radius: 10px;
-    selection-background-color: #9d6388;
+    min-height: 39px;
+    padding: 0 12px;
+    color: #fffdfd;
+    background-color: rgba(39, 28, 44, 90);
+    border: 1px solid rgba(255, 239, 248, 38);
+    border-radius: 11px;
+    selection-background-color: #b9799f;
+}
+QLineEdit:hover, QSpinBox:hover {
+    background-color: rgba(48, 33, 51, 105);
+    border-color: rgba(255, 240, 248, 54);
 }
 QLineEdit:focus, QSpinBox:focus {
-    border: 1px solid rgba(241, 185, 220, 135);
-    background-color: rgba(255, 255, 255, 22);
+    border: 1px solid rgba(255, 211, 235, 142);
+    background-color: rgba(45, 30, 49, 125);
 }
 QPushButton {
-    min-height: 37px;
+    min-height: 38px;
     padding: 0 16px;
-    border-radius: 10px;
-    border: 1px solid rgba(255, 255, 255, 38);
-    color: #f9f5fa;
-    background-color: rgba(255, 255, 255, 16);
+    border-radius: 11px;
+    border: 1px solid rgba(255, 239, 248, 40);
+    color: #fff9fc;
+    background-color: rgba(74, 52, 75, 112);
 }
 QPushButton:hover {
-    background-color: rgba(255, 255, 255, 26);
-    border-color: rgba(255, 255, 255, 58);
+    background-color: rgba(119, 76, 103, 145);
+    border-color: rgba(255, 237, 247, 72);
 }
 QPushButton:pressed {
-    background-color: rgba(255, 255, 255, 12);
+    background-color: rgba(68, 44, 66, 154);
 }
 QPushButton#primaryButton {
-    min-width: 132px;
-    font-weight: 700;
-    background-color: rgba(193, 112, 163, 175);
-    border: 1px solid rgba(255, 209, 237, 100);
+    min-width: 140px;
+    font-weight: 720;
+    background-color: rgba(190, 113, 157, 190);
+    border: 1px solid rgba(255, 220, 239, 105);
 }
 QPushButton#primaryButton:hover {
-    background-color: rgba(210, 127, 180, 205);
+    background-color: rgba(211, 132, 178, 220);
 }
 QPushButton#dangerButton {
-    background-color: rgba(150, 65, 80, 115);
+    background-color: rgba(131, 64, 79, 125);
+}
+QPushButton#quietButton {
+    background-color: rgba(61, 45, 66, 92);
 }
 QPushButton:disabled {
-    color: rgba(255, 255, 255, 75);
-    background-color: rgba(255, 255, 255, 7);
+    color: rgba(255, 246, 250, 78);
+    background-color: rgba(63, 48, 65, 68);
+    border-color: rgba(255,255,255,18);
 }
 QCheckBox {
-    spacing: 7px;
-    color: rgba(245, 237, 248, 205);
+    spacing: 8px;
+    color: rgba(255, 244, 249, 210);
 }
 QCheckBox::indicator {
     width: 17px;
     height: 17px;
     border-radius: 5px;
-    border: 1px solid rgba(255, 255, 255, 60);
-    background-color: rgba(255, 255, 255, 12);
+    border: 1px solid rgba(255, 243, 249, 65);
+    background-color: rgba(47, 34, 49, 92);
 }
 QCheckBox::indicator:checked {
-    background-color: #b56f9c;
-    border-color: #e3b6d2;
+    background-color: #c479a7;
+    border-color: #f5cce3;
 }
 QTableWidget {
-    color: #f4eef6;
-    background-color: rgba(8, 11, 17, 90);
-    alternate-background-color: rgba(255, 255, 255, 8);
-    border: 0;
-    border-radius: 10px;
-    gridline-color: rgba(255, 255, 255, 16);
-    selection-background-color: rgba(161, 96, 137, 115);
+    color: #fff8fc;
+    background-color: rgba(35, 28, 42, 96);
+    alternate-background-color: rgba(255, 233, 246, 9);
+    border: 1px solid rgba(255, 238, 248, 24);
+    border-radius: 13px;
+    gridline-color: rgba(255, 238, 248, 14);
+    selection-background-color: rgba(178, 107, 149, 115);
     selection-color: #ffffff;
 }
 QTableWidget::item {
-    padding: 7px 8px;
-    border-bottom: 1px solid rgba(255, 255, 255, 12);
+    padding: 8px 9px;
+    border-bottom: 1px solid rgba(255, 241, 249, 12);
 }
 QHeaderView::section {
-    padding: 8px 8px;
-    color: rgba(249, 241, 251, 205);
-    background-color: rgba(255, 255, 255, 11);
+    padding: 9px 9px;
+    color: rgba(255, 246, 251, 218);
+    background-color: rgba(101, 68, 94, 105);
     border: 0;
-    border-bottom: 1px solid rgba(255, 255, 255, 22);
-    font-weight: 600;
+    border-bottom: 1px solid rgba(255, 238, 248, 26);
+    font-weight: 650;
 }
 QPlainTextEdit {
-    color: #d8d9df;
-    background-color: rgba(5, 8, 13, 155);
-    border: 0;
-    border-radius: 10px;
-    padding: 8px;
-    selection-background-color: #8f5f7f;
+    color: #f3eaf0;
+    background-color: rgba(29, 24, 36, 106);
+    border: 1px solid rgba(255, 238, 248, 22);
+    border-radius: 13px;
+    padding: 10px;
+    selection-background-color: #a86990;
     font-family: "Cascadia Mono", "Consolas", monospace;
     font-size: 12px;
 }
-QScrollBar:vertical {
-    width: 10px;
+QScrollArea {
     background: transparent;
-    margin: 3px 2px 3px 2px;
+    border: 0;
+}
+QScrollBar:vertical {
+    width: 9px;
+    background: transparent;
+    margin: 4px 1px 4px 1px;
 }
 QScrollBar::handle:vertical {
-    min-height: 28px;
-    border-radius: 5px;
-    background: rgba(231, 197, 220, 80);
+    min-height: 30px;
+    border-radius: 4px;
+    background: rgba(255, 220, 240, 82);
 }
 QScrollBar::handle:vertical:hover {
-    background: rgba(231, 197, 220, 120);
+    background: rgba(255, 224, 241, 126);
 }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
@@ -186,21 +223,103 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
 }
 QSplitter::handle {
     background: transparent;
-    width: 8px;
-    height: 8px;
+    width: 12px;
+    height: 12px;
 }
 """
 
 
 STATUS_COLORS = {
-    "READY": QColor("#66d19e"),
-    "MISSING": QColor("#e9bd69"),
-    "CONFLICT": QColor("#e67e91"),
-    "BLOCKED": QColor("#d9879c"),
-    "SAME_PRODUCT": QColor("#66d19e"),
-    "DIFFERENT_PRODUCT": QColor("#e67e91"),
-    "UNCERTAIN": QColor("#e9bd69"),
+    "READY": QColor("#8fe1b9"),
+    "MISSING": QColor("#f4cb7a"),
+    "CONFLICT": QColor("#f18da0"),
+    "BLOCKED": QColor("#e796ae"),
+    "SAME_PRODUCT": QColor("#8fe1b9"),
+    "DIFFERENT_PRODUCT": QColor("#f18da0"),
+    "UNCERTAIN": QColor("#f4cb7a"),
 }
+
+
+class AtmosphereWidget(QWidget):
+    """Cheap procedural backdrop inspired by the earlier dreamy glass homepage.
+
+    It deliberately avoids network/background-image dependencies so the Windows
+    development GUI remains fast and deterministic.
+    """
+
+    _PETALS = (
+        (.04, .18, -20, 9), (.10, .73, 28, 7), (.16, .31, 16, 8),
+        (.23, .09, -12, 6), (.29, .58, 32, 9), (.36, .21, -28, 7),
+        (.43, .83, 14, 8), (.50, .13, 24, 7), (.58, .48, -16, 9),
+        (.63, .76, 30, 6), (.69, .24, -10, 8), (.75, .55, 22, 7),
+        (.81, .12, -30, 8), (.86, .68, 16, 9), (.92, .34, 29, 6),
+        (.96, .82, -14, 8),
+    )
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("root")
+        self.setAutoFillBackground(False)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = self.rect()
+        width = max(1, rect.width())
+        height = max(1, rect.height())
+
+        base = QLinearGradient(0, 0, width, height)
+        base.setColorAt(0.00, QColor(148, 91, 132))
+        base.setColorAt(0.28, QColor(102, 77, 116))
+        base.setColorAt(0.62, QColor(50, 52, 78))
+        base.setColorAt(1.00, QColor(24, 29, 46))
+        painter.fillRect(rect, base)
+
+        # Wide soft blooms mimic out-of-focus sakura/tree light without a bitmap.
+        blooms = (
+            (.10, .02, .42, QColor(255, 181, 213, 95)),
+            (.34, .08, .34, QColor(248, 200, 226, 74)),
+            (.73, .12, .43, QColor(191, 156, 211, 63)),
+            (.95, .45, .35, QColor(243, 163, 204, 52)),
+            (.26, .90, .44, QColor(166, 116, 164, 48)),
+        )
+        for x, y, radius_ratio, color in blooms:
+            center = QPointF(width * x, height * y)
+            radius = max(width, height) * radius_ratio
+            glow = QRadialGradient(center, radius)
+            glow.setColorAt(0.0, color)
+            fade = QColor(color)
+            fade.setAlpha(0)
+            glow.setColorAt(1.0, fade)
+            painter.fillRect(rect, glow)
+
+        # Gentle bright clearing through the middle, like the reference homepage.
+        clearing = QRadialGradient(
+            QPointF(width * .48, height * .48),
+            max(width, height) * .52,
+        )
+        clearing.setColorAt(0.0, QColor(255, 218, 234, 42))
+        clearing.setColorAt(.58, QColor(248, 205, 226, 18))
+        clearing.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.fillRect(rect, clearing)
+
+        painter.setPen(Qt.NoPen)
+        for x, y, angle, size in self._PETALS:
+            painter.save()
+            painter.translate(width * x, height * y)
+            painter.rotate(angle)
+            painter.setBrush(QColor(255, 222, 237, 150))
+            painter.drawEllipse(QRectF(-size * .60, -size * .23, size * 1.2, size * .46))
+            painter.restore()
+
+        # Bottom vignette improves readability of the log panel.
+        vignette = QLinearGradient(0, height * .55, 0, height)
+        vignette.setColorAt(0, QColor(17, 19, 31, 0))
+        vignette.setColorAt(1, QColor(13, 17, 29, 80))
+        painter.fillRect(rect, vignette)
+        painter.end()
+
+        super().paintEvent(event)
 
 
 class StatusCard(QFrame):
@@ -208,12 +327,12 @@ class StatusCard(QFrame):
         super().__init__(parent)
         self.setObjectName("statusCard")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 11, 14, 11)
-        layout.setSpacing(2)
+        layout.setContentsMargins(17, 13, 17, 13)
+        layout.setSpacing(3)
         self.value = QLabel("—")
-        self.value.setStyleSheet("font-size: 24px; font-weight: 750; color: white;")
+        self.value.setStyleSheet("font-size: 26px; font-weight: 760; color: white;")
         title_label = QLabel(title)
-        title_label.setStyleSheet("font-size: 12px; font-weight: 650; color: rgba(255,255,255,210);")
+        title_label.setStyleSheet("font-size: 11px; font-weight: 720; color: rgba(255,255,255,220);")
         caption_label = QLabel(caption)
         caption_label.setObjectName("cardHint")
         caption_label.setStyleSheet("font-size: 10px;")
@@ -224,7 +343,7 @@ class StatusCard(QFrame):
     def set_value(self, value: int | str, color: str | None = None) -> None:
         self.value.setText(str(value))
         if color:
-            self.value.setStyleSheet(f"font-size: 24px; font-weight: 750; color: {color};")
+            self.value.setStyleSheet(f"font-size: 26px; font-weight: 760; color: {color};")
 
 
 class MainWindow(QMainWindow):
@@ -234,29 +353,34 @@ class MainWindow(QMainWindow):
         self.runner = ReadOnlyRunner(self.project_root, self)
         self.current_result: RunResult | None = None
         self.setWindowTitle("ecommerce-agent · Read-only Test Lab")
-        self.resize(1520, 930)
+        self.resize(1540, 940)
         self.setMinimumSize(1180, 760)
 
-        root = QWidget()
-        root.setObjectName("root")
+        root = AtmosphereWidget()
         self.setCentralWidget(root)
         self.setStyleSheet(APP_STYLE)
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(22, 18, 22, 18)
-        outer.setSpacing(12)
+        outer.setContentsMargins(30, 24, 30, 24)
+        outer.setSpacing(14)
 
         outer.addLayout(self._build_header())
         outer.addWidget(self._build_input_card())
         outer.addLayout(self._build_status_row())
 
+        workspace = QWidget()
+        workspace.setObjectName("workspaceHost")
+        workspace_layout = QHBoxLayout(workspace)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(0)
         center = QSplitter(Qt.Horizontal)
         center.setChildrenCollapsible(False)
         center.addWidget(self._build_fields_card())
         center.addWidget(self._build_side_panel())
         center.setStretchFactor(0, 7)
         center.setStretchFactor(1, 3)
-        center.setSizes([1040, 430])
-        outer.addWidget(center, 1)
+        center.setSizes([1020, 440])
+        workspace_layout.addWidget(center)
+        outer.addWidget(workspace, 1)
 
         outer.addWidget(self._build_log_card())
 
@@ -269,43 +393,56 @@ class MainWindow(QMainWindow):
 
     def _build_header(self) -> QHBoxLayout:
         layout = QHBoxLayout()
+        layout.setSpacing(14)
         title_box = QVBoxLayout()
-        title = QLabel("ecommerce-agent  /  Read-only Lab")
+        title_box.setSpacing(2)
+        mark = QLabel("LOCAL DEVELOPMENT  ·  ZERO-WRITE ACCEPTANCE")
+        mark.setObjectName("brandMark")
+        title = QLabel("ecommerce-agent")
         title.setObjectName("appTitle")
-        subtitle = QLabel("供应商 URL → fresh schema → cold/hot Resolver → read-only Fill Plan")
+        subtitle = QLabel("Read-only Lab  /  供应商 URL → fresh schema → cold/hot Resolver → Fill Plan")
         subtitle.setObjectName("subtle")
+        title_box.addWidget(mark)
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         layout.addLayout(title_box)
         layout.addStretch(1)
+
         self.phase_badge = QLabel("Idle · No Makro writes")
         self.phase_badge.setObjectName("phaseBadge")
-        layout.addWidget(self.phase_badge)
-        self.open_run_button = QPushButton("打开本次结果目录")
+        layout.addWidget(self.phase_badge, 0, Qt.AlignBottom)
+        self.open_run_button = QPushButton("打开结果目录")
+        self.open_run_button.setObjectName("quietButton")
         self.open_run_button.setEnabled(False)
         self.open_run_button.clicked.connect(self._open_run_dir)
-        layout.addWidget(self.open_run_button)
+        layout.addWidget(self.open_run_button, 0, Qt.AlignBottom)
         return layout
 
     def _build_input_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("glassCard")
+        card.setObjectName("heroCard")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(15, 13, 15, 13)
-        layout.setSpacing(9)
+        layout.setContentsMargins(18, 15, 18, 15)
+        layout.setSpacing(10)
 
         top = QHBoxLayout()
+        text_box = QVBoxLayout()
+        text_box.setSpacing(1)
+        eyebrow = QLabel("PRODUCT SOURCE")
+        eyebrow.setObjectName("sectionEyebrow")
         title = QLabel("商品来源")
         title.setObjectName("cardTitle")
-        hint = QLabel("只输入 1688 / supplier 商品 URL；GUI 不接受人工 SKU。")
+        hint = QLabel("只输入一个 1688 / supplier 商品 URL；GUI 不接收人工 SKU，也不会写 Makro。")
         hint.setObjectName("cardHint")
-        top.addWidget(title)
-        top.addSpacing(10)
-        top.addWidget(hint)
-        top.addStretch(1)
+        text_box.addWidget(eyebrow)
+        text_box.addWidget(title)
+        top.addLayout(text_box)
+        top.addSpacing(12)
+        top.addWidget(hint, 1, Qt.AlignBottom)
         layout.addLayout(top)
 
         row = QHBoxLayout()
+        row.setSpacing(9)
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("https://detail.1688.com/offer/...")
         self.url_input.returnPressed.connect(self._start_run)
@@ -322,7 +459,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(row)
 
         settings = QHBoxLayout()
-        settings.setSpacing(12)
+        settings.setSpacing(10)
         self.makro_port = QSpinBox()
         self.makro_port.setRange(1, 65535)
         self.makro_port.setValue(9222)
@@ -350,7 +487,7 @@ class MainWindow(QMainWindow):
 
     def _build_status_row(self) -> QHBoxLayout:
         layout = QHBoxLayout()
-        layout.setSpacing(10)
+        layout.setSpacing(11)
         self.ready_card = StatusCard("READY", "Final Fill Plan")
         self.missing_card = StatusCard("MISSING", "AI final packet")
         self.conflict_card = StatusCard("CONFLICT", "AI final packet")
@@ -363,16 +500,22 @@ class MainWindow(QMainWindow):
         card = QFrame()
         card.setObjectName("glassCard")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(13, 12, 13, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(15, 13, 15, 14)
+        layout.setSpacing(9)
         title_row = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title_box.setSpacing(0)
+        eyebrow = QLabel("FIELD RESOLUTION")
+        eyebrow.setObjectName("sectionEyebrow")
         title = QLabel("字段表")
         title.setObjectName("cardTitle")
+        title_box.addWidget(eyebrow)
+        title_box.addWidget(title)
         self.fields_hint = QLabel("等待只读测试结果")
         self.fields_hint.setObjectName("cardHint")
-        title_row.addWidget(title)
+        title_row.addLayout(title_box)
         title_row.addStretch(1)
-        title_row.addWidget(self.fields_hint)
+        title_row.addWidget(self.fields_hint, 0, Qt.AlignBottom)
         layout.addLayout(title_row)
 
         self.field_table = QTableWidget(0, 5)
@@ -395,12 +538,11 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background: transparent; border: 0; }")
         host = QWidget()
-        host.setStyleSheet("background: transparent;")
+        host.setObjectName("sideHost")
         layout = QVBoxLayout(host)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(11)
         layout.addWidget(self._build_runtime_card())
         layout.addWidget(self._build_web_card(), 1)
         layout.addWidget(self._build_safety_card())
@@ -412,10 +554,13 @@ class MainWindow(QMainWindow):
         card = QFrame()
         card.setObjectName("glassCard")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(13, 12, 13, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(15, 13, 15, 14)
+        layout.setSpacing(7)
+        eyebrow = QLabel("RUN DIAGNOSTICS")
+        eyebrow.setObjectName("sectionEyebrow")
         title = QLabel("Local / Cache")
         title.setObjectName("cardTitle")
+        layout.addWidget(eyebrow)
         layout.addWidget(title)
         self.cold_label = QLabel("Cold  · waiting")
         self.hot_label = QLabel("Hot   · waiting")
@@ -431,16 +576,22 @@ class MainWindow(QMainWindow):
         card = QFrame()
         card.setObjectName("glassCard")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(13, 12, 13, 12)
+        layout.setContentsMargins(15, 13, 15, 14)
         layout.setSpacing(8)
         row = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title_box.setSpacing(0)
+        eyebrow = QLabel("ENTITY MATCH")
+        eyebrow.setObjectName("sectionEyebrow")
         title = QLabel("Web candidates")
         title.setObjectName("cardTitle")
+        title_box.addWidget(eyebrow)
+        title_box.addWidget(title)
         self.web_hint = QLabel("same / different / uncertain")
         self.web_hint.setObjectName("cardHint")
-        row.addWidget(title)
+        row.addLayout(title_box)
         row.addStretch(1)
-        row.addWidget(self.web_hint)
+        row.addWidget(self.web_hint, 0, Qt.AlignBottom)
         layout.addLayout(row)
         self.web_table = QTableWidget(0, 3)
         self.web_table.setHorizontalHeaderLabels(["判定", "来源", "原因"])
@@ -450,7 +601,7 @@ class MainWindow(QMainWindow):
         self.web_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.web_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.web_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.web_table.setMinimumHeight(180)
+        self.web_table.setMinimumHeight(176)
         layout.addWidget(self.web_table)
         return card
 
@@ -458,49 +609,59 @@ class MainWindow(QMainWindow):
         card = QFrame()
         card.setObjectName("glassCard")
         layout = QGridLayout(card)
-        layout.setContentsMargins(13, 12, 13, 12)
+        layout.setContentsMargins(15, 13, 15, 14)
         layout.setHorizontalSpacing(8)
         layout.setVerticalSpacing(7)
+        eyebrow = QLabel("ZERO-WRITE CONTRACT")
+        eyebrow.setObjectName("sectionEyebrow")
         title = QLabel("Makro write safety")
         title.setObjectName("cardTitle")
-        layout.addWidget(title, 0, 0, 1, 2)
+        layout.addWidget(eyebrow, 0, 0, 1, 2)
+        layout.addWidget(title, 1, 0, 1, 2)
         self.write_value = self._safety_value("NO / 0")
         self.save_value = self._safety_value("NO")
         self.qc_value = self._safety_value("NO")
-        layout.addWidget(QLabel("Makro Write"), 1, 0)
-        layout.addWidget(self.write_value, 1, 1)
-        layout.addWidget(QLabel("Save"), 2, 0)
-        layout.addWidget(self.save_value, 2, 1)
-        layout.addWidget(QLabel("Send to QC"), 3, 0)
-        layout.addWidget(self.qc_value, 3, 1)
+        layout.addWidget(QLabel("Makro Write"), 2, 0)
+        layout.addWidget(self.write_value, 2, 1)
+        layout.addWidget(QLabel("Save"), 3, 0)
+        layout.addWidget(self.save_value, 3, 1)
+        layout.addWidget(QLabel("Send to QC"), 4, 0)
+        layout.addWidget(self.qc_value, 4, 1)
         return card
 
     def _safety_value(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        label.setStyleSheet("color: #66d19e; font-weight: 750;")
+        label.setStyleSheet("color: #8fe1b9; font-weight: 760;")
         return label
 
     def _build_log_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("glassCard")
+        card.setObjectName("heroCard")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(13, 10, 13, 12)
+        layout.setContentsMargins(15, 11, 15, 13)
         layout.setSpacing(7)
         row = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title_box.setSpacing(0)
+        eyebrow = QLabel("LIVE CONSOLE")
+        eyebrow.setObjectName("sectionEyebrow")
         title = QLabel("实时运行日志")
         title.setObjectName("cardTitle")
+        title_box.addWidget(eyebrow)
+        title_box.addWidget(title)
         clear_button = QPushButton("清空显示")
+        clear_button.setObjectName("quietButton")
         clear_button.clicked.connect(lambda: self.log_view.clear())
-        row.addWidget(title)
+        row.addLayout(title_box)
         row.addStretch(1)
-        row.addWidget(clear_button)
+        row.addWidget(clear_button, 0, Qt.AlignBottom)
         layout.addLayout(row)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(8000)
-        self.log_view.setMinimumHeight(190)
-        self.log_view.setMaximumHeight(245)
+        self.log_view.setMinimumHeight(165)
+        self.log_view.setMaximumHeight(220)
         layout.addWidget(self.log_view)
         return card
 
@@ -551,10 +712,10 @@ class MainWindow(QMainWindow):
 
     def _apply_result(self, result: RunResult) -> None:
         self.current_result = result
-        self.ready_card.set_value(result.ready, "#66d19e")
-        self.missing_card.set_value(result.missing, "#e9bd69")
-        self.conflict_card.set_value(result.conflict, "#e67e91")
-        self.blocked_card.set_value(result.blocked, "#d9879c")
+        self.ready_card.set_value(result.ready, "#8fe1b9")
+        self.missing_card.set_value(result.missing, "#f4cb7a")
+        self.conflict_card.set_value(result.conflict, "#f18da0")
+        self.blocked_card.set_value(result.blocked, "#e796ae")
         self._populate_fields(result)
         self._populate_web(result)
         self._populate_runtime(result.cold, result.hot)
@@ -632,9 +793,9 @@ class MainWindow(QMainWindow):
         self.save_value.setText("YES" if save else "NO")
         self.qc_value.setText("YES" if qc else "NO")
         bad = writes > 0 or save or qc
-        color = "#ef7285" if bad else "#66d19e"
+        color = "#f18da0" if bad else "#8fe1b9"
         for label in (self.write_value, self.save_value, self.qc_value):
-            label.setStyleSheet(f"color: {color}; font-weight: 750;")
+            label.setStyleSheet(f"color: {color}; font-weight: 760;")
 
     def _run_completed(self, result: RunResult) -> None:
         if result.safety.safe:
