@@ -27,11 +27,10 @@ private_data/
 *.rar
 *.zip
 
-# Runtime output
-logs/*.jsonl
-logs/*.log
-logs/makro-probe/
-logs/makro-fill/
+# Runtime output may contain customer evidence, source manifests, screenshots,
+# resolver packets, semantic cache entries, local paths or listing state.
+# Keep none of it in git; only retain the empty directory marker.
+logs/*
 !logs/.gitkeep
 
 # Generated local spreadsheets

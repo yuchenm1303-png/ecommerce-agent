@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,13 +24,7 @@ def _sha256_text(text: str) -> str:
 
 @dataclass(slots=True, frozen=True)
 class GroundedSource:
-    """One exact source unit that a semantic extractor is allowed to cite.
-
-    Every source has a content digest. Builder-generated source ids include a
-    digest prefix as well, so a packet created for one captured page/image cannot
-    be silently replayed against changed source content while keeping the same
-    citation id.
-    """
+    """One exact source unit the AI may cite."""
 
     source_id: str
     source_type: str
@@ -38,6 +33,13 @@ class GroundedSource:
     content: str = ""
     image_path: str = ""
     sha256: str = ""
+
+    @property
+    def logical_source_id(self) -> str:
+        marker = ":text:"
+        if self.kind == TEXT_KIND and marker in self.source_id:
+            return self.source_id.split(marker, 1)[0]
+        return self.source_id
 
     def as_request_dict(self) -> dict[str, str]:
         payload = {
@@ -56,6 +58,7 @@ class GroundedSource:
     def as_manifest_dict(self) -> dict[str, str]:
         return {
             "source_id": self.source_id,
+            "logical_source_id": self.logical_source_id,
             "source_type": self.source_type,
             "kind": self.kind,
             "origin": self.origin,
@@ -93,27 +96,187 @@ class GroundingCatalog:
                 return source
         return None
 
+    @property
+    def logical_source_count(self) -> int:
+        return len({source.logical_source_id for source in self.sources})
+
     def as_request_list(self) -> list[dict[str, str]]:
         return [source.as_request_dict() for source in self.sources]
 
     def as_manifest(self) -> dict[str, object]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "source_count": len(self.sources),
+            "logical_source_count": self.logical_source_count,
             "sources": [source.as_manifest_dict() for source in self.sources],
         }
 
 
-def _snapshot_text(snapshot: SourceSnapshot) -> str:
-    parts: list[str] = []
+_PRODUCT_DATA_ANCHOR = re.compile(
+    r"\b(?:offerId|offerLoginId|skuId|sku2|skuMap|skuProps|specId|detailUrl)\b",
+    re.IGNORECASE,
+)
+
+
+def _structured_assignments(value: str) -> list[str]:
+    """Extract exact scalar/object assignments for known supplier transport keys."""
+
+    output: list[str] = []
+    for match in re.finditer(
+        r'''(?P<key>["']?(?:offerId|offerLoginId|skuId|sku2|skuMap|skuProps|specId|detailUrl)["']?)\s*[:=]\s*''',
+        value,
+        flags=re.IGNORECASE,
+    ):
+        start = match.start("key")
+        cursor = match.end()
+        if cursor >= len(value):
+            continue
+        opening = value[cursor]
+        end = cursor
+        if opening in {'"', "'"}:
+            quote = opening
+            end += 1
+            escaped = False
+            while end < len(value):
+                char = value[end]
+                end += 1
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    break
+            else:
+                continue
+        elif opening in "[{":
+            pairs = {"[": "]", "{": "}"}
+            stack = [pairs[opening]]
+            end += 1
+            quote = ""
+            escaped = False
+            while end < len(value) and stack:
+                char = value[end]
+                end += 1
+                if quote:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == quote:
+                        quote = ""
+                    continue
+                if char in {'"', "'"}:
+                    quote = char
+                elif char in pairs:
+                    stack.append(pairs[char])
+                elif char == stack[-1]:
+                    stack.pop()
+            if stack:
+                continue
+        else:
+            token = re.match(r"[^,;\s)}\]]+", value[cursor:])
+            if token is None:
+                continue
+            end = cursor + token.end()
+        exact = value[start:end].strip()
+        if exact:
+            output.append(exact)
+    return output
+
+
+def _compact_embedded_data(items: Iterable[str]) -> list[str]:
+    """Keep exact product/variant records while discarding generic page scripts.
+
+    Source snapshots remain untouched on disk. This function only builds the
+    compact, citable text view sent to AI. It deliberately uses structural page
+    markers rather than product-category or marketplace-field semantics.
+    """
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        value = re.sub(r"\s+", " ", str(raw or "")).strip()
+        if not value:
+            continue
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = None
+        is_dom_record = bool(
+            isinstance(parsed, dict)
+            and set(parsed).issubset({"tag", "text", "attrs"})
+            and (str(parsed.get("text") or "").strip() or parsed.get("attrs"))
+        )
+        extracted = [value] if is_dom_record else _structured_assignments(value)
+        for exact in extracted:
+            fingerprint = exact.casefold()
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            candidates.append(exact)
+
+    # Capture currently emits overlapping windows around nearby structured-data
+    # markers. Keeping only the longest exact container is lossless and prevents
+    # the same page JSON from being sent repeatedly.
+    kept: list[str] = []
+    kept_folded: list[str] = []
+    for value in sorted(candidates, key=len, reverse=True):
+        folded = value.casefold()
+        if any(folded in existing for existing in kept_folded):
+            continue
+        kept.append(value)
+        kept_folded.append(folded)
+    kept.reverse()
+    return kept
+
+
+def _compact_visible_text(value: str) -> str:
+    """Remove session-only storefront chrome from otherwise citable page text."""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    # Delivery destinations depend on the signed-in browser/session, not the
+    # product. Preserve the surrounding labels while dropping the address.
+    text = re.sub(r"(?m)(^|\n)送至\s*\n[^\n]*(?=\n预计)", r"\1送至\n预计", text)
+    # Marketplace price explanations are generic legal boilerplate and the
+    # captured tail can end at a different character while the page is loading.
+    for marker in ("【平台活动下价格】", "【非平台活动下价格】"):
+        index = text.find(marker)
+        if index >= 0:
+            text = text[:index].rstrip()
+            break
+    return text
+
+
+def _snapshot_non_row_parts(snapshot: SourceSnapshot) -> list[tuple[str, str]]:
+    """Build a compact citable view while the full snapshot stays unchanged."""
+
+    parts: list[tuple[str, str]] = []
+    identity: list[str] = []
     if snapshot.title:
-        parts.append(f"Title: {snapshot.title}")
+        identity.append(f"Title: {snapshot.title}")
     for key, value in snapshot.meta.items():
         if value:
-            parts.append(f"Meta {key}: {value}")
-    if snapshot.visible_text.strip():
-        parts.append(snapshot.visible_text.strip())
-    return "\n".join(parts).strip()
+            identity.append(f"Meta {key}: {value}")
+    if identity:
+        parts.append(("identity", "Page identity/meta:\n" + "\n".join(identity)))
+
+    if snapshot.json_ld:
+        parts.append(
+            (
+                "json-ld",
+                "Page JSON-LD:\n"
+                + json.dumps(snapshot.json_ld, ensure_ascii=False, separators=(",", ":")),
+            )
+        )
+    embedded = _compact_embedded_data(snapshot.embedded_data)
+    if embedded:
+        parts.append(("embedded", "Embedded page/variant data:\n" + "\n".join(embedded)))
+    visible_text = _compact_visible_text(snapshot.visible_text)
+    if visible_text:
+        parts.append(("visible-text", "Rendered page text:\n" + visible_text))
+    return [(kind, part) for kind, part in parts if part.strip()]
 
 
 def chunk_text(
@@ -122,7 +285,7 @@ def chunk_text(
     max_chars: int = 3000,
     overlap_chars: int = 250,
 ) -> list[str]:
-    """Deterministically split captured text while retaining small overlap."""
+    """Split long captured text for citation precision, not model batching."""
 
     if max_chars < 500:
         raise ValueError("max_chars 不能小于 500。")
@@ -169,12 +332,46 @@ def _text_source(
 ) -> GroundedSource:
     digest = _sha256_text(content)
     return GroundedSource(
-        source_id=(
-            f"{prefix}:{ordinal:03d}:text:{chunk_index:04d}:{digest[:12]}"
-        ),
+        source_id=f"{prefix}:{ordinal:03d}:text:{chunk_index:04d}:{digest[:12]}",
         source_type=source_type,
         kind=TEXT_KIND,
         origin=origin,
+        content=content,
+        sha256=digest,
+    )
+
+
+def _row_source(
+    *,
+    prefix: str,
+    source_type: str,
+    ordinal: int,
+    row_ordinal: int,
+    origin: str,
+    key: str,
+    value: str,
+    table_index: int,
+    row_index: int,
+) -> GroundedSource:
+    content = (
+        "Structured page row; preserve key/value meaning exactly: "
+        + json.dumps(
+            {
+                "key": key,
+                "value": value,
+                "table_index": table_index,
+                "row_index": row_index,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+    digest = _sha256_text(content)
+    return GroundedSource(
+        source_id=f"{prefix}:{ordinal:03d}:text:row-{row_ordinal:04d}:{digest[:12]}",
+        source_type=source_type,
+        kind=TEXT_KIND,
+        origin=f"{origin}#table={table_index}&row={row_index}",
         content=content,
         sha256=digest,
     )
@@ -193,20 +390,58 @@ def _sources_from_snapshot(
     if not path.is_file():
         raise FileNotFoundError(f"source snapshot 不存在：{path}")
     snapshot = source_snapshot_from_json(path)
-    text = _snapshot_text(snapshot)
-    chunks = chunk_text(text, max_chars=max_chars, overlap_chars=overlap_chars)
     origin = snapshot.final_url or snapshot.requested_url or str(path.resolve())
-    return [
-        _text_source(
-            prefix=prefix,
-            source_type=source_type,
-            ordinal=ordinal,
-            chunk_index=index,
-            origin=origin,
-            content=chunk,
+
+    sources: list[GroundedSource] = []
+    chunk_index = 1
+
+    non_row_parts = _snapshot_non_row_parts(snapshot)
+    if non_row_parts:
+        part_kind, first = non_row_parts.pop(0)
+        for chunk in chunk_text(first, max_chars=max_chars, overlap_chars=overlap_chars):
+            sources.append(
+                _text_source(
+                    prefix=prefix,
+                    source_type=source_type,
+                    ordinal=ordinal,
+                    chunk_index=chunk_index,
+                    origin=f"{origin}#evidence={part_kind}",
+                    content=chunk,
+                )
+            )
+            chunk_index += 1
+
+    for row_ordinal, row in enumerate(snapshot.table_rows, start=1):
+        if not row.key or not row.value:
+            continue
+        sources.append(
+            _row_source(
+                prefix=prefix,
+                source_type=source_type,
+                ordinal=ordinal,
+                row_ordinal=row_ordinal,
+                origin=origin,
+                key=row.key,
+                value=row.value,
+                table_index=row.table_index,
+                row_index=row.row_index,
+            )
         )
-        for index, chunk in enumerate(chunks, start=1)
-    ]
+
+    for part_kind, part in non_row_parts:
+        for chunk in chunk_text(part, max_chars=max_chars, overlap_chars=overlap_chars):
+            sources.append(
+                _text_source(
+                    prefix=prefix,
+                    source_type=source_type,
+                    ordinal=ordinal,
+                    chunk_index=chunk_index,
+                    origin=f"{origin}#evidence={part_kind}",
+                    content=chunk,
+                )
+            )
+            chunk_index += 1
+    return sources
 
 
 def build_grounding_catalog(
@@ -218,12 +453,7 @@ def build_grounding_catalog(
     max_text_chars: int = 3000,
     overlap_chars: int = 250,
 ) -> GroundingCatalog:
-    """Create the exact source universe visible to a semantic model.
-
-    Builder-generated source ids contain a digest prefix. Rebuilding the catalog
-    after a source file changes therefore produces different ids and old model
-    output fails closed instead of being validated against new content.
-    """
+    """Create the exact raw source universe visible to the field-filling AI."""
 
     sources: list[GroundedSource] = []
 
@@ -279,9 +509,7 @@ def build_grounding_catalog(
             digest = _sha256_text(chunk)
             sources.append(
                 GroundedSource(
-                    source_id=(
-                        f"customer-text:001:text:{index:04d}:{digest[:12]}"
-                    ),
+                    source_id=f"customer-text:001:text:{index:04d}:{digest[:12]}",
                     source_type="customer_file",
                     kind=TEXT_KIND,
                     origin="supplemental_text",

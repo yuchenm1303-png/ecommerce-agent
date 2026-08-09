@@ -46,13 +46,28 @@ def _split_options(value: str) -> tuple[str, ...]:
     text = value.strip()
     if not text:
         return ()
-    # Customer sheets commonly use line breaks, Chinese/English semicolons or
-    # pipes. Comma is intentionally not a primary delimiter because many option
-    # labels contain commas.
     parts = [item.strip() for item in re.split(r"[\n|;；]+", text) if item.strip()]
     if len(parts) <= 1:
         return (text,)
     return tuple(dict.fromkeys(parts))
+
+
+def _preamble_text(rows: list[list[Any]], header_row: int) -> str:
+    """Keep non-empty customer context before the QA header.
+
+    Customer workbooks often place the SKU, exact selected variant, supplier URL
+    and copy/compliance instructions above the question table. Dropping those
+    rows silently removes some of the strongest product-identity evidence before
+    semantic extraction even starts.
+    """
+
+    lines: list[str] = []
+    for row in rows[: max(0, header_row - 1)]:
+        values = [_stringify(value) for value in row]
+        values = [value for value in values if value]
+        if values:
+            lines.append(" | ".join(values))
+    return "\n".join(lines).strip()
 
 
 @dataclass(slots=True, frozen=True)
@@ -77,13 +92,6 @@ class QuestionRecord:
         return bool(self.answer.strip())
 
     def as_semantic_field(self) -> dict[str, Any]:
-        """Build a resolver-compatible field without pretending to know Makro DOM.
-
-        This is used for pre-resolution reports before a live listing is opened.
-        Live Makro scan data remains authoritative for real dropdown controls,
-        qualifiers and required flags.
-        """
-
         options = [{"text": item, "value": item} for item in self.options]
         controls: list[dict[str, Any]] = []
         if options:
@@ -115,6 +123,7 @@ class QuestionCatalog:
     sheet_name: str | None
     header_row: int
     questions: list[QuestionRecord]
+    preamble_text: str = ""
 
     @property
     def answered_count(self) -> int:
@@ -133,13 +142,6 @@ class QuestionCatalog:
 
 
 def _looks_like_header(row: Iterable[Any]) -> bool:
-    """Require a real tabular header, not a title cell such as ``Questions``.
-
-    A single title/instruction cell can legitimately equal one of our question
-    aliases. Accept the row only when it contains the question column plus at
-    least one independent companion column used by the QA schema.
-    """
-
     headers = [_stringify(item) for item in row]
     if _find_header(headers, QUESTION_HEADERS) is None:
         return False
@@ -166,13 +168,15 @@ def _locate_table(rows: list[list[Any]], max_header_rows: int = 50) -> tuple[lis
     )
 
 
-def _load_rows(path: Path) -> tuple[list[str], list[list[Any]], int, str | None]:
+def _load_rows(
+    path: Path,
+) -> tuple[list[str], list[list[Any]], int, str | None, str]:
     suffix = path.suffix.lower()
     if suffix == ".csv":
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
             rows = [list(row) for row in csv.reader(handle)]
         headers, data, header_row = _locate_table(rows)
-        return headers, data, header_row, None
+        return headers, data, header_row, None, _preamble_text(rows, header_row)
 
     if suffix not in {".xlsx", ".xlsm"}:
         raise ValueError("QA question catalog 仅支持 .csv / .xlsx / .xlsm。")
@@ -185,17 +189,23 @@ def _load_rows(path: Path) -> tuple[list[str], list[list[Any]], int, str | None]
                 headers, data, header_row = _locate_table(rows)
             except ValueError:
                 continue
-            return headers, data, header_row, sheet.title
+            return (
+                headers,
+                data,
+                header_row,
+                sheet.title,
+                _preamble_text(rows, header_row),
+            )
     finally:
         workbook.close()
     raise ValueError("已检查所有工作表，未识别到 QA 问题表。")
 
 
 def load_question_catalog(path: str | Path) -> QuestionCatalog:
-    """Load every question row, including rows whose Answer cell is blank."""
+    """Load every question row plus customer context above the table."""
 
     source = Path(path)
-    headers, rows, header_row, sheet_name = _load_rows(source)
+    headers, rows, header_row, sheet_name, preamble_text = _load_rows(source)
     question_index = _find_header(headers, QUESTION_HEADERS)
     if question_index is None:
         raise ValueError("QA 文件缺少 Question/问题 列。")
@@ -262,4 +272,5 @@ def load_question_catalog(path: str | Path) -> QuestionCatalog:
         sheet_name=sheet_name,
         header_row=header_row,
         questions=questions,
+        preamble_text=preamble_text,
     )

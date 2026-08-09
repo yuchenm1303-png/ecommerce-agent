@@ -6,8 +6,8 @@ from typing import Any
 
 from playwright.sync_api import Page
 
-from .answer_resolver import RESOLVED, ResolvedAnswer
 from .makro.locators import scoped_selector_for_control, selector_for_control  # noqa: F401
+from .resolution_types import RESOLVED, ResolvedAnswer
 
 
 @dataclass(slots=True)
@@ -67,13 +67,6 @@ def _single_locator(
     control: dict[str, Any],
     section_path: str | None,
 ) -> tuple[Any, str]:
-    """Resolve one control scoped to its section, refusing ambiguous matches.
-
-    A global ``[name=...]`` selector can collide with a duplicate or stale React
-    instance elsewhere in the document; scoping by the section card path keeps
-    the write/read on the visible control the user actually sees.
-    """
-
     selector = scoped_selector_for_control(section_path, control)
     all_locator = page.locator(selector)
     if all_locator.count() != 1:
@@ -96,7 +89,14 @@ def _fill_control(
     locator.wait_for(state="visible")
     kind = str(control.get("field_kind") or "input")
 
-    if kind in {"input", "textarea", "contenteditable", "custom_textbox", "custom_spinbutton"}:
+    if kind in {
+        "input",
+        "textarea",
+        "contenteditable",
+        "custom_textbox",
+        "custom_searchbox",
+        "custom_spinbutton",
+    }:
         locator.fill(value)
         return selector
     if kind == "select":
@@ -139,6 +139,109 @@ def _read_control(
     return locator.input_value(timeout=timeout_ms).strip()
 
 
+def _compare_answer_values(expected: list[str], actual: list[str]) -> bool:
+    return len(expected) == len(actual) and [_norm(item) for item in expected] == [
+        _norm(item) for item in actual
+    ]
+
+
+def _preflight_answer_capacity(
+    semantic_field: dict[str, Any],
+    answer: ResolvedAnswer,
+) -> str | None:
+    values = list(answer.answer_values)
+    controls = _value_controls(semantic_field)
+    if not values:
+        return "resolved answer 没有可写 answer_values。"
+    if not controls:
+        return "semantic field 中没有可填写 value control。"
+    if len(values) > len(controls):
+        return (
+            f"答案有 {len(values)} 个值，但当前页面只有 {len(controls)} 个 value control；"
+            "未执行任何部分写入。"
+        )
+    if answer.qualifier and not _qualifier_controls(semantic_field):
+        return "答案包含 qualifier，但当前 semantic field 没有 qualifier control；未执行写入。"
+    return None
+
+
+def verify_resolved_field(
+    page: Page,
+    semantic_field: dict[str, Any],
+    answer: ResolvedAnswer,
+    *,
+    section_path: str | None = None,
+) -> FillVerification:
+    values = list(answer.answer_values)
+    controls = _value_controls(semantic_field)
+    if len(values) > len(controls) or not controls:
+        return FillVerification(
+            attribute_key=answer.attribute_key,
+            label=answer.label,
+            status="validation_failed",
+            expected=values,
+            detail=(
+                f"持久化复核时答案有 {len(values)} 个值，但页面只有 {len(controls)} 个 value control。"
+            ),
+        )
+
+    actual: list[str] = []
+    selectors: list[str] = []
+    try:
+        for control in controls[: len(values)]:
+            _, selector = _single_locator(page, control, section_path)
+            selectors.append(selector)
+            actual.append(
+                _read_control(
+                    page,
+                    control,
+                    section_path=section_path,
+                    timeout_ms=3_000,
+                )
+            )
+
+        qualifier_ok = True
+        if answer.qualifier:
+            qualifier_controls = _qualifier_controls(semantic_field)
+            if not qualifier_controls:
+                qualifier_ok = False
+            else:
+                _, selector = _single_locator(page, qualifier_controls[0], section_path)
+                selectors.append(selector)
+                qualifier_actual = _read_control(
+                    page,
+                    qualifier_controls[0],
+                    section_path=section_path,
+                    timeout_ms=3_000,
+                )
+                qualifier_ok = _norm(qualifier_actual) == _norm(answer.qualifier)
+
+        passed = _compare_answer_values(values, actual) and qualifier_ok
+        return FillVerification(
+            attribute_key=answer.attribute_key,
+            label=answer.label,
+            status="persisted_verified" if passed else "validation_failed",
+            expected=values,
+            actual=actual,
+            selectors=selectors,
+            detail=(
+                "Save 后重新打开，字段值与期望一致。"
+                if passed
+                else "Save 后重新打开，字段值/qualifier 与期望不一致。"
+            ),
+        )
+    except Exception as exc:
+        return FillVerification(
+            attribute_key=answer.attribute_key,
+            label=answer.label,
+            status="validation_failed",
+            expected=values,
+            actual=actual,
+            selectors=selectors,
+            detail=f"Save 后重新打开复核失败：{exc}",
+        )
+
+
 def fill_resolved_field(
     page: Page,
     semantic_field: dict[str, Any],
@@ -147,80 +250,59 @@ def fill_resolved_field(
     section_path: str | None = None,
     recheck_wait_ms: int = 800,
 ) -> FillVerification:
-    """Fill one resolved semantic field and verify it survives a render cycle.
-
-    The locator is scoped to the owning listing section card (``section_path``)
-    so a duplicate/hidden React instance can never be written or read instead
-    of the visible control. After the immediate readback we wait one render
-    cycle (``recheck_wait_ms``) and re-read: a controlled React input may accept
-    a native DOM write and report it, then reset on the next render. Only a
-    value that still matches after the wait is reported as ``validated``.
-
-    This function never clicks section Save or Send to QC. It only touches the
-    controls belonging to the supplied semantic field.
-    """
-
     if answer.status != RESOLVED:
         return FillVerification(
             attribute_key=answer.attribute_key,
             label=answer.label,
             status="skipped",
-            detail=f"resolver status={answer.status}",
+            detail=f"resolution status={answer.status}",
         )
 
     values = list(answer.answer_values)
-    controls = _value_controls(semantic_field)
-    if not controls:
+    preflight_error = _preflight_answer_capacity(semantic_field, answer)
+    if preflight_error:
         return FillVerification(
             attribute_key=answer.attribute_key,
             label=answer.label,
-            status="fill_error",
+            status="validation_failed",
             expected=values,
-            detail="semantic field 中没有可填写 value control。",
+            detail=preflight_error,
         )
 
+    controls = _value_controls(semantic_field)
+    qualifier_controls = _qualifier_controls(semantic_field)
     selectors: list[str] = []
     actual: list[str] = []
     try:
         for control, value in zip(controls, values):
-            selectors.append(_fill_control(page, control, value, section_path=section_path))
+            selectors.append(
+                _fill_control(page, control, value, section_path=section_path)
+            )
         if answer.qualifier:
-            qualifier_controls = _qualifier_controls(semantic_field)
-            if qualifier_controls:
-                selectors.append(
-                    _fill_control(page, qualifier_controls[0], answer.qualifier, section_path=section_path)
+            selectors.append(
+                _fill_control(
+                    page,
+                    qualifier_controls[0],
+                    answer.qualifier,
+                    section_path=section_path,
                 )
+            )
 
         for control in controls[: len(values)]:
             actual.append(_read_control(page, control, section_path=section_path))
 
-        expected_norm = [_norm(item) for item in values[: len(actual)]]
-        actual_norm = [_norm(item) for item in actual]
-        immediate_passed = expected_norm == actual_norm and len(actual) == len(values)
-
-        if len(values) > len(controls):
-            return FillVerification(
-                attribute_key=answer.attribute_key,
-                label=answer.label,
-                status="validation_failed",
-                expected=values,
-                actual=actual,
-                selectors=selectors,
-                detail=(
-                    f"答案有 {len(values)} 个值，但当前页面只有 {len(controls)} 个 value control；"
-                    "已只填写当前可用槽位。"
-                ),
-            )
-
-        # Stable re-readback after a render cycle: a controlled React input may
-        # accept a native DOM write and immediately report it, then reset on the
-        # next render (observed on Makro Additional Description fields).
+        immediate_passed = _compare_answer_values(values, actual)
         page.wait_for_timeout(recheck_wait_ms)
         settled: list[str] = []
         try:
             for control in controls[: len(values)]:
                 settled.append(
-                    _read_control(page, control, section_path=section_path, timeout_ms=3_000)
+                    _read_control(
+                        page,
+                        control,
+                        section_path=section_path,
+                        timeout_ms=3_000,
+                    )
                 )
         except Exception as exc:
             return FillVerification(
@@ -236,13 +318,11 @@ def fill_resolved_field(
                 ),
             )
 
-        settled_norm = [_norm(item) for item in settled]
-        settled_passed = settled_norm == expected_norm and len(settled) == len(values)
-
+        settled_passed = _compare_answer_values(values, settled)
         if immediate_passed and settled_passed:
             passed = True
             detail = "填写后回读一致，且等待 React 渲染周期后再次回读一致。"
-        elif immediate_passed and not settled_passed:
+        elif immediate_passed:
             passed = False
             detail = (
                 f"填写后立即回读一致，但等待 {recheck_wait_ms}ms 后值被重置为 {settled!r}；"

@@ -1,9 +1,15 @@
-"""Makro listing section discovery, safe expand/cancel and section scanning.
+"""Makro listing section discovery, scanning and persistence primitives.
 
-Unified safe strategy for every listing section (Price, Stock and Shipping
-Information / Product Description / Additional Description / Product Photos):
-click EDIT, wait for fields, scan that section alone, then click only the safe
-Cancel. Never fills values, never uploads files, never clicks Save / Send to QC.
+This module owns the section lifecycle for every Step 3 card:
+
+- discover a card and normalize its title;
+- open only that card's EDIT control;
+- scan fields inside that card;
+- Cancel only that card when the caller explicitly wants to discard edits;
+- Save only that card and prove Makro accepted the save by observing collapse
+  back to EDIT with no residual validation badge.
+
+It never clicks Send to QC and contains no product/category-specific field list.
 """
 
 from __future__ import annotations
@@ -118,9 +124,28 @@ _SECTION_STATE_SCRIPT = (
     + "\n}"
 )
 
+
 def find_sections(page: Page) -> list[dict[str, Any]]:
     """List all listing section cards with title and expanded state."""
     return page.evaluate(_FIND_SECTIONS_SCRIPT)
+
+
+def _await_section_cards(
+    page: Page, *, wait_ms: int = 500, timeout_s: float = 30.0
+) -> list[dict[str, Any]]:
+    """Poll until at least one Step 3 section card is rendered.
+
+    The section cards and their attribute fields load asynchronously after the
+    listing draft / vertical attribute schema is ready. Scanning before that
+    would find zero fields, so wait for the first card to appear.
+    """
+    sections = find_sections(page)
+    deadline = time.monotonic() + timeout_s
+    while not sections and time.monotonic() < deadline:
+        page.wait_for_timeout(int(wait_ms))
+        sections = find_sections(page)
+    return sections
+
 
 def scan_section_fields(
     page: Page,
@@ -157,6 +182,7 @@ def scan_section_fields(
     prefix = section_path + " > "
     return [item for item in merged if item.get("path", "").startswith(prefix)]
 
+
 def scan_sections(
     page: Page,
     *,
@@ -164,16 +190,14 @@ def scan_sections(
     wait_ms: int = 350,
     max_scroll_steps: int = 200,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    """Expand every listing section that has an EDIT button, scan it, collapse.
+    """Expand every listing section that has EDIT, scan it, then discard scan-only state.
 
-    Unified safe strategy for all sections (Price, Stock and Shipping
-    Information / Product Description / Additional Description / Product
-    Photos): click EDIT, wait for fields to render, scan that section alone,
-    then click only the safe Cancel. Never fills values, never uploads files,
-    never clicks Save or Send to QC.
+    This function is intentionally read-only from the caller's perspective: a
+    section opened only for discovery is Cancelled immediately afterwards. Real
+    fill/persist workflows use :func:`save_section` explicitly instead.
     """
 
-    sections = find_sections(page)
+    sections = _await_section_cards(page)
     stats: dict[str, Any] = {
         "sections_found": len(sections),
         "sections_expanded_by_scan": 0,
@@ -188,7 +212,6 @@ def scan_sections(
         if not section_path:
             continue
 
-        # Re-check the live state: opening one section can collapse another.
         state = page.evaluate(_SECTION_STATE_SCRIPT, {"path": section_path})
         was_collapsed = bool(state.get("has_edit"))
         expanded = not was_collapsed
@@ -237,14 +260,11 @@ def scan_sections(
     flat_controls = merge_scans(flat_scans)
     return section_results, flat_controls, stats
 
+
 def _wait_for_section_fields(
     page: Page, section_path: str, *, wait_ms: int, timeout_s: float
 ) -> bool:
-    """Poll until the section renders fields or shows the Cancel control.
-
-    Field-less sections (e.g. Product Photos) only show Cancel once the EDIT
-    click has taken effect; waiting for either signal avoids a fixed long sleep.
-    """
+    """Poll until the section renders fields or shows the Cancel control."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         state = page.evaluate(_SECTION_STATE_SCRIPT, {"path": section_path})
@@ -255,12 +275,7 @@ def _wait_for_section_fields(
 
 
 def base_section_title(title: str) -> str:
-    """Return a stable Makro section identity, ignoring UI-only suffixes.
-
-    Makro appends changing completion counters such as ``(14/14)`` and can also
-    append ``(Optional)`` to section labels. Neither suffix is part of the
-    semantic section identity used by CLI selection or resolver matching.
-    """
+    """Return a stable Makro section identity, ignoring UI-only suffixes."""
 
     normalized = re.sub(r"\s*\(\d+\s*/\s*\d+\)\s*$", "", title).strip()
     normalized = re.sub(
@@ -280,11 +295,7 @@ def find_section(page: Page, wanted: str) -> dict[str, Any] | None:
 
 
 def open_section_for_edit(page: Page, section: dict[str, Any]) -> None:
-    """Click the safe EDIT button of a collapsed listing section.
-
-    Only clicks the section's own EDIT control; never fills values and never
-    clicks Save / Send to QC.
-    """
+    """Click only the safe EDIT button of a collapsed listing section."""
 
     if not section.get("has_edit"):
         return
@@ -296,3 +307,111 @@ def open_section_for_edit(page: Page, section: dict[str, Any]) -> None:
     button.scroll_into_view_if_needed()
     button.click()
     page.wait_for_timeout(500)
+
+
+def visible_section_errors(page: Page, section_path: str) -> list[str]:
+    """Return visible Makro validation messages inside one expanded card."""
+
+    card = page.locator(section_path)
+    texts: list[str] = []
+    selectors = ".form-error, [role='alert'], [class*='FormError'], [class*='error' i]"
+    try:
+        for text in card.locator(selectors).all_inner_texts():
+            clean = re.sub(r"\s+", " ", text).strip()
+            if clean and clean not in texts:
+                texts.append(clean)
+    except Exception:
+        pass
+    return texts[:30]
+
+
+def collapsed_error_badges(page: Page, section_title: str) -> list[str]:
+    """Read a collapsed-card validation summary such as ``1 Error``."""
+
+    section = find_section(page, section_title)
+    if section is None or not section.get("path"):
+        return []
+    try:
+        text = page.locator(str(section["path"])).inner_text(timeout=3_000)
+    except Exception:
+        return []
+    return list(dict.fromkeys(re.findall(r"\b\d+\s+Errors?\b", text, flags=re.I)))
+
+
+def cancel_section(page: Page, section_title: str, *, wait_ms: int = 450) -> None:
+    """Discard the target section's current edits and prove it collapsed."""
+
+    section = find_section(page, section_title)
+    if section is None:
+        raise RuntimeError(f"Cancel 前找不到 section：{section_title}")
+    if section.get("has_edit"):
+        return
+    path = str(section.get("path") or "")
+    if not path:
+        raise RuntimeError(f"section {section_title!r} 缺少稳定 DOM path。")
+    card = page.locator(path)
+    cancel = card.get_by_text("Cancel", exact=True)
+    if cancel.count() != 1 or not cancel.first.is_visible():
+        raise RuntimeError(
+            f"section {section_title!r} 没有唯一可见 Cancel；拒绝猜测其它按钮。"
+        )
+    cancel.first.scroll_into_view_if_needed()
+    cancel.first.click()
+    page.wait_for_timeout(wait_ms)
+    collapsed = find_section(page, section_title)
+    if collapsed is None or not collapsed.get("has_edit"):
+        raise RuntimeError(f"section {section_title!r} Cancel 后未恢复折叠态。")
+
+
+def save_section(page: Page, section_title: str, *, timeout_s: float = 15.0) -> None:
+    """Save one Step 3 card and prove Makro accepted the persistence operation.
+
+    Success means all of the following are true:
+    1. the expanded card has one unique visible Save button;
+    2. there are no already-visible validation errors before clicking Save;
+    3. after clicking Save the card collapses back to EDIT within ``timeout_s``;
+    4. the collapsed card has no ``N Error(s)`` badge.
+
+    This function never clicks Send to QC.
+    """
+
+    section = find_section(page, section_title)
+    if section is None:
+        raise RuntimeError(f"Save 前找不到 section：{section_title}")
+    if section.get("has_edit"):
+        raise RuntimeError(f"Save 前 section 已折叠：{section_title}")
+    path = str(section.get("path") or "")
+    if not path:
+        raise RuntimeError(f"Save 前 section 缺少 DOM path：{section_title}")
+
+    inline_errors = visible_section_errors(page, path)
+    if inline_errors:
+        raise RuntimeError(
+            f"{section_title} Save 前仍存在 Makro validation error："
+            + " | ".join(inline_errors)
+        )
+
+    card = page.locator(path)
+    save = card.locator("button").filter(has_text=re.compile(r"^\s*Save\s*$", re.I))
+    if save.count() != 1 or not save.first.is_visible():
+        raise RuntimeError(f"{section_title} 没有唯一可见 Save 按钮。")
+    save.first.scroll_into_view_if_needed()
+    save.first.click()
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(250)
+        live = find_section(page, section_title)
+        if live is not None and live.get("has_edit"):
+            page.wait_for_timeout(300)
+            badges = collapsed_error_badges(page, section_title)
+            if badges:
+                raise RuntimeError(
+                    f"{section_title} 保存后仍有 Makro validation error："
+                    + " | ".join(badges)
+                )
+            return
+
+    errors = visible_section_errors(page, path)
+    detail = " | ".join(errors) if errors else "未读取到可见 validation error"
+    raise RuntimeError(f"{section_title} 点击 Save 后未恢复 EDIT：{detail}")

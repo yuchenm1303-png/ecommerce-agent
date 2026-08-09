@@ -1,21 +1,17 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .evidence_contract import EvidencePacket, ProductIdentity, bundle_from_evidence_packet
+from .evidence_contract import ProductIdentity
 from .evidence_pipeline import (
+    add_fact,
     bundle_from_catalog_answers,
     bundle_from_facts_json,
-    bundle_from_key_value_text,
     merge_bundles,
 )
-from .evidence_validation import validate_evidence_packet
 from .qa_catalog import QuestionCatalog
-from .snapshot_evidence import extract_snapshot_evidence
 from .source_bundle import ProductSourceBundle, bundle_from_product_table, normalize_key
-from .source_snapshot import source_snapshot_from_json
 
 
 _TRUSTED_IDENTITY_SOURCE_TYPES = {
@@ -29,12 +25,18 @@ _TRUSTED_IDENTITY_SOURCE_TYPES = {
 
 @dataclass(slots=True, frozen=True)
 class ResolutionInputSpec:
+    """Explicit seller/customer inputs shared by resolver, planner and executor.
+
+    Supplier pages and images remain present on the spec because callers use the
+    same object to build the AI source pack, but this module never interprets
+    them into product attributes. Product semantics belong to the AI resolver.
+    """
+
     sku: str = ""
     expected_model: str = ""
     expected_brand: str = ""
     product_table: str | None = None
     facts_json: tuple[str, ...] = ()
-    evidence_packets: tuple[str, ...] = ()
     supplier_snapshots: tuple[str, ...] = ()
     official_snapshots: tuple[str, ...] = ()
     supplemental_text: str = ""
@@ -56,8 +58,6 @@ class ResolutionInputResult:
     bundle: ProductSourceBundle
     expected_identity: ProductIdentity
     warnings: list[str] = field(default_factory=list)
-    evidence_packet_files: list[str] = field(default_factory=list)
-    source_snapshot_files: list[str] = field(default_factory=list)
 
 
 def _trusted_identity_value(
@@ -139,87 +139,56 @@ def _derive_expected_identity(
     )
 
 
-def _append_validated_packet(
-    *,
-    packet: EvidencePacket,
+def customer_context_for_resolution(
     catalog: QuestionCatalog,
-    expected: ProductIdentity,
-    bundles: list[ProductSourceBundle],
-    warnings: list[str],
-    warning_prefix: str,
-) -> None:
-    validated = validate_evidence_packet(
-        packet,
-        catalog,
-        expected_identity=expected,
-    )
-    warnings.extend(
-        f"{warning_prefix}: {warning}" for warning in validated.warnings
-    )
-    bundles.append(
-        bundle_from_evidence_packet(
-            validated.packet,
-            expected_identity=expected,
-        )
-    )
+    spec: ResolutionInputSpec,
+) -> str:
+    """Return the exact customer text source shared by AI resolver and rebind."""
 
-
-def _append_snapshot_files(
-    *,
-    paths: tuple[str, ...],
-    source_type: str,
-    confidence: float,
-    catalog: QuestionCatalog,
-    expected: ProductIdentity,
-    bundles: list[ProductSourceBundle],
-    warnings: list[str],
-    snapshot_files: list[str],
-) -> None:
-    for path in paths:
-        snapshot_path = Path(path)
-        snapshot = source_snapshot_from_json(snapshot_path)
-        extracted = extract_snapshot_evidence(
-            snapshot,
-            catalog,
-            source_type=source_type,
-            confidence=confidence,
-        )
-        _append_validated_packet(
-            packet=extracted.packet,
-            catalog=catalog,
-            expected=expected,
-            bundles=bundles,
-            warnings=warnings,
-            warning_prefix=snapshot_path.name,
-        )
-        if extracted.ignored_rows:
-            warnings.append(
-                f"{snapshot_path.name}: ignored_source_rows={extracted.ignored_rows}"
-            )
-        snapshot_files.append(str(snapshot_path.resolve()))
+    parts = [catalog.preamble_text, spec.supplemental_text]
+    if spec.supplemental_text_file:
+        parts.append(Path(spec.supplemental_text_file).read_text(encoding="utf-8"))
+    return "\n".join(part for part in parts if part and part.strip()).strip()
 
 
 def build_resolution_inputs(
     catalog: QuestionCatalog,
     spec: ResolutionInputSpec,
 ) -> ResolutionInputResult:
-    """Load every explicit evidence source through one shared safety boundary.
+    """Load explicit seller/customer data without interpreting product semantics.
 
-    Explicit trusted inputs establish product identity first. External image/web/
-    AI evidence is then question-scoped and identity-checked before entering the
-    resolver. Deterministic source snapshots take the same validated packet path.
+    Customer Answer cells, explicit SKU, product tables and manual facts remain
+    trusted structured inputs. Supplier/official snapshots and images are not
+    converted to local product facts; they are raw AI sources. Workbook preamble
+    stays as one canonical text source and is not locally re-parsed into a second
+    set of pseudo-facts.
     """
 
+    customer_context = customer_context_for_resolution(catalog, spec)
     trusted_bundles: list[ProductSourceBundle] = [
         bundle_from_catalog_answers(
             catalog,
             sku=spec.sku,
             image_paths=spec.image_paths,
             product_url=spec.product_url,
-            supplemental_text=spec.supplemental_text,
+            supplemental_text=customer_context,
         )
     ]
     warnings: list[str] = []
+
+    if spec.sku.strip():
+        explicit_sku = ProductSourceBundle(sku=spec.sku.strip())
+        add_fact(
+            explicit_sku,
+            key="SKU",
+            value=spec.sku.strip(),
+            source_type="business",
+            source_reference="runtime:--sku",
+            confidence=1.0,
+            evidence_text=f"SKU={spec.sku.strip()}",
+            note="explicit seller-controlled SKU",
+        )
+        trusted_bundles.append(explicit_sku)
 
     if spec.product_table:
         trusted_bundles.append(
@@ -234,63 +203,11 @@ def build_resolution_inputs(
 
     trusted_bundle = merge_bundles(*trusted_bundles)
     expected = _derive_expected_identity(spec, trusted_bundle)
-    bundles = list(trusted_bundles)
-
-    packet_files: list[str] = []
-    for path in spec.evidence_packets:
-        packet_path = Path(path)
-        payload = json.loads(packet_path.read_text(encoding="utf-8"))
-        packet = EvidencePacket.from_mapping(payload)
-        _append_validated_packet(
-            packet=packet,
-            catalog=catalog,
-            expected=expected,
-            bundles=bundles,
-            warnings=warnings,
-            warning_prefix=packet_path.name,
-        )
-        packet_files.append(str(packet_path.resolve()))
-
-    snapshot_files: list[str] = []
-    _append_snapshot_files(
-        paths=spec.supplier_snapshots,
-        source_type="supplier_web",
-        confidence=0.88,
-        catalog=catalog,
-        expected=expected,
-        bundles=bundles,
-        warnings=warnings,
-        snapshot_files=snapshot_files,
-    )
-    _append_snapshot_files(
-        paths=spec.official_snapshots,
-        source_type="official_web",
-        confidence=0.92,
-        catalog=catalog,
-        expected=expected,
-        bundles=bundles,
-        warnings=warnings,
-        snapshot_files=snapshot_files,
-    )
-
-    text_parts = [spec.supplemental_text]
-    if spec.supplemental_text_file:
-        text_parts.append(
-            Path(spec.supplemental_text_file).read_text(encoding="utf-8")
-        )
-    explicit_text = "\n".join(part for part in text_parts if part.strip())
-    if explicit_text:
-        bundles.append(
-            bundle_from_key_value_text(
-                explicit_text,
-                source_reference=spec.supplemental_text_file or "--supplemental-text",
-            )
-        )
+    if customer_context:
+        warnings.append(f"customer_context_chars={len(customer_context)}")
 
     return ResolutionInputResult(
-        bundle=merge_bundles(*bundles),
+        bundle=trusted_bundle,
         expected_identity=expected,
         warnings=warnings,
-        evidence_packet_files=packet_files,
-        source_snapshot_files=snapshot_files,
     )
