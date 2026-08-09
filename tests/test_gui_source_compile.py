@@ -10,6 +10,7 @@ GUI_SOURCES = [
     PROJECT_ROOT / "gui" / "console_window.py",
     PROJECT_ROOT / "gui" / "acceptance_console.py",
     PROJECT_ROOT / "gui" / "readonly_runner.py",
+    PROJECT_ROOT / "gui" / "real_execution.py",
     PROJECT_ROOT / "gui" / "result_loader.py",
     PROJECT_ROOT / "gui" / "visual_style.py",
     PROJECT_ROOT / "gui" / "nekro_card_fx.py",
