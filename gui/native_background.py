@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import base64
-import math
+import ctypes
+import sys
 import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPainterPath
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickWindow
 from PySide6.QtWidgets import QApplication, QAbstractScrollArea, QFrame, QMainWindow, QWidget
@@ -17,6 +18,41 @@ _WALLPAPER_ASSET = Path(__file__).resolve().parent / "assets" / "fuji_sakura_wal
 _OVERSCAN = 1.06
 _TRAVEL = 0.90
 _GLASS_RADIUS = 6.0
+
+
+# Win32 SetWindowPos flags. The background window must stay immediately behind
+# the translucent QWidget top-level; otherwise unrelated application windows can
+# slip between the two native surfaces and become visible through the GUI.
+_SWP_NOSIZE = 0x0001
+_SWP_NOMOVE = 0x0002
+_SWP_NOACTIVATE = 0x0010
+_SWP_NOSENDCHANGING = 0x0400
+
+
+def _stack_native_window_behind(background_wid: int, foreground_wid: int) -> None:
+    if sys.platform != "win32" or not background_wid or not foreground_wid:
+        return
+
+    user32 = ctypes.windll.user32
+    user32.SetWindowPos.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    user32.SetWindowPos.restype = ctypes.c_int
+    user32.SetWindowPos(
+        ctypes.c_void_p(background_wid),
+        ctypes.c_void_p(foreground_wid),
+        0,
+        0,
+        0,
+        0,
+        _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE | _SWP_NOSENDCHANGING,
+    )
 
 
 def _decode_wallpaper() -> bytes:
@@ -39,8 +75,8 @@ def _decode_wallpaper() -> bytes:
 def _blur_wallpaper(source: QImage, radius: float = 10.0) -> QImage:
     """Create the one pre-blurred wallpaper used for the entire window lifetime."""
 
-    from PySide6.QtWidgets import QGraphicsBlurEffect, QGraphicsPixmapItem, QGraphicsScene
     from PySide6.QtGui import QPixmap
+    from PySide6.QtWidgets import QGraphicsBlurEffect, QGraphicsPixmapItem, QGraphicsScene
 
     pixmap = QPixmap.fromImage(source)
     item = QGraphicsPixmapItem(pixmap)
@@ -64,6 +100,7 @@ def _qml_source() -> str:
     max_y = (_OVERSCAN - 1.0) * 0.5 * _TRAVEL
     return f'''import QtQuick
 import QtQuick.Window
+import QtQuick.Effects
 
 Window {{
     id: root
@@ -86,6 +123,7 @@ Window {{
     readonly property real imageX: (width - width * {_OVERSCAN}) * 0.5 + offsetX
     readonly property real imageY: (height - height * {_OVERSCAN}) * 0.5 + offsetY
 
+    // Sharp wallpaper is the only full-window visible wallpaper layer.
     Image {{
         id: sharpImg
         width: root.width * {_OVERSCAN}
@@ -98,11 +136,16 @@ Window {{
         cache: true
     }}
 
+    // Hidden, root-sized texture source. Its child uses the exact same floating
+    // transform as sharpImg. The blur itself was generated once by Python.
     Item {{
-        id: blurHost
-        width: root.width
-        height: root.height
+        id: blurSource
+        anchors.fill: parent
         clip: true
+        visible: false
+        layer.enabled: true
+        layer.smooth: true
+
         Image {{
             id: blurImg
             width: root.width * {_OVERSCAN}
@@ -111,35 +154,30 @@ Window {{
             y: root.imageY
             source: root.blurUrl
             fillMode: Image.PreserveAspectCrop
-            smooth: false
+            smooth: true
             cache: true
         }}
     }}
 
+    // Global alpha mask generated from the live QWidget card geometry.
     Image {{
         id: maskImg
+        anchors.fill: parent
         source: root.maskUrl
-        width: root.width
-        height: root.height
         visible: false
         cache: false
         asynchronous: false
     }}
 
-    ShaderEffect {{
+    // QtQuick.Effects owns its precompiled shaders internally. This is a
+    // mask-only pass over the already blurred texture: no runtime Gaussian blur,
+    // no inline GLSL, and no per-card ShaderEffectSource.
+    MultiEffect {{
         anchors.fill: parent
-        property variant blurTex: blurHost
-        property variant maskTex: maskImg
-        fragmentShader: "
-            uniform sampler2D blurTex;
-            uniform sampler2D maskTex;
-            varying vec2 qt_TexCoord0;
-            void main() {{
-                vec4 blur = texture2D(blurTex, qt_TexCoord0);
-                vec4 mask = texture2D(maskTex, qt_TexCoord0);
-                gl_FragColor = vec4(blur.rgb, blur.a * mask.a);
-            }}
-        "
+        source: blurSource
+        maskEnabled: true
+        maskSource: maskImg
+        autoPaddingEnabled: false
     }}
 
     FrameAnimation {{
@@ -171,6 +209,7 @@ class NativeQuickBackground(QObject):
         self._shutting_down = False
         self._mask_pending = False
         self._mask_revision = 0
+        self._restack_pending = False
         self._temp = tempfile.TemporaryDirectory(prefix="ecommerce-agent-bg-")
         self._temp_dir = Path(self._temp.name)
         self._cards = [
@@ -254,6 +293,19 @@ class NativeQuickBackground(QObject):
         quick.setProperty("pointerY", ny)
         quick.setProperty("animationRunning", True)
 
+    def _schedule_restack(self) -> None:
+        if self._shutting_down or self._restack_pending:
+            return
+        self._restack_pending = True
+        QTimer.singleShot(0, self._restack_behind_main)
+
+    def _restack_behind_main(self) -> None:
+        self._restack_pending = False
+        quick = self.quick_window
+        if self._shutting_down or quick is None or not quick.isVisible():
+            return
+        _stack_native_window_behind(int(quick.winId()), int(self.window.winId()))
+
     def _sync_window(self) -> None:
         quick = self.quick_window
         if self._shutting_down or quick is None:
@@ -264,8 +316,8 @@ class NativeQuickBackground(QObject):
         if self.window.isVisible() and not self.window.isMinimized():
             if not quick.isVisible():
                 quick.show()
-            self.window.raise_()
             quick.setProperty("animationRunning", True)
+            self._schedule_restack()
         else:
             quick.setProperty("animationRunning", False)
             quick.hide()
@@ -353,9 +405,22 @@ class NativeQuickBackground(QObject):
         event_type = event.type()
 
         if watched is self.window:
-            if event_type in {QEvent.Type.Move, QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.WindowStateChange}:
+            if event_type in {
+                QEvent.Type.Move,
+                QEvent.Type.Resize,
+                QEvent.Type.Show,
+                QEvent.Type.WindowStateChange,
+            }:
                 self._sync_window()
                 self.schedule_mask_update()
+            if event_type in {
+                QEvent.Type.Show,
+                QEvent.Type.WindowActivate,
+                QEvent.Type.ActivationChange,
+                QEvent.Type.ZOrderChange,
+                QEvent.Type.WindowStateChange,
+            }:
+                self._schedule_restack()
             elif event_type == QEvent.Type.Hide:
                 quick = self.quick_window
                 if quick is not None:
