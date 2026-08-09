@@ -1,6 +1,10 @@
-"""Optional semantic extraction provider adapters.
+"""Provider adapters and cross-platform media registration."""
 
-Core resolver modules never depend on a specific model vendor. Provider modules
-translate the strict grounded request into one vendor API and return untrusted
-JSON that must still pass app.semantic_extraction validation.
-"""
+from __future__ import annotations
+
+import mimetypes
+
+# Windows/Python installations do not consistently ship a WebP MIME mapping.
+# Product-page capture legitimately stores supplier images as .webp, and the
+# multimodal provider needs an image/* data-URI media type before sending them.
+mimetypes.add_type("image/webp", ".webp", strict=True)
