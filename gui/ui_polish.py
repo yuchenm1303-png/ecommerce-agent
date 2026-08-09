@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QLabel,
     QLayout,
     QMainWindow,
     QSplitter,
@@ -16,9 +17,9 @@ from PySide6.QtWidgets import (
 )
 
 
-# Final presentation pass for the acceptance console.  This module is deliberately
-# layout/style-only: it does not touch Resolver state, runner configuration,
-# execution permissions, Save/image gates, or the QC lock.
+# Final presentation pass for the acceptance console. This module is layout and
+# presentation only; the existing runners, permission gates and execution widgets
+# remain the authoritative business implementation.
 _POLISH_STYLE = r"""
 QWidget#root {
     font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
@@ -109,14 +110,6 @@ QComboBox::drop-down {
     width: 28px;
     border: 0;
     background: transparent;
-}
-
-QComboBox::down-arrow {
-    width: 0;
-    height: 0;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid rgba(255,255,255,180);
 }
 
 QComboBox QAbstractItemView {
@@ -392,7 +385,7 @@ def _configure_data_table(table: QTableWidget, *, minimum_height: int = 0) -> No
 
 
 def _polish_field_table(table: QTableWidget) -> None:
-    _configure_data_table(table, minimum_height=300)
+    _configure_data_table(table, minimum_height=260)
     header = table.horizontalHeader()
     columns = table.columnCount()
     if columns >= 7:
@@ -413,6 +406,38 @@ def _polish_field_table(table: QTableWidget) -> None:
         table.setColumnWidth(2, 128)
 
 
+def _compact_field_header(window: QMainWindow, card: QFrame) -> None:
+    layout = card.layout()
+    hint = getattr(window, "fields_hint", None)
+    if not isinstance(layout, QVBoxLayout) or not isinstance(hint, QLabel):
+        return
+    if getattr(card, "_ui_polish_header_compact", False):
+        return
+
+    direct_labels = [child for child in card.children() if isinstance(child, QLabel)]
+    eyebrow = next((label for label in direct_labels if label.objectName() == "sectionEyebrow"), None)
+    title = next((label for label in direct_labels if label.objectName() == "cardTitle"), None)
+    if eyebrow is None or title is None:
+        return
+
+    layout.removeWidget(eyebrow)
+    layout.removeWidget(title)
+    layout.removeWidget(hint)
+
+    title_box = QVBoxLayout()
+    title_box.setSpacing(1)
+    title_box.addWidget(eyebrow)
+    title_box.addWidget(title)
+
+    header_row = QHBoxLayout()
+    header_row.setSpacing(12)
+    header_row.addLayout(title_box)
+    header_row.addStretch(1)
+    header_row.addWidget(hint, 0, Qt.AlignmentFlag.AlignBottom)
+    layout.insertLayout(0, header_row)
+    setattr(card, "_ui_polish_header_compact", True)
+
+
 def _reflow_real_execution_controls(window: QMainWindow, input_card: QFrame) -> None:
     required = (
         "real_start_button",
@@ -427,9 +452,6 @@ def _reflow_real_execution_controls(window: QMainWindow, input_card: QFrame) -> 
     if not isinstance(layout, QVBoxLayout) or getattr(window, "_ui_polish_real_reflow", False):
         return
 
-    # The original acceptance row was doing too much: scope + permission toggles
-    # + image controls + QC lock + both action buttons.  Keep permissions together
-    # and move the actions next to the policy explanation on a dedicated row.
     controls: QBoxLayout | None = None
     for index in range(layout.count()):
         candidate = layout.itemAt(index).layout()
@@ -476,8 +498,6 @@ def install_ui_polish(window: QMainWindow) -> None:
     if not isinstance(outer, QVBoxLayout):
         return
 
-    # Global rhythm: less dead space at the window edge, but more breathing room
-    # inside actual information surfaces.
     outer.setContentsMargins(24, 18, 24, 20)
     outer.setSpacing(12)
 
@@ -487,7 +507,7 @@ def install_ui_polish(window: QMainWindow) -> None:
 
     input_card = outer.itemAt(1).widget() if outer.count() > 1 else None
     if isinstance(input_card, QFrame):
-        _set_box_layout(input_card.layout(), margins=(20, 14, 20, 15), spacing=8)
+        _set_box_layout(input_card.layout(), margins=(18, 12, 18, 13), spacing=6)
         input_card.setMinimumHeight(0)
         _reflow_real_execution_controls(window, input_card)
 
@@ -497,12 +517,10 @@ def install_ui_polish(window: QMainWindow) -> None:
     for name in ("ready_card", "missing_card", "conflict_card", "blocked_card"):
         card = getattr(window, name, None)
         if isinstance(card, QFrame):
-            card.setMinimumHeight(88)
-            card.setMaximumHeight(98)
-            _set_box_layout(card.layout(), margins=(18, 11, 18, 11), spacing=2)
+            card.setMinimumHeight(84)
+            card.setMaximumHeight(92)
+            _set_box_layout(card.layout(), margins=(18, 10, 18, 10), spacing=2)
 
-    # Turn the crowded fixed stack into a real workspace.  The user can give the
-    # field table or console more room, while the default heavily favors fields.
     if outer.count() >= 5 and not hasattr(window, "_ui_polish_body_splitter"):
         workspace = outer.itemAt(3).widget()
         console = outer.itemAt(4).widget()
@@ -513,9 +531,9 @@ def install_ui_polish(window: QMainWindow) -> None:
             body.setObjectName("bodySplitter")
             body.setChildrenCollapsible(False)
             body.setHandleWidth(10)
-            workspace.setMinimumHeight(310)
+            workspace.setMinimumHeight(300)
             console.setMinimumHeight(238)
-            console.setMaximumHeight(350)
+            console.setMaximumHeight(420)
             body.addWidget(workspace)
             body.addWidget(console)
             body.setStretchFactor(0, 7)
@@ -524,8 +542,6 @@ def install_ui_polish(window: QMainWindow) -> None:
             outer.addWidget(body, 1)
             setattr(window, "_ui_polish_body_splitter", body)
 
-            # The existing horizontal workspace splitter is functionally good;
-            # only rebalance it so the seven-column trace table owns the canvas.
             workspace_splitter = workspace.findChild(QSplitter)
             if isinstance(workspace_splitter, QSplitter):
                 workspace_splitter.setObjectName("workspaceSplitter")
@@ -543,11 +559,12 @@ def install_ui_polish(window: QMainWindow) -> None:
         _polish_field_table(field_table)
         field_card = field_table.parentWidget()
         if isinstance(field_card, QFrame):
-            _set_box_layout(field_card.layout(), margins=(20, 15, 20, 18), spacing=10)
+            _compact_field_header(window, field_card)
+            _set_box_layout(field_card.layout(), margins=(20, 14, 20, 17), spacing=9)
 
     web_table = getattr(window, "web_table", None)
     if isinstance(web_table, QTableWidget):
-        _configure_data_table(web_table, minimum_height=205)
+        _configure_data_table(web_table, minimum_height=190)
         header = web_table.horizontalHeader()
         if web_table.columnCount() >= 3:
             header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
@@ -556,20 +573,19 @@ def install_ui_polish(window: QMainWindow) -> None:
             web_table.setColumnWidth(0, 108)
         web_card = web_table.parentWidget()
         if isinstance(web_card, QFrame):
-            _set_box_layout(web_card.layout(), margins=(18, 14, 18, 16), spacing=9)
+            _set_box_layout(web_card.layout(), margins=(18, 13, 18, 15), spacing=8)
 
-    # Runtime/safety cards should read like compact diagnostics, not raw labels.
     for anchor_name in ("cold_label", "write_value"):
         anchor = getattr(window, anchor_name, None)
         card = anchor.parentWidget() if isinstance(anchor, QWidget) else None
         if isinstance(card, QFrame):
-            _set_box_layout(card.layout(), margins=(18, 14, 18, 16), spacing=7)
+            _set_box_layout(card.layout(), margins=(18, 13, 18, 15), spacing=6)
 
     console = getattr(window, "console", None)
     if isinstance(console, QFrame):
         console.setMinimumHeight(238)
-        console.setMaximumHeight(350)
-        _set_box_layout(console.layout(), margins=(18, 13, 18, 15), spacing=9)
+        console.setMaximumHeight(420)
+        _set_box_layout(console.layout(), margins=(18, 12, 18, 14), spacing=8)
         console.setStyleSheet(console.styleSheet() + "\n" + _CONSOLE_POLISH_STYLE)
         tabs = getattr(console, "tabs", None)
         if isinstance(tabs, QWidget):
@@ -577,8 +593,6 @@ def install_ui_polish(window: QMainWindow) -> None:
         for table in console.findChildren(QTableWidget):
             _configure_data_table(table)
 
-    # Apply last so these visual rules intentionally win over the baseline and
-    # native-renderer compatibility styles without changing the glass renderer.
     window.setStyleSheet(window.styleSheet() + "\n" + _POLISH_STYLE)
 
     visual = getattr(window, "_visual_style", None)
