@@ -63,6 +63,17 @@ def _qualifier_options(field: dict[str, Any]) -> tuple[str, ...]:
     return tuple(output)
 
 
+def _field_context(field: dict[str, Any]) -> str:
+    direct = str(field.get("context_text") or "").strip()
+    if direct:
+        return direct
+    for control in field.get("controls") or []:
+        value = str(control.get("context_text") or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _schema_field(field: dict[str, Any]) -> dict[str, Any]:
     return {
         "attribute_key": str(field.get("attribute_key") or ""),
@@ -73,6 +84,9 @@ def _schema_field(field: dict[str, Any]) -> dict[str, Any]:
         "options": list(_field_options(field)),
         "qualifier_options": list(_qualifier_options(field)),
         "help_text": str(field.get("help_text") or ""),
+        # Nearby rendered UI text is carried to AI so fixed units/scope are not
+        # lost when Makro does not expose a separate qualifier control.
+        "context_text": _field_context(field),
     }
 
 
@@ -126,8 +140,9 @@ def assert_live_schema_matches(
 ) -> None:
     """Fail closed when the current page contract changed after AI planning.
 
-    DOM paths, current values, completion counters and render state are ignored.
-    Field identity, requiredness, multiplicity and option contracts must match.
+    DOM paths, current values, completion counters, nearby presentation text and
+    render state are ignored. Field identity, requiredness, multiplicity and
+    option contracts must match.
     """
 
     planned = Counter(_drift_signature(field) for field in planned_fields)
