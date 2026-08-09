@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Property, QAbstractListModel, QModelIndex, QObject, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QCursor, QDesktopServices, QImage, QPainter, QPixmap, QRadialGradient
+from PySide6.QtGui import QDesktopServices, QImage, QPainter, QPixmap, QRadialGradient
 from PySide6.QtQuick import QQuickImageProvider
 from PySide6.QtWidgets import QGraphicsBlurEffect, QGraphicsPixmapItem, QGraphicsScene
 
@@ -70,11 +70,21 @@ class WallpaperProvider(QQuickImageProvider):
         super().__init__(QQuickImageProvider.Image)
         source = self._load_source()
         self._sharp = self._compose_vignette(source)
-        self._blur = self._blur(source, 10.0)
+        self._blurred = self._blur(source, 10.0)
+        # Reuse the exact embedded sprite from the former QWidget effect layer;
+        # the presentation path changes, the artwork does not.
+        from .nekro_effects import _load_sprite
+
+        self._sakura = _load_sprite().toImage().convertToFormat(QImage.Format.Format_RGBA8888)
 
     def requestImage(self, image_id: str, size, requested_size):  # noqa: N802
         del size, requested_size
-        return QImage(self._blur if image_id.casefold() == "blur" else self._sharp)
+        key = image_id.casefold()
+        if key == "blur":
+            return QImage(self._blurred)
+        if key == "sakura":
+            return QImage(self._sakura)
+        return QImage(self._sharp)
 
     @staticmethod
     def _load_source() -> QImage:
@@ -87,13 +97,14 @@ class WallpaperProvider(QQuickImageProvider):
 
     @staticmethod
     def _compose_vignette(source: QImage) -> QImage:
+        from PySide6.QtGui import QColor
+
         image = QImage(source)
         painter = QPainter(image)
         center = image.rect().center()
         radius = max(1.0, math.hypot(image.width() / 2.0, image.height() / 2.0))
         gradient = QRadialGradient(center, radius)
-        gradient.setColorAt(0.0, Qt.transparent)
-        from PySide6.QtGui import QColor
+        gradient.setColorAt(0.0, QColor(0, 0, 0, 0))
         gradient.setColorAt(1.0, QColor(0, 0, 0, 92))
         painter.fillRect(image.rect(), gradient)
         painter.end()
