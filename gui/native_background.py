@@ -4,8 +4,20 @@ import base64
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPainterPath
+from PySide6.QtCore import (
+    QAbstractListModel,
+    QByteArray,
+    QEvent,
+    QModelIndex,
+    QObject,
+    QPoint,
+    QPointF,
+    QRectF,
+    Qt,
+    QTimer,
+    QUrl,
+)
+from PySide6.QtGui import QImage, QMouseEvent, QPainter
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickWindow
 from PySide6.QtWidgets import QApplication, QAbstractScrollArea, QFrame, QMainWindow, QWidget
@@ -16,6 +28,7 @@ _WALLPAPER_ASSET = Path(__file__).resolve().parent / "assets" / "fuji_sakura_wal
 _OVERSCAN = 1.06
 _TRAVEL = 0.90
 _GLASS_RADIUS = 6.0
+_NORMAL_GLASS_ALPHA = 64.0
 
 
 def _decode_wallpaper() -> bytes:
@@ -58,6 +71,200 @@ def _blur_wallpaper(source: QImage, radius: float = 10.0) -> QImage:
     return result
 
 
+class GlassCardModel(QAbstractListModel):
+    """Live card geometry and tint state consumed directly by the Quick scene."""
+
+    _ROLE_BASE = int(Qt.ItemDataRole.UserRole)
+    CARD_X_ROLE = _ROLE_BASE + 1
+    CARD_Y_ROLE = _ROLE_BASE + 2
+    CARD_W_ROLE = _ROLE_BASE + 3
+    CARD_H_ROLE = _ROLE_BASE + 4
+    CLIP_X_ROLE = _ROLE_BASE + 5
+    CLIP_Y_ROLE = _ROLE_BASE + 6
+    CLIP_W_ROLE = _ROLE_BASE + 7
+    CLIP_H_ROLE = _ROLE_BASE + 8
+    ALPHA_ROLE = _ROLE_BASE + 9
+    VISIBLE_ROLE = _ROLE_BASE + 10
+
+    _GEOMETRY_ROLES = [
+        CARD_X_ROLE,
+        CARD_Y_ROLE,
+        CARD_W_ROLE,
+        CARD_H_ROLE,
+        CLIP_X_ROLE,
+        CLIP_Y_ROLE,
+        CLIP_W_ROLE,
+        CLIP_H_ROLE,
+        VISIBLE_ROLE,
+    ]
+
+    def __init__(self, overlay: QMainWindow, cards: list[QFrame], parent: QObject) -> None:
+        super().__init__(parent)
+        self.overlay = overlay
+        self.cards = cards
+        self._rows = {frame: row for row, frame in enumerate(cards)}
+        self._states = [
+            {
+                "cardX": 0.0,
+                "cardY": 0.0,
+                "cardW": 0.0,
+                "cardH": 0.0,
+                "clipX": 0.0,
+                "clipY": 0.0,
+                "clipW": 0.0,
+                "clipH": 0.0,
+                "cardAlpha": _NORMAL_GLASS_ALPHA,
+                "cardVisible": False,
+            }
+            for _ in cards
+        ]
+        self.sync_geometry()
+
+    def roleNames(self) -> dict[int, QByteArray]:  # noqa: N802
+        return {
+            self.CARD_X_ROLE: QByteArray(b"cardX"),
+            self.CARD_Y_ROLE: QByteArray(b"cardY"),
+            self.CARD_W_ROLE: QByteArray(b"cardW"),
+            self.CARD_H_ROLE: QByteArray(b"cardH"),
+            self.CLIP_X_ROLE: QByteArray(b"clipX"),
+            self.CLIP_Y_ROLE: QByteArray(b"clipY"),
+            self.CLIP_W_ROLE: QByteArray(b"clipW"),
+            self.CLIP_H_ROLE: QByteArray(b"clipH"),
+            self.ALPHA_ROLE: QByteArray(b"cardAlpha"),
+            self.VISIBLE_ROLE: QByteArray(b"cardVisible"),
+        }
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802, B008
+        return 0 if parent.isValid() else len(self._states)
+
+    def data(self, index: QModelIndex, role: int = int(Qt.ItemDataRole.DisplayRole)):  # noqa: ANN201
+        if not index.isValid() or index.row() < 0 or index.row() >= len(self._states):
+            return None
+        state = self._states[index.row()]
+        role_to_key = {
+            self.CARD_X_ROLE: "cardX",
+            self.CARD_Y_ROLE: "cardY",
+            self.CARD_W_ROLE: "cardW",
+            self.CARD_H_ROLE: "cardH",
+            self.CLIP_X_ROLE: "clipX",
+            self.CLIP_Y_ROLE: "clipY",
+            self.CLIP_W_ROLE: "clipW",
+            self.CLIP_H_ROLE: "clipH",
+            self.ALPHA_ROLE: "cardAlpha",
+            self.VISIBLE_ROLE: "cardVisible",
+        }
+        key = role_to_key.get(role)
+        return state.get(key) if key is not None else None
+
+    def _snapshot(self, frame: QFrame) -> dict[str, float | bool]:
+        if (
+            not frame.isVisibleTo(self.overlay)
+            or frame.width() <= 0
+            or frame.height() <= 0
+            or self.overlay.width() <= 0
+            or self.overlay.height() <= 0
+        ):
+            return {
+                "cardX": 0.0,
+                "cardY": 0.0,
+                "cardW": 0.0,
+                "cardH": 0.0,
+                "clipX": 0.0,
+                "clipY": 0.0,
+                "clipW": 0.0,
+                "clipH": 0.0,
+                "cardVisible": False,
+            }
+
+        top_left = frame.mapTo(self.overlay, QPoint(0, 0))
+        card_rect = QRectF(
+            float(top_left.x()),
+            float(top_left.y()),
+            float(frame.width()),
+            float(frame.height()),
+        )
+        clip_rect = QRectF(
+            0.0,
+            0.0,
+            float(self.overlay.width()),
+            float(self.overlay.height()),
+        )
+
+        ancestor = frame.parentWidget()
+        while ancestor is not None:
+            if not ancestor.isVisibleTo(self.overlay):
+                return {
+                    "cardX": card_rect.x(),
+                    "cardY": card_rect.y(),
+                    "cardW": card_rect.width(),
+                    "cardH": card_rect.height(),
+                    "clipX": 0.0,
+                    "clipY": 0.0,
+                    "clipW": 0.0,
+                    "clipH": 0.0,
+                    "cardVisible": False,
+                }
+            ancestor_top_left = ancestor.mapTo(self.overlay, QPoint(0, 0))
+            ancestor_rect = QRectF(
+                float(ancestor_top_left.x()),
+                float(ancestor_top_left.y()),
+                float(ancestor.width()),
+                float(ancestor.height()),
+            )
+            clip_rect = clip_rect.intersected(ancestor_rect)
+            if clip_rect.isEmpty() or ancestor is self.overlay:
+                break
+            ancestor = ancestor.parentWidget()
+
+        visible_rect = card_rect.intersected(clip_rect)
+        visible = not visible_rect.isEmpty()
+        return {
+            "cardX": card_rect.x(),
+            "cardY": card_rect.y(),
+            "cardW": card_rect.width(),
+            "cardH": card_rect.height(),
+            "clipX": clip_rect.x() if visible else 0.0,
+            "clipY": clip_rect.y() if visible else 0.0,
+            "clipW": clip_rect.width() if visible else 0.0,
+            "clipH": clip_rect.height() if visible else 0.0,
+            "cardVisible": visible,
+        }
+
+    @staticmethod
+    def _different(old: object, new: object) -> bool:
+        if isinstance(old, float) or isinstance(new, float):
+            try:
+                return abs(float(old) - float(new)) > 0.01
+            except (TypeError, ValueError):
+                return old != new
+        return old != new
+
+    def sync_geometry(self) -> None:
+        for row, frame in enumerate(self.cards):
+            snapshot = self._snapshot(frame)
+            state = self._states[row]
+            changed = False
+            for key, value in snapshot.items():
+                if self._different(state.get(key), value):
+                    state[key] = value
+                    changed = True
+            if changed:
+                index = self.index(row, 0)
+                self.dataChanged.emit(index, index, self._GEOMETRY_ROLES)
+
+    def set_alpha(self, frame: QFrame, alpha: float) -> None:
+        row = self._rows.get(frame)
+        if row is None:
+            return
+        alpha = max(0.0, min(255.0, float(alpha)))
+        state = self._states[row]
+        if abs(float(state["cardAlpha"]) - alpha) < 0.1:
+            return
+        state["cardAlpha"] = alpha
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index, [self.ALPHA_ROLE])
+
+
 def _qml_source() -> str:
     max_x = (_OVERSCAN - 1.0) * 0.5 * _TRAVEL
     max_y = (_OVERSCAN - 1.0) * 0.5 * _TRAVEL
@@ -72,7 +279,6 @@ Window {{
 
     property url sharpUrl
     property url blurUrl
-    property url maskUrl
     property real pointerX: 0.0
     property real pointerY: 0.0
     property real offsetX: 0.0
@@ -107,7 +313,6 @@ Window {{
         layer.smooth: true
 
         Image {{
-            id: blurImg
             width: root.width * {_OVERSCAN}
             height: root.height * {_OVERSCAN}
             x: root.imageX
@@ -119,21 +324,64 @@ Window {{
         }}
     }}
 
-    Image {{
-        id: maskImg
+    Item {{
+        id: glassMaskSource
         anchors.fill: parent
-        source: root.maskUrl
         visible: false
-        cache: false
-        asynchronous: false
+        layer.enabled: true
+        layer.smooth: true
+
+        Repeater {{
+            model: glassCardModel
+            delegate: Item {{
+                x: clipX
+                y: clipY
+                width: clipW
+                height: clipH
+                clip: true
+                visible: cardVisible
+
+                Rectangle {{
+                    x: cardX - clipX
+                    y: cardY - clipY
+                    width: cardW
+                    height: cardH
+                    radius: {_GLASS_RADIUS:.1f}
+                    antialiasing: true
+                    color: "white"
+                }}
+            }}
+        }}
     }}
 
     MultiEffect {{
         anchors.fill: parent
         source: blurSource
         maskEnabled: true
-        maskSource: maskImg
+        maskSource: glassMaskSource
         autoPaddingEnabled: false
+    }}
+
+    Repeater {{
+        model: glassCardModel
+        delegate: Item {{
+            x: clipX
+            y: clipY
+            width: clipW
+            height: clipH
+            clip: true
+            visible: cardVisible
+
+            Rectangle {{
+                x: cardX - clipX
+                y: cardY - clipY
+                width: cardW
+                height: cardH
+                radius: {_GLASS_RADIUS:.1f}
+                antialiasing: true
+                color: Qt.rgba(0, 0, 0, cardAlpha / 255.0)
+            }}
+        }}
     }}
 
     FrameAnimation {{
@@ -157,14 +405,13 @@ Window {{
 
 
 class NativeQuickBackground(QObject):
-    """Native Quick wallpaper/parallax renderer used under the baseline QWidget UI."""
+    """Native Quick wallpaper, glass and parallax renderer under baseline widgets."""
 
     def __init__(self, overlay: QMainWindow) -> None:
         super().__init__(overlay)
         self.overlay = overlay
         self._shutting_down = False
-        self._mask_pending = False
-        self._mask_revision = 0
+        self._sync_pending = False
         self._temp = tempfile.TemporaryDirectory(prefix="ecommerce-agent-bg-")
         self._temp_dir = Path(self._temp.name)
         self._cards = [
@@ -172,6 +419,7 @@ class NativeQuickBackground(QObject):
             for frame in overlay.findChildren(QFrame)
             if frame.objectName() in _GLASS_NAMES
         ]
+        self.card_model = GlassCardModel(overlay, self._cards, self)
         self._geometry_watch: set[QObject] = {overlay}
         for frame in self._cards:
             current: QWidget | None = frame
@@ -186,6 +434,7 @@ class NativeQuickBackground(QObject):
         qml_path.write_text(_qml_source(), encoding="utf-8")
 
         self.engine = QQmlApplicationEngine(self)
+        self.engine.rootContext().setContextProperty("glassCardModel", self.card_model)
         self.engine.load(QUrl.fromLocalFile(str(qml_path)))
         roots = self.engine.rootObjects()
         if not roots or not isinstance(roots[0], QQuickWindow):
@@ -233,6 +482,9 @@ class NativeQuickBackground(QObject):
         if blurred.isNull() or not blurred.save(str(self._blur_path), "JPG", 92):
             raise RuntimeError("Failed to create the pre-blurred wallpaper")
 
+    def set_card_alpha(self, frame: QFrame, alpha: float) -> None:
+        self.card_model.set_alpha(frame, alpha)
+
     def _set_animation_target(self, point: QPointF | None) -> None:
         quick = self.quick_window
         if quick is None:
@@ -252,65 +504,19 @@ class NativeQuickBackground(QObject):
         quick.setProperty("pointerY", ny)
         quick.setProperty("animationRunning", True)
 
-    def _card_path(self, frame: QFrame) -> QPainterPath | None:
-        if not frame.isVisibleTo(self.overlay) or frame.width() <= 0 or frame.height() <= 0:
-            return None
-
-        top_left = frame.mapTo(self.overlay, QPoint(0, 0))
-        rect = QRectF(float(top_left.x()), float(top_left.y()), float(frame.width()), float(frame.height()))
-        path = QPainterPath()
-        path.addRoundedRect(rect, _GLASS_RADIUS, _GLASS_RADIUS)
-
-        ancestor = frame.parentWidget()
-        while ancestor is not None:
-            if not ancestor.isVisibleTo(self.overlay):
-                return None
-            ancestor_top_left = ancestor.mapTo(self.overlay, QPoint(0, 0))
-            clip_rect = QRectF(
-                float(ancestor_top_left.x()),
-                float(ancestor_top_left.y()),
-                float(ancestor.width()),
-                float(ancestor.height()),
-            )
-            clip_path = QPainterPath()
-            clip_path.addRect(clip_rect)
-            path = path.intersected(clip_path)
-            if path.isEmpty() or ancestor is self.overlay:
-                break
-            ancestor = ancestor.parentWidget()
-        return None if path.isEmpty() else path
-
     def schedule_mask_update(self, *_args: object) -> None:
-        if self._shutting_down or self._mask_pending:
+        """Compatibility name: coalesce live card geometry updates into one pass."""
+
+        if self._shutting_down or self._sync_pending:
             return
-        self._mask_pending = True
-        QTimer.singleShot(0, self._update_mask)
+        self._sync_pending = True
+        QTimer.singleShot(0, self._sync_card_geometry)
 
-    def _update_mask(self) -> None:
-        self._mask_pending = False
-        quick = self.quick_window
-        if self._shutting_down or quick is None:
+    def _sync_card_geometry(self) -> None:
+        self._sync_pending = False
+        if self._shutting_down:
             return
-
-        width = max(1, int(quick.width()))
-        height = max(1, int(quick.height()))
-        image = QImage(width, height, QImage.Format.Format_ARGB32)
-        image.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(image)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 255))
-        for frame in self._cards:
-            path = self._card_path(frame)
-            if path is not None:
-                painter.drawPath(path)
-        painter.end()
-
-        self._mask_revision += 1
-        mask_path = self._temp_dir / f"glass_mask_{self._mask_revision & 1}.png"
-        if not image.save(str(mask_path), "PNG"):
-            raise RuntimeError("Failed to update the global glass mask")
-        quick.setProperty("maskUrl", QUrl.fromLocalFile(str(mask_path)))
+        self.card_model.sync_geometry()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
