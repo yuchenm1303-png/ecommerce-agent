@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Any, Iterable, Protocol
 
 from .ai_decisions import (
+    CONFLICT,
+    MISSING,
+    READY,
     AIDecisionPacket,
     FieldDecision,
     field_contract,
@@ -29,61 +32,107 @@ class JSONTaskProvider(Protocol):
         ...
 
 
-FIELD_MAPPING_CONTRACT_VERSION = 8
-FIELD_MAPPING_CACHE_VERSION = 8
+FIELD_MAPPING_CONTRACT_VERSION = 9
+FIELD_MAPPING_CACHE_VERSION = 9
 
 
 MAPPING_SYSTEM_INSTRUCTION = (
     "You directly fill marketplace fields from the supplied exact supplier-page evidence. "
     "There is no intermediate product profile, review model, or Python semantic resolver. "
-    "Read the structured page rows, embedded variant data, rendered page text, full-page screenshot "
+    "Read structured page rows, embedded variant data, rendered page text, the full-page screenshot "
     "and captured product/detail images yourself. Preserve real source conflicts and leave unsupported "
-    "fields missing. Return JSON only."
+    "fields missing. The response shape is schema-constrained: classify each target into exactly one "
+    "of ready, conflicts, or missing."
 )
 
 
 MAPPING_RULES = [
-    "Answer every supplied target field_id exactly once with READY, CONFLICT, or MISSING.",
-    "Use READY only when the supplied exact-page evidence supports that exact Makro field. Cite an existing source_reference; evidence_text may be a concise faithful paraphrase and need not copy the source verbatim.",
-    "Use CONFLICT when supplied text/images genuinely give different values for the same exact field. Inspect all supplied image evidence as well as text; every alternative needs its own source citation.",
-    "Use MISSING when the value is not established. Do not guess from typical products, nearby facts, absence, class conventions, or general knowledge.",
+    "Place every supplied target field_id exactly once in ready, conflicts, or missing.",
+    "ready is for a single supported field value and requires at least one existing source_reference citation.",
+    "conflicts is for genuine different values for the same exact field and requires at least two cited alternatives.",
+    "missing is only for a value not established by the supplied exact-page evidence; do not guess from typical products, nearby facts, absence, class conventions, or general knowledge.",
     "Treat attribute_key, label, section_heading, help_text, context_text, options and qualifier_options together as the Makro field meaning. Do not invent a second taxonomy.",
     "Keep scope exact: packaging vs product body vs mount; cabin/interior vs rear/back; manual/documentation language vs device UI language; product brand vs compatible vehicle brand.",
     "Preserve dimension axes literally. Source length maps to Makro Length; source width/breadth maps to Makro Breadth; source height maps to Makro Height. Never swap or rotate axes to make values fit.",
     "Structured page rows and embedded key/value data are high-signal raw evidence. If they explicitly name length/width/height, preserve those names exactly.",
-    "Do not turn a conflict into a confident statement elsewhere. Generated Description/Keywords/Sales Package may use only supported, non-conflicting facts.",
+    "Generated Description/Keywords/Sales Package may use only supported, non-conflicting facts.",
     "Never infer No/False/Unsupported/Not included from absence. A negative value requires explicit evidence.",
     "If options exist, return exact option text only when evidence supports it. If multi_value=false return one value.",
-    "If qualifier_options exist, put the magnitude in values and an exact allowed unit in qualifier. If qualifier_options are empty, qualifier MUST be empty. Use a fixed unit shown in context_text/help_text by converting the magnitude to that unit; if no fixed unit is established, return MISSING rather than inventing a qualifier.",
+    "If qualifier_options exist, put the magnitude in values and an exact allowed unit in qualifier. If qualifier_options are empty, qualifier MUST be empty. Use a fixed unit shown in context_text/help_text by converting the magnitude to that unit; if no fixed unit is established, classify the field as missing.",
     "Embedded variant matrices may contain several options. Do not mix facts from different variants unless the page itself establishes they apply to the current product generally.",
     "Do not use external web knowledge in this local pass. Seller-operated price, stock, MOQ, fulfilment, shipping and listing-status fields are not product research questions.",
 ]
 
 
+_CITATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "source_reference": {"type": "string", "minLength": 1},
+        "evidence_text": {"type": "string", "minLength": 1},
+    },
+    "required": ["source_reference", "evidence_text"],
+}
+
+_READY_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "field_id": {"type": "string", "minLength": 1},
+        "values": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "qualifier": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "citations": {"type": "array", "minItems": 1, "items": _CITATION_SCHEMA},
+    },
+    "required": ["field_id", "values", "qualifier", "confidence", "citations"],
+}
+
+_ALTERNATIVE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "values": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "qualifier": {"type": "string"},
+        "citations": {"type": "array", "minItems": 1, "items": _CITATION_SCHEMA},
+    },
+    "required": ["values", "qualifier", "citations"],
+}
+
+_CONFLICT_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "field_id": {"type": "string", "minLength": 1},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "alternatives": {"type": "array", "minItems": 2, "items": _ALTERNATIVE_SCHEMA},
+    },
+    "required": ["field_id", "confidence", "alternatives"],
+}
+
+_MISSING_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "field_id": {"type": "string", "minLength": 1},
+        "search_queries": {
+            "type": "array",
+            "maxItems": 2,
+            "items": {"type": "string", "minLength": 1},
+        },
+    },
+    "required": ["field_id", "search_queries"],
+}
+
 MAPPING_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
+    "additionalProperties": False,
     "properties": {
-        "decisions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["field_id", "status"],
-                "properties": {
-                    "field_id": {"type": "string"},
-                    "status": {"type": "string", "enum": ["ready", "conflict", "missing"]},
-                    "values": {"type": "array", "items": {"type": "string"}},
-                    "qualifier": {"type": "string"},
-                    "confidence": {"type": "number"},
-                    "citations": {"type": "array"},
-                    "alternatives": {"type": "array"},
-                    "reason": {"type": "string"},
-                    "search_queries": {"type": "array", "items": {"type": "string"}},
-                },
-            },
-        },
+        "ready": {"type": "array", "items": _READY_ITEM_SCHEMA},
+        "conflicts": {"type": "array", "items": _CONFLICT_ITEM_SCHEMA},
+        "missing": {"type": "array", "items": _MISSING_ITEM_SCHEMA},
         "model_summary": {"type": "string"},
     },
-    "required": ["decisions"],
+    "required": ["ready", "conflicts", "missing", "model_summary"],
 }
 
 
@@ -120,17 +169,16 @@ def build_field_mapping_request(
         "task": "fill_marketplace_fields_from_exact_product_evidence",
         "system_instruction": MAPPING_SYSTEM_INSTRUCTION,
         "prompt_instruction": (
-            "Read the supplied exact product-page evidence and fill this small Makro field batch directly. "
-            "Use the raw structured rows and images before resorting to MISSING. Preserve any genuine text/image conflict. "
-            "There is no later local review stage; unsupported values must be MISSING for Web to research."
+            "Read the supplied exact product-page evidence and classify this Makro field batch directly into the "
+            "schema-defined ready/conflicts/missing collections. Use raw structured rows and images before missing; "
+            "preserve genuine text/image conflicts."
         ),
-        "product_identity": {
-            "source_product_url": product_url.strip(),
-        },
+        "product_identity": {"source_product_url": product_url.strip()},
         "target_fields": [_target_payload(field) for field in fields],
         "rules": list(MAPPING_RULES),
         "grounded_sources": grounding.as_request_list(),
         "json_contract": MAPPING_JSON_SCHEMA,
+        "strict_json_schema": True,
     }
 
 
@@ -175,6 +223,60 @@ def _cache_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _typed_decisions(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, dict):
+        raise ValueError("local field fill AI output 不是 JSON object")
+    output: list[dict[str, Any]] = []
+    for item in raw.get("ready") or []:
+        if isinstance(item, dict):
+            output.append(
+                {
+                    "field_id": item.get("field_id"),
+                    "status": READY,
+                    "values": list(item.get("values") or []),
+                    "qualifier": str(item.get("qualifier") or ""),
+                    "confidence": item.get("confidence", 0.0),
+                    "citations": list(item.get("citations") or []),
+                    "alternatives": [],
+                    "reason": "",
+                    "search_queries": [],
+                }
+            )
+    for item in raw.get("conflicts") or []:
+        if isinstance(item, dict):
+            output.append(
+                {
+                    "field_id": item.get("field_id"),
+                    "status": CONFLICT,
+                    "values": [],
+                    "qualifier": "",
+                    "confidence": item.get("confidence", 0.0),
+                    "citations": [],
+                    "alternatives": list(item.get("alternatives") or []),
+                    "reason": "",
+                    "search_queries": [],
+                }
+            )
+    for item in raw.get("missing") or []:
+        if isinstance(item, dict):
+            output.append(
+                {
+                    "field_id": item.get("field_id"),
+                    "status": MISSING,
+                    "values": [],
+                    "qualifier": "",
+                    "confidence": 0.0,
+                    "citations": [],
+                    "alternatives": [],
+                    "reason": "",
+                    "search_queries": list(item.get("search_queries") or []),
+                }
+            )
+    if not all(isinstance(raw.get(key), list) for key in ("ready", "conflicts", "missing")):
+        raise ValueError("local field fill AI output 缺少 ready/conflicts/missing 数组")
+    return output
+
+
 @dataclass(slots=True)
 class _BatchRun:
     index: int
@@ -195,14 +297,7 @@ def _run_batch(
     cache_dir: Path | None,
     cache_namespace: str,
 ) -> _BatchRun:
-    key = _cache_key(
-        provider,
-        cache_namespace,
-        batch_fields,
-        grounding,
-        expected_identity,
-        product_url,
-    )
+    key = _cache_key(provider, cache_namespace, batch_fields, grounding, expected_identity, product_url)
     cache_path = cache_dir / f"field-map-{key}.json" if cache_dir is not None else None
     if cache_path is not None and cache_path.is_file():
         try:
@@ -226,9 +321,7 @@ def _run_batch(
                 product_url=product_url,
             )
         )
-        raw_decisions = raw.get("decisions") if isinstance(raw, dict) else None
-        if not isinstance(raw_decisions, list):
-            raise ValueError("local field fill AI output 缺少 decisions 数组")
+        raw_decisions = _typed_decisions(raw)
         packet = AIDecisionPacket(
             identity=expected_identity,
             schema_sha256=schema_digest(batch_fields),
@@ -236,7 +329,6 @@ def _run_batch(
             decisions=[
                 FieldDecision.from_mapping(item, index=index)
                 for index, item in enumerate(raw_decisions, start=1)
-                if isinstance(item, dict)
             ],
             model_summary=str(raw.get("model_summary") or "").strip(),
             warnings=[],
