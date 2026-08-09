@@ -218,6 +218,61 @@ def is_product_info_step(page: Page) -> bool:
     )
 
 
+def _vertical_confirmation_content(page: Page) -> bool:
+    text = normalize_label(_body_text(page))
+    return normalize_label("Please select a brand to start selling in this vertical") in text
+
+
+def _vertical_select_brand_button(page: Page):
+    pattern = re.compile(r"^\s*select\s+brand\s*$", re.IGNORECASE)
+    button = _first_visible(page.get_by_role("button", name=pattern))
+    if button is None:
+        button = _first_visible(page.get_by_text(pattern))
+    return button
+
+
+def is_vertical_selected_confirmation(page: Page, selected_vertical: str) -> bool:
+    text = normalize_label(_body_text(page))
+    selected = normalize_label(selected_vertical)
+    return bool(
+        selected
+        and selected in text
+        and _vertical_confirmation_content(page)
+        and _vertical_select_brand_button(page) is not None
+    )
+
+
+def _brand_confirmation_content(page: Page) -> bool:
+    text = normalize_label(_body_text(page))
+    markers = (
+        "selected brand",
+        "brand details",
+        "please select this brand",
+        "please select a brand to continue",
+    )
+    return any(normalize_label(marker) in text for marker in markers)
+
+
+def _brand_confirmation_button(page: Page):
+    pattern = re.compile(r"^\s*(?:select|confirm|use)\s+brand\s*$", re.IGNORECASE)
+    button = _first_visible(page.get_by_role("button", name=pattern))
+    if button is None:
+        button = _first_visible(page.get_by_text(pattern))
+    return button
+
+
+def is_brand_selected_confirmation(page: Page, selected_brand: str) -> bool:
+    text = normalize_label(_body_text(page))
+    selected = normalize_label(selected_brand)
+    button = _brand_confirmation_button(page)
+    return bool(
+        selected
+        and selected in text
+        and (_brand_confirmation_content(page) or button is not None)
+        and button is not None
+    )
+
+
 def _wait_for(predicate, page: Page, *, timeout_s: float = 15.0, poll_s: float = 0.2) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -431,6 +486,74 @@ def _current_target_values(page: Page) -> tuple[str, str]:
         return "", ""
 
 
+def _verify_selected_value(kind: str, selected: str, actual: str) -> str:
+    if actual and normalize_label(actual) != normalize_label(selected):
+        raise RuntimeError(
+            f"Makro {kind} verification failed: selected={selected!r}, actual={actual!r}"
+        )
+    return actual or selected
+
+
+def _advance_vertical_confirmation(page: Page, selected: str) -> None:
+    transitioned = _wait_for(
+        lambda current: is_brand_step(current) or _vertical_confirmation_content(current),
+        page,
+        timeout_s=15.0,
+    )
+    if not transitioned:
+        raise RuntimeError(
+            f"Makro Step 1 selected vertical {selected!r}, but neither Step 2 nor the vertical confirmation appeared"
+        )
+    if is_brand_step(page):
+        return
+    text = normalize_label(_body_text(page))
+    if normalize_label(selected) not in text:
+        raise RuntimeError(
+            f"Makro Step 1 vertical confirmation mismatch: selected={selected!r}"
+        )
+    button = _vertical_select_brand_button(page)
+    if button is None:
+        raise RuntimeError(
+            "Makro Step 1 vertical confirmation appeared, but the exact Select Brand button was not found"
+        )
+    button.click(timeout=5000)
+    if not _wait_for(is_brand_step, page, timeout_s=15.0):
+        raise RuntimeError(
+            "Makro Step 1 clicked the vertical confirmation Select Brand button, but Step 2 did not appear"
+        )
+
+
+def _advance_brand_confirmation(page: Page, selected: str) -> None:
+    transitioned = _wait_for(
+        lambda current: is_product_info_step(current)
+        or _brand_confirmation_content(current)
+        or _brand_confirmation_button(current) is not None,
+        page,
+        timeout_s=15.0,
+    )
+    if not transitioned:
+        raise RuntimeError(
+            f"Makro Step 2 selected brand {selected!r}, but neither Step 3 nor the brand confirmation appeared"
+        )
+    if is_product_info_step(page):
+        return
+    text = normalize_label(_body_text(page))
+    if normalize_label(selected) not in text:
+        raise RuntimeError(
+            f"Makro Step 2 brand confirmation mismatch: selected={selected!r}"
+        )
+    button = _brand_confirmation_button(page)
+    if button is None:
+        raise RuntimeError(
+            "Makro Step 2 brand confirmation appeared, but no exact Select/Confirm/Use Brand button was found"
+        )
+    button.click(timeout=5000)
+    if not _wait_for(is_product_info_step, page, timeout_s=15.0):
+        raise RuntimeError(
+            "Makro Step 2 clicked the brand confirmation button, but Step 3 did not appear"
+        )
+
+
 def select_vertical(
     page: Page,
     provider: JSONTaskProvider,
@@ -452,15 +575,10 @@ def select_vertical(
         if not selected:
             continue
         if not _click_exact_visible_text(page, selected):
-            continue
-        if not _wait_for(is_brand_step, page, timeout_s=15.0):
-            continue
+            raise RuntimeError(f"Makro Step 1 could not click selected live vertical: {selected!r}")
+        _advance_vertical_confirmation(page, selected)
         actual_vertical, _ = _current_target_values(page)
-        if actual_vertical and normalize_label(actual_vertical) != normalize_label(selected):
-            raise RuntimeError(
-                f"Makro Step 1 URL verification failed: selected={selected!r}, actual={actual_vertical!r}"
-            )
-        return actual_vertical or selected
+        return _verify_selected_value("Step 1 URL", selected, actual_vertical)
     raise RuntimeError("Makro Step 1 could not resolve a live vertical from search terms: " + " | ".join(attempted))
 
 
@@ -563,22 +681,16 @@ def select_brand(
         page.wait_for_timeout(wait_ms)
         if is_product_info_step(page):
             _, actual_brand = _current_target_values(page)
-            return actual_brand or term
+            return _verify_selected_value("Step 2 URL", term, actual_brand)
         candidates = _visible_text_candidates(page)
         selected = choose_brand_candidate(provider, hints, term, candidates)
         if not selected:
             continue
         if not _click_exact_visible_text(page, selected):
-            continue
-        if not _wait_for(is_product_info_step, page, timeout_s=15.0):
-            continue
+            raise RuntimeError(f"Makro Step 2 could not click selected live brand: {selected!r}")
+        _advance_brand_confirmation(page, selected)
         _, actual_brand = _current_target_values(page)
-        if hints.brand_status == "explicit" and actual_brand:
-            if normalize_label(actual_brand) != normalize_label(selected):
-                raise RuntimeError(
-                    f"Makro Step 2 URL verification failed: selected={selected!r}, actual={actual_brand!r}"
-                )
-        return actual_brand or selected
+        return _verify_selected_value("Step 2 URL", selected, actual_brand)
     raise RuntimeError("Makro Step 2 could not select a verified brand from the live results")
 
 
@@ -636,7 +748,9 @@ __all__ = [
     "choose_vertical_candidate",
     "infer_listing_bootstrap",
     "is_brand_step",
+    "is_brand_selected_confirmation",
     "is_product_info_step",
+    "is_vertical_selected_confirmation",
     "is_vertical_step",
     "normalize_label",
     "run_listing_creation",
