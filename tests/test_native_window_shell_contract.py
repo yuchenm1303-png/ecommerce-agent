@@ -15,65 +15,45 @@ def test_native_window_shell_source_compiles_without_importing_pyside() -> None:
     compile(SHELL, str(SHELL_PATH), "exec")
 
 
-def test_top_level_keeps_the_real_windows_non_client_frame() -> None:
-    assert "flags &= ~Qt.WindowType.FramelessWindowHint" in SHELL
-    assert "Qt.WindowType.WindowTitleHint" in SHELL
-    assert "Qt.WindowType.WindowSystemMenuHint" in SHELL
-    assert "Qt.WindowType.WindowMinMaxButtonsHint" in SHELL
-    assert "Qt.WindowType.WindowCloseButtonHint" in SHELL
-    assert "_WindowTitleBar" not in SHELL
-    assert "setMenuWidget" not in SHELL
-    assert "nativeWindowMinimize" not in SHELL
-    assert "nativeWindowMaximize" not in SHELL
-    assert "nativeWindowClose" not in SHELL
+def test_quick_owner_has_real_windows_non_client_frame() -> None:
+    assert "Qt.WindowType.WindowTitleHint" in NATIVE
+    assert "Qt.WindowType.WindowSystemMenuHint" in NATIVE
+    assert "Qt.WindowType.WindowMinMaxButtonsHint" in NATIVE
+    assert "Qt.WindowType.WindowCloseButtonHint" in NATIVE
+    assert "_WindowTitleBar" not in SHELL + VISUAL
+    assert "setMenuWidget" not in SHELL + VISUAL
 
 
-def test_only_child_content_is_translucent_and_native() -> None:
-    assert "window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)" in SHELL
-    assert "content.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)" in SHELL
-    assert "content.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)" in SHELL
-    assert "_WS_CHILD" in SHELL
-    assert "_WS_EX_LAYERED" in SHELL
-    assert "_ensure_layered_child" in SHELL
-    assert "WS_EX_TRANSPARENT" not in SHELL
-
-
-def test_quick_uses_qt_supported_native_window_container() -> None:
-    assert "QWidget.createWindowContainer" in NATIVE
-    assert "self.quick_window.setParent(host_window)" not in NATIVE
-    assert "self.quick_container.setGeometry(surface_host.rect())" in NATIVE
-    assert "self.quick_container.stackUnder(self.content_layer)" in NATIVE
-    assert "_assert_same_native_parent" in NATIVE
-    assert "_place_child_behind" in NATIVE
-    assert "Qt.WindowType.Tool" not in NATIVE
-    assert "QQuickWidget" not in NATIVE
-
-
-def test_no_desktop_z_order_guard_or_custom_chrome_remains() -> None:
-    assert "_Z_GUARD_MS" not in SHELL + NATIVE
-    assert "setInterval(50)" not in SHELL + NATIVE
-    assert "_stack_immediately_behind" not in SHELL + NATIVE
-    assert "DWMWA_BORDER_COLOR" not in SHELL
-    assert "DwmSetWindowAttribute" not in SHELL
-    assert "class _ClientFrame" not in SHELL
-
-
-def test_quick_is_input_transparent_but_business_content_is_not() -> None:
-    assert "Qt.WindowType.WindowTransparentForInput" in NATIVE
-    assert "self.quick_container.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)" in NATIVE
+def test_widget_gui_is_owned_translucent_overlay_not_application_frame() -> None:
+    assert "Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint" in SHELL
+    assert "overlay.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)" in SHELL
+    assert "overlay_handle.setTransientParent(self.owner)" in SHELL
+    assert "_GWLP_HWNDPARENT" in SHELL
+    assert "_set_native_owner" in SHELL
     assert "WindowTransparentForInput" not in SHELL
     assert "WA_TransparentForMouseEvents" not in SHELL
 
 
-def test_runner_builds_native_host_before_visual_surfaces() -> None:
-    shell_pos = RUNNER.index("shell = install_native_window_shell(window)")
-    visual_pos = RUNNER.index("visual = install_visual_style(")
-    assert shell_pos < visual_pos
-    assert "content_root=shell.content_widget" in RUNNER
-    assert "surface_host=shell.host_widget" in RUNNER
+def test_owner_and_overlay_are_kept_as_one_windows_instance() -> None:
+    assert "_client_geometry" in SHELL
+    assert "GetClientRect" in SHELL
+    assert "ClientToScreen" in SHELL
+    assert "_stack_owner_directly_behind" in SHELL
+    assert "setInterval(50)" not in SHELL
+    assert "_Z_GUARD_MS" not in SHELL
 
 
-def test_visual_style_does_not_make_top_level_frameless_or_translucent() -> None:
-    assert "window.setWindowFlag(Qt.WindowType.FramelessWindowHint" not in VISUAL
-    assert "window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)" not in VISUAL
-    assert "WindowFrameOverlay" not in VISUAL
+def test_no_window_container_or_child_embedding_path_remains() -> None:
+    assert "createWindowContainer" not in NATIVE + SHELL + VISUAL
+    assert "setParent(host_window)" not in NATIVE
+    assert "_WS_EX_LAYERED" not in SHELL
+    assert "_WS_CHILD" not in SHELL
+    assert "QQuickWidget" not in NATIVE + VISUAL
+
+
+def test_runner_creates_renderer_then_owner_bound_shell() -> None:
+    visual_pos = RUNNER.index("visual = install_visual_style(window)")
+    shell_pos = RUNNER.index("shell = install_native_window_shell(window, quick_window)")
+    assert visual_pos < shell_pos
+    assert "shell.show()" in RUNNER
+    assert "window.show()" not in RUNNER
