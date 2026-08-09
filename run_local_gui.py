@@ -28,6 +28,7 @@ def main() -> int:
     from gui.nekro_card_fx import install_nekro_card_fx
     from gui.nekro_effects import install_nekro_effects
     from gui.visual_style import install_visual_style
+    from gui.window_diagnostics import install_window_diagnostics
 
     app = QApplication(sys.argv)
     app.setApplicationName("ecommerce-agent Read-only Lab")
@@ -37,7 +38,8 @@ def main() -> int:
 
     app.installEventFilter(SmoothWheelFilter(app))
 
-    window = MainWindow(Path(__file__).resolve().parent)
+    project_root = Path(__file__).resolve().parent
+    window = MainWindow(project_root)
     visual = install_visual_style(window)
     quick_window = visual.background.quick_window
     if quick_window is None:
@@ -50,6 +52,10 @@ def main() -> int:
 
     shell.show()
     effects.raise_()
+
+    # Disabled by default. Set ECOM_GUI_DIAGNOSTICS=1 for one-run geometry,
+    # Win32 ownership/Z-order, DPI and Quick frame-cadence telemetry.
+    install_window_diagnostics(window, visual.background, shell, project_root)
     return app.exec()
 
 
