@@ -21,6 +21,7 @@ def main() -> int:
     from gui.nekro_sakura import install_nekro_sakura
     from gui.nekro_visual_fx import NekroOverlay, install_nekro_visual_fx
     from gui.pastel_background import install_pastel_background
+    from gui.performance_tuning import install_gui_performance_tuning
 
     app = QApplication(sys.argv)
     app.setApplicationName("ecommerce-agent Read-only Lab")
@@ -28,26 +29,27 @@ def main() -> int:
     window = MainWindow(Path(__file__).resolve().parent)
     window.show()
 
-    # Disable the earlier approximation. Sakura now comes from the dedicated
-    # port of nekro.top's production canvas_sakura motion model below.
+    # Disable the old approximate sakura particles in nekro_visual_fx. The
+    # dedicated source-sprite implementation below is the only sakura layer.
     NekroOverlay.PETAL_COUNT = 0
     visual_fx = install_nekro_visual_fx(window)
 
-    # Use our own non-black wallpaper while preserving the original nekro/imsyy
-    # glass sampling, cursor and card interaction behavior.
+    # Stop the legacy permanent 60-fps full-window follower repaint, replace it
+    # with a dirty-region/on-demand cursor scheduler, and batch live log UI work.
+    performance = install_gui_performance_tuning(window, visual_fx)
+
+    # Local non-black wallpaper; original card glass sampling stays intact.
     install_pastel_background(visual_fx.background)
 
-    # Source .cards behavior: scale(1) -> hover scale(1.01) -> active scale(.98),
-    # with the original 0.3s CSS-style transition. Layout remains our test GUI.
+    # Original .cards states, now with an animation timer that sleeps while idle.
     install_nekro_card_fx(window)
 
-    # Original canvas_sakura motion model with a deliberately reduced particle
-    # count for this development tool (source site uses 50).
+    # Original nekro.top sakura sprite/motion, 12 particles. The Qt renderer
+    # paints at 30 fps with time-scaled motion and dirty-region invalidation.
     install_nekro_sakura(window, count=12)
 
-    # Keep the original cursor follower above the sakura canvas, matching the
-    # browser presentation where the cursor remains visually readable.
-    visual_fx.overlay.raise_()
+    # Cursor follower should remain visually above the transparent sakura canvas.
+    performance.raise_cursor()
     return app.exec()
 
 
