@@ -7,18 +7,49 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "gui" / "visual_style.py").read_text(encoding="utf-8")
 
 
-def test_parallax_uses_fractional_source_coordinates() -> None:
+def test_parallax_is_fractional_and_frame_swap_driven() -> None:
+    assert "class BackgroundLayer(QOpenGLWidget):" in SOURCE
+    assert "self.frameSwapped.connect(self._on_frame_swapped)" in SOURCE
     assert "def parallax_source_rect(self) -> QRectF:" in SOURCE
-    tick = SOURCE.split("def _parallax_tick(self)", 1)[1].split("def _detach_parallax", 1)[0]
-    assert "round(" not in tick
-    assert "self.scroll(" not in tick
-    assert "self.transform_changed.emit()" in tick
+    advance = SOURCE.split("def _advance_motion(self)", 1)[1].split("def _on_frame_swapped", 1)[0]
+    assert "round(" not in advance
+    assert "self.scroll(" not in advance
+    assert "math.exp" in advance
 
 
-def test_glass_samples_live_blurred_scene_instead_of_frozen_cache() -> None:
+def test_motion_hot_path_is_one_raw_gpu_pass() -> None:
+    paint = SOURCE.split("def paintGL(self)", 1)[1].split("def cleanup_gl", 1)[0]
+    assert "glDrawArrays" in paint
+    assert "QPainter" not in paint
+    assert ".scaled(" not in paint
+    assert "_blur_pixmap" not in paint
+    assert ".copy(" not in paint
+    assert "mapToGlobal" not in paint
+    assert "for frame" not in paint
+
+
+def test_sharp_blur_and_glass_mask_are_mixed_in_shader() -> None:
+    assert "uniform sampler2D u_sharp;" in SOURCE
+    assert "uniform sampler2D u_blur;" in SOURCE
+    assert "uniform sampler2D u_mask;" in SOURCE
+    assert "gl_FragColor = mix(sharp, blurred, glass);" in SOURCE
+    assert "QOpenGLTexture.MipMapGeneration.DontGenerateMipMaps" in SOURCE
+    assert "QOpenGLTexture.Filter.Linear" in SOURCE
+
+
+def test_card_backdrops_only_paint_tint_during_motion() -> None:
     glass = SOURCE.split("class GlassBackdrop", 1)[1].split("class VisualStyleController", 1)[0]
-    assert "_surface_cache" not in glass
-    assert "self.background.transform_changed.connect(self.update)" in glass
-    assert "scene = self.background.blurred_scene()" in glass
-    assert "source_rect = self._live_source_rect(scene)" in glass
-    assert "painter.drawPixmap(target_rect, scene, source_rect)" in glass
+    assert "blurred_scene" not in glass
+    assert "parallax_source_rect" not in glass
+    assert "QPainter" in glass
+    assert "painter.fillPath" in glass
+    assert "_overlay_alpha" in glass
+
+
+def test_glass_mask_rebuild_is_geometry_driven_not_motion_driven() -> None:
+    controller = SOURCE.split("class VisualStyleController", 1)[1]
+    assert "bar.valueChanged.connect(self._schedule_mask_rebuild)" in controller
+    assert "QEvent.Resize, QEvent.Move, QEvent.Show, QEvent.Hide" in controller
+    assert "self.background.set_glass_mask(image)" in controller
+    background = SOURCE.split("class BackgroundLayer", 1)[1].split("class GlassBackdrop", 1)[0]
+    assert "_schedule_mask_rebuild" not in background
