@@ -38,9 +38,11 @@ def test_real_glass_is_one_global_mask_over_preblurred_wallpaper() -> None:
     assert "QGraphicsBlurEffect" not in VISUAL
 
 
-def test_glass_mask_comes_from_live_widget_geometry_not_hardcoded_cards() -> None:
+def test_glass_mask_comes_from_live_widget_geometry_in_shared_client_space() -> None:
     assert 'frame.objectName() in _GLASS_NAMES' in NATIVE
-    assert "frame.mapToGlobal(QPoint(0, 0))" in NATIVE
+    assert "frame.mapTo(self.overlay, QPoint(0, 0))" in NATIVE
+    assert "ancestor.mapTo(self.overlay, QPoint(0, 0))" in NATIVE
+    assert "frame.mapToGlobal(QPoint(0, 0))" not in NATIVE
     assert "path.addRoundedRect(rect" in NATIVE
     assert "schedule_mask_update" in NATIVE
     assert "QEvent.Type.LayoutRequest" in NATIVE
