@@ -7,7 +7,6 @@ from app.ai_decisions import (
     CONFLICT,
     MISSING,
     READY,
-    REVIEW,
     AIDecisionPacket,
     DecisionAlternative,
     DecisionCitation,
@@ -67,7 +66,7 @@ def grounding(tmp_path: Path) -> GroundingCatalog:
     )
 
 
-def test_ungrounded_text_citation_cannot_authorize_ready(tmp_path):
+def test_existing_source_reference_allows_faithful_paraphrase(tmp_path):
     colour = field("colour", "Colour", options=("Black", "White"))
     sources = grounding(tmp_path)
     packet = AIDecisionPacket(
@@ -82,7 +81,7 @@ def test_ungrounded_text_citation_cannot_authorize_ready(tmp_path):
                 citations=[
                     DecisionCitation(
                         source_reference="supplier:001:text:0001:abc",
-                        evidence_text="This text does not exist",
+                        evidence_text="The supplier page identifies the colour as black.",
                     )
                 ],
             )
@@ -94,7 +93,28 @@ def test_ungrounded_text_citation_cannot_authorize_ready(tmp_path):
         sources,
         expected_identity=ProductIdentity(sku="SKU-1"),
     )
-    assert validated.decisions[0].status == REVIEW
+    assert validated.decisions[0].status == READY
+    assert len(validated.decisions[0].citations) == 1
+
+
+def test_unknown_source_reference_cannot_authorize_ready(tmp_path):
+    colour = field("colour", "Colour", options=("Black", "White"))
+    sources = grounding(tmp_path)
+    packet = AIDecisionPacket(
+        identity=ProductIdentity(sku="SKU-1"),
+        schema_sha256=schema_digest([colour]),
+        source_manifest_sha256=source_manifest_digest(sources),
+        decisions=[
+            FieldDecision(
+                field_id=field_id(colour),
+                status=READY,
+                values=["Black"],
+                citations=[DecisionCitation("invented:source", "Black")],
+            )
+        ],
+    )
+    validated = validate_ai_decision_packet(packet, [colour], sources)
+    assert validated.decisions[0].status == MISSING
     assert validated.decisions[0].citations == []
 
 
@@ -149,21 +169,11 @@ def test_real_cross_source_conflict_is_preserved(tmp_path):
                 alternatives=[
                     DecisionAlternative(
                         values=("720p",),
-                        citations=(
-                            DecisionCitation(
-                                "supplier:001:text:0001:abc",
-                                "Resolution: 720p",
-                            ),
-                        ),
+                        citations=(DecisionCitation("supplier:001:text:0001:abc", "Supplier lists 720p"),),
                     ),
                     DecisionAlternative(
                         values=("1080p",),
-                        citations=(
-                            DecisionCitation(
-                                "image:001",
-                                "visible FHD 1080P marking",
-                            ),
-                        ),
+                        citations=(DecisionCitation("image:001", "visible FHD 1080P marking"),),
                     ),
                 ],
             )
@@ -179,7 +189,7 @@ def test_real_cross_source_conflict_is_preserved(tmp_path):
     assert len(validated.decisions[0].alternatives) == 2
 
 
-def test_malformed_conflict_is_downgraded_to_review(tmp_path):
+def test_malformed_conflict_becomes_missing_not_review(tmp_path):
     resolution = field("recording_resolution", "Recording Resolution")
     sources = grounding(tmp_path)
     packet = AIDecisionPacket(
@@ -193,19 +203,14 @@ def test_malformed_conflict_is_downgraded_to_review(tmp_path):
                 alternatives=[
                     DecisionAlternative(
                         values=("720p",),
-                        citations=(
-                            DecisionCitation(
-                                "supplier:001:text:0001:abc",
-                                "Resolution: 720p",
-                            ),
-                        ),
+                        citations=(DecisionCitation("supplier:001:text:0001:abc", "720p"),),
                     )
                 ],
             )
         ],
     )
     validated = validate_ai_decision_packet(packet, [resolution], sources)
-    assert validated.decisions[0].status == REVIEW
+    assert validated.decisions[0].status == MISSING
 
 
 def test_omitted_field_becomes_missing_without_local_semantic_guess(tmp_path):
@@ -221,12 +226,7 @@ def test_omitted_field_becomes_missing_without_local_semantic_guess(tmp_path):
                 field_id=field_id(colour),
                 status=READY,
                 values=["Black"],
-                citations=[
-                    DecisionCitation(
-                        source_reference="supplier:001:text:0001:abc",
-                        evidence_text="Colour: Black",
-                    )
-                ],
+                citations=[DecisionCitation("supplier:001:text:0001:abc", "Colour is black")],
             )
         ],
     )
@@ -238,16 +238,9 @@ def test_grounded_web_ready_is_not_reinterpreted_by_seller_sku(tmp_path):
     mic = field("built_in_mic", "Built in Mic")
     sources = grounding(tmp_path)
     external_ref = "web-search:generic-m8"
-    external_content = (
-        "Search result title: M8 dash cam manual\n"
-        "Search evidence: Built in Mic: Yes"
-    )
+    external_content = "persisted current-search source"
     packet = AIDecisionPacket(
-        identity=ProductIdentity(
-            sku="237581229555",
-            model_number="M8",
-            brand="other",
-        ),
+        identity=ProductIdentity(sku="237581229555", model_number="M8", brand="other"),
         schema_sha256=schema_digest([mic]),
         source_manifest_sha256=source_manifest_digest(sources),
         decisions=[
@@ -263,11 +256,7 @@ def test_grounded_web_ready_is_not_reinterpreted_by_seller_sku(tmp_path):
         packet,
         [mic],
         sources,
-        expected_identity=ProductIdentity(
-            sku="237581229555",
-            model_number="M8",
-            brand="other",
-        ),
+        expected_identity=ProductIdentity(sku="237581229555", model_number="M8", brand="other"),
         external_sources={external_ref: external_content},
     )
     assert validated.decisions[0].status == READY
@@ -286,24 +275,14 @@ def test_python_validator_does_not_reinterpret_negative_or_dimension_semantics(t
                 field_id=field_id(remote),
                 status=READY,
                 values=["No"],
-                citations=[
-                    DecisionCitation(
-                        "supplier:001:text:0001:abc",
-                        "Package contents: camera, charger, bracket",
-                    )
-                ],
+                citations=[DecisionCitation("supplier:001:text:0001:abc", "AI interprets explicit negative evidence")],
             ),
             FieldDecision(
                 field_id=field_id(width),
                 status=READY,
                 values=["86"],
                 qualifier="mm",
-                citations=[
-                    DecisionCitation(
-                        "supplier:001:text:0001:abc",
-                        "Body Length: 86 mm",
-                    )
-                ],
+                citations=[DecisionCitation("supplier:001:text:0001:abc", "AI chose this dimension")],
             ),
         ],
     )
