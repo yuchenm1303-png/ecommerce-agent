@@ -56,13 +56,12 @@ def test_mouse_parallax_does_not_rebuild_blur_or_mask() -> None:
     assert "_blur_wallpaper" not in mouse
 
 
-def test_quick_background_is_embedded_not_a_second_desktop_window() -> None:
-    assert "QWidget.createWindowContainer" in NATIVE
-    assert "self.quick_window.setParent(host_window)" not in NATIVE
+def test_quick_is_the_framed_application_window_not_a_container() -> None:
+    assert "QWidget.createWindowContainer" not in NATIVE
+    assert "Qt.WindowType.WindowTitleHint" in NATIVE
+    assert "Qt.WindowType.WindowMinMaxButtonsHint" in NATIVE
+    assert "Qt.WindowType.WindowCloseButtonHint" in NATIVE
     assert "Qt.WindowType.Tool" not in NATIVE
-    assert "self.quick_container.stackUnder(self.content_layer)" in NATIVE
-    assert "int(self.window.winId())" not in NATIVE
-    assert "QEvent.Type.ZOrderChange" not in NATIVE
 
 
 def test_card_hover_keeps_local_tint_layer_without_per_card_blur() -> None:
@@ -74,9 +73,8 @@ def test_card_hover_keeps_local_tint_layer_without_per_card_blur() -> None:
     assert "background.transform_changed" not in glass
 
 
-def test_visual_style_does_not_create_custom_window_chrome() -> None:
+def test_visual_style_has_no_custom_window_chrome() -> None:
     assert "WindowFrameOverlay" not in VISUAL
-    assert "FramelessWindowHint" not in VISUAL
     assert "nativeWindowClose" not in VISUAL
     assert "setMenuWidget" not in VISUAL
 
@@ -90,9 +88,10 @@ def test_legacy_qwidget_background_paint_is_suppressed_without_layout_rewrite() 
 def test_native_background_has_explicit_shutdown_contract() -> None:
     shutdown = NATIVE.split("def shutdown(self)", 1)[1]
     assert 'setProperty("animationRunning", False)' in shutdown
+    assert "quick.hide()" in shutdown
     assert "quick.releaseResources()" in shutdown
-    assert "self.quick_container.hide()" in shutdown
-    assert "self.quick_container.deleteLater()" in shutdown
+    assert "quick.close()" in shutdown
+    assert "quick.deleteLater()" in shutdown
     assert "self.engine.clearComponentCache()" in shutdown
     assert "self.engine.deleteLater()" in shutdown
     assert "self._temp.cleanup()" in shutdown
