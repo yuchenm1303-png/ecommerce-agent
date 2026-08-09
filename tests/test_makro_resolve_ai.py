@@ -30,6 +30,7 @@ def _live_schema_file(tmp_path):
                         "options": [],
                         "qualifier_options": ["inch"],
                         "help_text": "",
+                        "context_text": "Screen Size inch",
                     },
                     {
                         "attribute_key": "package_length",
@@ -40,6 +41,7 @@ def _live_schema_file(tmp_path):
                         "options": [],
                         "qualifier_options": ["cm"],
                         "help_text": "",
+                        "context_text": "Length cm",
                     },
                 ],
             },
@@ -59,18 +61,22 @@ def _fake_capture(tmp_path):
         captured_at="2026-08-09T00:00:00Z",
         visible_text="Screen Size: 3.0 inch",
         table_rows=[SnapshotTableRow("Screen Size", "3.0 inch", 1, 1)],
-        embedded_data=[
-            '{"sku2":"m8WiFi dual front+cabin English+German manual","skuId":6017876765651}'
-        ],
+        embedded_data=['{"sku2":"m8WiFi dual front+cabin English+German manual","skuId":6017876765651}'],
+        image_urls=["https://img.test/detail.jpg"],
     )
     snapshot_path = write_source_snapshot(snapshot, capture_dir / "source-snapshot.json")
     screenshot_path = capture_dir / "source-page.png"
     screenshot_path.write_bytes(b"fake-page-image")
+    detail = capture_dir / "product-images" / "source-image-01.jpg"
+    detail.parent.mkdir(parents=True, exist_ok=True)
+    detail.write_bytes(b"fake-detail-image")
     return SimpleNamespace(
         snapshot_path=snapshot_path,
         screenshot_path=screenshot_path,
         snapshot=snapshot,
         launched_now=False,
+        product_image_paths=(detail,),
+        cache_hit=True,
     )
 
 
@@ -144,9 +150,8 @@ def test_resolver_uses_only_captured_product_url_sources(tmp_path, monkeypatch):
     assert makro_resolve_ai.main() == 0
     assert provider.calls == 2
     assert all(request["task"] == "fill_marketplace_fields_from_exact_product_evidence" for request in provider.requests)
-    assert all(request["product_identity"]["sku"] == "" for request in provider.requests)
-    assert all(request["product_identity"]["source_product_url"] == PRODUCT_URL for request in provider.requests)
-    assert all(any(source["kind"] == "image" for source in request["grounded_sources"]) for request in provider.requests)
+    assert all(request["product_identity"] == {"source_product_url": PRODUCT_URL} for request in provider.requests)
+    assert all(sum(source["kind"] == "image" for source in request["grounded_sources"]) == 2 for request in provider.requests)
     assert all(
         any("6017876765651" in source.get("content", "") for source in request["grounded_sources"])
         for request in provider.requests
@@ -173,6 +178,9 @@ def test_resolver_uses_only_captured_product_url_sources(tmp_path, monkeypatch):
     assert manifest["primary_product_url"] == PRODUCT_URL
     assert manifest["generated_listing_sku"] == generate_listing_sku(PRODUCT_URL)
     assert manifest["source_capture"]["embedded_data_items"] == 1
+    assert manifest["source_capture"]["product_image_urls"] == 1
+    assert manifest["source_capture"]["product_images_downloaded"] == 1
+    assert manifest["source_capture"]["source_cache_hit"] is True
     assert manifest["local_fill"]["batch_count"] == 2
     assert manifest["local_fill"]["model_calls"] == 2
     assert manifest["web_fill"]["searched"] is False
@@ -211,13 +219,14 @@ def test_cache_namespace_ignores_transport_timeout_but_keeps_semantic_config():
     assert makro_resolve_ai._cache_namespace(base) != makro_resolve_ai._cache_namespace(different)
 
 
-def test_cli_has_one_product_input_and_no_manual_sku_or_qa():
+def test_cli_has_one_product_input_and_source_cache_controls():
     parser = makro_resolve_ai.build_parser()
     args = parser.parse_args(["--live-schema", "live.json", "--product-url", PRODUCT_URL])
     assert args.model == "qwen3.7-plus"
     assert args.web_search_model == "qwen3.7-max"
     assert args.structured_mode == "json_object"
     assert args.enable_thinking is False
+    assert args.source_cache_ttl_seconds == 900
     options = {option for action in parser._actions for option in action.option_strings}
     assert "--product-url" in options
     assert "--sku" not in options
@@ -225,6 +234,9 @@ def test_cli_has_one_product_input_and_no_manual_sku_or_qa():
     assert "--product-table" not in options
     assert "--facts-json" not in options
     assert "--source-cdp-port" in options
+    assert "--source-cache-dir" in options
+    assert "--source-cache-ttl-seconds" in options
+    assert "--refresh-source" in options
     assert "--field-batch-size" in options
     assert "--web-batch-size" in options
 
