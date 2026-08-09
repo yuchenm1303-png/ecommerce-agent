@@ -20,6 +20,8 @@ def main() -> int:
     from gui.log_presenter import install_buffered_logs
     from gui.nekro_card_fx import install_nekro_card_fx
     from gui.nekro_effects import install_nekro_effects
+    from gui.visual_perf import VisualPerfRecorder
+    from gui.visual_perf_hooks import install_visual_perf_hooks
     from gui.visual_style import install_visual_style
 
     app = QApplication(sys.argv)
@@ -32,11 +34,24 @@ def main() -> int:
 
     app.installEventFilter(SmoothWheelFilter(app))
 
-    window = MainWindow(Path(__file__).resolve().parent)
+    project_root = Path(__file__).resolve().parent
+    window = MainWindow(project_root)
     visual = install_visual_style(window)
-    install_nekro_card_fx(window, visual)
-    install_buffered_logs(window)
+    card_fx = install_nekro_card_fx(window, visual)
+    buffered_logs = install_buffered_logs(window)
     effects = install_nekro_effects(window, sakura_count=3)
+
+    # Diagnostics are dormant unless Ctrl+Alt+P starts a capture. While idle the
+    # wrappers only take a single boolean branch and perform no sampling or IO.
+    recorder = VisualPerfRecorder(project_root)
+    install_visual_perf_hooks(
+        window,
+        visual,
+        effects,
+        card_fx,
+        buffered_logs,
+        recorder,
+    )
 
     window.show()
     effects.raise_()
