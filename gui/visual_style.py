@@ -568,6 +568,10 @@ class BackgroundLayer(QOpenGLWidget):
         vbo.release()
         self._vbo = vbo
         self._gl_ready = True
+        if self._pending_mask is None:
+            empty_mask = QImage(1, 1, QImage.Format.Format_RGBA8888)
+            empty_mask.fill(Qt.transparent)
+            self._pending_mask = empty_mask
         self._upload_pending_textures()
 
     def paintGL(self) -> None:  # type: ignore[override]
@@ -576,7 +580,7 @@ class BackgroundLayer(QOpenGLWidget):
         self._upload_pending_textures()
 
         functions = self.context().functions()
-        functions.glClearColor(0.09, 0.15, 0.23, 1.0)
+        functions.glClearColor(23.0 / 255.0, 38.0 / 255.0, 58.0 / 255.0, 1.0)
         functions.glClear(_GL_COLOR_BUFFER_BIT)
 
         if (
@@ -789,6 +793,7 @@ class VisualStyleController(QObject):
         painter.setPen(Qt.NoPen)
         painter.setBrush(Qt.white)
 
+        central_rect = QRectF(central.rect())
         for frame, backdrop in self._glass.items():
             if not frame.isVisibleTo(self.window) or frame.width() <= 0 or frame.height() <= 0:
                 continue
@@ -800,9 +805,28 @@ class VisualStyleController(QObject):
                 local.width(),
                 local.height(),
             )
+
+            visible_clip = QRectF(rect).intersected(central_rect)
+            ancestor = frame.parentWidget()
+            while ancestor is not None and ancestor is not central and not visible_clip.isEmpty():
+                ancestor_top_left = ancestor.mapTo(central, QPoint(0, 0))
+                ancestor_rect = QRectF(
+                    ancestor_top_left.x(),
+                    ancestor_top_left.y(),
+                    ancestor.width(),
+                    ancestor.height(),
+                )
+                visible_clip = visible_clip.intersected(ancestor_rect)
+                ancestor = ancestor.parentWidget()
+            if visible_clip.isEmpty():
+                continue
+
             path = QPainterPath()
             path.addRoundedRect(rect, 6.0, 6.0)
+            painter.save()
+            painter.setClipRect(visible_clip)
             painter.drawPath(path)
+            painter.restore()
 
         painter.end()
         self.background.set_glass_mask(image)
