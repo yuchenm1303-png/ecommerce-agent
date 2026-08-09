@@ -1,0 +1,2 @@
+# Development-only desktop shell. Core ecommerce-agent requirements stay unchanged.
+PySide6>=6.7,<7
