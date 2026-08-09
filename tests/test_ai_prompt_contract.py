@@ -15,6 +15,9 @@ from app.semantic_grounding import GroundedSource, GroundingCatalog, TEXT_KIND
 from app.web_enrichment import _targets
 
 
+PRODUCT_URL = "https://detail.1688.com/offer/850845635717.html"
+
+
 def _field():
     return {
         "attribute_key": "package_breadth",
@@ -36,7 +39,7 @@ def _grounding():
                 source_id="supplier:001:text:0001:abc",
                 source_type="supplier_web",
                 kind=TEXT_KIND,
-                origin="https://detail.1688.com/offer/1.html",
+                origin=PRODUCT_URL,
                 content="Package length 16 cm, width 11 cm, height 7 cm",
                 sha256="a" * 64,
             )
@@ -48,8 +51,8 @@ def test_local_fill_prompt_reads_original_sources_directly_and_has_no_review_sta
     request = build_field_mapping_request(
         [_field()],
         _grounding(),
-        expected_identity=ProductIdentity(model_number="M8"),
-        product_url="https://detail.1688.com/offer/1.html",
+        expected_identity=ProductIdentity(),
+        product_url=PRODUCT_URL,
     )
     target = request["target_fields"][0]
     assert request["task"] == "fill_marketplace_fields_from_exact_product_evidence"
@@ -57,7 +60,8 @@ def test_local_fill_prompt_reads_original_sources_directly_and_has_no_review_sta
     assert target["label"] == "Breadth"
     assert target["qualifier_options"] == ["cm", "mm"]
     assert request["grounded_sources"][0]["source_type"] == "supplier_web"
-    assert request["product_identity"]["source_product_url"].startswith("https://detail.1688.com/")
+    assert request["product_identity"]["sku"] == ""
+    assert request["product_identity"]["source_product_url"] == PRODUCT_URL
     statuses = request["json_contract"]["properties"]["decisions"]["items"]["properties"]["status"]["enum"]
     assert statuses == ["ready", "conflict", "missing"]
     rules = "\n".join(request["rules"])
@@ -66,11 +70,11 @@ def test_local_fill_prompt_reads_original_sources_directly_and_has_no_review_sta
     assert "Do not turn a conflict" in rules
 
 
-def test_cli_defaults_to_qwen37_plus_and_simple_parallel_fill():
+def test_cli_defaults_to_qwen37_plus_and_single_product_url_input():
     from makro_resolve_ai import build_parser
 
     parser = build_parser()
-    args = parser.parse_args(["--qa", "q.xlsx", "--live-schema", "live.json"])
+    args = parser.parse_args(["--live-schema", "live.json", "--product-url", PRODUCT_URL])
     assert args.model == "qwen3.7-plus"
     assert args.web_search_model == "qwen3.7-max"
     assert args.structured_mode == "json_object"
@@ -81,6 +85,8 @@ def test_cli_defaults_to_qwen37_plus_and_simple_parallel_fill():
     assert args.web_concurrency == 3
     options = {option for action in parser._actions for option in action.option_strings}
     assert "--product-url" in options
+    assert "--sku" not in options
+    assert "--qa" not in options
     assert "--source-cdp-port" in options
     assert "--max-repair-attempts" not in options
     assert "--field-batch-size" in options
@@ -106,7 +112,7 @@ def test_only_empty_field_enters_web_search_and_local_conflict_stays_frozen():
     grounding = GroundingCatalog(sources=[])
     citation = DecisionCitation("local", "evidence")
     packet = AIDecisionPacket(
-        identity=ProductIdentity(model_number="M8"),
+        identity=ProductIdentity(),
         schema_sha256=schema_digest([missing_field, conflict_field]),
         source_manifest_sha256=source_manifest_digest(grounding),
         decisions=[
