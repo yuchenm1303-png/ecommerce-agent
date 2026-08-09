@@ -28,6 +28,7 @@ def main() -> int:
     from gui.native_window_shell import install_native_window_shell
     from gui.nekro_card_fx import install_nekro_card_fx
     from gui.nekro_effects import install_nekro_effects
+    from gui.ui_polish import install_ui_polish
 
     app = QApplication(sys.argv)
     app.setApplicationName("ecommerce-agent Read-only Lab")
@@ -40,6 +41,12 @@ def main() -> int:
 
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_native_visual_style(window)
+
+    # Final presentation pass only.  This runs after NEKRO/native compatibility
+    # styling so table density, spacing and control styling are deterministic,
+    # while all business widgets/controllers remain the original instances.
+    install_ui_polish(window)
+
     quick_window = visual.background.quick_window
     if quick_window is None:
         raise RuntimeError("Native Quick renderer was not created")
