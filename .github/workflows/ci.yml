@@ -24,6 +24,31 @@ jobs:
       - name: Run unit tests
         run: pytest -q
 
+  gui-smoke:
+    runs-on: ubuntu-latest
+    needs: tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install GUI dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-gui.txt
+
+      - name: Load Qt Quick shell offscreen
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QSG_RHI_BACKEND: software
+          QSG_RENDER_LOOP: basic
+        run: python scripts/gui_qml_smoke.py
+
   mock-e2e:
     runs-on: ubuntu-latest
     needs: tests
