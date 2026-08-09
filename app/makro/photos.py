@@ -15,10 +15,11 @@ PRODUCT_PHOTOS_SECTION = "Product Photos"
 
 @dataclass(slots=True)
 class PhotoUploadResult:
-    """State of files staged into the open Product Photos editor.
+    """State of listing images accepted into the open Product Photos editor.
 
-    ``staged`` is intentionally not called persisted/uploaded: Makro keeps the
-    card in an unsaved edit transaction until its section Save is clicked.
+    ``staged`` means Makro has produced an observable card-level acceptance
+    signal (new preview/source or counter growth). Merely placing a file into
+    ``input.files`` is not enough and is recorded only as diagnostics.
     """
 
     status: str
@@ -115,23 +116,58 @@ def _select_file_input(page: Page, section_path: str):
     return None
 
 
+def _stage_accepted(
+    state: dict[str, Any],
+    *,
+    before_images: int,
+    before_sources: set[str],
+    before_completion: int | None,
+) -> bool:
+    """Return True only for a Makro-visible acceptance signal.
+
+    ``input.files`` is deliberately ignored: browsers populate it immediately
+    after ``set_input_files`` even when the application has not processed or
+    accepted the image yet.
+    """
+
+    images = int(state.get("visible_image_count") or 0)
+    sources = {
+        str(value).strip()
+        for value in state.get("visible_image_sources") or []
+        if str(value).strip()
+    }
+    raw_completion = state.get("completion_count")
+    completion = int(raw_completion) if raw_completion is not None else None
+    return bool(
+        images > before_images
+        or sources.difference(before_sources)
+        or (
+            before_completion is not None
+            and completion is not None
+            and completion > before_completion
+        )
+    )
+
+
 def _wait_for_staged_signal(
     page: Page,
     section_path: str,
     *,
     before_images: int,
+    before_sources: set[str],
+    before_completion: int | None,
     timeout_ms: int,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_ms / 1000.0
     latest = _photo_state(page, section_path)
     while time.monotonic() < deadline:
         latest = _photo_state(page, section_path)
-        file_count = max(
-            [int(item.get("files") or 0) for item in latest.get("file_inputs") or []]
-            or [0]
-        )
-        images = int(latest.get("visible_image_count") or 0)
-        if file_count > 0 or images > before_images:
+        if _stage_accepted(
+            latest,
+            before_images=before_images,
+            before_sources=before_sources,
+            before_completion=before_completion,
+        ):
             return latest
         page.wait_for_timeout(200)
     return latest
@@ -176,6 +212,16 @@ def upload_product_photos(
     initial_count = state.get("completion_count")
     capacity = state.get("capacity")
     current_images = int(state.get("visible_image_count") or 0)
+    current_sources = {
+        str(value).strip()
+        for value in state.get("visible_image_sources") or []
+        if str(value).strip()
+    }
+    current_completion = (
+        int(state["completion_count"])
+        if state.get("completion_count") is not None
+        else None
+    )
     input_meta = list(state.get("file_inputs") or [])
     if not input_meta:
         return PhotoUploadResult(
@@ -224,6 +270,8 @@ def upload_product_photos(
 
         result.attempted += 1
         before_images = current_images
+        before_sources = set(current_sources)
+        before_completion = current_completion
         try:
             file_input.set_input_files(str(path))
             try:
@@ -232,15 +280,33 @@ def upload_product_photos(
                 )
             except Exception:
                 immediate_files = 0
+
             settled = _wait_for_staged_signal(
                 page,
                 section_path,
                 before_images=before_images,
+                before_sources=before_sources,
+                before_completion=before_completion,
                 timeout_ms=timeout_ms,
             )
             current_images = int(settled.get("visible_image_count") or 0)
-            staged = immediate_files > 0 or current_images > before_images
-            if staged:
+            current_sources = {
+                str(value).strip()
+                for value in settled.get("visible_image_sources") or []
+                if str(value).strip()
+            }
+            current_completion = (
+                int(settled["completion_count"])
+                if settled.get("completion_count") is not None
+                else None
+            )
+            accepted = _stage_accepted(
+                settled,
+                before_images=before_images,
+                before_sources=before_sources,
+                before_completion=before_completion,
+            )
+            if accepted:
                 result.staged += 1
                 result.items.append(
                     {
@@ -249,7 +315,13 @@ def upload_product_photos(
                         "input_files": immediate_files,
                         "before_visible_images": before_images,
                         "after_visible_images": current_images,
-                        "detail": "文件已进入 Product Photos 编辑事务；尚未宣称持久化。",
+                        "before_completion_count": before_completion,
+                        "after_completion_count": current_completion,
+                        "new_visible_sources": sorted(current_sources.difference(before_sources)),
+                        "detail": (
+                            "Makro 已出现新增图片预览/来源或计数变化；"
+                            "图片已进入未保存编辑事务。"
+                        ),
                     }
                 )
             else:
@@ -260,9 +332,11 @@ def upload_product_photos(
                         "input_files": immediate_files,
                         "before_visible_images": before_images,
                         "after_visible_images": current_images,
+                        "before_completion_count": before_completion,
+                        "after_completion_count": current_completion,
                         "detail": (
-                            "set_input_files 未报错，但未观察到 files/预览变化；"
-                            "不能把它当成已上传或已保存。"
+                            "文件选择已执行，但在超时前 Makro 没有出现新增预览、"
+                            "新图片来源或计数变化；input.files 本身不再视为上传成功。"
                         ),
                     }
                 )
@@ -279,16 +353,19 @@ def upload_product_photos(
     result.final_count = final_state.get("completion_count")
     if result.staged == result.attempted and result.attempted > 0:
         result.status = "staged"
-        result.detail = "所有尝试文件都已进入未保存的 Product Photos 编辑事务。"
+        result.detail = "所有尝试图片都得到 Makro 页面接受信号，等待 section Save。"
     elif result.staged > 0:
         result.status = "partial_staged"
-        result.detail = "部分文件已进入编辑事务，部分无法确认。"
+        result.detail = "部分图片得到 Makro 页面接受信号，部分无法确认。"
     elif result.attempted == 0:
         result.status = "skipped"
         result.detail = "没有实际执行图片 staging。"
     else:
         result.status = "staging_unconfirmed"
-        result.detail = "已执行文件选择，但没有任何文件得到 staging 信号。"
+        result.detail = (
+            "已执行文件选择，但 Makro 没有确认任何图片；"
+            "调用方不得据此点击 Product Photos Save。"
+        )
     return result
 
 
