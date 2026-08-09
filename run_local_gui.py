@@ -27,10 +27,10 @@ def main() -> int:
     app.setOrganizationName("ecommerce-agent")
 
     window = MainWindow(Path(__file__).resolve().parent)
-    install_visual_style(window)
-    install_nekro_card_fx(window)
+    visual = install_visual_style(window)
+    install_nekro_card_fx(window, visual)
     install_buffered_logs(window)
-    effects = install_nekro_effects(window, sakura_count=4)
+    effects = install_nekro_effects(window, sakura_count=3)
 
     window.show()
     effects.raise_()
