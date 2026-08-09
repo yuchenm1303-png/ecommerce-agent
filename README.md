@@ -2,7 +2,7 @@
 
 Makro Marketplace Seller Center 的商品资料采集、AI 字段补全、只读规划与浏览器持久化验收工具。
 
-当前唯一生产思路：
+当前唯一生产链：
 
 **Makro live schema → 一个 1688/供应商商品链接 → 自动采集完整页面证据 → AI 直接填写 Makro fields → Web 只补仍为空的字段 → Thin Hard Guards → Fill Plan → Browser → Save/reopen verify → Product Photos persistence**
 
@@ -22,14 +22,7 @@ Makro Marketplace Seller Center 的商品资料采集、AI 字段补全、只读
 
 `makro_resolve_ai.py --product-url <URL>` 使用独立 source Edge（默认 CDP `9333`），与 Makro seller Edge 分离。
 
-采集内容包括：
-
-- 页面标题、meta；
-- rendered visible text；
-- table / dl 参数行；
-- JSON-LD；
-- 页面 DOM / inline script 中与 SKU、规格、variant、offer 相关的有限原始片段；
-- full-page screenshot。
+采集内容包括页面标题/meta、rendered text、table/dl 参数行、JSON-LD、页面 DOM / inline script 中与 SKU/规格/variant/offer 相关的有限原始片段，以及 full-page screenshot。
 
 采集器只记录原始页面证据，不点击 SKU、不选择款式、不判断哪个参数属于哪个字段，也不绕过 CAPTCHA/风控。若页面需要合法人工验证，完成后用 `--source-use-current-page` 继续。
 
@@ -39,7 +32,7 @@ Makro Marketplace Seller Center 的商品资料采集、AI 字段补全、只读
 
 `app/field_mapping.py` 直接接收原始页面 evidence + 小批 Makro live fields。AI 自己负责跨语言理解、规格关系、scope、冲突和字段映射。
 
-输出：
+输出只有：
 
 - `READY`：当前证据明确支持；
 - `CONFLICT`：同一字段存在真实冲突；
@@ -59,33 +52,17 @@ Web citation URL 必须来自本次真实 `web_search` sources；模型编造 UR
 
 `app/business_fields.py` 根据 exact product URL 生成稳定的 12 位数字 SKU。相同商品 URL 的 query/tracking 参数变化不会改变 SKU。
 
-这是机械 seller identifier：
-
-- 不传给 AI 作为商品身份；
-- 不拿它去搜索互联网；
-- 不用它否定供应商页面；
-- Planner 把它作为 `rule` 类型 business input 使用。
+它只是机械 seller identifier：不传给 AI 作为商品身份、不拿去搜互联网、不用它否定供应商页面。Planner/Executor 把它作为 `rule` 类型 business input 使用。
 
 价格、库存、MOQ、Fulfilment、Shipping SLA、Listing Status 等其他经营字段仍必须来自明确 seller data，缺失就保持 blocked，不能让 AI/Web 猜。
 
-## Thin Hard Guards / Fill Plan
+## Thin Hard Guards
 
-Python 只保留机械执行边界：
+Python 只保留机械执行边界：live schema/source rebind、citation provenance、business lock、single/multi-value shape、Makro option/qualifier、GTIN/numeric/maxlength、价格/MOQ关系、DOM唯一定位、React readback、Save/reopen persistence、Product Photos persistence 和禁止 Send to QC。
 
-- live schema / source rebind；
-- citation provenance；
-- seller business lock；
-- single/multi-value shape；
-- Makro option/qualifier 精确匹配；
-- GTIN checksum、numeric min/max、maxlength；
-- Selling Price <= Base Price/MRP、MinOQ <= MaxOQ；
-- DOM 唯一定位、React readback、Save/reopen persistence；
-- Product Photos persistence；
-- 禁止 Send to QC。
+Python 不判断 cabin/rear、manual/UI language、包装/机身尺寸、网页是不是同款等商品语义。
 
-Python 不判断 cabin/rear、manual/UI language、包装/机身尺寸、网页是否同款等商品语义。
-
-## 只读运行顺序
+## 运行顺序
 
 先扫描 Makro schema：
 
@@ -110,7 +87,7 @@ python makro_resolve_ai.py `
   --web-enrich auto
 ```
 
-主要输出：
+Resolver 主要输出：
 
 - `primary-source/source-snapshot.json`
 - `primary-source/source-page.png`
@@ -122,7 +99,7 @@ python makro_resolve_ai.py `
 - `source-manifest.json`
 - `run-manifest.json`
 
-最终只读 Fill Plan 使用同一 URL、同一 source snapshot 和 screenshot 重新绑定 decision packet：
+最终只读 Fill Plan 用同一 URL、同一 snapshot 和 screenshot strict rebind：
 
 ```powershell
 python makro_plan_listing.py `
@@ -134,7 +111,22 @@ python makro_plan_listing.py `
   --expected-vertical vehicle_camera_system
 ```
 
-真实 Makro persistence 只有在 read-only acceptance 通过后才运行；永不自动 `Send to QC`。
+只有 read-only acceptance 通过后，才使用生产执行入口：
+
+```powershell
+python makro_execute_listing.py `
+  --decision-packet <ai-decisions.json> `
+  --live-schema <live-schema.json> `
+  --product-url <same-product-url> `
+  --supplier-snapshot <primary-source/source-snapshot.json> `
+  --image <primary-source/source-page.png> `
+  --expected-vertical vehicle_camera_system `
+  --all-step3 `
+  --allow-section-save `
+  [--upload-image <listing-image>]
+```
+
+`makro_execute_listing.py` 不读旧 QA、不接受人工 `--sku`，只执行已经验证过的 plan。它复用成熟的字段写入/Save/reopen/Product Photos 浏览器函数，但不会重新判断商品语义。
 
 ## 关键文件
 
@@ -148,7 +140,8 @@ python makro_plan_listing.py `
 - `app/fill_plan.py`：decisions → executable plan
 - `makro_resolve_ai.py`：单商品链接 AI Resolver
 - `makro_plan_listing.py`：live schema / read-only Fill Plan
-- `makro_preview_listing.py`：browser persistence acceptance
+- `makro_execute_listing.py`：单商品链接生产 browser persistence runner
+- `makro_preview_listing.py`：底层浏览器执行 helpers / 旧兼容入口，不再作为新生产入口
 
 ## 验收
 
