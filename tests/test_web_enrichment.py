@@ -16,10 +16,12 @@ from app.ai_decisions import (
     source_manifest_digest,
 )
 from app.evidence_contract import ProductIdentity
-from app.product_profile import ProductFact, ProductProfile, ProfileCandidate
 from app.providers.dashscope_web_search import WebSearchJSONResult, WebSearchSource
 from app.semantic_grounding import GroundedSource, GroundingCatalog, TEXT_KIND
 from app.web_enrichment import run_web_enrichment, write_enriched_ai_decision_packet
+
+
+PRODUCT_URL = "https://detail.1688.com/offer/850845635717.html"
 
 
 def field(key: str, label: str, *, section="Product Description"):
@@ -39,42 +41,14 @@ def grounding() -> GroundingCatalog:
     return GroundingCatalog(
         sources=[
             GroundedSource(
-                source_id="customer-text:001:text:0001:abc",
-                source_type="customer_file",
+                source_id="supplier:001:text:0001:abc",
+                source_type="supplier_web",
                 kind=TEXT_KIND,
-                origin="supplemental_text",
+                origin=PRODUCT_URL,
                 content="Selected variant: M8 WiFi dual camera 64GB",
                 sha256="a" * 64,
             )
         ]
-    )
-
-
-def profile() -> ProductProfile:
-    sources = grounding()
-    return ProductProfile(
-        identity=ProductIdentity(sku="SKU-1", model_number="M8"),
-        source_manifest_sha256=source_manifest_digest(sources),
-        facts=[
-            ProductFact(
-                name="selected_variant",
-                scope="selected_variant",
-                status="supported",
-                candidates=(
-                    ProfileCandidate(
-                        value="M8 WiFi dual camera 64GB",
-                        citations=(
-                            DecisionCitation(
-                                "customer-text:001:text:0001:abc",
-                                "Selected variant: M8 WiFi dual camera 64GB",
-                            ),
-                        ),
-                    ),
-                ),
-            )
-        ],
-        summary="M8 selected variant",
-        extractor="profile-ai",
     )
 
 
@@ -103,11 +77,7 @@ class FakeWebProvider:
     def search_json(self, prompt):
         self.calls += 1
         self.prompts.append(prompt)
-        return WebSearchJSONResult(
-            payload=self.payload,
-            sources=self.sources,
-            request_id="req-web-1",
-        )
+        return WebSearchJSONResult(payload=self.payload, sources=self.sources, request_id="req-web-1")
 
 
 class DynamicWebProvider:
@@ -154,24 +124,15 @@ class FailingWebProvider:
         raise RuntimeError("network unavailable")
 
 
-def test_missing_field_is_searched_and_directly_filled_without_touching_ready(tmp_path):
+def test_missing_field_is_searched_and_ready_field_is_frozen(tmp_path):
     colour = field("colour", "Colour")
     sensor = field("image_sensor", "Image Sensor")
     fields = [colour, sensor]
+    citation = DecisionCitation("supplier:001:text:0001:abc", "Selected variant: M8 WiFi dual camera 64GB")
     initial = packet(
         fields,
         [
-            FieldDecision(
-                field_id=field_id(colour),
-                status=READY,
-                values=["Black"],
-                citations=[
-                    DecisionCitation(
-                        "customer-text:001:text:0001:abc",
-                        "Selected variant: M8 WiFi dual camera 64GB",
-                    )
-                ],
-            ),
+            FieldDecision(field_id=field_id(colour), status=READY, values=["Black"], citations=[citation]),
             FieldDecision(field_id=field_id(sensor), status=MISSING),
         ],
     )
@@ -183,9 +144,7 @@ def test_missing_field_is_searched_and_directly_filled_without_touching_ready(tm
                     "field_id": field_id(sensor),
                     "status": "ready",
                     "values": ["GC2053"],
-                    "citations": [
-                        {"source_url": url, "evidence_text": "Image sensor: GC2053"}
-                    ],
+                    "citations": [{"source_url": url, "evidence_text": "Image sensor: GC2053"}],
                 }
             ]
         },
@@ -197,28 +156,25 @@ def test_missing_field_is_searched_and_directly_filled_without_touching_ready(tm
         initial,
         fields,
         grounding(),
-        profile(),
+        product_url=PRODUCT_URL,
         cache_dir=tmp_path / "cache",
     )
 
     assert search.calls == 1
-    assert result.search_model_calls == 1
     assert result.target_field_count == 1
     assert result.packet.decisions[0].values == ["Black"]
     assert result.packet.decisions[1].status == READY
     assert result.packet.decisions[1].values == ["GC2053"]
-    assert len(result.web_sources) == 1
-    assert field_id(colour) not in search.prompts[0]
+    assert field_id(colour) not in search.prompts[0].split('"target_fields":', 1)[1]
+    assert PRODUCT_URL in search.prompts[0]
+    assert '"known_local_fields"' in search.prompts[0]
 
 
-def test_local_conflict_is_frozen_and_never_sent_to_web():
+def test_local_conflict_is_frozen_and_never_sent_as_target():
     resolution = field("recording_resolution", "Recording Resolution")
     sensor = field("image_sensor", "Image Sensor")
     fields = [resolution, sensor]
-    citation = DecisionCitation(
-        "customer-text:001:text:0001:abc",
-        "Selected variant: M8 WiFi dual camera 64GB",
-    )
+    citation = DecisionCitation("supplier:001:text:0001:abc", "Selected variant: M8 WiFi dual camera 64GB")
     initial = packet(
         fields,
         [
@@ -247,17 +203,15 @@ def test_local_conflict_is_frozen_and_never_sent_to_web():
         },
         [WebSearchSource(index="1", title="M8", url=url)],
     )
-    result = run_web_enrichment(search, initial, fields, grounding(), profile())
+    result = run_web_enrichment(search, initial, fields, grounding(), product_url=PRODUCT_URL)
     assert result.packet.decisions[0].status == CONFLICT
-    assert field_id(resolution) not in search.prompts[0]
+    prompt_payload = json.loads(search.prompts[0].split("\n\n", 1)[1])
+    assert [item["field_id"] for item in prompt_payload["target_fields"]] == [field_id(sensor)]
 
 
 def test_web_fill_is_small_parallel_batches_and_hot_cached(tmp_path):
     fields = [field(f"field_{index}", f"Field {index}") for index in range(5)]
-    initial = packet(
-        fields,
-        [FieldDecision(field_id=field_id(item), status=MISSING) for item in fields],
-    )
+    initial = packet(fields, [FieldDecision(field_id=field_id(item), status=MISSING) for item in fields])
     search = DynamicWebProvider()
     cache = tmp_path / "cache"
 
@@ -266,7 +220,7 @@ def test_web_fill_is_small_parallel_batches_and_hot_cached(tmp_path):
         initial,
         fields,
         grounding(),
-        profile(),
+        product_url=PRODUCT_URL,
         batch_size=2,
         concurrency=3,
         cache_dir=cache,
@@ -276,7 +230,7 @@ def test_web_fill_is_small_parallel_batches_and_hot_cached(tmp_path):
         initial,
         fields,
         grounding(),
-        profile(),
+        product_url=PRODUCT_URL,
         batch_size=2,
         concurrency=3,
         cache_dir=cache,
@@ -313,7 +267,7 @@ def test_invented_web_url_cannot_replace_local_missing():
         },
         [WebSearchSource(index="1", title="Real", url="https://example.test/real")],
     )
-    result = run_web_enrichment(search, initial, fields, grounding(), profile())
+    result = run_web_enrichment(search, initial, fields, grounding(), product_url=PRODUCT_URL)
     assert result.web_sources == []
     assert result.packet.decisions[0].status == MISSING
 
@@ -323,7 +277,7 @@ def test_search_failure_preserves_local_packet():
     fields = [sensor]
     initial = packet(fields, [FieldDecision(field_id=field_id(sensor), status=MISSING)])
     search = FailingWebProvider()
-    result = run_web_enrichment(search, initial, fields, grounding(), profile())
+    result = run_web_enrichment(search, initial, fields, grounding(), product_url=PRODUCT_URL)
     assert search.calls == 1
     assert result.packet.decisions[0].status == MISSING
     assert result.search_failed_batches == 1
@@ -348,12 +302,8 @@ def test_embedded_web_sources_reload_through_unified_decision_loader(tmp_path):
         },
         [WebSearchSource(index="1", title="M8", url=url)],
     )
-    result = run_web_enrichment(search, initial, fields, grounding(), profile())
-    path = write_enriched_ai_decision_packet(
-        result.packet,
-        result.web_sources,
-        tmp_path / "ai-decisions.json",
-    )
+    result = run_web_enrichment(search, initial, fields, grounding(), product_url=PRODUCT_URL)
+    path = write_enriched_ai_decision_packet(result.packet, result.web_sources, tmp_path / "ai-decisions.json")
     loaded = load_ai_decision_packet(
         path,
         fields,
