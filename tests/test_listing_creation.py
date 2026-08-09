@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.makro.listing_creation import (
     ListingBootstrapHints,
     _brand_search_terms,
@@ -9,6 +11,7 @@ from app.makro.listing_creation import (
     choose_vertical_candidate,
     normalize_label,
 )
+from app.providers.openai_compatible import _prompt_payload
 from app.source_snapshot import SnapshotTableRow, SourceSnapshot
 
 
@@ -36,13 +39,15 @@ def _snapshot() -> SourceSnapshot:
     )
 
 
-def test_bootstrap_request_is_bounded_and_source_only():
+def test_bootstrap_request_is_bounded_source_only_and_reaches_provider_payload():
     request = build_bootstrap_request(_snapshot())
-    evidence = request["supplier_evidence"]
+    payload = _prompt_payload(request)
+    evidence = payload["context"]["supplier_evidence"]
     assert len(evidence["visible_text"]) == 9000
     assert sum(len(item) for item in evidence["embedded_product_data"]) <= 3000
     assert evidence["table_rows"] == [{"key": "Brand", "value": "Neutral"}]
-    assert request["task"] == "infer_makro_listing_bootstrap_hints"
+    assert request["task"] == "infer_product_listing_bootstrap_hints"
+    assert payload["context"]["supplier_evidence"]["page_title"] == "M8 WiFi dual dash camera"
 
 
 def test_parse_bootstrap_explicit_brand_and_dedup_terms():
@@ -57,6 +62,18 @@ def test_parse_bootstrap_explicit_brand_and_dedup_terms():
     assert hints.vertical_search_terms == ("Dash Camera", "Vehicle Camera")
     assert hints.brand == "70mai"
     assert hints.brand_status == "explicit"
+
+
+def test_bootstrap_rejects_marketplace_or_listing_words_as_product_type_hints():
+    with pytest.raises(ValueError, match="no usable product-type"):
+        _parse_bootstrap_response(
+            {
+                "vertical_search_terms": ["Makro", "Marketplace Listing", "Vertical"],
+                "brand": "",
+                "brand_status": "unknown",
+                "product_summary": "dash camera",
+            }
+        )
 
 
 def test_unknown_brand_is_cleared_and_has_no_search_terms():
@@ -77,7 +94,7 @@ def test_unbranded_uses_only_platform_sentinel_searches():
     assert _brand_search_terms(hints) == ("Unbranded", "No Brand", "Generic")
 
 
-def test_vertical_choice_must_be_one_live_candidate():
+def test_vertical_choice_must_be_one_live_candidate_and_receives_context():
     hints = ListingBootstrapHints(("Vehicle Camera",), "", "unbranded", "dash camera")
     provider = FakeProvider({"selected_vertical": "Vehicle Camera System"})
     selected = choose_vertical_candidate(
@@ -87,6 +104,28 @@ def test_vertical_choice_must_be_one_live_candidate():
         ["Vehicle Camera System", "Automotive Spares"],
     )
     assert selected == "Vehicle Camera System"
+    request = provider.requests[0]
+    assert request["context"] == {
+        "product_summary": "dash camera",
+        "search_term": "Vehicle Camera",
+        "live_candidates": ["Vehicle Camera System", "Automotive Spares"],
+    }
+    assert _prompt_payload(request)["context"] == request["context"]
+
+
+def test_brand_choice_receives_supplier_status_and_live_candidates():
+    hints = ListingBootstrapHints(("Camera",), "", "unbranded", "camera")
+    provider = FakeProvider({"selected_brand": "Generic"})
+    selected = choose_brand_candidate(provider, hints, "Generic", ["Generic", "Samsung"])
+    assert selected == "Generic"
+    request = provider.requests[0]
+    assert request["context"] == {
+        "brand_status": "unbranded",
+        "supplier_brand": "",
+        "search_term": "Generic",
+        "live_candidates": ["Generic", "Samsung"],
+    }
+    assert _prompt_payload(request)["context"] == request["context"]
 
 
 def test_brand_explicit_exact_match_does_not_need_ai():
