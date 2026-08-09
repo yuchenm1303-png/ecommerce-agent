@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-import json
-
-from app.ai_decisions import BUSINESS_LOCKED, MISSING, READY, source_manifest_digest
+from app.ai_decisions import BUSINESS_LOCKED, MISSING, READY
 from app.evidence_contract import ProductIdentity
 from app.field_mapping import build_field_mapping_request, run_field_mapping
-from app.product_profile import ProductFact, ProductProfile, ProfileCandidate
-from app.ai_decisions import DecisionCitation
-from app.semantic_grounding import GroundedSource, GroundingCatalog, TEXT_KIND
+from app.semantic_grounding import GroundedSource, GroundingCatalog, IMAGE_KIND, TEXT_KIND
 
 
 def field(index: int, *, business: bool = False):
@@ -31,39 +27,19 @@ def grounding() -> GroundingCatalog:
                 source_id="supplier:001:text:0001:abc",
                 source_type="supplier_web",
                 kind=TEXT_KIND,
-                origin="supplier",
+                origin="https://detail.1688.com/offer/1.html",
                 content="Value: known",
                 sha256="a" * 64,
-            )
+            ),
+            GroundedSource(
+                source_id="image:001:def",
+                source_type="product_image",
+                kind=IMAGE_KIND,
+                origin="source-page.png",
+                image_path="source-page.png",
+                sha256="b" * 64,
+            ),
         ]
-    )
-
-
-def profile() -> ProductProfile:
-    sources = grounding()
-    return ProductProfile(
-        identity=ProductIdentity(sku="SKU-1"),
-        source_manifest_sha256=source_manifest_digest(sources),
-        facts=[
-            ProductFact(
-                name="known_fact",
-                scope="product",
-                status="supported",
-                candidates=(
-                    ProfileCandidate(
-                        value="known",
-                        citations=(
-                            DecisionCitation(
-                                "supplier:001:text:0001:abc",
-                                "Value: known",
-                            ),
-                        ),
-                    ),
-                ),
-            )
-        ],
-        summary="compact profile",
-        extractor="profile-ai",
     )
 
 
@@ -80,9 +56,8 @@ class FakeMapProvider:
         self.requests.append(request)
         if self.fail_call == self.calls:
             raise RuntimeError("batch failed")
-        decisions = []
-        for target in request["target_fields"]:
-            decisions.append(
+        return {
+            "decisions": [
                 {
                     "field_id": target["field_id"],
                     "status": "ready",
@@ -94,18 +69,20 @@ class FakeMapProvider:
                         }
                     ],
                 }
-            )
-        return {"decisions": decisions}
+                for target in request["target_fields"]
+            ]
+        }
 
 
-def test_mapping_mechanically_batches_non_business_fields_without_images():
+def test_mapping_mechanically_batches_non_business_fields_from_raw_sources():
     fields = [field(index) for index in range(5)] + [field(99, business=True)]
     provider = FakeMapProvider()
     result = run_field_mapping(
         provider,
         fields,
-        profile(),
         grounding(),
+        expected_identity=ProductIdentity(sku="SKU-1"),
+        product_url="https://detail.1688.com/offer/1.html",
         batch_size=2,
         concurrency=3,
     )
@@ -113,21 +90,26 @@ def test_mapping_mechanically_batches_non_business_fields_without_images():
     assert result.model_calls == 3
     assert len(provider.requests) == 3
     assert all(len(request["target_fields"]) <= 2 for request in provider.requests)
-    assert all(
-        all(source["kind"] == "text" for source in request["grounded_sources"])
-        for request in provider.requests
-    )
+    assert all(any(source["kind"] == "text" for source in request["grounded_sources"]) for request in provider.requests)
+    assert all(any(source["kind"] == "image" for source in request["grounded_sources"]) for request in provider.requests)
+    assert all(request["task"] == "fill_marketplace_fields_from_exact_product_evidence" for request in provider.requests)
     assert result.packet.decisions[-1].status == BUSINESS_LOCKED
     assert all(item.status == READY for item in result.packet.decisions[:-1])
 
 
-def test_mapping_request_has_no_python_semantic_fact_gate():
-    request = build_field_mapping_request([field(1)], profile())
+def test_mapping_request_is_direct_and_contains_no_intermediate_profile():
+    request = build_field_mapping_request(
+        [field(1)],
+        grounding(),
+        expected_identity=ProductIdentity(sku="SKU-1", model_number="M8"),
+        product_url="https://detail.1688.com/offer/1.html",
+    )
     target = request["target_fields"][0]
-    profile_payload = json.loads(request["grounded_sources"][0]["content"])
+    assert request["task"] == "fill_marketplace_fields_from_exact_product_evidence"
+    assert request["product_identity"]["source_product_url"].startswith("https://detail.1688.com/")
     assert "target_scope" not in target
-    assert "profile_fact_ids" not in request["json_contract"]["properties"]["decisions"]["items"]["properties"]
-    assert "fact_id" not in profile_payload["facts"][0]
+    assert any(source["source_type"] == "supplier_web" for source in request["grounded_sources"])
+    assert all(source["source_type"] != "derived_product_profile" for source in request["grounded_sources"])
 
 
 def test_mapping_preserves_ai_semantic_ready_when_citation_is_grounded():
@@ -153,7 +135,12 @@ def test_mapping_preserves_ai_semantic_ready_when_citation_is_grounded():
 
     target = field(1)
     target.update(attribute_key="remote_control", label="Remote Control")
-    result = run_field_mapping(SemanticProvider(), [target], profile(), grounding())
+    result = run_field_mapping(
+        SemanticProvider(),
+        [target],
+        grounding(),
+        expected_identity=ProductIdentity(sku="SKU-1"),
+    )
     assert result.packet.decisions[0].status == READY
 
 
@@ -163,8 +150,8 @@ def test_mapping_batch_failure_only_leaves_that_batch_unresolved():
     result = run_field_mapping(
         provider,
         fields,
-        profile(),
         grounding(),
+        expected_identity=ProductIdentity(sku="SKU-1"),
         batch_size=2,
         concurrency=1,
     )
@@ -178,26 +165,16 @@ def test_mapping_batch_cache_reuses_successful_batches(tmp_path):
     fields = [field(index) for index in range(4)]
     provider = FakeMapProvider()
     cache = tmp_path / "cache"
-    first = run_field_mapping(
-        provider,
-        fields,
-        profile(),
-        grounding(),
+    kwargs = dict(
+        expected_identity=ProductIdentity(sku="SKU-1"),
+        product_url="https://detail.1688.com/offer/1.html",
         batch_size=2,
         concurrency=2,
         cache_dir=cache,
         cache_namespace="model",
     )
-    second = run_field_mapping(
-        provider,
-        fields,
-        profile(),
-        grounding(),
-        batch_size=2,
-        concurrency=2,
-        cache_dir=cache,
-        cache_namespace="model",
-    )
+    first = run_field_mapping(provider, fields, grounding(), **kwargs)
+    second = run_field_mapping(provider, fields, grounding(), **kwargs)
     assert first.model_calls == 2
     assert second.model_calls == 0
     assert second.cache_hits == 2
@@ -207,5 +184,10 @@ def test_mapping_batch_cache_reuses_successful_batches(tmp_path):
 def test_mapping_targets_are_stable_live_field_ids():
     target = field(1)
     provider = FakeMapProvider()
-    run_field_mapping(provider, [target], profile(), grounding())
+    run_field_mapping(
+        provider,
+        [target],
+        grounding(),
+        expected_identity=ProductIdentity(sku="SKU-1"),
+    )
     assert provider.requests[0]["target_fields"][0]["field_id"]
