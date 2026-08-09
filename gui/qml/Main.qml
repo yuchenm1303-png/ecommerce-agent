@@ -122,7 +122,11 @@ ApplicationWindow {
             width: combo.width
             implicitHeight: Math.min(contentItem.implicitHeight, 360)
             padding: 4
-            background: Rectangle { color: "#e51b2532"; radius: 6; border.color: "#30ffffff" }
+            background: Rectangle {
+                color: "#e51b2532"
+                radius: 6
+                border.color: "#30ffffff"
+            }
             contentItem: ListView {
                 clip: true
                 implicitHeight: contentHeight
@@ -140,7 +144,10 @@ ApplicationWindow {
                 elide: Text.ElideRight
                 verticalAlignment: Text.AlignVCenter
             }
-            background: Rectangle { radius: 4; color: highlighted ? "#32ffffff" : "transparent" }
+            background: Rectangle {
+                radius: 4
+                color: highlighted ? "#32ffffff" : "transparent"
+            }
         }
     }
 
@@ -150,7 +157,6 @@ ApplicationWindow {
     }
 
     ColumnLayout {
-        id: shell
         anchors.fill: parent
         anchors.leftMargin: 30
         anchors.rightMargin: 30
@@ -166,10 +172,20 @@ ApplicationWindow {
             ColumnLayout {
                 spacing: 1
                 Eyebrow { text: "LOCAL DEVELOPMENT · ACCEPTANCE CONTROL" }
-                Text { text: "ecommerce-agent"; color: "white"; font.pixelSize: 31; font.weight: Font.Bold }
-                SmallText { text: "供应商 URL → fresh schema → cold/hot Resolver → Fill Plan → gated real execution"; Layout.preferredWidth: 760 }
+                Text {
+                    text: "ecommerce-agent"
+                    color: "white"
+                    font.pixelSize: 31
+                    font.weight: Font.Bold
+                }
+                SmallText {
+                    text: "供应商 URL → fresh schema → cold/hot Resolver → Fill Plan → gated real execution"
+                    Layout.preferredWidth: 760
+                }
             }
+
             Item { Layout.fillWidth: true }
+
             Rectangle {
                 radius: 6
                 color: "#40000000"
@@ -184,6 +200,7 @@ ApplicationWindow {
                     font.weight: Font.DemiBold
                 }
             }
+
             DarkButton {
                 text: "打开结果目录"
                 enabled: !bridge.readRunning
@@ -196,8 +213,14 @@ ApplicationWindow {
             Layout.fillWidth: true
             Layout.preferredHeight: 224
             blurScene: scene.blurScene
-            sceneX: { app.layoutEpoch; return inputCard.mapToItem(app.contentItem, 0, 0).x }
-            sceneY: { app.layoutEpoch; return inputCard.mapToItem(app.contentItem, 0, 0).y }
+            sceneX: {
+                app.layoutEpoch
+                return inputCard.mapToItem(app.contentItem, 0, 0).x
+            }
+            sceneY: {
+                app.layoutEpoch
+                return inputCard.mapToItem(app.contentItem, 0, 0).y
+            }
 
             ColumnLayout {
                 anchors.fill: parent
@@ -206,8 +229,15 @@ ApplicationWindow {
 
                 RowLayout {
                     Layout.fillWidth: true
-                    ColumnLayout { spacing: 0; Eyebrow { text: "PRODUCT SOURCE" }; CardTitle { text: "商品来源" } }
-                    SmallText { text: "只输入一个 1688 / supplier 商品 URL；AI 与浏览器链保持现有实现。"; Layout.fillWidth: true }
+                    ColumnLayout {
+                        spacing: 0
+                        Eyebrow { text: "PRODUCT SOURCE" }
+                        CardTitle { text: "商品来源" }
+                    }
+                    SmallText {
+                        text: "只输入一个 1688 / supplier 商品 URL；AI 与浏览器链保持现有实现。"
+                        Layout.fillWidth: true
+                    }
                 }
 
                 RowLayout {
@@ -226,27 +256,68 @@ ApplicationWindow {
                         enabled: !bridge.readRunning && !bridge.realRunning
                         onClicked: bridge.startReadOnly(urlInput.text, makroPort.value, sourcePort.value, verticalInput.text, currentPage.checked)
                     }
-                    DarkButton { text: "停止"; enabled: bridge.readRunning; onClicked: bridge.stopReadOnly() }
+                    DarkButton {
+                        text: "停止"
+                        enabled: bridge.readRunning
+                        onClicked: bridge.stopReadOnly()
+                    }
                 }
 
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 8
                     Text { text: "Makro CDP"; color: "#b8ffffff"; font.pixelSize: 10 }
-                    SpinBox { id: makroPort; from: 1; to: 65535; value: 9222; enabled: !bridge.readRunning && !bridge.realRunning; implicitWidth: 105 }
+                    SpinBox {
+                        id: makroPort
+                        from: 1
+                        to: 65535
+                        value: 9222
+                        enabled: !bridge.readRunning && !bridge.realRunning
+                        implicitWidth: 105
+                    }
                     Text { text: "Source CDP"; color: "#b8ffffff"; font.pixelSize: 10 }
-                    SpinBox { id: sourcePort; from: 1; to: 65535; value: 9333; enabled: !bridge.readRunning && !bridge.realRunning; implicitWidth: 105 }
-                    DarkField { id: verticalInput; text: "vehicle_camera_system"; Layout.preferredWidth: 220; implicitHeight: 34; enabled: !bridge.readRunning && !bridge.realRunning }
-                    DarkCheck { id: currentPage; text: "Source Edge 已人工验证：采集当前页"; enabled: !bridge.readRunning && !bridge.realRunning }
+                    SpinBox {
+                        id: sourcePort
+                        from: 1
+                        to: 65535
+                        value: 9333
+                        enabled: !bridge.readRunning && !bridge.realRunning
+                        implicitWidth: 105
+                    }
+                    DarkField {
+                        id: verticalInput
+                        text: "vehicle_camera_system"
+                        Layout.preferredWidth: 220
+                        implicitHeight: 34
+                        enabled: !bridge.readRunning && !bridge.realRunning
+                    }
+                    DarkCheck {
+                        id: currentPage
+                        text: "Source Edge 已人工验证：采集当前页"
+                        enabled: !bridge.readRunning && !bridge.realRunning
+                    }
                     Item { Layout.fillWidth: true }
                 }
 
-                Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: "#18ffffff" }
+                Rectangle {
+                    Layout.fillWidth: true
+                    implicitHeight: 1
+                    color: "#18ffffff"
+                }
 
                 RowLayout {
                     Layout.fillWidth: true
-                    ColumnLayout { spacing: 0; Eyebrow { text: "REAL BROWSER ACCEPTANCE · EXPLICIT PERMISSIONS" }; CardTitle { text: "真实网页填写验收" } }
-                    SmallText { text: bridge.realUnlocked ? "read-only 已通过；真实填写已解锁，Save / 图片仍需显式授权，QC 永久锁定。" : "完成 read-only 四阶段后才解锁真实填写。"; Layout.fillWidth: true }
+                    ColumnLayout {
+                        spacing: 0
+                        Eyebrow { text: "REAL BROWSER ACCEPTANCE · EXPLICIT PERMISSIONS" }
+                        CardTitle { text: "真实网页填写验收" }
+                    }
+                    SmallText {
+                        text: bridge.realUnlocked
+                            ? "read-only 已通过；真实填写已解锁，Save / 图片仍需显式授权，QC 永久锁定。"
+                            : "完成 read-only 四阶段后才解锁真实填写。"
+                        Layout.fillWidth: true
+                    }
                 }
 
                 RowLayout {
@@ -260,22 +331,38 @@ ApplicationWindow {
                         currentIndex: Math.min(1, count - 1)
                         enabled: !bridge.realRunning
                     }
-                    DarkCheck { id: saveCheck; text: "允许 Save + reopen"; enabled: !bridge.realRunning }
+                    DarkCheck {
+                        id: saveCheck
+                        text: "允许 Save + reopen"
+                        enabled: !bridge.realRunning
+                    }
                     DarkCheck {
                         id: uploadCheck
                         text: "上传图片"
                         enabled: !bridge.realRunning && (scopeCombo.currentIndex === scopeCombo.count - 1 || scopeCombo.currentText.indexOf("Product Photos") >= 0)
                     }
-                    DarkButton { text: "选择图片…"; enabled: uploadCheck.checked && !bridge.realRunning; onClicked: fileDialog.open() }
+                    DarkButton {
+                        text: "选择图片…"
+                        enabled: uploadCheck.checked && !bridge.realRunning
+                        onClicked: fileDialog.open()
+                    }
                     SmallText { text: bridge.selectedImageCount + " files" }
-                    DarkCheck { text: "Send to QC · LOCKED"; checked: false; enabled: false }
+                    DarkCheck {
+                        text: "Send to QC · LOCKED"
+                        checked: false
+                        enabled: false
+                    }
                     Item { Layout.fillWidth: true }
                     PrimaryButton {
                         text: "真实填写测试"
                         enabled: bridge.realUnlocked && !bridge.readRunning && !bridge.realRunning
                         onClicked: realConfirm.open()
                     }
-                    DarkButton { text: "停止真实测试"; enabled: bridge.realRunning; onClicked: bridge.stopReal() }
+                    DarkButton {
+                        text: "停止真实测试"
+                        enabled: bridge.realRunning
+                        onClicked: bridge.stopReal()
+                    }
                 }
             }
         }
@@ -285,10 +372,54 @@ ApplicationWindow {
             Layout.preferredHeight: 92
             spacing: 11
 
-            StatusCard { id: readyCard; Layout.fillWidth: true; Layout.fillHeight: true; blurScene: scene.blurScene; sceneX: { app.layoutEpoch; return readyCard.mapToItem(app.contentItem,0,0).x }; sceneY: { app.layoutEpoch; return readyCard.mapToItem(app.contentItem,0,0).y }; titleText: "READY"; captionText: "Final Fill Plan"; valueText: bridge.counts.ready < 0 ? "—" : bridge.counts.ready; valueColor: "#8fe1b9" }
-            StatusCard { id: missingCard; Layout.fillWidth: true; Layout.fillHeight: true; blurScene: scene.blurScene; sceneX: { app.layoutEpoch; return missingCard.mapToItem(app.contentItem,0,0).x }; sceneY: { app.layoutEpoch; return missingCard.mapToItem(app.contentItem,0,0).y }; titleText: "MISSING"; captionText: "AI final packet"; valueText: bridge.counts.missing < 0 ? "—" : bridge.counts.missing; valueColor: "#f4cb7a" }
-            StatusCard { id: conflictCard; Layout.fillWidth: true; Layout.fillHeight: true; blurScene: scene.blurScene; sceneX: { app.layoutEpoch; return conflictCard.mapToItem(app.contentItem,0,0).x }; sceneY: { app.layoutEpoch; return conflictCard.mapToItem(app.contentItem,0,0).y }; titleText: "CONFLICT"; captionText: "AI final packet"; valueText: bridge.counts.conflict < 0 ? "—" : bridge.counts.conflict; valueColor: "#f18da0" }
-            StatusCard { id: blockedCard; Layout.fillWidth: true; Layout.fillHeight: true; blurScene: scene.blurScene; sceneX: { app.layoutEpoch; return blockedCard.mapToItem(app.contentItem,0,0).x }; sceneY: { app.layoutEpoch; return blockedCard.mapToItem(app.contentItem,0,0).y }; titleText: "BLOCKED"; captionText: "Final hard/business gate"; valueText: bridge.counts.blocked < 0 ? "—" : bridge.counts.blocked; valueColor: "#e796ae" }
+            StatusCard {
+                id: readyCard
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                blurScene: scene.blurScene
+                sceneX: { app.layoutEpoch; return readyCard.mapToItem(app.contentItem, 0, 0).x }
+                sceneY: { app.layoutEpoch; return readyCard.mapToItem(app.contentItem, 0, 0).y }
+                titleText: "READY"
+                captionText: "Final Fill Plan"
+                valueText: bridge.counts.ready < 0 ? "—" : bridge.counts.ready
+                valueColor: "#8fe1b9"
+            }
+            StatusCard {
+                id: missingCard
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                blurScene: scene.blurScene
+                sceneX: { app.layoutEpoch; return missingCard.mapToItem(app.contentItem, 0, 0).x }
+                sceneY: { app.layoutEpoch; return missingCard.mapToItem(app.contentItem, 0, 0).y }
+                titleText: "MISSING"
+                captionText: "AI final packet"
+                valueText: bridge.counts.missing < 0 ? "—" : bridge.counts.missing
+                valueColor: "#f4cb7a"
+            }
+            StatusCard {
+                id: conflictCard
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                blurScene: scene.blurScene
+                sceneX: { app.layoutEpoch; return conflictCard.mapToItem(app.contentItem, 0, 0).x }
+                sceneY: { app.layoutEpoch; return conflictCard.mapToItem(app.contentItem, 0, 0).y }
+                titleText: "CONFLICT"
+                captionText: "AI final packet"
+                valueText: bridge.counts.conflict < 0 ? "—" : bridge.counts.conflict
+                valueColor: "#f18da0"
+            }
+            StatusCard {
+                id: blockedCard
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                blurScene: scene.blurScene
+                sceneX: { app.layoutEpoch; return blockedCard.mapToItem(app.contentItem, 0, 0).x }
+                sceneY: { app.layoutEpoch; return blockedCard.mapToItem(app.contentItem, 0, 0).y }
+                titleText: "BLOCKED"
+                captionText: "Final hard/business gate"
+                valueText: bridge.counts.blocked < 0 ? "—" : bridge.counts.blocked
+                valueColor: "#e796ae"
+            }
         }
 
         RowLayout {
@@ -303,19 +434,25 @@ ApplicationWindow {
                 Layout.fillHeight: true
                 Layout.minimumWidth: 720
                 blurScene: scene.blurScene
-                sceneX: { app.layoutEpoch; return fieldsCard.mapToItem(app.contentItem,0,0).x }
-                sceneY: { app.layoutEpoch; return fieldsCard.mapToItem(app.contentItem,0,0).y }
+                sceneX: { app.layoutEpoch; return fieldsCard.mapToItem(app.contentItem, 0, 0).x }
+                sceneY: { app.layoutEpoch; return fieldsCard.mapToItem(app.contentItem, 0, 0).y }
 
                 ColumnLayout {
                     anchors.fill: parent
                     anchors.margins: 13
                     spacing: 7
+
                     RowLayout {
                         Layout.fillWidth: true
-                        ColumnLayout { spacing: 0; Eyebrow { text: "FIELD RESOLUTION · FULL TRACE" }; CardTitle { text: "字段决策与最终 Gate" } }
+                        ColumnLayout {
+                            spacing: 0
+                            Eyebrow { text: "FIELD RESOLUTION · FULL TRACE" }
+                            CardTitle { text: "字段决策与最终 Gate" }
+                        }
                         Item { Layout.fillWidth: true }
                         SmallText { text: bridge.fieldsHint }
                     }
+
                     Rectangle {
                         Layout.fillWidth: true
                         implicitHeight: 30
@@ -323,15 +460,16 @@ ApplicationWindow {
                         Row {
                             anchors.fill: parent
                             property real unit: width / 100
-                            Text { width: parent.unit*15; text: "字段名"; color: "#dcffffff"; font.pixelSize: 10; leftPadding: 6; verticalAlignment: Text.AlignVCenter; height: parent.height }
-                            Text { width: parent.unit*9; text: "AI 状态"; color: "#dcffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; height: parent.height }
-                            Text { width: parent.unit*20; text: "AI 结果"; color: "#dcffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; height: parent.height }
-                            Text { width: parent.unit*10; text: "最终状态"; color: "#dcffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; height: parent.height }
-                            Text { width: parent.unit*18; text: "blocked / gate 原因"; color: "#dcffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; height: parent.height }
-                            Text { width: parent.unit*18; text: "来源"; color: "#dcffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; height: parent.height }
-                            Text { width: parent.unit*10; text: "Field ID"; color: "#dcffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; height: parent.height }
+                            Text { width: parent.unit * 15; height: parent.height; text: "字段名"; color: "#dcffffff"; font.pixelSize: 10; leftPadding: 6; verticalAlignment: Text.AlignVCenter }
+                            Text { width: parent.unit * 9; height: parent.height; text: "AI 状态"; color: "#dcffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter }
+                            Text { width: parent.unit * 20; height: parent.height; text: "AI 结果"; color: "#dcffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter }
+                            Text { width: parent.unit * 10; height: parent.height; text: "最终状态"; color: "#dcffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter }
+                            Text { width: parent.unit * 18; height: parent.height; text: "blocked / gate 原因"; color: "#dcffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter }
+                            Text { width: parent.unit * 18; height: parent.height; text: "来源"; color: "#dcffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter }
+                            Text { width: parent.unit * 10; height: parent.height; text: "Field ID"; color: "#dcffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter }
                         }
                     }
+
                     ListView {
                         id: fieldList
                         Layout.fillWidth: true
@@ -341,21 +479,19 @@ ApplicationWindow {
                         boundsBehavior: Flickable.StopAtBounds
                         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
                         delegate: Rectangle {
-                            required property var modelData
                             width: fieldList.width
                             height: 38
                             color: index % 2 ? "#08ffffff" : "#10000000"
                             Row {
                                 anchors.fill: parent
                                 property real unit: width / 100
-                                function cell(t, w, c) { return null }
-                                Text { width: parent.unit*15; text: modelData.fieldName; color: "white"; font.pixelSize: 10; leftPadding: 6; verticalAlignment: Text.AlignVCenter; height: parent.height; elide: Text.ElideRight }
-                                Text { width: parent.unit*9; text: modelData.aiStatus; color: "#d8ffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; height: parent.height; elide: Text.ElideRight }
-                                Text { width: parent.unit*20; text: modelData.aiResult; color: "white"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; height: parent.height; elide: Text.ElideRight }
-                                Text { width: parent.unit*10; text: modelData.finalStatus; color: modelData.finalStatus === "READY" ? "#8fe1b9" : modelData.finalStatus === "BLOCKED" ? "#e796ae" : "#f4cb7a"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; height: parent.height; elide: Text.ElideRight }
-                                Text { width: parent.unit*18; text: modelData.blockedReason; color: "#c8ffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; height: parent.height; elide: Text.ElideRight }
-                                Text { width: parent.unit*18; text: modelData.source; color: "#c8ffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; height: parent.height; elide: Text.ElideRight }
-                                Text { width: parent.unit*10; text: modelData.fieldId; color: "#9effffff"; font.pixelSize: 9; verticalAlignment: Text.AlignVCenter; height: parent.height; elide: Text.ElideRight }
+                                Text { width: parent.unit * 15; height: parent.height; text: modelData.fieldName; color: "white"; font.pixelSize: 10; leftPadding: 6; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
+                                Text { width: parent.unit * 9; height: parent.height; text: modelData.aiStatus; color: "#d8ffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
+                                Text { width: parent.unit * 20; height: parent.height; text: modelData.aiResult; color: "white"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
+                                Text { width: parent.unit * 10; height: parent.height; text: modelData.finalStatus; color: modelData.finalStatus === "READY" ? "#8fe1b9" : modelData.finalStatus === "BLOCKED" ? "#e796ae" : "#f4cb7a"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
+                                Text { width: parent.unit * 18; height: parent.height; text: modelData.blockedReason; color: "#c8ffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
+                                Text { width: parent.unit * 18; height: parent.height; text: modelData.source; color: "#c8ffffff"; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
+                                Text { width: parent.unit * 10; height: parent.height; text: modelData.fieldId; color: "#9effffff"; font.pixelSize: 9; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
                             }
                         }
                     }
@@ -369,7 +505,6 @@ ApplicationWindow {
                 clip: true
                 contentWidth: availableWidth
                 ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-                onContentItemChanged: app.layoutEpoch++
 
                 Column {
                     id: sideColumn
@@ -381,13 +516,29 @@ ApplicationWindow {
                         width: sideColumn.width
                         height: 222
                         blurScene: scene.blurScene
-                        sceneX: { app.layoutEpoch; sideScroll.contentItem.contentY; return telemetryCard.mapToItem(app.contentItem,0,0).x }
-                        sceneY: { app.layoutEpoch; sideScroll.contentItem.contentY; return telemetryCard.mapToItem(app.contentItem,0,0).y }
+                        sceneX: {
+                            app.layoutEpoch
+                            if (sideScroll.contentItem) sideScroll.contentItem.contentY
+                            return telemetryCard.mapToItem(app.contentItem, 0, 0).x
+                        }
+                        sceneY: {
+                            app.layoutEpoch
+                            if (sideScroll.contentItem) sideScroll.contentItem.contentY
+                            return telemetryCard.mapToItem(app.contentItem, 0, 0).y
+                        }
                         Column {
-                            anchors.fill: parent; anchors.margins: 13; spacing: 5
+                            anchors.fill: parent
+                            anchors.margins: 13
+                            spacing: 5
                             Eyebrow { text: "RUN DIAGNOSTICS · MODEL / CACHE" }
                             CardTitle { text: "Resolver Telemetry" }
-                            Repeater { model: bridge.telemetry; SmallText { width: telemetryCard.width - 26; text: modelData } }
+                            Repeater {
+                                model: bridge.telemetry
+                                SmallText {
+                                    width: telemetryCard.width - 26
+                                    text: modelData
+                                }
+                            }
                         }
                     }
 
@@ -396,24 +547,68 @@ ApplicationWindow {
                         width: sideColumn.width
                         height: 230
                         blurScene: scene.blurScene
-                        sceneX: { app.layoutEpoch; sideScroll.contentItem.contentY; return webCard.mapToItem(app.contentItem,0,0).x }
-                        sceneY: { app.layoutEpoch; sideScroll.contentItem.contentY; return webCard.mapToItem(app.contentItem,0,0).y }
+                        sceneX: {
+                            app.layoutEpoch
+                            if (sideScroll.contentItem) sideScroll.contentItem.contentY
+                            return webCard.mapToItem(app.contentItem, 0, 0).x
+                        }
+                        sceneY: {
+                            app.layoutEpoch
+                            if (sideScroll.contentItem) sideScroll.contentItem.contentY
+                            return webCard.mapToItem(app.contentItem, 0, 0).y
+                        }
                         ColumnLayout {
-                            anchors.fill: parent; anchors.margins: 13; spacing: 6
-                            RowLayout { Layout.fillWidth: true; ColumnLayout { spacing: 0; Eyebrow { text: "ENTITY MATCH" }; CardTitle { text: "Web candidates" } }; Item { Layout.fillWidth: true }; SmallText { text: bridge.webHint } }
+                            anchors.fill: parent
+                            anchors.margins: 13
+                            spacing: 6
+                            RowLayout {
+                                Layout.fillWidth: true
+                                ColumnLayout {
+                                    spacing: 0
+                                    Eyebrow { text: "ENTITY MATCH" }
+                                    CardTitle { text: "Web candidates" }
+                                }
+                                Item { Layout.fillWidth: true }
+                                SmallText { text: bridge.webHint }
+                            }
                             ListView {
                                 id: webList
-                                Layout.fillWidth: true; Layout.fillHeight: true; clip: true; model: bridge.webCandidates
+                                Layout.fillWidth: true
+                                Layout.fillHeight: true
+                                clip: true
+                                model: bridge.webCandidates
                                 ScrollBar.vertical: ScrollBar { }
                                 delegate: Rectangle {
-                                    required property var modelData
-                                    width: webList.width; height: 52; color: index % 2 ? "#08ffffff" : "#10000000"
-                                    Column { anchors.fill: parent; anchors.margins: 5; spacing: 2
-                                        Row { spacing: 7
-                                            Text { text: modelData.match; color: modelData.match === "SAME_PRODUCT" ? "#8fe1b9" : modelData.match === "DIFFERENT_PRODUCT" ? "#f18da0" : "#f4cb7a"; font.pixelSize: 10; font.weight: Font.DemiBold }
-                                            Text { width: webList.width - 115; text: modelData.source; color: "white"; font.pixelSize: 10; elide: Text.ElideRight }
+                                    width: webList.width
+                                    height: 52
+                                    color: index % 2 ? "#08ffffff" : "#10000000"
+                                    Column {
+                                        anchors.fill: parent
+                                        anchors.margins: 5
+                                        spacing: 2
+                                        Row {
+                                            spacing: 7
+                                            Text {
+                                                text: modelData.match
+                                                color: modelData.match === "SAME_PRODUCT" ? "#8fe1b9" : modelData.match === "DIFFERENT_PRODUCT" ? "#f18da0" : "#f4cb7a"
+                                                font.pixelSize: 10
+                                                font.weight: Font.DemiBold
+                                            }
+                                            Text {
+                                                width: webList.width - 115
+                                                text: modelData.source
+                                                color: "white"
+                                                font.pixelSize: 10
+                                                elide: Text.ElideRight
+                                            }
                                         }
-                                        Text { width: webList.width - 10; text: modelData.reason; color: "#a8ffffff"; font.pixelSize: 9; elide: Text.ElideRight }
+                                        Text {
+                                            width: webList.width - 10
+                                            text: modelData.reason
+                                            color: "#a8ffffff"
+                                            font.pixelSize: 9
+                                            elide: Text.ElideRight
+                                        }
                                     }
                                 }
                             }
@@ -425,21 +620,34 @@ ApplicationWindow {
                         width: sideColumn.width
                         height: 132
                         blurScene: scene.blurScene
-                        sceneX: { app.layoutEpoch; sideScroll.contentItem.contentY; return safetyCard.mapToItem(app.contentItem,0,0).x }
-                        sceneY: { app.layoutEpoch; sideScroll.contentItem.contentY; return safetyCard.mapToItem(app.contentItem,0,0).y }
+                        sceneX: {
+                            app.layoutEpoch
+                            if (sideScroll.contentItem) sideScroll.contentItem.contentY
+                            return safetyCard.mapToItem(app.contentItem, 0, 0).x
+                        }
+                        sceneY: {
+                            app.layoutEpoch
+                            if (sideScroll.contentItem) sideScroll.contentItem.contentY
+                            return safetyCard.mapToItem(app.contentItem, 0, 0).y
+                        }
                         ColumnLayout {
-                            anchors.fill: parent; anchors.margins: 13; spacing: 5
+                            anchors.fill: parent
+                            anchors.margins: 13
+                            spacing: 5
                             Eyebrow { text: "ZERO-WRITE / REAL EXECUTION SAFETY" }
                             CardTitle { text: "Makro write safety" }
-                            RowLayout { Layout.fillWidth: true
+                            RowLayout {
+                                Layout.fillWidth: true
                                 SmallText { text: "Makro Write"; Layout.fillWidth: true }
                                 Text { text: bridge.safety.writes; color: bridge.safety.safe ? "#8fe1b9" : "#f18da0"; font.pixelSize: 11; font.weight: Font.Bold }
                             }
-                            RowLayout { Layout.fillWidth: true
+                            RowLayout {
+                                Layout.fillWidth: true
                                 SmallText { text: "Save"; Layout.fillWidth: true }
                                 Text { text: bridge.safety.save; color: bridge.safety.safe ? "#8fe1b9" : "#f18da0"; font.pixelSize: 11; font.weight: Font.Bold }
                             }
-                            RowLayout { Layout.fillWidth: true
+                            RowLayout {
+                                Layout.fillWidth: true
                                 SmallText { text: "Send to QC"; Layout.fillWidth: true }
                                 Text { text: bridge.safety.qc; color: bridge.safety.qc.indexOf("YES") === 0 ? "#f18da0" : "#8fe1b9"; font.pixelSize: 11; font.weight: Font.Bold }
                             }
@@ -455,8 +663,8 @@ ApplicationWindow {
             Layout.preferredHeight: 258
             Layout.minimumHeight: 190
             blurScene: scene.blurScene
-            sceneX: { app.layoutEpoch; return consoleCard.mapToItem(app.contentItem,0,0).x }
-            sceneY: { app.layoutEpoch; return consoleCard.mapToItem(app.contentItem,0,0).y }
+            sceneX: { app.layoutEpoch; return consoleCard.mapToItem(app.contentItem, 0, 0).x }
+            sceneY: { app.layoutEpoch; return consoleCard.mapToItem(app.contentItem, 0, 0).y }
 
             ColumnLayout {
                 anchors.fill: parent
@@ -474,9 +682,17 @@ ApplicationWindow {
                         TabButton { text: "Real Fields" }
                         TabButton { text: "Report JSON" }
                     }
-                    SmallText { text: bridge.progressText; Layout.preferredWidth: 360; horizontalAlignment: Text.AlignRight }
+                    SmallText {
+                        text: bridge.progressText
+                        Layout.preferredWidth: 360
+                        horizontalAlignment: Text.AlignRight
+                    }
                 }
-                ProgressBar { Layout.fillWidth: true; value: bridge.progressValue / 100.0 }
+
+                ProgressBar {
+                    Layout.fillWidth: true
+                    value: bridge.progressValue / 100.0
+                }
 
                 StackLayout {
                     Layout.fillWidth: true
@@ -489,44 +705,99 @@ ApplicationWindow {
                         model: bridge.readLogModel
                         ScrollBar.vertical: ScrollBar { }
                         onCountChanged: positionViewAtEnd()
-                        delegate: Text { required property string text; width: readLog.width - 12; text: model.text; color: "#efefef"; font.family: "Cascadia Mono"; font.pixelSize: 11; wrapMode: Text.NoWrap }
+                        delegate: Text {
+                            width: readLog.width - 12
+                            text: model.text
+                            color: "#efefef"
+                            font.family: "Cascadia Mono"
+                            font.pixelSize: 11
+                            wrapMode: Text.NoWrap
+                        }
                     }
 
                     ColumnLayout {
                         spacing: 4
-                        TextArea { Layout.fillWidth: true; Layout.preferredHeight: 56; readOnly: true; text: bridge.realCommand; color: "#dfffffff"; font.family: "Cascadia Mono"; font.pixelSize: 10; background: Rectangle { color: "#30000000"; radius: 4 } }
+                        TextArea {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 56
+                            readOnly: true
+                            text: bridge.realCommand
+                            color: "#dfffffff"
+                            font.family: "Cascadia Mono"
+                            font.pixelSize: 10
+                            background: Rectangle { color: "#30000000"; radius: 4 }
+                        }
                         ListView {
                             id: realLog
-                            Layout.fillWidth: true; Layout.fillHeight: true; clip: true; model: bridge.realLogModel
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            clip: true
+                            model: bridge.realLogModel
                             ScrollBar.vertical: ScrollBar { }
                             onCountChanged: positionViewAtEnd()
-                            delegate: Text { required property string text; width: realLog.width - 12; text: model.text; color: "#efefef"; font.family: "Cascadia Mono"; font.pixelSize: 11; wrapMode: Text.NoWrap }
+                            delegate: Text {
+                                width: realLog.width - 12
+                                text: model.text
+                                color: "#efefef"
+                                font.family: "Cascadia Mono"
+                                font.pixelSize: 11
+                                wrapMode: Text.NoWrap
+                            }
                         }
                     }
 
                     ColumnLayout {
                         spacing: 4
                         SmallText { text: bridge.realSummary; Layout.fillWidth: true }
-                        Rectangle { Layout.fillWidth: true; implicitHeight: 28; color: "#18ffffff"
-                            Row { anchors.fill: parent; property real unit: width/100
-                                Repeater { model: [["Section",16],["Field",16],["Mode",10],["Execution",12],["Answer",20],["Persisted",10],["Detail",16]]; delegate: Text { width: parent.unit*modelData[1]; height: parent.height; text: modelData[0]; color: "#dcffffff"; font.pixelSize: 9; verticalAlignment: Text.AlignVCenter } }
+                        Rectangle {
+                            Layout.fillWidth: true
+                            implicitHeight: 28
+                            color: "#18ffffff"
+                            Row {
+                                anchors.fill: parent
+                                property real unit: width / 100
+                                Repeater {
+                                    model: [
+                                        {"label": "Section", "size": 16},
+                                        {"label": "Field", "size": 16},
+                                        {"label": "Mode", "size": 10},
+                                        {"label": "Execution", "size": 12},
+                                        {"label": "Answer", "size": 20},
+                                        {"label": "Persisted", "size": 10},
+                                        {"label": "Detail", "size": 16}
+                                    ]
+                                    delegate: Text {
+                                        width: parent.unit * modelData.size
+                                        height: parent.height
+                                        text: modelData.label
+                                        color: "#dcffffff"
+                                        font.pixelSize: 9
+                                        verticalAlignment: Text.AlignVCenter
+                                    }
+                                }
                             }
                         }
                         ListView {
                             id: realFieldsList
-                            Layout.fillWidth: true; Layout.fillHeight: true; clip: true; model: bridge.realFields
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            clip: true
+                            model: bridge.realFields
                             ScrollBar.vertical: ScrollBar { }
                             delegate: Rectangle {
-                                required property var modelData
-                                width: realFieldsList.width; height: 36; color: index%2 ? "#08ffffff" : "#10000000"
-                                Row { anchors.fill: parent; property real unit: width/100
-                                    Text { width: parent.unit*16; text: modelData.section; color: "#d8ffffff"; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; height: parent.height }
-                                    Text { width: parent.unit*16; text: modelData.field; color: "white"; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; height: parent.height }
-                                    Text { width: parent.unit*10; text: modelData.mode; color: "#c8ffffff"; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; height: parent.height }
-                                    Text { width: parent.unit*12; text: modelData.execution; color: modelData.execution.toLowerCase().indexOf("error")>=0 || modelData.execution.toLowerCase().indexOf("fail")>=0 ? "#f18da0" : "#8fe1b9"; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; height: parent.height }
-                                    Text { width: parent.unit*20; text: modelData.answer; color: "white"; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; height: parent.height }
-                                    Text { width: parent.unit*10; text: modelData.persisted; color: "#c8ffffff"; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; height: parent.height }
-                                    Text { width: parent.unit*16; text: modelData.detail; color: "#a8ffffff"; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter; height: parent.height }
+                                width: realFieldsList.width
+                                height: 36
+                                color: index % 2 ? "#08ffffff" : "#10000000"
+                                Row {
+                                    anchors.fill: parent
+                                    property real unit: width / 100
+                                    Text { width: parent.unit * 16; height: parent.height; text: modelData.section; color: "#d8ffffff"; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter }
+                                    Text { width: parent.unit * 16; height: parent.height; text: modelData.field; color: "white"; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter }
+                                    Text { width: parent.unit * 10; height: parent.height; text: modelData.mode; color: "#c8ffffff"; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter }
+                                    Text { width: parent.unit * 12; height: parent.height; text: modelData.execution; color: modelData.execution.toLowerCase().indexOf("error") >= 0 || modelData.execution.toLowerCase().indexOf("fail") >= 0 ? "#f18da0" : "#8fe1b9"; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter }
+                                    Text { width: parent.unit * 20; height: parent.height; text: modelData.answer; color: "white"; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter }
+                                    Text { width: parent.unit * 10; height: parent.height; text: modelData.persisted; color: "#c8ffffff"; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter }
+                                    Text { width: parent.unit * 16; height: parent.height; text: modelData.detail; color: "#a8ffffff"; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter }
                                 }
                             }
                         }
@@ -557,7 +828,8 @@ ApplicationWindow {
     Dialog {
         id: realConfirm
         modal: true
-        anchors.centerIn: Overlay.overlay
+        x: (app.width - width) / 2
+        y: (app.height - height) / 2
         title: "确认真实网页操作"
         standardButtons: Dialog.Yes | Dialog.No
         width: 520
@@ -565,12 +837,16 @@ ApplicationWindow {
             padding: 18
             color: "white"
             wrapMode: Text.WordWrap
-            text: "Scope: " + scopeCombo.currentText + "\n\n" +
-                  (saveCheck.checked ? "Save + reopen verification" : "NO SAVE") + "\n" +
-                  (uploadCheck.checked ? "上传 " + bridge.selectedImageCount + " 张图片" : "NO IMAGE UPLOAD") + "\n" +
-                  "Send to QC = LOCKED / FALSE\n\n确认开始？"
+            text: "Scope: " + scopeCombo.currentText + "\n\n"
+                  + (saveCheck.checked ? "Save + reopen verification" : "NO SAVE") + "\n"
+                  + (uploadCheck.checked ? "上传 " + bridge.selectedImageCount + " 张图片" : "NO IMAGE UPLOAD") + "\n"
+                  + "Send to QC = LOCKED / FALSE\n\n确认开始？"
         }
-        background: Rectangle { color: "#f01b2532"; radius: 8; border.color: "#30ffffff" }
+        background: Rectangle {
+            color: "#f01b2532"
+            radius: 8
+            border.color: "#30ffffff"
+        }
         onAccepted: {
             var row = bridge.realScopes[scopeCombo.currentIndex]
             bridge.startReal(row.value, saveCheck.checked, uploadCheck.checked)
@@ -581,11 +857,21 @@ ApplicationWindow {
         id: noticeDialog
         property string noticeText: ""
         modal: true
-        anchors.centerIn: Overlay.overlay
+        x: (app.width - width) / 2
+        y: (app.height - height) / 2
         standardButtons: Dialog.Ok
         width: 520
-        contentItem: Text { padding: 18; text: noticeDialog.noticeText; color: "white"; wrapMode: Text.WordWrap }
-        background: Rectangle { color: "#f01b2532"; radius: 8; border.color: "#30ffffff" }
+        contentItem: Text {
+            padding: 18
+            text: noticeDialog.noticeText
+            color: "white"
+            wrapMode: Text.WordWrap
+        }
+        background: Rectangle {
+            color: "#f01b2532"
+            radius: 8
+            border.color: "#30ffffff"
+        }
     }
 
     Connections {
