@@ -1,15 +1,15 @@
 """Resolve Makro product fields from one exact supplier product URL.
 
 Production pipeline:
-1) capture the exact supplier page mechanically, including rendered text, tables,
-   page screenshot and bounded embedded variant/SKU/spec data;
+1) capture the exact supplier page mechanically, including structured rows,
+   embedded variant/SKU data, full-page screenshot and discovered product images;
 2) AI directly fills Makro fields from those raw sources in mechanical batches;
-3) web-search only fields still unresolved and fill those blanks directly.
+3) web-search only fields still MISSING and fill those blanks directly.
 
-There is one Makro field table throughout.  No customer SKU, old QA answers,
-Product Profile or Final Resolve participates in product identity.  Python only
-collects sources, schedules work, preserves provenance, locks seller-business
-fields and keeps browser writes off.
+There is one Makro field table throughout. No customer SKU, old QA answers,
+Product Profile or Final Resolve participates in product identity. Python only
+collects sources, schedules/caches work, preserves provenance, locks seller
+business fields and keeps browser writes off.
 """
 
 from __future__ import annotations
@@ -91,6 +91,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="source Edge 已人工完成合法登录/验证后，不重新导航，直接采集当前页。",
     )
+    parser.add_argument(
+        "--source-cache-dir",
+        default="logs/source-cache",
+        help="短期复用同一 URL 的原始 snapshot/screenshot/product-image bytes，供 hot rerun 使用。",
+    )
+    parser.add_argument(
+        "--source-cache-ttl-seconds",
+        type=int,
+        default=900,
+        help="source byte cache 有效期；默认 15 分钟。",
+    )
+    parser.add_argument(
+        "--refresh-source",
+        action="store_true",
+        help="显式重新抓当前网页，不复用短期 source cache。",
+    )
 
     # Optional diagnostics/evidence may be appended, but no old QA/SKU/product-table
     # input is part of the product identity path.
@@ -158,7 +174,7 @@ def _search_requests(decisions: list[Any], fields: list[dict[str, Any]]) -> list
     field_by_id = {field_id(item): item for item in fields}
     output: list[dict[str, Any]] = []
     for decision in decisions:
-        if decision.status not in {MISSING, REVIEW}:
+        if decision.status != MISSING:
             continue
         item = field_by_id.get(decision.field_id, {})
         output.append(
@@ -216,13 +232,15 @@ def main() -> int:
         raise SystemExit("--max-text-chars 不能小于 500")
     if args.overlap_chars < 0 or args.overlap_chars >= args.max_text_chars:
         raise SystemExit("--overlap-chars 必须 >=0 且小于 --max-text-chars")
+    if args.source_cache_ttl_seconds < 0:
+        raise SystemExit("--source-cache-ttl-seconds 不能为负数")
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = Path(args.output_dir) / f"resolve-ai-{stamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     product_url = args.product_url.strip()
-    image_paths = list(args.image)
+    extra_images = list(args.image)
     supplier_snapshots = list(args.supplier_snapshot)
 
     print("===== PRIMARY PRODUCT SOURCE CAPTURE =====", flush=True)
@@ -237,6 +255,9 @@ def main() -> int:
             max_scroll_steps=args.source_max_scroll_steps,
             max_visible_text_chars=args.source_max_visible_text_chars,
             use_current_page=args.source_use_current_page,
+            cache_dir=args.source_cache_dir,
+            cache_ttl_seconds=args.source_cache_ttl_seconds,
+            force_refresh=args.refresh_source,
         )
     except SourceAccessBlocked as exc:
         print(str(exc), flush=True)
@@ -247,8 +268,9 @@ def main() -> int:
         )
         return 2
 
+    product_images = [str(path) for path in getattr(captured, "product_image_paths", ())]
+    image_paths = [str(captured.screenshot_path), *product_images, *extra_images]
     supplier_snapshots.insert(0, str(captured.snapshot_path))
-    image_paths.insert(0, str(captured.screenshot_path))
     product_url = captured.snapshot.final_url or product_url
     generated_sku = generate_listing_sku(product_url)
     capture_info: dict[str, Any] = {
@@ -260,12 +282,18 @@ def main() -> int:
         "visible_text_chars": len(captured.snapshot.visible_text),
         "json_ld_items": len(captured.snapshot.json_ld),
         "embedded_data_items": len(captured.snapshot.embedded_data),
+        "product_image_urls": len(getattr(captured.snapshot, "image_urls", [])),
+        "product_images_downloaded": len(product_images),
+        "product_images": [str(Path(path).resolve()) for path in product_images],
+        "source_cache_hit": bool(getattr(captured, "cache_hit", False)),
         "source_edge": "new" if captured.launched_now else "reused",
     }
     print(
-        f"captured exact product page: table_rows={capture_info['table_rows']}, "
-        f"visible_text_chars={capture_info['visible_text_chars']}, "
-        f"embedded_data_items={capture_info['embedded_data_items']}",
+        f"captured exact product page: cache_hit={capture_info['source_cache_hit']} "
+        f"table_rows={capture_info['table_rows']} "
+        f"visible_text_chars={capture_info['visible_text_chars']} "
+        f"embedded_data_items={capture_info['embedded_data_items']} "
+        f"product_images={capture_info['product_images_downloaded']}",
         flush=True,
     )
 
@@ -433,6 +461,7 @@ def main() -> int:
                     "source_manifest": str(source_manifest_path.resolve()),
                     "primary_source_snapshot": str(captured.snapshot_path.resolve()),
                     "primary_source_screenshot": str(captured.screenshot_path.resolve()),
+                    "primary_source_product_images": [str(Path(path).resolve()) for path in product_images],
                 },
             },
             ensure_ascii=False,
