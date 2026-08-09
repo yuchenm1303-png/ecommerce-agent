@@ -28,13 +28,7 @@ def _circle_rect(point: QPointF | None, radius: float = _CURSOR_RADIUS) -> QRect
 
 
 class OptimizedNekroCursorOverlay(QWidget):
-    """Source-faithful follower circle without a permanent full-window repaint.
-
-    The native 10 px white-dot cursor is still installed by nekro_visual_fx.
-    This layer only paints the original 18 px / 25% follower circle. It wakes
-    only while the follower is moving and invalidates only the old/new cursor
-    rectangles instead of the complete application surface.
-    """
+    """Source-faithful follower circle without permanent full-window repaint."""
 
     def __init__(self, window: QMainWindow) -> None:
         central = window.centralWidget()
@@ -130,16 +124,24 @@ class OptimizedNekroCursorOverlay(QWidget):
         self._invalidate_cursor(old, self.current)
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
-        if not self.visible_cursor or self.current is None:
-            return
         painter = QPainter(self)
         painter.setClipRegion(event.region())
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setPen(Qt.NoPen)
-        radius = _ACTIVE_RADIUS if self.pressed else _CURSOR_RADIUS
-        alpha = 128 if self.pressed else 64
-        painter.setBrush(QColor(255, 255, 255, alpha))
-        painter.drawEllipse(self.current, radius, radius)
+
+        # WA_NoSystemBackground avoids a full-surface clear. Explicitly clear
+        # only the invalidated cursor rectangles so the old follower never
+        # leaves trails while retaining the small dirty-region repaint cost.
+        painter.setCompositionMode(QPainter.CompositionMode_Source)
+        for rect in event.region():
+            painter.fillRect(rect, QColor(0, 0, 0, 0))
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
+        if self.visible_cursor and self.current is not None:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(Qt.NoPen)
+            radius = _ACTIVE_RADIUS if self.pressed else _CURSOR_RADIUS
+            alpha = 128 if self.pressed else 64
+            painter.setBrush(QColor(255, 255, 255, alpha))
+            painter.drawEllipse(self.current, radius, radius)
         painter.end()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
