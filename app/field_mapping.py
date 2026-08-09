@@ -22,26 +22,30 @@ from .product_profile import JSONTaskProvider, ProductProfile, profile_digest
 from .semantic_grounding import GroundingCatalog
 
 
-FIELD_MAPPING_CONTRACT_VERSION = 5
-FIELD_MAPPING_CACHE_VERSION = 5
+FIELD_MAPPING_CONTRACT_VERSION = 6
+FIELD_MAPPING_CACHE_VERSION = 6
 
 
 MAPPING_SYSTEM_INSTRUCTION = (
-    "You are the local product-field resolver. Read the compact grounded PRODUCT_PROFILE "
-    "and answer the supplied marketplace fields directly. Product semantics belong to you, "
-    "not to Python. Use only the supplied local profile and its original citations; do not "
-    "invent facts or use outside knowledge. Return compact JSON only."
+    "You are the local fill-table step of a marketplace listing workflow. "
+    "Read the grounded PRODUCT_PROFILE and answer the supplied Makro fields directly. "
+    "This is not an audit or a review layer. For each field, either provide the locally "
+    "supported answer, preserve a real source conflict, or mark it missing so web search "
+    "can fill it later. Product semantics belong to you, not to Python. Return JSON only."
 )
 
 MAPPING_RULES = [
-    "Answer only the supplied target field_id values.",
-    "READY means the local Product Profile is sufficient to answer this exact field for the selected variant. Include at least one underlying original citation from PRODUCT_PROFILE.",
-    "Use REVIEW when a plausible answer exists but the local evidence is not sufficient for automatic entry; include focused search_queries that Web Research can use.",
-    "Use CONFLICT when credible local sources genuinely disagree; preserve the competing cited alternatives instead of choosing silently.",
-    "Use MISSING when the local profile does not establish the value; include focused search_queries when web research could reasonably help.",
-    "Treat the selected variant as the listing target. Do not silently replace selected-variant facts with generic product-family facts.",
-    "Do not infer No/False/Unsupported/Not included from absence. A negative value needs evidence that actually states that negative claim.",
-    "Keep packaging dimensions/weight separate from product-body dimensions/weight and mount dimensions; preserve dimension axes exactly as written. Do not swap length/width/height/depth, cabin/rear, manual/UI language, or product/vehicle compatibility.",
+    "Answer every supplied target field_id exactly once.",
+    "Use READY when the local Product Profile directly supports the exact Makro field for the selected variant. READY must include at least one underlying original citation from PRODUCT_PROFILE.",
+    "Use CONFLICT only when local sources genuinely give different values for the same exact field; include at least two alternatives, and each alternative must carry its own original citation.",
+    "Use MISSING when the local Product Profile cannot establish the exact field value. Do not use REVIEW in this local pass; uncertainty means MISSING so Web can search it.",
+    "Treat attribute_key as the authoritative field identity when label text is generic or duplicated. Use section_heading as additional context.",
+    "For package_length/package_breadth/package_width/package_height/package_weight and shipping-section package dimensions/weight, use packaging facts only. Never substitute product-body or mount dimensions.",
+    "For product-body length/width/breadth/height/depth/weight fields, use product_body facts only and preserve the stated axis exactly. Never reorder 86 x 36 x 32 into a different axis assignment.",
+    "Keep cabin/interior distinct from rear/back. Keep manual/documentation language distinct from device UI Languages Supported. Keep product brand distinct from compatible vehicle brand.",
+    "Other Storage Features must contain storage-specific capabilities only; do not put loop recording, G-sensor, motion detection, HDR, night vision or other generic camera features into a storage field unless the evidence explicitly describes them as storage behavior.",
+    "Never infer No/False/Unsupported/Not included from absence. A negative value needs evidence that actually states the negative claim.",
+    "Treat the selected variant as the listing target. Do not replace selected-variant facts with conflicting generic product-family facts.",
     "If the field has marketplace options, use the exact option text only when it matches the supported meaning.",
     "If multi_value=false, return one value. If qualifier_options exist, put the magnitude in values and the unit in qualifier.",
     "Citations must use underlying original source_reference values present inside PRODUCT_PROFILE facts, never the derived product-profile source id.",
@@ -61,7 +65,7 @@ MAPPING_JSON_SCHEMA: dict[str, Any] = {
                     "field_id": {"type": "string"},
                     "status": {
                         "type": "string",
-                        "enum": ["ready", "review", "conflict", "missing"],
+                        "enum": ["ready", "conflict", "missing"],
                     },
                     "values": {"type": "array", "items": {"type": "string"}},
                     "qualifier": {"type": "string"},
@@ -128,13 +132,13 @@ def build_field_mapping_request(
 ) -> dict[str, Any]:
     fields = list(batch_fields)
     return {
-        "task": "map_product_profile_to_marketplace_fields",
+        "task": "fill_marketplace_fields_from_local_product_profile",
         "system_instruction": MAPPING_SYSTEM_INSTRUCTION,
         "prompt_instruction": (
-            "Use the local Product Profile to answer this small field batch once. "
-            "If local evidence cannot establish a field, mark it REVIEW/MISSING and give "
-            "focused search_queries instead of guessing. Return one decision for every "
-            "target field and no prose outside JSON."
+            "Fill this small Makro field batch from the local Product Profile. "
+            "If a field is not actually established by local evidence, mark it MISSING "
+            "so the next step can search the web. Preserve genuine local conflicts. "
+            "Return one decision for every target field and no prose outside JSON."
         ),
         "product_identity": {
             "sku": profile.identity.sku,
@@ -221,7 +225,7 @@ def _run_batch(
         raw = provider.extract_json(build_field_mapping_request(batch_fields, profile))
         raw_decisions = raw.get("decisions") if isinstance(raw, dict) else None
         if not isinstance(raw_decisions, list):
-            raise ValueError("field mapping AI output 缺少 decisions 数组")
+            raise ValueError("local field fill AI output 缺少 decisions 数组")
         packet = AIDecisionPacket(
             identity=profile.identity,
             schema_sha256=schema_digest(batch_fields),
@@ -247,7 +251,7 @@ def _run_batch(
             [],
             1,
             False,
-            warning=f"mapping batch {batch_index} failed: {exc}",
+            warning=f"local field batch {batch_index} failed: {exc}",
         )
 
     if cache_path is not None:
@@ -308,7 +312,7 @@ def run_field_mapping(
         workers = min(int(concurrency), len(batches))
         with ThreadPoolExecutor(
             max_workers=workers,
-            thread_name_prefix="field-map",
+            thread_name_prefix="local-field",
         ) as executor:
             futures = {
                 executor.submit(
@@ -339,9 +343,9 @@ def run_field_mapping(
         schema_sha256=schema_digest(field_list),
         source_manifest_sha256=source_manifest_digest(grounding),
         decisions=decisions,
-        model_summary="Answered Makro fields from the grounded local Product Profile.",
+        model_summary="Local Product Profile filled the first-pass Makro field table.",
         warnings=warnings,
-        extractor=f"{profile.extractor}+parallel-local-field-resolve".strip("+"),
+        extractor=f"{profile.extractor}+parallel-local-fill".strip("+"),
     )
     validated = validate_ai_decision_packet(
         candidate,
