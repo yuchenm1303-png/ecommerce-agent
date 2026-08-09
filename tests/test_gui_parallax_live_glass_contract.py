@@ -15,8 +15,8 @@ def test_runtime_uses_one_qquickwindow_scene_graph_not_widget_composition() -> N
     assert "QQmlApplicationEngine" in LAUNCHER
     assert 'QSG_RENDER_LOOP", "threaded"' in LAUNCHER
     assert "QQuickWindow.setGraphicsApi" in LAUNCHER
-    assert "QQuickWidget" not in LAUNCHER
-    assert "QOpenGLWidget" not in LAUNCHER
+    assert "QtQuickWidgets" not in LAUNCHER
+    assert "QtOpenGLWidgets" not in LAUNCHER
     assert "console_window" not in LAUNCHER
     assert "visual_style" not in LAUNCHER
     assert "nekro_card_fx" not in LAUNCHER
@@ -43,6 +43,13 @@ def test_live_glass_is_one_global_preblur_and_mask_pass() -> None:
     assert "property Item maskLayer" in GLASS
     assert "parent: root.maskLayer" in GLASS
     assert "maskLayer: scene.glassMaskLayer" in MAIN
+
+
+def test_glass_mask_preserves_ancestor_clip_geometry() -> None:
+    assert "function effectiveClipRect()" in GLASS
+    assert "ancestor.clip" in GLASS
+    assert "ancestor.mapToItem(root.maskLayer" in GLASS
+    assert "clip: true" in GLASS
 
 
 def test_sakura_and_cursor_share_the_same_scene_graph_overlay() -> None:
