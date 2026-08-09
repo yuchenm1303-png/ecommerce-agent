@@ -30,7 +30,7 @@ def main() -> int:
     install_visual_style(window)
     install_nekro_card_fx(window)
     install_buffered_logs(window)
-    effects = install_nekro_effects(window, sakura_count=12)
+    effects = install_nekro_effects(window, sakura_count=4)
 
     window.show()
     effects.raise_()
