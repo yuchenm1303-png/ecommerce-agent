@@ -14,7 +14,6 @@ from .ai_decisions import (
     READY,
     REVIEW,
     AIDecisionPacket,
-    DecisionAlternative,
     DecisionCitation,
     FieldDecision,
     field_contract,
@@ -23,14 +22,13 @@ from .ai_decisions import (
     validate_ai_decision_packet,
 )
 from .business_fields import is_business_question
-from .product_profile import ProductProfile, profile_digest
 from .providers.dashscope_web_search import WebSearchJSONResult, WebSearchSource
 from .semantic_grounding import GroundingCatalog
 from .source_bundle import normalize_key
 
 
-WEB_SEARCH_CONTRACT_VERSION = 4
-WEB_SEARCH_CACHE_VERSION = 4
+WEB_SEARCH_CONTRACT_VERSION = 5
+WEB_SEARCH_CACHE_VERSION = 5
 WEB_FILLABLE_STATUSES = {MISSING, REVIEW}
 
 
@@ -119,12 +117,6 @@ def _targets(
     packet: AIDecisionPacket,
     fields: Iterable[dict[str, Any]],
 ) -> list[tuple[dict[str, Any], FieldDecision]]:
-    """Return only fields that are still empty/unusable after the local pass.
-
-    Local READY answers and genuine local CONFLICT answers are frozen. Web search
-    is a fill-the-blanks step, not a second pass over already-known product facts.
-    """
-
     by_id = {field_id(field): field for field in fields}
     output: list[tuple[dict[str, Any], FieldDecision]] = []
     for decision in packet.decisions:
@@ -141,31 +133,50 @@ def _prior_payload(decision: FieldDecision) -> dict[str, Any]:
         "status": decision.status,
         "values": list(decision.values),
         "qualifier": decision.qualifier,
-        "citations": [item.as_dict() for item in decision.citations],
         "reason": decision.reason,
         "search_queries": list(decision.search_queries),
     }
 
 
-def _profile_payload(profile: ProductProfile) -> dict[str, Any]:
-    return {
-        "product_identity": {
-            "sku": profile.identity.sku,
-            "model_number": profile.identity.model_number,
-            "brand": profile.identity.brand,
-        },
-        "summary": profile.summary,
-        "facts": [fact.as_dict() for fact in profile.facts],
-    }
+def _local_anchor_payload(initial: AIDecisionPacket, fields: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_id = {field_id(field): field for field in fields}
+    output: list[dict[str, Any]] = []
+    for decision in initial.decisions:
+        if decision.status not in {READY, CONFLICT}:
+            continue
+        field = by_id.get(decision.field_id)
+        if field is None or _field_is_business(field):
+            continue
+        item: dict[str, Any] = {
+            "attribute_key": field_contract(field)["attribute_key"],
+            "label": field_contract(field)["label"],
+            "status": decision.status,
+        }
+        if decision.status == READY:
+            item["values"] = list(decision.values)
+            item["qualifier"] = decision.qualifier
+        else:
+            item["alternatives"] = [alternative.as_dict() for alternative in decision.alternatives]
+        output.append(item)
+    return output
 
 
 def _research_prompt(
-    profile: ProductProfile,
+    initial: AIDecisionPacket,
+    all_fields: list[dict[str, Any]],
     targets: list[tuple[dict[str, Any], FieldDecision]],
+    *,
+    product_url: str,
 ) -> str:
     payload = {
-        "task": "search_and_fill_missing_marketplace_fields",
-        "product_profile": _profile_payload(profile),
+        "task": "search_and_fill_only_missing_marketplace_fields",
+        "product_identity": {
+            "sku": initial.identity.sku,
+            "model_number": initial.identity.model_number,
+            "brand": initial.identity.brand,
+            "source_product_url": product_url.strip(),
+        },
+        "known_local_fields": _local_anchor_payload(initial, all_fields),
         "target_fields": [
             {
                 "field_id": decision.field_id,
@@ -175,15 +186,14 @@ def _research_prompt(
             for field, decision in targets
         ],
         "rules": [
-            "These fields were not filled from the supplied local product material. Search only these fields; do not revisit fields that were already locally READY or CONFLICT.",
-            "Use the Product Profile only to identify the exact current product/selected variant and to formulate focused searches. A seller SKU may be internal and does not need to appear on public pages.",
-            "For each field: return READY if web research establishes the exact value; return CONFLICT if credible web sources genuinely disagree; return MISSING if the value still cannot be established.",
-            "READY citations must use source_url values actually returned by this same web-search call and must include concise evidence_text supporting the exact field value.",
-            "Every CONFLICT alternative must include its own source_url/evidence_text citations from pages actually returned by this same web-search call.",
-            "Never invent a URL, product fact, option, qualifier or negative claim. Never infer No/False/Unsupported/Not included merely because a feature is absent from a page.",
-            "Treat attribute_key as authoritative when labels are generic or duplicated. Preserve dimension axes and scope exactly; do not mix packaging/body/mount, cabin/rear, manual/UI language, product/vehicle compatibility, or generic features with storage-specific fields.",
-            "Prefer the exact current supplier/offer, manufacturer manual, official product page, or another source that clearly applies to this product/variant. Generic family pages are usable only when the evidence clearly applies.",
-            "If multi_value=false return one value. If qualifier_options exist, put the magnitude in values and the unit in qualifier.",
+            "Search only the supplied unresolved target fields. Locally READY and CONFLICT fields are frozen and must not be rewritten.",
+            "The source_product_url is the primary identity anchor. When accessible, inspect/search that exact offer first before looking elsewhere.",
+            "known_local_fields are the product/variant fingerprint. A page sharing only a generic model name is not enough; use another page only when its product identity is consistent with the concrete local fingerprint and selected variant.",
+            "Return READY only when web evidence establishes the exact field for this product/variant; return CONFLICT for genuine disagreement; otherwise return MISSING.",
+            "READY citations must use source_url values actually returned by this same web-search call and concise evidence_text that supports the exact field. Every CONFLICT alternative needs its own returned URL evidence.",
+            "Do not guess, extrapolate typical specifications, infer a negative from absence, rotate dimension axes, or mix packaging/body/mount, cabin/rear, manual/UI language, product/vehicle compatibility, or generic/storage-specific features.",
+            "Do not turn a known local conflict into a confident statement in Description, Keywords, Sales Package or another field.",
+            "If multi_value=false return one value. If qualifier_options exist, put magnitude in values and the exact unit in qualifier.",
             "Never research seller-operated price, stock, MOQ, fulfilment, shipping policy or listing-status fields.",
             "Return one decision for every supplied field_id and JSON only.",
         ],
@@ -221,9 +231,9 @@ def _research_prompt(
         },
     }
     return (
-        "You are the web fill step of a product-listing workflow. Search the web for only "
-        "the still-empty fields below and directly return the field answers. Do not add a "
-        "separate review pass. Return one JSON object only.\n\n"
+        "You are the web fill step of a product-listing workflow. Search only the still-empty "
+        "fields and directly return their answers. There is no later semantic review model. "
+        "Return one JSON object only.\n\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
 
@@ -252,15 +262,24 @@ def _mechanical_batches(items: list[Any], batch_size: int) -> list[list[Any]]:
 
 def _search_cache_key(
     provider: SourcedWebSearchProvider,
-    profile: ProductProfile,
+    initial: AIDecisionPacket,
+    all_fields: list[dict[str, Any]],
     targets: list[tuple[dict[str, Any], FieldDecision]],
+    product_url: str,
 ) -> str:
     payload = {
         "cache_version": WEB_SEARCH_CACHE_VERSION,
         "contract_version": WEB_SEARCH_CONTRACT_VERSION,
         "provider": provider.name,
         "model": provider.model,
-        "profile_sha256": profile_digest(profile),
+        "source_manifest_sha256": initial.source_manifest_sha256,
+        "identity": {
+            "sku": initial.identity.sku,
+            "model_number": initial.identity.model_number,
+            "brand": initial.identity.brand,
+        },
+        "product_url": product_url.strip(),
+        "known_local_fields": _local_anchor_payload(initial, all_fields),
         "targets": [
             {
                 "field_id": decision.field_id,
@@ -310,13 +329,15 @@ class _SearchBatchRun:
 
 def _run_search_batch(
     provider: SourcedWebSearchProvider,
-    profile: ProductProfile,
+    initial: AIDecisionPacket,
+    all_fields: list[dict[str, Any]],
     batch_index: int,
     batch_targets: list[tuple[dict[str, Any], FieldDecision]],
+    product_url: str,
     *,
     cache_dir: Path | None,
 ) -> _SearchBatchRun:
-    key = _search_cache_key(provider, profile, batch_targets)
+    key = _search_cache_key(provider, initial, all_fields, batch_targets, product_url)
     cache_path = cache_dir / f"web-fill-{key}.json" if cache_dir is not None else None
     if cache_path is not None and cache_path.is_file():
         try:
@@ -326,7 +347,9 @@ def _run_search_batch(
             pass
 
     try:
-        result = provider.search_json(_research_prompt(profile, batch_targets))
+        result = provider.search_json(
+            _research_prompt(initial, all_fields, batch_targets, product_url=product_url)
+        )
     except Exception as exc:
         return _SearchBatchRun(
             batch_index,
@@ -339,10 +362,7 @@ def _run_search_batch(
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        temp.write_text(
-            json.dumps(_serialize_search_result(result), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        temp.write_text(json.dumps(_serialize_search_result(result), ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(cache_path)
     return _SearchBatchRun(batch_index, result, 1, False)
 
@@ -508,19 +528,13 @@ def run_web_enrichment(
     initial: AIDecisionPacket,
     fields: Iterable[dict[str, Any]],
     grounding: GroundingCatalog,
-    profile: ProductProfile,
     *,
+    product_url: str = "",
     batch_size: int = 5,
     concurrency: int = 3,
     cache_dir: str | Path | None = None,
 ) -> WebEnrichmentResult:
-    """Fill only still-unresolved fields with one web-search AI pass.
-
-    There is deliberately no second Final Resolve model call. The search model
-    both finds the information and returns the field decision. Python only
-    verifies that cited URLs really came from the search call and that the
-    resulting decision packet is structurally executable.
-    """
+    """Fill only still-unresolved fields with web search; no second semantic pass."""
 
     if not 1 <= int(batch_size) <= 12:
         raise ValueError("web batch_size 必须在 1..12。")
@@ -537,17 +551,16 @@ def run_web_enrichment(
     started = time.monotonic()
     runs: list[_SearchBatchRun] = []
     workers = min(int(concurrency), len(batches))
-    with ThreadPoolExecutor(
-        max_workers=workers,
-        thread_name_prefix="web-fill",
-    ) as executor:
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="web-fill") as executor:
         futures = {
             executor.submit(
                 _run_search_batch,
                 search_provider,
-                profile,
+                initial,
+                field_list,
                 index,
                 batch,
+                product_url,
                 cache_dir=cache_root,
             ): index
             for index, batch in enumerate(batches, start=1)
@@ -566,7 +579,7 @@ def run_web_enrichment(
         schema_sha256=schema_digest(update_fields),
         source_manifest_sha256=initial.source_manifest_sha256,
         decisions=raw_updates,
-        model_summary="Web search filled the unresolved Makro fields.",
+        model_summary="Web search filled unresolved Makro fields.",
         warnings=[],
         extractor=f"{search_provider.name}+web-fill",
     )
@@ -574,13 +587,10 @@ def run_web_enrichment(
         candidate,
         update_fields,
         grounding,
-        expected_identity=profile.identity,
+        expected_identity=initial.identity,
         external_sources=external,
     )
 
-    # Web is allowed to replace an unresolved local field only when it produced
-    # a usable answer or a genuine cited conflict. Invalid/incomplete web output
-    # simply leaves the original unresolved field untouched.
     usable_updates = {
         decision.field_id: decision
         for decision in validated_updates.decisions
@@ -599,7 +609,7 @@ def run_web_enrichment(
         merged,
         field_list,
         grounding,
-        expected_identity=profile.identity,
+        expected_identity=initial.identity,
         external_sources=external,
     )
 
