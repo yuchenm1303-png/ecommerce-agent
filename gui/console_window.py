@@ -145,7 +145,7 @@ class MainWindow(BaseMainWindow):
 
         self.real_policy_hint = QLabel(
             "默认：Single section / no Save / no image upload / QC locked。"
-            "Full Step 3 必须显式开启 Save；图片只有勾选并选择文件后才会传入 executor。"
+            "Single section 可单独授权 Save；Full Step 3 必须开启 Save。图片只有勾选并选择文件后才上传。"
         )
         self.real_policy_hint.setObjectName("cardHint")
         self.real_policy_hint.setWordWrap(True)
@@ -154,8 +154,6 @@ class MainWindow(BaseMainWindow):
 
     def _build_log_card(self) -> QFrame:
         self.console = AcceptanceConsole(self.runner)
-        # Keep the existing buffered log presenter contract: it receives the
-        # console's Live Console view as the one canonical read-only log widget.
         self.log_view = self.console.log_view
         return self.console
 
@@ -243,14 +241,10 @@ class MainWindow(BaseMainWindow):
 
     def _sync_real_controls(self, *_args: object) -> None:
         scope = self.real_scope_combo.currentData()
-        full = scope == FULL_STEP3
-        photos_supported = full or scope == PRODUCT_PHOTOS
+        photos_supported = scope == FULL_STEP3 or scope == PRODUCT_PHOTOS
         real_running = bool(getattr(self, "execution_runner", None) and self.execution_runner.is_running)
 
-        self.real_save_check.setEnabled(full and not real_running)
-        if not full:
-            self.real_save_check.setChecked(False)
-
+        self.real_save_check.setEnabled(not real_running)
         self.real_upload_check.setEnabled(photos_supported and not real_running)
         if not photos_supported:
             self.real_upload_check.setChecked(False)
@@ -281,7 +275,7 @@ class MainWindow(BaseMainWindow):
         self.real_start_button.setEnabled(True)
         self.real_policy_hint.setText(
             f"read-only acceptance 已通过：READY={result.ready}，真实执行已解锁。"
-            "默认仍是 no-save；所有写入结果会进入 Real Execution 控制台。"
+            "Save / 图片仍保持用户显式授权，QC 继续锁定。"
         )
 
     def _start_real_execution(self) -> None:
@@ -369,13 +363,17 @@ class MainWindow(BaseMainWindow):
         totals = report.get("field_totals") or {}
         if not isinstance(totals, dict):
             totals = {}
+        attempted = int(totals.get("writes_attempted", 0) or 0)
+        validated = int(totals.get("validated", 0) or 0)
+        persisted = int(totals.get("persisted_verified", 0) or 0)
+        saved = int(report.get("section_saved", 0) or 0)
+        qc = bool(report.get("send_to_qc_clicked", False))
         self.phase_badge.setText(
-            "REAL complete · attempted={} · validated={} · persisted={}".format(
-                totals.get("writes_attempted", 0),
-                totals.get("validated", 0),
-                totals.get("persisted_verified", 0),
-            )
+            f"REAL complete · attempted={attempted} · validated={validated} · persisted={persisted}"
         )
+        self.write_value.setText(f"YES / {attempted}" if attempted else "NO / 0")
+        self.save_value.setText(f"YES / {saved}" if saved else "NO")
+        self.qc_value.setText("YES" if qc else "NO · LOCKED")
         self.console.tabs.setCurrentWidget(self.execution_console)
 
     def _on_real_failed(self, message: str) -> None:
