@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Protocol
@@ -26,8 +25,8 @@ from .semantic_grounding import GroundingCatalog, TEXT_KIND
 from .source_bundle import normalize_key
 
 
-WEB_SEARCH_CONTRACT_VERSION = 6
-WEB_SEARCH_CACHE_VERSION = 6
+WEB_SEARCH_CONTRACT_VERSION = 7
+WEB_SEARCH_CACHE_VERSION = 7
 WEB_FILLABLE_STATUSES = {MISSING}
 
 
@@ -75,11 +74,28 @@ class WebEvidence:
         }
 
 
+@dataclass(slots=True, frozen=True)
+class WebSourceMatch:
+    source_url: str
+    match: str
+    reason: str = ""
+    identity_evidence: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "source_url": self.source_url,
+            "match": self.match,
+            "reason": self.reason,
+            "identity_evidence": list(self.identity_evidence),
+        }
+
+
 @dataclass(slots=True)
 class WebEnrichmentResult:
     packet: AIDecisionPacket
     web_sources: list[PersistedWebSource] = field(default_factory=list)
     evidence: list[WebEvidence] = field(default_factory=list)
+    source_matches: list[WebSourceMatch] = field(default_factory=list)
     target_field_count: int = 0
     search_batch_count: int = 0
     search_model_calls: int = 0
@@ -132,7 +148,6 @@ def _prior_payload(decision: FieldDecision) -> dict[str, Any]:
         "status": decision.status,
         "values": list(decision.values),
         "qualifier": decision.qualifier,
-        "reason": decision.reason,
         "search_queries": list(decision.search_queries),
     }
 
@@ -160,14 +175,11 @@ def _local_anchor_payload(initial: AIDecisionPacket, fields: Iterable[dict[str, 
     return output
 
 
-def _primary_source_evidence(grounding: GroundingCatalog, *, max_chars: int = 18_000) -> list[dict[str, str]]:
-    """Expose raw exact supplier-page text to Web identity reasoning.
-
-    This is mechanical source transport, not Python same-product judgment. The
-    Web model receives the actual page fingerprint even when Local READY anchors
-    are sparse.
-    """
-
+def _primary_source_evidence(
+    grounding: GroundingCatalog,
+    *,
+    max_chars: int = 18_000,
+) -> list[dict[str, str]]:
     output: list[dict[str, str]] = []
     used = 0
     for source in grounding.sources:
@@ -200,12 +212,12 @@ def _research_prompt(
     primary_source_evidence: list[dict[str, str]],
 ) -> str:
     payload = {
-        "task": "search_and_fill_only_missing_marketplace_fields",
-        "product_identity": {
+        "task": "research_one_exact_product_then_fill_all_missing_fields",
+        "canonical_product": {
             "source_product_url": product_url.strip(),
+            "primary_source_evidence": primary_source_evidence,
+            "known_local_fields": _local_anchor_payload(initial, all_fields),
         },
-        "primary_source_evidence": primary_source_evidence,
-        "known_local_fields": _local_anchor_payload(initial, all_fields),
         "target_fields": [
             {
                 "field_id": decision.field_id,
@@ -214,22 +226,35 @@ def _research_prompt(
             }
             for field, decision in targets
         ],
+        "workflow": [
+            "Treat the canonical supplier product above as the only product identity to enrich.",
+            "Use web search to discover candidate pages for this product as a whole, not one independent search per field.",
+            "For every external candidate page you intend to use, first classify it as same_product, different_product, or uncertain by comparing the whole available product evidence.",
+            "A shared generic model token, category name, or visual resemblance alone is not proof of same_product.",
+            "Only pages classified same_product may provide field values. different_product and uncertain pages are forbidden as field evidence.",
+            "After entity matching, fill all supplied missing target fields from the accepted same-product source set in this same research session.",
+        ],
         "rules": [
-            "Search only the supplied MISSING target fields. Locally READY and CONFLICT fields are frozen and must never be rewritten.",
-            "The exact source_product_url and primary_source_evidence define the current physical product. Inspect/search that exact offer first whenever possible.",
-            "A generic model token such as M8, L11, A1, Pro or Mini is NEVER sufficient to establish product identity by itself.",
-            "Before using a different URL, establish that it describes the same physical product/variant using multiple concrete anchors from primary_source_evidence such as exact supplier/manufacturer, title/specification combination, variant wording, appearance and known features. If identity is uncertain, return MISSING.",
-            "Reject pages for another brand, manufacturer, seller product family or clearly different hardware even when the model token is identical. Do not borrow specifications from similarly named products.",
-            "Never use statements such as typical, standard feature, generally supports, usually, commonly or category convention as evidence for this product.",
-            "Return READY only when web evidence establishes the exact target field for this same product. Return CONFLICT for genuine same-product disagreement; otherwise return MISSING.",
-            "READY citations must use source_url values actually returned by this same web-search call and concise evidence_text. Every CONFLICT alternative needs its own returned URL evidence.",
-            "Do not guess, extrapolate, infer a negative from absence, rotate dimension axes, or mix packaging/body/mount, cabin/rear, manual/UI language, product/vehicle compatibility, or generic/storage-specific features.",
-            "Do not turn a known local conflict into a confident statement in Description, Keywords, Sales Package or another field.",
-            "If multi_value=false return one value. If qualifier_options exist, put magnitude in values and the exact unit in qualifier. If qualifier_options are empty, qualifier must be empty; use fixed unit context when present.",
+            "Locally READY and CONFLICT fields are frozen and must never be rewritten.",
+            "Prefer the exact canonical supplier URL, manufacturer/brand sources, manuals, official product pages and clearly identified same-product distributor pages over generic marketplace matches.",
+            "Do not borrow specifications from another product merely because it is also named M8, A1, Pro, Mini or another generic model token.",
+            "If no external page can be established as the same physical product/variant, leave the target field missing.",
+            "Return READY only when an accepted same-product web source establishes the exact target field. Return CONFLICT for genuine disagreement among accepted same-product sources; otherwise return MISSING.",
+            "Every READY citation and every CONFLICT alternative citation must use a source_url actually returned by this same web-search call.",
+            "Do not guess, extrapolate, infer negatives from absence, rotate dimension axes, or mix packaging/body/mount, cabin/rear, manual/UI language, product/vehicle compatibility, or generic/storage-specific features.",
+            "If multi_value=false return one value. If qualifier_options exist, use an exact allowed qualifier; if qualifier_options are empty, qualifier must be empty.",
             "Never research seller-operated price, stock, MOQ, fulfilment, shipping policy or listing-status fields.",
-            "Return one decision for every supplied field_id and JSON only.",
+            "Return one JSON object only.",
         ],
         "json_contract": {
+            "source_matches": [
+                {
+                    "source_url": "exact URL returned by this web search",
+                    "match": "same_product | different_product | uncertain",
+                    "reason": "short identity judgment",
+                    "identity_evidence": ["concrete whole-product evidence used for the judgment"],
+                }
+            ],
             "decisions": [
                 {
                     "field_id": "exact target field_id",
@@ -239,8 +264,8 @@ def _research_prompt(
                     "confidence": 0.0,
                     "citations": [
                         {
-                            "source_url": "exact URL returned by this web search",
-                            "evidence_text": "concise evidence supporting READY",
+                            "source_url": "URL classified same_product above",
+                            "evidence_text": "concise field evidence",
                         }
                     ],
                     "alternatives": [
@@ -249,11 +274,10 @@ def _research_prompt(
                             "qualifier": "optional qualifier",
                             "citations": [
                                 {
-                                    "source_url": "exact URL returned by this web search",
+                                    "source_url": "URL classified same_product above",
                                     "evidence_text": "evidence for this alternative",
                                 }
                             ],
-                            "reason": "optional",
                         }
                     ],
                     "reason": "short explanation",
@@ -263,9 +287,9 @@ def _research_prompt(
         },
     }
     return (
-        "You are the unresolved-field Web fill step for one exact supplier product. "
-        "Use the raw primary supplier evidence to prevent model-name collisions. There is no later semantic reviewer. "
-        "Return one JSON object only.\n\n"
+        "You are performing one bounded product-level web research session for one exact supplier item. "
+        "Search for the product, explicitly resolve candidate identity, then enrich all remaining fields only from "
+        "sources you classified as the same product. Return JSON only.\n\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
 
@@ -286,10 +310,6 @@ def _source_lookup(items: Iterable[WebSearchSource]) -> dict[str, WebSearchSourc
         if key and key not in output:
             output[key] = item
     return output
-
-
-def _mechanical_batches(items: list[Any], batch_size: int) -> list[list[Any]]:
-    return [items[index : index + batch_size] for index in range(0, len(items), batch_size)]
 
 
 def _search_cache_key(
@@ -347,39 +367,29 @@ def _deserialize_search_result(payload: dict[str, Any]) -> WebSearchJSONResult:
     )
 
 
-@dataclass(slots=True)
-class _SearchBatchRun:
-    index: int
-    result: WebSearchJSONResult | None
-    model_calls: int
-    cache_hit: bool
-    warning: str = ""
-
-
-def _run_search_batch(
+def _run_research(
     provider: SourcedWebSearchProvider,
     initial: AIDecisionPacket,
     all_fields: list[dict[str, Any]],
-    batch_index: int,
-    batch_targets: list[tuple[dict[str, Any], FieldDecision]],
+    targets: list[tuple[dict[str, Any], FieldDecision]],
     product_url: str,
     primary_source_evidence: list[dict[str, str]],
     *,
     cache_dir: Path | None,
-) -> _SearchBatchRun:
+) -> tuple[WebSearchJSONResult | None, int, bool, str]:
     key = _search_cache_key(
         provider,
         initial,
         all_fields,
-        batch_targets,
+        targets,
         product_url,
         primary_source_evidence,
     )
-    cache_path = cache_dir / f"web-fill-{key}.json" if cache_dir is not None else None
+    cache_path = cache_dir / f"web-product-research-{key}.json" if cache_dir is not None else None
     if cache_path is not None and cache_path.is_file():
         try:
             cached = _deserialize_search_result(json.loads(cache_path.read_text(encoding="utf-8")))
-            return _SearchBatchRun(batch_index, cached, 0, True)
+            return cached, 0, True, ""
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
 
@@ -388,38 +398,73 @@ def _run_search_batch(
             _research_prompt(
                 initial,
                 all_fields,
-                batch_targets,
+                targets,
                 product_url=product_url,
                 primary_source_evidence=primary_source_evidence,
             )
         )
     except Exception as exc:
-        return _SearchBatchRun(
-            batch_index,
-            None,
-            1,
-            False,
-            warning=f"web fill batch {batch_index} failed: {exc}",
-        )
+        return None, 1, False, f"web product research failed: {exc}"
 
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temp = cache_path.with_suffix(cache_path.suffix + ".tmp")
         temp.write_text(json.dumps(_serialize_search_result(result), ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(cache_path)
-    return _SearchBatchRun(batch_index, result, 1, False)
+    return result, 1, False, ""
+
+
+def _parse_source_matches(
+    result: WebSearchJSONResult,
+) -> tuple[list[WebSourceMatch], dict[str, WebSearchSource], list[str]]:
+    returned = _source_lookup(result.sources)
+    accepted: dict[str, WebSearchSource] = {}
+    matches: list[WebSourceMatch] = []
+    warnings: list[str] = []
+    raw_matches = result.payload.get("source_matches") or []
+    if not isinstance(raw_matches, list):
+        return [], {}, ["web product research response missing source_matches array"]
+
+    seen: set[str] = set()
+    for item in raw_matches:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("source_url") or "").strip()
+        key = _normalize_url(url)
+        source = returned.get(key)
+        if source is None or not key or key in seen:
+            continue
+        seen.add(key)
+        match = str(item.get("match") or "").strip().casefold()
+        if match not in {"same_product", "different_product", "uncertain"}:
+            warnings.append(f"web source match ignored invalid status for {url}")
+            continue
+        identity_evidence = tuple(
+            str(value).strip()
+            for value in item.get("identity_evidence") or []
+            if str(value).strip()
+        )
+        matches.append(
+            WebSourceMatch(
+                source_url=source.url,
+                match=match,
+                reason=str(item.get("reason") or "").strip(),
+                identity_evidence=identity_evidence,
+            )
+        )
+        if match == "same_product":
+            accepted[key] = source
+    return matches, accepted, warnings
 
 
 def _accepted_citations(
     raw: Any,
-    source_lookup: dict[str, WebSearchSource],
+    accepted_sources: dict[str, WebSearchSource],
     *,
     field_identifier: str,
     evidence: list[WebEvidence],
     evidence_by_url: dict[str, list[str]],
 ) -> list[DecisionCitation]:
-    """Accept only URLs actually returned by the current Web search call."""
-
     if not isinstance(raw, list):
         return []
     output: list[DecisionCitation] = []
@@ -430,7 +475,7 @@ def _accepted_citations(
         url = str(item.get("source_url") or "").strip()
         text = str(item.get("evidence_text") or "").strip()
         url_key = _normalize_url(url)
-        source = source_lookup.get(url_key)
+        source = accepted_sources.get(url_key)
         if source is None or not text:
             continue
         reference = _web_source_reference(source.url)
@@ -452,88 +497,76 @@ def _accepted_citations(
 
 
 def _parse_web_decisions(
-    runs: list[_SearchBatchRun],
+    result: WebSearchJSONResult,
     target_ids: set[str],
+    accepted_sources: dict[str, WebSearchSource],
 ) -> tuple[list[FieldDecision], list[WebEvidence], list[PersistedWebSource], list[str]]:
     decisions: list[FieldDecision] = []
     evidence: list[WebEvidence] = []
     warnings: list[str] = []
-    source_meta: dict[str, WebSearchSource] = {}
-    source_request: dict[str, str] = {}
     evidence_by_url: dict[str, list[str]] = {}
     seen_decisions: set[str] = set()
 
-    for run in runs:
-        if run.warning:
-            warnings.append(run.warning)
-        if run.result is None:
-            continue
-        lookup = _source_lookup(run.result.sources)
-        for url_key, source in lookup.items():
-            source_meta.setdefault(url_key, source)
-            source_request.setdefault(url_key, run.result.request_id)
+    raw_decisions = result.payload.get("decisions") or []
+    if not isinstance(raw_decisions, list):
+        return [], [], [], ["web product research response missing decisions array"]
 
-        raw_decisions = run.result.payload.get("decisions") or []
-        if not isinstance(raw_decisions, list):
-            warnings.append(f"web fill batch {run.index}: response missing decisions array")
+    for raw_index, raw in enumerate(raw_decisions, start=1):
+        if not isinstance(raw, dict):
+            continue
+        identifier = str(raw.get("field_id") or "").strip()
+        if identifier not in target_ids or identifier in seen_decisions:
             continue
 
-        for raw_index, raw in enumerate(raw_decisions, start=1):
-            if not isinstance(raw, dict):
+        citations = _accepted_citations(
+            raw.get("citations"),
+            accepted_sources,
+            field_identifier=identifier,
+            evidence=evidence,
+            evidence_by_url=evidence_by_url,
+        )
+        alternatives: list[dict[str, Any]] = []
+        for alternative in raw.get("alternatives") or []:
+            if not isinstance(alternative, dict):
                 continue
-            identifier = str(raw.get("field_id") or "").strip()
-            if identifier not in target_ids or identifier in seen_decisions:
-                continue
-
-            citations = _accepted_citations(
-                raw.get("citations"),
-                lookup,
+            alt_citations = _accepted_citations(
+                alternative.get("citations"),
+                accepted_sources,
                 field_identifier=identifier,
                 evidence=evidence,
                 evidence_by_url=evidence_by_url,
             )
-            alternatives: list[dict[str, Any]] = []
-            for alternative in raw.get("alternatives") or []:
-                if not isinstance(alternative, dict):
-                    continue
-                alt_citations = _accepted_citations(
-                    alternative.get("citations"),
-                    lookup,
-                    field_identifier=identifier,
-                    evidence=evidence,
-                    evidence_by_url=evidence_by_url,
-                )
-                alternatives.append(
-                    {
-                        "values": list(alternative.get("values") or []),
-                        "qualifier": str(alternative.get("qualifier") or ""),
-                        "citations": [item.as_dict() for item in alt_citations],
-                        "reason": str(alternative.get("reason") or ""),
-                    }
-                )
+            alternatives.append(
+                {
+                    "values": list(alternative.get("values") or []),
+                    "qualifier": str(alternative.get("qualifier") or ""),
+                    "citations": [item.as_dict() for item in alt_citations],
+                    "reason": "",
+                }
+            )
 
-            normalized = {
-                "field_id": identifier,
-                "status": str(raw.get("status") or MISSING).strip().casefold(),
-                "values": list(raw.get("values") or []),
-                "qualifier": str(raw.get("qualifier") or ""),
-                "confidence": raw.get("confidence", 0.0),
-                "citations": [item.as_dict() for item in citations],
-                "alternatives": alternatives,
-                "reason": str(raw.get("reason") or ""),
-                "search_queries": [],
-            }
-            try:
-                decision = FieldDecision.from_mapping(normalized, index=raw_index)
-            except (TypeError, ValueError) as exc:
-                warnings.append(f"web fill field {identifier}: invalid decision ignored: {exc}")
-                continue
-            decisions.append(decision)
-            seen_decisions.add(identifier)
+        normalized = {
+            "field_id": identifier,
+            "status": str(raw.get("status") or MISSING).strip().casefold(),
+            "values": list(raw.get("values") or []),
+            "qualifier": str(raw.get("qualifier") or ""),
+            "confidence": raw.get("confidence", 0.0),
+            "citations": [item.as_dict() for item in citations],
+            "alternatives": alternatives,
+            "reason": str(raw.get("reason") or ""),
+            "search_queries": [],
+        }
+        try:
+            decision = FieldDecision.from_mapping(normalized, index=raw_index)
+        except (TypeError, ValueError) as exc:
+            warnings.append(f"web fill field {identifier}: invalid decision ignored: {exc}")
+            continue
+        decisions.append(decision)
+        seen_decisions.add(identifier)
 
     persisted: list[PersistedWebSource] = []
     for url_key, evidence_items in evidence_by_url.items():
-        source = source_meta.get(url_key)
+        source = accepted_sources.get(url_key)
         if source is None:
             continue
         unique: list[str] = []
@@ -557,10 +590,9 @@ def _parse_web_decisions(
                 title=source.title,
                 site_name=source.site_name,
                 content=content,
-                request_id=source_request.get(url_key, ""),
+                request_id=result.request_id,
             )
         )
-
     return decisions, evidence, persisted, warnings
 
 
@@ -579,12 +611,12 @@ def run_web_enrichment(
     concurrency: int = 3,
     cache_dir: str | Path | None = None,
 ) -> WebEnrichmentResult:
-    """Fill only MISSING fields with Web search; no second semantic pass."""
+    """Run one product-level Web research session, then fill only MISSING fields."""
 
-    if not 1 <= int(batch_size) <= 12:
-        raise ValueError("web batch_size 必须在 1..12。")
-    if not 1 <= int(concurrency) <= 8:
-        raise ValueError("web concurrency 必须在 1..8。")
+    if int(batch_size) < 1:
+        raise ValueError("web batch_size 必须 >= 1。")
+    if int(concurrency) < 1:
+        raise ValueError("web concurrency 必须 >= 1。")
 
     field_list = list(fields)
     targets = _targets(initial, field_list)
@@ -593,31 +625,39 @@ def run_web_enrichment(
 
     primary_evidence = _primary_source_evidence(grounding)
     cache_root = Path(cache_dir) if cache_dir is not None else None
-    batches = _mechanical_batches(targets, int(batch_size))
     started = time.monotonic()
-    runs: list[_SearchBatchRun] = []
-    workers = min(int(concurrency), len(batches))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="web-fill") as executor:
-        futures = {
-            executor.submit(
-                _run_search_batch,
-                search_provider,
-                initial,
-                field_list,
-                index,
-                batch,
-                product_url,
-                primary_evidence,
-                cache_dir=cache_root,
-            ): index
-            for index, batch in enumerate(batches, start=1)
-        }
-        for future in as_completed(futures):
-            runs.append(future.result())
-    runs.sort(key=lambda item: item.index)
+    result, model_calls, cache_hit, warning = _run_research(
+        search_provider,
+        initial,
+        field_list,
+        targets,
+        product_url,
+        primary_evidence,
+        cache_dir=cache_root,
+    )
+    warnings: list[str] = [warning] if warning else []
+    if result is None:
+        return WebEnrichmentResult(
+            packet=initial,
+            target_field_count=len(targets),
+            search_batch_count=1,
+            search_model_calls=model_calls,
+            search_cache_hits=1 if cache_hit else 0,
+            search_failed_batches=1,
+            searched=True,
+            search_elapsed_seconds=time.monotonic() - started,
+            warnings=warnings,
+        )
 
+    source_matches, accepted_sources, match_warnings = _parse_source_matches(result)
+    warnings.extend(match_warnings)
     target_ids = {decision.field_id for _, decision in targets}
-    raw_updates, evidence, web_sources, warnings = _parse_web_decisions(runs, target_ids)
+    raw_updates, evidence, web_sources, parse_warnings = _parse_web_decisions(
+        result,
+        target_ids,
+        accepted_sources,
+    )
+    warnings.extend(parse_warnings)
     external = _external_source_map(web_sources)
 
     update_fields = [field for field in field_list if field_id(field) in target_ids]
@@ -626,9 +666,9 @@ def run_web_enrichment(
         schema_sha256=schema_digest(update_fields),
         source_manifest_sha256=initial.source_manifest_sha256,
         decisions=raw_updates,
-        model_summary="Web search filled only MISSING Makro fields.",
+        model_summary="One product-level Web research session enriched only MISSING Makro fields.",
         warnings=[],
-        extractor=f"{search_provider.name}+web-fill",
+        extractor=f"{search_provider.name}+product-research",
     )
     validated_updates = validate_ai_decision_packet(
         candidate,
@@ -637,7 +677,6 @@ def run_web_enrichment(
         expected_identity=initial.identity,
         external_sources=external,
     )
-
     usable_updates = {
         decision.field_id: decision
         for decision in validated_updates.decisions
@@ -648,9 +687,9 @@ def run_web_enrichment(
         schema_sha256=initial.schema_sha256,
         source_manifest_sha256=initial.source_manifest_sha256,
         decisions=[usable_updates.get(item.field_id, item) for item in initial.decisions],
-        model_summary=(initial.model_summary + "\nWeb filled only previously MISSING fields.").strip(),
+        model_summary=(initial.model_summary + "\nWeb product research filled only previously MISSING fields.").strip(),
         warnings=[*initial.warnings, *warnings, *validated_updates.warnings],
-        extractor=(initial.extractor + "+web-fill").strip("+"),
+        extractor=(initial.extractor + "+product-research").strip("+"),
     )
     final_packet = validate_ai_decision_packet(
         merged,
@@ -664,11 +703,12 @@ def run_web_enrichment(
         packet=final_packet,
         web_sources=web_sources,
         evidence=evidence,
+        source_matches=source_matches,
         target_field_count=len(targets),
-        search_batch_count=len(batches),
-        search_model_calls=sum(run.model_calls for run in runs),
-        search_cache_hits=sum(1 for run in runs if run.cache_hit),
-        search_failed_batches=sum(1 for run in runs if run.warning),
+        search_batch_count=1,
+        search_model_calls=model_calls,
+        search_cache_hits=1 if cache_hit else 0,
+        search_failed_batches=0,
         searched=True,
         search_elapsed_seconds=time.monotonic() - started,
         warnings=warnings,
