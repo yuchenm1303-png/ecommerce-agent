@@ -3,7 +3,7 @@ from __future__ import annotations
 import ctypes
 import sys
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer
 from PySide6.QtQuick import QQuickWindow
 from PySide6.QtWidgets import QMainWindow
 
@@ -15,11 +15,18 @@ _WS_POPUP = 0x80000000
 _WS_EX_LAYERED = 0x00080000
 _WS_EX_APPWINDOW = 0x00040000
 _WS_EX_TOOLWINDOW = 0x00000080
-_SWP_NOSIZE = 0x0001
-_SWP_NOMOVE = 0x0002
 _SWP_NOZORDER = 0x0004
 _SWP_NOACTIVATE = 0x0010
 _SWP_FRAMECHANGED = 0x0020
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
 
 
 def _window_long_functions():
@@ -34,12 +41,7 @@ def _window_long_functions():
 
 
 def _embed_native_child(overlay_hwnd: int, owner_hwnd: int) -> None:
-    """Make the translucent QWidget surface a true child HWND of Quick.
-
-    The Quick window is the only desktop top-level window.  Keeping the business
-    QWidget as a layered child makes Windows own move/resize/Z-order as one
-    window tree and removes all screen-coordinate/DPI synchronization.
-    """
+    """Make the translucent QWidget surface a true child HWND of Quick."""
 
     if sys.platform != "win32" or not overlay_hwnd or not owner_hwnd:
         return
@@ -67,11 +69,7 @@ def _embed_native_child(overlay_hwnd: int, owner_hwnd: int) -> None:
         0,
         0,
         0,
-        _SWP_NOMOVE
-        | _SWP_NOSIZE
-        | _SWP_NOZORDER
-        | _SWP_NOACTIVATE
-        | _SWP_FRAMECHANGED,
+        _SWP_NOZORDER | _SWP_NOACTIVATE | _SWP_FRAMECHANGED,
     )
 
     user32.GetParent.argtypes = [ctypes.c_void_p]
@@ -81,6 +79,53 @@ def _embed_native_child(overlay_hwnd: int, owner_hwnd: int) -> None:
         raise RuntimeError(
             "QWidget overlay was not embedded under the native Quick application window"
         )
+
+
+def _fit_child_to_owner_client(overlay_hwnd: int, owner_hwnd: int) -> None:
+    """Fill the owner client area in native pixels, exactly once per native resize.
+
+    Once QWidget has been reparented to a Win32 child HWND, Win32 owns the
+    parent/child pixel boundary. Feeding native child geometry back through Qt
+    logical geometry causes an extra high-DPI conversion on 150% displays.
+    Keep this boundary entirely native: GetClientRect -> SetWindowPos.
+    """
+
+    if sys.platform != "win32" or not overlay_hwnd or not owner_hwnd:
+        return
+
+    user32 = ctypes.windll.user32
+    owner = ctypes.c_void_p(owner_hwnd)
+    overlay = ctypes.c_void_p(overlay_hwnd)
+    rect = _RECT()
+
+    user32.GetClientRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
+    user32.GetClientRect.restype = ctypes.c_int
+    if not user32.GetClientRect(owner, ctypes.byref(rect)):
+        raise OSError("GetClientRect failed for native Quick owner window")
+
+    width = max(1, int(rect.right - rect.left))
+    height = max(1, int(rect.bottom - rect.top))
+
+    user32.SetWindowPos.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    user32.SetWindowPos.restype = ctypes.c_int
+    if not user32.SetWindowPos(
+        overlay,
+        None,
+        0,
+        0,
+        width,
+        height,
+        _SWP_NOZORDER | _SWP_NOACTIVATE,
+    ):
+        raise OSError("SetWindowPos failed while fitting QWidget child to Quick client")
 
 
 class NativeWindowShell(QObject):
@@ -105,16 +150,16 @@ class NativeWindowShell(QObject):
         owner.setMinimumSize(overlay.minimumSize())
 
         # The system frame belongs exclusively to Quick. The old QMainWindow is
-        # only a per-pixel-alpha client surface and never exists as a second
-        # desktop-level application window after show().
+        # only a per-pixel-alpha client surface and never remains a second
+        # desktop-level application window after embedding.
         overlay.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         overlay.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         overlay.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
 
         owner.installEventFilter(self)
         overlay.installEventFilter(self)
-        owner.widthChanged.connect(self._sync_overlay_geometry)
-        owner.heightChanged.connect(self._sync_overlay_geometry)
+        owner.widthChanged.connect(self._schedule_native_fit)
+        owner.heightChanged.connect(self._schedule_native_fit)
 
     def show(self) -> None:
         self.owner.create()
@@ -123,37 +168,26 @@ class NativeWindowShell(QObject):
         if overlay_handle is None:
             raise RuntimeError("QWidget overlay has no native window handle")
 
-        # Tell Qt about the native hierarchy first, then enforce the equivalent
-        # Win32 child/layered styles. This avoids the previous owned-top-level
-        # pair and therefore removes external-window interleaving by design.
+        # Inform Qt about the hierarchy, then enforce the equivalent Win32
+        # child/layered styles. Geometry after this point is native-pixel only.
         overlay_handle.setParent(self.owner)
         _embed_native_child(int(self.overlay.winId()), int(self.owner.winId()))
         self._embedded = True
 
         self.owner.show()
-        self._sync_overlay_geometry()
+        self._fit_native_child()
         self.overlay.show()
-        QTimer.singleShot(0, self._sync_overlay_geometry)
+        QTimer.singleShot(0, self._fit_native_child)
 
-    def _sync_overlay_geometry(self, *_args: object) -> None:
+    def _schedule_native_fit(self, *_args: object) -> None:
         if self._closing or not self._embedded:
             return
+        QTimer.singleShot(0, self._fit_native_child)
 
-        width = max(1, int(self.owner.width()))
-        height = max(1, int(self.owner.height()))
-        target = QRect(0, 0, width, height)
-
-        if self.overlay.geometry() != target:
-            self.overlay.setGeometry(target)
-
-        handle = self.overlay.windowHandle()
-        if handle is not None:
-            # QWindow child coordinates are client-local. Never convert through
-            # Win32 physical pixels or screen coordinates; Qt owns DPR scaling.
-            if handle.position() != QPoint(0, 0):
-                handle.setPosition(QPoint(0, 0))
-            if handle.width() != width or handle.height() != height:
-                handle.resize(width, height)
+    def _fit_native_child(self) -> None:
+        if self._closing or not self._embedded:
+            return
+        _fit_child_to_owner_client(int(self.overlay.winId()), int(self.owner.winId()))
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
@@ -165,17 +199,14 @@ class NativeWindowShell(QObject):
                 QEvent.Type.WindowStateChange,
                 QEvent.Type.Expose,
             }:
-                QTimer.singleShot(0, self._sync_overlay_geometry)
+                self._schedule_native_fit()
             elif event_type == QEvent.Type.Close and not self._closing:
                 self._closing = True
                 self.overlay.close()
 
-        elif watched is self.overlay:
-            if event_type in {QEvent.Type.Show, QEvent.Type.Resize}:
-                QTimer.singleShot(0, self._sync_overlay_geometry)
-            elif event_type == QEvent.Type.Close and not self._closing:
-                self._closing = True
-                self.owner.close()
+        elif watched is self.overlay and event_type == QEvent.Type.Close and not self._closing:
+            self._closing = True
+            self.owner.close()
 
         return False
 
