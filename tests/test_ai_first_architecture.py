@@ -57,13 +57,17 @@ def test_production_path_has_no_legacy_semantic_import_or_rule_layer():
             assert token not in source, f"{module.__name__} reintroduced {token}"
 
 
-def test_production_resolver_is_staged_profile_mapping_web_final_pipeline():
+def test_production_resolver_is_profile_local_fill_then_web_fill_only():
     source = inspect.getsource(makro_resolve_ai)
+    web_source = inspect.getsource(web_enrichment)
     assert "run_product_profile(" in source
     assert "run_field_mapping(" in source
     assert "run_web_enrichment(" in source
     assert "run_ai_resolution(" not in source
-    assert "product_profile_then_parallel_field_mapping_then_parallel_web_research_then_final_text_resolve" in source
+    assert "product_profile_then_parallel_local_fill_then_parallel_web_fill" in source
+    assert "final_resolve" not in source
+    assert "Final Resolve" not in web_source
+    assert "final_provider" not in web_source
     assert "--field-batch-size" in source
     assert "--field-concurrency" in source
     assert "--web-batch-size" in source
