@@ -88,6 +88,7 @@ def test_close_reverses_from_current_real_drawer_state_without_handoff() -> None
     finish = _body(STATIC, "def _finish_close", "def _fallback_open")
     assert "self._original_close()" in finish
     assert "self._drawer_effect.setOpacity(1.0)" in finish
+    assert "self._resume_underlay()" in finish
 
 
 def test_geometry_sync_cannot_fight_drawer_position_animation() -> None:
@@ -103,6 +104,25 @@ def test_geometry_sync_cannot_fight_drawer_position_animation() -> None:
     assert "timer.stop()" in motion
     assert "self._geometry_sync_pending" in motion
     assert "self._original_schedule_geometry()" in motion
+
+
+def test_underlay_motion_is_frozen_for_entire_modal_lifetime() -> None:
+    suspend = _body(STATIC, "def _suspend_underlay", "def _resume_underlay")
+    assert 'getattr(self.window, "_nekro_card_fx", None)' in suspend
+    assert 'getattr(card_fx, "suspend_for_modal", None)' in suspend
+    assert 'getattr(self.background, "_pointer_timer", None)' in suspend
+    assert "timer.stop()" in suspend
+    assert 'quick.setProperty("animationRunning", False)' in suspend
+
+    resume = _body(STATIC, "def _resume_underlay", "def _schedule_geometry_guarded")
+    assert 'getattr(card_fx, "resume_from_modal", None)' in resume
+    assert "self.background._last_pointer_norm = None" in resume
+    assert "timer.start()" in resume
+
+    show = _body(STATIC, "def _show_with_animation", "def _finish_open")
+    assert show.index("self._suspend_underlay()") < show.index("self._prepare_open_state")
+    finish_open = _body(STATIC, "def _finish_open", "def request_close")
+    assert "self._resume_underlay()" not in finish_open
 
 
 def test_close_paths_are_rewired_but_escape_stays_on_shared_detail_controller() -> None:
@@ -121,6 +141,8 @@ def test_fail_soft_keeps_static_modal_available() -> None:
     assert "self._original_close()" in fallback_open
     assert "self._original_show_prepared_modal(ratio=ratio)" in fallback_open
     assert "self._drawer_effect.setOpacity(1.0)" in fallback_open
+    fallback_close = _body(STATIC, "def _fallback_close", "def cleanup")
+    assert "self._resume_underlay()" in fallback_close
 
 
 def test_real_modal_stays_in_existing_qwidget_tree() -> None:
