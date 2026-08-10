@@ -131,8 +131,24 @@ def test_modal_freezes_card_feedback_and_fuji_parallax_until_close_finishes() ->
     assert "def resume_from_modal" in CARD_FX
     assert "self._suspended = True" in CARD_FX
     assert "self._animation_timer.stop()" in CARD_FX
-    assert "state.settle(_NORMAL_ALPHA)" in CARD_FX
+    assert "state.freeze()" in CARD_FX
+    assert "state.begin(alpha=_NORMAL_ALPHA, duration=_RELEASE_SECONDS)" in CARD_FX
     assert "if self._suspended:" in CARD_FX
+
+
+def test_card_suspend_preserves_presented_alpha_instead_of_forcing_normal() -> None:
+    freeze = CARD_FX.split("def freeze(self) -> None:", 1)[1].split(
+        "class NekroCardInteractionController", 1
+    )[0]
+    assert "self.target_alpha = self.current_alpha" in freeze
+    assert "overlay_alpha=self.current_alpha" in freeze
+    assert "_NORMAL_ALPHA" not in freeze
+
+    suspend = CARD_FX.split("def suspend_for_modal", 1)[1].split(
+        "def resume_from_modal", 1
+    )[0]
+    assert "state.freeze()" in suspend
+    assert "state.settle" not in suspend
 
 
 def test_opening_is_prepared_hidden_and_revealed_only_under_final_quick_frame() -> None:
