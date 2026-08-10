@@ -23,6 +23,7 @@ def main() -> int:
     from gui.console_window import MainWindow
     from gui.workflow_console_window import WorkflowMainWindow
     from gui.inline_card_motion import install_inline_card_motion
+    from gui.inline_motion_glass_guard import install_inline_motion_glass_guard
     from gui.log_presenter import install_buffered_logs
     from gui.native_visual_style import install_native_visual_style
     from gui.native_window_shell import install_native_window_shell
@@ -41,6 +42,7 @@ def main() -> int:
 
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_native_visual_style(window)
+    install_inline_motion_glass_guard(window)
     install_ui_polish(window)
     install_card_details(window)
     install_mature_ui(window)
