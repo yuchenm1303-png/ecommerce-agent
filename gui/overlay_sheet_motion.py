@@ -16,6 +16,10 @@ def _smootherstep(value: float) -> float:
     return p * p * p * (p * (p * 6.0 - 15.0) + 10.0)
 
 
+def _lerp_int(start: int, end: int, progress: float) -> int:
+    return int(round(start + (end - start) * progress))
+
+
 class ClipSheetMotion(QObject):
     """Animate one absolute-positioned sheet without touching application layout.
 
@@ -23,6 +27,10 @@ class ClipSheetMotion(QObject):
     lightweight parent viewport changes geometry, so QLabel/QTableWidget layout,
     word wrapping, splitters and the main QWidget tree never see intermediate
     animation sizes.
+
+    ``focus`` mode reveals a fixed-size final panel from a small rectangle near
+    the source card. The content itself never scales or receives intermediate
+    geometry; only the clipping viewport changes.
     """
 
     opened = Signal()
@@ -36,14 +44,16 @@ class ClipSheetMotion(QObject):
         *,
         edge: str,
         duration_ms: int = _DEFAULT_DURATION_MS,
+        origin_provider: Callable[[], QRect] | None = None,
     ) -> None:
         super().__init__(root)
-        if edge not in {"top", "bottom", "right"}:
+        if edge not in {"top", "bottom", "right", "focus"}:
             raise ValueError(f"unsupported sheet edge: {edge}")
 
         self.root = root
         self.content = content
         self.rect_provider = rect_provider
+        self.origin_provider = origin_provider
         self.edge = edge
         self.duration_ms = max(120, int(duration_ms))
         self.progress = 0.0
@@ -51,6 +61,7 @@ class ClipSheetMotion(QObject):
         self.animating = False
         self._start_progress = 0.0
         self._final_rect = QRect()
+        self._focus_start_rect = QRect()
 
         self.viewport = QFrame(root)
         self.viewport.setObjectName("overlaySheetViewport")
@@ -71,6 +82,20 @@ class ClipSheetMotion(QObject):
     def is_open(self) -> bool:
         return self.progress >= 0.999 and self.viewport.isVisible()
 
+    def _prepare_focus_origin(self) -> None:
+        final = self._final_rect
+        origin = QRect(self.origin_provider()) if self.origin_provider is not None else QRect()
+        if origin.width() <= 0 or origin.height() <= 0:
+            origin = QRect(final.center().x() - 60, final.center().y() - 38, 120, 76)
+
+        center_x = max(final.left(), min(origin.center().x(), final.right()))
+        center_y = max(final.top(), min(origin.center().y(), final.bottom()))
+        width = min(final.width(), max(120, min(origin.width(), int(final.width() * 0.42))))
+        height = min(final.height(), max(76, min(origin.height(), int(final.height() * 0.30))))
+        x = max(final.left(), min(center_x - width // 2, final.right() - width + 1))
+        y = max(final.top(), min(center_y - height // 2, final.bottom() - height + 1))
+        self._focus_start_rect = QRect(x, y, width, height)
+
     def _prepare_final_geometry(self) -> None:
         rect = QRect(self.rect_provider())
         if rect.width() <= 0 or rect.height() <= 0:
@@ -80,13 +105,32 @@ class ClipSheetMotion(QObject):
         layout = self.content.layout()
         if layout is not None:
             layout.activate()
+        if self.edge == "focus":
+            self._prepare_focus_origin()
+
+    def _apply_focus(self, eased: float) -> None:
+        final = self._final_rect
+        start = self._focus_start_rect
+        rect = QRect(
+            _lerp_int(start.x(), final.x(), eased),
+            _lerp_int(start.y(), final.y(), eased),
+            max(1, _lerp_int(start.width(), final.width(), eased)),
+            max(1, _lerp_int(start.height(), final.height(), eased)),
+        )
+        self.viewport.setGeometry(rect)
+        # Keep the final live content stationary in root coordinates while the
+        # viewport reveals more of it. This is the key property that prevents
+        # text/table layout from changing during the transition.
+        self.content.move(final.x() - rect.x(), final.y() - rect.y())
 
     def _apply(self, raw_progress: float) -> None:
         self.progress = max(0.0, min(1.0, float(raw_progress)))
         eased = _smootherstep(self.progress)
         final = self._final_rect
 
-        if self.edge == "right":
+        if self.edge == "focus":
+            self._apply_focus(eased)
+        elif self.edge == "right":
             width = max(1, int(round(final.width() * eased)))
             x = final.x() + final.width() - width
             self.viewport.setGeometry(x, final.y(), width, final.height())
