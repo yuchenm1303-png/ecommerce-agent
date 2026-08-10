@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MODAL = (ROOT / "gui" / "modal_interaction.py").read_text(encoding="utf-8")
 CARD_FX = (ROOT / "gui" / "nekro_card_fx.py").read_text(encoding="utf-8")
+NATIVE_BACKGROUND = (ROOT / "gui" / "native_background.py").read_text(encoding="utf-8")
 RUNNER = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
@@ -23,6 +24,7 @@ def test_gpu_modal_interaction_is_installed_for_shared_details() -> None:
 def test_modal_transition_uses_threaded_quick_animators_not_widget_animation() -> None:
     assert "QQmlComponent" in MODAL
     assert "QQuickItem" in MODAL
+    assert "QQuickWindow" in MODAL
     assert "OpacityAnimator" in MODAL
     assert "YAnimator" in MODAL
     assert "ScaleAnimator" in MODAL
@@ -32,6 +34,7 @@ def test_modal_transition_uses_threaded_quick_animators_not_widget_animation() -
     assert "QPropertyAnimation" not in MODAL
     assert "QParallelAnimationGroup" not in MODAL
     assert "QEasingCurve" not in MODAL
+    assert "QQuickWidget" not in MODAL
 
 
 def test_qml_transition_is_startup_safe_and_has_no_optional_effects_import() -> None:
@@ -39,25 +42,39 @@ def test_qml_transition_is_startup_safe_and_has_no_optional_effects_import() -> 
     assert "MultiEffect" not in MODAL
     assert "property url blurUrl" in MODAL
     assert "id: blurImage" in MODAL
+    assert "self.transition_window: QQuickWindow | None = None" in MODAL
     assert "self.transition_item: QQuickItem | None = None" in MODAL
     init_body = MODAL.split("def __init__", 1)[1].split("def _error_text", 1)[0]
-    assert "_create_quick_transition_item" not in init_body
+    assert "QQuickWindow(self.quick_window)" not in init_body
+    assert "QQmlComponent(self.engine" not in init_body
     assert "component.status()" in MODAL
     assert "QQmlComponent.Status.Ready" in MODAL
     assert "return False" in MODAL
-    assert "Glass modal transition did not create" not in MODAL
 
 
-def test_real_widget_tree_is_removed_from_transition_hot_path() -> None:
-    assert "self.window.hide()" in MODAL
-    assert "self.window.show()" in MODAL
+def test_transition_uses_dedicated_native_quick_child_without_hiding_widget_tree() -> None:
+    assert "surface = QQuickWindow(self.quick_window)" in MODAL
+    assert 'surface.setObjectName("glassModalTransitionWindow")' in MODAL
+    assert "Qt.WindowType.WindowDoesNotAcceptFocus" in MODAL
+    assert "surface.setColor(QColor(0, 0, 0, 0))" in MODAL
+    assert "surface.show()" in MODAL
+    assert "surface.raise_()" in MODAL
+    assert "surface.hide()" in MODAL
+    assert "self.window.hide()" not in MODAL
+    assert "self.window.show()" not in MODAL
     assert "self.details.drawer.grab()" in MODAL
-    assert 'self.transition_item.setProperty("active", True)' not in MODAL
-    assert 'item.setProperty("active", True)' in MODAL
     assert "setSizes(" not in MODAL
     assert 'b"geometry"' not in MODAL
     assert 'b"minimumHeight"' not in MODAL
     assert 'b"maximumHeight"' not in MODAL
+
+
+def test_modal_transition_cannot_invalidate_native_glass_mask_via_parent_visibility() -> None:
+    assert "QEvent.Type.Show" in NATIVE_BACKGROUND
+    assert "QEvent.Type.Hide" in NATIVE_BACKGROUND
+    assert "self.schedule_mask_update()" in NATIVE_BACKGROUND
+    assert "self.window.hide()" not in MODAL
+    assert "self.window.show()" not in MODAL
 
 
 def test_preblurred_snapshot_replaces_runtime_qtquick_effect() -> None:
@@ -70,10 +87,9 @@ def test_preblurred_snapshot_replaces_runtime_qtquick_effect() -> None:
 
 
 def test_quick_failure_falls_back_to_atomic_modal_instead_of_crashing() -> None:
-    assert "if not self._ensure_transition_item():" in MODAL
+    assert "if not self._ensure_transition_surface():" in MODAL
     assert "self._fallback_open()" in MODAL
     assert "self._fallback_closed()" in MODAL
-    assert "return" in MODAL
     assert "raise RuntimeError(\"Glass modal transition" not in MODAL
 
 
@@ -82,7 +98,9 @@ def test_any_transition_preparation_exception_cannot_trap_modal_state() -> None:
     assert "def _fallback_closed" in MODAL
     assert "def _error_text" in MODAL
 
-    ensure_body = MODAL.split("def _ensure_transition_item", 1)[1].split("def _rewire_close_inputs", 1)[0]
+    ensure_body = MODAL.split("def _ensure_transition_surface", 1)[1].split(
+        "def _rewire_close_inputs", 1
+    )[0]
     assert "except Exception as exc:" in ensure_body
     assert "self._transition_error = self._error_text(exc)" in ensure_body
     assert "return False" in ensure_body
@@ -91,20 +109,26 @@ def test_any_transition_preparation_exception_cannot_trap_modal_state() -> None:
     assert "except Exception as exc:" in open_body
     assert "self._fallback_open(exc)" in open_body
 
-    close_body = MODAL.split("def request_close", 1)[1].split("def _restore_widget_layer", 1)[0]
+    close_body = MODAL.split("def request_close", 1)[1].split(
+        "def _on_transition_finished", 1
+    )[0]
     assert "except Exception as exc:" in close_body
     assert "self._fallback_closed(exc)" in close_body
 
     fallback_open = MODAL.split("def _fallback_open", 1)[1].split("def _fallback_closed", 1)[0]
     assert "self._state = _STATE_OPEN" in fallback_open
     assert "self._transitioning = False" in fallback_open
+    assert "self._hide_transition_surface()" in fallback_open
 
-    fallback_closed = MODAL.split("def _fallback_closed", 1)[1].split("def _ensure_transition_item", 1)[0]
+    fallback_closed = MODAL.split("def _fallback_closed", 1)[1].split(
+        "def _ensure_transition_surface", 1
+    )[0]
     assert "self._state = _STATE_CLOSED" in fallback_closed
     assert "self.details.close()" in fallback_closed
+    assert "self._hide_transition_surface()" in fallback_closed
 
 
-def test_modal_lifecycle_prevents_show_event_reentry_loop() -> None:
+def test_modal_lifecycle_has_one_open_edge_and_one_close_settlement() -> None:
     for state in (
         "_STATE_CLOSED",
         "_STATE_OPENING_PENDING",
@@ -113,21 +137,26 @@ def test_modal_lifecycle_prevents_show_event_reentry_loop() -> None:
         "_STATE_CLOSING",
     ):
         assert state in MODAL
-    assert "self._state = _STATE_CLOSED" in MODAL
     assert "if self._state == _STATE_CLOSED:" in MODAL
     assert "self._state = _STATE_OPENING_PENDING" in MODAL
     assert "if self._state != _STATE_OPENING_PENDING:" in MODAL
     assert "if self._state != _STATE_OPEN:" in MODAL
 
     finish_body = MODAL.split("def _on_transition_finished", 1)[1].split("def eventFilter", 1)[0]
-    open_state_index = finish_body.index("self._state = _STATE_OPEN")
-    restore_index = finish_body.index("self._restore_widget_layer()")
-    assert open_state_index < restore_index
+    open_branch = finish_body.split("if opened:", 1)[1].split(
+        "if self._state != _STATE_CLOSING:", 1
+    )[0]
+    assert open_branch.index("self._state = _STATE_OPEN") < open_branch.index(
+        "self._hide_transition_surface()"
+    )
 
     close_branch = finish_body.split("if self._state != _STATE_CLOSING:", 1)[1]
-    closed_state_index = close_branch.index("self._state = _STATE_CLOSED")
-    close_restore_index = close_branch.index("self._restore_widget_layer()")
-    assert closed_state_index < close_restore_index
+    assert close_branch.index("self._state = _STATE_CLOSED") < close_branch.index(
+        "self.details.close()"
+    )
+    assert close_branch.index("self.details.close()") < close_branch.index(
+        "self._hide_transition_surface()"
+    )
 
     filter_body = MODAL.split("def eventFilter", 1)[1].split("def cleanup", 1)[0]
     assert "if watched is self.details.drawer and event_type == QEvent.Type.Show:" in filter_body
@@ -142,6 +171,9 @@ def test_open_close_motion_is_short_and_subtle() -> None:
     assert "_PANEL_CLOSE_DROP_PX = 12" in MODAL
     assert "_PANEL_OPEN_SCALE = 0.985" in MODAL
     assert "_PANEL_CLOSE_SCALE = 0.990" in MODAL
+    assert "function prepareOpen()" in MODAL
+    assert "function prepareClose()" in MODAL
+    assert "onActiveChanged:" in MODAL
 
 
 def test_passive_card_text_becomes_part_of_card_hit_surface() -> None:
