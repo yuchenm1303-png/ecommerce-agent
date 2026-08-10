@@ -7,6 +7,9 @@ from PySide6.QtWidgets import QMainWindow
 from .modal_interaction import GlassModalInteractionController
 
 
+_BIND_RETRIES = 4
+
+
 class ModalOverlayZOrderController(QObject):
     """Keep the permanent Quick overlay mapped without blocking QWidget input.
 
@@ -26,6 +29,7 @@ class ModalOverlayZOrderController(QObject):
         self.window = window
         self.modal = modal
         self._bound_item: QQuickItem | None = None
+        self._bind_attempts = 0
         QTimer.singleShot(0, self._bind_after_modal_prime)
         window.destroyed.connect(self.cleanup)
 
@@ -33,7 +37,12 @@ class ModalOverlayZOrderController(QObject):
         item = self.modal.transition_item
         surface = self.modal.transition_window
         if not isinstance(item, QQuickItem) or not isinstance(surface, QQuickWindow):
+            self._bind_attempts += 1
+            if self._bind_attempts < _BIND_RETRIES:
+                QTimer.singleShot(0, self._bind_after_modal_prime)
             return
+
+        self._bind_attempts = _BIND_RETRIES
         if self._bound_item is item:
             surface.lower()
             return
@@ -60,6 +69,7 @@ class ModalOverlayZOrderController(QObject):
             surface.lower()
 
     def cleanup(self) -> None:
+        self._bind_attempts = _BIND_RETRIES
         item = self._bound_item
         self._bound_item = None
         if item is None:
