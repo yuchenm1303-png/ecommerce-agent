@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QLayout,
     QMainWindow,
     QPushButton,
-    QTabWidget,
+    QSplitter,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -58,11 +58,6 @@ QToolButton#anchoredSheetClose {
 QToolButton#anchoredSheetClose:hover {
     color: #ffffff;
     background-color: rgba(255,255,255,28);
-}
-QFrame#anchoredOverlaySheet QTabWidget::pane {
-    border: 1px solid rgba(255,255,255,12);
-    border-radius: 8px;
-    background-color: rgba(0,0,0,40);
 }
 """
 
@@ -121,7 +116,7 @@ def _header(sheet: QFrame, eyebrow: str, title: str, hint: str) -> tuple[QVBoxLa
 
 
 class AnchoredSheetController(QObject):
-    """Keep expandable controls out of the main layout animation path."""
+    """Settings stay in an anchored sheet; Console stays expanded in-place."""
 
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
@@ -131,8 +126,8 @@ class AnchoredSheetController(QObject):
             raise RuntimeError("anchored sheets require a central widget")
 
         window._anchored_sheets_active = True  # type: ignore[attr-defined]
+        window._console_summary_mode = True  # type: ignore[attr-defined]
         self._real_open = False
-        self._console_open = False
         self.root.setStyleSheet(self.root.styleSheet() + "\n" + _SHEET_STYLE)
         self._geometry_timer = QTimer(self)
         self._geometry_timer.setSingleShot(True)
@@ -143,10 +138,11 @@ class AnchoredSheetController(QObject):
         self.real_toggle = getattr(window, "real_settings_toggle", None)
         self.console_toggle = getattr(window, "console_detail_toggle", None)
         self.real_motion = self._build_real_sheet()
-        self.console_motion = self._build_console_sheet()
+        self._prepare_console_summary()
 
         window.destroyed.connect(self.cleanup)
         QTimer.singleShot(0, self._sync_geometry)
+        QTimer.singleShot(0, self._sync_console_summary_geometry)
 
     def _new_sheet(self) -> QFrame:
         sheet = QFrame(self.root)
@@ -168,19 +164,6 @@ class AnchoredSheetController(QObject):
             y = below
         else:
             y = max(_SHEET_MARGIN, top_left.y() - height - _SHEET_GAP)
-        return QRect(x, y, width, height)
-
-    def _console_rect(self) -> QRect:
-        console = getattr(self.window, "console", None)
-        if not isinstance(console, QWidget):
-            return QRect(_SHEET_MARGIN, 260, max(420, self.root.width() - 2 * _SHEET_MARGIN), 360)
-        top_left = console.mapTo(self.root, QPoint(0, 0))
-        width = min(console.width(), max(420, self.root.width() - 2 * _SHEET_MARGIN))
-        x = max(_SHEET_MARGIN, min(top_left.x(), self.root.width() - width - _SHEET_MARGIN))
-        available_above = max(260, top_left.y() - _SHEET_MARGIN - _SHEET_GAP)
-        desired = max(320, min(440, int(self.root.height() * 0.42)))
-        height = min(desired, available_above)
-        y = max(_SHEET_MARGIN, top_left.y() - height - _SHEET_GAP)
         return QRect(x, y, width, height)
 
     def _build_real_sheet(self) -> ClipSheetMotion | None:
@@ -215,7 +198,7 @@ class AnchoredSheetController(QObject):
             self.real_sheet,
             "REAL EXECUTION · SETTINGS",
             "真实填写设置",
-            "设置在独立浮层中展开；主工作区尺寸保持不变。",
+            "设置从商品来源卡片延伸展开；主工作区尺寸保持不变。",
         )
 
         controls = QHBoxLayout()
@@ -258,91 +241,77 @@ class AnchoredSheetController(QObject):
         toggle.setChecked(False)
         toggle.setCheckable(False)
         toggle.setText("展开设置 ﹀")
-        close.clicked.connect(lambda: self._set_sheet("real", False))
+        close.clicked.connect(lambda: self._set_real_sheet(False))
 
         motion = ClipSheetMotion(self.root, self.real_sheet, self._real_rect, edge="top", duration_ms=162)
-        toggle.clicked.connect(lambda: self._set_sheet("real", not self._real_open))
+        toggle.clicked.connect(lambda: self._set_real_sheet(not self._real_open))
         return motion
 
-    def _build_console_sheet(self) -> ClipSheetMotion | None:
+    def _prepare_console_summary(self) -> None:
         toggle = self.console_toggle
         console = getattr(self.window, "console", None)
         if not isinstance(toggle, QPushButton) or not isinstance(console, QFrame):
-            return None
-        tabs = getattr(console, "tabs", None)
-        phase_units = list(getattr(console, "phase_units", {}).values())
-        if not isinstance(tabs, QTabWidget) or not phase_units:
-            return None
+            return
 
-        console_layout = console.layout()
-        if console_layout is None:
-            return None
-        for unit in phase_units:
-            if isinstance(unit, QWidget):
-                _detach_widget(console_layout, unit)
-        _detach_widget(console_layout, tabs)
-
-        self.console_sheet = self._new_sheet()
-        layout, close = _header(
-            self.console_sheet,
-            "RUN DIAGNOSTICS · DETAILS",
-            "运行诊断详情",
-            "阶段状态、日志、产物、Diagnostics 与 Real Run 保持最终尺寸，不参与主布局动画。",
-        )
-
-        phases = QHBoxLayout()
-        phases.setSpacing(7)
-        for unit in phase_units:
-            if isinstance(unit, QWidget):
-                unit.setParent(self.console_sheet)
-                unit.show()
-                phases.addWidget(unit, 1)
-        layout.addLayout(phases)
-
-        tabs.setParent(self.console_sheet)
-        tabs.show()
-        layout.addWidget(tabs, 1)
-
+        # ui_polish originally wired this button to hide/show phase cards and
+        # resize the splitter. Disconnect that whole reflow path. The button is
+        # kept logically checked so ui_maturity continues to allocate the old
+        # expanded Console height, while clicks are free to open Focus Mode.
         try:
             toggle.toggled.disconnect()
         except (RuntimeError, TypeError):
             pass
-        toggle.setChecked(False)
-        toggle.setCheckable(False)
-        toggle.setText("展开详情 ﹀")
-        close.clicked.connect(lambda: self._set_sheet("console", False))
+        toggle.setCheckable(True)
+        toggle.setChecked(True)
+        toggle.setText("展开详情 ⌄")
+        toggle.clicked.connect(self._restore_console_summary_toggle)
 
-        motion = ClipSheetMotion(self.root, self.console_sheet, self._console_rect, edge="bottom", duration_ms=172)
-        toggle.clicked.connect(lambda: self._set_sheet("console", not self._console_open))
-        return motion
+        for unit in getattr(console, "phase_units", {}).values():
+            if isinstance(unit, QWidget):
+                unit.show()
+        tabs = getattr(console, "tabs", None)
+        if isinstance(tabs, QWidget):
+            tabs.show()
 
-    def _set_sheet(self, name: str, expanded: bool) -> None:
+        console.setMinimumHeight(300)
+        console.setMaximumHeight(460)
+
+    def _restore_console_summary_toggle(self, *_args: object) -> None:
+        toggle = self.console_toggle
+        if not isinstance(toggle, QPushButton):
+            return
+        # QAbstractButton toggles before clicked(). Restore the internal checked
+        # state immediately; no layout handler is attached to toggled anymore.
+        if not toggle.isChecked():
+            toggle.setChecked(True)
+        toggle.setText("展开详情 ⌄")
+
+    def _sync_console_summary_geometry(self) -> None:
+        body = getattr(self.window, "_ui_polish_body_splitter", None)
+        console = getattr(self.window, "console", None)
+        if not isinstance(body, QSplitter) or not isinstance(console, QWidget):
+            return
+        available = max(1, body.height() - body.handleWidth())
+        target = min(440, max(340, available - 300))
+        target = min(target, max(300, available - 260))
+        console.setMinimumHeight(300)
+        console.setMaximumHeight(460)
+        body.setSizes([max(260, available - target), target])
+
+    def _set_real_sheet(self, expanded: bool) -> None:
         expanded = bool(expanded)
         if expanded:
             details = getattr(self.window, "_card_details", None)
             if details is not None and hasattr(details, "close"):
                 details.close()
-
-        if name == "real":
-            if expanded and self._console_open:
-                self._set_sheet("console", False)
-            self._real_open = expanded
-            if isinstance(self.real_toggle, QPushButton):
-                self.real_toggle.setText("收起设置 ︿" if expanded else "展开设置 ﹀")
-            if self.real_motion is not None:
-                self.real_motion.toggle(expanded)
-        else:
-            if expanded and self._real_open:
-                self._set_sheet("real", False)
-            self._console_open = expanded
-            if isinstance(self.console_toggle, QPushButton):
-                self.console_toggle.setText("收起详情 ︿" if expanded else "展开详情 ﹀")
-            if self.console_motion is not None:
-                self.console_motion.toggle(expanded)
+        self._real_open = expanded
+        if isinstance(self.real_toggle, QPushButton):
+            self.real_toggle.setText("收起设置 ︿" if expanded else "展开设置 ﹀")
+        if self.real_motion is not None:
+            self.real_motion.toggle(expanded)
 
     def close_all(self) -> None:
-        self._set_sheet("real", False)
-        self._set_sheet("console", False)
+        self._set_real_sheet(False)
 
     def _schedule_geometry(self) -> None:
         if not self._geometry_timer.isActive():
@@ -351,8 +320,7 @@ class AnchoredSheetController(QObject):
     def _sync_geometry(self) -> None:
         if self.real_motion is not None:
             self.real_motion.sync_geometry()
-        if self.console_motion is not None:
-            self.console_motion.sync_geometry()
+        self._sync_console_summary_geometry()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if watched is self.root:
@@ -367,8 +335,6 @@ class AnchoredSheetController(QObject):
         self._geometry_timer.stop()
         if self.real_motion is not None:
             self.real_motion.cleanup()
-        if self.console_motion is not None:
-            self.console_motion.cleanup()
         try:
             self.root.removeEventFilter(self)
         except RuntimeError:
