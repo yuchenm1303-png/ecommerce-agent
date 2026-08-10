@@ -16,9 +16,7 @@ def test_maturity_pass_runs_after_detail_widgets_exist_before_native_shell() -> 
     assert "install_native_window_shell(window, quick_window)" in RUNNER
     assert RUNNER.index("install_ui_polish(window)") < RUNNER.index("install_card_details(window)")
     assert RUNNER.index("install_card_details(window)") < RUNNER.index("install_mature_ui(window)")
-    assert RUNNER.index("install_mature_ui(window)") < RUNNER.index(
-        "install_native_window_shell(window, quick_window)"
-    )
+    assert RUNNER.index("install_mature_ui(window)") < RUNNER.index("install_native_window_shell(window, quick_window)")
 
 
 def test_every_expandable_card_reserves_a_real_button_lane() -> None:
@@ -31,7 +29,7 @@ def test_every_expandable_card_reserves_a_real_button_lane() -> None:
 
 
 def test_console_phase_cards_cannot_overlap_state_text_and_expand_affordance() -> None:
-    assert 'getattr(console, "phase_units", {})' in MATURE
+    assert 'phase_units = list(getattr(console, "phase_units", {}).values())' in MATURE
     assert 'unit.setMinimumHeight(56)' in MATURE
     assert 'unit.setMaximumHeight(62)' in MATURE
     assert 'unit_layout.setContentsMargins(10, 6, _EXPAND_SAFE_RIGHT, 6)' in MATURE
