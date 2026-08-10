@@ -34,7 +34,7 @@ def test_every_presentation_card_family_is_discovered_for_details() -> None:
 
 
 def test_legacy_expand_icon_is_removed_before_window_show() -> None:
-    assert "self._expandable_cards = frozenset(self._installed_cards)" in FAST_DETAILS
+    assert "self._expandable_cards = tuple(self._installed_cards)" in FAST_DETAILS
     assert "for button in tuple(self._buttons.values())" in FAST_DETAILS
     assert "button.hide()" in FAST_DETAILS
     assert "button.setParent(None)" in FAST_DETAILS
