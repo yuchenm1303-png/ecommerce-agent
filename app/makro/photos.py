@@ -231,9 +231,6 @@ def _visible_upload_photo_button(page: Page, section_path: str):
         candidate = text_matches.nth(index)
         try:
             if candidate.is_visible():
-                # Prefer the real button ancestor when the text is rendered in
-                # a nested span/icon wrapper; otherwise the visible node itself
-                # is still safe because click bubbles to the upload control.
                 button = candidate.locator("xpath=ancestor-or-self::button[1]")
                 visible.append(button if button.count() == 1 else candidate)
         except Exception:
@@ -243,6 +240,18 @@ def _visible_upload_photo_button(page: Page, section_path: str):
             f"Product Photos 当前出现 {len(visible)} 个可见 Upload Photo；拒绝猜测。"
         )
     return visible[0] if visible else None
+
+
+def _wait_for_upload_photo_button(page: Page, section_path: str, *, timeout_ms: int = 900):
+    """Wait only for the active role panel control, not a blind fixed delay."""
+
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        current = _visible_upload_photo_button(page, section_path)
+        if current is not None:
+            return current
+        page.wait_for_timeout(50)
+    return None
 
 
 class _DynamicPhotoFileTarget:
@@ -267,39 +276,38 @@ class _DynamicPhotoFileTarget:
         if slot.count() != 1:
             raise RuntimeError(f"Product Photos 找不到目标图片槽 #{self.slot_id}。")
 
-        # Human-equivalent Makro interaction:
-        #   click the whole thumbnail role card -> blue Upload Photo -> file.
-        # The orange + is only used upstream to identify that the slot is empty.
+        # Verified human-equivalent flow: role card -> Upload Photo -> file.
+        # Bound click timeouts avoid Playwright's long actionability retries.
         slot.scroll_into_view_if_needed()
-        slot.click()
-        self.page.wait_for_timeout(250)
+        slot.click(timeout=1_500)
 
         current_path = self._current_path()
-        upload_button = _visible_upload_photo_button(self.page, current_path)
+        upload_button = _wait_for_upload_photo_button(self.page, current_path)
         if upload_button is None:
             raise RuntimeError(
-                f"点击 #{self.slot_id} 图片框后没有出现可见 Upload Photo 按钮。"
+                f"点击 #{self.slot_id} 图片框后 900ms 内没有出现可见 Upload Photo 按钮。"
             )
 
+        # The shared hidden input is commonly already mounted. Capture it before
+        # the click so a missing file-chooser event can fall back immediately.
+        shared = _raw_file_input(self.page, current_path)
         try:
-            with self.page.expect_file_chooser(timeout=2_500) as chooser_info:
-                upload_button.click()
+            with self.page.expect_file_chooser(timeout=700) as chooser_info:
+                upload_button.click(timeout=1_500)
             chooser_info.value.set_files(upload)
             self._selected = True
             return
         except PlaywrightTimeoutError:
-            # Some builds reveal/mount the shared hidden input after clicking
-            # Upload Photo instead of surfacing a native chooser event.
             pass
 
-        deadline = time.monotonic() + 3.0
-        shared = None
-        while time.monotonic() < deadline:
-            current_path = self._current_path()
-            shared = _raw_file_input(self.page, current_path)
-            if shared is not None:
-                break
-            self.page.wait_for_timeout(150)
+        if shared is None:
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                current_path = self._current_path()
+                shared = _raw_file_input(self.page, current_path)
+                if shared is not None:
+                    break
+                self.page.wait_for_timeout(50)
         if shared is None:
             raise RuntimeError(
                 f"#{self.slot_id} 图片框已选中且已点击 Upload Photo，但没有 file chooser，"
@@ -387,7 +395,7 @@ def _wait_for_staged_signal(
             target_slot_id=target_slot_id,
         ):
             return latest
-        page.wait_for_timeout(200)
+        page.wait_for_timeout(100)
     return latest
 
 
@@ -567,7 +575,7 @@ def verify_persisted_photo_count(
                 "expected_added": expected_added,
                 "detail": "Product Photos Save 后完成计数按预期增加。",
             }
-        page.wait_for_timeout(250)
+        page.wait_for_timeout(150)
 
     return {
         "status": "validation_failed",
