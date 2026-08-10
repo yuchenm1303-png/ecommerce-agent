@@ -31,8 +31,9 @@ class NativeGlassProxy(QObject):
         return self._overlay_alpha
 
     def set_interaction(self, *, scale: float, overlay_alpha: float) -> None:
-        # Baseline card FX supplies scale=1.0 and animates alpha only. Preserve
-        # the public API exactly while keeping the actual pixels in Quick.
+        # Baseline card FX supplies scale=1.0 and alpha-only interaction states.
+        # Publish the model role and explicitly request one Quick frame so hover
+        # and press feedback is not left waiting behind unrelated GUI events.
         scale = max(0.94, min(1.0, float(scale)))
         overlay_alpha = max(0.0, min(255.0, float(overlay_alpha)))
         if (
@@ -43,6 +44,12 @@ class NativeGlassProxy(QObject):
         self._surface_scale = scale
         self._overlay_alpha = overlay_alpha
         self.background.set_card_alpha(self.frame, overlay_alpha)
+        quick = self.background.quick_window
+        if quick is not None:
+            try:
+                quick.requestUpdate()
+            except RuntimeError:
+                pass
 
     def sync_geometry(self) -> None:
         self.background.schedule_mask_update()
