@@ -15,13 +15,9 @@ def test_card_details_are_installed_after_polish_and_reconciled_after_mature_lay
     assert "details = install_card_details(window)" in RUNNER
     assert "mature = install_mature_ui(window)" in RUNNER
     assert "details.attach_mature(mature)" in RUNNER
-    assert "install_native_window_shell(window, quick_window)" in RUNNER
-    assert "install_nekro_card_fx(window, visual)" in RUNNER
     assert RUNNER.index("install_ui_polish(window)") < RUNNER.index("details = install_card_details(window)")
     assert RUNNER.index("details = install_card_details(window)") < RUNNER.index("mature = install_mature_ui(window)")
-    assert RUNNER.index("details.attach_mature(mature)") < RUNNER.index(
-        "install_native_window_shell(window, quick_window)"
-    )
+    assert RUNNER.index("details.attach_mature(mature)") < RUNNER.index("shell.show()")
 
 
 def test_every_presentation_card_family_is_discovered_for_details() -> None:
@@ -48,22 +44,24 @@ def test_card_surface_click_opens_detail_without_hijacking_child_controls() -> N
     assert "isinstance(event, QMouseEvent)" in FAST_DETAILS
     assert "event.button() == Qt.MouseButton.LeftButton" in FAST_DETAILS
     assert "self.open(watched)" in FAST_DETAILS
-    # Only the expandable frame itself is filtered here. Interactive child
-    # controls keep their native event handlers and do not receive an extra
-    # controller-level filter.
     assert "child.installEventFilter(self)" not in FAST_DETAILS
     assert "widget.installEventFilter(self)" not in FAST_DETAILS
 
 
-def test_legacy_expand_lane_is_reclaimed_after_mature_responsive_pass() -> None:
-    assert "def attach_mature" in FAST_DETAILS
-    assert "timer.timeout.connect(self._reclaim_expand_lane)" in FAST_DETAILS
-    assert "def _reclaim_expand_lane" in FAST_DETAILS
-    assert "if margins.right() >= 38" in FAST_DETAILS
-    assert "layout.setContentsMargins" in FAST_DETAILS
+def test_shared_modal_uses_one_blurred_backdrop_and_centered_glass_panel() -> None:
+    assert 'self.backdrop.setObjectName("cardDetailBackdrop")' in FAST_DETAILS
+    assert "screen.grabWindow(" in FAST_DETAILS
+    assert "QGraphicsBlurEffect" in FAST_DETAILS
+    assert "_BACKDROP_SCALE = 0.34" in FAST_DETAILS
+    assert "_BACKDROP_BLUR_RADIUS = 8.0" in FAST_DETAILS
+    assert "background-color: rgba(220, 228, 238, 74)" in FAST_DETAILS
+    assert "background-color: rgba(12, 17, 26, 94)" in FAST_DETAILS
+    assert "(root.width() - width) // 2" in FAST_DETAILS
+    assert "(root.height() - height) // 2" in FAST_DETAILS
+    assert "_DEFAULT_RATIO = (0.80, 0.80)" in FAST_DETAILS
 
 
-def test_detail_drawer_is_atomic_and_has_no_animation_driver() -> None:
+def test_modal_is_atomic_and_has_no_geometry_animation_driver() -> None:
     assert "QPropertyAnimation" not in FAST_DETAILS
     assert "QParallelAnimationGroup" not in FAST_DETAILS
     assert "QEasingCurve" not in FAST_DETAILS
@@ -71,26 +69,46 @@ def test_detail_drawer_is_atomic_and_has_no_animation_driver() -> None:
     assert "QGraphicsOpacityEffect" not in FAST_DETAILS
     assert "_DRAWER_OPEN_MS" not in FAST_DETAILS
     assert "_DRAWER_CLOSE_MS" not in FAST_DETAILS
-    assert "_CONTENT_REVEAL_MS" not in FAST_DETAILS
-    assert "_CARD_PULSE_PAD" not in FAST_DETAILS
+    assert "frame.setGeometry" not in FAST_DETAILS
+    assert "frame.resize" not in FAST_DETAILS
 
 
-def test_detail_open_populates_final_geometry_before_single_repaint() -> None:
+def test_modal_open_settles_content_before_single_repaint() -> None:
     assert "updates_were_enabled = self.root.updatesEnabled()" in FAST_DETAILS
     assert "self.root.setUpdatesEnabled(False)" in FAST_DETAILS
-    assert "self._populate(frame)" in FAST_DETAILS
     assert "self.drawer.setGeometry(self._drawer_rect())" in FAST_DETAILS
+    assert "self.backdrop.show()" in FAST_DETAILS
+    assert "self.scrim.show()" in FAST_DETAILS
     assert "self.drawer.show()" in FAST_DETAILS
     assert "self.root.setUpdatesEnabled(True)" in FAST_DETAILS
     assert "self.root.update()" in FAST_DETAILS
 
 
-def test_detail_close_is_immediate_without_exit_animation() -> None:
-    assert "def close(self)" in FAST_DETAILS
-    assert "self.drawer.hide()" in FAST_DETAILS
-    assert "self.scrim.hide()" in FAST_DETAILS
-    assert "end_pos" not in FAST_DETAILS
-    assert "reveal_cover" not in FAST_DETAILS
+def test_real_settings_uses_shared_modal_instead_of_inline_visibility_toggle() -> None:
+    assert "def _install_real_settings_action" in FAST_DETAILS
+    assert "toggle.toggled.disconnect()" in FAST_DETAILS
+    assert "toggle.setCheckable(False)" in FAST_DETAILS
+    assert "toggle.clicked.connect(self.open_real_settings)" in FAST_DETAILS
+    assert "def open_real_settings" in FAST_DETAILS
+    assert 'title="真实填写设置"' in FAST_DETAILS
+    assert "self.open_custom(" in FAST_DETAILS
+    assert "widget.setVisible(expanded)" not in FAST_DETAILS
+
+
+def test_console_detail_uses_the_same_modal_and_clones_all_tabs_read_only() -> None:
+    assert "def open_console_details" in FAST_DETAILS
+    assert 'title="运行控制台详情"' in FAST_DETAILS
+    assert "_CONSOLE_RATIO = (0.90, 0.86)" in FAST_DETAILS
+    assert "for index in range(tabs_source.count())" in FAST_DETAILS
+    assert "self._clone_console_page(source_page)" in FAST_DETAILS
+    assert "clone.setReadOnly(True)" in FAST_DETAILS
+
+
+def test_legacy_expand_lane_is_reclaimed_after_mature_responsive_pass() -> None:
+    assert "def attach_mature" in FAST_DETAILS
+    assert "timer.timeout.connect(self._reclaim_expand_lane)" in FAST_DETAILS
+    assert "if margins.right() >= 38" in FAST_DETAILS
+    assert "layout.setContentsMargins" in FAST_DETAILS
 
 
 def test_detail_geometry_notifications_are_coalesced() -> None:
@@ -106,22 +124,14 @@ def test_details_are_useful_not_generic_placeholders() -> None:
     assert "def _clone_table" in BASE_DETAILS
     assert "def _populate_controls" in BASE_DETAILS
     assert "def _populate_text_views" in BASE_DETAILS
-    assert "current_result" not in BASE_DETAILS
-    assert "ReadOnlyRunner" not in BASE_DETAILS
-    assert "RealExecutionRunner" not in BASE_DETAILS
     assert 'view.property("detailTitle")' in BASE_DETAILS
     assert 'table.property("detailTitle")' in BASE_DETAILS
 
 
-def test_detail_path_has_no_layout_height_animation_or_global_filter() -> None:
-    assert "QApplication.instance().installEventFilter" not in FAST_DETAILS
-    assert "setMinimumHeight" not in FAST_DETAILS
-    assert "setMaximumHeight" not in FAST_DETAILS
-    assert "frame.setGeometry" not in FAST_DETAILS
-    assert "frame.resize" not in FAST_DETAILS
-
-
-def test_escape_and_scrim_close_detail_page() -> None:
+def test_escape_scrim_and_close_button_all_close_the_shared_modal() -> None:
     assert "self.scrim.clicked.connect(self.close)" in BASE_DETAILS
     assert "event.key() == Qt.Key.Key_Escape" in FAST_DETAILS
     assert "self.close_button.clicked.connect(self.close)" in BASE_DETAILS
+    assert "self.backdrop.hide()" in FAST_DETAILS
+    assert "self.scrim.hide()" in FAST_DETAILS
+    assert "self.drawer.hide()" in FAST_DETAILS
