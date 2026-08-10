@@ -25,13 +25,12 @@ def main() -> int:
     from gui.console_window import MainWindow
     from gui.workflow_console_window import WorkflowMainWindow
     from gui.log_presenter import install_buffered_logs
-    from gui.modal_interaction import install_modal_interaction
-    from gui.modal_overlay_zorder import install_modal_overlay_zorder
     from gui.native_visual_style import install_native_visual_style
     from gui.native_window_shell import install_native_window_shell
     from gui.nekro_card_fx import install_nekro_card_fx
     from gui.nekro_effects import install_nekro_effects
     from gui.required_input_support import install_required_input_support
+    from gui.static_modal_interaction import install_static_modal_interaction
     from gui.ui_maturity import install_mature_ui
     from gui.ui_polish import install_ui_polish
     from gui.smooth_scroll import SmoothWheelFilter
@@ -42,24 +41,22 @@ def main() -> int:
     app.setApplicationName("ecommerce-agent Current Workflow")
     app.setOrganizationName("ecommerce-agent")
 
-    # Both the native Fuji renderer and the permanent modal compositor use
-    # translucent QQuickWindow surfaces. Qt requires the alpha buffer policy to
-    # be enabled before the first QQuickWindow is created.
+    # Keep the native Fuji renderer compatible with the translucent QWidget
+    # child surface. Modal presentation itself now stays entirely in QWidget.
     QQuickWindow.setDefaultAlphaBuffer(True)
 
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_native_visual_style(window)
 
     # Finish the proven Single workspace exactly as before. Batch wraps that
-    # complete workspace afterwards, so old layout/card/modal plugins never
-    # reinterpret Batch controls as Single diagnostics.
+    # complete workspace afterwards, so old layout/card plugins never reinterpret
+    # Batch controls as Single diagnostics.
     install_ui_polish(window)
     details = install_card_details(window)
     mature = install_mature_ui(window)
     details.attach_mature(mature)
     install_console_summary_mode(window)
-    modal = install_modal_interaction(window, details)
-    install_modal_overlay_zorder(window, modal)
+    install_static_modal_interaction(window, details)
 
     window.install_mode_workspace()
     install_required_input_support(window)
