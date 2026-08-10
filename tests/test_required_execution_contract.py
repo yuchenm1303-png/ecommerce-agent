@@ -15,6 +15,7 @@ from app.makro.photos import (
     _select_file_input,
     _stage_accepted,
     _visible_upload_photo_button,
+    _wait_for_upload_photo_button,
 )
 from app.makro.sections import save_section
 from app.required_overrides import RequiredOverrideError, apply_required_overrides
@@ -172,10 +173,10 @@ def test_product_photos_uses_real_thumbnail_ids_and_shared_input_surface():
 def test_dynamic_photo_target_selects_whole_role_card_then_clicks_upload_photo():
     source = inspect.getsource(_DynamicPhotoFileTarget.set_input_files)
 
-    slot_click = source.index("slot.click()")
-    button_lookup = source.index("_visible_upload_photo_button", slot_click)
-    chooser = source.index("expect_file_chooser", button_lookup)
-    upload_click = source.index("upload_button.click()", chooser)
+    slot_click = source.index("slot.click(timeout=1_500)")
+    button_lookup = source.index("_wait_for_upload_photo_button", slot_click)
+    chooser = source.index("expect_file_chooser(timeout=700)", button_lookup)
+    upload_click = source.index("upload_button.click(timeout=1_500)", chooser)
 
     assert slot_click < button_lookup < chooser < upload_click
     assert 'locator(f"#{self.slot_id}")' in source
@@ -193,6 +194,19 @@ def test_upload_photo_button_is_exact_active_role_control():
     assert "is_visible" in source
     assert "ancestor-or-self::button" in source
     assert "len(visible) > 1" in source
+
+
+def test_photo_upload_fast_path_replaces_old_long_fixed_waits():
+    target_source = inspect.getsource(_DynamicPhotoFileTarget.set_input_files)
+    button_wait_source = inspect.getsource(_wait_for_upload_photo_button)
+
+    assert "wait_for_timeout(250)" not in target_source
+    assert "expect_file_chooser(timeout=2_500)" not in target_source
+    assert "time.monotonic() + 3.0" not in target_source
+    assert "expect_file_chooser(timeout=700)" in target_source
+    assert "time.monotonic() + 1.0" in target_source
+    assert "timeout_ms: int = 900" in button_wait_source
+    assert "wait_for_timeout(50)" in button_wait_source
 
 
 def test_photo_acceptance_can_be_proved_by_target_thumbnail_losing_plus():
