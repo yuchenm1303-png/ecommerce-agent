@@ -2,7 +2,7 @@
 
 Order of work:
 1) capture the exact supplier page;
-2) AI derives conservative category-search hints and brand status;
+2) AI resolves a grounded physical Product Identity, then derives category-search hints;
 3) automate Makro Step 1 (Vertical) and Step 2 (Brand), verifying both against
    the live UI / resulting listing URL;
 4) scan the just-created Step 3 live schema;
@@ -422,6 +422,7 @@ def main() -> int:
                 page,
                 provider,
                 captured.snapshot,
+                image_paths=captured.product_image_paths,
                 vertical_override=args.vertical,
                 brand_override=args.brand,
             )
