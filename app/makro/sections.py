@@ -264,11 +264,16 @@ def scan_sections(
 def _wait_for_section_fields(
     page: Page, section_path: str, *, wait_ms: int, timeout_s: float
 ) -> bool:
-    """Poll until the section renders fields or shows the Cancel control."""
+    """Poll until an expanded section has rendered its actual field controls.
+
+    Makro exposes the Cancel/Save actions before its asynchronous attribute
+    form has finished rendering.  Treating Cancel as readiness races the form
+    load and can produce an empty live schema immediately after Step 2.
+    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         state = page.evaluate(_SECTION_STATE_SCRIPT, {"path": section_path})
-        if state.get("has_fields") or state.get("has_cancel"):
+        if state.get("has_fields"):
             return True
         page.wait_for_timeout(int(wait_ms))
     return False
