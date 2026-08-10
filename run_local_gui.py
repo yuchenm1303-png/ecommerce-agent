@@ -41,7 +41,13 @@ def main() -> int:
 
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_native_visual_style(window)
+
+    # Preserve the mature Single workspace contract first. Batch wraps that
+    # already-polished workspace rather than changing the layout assumptions
+    # that the existing performance/UI pipeline has been tuned around.
     install_ui_polish(window)
+    window.install_mode_workspace()
+
     details = install_card_details(window)
     mature = install_mature_ui(window)
     details.attach_mature(mature)
