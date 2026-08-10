@@ -53,6 +53,7 @@ def main() -> int:
     install_modal_interaction(window, details)
 
     window.install_mode_workspace()
+    visual.refresh_glass_frames()
 
     smooth_wheel = SmoothWheelFilter(window)
     smooth_wheel.install(window)
