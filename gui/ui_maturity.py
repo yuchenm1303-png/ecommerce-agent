@@ -21,9 +21,7 @@ _EXPAND_SAFE_RIGHT = 38
 
 
 _MATURE_STYLE = r"""
-QWidget#root {
-    font-size: 12px;
-}
+QWidget#root { font-size: 12px; }
 QLabel#brandMark { font-size: 9px; color: rgba(255,255,255,148); }
 QLabel#appTitle { font-size: 25px; font-weight: 720; }
 QLabel#subtle { font-size: 10px; color: rgba(255,255,255,154); }
@@ -166,7 +164,6 @@ def _polish_workspace(window: QMainWindow) -> None:
     splitter = root.findChild(QSplitter, "workspaceSplitter") if root is not None else None
     if not isinstance(splitter, QSplitter):
         return
-
     splitter.setHandleWidth(8)
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 0)
@@ -174,7 +171,6 @@ def _polish_workspace(window: QMainWindow) -> None:
         side = splitter.widget(1)
         side.setMinimumWidth(300)
         side.setMaximumWidth(370)
-
     _polish_tabs(getattr(window, "side_detail_tabs", None), expanding=True)
 
 
@@ -182,12 +178,10 @@ def _polish_console(window: QMainWindow) -> None:
     console = getattr(window, "console", None)
     if not isinstance(console, QFrame):
         return
-
     layout = console.layout()
     if isinstance(layout, QVBoxLayout):
         layout.setSpacing(6)
         layout.setContentsMargins(16, 10, _EXPAND_SAFE_RIGHT, 11)
-
     phase_units = list(getattr(console, "phase_units", {}).values())
     for unit in phase_units:
         if not isinstance(unit, QFrame):
@@ -198,7 +192,6 @@ def _polish_console(window: QMainWindow) -> None:
         if isinstance(unit_layout, QVBoxLayout):
             unit_layout.setSpacing(1)
             unit_layout.setContentsMargins(10, 6, _EXPAND_SAFE_RIGHT, 6)
-
     tabs = getattr(console, "tabs", None)
     _polish_tabs(tabs, expanding=False)
     if isinstance(tabs, QTabWidget):
@@ -212,18 +205,15 @@ class MatureResponsiveController(QObject):
         self.root = window.centralWidget()
         if self.root is None:
             raise RuntimeError("mature UI requires a central widget")
-
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(32)
         self._timer.timeout.connect(self.apply)
         self.root.installEventFilter(self)
-
         for name in ("console_detail_toggle", "real_settings_toggle"):
             toggle = getattr(window, name, None)
             if isinstance(toggle, QPushButton):
                 toggle.toggled.connect(lambda *_: self.schedule())
-
         self.schedule()
 
     def schedule(self) -> None:
@@ -247,17 +237,12 @@ class MatureResponsiveController(QObject):
         _reserve_expand_lane(self.window)
         width = max(1, self.root.width())
         height = max(1, self.root.height())
-
         workspace_splitter = self._workspace_splitter()
         if isinstance(workspace_splitter, QSplitter) and workspace_splitter.count() > 1:
             total = max(1, workspace_splitter.width() - workspace_splitter.handleWidth())
             side_target = 330 if width >= 1500 else 310
             side_target = min(side_target, max(280, int(total * 0.28)))
-            self._set_splitter_sizes_if_needed(
-                workspace_splitter,
-                [max(560, total - side_target), side_target],
-            )
-
+            self._set_splitter_sizes_if_needed(workspace_splitter, [max(560, total - side_target), side_target])
         body = self._body_splitter()
         console = getattr(self.window, "console", None)
         if isinstance(body, QSplitter) and isinstance(console, QWidget):
@@ -274,7 +259,6 @@ class MatureResponsiveController(QObject):
                 console.setMinimumHeight(108)
                 console.setMaximumHeight(124)
             self._set_splitter_sizes_if_needed(body, [max(300, available - target), target])
-
         for button in self.window.findChildren(QToolButton, "cardExpandButton"):
             parent = button.parentWidget()
             if parent is not None:
@@ -282,18 +266,13 @@ class MatureResponsiveController(QObject):
                 if button.x() != target_x or button.y() != 7:
                     button.move(target_x, 7)
                 button.raise_()
-
         visual = getattr(self.window, "_visual_style", None)
         background = getattr(visual, "background", None)
         if background is not None and hasattr(background, "schedule_mask_update"):
             background.schedule_mask_update()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if watched is self.root and event.type() in {
-            QEvent.Type.Resize,
-            QEvent.Type.Show,
-            QEvent.Type.LayoutRequest,
-        }:
+        if watched is self.root and event.type() in {QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.LayoutRequest}:
             self.schedule()
         return False
 
@@ -309,20 +288,17 @@ def install_mature_ui(window: QMainWindow) -> MatureResponsiveController:
     root = window.centralWidget()
     if root is None:
         raise RuntimeError("mature UI requires a central widget")
-
     window.setStyleSheet(window.styleSheet() + "\n" + _MATURE_STYLE)
     outer = root.layout()
     if isinstance(outer, QVBoxLayout):
         outer.setContentsMargins(18, 16, 18, 16)
         outer.setSpacing(9)
-
     _polish_input_card(window)
     _polish_status_cards(window)
     _polish_workspace(window)
     _polish_console(window)
     _polish_tables(window)
     _reserve_expand_lane(window)
-
     controller = MatureResponsiveController(window)
     window._mature_ui = controller  # type: ignore[attr-defined]
     window.destroyed.connect(controller.cleanup)
