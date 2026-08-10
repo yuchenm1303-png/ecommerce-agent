@@ -12,13 +12,24 @@ def _background(window: QMainWindow):
     return getattr(visual, "background", None)
 
 
-def install_inline_motion_glass_guard(window: QMainWindow) -> None:
-    """Defer only the expensive blur-mask texture while inline layout moves.
+def _pause_timer(owner: object | None, name: str, window: QMainWindow, key: str) -> None:
+    timer = getattr(owner, name, None)
+    was_active = isinstance(timer, QTimer) and timer.isActive()
+    setattr(window, key, was_active)
+    if was_active:
+        timer.stop()
 
-    The native background keeps its lightweight card geometry model live, but
-    the full-window QImage -> PNG -> QML texture path is frozen for the short
-    expansion interval.  The final mask is rebuilt exactly once after motion.
-    """
+
+def _resume_timer(owner: object | None, name: str, window: QMainWindow, key: str) -> None:
+    if not bool(getattr(window, key, False)):
+        return
+    timer = getattr(owner, name, None)
+    if isinstance(timer, QTimer) and not timer.isActive():
+        timer.start()
+
+
+def install_inline_motion_glass_guard(window: QMainWindow) -> None:
+    """Freeze expensive glass texture work during short inline layout motion."""
 
     background = _background(window)
     if background is None or getattr(background, "_inline_motion_glass_guard", False):
@@ -51,21 +62,21 @@ def begin_inline_motion(window: QMainWindow) -> None:
 
     background = _background(window)
     if background is not None:
-        pointer_timer = getattr(background, "_pointer_timer", None)
-        pointer_was_active = isinstance(pointer_timer, QTimer) and pointer_timer.isActive()
-        window._inline_motion_pointer_was_active = pointer_was_active  # type: ignore[attr-defined]
-        if pointer_was_active:
-            pointer_timer.stop()
+        _pause_timer(background, "_pointer_timer", window, "_inline_motion_pointer_was_active")
         quick = getattr(background, "quick_window", None)
         if quick is not None:
             quick.setProperty("animationRunning", False)
 
     effects = getattr(window, "_nekro_effects", None)
-    effects_timer = getattr(effects, "timer", None)
-    effects_was_active = isinstance(effects_timer, QTimer) and effects_timer.isActive()
-    window._inline_motion_effects_was_active = effects_was_active  # type: ignore[attr-defined]
-    if effects_was_active:
-        effects_timer.stop()
+    _pause_timer(effects, "timer", window, "_inline_motion_effects_was_active")
+
+    card_fx = getattr(window, "_nekro_card_fx", None)
+    _pause_timer(card_fx, "_sample_timer", window, "_inline_motion_card_sample_was_active")
+    _pause_timer(card_fx, "_animation_timer", window, "_inline_motion_card_anim_was_active")
+
+    smooth = getattr(window, "_smooth_wheel_filter", None)
+    scroller = getattr(smooth, "_scroller", None)
+    _pause_timer(scroller, "_timer", window, "_inline_motion_scroll_was_active")
 
 
 def end_inline_motion(window: QMainWindow) -> None:
@@ -78,10 +89,10 @@ def end_inline_motion(window: QMainWindow) -> None:
 
     background = _background(window)
     if background is not None:
-        if bool(getattr(window, "_inline_motion_pointer_was_active", False)):
-            pointer_timer = getattr(background, "_pointer_timer", None)
-            if isinstance(pointer_timer, QTimer) and not pointer_timer.isActive():
-                pointer_timer.start()
+        # Force the next pointer sample to re-arm QML FrameAnimation even when
+        # the cursor did not move while layout motion was active.
+        setattr(background, "_last_pointer_norm", None)
+        _resume_timer(background, "_pointer_timer", window, "_inline_motion_pointer_was_active")
         setattr(background, "_mask_ready", False)
         setattr(background, "_inline_motion_mask_stale", False)
         schedule = getattr(background, "schedule_mask_update", None)
@@ -89,7 +100,11 @@ def end_inline_motion(window: QMainWindow) -> None:
             schedule()
 
     effects = getattr(window, "_nekro_effects", None)
-    effects_timer = getattr(effects, "timer", None)
-    if bool(getattr(window, "_inline_motion_effects_was_active", False)):
-        if isinstance(effects_timer, QTimer) and not effects_timer.isActive():
-            effects_timer.start()
+    _resume_timer(effects, "timer", window, "_inline_motion_effects_was_active")
+
+    card_fx = getattr(window, "_nekro_card_fx", None)
+    _resume_timer(card_fx, "_sample_timer", window, "_inline_motion_card_sample_was_active")
+    _resume_timer(card_fx, "_animation_timer", window, "_inline_motion_card_anim_was_active")
+
+    # A scroll animation interrupted by card expansion should not continue from
+    # a stale target after the layout has moved.  It remains stopped by design.
