@@ -24,19 +24,22 @@ def test_old_tiny_console_collapsed_state_is_not_used() -> None:
     assert "tabs.show()" in MODE
 
 
-def test_default_summary_keeps_legacy_responsive_code_on_expanded_branch() -> None:
+def test_default_summary_is_permanent_and_detail_never_resizes_splitter() -> None:
     assert "self.toggle.toggled.disconnect()" in MODE
     assert "self.toggle.setCheckable(True)" in MODE
     assert "self.toggle.setChecked(True)" in MODE
-    assert 'self.toggle.setText("展开详情 ⌄")' in MODE
+    assert 'self.toggle.setText("展开详情")' in MODE
+    assert "_DETAIL_MIN" not in MODE
+    assert "_DETAIL_MAX" not in MODE
+    assert "_detail_open" not in MODE
+    assert "def _open_detail" in MODE
+    assert "self.details.open_console_details()" in MODE
 
 
-def test_console_has_two_atomic_non_animated_sizes() -> None:
-    assert "_SUMMARY_MIN = 300" in MODE
-    assert "_DETAIL_MIN = 460" in MODE
-    assert "_DETAIL_MAX = 620" in MODE
-    assert "_detail_open" in MODE
-    assert '"收起详情 ⌃" if self._detail_open else "展开详情 ⌄"' in MODE
+def test_console_summary_keeps_only_one_atomic_base_size() -> None:
+    assert "self.console.setMinimumHeight(_SUMMARY_MIN)" in MODE
+    assert "self.console.setMaximumHeight(_SUMMARY_MAX)" in MODE
+    assert "target = self._summary_target(available)" in MODE
     assert "QPropertyAnimation" not in MODE
     assert "QParallelAnimationGroup" not in MODE
     assert "QEasingCurve" not in MODE
