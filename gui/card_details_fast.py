@@ -35,7 +35,7 @@ class FastCardDetailController(CardDetailController):
         # The frame event filters installed by the base controller become the
         # click targets instead.  This happens before shell.show(), so the old
         # affordance never flashes on screen.
-        self._expandable_cards = frozenset(self._installed_cards)
+        self._expandable_cards = tuple(self._installed_cards)
         for button in tuple(self._buttons.values()):
             button.hide()
             button.setParent(None)
