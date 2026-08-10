@@ -69,12 +69,7 @@ class _CardState:
 
 
 class NekroCardInteractionController(QObject):
-    """Baseline hover/press animation without filtering every QWidget event.
-
-    A single low-cost pointer sample resolves the card under the cursor.  This
-    avoids Python receiving Resize/LayoutRequest/Paint events for the whole
-    widget tree during inline expansion.
-    """
+    """Low-cost hover/press feedback without filtering every QWidget event."""
 
     def __init__(self, window: QMainWindow, visual: VisualStyleController) -> None:
         super().__init__(window)
@@ -143,8 +138,6 @@ class NekroCardInteractionController(QObject):
             self._animate(frame, _HOVER_ALPHA, _HOVER_SECONDS)
 
     def _sample_pointer(self) -> None:
-        if bool(getattr(self.window, "_inline_card_motion_active", False)):
-            return
         card = self._card_under_cursor()
         down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
 
@@ -162,15 +155,6 @@ class NekroCardInteractionController(QObject):
         self._button_down = down
 
     def _tick_animation(self) -> None:
-        if bool(getattr(self.window, "_inline_card_motion_active", False)):
-            for state in self.states.values():
-                if state.animating:
-                    state.current_alpha = state.target_alpha
-                    state.animating = False
-                    state.surface.set_interaction(scale=1.0, overlay_alpha=state.target_alpha)
-            self._animation_timer.stop()
-            return
-
         now = time.monotonic()
         any_animating = False
         for state in self.states.values():
