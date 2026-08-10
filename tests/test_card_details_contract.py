@@ -35,23 +35,43 @@ def test_every_presentation_card_family_gets_expand_affordance() -> None:
     assert "frame.installEventFilter(self)" in BASE_DETAILS
 
 
-def test_runtime_detail_drawer_uses_shared_clip_sheet_driver() -> None:
+def test_runtime_card_detail_is_spotlight_focus_mode_not_right_drawer() -> None:
     assert "from .overlay_sheet_motion import ClipSheetMotion" in FAST_DETAILS
     assert "self._motion = ClipSheetMotion" in FAST_DETAILS
-    assert 'edge="right"' in FAST_DETAILS
-    assert "duration_ms=158" in FAST_DETAILS
+    assert 'edge="focus"' in FAST_DETAILS
+    assert "origin_provider=self._focus_origin_rect" in FAST_DETAILS
+    assert "duration_ms=176" in FAST_DETAILS
     assert "QPropertyAnimation" not in FAST_DETAILS
     assert "QParallelAnimationGroup" not in FAST_DETAILS
     assert "QEasingCurve" not in FAST_DETAILS
     assert "QGraphicsOpacityEffect" not in FAST_DETAILS
 
 
-def test_detail_body_is_populated_at_final_size_before_reveal() -> None:
-    assert "self._populate(frame)" in FAST_DETAILS
+def test_focus_panel_dims_other_cards_without_moving_them() -> None:
+    assert "QFrame#cardDetailScrim" in FAST_DETAILS
+    assert "background-color: rgba(7,10,16,150)" in FAST_DETAILS
+    assert "def _focus_rect" in FAST_DETAILS
+    assert "0.94, 0.84" in FAST_DETAILS
+    assert "0.74, 0.70" in FAST_DETAILS
+    assert "0.90, 0.82" in FAST_DETAILS
+    assert "0.84, 0.76" in FAST_DETAILS
+
+
+def test_detail_body_is_populated_at_final_size_before_focus_reveal() -> None:
+    assert "self._populate_focus(frame)" in FAST_DETAILS
     assert "self.body_layout.activate()" in FAST_DETAILS
     assert "self.drawer.layout().activate()" in FAST_DETAILS
     assert "self._motion.open()" in FAST_DETAILS
-    assert FAST_DETAILS.index("self._populate(frame)") < FAST_DETAILS.index("self._motion.open()")
+    assert FAST_DETAILS.index("self._populate_focus(frame)") < FAST_DETAILS.index("self._motion.open()")
+
+
+def test_console_focus_collects_all_tabs_not_only_current_tab() -> None:
+    assert "def _populate_console_focus" in FAST_DETAILS
+    assert "for index in range(tabs.count())" in FAST_DETAILS
+    assert "page.findChildren(QTableWidget)" in FAST_DETAILS
+    assert "page.findChildren(QPlainTextEdit)" in FAST_DETAILS
+    assert 'self.title.setText("运行控制台 · 深度详情")' in FAST_DETAILS
+    assert "console_detail_toggle" in FAST_DETAILS
 
 
 def test_detail_close_only_reverses_clip_viewport() -> None:
@@ -82,7 +102,7 @@ def test_details_are_useful_not_generic_placeholders() -> None:
     assert 'table.property("detailTitle")' in BASE_DETAILS
 
 
-def test_detail_path_has_no_layout_height_animation_or_global_filter() -> None:
+def test_detail_path_has_no_main_layout_height_animation_or_global_filter() -> None:
     assert "QApplication.instance().installEventFilter" not in FAST_DETAILS
     assert "setMinimumHeight" not in FAST_DETAILS
     assert "setMaximumHeight" not in FAST_DETAILS
