@@ -4,9 +4,6 @@ import os
 import sys
 from pathlib import Path
 
-
-# The only performance-specific process setting. It must be set before Qt is
-# imported so QQuickWindow FrameAnimation follows the threaded scene graph.
 os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
 
 
@@ -32,30 +29,19 @@ def main() -> int:
     from gui.nekro_effects import install_nekro_effects
     from gui.ui_maturity import install_mature_ui
     from gui.ui_polish import install_ui_polish
+    from gui.smooth_scroll import SmoothWheelFilter
 
     MainWindow = WorkflowMainWindow
 
     app = QApplication(sys.argv)
     app.setApplicationName("ecommerce-agent Current Workflow")
     app.setOrganizationName("ecommerce-agent")
-
-    from gui.smooth_scroll import SmoothWheelFilter
-
     app.installEventFilter(SmoothWheelFilter(app))
 
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_native_visual_style(window)
-
-    # First arrange the existing business widgets into the responsive workspace.
     install_ui_polish(window)
-
-    # Then create detail affordances. They use the fast short-lived move/reveal
-    # controller and never resize the source cards during animation.
     install_card_details(window)
-
-    # Finally establish the definitive visual hierarchy and responsive sizing.
-    # Running this after card details means every expand button gets a protected
-    # top-right lane before native focus/hover controllers enumerate widgets.
     install_mature_ui(window)
 
     quick_window = visual.background.quick_window
