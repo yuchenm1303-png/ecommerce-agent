@@ -348,9 +348,29 @@ def save_section(page: Page, section_title: str, *, timeout_s: float = 15.0) -> 
             page.wait_for_timeout(300)
             badges = collapsed_error_badges(page, section_title)
             if badges:
+                # Makro sometimes collapses the card while retaining only an
+                # aggregate "N Error" badge. Reopen that exact card solely to
+                # expose Makro's real field-level rejection so the caller can
+                # report the root cause instead of guessing business rules.
+                field_errors: list[str] = []
+                try:
+                    open_section_for_edit(page, live)
+                    page.wait_for_timeout(400)
+                    expanded = find_section(page, section_title)
+                    expanded_path = str((expanded or {}).get("path") or "")
+                    if expanded_path:
+                        field_errors = visible_section_errors(page, expanded_path)
+                except Exception:
+                    pass
+                detail = (
+                    "；字段错误：" + " | ".join(field_errors)
+                    if field_errors
+                    else ""
+                )
                 raise RuntimeError(
                     f"{section_title} 保存后仍有 Makro validation error："
                     + " | ".join(badges)
+                    + detail
                 )
             return
 
