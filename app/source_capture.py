@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
 from .browser_session import cdp_endpoint, is_cdp_ready, launch_detached_edge
 from .source_snapshot import (
@@ -33,6 +33,7 @@ _IMAGE_URL_PATTERN = re.compile(
     r"(?:(?:https?:)?\\?/\\?/)[^\\\"'<>\s]+?\.(?:jpe?g|png|webp|gif|avif)(?:\?[^\\\"'<>\s]*)?",
     re.IGNORECASE,
 )
+_NO_EVALUATE_ARG = object()
 
 
 @dataclass(slots=True, frozen=True)
@@ -164,18 +165,63 @@ def _connect_source_edge(playwright, *, profile_dir: Path, port: int, start_url:
     return browser, context, page, launched_now
 
 
+def _is_navigation_context_error(exc: BaseException) -> bool:
+    text = str(exc).casefold()
+    return "execution context was destroyed" in text and "navigation" in text
+
+
+def _wait_for_navigation_recovery(page, *, settle_ms: int) -> None:
+    """Wait for a replacement execution context after a supplier-side navigation.
+
+    1688 may perform a canonical/client redirect after DOMContentLoaded. That is
+    normal page behavior and must not abort a source capture. Only the specific
+    transient execution-context error is retried; unrelated Playwright failures
+    still fail closed.
+    """
+
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15_000)
+    except PlaywrightError:
+        # A second client-side transition may already be in flight. The short
+        # settle delay below gives the new main-frame context time to attach.
+        pass
+    page.wait_for_timeout(max(250, min(1_500, int(settle_ms) or 250)))
+
+
+def _evaluate_with_navigation_retry(
+    page,
+    expression: str,
+    arg=_NO_EVALUATE_ARG,
+    *,
+    settle_ms: int,
+    attempts: int = 4,
+):
+    for attempt in range(max(1, attempts)):
+        try:
+            if arg is _NO_EVALUATE_ARG:
+                return page.evaluate(expression)
+            return page.evaluate(expression, arg)
+        except PlaywrightError as exc:
+            if not _is_navigation_context_error(exc) or attempt + 1 >= attempts:
+                raise
+            _wait_for_navigation_recovery(page, settle_ms=settle_ms)
+    raise RuntimeError("unreachable navigation retry state")
+
+
 def _load_lazy_page(page, *, initial_wait_ms: int, scroll_wait_ms: int, max_scroll_steps: int) -> None:
     if initial_wait_ms:
         page.wait_for_timeout(initial_wait_ms)
     stable_rounds = 0
     previous_height = 0
     for _ in range(max_scroll_steps):
-        state = page.evaluate(
+        state = _evaluate_with_navigation_retry(
+            page,
             """() => ({
                 y: window.scrollY,
                 h: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
                 vh: window.innerHeight || 800
-            })"""
+            })""",
+            settle_ms=scroll_wait_ms,
         )
         height = int(state.get("h") or 0)
         y = int(state.get("y") or 0)
@@ -186,13 +232,61 @@ def _load_lazy_page(page, *, initial_wait_ms: int, scroll_wait_ms: int, max_scro
             stable_rounds = stable_rounds + 1 if height == previous_height else 0
             if stable_rounds >= 2:
                 break
-        page.evaluate("(step) => window.scrollBy(0, step)", max(300, int(viewport * 0.85)))
+        _evaluate_with_navigation_retry(
+            page,
+            "(step) => window.scrollBy(0, step)",
+            max(300, int(viewport * 0.85)),
+            settle_ms=scroll_wait_ms,
+        )
         if scroll_wait_ms:
             page.wait_for_timeout(scroll_wait_ms)
         previous_height = height
-    page.evaluate("() => window.scrollTo(0, 0)")
+    _evaluate_with_navigation_retry(
+        page,
+        "() => window.scrollTo(0, 0)",
+        settle_ms=scroll_wait_ms,
+    )
     if scroll_wait_ms:
         page.wait_for_timeout(scroll_wait_ms)
+
+
+def _capture_snapshot_with_navigation_retry(
+    page,
+    *,
+    requested_url: str,
+    max_visible_text_chars: int,
+    settle_ms: int,
+    attempts: int = 4,
+) -> SourceSnapshot:
+    for attempt in range(max(1, attempts)):
+        try:
+            return capture_page_snapshot(
+                page,
+                requested_url=requested_url,
+                max_visible_text_chars=max_visible_text_chars,
+            )
+        except PlaywrightError as exc:
+            if not _is_navigation_context_error(exc) or attempt + 1 >= attempts:
+                raise
+            _wait_for_navigation_recovery(page, settle_ms=settle_ms)
+    raise RuntimeError("unreachable snapshot retry state")
+
+
+def _screenshot_with_navigation_retry(
+    page,
+    path: Path,
+    *,
+    settle_ms: int,
+    attempts: int = 4,
+) -> None:
+    for attempt in range(max(1, attempts)):
+        try:
+            page.screenshot(path=str(path), full_page=True)
+            return
+        except PlaywrightError as exc:
+            if not _is_navigation_context_error(exc) or attempt + 1 >= attempts:
+                raise
+            _wait_for_navigation_recovery(page, settle_ms=settle_ms)
 
 
 def _image_extension(content_type: str, url: str) -> str:
@@ -374,10 +468,11 @@ def capture_product_source(
             scroll_wait_ms=int(scroll_wait_ms),
             max_scroll_steps=int(max_scroll_steps),
         )
-        snapshot = capture_page_snapshot(
+        snapshot = _capture_snapshot_with_navigation_retry(
             page,
             requested_url=source_url,
             max_visible_text_chars=int(max_visible_text_chars),
+            settle_ms=int(scroll_wait_ms),
         )
         detail_documents, detail_images = _discover_detail_images(context, snapshot)
         combined_images: list[str] = []
@@ -399,7 +494,11 @@ def capture_product_source(
             snapshot.meta["detail_image_count"] = str(len(detail_images))
         snapshot_path = write_source_snapshot(snapshot, target_dir / "source-snapshot.json")
         screenshot_path = target_dir / "source-page.png"
-        page.screenshot(path=str(screenshot_path), full_page=True)
+        _screenshot_with_navigation_retry(
+            page,
+            screenshot_path,
+            settle_ms=int(scroll_wait_ms),
+        )
         product_images = _download_page_images(
             context,
             snapshot.image_urls,
