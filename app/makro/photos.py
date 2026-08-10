@@ -200,7 +200,10 @@ def _raw_file_input(page: Page, section_path: str):
 
 
 def _next_empty_photo_slot(page: Page, section_path: str) -> tuple[str, Any] | None:
-    """Return the first real empty ``#thumbnail_N`` slot in DOM order."""
+    """Return the first real empty ``#thumbnail_N`` slot in DOM order.
+
+    ``fa-plus`` is only the empty-state marker. It is not the upload action.
+    """
 
     surface = _photo_surface(page, section_path)
     for slot_id in PHOTO_SLOT_IDS:
@@ -219,12 +222,7 @@ def _next_empty_photo_slot(page: Page, section_path: str) -> tuple[str, Any] | N
 
 
 def _visible_upload_photo_button(page: Page, section_path: str):
-    """Return the active slot's single visible ``Upload Photo`` control.
-
-    Clicking a thumbnail's orange ``+`` only selects the image role. The real
-    file chooser is opened by the blue ``Upload Photo`` control in the large
-    role panel below the thumbnail strip.
-    """
+    """Return the active role panel's visible blue ``Upload Photo`` control."""
 
     surface = _photo_surface(page, section_path)
     text_matches = surface.get_by_text("Upload Photo", exact=True)
@@ -233,7 +231,11 @@ def _visible_upload_photo_button(page: Page, section_path: str):
         candidate = text_matches.nth(index)
         try:
             if candidate.is_visible():
-                visible.append(candidate)
+                # Prefer the real button ancestor when the text is rendered in
+                # a nested span/icon wrapper; otherwise the visible node itself
+                # is still safe because click bubbles to the upload control.
+                button = candidate.locator("xpath=ancestor-or-self::button[1]")
+                visible.append(button if button.count() == 1 else candidate)
         except Exception:
             continue
     if len(visible) > 1:
@@ -244,7 +246,7 @@ def _visible_upload_photo_button(page: Page, section_path: str):
 
 
 class _DynamicPhotoFileTarget:
-    """Upload target bound to one concrete Makro ``#thumbnail_N`` slot."""
+    """Upload target bound to one concrete Makro ``#thumbnail_N`` role card."""
 
     def __init__(self, page: Page, section_path: str, slot_id: str) -> None:
         self.page = page
@@ -265,30 +267,18 @@ class _DynamicPhotoFileTarget:
         if slot.count() != 1:
             raise RuntimeError(f"Product Photos 找不到目标图片槽 #{self.slot_id}。")
 
-        plus = slot.locator("i.fa-plus, .fa-plus")
-        role_selector = None
-        for index in range(plus.count()):
-            candidate = plus.nth(index)
-            try:
-                if candidate.is_visible():
-                    role_selector = candidate
-                    break
-            except Exception:
-                continue
-        if role_selector is None:
-            raise RuntimeError(f"图片槽 #{self.slot_id} 已没有可见橙色 +，不能重复上传。")
-
-        # Real Makro interaction:
-        #   thumbnail + -> activates that role -> blue Upload Photo -> file.
-        role_selector.scroll_into_view_if_needed()
-        role_selector.click()
+        # Human-equivalent Makro interaction:
+        #   click the whole thumbnail role card -> blue Upload Photo -> file.
+        # The orange + is only used upstream to identify that the slot is empty.
+        slot.scroll_into_view_if_needed()
+        slot.click()
         self.page.wait_for_timeout(250)
 
         current_path = self._current_path()
         upload_button = _visible_upload_photo_button(self.page, current_path)
         if upload_button is None:
             raise RuntimeError(
-                f"选择 #{self.slot_id} 后没有出现可见 Upload Photo 按钮。"
+                f"点击 #{self.slot_id} 图片框后没有出现可见 Upload Photo 按钮。"
             )
 
         try:
@@ -298,8 +288,8 @@ class _DynamicPhotoFileTarget:
             self._selected = True
             return
         except PlaywrightTimeoutError:
-            # Some builds mount/reveal the shared hidden input after the button
-            # click instead of surfacing a native file chooser event.
+            # Some builds reveal/mount the shared hidden input after clicking
+            # Upload Photo instead of surfacing a native chooser event.
             pass
 
         deadline = time.monotonic() + 3.0
@@ -312,7 +302,7 @@ class _DynamicPhotoFileTarget:
             self.page.wait_for_timeout(150)
         if shared is None:
             raise RuntimeError(
-                f"#{self.slot_id} 已选中且已点击 Upload Photo，但没有 file chooser，"
+                f"#{self.slot_id} 图片框已选中且已点击 Upload Photo，但没有 file chooser，"
                 "也找不到共享 input[type=file]。"
             )
         shared.set_input_files(upload)
@@ -323,7 +313,7 @@ class _DynamicPhotoFileTarget:
 
 
 def _select_file_input(page: Page, section_path: str):
-    """Bind the next empty real thumbnail slot to Makro's upload workflow."""
+    """Bind the next empty real thumbnail role to Makro's upload workflow."""
 
     next_slot = _next_empty_photo_slot(page, section_path)
     if next_slot is None:
@@ -459,7 +449,7 @@ def upload_product_photos(
         section_path = str(section.get("path") or section_path)
         target = _select_file_input(page, section_path)
         if target is None:
-            result.items.append({"path": str(path), "status": "slot_missing", "detail": "没有下一个带橙色 + 的 #thumbnail_N 图片槽。"})
+            result.items.append({"path": str(path), "status": "slot_missing", "detail": "没有下一个空的 #thumbnail_N 图片框。"})
             continue
 
         result.attempted += 1
@@ -511,7 +501,7 @@ def upload_product_photos(
                         "path": str(path),
                         "status": "staging_unconfirmed",
                         "slot_id": target.slot_id,
-                        "detail": "Makro 没有确认目标 thumbnail 槽已被占用。",
+                        "detail": "Makro 没有确认目标 thumbnail 图片框已上传新图片。",
                     }
                 )
         except Exception as exc:
@@ -525,13 +515,13 @@ def upload_product_photos(
     result.final_count = final_state.get("completion_count")
     if result.staged == len(resolved_paths):
         result.status = "staged"
-        result.detail = f"{result.staged}/{len(resolved_paths)} 个固定 thumbnail 槽已填入，等待 Save。"
+        result.detail = f"{result.staged}/{len(resolved_paths)} 个固定 thumbnail 图片框已依次上传，等待 Save。"
     elif result.staged > 0:
         result.status = "partial_staged"
-        result.detail = f"仅 {result.staged}/{len(resolved_paths)} 个固定 thumbnail 槽确认填入。"
+        result.detail = f"仅 {result.staged}/{len(resolved_paths)} 个固定 thumbnail 图片框确认上传。"
     else:
         result.status = "staging_unconfirmed"
-        result.detail = "没有任何固定 thumbnail 槽确认填入。"
+        result.detail = "没有任何固定 thumbnail 图片框确认上传。"
     return result
 
 
