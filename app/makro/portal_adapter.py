@@ -16,6 +16,7 @@ import re
 import unicodedata
 from enum import Enum
 from typing import Any
+from urllib.parse import urlparse
 
 from playwright.sync_api import Page
 
@@ -40,6 +41,20 @@ _VERTICAL_TOKENS = (
     "品类",
 )
 _BRAND_TOKENS = ("brand", "品牌")
+_PRODUCT_INFO_MARKERS = (
+    "add product info",
+    "please fill all mandatory attributes",
+    "product photos",
+    "price stock and shipping information",
+    "product description",
+    "additional description",
+    "添加产品信息",
+    "请填写所有必填属性",
+    "产品照片",
+    "价格 库存和配送信息",
+    "产品描述",
+    "附加描述",
+)
 _ACTION_TOKENS: dict[str, tuple[str, ...]] = {
     "check_brand": (
         "check brand",
@@ -172,6 +187,12 @@ class MakroPortalAdapter:
         except (ValueError, AttributeError):
             return None
 
+    def _is_makro_host(self) -> bool:
+        try:
+            return urlparse(str(getattr(self.page, "url", "") or "")).hostname == "seller.makro.co.za"
+        except ValueError:
+            return False
+
     def _has_password(self) -> bool:
         try:
             return _first_visible(self.page.locator('input[type="password"]')) is not None
@@ -206,6 +227,62 @@ class MakroPortalAdapter:
         except Exception:
             return 0
 
+    def _product_info_structure_visible(self) -> bool:
+        """Recognize the collapsed Step 3 shell before any section is opened.
+
+        Step 3 initially renders mostly section summaries and EDIT actions, so a
+        visible-input-count gate is not reliable immediately after Create New
+        Listing. Read the rendered shell directly and require multiple stable
+        Step 3 section markers. This check is host-bound and read-only.
+        """
+
+        if not self._is_makro_host():
+            return False
+        try:
+            raw = self.page.evaluate(
+                r"""() => {
+                  const visible = (el) => {
+                    const s = getComputedStyle(el), r = el.getBoundingClientRect();
+                    return s.display !== 'none' && s.visibility !== 'hidden'
+                      && Number(s.opacity || 1) !== 0 && r.width > 2 && r.height > 2;
+                  };
+                  const body = document.body;
+                  const text = body ? (body.innerText || body.textContent || '') : '';
+                  let editActions = 0;
+                  for (const el of document.querySelectorAll('button,a,[role="button"]')) {
+                    if (!visible(el)) continue;
+                    const value = String(el.innerText || el.textContent || '').trim().toLocaleLowerCase();
+                    if (value === 'edit' || value === '编辑') editActions += 1;
+                  }
+                  return {text, editActions};
+                }"""
+            )
+        except Exception:
+            return False
+        if not isinstance(raw, dict):
+            return False
+        text = normalize_ui_text(raw.get("text") or "")
+        marker_hits = sum(
+            normalize_ui_text(marker) in text
+            for marker in _PRODUCT_INFO_MARKERS
+        )
+        if marker_hits >= 2:
+            return True
+        try:
+            edit_actions = int(raw.get("editActions") or 0)
+        except (TypeError, ValueError):
+            edit_actions = 0
+        mandatory = any(
+            normalize_ui_text(marker) in text
+            for marker in (
+                "please fill all mandatory attributes",
+                "preview title",
+                "请填写所有必填属性",
+                "预览标题",
+            )
+        )
+        return edit_actions >= 2 and mandatory
+
     def _text_stage_fallback(self) -> ListingStage:
         text = normalize_ui_text(self.body_text())
         vertical_markers = (
@@ -221,15 +298,7 @@ class MakroPortalAdapter:
             "检查您要销售的品牌",
             "输入品牌名称",
         )
-        product_markers = (
-            "add product info",
-            "product photos",
-            "price stock and shipping information",
-            "添加产品信息",
-            "产品照片",
-            "价格 库存和配送信息",
-        )
-        if sum(normalize_ui_text(marker) in text for marker in product_markers) >= 2:
+        if sum(normalize_ui_text(marker) in text for marker in _PRODUCT_INFO_MARKERS) >= 2:
             return ListingStage.PRODUCT_INFO
         if any(normalize_ui_text(marker) in text for marker in brand_markers):
             return ListingStage.BRAND
@@ -240,8 +309,18 @@ class MakroPortalAdapter:
     def detect_stage(self) -> ListingStage:
         """Detect Step 1/2/3 without making display language the primary signal."""
 
+        if self._has_password():
+            return ListingStage.UNKNOWN
+
+        # A collapsed Step 3 page is structurally complete even before its
+        # sections expose input controls, and the SPA URL can lag or use a
+        # transient shape immediately after Create New Listing. Recognize the
+        # live Step 3 shell before requiring route parsing or control density.
+        if self._product_info_structure_visible():
+            return ListingStage.PRODUCT_INFO
+
         target = self.target()
-        if target is None or self._has_password():
+        if target is None:
             return ListingStage.UNKNOWN
 
         controls = self._form_control_count()
@@ -249,9 +328,8 @@ class MakroPortalAdapter:
         vertical = str(target.vertical or "").strip()
         brand = str(target.brand or "").strip()
 
-        # Step 3 exposes a dense attribute form. requestId/vid are useful hints,
-        # but density prevents a brand-confirmation page from being mistaken for
-        # the editable product form.
+        # Expanded Step 3 forms remain a structural fallback when labels are
+        # localized beyond the known shell markers.
         if (target.request_id or target.vid or (vertical and brand)) and controls >= 5:
             return ListingStage.PRODUCT_INFO
 
