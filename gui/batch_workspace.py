@@ -9,7 +9,6 @@ from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
-    QDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -55,62 +54,7 @@ _STAGE_LABELS = {
     "STOPPED": "已停止",
 }
 
-
-class _JobDetailDialog(QDialog):
-    def __init__(self, job: BatchJob, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(f"{job.job_id} · Batch Job")
-        self.setModal(True)
-        self.resize(720, 520)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 20, 22, 20)
-        layout.setSpacing(12)
-
-        eyebrow = QLabel("BATCH JOB · FULL TRACE")
-        eyebrow.setObjectName("sectionEyebrow")
-        title = QLabel(job.product_name or _product_label(job.product_url))
-        title.setObjectName("appTitle")
-        title.setStyleSheet("font-size: 24px; font-weight: 740;")
-        layout.addWidget(eyebrow)
-        layout.addWidget(title)
-
-        summary = QLabel(
-            f"{job.job_id}   ·   {_STAGE_LABELS.get(job.status, job.status)}   ·   "
-            f"READY {job.ready}   ·   BLOCKED {job.blocked}"
-        )
-        summary.setObjectName("phaseBadge")
-        layout.addWidget(summary)
-
-        detail = QPlainTextEdit()
-        detail.setReadOnly(True)
-        detail.setPlainText(
-            "\n".join(
-                (
-                    f"Supplier URL\n{job.product_url}",
-                    f"\nVertical\n{job.vertical or '—'}",
-                    f"\nBrand\n{job.brand or '—'}",
-                    f"\nRequired blocked\n{job.required_blocked}",
-                    f"\nProduct images\n{job.image_count}",
-                    f"\nMakro targetId\n{job.makro_target_id or '—'}",
-                    f"\nRun directory\n{job.run_dir or '—'}",
-                    f"\nExecution report\n{job.execution_report or '—'}",
-                    f"\nLast detail\n{job.stage_detail or '—'}",
-                    f"\nError / review reason\n{job.error or '—'}",
-                )
-            )
-        )
-        layout.addWidget(detail, 1)
-
-        row = QHBoxLayout()
-        open_dir = QPushButton("打开 Job 目录")
-        open_dir.setObjectName("quietButton")
-        open_dir.clicked.connect(lambda: _open_path(Path(job.run_dir).parent))
-        close = QPushButton("关闭")
-        close.clicked.connect(self.accept)
-        row.addWidget(open_dir)
-        row.addStretch(1)
-        row.addWidget(close)
-        layout.addLayout(row)
+_BATCH_DETAIL_RATIO = (0.84, 0.82)
 
 
 class BatchWorkspace(QWidget):
@@ -440,11 +384,80 @@ class BatchWorkspace(QWidget):
     def _show_failure(self, text: str) -> None:
         QMessageBox.warning(self, "Batch", text)
 
+    @staticmethod
+    def _job_detail_text(job: BatchJob) -> str:
+        return "\n".join(
+            (
+                f"Supplier URL\n{job.product_url}",
+                f"\nVertical\n{job.vertical or '—'}",
+                f"\nBrand\n{job.brand or '—'}",
+                f"\nRequired blocked\n{job.required_blocked}",
+                f"\nProduct images\n{job.image_count}",
+                f"\nMakro targetId\n{job.makro_target_id or '—'}",
+                f"\nRun directory\n{job.run_dir or '—'}",
+                f"\nExecution report\n{job.execution_report or '—'}",
+                f"\nLast detail\n{job.stage_detail or '—'}",
+                f"\nError / review reason\n{job.error or '—'}",
+            )
+        )
+
+    def _open_job_in_shared_modal(self, job: BatchJob) -> bool:
+        # The formal GUI installs one FastCardDetailController on the top-level
+        # window before BatchWorkspace is created. Reuse that exact modal so
+        # Batch details get the same Quick snapshot transition, scrim, blur and
+        # close lifecycle as Single cards / Console / settings.
+        details = getattr(self.window(), "_card_details", None)
+        open_custom = getattr(details, "open_custom", None)
+        body_layout = getattr(details, "body_layout", None)
+        if not callable(open_custom) or not isinstance(body_layout, QVBoxLayout):
+            return False
+
+        def populate() -> None:
+            summary = QLabel(
+                f"{job.job_id}   ·   {_STAGE_LABELS.get(job.status, job.status)}   ·   "
+                f"READY {job.ready}   ·   BLOCKED {job.blocked}"
+            )
+            summary.setObjectName("modalMetaLabel")
+            body_layout.addWidget(summary)
+
+            detail = QPlainTextEdit()
+            detail.setObjectName("cardDetailTextView")
+            detail.setReadOnly(True)
+            detail.setPlainText(self._job_detail_text(job))
+            detail.setMinimumHeight(360)
+            body_layout.addWidget(detail, 1)
+
+            row = QHBoxLayout()
+            row.addStretch(1)
+            open_dir = QPushButton("打开 Job 目录")
+            open_dir.setObjectName("modalPrimaryButton")
+            open_dir.clicked.connect(lambda: _open_path(Path(job.run_dir).parent))
+            row.addWidget(open_dir)
+            body_layout.addLayout(row)
+
+        open_custom(
+            title=job.product_name or _product_label(job.product_url),
+            eyebrow=f"BATCH JOB · {job.job_id}",
+            populate=populate,
+            ratio=_BATCH_DETAIL_RATIO,
+        )
+        return True
+
     def _open_selected_job(self) -> None:
         row = self.table.currentRow()
         if not (0 <= row < len(self._jobs)):
             return
-        _JobDetailDialog(self._jobs[row], self).exec()
+        job = self._jobs[row]
+        if self._open_job_in_shared_modal(job):
+            return
+        # This path is only for standalone BatchWorkspace use without the formal
+        # application shell. Production run_local_gui always has the shared
+        # glass detail controller installed.
+        QMessageBox.information(
+            self,
+            f"{job.job_id} · Batch Job",
+            self._job_detail_text(job),
+        )
 
     def _open_batch_dir(self) -> None:
         batch = self.controller.batch
