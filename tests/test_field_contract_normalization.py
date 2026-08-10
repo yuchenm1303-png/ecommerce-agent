@@ -68,6 +68,39 @@ def test_fill_plan_matches_numeric_value_against_qualifier_contract_not_unit_as_
     assert error is None
 
 
+def test_numeric_hard_guard_still_blocks_composite_text() -> None:
+    field = {
+        "attribute_key": "power_consumption",
+        "label": "Power Consumption",
+        "section_heading": "Additional Description",
+        "required": False,
+        "multi_value": False,
+        "options": [],
+        "qualifier_options": [],
+        "context_text": "",
+        "controls": [
+            {
+                "id": "power_consumption",
+                "name": "power_consumption_0_value",
+                "type": "number",
+                "field_kind": "input",
+            }
+        ],
+    }
+    decision = FieldDecision(
+        field_id=field_id(field),
+        status=READY,
+        values=["5V/2A"],
+        qualifier="",
+        confidence=1.0,
+    )
+
+    _values, _qualifier, error = _hard_guard_values(field, decision)
+
+    assert error is not None
+    assert "不是有限数字" in error
+
+
 def test_direct_product_fact_contract_requires_single_value_and_real_qualifiers() -> None:
     field = live_schema_payload([_numeric_unit_field()])["fields"][0]
     compact = CompactEvidence(
