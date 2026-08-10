@@ -24,6 +24,9 @@ def test_idle_overlay_is_lowered_after_modal_surface_prime() -> None:
         "def _raise_for_transition", 1
     )[0]
     assert "surface.lower()" in bind
+    assert "_BIND_RETRIES = 4" in BRIDGE
+    assert "self._bind_attempts += 1" in bind
+    assert "self._bind_attempts < _BIND_RETRIES" in bind
     assert "QTimer.singleShot(0, self._bind_after_modal_prime)" in BRIDGE
 
 
