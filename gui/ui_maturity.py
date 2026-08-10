@@ -5,11 +5,9 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QBoxLayout,
     QFrame,
-    QLayout,
     QMainWindow,
     QPushButton,
     QSplitter,
-    QTabBar,
     QTabWidget,
     QTableWidget,
     QToolButton,
@@ -177,19 +175,6 @@ QFrame#acceptanceConsole QPlainTextEdit#consoleText {
 """
 
 
-def _set_layout_margins(layout: QLayout | None, *, left: int | None = None, top: int | None = None,
-                        right: int | None = None, bottom: int | None = None) -> None:
-    if layout is None:
-        return
-    margins = layout.contentsMargins()
-    layout.setContentsMargins(
-        margins.left() if left is None else left,
-        margins.top() if top is None else top,
-        margins.right() if right is None else right,
-        margins.bottom() if bottom is None else bottom,
-    )
-
-
 def _reserve_expand_lane(window: QMainWindow) -> None:
     """Keep a fixed top-right lane so detail affordances never cover card text."""
 
@@ -201,15 +186,19 @@ def _reserve_expand_lane(window: QMainWindow) -> None:
             continue
         margins = layout.contentsMargins()
         right = max(margins.right(), _EXPAND_SAFE_RIGHT)
-        layout.setContentsMargins(margins.left(), margins.top(), right, margins.bottom())
+        if right != margins.right():
+            layout.setContentsMargins(margins.left(), margins.top(), right, margins.bottom())
 
     for button in window.findChildren(QToolButton, "cardExpandButton"):
         button.setText("⤢")
         button.setToolTip("展开详情")
-        button.setFixedSize(20, 20)
+        if button.size().width() != 20 or button.size().height() != 20:
+            button.setFixedSize(20, 20)
         parent = button.parentWidget()
         if parent is not None:
-            button.move(max(5, parent.width() - 27), 7)
+            target_x = max(5, parent.width() - 27)
+            if button.x() != target_x or button.y() != 7:
+                button.move(target_x, 7)
             button.raise_()
 
 
@@ -289,10 +278,8 @@ def _polish_input_card(window: QMainWindow) -> None:
 
 
 def _polish_workspace(window: QMainWindow) -> None:
-    splitter = None
     root = window.centralWidget()
-    if root is not None:
-        splitter = root.findChild(QSplitter, "workspaceSplitter")
+    splitter = root.findChild(QSplitter, "workspaceSplitter") if root is not None else None
     if not isinstance(splitter, QSplitter):
         return
 
@@ -304,8 +291,7 @@ def _polish_workspace(window: QMainWindow) -> None:
         side.setMinimumWidth(300)
         side.setMaximumWidth(370)
 
-    side_tabs = getattr(window, "side_detail_tabs", None)
-    _polish_tabs(side_tabs, expanding=True)
+    _polish_tabs(getattr(window, "side_detail_tabs", None), expanding=True)
 
 
 def _polish_console(window: QMainWindow) -> None:
@@ -318,8 +304,7 @@ def _polish_console(window: QMainWindow) -> None:
         layout.setSpacing(6)
         layout.setContentsMargins(16, 10, _EXPAND_SAFE_RIGHT, 11)
 
-    phase_units = list(getattr(console, "phase_units", {}).values())
-    for unit in phase_units:
+    for unit in list(getattr(console, "phase_units", {}).values()):
         if not isinstance(unit, QFrame):
             continue
         unit.setMinimumHeight(56)
@@ -336,7 +321,7 @@ def _polish_console(window: QMainWindow) -> None:
 
 
 class MatureResponsiveController(QObject):
-    """Single responsive coordinator for the polished desktop composition."""
+    """Single coalesced responsive coordinator for the desktop composition."""
 
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
@@ -369,6 +354,12 @@ class MatureResponsiveController(QObject):
     def _workspace_splitter(self) -> QSplitter | None:
         return self.root.findChild(QSplitter, "workspaceSplitter")
 
+    @staticmethod
+    def _set_splitter_sizes_if_needed(splitter: QSplitter, target: list[int]) -> None:
+        current = splitter.sizes()
+        if len(current) != len(target) or any(abs(a - b) > 3 for a, b in zip(current, target)):
+            splitter.setSizes(target)
+
     def apply(self) -> None:
         _reserve_expand_lane(self.window)
 
@@ -380,7 +371,10 @@ class MatureResponsiveController(QObject):
             total = max(1, workspace_splitter.width() - workspace_splitter.handleWidth())
             side_target = 330 if width >= 1500 else 310
             side_target = min(side_target, max(280, int(total * 0.28)))
-            workspace_splitter.setSizes([max(560, total - side_target), side_target])
+            self._set_splitter_sizes_if_needed(
+                workspace_splitter,
+                [max(560, total - side_target), side_target],
+            )
 
         body = self._body_splitter()
         console = getattr(self.window, "console", None)
@@ -389,8 +383,6 @@ class MatureResponsiveController(QObject):
             toggle = getattr(self.window, "console_detail_toggle", None)
             expanded = isinstance(toggle, QPushButton) and toggle.isChecked()
             if expanded:
-                # Keep the data workspace dominant. The console remains useful
-                # but no longer consumes nearly half of a 1080p screen.
                 target = int(available * (0.34 if height >= 980 else 0.31))
                 target = min(350, max(260, target))
                 console.setMinimumHeight(230)
@@ -399,14 +391,14 @@ class MatureResponsiveController(QObject):
                 target = 116
                 console.setMinimumHeight(108)
                 console.setMaximumHeight(124)
-            body.setSizes([max(300, available - target), target])
+            self._set_splitter_sizes_if_needed(body, [max(300, available - target), target])
 
-        # Detail buttons are absolute children; reposition after any responsive
-        # layout pass so the reserved lane and the icon remain in sync.
         for button in self.window.findChildren(QToolButton, "cardExpandButton"):
             parent = button.parentWidget()
             if parent is not None:
-                button.move(max(5, parent.width() - 27), 7)
+                target_x = max(5, parent.width() - 27)
+                if button.x() != target_x or button.y() != 7:
+                    button.move(target_x, 7)
                 button.raise_()
 
         visual = getattr(self.window, "_visual_style", None)
