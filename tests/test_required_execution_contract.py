@@ -7,7 +7,13 @@ import pytest
 from app.ai_decisions import field_id
 from app.fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem
 from app.makro.execution import fill_one_section, run_photos
-from app.makro.photos import _DynamicPhotoFileTarget, _photo_surface, _select_file_input
+from app.makro.photos import (
+    _DynamicPhotoFileTarget,
+    _photo_surface,
+    _select_file_input,
+    _stage_accepted,
+    _visible_add_product_image_tiles,
+)
 from app.makro.sections import save_section
 from app.required_overrides import RequiredOverrideError, apply_required_overrides
 from app.resolution_types import MISSING, ResolutionRecord
@@ -126,31 +132,35 @@ def test_rejected_save_reopens_same_section_to_expose_field_level_error():
     assert "字段错误" in after_click
 
 
-def test_production_photo_path_saves_and_verifies_each_image_before_next():
+def test_production_photo_path_fills_all_fixed_slots_then_saves_once():
     source = inspect.getsource(run_photos)
-    loop = source.index("for index, image in enumerate(resolved, start=1):")
+    loop = source.index("for offset, image in enumerate(pending, start=1):")
     save = source.index("adapter.save_section(PRODUCT_PHOTOS)", loop)
-    verify_one = source.index("expected_added=1", save)
+    verify = source.index("expected_added=expected_new", save)
 
-    assert loop < save < verify_one
-    assert 'report["persisted"] += 1' in source
-    assert 'int(report["persisted"]) != requested' in source
-    assert "_wait_for_file_input(adapter" in source
-    assert "expected_added=requested" not in source
+    assert loop < save < verify
+    assert 'report["save_count"] = 1' in source
+    assert 'report["staged"] += 1' in source
+    assert 'report["persisted"] = final_count' in source
+    assert "before_add_tiles=before_add_tiles" in source
+    assert "expected_added=1" not in source
 
 
-def test_product_photos_searches_the_gallery_sibling_surface_not_only_title_card():
+def test_product_photos_treats_multiple_add_tiles_as_expected_fixed_slots():
     surface_source = inspect.getsource(_photo_surface)
+    tiles_source = inspect.getsource(_visible_add_product_image_tiles)
     select_source = inspect.getsource(_select_file_input)
 
     assert 'locator("xpath=..")' in surface_source
     assert 'ImageGalleryWrapper' in surface_source
     assert 'AddProductImage' in surface_source
+    assert "return visible" in tiles_source
+    assert "len(visible) > 1" not in tiles_source
     assert "_raw_file_input" in select_source
     assert "_add_product_image_tile" in select_source
 
 
-def test_dynamic_photo_target_uses_exact_add_tile_file_chooser_or_fresh_input():
+def test_dynamic_photo_target_clicks_next_visible_slot_and_uses_file_chooser():
     source = inspect.getsource(_DynamicPhotoFileTarget.set_input_files)
 
     assert "_raw_file_input" in source
@@ -158,3 +168,19 @@ def test_dynamic_photo_target_uses_exact_add_tile_file_chooser_or_fresh_input():
     assert "expect_file_chooser" in source
     assert "set_files" in source
     assert "direct.set_input_files" in source
+    assert "唯一可见 AddProductImage" not in source
+
+
+def test_photo_acceptance_can_be_proved_by_empty_slot_count_decreasing():
+    assert _stage_accepted(
+        {
+            "visible_image_count": 5,
+            "visible_image_sources": ["sample-a", "sample-b"],
+            "completion_count": 1,
+            "add_image_tile_count": 3,
+        },
+        before_images=5,
+        before_sources={"sample-a", "sample-b"},
+        before_completion=1,
+        before_add_tiles=4,
+    )
