@@ -41,8 +41,9 @@ def main() -> int:
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_native_visual_style(window)
     install_ui_polish(window)
-    install_card_details(window)
-    install_mature_ui(window)
+    details = install_card_details(window)
+    mature = install_mature_ui(window)
+    details.attach_mature(mature)
     install_console_summary_mode(window)
 
     smooth_wheel = SmoothWheelFilter(window)
