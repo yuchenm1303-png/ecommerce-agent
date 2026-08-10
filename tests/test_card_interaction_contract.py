@@ -79,11 +79,39 @@ def test_modal_resume_reconciles_hover_with_current_cursor() -> None:
     assert "state.snap(_NORMAL_ALPHA)" in resume
 
 
-def test_native_quick_proxy_requests_a_frame_for_each_real_alpha_change() -> None:
+def test_interaction_tint_is_local_mouse_transparent_qwidget() -> None:
+    assert "class _CardInteractionTint(QWidget)" in NATIVE_VISUAL
+    tint = _body(NATIVE_VISUAL, "class _CardInteractionTint", "class NativeGlassProxy")
+    assert "WA_TransparentForMouseEvents" in tint
+    assert "WA_TranslucentBackground" in tint
+    assert "self.lower()" in tint
+    assert "self.repaint()" in tint
+    assert "QColor(0, 0, 0, self._alpha)" in tint
+    assert "drawRoundedRect" in tint
+
+
+def test_local_tint_preserves_exact_composed_90_and_110_visual_targets() -> None:
+    assert "def _interaction_overlay_alpha" in NATIVE_VISUAL
+    helper = _body(
+        NATIVE_VISUAL,
+        "def _interaction_overlay_alpha",
+        "class _CardInteractionTint",
+    )
+    assert "255.0 * (target - _NORMAL_GLASS_ALPHA) / denominator" in helper
+    assert "_NORMAL_GLASS_ALPHA = 64.0" in NATIVE_VISUAL
+
+
+def test_high_frequency_interaction_never_crosses_into_quick_model() -> None:
     setter = _body(NATIVE_VISUAL, "def set_interaction", "def sync_geometry")
-    assert "self.background.set_card_alpha(self.frame, overlay_alpha)" in setter
-    assert "quick = self.background.quick_window" in setter
-    assert "quick.requestUpdate()" in setter
+    assert "self._interaction_tint.set_target_alpha(overlay_alpha)" in setter
+    assert "self.background.set_card_alpha" not in setter
+    assert "quick.requestUpdate" not in setter
+    assert "dataChanged" not in setter
+
+
+def test_quick_model_keeps_stable_base_glass_alpha() -> None:
+    assert '"cardAlpha": _NORMAL_GLASS_ALPHA' in NATIVE_VISUAL
+    assert "self._glass[frame] = NativeGlassProxy(frame, self.background)" in NATIVE_VISUAL
 
 
 def test_sources_compile_without_importing_pyside() -> None:
