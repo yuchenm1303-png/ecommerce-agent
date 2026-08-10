@@ -2,7 +2,9 @@
 
 Product semantics and portal mechanics are intentionally separated:
 - supplier evidence may be in any language;
-- a grounded Product Identity is resolved before marketplace search terms;
+- a grounded Product Identity is resolved before marketplace selection;
+- Step 1 reads Makro's live taxonomy and AI can only choose exact live nodes;
+- search is a bounded fallback only when the taxonomy DOM is unavailable;
 - ``MakroPortalAdapter`` handles Step 1/2 mechanics using URL/DOM structure
   before localized text;
 - only exact live Makro candidates are selected;
@@ -21,10 +23,11 @@ from typing import Any, Iterable, Protocol
 
 from playwright.sync_api import Page
 
-from ..product_identity import build_vertical_search_terms_request, infer_product_identity
+from ..product_identity import infer_product_identity
 from ..source_snapshot import SourceSnapshot
 from .listing import MAKRO_HOME_URL, MAKRO_SINGLE_LISTING_ROUTE, parse_makro_listing_url
 from .portal_adapter import ListingStage, MakroPortalAdapter, normalize_ui_text
+from .taxonomy import MakroTaxonomyBrowser
 
 
 MAKRO_NEW_LISTING_URL = f"{MAKRO_HOME_URL}#{MAKRO_SINGLE_LISTING_ROUTE}"
@@ -42,7 +45,7 @@ class JSONTaskProvider(Protocol):
 
 
 class BootstrapSearchTermsError(ValueError):
-    """The model response had no safe canonical English product-type terms."""
+    """The canonical product type is not safe enough for bounded search fallback."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -275,30 +278,22 @@ def infer_listing_bootstrap(
     *,
     image_paths: Iterable[str | Path] = (),
 ) -> ListingBootstrapHints:
-    """Resolve Product Identity first, then derive marketplace search phrases.
+    """Resolve one grounded Product Identity for taxonomy selection.
 
-    Raw supplier page-body text never flows into the production bootstrap path.
-    The second AI task receives only the already-grounded Product Identity, so a
-    supplier platform description cannot become the marketplace search subject.
+    Normal Step 1 no longer asks AI to invent marketplace search synonyms. The
+    canonical English product type is retained only as a single bounded search
+    fallback for portals where the live taxonomy DOM cannot be read.
     """
 
     identity = infer_product_identity(provider, snapshot, image_paths=image_paths)
-    raw_terms = provider.extract_json(build_vertical_search_terms_request(identity))
-    if not isinstance(raw_terms, dict):
-        raise BootstrapSearchTermsError("product-type search-term response must be a JSON object")
-
-    # The canonical identity itself is always the first candidate. Model-derived
-    # synonyms are supplemental, bounded search recall only.
-    merged = {
-        "vertical_search_terms": [
-            identity.product_type_en,
-            *list(raw_terms.get("vertical_search_terms") or []),
-        ],
-        "brand": identity.brand,
-        "brand_status": identity.brand_status,
-        "product_summary": identity.product_summary,
-    }
-    parsed = _parse_bootstrap_response(merged)
+    parsed = _parse_bootstrap_response(
+        {
+            "vertical_search_terms": [identity.product_type_en],
+            "brand": identity.brand,
+            "brand_status": identity.brand_status,
+            "product_summary": identity.product_summary,
+        }
+    )
     return ListingBootstrapHints(
         vertical_search_terms=parsed.vertical_search_terms,
         brand=parsed.brand,
@@ -310,6 +305,18 @@ def infer_listing_bootstrap(
 
 def _portal(page: Page) -> MakroPortalAdapter:
     return MakroPortalAdapter(page)
+
+
+def _taxonomy(page: Page) -> MakroTaxonomyBrowser:
+    return MakroTaxonomyBrowser(page)
+
+
+def _taxonomy_columns(page: Page) -> list[list[str]]:
+    return _taxonomy(page).columns()
+
+
+def _click_taxonomy_node(page: Page, level: int, text: str) -> bool:
+    return _taxonomy(page).click_node(level, text)
 
 
 def _body_text(page: Page) -> str:
@@ -485,6 +492,73 @@ def _visible_text_candidates(page: Page, *, limit: int = 160) -> list[str]:
         seen.add(key)
         output.append(value)
     return output
+
+
+def _build_taxonomy_choice_request(
+    hints: ListingBootstrapHints,
+    current_path: list[str],
+    candidates: list[str],
+) -> dict[str, Any]:
+    allowed = list(dict.fromkeys(candidates))
+    identity = dict(hints.product_identity or {})
+    return {
+        "task": "choose_exact_makro_taxonomy_node",
+        "system_instruction": (
+            "Navigate a marketplace category taxonomy by choosing exactly one supplied live node. "
+            "Never invent or rewrite a category label. JSON only."
+        ),
+        "prompt_instruction": (
+            "Choose the live node at this exact taxonomy level that is the best path toward the "
+            "physical product in context.product_identity. Early levels may be broad departments; "
+            "later levels should become progressively specific."
+        ),
+        "context": {
+            "product_summary": hints.product_summary,
+            "product_identity": identity,
+            "current_path": list(current_path),
+            "live_nodes": allowed,
+        },
+        "rules": [
+            "selected_node must be copied exactly from live_nodes or be empty.",
+            "Choose a broad branch when that is the correct parent at the current level.",
+            "Do not require the current node label to exactly match the supplier's ordinary product name.",
+            "Prefer the branch that can logically contain the product described by product_identity.",
+            "Never choose a recently-used/favorite node merely because it is visible unless it semantically fits the product.",
+            "If no live node plausibly contains the product, return an empty string.",
+        ],
+        "json_contract": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "selected_node": {"type": "string", "enum": ["", *allowed]},
+            },
+            "required": ["selected_node"],
+        },
+        "strict_json_schema": True,
+    }
+
+
+def choose_taxonomy_candidate(
+    provider: JSONTaskProvider,
+    hints: ListingBootstrapHints,
+    current_path: list[str],
+    candidates: list[str],
+) -> str:
+    if not candidates:
+        return ""
+    raw = provider.extract_json(_build_taxonomy_choice_request(hints, current_path, candidates))
+    if not isinstance(raw, dict):
+        raise ValueError("taxonomy chooser response must be a JSON object")
+    selected = str(raw.get("selected_node") or "").strip()
+    if not selected:
+        return ""
+    by_normalized: dict[str, list[str]] = {}
+    for candidate in candidates:
+        by_normalized.setdefault(normalize_label(candidate), []).append(candidate)
+    matches = by_normalized.get(normalize_label(selected), [])
+    if len(matches) != 1:
+        raise ValueError(f"AI returned a taxonomy node that is not one unique live candidate: {selected!r}")
+    return matches[0]
 
 
 def _build_vertical_choice_request(
@@ -695,15 +769,85 @@ def _advance_brand_confirmation(page: Page, selected: str) -> None:
     _click_create_new_listing(page, selected)
 
 
-def select_vertical(
+def _complete_vertical_leaf(page: Page, selected: str) -> str:
+    _advance_vertical_confirmation(page, selected)
+    actual_vertical, _ = _current_target_values(page)
+    return _verify_selected_value("Step 1 URL", selected, actual_vertical)
+
+
+def _select_vertical_via_taxonomy(
     page: Page,
     provider: JSONTaskProvider,
     hints: ListingBootstrapHints,
     *,
-    wait_ms: int = 800,
+    wait_ms: int,
+    max_depth: int = 7,
 ) -> str:
-    if not is_vertical_step(page):
-        raise RuntimeError("Makro is not on Step 1 / Select Vertical")
+    """Navigate exact live taxonomy nodes from root to a verified leaf vertical."""
+
+    search = _vertical_search_input(page)
+    search.fill("")
+    page.wait_for_timeout(wait_ms)
+    columns = _taxonomy_columns(page)
+    if not columns:
+        return ""
+
+    path: list[str] = []
+    for level in range(max_depth):
+        columns = _taxonomy_columns(page)
+        if level >= len(columns) or not columns[level]:
+            raise RuntimeError(
+                "Makro live taxonomy stopped before a leaf vertical was reached: "
+                + " / ".join(path)
+            )
+        candidates = columns[level]
+        selected = choose_taxonomy_candidate(provider, hints, path, candidates)
+        if not selected:
+            raise RuntimeError(
+                "AI could not choose a plausible Makro taxonomy node from exact live options at path "
+                + (" / ".join(path) if path else "<root>")
+            )
+        if not _click_taxonomy_node(page, level, selected):
+            raise RuntimeError(
+                f"Makro Step 1 could not click taxonomy node level={level}: {selected!r}"
+            )
+        path.append(selected)
+        page.wait_for_timeout(wait_ms)
+
+        if is_brand_step(page) or _vertical_confirmation_content(page):
+            return _complete_vertical_leaf(page, selected)
+
+        # Branch nodes reveal the next live column. Give the SPA a short bounded
+        # settle window, but never reinterpret unrelated page text as children.
+        next_ready = False
+        for _ in range(12):
+            columns = _taxonomy_columns(page)
+            if len(columns) > level + 1 and columns[level + 1]:
+                next_ready = True
+                break
+            if is_brand_step(page) or _vertical_confirmation_content(page):
+                return _complete_vertical_leaf(page, selected)
+            page.wait_for_timeout(250)
+        if not next_ready:
+            raise RuntimeError(
+                "Makro taxonomy node exposed neither child nodes nor a verified leaf confirmation: "
+                + " / ".join(path)
+            )
+
+    raise RuntimeError(
+        f"Makro taxonomy exceeded safe depth {max_depth}: " + " / ".join(path)
+    )
+
+
+def _select_vertical_via_search(
+    page: Page,
+    provider: JSONTaskProvider,
+    hints: ListingBootstrapHints,
+    *,
+    wait_ms: int,
+) -> str:
+    """Bounded compatibility fallback when the live taxonomy DOM is unavailable."""
+
     search = _vertical_search_input(page)
     attempted: list[str] = []
     for term in hints.vertical_search_terms:
@@ -717,10 +861,37 @@ def select_vertical(
             continue
         if not _click_exact_visible_text(page, selected):
             raise RuntimeError(f"Makro Step 1 could not click selected live vertical: {selected!r}")
-        _advance_vertical_confirmation(page, selected)
-        actual_vertical, _ = _current_target_values(page)
-        return _verify_selected_value("Step 1 URL", selected, actual_vertical)
-    raise RuntimeError("Makro Step 1 could not resolve a live vertical from search terms: " + " | ".join(attempted))
+        return _complete_vertical_leaf(page, selected)
+    raise RuntimeError(
+        "Makro Step 1 taxonomy DOM was unavailable and bounded search fallback could not resolve a live vertical from: "
+        + " | ".join(attempted)
+    )
+
+
+def select_vertical(
+    page: Page,
+    provider: JSONTaskProvider,
+    hints: ListingBootstrapHints,
+    *,
+    wait_ms: int = 800,
+) -> str:
+    if not is_vertical_step(page):
+        raise RuntimeError("Makro is not on Step 1 / Select Vertical")
+
+    selected = _select_vertical_via_taxonomy(
+        page,
+        provider,
+        hints,
+        wait_ms=wait_ms,
+    )
+    if selected:
+        return selected
+    return _select_vertical_via_search(
+        page,
+        provider,
+        hints,
+        wait_ms=wait_ms,
+    )
 
 
 def _brand_search_terms(hints: ListingBootstrapHints) -> tuple[str, ...]:
@@ -895,6 +1066,7 @@ __all__ = [
     "build_bootstrap_repair_request",
     "build_bootstrap_request",
     "choose_brand_candidate",
+    "choose_taxonomy_candidate",
     "choose_vertical_candidate",
     "infer_listing_bootstrap",
     "is_brand_ready_to_create_listing",
