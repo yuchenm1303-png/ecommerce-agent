@@ -24,160 +24,44 @@ _MATURE_STYLE = r"""
 QWidget#root {
     font-size: 12px;
 }
-
-QLabel#brandMark {
-    font-size: 9px;
-    color: rgba(255,255,255,148);
-}
-
-QLabel#appTitle {
-    font-size: 25px;
-    font-weight: 720;
-}
-
-QLabel#subtle {
-    font-size: 10px;
-    color: rgba(255,255,255,154);
-}
-
-QLabel#sectionEyebrow,
-QLabel#consoleEyebrow {
-    font-size: 9px;
-    color: rgba(255,255,255,126);
-}
-
-QLabel#cardTitle {
-    font-size: 14px;
-    font-weight: 700;
-}
-
-QLabel#cardHint,
-QLabel#consoleHint {
-    font-size: 10px;
-    color: rgba(255,255,255,156);
-}
-
-QPushButton {
-    min-height: 33px;
-    padding-left: 13px;
-    padding-right: 13px;
-}
-
-QLineEdit,
-QSpinBox,
-QComboBox {
-    min-height: 33px;
-}
-
-QTableWidget {
-    background-color: rgba(0,0,0,54);
-}
-
-QTableWidget::item {
-    padding: 7px 9px;
-}
-
-QHeaderView::section {
-    min-height: 37px;
-    padding-left: 9px;
-    padding-right: 9px;
-    background-color: rgba(255,255,255,25);
-}
-
+QLabel#brandMark { font-size: 9px; color: rgba(255,255,255,148); }
+QLabel#appTitle { font-size: 25px; font-weight: 720; }
+QLabel#subtle { font-size: 10px; color: rgba(255,255,255,154); }
+QLabel#sectionEyebrow, QLabel#consoleEyebrow { font-size: 9px; color: rgba(255,255,255,126); }
+QLabel#cardTitle { font-size: 14px; font-weight: 700; }
+QLabel#cardHint, QLabel#consoleHint { font-size: 10px; color: rgba(255,255,255,156); }
+QPushButton { min-height: 33px; padding-left: 13px; padding-right: 13px; }
+QLineEdit, QSpinBox, QComboBox { min-height: 33px; }
+QTableWidget { background-color: rgba(0,0,0,54); }
+QTableWidget::item { padding: 7px 9px; }
+QHeaderView::section { min-height: 37px; padding-left: 9px; padding-right: 9px; background-color: rgba(255,255,255,25); }
 QToolButton#cardExpandButton {
-    min-width: 20px;
-    max-width: 20px;
-    min-height: 20px;
-    max-height: 20px;
-    padding: 0;
-    margin: 0;
-    color: rgba(255,255,255,160);
-    background-color: rgba(0,0,0,30);
-    border: 1px solid rgba(255,255,255,14);
-    border-radius: 6px;
-    font-size: 11px;
-    font-weight: 650;
+    min-width: 20px; max-width: 20px; min-height: 20px; max-height: 20px;
+    padding: 0; margin: 0; color: rgba(255,255,255,160);
+    background-color: rgba(0,0,0,30); border: 1px solid rgba(255,255,255,14);
+    border-radius: 6px; font-size: 11px; font-weight: 650;
 }
-
-QToolButton#cardExpandButton:hover {
-    color: #ffffff;
-    background-color: rgba(255,255,255,30);
-    border-color: rgba(255,255,255,30);
-}
-
-QToolButton#cardExpandButton:pressed {
-    background-color: rgba(255,255,255,20);
-}
-
-QTabWidget#sideDetailTabs::pane {
-    border: 1px solid rgba(255,255,255,12);
-    border-radius: 9px;
-    background-color: rgba(0,0,0,22);
-    top: -1px;
-}
-
-QTabWidget#sideDetailTabs QTabBar {
-    background: transparent;
-}
-
+QToolButton#cardExpandButton:hover { color: #ffffff; background-color: rgba(255,255,255,30); border-color: rgba(255,255,255,30); }
+QToolButton#cardExpandButton:pressed { background-color: rgba(255,255,255,20); }
+QTabWidget#sideDetailTabs::pane { border: 1px solid rgba(255,255,255,12); border-radius: 9px; background-color: rgba(0,0,0,22); top: -1px; }
+QTabWidget#sideDetailTabs QTabBar { background: transparent; }
 QTabWidget#sideDetailTabs QTabBar::tab {
-    min-height: 27px;
-    margin: 0 4px 5px 0;
-    padding: 0 12px;
-    color: rgba(255,255,255,152);
-    background-color: rgba(0,0,0,28);
-    border: 1px solid rgba(255,255,255,10);
-    border-radius: 7px;
+    min-height: 27px; margin: 0 4px 5px 0; padding: 0 12px;
+    color: rgba(255,255,255,152); background-color: rgba(0,0,0,28);
+    border: 1px solid rgba(255,255,255,10); border-radius: 7px;
 }
-
-QTabWidget#sideDetailTabs QTabBar::tab:selected {
-    color: #ffffff;
-    background-color: rgba(255,255,255,30);
-    border-color: rgba(255,255,255,20);
-}
-
-QTabWidget#sideDetailTabs QTabBar::tab:hover {
-    color: #ffffff;
-    background-color: rgba(255,255,255,20);
-}
-
-QFrame#consolePhaseUnit {
-    background-color: rgba(0,0,0,42);
-    border: 1px solid rgba(255,255,255,12);
-    border-radius: 8px;
-}
-
-QFrame#consolePhaseUnit QLabel#consoleHint {
-    font-size: 9px;
-}
-
-QFrame#acceptanceConsole QTabWidget::pane {
-    background-color: rgba(0,0,0,32);
-    border: 1px solid rgba(255,255,255,12);
-    border-radius: 7px;
-}
-
-QFrame#acceptanceConsole QTabBar::tab {
-    min-height: 25px;
-    padding: 0 11px;
-    margin-right: 3px;
-    background-color: rgba(0,0,0,26);
-    border-radius: 6px;
-}
-
-QFrame#acceptanceConsole QTabBar::tab:selected {
-    background-color: rgba(255,255,255,28);
-}
-
-QFrame#acceptanceConsole QPlainTextEdit#consoleText {
-    background-color: rgba(0,0,0,66);
-}
+QTabWidget#sideDetailTabs QTabBar::tab:selected { color: #ffffff; background-color: rgba(255,255,255,30); border-color: rgba(255,255,255,20); }
+QTabWidget#sideDetailTabs QTabBar::tab:hover { color: #ffffff; background-color: rgba(255,255,255,20); }
+QFrame#consolePhaseUnit { background-color: rgba(0,0,0,42); border: 1px solid rgba(255,255,255,12); border-radius: 8px; }
+QFrame#consolePhaseUnit QLabel#consoleHint { font-size: 9px; }
+QFrame#acceptanceConsole QTabWidget::pane { background-color: rgba(0,0,0,32); border: 1px solid rgba(255,255,255,12); border-radius: 7px; }
+QFrame#acceptanceConsole QTabBar::tab { min-height: 25px; padding: 0 11px; margin-right: 3px; background-color: rgba(0,0,0,26); border-radius: 6px; }
+QFrame#acceptanceConsole QTabBar::tab:selected { background-color: rgba(255,255,255,28); }
+QFrame#acceptanceConsole QPlainTextEdit#consoleText { background-color: rgba(0,0,0,66); }
 """
 
 
 def _reserve_expand_lane(window: QMainWindow) -> None:
-    """Keep a fixed top-right lane so detail affordances never cover card text."""
-
     for frame in window.findChildren(QFrame):
         if frame.objectName() not in _EXPANDABLE_NAMES:
             continue
@@ -304,7 +188,8 @@ def _polish_console(window: QMainWindow) -> None:
         layout.setSpacing(6)
         layout.setContentsMargins(16, 10, _EXPAND_SAFE_RIGHT, 11)
 
-    for unit in list(getattr(console, "phase_units", {}).values()):
+    phase_units = list(getattr(console, "phase_units", {}).values())
+    for unit in phase_units:
         if not isinstance(unit, QFrame):
             continue
         unit.setMinimumHeight(56)
@@ -321,8 +206,6 @@ def _polish_console(window: QMainWindow) -> None:
 
 
 class MatureResponsiveController(QObject):
-    """Single coalesced responsive coordinator for the desktop composition."""
-
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
         self.window = window
@@ -362,7 +245,6 @@ class MatureResponsiveController(QObject):
 
     def apply(self) -> None:
         _reserve_expand_lane(self.window)
-
         width = max(1, self.root.width())
         height = max(1, self.root.height())
 
@@ -424,14 +306,11 @@ class MatureResponsiveController(QObject):
 
 
 def install_mature_ui(window: QMainWindow) -> MatureResponsiveController:
-    """Final visual hierarchy and responsive pass after cards/details exist."""
-
     root = window.centralWidget()
     if root is None:
         raise RuntimeError("mature UI requires a central widget")
 
     window.setStyleSheet(window.styleSheet() + "\n" + _MATURE_STYLE)
-
     outer = root.layout()
     if isinstance(outer, QVBoxLayout):
         outer.setContentsMargins(18, 16, 18, 16)
