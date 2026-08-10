@@ -378,7 +378,12 @@ class FastCardDetailController(CardDetailController):
         self._show_prepared_modal(ratio=ratio)
 
     def close(self) -> None:
-        if not self.drawer.isVisible() and not self.scrim.isVisible():
+        # isVisible() becomes False when the native QWidget layer's parent is
+        # temporarily hidden for a Quick close transition, even though the
+        # drawer/scrim themselves were never explicitly hidden. isHidden()
+        # tracks that explicit state, so close must still run while the parent
+        # is off-screen and prevent those children from resurfacing on show().
+        if self.drawer.isHidden() and self.scrim.isHidden():
             return
 
         self._stop_animation()
