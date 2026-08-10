@@ -40,7 +40,7 @@ def test_qml_transition_is_startup_safe_and_has_no_optional_effects_import() -> 
     assert "property url blurUrl" in MODAL
     assert "id: blurImage" in MODAL
     assert "self.transition_item: QQuickItem | None = None" in MODAL
-    init_body = MODAL.split("def __init__", 1)[1].split("def _ensure_transition_item", 1)[0]
+    init_body = MODAL.split("def __init__", 1)[1].split("def _error_text", 1)[0]
     assert "_create_quick_transition_item" not in init_body
     assert "component.status()" in MODAL
     assert "QQmlComponent.Status.Ready" in MODAL
@@ -71,9 +71,37 @@ def test_preblurred_snapshot_replaces_runtime_qtquick_effect() -> None:
 
 def test_quick_failure_falls_back_to_atomic_modal_instead_of_crashing() -> None:
     assert "if not self._ensure_transition_item():" in MODAL
-    assert "self.details.close()" in MODAL
+    assert "self._fallback_open()" in MODAL
+    assert "self._fallback_closed()" in MODAL
     assert "return" in MODAL
     assert "raise RuntimeError(\"Glass modal transition" not in MODAL
+
+
+def test_any_transition_preparation_exception_cannot_trap_modal_state() -> None:
+    assert "def _fallback_open" in MODAL
+    assert "def _fallback_closed" in MODAL
+    assert "def _error_text" in MODAL
+
+    ensure_body = MODAL.split("def _ensure_transition_item", 1)[1].split("def _rewire_close_inputs", 1)[0]
+    assert "except Exception as exc:" in ensure_body
+    assert "self._transition_error = self._error_text(exc)" in ensure_body
+    assert "return False" in ensure_body
+
+    open_body = MODAL.split("def _start_open_transition", 1)[1].split("def request_close", 1)[0]
+    assert "except Exception as exc:" in open_body
+    assert "self._fallback_open(exc)" in open_body
+
+    close_body = MODAL.split("def request_close", 1)[1].split("def _restore_widget_layer", 1)[0]
+    assert "except Exception as exc:" in close_body
+    assert "self._fallback_closed(exc)" in close_body
+
+    fallback_open = MODAL.split("def _fallback_open", 1)[1].split("def _fallback_closed", 1)[0]
+    assert "self._state = _STATE_OPEN" in fallback_open
+    assert "self._transitioning = False" in fallback_open
+
+    fallback_closed = MODAL.split("def _fallback_closed", 1)[1].split("def _ensure_transition_item", 1)[0]
+    assert "self._state = _STATE_CLOSED" in fallback_closed
+    assert "self.details.close()" in fallback_closed
 
 
 def test_modal_lifecycle_prevents_show_event_reentry_loop() -> None:
