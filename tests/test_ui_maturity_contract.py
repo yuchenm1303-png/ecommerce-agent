@@ -37,10 +37,12 @@ def test_console_phase_cards_cannot_overlap_state_text_and_expand_affordance() -
     assert 'unit_layout.setContentsMargins(10, 6, _EXPAND_SAFE_RIGHT, 6)' in MATURE
 
 
-def test_responsive_controller_coalesces_layout_work_instead_of_frame_loop() -> None:
+def test_responsive_controller_coalesces_and_is_idempotent() -> None:
     assert 'class MatureResponsiveController(QObject)' in MATURE
     assert 'self._timer.setSingleShot(True)' in MATURE
     assert 'self._timer.setInterval(32)' in MATURE
+    assert 'def _set_splitter_sizes_if_needed' in MATURE
+    assert 'any(abs(a - b) > 3 for a, b in zip(current, target))' in MATURE
     assert 'QEvent.Type.Resize' in MATURE
     assert 'QEvent.Type.LayoutRequest' in MATURE
     assert 'setInterval(16)' not in MATURE
