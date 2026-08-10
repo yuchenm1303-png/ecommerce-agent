@@ -1,36 +1,23 @@
-"""Continuous smooth wheel scrolling for the dev GUI.
-
-PySide6 does not expose ``QAbstractScrollArea.setVerticalScrollMode()`` on
-``QScrollArea`` / ``QPlainTextEdit``, and plain per-pixel ``setValue`` still
-steps once per wheel notch. So this module glides the scrollbar toward the
-wheel-driven target with a short ease-out animation: every notch becomes a
-smooth motion, and rapid notches compound into a continuous flow.
-
-Wheel events over widgets that have no scrollable ancestor (spin boxes, plain
-buttons, splitter handles, ...) are left untouched.
-"""
+"""Continuous smooth wheel scrolling without a QApplication-wide event filter."""
 
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer
-from PySide6.QtWidgets import QAbstractScrollArea, QApplication
+from PySide6.QtWidgets import QAbstractScrollArea, QWidget
 
 
 class SmoothScroller(QObject):
-    """Animate scrollbar moves so wheel notches glide instead of jump."""
-
-    _STEP_MS = 16  # ~60 fps while an animation is in flight
-    _EASE = 0.18  # fraction of the remaining distance covered per tick
+    _STEP_MS = 16
+    _EASE = 0.18
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
-        self._animations: dict[int, list] = {}  # id(bar) -> [bar, target]
+        self._animations: dict[int, list] = {}
         self._timer = QTimer(self)
         self._timer.setInterval(self._STEP_MS)
         self._timer.timeout.connect(self._tick)
 
     def push(self, bar, delta: int) -> None:
-        """Add a pixel offset to the scrollbar's glide target."""
         entry = self._animations.get(id(bar))
         if entry is None:
             entry = self._animations[id(bar)] = [bar, float(bar.value())]
@@ -56,37 +43,54 @@ class SmoothScroller(QObject):
 
 
 class SmoothWheelFilter(QObject):
-    """Consume wheel events and animate the area under the cursor."""
+    """Filter Wheel only on real scroll areas/viewports, never on QApplication."""
 
     PIXELS_PER_NOTCH = 36
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._scroller = SmoothScroller(self)
+        self._areas: dict[QObject, QAbstractScrollArea] = {}
 
-    def eventFilter(self, watched, event) -> bool:
-        del watched  # the filter is global; the target is found by position
-        if event.type() != QEvent.Wheel:
+    def install(self, root: QWidget) -> None:
+        for area in root.findChildren(QAbstractScrollArea):
+            self._attach(area)
+
+    def _attach(self, area: QAbstractScrollArea) -> None:
+        for watched in (area, area.viewport()):
+            if watched in self._areas:
+                continue
+            self._areas[watched] = area
+            watched.installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event) -> bool:  # noqa: ANN001, N802
+        if event.type() != QEvent.Type.Wheel:
             return False
-        # Keep Ctrl+wheel (e.g. text zoom) on the original widget.
-        if event.modifiers() & Qt.ControlModifier:
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             return False
 
+        area = self._areas.get(watched)
+        if area is None:
+            return False
         delta = event.angleDelta().y()
         if delta == 0:
             return False
 
-        cursor_widget = QApplication.widgetAt(event.globalPosition().toPoint())
-        node = cursor_widget
-        while node is not None:
-            # Only real scroll areas own a vertical scrollbar; QSpinBox and
-            # friends must keep their native wheel behavior.
-            if isinstance(node, QAbstractScrollArea):
-                bar = node.verticalScrollBar()
-                if bar.isVisible() and bar.maximum() > bar.minimum():
-                    self._scroller.push(
-                        bar, -round(delta / 120 * self.PIXELS_PER_NOTCH)
-                    )
-                    return True
-            node = node.parentWidget()
-        return False
+        bar = area.verticalScrollBar()
+        if not bar.isVisible() or bar.maximum() <= bar.minimum():
+            return False
+
+        self._scroller.push(
+            bar,
+            -round(delta / 120 * self.PIXELS_PER_NOTCH),
+        )
+        return True
+
+    def cleanup(self) -> None:
+        self._scroller._timer.stop()
+        for watched in tuple(self._areas):
+            try:
+                watched.removeEventFilter(self)
+            except RuntimeError:
+                pass
+        self._areas.clear()
