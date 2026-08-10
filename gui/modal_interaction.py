@@ -26,7 +26,7 @@ _STATE_OPEN = "open"
 _STATE_CLOSING = "closing"
 
 
-_TRANSITION_QML = rf'''
+_TRANSITION_QML = rf"""
 import QtQuick
 
 Item {{
@@ -37,7 +37,6 @@ Item {{
     property bool active: false
     property bool closingRequest: false
     property int command: 0
-    property url baseUrl
     property url blurUrl
     property url panelUrl
     property real panelX: 0
@@ -48,7 +47,6 @@ Item {{
     signal transitionFinished(bool opened)
 
     function prepareOpen() {{
-        baseImage.opacity = 1.0
         blurImage.opacity = 0.0
         scrim.opacity = 0.0
         panelImage.opacity = 0.0
@@ -57,7 +55,6 @@ Item {{
     }}
 
     function prepareClose() {{
-        baseImage.opacity = 1.0
         blurImage.opacity = 1.0
         scrim.opacity = 1.0
         panelImage.opacity = 1.0
@@ -81,16 +78,6 @@ Item {{
             closeAnimation.restart()
         else
             openAnimation.restart()
-    }}
-
-    Image {{
-        id: baseImage
-        anchors.fill: parent
-        source: root.baseUrl
-        cache: false
-        asynchronous: false
-        smooth: true
-        fillMode: Image.Stretch
     }}
 
     Image {{
@@ -213,25 +200,22 @@ Item {{
         onFinished: root.transitionFinished(false)
     }}
 }}
-'''
+"""
 
 
 class GlassModalInteractionController(QObject):
-    """Frame-atomic GPU modal transitions over one stable native underlay.
+    """GPU modal bridge with one permanently mapped transparent Quick overlay.
 
-    The baseline QWidget child HWND stays mapped for the entire interaction. At
-    open, card feedback is frozen at the alpha already presented on screen and
-    Fuji parallax is paused; the background QQuickWindow is allowed to swap that
-    stable frame before any screenshot is taken. The real modal is laid out while
-    hidden, then a dedicated child QQuickWindow animates static snapshots above
-    the unchanged application. Its final frame covers the reveal of the real
-    QWidget modal.
+    The QWidget application remains mapped and owns all real content. A single
+    input-transparent QQuickWindow is primed once after the event loop starts and
+    then stays transparent above the QWidget child for the application lifetime.
+    Opening/closing only toggles scene-graph items inside that already-mapped
+    surface, so Windows never has to show/hide/reorder a native transition HWND.
 
-    Closing is the exact inverse. The Quick child covers the real modal, the real
-    modal is hidden beneath the final Quick frame, the overlay is removed, and
-    only then are card feedback and parallax resumed. No QWidget parent hide/show,
-    drawer Show re-entry, layout interpolation, or moving background exists in the
-    transition hot path.
+    The underlay is frozen before capture. Only the blurred backdrop and modal
+    panel are snapshotted; the live base UI remains visible through the transparent
+    overlay. At both handoff edges, QWidget repaint is completed while the final
+    Quick frame still covers it, then the Quick item is made transparent.
     """
 
     def __init__(self, window: QMainWindow, details: FastCardDetailController) -> None:
@@ -255,9 +239,7 @@ class GlassModalInteractionController(QObject):
         self._target_open = False
         self._command = 0
         self._snapshot_revision = 0
-        self._base_snapshot = QPixmap()
         self._blur_snapshot = QPixmap()
-        self._base_url = QUrl()
         self._blur_url = QUrl()
         self._passive_labels: dict[QLabel, bool] = {}
         self._prepared_modal = False
@@ -266,9 +248,7 @@ class GlassModalInteractionController(QObject):
         self._underlay_suspended = False
         self._pointer_timer_was_active = False
 
-        self._original_capture_backdrop = self.details._capture_backdrop  # noqa: SLF001
         self._original_show_prepared_modal = self.details._show_prepared_modal  # noqa: SLF001
-        self.details._capture_backdrop = self._capture_raw_backdrop  # type: ignore[method-assign]  # noqa: SLF001
         self.details._show_prepared_modal = self._show_modal_with_transition  # type: ignore[method-assign]  # noqa: SLF001
 
         self.root.installEventFilter(self)
@@ -276,10 +256,17 @@ class GlassModalInteractionController(QObject):
         self._rewire_close_inputs()
         window.destroyed.connect(self.cleanup)
 
+        # Startup-safe: this runs only after shell.show() has completed and the
+        # event loop begins. The transition surface is mapped once, transparent.
+        QTimer.singleShot(0, self._prime_transition_surface)
+
     @staticmethod
     def _error_text(exc: Exception) -> str:
         text = str(exc).strip()
         return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+    def _prime_transition_surface(self) -> None:
+        self._ensure_transition_surface()
 
     def _sync_transition_window_geometry(self, *_args: object) -> None:
         surface = self.transition_window
@@ -288,23 +275,22 @@ class GlassModalInteractionController(QObject):
             return
         surface.setGeometry(0, 0, max(1, owner.width()), max(1, owner.height()))
 
-    def _hide_transition_surface(self) -> None:
-        if self.transition_item is not None:
+    def _deactivate_transition(self) -> None:
+        item = self.transition_item
+        surface = self.transition_window
+        if item is not None:
             try:
-                self.transition_item.setProperty("active", False)
+                item.setProperty("active", False)
             except RuntimeError:
                 pass
-        surface = self.transition_window
         if surface is not None:
             try:
-                surface.hide()
+                surface.requestUpdate()
             except RuntimeError:
                 pass
 
     def _clear_snapshots(self) -> None:
-        self._base_snapshot = QPixmap()
         self._blur_snapshot = QPixmap()
-        self._base_url = QUrl()
         self._blur_url = QUrl()
 
     def _suspend_underlay(self) -> None:
@@ -400,15 +386,37 @@ class GlassModalInteractionController(QObject):
             self._disconnect_underlay_frame_wait()
             self._begin_pending_open()
 
-    def _prepare_hidden_modal(self, *, ratio: tuple[float, float]) -> QPixmap:
+    def _capture_raw_backdrop(self) -> QPixmap:
+        screen = self.window.screen()
+        pixmap = QPixmap()
+        if screen is not None:
+            global_pos = self.root.mapToGlobal(QPoint(0, 0))
+            screen_origin = screen.geometry().topLeft()
+            local_pos = global_pos - screen_origin
+            pixmap = screen.grabWindow(
+                0,
+                local_pos.x(),
+                local_pos.y(),
+                self.root.width(),
+                self.root.height(),
+            )
+        if pixmap.isNull():
+            pixmap = self.root.grab()
+        return pixmap
+
+    def _prepare_hidden_modal(
+        self,
+        *,
+        ratio: tuple[float, float],
+        blurred: QPixmap,
+    ) -> None:
         self.details._modal_ratio = ratio  # noqa: SLF001
-        snapshot = self.details._capture_backdrop()  # noqa: SLF001
         updates_were_enabled = self.root.updatesEnabled()
         if updates_were_enabled:
             self.root.setUpdatesEnabled(False)
 
         try:
-            self.details.backdrop.setPixmap(snapshot)
+            self.details.backdrop.setPixmap(blurred)
             self.details.backdrop.setGeometry(self.root.rect())
             self.details.scrim.setGeometry(self.root.rect())
             self.details.drawer.setGeometry(self.details._drawer_rect())  # noqa: SLF001
@@ -424,10 +432,8 @@ class GlassModalInteractionController(QObject):
         finally:
             if updates_were_enabled:
                 self.root.setUpdatesEnabled(True)
-                self.root.update()
 
         self.details._schedule_geometry()  # noqa: SLF001
-        return snapshot
 
     def _reveal_prepared_modal(self) -> None:
         if not self._prepared_modal:
@@ -446,7 +452,7 @@ class GlassModalInteractionController(QObject):
         finally:
             if updates_were_enabled:
                 self.root.setUpdatesEnabled(True)
-                self.root.update()
+
         self.details.close_button.setFocus(Qt.FocusReason.OtherFocusReason)
         self.details._schedule_geometry()  # noqa: SLF001
         self._prepared_modal = False
@@ -460,7 +466,8 @@ class GlassModalInteractionController(QObject):
         self._target_open = True
         self._pending_ratio = None
         self._reveal_prepared_modal()
-        self._hide_transition_surface()
+        self.root.repaint()
+        self._deactivate_transition()
 
     def _abort_open(self, exc: Exception | None = None) -> None:
         if exc is not None:
@@ -471,7 +478,7 @@ class GlassModalInteractionController(QObject):
         self._target_open = False
         self._pending_ratio = None
         self._prepared_modal = False
-        self._hide_transition_surface()
+        self._deactivate_transition()
         self._clear_snapshots()
         self._resume_underlay()
 
@@ -483,10 +490,11 @@ class GlassModalInteractionController(QObject):
         self._target_open = False
         try:
             self.details.close()
+            self.root.repaint()
         except RuntimeError:
             pass
         self._prepared_modal = False
-        self._hide_transition_surface()
+        self._deactivate_transition()
         self._clear_snapshots()
         self._resume_underlay()
 
@@ -506,15 +514,17 @@ class GlassModalInteractionController(QObject):
             surface.setFlags(
                 Qt.WindowType.FramelessWindowHint
                 | Qt.WindowType.WindowDoesNotAcceptFocus
+                | Qt.WindowType.WindowTransparentForInput
             )
             surface.setColor(QColor(0, 0, 0, 0))
+            surface.setPersistentGraphics(True)
+            surface.setPersistentSceneGraph(True)
             surface.setGeometry(
                 0,
                 0,
                 max(1, self.quick_window.width()),
                 max(1, self.quick_window.height()),
             )
-            surface.hide()
 
             component = QQmlComponent(self.engine, self)
             component.setData(
@@ -541,8 +551,17 @@ class GlassModalInteractionController(QObject):
             self.transition_item = obj
             surface = None
             obj = None
+
             self.quick_window.widthChanged.connect(self._sync_transition_window_geometry)
             self.quick_window.heightChanged.connect(self._sync_transition_window_geometry)
+
+            # One native show/raise for the entire process lifetime. After this,
+            # the window stays mapped and transparent; transitions never touch
+            # native visibility or sibling HWND z-order again.
+            self.transition_window.show()
+            self.transition_window.raise_()
+            self.transition_window.requestUpdate()
+
             self._transition_error = ""
             return True
         except Exception as exc:
@@ -590,56 +609,77 @@ class GlassModalInteractionController(QObject):
                 self._passive_labels[label] = previous
                 label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
-    def _capture_raw_backdrop(self) -> QPixmap:
-        screen = self.window.screen()
-        pixmap = QPixmap()
-        if screen is not None:
-            global_pos = self.root.mapToGlobal(QPoint(0, 0))
-            screen_origin = screen.geometry().topLeft()
-            local_pos = global_pos - screen_origin
-            pixmap = screen.grabWindow(
-                0,
-                local_pos.x(),
-                local_pos.y(),
-                self.root.width(),
-                self.root.height(),
-            )
-        if pixmap.isNull():
-            pixmap = self.root.grab()
-        return pixmap
-
-    def _snapshot_path(self, stem: str, *, alpha: bool = False) -> Path:
-        self._snapshot_revision += 1
+    def _snapshot_path(self, stem: str, *, slot: int, alpha: bool = False) -> Path:
         temp_dir = getattr(self.background, "_temp_dir", None)
         if not isinstance(temp_dir, Path):
             raise RuntimeError("native Quick temporary directory is unavailable")
         suffix = ".png" if alpha else ".bmp"
-        return temp_dir / f"{stem}_{self._snapshot_revision}{suffix}"
+        return temp_dir / f"{stem}_{slot}{suffix}"
 
-    def _publish_pixmap(self, stem: str, pixmap: QPixmap, *, alpha: bool = False) -> QUrl:
-        path = self._snapshot_path(stem, alpha=alpha)
+    @staticmethod
+    def _save_pixmap(path: Path, pixmap: QPixmap, *, alpha: bool = False) -> QUrl:
         fmt = "PNG" if alpha else "BMP"
         if pixmap.isNull() or not pixmap.save(str(path), fmt):
-            raise RuntimeError(f"Failed to publish {stem} snapshot for modal transition")
+            raise RuntimeError(f"Failed to publish modal transition image: {path.name}")
         return QUrl.fromLocalFile(str(path))
 
-    def _configure_quick_item(self, base: QPixmap, blurred: QPixmap, panel: QPixmap) -> None:
+    def _next_snapshot_slot(self) -> int:
+        self._snapshot_revision += 1
+        return self._snapshot_revision & 1
+
+    def _set_panel_geometry(self) -> None:
         item = self.transition_item
         if item is None:
             return
         target = self.details._drawer_rect()  # noqa: SLF001
-        self._base_snapshot = base
-        self._blur_snapshot = blurred
-        self._base_url = self._publish_pixmap("modal_base", base)
-        self._blur_url = self._publish_pixmap("modal_blur", blurred)
-        panel_url = self._publish_pixmap("modal_panel", panel, alpha=True)
-        item.setProperty("baseUrl", self._base_url)
-        item.setProperty("blurUrl", self._blur_url)
-        item.setProperty("panelUrl", panel_url)
         item.setProperty("panelX", float(target.x()))
         item.setProperty("panelY", float(target.y()))
         item.setProperty("panelW", float(target.width()))
         item.setProperty("panelH", float(target.height()))
+
+    def _configure_open_assets(self, blurred: QPixmap, panel: QPixmap) -> None:
+        item = self.transition_item
+        if item is None:
+            return
+        slot = self._next_snapshot_slot()
+        blur_url = self._save_pixmap(
+            self._snapshot_path("modal_blur", slot=slot),
+            blurred,
+        )
+        panel_url = self._save_pixmap(
+            self._snapshot_path("modal_panel", slot=slot, alpha=True),
+            panel,
+            alpha=True,
+        )
+        self._blur_snapshot = blurred
+        self._blur_url = blur_url
+        item.setProperty("blurUrl", blur_url)
+        item.setProperty("panelUrl", panel_url)
+        self._set_panel_geometry()
+
+    def _configure_close_assets(self, panel: QPixmap) -> None:
+        item = self.transition_item
+        if item is None:
+            return
+        slot = self._next_snapshot_slot()
+        panel_url = self._save_pixmap(
+            self._snapshot_path("modal_panel", slot=slot, alpha=True),
+            panel,
+            alpha=True,
+        )
+        if self._blur_url.isEmpty():
+            blurred = self.details.backdrop.pixmap()
+            if blurred.isNull():
+                blurred = self.details._blur_pixmap(self._capture_raw_backdrop())  # noqa: SLF001
+            blur_url = self._save_pixmap(
+                self._snapshot_path("modal_blur", slot=slot),
+                blurred,
+            )
+            self._blur_snapshot = blurred
+            self._blur_url = blur_url
+            item.setProperty("blurUrl", blur_url)
+        item.setProperty("panelUrl", panel_url)
+        self._set_panel_geometry()
 
     def _issue_transition(self, *, closing: bool) -> None:
         item = self.transition_item
@@ -649,10 +689,6 @@ class GlassModalInteractionController(QObject):
 
         item.setProperty("closingRequest", closing)
         item.setProperty("active", True)
-        self._sync_transition_window_geometry()
-        surface.show()
-        surface.raise_()
-
         self._command += 1
         item.setProperty("command", self._command)
         surface.requestUpdate()
@@ -667,17 +703,19 @@ class GlassModalInteractionController(QObject):
             return
 
         try:
-            base = self._prepare_hidden_modal(ratio=ratio)
-            blurred = self.details._blur_pixmap(base)  # noqa: SLF001
-            if not blurred.isNull():
-                self.details.backdrop.setPixmap(blurred)
+            raw = self._capture_raw_backdrop()
+            blurred = self.details._blur_pixmap(raw)  # noqa: SLF001
+            self._prepare_hidden_modal(ratio=ratio, blurred=blurred)
 
             if not self._ensure_transition_surface():
                 self._fallback_open()
                 return
 
             panel = self.details.drawer.grab()
-            self._configure_quick_item(base, blurred if not blurred.isNull() else base, panel)
+            self._configure_open_assets(
+                blurred if not blurred.isNull() else raw,
+                panel,
+            )
             self._pending_ratio = None
             self._state = _STATE_OPENING
             self._transitioning = True
@@ -721,15 +759,8 @@ class GlassModalInteractionController(QObject):
                 self._fallback_closed()
                 return
 
-            base = self._base_snapshot
-            if base.isNull():
-                base = self._capture_raw_backdrop()
-            blurred = self._blur_snapshot
-            if blurred.isNull():
-                blurred = self.details._blur_pixmap(base)  # noqa: SLF001
             panel = self.details.drawer.grab()
-            self._configure_quick_item(base, blurred if not blurred.isNull() else base, panel)
-
+            self._configure_close_assets(panel)
             self._state = _STATE_CLOSING
             self._transitioning = True
             self._target_open = False
@@ -745,10 +776,11 @@ class GlassModalInteractionController(QObject):
             self._transitioning = False
             self._target_open = True
 
-            # The final Quick frame remains above the app while the real modal
-            # becomes visible underneath it. Underlay motion stays suspended.
+            # Paint the real modal completely while the final Quick frame is
+            # still above it. Only then make the permanent Quick overlay clear.
             self._reveal_prepared_modal()
-            self._hide_transition_surface()
+            self.root.repaint()
+            self._deactivate_transition()
             return
 
         if self._state != _STATE_CLOSING:
@@ -757,12 +789,12 @@ class GlassModalInteractionController(QObject):
         self._transitioning = False
         self._target_open = False
 
-        # Hide the real modal under the last Quick frame. The base UI is still at
-        # the exact card/parallax state captured for opening; expose it first,
-        # then resume interaction/motion for subsequent frames.
+        # Exact inverse handoff: remove the real modal and synchronously repaint
+        # the frozen base UI while the final Quick frame still covers it.
         self.details.close()
         self._prepared_modal = False
-        self._hide_transition_surface()
+        self.root.repaint()
+        self._deactivate_transition()
         self._clear_snapshots()
         self._resume_underlay()
 
@@ -780,7 +812,7 @@ class GlassModalInteractionController(QObject):
         self._target_open = False
         self._pending_ratio = None
         self._prepared_modal = False
-        self._hide_transition_surface()
+        self._deactivate_transition()
         self._resume_underlay()
         try:
             self.root.removeEventFilter(self)
@@ -795,7 +827,6 @@ class GlassModalInteractionController(QObject):
         self._passive_labels.clear()
 
         try:
-            self.details._capture_backdrop = self._original_capture_backdrop  # type: ignore[method-assign]  # noqa: SLF001
             self.details._show_prepared_modal = self._original_show_prepared_modal  # type: ignore[method-assign]  # noqa: SLF001
         except RuntimeError:
             pass
