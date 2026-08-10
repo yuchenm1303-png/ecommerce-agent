@@ -9,6 +9,7 @@ os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
 
 def main() -> int:
     try:
+        from PySide6.QtQuick import QQuickWindow
         from PySide6.QtWidgets import QApplication
     except ImportError:
         print(
@@ -39,6 +40,11 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("ecommerce-agent Current Workflow")
     app.setOrganizationName("ecommerce-agent")
+
+    # Both the native Fuji renderer and the permanent modal compositor use
+    # translucent QQuickWindow surfaces. Qt requires the alpha buffer policy to
+    # be enabled before the first QQuickWindow is created.
+    QQuickWindow.setDefaultAlphaBuffer(True)
 
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_native_visual_style(window)
