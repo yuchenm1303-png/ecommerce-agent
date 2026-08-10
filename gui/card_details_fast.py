@@ -60,6 +60,11 @@ class FastCardDetailController(CardDetailController):
         self._geometry_timer.timeout.connect(self._sync_geometry)
 
     def _schedule_geometry(self) -> None:
+        # Inline expansion is already moving the surrounding card tree. Repeating
+        # expand-button placement while that motion is in flight only adds event
+        # queue churn; the shared motion gate schedules one exact final pass.
+        if bool(getattr(self.window, "_inline_card_motion_active", False)):
+            return
         if not self._geometry_timer.isActive():
             self._geometry_timer.start()
 
