@@ -7,6 +7,7 @@ import pytest
 from app.ai_decisions import field_id
 from app.fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem
 from app.makro.execution import fill_one_section, run_photos
+from app.makro.photos import _DynamicPhotoFileTarget, _photo_surface, _select_file_input
 from app.makro.sections import save_section
 from app.required_overrides import RequiredOverrideError, apply_required_overrides
 from app.resolution_types import MISSING, ResolutionRecord
@@ -115,6 +116,16 @@ def test_save_section_clicks_makro_even_when_old_inline_errors_are_rendered():
     assert "visible_section_errors(" in after_click
 
 
+def test_rejected_save_reopens_same_section_to_expose_field_level_error():
+    source = inspect.getsource(save_section)
+    after_click = source.split("save.first.click()", maxsplit=1)[1]
+
+    assert "open_section_for_edit(page, live)" in after_click
+    assert "expanded = find_section(page, section_title)" in after_click
+    assert "field_errors = visible_section_errors(page, expanded_path)" in after_click
+    assert "字段错误" in after_click
+
+
 def test_production_photo_path_saves_and_verifies_each_image_before_next():
     source = inspect.getsource(run_photos)
     loop = source.index("for index, image in enumerate(resolved, start=1):")
@@ -126,3 +137,24 @@ def test_production_photo_path_saves_and_verifies_each_image_before_next():
     assert 'int(report["persisted"]) != requested' in source
     assert "_wait_for_file_input(adapter" in source
     assert "expected_added=requested" not in source
+
+
+def test_product_photos_searches_the_gallery_sibling_surface_not_only_title_card():
+    surface_source = inspect.getsource(_photo_surface)
+    select_source = inspect.getsource(_select_file_input)
+
+    assert 'locator("xpath=..")' in surface_source
+    assert 'ImageGalleryWrapper' in surface_source
+    assert 'AddProductImage' in surface_source
+    assert "_raw_file_input" in select_source
+    assert "_add_product_image_tile" in select_source
+
+
+def test_dynamic_photo_target_uses_exact_add_tile_file_chooser_or_fresh_input():
+    source = inspect.getsource(_DynamicPhotoFileTarget.set_input_files)
+
+    assert "_raw_file_input" in source
+    assert "_add_product_image_tile" in source
+    assert "expect_file_chooser" in source
+    assert "set_files" in source
+    assert "direct.set_input_files" in source
