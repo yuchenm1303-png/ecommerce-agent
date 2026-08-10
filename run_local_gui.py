@@ -24,6 +24,7 @@ def main() -> int:
     from gui.console_window import MainWindow
     from gui.workflow_console_window import WorkflowMainWindow
     from gui.log_presenter import install_buffered_logs
+    from gui.modal_interaction import install_modal_interaction
     from gui.native_visual_style import install_native_visual_style
     from gui.native_window_shell import install_native_window_shell
     from gui.nekro_card_fx import install_nekro_card_fx
@@ -45,6 +46,7 @@ def main() -> int:
     mature = install_mature_ui(window)
     details.attach_mature(mature)
     install_console_summary_mode(window)
+    install_modal_interaction(window, details)
 
     smooth_wheel = SmoothWheelFilter(window)
     smooth_wheel.install(window)
