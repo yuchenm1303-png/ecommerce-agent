@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QModelIndex, QObject, QRectF, Qt, QTimer
-from PySide6.QtGui import QCursor, QPainter, QPixmap
-from PySide6.QtWidgets import QAbstractScrollArea, QApplication, QFrame, QMainWindow
+from PySide6.QtGui import QColor, QCursor, QPainter, QPixmap
+from PySide6.QtWidgets import (
+    QAbstractScrollArea,
+    QApplication,
+    QFrame,
+    QMainWindow,
+    QWidget,
+)
 
 from .native_background import NativeQuickBackground
 from .visual_style import NEKRO_STYLE
@@ -10,10 +16,95 @@ from .visual_style import NEKRO_STYLE
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
 _NORMAL_GLASS_ALPHA = 64.0
+_GLASS_RADIUS = 6.0
+
+
+def _interaction_overlay_alpha(target_alpha: float) -> int:
+    """Return the local black overlay that composes base 64 to target alpha.
+
+    Quick owns the stable base glass tint (64). Interactive hover/press tint is
+    painted above that base in QWidget. Alpha composition is solved exactly so
+    target 90/110 keeps the same visual darkness as the former Quick role update.
+    """
+
+    target = max(_NORMAL_GLASS_ALPHA, min(255.0, float(target_alpha)))
+    if target <= _NORMAL_GLASS_ALPHA:
+        return 0
+    denominator = 255.0 - _NORMAL_GLASS_ALPHA
+    return max(
+        0,
+        min(
+            255,
+            int(round(255.0 * (target - _NORMAL_GLASS_ALPHA) / denominator)),
+        ),
+    )
+
+
+class _CardInteractionTint(QWidget):
+    """Tiny synchronous hover/press layer inside one QWidget card.
+
+    This layer is deliberately kept in the same renderer that receives mouse
+    input. It sits below the card's labels/controls, above the native Quick glass,
+    never accepts input, and repaints only the card rectangle.
+    """
+
+    def __init__(self, frame: QFrame) -> None:
+        super().__init__(frame)
+        self.frame = frame
+        self._alpha = 0
+        self.setObjectName("nativeCardInteractionTint")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.sync_geometry()
+        self.show()
+        self.lower()
+        frame.installEventFilter(self)
+
+    def set_target_alpha(self, target_alpha: float) -> None:
+        alpha = _interaction_overlay_alpha(target_alpha)
+        if alpha == self._alpha:
+            return
+        self._alpha = alpha
+        # This is intentionally synchronous. Hover/press is a tiny card-local
+        # paint and should be visible in the same GUI turn as the mouse event.
+        self.repaint()
+
+    def sync_geometry(self) -> None:
+        geometry = self.frame.rect()
+        if self.geometry() != geometry:
+            self.setGeometry(geometry)
+        self.lower()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if watched is self.frame and event.type() in {
+            QEvent.Type.Resize,
+            QEvent.Type.Show,
+        }:
+            self.sync_geometry()
+        return False
+
+    def paintEvent(self, _event) -> None:  # type: ignore[override]
+        if self._alpha <= 0 or self.width() <= 0 or self.height() <= 0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, self._alpha))
+        painter.drawRoundedRect(QRectF(self.rect()), _GLASS_RADIUS, _GLASS_RADIUS)
+        painter.end()
+
+    def cleanup(self) -> None:
+        try:
+            self.frame.removeEventFilter(self)
+        except RuntimeError:
+            pass
 
 
 class NativeGlassProxy(QObject):
-    """Baseline GlassBackdrop API with all glass pixels rendered in Quick."""
+    """Stable Quick glass plus immediate QWidget interaction tint."""
 
     def __init__(self, frame: QFrame, background: NativeQuickBackground) -> None:
         super().__init__(frame)
@@ -21,6 +112,7 @@ class NativeGlassProxy(QObject):
         self.background = background
         self._surface_scale = 1.0
         self._overlay_alpha = _NORMAL_GLASS_ALPHA
+        self._interaction_tint = _CardInteractionTint(frame)
 
     @property
     def surface_scale(self) -> float:
@@ -31,9 +123,11 @@ class NativeGlassProxy(QObject):
         return self._overlay_alpha
 
     def set_interaction(self, *, scale: float, overlay_alpha: float) -> None:
-        # Baseline card FX supplies scale=1.0 and alpha-only interaction states.
-        # Publish the model role and explicitly request one Quick frame so hover
-        # and press feedback is not left waiting behind unrelated GUI events.
+        # High-frequency input feedback stays entirely in QWidget. Crossing from
+        # QWidget input -> QAbstractListModel -> QML -> threaded Quick present was
+        # the source of inconsistent hover/click latency. Quick now remains at the
+        # stable 64-alpha glass baseline while this tiny local tint composes the
+        # exact target 90/110 darkness synchronously.
         scale = max(0.94, min(1.0, float(scale)))
         overlay_alpha = max(0.0, min(255.0, float(overlay_alpha)))
         if (
@@ -43,20 +137,18 @@ class NativeGlassProxy(QObject):
             return
         self._surface_scale = scale
         self._overlay_alpha = overlay_alpha
-        self.background.set_card_alpha(self.frame, overlay_alpha)
-        quick = self.background.quick_window
-        if quick is not None:
-            try:
-                quick.requestUpdate()
-            except RuntimeError:
-                pass
+        self._interaction_tint.set_target_alpha(overlay_alpha)
 
     def sync_geometry(self) -> None:
+        self._interaction_tint.sync_geometry()
         self.background.schedule_mask_update()
+
+    def cleanup(self) -> None:
+        self._interaction_tint.cleanup()
 
 
 class NativeVisualStyleController(QObject):
-    """Baseline presentation adapter with only wallpaper/glass moved to Quick."""
+    """Native Quick background/base glass with QWidget interaction feedback."""
 
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
@@ -99,10 +191,8 @@ class NativeVisualStyleController(QObject):
         """Register glass cards created after the native Quick scene started.
 
         Batch Workspace is intentionally constructed only after the proven Single
-        UI plugins finish installing. The Quick background therefore cannot see
-        those later QFrames during its initial one-shot scan. Append only the new
-        glass frames to the existing model so Single and Batch share the exact
-        same blur mask/tint renderer instead of introducing a second glass path.
+        UI plugins finish installing. Append new glass frames to the same stable
+        Quick base-glass model and give each one the same local interaction tint.
         """
 
         new_frames = [
@@ -187,6 +277,8 @@ class NativeVisualStyleController(QObject):
         self._cursor_installed = True
 
     def _sync_glass(self) -> None:
+        for surface in self._glass.values():
+            surface.sync_geometry()
         self.background.schedule_mask_update()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
@@ -200,6 +292,11 @@ class NativeVisualStyleController(QObject):
         if self.central is not None:
             try:
                 self.central.removeEventFilter(self)
+            except RuntimeError:
+                pass
+        for surface in tuple(self._glass.values()):
+            try:
+                surface.cleanup()
             except RuntimeError:
                 pass
         self.background.shutdown()
