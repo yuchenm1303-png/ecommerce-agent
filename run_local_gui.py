@@ -24,7 +24,7 @@ def main() -> int:
 
     # Keep the baseline import contract for visual tests, then layer the current
     # business workflow over that preserved QWidget shell.
-    from gui.card_details import install_card_details
+    from gui.card_details_fast import install_card_details
     from gui.console_window import MainWindow
     from gui.workflow_console_window import WorkflowMainWindow
     from gui.log_presenter import install_buffered_logs
@@ -55,7 +55,8 @@ def main() -> int:
 
     # Card details are created after the responsive layout is finalized but
     # before the native shell/focus and card-hover controllers enumerate the
-    # widget tree. The source cards never reflow during the open/close animation.
+    # widget tree. The fast controller keeps the drawer at fixed size and runs
+    # only short-lived 8 ms move/reveal motion during open/close.
     install_card_details(window)
 
     quick_window = visual.background.quick_window
