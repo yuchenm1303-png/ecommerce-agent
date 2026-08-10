@@ -15,10 +15,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-
 _EXPANDABLE_NAMES = {"glassCard", "heroCard", "statusCard", "microCard", "consolePhaseUnit"}
 _EXPAND_SAFE_RIGHT = 38
-
 
 _MATURE_STYLE = r"""
 QWidget#root { font-size: 12px; }
@@ -33,21 +31,12 @@ QLineEdit, QSpinBox, QComboBox { min-height: 33px; }
 QTableWidget { background-color: rgba(0,0,0,54); }
 QTableWidget::item { padding: 7px 9px; }
 QHeaderView::section { min-height: 37px; padding-left: 9px; padding-right: 9px; background-color: rgba(255,255,255,25); }
-QToolButton#cardExpandButton {
-    min-width: 20px; max-width: 20px; min-height: 20px; max-height: 20px;
-    padding: 0; margin: 0; color: rgba(255,255,255,160);
-    background-color: rgba(0,0,0,30); border: 1px solid rgba(255,255,255,14);
-    border-radius: 6px; font-size: 11px; font-weight: 650;
-}
+QToolButton#cardExpandButton { min-width: 20px; max-width: 20px; min-height: 20px; max-height: 20px; padding: 0; margin: 0; color: rgba(255,255,255,160); background-color: rgba(0,0,0,30); border: 1px solid rgba(255,255,255,14); border-radius: 6px; font-size: 11px; font-weight: 650; }
 QToolButton#cardExpandButton:hover { color: #ffffff; background-color: rgba(255,255,255,30); border-color: rgba(255,255,255,30); }
 QToolButton#cardExpandButton:pressed { background-color: rgba(255,255,255,20); }
 QTabWidget#sideDetailTabs::pane { border: 1px solid rgba(255,255,255,12); border-radius: 9px; background-color: rgba(0,0,0,22); top: -1px; }
 QTabWidget#sideDetailTabs QTabBar { background: transparent; }
-QTabWidget#sideDetailTabs QTabBar::tab {
-    min-height: 27px; margin: 0 4px 5px 0; padding: 0 12px;
-    color: rgba(255,255,255,152); background-color: rgba(0,0,0,28);
-    border: 1px solid rgba(255,255,255,10); border-radius: 7px;
-}
+QTabWidget#sideDetailTabs QTabBar::tab { min-height: 27px; margin: 0 4px 5px 0; padding: 0 12px; color: rgba(255,255,255,152); background-color: rgba(0,0,0,28); border: 1px solid rgba(255,255,255,10); border-radius: 7px; }
 QTabWidget#sideDetailTabs QTabBar::tab:selected { color: #ffffff; background-color: rgba(255,255,255,30); border-color: rgba(255,255,255,20); }
 QTabWidget#sideDetailTabs QTabBar::tab:hover { color: #ffffff; background-color: rgba(255,255,255,20); }
 QFrame#consolePhaseUnit { background-color: rgba(0,0,0,42); border: 1px solid rgba(255,255,255,12); border-radius: 8px; }
@@ -57,7 +46,6 @@ QFrame#acceptanceConsole QTabBar::tab { min-height: 25px; padding: 0 11px; margi
 QFrame#acceptanceConsole QTabBar::tab:selected { background-color: rgba(255,255,255,28); }
 QFrame#acceptanceConsole QPlainTextEdit#consoleText { background-color: rgba(0,0,0,66); }
 """
-
 
 def _reserve_expand_lane(window: QMainWindow) -> None:
     for frame in window.findChildren(QFrame):
@@ -70,7 +58,6 @@ def _reserve_expand_lane(window: QMainWindow) -> None:
         right = max(margins.right(), _EXPAND_SAFE_RIGHT)
         if right != margins.right():
             layout.setContentsMargins(margins.left(), margins.top(), right, margins.bottom())
-
     for button in window.findChildren(QToolButton, "cardExpandButton"):
         button.setText("⤢")
         button.setToolTip("展开详情")
@@ -83,7 +70,6 @@ def _reserve_expand_lane(window: QMainWindow) -> None:
                 button.move(target_x, 7)
             button.raise_()
 
-
 def _polish_tabs(tabs: QTabWidget | None, *, expanding: bool) -> None:
     if not isinstance(tabs, QTabWidget):
         return
@@ -94,7 +80,6 @@ def _polish_tabs(tabs: QTabWidget | None, *, expanding: bool) -> None:
     bar.setElideMode(Qt.TextElideMode.ElideRight)
     tabs.setDocumentMode(True)
 
-
 def _polish_tables(window: QMainWindow) -> None:
     field_table = getattr(window, "field_table", None)
     if isinstance(field_table, QTableWidget):
@@ -103,18 +88,15 @@ def _polish_tables(window: QMainWindow) -> None:
         field_table.horizontalHeader().setMinimumHeight(37)
         field_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         field_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-
     web_table = getattr(window, "web_table", None)
     if isinstance(web_table, QTableWidget):
         web_table.verticalHeader().setDefaultSectionSize(37)
         web_table.horizontalHeader().setMinimumHeight(36)
-
     console = getattr(window, "console", None)
     if isinstance(console, QWidget):
         for table in console.findChildren(QTableWidget):
             table.verticalHeader().setDefaultSectionSize(35)
             table.horizontalHeader().setMinimumHeight(35)
-
 
 def _polish_status_cards(window: QMainWindow) -> None:
     for name in ("ready_card", "missing_card", "conflict_card", "blocked_card"):
@@ -128,28 +110,22 @@ def _polish_status_cards(window: QMainWindow) -> None:
             layout.setSpacing(1)
             layout.setContentsMargins(15, 8, _EXPAND_SAFE_RIGHT, 8)
 
-
 def _polish_input_card(window: QMainWindow) -> None:
     url_input = getattr(window, "url_input", None)
     input_card = url_input.parentWidget() if isinstance(url_input, QWidget) else None
-    while isinstance(input_card, QWidget) and not (
-        isinstance(input_card, QFrame) and input_card.objectName() == "heroCard"
-    ):
+    while isinstance(input_card, QWidget) and not (isinstance(input_card, QFrame) and input_card.objectName() == "heroCard"):
         input_card = input_card.parentWidget()
     if not isinstance(input_card, QFrame):
         return
-
     layout = input_card.layout()
     if isinstance(layout, QVBoxLayout):
         layout.setSpacing(7)
         layout.setContentsMargins(18, 11, _EXPAND_SAFE_RIGHT, 12)
-
     for name in ("step1_button", "step2_button", "step3_button"):
         button = getattr(window, name, None)
         if isinstance(button, QPushButton):
             button.setMinimumWidth(132)
             button.setMaximumWidth(158)
-
     start = getattr(window, "start_button", None)
     stop = getattr(window, "stop_button", None)
     if isinstance(start, QPushButton):
@@ -157,7 +133,6 @@ def _polish_input_card(window: QMainWindow) -> None:
     if isinstance(stop, QPushButton):
         stop.setMinimumWidth(58)
         stop.setMaximumWidth(74)
-
 
 def _polish_workspace(window: QMainWindow) -> None:
     root = window.centralWidget()
@@ -172,7 +147,6 @@ def _polish_workspace(window: QMainWindow) -> None:
         side.setMinimumWidth(300)
         side.setMaximumWidth(370)
     _polish_tabs(getattr(window, "side_detail_tabs", None), expanding=True)
-
 
 def _polish_console(window: QMainWindow) -> None:
     console = getattr(window, "console", None)
@@ -197,7 +171,6 @@ def _polish_console(window: QMainWindow) -> None:
     if isinstance(tabs, QTabWidget):
         tabs.setMinimumHeight(118)
 
-
 class MatureResponsiveController(QObject):
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
@@ -215,24 +188,19 @@ class MatureResponsiveController(QObject):
             if isinstance(toggle, QPushButton):
                 toggle.toggled.connect(lambda *_: self.schedule())
         self.schedule()
-
     def schedule(self) -> None:
         if not self._timer.isActive():
             self._timer.start()
-
     def _body_splitter(self) -> QSplitter | None:
         value = getattr(self.window, "_ui_polish_body_splitter", None)
         return value if isinstance(value, QSplitter) else None
-
     def _workspace_splitter(self) -> QSplitter | None:
         return self.root.findChild(QSplitter, "workspaceSplitter")
-
     @staticmethod
     def _set_splitter_sizes_if_needed(splitter: QSplitter, target: list[int]) -> None:
         current = splitter.sizes()
         if len(current) != len(target) or any(abs(a - b) > 3 for a, b in zip(current, target)):
             splitter.setSizes(target)
-
     def apply(self) -> None:
         _reserve_expand_lane(self.window)
         width = max(1, self.root.width())
@@ -270,19 +238,16 @@ class MatureResponsiveController(QObject):
         background = getattr(visual, "background", None)
         if background is not None and hasattr(background, "schedule_mask_update"):
             background.schedule_mask_update()
-
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if watched is self.root and event.type() in {QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.LayoutRequest}:
             self.schedule()
         return False
-
     def cleanup(self) -> None:
         self._timer.stop()
         try:
             self.root.removeEventFilter(self)
         except RuntimeError:
             pass
-
 
 def install_mature_ui(window: QMainWindow) -> MatureResponsiveController:
     root = window.centralWidget()
