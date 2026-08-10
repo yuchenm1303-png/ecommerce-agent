@@ -12,7 +12,56 @@ def _body(source: str, start: str, end: str) -> str:
     return source.split(start, 1)[1].split(end, 1)[0]
 
 
-def test_card_interaction_watches_the_entire_widget_subtree() -> None:
+def test_card_feedback_keeps_simple_three_state_visuals() -> None:
+    assert "_NORMAL_ALPHA = 64.0" in CARD_FX
+    assert "_HOVER_ALPHA = 90.0" in CARD_FX
+    assert "_ACTIVE_ALPHA = 110.0" in CARD_FX
+    assert "_css_ease" not in CARD_FX
+    assert "_HOVER_SECONDS" not in CARD_FX
+    assert "_PRESS_SECONDS" not in CARD_FX
+    assert "_RELEASE_SECONDS" not in CARD_FX
+
+
+def test_one_pointer_sampler_is_the_authoritative_hover_fallback() -> None:
+    assert "_POINTER_SAMPLE_MS = 8" in CARD_FX
+    assert "self._pointer_timer = QTimer(self)" in CARD_FX
+    assert "self._pointer_timer.setTimerType(Qt.TimerType.PreciseTimer)" in CARD_FX
+    assert "self._pointer_timer.setInterval(_POINTER_SAMPLE_MS)" in CARD_FX
+    assert "self._pointer_timer.timeout.connect(self._sample_pointer)" in CARD_FX
+    assert "def _card_at_global" in CARD_FX
+    assert "QApplication.widgetAt(global_pos)" in CARD_FX
+    assert "self._card_at_global(QCursor.pos())" in CARD_FX
+
+
+def test_existing_widget_events_are_only_zero_latency_resample_hints() -> None:
+    event_filter = _body(CARD_FX, "def eventFilter", "def _cleanup")
+    assert "QEvent.Type.Enter" in event_filter
+    assert "QEvent.Type.MouseMove" in event_filter
+    assert "QEvent.Type.Leave" in event_filter
+    assert "self._sample_pointer()" in event_filter
+    assert "self._begin_press(self._card_at_global(QCursor.pos()))" in event_filter
+    assert "self._end_press()" in event_filter
+    assert event_filter.rstrip().endswith("return False")
+
+
+def test_fast_press_release_cannot_collapse_before_one_presented_frame() -> None:
+    assert "_MIN_PRESSED_MS = 24" in CARD_FX
+    assert "self._press_clock = QElapsedTimer()" in CARD_FX
+    assert "self._release_timer = QTimer(self)" in CARD_FX
+    assert "self._release_timer.setSingleShot(True)" in CARD_FX
+    assert "self._release_timer.setTimerType(Qt.TimerType.PreciseTimer)" in CARD_FX
+
+    begin = _body(CARD_FX, "def _begin_press", "def _end_press")
+    end = _body(CARD_FX, "def _end_press", "def _finish_release")
+    finish = _body(CARD_FX, "def _finish_release", "def _sample_pointer")
+    assert "self._press_clock.start()" in begin
+    assert "self._publish(frame, _ACTIVE_ALPHA)" in begin
+    assert "_MIN_PRESSED_MS - int(elapsed)" in end
+    assert "self._release_timer.start(remaining)" in end
+    assert "self._publish(current, _HOVER_ALPHA)" in finish
+
+
+def test_subtree_events_are_preserved_without_becoming_pointer_truth() -> None:
     assert "self._watched_to_card: dict[QObject, QFrame]" in CARD_FX
     assert "def _nearest_card" in CARD_FX
     assert "def _watch_widget" in CARD_FX
@@ -20,63 +69,18 @@ def test_card_interaction_watches_the_entire_widget_subtree() -> None:
     assert "root.findChildren(QWidget)" in CARD_FX
     assert "widget.setMouseTracking(True)" in CARD_FX
     assert "widget.installEventFilter(self)" in CARD_FX
+    assert "QEvent.Type.ChildAdded" in CARD_FX
 
 
-def test_card_feedback_is_a_direct_three_state_machine_without_timer_latency() -> None:
-    assert "_NORMAL_ALPHA = 64.0" in CARD_FX
-    assert "_HOVER_ALPHA = 90.0" in CARD_FX
-    assert "_ACTIVE_ALPHA = 110.0" in CARD_FX
-    assert "QTimer" not in CARD_FX
-    assert "time.monotonic" not in CARD_FX
-    assert "_css_ease" not in CARD_FX
-    assert "_ANIMATION_FRAME_MS" not in CARD_FX
-    assert "_HOVER_SECONDS" not in CARD_FX
-    assert "_PRESS_SECONDS" not in CARD_FX
-    assert "_RELEASE_SECONDS" not in CARD_FX
-
-
-def test_enter_and_mouse_move_publish_hover_immediately() -> None:
-    event_filter = _body(CARD_FX, "def eventFilter", "def _cleanup")
-    assert "QEvent.Type.Enter" in event_filter
-    assert "QEvent.Type.MouseMove" in event_filter
-    assert "self._enter(frame)" in event_filter
-
-    enter = _body(CARD_FX, "def _enter", "def _leave")
-    assert "self._publish(frame, _HOVER_ALPHA)" in enter
-
-
-def test_every_press_and_release_forms_one_complete_click_pulse() -> None:
-    press = _body(CARD_FX, "def _press", "def _release")
-    release = _body(CARD_FX, "def _release", "def _reset_card")
-
-    assert "self._publish(frame, _ACTIVE_ALPHA)" in press
-    assert "self._publish(frame, _HOVER_ALPHA)" in release
-    assert "self._publish(frame, _NORMAL_ALPHA)" in release
-    assert "_animate" not in press
-    assert "_animate" not in release
-
-
-def test_child_leave_only_clears_hover_after_pointer_leaves_whole_card() -> None:
-    event_filter = _body(CARD_FX, "def eventFilter", "def _cleanup")
-    assert "QEvent.Type.Leave" in event_filter
-    assert "if not self._cursor_inside_card(frame):" in event_filter
-    assert "self._leave(frame)" in event_filter
-    assert "frame.mapFromGlobal(QCursor.pos())" in CARD_FX
-
-
-def test_dynamic_card_children_are_registered_without_consuming_events() -> None:
-    event_filter = _body(CARD_FX, "def eventFilter", "def _cleanup")
-    assert "QEvent.Type.ChildAdded" in event_filter
-    assert "self._register_widget_tree(child)" in event_filter
-    assert event_filter.rstrip().endswith("return False")
-
-
-def test_modal_resume_reconciles_hover_with_current_cursor() -> None:
-    assert "def suspend_for_modal" in CARD_FX
+def test_modal_suspend_stops_pointer_work_and_resume_reconciles_immediately() -> None:
+    suspend = _body(CARD_FX, "def suspend_for_modal", "def resume_from_modal")
     resume = _body(CARD_FX, "def resume_from_modal", "def eventFilter")
-    assert "self._cursor_inside_card(frame)" in resume
-    assert "state.snap(_HOVER_ALPHA)" in resume
-    assert "state.snap(_NORMAL_ALPHA)" in resume
+    assert "self._pointer_timer.stop()" in suspend
+    assert "self._release_timer.stop()" in suspend
+    assert "state.republish()" in suspend
+    assert "current = self._card_at_global(QCursor.pos())" in resume
+    assert "state.snap(_HOVER_ALPHA if frame is current else _NORMAL_ALPHA)" in resume
+    assert "self._pointer_timer.start()" in resume
 
 
 def test_interaction_tint_is_local_mouse_transparent_qwidget() -> None:
