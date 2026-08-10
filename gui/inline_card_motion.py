@@ -5,8 +5,8 @@ from collections.abc import Callable
 
 from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtWidgets import (
-    QBoxLayout,
     QFrame,
+    QHBoxLayout,
     QLayout,
     QMainWindow,
     QPushButton,
@@ -49,20 +49,20 @@ def _widget_index(parent: QLayout, widget: QWidget) -> int:
     return -1
 
 
-def _detach_layout(parent: QLayout, child: QLayout) -> QLayout:
+def _remove_layout(parent: QLayout, child: QLayout) -> None:
     index = _layout_index(parent, child)
     if index < 0:
-        return child
+        return
     item = parent.takeAt(index)
-    return item.layout() or child
+    layout = item.layout()
+    if layout is not None:
+        layout.deleteLater()
 
 
-def _detach_widget(parent: QLayout, widget: QWidget) -> QWidget:
+def _detach_widget(parent: QLayout, widget: QWidget) -> None:
     index = _widget_index(parent, widget)
-    if index < 0:
-        return widget
-    item = parent.takeAt(index)
-    return item.widget() or widget
+    if index >= 0:
+        parent.takeAt(index)
 
 
 def _glass_sync(window: QMainWindow) -> None:
@@ -73,13 +73,7 @@ def _glass_sync(window: QMainWindow) -> None:
 
 
 class AdaptiveReveal(QObject):
-    """Animate an inline card body without ever overlapping sibling cards.
-
-    Only the clipping wrapper height changes. The parent layout performs normal
-    reflow each frame, so following cards move with the animation instead of
-    jumping after it. For splitter-hosted cards, the splitter allocation follows
-    the same progress curve.
-    """
+    """Animate inline card content while the normal layout keeps siblings apart."""
 
     def __init__(
         self,
@@ -114,6 +108,7 @@ class AdaptiveReveal(QObject):
         self._duration_ms = _MIN_DURATION_MS
         self._expanded = False
         self._last_mask_sync = 0.0
+        self._responsive_suspended = False
 
         self.wrapper.setMinimumHeight(0)
         self.wrapper.setMaximumHeight(0)
@@ -123,7 +118,7 @@ class AdaptiveReveal(QObject):
 
     @staticmethod
     def _ease(progress: float) -> float:
-        # Quintic smoothstep: zero velocity at both ends and no abrupt layout snap.
+        # Quintic smoothstep gives zero start/end velocity, avoiding the final snap.
         p = min(1.0, max(0.0, progress))
         return p * p * p * (p * (p * 6.0 - 15.0) + 10.0)
 
@@ -143,11 +138,15 @@ class AdaptiveReveal(QObject):
             natural = min(natural, max(0, int(self.expanded_height(natural))))
         return natural
 
-    def _duration_for(self, distance: int) -> int:
-        # Longer cards get a little more travel time, never enough to feel slow.
+    @staticmethod
+    def _duration_for(distance: int) -> int:
+        # A small card feels immediate; a taller card gets enough time to read as
+        # physical expansion, but never turns into a slow accordion animation.
         return max(_MIN_DURATION_MS, min(_MAX_DURATION_MS, 148 + int(abs(distance) * 0.28)))
 
     def _suspend_responsive_controller(self) -> None:
+        if self._responsive_suspended:
+            return
         mature = getattr(self.window, "_mature_ui", None)
         timer = getattr(mature, "_timer", None)
         root = getattr(mature, "root", None)
@@ -158,9 +157,12 @@ class AdaptiveReveal(QObject):
                 root.removeEventFilter(mature)
             except RuntimeError:
                 pass
+        self._responsive_suspended = True
         setattr(self.window, "_inline_card_motion_active", True)
 
     def _resume_responsive_controller(self) -> None:
+        if not self._responsive_suspended:
+            return
         mature = getattr(self.window, "_mature_ui", None)
         root = getattr(mature, "root", None)
         if root is not None and mature is not None:
@@ -168,6 +170,7 @@ class AdaptiveReveal(QObject):
                 root.installEventFilter(mature)
             except RuntimeError:
                 pass
+        self._responsive_suspended = False
         setattr(self.window, "_inline_card_motion_active", False)
         if mature is not None and hasattr(mature, "schedule"):
             mature.schedule()
@@ -200,8 +203,6 @@ class AdaptiveReveal(QObject):
         if self.splitter is None or self.splitter.count() < 2:
             return
         available = max(1, self.splitter.height() - self.splitter.handleWidth())
-        # The collapsed shell is header + progress + margins; current card height
-        # minus the currently visible wrapper is the most robust live estimate.
         shell = max(86, self.card.height() - max(0, self.wrapper.height()))
         target_card = min(max(108, shell + wrapper_height), max(108, available - 250))
         self.splitter.setSizes([max(250, available - target_card), target_card])
@@ -211,6 +212,9 @@ class AdaptiveReveal(QObject):
         progress = min(1.0, elapsed_ms / max(1.0, float(self._duration_ms)))
         eased = self._ease(progress)
         height = int(round(self._from + (self._to - self._from) * eased))
+
+        # This is the only animated layout property. The parent QVBox/QSplitter
+        # reflows normally, so no two cards can occupy the same geometry.
         self.wrapper.setMaximumHeight(max(0, height))
         self._apply_splitter_height(height)
 
@@ -247,7 +251,7 @@ def _build_real_settings_motion(window: QMainWindow) -> AdaptiveReveal | None:
     toggle = getattr(window, "real_settings_toggle", None)
     scope = getattr(window, "real_scope_combo", None)
     start = getattr(window, "real_start_button", None)
-    if not all(isinstance(value, QWidget) for value in (toggle, scope, start)):
+    if not isinstance(toggle, QPushButton) or not isinstance(scope, QWidget) or not isinstance(start, QWidget):
         return None
 
     card = scope.parentWidget()
@@ -261,10 +265,10 @@ def _build_real_settings_motion(window: QMainWindow) -> AdaptiveReveal | None:
     if not isinstance(layout, QVBoxLayout):
         return None
 
-    controls = _find_direct_layout(layout, scope)
-    actions = _find_direct_layout(layout, start)
+    old_controls = _find_direct_layout(layout, scope)
+    old_actions = _find_direct_layout(layout, start)
     summary = _find_direct_layout(layout, toggle)
-    if not all(isinstance(value, QLayout) for value in (controls, actions, summary)):
+    if old_controls is None or old_actions is None or summary is None:
         return None
 
     try:
@@ -272,17 +276,17 @@ def _build_real_settings_motion(window: QMainWindow) -> AdaptiveReveal | None:
     except (RuntimeError, TypeError):
         pass
 
-    controls = _detach_layout(layout, controls)
-    actions = _detach_layout(layout, actions)
+    _remove_layout(layout, old_controls)
+    _remove_layout(layout, old_actions)
 
     wrapper = QWidget(card)
     wrapper.setObjectName("realSettingsReveal")
     body = QVBoxLayout(wrapper)
     body.setContentsMargins(0, 0, 0, 0)
     body.setSpacing(6)
-    body.addLayout(controls)
-    body.addLayout(actions)
 
+    controls = QHBoxLayout()
+    controls.setSpacing(9)
     for name in (
         "real_scope_combo",
         "real_save_check",
@@ -290,13 +294,27 @@ def _build_real_settings_motion(window: QMainWindow) -> AdaptiveReveal | None:
         "real_pick_images_button",
         "real_image_count",
         "real_qc_check",
-        "real_policy_hint",
-        "real_start_button",
-        "real_stop_button",
     ):
         widget = getattr(window, name, None)
         if isinstance(widget, QWidget):
             widget.setVisible(True)
+            controls.addWidget(widget)
+    controls.addStretch(1)
+    body.addLayout(controls)
+
+    actions = QHBoxLayout()
+    actions.setSpacing(8)
+    policy = getattr(window, "real_policy_hint", None)
+    if isinstance(policy, QWidget):
+        policy.setVisible(True)
+        actions.addWidget(policy, 1)
+    actions.addSpacing(10)
+    for name in ("real_start_button", "real_stop_button"):
+        widget = getattr(window, name, None)
+        if isinstance(widget, QWidget):
+            widget.setVisible(True)
+            actions.addWidget(widget)
+    body.addLayout(actions)
 
     summary_index = _layout_index(layout, summary)
     layout.insertWidget(max(0, summary_index + 1), wrapper)
@@ -325,9 +343,9 @@ def _build_console_motion(window: QMainWindow) -> AdaptiveReveal | None:
     if not isinstance(layout, QVBoxLayout) or not isinstance(tabs, QTabWidget) or not phase_units:
         return None
 
-    phases = _find_direct_layout(layout, phase_units[0]) if isinstance(phase_units[0], QWidget) else None
+    old_phases = _find_direct_layout(layout, phase_units[0]) if isinstance(phase_units[0], QWidget) else None
     progress_row = _find_direct_layout(layout, progress) if isinstance(progress, QWidget) else None
-    if not isinstance(phases, QLayout) or not isinstance(progress_row, QLayout):
+    if old_phases is None or progress_row is None:
         return None
 
     try:
@@ -335,7 +353,7 @@ def _build_console_motion(window: QMainWindow) -> AdaptiveReveal | None:
     except (RuntimeError, TypeError):
         pass
 
-    phases = _detach_layout(layout, phases)
+    _remove_layout(layout, old_phases)
     _detach_widget(layout, tabs)
 
     wrapper = QWidget(console)
@@ -343,22 +361,26 @@ def _build_console_motion(window: QMainWindow) -> AdaptiveReveal | None:
     wrapper_layout = QVBoxLayout(wrapper)
     wrapper_layout.setContentsMargins(0, 0, 0, 0)
     wrapper_layout.setSpacing(5)
-    wrapper_layout.addLayout(phases)
-    wrapper_layout.addWidget(tabs, 1)
 
+    phases = QHBoxLayout()
+    phases.setSpacing(7)
     for unit in phase_units:
         if isinstance(unit, QWidget):
             unit.setVisible(True)
+            phases.addWidget(unit, 1)
+    wrapper_layout.addLayout(phases)
     tabs.setVisible(True)
+    wrapper_layout.addWidget(tabs, 1)
 
     progress_index = _layout_index(layout, progress_row)
     layout.insertWidget(max(0, progress_index + 1), wrapper, 1)
 
     def expanded_target(natural: int) -> int:
         available = max(1, body_splitter.height() - body_splitter.handleWidth())
-        # Preserve at least 250 px for the field workspace. The wrapper gets the
-        # rest after the ~90 px console shell, capped by its natural size.
-        budget = max(220, min(360, available - 340))
+        target_total = min(440, max(340, available - 300))
+        target_total = min(target_total, max(260, available - 260))
+        collapsed_shell = max(96, console.height())
+        budget = max(220, target_total - collapsed_shell)
         return min(natural, budget)
 
     return AdaptiveReveal(
@@ -383,6 +405,6 @@ def install_inline_card_motion(window: QMainWindow) -> list[AdaptiveReveal]:
             motions.append(motion)
 
     window._inline_card_motions = motions  # type: ignore[attr-defined]
-    window.destroyed.connect(lambda: [motion.cleanup() for motion in motions])
+    window.destroyed.connect(lambda *_: [motion.cleanup() for motion in motions])
     QTimer.singleShot(0, lambda: _glass_sync(window))
     return motions
