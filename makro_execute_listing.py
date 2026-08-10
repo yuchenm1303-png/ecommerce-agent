@@ -26,21 +26,20 @@ from app.browser_page_owner import find_page_by_target_id
 from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness, is_cdp_ready
 from app.business_fields import generate_listing_sku, generated_business_bundle
 from app.evidence_contract import ProductIdentity
-from app.fill_plan import build_live_fill_plan
+from app.fill_plan import BLOCKED, build_live_fill_plan
 from app.live_schema import assert_live_schema_matches, load_live_schema
 from app.makro import MAKRO_HOME_URL, base_section_title
 from app.makro.direct_visual_hold import is_listing_attribute_field
 from app.makro.domain import MakroDomainAdapter
+from app.makro.execution import PRODUCT_PHOTOS, fill_one_section as _fill_one_section, run_photos as _run_photos
 from app.makro.listing_preflight import CORE_FORM_SECTIONS
+from app.required_overrides import apply_required_overrides, load_required_overrides
 from app.semantic_grounding import build_grounding_catalog
 from makro_preview_listing import (
-    PRODUCT_PHOTOS,
     _assert_clean_step3_start,
     _assert_single_listing_tab,
     _blocked_reason_summary,
     _completion_summary,
-    _fill_one_section,
-    _run_photos,
     _totals,
 )
 
@@ -143,6 +142,12 @@ def _scan_semantic_fields(
     return semantic_fields, sections_payload, scan_stats
 
 
+def _required_override_path(live_schema: str) -> Path:
+    """GUI writes explicit required-field values beside this run's live schema."""
+
+    return Path(live_schema).resolve().with_name("required-overrides.json")
+
+
 def main() -> int:
     args = build_parser().parse_args()
     _validate_args(args)
@@ -234,7 +239,32 @@ def main() -> int:
             semantic_fields,
             business_bundle,
         )
+
+        # Resolver has already done its work. If it could not solve a required
+        # field, the GUI may provide one explicit user value. This is applied
+        # once to the plan; there is no second AI/search pass and no placeholder
+        # string is ever sent to Makro.
+        override_path = _required_override_path(args.live_schema)
+        override_summary: dict[str, Any] = {"applied": 0, "field_ids": []}
+        if override_path.is_file():
+            override_summary = apply_required_overrides(
+                plan,
+                semantic_fields,
+                load_required_overrides(override_path),
+            )
+
         summary = plan.summary()
+        if args.all_step3 and int(summary.get("required_blocked") or 0) > 0:
+            missing_required = [
+                item.label
+                for item in plan.items
+                if item.required and item.action == BLOCKED
+            ]
+            raise RuntimeError(
+                "Full Step 3 仍有 Makro 必填项没有可靠答案；已在任何字段写入前停止。"
+                "请在 GUI 的必填输入框补齐后再执行："
+                + " | ".join(missing_required)
+            )
 
         if args.all_step3:
             banner = "===== MAKRO STEP 3 DIRECT ACCEPTANCE ====="
@@ -248,6 +278,7 @@ def main() -> int:
             print(f"makro_target_id={args.makro_target_id}")
         print(f"product_url={args.product_url}")
         print(f"generated_listing_sku={generated_sku}")
+        print(f"user_required_overrides={override_summary['applied']}")
         print(
             f"live_fields={summary['live_field_count']}, ready={summary['ready']}, "
             f"preview_eligible={summary['preview_eligible']}, blocked={summary['blocked']}, "
@@ -343,6 +374,8 @@ def main() -> int:
             "expected_vertical": args.expected_vertical,
             "decision_packet": str(Path(args.decision_packet).resolve()),
             "live_schema": str(Path(args.live_schema).resolve()),
+            "required_override_file": str(override_path) if override_path.is_file() else "",
+            "required_overrides": override_summary,
             "source_snapshots": [str(Path(path).resolve()) for path in args.supplier_snapshot],
             "evidence_images": [str(Path(path).resolve()) for path in args.image],
             "live_schema_verified": True,
@@ -388,8 +421,9 @@ def main() -> int:
         if photo_report is not None:
             print(
                 "photos: "
-                f"status={photo_report.get('status')} attempted={photo_report.get('attempted', 0)} "
-                f"staged={photo_report.get('staged', 0)} saved={photo_report.get('saved', False)}"
+                f"status={photo_report.get('status')} requested={photo_report.get('requested', 0)} "
+                f"attempted={photo_report.get('attempted', 0)} staged={photo_report.get('staged', 0)} "
+                f"saved={photo_report.get('saved', False)}"
             )
         if completion is not None:
             print(f"draft_persisted_complete={completion['draft_persisted_complete']}")

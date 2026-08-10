@@ -29,6 +29,7 @@ def main() -> int:
     from gui.native_window_shell import install_native_window_shell
     from gui.nekro_card_fx import install_nekro_card_fx
     from gui.nekro_effects import install_nekro_effects
+    from gui.required_input_support import install_required_input_support
     from gui.ui_maturity import install_mature_ui
     from gui.ui_polish import install_ui_polish
     from gui.smooth_scroll import SmoothWheelFilter
@@ -53,6 +54,7 @@ def main() -> int:
     install_modal_interaction(window, details)
 
     window.install_mode_workspace()
+    install_required_input_support(window)
     visual.refresh_glass_frames()
 
     smooth_wheel = SmoothWheelFilter(window)
