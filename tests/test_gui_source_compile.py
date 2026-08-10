@@ -15,8 +15,16 @@ GUI_SOURCES = [
     PROJECT_ROOT / "gui" / "real_execution.py",
     PROJECT_ROOT / "gui" / "result_loader.py",
     PROJECT_ROOT / "gui" / "visual_style.py",
+    PROJECT_ROOT / "gui" / "native_background.py",
+    PROJECT_ROOT / "gui" / "native_visual_style.py",
+    PROJECT_ROOT / "gui" / "native_window_shell.py",
+    PROJECT_ROOT / "gui" / "ui_polish.py",
+    PROJECT_ROOT / "gui" / "ui_maturity.py",
+    PROJECT_ROOT / "gui" / "card_details.py",
+    PROJECT_ROOT / "gui" / "card_details_fast.py",
     PROJECT_ROOT / "gui" / "nekro_card_fx.py",
     PROJECT_ROOT / "gui" / "nekro_effects.py",
+    PROJECT_ROOT / "gui" / "smooth_scroll.py",
     PROJECT_ROOT / "gui" / "log_presenter.py",
 ]
 
