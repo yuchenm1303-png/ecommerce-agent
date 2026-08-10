@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from PySide6.QtCore import (
     QAbstractAnimation,
+    QEvent,
     QEasingCurve,
+    QObject,
     QPoint,
     QRect,
     Qt,
     QParallelAnimationGroup,
     QPropertyAnimation,
+    QTimer,
 )
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QFrame, QGraphicsOpacityEffect, QMainWindow
 
 from .card_details import CardDetailController
@@ -19,15 +23,16 @@ _CONTENT_REVEAL_MS = 104
 _DRAWER_CLOSE_MS = 126
 _DRAWER_TRAVEL = 44
 _CARD_PULSE_PAD = 4
+_GEOMETRY_COALESCE_MS = 32
 
 
 class FastCardDetailController(CardDetailController):
     """Detail drawer motion with no Python per-frame timer.
 
     The drawer is created at its final size and only its position is animated by
-    Qt's C++ animation driver.  Detail content is built while covered, then a
-    small clipping cover animates away.  No large opacity surface and no layout
-    height animation are used.
+    Qt's C++ animation driver. Detail content is built while covered, then a
+    small clipping cover animates away. Card-resize notifications share one
+    coalesced geometry pass instead of queueing one callback per card/event.
     """
 
     def __init__(self, window: QMainWindow) -> None:
@@ -48,6 +53,15 @@ class FastCardDetailController(CardDetailController):
         )
         self.reveal_cover.hide()
         self._source_rect = QRect()
+
+        self._geometry_timer = QTimer(self)
+        self._geometry_timer.setSingleShot(True)
+        self._geometry_timer.setInterval(_GEOMETRY_COALESCE_MS)
+        self._geometry_timer.timeout.connect(self._sync_geometry)
+
+    def _schedule_geometry(self) -> None:
+        if not self._geometry_timer.isActive():
+            self._geometry_timer.start()
 
     def _sync_geometry(self) -> None:
         self.scrim.setGeometry(self.root.rect())
@@ -256,6 +270,24 @@ class FastCardDetailController(CardDetailController):
         self.reveal_cover.hide()
         self.scrim.hide()
         self._selected = None
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        event_type = event.type()
+        if watched is self.root:
+            if event_type in {QEvent.Type.Resize, QEvent.Type.Show}:
+                self._schedule_geometry()
+            elif event_type == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
+                if event.key() == Qt.Key.Key_Escape and self.drawer.isVisible():
+                    self.close()
+                    return True
+        elif isinstance(watched, QFrame) and watched in self._buttons:
+            if event_type in {QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.LayoutRequest}:
+                self._schedule_geometry()
+        return False
+
+    def _cleanup(self) -> None:
+        self._geometry_timer.stop()
+        super()._cleanup()
 
 
 def install_card_details(window: QMainWindow) -> FastCardDetailController:
