@@ -29,7 +29,7 @@ def test_overlay_motion_changes_only_absolute_clip_viewport() -> None:
     assert "class ClipSheetMotion(QObject)" in MOTION
     assert "QElapsedTimer" in MOTION
     assert "Qt.TimerType.PreciseTimer" in MOTION
-    assert "_FRAME_MS = 8" in MOTION
+    assert "_FRAME_MS = 6" in MOTION
     assert "self.content.resize(rect.size())" in MOTION
     assert "self.viewport.setGeometry" in MOTION
     assert "self.content.move" in MOTION
