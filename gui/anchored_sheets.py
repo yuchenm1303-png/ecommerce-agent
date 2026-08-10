@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, QTimer
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -130,6 +131,8 @@ class AnchoredSheetController(QObject):
             raise RuntimeError("anchored sheets require a central widget")
 
         window._anchored_sheets_active = True  # type: ignore[attr-defined]
+        self._real_open = False
+        self._console_open = False
         self.root.setStyleSheet(self.root.styleSheet() + "\n" + _SHEET_STYLE)
         self._geometry_timer = QTimer(self)
         self._geometry_timer.setSingleShot(True)
@@ -252,11 +255,13 @@ class AnchoredSheetController(QObject):
             toggle.toggled.disconnect()
         except (RuntimeError, TypeError):
             pass
+        toggle.setChecked(False)
+        toggle.setCheckable(False)
         toggle.setText("展开设置 ﹀")
-        close.clicked.connect(lambda: toggle.setChecked(False))
+        close.clicked.connect(lambda: self._set_sheet("real", False))
 
         motion = ClipSheetMotion(self.root, self.real_sheet, self._real_rect, edge="top", duration_ms=162)
-        toggle.toggled.connect(lambda expanded: self._toggle("real", bool(expanded)))
+        toggle.clicked.connect(lambda: self._set_sheet("real", not self._real_open))
         return motion
 
     def _build_console_sheet(self) -> ClipSheetMotion | None:
@@ -302,47 +307,42 @@ class AnchoredSheetController(QObject):
             toggle.toggled.disconnect()
         except (RuntimeError, TypeError):
             pass
+        toggle.setChecked(False)
+        toggle.setCheckable(False)
         toggle.setText("展开详情 ﹀")
-        close.clicked.connect(lambda: toggle.setChecked(False))
+        close.clicked.connect(lambda: self._set_sheet("console", False))
 
         motion = ClipSheetMotion(self.root, self.console_sheet, self._console_rect, edge="bottom", duration_ms=172)
-        toggle.toggled.connect(lambda expanded: self._toggle("console", bool(expanded)))
+        toggle.clicked.connect(lambda: self._set_sheet("console", not self._console_open))
         return motion
 
-    def _toggle(self, name: str, expanded: bool) -> None:
+    def _set_sheet(self, name: str, expanded: bool) -> None:
+        expanded = bool(expanded)
         if expanded:
             details = getattr(self.window, "_card_details", None)
             if details is not None and hasattr(details, "close"):
                 details.close()
-            if name == "real":
-                if isinstance(self.console_toggle, QPushButton) and self.console_toggle.isChecked():
-                    self.console_toggle.setChecked(False)
-                if self.real_motion is not None:
-                    self.real_toggle.setText("收起设置 ︿")
-                    self.real_motion.open()
-            else:
-                if isinstance(self.real_toggle, QPushButton) and self.real_toggle.isChecked():
-                    self.real_toggle.setChecked(False)
-                if self.console_motion is not None:
-                    self.console_toggle.setText("收起详情 ︿")
-                    self.console_motion.open()
+
+        if name == "real":
+            if expanded and self._console_open:
+                self._set_sheet("console", False)
+            self._real_open = expanded
+            if isinstance(self.real_toggle, QPushButton):
+                self.real_toggle.setText("收起设置 ︿" if expanded else "展开设置 ﹀")
+            if self.real_motion is not None:
+                self.real_motion.toggle(expanded)
         else:
-            if name == "real" and self.real_motion is not None:
-                self.real_toggle.setText("展开设置 ﹀")
-                self.real_motion.close()
-            elif name == "console" and self.console_motion is not None:
-                self.console_toggle.setText("展开详情 ﹀")
-                self.console_motion.close()
+            if expanded and self._real_open:
+                self._set_sheet("real", False)
+            self._console_open = expanded
+            if isinstance(self.console_toggle, QPushButton):
+                self.console_toggle.setText("收起详情 ︿" if expanded else "展开详情 ﹀")
+            if self.console_motion is not None:
+                self.console_motion.toggle(expanded)
 
     def close_all(self) -> None:
-        if isinstance(self.real_toggle, QPushButton) and self.real_toggle.isChecked():
-            self.real_toggle.setChecked(False)
-        elif self.real_motion is not None:
-            self.real_motion.close()
-        if isinstance(self.console_toggle, QPushButton) and self.console_toggle.isChecked():
-            self.console_toggle.setChecked(False)
-        elif self.console_motion is not None:
-            self.console_motion.close()
+        self._set_sheet("real", False)
+        self._set_sheet("console", False)
 
     def _schedule_geometry(self) -> None:
         if not self._geometry_timer.isActive():
@@ -358,8 +358,9 @@ class AnchoredSheetController(QObject):
         if watched is self.root:
             if event.type() in {QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.LayoutRequest}:
                 self._schedule_geometry()
-            elif event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape:  # type: ignore[attr-defined]
-                self.close_all()
+            elif event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
+                if event.key() == Qt.Key.Key_Escape:
+                    self.close_all()
         return False
 
     def cleanup(self) -> None:
