@@ -77,6 +77,47 @@ def test_modal_transition_cannot_invalidate_native_glass_mask_via_parent_visibil
     assert "self.window.show()" not in MODAL
 
 
+def test_opening_is_prepared_hidden_and_revealed_only_under_final_quick_frame() -> None:
+    assert "self._original_show_prepared_modal = self.details._show_prepared_modal" in MODAL
+    assert "self.details._show_prepared_modal = self._show_modal_with_transition" in MODAL
+    assert "def _prepare_hidden_modal" in MODAL
+    assert "self.details.backdrop.hide()" in MODAL
+    assert "self.details.scrim.hide()" in MODAL
+    assert "self.details.drawer.hide()" in MODAL
+    assert "def _reveal_prepared_modal" in MODAL
+
+    open_driver = MODAL.split("def _show_modal_with_transition", 1)[1].split(
+        "def request_close", 1
+    )[0]
+    assert "base = self._prepare_hidden_modal(ratio=ratio)" in open_driver
+    assert "self.details.drawer.grab()" in open_driver
+    assert "self._state = _STATE_OPENING" in open_driver
+    assert "self._issue_transition(closing=False)" in open_driver
+    assert "self.details.drawer.show()" not in open_driver
+
+    finish = MODAL.split("def _on_transition_finished", 1)[1].split("def eventFilter", 1)[0]
+    open_branch = finish.split("if opened:", 1)[1].split(
+        "if self._state != _STATE_CLOSING:", 1
+    )[0]
+    assert open_branch.index("self._state = _STATE_OPEN") < open_branch.index(
+        "self._reveal_prepared_modal()"
+    )
+    assert open_branch.index("self._reveal_prepared_modal()") < open_branch.index(
+        "self._hide_transition_surface()"
+    )
+
+
+def test_closing_hides_real_modal_before_transition_surface_is_removed() -> None:
+    finish = MODAL.split("def _on_transition_finished", 1)[1].split("def eventFilter", 1)[0]
+    close_branch = finish.split("if self._state != _STATE_CLOSING:", 1)[1]
+    assert close_branch.index("self._state = _STATE_CLOSED") < close_branch.index(
+        "self.details.close()"
+    )
+    assert close_branch.index("self.details.close()") < close_branch.index(
+        "self._hide_transition_surface()"
+    )
+
+
 def test_preblurred_snapshot_replaces_runtime_qtquick_effect() -> None:
     assert "self._original_capture_backdrop = self.details._capture_backdrop" in MODAL
     assert "self.details._capture_backdrop = self._capture_raw_backdrop" in MODAL
@@ -90,6 +131,7 @@ def test_quick_failure_falls_back_to_atomic_modal_instead_of_crashing() -> None:
     assert "if not self._ensure_transition_surface():" in MODAL
     assert "self._fallback_open()" in MODAL
     assert "self._fallback_closed()" in MODAL
+    assert "self._reveal_prepared_modal()" in MODAL
     assert "raise RuntimeError(\"Glass modal transition" not in MODAL
 
 
@@ -105,7 +147,9 @@ def test_any_transition_preparation_exception_cannot_trap_modal_state() -> None:
     assert "self._transition_error = self._error_text(exc)" in ensure_body
     assert "return False" in ensure_body
 
-    open_body = MODAL.split("def _start_open_transition", 1)[1].split("def request_close", 1)[0]
+    open_body = MODAL.split("def _show_modal_with_transition", 1)[1].split(
+        "def request_close", 1
+    )[0]
     assert "except Exception as exc:" in open_body
     assert "self._fallback_open(exc)" in open_body
 
@@ -118,6 +162,7 @@ def test_any_transition_preparation_exception_cannot_trap_modal_state() -> None:
     fallback_open = MODAL.split("def _fallback_open", 1)[1].split("def _fallback_closed", 1)[0]
     assert "self._state = _STATE_OPEN" in fallback_open
     assert "self._transitioning = False" in fallback_open
+    assert "self._reveal_prepared_modal()" in fallback_open
     assert "self._hide_transition_surface()" in fallback_open
 
     fallback_closed = MODAL.split("def _fallback_closed", 1)[1].split(
@@ -128,40 +173,20 @@ def test_any_transition_preparation_exception_cannot_trap_modal_state() -> None:
     assert "self._hide_transition_surface()" in fallback_closed
 
 
-def test_modal_lifecycle_has_one_open_edge_and_one_close_settlement() -> None:
+def test_modal_lifecycle_no_longer_depends_on_drawer_show_reentry() -> None:
     for state in (
         "_STATE_CLOSED",
-        "_STATE_OPENING_PENDING",
         "_STATE_OPENING",
         "_STATE_OPEN",
         "_STATE_CLOSING",
     ):
         assert state in MODAL
-    assert "if self._state == _STATE_CLOSED:" in MODAL
-    assert "self._state = _STATE_OPENING_PENDING" in MODAL
-    assert "if self._state != _STATE_OPENING_PENDING:" in MODAL
-    assert "if self._state != _STATE_OPEN:" in MODAL
-
-    finish_body = MODAL.split("def _on_transition_finished", 1)[1].split("def eventFilter", 1)[0]
-    open_branch = finish_body.split("if opened:", 1)[1].split(
-        "if self._state != _STATE_CLOSING:", 1
-    )[0]
-    assert open_branch.index("self._state = _STATE_OPEN") < open_branch.index(
-        "self._hide_transition_surface()"
-    )
-
-    close_branch = finish_body.split("if self._state != _STATE_CLOSING:", 1)[1]
-    assert close_branch.index("self._state = _STATE_CLOSED") < close_branch.index(
-        "self.details.close()"
-    )
-    assert close_branch.index("self.details.close()") < close_branch.index(
-        "self._hide_transition_surface()"
-    )
-
+    assert "_STATE_OPENING_PENDING" not in MODAL
+    assert "self.details.drawer.installEventFilter(self)" not in MODAL
     filter_body = MODAL.split("def eventFilter", 1)[1].split("def cleanup", 1)[0]
-    assert "if watched is self.details.drawer and event_type == QEvent.Type.Show:" in filter_body
-    assert "if self._state == _STATE_CLOSED:" in filter_body
-    assert "QTimer.singleShot(0, self._start_open_transition)" in filter_body
+    assert "self.details.drawer" not in filter_body
+    assert "QEvent.Type.Show" not in filter_body
+    assert "QTimer.singleShot" not in MODAL
 
 
 def test_open_close_motion_is_short_and_subtle() -> None:
