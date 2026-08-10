@@ -10,7 +10,6 @@ labels returned here.
 from __future__ import annotations
 
 import re
-from typing import Any
 
 from playwright.sync_api import Page
 
@@ -21,6 +20,11 @@ _COLUMNS_JS = r"""(limit) => {
     const s = getComputedStyle(el);
     return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) !== 0;
   };
+  const searchRects = [...document.querySelectorAll('input:not([type]),input[type="text"],input[type="search"]')]
+    .filter((el) => visibleStyle(el))
+    .map((el) => el.getBoundingClientRect())
+    .filter((r) => r.width >= 180 && r.height >= 20 && r.top < innerHeight * 0.35);
+  const anchorBottom = searchRects.length ? Math.max(...searchRects.map((r) => r.bottom)) : 0;
   const leafText = (el) => {
     const text = clean(el.innerText || el.textContent || '');
     if (!text || text.length < 2 || text.length > 90) return '';
@@ -60,6 +64,7 @@ _COLUMNS_JS = r"""(limit) => {
     const r = el.getBoundingClientRect();
     if (r.width < 80 || r.width > 360 || r.height < 150) continue;
     if (r.right < 0 || r.left > innerWidth || r.bottom < 0 || r.top > innerHeight) continue;
+    if (r.top < anchorBottom - 16) continue;
     if (r.left > innerWidth * 0.68) continue;
     const s = getComputedStyle(el);
     const scrollable = ['auto', 'scroll'].includes(s.overflowY)
@@ -104,6 +109,11 @@ _CLICK_JS = r"""({level, wanted, limit}) => {
     const s = getComputedStyle(el);
     return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) !== 0;
   };
+  const searchRects = [...document.querySelectorAll('input:not([type]),input[type="text"],input[type="search"]')]
+    .filter((el) => visibleStyle(el))
+    .map((el) => el.getBoundingClientRect())
+    .filter((r) => r.width >= 180 && r.height >= 20 && r.top < innerHeight * 0.35);
+  const anchorBottom = searchRects.length ? Math.max(...searchRects.map((r) => r.bottom)) : 0;
   const leafText = (el) => {
     const text = clean(el.innerText || el.textContent || '');
     if (!text || text.length < 2 || text.length > 90) return '';
@@ -143,6 +153,7 @@ _CLICK_JS = r"""({level, wanted, limit}) => {
     const r = el.getBoundingClientRect();
     if (r.width < 80 || r.width > 360 || r.height < 150) continue;
     if (r.right < 0 || r.left > innerWidth || r.bottom < 0 || r.top > innerHeight) continue;
+    if (r.top < anchorBottom - 16) continue;
     if (r.left > innerWidth * 0.68) continue;
     const s = getComputedStyle(el);
     const scrollable = ['auto', 'scroll'].includes(s.overflowY)
