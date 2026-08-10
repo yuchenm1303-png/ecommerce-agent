@@ -3,18 +3,16 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, QObject, QPointF, Qt, QTimer
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QApplication, QFrame, QMainWindow, QWidget
 
 from .visual_style import GlassBackdrop, VisualStyleController
 
 
-# Keep card interaction cheap and uniform across every business card.
-# QWidget subtrees are never scaled/re-laid-out. Only the cached glass surface
-# opacity changes, so tables, logs, inputs and labels stay out of animation work.
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
-_FRAME_MS = 16
+_ANIMATION_FRAME_MS = 16
+_POINTER_SAMPLE_MS = 24
 
 _NORMAL_ALPHA = 64.0
 _HOVER_ALPHA = 82.0
@@ -26,8 +24,6 @@ _RELEASE_SECONDS = 0.12
 
 
 def _css_ease(progress: float) -> float:
-    """CSS default ease cubic-bezier(.25,.1,.25,1)."""
-
     p = min(1.0, max(0.0, progress))
     x1, y1, x2, y2 = 0.25, 0.10, 0.25, 1.00
 
@@ -56,29 +52,29 @@ class _CardState:
     duration: float = _RELEASE_SECONDS
     animating: bool = False
 
-    def begin(self, *, alpha: float, duration: float) -> bool:
+    def begin(self, *, alpha: float, duration: float) -> None:
         alpha = float(alpha)
-        if abs(alpha - self.target_alpha) < 0.1 and self.animating:
-            return False
-
         if abs(alpha - self.current_alpha) < 0.1:
             self.current_alpha = alpha
             self.start_alpha = alpha
             self.target_alpha = alpha
             self.animating = False
             self.surface.set_interaction(scale=1.0, overlay_alpha=alpha)
-            return False
-
+            return
         self.start_alpha = self.current_alpha
         self.target_alpha = alpha
         self.started_at = time.monotonic()
         self.duration = max(0.001, float(duration))
         self.animating = True
-        return True
 
 
 class NekroCardInteractionController(QObject):
-    """Uniform low-cost hover/press feedback for every glass business card."""
+    """Baseline hover/press animation without filtering every QWidget event.
+
+    A single low-cost pointer sample resolves the card under the cursor.  This
+    avoids Python receiving Resize/LayoutRequest/Paint events for the whole
+    widget tree during inline expansion.
+    """
 
     def __init__(self, window: QMainWindow, visual: VisualStyleController) -> None:
         super().__init__(window)
@@ -87,6 +83,7 @@ class NekroCardInteractionController(QObject):
         self.states: dict[QFrame, _CardState] = {}
         self.hovered: QFrame | None = None
         self.pressed: QFrame | None = None
+        self._button_down = False
 
         for frame in window.findChildren(QFrame):
             if frame.objectName() not in _GLASS_NAMES:
@@ -95,21 +92,19 @@ class NekroCardInteractionController(QObject):
             if surface is not None:
                 self.states[frame] = _CardState(frame=frame, surface=surface)
 
-        # ui_polish has already run before this controller is installed, so the
-        # widget tree is stable. Cache card ownership once instead of repeating
-        # parent walks / QApplication.widgetAt() on every mouse sample.
-        self._watched_widgets = [window, *window.findChildren(QWidget)]
-        self._widget_cards: dict[QWidget, QFrame | None] = {}
-        for widget in self._watched_widgets:
-            widget.setMouseTracking(True)
-            self._widget_cards[widget] = self._card_from_widget(widget)
-            widget.installEventFilter(self)
+        self._sample_timer = QTimer(self)
+        self._sample_timer.setInterval(_POINTER_SAMPLE_MS)
+        self._sample_timer.timeout.connect(self._sample_pointer)
 
-        self.timer = QTimer(self)
-        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self.timer.setInterval(_FRAME_MS)
-        self.timer.timeout.connect(self._tick)
+        self._animation_timer = QTimer(self)
+        self._animation_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._animation_timer.setInterval(_ANIMATION_FRAME_MS)
+        self._animation_timer.timeout.connect(self._tick_animation)
+
+        window.installEventFilter(self)
         window.destroyed.connect(self._cleanup)
+        if window.isVisible():
+            self._sample_timer.start()
 
     def _card_from_widget(self, widget: QWidget | None) -> QFrame | None:
         current = widget
@@ -119,63 +114,68 @@ class NekroCardInteractionController(QObject):
             current = current.parentWidget()
         return None
 
-    def _card_at_global(self, point: QPointF) -> QFrame | None:
-        local = self.window.mapFromGlobal(point.toPoint())
-        if self.window.rect().contains(local):
-            card = self._card_from_widget(self.window.childAt(local))
-            if card is not None:
-                return card
-        return self._card_from_widget(QApplication.widgetAt(point.toPoint()))
+    def _card_under_cursor(self) -> QFrame | None:
+        point = QCursor.pos()
+        local = self.window.mapFromGlobal(point)
+        if not self.window.rect().contains(local):
+            return None
+        return self._card_from_widget(self.window.childAt(local))
 
-    def _card_for_event(self, watched: QObject, point: QPointF) -> QFrame | None:
-        if isinstance(watched, QWidget) and watched in self._widget_cards:
-            return self._widget_cards[watched]
-        return self._card_at_global(point)
-
-    def _ensure_timer(self) -> None:
-        if any(state.animating for state in self.states.values()) and not self.timer.isActive():
-            self.timer.start()
+    def _ensure_animation_timer(self) -> None:
+        if any(state.animating for state in self.states.values()) and not self._animation_timer.isActive():
+            self._animation_timer.start()
 
     def _animate(self, frame: QFrame, alpha: float, duration: float) -> None:
         state = self.states.get(frame)
-        if state is not None:
-            state.begin(alpha=alpha, duration=duration)
-            self._ensure_timer()
+        if state is None:
+            return
+        state.begin(alpha=alpha, duration=duration)
+        self._ensure_animation_timer()
 
     def _set_hovered(self, frame: QFrame | None) -> None:
         if frame is self.hovered:
             return
-
         previous = self.hovered
         self.hovered = frame
-
         if previous is not None and previous is not self.pressed:
             self._animate(previous, _NORMAL_ALPHA, _RELEASE_SECONDS)
         if frame is not None and frame is not self.pressed:
             self._animate(frame, _HOVER_ALPHA, _HOVER_SECONDS)
 
-    def _press(self, frame: QFrame | None) -> None:
-        self.pressed = frame
-        if frame is not None:
-            self._animate(frame, _ACTIVE_ALPHA, _PRESS_SECONDS)
+    def _sample_pointer(self) -> None:
+        if bool(getattr(self.window, "_inline_card_motion_active", False)):
+            return
+        card = self._card_under_cursor()
+        down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
 
-    def _release(self, frame_under_pointer: QFrame | None) -> None:
-        pressed = self.pressed
-        self.pressed = None
-        self._set_hovered(frame_under_pointer)
+        self._set_hovered(card)
+        if down and not self._button_down:
+            self.pressed = card
+            if card is not None:
+                self._animate(card, _ACTIVE_ALPHA, _PRESS_SECONDS)
+        elif not down and self._button_down:
+            pressed = self.pressed
+            self.pressed = None
+            if pressed is not None:
+                target = _HOVER_ALPHA if pressed is card else _NORMAL_ALPHA
+                self._animate(pressed, target, _RELEASE_SECONDS)
+        self._button_down = down
 
-        if pressed is not None:
-            target = _HOVER_ALPHA if pressed is frame_under_pointer else _NORMAL_ALPHA
-            self._animate(pressed, target, _RELEASE_SECONDS)
+    def _tick_animation(self) -> None:
+        if bool(getattr(self.window, "_inline_card_motion_active", False)):
+            for state in self.states.values():
+                if state.animating:
+                    state.current_alpha = state.target_alpha
+                    state.animating = False
+                    state.surface.set_interaction(scale=1.0, overlay_alpha=state.target_alpha)
+            self._animation_timer.stop()
+            return
 
-    def _tick(self) -> None:
         now = time.monotonic()
         any_animating = False
-
         for state in self.states.values():
             if not state.animating:
                 continue
-
             raw = (now - state.started_at) / state.duration
             if raw >= 1.0:
                 state.current_alpha = state.target_alpha
@@ -186,47 +186,41 @@ class NekroCardInteractionController(QObject):
                     state.target_alpha - state.start_alpha
                 ) * eased
                 any_animating = True
-
-            state.surface.set_interaction(
-                scale=1.0,
-                overlay_alpha=state.current_alpha,
-            )
+            state.surface.set_interaction(scale=1.0, overlay_alpha=state.current_alpha)
 
         if not any_animating and not any(state.animating for state in self.states.values()):
-            self.timer.stop()
+            self._animation_timer.stop()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if watched is not self.window:
+            return False
         event_type = event.type()
-
-        if isinstance(event, QMouseEvent):
-            card = self._card_for_event(watched, event.globalPosition())
-            if event_type == QEvent.Type.MouseMove:
-                self._set_hovered(card)
-            elif event_type == QEvent.Type.MouseButtonPress:
-                self._set_hovered(card)
-                self._press(card)
-            elif event_type == QEvent.Type.MouseButtonRelease:
-                self._release(card)
-
-        if event_type == QEvent.Type.Enter and isinstance(watched, QWidget):
-            self._set_hovered(self._widget_cards.get(watched))
-
-        if watched is self.window and event_type == QEvent.Type.Leave:
-            pressed = self.pressed
+        if event_type in {
+            QEvent.Type.Show,
+            QEvent.Type.Enter,
+            QEvent.Type.WindowActivate,
+        }:
+            if not self._sample_timer.isActive():
+                self._sample_timer.start()
+        elif event_type in {QEvent.Type.Hide, QEvent.Type.Leave}:
+            self._sample_timer.stop()
+            self._button_down = False
             self.pressed = None
             self._set_hovered(None)
-            if pressed is not None:
-                self._animate(pressed, _NORMAL_ALPHA, _RELEASE_SECONDS)
-
+        elif event_type == QEvent.Type.WindowStateChange:
+            if self.window.isMinimized():
+                self._sample_timer.stop()
+            elif not self._sample_timer.isActive():
+                self._sample_timer.start()
         return False
 
     def _cleanup(self) -> None:
-        self.timer.stop()
-        for widget in self._watched_widgets:
-            try:
-                widget.removeEventFilter(self)
-            except RuntimeError:
-                pass
+        self._sample_timer.stop()
+        self._animation_timer.stop()
+        try:
+            self.window.removeEventFilter(self)
+        except RuntimeError:
+            pass
         for state in self.states.values():
             state.surface.set_interaction(scale=1.0, overlay_alpha=_NORMAL_ALPHA)
 
