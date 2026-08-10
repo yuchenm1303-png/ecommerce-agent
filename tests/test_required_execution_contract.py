@@ -7,6 +7,7 @@ import pytest
 from app.ai_decisions import field_id
 from app.fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem
 from app.makro.execution import fill_one_section, run_photos
+from app.makro.sections import save_section
 from app.required_overrides import RequiredOverrideError, apply_required_overrides
 from app.resolution_types import MISSING, ResolutionRecord
 
@@ -105,9 +106,23 @@ def test_production_ready_executor_has_no_existing_value_second_gate():
     assert 'report["writes_attempted"] += 1' in source
 
 
-def test_production_photo_path_requires_complete_requested_set_and_rediscovers_card():
+def test_save_section_clicks_makro_even_when_old_inline_errors_are_rendered():
+    source = inspect.getsource(save_section)
+    before_click, after_click = source.split("save.first.click()", maxsplit=1)
+
+    assert "visible_section_errors(" not in before_click
+    assert "collapsed_error_badges(" in after_click
+    assert "visible_section_errors(" in after_click
+
+
+def test_production_photo_path_saves_and_verifies_each_image_before_next():
     source = inspect.getsource(run_photos)
-    assert 'int(report["staged"]) != requested' in source
-    assert 'report["status"] = "incomplete_upload"' in source
+    loop = source.index("for index, image in enumerate(resolved, start=1):")
+    save = source.index("adapter.save_section(PRODUCT_PHOTOS)", loop)
+    verify_one = source.index("expected_added=1", save)
+
+    assert loop < save < verify_one
+    assert 'report["persisted"] += 1' in source
+    assert 'int(report["persisted"]) != requested' in source
     assert "_wait_for_file_input(adapter" in source
-    assert "expected_added=requested" in source
+    assert "expected_added=requested" not in source
