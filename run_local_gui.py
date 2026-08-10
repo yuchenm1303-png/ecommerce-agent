@@ -19,6 +19,7 @@ def main() -> int:
         )
         return 2
 
+    from gui.anchored_sheets import install_anchored_sheets
     from gui.card_details_fast import install_card_details
     from gui.console_window import MainWindow
     from gui.workflow_console_window import WorkflowMainWindow
@@ -42,6 +43,7 @@ def main() -> int:
     install_ui_polish(window)
     install_card_details(window)
     install_mature_ui(window)
+    install_anchored_sheets(window)
 
     smooth_wheel = SmoothWheelFilter(window)
     smooth_wheel.install(window)
