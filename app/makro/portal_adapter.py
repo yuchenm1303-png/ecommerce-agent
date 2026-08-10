@@ -255,14 +255,26 @@ class MakroPortalAdapter:
         if (target.request_id or target.vid or (vertical and brand)) and controls >= 5:
             return ListingStage.PRODUCT_INFO
 
-        # The URL is the strongest pre-Step-3 state signal. The single editable
-        # search control is structural confirmation that the SPA has rendered.
+        fallback = self._text_stage_fallback()
+
+        # No chosen vertical + an editable search control is unambiguously Step 1.
         if not vertical and inputs:
             return ListingStage.VERTICAL
+
+        # A chosen vertical does not automatically mean Step 2: Makro keeps the
+        # Step 1 vertical search/browser visible while showing the leaf
+        # confirmation + Select Brand action. Prefer the actual input semantics
+        # and page structure before treating this as the brand-search step.
         if vertical and not brand and inputs:
+            blobs = [_attribute_blob(item) for item in inputs]
+            if any(_contains_any(blob, _VERTICAL_TOKENS) for blob in blobs):
+                return ListingStage.VERTICAL
+            if any(_contains_any(blob, _BRAND_TOKENS) for blob in blobs):
+                return ListingStage.BRAND
+            if fallback in {ListingStage.VERTICAL, ListingStage.BRAND}:
+                return fallback
             return ListingStage.BRAND
 
-        fallback = self._text_stage_fallback()
         if fallback is not ListingStage.UNKNOWN:
             return fallback
         return ListingStage.UNKNOWN
