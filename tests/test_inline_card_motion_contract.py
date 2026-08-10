@@ -19,39 +19,42 @@ def test_inline_motion_installs_after_layout_and_maturity_before_native_shell() 
     )
 
 
-def test_inline_card_body_animates_clipped_height_instead_of_visibility_snap() -> None:
+def test_inline_card_body_uses_qt_animation_driver_not_python_frame_timer() -> None:
     assert "class AdaptiveReveal(QObject)" in MOTION
-    assert "self.wrapper.setMaximumHeight" in MOTION
-    assert "self.wrapper.setMinimumHeight(0)" in MOTION
-    assert "self._timer.setInterval(_TICK_MS)" in MOTION
-    assert "Qt.TimerType.PreciseTimer" in MOTION
+    assert "QPropertyAnimation" in MOTION
+    assert "QParallelAnimationGroup" in MOTION
+    assert 'QPropertyAnimation(self.wrapper, b"maximumHeight")' in MOTION
+    assert "QEasingCurve.Type.InOutCubic" in MOTION
+    assert "PreciseTimer" not in MOTION
+    assert "def _tick(" not in MOTION
+    assert "setInterval(8)" not in MOTION
     assert "setGeometry(" not in MOTION
-    assert "QPropertyAnimation" not in MOTION
     assert "QGraphicsOpacityEffect" not in MOTION
 
 
-def test_travel_duration_adapts_to_real_content_distance() -> None:
-    assert "_MIN_DURATION_MS = 156" in MOTION
-    assert "_MAX_DURATION_MS = 218" in MOTION
-    assert "148 + int(abs(distance) * 0.28)" in MOTION
+def test_travel_duration_is_short_and_adapts_to_content_distance() -> None:
+    assert "_MIN_DURATION_MS = 154" in MOTION
+    assert "_MAX_DURATION_MS = 198" in MOTION
+    assert "146 + int(abs(distance) * 0.18)" in MOTION
     assert "def _measure_natural_height" in MOTION
     assert "self.wrapper.sizeHint().height()" in MOTION
 
 
-def test_layout_reflows_siblings_and_console_splitter_during_motion() -> None:
-    assert "self.splitter.setSizes" in MOTION
-    assert "available - target_card" in MOTION
-    assert "shell + wrapper_height" in MOTION
+def test_console_splitter_follows_widget_constraints_without_per_frame_setsizes() -> None:
+    assert 'QPropertyAnimation(self.card, b"minimumHeight")' in MOTION
+    assert 'QPropertyAnimation(self.card, b"maximumHeight")' in MOTION
+    assert "self.splitter.setSizes" not in MOTION
+    assert "available - 250" in MOTION
     assert "_inline_card_motion_active" in MOTION
     assert "removeEventFilter(mature)" in MOTION
     assert "installEventFilter(mature)" in MOTION
 
 
-def test_glass_geometry_is_throttled_during_short_motion_only() -> None:
-    assert "_MASK_SYNC_MS = 32" in MOTION
+def test_glass_mask_is_not_manually_rebuilt_from_a_python_animation_loop() -> None:
+    assert "_MASK_SYNC_MS" not in MOTION
+    assert "_last_mask_sync" not in MOTION
     assert "schedule_mask_update" in MOTION
-    assert "now_ms - self._last_mask_sync >= _MASK_SYNC_MS" in MOTION
-    assert "self._timer.stop()" in MOTION
+    assert MOTION.count("_glass_sync(self.window)") <= 2
 
 
 def test_both_existing_inline_card_families_use_same_motion_engine() -> None:
