@@ -6,19 +6,16 @@ from PySide6.QtWidgets import QFrame, QMainWindow, QPushButton, QSplitter, QTabW
 
 _SUMMARY_MIN = 300
 _SUMMARY_MAX = 460
-_DETAIL_MIN = 460
-_DETAIL_MAX = 620
 _COALESCE_MS = 40
 
 
 class ConsoleSummaryMode(QObject):
-    """Keep the old expanded console as the permanent compact/default state.
+    """Keep the rich console summary permanent and open detail as a modal.
 
-    The former ~112 px collapsed strip is removed from the interaction model.
-    Phase cards, tabs and the active console viewport stay visible at all times.
-    The header button now switches between this rich summary state and a larger
-    diagnostic state. Both transitions are atomic splitter changes; no layout
-    animation is involved.
+    The former tiny collapsed strip is not part of the interaction model.  Four
+    phase cards, tabs and the current viewport stay visible in the main layout.
+    Clicking the header detail action opens the shared blurred glass modal and
+    therefore never resizes the body splitter.
     """
 
     def __init__(self, window: QMainWindow) -> None:
@@ -28,7 +25,7 @@ class ConsoleSummaryMode(QObject):
         self.console = getattr(window, "console", None)
         self.toggle = getattr(window, "console_detail_toggle", None)
         self.body = getattr(window, "_ui_polish_body_splitter", None)
-        self._detail_open = False
+        self.details = getattr(window, "_card_details", None)
         self._mature_apply = None
 
         if not isinstance(self.root, QWidget):
@@ -39,19 +36,24 @@ class ConsoleSummaryMode(QObject):
             raise RuntimeError("console summary mode requires console_detail_toggle")
         if not isinstance(self.body, QSplitter):
             raise RuntimeError("console summary mode requires bodySplitter")
+        if self.details is None or not hasattr(self.details, "open_console_details"):
+            raise RuntimeError("console summary mode requires the shared glass detail controller")
 
-        # ui_polish used toggled() to hide phase cards/tabs and collapse the
-        # console to ~112 px. ui_maturity also listened to the same signal.
-        # Remove both old state transitions and keep the button logically
-        # checked so ui_maturity always regards the console as usable/expanded.
+        # Remove ui_polish/ui_maturity's old expand/collapse state machine. Keep
+        # the logical checked bit true so any direct maturity pass continues to
+        # treat this permanently-rich summary as an expanded/usable console.
         try:
             self.toggle.toggled.disconnect()
         except (RuntimeError, TypeError):
             pass
+        try:
+            self.toggle.clicked.disconnect()
+        except (RuntimeError, TypeError):
+            pass
         self.toggle.setCheckable(True)
         self.toggle.setChecked(True)
-        self.toggle.setText("展开详情 ⌄")
-        self.toggle.clicked.connect(self._toggle_detail)
+        self.toggle.setText("展开详情")
+        self.toggle.clicked.connect(self._open_detail)
 
         for unit in getattr(self.console, "phase_units", {}).values():
             if isinstance(unit, QWidget):
@@ -60,10 +62,9 @@ class ConsoleSummaryMode(QObject):
         if isinstance(tabs, QTabWidget):
             tabs.show()
 
-        # MatureResponsiveController still owns the rest of the responsive
-        # workspace. Wrap only its timeout callback so our console geometry is
-        # applied immediately after its normal sizing pass, never in competition
-        # with it on a later frame.
+        # MatureResponsiveController continues to own the rest of the workspace.
+        # Our pass runs immediately after it and only restores the fixed rich
+        # summary geometry, never an expanded detail geometry.
         mature = getattr(window, "_mature_ui", None)
         timer = getattr(mature, "_timer", None)
         apply = getattr(mature, "apply", None)
@@ -90,30 +91,19 @@ class ConsoleSummaryMode(QObject):
         if len(current) != len(target) or any(abs(a - b) > 3 for a, b in zip(current, target)):
             splitter.setSizes(target)
 
-    def _summary_target(self, available: int) -> int:
+    @staticmethod
+    def _summary_target(available: int) -> int:
         target = min(440, max(340, available - 300))
         return min(target, max(_SUMMARY_MIN, available - 260))
 
-    def _detail_target(self, available: int) -> int:
-        target = min(590, max(480, available - 220))
-        return min(target, max(420, available - 220))
-
     def apply(self) -> None:
         available = max(1, self.body.height() - self.body.handleWidth())
-        if self._detail_open:
-            self.console.setMinimumHeight(_DETAIL_MIN)
-            self.console.setMaximumHeight(_DETAIL_MAX)
-            target = self._detail_target(available)
-            workspace_min = 220
-        else:
-            self.console.setMinimumHeight(_SUMMARY_MIN)
-            self.console.setMaximumHeight(_SUMMARY_MAX)
-            target = self._summary_target(available)
-            workspace_min = 260
-
+        self.console.setMinimumHeight(_SUMMARY_MIN)
+        self.console.setMaximumHeight(_SUMMARY_MAX)
+        target = self._summary_target(available)
         self._set_sizes_if_needed(
             self.body,
-            [max(workspace_min, available - target), target],
+            [max(260, available - target), target],
         )
 
     def _apply_after_mature(self) -> None:
@@ -121,15 +111,13 @@ class ConsoleSummaryMode(QObject):
             self._mature_apply()
         self.apply()
 
-    def _toggle_detail(self, *_args: object) -> None:
-        # QAbstractButton flips its checked state before clicked(). Restore the
-        # internal checked bit immediately so legacy responsive code can never
-        # reinterpret the rich summary as the old tiny collapsed state.
+    def _open_detail(self, *_args: object) -> None:
+        # QAbstractButton flips a checkable button before clicked(). Restore the
+        # legacy checked bit immediately, but do not resize anything.
         if not self.toggle.isChecked():
             self.toggle.setChecked(True)
-        self._detail_open = not self._detail_open
-        self.toggle.setText("收起详情 ⌃" if self._detail_open else "展开详情 ⌄")
-        self.apply()
+        self.toggle.setText("展开详情")
+        self.details.open_console_details()
 
     def schedule(self) -> None:
         if not self._timer.isActive():
