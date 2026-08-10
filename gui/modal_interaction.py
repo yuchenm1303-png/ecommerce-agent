@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Qt, QUrl
-from PySide6.QtGui import QKeyEvent, QPixmap
+from PySide6.QtGui import QColor, QKeyEvent, QPixmap
 from PySide6.QtQml import QQmlComponent
-from PySide6.QtQuick import QQuickItem
+from PySide6.QtQuick import QQuickItem, QQuickWindow
 from PySide6.QtWidgets import QFrame, QLabel, QMainWindow
 
 from .card_details_fast import FastCardDetailController
@@ -31,7 +31,6 @@ import QtQuick
 Item {{
     id: root
     anchors.fill: parent
-    z: 100000
     visible: active
 
     property bool active: false
@@ -47,6 +46,33 @@ Item {{
 
     signal transitionFinished(bool opened)
 
+    function prepareOpen() {{
+        baseImage.opacity = 1.0
+        blurImage.opacity = 0.0
+        scrim.opacity = 0.0
+        panelImage.opacity = 0.0
+        panelImage.y = panelY + {_PANEL_RISE_PX}
+        panelImage.scale = {_PANEL_OPEN_SCALE}
+    }}
+
+    function prepareClose() {{
+        baseImage.opacity = 1.0
+        blurImage.opacity = 1.0
+        scrim.opacity = 1.0
+        panelImage.opacity = 1.0
+        panelImage.y = panelY
+        panelImage.scale = 1.0
+    }}
+
+    onActiveChanged: {{
+        if (!active)
+            return
+        if (closingRequest)
+            prepareClose()
+        else
+            prepareOpen()
+    }}
+
     onCommandChanged: {{
         if (command <= 0)
             return
@@ -57,24 +83,12 @@ Item {{
     }}
 
     function startOpen() {{
-        active = true
-        baseImage.opacity = 1.0
-        blurImage.opacity = 0.0
-        scrim.opacity = 0.0
-        panelImage.opacity = 0.0
-        panelImage.y = panelY + {_PANEL_RISE_PX}
-        panelImage.scale = {_PANEL_OPEN_SCALE}
+        prepareOpen()
         openAnimation.restart()
     }}
 
     function startClose() {{
-        active = true
-        baseImage.opacity = 1.0
-        blurImage.opacity = 1.0
-        scrim.opacity = 1.0
-        panelImage.opacity = 1.0
-        panelImage.y = panelY
-        panelImage.scale = 1.0
+        prepareClose()
         closeAnimation.restart()
     }}
 
@@ -212,17 +226,16 @@ Item {{
 
 
 class GlassModalInteractionController(QObject):
-    """GPU-composited modal transitions over the stable QWidget application.
+    """GPU modal transition hosted by a dedicated native Quick child window.
 
-    QML is created lazily after the event loop is running. If the transition
-    item cannot be created on a particular PySide/Qt build, the modal remains
-    fully functional and simply falls back to the already-prepared atomic
-    QWidget presentation instead of aborting application startup.
+    The production window keeps the baseline QWidget tree continuously mapped.
+    A short-lived child QQuickWindow is raised above that QWidget child only
+    while an open/close animation is running. It renders static snapshots, so
+    there is no QWidget geometry animation, layout reflow, or parent hide/show
+    churn in the transition hot path.
 
-    The lifecycle is an explicit finite state machine. In particular, restoring
-    the QWidget child after a Quick transition can emit QEvent.Show again for the
-    still-visible drawer; those synthetic show events must never start a second
-    transition.
+    QML and the transition surface are created lazily after app.exec(). If any
+    preparation step fails, the already-prepared QWidget modal remains usable.
     """
 
     def __init__(self, window: QMainWindow, details: FastCardDetailController) -> None:
@@ -238,6 +251,7 @@ class GlassModalInteractionController(QObject):
         self.quick_window = getattr(self.background, "quick_window", None)
         self.engine = getattr(self.background, "engine", None)
 
+        self.transition_window: QQuickWindow | None = None
         self.transition_item: QQuickItem | None = None
         self._transition_error = ""
         self._state = _STATE_CLOSED
@@ -254,8 +268,6 @@ class GlassModalInteractionController(QObject):
         self._original_capture_backdrop = self.details._capture_backdrop  # noqa: SLF001
         self.details._capture_backdrop = self._capture_raw_backdrop  # type: ignore[method-assign]  # noqa: SLF001
 
-        # Do NOT create QQmlComponent here. This controller is installed before
-        # app.exec(); optional QML imports can still be in Loading state there.
         self.details.drawer.installEventFilter(self)
         self.root.installEventFilter(self)
         self._install_passive_card_surfaces()
@@ -267,13 +279,25 @@ class GlassModalInteractionController(QObject):
         text = str(exc).strip()
         return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
-    def _deactivate_transition_item(self) -> None:
-        if self.transition_item is None:
+    def _sync_transition_window_geometry(self, *_args: object) -> None:
+        surface = self.transition_window
+        owner = self.quick_window
+        if surface is None or owner is None:
             return
-        try:
-            self.transition_item.setProperty("active", False)
-        except RuntimeError:
-            pass
+        surface.setGeometry(0, 0, max(1, owner.width()), max(1, owner.height()))
+
+    def _hide_transition_surface(self) -> None:
+        if self.transition_item is not None:
+            try:
+                self.transition_item.setProperty("active", False)
+            except RuntimeError:
+                pass
+        surface = self.transition_window
+        if surface is not None:
+            try:
+                surface.hide()
+            except RuntimeError:
+                pass
 
     def _clear_snapshots(self) -> None:
         self._base_snapshot = QPixmap()
@@ -287,47 +311,52 @@ class GlassModalInteractionController(QObject):
         self._state = _STATE_OPEN
         self._transitioning = False
         self._target_open = True
-        self._deactivate_transition_item()
-        if not self.window.isVisible():
-            self.window.show()
-            shell = getattr(self.window, "_native_window_shell", None)
-            fit = getattr(shell, "_fit_native_child", None)
-            if callable(fit):
-                QTimer.singleShot(0, fit)
+        self._hide_transition_surface()
 
     def _fallback_closed(self, exc: Exception | None = None) -> None:
         if exc is not None:
             self._transition_error = self._error_text(exc)
-        # Settle CLOSED before touching QWidget visibility. This preserves the
-        # same no-reentry invariant as a normally completed close transition.
         self._state = _STATE_CLOSED
         self._transitioning = False
         self._target_open = False
-        self._deactivate_transition_item()
         try:
             self.details.close()
         except RuntimeError:
             pass
-        if not self.window.isVisible():
-            self.window.show()
-            shell = getattr(self.window, "_native_window_shell", None)
-            fit = getattr(shell, "_fit_native_child", None)
-            if callable(fit):
-                QTimer.singleShot(0, fit)
+        self._hide_transition_surface()
         self._clear_snapshots()
 
-    def _ensure_transition_item(self) -> bool:
-        if self.transition_item is not None:
+    def _ensure_transition_surface(self) -> bool:
+        if self.transition_window is not None and self.transition_item is not None:
             return True
         if self.quick_window is None or self.engine is None:
             self._transition_error = "native Quick renderer unavailable"
             return False
 
+        surface: QQuickWindow | None = None
         component: QQmlComponent | None = None
         obj: QObject | None = None
         try:
+            surface = QQuickWindow(self.quick_window)
+            surface.setObjectName("glassModalTransitionWindow")
+            surface.setFlags(
+                Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.WindowDoesNotAcceptFocus
+            )
+            surface.setColor(QColor(0, 0, 0, 0))
+            surface.setGeometry(
+                0,
+                0,
+                max(1, self.quick_window.width()),
+                max(1, self.quick_window.height()),
+            )
+            surface.hide()
+
             component = QQmlComponent(self.engine, self)
-            component.setData(_TRANSITION_QML.encode("utf-8"), QUrl("inline:glass-modal-transition.qml"))
+            component.setData(
+                _TRANSITION_QML.encode("utf-8"),
+                QUrl("inline:glass-modal-transition.qml"),
+            )
             status = component.status()
             if status != QQmlComponent.Status.Ready:
                 errors = "\n".join(error.toString() for error in component.errors())
@@ -340,11 +369,16 @@ class GlassModalInteractionController(QObject):
                 return False
 
             obj.setParent(self)
-            obj.setParentItem(self.quick_window.contentItem())
+            obj.setParentItem(surface.contentItem())
             obj.setProperty("active", False)
             obj.transitionFinished.connect(self._on_transition_finished)  # type: ignore[attr-defined]
+
+            self.transition_window = surface
             self.transition_item = obj
+            surface = None
             obj = None
+            self.quick_window.widthChanged.connect(self._sync_transition_window_geometry)
+            self.quick_window.heightChanged.connect(self._sync_transition_window_geometry)
             self._transition_error = ""
             return True
         except Exception as exc:
@@ -355,6 +389,10 @@ class GlassModalInteractionController(QObject):
                 obj.deleteLater()
             if component is not None:
                 component.deleteLater()
+            if surface is not None:
+                surface.hide()
+                surface.close()
+                surface.deleteLater()
 
     def _rewire_close_inputs(self) -> None:
         try:
@@ -441,12 +479,19 @@ class GlassModalInteractionController(QObject):
 
     def _issue_transition(self, *, closing: bool) -> None:
         item = self.transition_item
-        if item is None:
+        surface = self.transition_window
+        if item is None or surface is None:
             return
-        self._command += 1
-        item.setProperty("active", True)
+
         item.setProperty("closingRequest", closing)
+        item.setProperty("active", True)
+        self._sync_transition_window_geometry()
+        surface.show()
+        surface.raise_()
+
+        self._command += 1
         item.setProperty("command", self._command)
+        surface.requestUpdate()
 
     def _start_open_transition(self) -> None:
         if self._state != _STATE_OPENING_PENDING:
@@ -460,11 +505,7 @@ class GlassModalInteractionController(QObject):
             if not blurred.isNull():
                 self.details.backdrop.setPixmap(blurred)
 
-            # Quick animation is optional presentation. Any failure in QML,
-            # snapshot publication or animator setup must leave the already
-            # prepared QWidget modal usable rather than trapping the state
-            # machine in OPENING_PENDING.
-            if not self._ensure_transition_item():
+            if not self._ensure_transition_surface():
                 self._fallback_open()
                 return
 
@@ -474,20 +515,19 @@ class GlassModalInteractionController(QObject):
             self._transitioning = True
             self._target_open = True
             self._issue_transition(closing=False)
-            self.window.hide()
         except Exception as exc:
             self._fallback_open(exc)
 
     def request_close(self, *_args: object) -> None:
         if self._state != _STATE_OPEN:
             return
-        if not self.details.drawer.isVisible() and not self.details.scrim.isVisible():
+        if self.details.drawer.isHidden() and self.details.scrim.isHidden():
             self._state = _STATE_CLOSED
             self._target_open = False
             return
 
         try:
-            if not self._ensure_transition_item():
+            if not self._ensure_transition_surface():
                 self._fallback_closed()
                 return
 
@@ -504,50 +544,37 @@ class GlassModalInteractionController(QObject):
             self._transitioning = True
             self._target_open = False
             self._issue_transition(closing=True)
-            self.window.hide()
         except Exception as exc:
             self._fallback_closed(exc)
-
-    def _restore_widget_layer(self) -> None:
-        self.window.show()
-        shell = getattr(self.window, "_native_window_shell", None)
-        fit = getattr(shell, "_fit_native_child", None)
-        if callable(fit):
-            QTimer.singleShot(0, fit)
-        self._deactivate_transition_item()
 
     def _on_transition_finished(self, opened: bool) -> None:
         if opened:
             if self._state != _STATE_OPENING:
                 return
-            # Move to OPEN *before* window.show(). Showing the parent emits Show
-            # again for visible children on Windows; eventFilter must see OPEN and
-            # ignore that synthetic drawer Show instead of recursively reopening.
             self._state = _STATE_OPEN
             self._transitioning = False
             self._target_open = True
-            self._restore_widget_layer()
+            self._hide_transition_surface()
             self.details.close_button.setFocus(Qt.FocusReason.OtherFocusReason)
             return
 
         if self._state != _STATE_CLOSING:
             return
-        # Likewise settle CLOSED before hiding modal widgets/restoring the parent
-        # so no lifecycle event can schedule another transition.
         self._state = _STATE_CLOSED
         self._transitioning = False
         self._target_open = False
+
+        # Keep the Quick child covering the real widget modal until the modal
+        # widgets are explicitly hidden. Then remove the transition surface in
+        # the same GUI-thread turn, so no intermediate modal frame can resurface.
         self.details.close()
-        self._restore_widget_layer()
+        self._hide_transition_surface()
         self._clear_snapshots()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
 
         if watched is self.details.drawer and event_type == QEvent.Type.Show:
-            # A real open is the CLOSED -> OPENING_PENDING edge. Parent-window
-            # restoration can emit Show for the same visible drawer again; all
-            # non-CLOSED states intentionally ignore those synthetic events.
             if self._state == _STATE_CLOSED:
                 self._state = _STATE_OPENING_PENDING
                 QTimer.singleShot(0, self._start_open_transition)
@@ -586,10 +613,23 @@ class GlassModalInteractionController(QObject):
             pass
 
         if self.transition_item is not None:
-            self._deactivate_transition_item()
-            self.transition_item.setParentItem(None)
+            try:
+                self.transition_item.setProperty("active", False)
+                self.transition_item.setParentItem(None)
+            except RuntimeError:
+                pass
             self.transition_item.deleteLater()
             self.transition_item = None
+
+        if self.transition_window is not None:
+            try:
+                self.transition_window.hide()
+                self.transition_window.releaseResources()
+                self.transition_window.close()
+            except RuntimeError:
+                pass
+            self.transition_window.deleteLater()
+            self.transition_window = None
 
 
 def install_modal_interaction(
