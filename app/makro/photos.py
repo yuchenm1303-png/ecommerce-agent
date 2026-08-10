@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from playwright.sync_api import Page
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from .sections import find_section, open_section_for_edit
 
@@ -55,19 +55,43 @@ def parse_completion_counter(title: str) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2))
 
 
+def _photo_surface(page: Page, section_path: str):
+    """Return the whole Product Photos surface, including the gallery sibling."""
+
+    card = page.locator(section_path)
+    if card.count() != 1:
+        return card
+    parent = card.locator("xpath=..")
+    if parent.count() == 1:
+        markers = parent.locator(
+            '[class*="ImageGalleryWrapper"], [class*="AddProductImage"], input[type="file"]'
+        )
+        if markers.count() > 0:
+            return parent
+    return card
+
+
 def _photo_state(page: Page, section_path: str) -> dict[str, Any]:
     card = page.locator(section_path)
     if card.count() != 1:
         return {"found": False, "detail": f"section path 匹配 {card.count()} 个节点"}
 
-    payload = card.evaluate(
-        r"""card => {
+    surface = _photo_surface(page, section_path)
+    payload = surface.evaluate(
+        r"""surface => {
           const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
-          const titleEl = card.querySelector(
+          const titleEl = surface.querySelector(
             '[class*="styles__Title-"], [class*="Title-ef7o31"], [class*="Title-"]'
           );
-          const inputs = Array.from(card.querySelectorAll('input[type="file"]'));
-          const images = Array.from(card.querySelectorAll('img')).filter(img => {
+          const inputs = Array.from(surface.querySelectorAll('input[type="file"]'));
+          const addTiles = Array.from(
+            surface.querySelectorAll('[class*="AddProductImage"]')
+          ).filter(el => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+          });
+          const images = Array.from(surface.querySelectorAll('img')).filter(img => {
             const src = clean(img.getAttribute('src'));
             const rect = img.getBoundingClientRect();
             return Boolean(src) && rect.width > 0 && rect.height > 0;
@@ -82,6 +106,7 @@ def _photo_state(page: Page, section_path: str) -> dict[str, Any]:
               disabled: input.disabled === true || input.hasAttribute('disabled'),
               files: input.files ? input.files.length : 0,
             })),
+            add_image_tile_count: addTiles.length,
             visible_image_count: images.length,
             visible_image_sources: images.map(img => clean(img.getAttribute('src'))).filter(Boolean),
           };
@@ -107,12 +132,101 @@ def inspect_product_photos(page: Page) -> dict[str, Any]:
     return state
 
 
-def _select_file_input(page: Page, section_path: str):
-    inputs = page.locator(section_path).locator('input[type="file"]')
+def _raw_file_input(page: Page, section_path: str):
+    inputs = _photo_surface(page, section_path).locator('input[type="file"]')
+    usable = []
     for index in range(inputs.count()):
         candidate = inputs.nth(index)
         if not candidate.is_disabled():
-            return candidate
+            usable.append(candidate)
+    if len(usable) > 1:
+        raise RuntimeError(
+            f"Product Photos 当前出现 {len(usable)} 个可用 file input；拒绝猜测上传目标。"
+        )
+    return usable[0] if usable else None
+
+
+def _add_product_image_tile(page: Page, section_path: str):
+    tiles = _photo_surface(page, section_path).locator('[class*="AddProductImage"]')
+    visible = []
+    for index in range(tiles.count()):
+        candidate = tiles.nth(index)
+        try:
+            if candidate.is_visible():
+                visible.append(candidate)
+        except Exception:
+            continue
+    if len(visible) > 1:
+        raise RuntimeError(
+            f"Product Photos 当前出现 {len(visible)} 个可见 AddProductImage；拒绝猜测上传入口。"
+        )
+    return visible[0] if visible else None
+
+
+class _DynamicPhotoFileTarget:
+    """File target backed by Makro's dynamic AddProductImage tile."""
+
+    def __init__(self, page: Page, section_path: str) -> None:
+        self.page = page
+        self.section_path = section_path
+        self._selected = False
+
+    def _current_path(self) -> str:
+        section = find_section(self.page, PRODUCT_PHOTOS_SECTION)
+        path = str((section or {}).get("path") or "")
+        return path or self.section_path
+
+    def set_input_files(self, files: str | Path) -> None:
+        upload = str(Path(files).expanduser().resolve())
+        current_path = self._current_path()
+        direct = _raw_file_input(self.page, current_path)
+        if direct is not None:
+            direct.set_input_files(upload)
+            self._selected = True
+            return
+
+        tile = _add_product_image_tile(self.page, current_path)
+        if tile is None:
+            raise RuntimeError(
+                "Product Photos 没有 file input，也没有唯一可见 AddProductImage 上传入口。"
+            )
+
+        try:
+            with self.page.expect_file_chooser(timeout=2_500) as chooser_info:
+                tile.click()
+            chooser_info.value.set_files(upload)
+            self._selected = True
+            return
+        except PlaywrightTimeoutError:
+            # Some Makro renders use the tile only to mount a fresh hidden input.
+            pass
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            current_path = self._current_path()
+            direct = _raw_file_input(self.page, current_path)
+            if direct is not None:
+                direct.set_input_files(upload)
+                self._selected = True
+                return
+            self.page.wait_for_timeout(150)
+
+        raise RuntimeError(
+            "点击 Product Photos 的 AddProductImage 后既未出现 file chooser，也未挂载 file input。"
+        )
+
+    def evaluate(self, _expression: str) -> int:
+        return 1 if self._selected else 0
+
+
+def _select_file_input(page: Page, section_path: str):
+    """Return a direct file input or the exact Product Photos add-image target."""
+
+    direct = _raw_file_input(page, section_path)
+    if direct is not None:
+        return direct
+    if _add_product_image_tile(page, section_path) is not None:
+        return _DynamicPhotoFileTarget(page, section_path)
     return None
 
 
@@ -123,12 +237,7 @@ def _stage_accepted(
     before_sources: set[str],
     before_completion: int | None,
 ) -> bool:
-    """Return True only for a Makro-visible acceptance signal.
-
-    ``input.files`` is deliberately ignored: browsers populate it immediately
-    after ``set_input_files`` even when the application has not processed or
-    accepted the image yet.
-    """
+    """Return True only for a Makro-visible acceptance signal."""
 
     images = int(state.get("visible_image_count") or 0)
     sources = {
@@ -161,7 +270,9 @@ def _wait_for_staged_signal(
     deadline = time.monotonic() + timeout_ms / 1000.0
     latest = _photo_state(page, section_path)
     while time.monotonic() < deadline:
-        latest = _photo_state(page, section_path)
+        section = find_section(page, PRODUCT_PHOTOS_SECTION)
+        live_path = str((section or {}).get("path") or section_path)
+        latest = _photo_state(page, live_path)
         if _stage_accepted(
             latest,
             before_images=before_images,
@@ -223,19 +334,20 @@ def upload_product_photos(
         else None
     )
     input_meta = list(state.get("file_inputs") or [])
-    if not input_meta:
+    add_tile_count = int(state.get("add_image_tile_count") or 0)
+    if not input_meta and add_tile_count != 1:
         return PhotoUploadResult(
             status="unsupported",
             initial_count=initial_count,
             final_count=initial_count,
             capacity=capacity,
             detail=(
-                "Product Photos 已展开，但卡片内没有 input[type=file]；"
-                "拒绝猜测其它按钮。需要真实 DOM 更新定位。"
+                "Product Photos 已展开，但既没有可用 input[type=file]，"
+                "也没有唯一 AddProductImage 上传入口。"
             ),
         )
 
-    first_meta = input_meta[0]
+    first_meta = input_meta[0] if input_meta else {}
     result = PhotoUploadResult(
         status="running",
         initial_count=initial_count,
@@ -257,13 +369,15 @@ def upload_product_photos(
                 )
                 continue
 
+        section = find_section(page, PRODUCT_PHOTOS_SECTION) or section
+        section_path = str(section.get("path") or section_path)
         file_input = _select_file_input(page, section_path)
         if file_input is None:
             result.items.append(
                 {
                     "path": str(path),
                     "status": "file_input_missing",
-                    "detail": "上传过程中找不到可用 input[type=file]。",
+                    "detail": "上传过程中找不到 file input 或唯一 AddProductImage 入口。",
                 }
             )
             continue
@@ -349,6 +463,8 @@ def upload_product_photos(
                 }
             )
 
+    section = find_section(page, PRODUCT_PHOTOS_SECTION) or section
+    section_path = str(section.get("path") or section_path)
     final_state = _photo_state(page, section_path)
     result.final_count = final_state.get("completion_count")
     if result.staged == result.attempted and result.attempted > 0:
