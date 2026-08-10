@@ -35,41 +35,38 @@ def test_every_presentation_card_family_gets_expand_affordance() -> None:
     assert "frame.installEventFilter(self)" in BASE_DETAILS
 
 
-def test_detail_drawer_is_atomic_and_has_no_animation_driver() -> None:
+def test_runtime_detail_drawer_uses_shared_clip_sheet_driver() -> None:
+    assert "from .overlay_sheet_motion import ClipSheetMotion" in FAST_DETAILS
+    assert "self._motion = ClipSheetMotion" in FAST_DETAILS
+    assert 'edge="right"' in FAST_DETAILS
+    assert "duration_ms=158" in FAST_DETAILS
     assert "QPropertyAnimation" not in FAST_DETAILS
     assert "QParallelAnimationGroup" not in FAST_DETAILS
     assert "QEasingCurve" not in FAST_DETAILS
-    assert "QAbstractAnimation" not in FAST_DETAILS
     assert "QGraphicsOpacityEffect" not in FAST_DETAILS
-    assert "_DRAWER_OPEN_MS" not in FAST_DETAILS
-    assert "_DRAWER_CLOSE_MS" not in FAST_DETAILS
-    assert "_CONTENT_REVEAL_MS" not in FAST_DETAILS
-    assert "_CARD_PULSE_PAD" not in FAST_DETAILS
 
 
-def test_detail_open_populates_final_geometry_before_single_repaint() -> None:
-    assert "updates_were_enabled = self.root.updatesEnabled()" in FAST_DETAILS
-    assert "self.root.setUpdatesEnabled(False)" in FAST_DETAILS
+def test_detail_body_is_populated_at_final_size_before_reveal() -> None:
     assert "self._populate(frame)" in FAST_DETAILS
-    assert "self.drawer.setGeometry(self._drawer_rect())" in FAST_DETAILS
-    assert "self.drawer.show()" in FAST_DETAILS
-    assert "self.root.setUpdatesEnabled(True)" in FAST_DETAILS
-    assert "self.root.update()" in FAST_DETAILS
+    assert "self.body_layout.activate()" in FAST_DETAILS
+    assert "self.drawer.layout().activate()" in FAST_DETAILS
+    assert "self._motion.open()" in FAST_DETAILS
+    assert FAST_DETAILS.index("self._populate(frame)") < FAST_DETAILS.index("self._motion.open()")
 
 
-def test_detail_close_is_immediate_without_exit_animation() -> None:
+def test_detail_close_only_reverses_clip_viewport() -> None:
     assert "def close(self)" in FAST_DETAILS
-    assert "self.drawer.hide()" in FAST_DETAILS
+    assert "self._motion.close()" in FAST_DETAILS
     assert "self.scrim.hide()" in FAST_DETAILS
-    assert "end_pos" not in FAST_DETAILS
-    assert "reveal_cover" not in FAST_DETAILS
+    assert "drawer.setGeometry" not in FAST_DETAILS
+    assert "drawer.resize" not in FAST_DETAILS
 
 
 def test_detail_geometry_notifications_are_coalesced() -> None:
     assert "_GEOMETRY_COALESCE_MS = 32" in FAST_DETAILS
     assert "self._geometry_timer.setSingleShot(True)" in FAST_DETAILS
     assert "def _schedule_geometry" in FAST_DETAILS
-    assert "QTimer.singleShot(0, lambda card=" not in FAST_DETAILS
+    assert "self._motion.sync_geometry()" in FAST_DETAILS
 
 
 def test_details_are_useful_not_generic_placeholders() -> None:
@@ -95,5 +92,5 @@ def test_detail_path_has_no_layout_height_animation_or_global_filter() -> None:
 
 def test_escape_and_scrim_close_detail_page() -> None:
     assert "self.scrim.clicked.connect(self.close)" in BASE_DETAILS
-    assert "event.key() == Qt.Key.Key_Escape" in BASE_DETAILS
+    assert "event.key() == Qt.Key.Key_Escape" in FAST_DETAILS
     assert "self.close_button.clicked.connect(self.close)" in BASE_DETAILS
