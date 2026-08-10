@@ -84,6 +84,16 @@ def test_modal_open_settles_content_before_single_repaint() -> None:
     assert "self.root.update()" in FAST_DETAILS
 
 
+def test_modal_close_uses_explicit_hidden_state_when_parent_layer_is_hidden() -> None:
+    close_body = FAST_DETAILS.split("def close(self) -> None:", 1)[1].split(
+        "def _install_real_settings_action", 1
+    )[0]
+    assert "self.drawer.isHidden() and self.scrim.isHidden()" in close_body
+    assert "not self.drawer.isVisible()" not in close_body
+    assert "self.drawer.hide()" in close_body
+    assert "self.scrim.hide()" in close_body
+
+
 def test_real_settings_uses_shared_modal_instead_of_inline_visibility_toggle() -> None:
     assert "def _install_real_settings_action" in FAST_DETAILS
     assert "toggle.toggled.disconnect()" in FAST_DETAILS
