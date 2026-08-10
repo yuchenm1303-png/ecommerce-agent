@@ -4,7 +4,7 @@ from app.ai_decisions import AIDecisionPacket, FieldDecision, MISSING, READY, fi
 from app.best_effort_inference import build_best_effort_inference_request
 from app.compact_evidence import CompactEvidence
 from app.evidence_contract import ProductIdentity
-from app.fill_plan import _hard_guard_values
+from app.fill_plan import GATE_HARD_FIELD_CONSTRAINT, _decision_record, _hard_guard_values
 from app.live_schema import live_schema_payload
 from app.product_facts import build_product_fact_request
 
@@ -95,10 +95,11 @@ def test_numeric_hard_guard_still_blocks_composite_text() -> None:
         confidence=1.0,
     )
 
-    _values, _qualifier, error = _hard_guard_values(field, decision)
+    record = _decision_record(field, decision)
 
-    assert error is not None
-    assert "不是有限数字" in error
+    assert record.gate_reason == GATE_HARD_FIELD_CONSTRAINT
+    assert record.eligible_for_autofill is False
+    assert "不是有限数字" in record.detail
 
 
 def test_direct_product_fact_contract_requires_single_value_and_real_qualifiers() -> None:
