@@ -102,12 +102,15 @@ def test_details_are_useful_not_generic_placeholders() -> None:
     assert 'table.property("detailTitle")' in BASE_DETAILS
 
 
-def test_detail_path_has_no_main_layout_height_animation_or_global_filter() -> None:
+def test_detail_path_has_no_source_card_or_splitter_height_animation() -> None:
     assert "QApplication.instance().installEventFilter" not in FAST_DETAILS
-    assert "setMinimumHeight" not in FAST_DETAILS
-    assert "setMaximumHeight" not in FAST_DETAILS
+    assert "frame.setMinimumHeight" not in FAST_DETAILS
+    assert "frame.setMaximumHeight" not in FAST_DETAILS
     assert "frame.setGeometry" not in FAST_DETAILS
     assert "frame.resize" not in FAST_DETAILS
+    assert "splitter.setSizes" not in FAST_DETAILS
+    assert "drawer.setGeometry" not in FAST_DETAILS
+    assert "drawer.resize" not in FAST_DETAILS
 
 
 def test_escape_and_scrim_close_detail_page() -> None:
