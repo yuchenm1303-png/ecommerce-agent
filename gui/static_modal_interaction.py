@@ -52,9 +52,11 @@ class StaticModalInteractionController(QObject):
         self._passive_labels: dict[QLabel, bool] = {}
         self._state = _STATE_IDLE
         self._animation: QParallelAnimationGroup | None = None
+        self._geometry_sync_pending = False
 
         self._original_show_prepared_modal = self.details._show_prepared_modal  # noqa: SLF001
         self._original_close = self.details.close
+        self._original_schedule_geometry = self.details._schedule_geometry  # noqa: SLF001
 
         # Fade the real drawer subtree. Unlike the previous panel snapshot, this
         # makes text, tables and buttons share one continuous opacity curve.
@@ -65,6 +67,7 @@ class StaticModalInteractionController(QObject):
 
         self.details._show_prepared_modal = self._show_with_animation  # type: ignore[method-assign]  # noqa: SLF001
         self.details.close = self.request_close  # type: ignore[method-assign]
+        self.details._schedule_geometry = self._schedule_geometry_guarded  # type: ignore[method-assign]  # noqa: SLF001
         self._rewire_close_inputs()
         self._install_card_surfaces()
         window.destroyed.connect(self.cleanup)
@@ -103,14 +106,26 @@ class StaticModalInteractionController(QObject):
             pass
         self.details.scrim.clicked.connect(self.request_close)
 
+    def _schedule_geometry_guarded(self, *_args: object) -> None:
+        if self._state in {_STATE_OPENING, _STATE_CLOSING}:
+            self._geometry_sync_pending = True
+            return
+        self._original_schedule_geometry()
+
     def _set_motion_active(self, active: bool) -> None:
         self.details._presentation_animating = bool(active)  # noqa: SLF001
         timer = getattr(self.details, "_geometry_timer", None)
-        if active and timer is not None:
-            try:
-                timer.stop()
-            except RuntimeError:
-                pass
+        if active:
+            if timer is not None:
+                try:
+                    timer.stop()
+                except RuntimeError:
+                    pass
+            return
+
+        if self._geometry_sync_pending:
+            self._geometry_sync_pending = False
+            self._original_schedule_geometry()
 
     @staticmethod
     def _property_animation(
@@ -220,8 +235,8 @@ class StaticModalInteractionController(QObject):
         target = self.details._drawer_rect()  # noqa: SLF001
         self.details.drawer.move(target.topLeft())
         self._drawer_effect.setOpacity(1.0)
-        self._set_motion_active(False)
         self._state = _STATE_OPEN
+        self._set_motion_active(False)
         self.details.close_button.setFocus(Qt.FocusReason.OtherFocusReason)
         self.details._schedule_geometry()  # noqa: SLF001
 
@@ -231,8 +246,8 @@ class StaticModalInteractionController(QObject):
 
         if self.details.drawer.isHidden() and self.details.scrim.isHidden():
             self._stop_animation()
-            self._set_motion_active(False)
             self._state = _STATE_IDLE
+            self._set_motion_active(False)
             return
 
         if self._state not in {_STATE_OPENING, _STATE_OPEN, _STATE_IDLE}:
@@ -282,13 +297,14 @@ class StaticModalInteractionController(QObject):
         if animation is not None:
             animation.deleteLater()
 
+        self._state = _STATE_IDLE
         self._set_motion_active(False)
         self._original_close()
         self._drawer_effect.setOpacity(1.0)
-        self._state = _STATE_IDLE
 
     def _fallback_open(self, ratio: tuple[float, float]) -> None:
         self._stop_animation()
+        self._state = _STATE_IDLE
         self._set_motion_active(False)
         self._drawer_effect.setOpacity(1.0)
         try:
@@ -301,15 +317,15 @@ class StaticModalInteractionController(QObject):
 
     def _fallback_close(self) -> None:
         self._stop_animation()
+        self._state = _STATE_IDLE
         self._set_motion_active(False)
         self._original_close()
         self._drawer_effect.setOpacity(1.0)
-        self._state = _STATE_IDLE
 
     def cleanup(self) -> None:
         self._stop_animation()
-        self._set_motion_active(False)
         self._state = _STATE_IDLE
+        self._set_motion_active(False)
 
         try:
             self.details.close_button.clicked.disconnect(self.request_close)
@@ -328,6 +344,7 @@ class StaticModalInteractionController(QObject):
         try:
             self.details._show_prepared_modal = self._original_show_prepared_modal  # type: ignore[method-assign]  # noqa: SLF001
             self.details.close = self._original_close  # type: ignore[method-assign]
+            self.details._schedule_geometry = self._original_schedule_geometry  # type: ignore[method-assign]  # noqa: SLF001
         except RuntimeError:
             pass
 
