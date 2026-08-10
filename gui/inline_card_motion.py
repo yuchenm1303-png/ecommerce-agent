@@ -112,7 +112,7 @@ class AdaptiveReveal(QObject):
 
         self.wrapper.setMinimumHeight(0)
         self.wrapper.setMaximumHeight(0)
-        self.wrapper.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.wrapper.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.toggle.setText(self.collapsed_text)
         self.toggle.toggled.connect(self.set_expanded)
 
@@ -135,7 +135,7 @@ class AdaptiveReveal(QObject):
     def _target_height(self) -> int:
         natural = self._measure_natural_height()
         if self.expanded_height is not None:
-            natural = min(natural, max(0, int(self.expanded_height(natural))))
+            return max(0, int(self.expanded_height(natural)))
         return natural
 
     @staticmethod
@@ -375,13 +375,12 @@ def _build_console_motion(window: QMainWindow) -> AdaptiveReveal | None:
     progress_index = _layout_index(layout, progress_row)
     layout.insertWidget(max(0, progress_index + 1), wrapper, 1)
 
-    def expanded_target(natural: int) -> int:
+    def expanded_target(_natural: int) -> int:
         available = max(1, body_splitter.height() - body_splitter.handleWidth())
         target_total = min(440, max(340, available - 300))
         target_total = min(target_total, max(260, available - 260))
         collapsed_shell = max(96, console.height())
-        budget = max(220, target_total - collapsed_shell)
-        return min(natural, budget)
+        return max(220, target_total - collapsed_shell)
 
     return AdaptiveReveal(
         window,
