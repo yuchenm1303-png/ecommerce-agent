@@ -4,7 +4,8 @@ import time
 from dataclasses import dataclass
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer
-from PySide6.QtWidgets import QFrame, QMainWindow
+from PySide6.QtGui import QCursor, QMouseEvent
+from PySide6.QtWidgets import QFrame, QMainWindow, QWidget
 
 from .visual_style import GlassBackdrop, VisualStyleController
 
@@ -53,11 +54,7 @@ class _CardState:
     def begin(self, *, alpha: float, duration: float) -> None:
         alpha = float(alpha)
         if abs(alpha - self.current_alpha) < 0.1:
-            self.current_alpha = alpha
-            self.start_alpha = alpha
-            self.target_alpha = alpha
-            self.animating = False
-            self.surface.set_interaction(scale=1.0, overlay_alpha=alpha)
+            self.snap(alpha)
             return
         self.start_alpha = self.current_alpha
         self.target_alpha = alpha
@@ -65,23 +62,34 @@ class _CardState:
         self.duration = max(0.001, float(duration))
         self.animating = True
 
+    def snap(self, alpha: float) -> None:
+        """Publish one interaction state immediately, without waiting for a timer tick."""
+
+        alpha = float(alpha)
+        self.current_alpha = alpha
+        self.start_alpha = alpha
+        self.target_alpha = alpha
+        self.animating = False
+        self.surface.set_interaction(scale=1.0, overlay_alpha=alpha)
+
     def freeze(self) -> None:
         # Preserve the exact alpha already on screen. Forcing hover/pressed
         # feedback to NORMAL here would itself create the flash the modal is
         # trying to eliminate.
-        self.start_alpha = self.current_alpha
-        self.target_alpha = self.current_alpha
-        self.animating = False
-        self.surface.set_interaction(scale=1.0, overlay_alpha=self.current_alpha)
+        self.snap(self.current_alpha)
 
 
 class NekroCardInteractionController(QObject):
-    """Immediate card hover/press feedback with no pointer polling loop.
+    """Reliable card hover/press feedback without pointer polling.
 
-    Modal suspension freezes every card at the alpha already presented on screen
-    and stops the animation timer. Nothing changes while the modal is active.
-    After the modal is fully gone, cards ease back to neutral with the existing
-    release curve instead of jumping between interaction states.
+    Input is observed across each card's entire QWidget subtree rather than only
+    on the outer QFrame. Child labels, buttons and editors therefore cannot make
+    hover/press feedback disappear. Events are never consumed: real child controls
+    continue to own their normal behavior.
+
+    Press feedback is committed synchronously so even a click shorter than the
+    8 ms animation timer interval visibly reaches ACTIVE_ALPHA once. Hover and
+    release keep the existing easing, colors and durations.
     """
 
     def __init__(self, window: QMainWindow, visual: VisualStyleController) -> None:
@@ -92,7 +100,10 @@ class NekroCardInteractionController(QObject):
         self.hovered: QFrame | None = None
         self.pressed: QFrame | None = None
         self._suspended = False
+        self._watched_to_card: dict[QObject, QFrame] = {}
 
+        # Build every card state before assigning descendants. This lets nested
+        # glass cards resolve to their nearest card instead of an outer ancestor.
         for frame in window.findChildren(QFrame):
             if frame.objectName() not in _GLASS_NAMES:
                 continue
@@ -100,8 +111,9 @@ class NekroCardInteractionController(QObject):
             if surface is None:
                 continue
             self.states[frame] = _CardState(frame=frame, surface=surface)
-            frame.setMouseTracking(True)
-            frame.installEventFilter(self)
+
+        for frame in self.states:
+            self._register_widget_tree(frame)
 
         self._animation_timer = QTimer(self)
         self._animation_timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -109,6 +121,44 @@ class NekroCardInteractionController(QObject):
         self._animation_timer.timeout.connect(self._tick_animation)
 
         window.destroyed.connect(self._cleanup)
+
+    def _nearest_card(self, widget: QWidget) -> QFrame | None:
+        current: QWidget | None = widget
+        while current is not None:
+            if isinstance(current, QFrame) and current in self.states:
+                return current
+            current = current.parentWidget()
+        return None
+
+    def _watch_widget(self, widget: QWidget, frame: QFrame) -> None:
+        previous = self._watched_to_card.get(widget)
+        if previous is frame:
+            return
+        if previous is not None:
+            try:
+                widget.removeEventFilter(self)
+            except RuntimeError:
+                pass
+        widget.setMouseTracking(True)
+        widget.installEventFilter(self)
+        self._watched_to_card[widget] = frame
+
+    def _register_widget_tree(self, root: QWidget) -> None:
+        widgets = [root, *root.findChildren(QWidget)]
+        for widget in widgets:
+            frame = self._nearest_card(widget)
+            if frame is not None:
+                self._watch_widget(widget, frame)
+
+    @staticmethod
+    def _cursor_inside_card(frame: QFrame) -> bool:
+        if not frame.isVisible() or not frame.isEnabled():
+            return False
+        try:
+            local = frame.mapFromGlobal(QCursor.pos())
+        except RuntimeError:
+            return False
+        return frame.rect().contains(local)
 
     def suspend_for_modal(self) -> None:
         if self._suspended:
@@ -143,6 +193,14 @@ class NekroCardInteractionController(QObject):
         state.begin(alpha=alpha, duration=duration)
         self._ensure_animation_timer()
 
+    def _snap(self, frame: QFrame, alpha: float) -> None:
+        if self._suspended:
+            return
+        state = self.states.get(frame)
+        if state is None:
+            return
+        state.snap(alpha)
+
     def _enter(self, frame: QFrame) -> None:
         if self.hovered is frame:
             return
@@ -160,14 +218,42 @@ class NekroCardInteractionController(QObject):
             self._animate(frame, _NORMAL_ALPHA, _RELEASE_SECONDS)
 
     def _press(self, frame: QFrame) -> None:
+        if self.hovered is not frame:
+            self._enter(frame)
+        previous = self.pressed
+        if previous is not None and previous is not frame:
+            self._animate(previous, _NORMAL_ALPHA, _RELEASE_SECONDS)
         self.pressed = frame
-        self._animate(frame, _ACTIVE_ALPHA, _PRESS_SECONDS)
 
-    def _release(self, frame: QFrame) -> None:
+        # A fast click can complete before the first 8 ms animation tick. Commit
+        # ACTIVE_ALPHA synchronously so every physical press produces one visible
+        # dark frame, then let release use the normal easing back to hover/normal.
+        self._snap(frame, _ACTIVE_ALPHA)
+
+    def _release(self, frame: QFrame, *, inside: bool) -> None:
         if self.pressed is frame:
             self.pressed = None
-        target = _HOVER_ALPHA if self.hovered is frame else _NORMAL_ALPHA
+        elif self.pressed is not None:
+            previous = self.pressed
+            self.pressed = None
+            self._animate(previous, _NORMAL_ALPHA, _RELEASE_SECONDS)
+
+        if inside:
+            if self.hovered is not frame:
+                self._enter(frame)
+            target = _HOVER_ALPHA
+        else:
+            if self.hovered is frame:
+                self.hovered = None
+            target = _NORMAL_ALPHA
         self._animate(frame, target, _RELEASE_SECONDS)
+
+    def _reset_card(self, frame: QFrame) -> None:
+        if self.hovered is frame:
+            self.hovered = None
+        if self.pressed is frame:
+            self.pressed = None
+        self._animate(frame, _NORMAL_ALPHA, _RELEASE_SECONDS)
 
     def _tick_animation(self) -> None:
         if self._suspended:
@@ -195,41 +281,60 @@ class NekroCardInteractionController(QObject):
             self._animation_timer.stop()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if not isinstance(watched, QFrame) or watched not in self.states:
-            return False
-        if self._suspended:
+        frame = self._watched_to_card.get(watched)
+        if frame is None:
             return False
 
         event_type = event.type()
-        if event_type == QEvent.Type.Enter:
-            self._enter(watched)
+
+        # Cards may gain small helper widgets after startup. Register them as they
+        # appear so the interaction surface stays complete without polling.
+        if event_type == QEvent.Type.ChildAdded:
+            child_getter = getattr(event, "child", None)
+            child = child_getter() if callable(child_getter) else None
+            if isinstance(child, QWidget):
+                self._register_widget_tree(child)
+            return False
+
+        if self._suspended:
+            return False
+
+        if event_type in {QEvent.Type.Enter, QEvent.Type.MouseMove}:
+            self._enter(frame)
         elif event_type == QEvent.Type.Leave:
-            self._leave(watched)
-        elif event_type == QEvent.Type.MouseButtonPress:
-            self._press(watched)
-        elif event_type == QEvent.Type.MouseButtonRelease:
-            self._release(watched)
-        elif event_type in {QEvent.Type.Hide, QEvent.Type.EnabledChange} and not watched.isVisible():
-            if self.hovered is watched:
-                self.hovered = None
-            if self.pressed is watched:
-                self.pressed = None
-            self._animate(watched, _NORMAL_ALPHA, _RELEASE_SECONDS)
+            # Child-to-child transitions generate Leave events too. Only release
+            # the card hover when the pointer has actually left the whole card.
+            if not self._cursor_inside_card(frame):
+                self._leave(frame)
+        elif event_type == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._press(frame)
+        elif event_type == QEvent.Type.MouseButtonRelease and isinstance(event, QMouseEvent):
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._release(frame, inside=self._cursor_inside_card(frame))
+        elif watched is frame and event_type in {QEvent.Type.Hide, QEvent.Type.EnabledChange}:
+            if not frame.isVisible() or not frame.isEnabled():
+                self._reset_card(frame)
         return False
 
     def _cleanup(self) -> None:
         self._animation_timer.stop()
         self._suspended = False
-        for frame, state in tuple(self.states.items()):
+        for watched in tuple(self._watched_to_card):
             try:
-                frame.removeEventFilter(self)
+                watched.removeEventFilter(self)
             except RuntimeError:
                 pass
+        self._watched_to_card.clear()
+
+        for state in tuple(self.states.values()):
             try:
                 state.surface.set_interaction(scale=1.0, overlay_alpha=_NORMAL_ALPHA)
             except RuntimeError:
                 pass
         self.states.clear()
+        self.hovered = None
+        self.pressed = None
 
 
 def install_nekro_card_fx(
