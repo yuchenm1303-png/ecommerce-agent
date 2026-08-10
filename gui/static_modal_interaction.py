@@ -49,10 +49,15 @@ class StaticModalInteractionController(QObject):
         if self.root is None:
             raise RuntimeError("static modal interaction requires a central widget")
 
+        visual = getattr(window, "_visual_style", None)
+        self.background = getattr(visual, "background", None)
+
         self._passive_labels: dict[QLabel, bool] = {}
         self._state = _STATE_IDLE
         self._animation: QParallelAnimationGroup | None = None
         self._geometry_sync_pending = False
+        self._underlay_suspended = False
+        self._pointer_timer_was_active = False
 
         self._original_show_prepared_modal = self.details._show_prepared_modal  # noqa: SLF001
         self._original_close = self.details.close
@@ -105,6 +110,64 @@ class StaticModalInteractionController(QObject):
         except (RuntimeError, TypeError):
             pass
         self.details.scrim.clicked.connect(self.request_close)
+
+    def _suspend_underlay(self) -> None:
+        if self._underlay_suspended:
+            return
+        self._underlay_suspended = True
+
+        card_fx = getattr(self.window, "_nekro_card_fx", None)
+        suspend_cards = getattr(card_fx, "suspend_for_modal", None)
+        if callable(suspend_cards):
+            try:
+                suspend_cards()
+            except RuntimeError:
+                pass
+
+        timer = getattr(self.background, "_pointer_timer", None)
+        try:
+            self._pointer_timer_was_active = bool(timer is not None and timer.isActive())
+        except RuntimeError:
+            self._pointer_timer_was_active = False
+        if self._pointer_timer_was_active:
+            try:
+                timer.stop()
+            except RuntimeError:
+                pass
+
+        quick = getattr(self.background, "quick_window", None)
+        if quick is not None:
+            try:
+                quick.setProperty("animationRunning", False)
+            except RuntimeError:
+                pass
+
+    def _resume_underlay(self) -> None:
+        if not self._underlay_suspended:
+            return
+        self._underlay_suspended = False
+
+        card_fx = getattr(self.window, "_nekro_card_fx", None)
+        resume_cards = getattr(card_fx, "resume_from_modal", None)
+        if callable(resume_cards):
+            try:
+                resume_cards()
+            except RuntimeError:
+                pass
+
+        if self.background is not None:
+            try:
+                self.background._last_pointer_norm = None  # noqa: SLF001
+            except (AttributeError, RuntimeError):
+                pass
+
+        timer = getattr(self.background, "_pointer_timer", None)
+        if self._pointer_timer_was_active and timer is not None:
+            try:
+                timer.start()
+            except RuntimeError:
+                pass
+        self._pointer_timer_was_active = False
 
     def _schedule_geometry_guarded(self, *_args: object) -> None:
         if self._state in {_STATE_OPENING, _STATE_CLOSING}:
@@ -193,6 +256,7 @@ class StaticModalInteractionController(QObject):
         if self._state != _STATE_IDLE or self.details.drawer.isVisible():
             return
 
+        self._suspend_underlay()
         self._state = _STATE_OPENING
         self._set_motion_active(True)
         try:
@@ -248,6 +312,7 @@ class StaticModalInteractionController(QObject):
             self._stop_animation()
             self._state = _STATE_IDLE
             self._set_motion_active(False)
+            self._resume_underlay()
             return
 
         if self._state not in {_STATE_OPENING, _STATE_OPEN, _STATE_IDLE}:
@@ -301,6 +366,7 @@ class StaticModalInteractionController(QObject):
         self._set_motion_active(False)
         self._original_close()
         self._drawer_effect.setOpacity(1.0)
+        self._resume_underlay()
 
     def _fallback_open(self, ratio: tuple[float, float]) -> None:
         self._stop_animation()
@@ -311,9 +377,13 @@ class StaticModalInteractionController(QObject):
             self._original_close()
         except RuntimeError:
             pass
-        self._original_show_prepared_modal(ratio=ratio)
-        self._drawer_effect.setOpacity(1.0)
-        self._state = _STATE_OPEN
+        try:
+            self._original_show_prepared_modal(ratio=ratio)
+            self._drawer_effect.setOpacity(1.0)
+            self._state = _STATE_OPEN
+        except Exception:
+            self._state = _STATE_IDLE
+            self._resume_underlay()
 
     def _fallback_close(self) -> None:
         self._stop_animation()
@@ -321,11 +391,13 @@ class StaticModalInteractionController(QObject):
         self._set_motion_active(False)
         self._original_close()
         self._drawer_effect.setOpacity(1.0)
+        self._resume_underlay()
 
     def cleanup(self) -> None:
         self._stop_animation()
         self._state = _STATE_IDLE
         self._set_motion_active(False)
+        self._resume_underlay()
 
         try:
             self.details.close_button.clicked.disconnect(self.request_close)
