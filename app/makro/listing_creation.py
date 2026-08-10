@@ -1,13 +1,14 @@
 """Makro Step 1/2 creation for the one-link listing workflow.
 
-This module owns only the pre-Step-3 browser work:
-- derive conservative category-search hints and brand status from the exact
-  supplier snapshot;
-- search the live Makro vertical UI and choose only an option that actually
-  exists on the current page;
-- check/select the brand and verify that Makro reached Step 3.
+Product semantics and portal mechanics are intentionally separated:
+- supplier evidence may be in any language;
+- AI converts the product intent into bounded canonical English search terms;
+- ``MakroPortalAdapter`` handles Step 1/2 mechanics using URL/DOM structure
+  before localized text;
+- only exact live Makro candidates are selected;
+- Step 3 writing remains outside this module.
 
-It never writes Step 3 attributes and never clicks Send to QC.
+The workflow never clicks Send to QC.
 """
 
 from __future__ import annotations
@@ -21,11 +22,14 @@ from playwright.sync_api import Page
 
 from ..source_snapshot import SourceSnapshot
 from .listing import MAKRO_HOME_URL, MAKRO_SINGLE_LISTING_ROUTE, parse_makro_listing_url
+from .portal_adapter import ListingStage, MakroPortalAdapter, normalize_ui_text
 
 
 MAKRO_NEW_LISTING_URL = f"{MAKRO_HOME_URL}#{MAKRO_SINGLE_LISTING_ROUTE}"
 _DISALLOWED_VERTICAL_HINT_TOKENS = {"makro", "marketplace", "listing", "seller", "vertical"}
 _DISALLOWED_VERTICAL_HINT_VALUES = {"category", "product"}
+_ENGLISH_SEARCH_TERM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 '&/()+.,-]*$")
+_ENGLISH_LETTER = re.compile(r"[A-Za-z]")
 
 
 class JSONTaskProvider(Protocol):
@@ -33,6 +37,10 @@ class JSONTaskProvider(Protocol):
 
     def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
         ...
+
+
+class BootstrapSearchTermsError(ValueError):
+    """The model response had no safe canonical English product-type terms."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -68,11 +76,22 @@ class ListingCreationResult:
 
 
 def normalize_label(value: str) -> str:
+    """Normalize a live UI label without deleting non-Latin scripts."""
+
+    return normalize_ui_text(value)
+
+
+def _english_search_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
 
 
 def _is_usable_vertical_hint(value: str) -> bool:
-    key = normalize_label(value)
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) < 2 or not text.isascii() or not _ENGLISH_SEARCH_TERM.fullmatch(text):
+        return False
+    if not _ENGLISH_LETTER.search(text):
+        return False
+    key = _english_search_key(text)
     if not key or key in _DISALLOWED_VERTICAL_HINT_VALUES:
         return False
     return not bool(set(key.split()) & _DISALLOWED_VERTICAL_HINT_TOKENS)
@@ -109,17 +128,21 @@ def build_bootstrap_request(snapshot: SourceSnapshot) -> dict[str, Any]:
         "task": "infer_product_listing_bootstrap_hints",
         "system_instruction": (
             "Infer concise product-type search phrases and product brand status only from exact "
-            "supplier evidence. Marketplace names and listing UI terminology are not product types. "
-            "JSON only."
+            "supplier evidence. Supplier evidence may be written in any language. Convert the "
+            "product type into canonical English marketplace search phrases. Marketplace names "
+            "and listing UI terminology are not product types. JSON only."
         ),
         "prompt_instruction": (
-            "Use context.supplier_evidence as the sole product evidence. The category phrases will "
-            "later be searched against live marketplace options; do not output marketplace/platform "
-            "names, UI labels, or generic words such as product/category/vertical."
+            "Use context.supplier_evidence as the sole product evidence. Regardless of the source "
+            "language, vertical_search_terms must be short English product-type noun phrases that "
+            "can be searched against live Makro options. Do not output marketplace/platform names, "
+            "UI labels, or generic words such as product/category/vertical."
         ),
         "context": {"supplier_evidence": _bounded_supplier_evidence(snapshot)},
         "rules": [
             "Return 1 to 4 concise English product-type noun phrases, most specific first.",
+            "product_summary should be a concise English description of the product type.",
+            "Translate or normalize non-English supplier terminology into ordinary English product nouns.",
             "Search terms are product-type hints only; do not invent an exact marketplace vertical name.",
             "Never return marketplace/platform names or listing UI words as category search terms.",
             "Treat model numbers, variant names and descriptive words as non-brand unless the source explicitly identifies them as a brand.",
@@ -155,6 +178,52 @@ def build_bootstrap_request(snapshot: SourceSnapshot) -> dict[str, Any]:
     }
 
 
+def build_bootstrap_repair_request(snapshot: SourceSnapshot, raw: dict[str, Any]) -> dict[str, Any]:
+    """One bounded semantic repair for non-English/invalid product-type terms."""
+
+    return {
+        "task": "repair_product_listing_bootstrap_search_terms",
+        "system_instruction": (
+            "Normalize an already identified supplier product type into canonical English search "
+            "phrases. Do not add new product facts. JSON only."
+        ),
+        "prompt_instruction": (
+            "Return only corrected vertical_search_terms. Translate any non-English terms to concise "
+            "ordinary English product-type noun phrases. Preserve the product meaning and do not "
+            "invent a marketplace category name."
+        ),
+        "context": {
+            "supplier_evidence": _bounded_supplier_evidence(snapshot),
+            "initial_product_summary": str(raw.get("product_summary") or "").strip(),
+            "invalid_search_terms": [
+                str(item).strip()
+                for item in raw.get("vertical_search_terms") or []
+                if str(item).strip()
+            ][:4],
+        },
+        "rules": [
+            "Return 1 to 4 English product-type noun phrases, most specific first.",
+            "Use ASCII English letters/digits and ordinary spacing/punctuation only.",
+            "Do not output Makro, marketplace, listing, seller, vertical, category, or product as a standalone/generic search term.",
+            "Do not change brand status or infer any new fact.",
+        ],
+        "json_contract": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "vertical_search_terms": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {"type": "string", "minLength": 2},
+                }
+            },
+            "required": ["vertical_search_terms"],
+        },
+        "strict_json_schema": True,
+    }
+
+
 def _parse_bootstrap_response(raw: Any) -> ListingBootstrapHints:
     if not isinstance(raw, dict):
         raise ValueError("listing bootstrap response must be a JSON object")
@@ -162,7 +231,7 @@ def _parse_bootstrap_response(raw: Any) -> ListingBootstrapHints:
     seen: set[str] = set()
     for item in raw.get("vertical_search_terms") or []:
         value = re.sub(r"\s+", " ", str(item or "")).strip()
-        key = normalize_label(value)
+        key = _english_search_key(value)
         if len(value) < 2 or not _is_usable_vertical_hint(value) or key in seen:
             continue
         seen.add(key)
@@ -170,7 +239,7 @@ def _parse_bootstrap_response(raw: Any) -> ListingBootstrapHints:
         if len(terms) >= 4:
             break
     if not terms:
-        raise ValueError("listing bootstrap produced no usable product-type search terms")
+        raise BootstrapSearchTermsError("listing bootstrap produced no usable product-type search terms")
 
     status = str(raw.get("brand_status") or "").strip().casefold()
     if status not in {"explicit", "unbranded", "unknown"}:
@@ -189,54 +258,73 @@ def _parse_bootstrap_response(raw: Any) -> ListingBootstrapHints:
 
 
 def infer_listing_bootstrap(provider: JSONTaskProvider, snapshot: SourceSnapshot) -> ListingBootstrapHints:
-    return _parse_bootstrap_response(provider.extract_json(build_bootstrap_request(snapshot)))
+    raw = provider.extract_json(build_bootstrap_request(snapshot))
+    try:
+        return _parse_bootstrap_response(raw)
+    except BootstrapSearchTermsError:
+        if not isinstance(raw, dict):
+            raise
+        repair = provider.extract_json(build_bootstrap_repair_request(snapshot, raw))
+        if not isinstance(repair, dict):
+            raise BootstrapSearchTermsError(
+                "listing bootstrap repair did not return a JSON object"
+            )
+        merged = dict(raw)
+        merged["vertical_search_terms"] = repair.get("vertical_search_terms") or []
+        return _parse_bootstrap_response(merged)
+
+
+def _portal(page: Page) -> MakroPortalAdapter:
+    return MakroPortalAdapter(page)
 
 
 def _body_text(page: Page) -> str:
-    try:
-        return page.locator("body").inner_text(timeout=3000)
-    except Exception:
-        return ""
+    return _portal(page).body_text()
 
 
 def is_vertical_step(page: Page) -> bool:
-    text = _body_text(page).casefold()
-    return "select the vertical for your product" in text and "browse verticals" in text
+    return _portal(page).detect_stage() is ListingStage.VERTICAL
 
 
 def is_brand_step(page: Page) -> bool:
-    text = _body_text(page).casefold()
-    return "check for the brand you want to sell" in text or "enter brand name" in text
+    return _portal(page).detect_stage() is ListingStage.BRAND
 
 
 def is_product_info_step(page: Page) -> bool:
-    text = _body_text(page).casefold()
-    return (
-        "add product info" in text
-        and "product photos" in text
-        and "price, stock and shipping information" in text
-    )
+    return _portal(page).detect_stage() is ListingStage.PRODUCT_INFO
 
 
 def _vertical_confirmation_content(page: Page) -> bool:
     text = normalize_label(_body_text(page))
-    return normalize_label("Please select a brand to start selling in this vertical") in text
+    markers = (
+        "Please select a brand to start selling in this vertical",
+        "请选择一个品牌开始在此垂直领域销售",
+        "请选择品牌以开始在此垂直领域销售",
+    )
+    if any(normalize_label(marker) in text for marker in markers):
+        return True
+    try:
+        target = _portal(page).target()
+        return bool(
+            target
+            and str(target.vertical or "").strip()
+            and not str(target.brand or "").strip()
+            and _vertical_select_brand_button(page) is not None
+            and not is_brand_step(page)
+        )
+    except Exception:
+        return False
 
 
 def _vertical_select_brand_button(page: Page):
-    pattern = re.compile(r"^\s*select\s+brand\s*$", re.IGNORECASE)
-    button = _first_visible(page.get_by_role("button", name=pattern))
-    if button is None:
-        button = _first_visible(page.get_by_text(pattern))
-    return button
+    return _portal(page).find_action_button("select_brand")
 
 
 def is_vertical_selected_confirmation(page: Page, selected_vertical: str) -> bool:
-    text = normalize_label(_body_text(page))
     selected = normalize_label(selected_vertical)
     return bool(
         selected
-        and selected in text
+        and _selected_value_verified(page, selected_vertical, index=0, kind="Step 1 URL")
         and _vertical_confirmation_content(page)
         and _vertical_select_brand_button(page) is not None
     )
@@ -249,25 +337,23 @@ def _brand_confirmation_content(page: Page) -> bool:
         "brand details",
         "please select this brand",
         "please select a brand to continue",
+        "已选择品牌",
+        "品牌详情",
+        "请选择此品牌",
+        "请选择品牌以继续",
     )
     return any(normalize_label(marker) in text for marker in markers)
 
 
 def _brand_confirmation_button(page: Page):
-    pattern = re.compile(r"^\s*(?:select|confirm|use)\s+brand\s*$", re.IGNORECASE)
-    button = _first_visible(page.get_by_role("button", name=pattern))
-    if button is None:
-        button = _first_visible(page.get_by_text(pattern))
-    return button
+    return _portal(page).find_action_button("confirm_brand")
 
 
 def is_brand_selected_confirmation(page: Page, selected_brand: str) -> bool:
-    text = normalize_label(_body_text(page))
-    selected = normalize_label(selected_brand)
     button = _brand_confirmation_button(page)
     return bool(
-        selected
-        and selected in text
+        selected_brand.strip()
+        and _selected_value_verified(page, selected_brand, index=1, kind="Step 2 URL")
         and (_brand_confirmation_content(page) or button is not None)
         and button is not None
     )
@@ -275,35 +361,27 @@ def is_brand_selected_confirmation(page: Page, selected_brand: str) -> bool:
 
 def _create_new_listing_content(page: Page) -> bool:
     text = normalize_label(_body_text(page))
-    return normalize_label("You can start selling under this brand") in text
+    markers = (
+        "You can start selling under this brand",
+        "您可以开始使用此品牌销售",
+        "您现在可以在此品牌下销售",
+    )
+    if any(normalize_label(marker) in text for marker in markers):
+        return True
+    try:
+        return _create_new_listing_button(page) is not None
+    except Exception:
+        return False
 
 
 def _create_new_listing_button(page: Page):
-    pattern = re.compile(r"^\s*create\s+new\s+listing\s*$", re.IGNORECASE)
-    button = None
-    get_by_role = getattr(page, "get_by_role", None)
-    if callable(get_by_role):
-        try:
-            button = _first_visible(get_by_role("button", name=pattern))
-        except Exception:
-            button = None
-    if button is None:
-        get_by_text = getattr(page, "get_by_text", None)
-        if callable(get_by_text):
-            try:
-                button = _first_visible(get_by_text(pattern))
-            except Exception:
-                button = None
-    return button
+    return _portal(page).find_action_button("create_listing")
 
 
 def is_brand_ready_to_create_listing(page: Page, selected_brand: str) -> bool:
-    text = normalize_label(_body_text(page))
-    selected = normalize_label(selected_brand)
     return bool(
-        selected
-        and selected in text
-        and _create_new_listing_content(page)
+        selected_brand.strip()
+        and _selected_value_verified(page, selected_brand, index=1, kind="Step 2 URL")
         and _create_new_listing_button(page) is not None
     )
 
@@ -333,71 +411,35 @@ def _first_visible(locator):
 
 
 def _vertical_search_input(page: Page):
-    candidates = (
-        page.get_by_placeholder(re.compile(r"vertical|category", re.IGNORECASE)),
-        page.locator('input[placeholder*="vertical" i], input[placeholder*="category" i]'),
-    )
-    for locator in candidates:
-        item = _first_visible(locator)
-        if item is not None:
-            return item
-    raise RuntimeError("Makro Step 1 vertical/category search input not found")
+    try:
+        return _portal(page).find_search_input("vertical")
+    except RuntimeError as exc:
+        raise RuntimeError("Makro Step 1 vertical/category search input not found") from exc
 
 
 def _brand_input(page: Page):
-    candidates = (
-        page.get_by_placeholder(re.compile(r"brand", re.IGNORECASE)),
-        page.locator('input[placeholder*="brand" i]'),
-    )
-    for locator in candidates:
-        item = _first_visible(locator)
-        if item is not None:
-            return item
-    raise RuntimeError("Makro Step 2 brand input not found")
+    try:
+        return _portal(page).find_search_input("brand")
+    except RuntimeError as exc:
+        raise RuntimeError("Makro Step 2 brand input not found") from exc
 
 
 def _visible_text_candidates(page: Page, *, limit: int = 160) -> list[str]:
-    raw = page.evaluate(
-        r"""(limit) => {
-          const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-          const visible = (el) => {
-            const style = getComputedStyle(el);
-            const rect = el.getBoundingClientRect();
-            return style.display !== 'none' && style.visibility !== 'hidden'
-              && rect.width > 2 && rect.height > 2;
-          };
-          const out = [];
-          const seen = new Set();
-          for (const el of document.querySelectorAll('body *')) {
-            if (out.length >= limit) break;
-            if (!visible(el)) continue;
-            const text = clean(el.innerText || el.textContent || '');
-            if (!text || text.length < 2 || text.length > 90 || text.includes('\n')) continue;
-            let sameChild = false;
-            for (const child of el.children || []) {
-              if (clean(child.innerText || child.textContent || '') === text) {
-                sameChild = true;
-                break;
-              }
-            }
-            if (sameChild) continue;
-            const key = text.toLowerCase();
-            if (seen.has(key)) continue;
-            seen.add(key);
-            out.push(text);
-          }
-          return out;
-        }""",
-        int(limit),
-    )
+    raw = _portal(page).visible_text_candidates(limit=limit)
     excluded = {
-        "select vertical",
-        "select brand",
-        "add product info",
-        "your verticals",
-        "browse verticals",
-        "check brand",
-        "or",
+        normalize_label("select vertical"),
+        normalize_label("select brand"),
+        normalize_label("add product info"),
+        normalize_label("your verticals"),
+        normalize_label("browse verticals"),
+        normalize_label("check brand"),
+        normalize_label("选择垂直领域"),
+        normalize_label("选择品牌"),
+        normalize_label("添加产品信息"),
+        normalize_label("浏览垂直栏目"),
+        normalize_label("检查品牌"),
+        normalize_label("or"),
+        normalize_label("或"),
     }
     output: list[str] = []
     seen: set[str] = set()
@@ -419,11 +461,14 @@ def _build_vertical_choice_request(
     allowed = list(dict.fromkeys(candidates))
     return {
         "task": "choose_exact_makro_vertical",
-        "system_instruction": "Choose the best exact Makro vertical from the supplied live candidates. JSON only.",
+        "system_instruction": (
+            "Choose the best exact Makro vertical from supplied live candidates. Candidate labels "
+            "may be browser-translated or written in another language. JSON only."
+        ),
         "prompt_instruction": (
             "Use context.product_summary and context.search_term to choose from "
-            "context.live_candidates. Do not choose a broad department when a specific matching "
-            "product type is present."
+            "context.live_candidates. Understand candidate meaning regardless of display language. "
+            "Do not choose a broad department when a specific matching product type is present."
         ),
         "context": {
             "product_summary": hints.product_summary,
@@ -472,61 +517,55 @@ def choose_vertical_candidate(
 
 
 def _click_exact_visible_text(page: Page, text: str) -> bool:
-    locator = page.get_by_text(text, exact=True)
-    item = _first_visible(locator)
-    if item is not None:
-        try:
-            item.click(timeout=5000)
-            return True
-        except Exception:
-            pass
-    try:
-        return bool(
-            page.evaluate(
-                """(wanted) => {
-                  const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-                  const visible = (el) => {
-                    const s = getComputedStyle(el), r = el.getBoundingClientRect();
-                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 2 && r.height > 2;
-                  };
-                  for (const el of document.querySelectorAll('body *')) {
-                    if (!visible(el) || clean(el.innerText || el.textContent || '') !== wanted) continue;
-                    let target = el;
-                    for (let i = 0; i < 5 && target; i++, target = target.parentElement) {
-                      const role = target.getAttribute && target.getAttribute('role');
-                      const style = target instanceof Element ? getComputedStyle(target) : null;
-                      if (target.tagName === 'BUTTON' || target.tagName === 'A' || role === 'button'
-                          || target.onclick || (style && style.cursor === 'pointer')) {
-                        target.click();
-                        return true;
-                      }
-                    }
-                    el.click();
-                    return true;
-                  }
-                  return false;
-                }""",
-                text,
-            )
-        )
-    except Exception:
-        return False
+    return _portal(page).click_exact_visible_text(text)
 
 
 def _current_target_values(page: Page) -> tuple[str, str]:
     try:
         target = parse_makro_listing_url(page.url)
         return (target.vertical or "").strip(), (target.brand or "").strip()
-    except ValueError:
+    except (ValueError, AttributeError):
         return "", ""
+
+
+def _contains_non_ascii_letter(value: str) -> bool:
+    return any(ch.isalpha() and ord(ch) > 127 for ch in str(value or ""))
+
+
+def _labels_may_be_localized(selected: str, actual: str) -> bool:
+    selected_non_ascii = _contains_non_ascii_letter(selected)
+    actual_non_ascii = _contains_non_ascii_letter(actual)
+    selected_ascii_letters = bool(re.search(r"[A-Za-z]", selected))
+    actual_ascii_letters = bool(re.search(r"[A-Za-z]", actual))
+    return bool(
+        (selected_non_ascii and actual_ascii_letters)
+        or (actual_non_ascii and selected_ascii_letters)
+    )
 
 
 def _verify_selected_value(kind: str, selected: str, actual: str) -> str:
     if actual and normalize_label(actual) != normalize_label(selected):
-        raise RuntimeError(
-            f"Makro {kind} verification failed: selected={selected!r}, actual={actual!r}"
-        )
+        # Browser translation can change the displayed label while the URL keeps
+        # Makro's canonical English value. Exact display click + canonical URL is
+        # a valid verification in that specific cross-script case.
+        if not _labels_may_be_localized(selected, actual):
+            raise RuntimeError(
+                f"Makro {kind} verification failed: selected={selected!r}, actual={actual!r}"
+            )
     return actual or selected
+
+
+def _selected_value_verified(page: Page, selected: str, *, index: int, kind: str) -> bool:
+    values = _current_target_values(page)
+    actual = values[index] if index < len(values) else ""
+    if actual:
+        try:
+            _verify_selected_value(kind, selected, actual)
+            return True
+        except RuntimeError:
+            return False
+    text = normalize_label(_body_text(page))
+    return bool(normalize_label(selected) and normalize_label(selected) in text)
 
 
 def _advance_vertical_confirmation(page: Page, selected: str) -> None:
@@ -541,8 +580,7 @@ def _advance_vertical_confirmation(page: Page, selected: str) -> None:
         )
     if is_brand_step(page):
         return
-    text = normalize_label(_body_text(page))
-    if normalize_label(selected) not in text:
+    if not _selected_value_verified(page, selected, index=0, kind="Step 1 URL"):
         raise RuntimeError(
             f"Makro Step 1 vertical confirmation mismatch: selected={selected!r}"
         )
@@ -559,14 +597,9 @@ def _advance_vertical_confirmation(page: Page, selected: str) -> None:
 
 
 def _click_create_new_listing(page: Page, selected: str) -> None:
-    text = normalize_label(_body_text(page))
-    if normalize_label(selected) not in text:
+    if not _selected_value_verified(page, selected, index=1, kind="Step 2 URL"):
         raise RuntimeError(
             f"Makro Step 2 create-listing confirmation mismatch: selected={selected!r}"
-        )
-    if not _create_new_listing_content(page):
-        raise RuntimeError(
-            "Makro Step 2 exposed Create New Listing without the expected brand-ready confirmation text"
         )
     button = _create_new_listing_button(page)
     if button is None:
@@ -601,8 +634,7 @@ def _advance_brand_confirmation(page: Page, selected: str) -> None:
         _click_create_new_listing(page, selected)
         return
 
-    text = normalize_label(_body_text(page))
-    if normalize_label(selected) not in text:
+    if not _selected_value_verified(page, selected, index=1, kind="Step 2 URL"):
         raise RuntimeError(
             f"Makro Step 2 brand confirmation mismatch: selected={selected!r}"
         )
@@ -673,10 +705,14 @@ def _build_brand_choice_request(
     allowed = list(dict.fromkeys(candidates))
     return {
         "task": "choose_exact_makro_brand",
-        "system_instruction": "Choose an exact Makro brand result from the supplied live candidates. JSON only.",
+        "system_instruction": (
+            "Choose an exact Makro brand result from supplied live candidates. Candidate labels may "
+            "be browser-translated. JSON only."
+        ),
         "prompt_instruction": (
             "Use context.brand_status, context.supplier_brand and context.search_term to choose only "
-            "from context.live_candidates. Never substitute another commercial brand."
+            "from context.live_candidates. Understand unbranded/generic labels regardless of display "
+            "language. Never substitute another commercial brand."
         ),
         "context": {
             "brand_status": hints.brand_status,
@@ -726,9 +762,11 @@ def choose_brand_candidate(
 
 
 def _click_check_brand(page: Page) -> None:
-    button = _first_visible(page.get_by_role("button", name=re.compile(r"check\s*brand", re.IGNORECASE)))
-    if button is None:
-        button = _first_visible(page.get_by_text(re.compile(r"^\s*check\s*brand\s*$", re.IGNORECASE)))
+    try:
+        brand_input = _brand_input(page)
+    except RuntimeError:
+        brand_input = None
+    button = _portal(page).find_action_button("check_brand", related_input=brand_input)
     if button is None:
         raise RuntimeError("Makro Step 2 Check Brand button not found")
     button.click(timeout=5000)
@@ -801,10 +839,8 @@ def run_listing_creation(
     if not is_product_info_step(page):
         raise RuntimeError("Makro did not reach Step 3 after Step 1/2 automation")
     actual_vertical, actual_brand = _current_target_values(page)
-    if actual_vertical and normalize_label(actual_vertical) != normalize_label(vertical):
-        raise RuntimeError(
-            f"Final vertical verification failed: expected={vertical!r}, actual={actual_vertical!r}"
-        )
+    if actual_vertical:
+        _verify_selected_value("final vertical", vertical, actual_vertical)
     return ListingCreationResult(
         vertical=actual_vertical or vertical,
         brand=actual_brand or brand,
@@ -814,10 +850,12 @@ def run_listing_creation(
 
 
 __all__ = [
+    "BootstrapSearchTermsError",
     "JSONTaskProvider",
     "ListingBootstrapHints",
     "ListingCreationResult",
     "MAKRO_NEW_LISTING_URL",
+    "build_bootstrap_repair_request",
     "build_bootstrap_request",
     "choose_brand_candidate",
     "choose_vertical_candidate",
