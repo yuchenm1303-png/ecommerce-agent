@@ -131,7 +131,7 @@ def _focus_native_child(overlay_hwnd: int) -> bool:
 
 
 class NativeWindowShell(QObject):
-    """Native Windows frame with the unchanged baseline QWidget tree inside."""
+    """Native Windows frame with the baseline QWidget tree as one child HWND."""
 
     def __init__(self, overlay: QMainWindow, owner: QQuickWindow) -> None:
         super().__init__(overlay)
@@ -157,21 +157,13 @@ class NativeWindowShell(QObject):
         overlay.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         overlay.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
 
+        # Only the two actual native surfaces are filtered.  Keyboard ownership
+        # is recovered from QApplication.focusChanged instead of installing a
+        # Python event filter on every focusable QWidget.
         owner.installEventFilter(self)
         overlay.installEventFilter(self)
         owner.widthChanged.connect(self._schedule_native_fit)
         owner.heightChanged.connect(self._schedule_native_fit)
-
-        # Only actual focusable controls need click bridging. Qt's focusChanged
-        # signal covers focus transitions without putting a Python event filter on
-        # every label/container/viewport in the application.
-        self._focus_watch = [
-            widget
-            for widget in overlay.findChildren(QWidget)
-            if widget.focusPolicy() != Qt.FocusPolicy.NoFocus
-        ]
-        for widget in self._focus_watch:
-            widget.installEventFilter(self)
 
         app = QApplication.instance()
         if app is not None:
@@ -261,13 +253,11 @@ class NativeWindowShell(QObject):
                 self.overlay.close()
 
         elif watched is self.overlay:
-            if event_type == QEvent.Type.Close and not self._closing:
+            if event_type == QEvent.Type.FocusIn:
+                self._schedule_widget_focus()
+            elif event_type == QEvent.Type.Close and not self._closing:
                 self._closing = True
                 self.owner.close()
-
-        elif isinstance(watched, QWidget) and event_type == QEvent.Type.MouseButtonPress:
-            self._last_focus_widget = watched
-            self._schedule_widget_focus()
 
         return False
 
