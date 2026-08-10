@@ -23,7 +23,6 @@ def test_gpu_modal_interaction_is_installed_for_shared_details() -> None:
 def test_modal_transition_uses_threaded_quick_animators_not_widget_animation() -> None:
     assert "QQmlComponent" in MODAL
     assert "QQuickItem" in MODAL
-    assert "MultiEffect" in MODAL
     assert "OpacityAnimator" in MODAL
     assert "YAnimator" in MODAL
     assert "ScaleAnimator" in MODAL
@@ -35,23 +34,46 @@ def test_modal_transition_uses_threaded_quick_animators_not_widget_animation() -
     assert "QEasingCurve" not in MODAL
 
 
+def test_qml_transition_is_startup_safe_and_has_no_optional_effects_import() -> None:
+    assert "import QtQuick.Effects" not in MODAL
+    assert "MultiEffect" not in MODAL
+    assert "property url blurUrl" in MODAL
+    assert "id: blurImage" in MODAL
+    assert "self.transition_item: QQuickItem | None = None" in MODAL
+    init_body = MODAL.split("def __init__", 1)[1].split("def _ensure_transition_item", 1)[0]
+    assert "_create_quick_transition_item" not in init_body
+    assert "component.status()" in MODAL
+    assert "QQmlComponent.Status.Ready" in MODAL
+    assert "return False" in MODAL
+    assert "Glass modal transition did not create" not in MODAL
+
+
 def test_real_widget_tree_is_removed_from_transition_hot_path() -> None:
     assert "self.window.hide()" in MODAL
     assert "self.window.show()" in MODAL
     assert "self.details.drawer.grab()" in MODAL
-    assert 'pixmap.save(str(path), "BMP")' in MODAL
-    assert 'self.transition_item.setProperty("active", True)' in MODAL
+    assert 'self.transition_item.setProperty("active", True)' not in MODAL
+    assert 'item.setProperty("active", True)' in MODAL
     assert "setSizes(" not in MODAL
     assert 'b"geometry"' not in MODAL
     assert 'b"minimumHeight"' not in MODAL
     assert 'b"maximumHeight"' not in MODAL
 
 
-def test_cpu_backdrop_blur_is_deferred_until_quick_animation_started() -> None:
+def test_preblurred_snapshot_replaces_runtime_qtquick_effect() -> None:
     assert "self._original_capture_backdrop = self.details._capture_backdrop" in MODAL
     assert "self.details._capture_backdrop = self._capture_raw_backdrop" in MODAL
-    assert "QTimer.singleShot(24, self._prepare_static_blur)" in MODAL
-    assert "self.details._blur_pixmap(self._base_snapshot)" in MODAL
+    assert "blurred = self.details._blur_pixmap(base)" in MODAL
+    assert 'item.setProperty("blurUrl", self._blur_url)' in MODAL
+    assert 'suffix = ".png" if alpha else ".bmp"' in MODAL
+    assert 'panel_url = self._publish_pixmap("modal_panel", panel, alpha=True)' in MODAL
+
+
+def test_quick_failure_falls_back_to_atomic_modal_instead_of_crashing() -> None:
+    assert "if not self._ensure_transition_item():" in MODAL
+    assert "self.details.close()" in MODAL
+    assert "return" in MODAL
+    assert "raise RuntimeError(\"Glass modal transition" not in MODAL
 
 
 def test_open_close_motion_is_short_and_subtle() -> None:
