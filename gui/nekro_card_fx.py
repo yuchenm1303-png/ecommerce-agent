@@ -65,15 +65,22 @@ class _CardState:
         self.duration = max(0.001, float(duration))
         self.animating = True
 
+    def settle(self, alpha: float) -> None:
+        alpha = float(alpha)
+        self.current_alpha = alpha
+        self.start_alpha = alpha
+        self.target_alpha = alpha
+        self.animating = False
+        self.surface.set_interaction(scale=1.0, overlay_alpha=alpha)
+
 
 class NekroCardInteractionController(QObject):
     """Immediate card hover/press feedback with no pointer polling loop.
 
-    Only the small set of presentation cards is filtered. Enter/leave and press
-    events start feedback immediately; an 8 ms timer runs only while alpha is
-    actually interpolating. Passive QLabel children are mouse-transparent in the
-    modal interaction layer, so title/status text naturally belongs to the card
-    hit target without installing filters across the QWidget tree.
+    The controller can be suspended by the shared modal transition. Suspension
+    settles every card to the neutral alpha and stops the release timer, so the
+    modal never snapshots a half-finished press/hover frame and the hidden base
+    stays visually stable until the modal handoff completes.
     """
 
     def __init__(self, window: QMainWindow, visual: VisualStyleController) -> None:
@@ -83,6 +90,7 @@ class NekroCardInteractionController(QObject):
         self.states: dict[QFrame, _CardState] = {}
         self.hovered: QFrame | None = None
         self.pressed: QFrame | None = None
+        self._suspended = False
 
         for frame in window.findChildren(QFrame):
             if frame.objectName() not in _GLASS_NAMES:
@@ -101,11 +109,28 @@ class NekroCardInteractionController(QObject):
 
         window.destroyed.connect(self._cleanup)
 
+    def suspend_for_modal(self) -> None:
+        if self._suspended:
+            return
+        self._suspended = True
+        self._animation_timer.stop()
+        self.hovered = None
+        self.pressed = None
+        for state in self.states.values():
+            state.settle(_NORMAL_ALPHA)
+
+    def resume_from_modal(self) -> None:
+        self._suspended = False
+
     def _ensure_animation_timer(self) -> None:
+        if self._suspended:
+            return
         if any(state.animating for state in self.states.values()) and not self._animation_timer.isActive():
             self._animation_timer.start()
 
     def _animate(self, frame: QFrame, alpha: float, duration: float) -> None:
+        if self._suspended:
+            return
         state = self.states.get(frame)
         if state is None:
             return
@@ -139,6 +164,10 @@ class NekroCardInteractionController(QObject):
         self._animate(frame, target, _RELEASE_SECONDS)
 
     def _tick_animation(self) -> None:
+        if self._suspended:
+            self._animation_timer.stop()
+            return
+
         now = time.monotonic()
         any_animating = False
         for state in self.states.values():
@@ -162,6 +191,8 @@ class NekroCardInteractionController(QObject):
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if not isinstance(watched, QFrame) or watched not in self.states:
             return False
+        if self._suspended:
+            return False
 
         event_type = event.type()
         if event_type == QEvent.Type.Enter:
@@ -182,6 +213,7 @@ class NekroCardInteractionController(QObject):
 
     def _cleanup(self) -> None:
         self._animation_timer.stop()
+        self._suspended = False
         for frame, state in tuple(self.states.items()):
             try:
                 frame.removeEventFilter(self)
