@@ -121,9 +121,12 @@ class _PanelTransitionWidget(QWidget):
         self._timer.stop()
         callback = self._finished
         self._finished = None
-        self.hide()
+        # Keep the final snapshot above the real UI until the callback has
+        # synchronously painted the destination state. This removes the classic
+        # one-frame QWidget handoff flash without touching any native window.
         if callback is not None:
             callback()
+        self.hide()
 
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         if self._pixmap.isNull() or self._target.isEmpty():
@@ -251,6 +254,9 @@ class StaticModalInteractionController(QObject):
                 self.root.setUpdatesEnabled(True)
                 self.root.update()
 
+        # Paint the static blur/scrim exactly once before panel motion begins.
+        # The 60 Hz hot path below therefore redraws only the small panel snapshot.
+        self.root.repaint()
         return panel, target
 
     def _show_with_animation(self, *, ratio: tuple[float, float]) -> None:
@@ -274,8 +280,15 @@ class StaticModalInteractionController(QObject):
             self._panel.start()
         except Exception:
             self._panel.stop()
-            self._state = _STATE_OPEN
+            # _prepare_open_frame may already have exposed backdrop/scrim. Reset
+            # that partial state before the direct static fallback captures again.
+            try:
+                self._original_close()
+            except RuntimeError:
+                pass
+            self._state = _STATE_IDLE
             self._original_show_prepared_modal(ratio=ratio)
+            self._state = _STATE_OPEN
 
     def _finish_open(self) -> None:
         if self._state != _STATE_OPENING:
@@ -285,6 +298,7 @@ class StaticModalInteractionController(QObject):
         self.details.drawer.raise_()
         self.details.close_button.setFocus(Qt.FocusReason.OtherFocusReason)
         self.details._schedule_geometry()  # noqa: SLF001
+        self.root.repaint()
         self._state = _STATE_OPEN
 
     def request_close(self, *_args: object) -> None:
@@ -328,6 +342,7 @@ class StaticModalInteractionController(QObject):
         if self._state != _STATE_CLOSING:
             return
         self._original_close()
+        self.root.repaint()
         self._state = _STATE_IDLE
 
     def cleanup(self) -> None:
