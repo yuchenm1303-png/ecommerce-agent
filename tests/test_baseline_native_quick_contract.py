@@ -56,6 +56,18 @@ def test_glass_blur_mask_is_static_until_geometry_changes() -> None:
     assert "_GEOMETRY_SYNC_MS = 24" in NATIVE
 
 
+def test_batch_cards_join_the_existing_native_glass_model_after_workspace_install() -> None:
+    assert "def refresh_glass_frames(self) -> int:" in ADAPTER
+    assert "model.beginInsertRows" in ADAPTER
+    assert "model.cards.append(frame)" in ADAPTER
+    assert "self.background._geometry_watch.add(current)" in ADAPTER
+    assert "mode_stack.currentChanged.connect" in ADAPTER
+    assert "window.install_mode_workspace()" in RUNNER
+    assert "visual.refresh_glass_frames()" in RUNNER
+    assert RUNNER.index("window.install_mode_workspace()") < RUNNER.index("visual.refresh_glass_frames()")
+    assert RUNNER.index("visual.refresh_glass_frames()") < RUNNER.index("install_nekro_card_fx(window, visual)")
+
+
 def test_renderer_samples_pointer_without_global_event_filter() -> None:
     assert "QQuickWindow" in NATIVE
     assert "FrameAnimation" in NATIVE
