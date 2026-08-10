@@ -67,10 +67,10 @@ def _detach_widget(parent: QLayout, widget: QWidget) -> None:
 class AdaptiveReveal(QObject):
     """Inline reveal with exactly one layout-changing property per frame.
 
-    The detail wrapper is made fully available before expansion and is clipped by
-    its parent card.  Only the card's height constraint is animated in Qt's C++
-    animation driver.  This avoids the previous double animation where both the
-    wrapper and the card/splitter constraints changed every frame.
+    The detail wrapper is prepared at full internal height and the parent card
+    clips it. Only the card's height constraint is animated by Qt's C++ driver.
+    No Python frame timer, no per-frame splitter setSizes, and no second wrapper
+    height animation participate in the hot path.
     """
 
     def __init__(
@@ -105,6 +105,7 @@ class AdaptiveReveal(QObject):
         self.wrapper.setMinimumHeight(0)
         self.wrapper.setMaximumHeight(0)
         self.wrapper.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.wrapper.hide()
         self.toggle.setText(self.collapsed_text)
         self.toggle.toggled.connect(self.set_expanded)
 
@@ -182,14 +183,10 @@ class AdaptiveReveal(QObject):
         duration: int,
     ) -> QPropertyAnimation:
         if self.splitter is not None and expanded:
-            # Increasing minimumHeight forces QSplitter to yield space while the
-            # content is already clipped inside the console card.
             self.card.setMaximumHeight(max(end_height, 460))
             self.card.setMinimumHeight(start_height)
             animation = QPropertyAnimation(self.card, b"minimumHeight")
         else:
-            # VBox cards expand by relaxing maximumHeight; splitter cards collapse
-            # by tightening maximumHeight.  Either way only one constraint moves.
             self.card.setMinimumHeight(0)
             self.card.setMaximumHeight(start_height)
             animation = QPropertyAnimation(self.card, b"maximumHeight")
@@ -210,15 +207,21 @@ class AdaptiveReveal(QObject):
             self._collapsed_card_height = current_height
 
         self._expanded = expanded
-        self.wrapper.setEnabled(False)
         self.toggle.setText(self.expanded_text if expanded else self.collapsed_text)
 
         if expanded:
+            self.wrapper.show()
             self._expanded_wrapper_height = self._measure_target_wrapper_height()
             self.wrapper.setMaximumHeight(self._expanded_wrapper_height)
             if self.wrapper.layout() is not None:
                 self.wrapper.layout().activate()
+            if self.card.layout() is not None:
+                self.card.layout().activate()
             end_height = self._expanded_card_target(self._expanded_wrapper_height)
+            if self.splitter is None:
+                # Land directly at the real final layout size so there is no
+                # post-animation correction/jump by a few pixels.
+                end_height = max(end_height, self.card.sizeHint().height())
             self._final_card_height = end_height
         else:
             end_height = max(1, self._collapsed_card_height)
@@ -246,15 +249,17 @@ class AdaptiveReveal(QObject):
 
         if self._expanded:
             self.wrapper.setMaximumHeight(max(0, self._expanded_wrapper_height))
+            self.wrapper.show()
             if self.splitter is not None:
                 final_height = max(300, min(460, self._final_card_height))
                 self.card.setMinimumHeight(final_height)
                 self.card.setMaximumHeight(460)
             else:
                 self.card.setMinimumHeight(0)
-                self.card.setMaximumHeight(max(self._final_card_height, self.card.sizeHint().height()))
+                self.card.setMaximumHeight(self._final_card_height)
         else:
             self.wrapper.setMaximumHeight(0)
+            self.wrapper.hide()
             if self.splitter is not None:
                 self.card.setMinimumHeight(108)
                 self.card.setMaximumHeight(124)
@@ -262,7 +267,6 @@ class AdaptiveReveal(QObject):
                 self.card.setMinimumHeight(0)
                 self.card.setMaximumHeight(_MAX_HEIGHT)
 
-        self.wrapper.setEnabled(True)
         self._resume_responsive_controller()
 
     def cleanup(self) -> None:
