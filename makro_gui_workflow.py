@@ -308,7 +308,11 @@ def main() -> int:
             cache_ttl_seconds=args.source_cache_ttl_seconds,
             force_refresh=args.refresh_source,
         )
-        hints = infer_listing_bootstrap(provider, captured.snapshot)
+        hints = infer_listing_bootstrap(
+            provider,
+            captured.snapshot,
+            image_paths=captured.product_image_paths,
+        )
         manifest["bootstrap_source"] = {
             "snapshot": str(captured.snapshot_path.resolve()),
             "screenshot": str(captured.screenshot_path.resolve()),
