@@ -1,22 +1,30 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-
-from PySide6.QtCore import QElapsedTimer, QObject, QRect, QRectF, Qt, QTimer
-from PySide6.QtGui import QPainter, QPixmap
-from PySide6.QtWidgets import QFrame, QLabel, QMainWindow, QWidget
+from PySide6.QtCore import (
+    QAbstractAnimation,
+    QEasingCurve,
+    QObject,
+    QPoint,
+    QParallelAnimationGroup,
+    QPropertyAnimation,
+    Qt,
+)
+from PySide6.QtWidgets import (
+    QFrame,
+    QGraphicsOpacityEffect,
+    QLabel,
+    QMainWindow,
+)
 
 from .card_details_fast import FastCardDetailController
 
 
-_OPEN_MS = 210
-_CLOSE_MS = 165
-_FRAME_MS = 16
-_OPEN_RISE_PX = 14.0
-_CLOSE_DROP_PX = 10.0
-_OPEN_SCALE = 0.985
-_CLOSE_SCALE = 0.990
-_OVERLAY_PAD = 28
+_OPEN_MS = 220
+_OPEN_FADE_MS = 205
+_CLOSE_MS = 170
+_CLOSE_FADE_MS = 150
+_OPEN_RISE_PX = 12
+_CLOSE_DROP_PX = 9
 
 _STATE_IDLE = "idle"
 _STATE_OPENING = "opening"
@@ -24,150 +32,13 @@ _STATE_OPEN = "open"
 _STATE_CLOSING = "closing"
 
 
-class _PanelTransitionWidget(QWidget):
-    """Paint one panel snapshot; never owns input or layout."""
-
-    def __init__(self, parent: QWidget) -> None:
-        super().__init__(parent)
-        self.setObjectName("cardDetailPanelTransition")
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAutoFillBackground(False)
-        self.hide()
-
-        self._pixmap = QPixmap()
-        self._target = QRectF()
-        self._opening = True
-        self._duration_ms = _OPEN_MS
-        self._progress = 0.0
-        self._finished: Callable[[], None] | None = None
-        self._elapsed = QElapsedTimer()
-
-        self._timer = QTimer(self)
-        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._timer.setInterval(_FRAME_MS)
-        self._timer.timeout.connect(self._tick)
-
-    def configure(
-        self,
-        pixmap: QPixmap,
-        target: QRect,
-        *,
-        opening: bool,
-        duration_ms: int,
-        finished: Callable[[], None],
-    ) -> None:
-        self.stop()
-        self._pixmap = pixmap
-        self._opening = opening
-        self._duration_ms = max(1, int(duration_ms))
-        self._progress = 0.0
-        self._finished = finished
-
-        parent = self.parentWidget()
-        if parent is None:
-            raise RuntimeError("panel transition requires a QWidget parent")
-        bounds = target.adjusted(
-            -_OVERLAY_PAD,
-            -_OVERLAY_PAD,
-            _OVERLAY_PAD,
-            _OVERLAY_PAD + int(max(_OPEN_RISE_PX, _CLOSE_DROP_PX)),
-        ).intersected(parent.rect())
-        self.setGeometry(bounds)
-        local = QRect(target)
-        local.translate(-bounds.left(), -bounds.top())
-        self._target = QRectF(local)
-
-    @staticmethod
-    def _out_cubic(value: float) -> float:
-        inv = 1.0 - value
-        return 1.0 - inv * inv * inv
-
-    @staticmethod
-    def _out_quart(value: float) -> float:
-        inv = 1.0 - value
-        return 1.0 - inv * inv * inv * inv
-
-    @staticmethod
-    def _in_cubic(value: float) -> float:
-        return value * value * value
-
-    def start(self) -> None:
-        if self._pixmap.isNull() or self._target.isEmpty():
-            callback = self._finished
-            self._finished = None
-            if callback is not None:
-                callback()
-            return
-        self._progress = 0.0
-        self._elapsed.start()
-        self.show()
-        self.raise_()
-        self.repaint()
-        self._timer.start()
-
-    def stop(self) -> None:
-        self._timer.stop()
-        self._finished = None
-        self.hide()
-
-    def _tick(self) -> None:
-        elapsed = self._elapsed.elapsed()
-        self._progress = min(1.0, elapsed / float(self._duration_ms))
-        self.update()
-        if self._progress < 1.0:
-            return
-        self._timer.stop()
-        callback = self._finished
-        self._finished = None
-        # Keep the final snapshot above the real UI until the callback has
-        # synchronously painted the destination state. This removes the classic
-        # one-frame QWidget handoff flash without touching any native window.
-        if callback is not None:
-            callback()
-        self.hide()
-
-    def paintEvent(self, _event) -> None:  # type: ignore[override]
-        if self._pixmap.isNull() or self._target.isEmpty():
-            return
-
-        progress = max(0.0, min(1.0, self._progress))
-        if self._opening:
-            motion = self._out_quart(progress)
-            opacity = self._out_cubic(progress)
-            scale = _OPEN_SCALE + (1.0 - _OPEN_SCALE) * motion
-            offset_y = _OPEN_RISE_PX * (1.0 - motion)
-        else:
-            motion = self._in_cubic(progress)
-            opacity = 1.0 - motion
-            scale = 1.0 - (1.0 - _CLOSE_SCALE) * motion
-            offset_y = _CLOSE_DROP_PX * motion
-
-        target = QRectF(self._target)
-        width = target.width() * scale
-        height = target.height() * scale
-        draw_rect = QRectF(
-            target.center().x() - width * 0.5,
-            target.center().y() - height * 0.5 + offset_y,
-            width,
-            height,
-        )
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.setOpacity(max(0.0, min(1.0, opacity)))
-        painter.drawPixmap(draw_rect, self._pixmap, QRectF(self._pixmap.rect()))
-        painter.end()
-
-
 class StaticModalInteractionController(QObject):
-    """Animate the existing QWidget modal without creating another native surface.
+    """Animate the real QWidget drawer without snapshots or native overlays.
 
-    The real blurred backdrop and scrim stay static in the existing QWidget tree.
-    Only a mouse-transparent snapshot of the modal panel is animated. No main
-    layout, splitter, source card, native HWND, QQuickWindow or real drawer geometry
-    participates in the per-frame path.
+    The backdrop and scrim are static. Only the real drawer's opacity and position
+    animate, so every child control (text, tables, buttons) participates in the
+    same fade. Width and height never animate, which keeps layout/reflow out of
+    the hot path. No additional QQuickWindow or native HWND is created.
     """
 
     def __init__(self, window: QMainWindow, details: FastCardDetailController) -> None:
@@ -180,9 +51,17 @@ class StaticModalInteractionController(QObject):
 
         self._passive_labels: dict[QLabel, bool] = {}
         self._state = _STATE_IDLE
+        self._animation: QParallelAnimationGroup | None = None
+
         self._original_show_prepared_modal = self.details._show_prepared_modal  # noqa: SLF001
         self._original_close = self.details.close
-        self._panel = _PanelTransitionWidget(self.root)
+
+        # Fade the real drawer subtree. Unlike the previous panel snapshot, this
+        # makes text, tables and buttons share one continuous opacity curve.
+        self._drawer_effect = QGraphicsOpacityEffect(self.details.drawer)
+        self._drawer_effect.setOpacity(1.0)
+        self.details.drawer.setGraphicsEffect(self._drawer_effect)
+        self.details.drawer_effect = self._drawer_effect  # type: ignore[assignment]
 
         self.details._show_prepared_modal = self._show_with_animation  # type: ignore[method-assign]  # noqa: SLF001
         self.details.close = self.request_close  # type: ignore[method-assign]
@@ -224,15 +103,50 @@ class StaticModalInteractionController(QObject):
             pass
         self.details.scrim.clicked.connect(self.request_close)
 
-    def _prepare_open_frame(self, *, ratio: tuple[float, float]) -> tuple[QPixmap, QRect]:
+    def _set_motion_active(self, active: bool) -> None:
+        self.details._presentation_animating = bool(active)  # noqa: SLF001
+        timer = getattr(self.details, "_geometry_timer", None)
+        if active and timer is not None:
+            try:
+                timer.stop()
+            except RuntimeError:
+                pass
+
+    @staticmethod
+    def _property_animation(
+        target: QObject,
+        prop: bytes,
+        start: object,
+        end: object,
+        duration_ms: int,
+        easing: QEasingCurve.Type,
+    ) -> QPropertyAnimation:
+        animation = QPropertyAnimation(target, prop)
+        animation.setStartValue(start)
+        animation.setEndValue(end)
+        animation.setDuration(max(1, int(duration_ms)))
+        animation.setEasingCurve(easing)
+        return animation
+
+    def _stop_animation(self) -> None:
+        animation = self._animation
+        self._animation = None
+        if animation is not None:
+            animation.stop()
+            animation.deleteLater()
+
+    def _prepare_open_state(self, *, ratio: tuple[float, float]) -> QPoint:
         self.details._modal_ratio = ratio  # noqa: SLF001
         backdrop = self.details._capture_backdrop()  # noqa: SLF001
         target = self.details._drawer_rect()  # noqa: SLF001
+        start_pos = target.topLeft() + QPoint(0, _OPEN_RISE_PX)
+
         updates_were_enabled = self.root.updatesEnabled()
         if updates_were_enabled:
             self.root.setUpdatesEnabled(False)
 
         try:
+            self._drawer_effect.setOpacity(0.0)
             self.details.backdrop.setPixmap(backdrop)
             self.details.backdrop.setGeometry(self.root.rect())
             self.details.scrim.setGeometry(self.root.rect())
@@ -241,112 +155,160 @@ class StaticModalInteractionController(QObject):
             if self.details.drawer.layout() is not None:
                 self.details.drawer.layout().activate()
             self.details.scroll.verticalScrollBar().setValue(0)
+            self.details.ghost.hide()
 
-            panel = self.details.drawer.grab()
+            # Build the first frame atomically: the real drawer exists already,
+            # but starts fully transparent and slightly lower than its final pos.
+            self.details.drawer.move(start_pos)
             self.details.backdrop.show()
             self.details.backdrop.raise_()
             self.details.scrim.show()
             self.details.scrim.raise_()
-            self.details.drawer.hide()
-            self.details.ghost.hide()
+            self.details.drawer.show()
+            self.details.drawer.raise_()
         finally:
             if updates_were_enabled:
                 self.root.setUpdatesEnabled(True)
-                self.root.update()
 
-        # Paint the static blur/scrim exactly once before panel motion begins.
-        # The 60 Hz hot path below therefore redraws only the small panel snapshot.
+        # One synchronous first paint prevents a half-constructed panel frame.
         self.root.repaint()
-        return panel, target
+        return target.topLeft()
 
     def _show_with_animation(self, *, ratio: tuple[float, float]) -> None:
-        if self._state not in {_STATE_IDLE, _STATE_OPEN}:
-            return
-        if self._state == _STATE_OPEN or self.details.drawer.isVisible():
+        if self._state != _STATE_IDLE or self.details.drawer.isVisible():
             return
 
+        self._state = _STATE_OPENING
+        self._set_motion_active(True)
         try:
-            panel, target = self._prepare_open_frame(ratio=ratio)
-            if panel.isNull():
-                raise RuntimeError("modal panel snapshot is empty")
-            self._state = _STATE_OPENING
-            self._panel.configure(
-                panel,
-                target,
-                opening=True,
-                duration_ms=_OPEN_MS,
-                finished=self._finish_open,
+            target_pos = self._prepare_open_state(ratio=ratio)
+            group = QParallelAnimationGroup(self)
+            group.addAnimation(
+                self._property_animation(
+                    self.details.drawer,
+                    b"pos",
+                    self.details.drawer.pos(),
+                    target_pos,
+                    _OPEN_MS,
+                    QEasingCurve.Type.OutQuart,
+                )
             )
-            self._panel.start()
+            group.addAnimation(
+                self._property_animation(
+                    self._drawer_effect,
+                    b"opacity",
+                    self._drawer_effect.opacity(),
+                    1.0,
+                    _OPEN_FADE_MS,
+                    QEasingCurve.Type.OutCubic,
+                )
+            )
+            group.finished.connect(self._finish_open)
+            self._animation = group
+            group.start(QAbstractAnimation.DeletionPolicy.KeepWhenStopped)
         except Exception:
-            self._panel.stop()
-            # _prepare_open_frame may already have exposed backdrop/scrim. Reset
-            # that partial state before the direct static fallback captures again.
-            try:
-                self._original_close()
-            except RuntimeError:
-                pass
-            self._state = _STATE_IDLE
-            self._original_show_prepared_modal(ratio=ratio)
-            self._state = _STATE_OPEN
+            self._fallback_open(ratio)
 
     def _finish_open(self) -> None:
         if self._state != _STATE_OPENING:
             return
-        self.details.drawer.setGeometry(self.details._drawer_rect())  # noqa: SLF001
-        self.details.drawer.show()
-        self.details.drawer.raise_()
+        animation = self._animation
+        self._animation = None
+        if animation is not None:
+            animation.deleteLater()
+
+        target = self.details._drawer_rect()  # noqa: SLF001
+        self.details.drawer.move(target.topLeft())
+        self._drawer_effect.setOpacity(1.0)
+        self._set_motion_active(False)
+        self._state = _STATE_OPEN
         self.details.close_button.setFocus(Qt.FocusReason.OtherFocusReason)
         self.details._schedule_geometry()  # noqa: SLF001
-        self.root.repaint()
-        self._state = _STATE_OPEN
 
     def request_close(self, *_args: object) -> None:
-        if self._state == _STATE_OPENING:
-            self._panel.stop()
-            self._state = _STATE_OPENING
-            self._finish_open()
         if self._state == _STATE_CLOSING:
             return
 
-        if not self.details.drawer.isVisible() and not self.details.scrim.isVisible():
+        if self.details.drawer.isHidden() and self.details.scrim.isHidden():
+            self._stop_animation()
+            self._set_motion_active(False)
             self._state = _STATE_IDLE
             return
 
-        if self._state not in {_STATE_OPEN, _STATE_IDLE}:
+        if self._state not in {_STATE_OPENING, _STATE_OPEN, _STATE_IDLE}:
             return
+
+        # If close arrives while opening, reverse smoothly from the exact current
+        # pos/opacity instead of snapping to either endpoint first.
+        self._stop_animation()
+        self._state = _STATE_CLOSING
+        self._set_motion_active(True)
 
         try:
-            target = self.details.drawer.geometry()
-            panel = self.details.drawer.grab()
-            if panel.isNull():
-                raise RuntimeError("modal panel snapshot is empty")
-
-            self._state = _STATE_CLOSING
-            self._panel.configure(
-                panel,
-                target,
-                opening=False,
-                duration_ms=_CLOSE_MS,
-                finished=self._finish_close,
+            target = self.details._drawer_rect()  # noqa: SLF001
+            end_pos = target.topLeft() + QPoint(0, _CLOSE_DROP_PX)
+            group = QParallelAnimationGroup(self)
+            group.addAnimation(
+                self._property_animation(
+                    self.details.drawer,
+                    b"pos",
+                    self.details.drawer.pos(),
+                    end_pos,
+                    _CLOSE_MS,
+                    QEasingCurve.Type.InCubic,
+                )
             )
-            self._panel.start()
-            self._panel.repaint()
-            self.details.drawer.hide()
+            group.addAnimation(
+                self._property_animation(
+                    self._drawer_effect,
+                    b"opacity",
+                    self._drawer_effect.opacity(),
+                    0.0,
+                    _CLOSE_FADE_MS,
+                    QEasingCurve.Type.InCubic,
+                )
+            )
+            group.finished.connect(self._finish_close)
+            self._animation = group
+            group.start(QAbstractAnimation.DeletionPolicy.KeepWhenStopped)
         except Exception:
-            self._panel.stop()
-            self._state = _STATE_IDLE
-            self._original_close()
+            self._fallback_close()
 
     def _finish_close(self) -> None:
         if self._state != _STATE_CLOSING:
             return
+        animation = self._animation
+        self._animation = None
+        if animation is not None:
+            animation.deleteLater()
+
+        self._set_motion_active(False)
         self._original_close()
-        self.root.repaint()
+        self._drawer_effect.setOpacity(1.0)
+        self._state = _STATE_IDLE
+
+    def _fallback_open(self, ratio: tuple[float, float]) -> None:
+        self._stop_animation()
+        self._set_motion_active(False)
+        self._drawer_effect.setOpacity(1.0)
+        try:
+            self._original_close()
+        except RuntimeError:
+            pass
+        self._original_show_prepared_modal(ratio=ratio)
+        self._drawer_effect.setOpacity(1.0)
+        self._state = _STATE_OPEN
+
+    def _fallback_close(self) -> None:
+        self._stop_animation()
+        self._set_motion_active(False)
+        self._original_close()
+        self._drawer_effect.setOpacity(1.0)
         self._state = _STATE_IDLE
 
     def cleanup(self) -> None:
-        self._panel.stop()
+        self._stop_animation()
+        self._set_motion_active(False)
         self._state = _STATE_IDLE
 
         try:
@@ -366,6 +328,13 @@ class StaticModalInteractionController(QObject):
         try:
             self.details._show_prepared_modal = self._original_show_prepared_modal  # type: ignore[method-assign]  # noqa: SLF001
             self.details.close = self._original_close  # type: ignore[method-assign]
+        except RuntimeError:
+            pass
+
+        try:
+            if self.details.drawer.graphicsEffect() is self._drawer_effect:
+                self.details.drawer.setGraphicsEffect(None)
+            self.details.drawer_effect = None  # type: ignore[assignment]
         except RuntimeError:
             pass
 
