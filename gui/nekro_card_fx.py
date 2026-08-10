@@ -11,16 +11,16 @@ from .visual_style import GlassBackdrop, VisualStyleController
 
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
-_ANIMATION_FRAME_MS = 16
-_POINTER_SAMPLE_MS = 24
+_ANIMATION_FRAME_MS = 8
+_POINTER_SAMPLE_MS = 8
 
 _NORMAL_ALPHA = 64.0
-_HOVER_ALPHA = 82.0
-_ACTIVE_ALPHA = 96.0
+_HOVER_ALPHA = 88.0
+_ACTIVE_ALPHA = 106.0
 
-_HOVER_SECONDS = 0.12
-_PRESS_SECONDS = 0.08
-_RELEASE_SECONDS = 0.12
+_HOVER_SECONDS = 0.07
+_PRESS_SECONDS = 0.045
+_RELEASE_SECONDS = 0.09
 
 
 def _css_ease(progress: float) -> float:
@@ -69,7 +69,7 @@ class _CardState:
 
 
 class NekroCardInteractionController(QObject):
-    """Low-cost hover/press feedback without filtering every QWidget event."""
+    """Responsive low-cost hover/press feedback without filtering every widget."""
 
     def __init__(self, window: QMainWindow, visual: VisualStyleController) -> None:
         super().__init__(window)
@@ -88,6 +88,7 @@ class NekroCardInteractionController(QObject):
                 self.states[frame] = _CardState(frame=frame, surface=surface)
 
         self._sample_timer = QTimer(self)
+        self._sample_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._sample_timer.setInterval(_POINTER_SAMPLE_MS)
         self._sample_timer.timeout.connect(self._sample_pointer)
 
@@ -98,8 +99,15 @@ class NekroCardInteractionController(QObject):
 
         window.installEventFilter(self)
         window.destroyed.connect(self._cleanup)
-        if window.isVisible():
+        # This controller is installed immediately before shell.show(). Starting
+        # on the first event-loop turn avoids relying on a particular layered
+        # child-window Show/Enter ordering on Windows.
+        QTimer.singleShot(0, self._start_sampling_if_visible)
+
+    def _start_sampling_if_visible(self) -> None:
+        if self.window.isVisible() and not self.window.isMinimized() and not self._sample_timer.isActive():
             self._sample_timer.start()
+            self._sample_pointer()
 
     def _card_from_widget(self, widget: QWidget | None) -> QFrame | None:
         current = widget
@@ -184,8 +192,7 @@ class NekroCardInteractionController(QObject):
             QEvent.Type.Enter,
             QEvent.Type.WindowActivate,
         }:
-            if not self._sample_timer.isActive():
-                self._sample_timer.start()
+            self._start_sampling_if_visible()
         elif event_type in {QEvent.Type.Hide, QEvent.Type.Leave}:
             self._sample_timer.stop()
             self._button_down = False
@@ -194,8 +201,8 @@ class NekroCardInteractionController(QObject):
         elif event_type == QEvent.Type.WindowStateChange:
             if self.window.isMinimized():
                 self._sample_timer.stop()
-            elif not self._sample_timer.isActive():
-                self._sample_timer.start()
+            else:
+                self._start_sampling_if_visible()
         return False
 
     def _cleanup(self) -> None:
