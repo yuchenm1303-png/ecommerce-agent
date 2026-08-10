@@ -15,12 +15,7 @@ PRODUCT_PHOTOS_SECTION = "Product Photos"
 
 @dataclass(slots=True)
 class PhotoUploadResult:
-    """State of listing images accepted into the open Product Photos editor.
-
-    ``staged`` means Makro has produced an observable card-level acceptance
-    signal (new preview/source or counter growth). Merely placing a file into
-    ``input.files`` is not enough and is recorded only as diagnostics.
-    """
+    """State of listing images accepted into the open Product Photos editor."""
 
     status: str
     initial_count: int | None = None
@@ -56,7 +51,7 @@ def parse_completion_counter(title: str) -> tuple[int, int] | None:
 
 
 def _photo_surface(page: Page, section_path: str):
-    """Return the whole Product Photos surface, including the gallery sibling."""
+    """Return Product Photos plus the sibling image-slot gallery."""
 
     card = page.locator(section_path)
     if card.count() != 1:
@@ -69,6 +64,27 @@ def _photo_surface(page: Page, section_path: str):
         if markers.count() > 0:
             return parent
     return card
+
+
+def _visible_add_product_image_tiles(page: Page, section_path: str) -> list[Any]:
+    """Return all visible orange add-image slots in DOM/gallery order.
+
+    Makro Cases & Covers renders one fixed slot per required photo role. After
+    Front View is filled, for example, four AddProductImage controls remain for
+    Side View / Feature View / Close Up / Life Style. Multiple visible controls
+    are therefore expected and are not an ambiguity.
+    """
+
+    tiles = _photo_surface(page, section_path).locator('[class*="AddProductImage"]')
+    visible: list[Any] = []
+    for index in range(tiles.count()):
+        candidate = tiles.nth(index)
+        try:
+            if candidate.is_visible():
+                visible.append(candidate)
+        except Exception:
+            continue
+    return visible
 
 
 def _photo_state(page: Page, section_path: str) -> dict[str, Any]:
@@ -133,38 +149,32 @@ def inspect_product_photos(page: Page) -> dict[str, Any]:
 
 
 def _raw_file_input(page: Page, section_path: str):
+    """Return the first usable file input in the image-slot surface.
+
+    If Makro renders several slot inputs at once, DOM order is the same visual
+    left-to-right slot order, so the first usable input is the next empty slot.
+    """
+
     inputs = _photo_surface(page, section_path).locator('input[type="file"]')
-    usable = []
     for index in range(inputs.count()):
         candidate = inputs.nth(index)
-        if not candidate.is_disabled():
-            usable.append(candidate)
-    if len(usable) > 1:
-        raise RuntimeError(
-            f"Product Photos 当前出现 {len(usable)} 个可用 file input；拒绝猜测上传目标。"
-        )
-    return usable[0] if usable else None
+        try:
+            if not candidate.is_disabled():
+                return candidate
+        except Exception:
+            continue
+    return None
 
 
 def _add_product_image_tile(page: Page, section_path: str):
-    tiles = _photo_surface(page, section_path).locator('[class*="AddProductImage"]')
-    visible = []
-    for index in range(tiles.count()):
-        candidate = tiles.nth(index)
-        try:
-            if candidate.is_visible():
-                visible.append(candidate)
-        except Exception:
-            continue
-    if len(visible) > 1:
-        raise RuntimeError(
-            f"Product Photos 当前出现 {len(visible)} 个可见 AddProductImage；拒绝猜测上传入口。"
-        )
+    """Return the next empty image slot, left-to-right."""
+
+    visible = _visible_add_product_image_tiles(page, section_path)
     return visible[0] if visible else None
 
 
 class _DynamicPhotoFileTarget:
-    """File target backed by Makro's dynamic AddProductImage tile."""
+    """File target backed by Makro's next empty fixed image slot."""
 
     def __init__(self, page: Page, section_path: str) -> None:
         self.page = page
@@ -187,9 +197,7 @@ class _DynamicPhotoFileTarget:
 
         tile = _add_product_image_tile(self.page, current_path)
         if tile is None:
-            raise RuntimeError(
-                "Product Photos 没有 file input，也没有唯一可见 AddProductImage 上传入口。"
-            )
+            raise RuntimeError("Product Photos 已没有未完成的图片槽位。")
 
         try:
             with self.page.expect_file_chooser(timeout=2_500) as chooser_info:
@@ -198,7 +206,7 @@ class _DynamicPhotoFileTarget:
             self._selected = True
             return
         except PlaywrightTimeoutError:
-            # Some Makro renders use the tile only to mount a fresh hidden input.
+            # Some Makro builds mount a hidden input only after clicking +.
             pass
 
         deadline = time.monotonic() + 3.0
@@ -212,7 +220,7 @@ class _DynamicPhotoFileTarget:
             self.page.wait_for_timeout(150)
 
         raise RuntimeError(
-            "点击 Product Photos 的 AddProductImage 后既未出现 file chooser，也未挂载 file input。"
+            "点击下一个 Product Photos 橙色 + 后既未出现 file chooser，也未挂载 file input。"
         )
 
     def evaluate(self, _expression: str) -> int:
@@ -220,7 +228,7 @@ class _DynamicPhotoFileTarget:
 
 
 def _select_file_input(page: Page, section_path: str):
-    """Return a direct file input or the exact Product Photos add-image target."""
+    """Return a direct input or a target for the next empty image slot."""
 
     direct = _raw_file_input(page, section_path)
     if direct is not None:
@@ -236,8 +244,9 @@ def _stage_accepted(
     before_images: int,
     before_sources: set[str],
     before_completion: int | None,
+    before_add_tiles: int | None = None,
 ) -> bool:
-    """Return True only for a Makro-visible acceptance signal."""
+    """Return True only when the gallery visibly consumed one image slot."""
 
     images = int(state.get("visible_image_count") or 0)
     sources = {
@@ -247,6 +256,7 @@ def _stage_accepted(
     }
     raw_completion = state.get("completion_count")
     completion = int(raw_completion) if raw_completion is not None else None
+    add_tiles = int(state.get("add_image_tile_count") or 0)
     return bool(
         images > before_images
         or sources.difference(before_sources)
@@ -254,6 +264,10 @@ def _stage_accepted(
             before_completion is not None
             and completion is not None
             and completion > before_completion
+        )
+        or (
+            before_add_tiles is not None
+            and add_tiles < before_add_tiles
         )
     )
 
@@ -265,6 +279,7 @@ def _wait_for_staged_signal(
     before_images: int,
     before_sources: set[str],
     before_completion: int | None,
+    before_add_tiles: int | None = None,
     timeout_ms: int,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_ms / 1000.0
@@ -278,6 +293,7 @@ def _wait_for_staged_signal(
             before_images=before_images,
             before_sources=before_sources,
             before_completion=before_completion,
+            before_add_tiles=before_add_tiles,
         ):
             return latest
         page.wait_for_timeout(200)
@@ -290,7 +306,7 @@ def upload_product_photos(
     *,
     timeout_ms: int = 8_000,
 ) -> PhotoUploadResult:
-    """Stage explicit listing images into Product Photos; never Save the card."""
+    """Stage images into the fixed Product Photos slots; never Save the card."""
 
     resolved_paths: list[Path] = []
     seen: set[str] = set()
@@ -301,10 +317,7 @@ def upload_product_photos(
             continue
         seen.add(key)
         if not path.is_file():
-            return PhotoUploadResult(
-                status="invalid_input",
-                detail=f"上传图片不存在或不是文件：{path}",
-            )
+            return PhotoUploadResult(status="invalid_input", detail=f"上传图片不存在或不是文件：{path}")
         resolved_paths.append(path)
 
     if not resolved_paths:
@@ -322,32 +335,17 @@ def upload_product_photos(
     state = _photo_state(page, section_path)
     initial_count = state.get("completion_count")
     capacity = state.get("capacity")
-    current_images = int(state.get("visible_image_count") or 0)
-    current_sources = {
-        str(value).strip()
-        for value in state.get("visible_image_sources") or []
-        if str(value).strip()
-    }
-    current_completion = (
-        int(state["completion_count"])
-        if state.get("completion_count") is not None
-        else None
-    )
-    input_meta = list(state.get("file_inputs") or [])
-    add_tile_count = int(state.get("add_image_tile_count") or 0)
-    if not input_meta and add_tile_count != 1:
+    available = int(state.get("add_image_tile_count") or 0)
+    if available == 0 and _raw_file_input(page, section_path) is None:
         return PhotoUploadResult(
             status="unsupported",
             initial_count=initial_count,
             final_count=initial_count,
             capacity=capacity,
-            detail=(
-                "Product Photos 已展开，但既没有可用 input[type=file]，"
-                "也没有唯一 AddProductImage 上传入口。"
-            ),
+            detail="Product Photos 已展开，但没有未完成图片槽位或 file input。",
         )
 
-    first_meta = input_meta[0] if input_meta else {}
+    first_meta = (state.get("file_inputs") or [{}])[0] if state.get("file_inputs") else {}
     result = PhotoUploadResult(
         status="running",
         initial_count=initial_count,
@@ -357,27 +355,26 @@ def upload_product_photos(
         multiple=bool(first_meta.get("multiple")),
     )
 
-    for path in resolved_paths:
-        if capacity is not None and initial_count is not None:
-            if initial_count + result.staged >= capacity:
-                result.items.append(
-                    {
-                        "path": str(path),
-                        "status": "skipped_full",
-                        "detail": f"Product Photos 最多 {capacity} 张。",
-                    }
-                )
-                continue
+    current_images = int(state.get("visible_image_count") or 0)
+    current_sources = {
+        str(value).strip()
+        for value in state.get("visible_image_sources") or []
+        if str(value).strip()
+    }
+    current_completion = int(state["completion_count"]) if state.get("completion_count") is not None else None
+    current_add_tiles = int(state.get("add_image_tile_count") or 0)
 
+    for slot_offset, path in enumerate(resolved_paths, start=1):
         section = find_section(page, PRODUCT_PHOTOS_SECTION) or section
         section_path = str(section.get("path") or section_path)
-        file_input = _select_file_input(page, section_path)
-        if file_input is None:
+        target = _select_file_input(page, section_path)
+        if target is None:
             result.items.append(
                 {
                     "path": str(path),
                     "status": "file_input_missing",
-                    "detail": "上传过程中找不到 file input 或唯一 AddProductImage 入口。",
+                    "slot_offset": slot_offset,
+                    "detail": "找不到下一个未完成图片槽位。",
                 }
             )
             continue
@@ -386,21 +383,16 @@ def upload_product_photos(
         before_images = current_images
         before_sources = set(current_sources)
         before_completion = current_completion
+        before_add_tiles = current_add_tiles
         try:
-            file_input.set_input_files(str(path))
-            try:
-                immediate_files = int(
-                    file_input.evaluate("el => el.files ? el.files.length : 0") or 0
-                )
-            except Exception:
-                immediate_files = 0
-
+            target.set_input_files(str(path))
             settled = _wait_for_staged_signal(
                 page,
                 section_path,
                 before_images=before_images,
                 before_sources=before_sources,
                 before_completion=before_completion,
+                before_add_tiles=before_add_tiles,
                 timeout_ms=timeout_ms,
             )
             current_images = int(settled.get("visible_image_count") or 0)
@@ -409,16 +401,14 @@ def upload_product_photos(
                 for value in settled.get("visible_image_sources") or []
                 if str(value).strip()
             }
-            current_completion = (
-                int(settled["completion_count"])
-                if settled.get("completion_count") is not None
-                else None
-            )
+            current_completion = int(settled["completion_count"]) if settled.get("completion_count") is not None else None
+            current_add_tiles = int(settled.get("add_image_tile_count") or 0)
             accepted = _stage_accepted(
                 settled,
                 before_images=before_images,
                 before_sources=before_sources,
                 before_completion=before_completion,
+                before_add_tiles=before_add_tiles,
             )
             if accepted:
                 result.staged += 1
@@ -426,16 +416,8 @@ def upload_product_photos(
                     {
                         "path": str(path),
                         "status": "staged",
-                        "input_files": immediate_files,
-                        "before_visible_images": before_images,
-                        "after_visible_images": current_images,
-                        "before_completion_count": before_completion,
-                        "after_completion_count": current_completion,
-                        "new_visible_sources": sorted(current_sources.difference(before_sources)),
-                        "detail": (
-                            "Makro 已出现新增图片预览/来源或计数变化；"
-                            "图片已进入未保存编辑事务。"
-                        ),
+                        "slot_offset": slot_offset,
+                        "remaining_empty_slots": current_add_tiles,
                     }
                 )
             else:
@@ -443,15 +425,8 @@ def upload_product_photos(
                     {
                         "path": str(path),
                         "status": "staging_unconfirmed",
-                        "input_files": immediate_files,
-                        "before_visible_images": before_images,
-                        "after_visible_images": current_images,
-                        "before_completion_count": before_completion,
-                        "after_completion_count": current_completion,
-                        "detail": (
-                            "文件选择已执行，但在超时前 Makro 没有出现新增预览、"
-                            "新图片来源或计数变化；input.files 本身不再视为上传成功。"
-                        ),
+                        "slot_offset": slot_offset,
+                        "detail": "Makro 没有确认该图片槽已被占用。",
                     }
                 )
         except Exception as exc:
@@ -459,6 +434,7 @@ def upload_product_photos(
                 {
                     "path": str(path),
                     "status": "upload_error",
+                    "slot_offset": slot_offset,
                     "detail": str(exc),
                 }
             )
@@ -467,21 +443,15 @@ def upload_product_photos(
     section_path = str(section.get("path") or section_path)
     final_state = _photo_state(page, section_path)
     result.final_count = final_state.get("completion_count")
-    if result.staged == result.attempted and result.attempted > 0:
+    if result.staged == len(resolved_paths):
         result.status = "staged"
-        result.detail = "所有尝试图片都得到 Makro 页面接受信号，等待 section Save。"
+        result.detail = f"{result.staged}/{len(resolved_paths)} 张图片已按固定槽位顺序 staged，等待一次 Save。"
     elif result.staged > 0:
         result.status = "partial_staged"
-        result.detail = "部分图片得到 Makro 页面接受信号，部分无法确认。"
-    elif result.attempted == 0:
-        result.status = "skipped"
-        result.detail = "没有实际执行图片 staging。"
+        result.detail = f"只确认 {result.staged}/{len(resolved_paths)} 个图片槽已填写。"
     else:
         result.status = "staging_unconfirmed"
-        result.detail = (
-            "已执行文件选择，但 Makro 没有确认任何图片；"
-            "调用方不得据此点击 Product Photos Save。"
-        )
+        result.detail = "没有图片槽得到 Makro 接受信号。"
     return result
 
 
