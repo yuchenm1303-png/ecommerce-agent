@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -13,7 +14,8 @@ from PySide6.QtWidgets import (
 
 from .console_window import MainWindow as ConsoleMainWindow
 from .readonly_runner import RunnerConfig
-from .result_loader import RunResult
+from .real_execution import FULL_STEP3
+from .result_loader import RunResult, latest_resolver_manifest
 
 
 _STAGE_LABELS = {
@@ -22,6 +24,8 @@ _STAGE_LABELS = {
     "hot": "Step 2 · Brand",
     "plan": "Step 3 · Resolve / Fill Plan",
 }
+
+_AUTO_PRODUCT_PHOTO_LIMIT = 5
 
 
 class WorkflowMainWindow(ConsoleMainWindow):
@@ -59,8 +63,31 @@ class WorkflowMainWindow(ConsoleMainWindow):
             elif "只有完成 read-only 四阶段后才解锁" in text:
                 label.setText(
                     "完成 Step 3 当前 Resolver + Fill Plan 后才解锁真实填写；"
-                    "Save / 图片分别授权，Send to QC 永久锁定。"
+                    "正式入口默认 Full Step 3，Save / 图片分别授权，Send to QC 永久锁定。"
                 )
+
+        # The formal execution path is Full Step 3. Single-section choices stay
+        # available as diagnostics, but they are no longer the default action.
+        full_index = self.real_scope_combo.findData(FULL_STEP3)
+        if full_index >= 0:
+            self.real_scope_combo.setCurrentIndex(full_index)
+        self.real_scope_combo.currentIndexChanged.connect(self._sync_execution_mode_copy)
+
+        self.real_upload_check.setText("上传本次商品图")
+        self.real_upload_check.setToolTip(
+            "勾选后默认使用当前 Resolver 已抓取的真实商品图片；不会把 source-page 截图当 listing 图片。"
+        )
+        self.real_pick_images_button.setText("手动覆盖图片…")
+        self.real_pick_images_button.setToolTip(
+            "可选。只有需要替换自动商品图时才手动选择；不选择时使用当前 Resolver 商品图。"
+        )
+        self.real_image_count.setText("AUTO · waiting")
+        self.real_start_button.setText("一键填写全部 READY")
+        self.real_policy_hint.setText(
+            "正式入口默认 Full Step 3：填写全部 READY。Save 与图片仍需每件商品显式授权；"
+            "勾选图片后自动复用当前 Resolver 商品图，无需重新选文件；Send to QC 永久锁定。"
+        )
+        self._sync_execution_mode_copy()
 
         stage_row = QHBoxLayout()
         stage_row.setSpacing(8)
@@ -77,6 +104,18 @@ class WorkflowMainWindow(ConsoleMainWindow):
         self.step3_button.clicked.connect(lambda: self._start_mode("step3"))
         layout.insertLayout(2, stage_row)
         return card
+
+    def _sync_execution_mode_copy(self, *_args: object) -> None:
+        if not hasattr(self, "real_scope_combo") or not hasattr(self, "real_start_button"):
+            return
+        if self.real_scope_combo.currentData() == FULL_STEP3:
+            self.real_start_button.setText("一键填写全部 READY")
+            self.real_start_button.setToolTip(
+                "执行全部 Step 3 READY 字段；按授权 Save + reopen，并可自动上传本次 Resolver 商品图。"
+            )
+        else:
+            self.real_start_button.setText("运行单项诊断")
+            self.real_start_button.setToolTip("仅执行当前选中的单 section / Product Photos，用于诊断。")
 
     def _relabel_acceptance_console(self) -> None:
         for key, title in _STAGE_LABELS.items():
@@ -99,6 +138,32 @@ class WorkflowMainWindow(ConsoleMainWindow):
         from PySide6.QtWidgets import QTableWidgetItem
 
         return QTableWidgetItem(text)
+
+    def _current_resolver_product_images(self) -> tuple[Path, ...]:
+        result = getattr(self, "current_result", None)
+        if result is None:
+            return ()
+        manifest_path = latest_resolver_manifest(result.run_dir, "03-hot-resolver")
+        if manifest_path is None or not manifest_path.is_file():
+            return ()
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return ()
+        outputs = manifest.get("outputs") or {}
+        images: list[Path] = []
+        seen: set[str] = set()
+        for raw in outputs.get("primary_source_product_images") or []:
+            value = str(raw or "").strip()
+            if not value:
+                continue
+            path = Path(value).resolve()
+            key = str(path).casefold()
+            if key in seen or not path.is_file():
+                continue
+            seen.add(key)
+            images.append(path)
+        return tuple(images)
 
     def _start_run(self) -> None:
         self._start_mode("full")
@@ -134,6 +199,24 @@ class WorkflowMainWindow(ConsoleMainWindow):
         for button in (self.step1_button, self.step2_button, self.step3_button):
             button.setEnabled(not running and not workflow_running)
 
+    def _reset_result_views(self) -> None:
+        super()._reset_result_views()
+        # Permissions are per product/run. Never carry Save/image authorization
+        # or manually selected photos across products.
+        self._selected_upload_images = []
+        if hasattr(self, "real_save_check"):
+            self.real_save_check.setChecked(False)
+        if hasattr(self, "real_upload_check"):
+            self.real_upload_check.setChecked(False)
+        if hasattr(self, "real_scope_combo"):
+            full_index = self.real_scope_combo.findData(FULL_STEP3)
+            if full_index >= 0:
+                self.real_scope_combo.setCurrentIndex(full_index)
+        if hasattr(self, "real_image_count"):
+            self.real_image_count.setText("AUTO · waiting")
+            self.real_image_count.setToolTip("")
+        self._sync_execution_mode_copy()
+
     def _apply_result(self, result: RunResult) -> None:
         super()._apply_result(result)
         if result.vertical:
@@ -150,6 +233,18 @@ class WorkflowMainWindow(ConsoleMainWindow):
             )
 
     def _unlock_real_execution(self, result: RunResult) -> None:
+        images = self._current_resolver_product_images()
+        if images:
+            auto_count = min(len(images), _AUTO_PRODUCT_PHOTO_LIMIT)
+            self.real_image_count.setText(f"AUTO {auto_count}/{len(images)}")
+            self.real_image_count.setToolTip(
+                "自动候选来自本次 Resolver primary_source_product_images：\n"
+                + "\n".join(str(path) for path in images[:_AUTO_PRODUCT_PHOTO_LIMIT])
+            )
+        else:
+            self.real_image_count.setText("AUTO 0")
+            self.real_image_count.setToolTip("本次 Resolver 没有可用于 Product Photos 的商品图片。")
+
         if not result.plan_summary or result.ready <= 0:
             self.real_start_button.setEnabled(False)
             self.real_policy_hint.setText(
@@ -158,11 +253,29 @@ class WorkflowMainWindow(ConsoleMainWindow):
             return
         self.real_start_button.setEnabled(True)
         self.real_policy_hint.setText(
-            f"当前 Step 3 Fill Plan 已通过：READY={result.ready}，真实填写已解锁。"
+            f"当前 Step 3 Fill Plan 已通过：READY={result.ready}。默认 Full Step 3 会填写全部 READY；"
+            f"本次可自动使用 {min(len(images), _AUTO_PRODUCT_PHOTO_LIMIT)} 张商品图。"
             "Save / 图片仍需显式授权，Send to QC 继续锁定。"
         )
 
     def _start_real_execution(self) -> None:
         if self.current_result is not None and self.current_result.vertical:
             self.vertical_input.setText(self.current_result.vertical)
+
+        # If image upload is explicitly authorized and no manual override was
+        # chosen, bind Product Photos to this exact run's captured product images.
+        if self.real_upload_check.isChecked() and not self._selected_upload_images:
+            images = self._current_resolver_product_images()
+            if not images:
+                QMessageBox.warning(
+                    self,
+                    "没有商品图片",
+                    "本次 Resolver 没有 primary_source_product_images；不会拿网页截图冒充商品图。",
+                )
+                return
+            selected = list(images[:_AUTO_PRODUCT_PHOTO_LIMIT])
+            self._selected_upload_images = selected
+            self.real_image_count.setText(f"AUTO {len(selected)}/{len(images)}")
+            self.real_image_count.setToolTip("\n".join(str(path) for path in selected))
+
         super()._start_real_execution()
