@@ -5,31 +5,35 @@ from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QFrame, QMainWindow
 
 from .card_details import CardDetailController
+from .overlay_sheet_motion import ClipSheetMotion
 
 
 _GEOMETRY_COALESCE_MS = 32
 
 
 class FastCardDetailController(CardDetailController):
-    """Stable detail drawer with no intermediate animation state.
-
-    Opening and closing are atomic layout transactions: the full detail body is
-    populated at its final geometry while QWidget painting is disabled, then the
-    settled drawer is shown in one repaint.  This avoids partial text/layout
-    states on the layered QWidget surface.
-    """
+    """Right-side detail sheet whose live body never changes animation size."""
 
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
 
-        # The base controller creates opacity effects for its animated path.
-        # This controller has no animated path, so remove those offscreen
-        # composition surfaces completely.
+        # Remove the old QWidget opacity/geometry animation surfaces. The drawer
+        # itself stays at final size inside a clipping viewport.
         self.drawer.setGraphicsEffect(None)
         self.drawer_effect = None  # type: ignore[assignment]
         self.ghost.setGraphicsEffect(None)
         self.ghost_effect = None  # type: ignore[assignment]
         self.ghost.hide()
+
+        self._motion = ClipSheetMotion(
+            self.root,
+            self.drawer,
+            self._drawer_rect,
+            edge="right",
+            duration_ms=158,
+        )
+        self._motion.opened.connect(self._finish_open)
+        self._motion.closed.connect(self._finish_close)
 
         self._geometry_timer = QTimer(self)
         self._geometry_timer.setSingleShot(True)
@@ -44,67 +48,53 @@ class FastCardDetailController(CardDetailController):
         self.scrim.setGeometry(self.root.rect())
         for frame in self._installed_cards:
             self._position_button(frame)
-        if self.drawer.isVisible():
-            self.drawer.setGeometry(self._drawer_rect())
+        self._motion.sync_geometry()
 
     def _stop_animation(self) -> None:
-        # Defensive cleanup for the base API. No animation is created here.
         animation = self._animation
         self._animation = None
         if animation is not None:
             animation.stop()
             animation.deleteLater()
+        self._motion.stop()
         self.ghost.hide()
 
     def open(self, frame: QFrame) -> None:
         if frame not in self._buttons:
             return
 
+        anchored = getattr(self.window, "_anchored_sheets", None)
+        if anchored is not None and hasattr(anchored, "close_all"):
+            anchored.close_all()
+
         self._stop_animation()
-        updates_were_enabled = self.root.updatesEnabled()
-        if updates_were_enabled:
-            self.root.setUpdatesEnabled(False)
+        self._selected = frame
+        self._populate(frame)
+        self.body_layout.activate()
+        if self.drawer.layout() is not None:
+            self.drawer.layout().activate()
+        self.scroll.verticalScrollBar().setValue(0)
 
-        try:
-            self._selected = frame
-            self._populate(frame)
-            self.body_layout.activate()
-            if self.drawer.layout() is not None:
-                self.drawer.layout().activate()
-            self.scroll.verticalScrollBar().setValue(0)
+        self.scrim.setGeometry(self.root.rect())
+        self.scrim.show()
+        self.scrim.raise_()
+        self._motion.open()
+        self._motion.viewport.raise_()
+        self.ghost.hide()
 
-            self.scrim.setGeometry(self.root.rect())
-            self.drawer.setGeometry(self._drawer_rect())
-            self.scrim.show()
-            self.scrim.raise_()
-            self.drawer.show()
-            self.drawer.raise_()
-            self.ghost.hide()
-        finally:
-            if updates_were_enabled:
-                self.root.setUpdatesEnabled(True)
-                self.root.update()
-
+    def _finish_open(self) -> None:
+        self._motion.viewport.raise_()
         self.close_button.setFocus(Qt.FocusReason.OtherFocusReason)
-        self._schedule_geometry()
 
     def close(self) -> None:
-        if not self.drawer.isVisible() and not self.scrim.isVisible():
+        if self._selected is None and not self.scrim.isVisible():
             return
+        self._motion.close()
 
-        self._stop_animation()
-        updates_were_enabled = self.root.updatesEnabled()
-        if updates_were_enabled:
-            self.root.setUpdatesEnabled(False)
-        try:
-            self.drawer.hide()
-            self.ghost.hide()
-            self.scrim.hide()
-            self._selected = None
-        finally:
-            if updates_were_enabled:
-                self.root.setUpdatesEnabled(True)
-                self.root.update()
+    def _finish_close(self) -> None:
+        self.scrim.hide()
+        self.ghost.hide()
+        self._selected = None
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
@@ -112,7 +102,7 @@ class FastCardDetailController(CardDetailController):
             if event_type in {QEvent.Type.Resize, QEvent.Type.Show}:
                 self._schedule_geometry()
             elif event_type == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
-                if event.key() == Qt.Key.Key_Escape and self.drawer.isVisible():
+                if event.key() == Qt.Key.Key_Escape and self.scrim.isVisible():
                     self.close()
                     return True
         elif isinstance(watched, QFrame) and watched in self._buttons:
@@ -122,6 +112,7 @@ class FastCardDetailController(CardDetailController):
 
     def _cleanup(self) -> None:
         self._geometry_timer.stop()
+        self._motion.cleanup()
         super()._cleanup()
 
 
