@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QComboBox,
+    QLineEdit,
     QPlainTextEdit,
     QProgressBar,
     QTabWidget,
@@ -328,6 +330,7 @@ class RealExecutionConsole(QWidget):
         super().__init__(parent)
         self.runner = runner
         self._pending_logs: list[str] = []
+        self._field_rows: list[tuple[str, dict[str, Any], str]] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -351,9 +354,9 @@ class RealExecutionConsole(QWidget):
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
-        self.tabs.addTab(self._build_live_tab(), "Live Output")
-        self.tabs.addTab(self._build_fields_tab(), "Field Execution")
-        self.tabs.addTab(self._build_report_tab(), "Report JSON")
+        self.tabs.addTab(self._build_fields_tab(), "执行结果")
+        self.tabs.addTab(self._build_live_tab(), "运行日志")
+        self.tabs.addTab(self._build_report_tab(), "原始报告")
         layout.addWidget(self.tabs, 1)
 
         self.flush_timer = QTimer(self)
@@ -374,12 +377,14 @@ class RealExecutionConsole(QWidget):
         layout.setSpacing(5)
         self.command_view = QPlainTextEdit()
         self.command_view.setObjectName("consoleText")
+        self.command_view.setProperty("detailTitle", "执行命令")
         self.command_view.setReadOnly(True)
         self.command_view.setMaximumHeight(64)
         self.command_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.command_view.setPlaceholderText("真实 executor 命令会显示在这里")
         self.log_view = QPlainTextEdit()
         self.log_view.setObjectName("consoleText")
+        self.log_view.setProperty("detailTitle", "真实网页执行日志")
         self.log_view.setReadOnly(True)
         self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.log_view.document().setMaximumBlockCount(12000)
@@ -394,8 +399,25 @@ class RealExecutionConsole(QWidget):
         self.summary_label = QLabel("等待真实执行报告")
         self.summary_label.setObjectName("consoleHint")
         layout.addWidget(self.summary_label)
+
+        filters = QHBoxLayout()
+        self.field_filter = QComboBox()
+        self.field_filter.addItem("全部字段", "all")
+        self.field_filter.addItem("仅失败/阻止", "problem")
+        self.field_filter.addItem("仅已填写", "filled")
+        self.field_filter.addItem("仅跳过", "skipped")
+        self.field_filter.currentIndexChanged.connect(self._refresh_field_table)
+        self.field_search = QLineEdit()
+        self.field_search.setPlaceholderText("搜索字段、答案或原因…")
+        self.field_search.setClearButtonEnabled(True)
+        self.field_search.textChanged.connect(self._refresh_field_table)
+        filters.addWidget(self.field_filter)
+        filters.addWidget(self.field_search, 1)
+        layout.addLayout(filters)
+
         self.field_table = QTableWidget(0, 7)
         self.field_table.setObjectName("consoleTable")
+        self.field_table.setProperty("detailTitle", "逐字段执行结果")
         self.field_table.setHorizontalHeaderLabels(
             ["Section", "Field", "Mode", "Execution", "Answer", "Persisted", "Detail"]
         )
@@ -420,6 +442,7 @@ class RealExecutionConsole(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self.report_view = QPlainTextEdit()
         self.report_view.setObjectName("consoleText")
+        self.report_view.setProperty("detailTitle", "原始 report.json（高级诊断）")
         self.report_view.setReadOnly(True)
         self.report_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.report_view.setPlaceholderText("report.json 会在真实执行完成后显示")
@@ -461,8 +484,9 @@ class RealExecutionConsole(QWidget):
             self.log_view.clear()
             self.report_view.clear()
             self.field_table.setRowCount(0)
+            self._field_rows.clear()
             self.summary_label.setText("真实网页执行中…")
-            self.tabs.setCurrentIndex(0)
+            self.tabs.setCurrentIndex(1)
         else:
             self._flush_logs()
 
@@ -510,6 +534,42 @@ class RealExecutionConsole(QWidget):
                     key = str(item.get("label") or item.get("attribute_key") or "")
                     rows.append((str(section.get("section") or ""), item, persisted.get(key, "")))
 
+        self._field_rows = rows
+        self._refresh_field_table()
+
+        self.report_view.setPlainText(json.dumps(report, ensure_ascii=False, indent=2))
+        self.tabs.setCurrentIndex(0)
+
+    def _refresh_field_table(self, *_args: object) -> None:
+        mode = str(self.field_filter.currentData() or "all")
+        query = self.field_search.text().strip().casefold()
+        rows: list[tuple[str, dict[str, Any], str]] = []
+        for section, item, persisted in self._field_rows:
+            status = str(item.get("execution_status") or "").casefold()
+            detail = str(item.get("detail") or "")
+            searchable = " ".join(
+                (
+                    section,
+                    str(item.get("label") or item.get("attribute_key") or ""),
+                    str(item.get("answer_values") or item.get("answer") or ""),
+                    status,
+                    detail,
+                    persisted,
+                )
+            ).casefold()
+            is_problem = any(token in status for token in ("error", "fail", "blocked", "invalid"))
+            is_filled = any(token in status for token in ("validated", "filled"))
+            is_skipped = "skip" in status
+            if mode == "problem" and not is_problem:
+                continue
+            if mode == "filled" and not is_filled:
+                continue
+            if mode == "skipped" and not is_skipped:
+                continue
+            if query and query not in searchable:
+                continue
+            rows.append((section, item, persisted))
+
         self.field_table.setUpdatesEnabled(False)
         try:
             self.field_table.setRowCount(len(rows))
@@ -538,6 +598,3 @@ class RealExecutionConsole(QWidget):
                     self.field_table.setItem(row_index, column, table_item)
         finally:
             self.field_table.setUpdatesEnabled(True)
-
-        self.report_view.setPlainText(json.dumps(report, ensure_ascii=False, indent=2))
-        self.tabs.setCurrentIndex(1)

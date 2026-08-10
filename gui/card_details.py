@@ -630,7 +630,8 @@ class CardDetailController(QObject):
         self._add_text_lines("当前状态", texts[:30])
 
     def _populate_text_views(self, frame: QFrame) -> None:
-        for index, view in enumerate(frame.findChildren(QPlainTextEdit)):
+        visible_index = 0
+        for view in frame.findChildren(QPlainTextEdit):
             if not view.isVisibleTo(frame):
                 continue
             text = view.toPlainText().strip()
@@ -638,7 +639,9 @@ class CardDetailController(QObject):
                 continue
             lines = text.splitlines()
             clipped = "\n".join(lines[-240:])
-            layout = self._section("日志 / 文本" if index == 0 else f"文本 {index + 1}")
+            explicit_title = str(view.property("detailTitle") or "").strip()
+            fallback_title = "日志 / 文本" if visible_index == 0 else f"文本 {visible_index + 1}"
+            layout = self._section(explicit_title or fallback_title)
             clone = QPlainTextEdit()
             clone.setObjectName("cardDetailTextView")
             clone.setReadOnly(True)
@@ -647,6 +650,7 @@ class CardDetailController(QObject):
             clone.setMinimumHeight(190)
             clone.setMaximumHeight(360)
             layout.addWidget(clone)
+            visible_index += 1
 
     def _populate(self, frame: QFrame) -> None:
         self._clear_body()
@@ -666,7 +670,11 @@ class CardDetailController(QObject):
                 if table.isVisibleTo(frame)
             ]
             for index, table in enumerate(tables[:3]):
-                self._clone_table(table, title="完整数据" if index == 0 else f"数据表 {index + 1}")
+                explicit_title = str(table.property("detailTitle") or "").strip()
+                self._clone_table(
+                    table,
+                    title=explicit_title or ("完整数据" if index == 0 else f"数据表 {index + 1}"),
+                )
             self._populate_text_views(frame)
 
         if self.body_layout.count() == 0:

@@ -67,3 +67,13 @@ def test_real_execution_uses_page_screenshot_only_as_image_fallback(
             "primary_source_product_images": [],
         }
     ) == [screenshot]
+
+
+def test_real_execution_console_is_structured_before_raw_diagnostics() -> None:
+    assert 'self.tabs.addTab(self._build_fields_tab(), "执行结果")' in REAL
+    assert 'self.tabs.addTab(self._build_live_tab(), "运行日志")' in REAL
+    assert 'self.tabs.addTab(self._build_report_tab(), "原始报告")' in REAL
+    assert 'self.field_filter.addItem("仅失败/阻止", "problem")' in REAL
+    assert 'self.field_search.setPlaceholderText("搜索字段、答案或原因…")' in REAL
+    assert 'setProperty("detailTitle", "真实网页执行日志")' in REAL
+    assert 'setProperty("detailTitle", "原始 report.json（高级诊断）")' in REAL

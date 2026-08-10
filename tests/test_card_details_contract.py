@@ -81,6 +81,8 @@ def test_details_are_useful_not_generic_placeholders() -> None:
     assert "current_result" not in BASE_DETAILS
     assert "ReadOnlyRunner" not in BASE_DETAILS
     assert "RealExecutionRunner" not in BASE_DETAILS
+    assert 'view.property("detailTitle")' in BASE_DETAILS
+    assert 'table.property("detailTitle")' in BASE_DETAILS
 
 
 def test_detail_motion_has_no_continuous_idle_timer_or_layout_height_animation() -> None:
