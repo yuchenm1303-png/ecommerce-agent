@@ -38,7 +38,6 @@ class WorkflowMainWindow(ConsoleMainWindow):
         super().__init__(project_root)
         self.setWindowTitle("ecommerce-agent · Listing Automation")
         self._relabel_acceptance_console()
-        self._install_mode_workspace()
 
     def _build_input_card(self) -> QFrame:
         card = super()._build_input_card()
@@ -109,14 +108,17 @@ class WorkflowMainWindow(ConsoleMainWindow):
         layout.insertLayout(2, stage_row)
         return card
 
-    def _install_mode_workspace(self) -> None:
-        """Wrap the preserved Single UI and the new Batch UI in one instant stack.
+    def install_mode_workspace(self) -> None:
+        """Wrap the fully-polished Single UI and Batch UI in one instant stack.
 
-        The base QWidget GUI is not rebuilt. Its existing top-level cards/layouts
-        are moved intact into the Single page, preserving all parallel visual
-        work, while Batch gets a separate full workspace using the same shell.
+        This is deliberately called by ``run_local_gui.py`` *after* the existing
+        Single UI polish has created its splitters. That preserves the stable
+        Single layout/performance work while still giving Batch a full-screen
+        sibling workspace. Business widgets are moved, never reconstructed.
         """
 
+        if hasattr(self, "mode_stack"):
+            return
         root = self.centralWidget()
         outer = root.layout() if root is not None else None
         if root is None or not isinstance(outer, QVBoxLayout):
@@ -126,18 +128,19 @@ class WorkflowMainWindow(ConsoleMainWindow):
         single_page.setObjectName("singleWorkspace")
         single_layout = QVBoxLayout(single_page)
         single_layout.setContentsMargins(0, 0, 0, 0)
-        single_layout.setSpacing(14)
+        single_layout.setSpacing(10)
 
-        # Item 0 is the common application header. Everything below it belongs
-        # to the existing Single workspace and is moved without reconstruction.
+        # Item 0 remains the common application header. ui_polish has already
+        # converted the Single body into its stable splitters at this point.
         while outer.count() > 1:
             item = outer.takeAt(1)
             widget = item.widget()
             child_layout = item.layout()
             if widget is not None:
-                stretch = 1 if widget.objectName() == "workspaceHost" else 0
+                stretch = 1 if widget.objectName() in {"workspaceHost", "bodySplitter"} else 0
                 single_layout.addWidget(widget, stretch)
             elif child_layout is not None:
+                child_layout.setParent(None)
                 single_layout.addLayout(child_layout)
 
         switch_card = QFrame()
