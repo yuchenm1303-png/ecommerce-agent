@@ -8,11 +8,12 @@ from app.ai_decisions import field_id
 from app.fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem
 from app.makro.execution import fill_one_section, run_photos
 from app.makro.photos import (
+    PHOTO_SLOT_IDS,
     _DynamicPhotoFileTarget,
+    _next_empty_photo_slot,
     _photo_surface,
     _select_file_input,
     _stage_accepted,
-    _visible_add_product_image_tiles,
 )
 from app.makro.sections import save_section
 from app.required_overrides import RequiredOverrideError, apply_required_overrides
@@ -146,41 +147,55 @@ def test_production_photo_path_fills_all_fixed_slots_then_saves_once():
     assert "expected_added=1" not in source
 
 
-def test_product_photos_treats_multiple_add_tiles_as_expected_fixed_slots():
+def test_product_photos_uses_real_thumbnail_ids_and_shared_input_surface():
     surface_source = inspect.getsource(_photo_surface)
-    tiles_source = inspect.getsource(_visible_add_product_image_tiles)
+    next_slot_source = inspect.getsource(_next_empty_photo_slot)
     select_source = inspect.getsource(_select_file_input)
 
-    assert 'locator("xpath=..")' in surface_source
-    assert 'ImageGalleryWrapper' in surface_source
-    assert 'AddProductImage' in surface_source
-    assert "return visible" in tiles_source
-    assert "len(visible) > 1" not in tiles_source
-    assert "_raw_file_input" in select_source
-    assert "_add_product_image_tile" in select_source
+    assert PHOTO_SLOT_IDS == (
+        "thumbnail_0",
+        "thumbnail_1",
+        "thumbnail_2",
+        "thumbnail_3",
+        "thumbnail_4",
+    )
+    assert '[id^="thumbnail_"]' in surface_source
+    assert 'input[type="file"]' in surface_source
+    assert "i.fa-plus" in next_slot_source
+    assert "PHOTO_SLOT_IDS" in next_slot_source
+    assert "_next_empty_photo_slot" in select_source
+    assert "_DynamicPhotoFileTarget" in select_source
+    assert "AddProductImage" not in next_slot_source
 
 
-def test_dynamic_photo_target_clicks_next_visible_slot_and_uses_file_chooser():
+def test_dynamic_photo_target_clicks_concrete_thumbnail_before_shared_input():
     source = inspect.getsource(_DynamicPhotoFileTarget.set_input_files)
 
-    assert "_raw_file_input" in source
-    assert "_add_product_image_tile" in source
+    assert 'locator(f"#{self.slot_id}")' in source
+    assert "i.fa-plus" in source
     assert "expect_file_chooser" in source
     assert "set_files" in source
-    assert "direct.set_input_files" in source
-    assert "唯一可见 AddProductImage" not in source
+    assert "_raw_file_input" in source
+    assert "shared.set_input_files" in source
 
 
-def test_photo_acceptance_can_be_proved_by_empty_slot_count_decreasing():
+def test_photo_acceptance_can_be_proved_by_target_thumbnail_losing_plus():
     assert _stage_accepted(
         {
             "visible_image_count": 5,
             "visible_image_sources": ["sample-a", "sample-b"],
-            "completion_count": 1,
-            "add_image_tile_count": 3,
+            "completion_count": 0,
+            "add_image_tile_count": 4,
+            "empty_slot_ids": [
+                "thumbnail_1",
+                "thumbnail_2",
+                "thumbnail_3",
+                "thumbnail_4",
+            ],
         },
         before_images=5,
         before_sources={"sample-a", "sample-b"},
-        before_completion=1,
-        before_add_tiles=4,
+        before_completion=0,
+        before_add_tiles=5,
+        target_slot_id="thumbnail_0",
     )
