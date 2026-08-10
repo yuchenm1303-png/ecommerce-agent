@@ -4,23 +4,21 @@ import time
 from dataclasses import dataclass
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer
-from PySide6.QtGui import QCursor
-from PySide6.QtWidgets import QApplication, QFrame, QMainWindow, QWidget
+from PySide6.QtWidgets import QFrame, QMainWindow
 
 from .visual_style import GlassBackdrop, VisualStyleController
 
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
 _ANIMATION_FRAME_MS = 8
-_POINTER_SAMPLE_MS = 8
 
 _NORMAL_ALPHA = 64.0
-_HOVER_ALPHA = 88.0
-_ACTIVE_ALPHA = 106.0
+_HOVER_ALPHA = 90.0
+_ACTIVE_ALPHA = 110.0
 
-_HOVER_SECONDS = 0.07
-_PRESS_SECONDS = 0.045
-_RELEASE_SECONDS = 0.09
+_HOVER_SECONDS = 0.065
+_PRESS_SECONDS = 0.040
+_RELEASE_SECONDS = 0.085
 
 
 def _css_ease(progress: float) -> float:
@@ -69,7 +67,14 @@ class _CardState:
 
 
 class NekroCardInteractionController(QObject):
-    """Responsive low-cost hover/press feedback without filtering every widget."""
+    """Immediate card hover/press feedback with no pointer polling loop.
+
+    Only the small set of presentation cards is filtered. Enter/leave and press
+    events start feedback immediately; an 8 ms timer runs only while alpha is
+    actually interpolating. Passive QLabel children are mouse-transparent in the
+    modal interaction layer, so title/status text naturally belongs to the card
+    hit target without installing filters across the QWidget tree.
+    """
 
     def __init__(self, window: QMainWindow, visual: VisualStyleController) -> None:
         super().__init__(window)
@@ -78,51 +83,23 @@ class NekroCardInteractionController(QObject):
         self.states: dict[QFrame, _CardState] = {}
         self.hovered: QFrame | None = None
         self.pressed: QFrame | None = None
-        self._button_down = False
 
         for frame in window.findChildren(QFrame):
             if frame.objectName() not in _GLASS_NAMES:
                 continue
             surface = visual.surface_for(frame)
-            if surface is not None:
-                self.states[frame] = _CardState(frame=frame, surface=surface)
-
-        self._sample_timer = QTimer(self)
-        self._sample_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._sample_timer.setInterval(_POINTER_SAMPLE_MS)
-        self._sample_timer.timeout.connect(self._sample_pointer)
+            if surface is None:
+                continue
+            self.states[frame] = _CardState(frame=frame, surface=surface)
+            frame.setMouseTracking(True)
+            frame.installEventFilter(self)
 
         self._animation_timer = QTimer(self)
         self._animation_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._animation_timer.setInterval(_ANIMATION_FRAME_MS)
         self._animation_timer.timeout.connect(self._tick_animation)
 
-        window.installEventFilter(self)
         window.destroyed.connect(self._cleanup)
-        # This controller is installed immediately before shell.show(). Starting
-        # on the first event-loop turn avoids relying on a particular layered
-        # child-window Show/Enter ordering on Windows.
-        QTimer.singleShot(0, self._start_sampling_if_visible)
-
-    def _start_sampling_if_visible(self) -> None:
-        if self.window.isVisible() and not self.window.isMinimized() and not self._sample_timer.isActive():
-            self._sample_timer.start()
-            self._sample_pointer()
-
-    def _card_from_widget(self, widget: QWidget | None) -> QFrame | None:
-        current = widget
-        while current is not None:
-            if isinstance(current, QFrame) and current in self.states:
-                return current
-            current = current.parentWidget()
-        return None
-
-    def _card_under_cursor(self) -> QFrame | None:
-        point = QCursor.pos()
-        local = self.window.mapFromGlobal(point)
-        if not self.window.rect().contains(local):
-            return None
-        return self._card_from_widget(self.window.childAt(local))
 
     def _ensure_animation_timer(self) -> None:
         if any(state.animating for state in self.states.values()) and not self._animation_timer.isActive():
@@ -135,32 +112,31 @@ class NekroCardInteractionController(QObject):
         state.begin(alpha=alpha, duration=duration)
         self._ensure_animation_timer()
 
-    def _set_hovered(self, frame: QFrame | None) -> None:
-        if frame is self.hovered:
+    def _enter(self, frame: QFrame) -> None:
+        if self.hovered is frame:
             return
         previous = self.hovered
         self.hovered = frame
         if previous is not None and previous is not self.pressed:
             self._animate(previous, _NORMAL_ALPHA, _RELEASE_SECONDS)
-        if frame is not None and frame is not self.pressed:
+        if frame is not self.pressed:
             self._animate(frame, _HOVER_ALPHA, _HOVER_SECONDS)
 
-    def _sample_pointer(self) -> None:
-        card = self._card_under_cursor()
-        down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
+    def _leave(self, frame: QFrame) -> None:
+        if self.hovered is frame:
+            self.hovered = None
+        if frame is not self.pressed:
+            self._animate(frame, _NORMAL_ALPHA, _RELEASE_SECONDS)
 
-        self._set_hovered(card)
-        if down and not self._button_down:
-            self.pressed = card
-            if card is not None:
-                self._animate(card, _ACTIVE_ALPHA, _PRESS_SECONDS)
-        elif not down and self._button_down:
-            pressed = self.pressed
+    def _press(self, frame: QFrame) -> None:
+        self.pressed = frame
+        self._animate(frame, _ACTIVE_ALPHA, _PRESS_SECONDS)
+
+    def _release(self, frame: QFrame) -> None:
+        if self.pressed is frame:
             self.pressed = None
-            if pressed is not None:
-                target = _HOVER_ALPHA if pressed is card else _NORMAL_ALPHA
-                self._animate(pressed, target, _RELEASE_SECONDS)
-        self._button_down = down
+        target = _HOVER_ALPHA if self.hovered is frame else _NORMAL_ALPHA
+        self._animate(frame, target, _RELEASE_SECONDS)
 
     def _tick_animation(self) -> None:
         now = time.monotonic()
@@ -184,36 +160,38 @@ class NekroCardInteractionController(QObject):
             self._animation_timer.stop()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if watched is not self.window:
+        if not isinstance(watched, QFrame) or watched not in self.states:
             return False
+
         event_type = event.type()
-        if event_type in {
-            QEvent.Type.Show,
-            QEvent.Type.Enter,
-            QEvent.Type.WindowActivate,
-        }:
-            self._start_sampling_if_visible()
-        elif event_type in {QEvent.Type.Hide, QEvent.Type.Leave}:
-            self._sample_timer.stop()
-            self._button_down = False
-            self.pressed = None
-            self._set_hovered(None)
-        elif event_type == QEvent.Type.WindowStateChange:
-            if self.window.isMinimized():
-                self._sample_timer.stop()
-            else:
-                self._start_sampling_if_visible()
+        if event_type == QEvent.Type.Enter:
+            self._enter(watched)
+        elif event_type == QEvent.Type.Leave:
+            self._leave(watched)
+        elif event_type == QEvent.Type.MouseButtonPress:
+            self._press(watched)
+        elif event_type == QEvent.Type.MouseButtonRelease:
+            self._release(watched)
+        elif event_type in {QEvent.Type.Hide, QEvent.Type.EnabledChange} and not watched.isVisible():
+            if self.hovered is watched:
+                self.hovered = None
+            if self.pressed is watched:
+                self.pressed = None
+            self._animate(watched, _NORMAL_ALPHA, _RELEASE_SECONDS)
         return False
 
     def _cleanup(self) -> None:
-        self._sample_timer.stop()
         self._animation_timer.stop()
-        try:
-            self.window.removeEventFilter(self)
-        except RuntimeError:
-            pass
-        for state in self.states.values():
-            state.surface.set_interaction(scale=1.0, overlay_alpha=_NORMAL_ALPHA)
+        for frame, state in tuple(self.states.items()):
+            try:
+                frame.removeEventFilter(self)
+            except RuntimeError:
+                pass
+            try:
+                state.surface.set_interaction(scale=1.0, overlay_alpha=_NORMAL_ALPHA)
+            except RuntimeError:
+                pass
+        self.states.clear()
 
 
 def install_nekro_card_fx(
