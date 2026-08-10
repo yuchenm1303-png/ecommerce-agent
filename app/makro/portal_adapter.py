@@ -452,7 +452,7 @@ class MakroPortalAdapter:
         try:
             return bool(
                 self.page.evaluate(
-                    """(wanted) => {
+                    r"""(wanted) => {
                       const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
                       const visible = (el) => {
                         const s = getComputedStyle(el), r = el.getBoundingClientRect();
