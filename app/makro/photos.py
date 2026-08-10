@@ -218,6 +218,31 @@ def _next_empty_photo_slot(page: Page, section_path: str) -> tuple[str, Any] | N
     return None
 
 
+def _visible_upload_photo_button(page: Page, section_path: str):
+    """Return the active slot's single visible ``Upload Photo`` control.
+
+    Clicking a thumbnail's orange ``+`` only selects the image role. The real
+    file chooser is opened by the blue ``Upload Photo`` control in the large
+    role panel below the thumbnail strip.
+    """
+
+    surface = _photo_surface(page, section_path)
+    text_matches = surface.get_by_text("Upload Photo", exact=True)
+    visible = []
+    for index in range(text_matches.count()):
+        candidate = text_matches.nth(index)
+        try:
+            if candidate.is_visible():
+                visible.append(candidate)
+        except Exception:
+            continue
+    if len(visible) > 1:
+        raise RuntimeError(
+            f"Product Photos 当前出现 {len(visible)} 个可见 Upload Photo；拒绝猜测。"
+        )
+    return visible[0] if visible else None
+
+
 class _DynamicPhotoFileTarget:
     """Upload target bound to one concrete Makro ``#thumbnail_N`` slot."""
 
@@ -241,41 +266,54 @@ class _DynamicPhotoFileTarget:
             raise RuntimeError(f"Product Photos 找不到目标图片槽 #{self.slot_id}。")
 
         plus = slot.locator("i.fa-plus, .fa-plus")
-        clickable = None
+        role_selector = None
         for index in range(plus.count()):
             candidate = plus.nth(index)
             try:
                 if candidate.is_visible():
-                    clickable = candidate
+                    role_selector = candidate
                     break
             except Exception:
                 continue
-        if clickable is None:
+        if role_selector is None:
             raise RuntimeError(f"图片槽 #{self.slot_id} 已没有可见橙色 +，不能重复上传。")
 
-        # Critical real-DOM behavior: clicking a thumbnail chooses the role;
-        # the entire Product Photos editor owns only one shared file input.
+        # Real Makro interaction:
+        #   thumbnail + -> activates that role -> blue Upload Photo -> file.
+        role_selector.scroll_into_view_if_needed()
+        role_selector.click()
+        self.page.wait_for_timeout(250)
+
+        current_path = self._current_path()
+        upload_button = _visible_upload_photo_button(self.page, current_path)
+        if upload_button is None:
+            raise RuntimeError(
+                f"选择 #{self.slot_id} 后没有出现可见 Upload Photo 按钮。"
+            )
+
         try:
-            with self.page.expect_file_chooser(timeout=2_000) as chooser_info:
-                clickable.click()
+            with self.page.expect_file_chooser(timeout=2_500) as chooser_info:
+                upload_button.click()
             chooser_info.value.set_files(upload)
             self._selected = True
             return
         except PlaywrightTimeoutError:
+            # Some builds mount/reveal the shared hidden input after the button
+            # click instead of surfacing a native file chooser event.
             pass
 
-        shared = _raw_file_input(self.page, current_path)
-        if shared is None:
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline:
-                current_path = self._current_path()
-                shared = _raw_file_input(self.page, current_path)
-                if shared is not None:
-                    break
-                self.page.wait_for_timeout(150)
+        deadline = time.monotonic() + 3.0
+        shared = None
+        while time.monotonic() < deadline:
+            current_path = self._current_path()
+            shared = _raw_file_input(self.page, current_path)
+            if shared is not None:
+                break
+            self.page.wait_for_timeout(150)
         if shared is None:
             raise RuntimeError(
-                f"点击 #{self.slot_id} 的橙色 + 后没有 file chooser，也找不到共享 input[type=file]。"
+                f"#{self.slot_id} 已选中且已点击 Upload Photo，但没有 file chooser，"
+                "也找不到共享 input[type=file]。"
             )
         shared.set_input_files(upload)
         self._selected = True
@@ -285,7 +323,7 @@ class _DynamicPhotoFileTarget:
 
 
 def _select_file_input(page: Page, section_path: str):
-    """Bind the next empty real thumbnail slot to Makro's shared file input."""
+    """Bind the next empty real thumbnail slot to Makro's upload workflow."""
 
     next_slot = _next_empty_photo_slot(page, section_path)
     if next_slot is None:
