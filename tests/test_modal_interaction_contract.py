@@ -187,6 +187,11 @@ def test_closing_hides_real_modal_then_exposes_stable_base_then_resumes_motion()
     )
 
 
+def test_quick_scrim_matches_widget_modal_scrim_rgba_exactly() -> None:
+    assert "color: Qt.rgba(12 / 255.0, 17 / 255.0, 26 / 255.0, 94 / 255.0)" in MODAL
+    assert '#67101822' not in MODAL
+
+
 def test_preblurred_snapshot_replaces_runtime_qtquick_effect() -> None:
     assert "self._original_capture_backdrop = self.details._capture_backdrop" in MODAL
     assert "self.details._capture_backdrop = self._capture_raw_backdrop" in MODAL
