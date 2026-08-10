@@ -20,6 +20,8 @@ GUI_SOURCES = [
     PROJECT_ROOT / "gui" / "native_window_shell.py",
     PROJECT_ROOT / "gui" / "ui_polish.py",
     PROJECT_ROOT / "gui" / "ui_maturity.py",
+    PROJECT_ROOT / "gui" / "overlay_sheet_motion.py",
+    PROJECT_ROOT / "gui" / "anchored_sheets.py",
     PROJECT_ROOT / "gui" / "card_details.py",
     PROJECT_ROOT / "gui" / "card_details_fast.py",
     PROJECT_ROOT / "gui" / "nekro_card_fx.py",
