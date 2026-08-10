@@ -11,13 +11,13 @@ _BIND_RETRIES = 4
 
 
 class ModalOverlayZOrderController(QObject):
-    """Keep the permanent Quick overlay mapped without blocking QWidget input.
+    """Map the reusable Quick transition surface only while it is animating.
 
-    The transition QQuickWindow stays alive for the process lifetime, but it is
-    only above the QWidget child while a scene-graph transition is actually
-    running. When idle or when the real modal is open, it is lowered below the
-    QWidget surface so close buttons, scrim clicks and keyboard focus remain
-    owned by the real application UI.
+    The QQuickWindow/QML scene is created once and retained for the process
+    lifetime, but the native transition window is hidden whenever the transition
+    item is inactive. This keeps it completely out of Windows hit testing while
+    the real QWidget modal owns interaction. The main QWidget child HWND is never
+    hidden, recreated, or reordered.
     """
 
     def __init__(
@@ -44,29 +44,31 @@ class ModalOverlayZOrderController(QObject):
 
         self._bind_attempts = _BIND_RETRIES
         if self._bound_item is item:
-            surface.lower()
+            self._sync_surface_visibility()
             return
 
-        command_changed = getattr(item, "commandChanged", None)
-        transition_finished = getattr(item, "transitionFinished", None)
-        if command_changed is None or transition_finished is None:
-            surface.lower()
+        active_changed = getattr(item, "activeChanged", None)
+        if active_changed is None:
+            surface.hide()
             return
 
-        command_changed.connect(self._raise_for_transition)
-        transition_finished.connect(self._lower_after_transition)
+        active_changed.connect(self._sync_surface_visibility)
         self._bound_item = item
-        surface.lower()
+        self._sync_surface_visibility()
 
-    def _raise_for_transition(self) -> None:
+    def _sync_surface_visibility(self) -> None:
+        item = self.modal.transition_item
         surface = self.modal.transition_window
-        if isinstance(surface, QQuickWindow):
+        if not isinstance(item, QQuickItem) or not isinstance(surface, QQuickWindow):
+            return
+
+        if bool(item.property("active")):
+            surface.show()
             surface.raise_()
+            surface.requestUpdate()
+            return
 
-    def _lower_after_transition(self, *_args: object) -> None:
-        surface = self.modal.transition_window
-        if isinstance(surface, QQuickWindow):
-            surface.lower()
+        surface.hide()
 
     def cleanup(self) -> None:
         self._bind_attempts = _BIND_RETRIES
@@ -74,16 +76,10 @@ class ModalOverlayZOrderController(QObject):
         self._bound_item = None
         if item is None:
             return
-        command_changed = getattr(item, "commandChanged", None)
-        transition_finished = getattr(item, "transitionFinished", None)
-        if command_changed is not None:
+        active_changed = getattr(item, "activeChanged", None)
+        if active_changed is not None:
             try:
-                command_changed.disconnect(self._raise_for_transition)
-            except (RuntimeError, TypeError):
-                pass
-        if transition_finished is not None:
-            try:
-                transition_finished.disconnect(self._lower_after_transition)
+                active_changed.disconnect(self._sync_surface_visibility)
             except (RuntimeError, TypeError):
                 pass
 
