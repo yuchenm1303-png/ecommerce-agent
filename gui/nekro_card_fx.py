@@ -65,22 +65,23 @@ class _CardState:
         self.duration = max(0.001, float(duration))
         self.animating = True
 
-    def settle(self, alpha: float) -> None:
-        alpha = float(alpha)
-        self.current_alpha = alpha
-        self.start_alpha = alpha
-        self.target_alpha = alpha
+    def freeze(self) -> None:
+        # Preserve the exact alpha already on screen. Forcing hover/pressed
+        # feedback to NORMAL here would itself create the flash the modal is
+        # trying to eliminate.
+        self.start_alpha = self.current_alpha
+        self.target_alpha = self.current_alpha
         self.animating = False
-        self.surface.set_interaction(scale=1.0, overlay_alpha=alpha)
+        self.surface.set_interaction(scale=1.0, overlay_alpha=self.current_alpha)
 
 
 class NekroCardInteractionController(QObject):
     """Immediate card hover/press feedback with no pointer polling loop.
 
-    The controller can be suspended by the shared modal transition. Suspension
-    settles every card to the neutral alpha and stops the release timer, so the
-    modal never snapshots a half-finished press/hover frame and the hidden base
-    stays visually stable until the modal handoff completes.
+    Modal suspension freezes every card at the alpha already presented on screen
+    and stops the animation timer. Nothing changes while the modal is active.
+    After the modal is fully gone, cards ease back to neutral with the existing
+    release curve instead of jumping between interaction states.
     """
 
     def __init__(self, window: QMainWindow, visual: VisualStyleController) -> None:
@@ -117,10 +118,15 @@ class NekroCardInteractionController(QObject):
         self.hovered = None
         self.pressed = None
         for state in self.states.values():
-            state.settle(_NORMAL_ALPHA)
+            state.freeze()
 
     def resume_from_modal(self) -> None:
+        if not self._suspended:
+            return
         self._suspended = False
+        for state in self.states.values():
+            state.begin(alpha=_NORMAL_ALPHA, duration=_RELEASE_SECONDS)
+        self._ensure_animation_timer()
 
     def _ensure_animation_timer(self) -> None:
         if self._suspended:
