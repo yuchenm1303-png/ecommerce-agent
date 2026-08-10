@@ -11,6 +11,7 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 from .sections import find_section, open_section_for_edit
 
 PRODUCT_PHOTOS_SECTION = "Product Photos"
+PHOTO_SLOT_IDS = tuple(f"thumbnail_{index}" for index in range(5))
 
 
 @dataclass(slots=True)
@@ -51,87 +52,118 @@ def parse_completion_counter(title: str) -> tuple[int, int] | None:
 
 
 def _photo_surface(page: Page, section_path: str):
-    """Return Product Photos plus the sibling image-slot gallery."""
+    """Return the nearest Product Photos ancestor that owns the five thumbnails.
 
-    card = page.locator(section_path)
-    if card.count() != 1:
-        return card
-    parent = card.locator("xpath=..")
-    if parent.count() == 1:
-        markers = parent.locator(
-            '[class*="ImageGalleryWrapper"], [class*="AddProductImage"], input[type="file"]'
-        )
-        if markers.count() > 0:
-            return parent
-    return card
-
-
-def _visible_add_product_image_tiles(page: Page, section_path: str) -> list[Any]:
-    """Return all visible orange add-image slots in DOM/gallery order.
-
-    Makro Cases & Covers renders one fixed slot per required photo role. After
-    Front View is filled, for example, four AddProductImage controls remain for
-    Side View / Feature View / Close Up / Life Style. Multiple visible controls
-    are therefore expected and are not an ambiguity.
+    The real Makro editor renders ``#thumbnail_0`` .. ``#thumbnail_4`` plus one
+    shared ``input[type=file]``. The thumbnail gallery can be a sibling of the
+    title card, so walk a few ancestors instead of assuming one CSS wrapper.
     """
 
-    tiles = _photo_surface(page, section_path).locator('[class*="AddProductImage"]')
-    visible: list[Any] = []
-    for index in range(tiles.count()):
-        candidate = tiles.nth(index)
-        try:
-            if candidate.is_visible():
-                visible.append(candidate)
-        except Exception:
-            continue
-    return visible
+    current = page.locator(section_path)
+    if current.count() != 1:
+        return current
+    best = current
+    for _ in range(4):
+        if current.count() != 1:
+            break
+        slot_count = current.locator('[id^="thumbnail_"]').count()
+        input_count = current.locator('input[type="file"]').count()
+        if slot_count >= 5 or (slot_count > 0 and input_count > 0):
+            return current
+        best = current
+        parent = current.locator("xpath=..")
+        if parent.count() != 1:
+            break
+        current = parent
+    return best
+
+
+def _slot_snapshot(page: Page, section_path: str) -> list[dict[str, Any]]:
+    surface = _photo_surface(page, section_path)
+    return surface.evaluate(
+        r"""surface => {
+          const visible = el => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 &&
+              style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+          const slots = [];
+          for (let index = 0; index < 5; index += 1) {
+            const id = `thumbnail_${index}`;
+            const slot = surface.querySelector(`#${id}`);
+            if (!slot) continue;
+            const plus = Array.from(slot.querySelectorAll('i.fa-plus, .fa-plus')).find(visible) || null;
+            const check = Array.from(slot.querySelectorAll('i.fa-check, .fa-check, .fa-check-circle')).find(visible) || null;
+            const labelCandidates = Array.from(slot.querySelectorAll('span'))
+              .map(el => clean(el.innerText || el.textContent))
+              .filter(Boolean);
+            const images = Array.from(slot.querySelectorAll('img'))
+              .map(img => clean(img.getAttribute('src')))
+              .filter(Boolean);
+            slots.push({
+              id,
+              index,
+              label: labelCandidates[labelCandidates.length - 1] || '',
+              has_plus: Boolean(plus),
+              has_check: Boolean(check),
+              image_sources: images,
+            });
+          }
+          return slots;
+        }"""
+    )
 
 
 def _photo_state(page: Page, section_path: str) -> dict[str, Any]:
-    card = page.locator(section_path)
-    if card.count() != 1:
-        return {"found": False, "detail": f"section path 匹配 {card.count()} 个节点"}
-
     surface = _photo_surface(page, section_path)
-    payload = surface.evaluate(
-        r"""surface => {
-          const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
-          const titleEl = surface.querySelector(
-            '[class*="styles__Title-"], [class*="Title-ef7o31"], [class*="Title-"]'
-          );
-          const inputs = Array.from(surface.querySelectorAll('input[type="file"]'));
-          const addTiles = Array.from(
-            surface.querySelectorAll('[class*="AddProductImage"]')
-          ).filter(el => {
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-          });
-          const images = Array.from(surface.querySelectorAll('img')).filter(img => {
-            const src = clean(img.getAttribute('src'));
-            const rect = img.getBoundingClientRect();
-            return Boolean(src) && rect.width > 0 && rect.height > 0;
-          });
-          return {
-            found: true,
-            title: titleEl ? clean(titleEl.innerText || titleEl.textContent) : '',
-            file_input_count: inputs.length,
-            file_inputs: inputs.map(input => ({
-              accept: clean(input.getAttribute('accept')),
-              multiple: input.multiple === true || input.hasAttribute('multiple'),
-              disabled: input.disabled === true || input.hasAttribute('disabled'),
-              files: input.files ? input.files.length : 0,
-            })),
-            add_image_tile_count: addTiles.length,
-            visible_image_count: images.length,
-            visible_image_sources: images.map(img => clean(img.getAttribute('src'))).filter(Boolean),
-          };
-        }"""
-    )
-    counter = parse_completion_counter(str(payload.get("title") or ""))
-    payload["completion_count"] = counter[0] if counter else None
-    payload["capacity"] = counter[1] if counter else None
-    return payload
+    if surface.count() != 1:
+        return {"found": False, "detail": f"Product Photos surface 匹配 {surface.count()} 个节点"}
+
+    slots = _slot_snapshot(page, section_path)
+    inputs = surface.locator('input[type="file"]')
+    input_meta: list[dict[str, Any]] = []
+    for index in range(inputs.count()):
+        candidate = inputs.nth(index)
+        try:
+            input_meta.append(
+                {
+                    "accept": str(candidate.get_attribute("accept") or "").strip(),
+                    "multiple": bool(candidate.get_attribute("multiple") is not None),
+                    "disabled": bool(candidate.is_disabled()),
+                }
+            )
+        except Exception:
+            continue
+
+    section = find_section(page, PRODUCT_PHOTOS_SECTION)
+    title = str((section or {}).get("title") or "")
+    counter = parse_completion_counter(title)
+    empty_slot_ids = [str(slot["id"]) for slot in slots if slot.get("has_plus")]
+    filled_slot_ids = [str(slot["id"]) for slot in slots if not slot.get("has_plus")]
+    sources = [
+        source
+        for slot in slots
+        for source in (slot.get("image_sources") or [])
+        if str(source).strip()
+    ]
+    return {
+        "found": True,
+        "title": title,
+        "completion_count": counter[0] if counter else None,
+        "capacity": counter[1] if counter else (5 if len(slots) == 5 else None),
+        "slot_count": len(slots),
+        "slots": slots,
+        "empty_slot_ids": empty_slot_ids,
+        "filled_slot_ids": filled_slot_ids,
+        "add_image_tile_count": len(empty_slot_ids),
+        "file_input_count": len(input_meta),
+        "file_inputs": input_meta,
+        "visible_image_count": len(sources),
+        "visible_image_sources": sources,
+    }
 
 
 def inspect_product_photos(page: Page) -> dict[str, Any]:
@@ -149,36 +181,50 @@ def inspect_product_photos(page: Page) -> dict[str, Any]:
 
 
 def _raw_file_input(page: Page, section_path: str):
-    """Return the first usable file input in the image-slot surface.
-
-    If Makro renders several slot inputs at once, DOM order is the same visual
-    left-to-right slot order, so the first usable input is the next empty slot.
-    """
+    """Return Makro's one shared Product Photos file input."""
 
     inputs = _photo_surface(page, section_path).locator('input[type="file"]')
+    usable = []
     for index in range(inputs.count()):
         candidate = inputs.nth(index)
         try:
             if not candidate.is_disabled():
-                return candidate
+                usable.append(candidate)
         except Exception:
             continue
+    if len(usable) > 1:
+        raise RuntimeError(
+            f"Product Photos 出现 {len(usable)} 个可用共享 file input；拒绝猜测。"
+        )
+    return usable[0] if usable else None
+
+
+def _next_empty_photo_slot(page: Page, section_path: str) -> tuple[str, Any] | None:
+    """Return the first real empty ``#thumbnail_N`` slot in DOM order."""
+
+    surface = _photo_surface(page, section_path)
+    for slot_id in PHOTO_SLOT_IDS:
+        slot = surface.locator(f"#{slot_id}")
+        if slot.count() != 1:
+            continue
+        plus = slot.locator("i.fa-plus, .fa-plus")
+        for index in range(plus.count()):
+            candidate = plus.nth(index)
+            try:
+                if candidate.is_visible():
+                    return slot_id, slot
+            except Exception:
+                continue
     return None
 
 
-def _add_product_image_tile(page: Page, section_path: str):
-    """Return the next empty image slot, left-to-right."""
-
-    visible = _visible_add_product_image_tiles(page, section_path)
-    return visible[0] if visible else None
-
-
 class _DynamicPhotoFileTarget:
-    """File target backed by Makro's next empty fixed image slot."""
+    """Upload target bound to one concrete Makro ``#thumbnail_N`` slot."""
 
-    def __init__(self, page: Page, section_path: str) -> None:
+    def __init__(self, page: Page, section_path: str, slot_id: str) -> None:
         self.page = page
         self.section_path = section_path
+        self.slot_id = slot_id
         self._selected = False
 
     def _current_path(self) -> str:
@@ -189,53 +235,63 @@ class _DynamicPhotoFileTarget:
     def set_input_files(self, files: str | Path) -> None:
         upload = str(Path(files).expanduser().resolve())
         current_path = self._current_path()
-        direct = _raw_file_input(self.page, current_path)
-        if direct is not None:
-            direct.set_input_files(upload)
-            self._selected = True
-            return
+        surface = _photo_surface(self.page, current_path)
+        slot = surface.locator(f"#{self.slot_id}")
+        if slot.count() != 1:
+            raise RuntimeError(f"Product Photos 找不到目标图片槽 #{self.slot_id}。")
 
-        tile = _add_product_image_tile(self.page, current_path)
-        if tile is None:
-            raise RuntimeError("Product Photos 已没有未完成的图片槽位。")
+        plus = slot.locator("i.fa-plus, .fa-plus")
+        clickable = None
+        for index in range(plus.count()):
+            candidate = plus.nth(index)
+            try:
+                if candidate.is_visible():
+                    clickable = candidate
+                    break
+            except Exception:
+                continue
+        if clickable is None:
+            raise RuntimeError(f"图片槽 #{self.slot_id} 已没有可见橙色 +，不能重复上传。")
 
+        # Critical real-DOM behavior: clicking a thumbnail chooses the role;
+        # the entire Product Photos editor owns only one shared file input.
         try:
-            with self.page.expect_file_chooser(timeout=2_500) as chooser_info:
-                tile.click()
+            with self.page.expect_file_chooser(timeout=2_000) as chooser_info:
+                clickable.click()
             chooser_info.value.set_files(upload)
             self._selected = True
             return
         except PlaywrightTimeoutError:
-            # Some Makro builds mount a hidden input only after clicking +.
             pass
 
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            current_path = self._current_path()
-            direct = _raw_file_input(self.page, current_path)
-            if direct is not None:
-                direct.set_input_files(upload)
-                self._selected = True
-                return
-            self.page.wait_for_timeout(150)
-
-        raise RuntimeError(
-            "点击下一个 Product Photos 橙色 + 后既未出现 file chooser，也未挂载 file input。"
-        )
+        shared = _raw_file_input(self.page, current_path)
+        if shared is None:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                current_path = self._current_path()
+                shared = _raw_file_input(self.page, current_path)
+                if shared is not None:
+                    break
+                self.page.wait_for_timeout(150)
+        if shared is None:
+            raise RuntimeError(
+                f"点击 #{self.slot_id} 的橙色 + 后没有 file chooser，也找不到共享 input[type=file]。"
+            )
+        shared.set_input_files(upload)
+        self._selected = True
 
     def evaluate(self, _expression: str) -> int:
         return 1 if self._selected else 0
 
 
 def _select_file_input(page: Page, section_path: str):
-    """Return a direct input or a target for the next empty image slot."""
+    """Bind the next empty real thumbnail slot to Makro's shared file input."""
 
-    direct = _raw_file_input(page, section_path)
-    if direct is not None:
-        return direct
-    if _add_product_image_tile(page, section_path) is not None:
-        return _DynamicPhotoFileTarget(page, section_path)
-    return None
+    next_slot = _next_empty_photo_slot(page, section_path)
+    if next_slot is None:
+        return None
+    slot_id, _slot = next_slot
+    return _DynamicPhotoFileTarget(page, section_path, slot_id)
 
 
 def _stage_accepted(
@@ -245,8 +301,13 @@ def _stage_accepted(
     before_sources: set[str],
     before_completion: int | None,
     before_add_tiles: int | None = None,
+    target_slot_id: str | None = None,
 ) -> bool:
-    """Return True only when the gallery visibly consumed one image slot."""
+    """Return True when the selected fixed thumbnail is no longer empty."""
+
+    empty_slots = {str(value) for value in state.get("empty_slot_ids") or []}
+    if target_slot_id and target_slot_id not in empty_slots:
+        return True
 
     images = int(state.get("visible_image_count") or 0)
     sources = {
@@ -280,6 +341,7 @@ def _wait_for_staged_signal(
     before_sources: set[str],
     before_completion: int | None,
     before_add_tiles: int | None = None,
+    target_slot_id: str | None = None,
     timeout_ms: int,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_ms / 1000.0
@@ -294,6 +356,7 @@ def _wait_for_staged_signal(
             before_sources=before_sources,
             before_completion=before_completion,
             before_add_tiles=before_add_tiles,
+            target_slot_id=target_slot_id,
         ):
             return latest
         page.wait_for_timeout(200)
@@ -306,7 +369,7 @@ def upload_product_photos(
     *,
     timeout_ms: int = 8_000,
 ) -> PhotoUploadResult:
-    """Stage images into the fixed Product Photos slots; never Save the card."""
+    """Stage images into Makro's five fixed thumbnail slots; never Save."""
 
     resolved_paths: list[Path] = []
     seen: set[str] = set()
@@ -335,24 +398,13 @@ def upload_product_photos(
     state = _photo_state(page, section_path)
     initial_count = state.get("completion_count")
     capacity = state.get("capacity")
-    available = int(state.get("add_image_tile_count") or 0)
-    if available == 0 and _raw_file_input(page, section_path) is None:
-        return PhotoUploadResult(
-            status="unsupported",
-            initial_count=initial_count,
-            final_count=initial_count,
-            capacity=capacity,
-            detail="Product Photos 已展开，但没有未完成图片槽位或 file input。",
-        )
-
-    first_meta = (state.get("file_inputs") or [{}])[0] if state.get("file_inputs") else {}
     result = PhotoUploadResult(
         status="running",
         initial_count=initial_count,
         final_count=initial_count,
         capacity=capacity,
-        accept=str(first_meta.get("accept") or ""),
-        multiple=bool(first_meta.get("multiple")),
+        accept=str(((state.get("file_inputs") or [{}])[0]).get("accept") or ""),
+        multiple=False,
     )
 
     current_images = int(state.get("visible_image_count") or 0)
@@ -364,19 +416,12 @@ def upload_product_photos(
     current_completion = int(state["completion_count"]) if state.get("completion_count") is not None else None
     current_add_tiles = int(state.get("add_image_tile_count") or 0)
 
-    for slot_offset, path in enumerate(resolved_paths, start=1):
+    for path in resolved_paths:
         section = find_section(page, PRODUCT_PHOTOS_SECTION) or section
         section_path = str(section.get("path") or section_path)
         target = _select_file_input(page, section_path)
         if target is None:
-            result.items.append(
-                {
-                    "path": str(path),
-                    "status": "file_input_missing",
-                    "slot_offset": slot_offset,
-                    "detail": "找不到下一个未完成图片槽位。",
-                }
-            )
+            result.items.append({"path": str(path), "status": "slot_missing", "detail": "没有下一个带橙色 + 的 #thumbnail_N 图片槽。"})
             continue
 
         result.attempted += 1
@@ -393,6 +438,7 @@ def upload_product_photos(
                 before_sources=before_sources,
                 before_completion=before_completion,
                 before_add_tiles=before_add_tiles,
+                target_slot_id=target.slot_id,
                 timeout_ms=timeout_ms,
             )
             current_images = int(settled.get("visible_image_count") or 0)
@@ -409,6 +455,7 @@ def upload_product_photos(
                 before_sources=before_sources,
                 before_completion=before_completion,
                 before_add_tiles=before_add_tiles,
+                target_slot_id=target.slot_id,
             )
             if accepted:
                 result.staged += 1
@@ -416,7 +463,7 @@ def upload_product_photos(
                     {
                         "path": str(path),
                         "status": "staged",
-                        "slot_offset": slot_offset,
+                        "slot_id": target.slot_id,
                         "remaining_empty_slots": current_add_tiles,
                     }
                 )
@@ -425,18 +472,13 @@ def upload_product_photos(
                     {
                         "path": str(path),
                         "status": "staging_unconfirmed",
-                        "slot_offset": slot_offset,
-                        "detail": "Makro 没有确认该图片槽已被占用。",
+                        "slot_id": target.slot_id,
+                        "detail": "Makro 没有确认目标 thumbnail 槽已被占用。",
                     }
                 )
         except Exception as exc:
             result.items.append(
-                {
-                    "path": str(path),
-                    "status": "upload_error",
-                    "slot_offset": slot_offset,
-                    "detail": str(exc),
-                }
+                {"path": str(path), "status": "upload_error", "slot_id": target.slot_id, "detail": str(exc)}
             )
 
     section = find_section(page, PRODUCT_PHOTOS_SECTION) or section
@@ -445,13 +487,13 @@ def upload_product_photos(
     result.final_count = final_state.get("completion_count")
     if result.staged == len(resolved_paths):
         result.status = "staged"
-        result.detail = f"{result.staged}/{len(resolved_paths)} 张图片已按固定槽位顺序 staged，等待一次 Save。"
+        result.detail = f"{result.staged}/{len(resolved_paths)} 个固定 thumbnail 槽已填入，等待 Save。"
     elif result.staged > 0:
         result.status = "partial_staged"
-        result.detail = f"只确认 {result.staged}/{len(resolved_paths)} 个图片槽已填写。"
+        result.detail = f"仅 {result.staged}/{len(resolved_paths)} 个固定 thumbnail 槽确认填入。"
     else:
         result.status = "staging_unconfirmed"
-        result.detail = "没有图片槽得到 Makro 接受信号。"
+        result.detail = "没有任何固定 thumbnail 槽确认填入。"
     return result
 
 
@@ -506,6 +548,6 @@ def verify_persisted_photo_count(
         "expected_added": expected_added,
         "detail": (
             f"Product Photos Save 后 {timeout_ms}ms 内完成计数未达到 {target}；"
-            "不能证明 staged 图片已持久化。"
+            "不能证明图片已持久化。"
         ),
     }
