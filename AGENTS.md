@@ -15,7 +15,7 @@
 
 `Send to QC` 绝对禁止自动点击。
 
-核心原则：**链接是新商品唯一人工产品输入。页面写什么就采什么；AI负责理解；空字段才搜索；搜不到留空；真实冲突保留。不要增加 Product Profile、Final Resolve、Python 商品语义规则或循环复核。**
+核心原则：**链接是新商品唯一人工产品输入。页面写什么就采什么；AI负责理解；空字段才搜索；搜不到不循环硬找、不编造。若 Makro required 字段在正常 Resolver/Web 后仍无可靠答案，则交给用户显式补充；optional 字段可以继续留空。不要增加 Product Profile、Final Resolve、Python 商品语义规则或循环复核。**
 
 ## 商品输入
 
@@ -47,13 +47,15 @@ Web 使用 exact `source_product_url`、已确定 local READY/CONFLICT 商品指
 
 returned URL 必须来自实际 `web_search` source；模型编造 URL 丢弃。
 
-## Makro SKU
+## Makro SKU / required 用户补充
 
 SKU ID 是 seller-controlled identifier，不是产品事实。
 
 `app/business_fields.py` 根据 exact product URL 机械生成稳定 12 位数字 SKU：相同商品 URL 稳定复用，query/tracking 参数不影响结果，source_type=`rule`，不进入 AI 商品身份，也不拿去搜索或验证商品。
 
 其他 business fields（价格、库存、MOQ、Fulfilment、Shipping SLA、Listing Status、Selling Region 等）只能来自明确 seller/business/config/rule 输入；缺失就 blocked，不允许 AI/Web 猜。
+
+当前 live schema 已明确知道哪些字段 `required=true`。正常 Resolver/Web 跑完后，仍 BLOCKED 的 required 字段由 GUI 显示为空的用户输入框；占位提示只用于 GUI，绝不能写进 Makro。用户显式输入后只经过当前 Makro option/unit 等机械硬约束，然后进入 READY；不得再触发第二轮 AI/Web 搜索。
 
 ## Python 只能守机械边界
 
@@ -67,13 +69,15 @@ SKU ID 是 seller-controlled identifier，不是产品事实。
 
 最终 planner 必须用 Resolver 的同一 product URL、同一 source snapshot/screenshot 重建 grounding，并 strict rebind `ai-decisions.json`。
 
-新生产 Browser 入口是 `makro_execute_listing.py`。它不读 QA、不接受人工 `--sku`，只使用同一 product URL、source evidence、decision packet 和 live schema。它复用旧执行 helpers，但不重新解释商品。
+新生产 Browser 入口是 `makro_execute_listing.py`。它不读 QA、不接受人工 `--sku`，只使用同一 product URL、source evidence、decision packet 和 live schema。它复用成熟浏览器能力，但不重新解释商品。
 
 `makro_preview_listing.py` 仅保留底层成熟浏览器 helper/旧兼容 CLI，不再作为新商品生产入口。
 
-已有非-placeholder 用户值不覆盖；schema/source drift fail closed；真实 section Save 后必须 reopen 验证 persisted values。
+**Fill Plan 的 READY 是最终写入许可。** 生产 executor 只保留“当前 live field 必须唯一匹配”这一写错位置防线；不得再用“当前控件看起来已有值”之类的二次判断把 READY 静默跳过。Full Step 3 若仍有 `required_blocked > 0`，必须在任何字段写入前停止并要求用户补齐。
 
-`input[type=file].files > 0` 不等于图片上传成功。Product Photos 必须看到 Makro 接受信号，Save 后还要验证 completion count。
+`input[type=file].files > 0` 不等于图片上传成功。Product Photos 每张上传前都要重新定位当前 React card/file input；请求 N 张就必须确认 N/N 张进入编辑事务后才允许 Save，部分上传不能报告为成功。Save 后仍验证 completion count。
+
+schema/source drift fail closed；真实 section Save 后保持现有 reopen persisted verification。
 
 ## 工作树安全
 
