@@ -56,7 +56,7 @@ def test_product_identity_request_is_physical_product_grounded_contract():
     assert "evidence_refs" in request["json_contract"]["required"]
 
 
-def test_listing_bootstrap_uses_identity_then_identity_only_search_terms():
+def test_listing_bootstrap_stops_after_grounded_identity_before_live_taxonomy():
     provider = SequenceProvider(
         [
             {
@@ -67,27 +67,14 @@ def test_listing_bootstrap_uses_identity_then_identity_only_search_terms():
                 "product_summary": "750 ml stainless steel vacuum insulated bottle",
                 "confidence": 0.98,
                 "evidence_refs": ["identity:page-title", "identity:attribute:1:1"],
-            },
-            {
-                "vertical_search_terms": [
-                    "insulated water bottle",
-                    "vacuum flask",
-                ]
-            },
+            }
         ]
     )
 
     hints = infer_listing_bootstrap(provider, _snapshot())
 
-    assert hints.vertical_search_terms == (
-        "vacuum insulated bottle",
-        "insulated water bottle",
-        "vacuum flask",
-    )
+    assert hints.vertical_search_terms == ("vacuum insulated bottle",)
     assert hints.product_identity is not None
     assert hints.product_identity["entity_kind"] == "physical_product"
-    assert len(provider.requests) == 2
+    assert len(provider.requests) == 1
     assert provider.requests[0]["task"] == "infer_grounded_supplier_product_identity"
-    assert provider.requests[1]["task"] == "derive_product_type_search_terms"
-    assert "supplier_evidence" not in provider.requests[1].get("context", {})
-    assert provider.requests[1]["context"]["product_identity"]["product_type_en"] == "vacuum insulated bottle"
