@@ -76,6 +76,37 @@ def test_quick_failure_falls_back_to_atomic_modal_instead_of_crashing() -> None:
     assert "raise RuntimeError(\"Glass modal transition" not in MODAL
 
 
+def test_modal_lifecycle_prevents_show_event_reentry_loop() -> None:
+    for state in (
+        "_STATE_CLOSED",
+        "_STATE_OPENING_PENDING",
+        "_STATE_OPENING",
+        "_STATE_OPEN",
+        "_STATE_CLOSING",
+    ):
+        assert state in MODAL
+    assert "self._state = _STATE_CLOSED" in MODAL
+    assert "if self._state == _STATE_CLOSED:" in MODAL
+    assert "self._state = _STATE_OPENING_PENDING" in MODAL
+    assert "if self._state != _STATE_OPENING_PENDING:" in MODAL
+    assert "if self._state != _STATE_OPEN:" in MODAL
+
+    finish_body = MODAL.split("def _on_transition_finished", 1)[1].split("def eventFilter", 1)[0]
+    open_state_index = finish_body.index("self._state = _STATE_OPEN")
+    restore_index = finish_body.index("self._restore_widget_layer()")
+    assert open_state_index < restore_index
+
+    close_branch = finish_body.split("if self._state != _STATE_CLOSING:", 1)[1]
+    closed_state_index = close_branch.index("self._state = _STATE_CLOSED")
+    close_restore_index = close_branch.index("self._restore_widget_layer()")
+    assert closed_state_index < close_restore_index
+
+    filter_body = MODAL.split("def eventFilter", 1)[1].split("def cleanup", 1)[0]
+    assert "if watched is self.details.drawer and event_type == QEvent.Type.Show:" in filter_body
+    assert "if self._state == _STATE_CLOSED:" in filter_body
+    assert "QTimer.singleShot(0, self._start_open_transition)" in filter_body
+
+
 def test_open_close_motion_is_short_and_subtle() -> None:
     assert "_OPEN_MS = 235" in MODAL
     assert "_CLOSE_MS = 165" in MODAL
