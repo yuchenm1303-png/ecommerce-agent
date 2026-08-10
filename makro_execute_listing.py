@@ -22,6 +22,7 @@ from typing import Any
 from playwright.sync_api import sync_playwright
 
 from app.ai_decisions import load_ai_decision_packet
+from app.browser_page_owner import find_page_by_target_id
 from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness, is_cdp_ready
 from app.business_fields import generate_listing_sku, generated_business_bundle
 from app.evidence_contract import ProductIdentity
@@ -82,6 +83,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--profile-dir", default="browser_profiles/makro-edge")
     parser.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT)
+    parser.add_argument(
+        "--makro-target-id",
+        default="",
+        help=(
+            "Batch-only owned-tab token. When supplied, execute only that exact Chromium tab; "
+            "single-mode unique-tab safety remains unchanged when omitted."
+        ),
+    )
     parser.add_argument("--scroll-wait-ms", type=int, default=250)
     parser.add_argument("--max-scroll-steps", type=int, default=200)
     parser.add_argument("--recheck-wait-ms", type=int, default=800)
@@ -176,20 +185,38 @@ def main() -> int:
             raise RuntimeError(
                 "CDP 在连接前消失，EdgeHarness 进入启动路径；已中止，不继续页面操作。"
             )
+        if harness.context is None:
+            raise RuntimeError("Makro Edge context is unavailable")
 
-        page = harness.page
+        if args.makro_target_id:
+            page = find_page_by_target_id(harness.context, args.makro_target_id)
+            harness.page = page
+        else:
+            page = harness.page
+            if page is None:
+                raise RuntimeError("Makro Edge did not expose a usable page")
+
         page.set_default_timeout(15_000)
         adapter = MakroDomainAdapter(page)
         if not adapter.is_listing_page():
+            if args.makro_target_id:
+                raise RuntimeError(
+                    "Batch owned Makro tab no longer points at an Add Listing page; refusing to navigate another tab."
+                )
             adapter.wait_for_authenticated_listing(
                 MAKRO_HOME_URL,
                 headless=False,
                 navigate_first=False,
             )
 
-        page = harness.ensure_page()
+        if args.makro_target_id:
+            page = find_page_by_target_id(harness.context, args.makro_target_id)
+            harness.page = page
+        else:
+            page = harness.ensure_page()
         adapter = MakroDomainAdapter(page)
-        _assert_single_listing_tab(harness.context)
+        if not args.makro_target_id:
+            _assert_single_listing_tab(harness.context)
         adapter.assert_expected_vertical(args.expected_vertical)
         _assert_clean_step3_start(adapter)
 
@@ -217,6 +244,8 @@ def main() -> int:
             banner = "===== MAKRO DIRECT SECTION PREVIEW ====="
         print(banner)
         print(f"page={page.url}")
+        if args.makro_target_id:
+            print(f"makro_target_id={args.makro_target_id}")
         print(f"product_url={args.product_url}")
         print(f"generated_listing_sku={generated_sku}")
         print(
@@ -308,6 +337,7 @@ def main() -> int:
         payload = {
             "mode": mode,
             "page_url": page.url,
+            "makro_target_id": args.makro_target_id,
             "product_url": args.product_url,
             "generated_listing_sku": generated_sku,
             "expected_vertical": args.expected_vertical,
