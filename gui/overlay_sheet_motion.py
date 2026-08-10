@@ -6,7 +6,7 @@ from PySide6.QtCore import QElapsedTimer, QObject, QRect, Qt, QTimer, Signal
 from PySide6.QtWidgets import QFrame, QWidget
 
 
-_FRAME_MS = 8
+_FRAME_MS = 6
 _DEFAULT_DURATION_MS = 168
 _TRAVEL_PX = 9
 
@@ -19,7 +19,7 @@ def _smootherstep(value: float) -> float:
 class ClipSheetMotion(QObject):
     """Animate one absolute-positioned sheet without touching application layout.
 
-    The live content widget is always kept at its final width/height.  Only a
+    The live content widget is always kept at its final width/height. Only a
     lightweight parent viewport changes geometry, so QLabel/QTableWidget layout,
     word wrapping, splitters and the main QWidget tree never see intermediate
     animation sizes.
@@ -120,6 +120,7 @@ class ClipSheetMotion(QObject):
         self._start_progress = self.progress
         self.animating = True
         self.viewport.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._apply(self.progress)
         self._elapsed.restart()
         if not self._timer.isActive():
             self._timer.start()
