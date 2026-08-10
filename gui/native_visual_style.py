@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QObject, QRectF, Qt, QTimer
+from PySide6.QtCore import QEvent, QModelIndex, QObject, QRectF, Qt, QTimer
 from PySide6.QtGui import QCursor, QPainter, QPixmap
-from PySide6.QtWidgets import QApplication, QFrame, QMainWindow
+from PySide6.QtWidgets import QAbstractScrollArea, QApplication, QFrame, QMainWindow
 
 from .native_background import NativeQuickBackground
 from .visual_style import NEKRO_STYLE
 
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
+_NORMAL_GLASS_ALPHA = 64.0
 
 
 class NativeGlassProxy(QObject):
@@ -19,7 +20,7 @@ class NativeGlassProxy(QObject):
         self.frame = frame
         self.background = background
         self._surface_scale = 1.0
-        self._overlay_alpha = 64.0
+        self._overlay_alpha = _NORMAL_GLASS_ALPHA
 
     @property
     def surface_scale(self) -> float:
@@ -55,6 +56,7 @@ class NativeVisualStyleController(QObject):
         self.window = window
         self._glass: dict[QFrame, NativeGlassProxy] = {}
         self._cursor_installed = False
+        self._mode_stack_glass_connected = False
 
         # The QWidget tree remains the baseline UI. Only the top-level client
         # surface is translucent so the native Quick scene can present below it.
@@ -85,6 +87,85 @@ class NativeVisualStyleController(QObject):
 
     def surface_for(self, frame: QFrame) -> NativeGlassProxy | None:
         return self._glass.get(frame)
+
+    def refresh_glass_frames(self) -> int:
+        """Register glass cards created after the native Quick scene started.
+
+        Batch Workspace is intentionally constructed only after the proven Single
+        UI plugins finish installing. The Quick background therefore cannot see
+        those later QFrames during its initial one-shot scan. Append only the new
+        glass frames to the existing model so Single and Batch share the exact
+        same blur mask/tint renderer instead of introducing a second glass path.
+        """
+
+        new_frames = [
+            frame
+            for frame in self.window.findChildren(QFrame)
+            if frame.objectName() in _GLASS_NAMES and frame not in self._glass
+        ]
+        if not new_frames:
+            self.background.schedule_mask_update()
+            return 0
+
+        model = self.background.card_model
+        first_row = len(model.cards)
+        last_row = first_row + len(new_frames) - 1
+        model.beginInsertRows(QModelIndex(), first_row, last_row)
+        try:
+            for frame in new_frames:
+                row = len(model.cards)
+                frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+                model.cards.append(frame)
+                model._rows[frame] = row
+                model._states.append(
+                    {
+                        "cardX": 0.0,
+                        "cardY": 0.0,
+                        "cardW": 0.0,
+                        "cardH": 0.0,
+                        "clipX": 0.0,
+                        "clipY": 0.0,
+                        "clipW": 0.0,
+                        "clipH": 0.0,
+                        "cardAlpha": _NORMAL_GLASS_ALPHA,
+                        "cardVisible": False,
+                    }
+                )
+                self._glass[frame] = NativeGlassProxy(frame, self.background)
+        finally:
+            model.endInsertRows()
+
+        # NativeQuickBackground intentionally watches only relevant widgets, not
+        # the whole QApplication. Extend that same scoped watch set to Batch card
+        # ancestors so stack changes, layout changes and resizes refresh the mask.
+        for frame in new_frames:
+            current = frame
+            while current is not None:
+                if current not in self.background._geometry_watch:
+                    self.background._geometry_watch.add(current)
+                    current.installEventFilter(self.background)
+                if current is self.window:
+                    break
+                current = current.parentWidget()
+
+        # Batch owns its own tables/scroll areas, created after background init.
+        # Connect only scroll areas under the newly registered cards.
+        scroll_areas: set[QAbstractScrollArea] = set()
+        for frame in new_frames:
+            scroll_areas.update(frame.findChildren(QAbstractScrollArea))
+        for area in scroll_areas:
+            area.verticalScrollBar().valueChanged.connect(self.background.schedule_mask_update)
+            area.horizontalScrollBar().valueChanged.connect(self.background.schedule_mask_update)
+
+        mode_stack = getattr(self.window, "mode_stack", None)
+        if mode_stack is not None and not self._mode_stack_glass_connected:
+            mode_stack.currentChanged.connect(
+                lambda *_: QTimer.singleShot(0, self.background.schedule_mask_update)
+            )
+            self._mode_stack_glass_connected = True
+
+        QTimer.singleShot(0, self.background.schedule_mask_update)
+        return len(new_frames)
 
     def _install_cursor(self) -> None:
         pixmap = QPixmap(10, 10)
