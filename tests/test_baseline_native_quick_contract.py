@@ -11,6 +11,7 @@ NATIVE = (ROOT / "gui" / "native_background.py").read_text(encoding="utf-8")
 EFFECTS = (ROOT / "gui" / "nekro_effects.py").read_text(encoding="utf-8")
 LOGS = (ROOT / "gui" / "log_presenter.py").read_text(encoding="utf-8")
 SHELL = (ROOT / "gui" / "native_window_shell.py").read_text(encoding="utf-8")
+SCROLL = (ROOT / "gui" / "smooth_scroll.py").read_text(encoding="utf-8")
 RUNNER = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
@@ -21,18 +22,19 @@ def test_baseline_card_animation_curve_is_preserved() -> None:
     assert "_HOVER_SECONDS = 0.12" in CARD_FX
     assert "_PRESS_SECONDS = 0.08" in CARD_FX
     assert "_RELEASE_SECONDS = 0.12" in CARD_FX
-    assert "CSS default ease cubic-bezier(.25,.1,.25,1)" in CARD_FX
     assert "scale=1.0" in CARD_FX
     assert "install_nekro_card_fx(window, visual)" in RUNNER
 
 
-def test_card_hit_test_is_cached_without_changing_animation_values() -> None:
-    assert "self._widget_cards" in CARD_FX
-    assert "self._card_from_widget(widget)" in CARD_FX
-    assert "widget.installEventFilter(self)" in CARD_FX
+def test_card_hit_test_uses_one_pointer_sampler_not_per_widget_filters() -> None:
+    assert "_POINTER_SAMPLE_MS = 24" in CARD_FX
+    assert "QCursor.pos()" in CARD_FX
+    assert "self.window.childAt(local)" in CARD_FX
+    assert "window.installEventFilter(self)" in CARD_FX
+    assert "widget.installEventFilter(self)" not in CARD_FX
+    assert "QApplication.widgetAt" not in CARD_FX
     assert "app.installEventFilter(self)" not in CARD_FX
-    assert "QApplication.widgetAt(point.toPoint())" in CARD_FX
-    assert "event_type == QEvent.Type.Enter" in CARD_FX
+    assert "_inline_card_motion_active" in CARD_FX
 
 
 def test_glass_blur_mask_is_static_until_geometry_changes() -> None:
@@ -106,15 +108,27 @@ def test_native_shell_is_single_window_tree_and_native_pixel_sized() -> None:
     assert "createWindowContainer" not in SHELL + NATIVE
 
 
-def test_native_shell_bridges_keyboard_focus_deterministically() -> None:
+def test_native_shell_focus_bridge_has_no_per_control_event_filters() -> None:
     assert "def _focus_native_child" in SHELL
     assert "user32.SetFocus" in SHELL
     assert "user32.GetFocus" in SHELL
     assert "QEvent.Type.WindowActivate" in SHELL
     assert "QEvent.Type.FocusIn" in SHELL
-    assert "QEvent.Type.MouseButtonPress" in SHELL
+    assert "app.focusChanged.connect(self._on_focus_changed)" in SHELL
     assert "self._last_focus_widget" in SHELL
     assert "target.setFocus(Qt.FocusReason.ActiveWindowFocusReason)" in SHELL
+    assert "_focus_watch" not in SHELL
+    assert "widget.installEventFilter(self)" not in SHELL
+    assert "QEvent.Type.MouseButtonPress" not in SHELL
+
+
+def test_smooth_wheel_filter_is_scoped_to_scroll_areas() -> None:
+    assert "def install(self, root: QWidget)" in SCROLL
+    assert "root.findChildren(QAbstractScrollArea)" in SCROLL
+    assert "watched.installEventFilter(self)" in SCROLL
+    assert "QApplication" not in SCROLL
+    assert "app.installEventFilter" not in RUNNER
+    assert "smooth_wheel.install(window)" in RUNNER
 
 
 def test_runner_keeps_baseline_business_and_effect_controllers() -> None:
