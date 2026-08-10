@@ -2,7 +2,7 @@
 
 Product semantics and portal mechanics are intentionally separated:
 - supplier evidence may be in any language;
-- AI converts the product intent into bounded canonical English search terms;
+- a grounded Product Identity is resolved before marketplace search terms;
 - ``MakroPortalAdapter`` handles Step 1/2 mechanics using URL/DOM structure
   before localized text;
 - only exact live Makro candidates are selected;
@@ -16,10 +16,12 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Protocol
+from pathlib import Path
+from typing import Any, Iterable, Protocol
 
 from playwright.sync_api import Page
 
+from ..product_identity import build_vertical_search_terms_request, infer_product_identity
 from ..source_snapshot import SourceSnapshot
 from .listing import MAKRO_HOME_URL, MAKRO_SINGLE_LISTING_ROUTE, parse_makro_listing_url
 from .portal_adapter import ListingStage, MakroPortalAdapter, normalize_ui_text
@@ -49,6 +51,7 @@ class ListingBootstrapHints:
     brand: str
     brand_status: str
     product_summary: str
+    product_identity: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +59,7 @@ class ListingBootstrapHints:
             "brand": self.brand,
             "brand_status": self.brand_status,
             "product_summary": self.product_summary,
+            "product_identity": dict(self.product_identity or {}),
         }
 
 
@@ -98,6 +102,12 @@ def _is_usable_vertical_hint(value: str) -> bool:
 
 
 def _bounded_supplier_evidence(snapshot: SourceSnapshot) -> dict[str, Any]:
+    """Legacy prompt helper retained for compatibility tests only.
+
+    Production bootstrap no longer calls this helper; it now routes through the
+    grounded Product Identity boundary in ``app.product_identity``.
+    """
+
     rows = [
         {"key": row.key, "value": row.value}
         for row in snapshot.table_rows[:100]
@@ -124,6 +134,8 @@ def _bounded_supplier_evidence(snapshot: SourceSnapshot) -> dict[str, Any]:
 
 
 def build_bootstrap_request(snapshot: SourceSnapshot) -> dict[str, Any]:
+    """Legacy request builder; production uses Product Identity first."""
+
     return {
         "task": "infer_product_listing_bootstrap_hints",
         "system_instruction": (
@@ -179,7 +191,7 @@ def build_bootstrap_request(snapshot: SourceSnapshot) -> dict[str, Any]:
 
 
 def build_bootstrap_repair_request(snapshot: SourceSnapshot, raw: dict[str, Any]) -> dict[str, Any]:
-    """One bounded semantic repair for non-English/invalid product-type terms."""
+    """Legacy repair builder retained for compatibility tests only."""
 
     return {
         "task": "repair_product_listing_bootstrap_search_terms",
@@ -257,21 +269,43 @@ def _parse_bootstrap_response(raw: Any) -> ListingBootstrapHints:
     )
 
 
-def infer_listing_bootstrap(provider: JSONTaskProvider, snapshot: SourceSnapshot) -> ListingBootstrapHints:
-    raw = provider.extract_json(build_bootstrap_request(snapshot))
-    try:
-        return _parse_bootstrap_response(raw)
-    except BootstrapSearchTermsError:
-        if not isinstance(raw, dict):
-            raise
-        repair = provider.extract_json(build_bootstrap_repair_request(snapshot, raw))
-        if not isinstance(repair, dict):
-            raise BootstrapSearchTermsError(
-                "listing bootstrap repair did not return a JSON object"
-            )
-        merged = dict(raw)
-        merged["vertical_search_terms"] = repair.get("vertical_search_terms") or []
-        return _parse_bootstrap_response(merged)
+def infer_listing_bootstrap(
+    provider: JSONTaskProvider,
+    snapshot: SourceSnapshot,
+    *,
+    image_paths: Iterable[str | Path] = (),
+) -> ListingBootstrapHints:
+    """Resolve Product Identity first, then derive marketplace search phrases.
+
+    Raw supplier page-body text never flows into the production bootstrap path.
+    The second AI task receives only the already-grounded Product Identity, so a
+    supplier platform description cannot become the marketplace search subject.
+    """
+
+    identity = infer_product_identity(provider, snapshot, image_paths=image_paths)
+    raw_terms = provider.extract_json(build_vertical_search_terms_request(identity))
+    if not isinstance(raw_terms, dict):
+        raise BootstrapSearchTermsError("product-type search-term response must be a JSON object")
+
+    # The canonical identity itself is always the first candidate. Model-derived
+    # synonyms are supplemental, bounded search recall only.
+    merged = {
+        "vertical_search_terms": [
+            identity.product_type_en,
+            *list(raw_terms.get("vertical_search_terms") or []),
+        ],
+        "brand": identity.brand,
+        "brand_status": identity.brand_status,
+        "product_summary": identity.product_summary,
+    }
+    parsed = _parse_bootstrap_response(merged)
+    return ListingBootstrapHints(
+        vertical_search_terms=parsed.vertical_search_terms,
+        brand=parsed.brand,
+        brand_status=parsed.brand_status,
+        product_summary=parsed.product_summary,
+        product_identity=identity.as_dict(),
+    )
 
 
 def _portal(page: Page) -> MakroPortalAdapter:
@@ -812,19 +846,21 @@ def run_listing_creation(
     provider: JSONTaskProvider,
     snapshot: SourceSnapshot,
     *,
+    image_paths: Iterable[str | Path] = (),
     vertical_override: str = "",
     brand_override: str = "",
 ) -> ListingCreationResult:
     if not is_vertical_step(page):
         raise RuntimeError("Start page must be Makro Step 1 / Select Vertical")
 
-    hints = infer_listing_bootstrap(provider, snapshot)
+    hints = infer_listing_bootstrap(provider, snapshot, image_paths=image_paths)
     if vertical_override.strip():
         hints = ListingBootstrapHints(
             vertical_search_terms=(vertical_override.strip(),),
             brand=hints.brand,
             brand_status=hints.brand_status,
             product_summary=hints.product_summary,
+            product_identity=hints.product_identity,
         )
     if brand_override.strip():
         hints = ListingBootstrapHints(
@@ -832,6 +868,7 @@ def run_listing_creation(
             brand=brand_override.strip(),
             brand_status="explicit",
             product_summary=hints.product_summary,
+            product_identity=hints.product_identity,
         )
 
     vertical = select_vertical(page, provider, hints)
