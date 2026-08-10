@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QUrl
+from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Qt, QUrl
 from PySide6.QtGui import QColor, QKeyEvent, QPixmap
 from PySide6.QtQml import QQmlComponent
 from PySide6.QtQuick import QQuickItem, QQuickWindow
@@ -13,12 +13,14 @@ from .card_details_fast import FastCardDetailController
 
 _OPEN_MS = 235
 _CLOSE_MS = 165
+_UNDERLAY_SETTLE_FALLBACK_MS = 48
 _PANEL_RISE_PX = 18
 _PANEL_CLOSE_DROP_PX = 12
 _PANEL_OPEN_SCALE = 0.985
 _PANEL_CLOSE_SCALE = 0.990
 
 _STATE_CLOSED = "closed"
+_STATE_OPENING_PENDING = "opening-pending"
 _STATE_OPENING = "opening"
 _STATE_OPEN = "open"
 _STATE_CLOSING = "closing"
@@ -215,17 +217,20 @@ Item {{
 
 
 class GlassModalInteractionController(QObject):
-    """Frame-atomic GPU modal transitions over the stable QWidget application.
+    """Frame-atomic GPU modal transitions over one stable native underlay.
 
-    The baseline QWidget child HWND is never hidden. For opening, the real modal
-    is laid out while hidden, then a dedicated child QQuickWindow animates static
-    snapshots above the unchanged application. The real modal is revealed only
-    under the final Quick frame. Closing uses the inverse handoff: Quick covers
-    the visible modal first, the real modal is hidden under the last Quick frame,
-    and only then is the transition child removed.
+    The baseline QWidget child HWND stays mapped for the entire interaction. At
+    open, card feedback is first settled to neutral and Fuji parallax is paused;
+    the background QQuickWindow is allowed to swap that settled frame before any
+    screenshot is taken. The real modal is laid out while hidden, then a dedicated
+    child QQuickWindow animates static snapshots above the unchanged application.
+    Its final frame covers the reveal of the real QWidget modal.
 
-    QML and the transition surface are lazy. If Quick preparation fails, the
-    already-prepared QWidget modal still opens/closes atomically.
+    Closing is the exact inverse. The Quick child covers the real modal, the real
+    modal is hidden beneath the final Quick frame, the overlay is removed, and
+    only then are card feedback and parallax resumed. No QWidget parent hide/show,
+    drawer Show re-entry, layout interpolation, or moving background exists in the
+    transition hot path.
     """
 
     def __init__(self, window: QMainWindow, details: FastCardDetailController) -> None:
@@ -255,6 +260,10 @@ class GlassModalInteractionController(QObject):
         self._blur_url = QUrl()
         self._passive_labels: dict[QLabel, bool] = {}
         self._prepared_modal = False
+        self._pending_ratio: tuple[float, float] | None = None
+        self._open_frame_waiting = False
+        self._underlay_suspended = False
+        self._pointer_timer_was_active = False
 
         self._original_capture_backdrop = self.details._capture_backdrop  # noqa: SLF001
         self._original_show_prepared_modal = self.details._show_prepared_modal  # noqa: SLF001
@@ -296,6 +305,99 @@ class GlassModalInteractionController(QObject):
         self._blur_snapshot = QPixmap()
         self._base_url = QUrl()
         self._blur_url = QUrl()
+
+    def _suspend_underlay(self) -> None:
+        if self._underlay_suspended:
+            return
+        self._underlay_suspended = True
+
+        card_fx = getattr(self.window, "_nekro_card_fx", None)
+        suspend_cards = getattr(card_fx, "suspend_for_modal", None)
+        if callable(suspend_cards):
+            try:
+                suspend_cards()
+            except RuntimeError:
+                pass
+
+        timer = getattr(self.background, "_pointer_timer", None)
+        self._pointer_timer_was_active = bool(
+            isinstance(timer, QTimer) and timer.isActive()
+        )
+        if self._pointer_timer_was_active:
+            timer.stop()
+
+        quick = self.quick_window
+        if quick is not None:
+            try:
+                quick.setProperty("animationRunning", False)
+            except RuntimeError:
+                pass
+
+    def _resume_underlay(self) -> None:
+        if not self._underlay_suspended:
+            return
+        self._underlay_suspended = False
+
+        card_fx = getattr(self.window, "_nekro_card_fx", None)
+        resume_cards = getattr(card_fx, "resume_from_modal", None)
+        if callable(resume_cards):
+            try:
+                resume_cards()
+            except RuntimeError:
+                pass
+
+        if self.background is not None:
+            try:
+                self.background._last_pointer_norm = None  # noqa: SLF001
+            except (AttributeError, RuntimeError):
+                pass
+
+        timer = getattr(self.background, "_pointer_timer", None)
+        if self._pointer_timer_was_active and isinstance(timer, QTimer):
+            try:
+                timer.start()
+            except RuntimeError:
+                pass
+        self._pointer_timer_was_active = False
+
+    def _disconnect_underlay_frame_wait(self) -> None:
+        if not self._open_frame_waiting:
+            return
+        self._open_frame_waiting = False
+        quick = self.quick_window
+        if quick is None:
+            return
+        try:
+            quick.frameSwapped.disconnect(self._on_underlay_frame_swapped)
+        except (RuntimeError, TypeError):
+            pass
+
+    def _on_underlay_frame_swapped(self) -> None:
+        if self._state != _STATE_OPENING_PENDING or not self._open_frame_waiting:
+            return
+        self._disconnect_underlay_frame_wait()
+        self._begin_pending_open()
+
+    def _wait_for_stable_underlay_frame(self) -> None:
+        quick = self.quick_window
+        if quick is None:
+            self._begin_pending_open()
+            return
+
+        try:
+            quick.frameSwapped.connect(
+                self._on_underlay_frame_swapped,
+                Qt.ConnectionType.QueuedConnection,
+            )
+            self._open_frame_waiting = True
+            quick.requestUpdate()
+            QTimer.singleShot(
+                _UNDERLAY_SETTLE_FALLBACK_MS,
+                self._begin_pending_open,
+            )
+        except (RuntimeError, TypeError):
+            self._disconnect_underlay_frame_wait()
+            self._begin_pending_open()
 
     def _prepare_hidden_modal(self, *, ratio: tuple[float, float]) -> QPixmap:
         self.details._modal_ratio = ratio  # noqa: SLF001
@@ -351,11 +453,26 @@ class GlassModalInteractionController(QObject):
     def _fallback_open(self, exc: Exception | None = None) -> None:
         if exc is not None:
             self._transition_error = self._error_text(exc)
+        self._disconnect_underlay_frame_wait()
         self._state = _STATE_OPEN
         self._transitioning = False
         self._target_open = True
+        self._pending_ratio = None
         self._reveal_prepared_modal()
         self._hide_transition_surface()
+
+    def _abort_open(self, exc: Exception | None = None) -> None:
+        if exc is not None:
+            self._transition_error = self._error_text(exc)
+        self._disconnect_underlay_frame_wait()
+        self._state = _STATE_CLOSED
+        self._transitioning = False
+        self._target_open = False
+        self._pending_ratio = None
+        self._prepared_modal = False
+        self._hide_transition_surface()
+        self._clear_snapshots()
+        self._resume_underlay()
 
     def _fallback_closed(self, exc: Exception | None = None) -> None:
         if exc is not None:
@@ -370,6 +487,7 @@ class GlassModalInteractionController(QObject):
         self._prepared_modal = False
         self._hide_transition_surface()
         self._clear_snapshots()
+        self._resume_underlay()
 
     def _ensure_transition_surface(self) -> bool:
         if self.transition_window is not None and self.transition_item is not None:
@@ -538,8 +656,13 @@ class GlassModalInteractionController(QObject):
         item.setProperty("command", self._command)
         surface.requestUpdate()
 
-    def _show_modal_with_transition(self, *, ratio: tuple[float, float]) -> None:
-        if self._state != _STATE_CLOSED:
+    def _begin_pending_open(self) -> None:
+        if self._state != _STATE_OPENING_PENDING:
+            return
+        self._disconnect_underlay_frame_wait()
+        ratio = self._pending_ratio
+        if ratio is None:
+            self._abort_open()
             return
 
         try:
@@ -554,21 +677,34 @@ class GlassModalInteractionController(QObject):
 
             panel = self.details.drawer.grab()
             self._configure_quick_item(base, blurred if not blurred.isNull() else base, panel)
+            self._pending_ratio = None
             self._state = _STATE_OPENING
             self._transitioning = True
             self._target_open = True
             self._issue_transition(closing=False)
         except Exception as exc:
-            if not self._prepared_modal:
-                try:
-                    self._original_show_prepared_modal(ratio=ratio)
-                    self._state = _STATE_OPEN
-                    self._target_open = True
-                    self._transitioning = False
-                    return
-                except Exception:
-                    self._state = _STATE_CLOSED
-            self._fallback_open(exc)
+            if self._prepared_modal:
+                self._fallback_open(exc)
+                return
+            try:
+                self._original_show_prepared_modal(ratio=ratio)
+                self._pending_ratio = None
+                self._state = _STATE_OPEN
+                self._target_open = True
+                self._transitioning = False
+            except Exception:
+                self._abort_open(exc)
+
+    def _show_modal_with_transition(self, *, ratio: tuple[float, float]) -> None:
+        if self._state != _STATE_CLOSED:
+            return
+
+        self._state = _STATE_OPENING_PENDING
+        self._transitioning = False
+        self._target_open = True
+        self._pending_ratio = ratio
+        self._suspend_underlay()
+        self._wait_for_stable_underlay_frame()
 
     def request_close(self, *_args: object) -> None:
         if self._state != _STATE_OPEN:
@@ -576,6 +712,7 @@ class GlassModalInteractionController(QObject):
         if self.details.drawer.isHidden() and self.details.scrim.isHidden():
             self._state = _STATE_CLOSED
             self._target_open = False
+            self._resume_underlay()
             return
 
         try:
@@ -608,8 +745,7 @@ class GlassModalInteractionController(QObject):
             self._target_open = True
 
             # The final Quick frame remains above the app while the real modal
-            # becomes visible underneath it. Removing the child afterwards is a
-            # same-state handoff, not a flash from closed to fully-open content.
+            # becomes visible underneath it. Underlay motion stays suspended.
             self._reveal_prepared_modal()
             self._hide_transition_surface()
             return
@@ -620,12 +756,14 @@ class GlassModalInteractionController(QObject):
         self._transitioning = False
         self._target_open = False
 
-        # Inverse handoff: hide the real modal while the last Quick frame still
-        # covers it, then remove that Quick child to reveal the unchanged base UI.
+        # Hide the real modal under the last Quick frame. The base UI is still at
+        # the exact card/parallax state captured for opening; expose it first,
+        # then resume interaction/motion for subsequent frames.
         self.details.close()
         self._prepared_modal = False
         self._hide_transition_surface()
         self._clear_snapshots()
+        self._resume_underlay()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if watched is self.root and event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
@@ -635,10 +773,14 @@ class GlassModalInteractionController(QObject):
         return False
 
     def cleanup(self) -> None:
+        self._disconnect_underlay_frame_wait()
         self._state = _STATE_CLOSED
         self._transitioning = False
         self._target_open = False
+        self._pending_ratio = None
         self._prepared_modal = False
+        self._hide_transition_surface()
+        self._resume_underlay()
         try:
             self.root.removeEventFilter(self)
         except RuntimeError:
