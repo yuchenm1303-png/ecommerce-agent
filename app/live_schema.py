@@ -36,30 +36,54 @@ def _clean_options(items: Iterable[object]) -> tuple[str, ...]:
 
 
 def _field_options(field: dict[str, Any]) -> tuple[str, ...]:
-    output = list(_clean_options(field.get("options") or []))
-    seen = {normalize_key(item) for item in output}
-    for control in field.get("controls") or []:
+    """Return value options only, never options owned by a qualifier/unit control.
+
+    The raw semantic-field aggregator keeps a convenience union in ``field.options``.
+    On Makro numeric+unit attributes that union can contain only the unit selector
+    options (kg/g/cm/...), which previously made Fill Plan compare the numeric value
+    itself against the unit list.  When live controls are available, reconstruct the
+    value-option contract from non-qualifier controls and use the aggregate list only
+    as a legacy/final fallback.
+    """
+
+    controls = [
+        control
+        for control in field.get("controls") or []
+        if isinstance(control, dict)
+    ]
+    output: list[str] = []
+    seen: set[str] = set()
+    has_qualifier_control = False
+
+    for control in controls:
         if str(control.get("name") or "").endswith("_qualifier"):
+            has_qualifier_control = True
             continue
         for item in _clean_options(control.get("options") or []):
             key = normalize_key(item)
             if key not in seen:
                 output.append(item)
                 seen.add(key)
-    return tuple(output)
+
+    if output:
+        return tuple(output)
+    if controls and has_qualifier_control:
+        # The aggregate field.options may be polluted solely by qualifier options.
+        # No primary-control options means this is a free/numeric value input.
+        return ()
+    return _clean_options(field.get("options") or [])
 
 
 def _qualifier_options(field: dict[str, Any]) -> tuple[str, ...]:
     output = list(_clean_options(field.get("qualifier_options") or []))
     seen = {normalize_key(item) for item in output}
     for control in field.get("controls") or []:
-        if not str(control.get("name") or "").endswith("_qualifier"):
-            continue
-        for item in _clean_options(control.get("options") or []):
-            key = normalize_key(item)
-            if key not in seen:
-                output.append(item)
-                seen.add(key)
+        if str(control.get("name") or "").endswith("_qualifier"):
+            for item in _clean_options(control.get("options") or []):
+                key = normalize_key(item)
+                if key not in seen:
+                    output.append(item)
+                    seen.add(key)
     return tuple(output)
 
 

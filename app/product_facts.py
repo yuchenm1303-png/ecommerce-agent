@@ -28,8 +28,8 @@ from .semantic_grounding import GroundingCatalog
 from .source_bundle import normalize_key
 
 
-PRODUCT_FACT_CONTRACT_VERSION = 2
-PRODUCT_FACT_CACHE_VERSION = 5
+PRODUCT_FACT_CONTRACT_VERSION = 3
+PRODUCT_FACT_CACHE_VERSION = 6
 
 
 class JSONTaskProvider(Protocol):
@@ -49,6 +49,9 @@ RULES = [
     "A field may appear at most once. Omit unsupported fields; omission means MISSING.",
     "READY requires an explicit value, exact attribute meaning and matching physical scope.",
     "Two incompatible direct values for the same target and scope require CONFLICT.",
+    "If multi_value=false, READY must contain exactly one value string. When several compatible facets belong in a free-text field, combine them into one concise string; incompatible alternatives require CONFLICT instead of multiple READY values.",
+    "qualifier is only the marketplace unit/qualifier, never explanation, scope commentary, confidence text or field description. If qualifier_options exist, use one exact allowed qualifier. If qualifier_options are absent, qualifier must be empty unless context_text explicitly renders a fixed physical unit for the value input.",
+    "For a numeric target with a qualifier option or fixed unit rendered in context_text, return the bare finite number in values and the unit in qualifier; never embed the unit token inside the numeric value.",
     "Do not infer negative values, compatibility, contents, quantity, identity or seller details from absence or convention.",
     "Keep packaging, product body, mount and lens scopes separate; keep physical axes separate.",
     "Keep front, cabin and rear cameras separate; keep documentation language and device capability separate.",
@@ -150,7 +153,8 @@ def build_product_fact_request(
         "prompt_instruction": (
             "Return only fields with direct evidence. For READY, values and citations must be non-empty and "
             "alternatives empty. For CONFLICT, values and citations must be empty and alternatives must contain "
-            "at least two distinct grounded values. Check every source for disagreement before READY."
+            "at least two distinct grounded values. Check every source for disagreement before READY. "
+            "Follow the target field's multi_value/options/qualifier contract exactly."
         ),
         "product_identity": {"source_product_url": product_url.strip()},
         "target_fields": [_target(field) for field in targets],

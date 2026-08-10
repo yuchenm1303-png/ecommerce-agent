@@ -25,8 +25,8 @@ from .semantic_grounding import GroundingCatalog
 from .web_enrichment import PersistedWebSource, WebEvidence
 
 
-INFERENCE_CONTRACT_VERSION = 3
-INFERENCE_CACHE_VERSION = 3
+INFERENCE_CONTRACT_VERSION = 4
+INFERENCE_CACHE_VERSION = 4
 INFERENCE_REFERENCE = "model-inference:category-knowledge"
 INFERENCE_URL = "model-inference://category-knowledge"
 INFERENCE_CONTENT = (
@@ -75,13 +75,14 @@ def _target(field: dict[str, Any]) -> dict[str, Any]:
             if "product description" in section
             else "A"
         ),
+        "multi_value": contract["multi_value"],
     }
-    if contract["multi_value"]:
-        output["multi_value"] = True
     if contract["options"]:
         output["options"] = contract["options"]
     if contract["qualifier_options"]:
         output["qualifier_options"] = contract["qualifier_options"]
+    if contract["context_text"]:
+        output["context_text"] = contract["context_text"]
     return output
 
 
@@ -186,7 +187,8 @@ def build_best_effort_inference_request(
         ),
         "prompt_instruction": (
             "Return exactly one decision per target. Prefer a practical READY estimate over MISSING. "
-            "Use lower confidence for inference. Preserve physical scope and supplied options/units."
+            "Use lower confidence for inference. Preserve physical scope and obey each target's "
+            "multi_value/options/qualifier contract exactly."
         ),
         "evidence_policy": "best_effort",
         "context": {
@@ -203,7 +205,10 @@ def build_best_effort_inference_request(
             "Keep packaging/product body/mount dimensions and front/cabin/rear scopes separate. Packaging dimensions may fill only section S logistics fields, never product-body Width/Height/Depth or mount dimensions.",
             "For scoped dimensions, map keys literally without rotating axes: length->length, breadth->breadth, height->height, weight->weight.",
             "An unscoped viewing angle must not be assigned to Exterior or Interior Field of View.",
-            "For options or qualifier_options, return an exact allowed value.",
+            "If multi_value=false, return exactly one value string. If several compatible facets belong in a free-text field, combine them into one concise string rather than returning several values.",
+            "For options, return one exact allowed value. For qualifier_options, qualifier must be one exact allowed qualifier. If qualifier_options are absent, qualifier must be empty unless context_text explicitly renders a fixed physical unit.",
+            "qualifier is only a marketplace unit/qualifier, never explanation, scope commentary, confidence text or field description.",
+            "For numeric targets with a qualifier option or fixed unit in context_text, return a bare finite number in values and the unit in qualifier; never embed the unit token inside the numeric value.",
             "Return MISSING only for identifiers or legal/seller facts that cannot be responsibly invented, such as EAN or importer identity.",
         ],
         "grounded_sources": [],
