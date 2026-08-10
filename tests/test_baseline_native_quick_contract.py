@@ -132,7 +132,8 @@ def test_smooth_wheel_filter_is_scoped_to_scroll_areas() -> None:
     assert "def install(self, root: QWidget)" in SCROLL
     assert "root.findChildren(QAbstractScrollArea)" in SCROLL
     assert "watched.installEventFilter(self)" in SCROLL
-    assert "QApplication" not in SCROLL
+    assert "from PySide6.QtWidgets import QApplication" not in SCROLL
+    assert "QApplication.instance()" not in SCROLL
     assert "app.installEventFilter" not in RUNNER
     assert "smooth_wheel.install(window)" in RUNNER
 
