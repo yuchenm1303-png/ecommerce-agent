@@ -14,6 +14,7 @@ from app.makro.photos import (
     _photo_surface,
     _select_file_input,
     _stage_accepted,
+    _visible_upload_photo_button,
 )
 from app.makro.sections import save_section
 from app.required_overrides import RequiredOverrideError, apply_required_overrides
@@ -168,15 +169,28 @@ def test_product_photos_uses_real_thumbnail_ids_and_shared_input_surface():
     assert "AddProductImage" not in next_slot_source
 
 
-def test_dynamic_photo_target_clicks_concrete_thumbnail_before_shared_input():
+def test_dynamic_photo_target_selects_slot_then_clicks_blue_upload_photo():
     source = inspect.getsource(_DynamicPhotoFileTarget.set_input_files)
 
+    role_click = source.index("role_selector.click()")
+    button_lookup = source.index("_visible_upload_photo_button", role_click)
+    chooser = source.index("expect_file_chooser", button_lookup)
+    upload_click = source.index("upload_button.click()", chooser)
+
+    assert role_click < button_lookup < chooser < upload_click
     assert 'locator(f"#{self.slot_id}")' in source
     assert "i.fa-plus" in source
-    assert "expect_file_chooser" in source
     assert "set_files" in source
     assert "_raw_file_input" in source
     assert "shared.set_input_files" in source
+
+
+def test_upload_photo_button_is_exact_active_role_control():
+    source = inspect.getsource(_visible_upload_photo_button)
+
+    assert 'get_by_text("Upload Photo", exact=True)' in source
+    assert "is_visible" in source
+    assert "len(visible) > 1" in source
 
 
 def test_photo_acceptance_can_be_proved_by_target_thumbnail_losing_plus():
