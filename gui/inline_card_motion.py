@@ -2,13 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import (
-    QEasingCurve,
-    QObject,
-    QParallelAnimationGroup,
-    QPropertyAnimation,
-    QTimer,
-)
+from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, QTimer
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -22,9 +16,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .inline_motion_glass_guard import begin_inline_motion, end_inline_motion
+
 _MAX_HEIGHT = 16_777_215
-_MIN_DURATION_MS = 154
-_MAX_DURATION_MS = 198
+_MIN_DURATION_MS = 150
+_MAX_DURATION_MS = 188
 
 
 def _find_direct_layout(parent: QLayout, widget: QWidget) -> QLayout | None:
@@ -68,20 +64,13 @@ def _detach_widget(parent: QLayout, widget: QWidget) -> None:
         parent.takeAt(index)
 
 
-def _glass_sync(window: QMainWindow) -> None:
-    visual = getattr(window, "_visual_style", None)
-    background = getattr(visual, "background", None)
-    if background is not None and hasattr(background, "schedule_mask_update"):
-        background.schedule_mask_update()
-
-
 class AdaptiveReveal(QObject):
-    """Smooth inline expansion without a Python per-frame layout loop.
+    """Inline reveal with exactly one layout-changing property per frame.
 
-    The reveal body is clipped by ``maximumHeight`` and Qt's C++ animation
-    driver changes that property.  Normal layouts still reflow sibling cards,
-    but Python no longer executes every 8 ms, and splitter allocation is not
-    rewritten every frame.
+    The detail wrapper is made fully available before expansion and is clipped by
+    its parent card.  Only the card's height constraint is animated in Qt's C++
+    animation driver.  This avoids the previous double animation where both the
+    wrapper and the card/splitter constraints changed every frame.
     """
 
     def __init__(
@@ -106,10 +95,12 @@ class AdaptiveReveal(QObject):
         self.collapsed_text = collapsed_text
         self.expanded_height = expanded_height
 
-        self._group: QParallelAnimationGroup | None = None
+        self._animation: QPropertyAnimation | None = None
         self._expanded = False
         self._responsive_suspended = False
-        self._final_card_height = 0
+        self._collapsed_card_height = max(1, card.height())
+        self._expanded_wrapper_height = 0
+        self._final_card_height = self._collapsed_card_height
 
         self.wrapper.setMinimumHeight(0)
         self.wrapper.setMaximumHeight(0)
@@ -117,7 +108,7 @@ class AdaptiveReveal(QObject):
         self.toggle.setText(self.collapsed_text)
         self.toggle.toggled.connect(self.set_expanded)
 
-    def _measure_natural_height(self) -> int:
+    def _measure_target_wrapper_height(self) -> int:
         old = self.wrapper.maximumHeight()
         self.wrapper.setMaximumHeight(_MAX_HEIGHT)
         layout = self.wrapper.layout()
@@ -125,10 +116,6 @@ class AdaptiveReveal(QObject):
             layout.activate()
         natural = max(0, self.wrapper.sizeHint().height())
         self.wrapper.setMaximumHeight(old)
-        return natural
-
-    def _target_height(self) -> int:
-        natural = self._measure_natural_height()
         if self.expanded_height is not None:
             return max(0, int(self.expanded_height(natural)))
         return natural
@@ -137,16 +124,15 @@ class AdaptiveReveal(QObject):
     def _duration_for(distance: int) -> int:
         return max(
             _MIN_DURATION_MS,
-            min(_MAX_DURATION_MS, 146 + int(abs(distance) * 0.18)),
+            min(_MAX_DURATION_MS, 142 + int(abs(distance) * 0.15)),
         )
 
     def _stop_animation(self) -> None:
-        group = self._group
-        self._group = None
-        if group is None:
-            return
-        group.stop()
-        group.deleteLater()
+        animation = self._animation
+        self._animation = None
+        if animation is not None:
+            animation.stop()
+            animation.deleteLater()
 
     def _suspend_responsive_controller(self) -> None:
         if self._responsive_suspended:
@@ -162,7 +148,7 @@ class AdaptiveReveal(QObject):
             except RuntimeError:
                 pass
         self._responsive_suspended = True
-        setattr(self.window, "_inline_card_motion_active", True)
+        begin_inline_motion(self.window)
 
     def _resume_responsive_controller(self) -> None:
         if not self._responsive_suspended:
@@ -175,57 +161,41 @@ class AdaptiveReveal(QObject):
             except RuntimeError:
                 pass
         self._responsive_suspended = False
-        setattr(self.window, "_inline_card_motion_active", False)
         if mature is not None and hasattr(mature, "schedule"):
             mature.schedule()
+        end_inline_motion(self.window)
 
-    def _build_wrapper_animation(self, start: int, end: int, duration: int) -> QPropertyAnimation:
-        animation = QPropertyAnimation(self.wrapper, b"maximumHeight")
-        animation.setStartValue(max(0, int(start)))
-        animation.setEndValue(max(0, int(end)))
-        animation.setDuration(duration)
-        animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
-        return animation
+    def _expanded_card_target(self, wrapper_height: int) -> int:
+        if self.splitter is None:
+            return max(self._collapsed_card_height, self._collapsed_card_height + wrapper_height)
 
-    def _build_splitter_constraint_animation(
+        available = max(1, self.splitter.height() - self.splitter.handleWidth())
+        target = min(440, max(340, available - 300))
+        return min(target, max(260, available - 260))
+
+    def _build_constraint_animation(
         self,
         *,
         expanded: bool,
-        wrapper_start: int,
-        wrapper_end: int,
+        start_height: int,
+        end_height: int,
         duration: int,
-    ) -> QPropertyAnimation | None:
-        if self.splitter is None or self.splitter.count() < 2:
-            self._final_card_height = 0
-            return None
-
-        available = max(1, self.splitter.height() - self.splitter.handleWidth())
-        current_card = max(108, self.card.height())
-        shell = max(86, current_card - max(0, wrapper_start))
-        final_card = min(
-            max(108, shell + max(0, wrapper_end)),
-            max(108, available - 250),
-        )
-        self._final_card_height = final_card
-
-        if expanded:
-            # Raising minimumHeight lets QSplitter give the console more room as
-            # the body reveals, without a Python setSizes() call every frame.
-            self.card.setMaximumHeight(_MAX_HEIGHT)
-            self.card.setMinimumHeight(min(current_card, final_card))
+    ) -> QPropertyAnimation:
+        if self.splitter is not None and expanded:
+            # Increasing minimumHeight forces QSplitter to yield space while the
+            # content is already clipped inside the console card.
+            self.card.setMaximumHeight(max(end_height, 460))
+            self.card.setMinimumHeight(start_height)
             animation = QPropertyAnimation(self.card, b"minimumHeight")
-            animation.setStartValue(current_card)
-            animation.setEndValue(final_card)
         else:
-            # Lowering only minimumHeight would not force QSplitter to shrink.
-            # Animate maximumHeight down instead; the splitter follows the
-            # constraint in C++ while the body clips closed in parallel.
+            # VBox cards expand by relaxing maximumHeight; splitter cards collapse
+            # by tightening maximumHeight.  Either way only one constraint moves.
             self.card.setMinimumHeight(0)
-            self.card.setMaximumHeight(max(current_card, 124))
+            self.card.setMaximumHeight(start_height)
             animation = QPropertyAnimation(self.card, b"maximumHeight")
-            animation.setStartValue(current_card)
-            animation.setEndValue(124)
 
+        animation.setStartValue(start_height)
+        animation.setEndValue(end_height)
         animation.setDuration(duration)
         animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
         return animation
@@ -235,58 +205,65 @@ class AdaptiveReveal(QObject):
         self._stop_animation()
         self._suspend_responsive_controller()
 
-        start = max(0, self.wrapper.height())
-        end = self._target_height() if expanded else 0
+        current_height = max(1, self.card.height())
+        if expanded and not self._expanded:
+            self._collapsed_card_height = current_height
+
         self._expanded = expanded
         self.wrapper.setEnabled(False)
         self.toggle.setText(self.expanded_text if expanded else self.collapsed_text)
 
-        if start == end:
+        if expanded:
+            self._expanded_wrapper_height = self._measure_target_wrapper_height()
+            self.wrapper.setMaximumHeight(self._expanded_wrapper_height)
+            if self.wrapper.layout() is not None:
+                self.wrapper.layout().activate()
+            end_height = self._expanded_card_target(self._expanded_wrapper_height)
+            self._final_card_height = end_height
+        else:
+            end_height = max(1, self._collapsed_card_height)
+            self._final_card_height = end_height
+
+        if current_height == end_height:
             self._finish()
             return
 
-        duration = self._duration_for(end - start)
-        group = QParallelAnimationGroup(self)
-        group.addAnimation(self._build_wrapper_animation(start, end, duration))
-        splitter_animation = self._build_splitter_constraint_animation(
+        animation = self._build_constraint_animation(
             expanded=expanded,
-            wrapper_start=start,
-            wrapper_end=end,
-            duration=duration,
+            start_height=current_height,
+            end_height=end_height,
+            duration=self._duration_for(end_height - current_height),
         )
-        if splitter_animation is not None:
-            group.addAnimation(splitter_animation)
-        group.finished.connect(self._finish)
-        self._group = group
-
-        # NativeQuickBackground already coalesces geometry changes.  A single
-        # start sync switches it into motion-rate batching; there is deliberately
-        # no extra Python timer calling mask updates during the animation.
-        _glass_sync(self.window)
-        group.start()
+        animation.finished.connect(self._finish)
+        self._animation = animation
+        animation.start()
 
     def _finish(self) -> None:
-        group = self._group
-        self._group = None
-        if group is not None:
-            group.deleteLater()
+        animation = self._animation
+        self._animation = None
+        if animation is not None:
+            animation.deleteLater()
 
-        target = self._target_height() if self._expanded else 0
-        self.wrapper.setMaximumHeight(max(0, target))
-        self.wrapper.setEnabled(True)
-
-        if self.splitter is not None:
-            if self._expanded:
-                final_height = max(300, min(460, self._final_card_height or self.card.height()))
+        if self._expanded:
+            self.wrapper.setMaximumHeight(max(0, self._expanded_wrapper_height))
+            if self.splitter is not None:
+                final_height = max(300, min(460, self._final_card_height))
                 self.card.setMinimumHeight(final_height)
                 self.card.setMaximumHeight(460)
             else:
+                self.card.setMinimumHeight(0)
+                self.card.setMaximumHeight(max(self._final_card_height, self.card.sizeHint().height()))
+        else:
+            self.wrapper.setMaximumHeight(0)
+            if self.splitter is not None:
                 self.card.setMinimumHeight(108)
                 self.card.setMaximumHeight(124)
+            else:
+                self.card.setMinimumHeight(0)
+                self.card.setMaximumHeight(_MAX_HEIGHT)
 
-        # Restore normal geometry cadence and force one exact final glass mask.
+        self.wrapper.setEnabled(True)
         self._resume_responsive_controller()
-        _glass_sync(self.window)
 
     def cleanup(self) -> None:
         self._stop_animation()
@@ -451,5 +428,4 @@ def install_inline_card_motion(window: QMainWindow) -> list[AdaptiveReveal]:
 
     window._inline_card_motions = motions  # type: ignore[attr-defined]
     window.destroyed.connect(lambda *_: [motion.cleanup() for motion in motions])
-    QTimer.singleShot(0, lambda: _glass_sync(window))
     return motions
