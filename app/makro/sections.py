@@ -63,68 +63,6 @@ _FIND_SECTIONS_SCRIPT = (
     + "\n}"
 )
 
-_CLICK_EDIT_SCRIPT = (
-    "({path}) => {\n"
-    + _JS_HELPERS
-    + r"""
-  const card = document.querySelector(path);
-  if (!card) return false;
-  const btn = Array.from(card.querySelectorAll("button")).find((b) => clean(b.innerText).toUpperCase() === "EDIT");
-  if (!btn) return false;
-  try {
-    btn.scrollIntoView({ block: "center", inline: "center" });
-    btn.click();
-    return true;
-  } catch (err) {
-    return false;
-  }
-"""
-    + "\n}"
-)
-
-_CLICK_CANCEL_SCRIPT = (
-    "({path}) => {\n"
-    + _JS_HELPERS
-    + r"""
-  const card = document.querySelector(path);
-  if (!card) return false;
-  const el = [...card.querySelectorAll("a, button")].find((b) => clean(b.innerText).toUpperCase() === "CANCEL");
-  if (!el) return false;
-  try {
-    el.scrollIntoView({ block: "center", inline: "center" });
-    el.click();
-    return true;
-  } catch (err) {
-    return false;
-  }
-"""
-    + "\n}"
-)
-
-_SECTION_STATE_SCRIPT = (
-    "({path}) => {\n"
-    + _JS_HELPERS
-    + r"""
-  const card = document.querySelector(path);
-  if (!card) return { found: false };
-  const buttons = Array.from(card.querySelectorAll("button"));
-  const links = Array.from(card.querySelectorAll("a"));
-  const editBtn = buttons.find((b) => clean(b.innerText).toUpperCase() === "EDIT");
-  const cancelEl = [...links, ...buttons].find((b) => clean(b.innerText).toUpperCase() === "CANCEL");
-  const hasFields = card.querySelectorAll(
-    'input, textarea, select, [role="combobox"], [contenteditable="true"]'
-  ).length > 0;
-  return {
-    found: true,
-    has_edit: Boolean(editBtn),
-    has_cancel: Boolean(cancelEl),
-    has_fields: hasFields,
-  };
-"""
-    + "\n}"
-)
-
-
 def find_sections(page: Page) -> list[dict[str, Any]]:
     """List all listing section cards with title and expanded state."""
     return page.evaluate(_FIND_SECTIONS_SCRIPT)
@@ -208,21 +146,28 @@ def scan_sections(
 
     for section in sections:
         title = section.get("title", "")
-        section_path = section.get("path")
+        current_section = find_section(page, title) or section
+        section_path = current_section.get("path")
         if not section_path:
             continue
 
-        state = page.evaluate(_SECTION_STATE_SCRIPT, {"path": section_path})
-        was_collapsed = bool(state.get("has_edit"))
+        was_collapsed = bool(current_section.get("has_edit"))
         expanded = not was_collapsed
         if was_collapsed:
-            clicked = page.evaluate(_CLICK_EDIT_SCRIPT, {"path": section_path})
-            if clicked:
-                stats["sections_expanded_by_scan"] += 1
-                expanded = True
-                _wait_for_section_fields(
-                    page, section_path, wait_ms=wait_ms, timeout_s=10.0
-                )
+            open_section_for_edit(page, current_section)
+            stats["sections_expanded_by_scan"] += 1
+            expanded = True
+
+        # Expanding a card can make React replace it with a newly rendered
+        # node. Reacquire the card by its stable title instead of continuing
+        # with the collapsed card's now-stale structural path.
+        ready_section = _wait_for_section_fields(
+            page, title, wait_ms=wait_ms, timeout_s=10.0
+        )
+        current_section = ready_section or find_section(page, title) or current_section
+        section_path = current_section.get("path")
+        if not section_path:
+            continue
 
         controls = scan_section_fields(
             page,
@@ -252,31 +197,31 @@ def scan_sections(
         flat_scans.append(controls)
 
         if was_collapsed:
-            cancelled = page.evaluate(_CLICK_CANCEL_SCRIPT, {"path": section_path})
-            if cancelled:
-                stats["sections_cancelled"] += 1
-                page.wait_for_timeout(wait_ms)
+            cancel_section(page, title, wait_ms=wait_ms)
+            stats["sections_cancelled"] += 1
 
     flat_controls = merge_scans(flat_scans)
     return section_results, flat_controls, stats
 
 
 def _wait_for_section_fields(
-    page: Page, section_path: str, *, wait_ms: int, timeout_s: float
-) -> bool:
-    """Poll until an expanded section has rendered its actual field controls.
+    page: Page, section_title: str, *, wait_ms: int, timeout_s: float
+) -> dict[str, Any] | None:
+    """Return the current section node once its actual fields have rendered.
 
     Makro exposes the Cancel/Save actions before its asynchronous attribute
     form has finished rendering.  Treating Cancel as readiness races the form
-    load and can produce an empty live schema immediately after Step 2.
+    load and can produce an empty live schema immediately after Step 2. React
+    may also replace the card while expanding it, so every poll resolves the
+    card again by its stable title rather than retaining a structural DOM path.
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        state = page.evaluate(_SECTION_STATE_SCRIPT, {"path": section_path})
-        if state.get("has_fields"):
-            return True
+        section = find_section(page, section_title)
+        if section and section.get("has_fields"):
+            return section
         page.wait_for_timeout(int(wait_ms))
-    return False
+    return None
 
 
 def base_section_title(title: str) -> str:
@@ -349,7 +294,7 @@ def cancel_section(page: Page, section_title: str, *, wait_ms: int = 450) -> Non
     section = find_section(page, section_title)
     if section is None:
         raise RuntimeError(f"Cancel 前找不到 section：{section_title}")
-    if section.get("has_edit"):
+    if section.get("has_edit") and not section.get("has_cancel"):
         return
     path = str(section.get("path") or "")
     if not path:

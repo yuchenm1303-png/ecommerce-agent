@@ -2,39 +2,47 @@
 
 from __future__ import annotations
 
-from app.makro.sections import _wait_for_section_fields
+from app.makro import sections
 
 
 class _AsyncSectionPage:
     def __init__(self) -> None:
-        self.states = [
-            {"found": True, "has_cancel": True, "has_fields": False},
-            {"found": True, "has_cancel": True, "has_fields": False},
-            {"found": True, "has_cancel": True, "has_fields": True},
-        ]
-        self.evaluate_calls = 0
         self.wait_calls: list[int] = []
-
-    def evaluate(self, _script, _payload):
-        index = min(self.evaluate_calls, len(self.states) - 1)
-        self.evaluate_calls += 1
-        return self.states[index]
 
     def wait_for_timeout(self, milliseconds: int) -> None:
         self.wait_calls.append(milliseconds)
 
 
-def test_section_readiness_waits_for_fields_after_cancel_appears() -> None:
+def test_section_readiness_reacquires_replaced_card_until_fields_render(
+    monkeypatch,
+) -> None:
     page = _AsyncSectionPage()
-
-    assert (
-        _wait_for_section_fields(
-            page,
-            "body > section",
-            wait_ms=25,
-            timeout_s=1.0,
-        )
-        is True
+    rendered_sections = iter(
+        [
+            {"path": "body > collapsed-card", "has_cancel": True, "has_fields": False},
+            {"path": "body > expanded-card", "has_cancel": True, "has_fields": False},
+            {"path": "body > expanded-card", "has_cancel": True, "has_fields": True},
+        ]
     )
-    assert page.evaluate_calls == 3
+    observed: list[tuple[object, str]] = []
+
+    def fake_find_section(current_page, title: str):
+        observed.append((current_page, title))
+        return next(rendered_sections)
+
+    monkeypatch.setattr(sections, "find_section", fake_find_section)
+
+    ready = sections._wait_for_section_fields(
+        page,
+        "Product Description",
+        wait_ms=25,
+        timeout_s=1.0,
+    )
+
+    assert ready == {
+        "path": "body > expanded-card",
+        "has_cancel": True,
+        "has_fields": True,
+    }
+    assert observed == [(page, "Product Description")] * 3
     assert page.wait_calls == [25, 25]
