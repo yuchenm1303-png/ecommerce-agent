@@ -22,8 +22,6 @@ def main() -> int:
         )
         return 2
 
-    # Keep the baseline import contract for visual tests, then layer the current
-    # business workflow over that preserved QWidget shell.
     from gui.card_details_fast import install_card_details
     from gui.console_window import MainWindow
     from gui.workflow_console_window import WorkflowMainWindow
@@ -41,7 +39,6 @@ def main() -> int:
     app.setApplicationName("ecommerce-agent Current Workflow")
     app.setOrganizationName("ecommerce-agent")
 
-    # Preserve the baseline global smooth-scroll behavior unchanged.
     from gui.smooth_scroll import SmoothWheelFilter
 
     app.installEventFilter(SmoothWheelFilter(app))
@@ -49,18 +46,16 @@ def main() -> int:
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_native_visual_style(window)
 
-    # Structural responsive pass: keep the original business widget instances,
-    # improve data density, and organize workspace/console splitters.
+    # First arrange the existing business widgets into the responsive workspace.
     install_ui_polish(window)
 
-    # Card details are created before the final maturity pass so the latter can
-    # reserve a real top-right affordance lane for every card. The fast detail
-    # controller still uses only short-lived 8 ms move/reveal motion.
+    # Then create detail affordances. They use the fast short-lived move/reveal
+    # controller and never resize the source cards during animation.
     install_card_details(window)
 
-    # One final visual hierarchy/responsive coordinator. This pass owns spacing,
-    # detail-button safe zones, side tabs and console proportions; it does not
-    # change Resolver/execution behavior or the Quick renderer.
+    # Finally establish the definitive visual hierarchy and responsive sizing.
+    # Running this after card details means every expand button gets a protected
+    # top-right lane before native focus/hover controllers enumerate widgets.
     install_mature_ui(window)
 
     quick_window = visual.background.quick_window
@@ -68,8 +63,6 @@ def main() -> int:
         raise RuntimeError("Native Quick renderer was not created")
     shell = install_native_window_shell(window, quick_window)
 
-    # These are the baseline controllers, unchanged. In particular the card
-    # hover/press timing and easing remain exactly the d89cbcc implementation.
     install_nekro_card_fx(window, visual)
     install_buffered_logs(window)
     effects = install_nekro_effects(window, sakura_count=3)
