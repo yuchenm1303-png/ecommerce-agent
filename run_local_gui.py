@@ -32,6 +32,7 @@ def main() -> int:
     from gui.native_window_shell import install_native_window_shell
     from gui.nekro_card_fx import install_nekro_card_fx
     from gui.nekro_effects import install_nekro_effects
+    from gui.ui_maturity import install_mature_ui
     from gui.ui_polish import install_ui_polish
 
     MainWindow = WorkflowMainWindow
@@ -48,16 +49,19 @@ def main() -> int:
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_native_visual_style(window)
 
-    # Final presentation pass only. This runs after NEKRO/native compatibility
-    # styling so table density, spacing and control styling are deterministic,
-    # while all business widgets/controllers remain the original instances.
+    # Structural responsive pass: keep the original business widget instances,
+    # improve data density, and organize workspace/console splitters.
     install_ui_polish(window)
 
-    # Card details are created after the responsive layout is finalized but
-    # before the native shell/focus and card-hover controllers enumerate the
-    # widget tree. The fast controller keeps the drawer at fixed size and runs
-    # only short-lived 8 ms move/reveal motion during open/close.
+    # Card details are created before the final maturity pass so the latter can
+    # reserve a real top-right affordance lane for every card. The fast detail
+    # controller still uses only short-lived 8 ms move/reveal motion.
     install_card_details(window)
+
+    # One final visual hierarchy/responsive coordinator. This pass owns spacing,
+    # detail-button safe zones, side tabs and console proportions; it does not
+    # change Resolver/execution behavior or the Quick renderer.
+    install_mature_ui(window)
 
     quick_window = visual.background.quick_window
     if quick_window is None:
