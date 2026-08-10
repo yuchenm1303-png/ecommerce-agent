@@ -107,7 +107,7 @@ Item {{
     Rectangle {{
         id: scrim
         anchors.fill: parent
-        color: "#67101822"
+        color: Qt.rgba(12 / 255.0, 17 / 255.0, 26 / 255.0, 94 / 255.0)
         opacity: 0.0
     }}
 
@@ -220,11 +220,12 @@ class GlassModalInteractionController(QObject):
     """Frame-atomic GPU modal transitions over one stable native underlay.
 
     The baseline QWidget child HWND stays mapped for the entire interaction. At
-    open, card feedback is first settled to neutral and Fuji parallax is paused;
-    the background QQuickWindow is allowed to swap that settled frame before any
-    screenshot is taken. The real modal is laid out while hidden, then a dedicated
-    child QQuickWindow animates static snapshots above the unchanged application.
-    Its final frame covers the reveal of the real QWidget modal.
+    open, card feedback is frozen at the alpha already presented on screen and
+    Fuji parallax is paused; the background QQuickWindow is allowed to swap that
+    stable frame before any screenshot is taken. The real modal is laid out while
+    hidden, then a dedicated child QQuickWindow animates static snapshots above
+    the unchanged application. Its final frame covers the reveal of the real
+    QWidget modal.
 
     Closing is the exact inverse. The Quick child covers the real modal, the real
     modal is hidden beneath the final Quick frame, the overlay is removed, and
