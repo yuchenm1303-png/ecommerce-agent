@@ -20,6 +20,7 @@ def main() -> int:
         return 2
 
     from gui.card_details_fast import install_card_details
+    from gui.console_summary_mode import install_console_summary_mode
     from gui.console_window import MainWindow
     from gui.workflow_console_window import WorkflowMainWindow
     from gui.log_presenter import install_buffered_logs
@@ -42,6 +43,7 @@ def main() -> int:
     install_ui_polish(window)
     install_card_details(window)
     install_mature_ui(window)
+    install_console_summary_mode(window)
 
     smooth_wheel = SmoothWheelFilter(window)
     smooth_wheel.install(window)
