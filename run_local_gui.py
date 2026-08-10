@@ -38,7 +38,6 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("ecommerce-agent Current Workflow")
     app.setOrganizationName("ecommerce-agent")
-    app.installEventFilter(SmoothWheelFilter(app))
 
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_native_visual_style(window)
@@ -47,6 +46,11 @@ def main() -> int:
     install_card_details(window)
     install_mature_ui(window)
     install_inline_card_motion(window)
+
+    smooth_wheel = SmoothWheelFilter(window)
+    smooth_wheel.install(window)
+    window._smooth_wheel_filter = smooth_wheel  # type: ignore[attr-defined]
+    window.destroyed.connect(smooth_wheel.cleanup)
 
     quick_window = visual.background.quick_window
     if quick_window is None:
