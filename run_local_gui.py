@@ -22,6 +22,7 @@ def main() -> int:
     from gui.card_details_fast import install_card_details
     from gui.console_window import MainWindow
     from gui.workflow_console_window import WorkflowMainWindow
+    from gui.inline_card_motion import install_inline_card_motion
     from gui.log_presenter import install_buffered_logs
     from gui.native_visual_style import install_native_visual_style
     from gui.native_window_shell import install_native_window_shell
@@ -43,6 +44,7 @@ def main() -> int:
     install_ui_polish(window)
     install_card_details(window)
     install_mature_ui(window)
+    install_inline_card_motion(window)
 
     quick_window = visual.background.quick_window
     if quick_window is None:
