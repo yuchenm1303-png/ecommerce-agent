@@ -106,5 +106,12 @@ def end_inline_motion(window: QMainWindow) -> None:
     _resume_timer(card_fx, "_sample_timer", window, "_inline_motion_card_sample_was_active")
     _resume_timer(card_fx, "_animation_timer", window, "_inline_motion_card_anim_was_active")
 
+    # Detail expand affordances deliberately skipped all intermediate reflow.
+    # Place them once at the settled geometry.
+    details = getattr(window, "_card_details", None)
+    schedule_details = getattr(details, "_schedule_geometry", None)
+    if callable(schedule_details):
+        schedule_details()
+
     # A scroll animation interrupted by card expansion should not continue from
-    # a stale target after the layout has moved.  It remains stopped by design.
+    # a stale target after the layout has moved. It remains stopped by design.
