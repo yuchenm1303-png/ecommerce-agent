@@ -191,16 +191,12 @@ class FastCardDetailController(CardDetailController):
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
 
-        # The base controller still carries its historical animated path.  This
-        # runtime controller never uses it and removes both offscreen effects.
         self.drawer.setGraphicsEffect(None)
         self.drawer_effect = None  # type: ignore[assignment]
         self.ghost.setGraphicsEffect(None)
         self.ghost_effect = None  # type: ignore[assignment]
         self.ghost.hide()
 
-        # The old corner affordance is gone.  The discovered cards themselves
-        # are the click targets, while child controls retain native mouse input.
         self._expandable_cards = tuple(self._installed_cards)
         for button in tuple(self._buttons.values()):
             button.hide()
@@ -208,8 +204,6 @@ class FastCardDetailController(CardDetailController):
             button.deleteLater()
         self._buttons.clear()
 
-        # A pre-blurred snapshot of the complete composited app surface sits
-        # underneath the scrim.  It is generated once per open, never per frame.
         self.backdrop = QLabel(self.root)
         self.backdrop.setObjectName("cardDetailBackdrop")
         self.backdrop.setScaledContents(True)
@@ -227,8 +221,6 @@ class FastCardDetailController(CardDetailController):
         self._install_real_settings_action()
 
     def attach_mature(self, mature: QObject) -> None:
-        """Reclaim the lane that ui_maturity used to reserve for the old icon."""
-
         self._reclaim_expand_lane()
         timer = getattr(mature, "_timer", None)
         if isinstance(timer, QTimer):
@@ -359,6 +351,9 @@ class FastCardDetailController(CardDetailController):
     def open(self, frame: QFrame) -> None:
         if frame not in self._expandable_cards or self.drawer.isVisible():
             return
+        if frame is getattr(self.window, "console", None):
+            self.open_console_details()
+            return
         self._stop_animation()
         self._selected = frame
         self._populate(frame)
@@ -439,19 +434,16 @@ class FastCardDetailController(CardDetailController):
         policy_source = getattr(self.window, "real_policy_hint", None)
         start_source = getattr(self.window, "real_start_button", None)
         stop_source = getattr(self.window, "real_stop_button", None)
-        if not all(
-            isinstance(widget, QWidget)
-            for widget in (
-                scope_source,
-                save_source,
-                upload_source,
-                pick_source,
-                count_source,
-                qc_source,
-                policy_source,
-                start_source,
-                stop_source,
-            )
+        if not (
+            isinstance(scope_source, QComboBox)
+            and isinstance(save_source, QCheckBox)
+            and isinstance(upload_source, QCheckBox)
+            and isinstance(pick_source, QPushButton)
+            and isinstance(count_source, QLabel)
+            and isinstance(qc_source, QCheckBox)
+            and isinstance(policy_source, QLabel)
+            and isinstance(start_source, QPushButton)
+            and isinstance(stop_source, QPushButton)
         ):
             return
 
@@ -463,7 +455,6 @@ class FastCardDetailController(CardDetailController):
             scope_row.addWidget(label)
             combo = QComboBox()
             combo.setObjectName("modalCombo")
-            assert isinstance(scope_source, QComboBox)
             for index in range(scope_source.count()):
                 combo.addItem(scope_source.itemText(index), scope_source.itemData(index))
             combo.setCurrentIndex(scope_source.currentIndex())
@@ -474,9 +465,6 @@ class FastCardDetailController(CardDetailController):
 
             permissions = self._section("写入与图片授权")
             checks = QHBoxLayout()
-            assert isinstance(save_source, QCheckBox)
-            assert isinstance(upload_source, QCheckBox)
-            assert isinstance(qc_source, QCheckBox)
             save = self._proxy_checkbox(save_source)
             upload = self._proxy_checkbox(upload_source)
             qc = self._proxy_checkbox(qc_source)
@@ -531,6 +519,10 @@ class FastCardDetailController(CardDetailController):
                 qc.setEnabled(qc_source.isEnabled())
                 policy.setText(policy_source.text())
                 sync_image_controls()
+
+            combo.currentIndexChanged.connect(
+                lambda *_: QTimer.singleShot(0, sync_execution_buttons)
+            )
 
             def start_execution() -> None:
                 start_source.click()
