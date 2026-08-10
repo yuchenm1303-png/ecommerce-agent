@@ -77,6 +77,64 @@ def test_modal_transition_cannot_invalidate_native_glass_mask_via_parent_visibil
     assert "self.window.show()" not in MODAL
 
 
+def test_opening_waits_for_one_stable_quick_underlay_frame_before_capture() -> None:
+    assert '_STATE_OPENING_PENDING = "opening-pending"' in MODAL
+    assert "_UNDERLAY_SETTLE_FALLBACK_MS = 48" in MODAL
+    assert "def _suspend_underlay" in MODAL
+    assert "def _wait_for_stable_underlay_frame" in MODAL
+    assert "def _on_underlay_frame_swapped" in MODAL
+    assert "def _begin_pending_open" in MODAL
+    assert "quick.frameSwapped.connect(" in MODAL
+    assert "Qt.ConnectionType.QueuedConnection" in MODAL
+    assert "quick.requestUpdate()" in MODAL
+    assert "QTimer.singleShot(" in MODAL
+
+    entry = MODAL.split("def _show_modal_with_transition", 1)[1].split(
+        "def request_close", 1
+    )[0]
+    assert entry.index("self._state = _STATE_OPENING_PENDING") < entry.index(
+        "self._suspend_underlay()"
+    )
+    assert entry.index("self._suspend_underlay()") < entry.index(
+        "self._wait_for_stable_underlay_frame()"
+    )
+    assert "_prepare_hidden_modal" not in entry
+
+    begin = MODAL.split("def _begin_pending_open", 1)[1].split(
+        "def _show_modal_with_transition", 1
+    )[0]
+    assert "if self._state != _STATE_OPENING_PENDING:" in begin
+    assert "base = self._prepare_hidden_modal(ratio=ratio)" in begin
+    assert "self.details.drawer.grab()" in begin
+    assert "self._state = _STATE_OPENING" in begin
+    assert "self._issue_transition(closing=False)" in begin
+
+
+def test_modal_freezes_card_feedback_and_fuji_parallax_until_close_finishes() -> None:
+    suspend = MODAL.split("def _suspend_underlay", 1)[1].split(
+        "def _resume_underlay", 1
+    )[0]
+    assert 'getattr(self.window, "_nekro_card_fx", None)' in suspend
+    assert 'getattr(card_fx, "suspend_for_modal", None)' in suspend
+    assert 'getattr(self.background, "_pointer_timer", None)' in suspend
+    assert "timer.stop()" in suspend
+    assert 'quick.setProperty("animationRunning", False)' in suspend
+
+    resume = MODAL.split("def _resume_underlay", 1)[1].split(
+        "def _disconnect_underlay_frame_wait", 1
+    )[0]
+    assert 'getattr(card_fx, "resume_from_modal", None)' in resume
+    assert "self.background._last_pointer_norm = None" in resume
+    assert "timer.start()" in resume
+
+    assert "def suspend_for_modal" in CARD_FX
+    assert "def resume_from_modal" in CARD_FX
+    assert "self._suspended = True" in CARD_FX
+    assert "self._animation_timer.stop()" in CARD_FX
+    assert "state.settle(_NORMAL_ALPHA)" in CARD_FX
+    assert "if self._suspended:" in CARD_FX
+
+
 def test_opening_is_prepared_hidden_and_revealed_only_under_final_quick_frame() -> None:
     assert "self._original_show_prepared_modal = self.details._show_prepared_modal" in MODAL
     assert "self.details._show_prepared_modal = self._show_modal_with_transition" in MODAL
@@ -85,15 +143,6 @@ def test_opening_is_prepared_hidden_and_revealed_only_under_final_quick_frame() 
     assert "self.details.scrim.hide()" in MODAL
     assert "self.details.drawer.hide()" in MODAL
     assert "def _reveal_prepared_modal" in MODAL
-
-    open_driver = MODAL.split("def _show_modal_with_transition", 1)[1].split(
-        "def request_close", 1
-    )[0]
-    assert "base = self._prepare_hidden_modal(ratio=ratio)" in open_driver
-    assert "self.details.drawer.grab()" in open_driver
-    assert "self._state = _STATE_OPENING" in open_driver
-    assert "self._issue_transition(closing=False)" in open_driver
-    assert "self.details.drawer.show()" not in open_driver
 
     finish = MODAL.split("def _on_transition_finished", 1)[1].split("def eventFilter", 1)[0]
     open_branch = finish.split("if opened:", 1)[1].split(
@@ -105,9 +154,10 @@ def test_opening_is_prepared_hidden_and_revealed_only_under_final_quick_frame() 
     assert open_branch.index("self._reveal_prepared_modal()") < open_branch.index(
         "self._hide_transition_surface()"
     )
+    assert "self._resume_underlay()" not in open_branch
 
 
-def test_closing_hides_real_modal_before_transition_surface_is_removed() -> None:
+def test_closing_hides_real_modal_then_exposes_stable_base_then_resumes_motion() -> None:
     finish = MODAL.split("def _on_transition_finished", 1)[1].split("def eventFilter", 1)[0]
     close_branch = finish.split("if self._state != _STATE_CLOSING:", 1)[1]
     assert close_branch.index("self._state = _STATE_CLOSED") < close_branch.index(
@@ -115,6 +165,9 @@ def test_closing_hides_real_modal_before_transition_surface_is_removed() -> None
     )
     assert close_branch.index("self.details.close()") < close_branch.index(
         "self._hide_transition_surface()"
+    )
+    assert close_branch.index("self._hide_transition_surface()") < close_branch.index(
+        "self._resume_underlay()"
     )
 
 
@@ -127,43 +180,19 @@ def test_preblurred_snapshot_replaces_runtime_qtquick_effect() -> None:
     assert 'panel_url = self._publish_pixmap("modal_panel", panel, alpha=True)' in MODAL
 
 
-def test_quick_failure_falls_back_to_atomic_modal_instead_of_crashing() -> None:
+def test_quick_failure_falls_back_without_leaving_underlay_or_modal_stuck() -> None:
     assert "if not self._ensure_transition_surface():" in MODAL
     assert "self._fallback_open()" in MODAL
     assert "self._fallback_closed()" in MODAL
+    assert "def _abort_open" in MODAL
     assert "self._reveal_prepared_modal()" in MODAL
     assert "raise RuntimeError(\"Glass modal transition" not in MODAL
 
-
-def test_any_transition_preparation_exception_cannot_trap_modal_state() -> None:
-    assert "def _fallback_open" in MODAL
-    assert "def _fallback_closed" in MODAL
-    assert "def _error_text" in MODAL
-
-    ensure_body = MODAL.split("def _ensure_transition_surface", 1)[1].split(
-        "def _rewire_close_inputs", 1
-    )[0]
-    assert "except Exception as exc:" in ensure_body
-    assert "self._transition_error = self._error_text(exc)" in ensure_body
-    assert "return False" in ensure_body
-
-    open_body = MODAL.split("def _show_modal_with_transition", 1)[1].split(
-        "def request_close", 1
-    )[0]
-    assert "except Exception as exc:" in open_body
-    assert "self._fallback_open(exc)" in open_body
-
-    close_body = MODAL.split("def request_close", 1)[1].split(
-        "def _on_transition_finished", 1
-    )[0]
-    assert "except Exception as exc:" in close_body
-    assert "self._fallback_closed(exc)" in close_body
-
-    fallback_open = MODAL.split("def _fallback_open", 1)[1].split("def _fallback_closed", 1)[0]
-    assert "self._state = _STATE_OPEN" in fallback_open
-    assert "self._transitioning = False" in fallback_open
-    assert "self._reveal_prepared_modal()" in fallback_open
-    assert "self._hide_transition_surface()" in fallback_open
+    abort = MODAL.split("def _abort_open", 1)[1].split("def _fallback_closed", 1)[0]
+    assert "self._state = _STATE_CLOSED" in abort
+    assert "self._hide_transition_surface()" in abort
+    assert "self._clear_snapshots()" in abort
+    assert "self._resume_underlay()" in abort
 
     fallback_closed = MODAL.split("def _fallback_closed", 1)[1].split(
         "def _ensure_transition_surface", 1
@@ -171,22 +200,22 @@ def test_any_transition_preparation_exception_cannot_trap_modal_state() -> None:
     assert "self._state = _STATE_CLOSED" in fallback_closed
     assert "self.details.close()" in fallback_closed
     assert "self._hide_transition_surface()" in fallback_closed
+    assert "self._resume_underlay()" in fallback_closed
 
 
-def test_modal_lifecycle_no_longer_depends_on_drawer_show_reentry() -> None:
+def test_modal_lifecycle_never_uses_drawer_show_reentry_as_transition_driver() -> None:
     for state in (
         "_STATE_CLOSED",
+        "_STATE_OPENING_PENDING",
         "_STATE_OPENING",
         "_STATE_OPEN",
         "_STATE_CLOSING",
     ):
         assert state in MODAL
-    assert "_STATE_OPENING_PENDING" not in MODAL
     assert "self.details.drawer.installEventFilter(self)" not in MODAL
     filter_body = MODAL.split("def eventFilter", 1)[1].split("def cleanup", 1)[0]
     assert "self.details.drawer" not in filter_body
     assert "QEvent.Type.Show" not in filter_body
-    assert "QTimer.singleShot" not in MODAL
 
 
 def test_open_close_motion_is_short_and_subtle() -> None:
