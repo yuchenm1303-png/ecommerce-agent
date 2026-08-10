@@ -51,13 +51,17 @@ def test_motion_suspends_responsive_competition_and_uses_shared_gate() -> None:
     assert "end_inline_motion(self.window)" in MOTION
 
 
-def test_glass_png_and_background_effects_are_frozen_during_reflow() -> None:
+def test_glass_png_and_competing_ui_timers_are_frozen_during_reflow() -> None:
     assert "_update_mask_texture" in GUARD
     assert "_inline_card_motion_active" in GUARD
     assert "_mask_ready" in GUARD
-    assert "pointer_timer.stop()" in GUARD
     assert 'quick.setProperty("animationRunning", False)' in GUARD
-    assert "effects_timer.stop()" in GUARD
+    assert '_pause_timer(background, "_pointer_timer"' in GUARD
+    assert '_pause_timer(effects, "timer"' in GUARD
+    assert '_pause_timer(card_fx, "_sample_timer"' in GUARD
+    assert '_pause_timer(card_fx, "_animation_timer"' in GUARD
+    assert '_pause_timer(scroller, "_timer"' in GUARD
+    assert 'setattr(background, "_last_pointer_norm", None)' in GUARD
     assert "schedule()" in GUARD
 
 
