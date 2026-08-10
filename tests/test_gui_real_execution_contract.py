@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from gui.real_execution import resolver_evidence_images
+
 
 ROOT = Path(__file__).resolve().parents[1]
 REAL = (ROOT / "gui" / "real_execution.py").read_text(encoding="utf-8")
@@ -33,3 +35,35 @@ def test_image_upload_is_explicit_and_qc_stays_policy_locked() -> None:
     assert 'send_to_qc=False (repository policy lock)' in REAL
     assert '"--send-to-qc"' not in REAL
     assert '"send_to_qc_clicked": False' in EXECUTOR
+
+
+def test_real_execution_uses_product_images_without_adding_page_screenshot(
+    tmp_path: Path,
+) -> None:
+    screenshot = tmp_path / "source-page.png"
+    screenshot.write_bytes(b"page")
+    first = tmp_path / "product-01.jpg"
+    second = tmp_path / "product-02.jpg"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+
+    assert resolver_evidence_images(
+        {
+            "primary_source_screenshot": str(screenshot),
+            "primary_source_product_images": [str(first), str(second)],
+        }
+    ) == [first, second]
+
+
+def test_real_execution_uses_page_screenshot_only_as_image_fallback(
+    tmp_path: Path,
+) -> None:
+    screenshot = tmp_path / "source-page.png"
+    screenshot.write_bytes(b"page")
+
+    assert resolver_evidence_images(
+        {
+            "primary_source_screenshot": str(screenshot),
+            "primary_source_product_images": [],
+        }
+    ) == [screenshot]

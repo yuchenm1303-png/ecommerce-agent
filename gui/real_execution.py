@@ -31,6 +31,25 @@ FULL_STEP3 = "__full_step3__"
 PRODUCT_PHOTOS = "Product Photos"
 
 
+def resolver_evidence_images(outputs: dict[str, Any]) -> list[Path]:
+    """Return the exact image universe used by the Resolver.
+
+    Product images are authoritative when capture downloaded them. The page
+    screenshot is only the Resolver's fallback when no product image exists;
+    combining both changes the strict source-manifest digest.
+    """
+
+    product_images = [
+        Path(str(value))
+        for value in outputs.get("primary_source_product_images") or []
+        if str(value).strip() and Path(str(value)).is_file()
+    ]
+    if product_images:
+        return product_images
+    screenshot = Path(str(outputs.get("primary_source_screenshot") or ""))
+    return [screenshot] if screenshot.is_file() else []
+
+
 @dataclass(slots=True)
 class RealExecutionConfig:
     read_only_run_dir: Path
@@ -88,8 +107,6 @@ class RealExecutionRunner(QObject):
             str(prepared["product_url"]),
             "--supplier-snapshot",
             str(prepared["snapshot"]),
-            "--image",
-            str(prepared["screenshot"]),
             "--expected-vertical",
             config.expected_vertical,
             "--cdp-port",
@@ -182,21 +199,17 @@ class RealExecutionRunner(QObject):
         outputs = manifest.get("outputs") or {}
         decision_packet = Path(str(outputs.get("final_decisions") or ""))
         snapshot = Path(str(outputs.get("primary_source_snapshot") or ""))
-        screenshot = Path(str(outputs.get("primary_source_screenshot") or ""))
-        evidence_images = [
-            Path(str(value))
-            for value in outputs.get("primary_source_product_images") or []
-            if str(value).strip()
-        ]
+        evidence_images = resolver_evidence_images(outputs)
         product_url = str(manifest.get("primary_product_url") or "").strip()
 
         required = {
             "live_schema": live_schema,
             "decision_packet": decision_packet,
             "snapshot": snapshot,
-            "screenshot": screenshot,
         }
         missing = [f"{name}={path}" for name, path in required.items() if not path.is_file()]
+        if not evidence_images:
+            missing.append("evidence_images=<missing>")
         if not product_url:
             missing.append("primary_product_url=<missing>")
         if missing:
@@ -205,7 +218,7 @@ class RealExecutionRunner(QObject):
         return {
             **required,
             "product_url": product_url,
-            "evidence_images": [path for path in evidence_images if path.is_file()],
+            "evidence_images": evidence_images,
         }
 
     def _read_output(self) -> None:
