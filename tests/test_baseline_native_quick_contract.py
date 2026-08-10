@@ -124,7 +124,7 @@ def test_native_shell_focus_bridge_is_limited_to_keyboard_controls() -> None:
     assert "QPlainTextEdit" in SHELL
     assert "QAbstractItemView" in SHELL
     assert "focusPolicy()" not in SHELL
-    assert "_focus_watch" not in SHELL
+    assert "_keyboard_focus_watch" in SHELL
     assert "QEvent.Type.MouseButtonPress" in SHELL
 
 
