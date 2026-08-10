@@ -170,6 +170,11 @@ def _is_navigation_context_error(exc: BaseException) -> bool:
     return "execution context was destroyed" in text and "navigation" in text
 
 
+def _is_timeout_error(exc: BaseException) -> bool:
+    text = str(exc).casefold()
+    return "timeout" in text and "exceeded" in text
+
+
 def _wait_for_navigation_recovery(page, *, settle_ms: int) -> None:
     """Wait for a replacement execution context after a supplier-side navigation.
 
@@ -279,9 +284,28 @@ def _screenshot_with_navigation_retry(
     settle_ms: int,
     attempts: int = 4,
 ) -> None:
+    """Capture a useful screenshot without making full-page rendering a hard gate.
+
+    Very long/dynamic supplier pages can exceed Playwright's screenshot timeout
+    even after the source snapshot is already valid. Retry only navigation races;
+    on a plain full-page timeout, immediately fall back to the current viewport.
+    """
+
     for attempt in range(max(1, attempts)):
         try:
             page.screenshot(path=str(path), full_page=True)
+            return
+        except PlaywrightError as exc:
+            if _is_navigation_context_error(exc) and attempt + 1 < attempts:
+                _wait_for_navigation_recovery(page, settle_ms=settle_ms)
+                continue
+            if not _is_timeout_error(exc):
+                raise
+            break
+
+    for attempt in range(max(1, attempts)):
+        try:
+            page.screenshot(path=str(path), full_page=False)
             return
         except PlaywrightError as exc:
             if not _is_navigation_context_error(exc) or attempt + 1 >= attempts:
@@ -338,8 +362,8 @@ def _download_page_images(context, image_urls: list[str], output_dir: Path, *, m
             path.write_bytes(body)
             saved.append(path)
         except Exception:
-            # Image downloads are supplemental. The snapshot + full-page screenshot
-            # remain valid evidence even when a CDN refuses an individual request.
+            # Image downloads are supplemental. The snapshot + screenshot remain
+            # valid evidence even when a CDN refuses an individual request.
             continue
         finally:
             if response is not None:
