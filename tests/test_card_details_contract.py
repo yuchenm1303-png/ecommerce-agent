@@ -35,41 +35,48 @@ def test_every_presentation_card_family_gets_expand_affordance() -> None:
     assert "frame.installEventFilter(self)" in BASE_DETAILS
 
 
-def test_fast_drawer_uses_short_lived_high_refresh_position_only_motion() -> None:
-    assert "_MOTION_INTERVAL_MS = 8" in FAST_DETAILS
-    assert "Qt.TimerType.PreciseTimer" in FAST_DETAILS
-    assert 'self._motion_timer.setInterval(_MOTION_INTERVAL_MS)' in FAST_DETAILS
-    assert 'self._start_motion("opening")' in FAST_DETAILS
-    assert 'self.drawer.move(' in FAST_DETAILS
-    assert 'self.drawer.setGraphicsEffect(None)' in FAST_DETAILS
-    assert 'b"geometry"' not in FAST_DETAILS
-    assert "QParallelAnimationGroup" not in FAST_DETAILS
-    assert "QPropertyAnimation" not in FAST_DETAILS
+def test_fast_drawer_uses_qt_property_animation_not_python_8ms_loop() -> None:
+    assert "QPropertyAnimation" in FAST_DETAILS
+    assert "QParallelAnimationGroup" in FAST_DETAILS
+    assert 'b"pos"' in FAST_DETAILS
+    assert 'b"geometry"' in FAST_DETAILS
+    assert "_DRAWER_OPEN_MS = 138" in FAST_DETAILS
+    assert "_DRAWER_CLOSE_MS = 126" in FAST_DETAILS
+    assert "PreciseTimer" not in FAST_DETAILS
+    assert "_motion_timer" not in FAST_DETAILS
+    assert "def _tick_motion" not in FAST_DETAILS
+    assert "time.perf_counter" not in FAST_DETAILS
+    assert "self.drawer.setGraphicsEffect(None)" in FAST_DETAILS
 
 
 def test_source_card_feedback_stays_small_instead_of_resizing_to_drawer() -> None:
-    assert "_CARD_PULSE_PAD = 5" in FAST_DETAILS
-    assert "self._source_rect.adjusted(-pad, -pad, pad, pad)" in FAST_DETAILS
-    assert "self.ghost_effect.setOpacity" in FAST_DETAILS
-    assert "source,\n                target" not in FAST_DETAILS
+    assert "_CARD_PULSE_PAD = 4" in FAST_DETAILS
+    assert "self._source_rect.adjusted" in FAST_DETAILS
+    assert "self.ghost_effect" in FAST_DETAILS
+    assert "ghost_geometry.setKeyValueAt" in FAST_DETAILS
 
 
-def test_detail_body_has_separate_animated_reveal_instead_of_popping() -> None:
+def test_detail_body_has_separate_qt_animated_reveal_instead_of_popping() -> None:
     assert 'self.reveal_cover.setObjectName("cardDetailRevealCover")' in FAST_DETAILS
-    assert "def _set_reveal_progress" in FAST_DETAILS
     assert "def _start_content_reveal" in FAST_DETAILS
-    assert 'self._start_motion("revealing")' in FAST_DETAILS
-    assert "_CONTENT_REVEAL_MS = 108" in FAST_DETAILS
+    assert "_CONTENT_REVEAL_MS = 104" in FAST_DETAILS
     assert "self._populate(frame)" in FAST_DETAILS
-    assert FAST_DETAILS.index("self.drawer.setGeometry(target)") < FAST_DETAILS.index("self._populate(frame)")
+    assert 'self.reveal_cover,\n                b"geometry"' in FAST_DETAILS
 
 
 def test_close_animation_covers_complex_body_while_sliding_out() -> None:
-    assert 'self._start_motion("closing")' in FAST_DETAILS
-    assert "_DRAWER_CLOSE_MS = 128" in FAST_DETAILS
-    assert "self._set_reveal_progress(1.0 - cover)" in FAST_DETAILS
+    assert "_DRAWER_CLOSE_MS = 126" in FAST_DETAILS
+    assert "end_pos" in FAST_DETAILS
+    assert "self.reveal_cover" in FAST_DETAILS
     assert "self.drawer.hide()" in FAST_DETAILS
     assert "self.scrim.hide()" in FAST_DETAILS
+
+
+def test_detail_geometry_notifications_are_coalesced() -> None:
+    assert "_GEOMETRY_COALESCE_MS = 32" in FAST_DETAILS
+    assert "self._geometry_timer.setSingleShot(True)" in FAST_DETAILS
+    assert "def _schedule_geometry" in FAST_DETAILS
+    assert "QTimer.singleShot(0, lambda card=" not in FAST_DETAILS
 
 
 def test_details_are_useful_not_generic_placeholders() -> None:
@@ -85,10 +92,7 @@ def test_details_are_useful_not_generic_placeholders() -> None:
     assert 'table.property("detailTitle")' in BASE_DETAILS
 
 
-def test_detail_motion_has_no_continuous_idle_timer_or_layout_height_animation() -> None:
-    assert "self._motion_timer.start()" in FAST_DETAILS
-    assert "self._motion_timer.stop()" in FAST_DETAILS
-    assert "setInterval(16)" not in FAST_DETAILS
+def test_detail_motion_has_no_layout_height_animation_or_global_filter() -> None:
     assert "QApplication.instance().installEventFilter" not in FAST_DETAILS
     assert "setMinimumHeight" not in FAST_DETAILS
     assert "setMaximumHeight" not in FAST_DETAILS
