@@ -18,6 +18,12 @@ _PANEL_CLOSE_DROP_PX = 12
 _PANEL_OPEN_SCALE = 0.985
 _PANEL_CLOSE_SCALE = 0.990
 
+_STATE_CLOSED = "closed"
+_STATE_OPENING_PENDING = "opening-pending"
+_STATE_OPENING = "opening"
+_STATE_OPEN = "open"
+_STATE_CLOSING = "closing"
+
 
 _TRANSITION_QML = rf'''
 import QtQuick
@@ -208,10 +214,15 @@ Item {{
 class GlassModalInteractionController(QObject):
     """GPU-composited modal transitions over the stable QWidget application.
 
-    QML is created lazily after the event loop is running.  If the transition
+    QML is created lazily after the event loop is running. If the transition
     item cannot be created on a particular PySide/Qt build, the modal remains
     fully functional and simply falls back to the already-prepared atomic
     QWidget presentation instead of aborting application startup.
+
+    The lifecycle is an explicit finite state machine. In particular, restoring
+    the QWidget child after a Quick transition can emit QEvent.Show again for the
+    still-visible drawer; those synthetic show events must never start a second
+    transition.
     """
 
     def __init__(self, window: QMainWindow, details: FastCardDetailController) -> None:
@@ -229,6 +240,7 @@ class GlassModalInteractionController(QObject):
 
         self.transition_item: QQuickItem | None = None
         self._transition_error = ""
+        self._state = _STATE_CLOSED
         self._transitioning = False
         self._target_open = False
         self._command = 0
@@ -242,7 +254,7 @@ class GlassModalInteractionController(QObject):
         self._original_capture_backdrop = self.details._capture_backdrop  # noqa: SLF001
         self.details._capture_backdrop = self._capture_raw_backdrop  # type: ignore[method-assign]  # noqa: SLF001
 
-        # Do NOT create QQmlComponent here.  This controller is installed before
+        # Do NOT create QQmlComponent here. This controller is installed before
         # app.exec(); optional QML imports can still be in Loading state there.
         self.details.drawer.installEventFilter(self)
         self.root.installEventFilter(self)
@@ -375,7 +387,7 @@ class GlassModalInteractionController(QObject):
         item.setProperty("command", self._command)
 
     def _start_open_transition(self) -> None:
-        if self._transitioning:
+        if self._state != _STATE_OPENING_PENDING:
             return
 
         base = self.details.backdrop.pixmap()
@@ -385,25 +397,36 @@ class GlassModalInteractionController(QObject):
         if not blurred.isNull():
             self.details.backdrop.setPixmap(blurred)
 
-        # QML is optional presentation.  If it is unavailable, the fully prepared
+        # QML is optional presentation. If it is unavailable, the fully prepared
         # atomic modal that FastCardDetailController already showed simply stays.
         if not self._ensure_transition_item():
+            self._state = _STATE_OPEN
+            self._transitioning = False
+            self._target_open = True
             return
 
         panel = self.details.drawer.grab()
         self._configure_quick_item(base, blurred if not blurred.isNull() else base, panel)
+        self._state = _STATE_OPENING
         self._transitioning = True
         self._target_open = True
         self._issue_transition(closing=False)
         self.window.hide()
 
     def request_close(self, *_args: object) -> None:
-        if self._transitioning:
+        if self._state != _STATE_OPEN:
             return
         if not self.details.drawer.isVisible() and not self.details.scrim.isVisible():
+            self._state = _STATE_CLOSED
+            self._target_open = False
             return
+
         if not self._ensure_transition_item():
+            self._state = _STATE_CLOSING
+            self._transitioning = False
+            self._target_open = False
             self.details.close()
+            self._state = _STATE_CLOSED
             return
 
         base = self._base_snapshot
@@ -415,6 +438,7 @@ class GlassModalInteractionController(QObject):
         panel = self.details.drawer.grab()
         self._configure_quick_item(base, blurred if not blurred.isNull() else base, panel)
 
+        self._state = _STATE_CLOSING
         self._transitioning = True
         self._target_open = False
         self._issue_transition(closing=True)
@@ -431,36 +455,55 @@ class GlassModalInteractionController(QObject):
 
     def _on_transition_finished(self, opened: bool) -> None:
         if opened:
+            if self._state != _STATE_OPENING:
+                return
+            # Move to OPEN *before* window.show(). Showing the parent emits Show
+            # again for visible children on Windows; eventFilter must see OPEN and
+            # ignore that synthetic drawer Show instead of recursively reopening.
+            self._state = _STATE_OPEN
+            self._transitioning = False
+            self._target_open = True
             self._restore_widget_layer()
             self.details.close_button.setFocus(Qt.FocusReason.OtherFocusReason)
-        else:
-            self.details.close()
-            self._restore_widget_layer()
-            self._base_snapshot = QPixmap()
-            self._blur_snapshot = QPixmap()
-            self._base_url = QUrl()
-            self._blur_url = QUrl()
+            return
 
+        if self._state != _STATE_CLOSING:
+            return
+        # Likewise settle CLOSED before hiding modal widgets/restoring the parent
+        # so no lifecycle event can schedule another transition.
+        self._state = _STATE_CLOSED
         self._transitioning = False
-        self._target_open = bool(opened)
+        self._target_open = False
+        self.details.close()
+        self._restore_widget_layer()
+        self._base_snapshot = QPixmap()
+        self._blur_snapshot = QPixmap()
+        self._base_url = QUrl()
+        self._blur_url = QUrl()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
 
         if watched is self.details.drawer and event_type == QEvent.Type.Show:
-            # Run after FastCardDetailController finishes its atomic final-layout
-            # preparation.  This also guarantees the normal Qt event loop is live.
-            QTimer.singleShot(0, self._start_open_transition)
+            # A real open is the CLOSED -> OPENING_PENDING edge. Parent-window
+            # restoration can emit Show for the same visible drawer again; all
+            # non-CLOSED states intentionally ignore those synthetic events.
+            if self._state == _STATE_CLOSED:
+                self._state = _STATE_OPENING_PENDING
+                QTimer.singleShot(0, self._start_open_transition)
             return False
 
         if watched is self.root and event_type == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
-            if event.key() == Qt.Key.Key_Escape and self.details.drawer.isVisible():
+            if event.key() == Qt.Key.Key_Escape and self._state == _STATE_OPEN:
                 self.request_close()
                 return True
 
         return False
 
     def cleanup(self) -> None:
+        self._state = _STATE_CLOSED
+        self._transitioning = False
+        self._target_open = False
         try:
             self.details.drawer.removeEventFilter(self)
         except RuntimeError:
