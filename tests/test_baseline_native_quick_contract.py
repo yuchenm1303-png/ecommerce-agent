@@ -108,7 +108,7 @@ def test_native_shell_is_single_window_tree_and_native_pixel_sized() -> None:
     assert "createWindowContainer" not in SHELL + NATIVE
 
 
-def test_native_shell_focus_bridge_has_no_per_control_event_filters() -> None:
+def test_native_shell_focus_bridge_is_limited_to_keyboard_controls() -> None:
     assert "def _focus_native_child" in SHELL
     assert "user32.SetFocus" in SHELL
     assert "user32.GetFocus" in SHELL
@@ -117,9 +117,15 @@ def test_native_shell_focus_bridge_has_no_per_control_event_filters() -> None:
     assert "app.focusChanged.connect(self._on_focus_changed)" in SHELL
     assert "self._last_focus_widget" in SHELL
     assert "target.setFocus(Qt.FocusReason.ActiveWindowFocusReason)" in SHELL
+    assert "_KEYBOARD_WIDGET_TYPES" in SHELL
+    assert "QLineEdit" in SHELL
+    assert "QAbstractSpinBox" in SHELL
+    assert "QComboBox" in SHELL
+    assert "QPlainTextEdit" in SHELL
+    assert "QAbstractItemView" in SHELL
+    assert "focusPolicy()" not in SHELL
     assert "_focus_watch" not in SHELL
-    assert "widget.installEventFilter(self)" not in SHELL
-    assert "QEvent.Type.MouseButtonPress" not in SHELL
+    assert "QEvent.Type.MouseButtonPress" in SHELL
 
 
 def test_smooth_wheel_filter_is_scoped_to_scroll_areas() -> None:
