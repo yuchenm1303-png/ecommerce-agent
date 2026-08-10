@@ -22,6 +22,7 @@ GUI_SOURCES = [
     PROJECT_ROOT / "gui" / "ui_maturity.py",
     PROJECT_ROOT / "gui" / "card_details.py",
     PROJECT_ROOT / "gui" / "card_details_fast.py",
+    PROJECT_ROOT / "gui" / "modal_interaction.py",
     PROJECT_ROOT / "gui" / "console_summary_mode.py",
     PROJECT_ROOT / "gui" / "nekro_card_fx.py",
     PROJECT_ROOT / "gui" / "nekro_effects.py",
