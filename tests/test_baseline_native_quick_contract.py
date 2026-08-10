@@ -34,7 +34,7 @@ def test_card_hit_test_uses_one_pointer_sampler_not_per_widget_filters() -> None
     assert "widget.installEventFilter(self)" not in CARD_FX
     assert "QApplication.widgetAt" not in CARD_FX
     assert "app.installEventFilter(self)" not in CARD_FX
-    assert "_inline_card_motion_active" in CARD_FX
+    assert "_inline_card_motion_active" not in CARD_FX
 
 
 def test_glass_blur_mask_is_static_until_geometry_changes() -> None:
