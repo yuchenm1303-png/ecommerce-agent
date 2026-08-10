@@ -9,9 +9,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QStackedWidget,
     QVBoxLayout,
+    QWidget,
 )
 
+from .batch_workspace import BatchWorkspace
 from .console_window import MainWindow as ConsoleMainWindow
 from .readonly_runner import RunnerConfig
 from .real_execution import FULL_STEP3
@@ -29,12 +32,13 @@ _AUTO_PRODUCT_PHOTO_LIMIT = 5
 
 
 class WorkflowMainWindow(ConsoleMainWindow):
-    """Business-wiring upgrade layered over the preserved QWidget visual shell."""
+    """Single-product lab plus production-oriented Batch control tower."""
 
     def __init__(self, project_root: Path) -> None:
         super().__init__(project_root)
-        self.setWindowTitle("ecommerce-agent · Current Workflow Acceptance")
+        self.setWindowTitle("ecommerce-agent · Listing Automation")
         self._relabel_acceptance_console()
+        self._install_mode_workspace()
 
     def _build_input_card(self) -> QFrame:
         card = super()._build_input_card()
@@ -105,6 +109,121 @@ class WorkflowMainWindow(ConsoleMainWindow):
         layout.insertLayout(2, stage_row)
         return card
 
+    def _install_mode_workspace(self) -> None:
+        """Wrap the preserved Single UI and the new Batch UI in one instant stack.
+
+        The base QWidget GUI is not rebuilt. Its existing top-level cards/layouts
+        are moved intact into the Single page, preserving all parallel visual
+        work, while Batch gets a separate full workspace using the same shell.
+        """
+
+        root = self.centralWidget()
+        outer = root.layout() if root is not None else None
+        if root is None or not isinstance(outer, QVBoxLayout):
+            raise RuntimeError("WorkflowMainWindow expected the preserved QVBoxLayout root")
+
+        single_page = QWidget()
+        single_page.setObjectName("singleWorkspace")
+        single_layout = QVBoxLayout(single_page)
+        single_layout.setContentsMargins(0, 0, 0, 0)
+        single_layout.setSpacing(14)
+
+        # Item 0 is the common application header. Everything below it belongs
+        # to the existing Single workspace and is moved without reconstruction.
+        while outer.count() > 1:
+            item = outer.takeAt(1)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget is not None:
+                stretch = 1 if widget.objectName() == "workspaceHost" else 0
+                single_layout.addWidget(widget, stretch)
+            elif child_layout is not None:
+                single_layout.addLayout(child_layout)
+
+        switch_card = QFrame()
+        switch_card.setObjectName("microCard")
+        switch_layout = QHBoxLayout(switch_card)
+        switch_layout.setContentsMargins(7, 5, 7, 5)
+        switch_layout.setSpacing(3)
+        switch_layout.addStretch(1)
+        self.single_mode_button = QPushButton("SINGLE")
+        self.batch_mode_button = QPushButton("BATCH")
+        for button in (self.single_mode_button, self.batch_mode_button):
+            button.setCheckable(True)
+            button.setObjectName("quietButton")
+            button.setMinimumWidth(112)
+            button.setStyleSheet(
+                "QPushButton:checked {"
+                "background-color: rgba(190, 113, 157, 190);"
+                "border-color: rgba(255, 220, 239, 105);"
+                "font-weight: 720;"
+                "}"
+            )
+            switch_layout.addWidget(button)
+        switch_layout.addStretch(1)
+
+        self.mode_stack = QStackedWidget()
+        self.mode_stack.setObjectName("modeStack")
+        self.mode_stack.addWidget(single_page)
+        self.batch_workspace = BatchWorkspace(
+            self.project_root,
+            busy_guard=self._single_is_busy,
+            parent=self.mode_stack,
+        )
+        self.mode_stack.addWidget(self.batch_workspace)
+
+        self.single_mode_button.clicked.connect(lambda: self._set_workspace_mode(0))
+        self.batch_mode_button.clicked.connect(lambda: self._set_workspace_mode(1))
+        self.batch_workspace.controller.state_changed.connect(self._batch_state_changed)
+
+        outer.addWidget(switch_card)
+        outer.addWidget(self.mode_stack, 1)
+        self._set_workspace_mode(0)
+
+    def _set_workspace_mode(self, index: int) -> None:
+        index = 0 if int(index) <= 0 else 1
+        self.mode_stack.setCurrentIndex(index)
+        self.single_mode_button.setChecked(index == 0)
+        self.batch_mode_button.setChecked(index == 1)
+        self.open_run_button.setVisible(index == 0)
+        if index == 0:
+            if self.runner.is_running:
+                self.phase_badge.setText("SINGLE · workflow running")
+            elif getattr(self, "execution_runner", None) is not None and self.execution_runner.is_running:
+                self.phase_badge.setText("SINGLE · real execution running")
+            else:
+                self.phase_badge.setText("SINGLE · ready")
+        else:
+            batch = self.batch_workspace.controller.batch
+            if self.batch_workspace.is_running:
+                self.phase_badge.setText("BATCH · running")
+            elif batch is not None:
+                summary = batch.summary()
+                self.phase_badge.setText(
+                    f"BATCH · {summary['ready']} ready · {summary['done']} done · {summary['review']} review"
+                )
+            else:
+                self.phase_badge.setText("BATCH · ready for URLs")
+
+    def _batch_state_changed(self, text: str) -> None:
+        if hasattr(self, "mode_stack") and self.mode_stack.currentIndex() == 1:
+            self.phase_badge.setText(f"BATCH · {text}")
+
+    def _single_is_busy(self) -> bool:
+        return bool(
+            self.runner.is_running
+            or (
+                getattr(self, "execution_runner", None) is not None
+                and self.execution_runner.is_running
+            )
+        )
+
+    def _batch_is_busy(self) -> bool:
+        return bool(
+            hasattr(self, "batch_workspace")
+            and self.batch_workspace.is_running
+        )
+
     def _sync_execution_mode_copy(self, *_args: object) -> None:
         if not hasattr(self, "real_scope_combo") or not hasattr(self, "real_start_button"):
             return
@@ -169,6 +288,9 @@ class WorkflowMainWindow(ConsoleMainWindow):
         self._start_mode("full")
 
     def _start_mode(self, mode: str) -> None:
+        if self._batch_is_busy():
+            QMessageBox.warning(self, "无法开始 Single", "Batch worker 仍在运行。")
+            return
         if getattr(self, "execution_runner", None) is not None and self.execution_runner.is_running:
             QMessageBox.warning(self, "无法开始", "真实 Step 3 执行仍在运行。")
             return
@@ -259,6 +381,9 @@ class WorkflowMainWindow(ConsoleMainWindow):
         )
 
     def _start_real_execution(self) -> None:
+        if self._batch_is_busy():
+            QMessageBox.warning(self, "无法开始 Single 真实填写", "Batch worker 仍在运行。")
+            return
         if self.current_result is not None and self.current_result.vertical:
             self.vertical_input.setText(self.current_result.vertical)
 
