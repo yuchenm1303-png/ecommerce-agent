@@ -314,13 +314,12 @@ def cancel_section(page: Page, section_title: str, *, wait_ms: int = 450) -> Non
 
 
 def save_section(page: Page, section_title: str, *, timeout_s: float = 15.0) -> None:
-    """Save one Step 3 card and prove Makro accepted the persistence operation.
+    """Click one Step 3 card's Save and prove Makro accepted persistence.
 
-    Success means all of the following are true:
-    1. the expanded card has one unique visible Save button;
-    2. there are no already-visible validation errors before clicking Save;
-    3. after clicking Save the card collapses back to EDIT within ``timeout_s``;
-    4. the collapsed card has no ``N Error(s)`` badge.
+    The browser executor deliberately does not veto Save because stale inline
+    validation text is still rendered before the click. Makro owns the actual
+    section validation transaction; success is determined only by what happens
+    after Save: the card must collapse back to EDIT and expose no error badge.
 
     This function never clicks Send to QC.
     """
@@ -333,13 +332,6 @@ def save_section(page: Page, section_title: str, *, timeout_s: float = 15.0) -> 
     path = str(section.get("path") or "")
     if not path:
         raise RuntimeError(f"Save 前 section 缺少 DOM path：{section_title}")
-
-    inline_errors = visible_section_errors(page, path)
-    if inline_errors:
-        raise RuntimeError(
-            f"{section_title} Save 前仍存在 Makro validation error："
-            + " | ".join(inline_errors)
-        )
 
     card = page.locator(path)
     save = card.locator("button").filter(has_text=re.compile(r"^\s*Save\s*$", re.I))
@@ -362,6 +354,8 @@ def save_section(page: Page, section_title: str, *, timeout_s: float = 15.0) -> 
                 )
             return
 
-    errors = visible_section_errors(page, path)
+    live = find_section(page, section_title)
+    live_path = str((live or {}).get("path") or path)
+    errors = visible_section_errors(page, live_path)
     detail = " | ".join(errors) if errors else "未读取到可见 validation error"
     raise RuntimeError(f"{section_title} 点击 Save 后未恢复 EDIT：{detail}")
