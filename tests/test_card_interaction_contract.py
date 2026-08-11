@@ -69,6 +69,18 @@ def test_all_big_and_small_glass_cards_use_the_same_full_interaction() -> None:
     assert "for frame in window.findChildren(QFrame):" in CARD_FX
 
 
+def test_large_cards_normalize_hover_by_reference_edge_growth() -> None:
+    assert "_REFERENCE_CARD_SPAN_PX = 300.0" in CARD_FX
+    assert "_REFERENCE_EDGE_GROWTH_PX" in CARD_FX
+    assert "def _hover_scale_for(frame: QFrame) -> float:" in CARD_FX
+    normalizer = _body(CARD_FX, "def _hover_scale_for", "def _nearest_card")
+    assert "max(1.0, float(frame.width()), float(frame.height()))" in normalizer
+    assert "2.0 * _REFERENCE_EDGE_GROWTH_PX / span" in normalizer
+    assert "min(_HOVER_SCALE, normalized)" in normalizer
+    hover = _body(CARD_FX, "def _hover", "def _active")
+    assert "scale=self._hover_scale_for(frame)" in hover
+
+
 def test_quick_glass_and_widget_content_share_one_scale_state() -> None:
     assert "SCALE_ROLE = _ROLE_BASE + 11" in NATIVE_BG
     assert 'SCALE_ROLE: "cardScale"' in NATIVE_BG
@@ -82,6 +94,22 @@ def test_quick_glass_and_widget_content_share_one_scale_state() -> None:
     assert "scale=scale" in proxy
     assert "alpha=overlay_alpha" in proxy
     assert "self._scale_effect.set_scale(scale)" in proxy
+
+
+def test_hover_shell_uses_window_coordinates_without_internal_clip_regions() -> None:
+    qml = _body(NATIVE_BG, "def _qml_source", "class NativeQuickBackground")
+    repeater = qml.split("Repeater {{", 1)[1].split("FrameAnimation {{", 1)[0]
+    assert "x: 0" in repeater
+    assert "y: 0" in repeater
+    assert "width: root.width" in repeater
+    assert "height: root.height" in repeater
+    assert "clip: false" in repeater
+    assert "x: cardX" in repeater
+    assert "y: cardY" in repeater
+    assert "x: clipX" not in repeater
+    assert "y: clipY" not in repeater
+    assert "width: clipW" not in repeater
+    assert "height: clipH" not in repeater
 
 
 def test_quick_owns_glass_darkening_without_extra_qwidget_tint_layer() -> None:
