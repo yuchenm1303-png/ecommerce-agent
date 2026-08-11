@@ -132,11 +132,10 @@ def test_high_frequency_interaction_updates_only_one_quick_model_row_not_global_
     assert "schedule_mask_update" not in presentation
 
 
-def test_static_blur_mask_can_reflect_current_scale_when_geometry_refreshes() -> None:
+def test_global_blur_mask_remains_geometry_only_during_hover() -> None:
     render_mask = _body(NATIVE_BG, "def render_mask", "def _qml_source")
-    assert 'scale = float(state.get("cardScale", 1.0))' in render_mask
-    assert "half_w = card.width() * scale * 0.5" in render_mask
-    assert "half_h = card.height() * scale * 0.5" in render_mask
+    assert 'state.get("cardScale"' not in render_mask
+    assert "painter.drawRoundedRect(card, _GLASS_RADIUS, _GLASS_RADIUS)" in render_mask
 
 
 def test_modal_suspend_returns_cards_to_exact_normal_state() -> None:
