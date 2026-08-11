@@ -33,8 +33,10 @@ def test_switch_matches_reference_300ms_cubic_bezier_and_supports_reversal() -> 
 def test_switch_matches_reference_settings_panel_visual_override_and_inline_prompts() -> None:
     assert "QColor(255, 255, 255, 0x30)" in TOGGLE
     assert "painter.drawRoundedRect(core, 10.0, 10.0)" in TOGGLE
-    assert 'painter.drawText(icon_rect, Qt.AlignmentFlag.AlignCenter, "✓")' in TOGGLE
-    assert 'painter.drawText(icon_rect, Qt.AlignmentFlag.AlignCenter, "×")' in TOGGLE
+    assert 'painter.drawText(on_rect, Qt.AlignmentFlag.AlignCenter, "✓")' in TOGGLE
+    assert 'painter.drawText(off_rect, Qt.AlignmentFlag.AlignCenter, "×")' in TOGGLE
+    assert "painter.setOpacity(self._action_position)" in TOGGLE
+    assert "painter.setOpacity(1.0 - self._action_position)" in TOGGLE
     assert "painter.drawEllipse(action)" in TOGGLE
     assert "hover" not in TOGGLE.lower()
 
