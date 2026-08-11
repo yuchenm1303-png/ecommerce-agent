@@ -20,6 +20,7 @@ def main() -> int:
         )
         return 2
 
+    from gui.activity_presence import install_activity_presence
     from gui.card_details_fast import install_card_details
     from gui.console_summary_mode import install_console_summary_mode
     from gui.console_window import MainWindow
@@ -62,6 +63,7 @@ def main() -> int:
     window.install_mode_workspace()
     install_workspace_mode_switch(window)
     install_required_input_support(window)
+    install_activity_presence(window)
     visual.refresh_glass_frames()
 
     smooth_wheel = SmoothWheelFilter(window)
