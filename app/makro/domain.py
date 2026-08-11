@@ -269,18 +269,28 @@ class MakroDomainAdapter:
         section_path: str | None = None,
         recheck_wait_ms: int = 800,
     ) -> FillVerification:
+        section = base_section_title(str(semantic_field.get("section_heading") or ""))
+        label = str(semantic_field.get("label") or semantic_field.get("attribute_key") or "field").strip()
+        safe_section = section.replace("\t", " ").replace("\n", " ")
+        safe_label = label.replace("\t", " ").replace("\n", " ")
+        print(f"GUI_EXEC_FIELD\tSTART\t{safe_section}\t{safe_label}", flush=True)
         expanded = self._ensure_answer_value_slots(
             semantic_field,
             answer,
             section_path,
         )
-        return fill_resolved_field(
+        verification = fill_resolved_field(
             self.page,
             expanded,
             answer,
             section_path=section_path,
             recheck_wait_ms=recheck_wait_ms,
         )
+        print(
+            f"GUI_EXEC_FIELD\tCOMPLETE\t{safe_section}\t{safe_label}\t{verification.status}",
+            flush=True,
+        )
+        return verification
 
     def verify_resolved_field(
         self,
