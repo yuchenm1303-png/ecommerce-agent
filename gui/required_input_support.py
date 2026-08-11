@@ -19,6 +19,10 @@ class RequiredInputSupport(QObject):
     still BLOCKED after that pass get an input. Placeholder text is GUI-only and
     is never written to Makro; only non-empty text explicitly entered by the
     user is persisted to required-overrides.json for the production executor.
+
+    ``request_start`` is the canonical GUI execution request. Both the preserved
+    main button and any detail-panel action call this exact preflight directly;
+    no action simulates a click on another hidden QPushButton.
     """
 
     def __init__(self, window: Any) -> None:
@@ -33,14 +37,13 @@ class RequiredInputSupport(QObject):
         window.execution_runner.running_changed.connect(lambda _running: self._sync_button())
         window.real_scope_combo.currentIndexChanged.connect(lambda _index: self._sync_button())
 
-        # The button was connected to the subclass method during construction.
-        # Replace that one action with our required-input preflight, then call the
-        # exact original method after the explicit user values have been written.
+        # Replace the construction-time action with one canonical preflight.
         try:
             window.real_start_button.clicked.disconnect()
         except Exception:
             pass
-        window.real_start_button.clicked.connect(self._on_start_clicked)
+        window.real_start_button.clicked.connect(self.request_start)
+        window._request_real_execution = self.request_start
 
     @staticmethod
     def _identity(payload: dict[str, Any]) -> tuple[str, str, str]:
@@ -144,9 +147,11 @@ class RequiredInputSupport(QObject):
         result = getattr(self.window, "current_result", None)
         if result is None or not result.plan_summary:
             self.window.real_start_button.setEnabled(False)
+            self.window.real_start_button.setToolTip("请先完成 Step 3 Resolver + Fill Plan。")
             return
         if self.window.runner.is_running or self.window.execution_runner.is_running:
             self.window.real_start_button.setEnabled(False)
+            self.window.real_start_button.setToolTip("当前已有准备流程或真实执行正在运行。")
             return
         scope = self.window.real_scope_combo.currentData()
         if scope == FULL_STEP3 and self.inputs:
@@ -159,6 +164,8 @@ class RequiredInputSupport(QObject):
                 self.window.real_start_button.setToolTip("必填项已补齐；执行全部 READY + 用户补充字段。")
         else:
             self.window.real_start_button.setEnabled(result.ready > 0)
+            if result.ready <= 0:
+                self.window.real_start_button.setToolTip("当前 Fill Plan 没有 READY 字段。")
 
     def _write_overrides(self) -> Path | None:
         result = getattr(self.window, "current_result", None)
@@ -186,7 +193,20 @@ class RequiredInputSupport(QObject):
         )
         return path
 
-    def _on_start_clicked(self, _checked: bool = False) -> None:
+    def request_start(self, _checked: bool = False) -> None:
+        """Run the one canonical GUI preflight, regardless of which UI invoked it."""
+
+        result = getattr(self.window, "current_result", None)
+        if self.window.runner.is_running or self.window.execution_runner.is_running:
+            QMessageBox.warning(self.window, "无法开始真实填写", "当前已有准备流程或真实执行正在运行。")
+            return
+        if result is None or not result.plan_summary:
+            QMessageBox.warning(self.window, "无法开始真实填写", "请先完成 Step 3 Resolver + Fill Plan。")
+            return
+        if result.ready <= 0:
+            QMessageBox.warning(self.window, "没有可填写字段", "当前 Fill Plan 没有 READY 字段，真实填写保持锁定。")
+            return
+
         scope = self.window.real_scope_combo.currentData()
         if scope == FULL_STEP3 and self.inputs and not self._all_required_filled():
             missing = [
@@ -206,6 +226,10 @@ class RequiredInputSupport(QObject):
             QMessageBox.critical(self.window, "无法保存必填补充值", str(exc))
             return
         self._original_start()
+
+    def _on_start_clicked(self, _checked: bool = False) -> None:
+        # Compatibility for older callers/tests; all new UI uses request_start.
+        self.request_start(_checked)
 
 
 def install_required_input_support(window: Any) -> RequiredInputSupport:
