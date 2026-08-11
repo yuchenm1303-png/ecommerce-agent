@@ -154,6 +154,10 @@ QPushButton#modalPrimaryButton {
 QPushButton#modalPrimaryButton:hover {
     background-color: rgba(255, 255, 255, 52);
 }
+QPushButton#modalPrimaryButton:pressed {
+    background-color: rgba(255, 255, 255, 30);
+    border-color: rgba(255, 255, 255, 44);
+}
 QPushButton#modalDangerButton {
     min-height: 35px;
     padding: 0 18px;
@@ -266,7 +270,9 @@ class FastCardDetailController(CardDetailController):
         result.setDevicePixelRatio(1.0)
         return result
 
-    def _capture_backdrop(self) -> QPixmap:
+    def _capture_source(self) -> QPixmap:
+        """Capture the current live underlay exactly once before modal presentation."""
+
         screen = self.window.screen()
         pixmap = QPixmap()
         if screen is not None:
@@ -282,7 +288,10 @@ class FastCardDetailController(CardDetailController):
             )
         if pixmap.isNull():
             pixmap = self.root.grab()
-        return self._blur_pixmap(pixmap)
+        return pixmap
+
+    def _capture_backdrop(self) -> QPixmap:
+        return self._blur_pixmap(self._capture_source())
 
     def _schedule_geometry(self) -> None:
         if not self._geometry_timer.isActive():
@@ -378,11 +387,6 @@ class FastCardDetailController(CardDetailController):
         self._show_prepared_modal(ratio=ratio)
 
     def close(self) -> None:
-        # isVisible() becomes False when the native QWidget layer's parent is
-        # temporarily hidden for a Quick close transition, even though the
-        # drawer/scrim themselves were never explicitly hidden. isHidden()
-        # tracks that explicit state, so close must still run while the parent
-        # is off-screen and prevent those children from resurfacing on show().
         if self.drawer.isHidden() and self.scrim.isHidden():
             return
 
@@ -487,12 +491,18 @@ class FastCardDetailController(CardDetailController):
 
             def sync_image_controls() -> None:
                 count.setText(count_source.text())
+                pick.setText(pick_source.text())
+                pick.setToolTip(pick_source.toolTip())
                 pick.setEnabled(pick_source.isEnabled())
                 upload.setChecked(upload_source.isChecked())
                 upload.setEnabled(upload_source.isEnabled())
 
             def choose_images() -> None:
-                pick_source.click()
+                action = getattr(self.window, "_pick_upload_images", None)
+                if callable(action):
+                    action()
+                else:
+                    pick_source.click()
                 QTimer.singleShot(0, sync_image_controls)
 
             pick.setEnabled(pick_source.isEnabled())
@@ -517,8 +527,16 @@ class FastCardDetailController(CardDetailController):
             stop.setObjectName("modalDangerButton")
 
             def sync_execution_buttons() -> None:
-                start.setEnabled(start_source.isEnabled())
+                busy = bool(
+                    self.window.runner.is_running
+                    or self.window.execution_runner.is_running
+                )
+                start.setEnabled(not busy)
+                start.setText(start_source.text())
+                start.setToolTip(start_source.toolTip())
                 stop.setEnabled(stop_source.isEnabled())
+                stop.setText(stop_source.text())
+                stop.setToolTip(stop_source.toolTip())
                 combo.setEnabled(scope_source.isEnabled())
                 save.setEnabled(save_source.isEnabled())
                 qc.setEnabled(qc_source.isEnabled())
@@ -530,12 +548,20 @@ class FastCardDetailController(CardDetailController):
             )
 
             def start_execution() -> None:
-                start_source.click()
+                request = getattr(self.window, "_request_real_execution", None)
+                if callable(request):
+                    request()
+                else:
+                    action = getattr(self.window, "_start_real_execution", None)
+                    if callable(action):
+                        action()
                 QTimer.singleShot(0, sync_execution_buttons)
                 QTimer.singleShot(250, sync_execution_buttons)
 
             def stop_execution() -> None:
-                stop_source.click()
+                action = getattr(self.window, "_stop_real_execution", None)
+                if callable(action):
+                    action()
                 QTimer.singleShot(0, sync_execution_buttons)
                 QTimer.singleShot(250, sync_execution_buttons)
 
