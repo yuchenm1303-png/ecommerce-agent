@@ -63,12 +63,24 @@ def test_minimize_restore_keeps_quick_resources_and_last_complete_glass_mask() -
     assert "self._original_flush()" in flush
 
 
-def test_tables_reuse_items_and_cached_brushes() -> None:
+def test_idle_background_pointer_sampling_keeps_8ms_semantics_but_skips_static_work() -> None:
+    assert "def _install_idle_pointer_fast_path" in RUNTIME
+    assert "timer.timeout.disconnect(original)" in RUNTIME
+    assert "controller._last_pointer_global == point" in RUNTIME
+    assert "controller._last_pointer_quick_geometry == geometry" in RUNTIME
+    assert 'getattr(bg, "_last_pointer_norm", None) is not None' in RUNTIME
+    assert "original()" in RUNTIME
+
+
+def test_tables_reuse_items_cached_brushes_and_batch_row_fingerprints() -> None:
     assert "item = table.item(row, column)" in RUNTIME
     assert "if item is None:" in RUNTIME
     assert "self._ai_status_brushes" in RUNTIME
     assert "self._final_status_brushes" in RUNTIME
     assert "self._batch_status_brushes" in RUNTIME
+    assert "self._batch_row_fingerprints" in RUNTIME
+    assert "previous != new_fingerprints" in RUNTIME
+    assert "previous[row] == new_fingerprints[row]" in RUNTIME
     assert "if old_rows != new_rows:" in RUNTIME
     assert "table.resizeRowsToContents()" in RUNTIME
 
@@ -92,12 +104,15 @@ def test_activity_log_filters_forward_only_existing_progress_markers() -> None:
         assert marker in RUNTIME
 
 
-def test_card_visual_parameters_are_unchanged_while_descendant_filters_are_removed() -> None:
+def test_card_visual_parameters_are_current_while_hot_paths_are_local() -> None:
     assert "_NORMAL_ALPHA = 64.0" in CARD_FX
-    assert "_HOVER_ALPHA = 90.0" in CARD_FX
-    assert "_ACTIVE_ALPHA = 110.0" in CARD_FX
+    assert "_HOVER_ALPHA = 102.0" in CARD_FX
+    assert "_ACTIVE_ALPHA = 102.0" in CARD_FX
+    assert "_TRANSITION_MS = 300" in CARD_FX
     assert "_POINTER_SAMPLE_MS = 8" in CARD_FX
-    assert "_MIN_PRESSED_MS = 24" in CARD_FX
+    assert "_MIN_PRESSED_MS" not in CARD_FX
+    assert "self._moving_frames" in CARD_FX
+    assert "def _hover_still_owns_global" in CARD_FX
     assert "self.window.childAt(local)" in CARD_FX
     assert "widget.installEventFilter(self)" not in CARD_FX
     assert "QApplication.widgetAt" not in CARD_FX
