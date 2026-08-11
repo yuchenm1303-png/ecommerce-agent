@@ -16,6 +16,7 @@ from .visual_style import NEKRO_STYLE
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
 _NORMAL_GLASS_ALPHA = 64.0
+_EFFECT_BOUND_SCALE = 1.04
 
 
 class _CardScaleEffect(QGraphicsEffect):
@@ -37,23 +38,25 @@ class _CardScaleEffect(QGraphicsEffect):
         return self._scale
 
     def set_scale(self, scale: float) -> None:
-        scale = max(0.96, min(1.04, float(scale)))
+        scale = max(0.96, min(_EFFECT_BOUND_SCALE, float(scale)))
         if abs(scale - self._scale) <= 1e-5:
             return
         self._scale = scale
         active = abs(scale - 1.0) > 1e-4
         if self.isEnabled() != active:
+            # The effect uses one fixed maximum bounding rect for its whole active
+            # lifetime. Only entering/leaving the effect changes geometry; the
+            # dozens of intermediate hover frames now invalidate pixels only.
             self.setEnabled(active)
-        self.updateBoundingRect()
+            self.updateBoundingRect()
         self.update()
 
     def boundingRectFor(self, source_rect: QRectF) -> QRectF:  # noqa: N802
-        scale = self._scale
-        if scale <= 1.0 + 1e-4:
+        if not self.isEnabled():
             return QRectF(source_rect)
         center = source_rect.center()
-        half_w = source_rect.width() * scale * 0.5
-        half_h = source_rect.height() * scale * 0.5
+        half_w = source_rect.width() * _EFFECT_BOUND_SCALE * 0.5
+        half_h = source_rect.height() * _EFFECT_BOUND_SCALE * 0.5
         return QRectF(
             center.x() - half_w,
             center.y() - half_h,
