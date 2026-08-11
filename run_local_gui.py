@@ -41,6 +41,7 @@ def main() -> int:
     from gui.ui_polish import install_ui_polish
     from gui.ui_runtime_optimizations import install_ui_runtime_optimizations
     from gui.workspace_transition import install_workspace_transition
+    from gui.workspace_transition_tuning import apply_workspace_transition_tuning
     from gui.smooth_scroll import SmoothWheelFilter
 
     MainWindow = WorkflowMainWindow
@@ -104,10 +105,10 @@ def main() -> int:
     install_buffered_logs(window)
     effects = install_nekro_effects(window, sakura_count=3)
 
-    # Single/Batch keeps the established business QStackedWidget, but its visible
-    # handoff is staged through two cached composite frames. The switch thumb and
-    # workspace transition share the same 300 ms interaction window; complex
-    # QWidget pages are never animated live.
+    # Keep the stabilized workspace transition implementation unchanged. Only its
+    # presentation timing tokens are tuned here: the large workspace now takes
+    # 480 ms while the tiny 300 ms switch remains quick to acknowledge input.
+    apply_workspace_transition_tuning()
     install_workspace_transition(window, visual)
 
     shell.show()
