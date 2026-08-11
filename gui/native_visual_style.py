@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QApplication,
     QFrame,
+    QGraphicsEffect,
     QMainWindow,
     QWidget,
 )
@@ -22,9 +23,9 @@ _GLASS_RADIUS = 6.0
 def _interaction_overlay_alpha(target_alpha: float) -> int:
     """Return the local black overlay that composes base 64 to target alpha.
 
-    Quick owns the stable base glass tint (64). Interactive hover/press tint is
-    painted above that base in QWidget. Alpha composition is solved exactly so
-    target 90/110 keeps the same visual darkness as the former Quick role update.
+    Quick owns the stable base glass tint (64). The reference website's link
+    cards deepen to rgba(0, 0, 0, .4) on hover, so interaction darkness remains
+    local to the QWidget card rather than crossing the QWidget -> QML boundary.
     """
 
     target = max(_NORMAL_GLASS_ALPHA, min(255.0, float(target_alpha)))
@@ -41,12 +42,7 @@ def _interaction_overlay_alpha(target_alpha: float) -> int:
 
 
 class _CardInteractionTint(QWidget):
-    """Tiny synchronous hover/press layer inside one QWidget card.
-
-    This layer is deliberately kept in the same renderer that receives mouse
-    input. It sits below the card's labels/controls, above the native Quick glass,
-    never accepts input, and repaints only the card rectangle.
-    """
+    """Mouse-transparent darkening layer inside one native-glass card."""
 
     def __init__(self, frame: QFrame) -> None:
         super().__init__(frame)
@@ -68,9 +64,9 @@ class _CardInteractionTint(QWidget):
         if alpha == self._alpha:
             return
         self._alpha = alpha
-        # This is intentionally synchronous. Hover/press is a tiny card-local
-        # paint and should be visible in the same GUI turn as the mouse event.
-        self.repaint()
+        # Interaction is now a continuous 300 ms motion. Let Qt coalesce these
+        # tiny card-local updates instead of synchronously blocking on repaint().
+        self.update()
 
     def sync_geometry(self) -> None:
         geometry = self.frame.rect()
@@ -103,8 +99,69 @@ class _CardInteractionTint(QWidget):
             pass
 
 
+class _CardScaleEffect(QGraphicsEffect):
+    """CSS-transform analogue for one complete QWidget card subtree.
+
+    The reference website transforms the card as a single DOM layer, so text,
+    icons and the hover glass tint must move together. QWidget has no native CSS
+    transform; this effect transforms the already composed widget source without
+    resizing layouts or touching any child geometry. At scale 1 it is disabled,
+    so steady-state cards remain on the normal QWidget paint path.
+    """
+
+    def __init__(self, parent: QObject) -> None:
+        super().__init__(parent)
+        self._scale = 1.0
+        self.setEnabled(False)
+
+    @property
+    def scale(self) -> float:
+        return self._scale
+
+    def set_scale(self, scale: float) -> None:
+        scale = max(0.96, min(1.04, float(scale)))
+        if abs(scale - self._scale) <= 1e-5:
+            return
+        self._scale = scale
+        active = abs(scale - 1.0) > 1e-4
+        if self.isEnabled() != active:
+            self.setEnabled(active)
+        self.updateBoundingRect()
+        self.update()
+
+    def boundingRectFor(self, source_rect: QRectF) -> QRectF:  # noqa: N802
+        scale = self._scale
+        if scale <= 1.0 + 1e-4:
+            return QRectF(source_rect)
+        center = source_rect.center()
+        half_w = source_rect.width() * scale * 0.5
+        half_h = source_rect.height() * scale * 0.5
+        return QRectF(
+            center.x() - half_w,
+            center.y() - half_h,
+            half_w * 2.0,
+            half_h * 2.0,
+        )
+
+    def draw(self, painter: QPainter) -> None:  # type: ignore[override]
+        scale = self._scale
+        if abs(scale - 1.0) <= 1e-4:
+            self.drawSource(painter)
+            return
+
+        source_rect = self.sourceBoundingRect(Qt.CoordinateSystem.LogicalCoordinates)
+        center = source_rect.center()
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.translate(center)
+        painter.scale(scale, scale)
+        painter.translate(-center)
+        self.drawSource(painter)
+        painter.restore()
+
+
 class NativeGlassProxy(QObject):
-    """Stable Quick glass plus immediate QWidget interaction tint."""
+    """Stable Quick glass plus reference-web QWidget interaction presentation."""
 
     def __init__(self, frame: QFrame, background: NativeQuickBackground) -> None:
         super().__init__(frame)
@@ -113,6 +170,8 @@ class NativeGlassProxy(QObject):
         self._surface_scale = 1.0
         self._overlay_alpha = _NORMAL_GLASS_ALPHA
         self._interaction_tint = _CardInteractionTint(frame)
+        self._scale_effect = _CardScaleEffect(frame)
+        frame.setGraphicsEffect(self._scale_effect)
 
     @property
     def surface_scale(self) -> float:
@@ -123,13 +182,12 @@ class NativeGlassProxy(QObject):
         return self._overlay_alpha
 
     def set_interaction(self, *, scale: float, overlay_alpha: float) -> None:
-        # High-frequency input feedback stays entirely in QWidget. Crossing from
-        # QWidget input -> QAbstractListModel -> QML -> threaded Quick present was
-        # the source of inconsistent hover/click latency. Quick now remains at the
-        # stable 64-alpha glass baseline while this tiny local tint composes the
-        # exact target 90/110 darkness synchronously.
-        scale = max(0.94, min(1.0, float(scale)))
-        overlay_alpha = max(0.0, min(255.0, float(overlay_alpha)))
+        # Keep the expensive native Quick blur/mask stable. The small interactive
+        # delta stays entirely in QWidget: the local dark tint deepens the glass,
+        # and one card-local effect scales the complete composed subtree exactly
+        # like the reference site's `.item.cards` transform.
+        scale = max(0.96, min(1.04, float(scale)))
+        overlay_alpha = max(_NORMAL_GLASS_ALPHA, min(255.0, float(overlay_alpha)))
         if (
             abs(scale - self._surface_scale) < 0.0001
             and abs(overlay_alpha - self._overlay_alpha) < 0.1
@@ -138,12 +196,18 @@ class NativeGlassProxy(QObject):
         self._surface_scale = scale
         self._overlay_alpha = overlay_alpha
         self._interaction_tint.set_target_alpha(overlay_alpha)
+        self._scale_effect.set_scale(scale)
 
     def sync_geometry(self) -> None:
         self._interaction_tint.sync_geometry()
         self.background.schedule_mask_update()
 
     def cleanup(self) -> None:
+        try:
+            self._scale_effect.set_scale(1.0)
+            self.frame.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
         self._interaction_tint.cleanup()
 
 
@@ -170,8 +234,8 @@ class NativeVisualStyleController(QObject):
             # paint. Installing it globally made every Qt event cross Python.
             self.central.installEventFilter(self)
 
-        # Reuse baseline style constants verbatim. No replacement card border,
-        # tint or hover CSS is introduced here.
+        # Reuse baseline style constants verbatim. No replacement card border is
+        # introduced; only the reference site's interaction presentation differs.
         window.setStyleSheet(window.styleSheet() + "\n" + NEKRO_STYLE)
 
         self.background = NativeQuickBackground(window)
@@ -188,12 +252,7 @@ class NativeVisualStyleController(QObject):
         return self._glass.get(frame)
 
     def refresh_glass_frames(self) -> int:
-        """Register glass cards created after the native Quick scene started.
-
-        Batch Workspace is intentionally constructed only after the proven Single
-        UI plugins finish installing. Append new glass frames to the same stable
-        Quick base-glass model and give each one the same local interaction tint.
-        """
+        """Register glass cards created after the native Quick scene started."""
 
         new_frames = [
             frame
