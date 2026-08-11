@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import (
     QAbstractAnimation,
+    QCoreApplication,
     QEasingCurve,
     QEvent,
     QObject,
@@ -137,9 +138,6 @@ class StaticModalInteractionController(QObject):
         self._original_close = self.details.close
         self._original_schedule_geometry = self.details._schedule_geometry  # noqa: SLF001
 
-        # FastCardDetailController already owns the final glass appearance.
-        # Transition frames must not attach a QGraphicsOpacityEffect to that
-        # complex child tree; the compositor handles opacity as one cached layer.
         self.details.drawer.setGraphicsEffect(None)
         self.details.drawer_effect = None  # type: ignore[assignment]
 
@@ -311,12 +309,39 @@ class StaticModalInteractionController(QObject):
         self._progress_animation.setEasingCurve(easing)
         self._progress_animation.start()
 
+    def _settle_drawer_tree(self) -> None:
+        """Synchronously realize style/layout for every child before capture.
+
+        A newly shown complex QWidget can have posted polish/layout work pending
+        even though show() has already returned. Capturing in that gap produced a
+        panel-only frame and made the real text pop in at handoff. Flush only the
+        non-input polish/layout queues, then activate every nested layout twice so
+        scroll-area viewports, tables, labels and buttons have final geometry.
+        """
+
+        drawer = self.details.drawer
+        widgets = (drawer, *drawer.findChildren(QWidget))
+        for widget in widgets:
+            try:
+                widget.ensurePolished()
+            except RuntimeError:
+                pass
+
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.PolishRequest)
+        for _ in range(2):
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)
+            self.details.body_layout.activate()
+            for widget in widgets:
+                try:
+                    layout = widget.layout()
+                    if layout is not None:
+                        layout.activate()
+                except RuntimeError:
+                    pass
+
     def _render_drawer_frame(self) -> QPixmap:
         drawer = self.details.drawer
-        drawer.ensurePolished()
-        self.details.body_layout.activate()
-        if drawer.layout() is not None:
-            drawer.layout().activate()
+        self._settle_drawer_tree()
 
         dpr = max(1.0, float(drawer.devicePixelRatioF()))
         width = max(1, int(round(drawer.width() * dpr)))
@@ -336,31 +361,39 @@ class StaticModalInteractionController(QObject):
         self.details._modal_ratio = ratio  # noqa: SLF001
         backdrop = self.details._capture_backdrop()  # noqa: SLF001
         target = self.details._drawer_rect()  # noqa: SLF001
+        drawer = self.details.drawer
 
         updates_were_enabled = self.root.updatesEnabled()
         if updates_were_enabled:
             self.root.setUpdatesEnabled(False)
 
+        previous_dont_show = drawer.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
+        drawer.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        frame = QPixmap()
+
         try:
             self.details.backdrop.setPixmap(backdrop)
             self.details.backdrop.setGeometry(self.root.rect())
             self.details.scrim.setGeometry(self.root.rect())
-            self.details.drawer.setGeometry(target)
-            self.details.body_layout.activate()
-            if self.details.drawer.layout() is not None:
-                self.details.drawer.layout().activate()
+            drawer.setGeometry(target)
             self.details.scroll.verticalScrollBar().setValue(0)
             self.details.ghost.hide()
 
-            # The drawer is shown only while it paints into the off-screen cache.
-            # Root updates are disabled, so no intermediate real frame is exposed.
-            self.details.drawer.show()
-            self.details.drawer.raise_()
+            # Enter a real visible QWidget state so every nested child receives
+            # its normal show/polish/layout lifecycle, but WA_DontShowOnScreen
+            # guarantees this priming frame can never reach the user's display.
+            drawer.show()
             frame = self._render_drawer_frame()
             if frame.isNull():
                 raise RuntimeError("failed to render modal drawer frame")
-            self.details.drawer.hide()
+        finally:
+            drawer.hide()
+            drawer.setAttribute(
+                Qt.WidgetAttribute.WA_DontShowOnScreen,
+                previous_dont_show,
+            )
 
+        try:
             self.details.backdrop.show()
             self.details.backdrop.raise_()
             self.details.scrim.show()
@@ -374,6 +407,7 @@ class StaticModalInteractionController(QObject):
                 self.root.setUpdatesEnabled(True)
 
         self.root.repaint()
+        self._compositor.repaint()
         return target
 
     def _prepare_close_state(self) -> QRect:
@@ -546,8 +580,6 @@ class StaticModalInteractionController(QObject):
                     self.request_close()
                     return True
             elif event_type == QEvent.Type.Resize:
-                # A mid-transition resize invalidates the cached target rect.
-                # Finalize atomically rather than stretching a stale snapshot.
                 if self._state == _STATE_OPENING:
                     self._stop_animation()
                     self._finish_open()
