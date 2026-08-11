@@ -21,12 +21,12 @@ from app.makro.listing_creation import (
     MAKRO_NEW_LISTING_URL,
     infer_listing_bootstrap,
     is_vertical_step,
-    select_vertical,
 )
 from app.makro.step3_transition import (
     dismiss_joyride_overlay,
     select_brand_to_product_info,
 )
+from app.makro.vertical_selection import select_vertical
 from app.providers.registry import ProviderConfigurationError, build_semantic_provider
 from app.source_capture import SourceAccessBlocked, capture_product_source
 from makro_gui_workflow import _phase, _prepare_step3, _write_manifest, build_parser
