@@ -19,8 +19,10 @@ def test_runtime_assistant_is_independent_non_modal_tool_window() -> None:
     assert "Qt.WindowType.Tool" in ASSISTANT
     assert "Qt.WindowType.FramelessWindowHint" in ASSISTANT
     assert "Qt.WindowType.WindowStaysOnTopHint" in ASSISTANT
-    assert "WA_TranslucentBackground" in ASSISTANT
+    assert "WA_TranslucentBackground" not in ASSISTANT
     assert "WA_ShowWithoutActivating" in ASSISTANT
+    assert "background-color: #0b1a2b" in ASSISTANT
+    assert "setWindowOpacity(0.96)" in ASSISTANT
 
 
 def test_runtime_assistant_is_draggable_and_remembers_position() -> None:
@@ -28,11 +30,22 @@ def test_runtime_assistant_is_draggable_and_remembers_position() -> None:
     assert "def mousePressEvent" in ASSISTANT
     assert "def mouseMoveEvent" in ASSISTANT
     assert "def mouseReleaseEvent" in ASSISTANT
+    assert "self.grabMouse()" in ASSISTANT
+    assert "self.releaseMouse()" in ASSISTANT
+    assert "WA_TransparentForMouseEvents" in ASSISTANT
     assert "self._settings.setValue(\"position\", self.pos())" in ASSISTANT
+    assert "self._settings.setValue(\"position_version\", self._POSITION_VERSION)" in ASSISTANT
     assert "QApplication.screens()" in ASSISTANT
     assert "QApplication.screenAt" in ASSISTANT
     assert "self._COMPACT_WIDTH" in ASSISTANT
     assert "self._EXPANDED_WIDTH" in ASSISTANT
+
+
+def test_runtime_assistant_defaults_to_top_right_and_migrates_old_position() -> None:
+    assert "_POSITION_VERSION = 2" in ASSISTANT
+    assert "version == self._POSITION_VERSION" in ASSISTANT
+    assert "y = area.top() + self._SCREEN_MARGIN" in ASSISTANT
+    assert "area.bottom() - self.height()" not in ASSISTANT
 
 
 def test_phase_one_is_explicit_shadow_mode() -> None:
