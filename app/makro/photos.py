@@ -117,6 +117,20 @@ def _slot_snapshot(page: Page, section_path: str) -> list[dict[str, Any]]:
     )
 
 
+def _uploading_visible(page: Page, section_path: str) -> bool:
+    """Return whether Makro is actively processing the selected photo upload."""
+
+    surface = _photo_surface(page, section_path)
+    matches = surface.get_by_text(re.compile(r"\bUploading\b", re.IGNORECASE))
+    for index in range(matches.count()):
+        try:
+            if matches.nth(index).is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _photo_state(page: Page, section_path: str) -> dict[str, Any]:
     surface = _photo_surface(page, section_path)
     if surface.count() != 1:
@@ -163,6 +177,7 @@ def _photo_state(page: Page, section_path: str) -> dict[str, Any]:
         "file_inputs": input_meta,
         "visible_image_count": len(sources),
         "visible_image_sources": sources,
+        "uploading": _uploading_visible(page, section_path),
     }
 
 
@@ -232,7 +247,9 @@ def _visible_upload_photo_button(page: Page, section_path: str):
         try:
             if candidate.is_visible():
                 button = candidate.locator("xpath=ancestor-or-self::button[1]")
-                visible.append(button if button.count() == 1 else candidate)
+                control = button if button.count() == 1 else candidate
+                if control.is_enabled():
+                    visible.append(control)
         except Exception:
             continue
     if len(visible) > 1:
@@ -242,8 +259,8 @@ def _visible_upload_photo_button(page: Page, section_path: str):
     return visible[0] if visible else None
 
 
-def _wait_for_upload_photo_button(page: Page, section_path: str, *, timeout_ms: int = 900):
-    """Wait only for the active role panel control, not a blind fixed delay."""
+def _wait_for_upload_photo_button(page: Page, section_path: str, *, timeout_ms: int = 2_000):
+    """Wait for the active role control without waiting for page-wide stability."""
 
     deadline = time.monotonic() + timeout_ms / 1000.0
     while time.monotonic() < deadline:
@@ -252,6 +269,53 @@ def _wait_for_upload_photo_button(page: Page, section_path: str, *, timeout_ms: 
             return current
         page.wait_for_timeout(50)
     return None
+
+
+def _wait_for_target_slot_completion(
+    page: Page,
+    section_path: str,
+    slot_id: str,
+    *,
+    soft_timeout_ms: int = 12_000,
+    uploading_timeout_ms: int = 60_000,
+) -> dict[str, Any]:
+    """Wait for one submitted image without ever clicking it again.
+
+    Before Makro exposes ``Uploading`` we allow a short submission window. Once
+    that real server-processing state appears, the only correct action is to
+    wait until the selected thumbnail loses its orange ``+``. The long timeout
+    is a hard safety ceiling, not a fixed sleep: completion returns immediately.
+    """
+
+    started = time.monotonic()
+    soft_deadline = started + soft_timeout_ms / 1000.0
+    hard_deadline = started + max(uploading_timeout_ms, soft_timeout_ms) / 1000.0
+    uploading_seen = False
+    latest: dict[str, Any] = {}
+
+    while True:
+        section = find_section(page, PRODUCT_PHOTOS_SECTION)
+        live_path = str((section or {}).get("path") or section_path)
+        latest = _photo_state(page, live_path)
+        empty_slots = {str(value) for value in latest.get("empty_slot_ids") or []}
+        if slot_id not in empty_slots:
+            latest["uploading_seen"] = uploading_seen
+            return latest
+
+        if bool(latest.get("uploading")):
+            uploading_seen = True
+
+        now = time.monotonic()
+        if uploading_seen:
+            if now >= hard_deadline:
+                raise RuntimeError(
+                    f"#{slot_id} 已进入 Uploading，但 {uploading_timeout_ms}ms 内仍未完成。"
+                )
+        elif now >= soft_deadline:
+            raise RuntimeError(
+                f"#{slot_id} 文件已提交，但 {soft_timeout_ms}ms 内既未进入 Uploading 也未完成。"
+            )
+        page.wait_for_timeout(100)
 
 
 class _DynamicPhotoFileTarget:
@@ -275,45 +339,52 @@ class _DynamicPhotoFileTarget:
         slot = surface.locator(f"#{self.slot_id}")
         if slot.count() != 1:
             raise RuntimeError(f"Product Photos 找不到目标图片槽 #{self.slot_id}。")
+        if not slot.is_visible():
+            raise RuntimeError(f"Product Photos 图片槽 #{self.slot_id} 当前不可见。")
 
-        # Verified human-equivalent flow: role card -> Upload Photo -> file.
-        # Bound click timeouts avoid Playwright's long actionability retries.
-        slot.scroll_into_view_if_needed()
-        slot.click(timeout=1_500)
+        # Makro's flashing global banner can keep Playwright's normal click in
+        # the actionability "stable" wait for many seconds. We already verified
+        # this exact role card is visible, so use a forced real mouse click to
+        # bypass only that unrelated stability gate.
+        slot.evaluate("el => el.scrollIntoView({block: 'nearest', inline: 'nearest'})")
+        slot.click(timeout=1_500, force=True)
 
         current_path = self._current_path()
         upload_button = _wait_for_upload_photo_button(self.page, current_path)
         if upload_button is None:
             raise RuntimeError(
-                f"点击 #{self.slot_id} 图片框后 900ms 内没有出现可见 Upload Photo 按钮。"
+                f"点击 #{self.slot_id} 图片框后 2000ms 内没有出现可见 Upload Photo 按钮。"
             )
 
-        # The shared hidden input is commonly already mounted. Capture it before
-        # the click so a missing file-chooser event can fall back immediately.
         shared = _raw_file_input(self.page, current_path)
         try:
-            with self.page.expect_file_chooser(timeout=700) as chooser_info:
-                upload_button.click(timeout=1_500)
+            with self.page.expect_file_chooser(timeout=1_500) as chooser_info:
+                # Same reason as the role card: the button is already proven
+                # visible/enabled, so do not let page-wide animation block it.
+                upload_button.click(timeout=1_500, force=True)
             chooser_info.value.set_files(upload)
-            self._selected = True
-            return
         except PlaywrightTimeoutError:
-            pass
+            # Fallback is retained only for Makro builds that do not surface a
+            # filechooser event. It is never used as a retry while Uploading.
+            if shared is None:
+                deadline = time.monotonic() + 1.5
+                while time.monotonic() < deadline:
+                    current_path = self._current_path()
+                    shared = _raw_file_input(self.page, current_path)
+                    if shared is not None:
+                        break
+                    self.page.wait_for_timeout(50)
+            if shared is None:
+                raise RuntimeError(
+                    f"#{self.slot_id} 已点击 Upload Photo，但没有 file chooser，"
+                    "也找不到共享 input[type=file]。"
+                )
+            shared.set_input_files(upload)
 
-        if shared is None:
-            deadline = time.monotonic() + 1.0
-            while time.monotonic() < deadline:
-                current_path = self._current_path()
-                shared = _raw_file_input(self.page, current_path)
-                if shared is not None:
-                    break
-                self.page.wait_for_timeout(50)
-        if shared is None:
-            raise RuntimeError(
-                f"#{self.slot_id} 图片框已选中且已点击 Upload Photo，但没有 file chooser，"
-                "也找不到共享 input[type=file]。"
-            )
-        shared.set_input_files(upload)
+        # The file has now been submitted exactly once. Do not click again.
+        # If Makro shows Uploading, wait for the server to finish; if the slot
+        # completes quickly, this returns immediately.
+        _wait_for_target_slot_completion(self.page, current_path, self.slot_id)
         self._selected = True
 
     def evaluate(self, _expression: str) -> int:
