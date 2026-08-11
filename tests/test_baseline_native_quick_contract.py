@@ -8,6 +8,7 @@ CARD_FX = (ROOT / "gui" / "nekro_card_fx.py").read_text(encoding="utf-8")
 BASE_VISUAL = (ROOT / "gui" / "visual_style.py").read_text(encoding="utf-8")
 ADAPTER = (ROOT / "gui" / "native_visual_style.py").read_text(encoding="utf-8")
 NATIVE = (ROOT / "gui" / "native_background.py").read_text(encoding="utf-8")
+RUNTIME = (ROOT / "gui" / "ui_runtime_optimizations.py").read_text(encoding="utf-8")
 EFFECTS = (ROOT / "gui" / "nekro_effects.py").read_text(encoding="utf-8")
 LOGS = (ROOT / "gui" / "log_presenter.py").read_text(encoding="utf-8")
 SHELL = (ROOT / "gui" / "native_window_shell.py").read_text(encoding="utf-8")
@@ -15,24 +16,22 @@ SCROLL = (ROOT / "gui" / "smooth_scroll.py").read_text(encoding="utf-8")
 RUNNER = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
-def test_baseline_card_animation_curve_is_preserved() -> None:
+def test_baseline_card_interaction_visual_is_preserved() -> None:
     assert "_NORMAL_ALPHA = 64.0" in CARD_FX
-    assert "_HOVER_ALPHA = 82.0" in CARD_FX
-    assert "_ACTIVE_ALPHA = 96.0" in CARD_FX
-    assert "_HOVER_SECONDS = 0.12" in CARD_FX
-    assert "_PRESS_SECONDS = 0.08" in CARD_FX
-    assert "_RELEASE_SECONDS = 0.12" in CARD_FX
+    assert "_HOVER_ALPHA = 90.0" in CARD_FX
+    assert "_ACTIVE_ALPHA = 110.0" in CARD_FX
+    assert "_MIN_PRESSED_MS = 24" in CARD_FX
     assert "scale=1.0" in CARD_FX
     assert "install_nekro_card_fx(window, visual)" in RUNNER
 
 
-def test_card_hit_test_uses_one_pointer_sampler_not_per_widget_filters() -> None:
-    assert "_POINTER_SAMPLE_MS = 24" in CARD_FX
+def test_card_hit_test_uses_one_local_sampler_not_per_widget_filters() -> None:
+    assert "_POINTER_SAMPLE_MS = 8" in CARD_FX
     assert "QCursor.pos()" in CARD_FX
     assert "self.window.childAt(local)" in CARD_FX
-    assert "window.installEventFilter(self)" in CARD_FX
     assert "widget.installEventFilter(self)" not in CARD_FX
     assert "QApplication.widgetAt" not in CARD_FX
+    assert "QMouseEvent" not in CARD_FX
     assert "app.installEventFilter(self)" not in CARD_FX
     assert "_inline_card_motion_active" not in CARD_FX
 
@@ -49,11 +48,18 @@ def test_glass_blur_mask_is_static_until_geometry_changes() -> None:
     assert "property url maskUrl" in NATIVE
     assert "id: maskImg" in NATIVE
     assert "maskSource: maskImg" in NATIVE
-    assert "glass_mask_" in NATIVE
-    assert "ShaderEffectSource" not in NATIVE
-    assert "live: true" not in NATIVE
     assert "cardAlpha / 255.0" in NATIVE
     assert "_GEOMETRY_SYNC_MS = 24" in NATIVE
+
+
+def test_runtime_glass_mask_avoids_png_round_trip_without_changing_mask_pixels() -> None:
+    assert "class _GlassMaskImageProvider(QQuickImageProvider)" in RUNTIME
+    assert "engine.addImageProvider(_MASK_PROVIDER_ID, provider)" in RUNTIME
+    assert "bg.card_model.render_mask(quick.width(), quick.height())" in RUNTIME
+    assert 'QUrl(f"image://{_MASK_PROVIDER_ID}/{bg._mask_revision}")' in RUNTIME
+    assert "image.save(" not in RUNTIME
+    assert "self._original_mask_update()" in RUNTIME
+    assert "install_ui_runtime_optimizations(window, visual)" in RUNNER
 
 
 def test_batch_cards_join_the_existing_native_glass_model_after_workspace_install() -> None:
@@ -65,7 +71,12 @@ def test_batch_cards_join_the_existing_native_glass_model_after_workspace_instal
     assert "window.install_mode_workspace()" in RUNNER
     assert "visual.refresh_glass_frames()" in RUNNER
     assert RUNNER.index("window.install_mode_workspace()") < RUNNER.index("visual.refresh_glass_frames()")
-    assert RUNNER.index("visual.refresh_glass_frames()") < RUNNER.index("install_nekro_card_fx(window, visual)")
+    assert RUNNER.index("visual.refresh_glass_frames()") < RUNNER.index(
+        "install_ui_runtime_optimizations(window, visual)"
+    )
+    assert RUNNER.index("install_ui_runtime_optimizations(window, visual)") < RUNNER.index(
+        "install_nekro_card_fx(window, visual)"
+    )
 
 
 def test_renderer_samples_pointer_without_global_event_filter() -> None:
@@ -97,6 +108,15 @@ def test_hidden_console_defers_text_document_work() -> None:
     assert "_MAX_HIDDEN_PENDING = 8000" in LOGS
     assert "_MAX_CATCHUP_LINES = 800" in LOGS
     assert "QEvent.Type.Show" in LOGS
+
+
+def test_runtime_tables_reuse_items_instead_of_rebuilding_every_update() -> None:
+    assert "item = table.item(row, column)" in RUNTIME
+    assert "if item is None:" in RUNTIME
+    assert "controller.jobs_changed.disconnect(workspace._apply_jobs)" in RUNTIME
+    assert "controller.jobs_changed.connect(self._apply_batch_jobs)" in RUNTIME
+    assert "if old_rows != new_rows:" in RUNTIME
+    assert "table.resizeRowsToContents()" in RUNTIME
 
 
 def test_baseline_style_and_public_glass_api_are_preserved() -> None:
@@ -140,7 +160,7 @@ def test_native_shell_focus_bridge_is_limited_to_keyboard_controls() -> None:
     assert "QEvent.Type.MouseButtonPress" in SHELL
 
 
-def test_smooth_wheel_filter_is_scoped_to_scroll_areas() -> None:
+def test_smooth_wheel_filter_is_scoped_bounded_and_frame_rate_independent() -> None:
     assert "def install(self, root: QWidget)" in SCROLL
     assert "root.findChildren(QAbstractScrollArea)" in SCROLL
     assert "watched.installEventFilter(self)" in SCROLL
@@ -148,6 +168,11 @@ def test_smooth_wheel_filter_is_scoped_to_scroll_areas() -> None:
     assert "QApplication.instance()" not in SCROLL
     assert "app.installEventFilter" not in RUNNER
     assert "smooth_wheel.install(window)" in RUNNER
+    assert "_clamp_target" in SCROLL
+    assert "if step == 0:" in SCROLL
+    assert "if bar.value() == current:" in SCROLL
+    assert "math.pow(1.0 - self._EASE, dt / self._REFERENCE_DT_S)" in SCROLL
+    assert "self._scroller._animations.clear()" in SCROLL
 
 
 def test_runner_keeps_baseline_business_and_effect_controllers() -> None:
