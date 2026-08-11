@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from types import MethodType
 from threading import RLock
+from types import MethodType
 from typing import Any
 
 from PySide6.QtCore import QObject, QUrl
@@ -50,7 +50,8 @@ class UiRuntimeOptimizations(QObject):
 
     Business runners, permission gates, values, geometry, colors and transition
     durations stay owned by the existing GUI. This controller only removes
-    avoidable allocation/serialization work from paths that can run repeatedly.
+    avoidable allocation/serialization/parsing work from paths that can run
+    repeatedly.
     """
 
     def __init__(self, window: QMainWindow, visual: Any) -> None:
@@ -59,9 +60,17 @@ class UiRuntimeOptimizations(QObject):
         self.visual = visual
         self._mask_provider: _GlassMaskImageProvider | None = None
         self._original_mask_update = None
+        self._default_brush = QBrush()
+        self._ai_status_brushes = {key: QBrush(color) for key, color in _AI_STATUS_COLORS.items()}
+        self._final_status_brushes = {key: QBrush(color) for key, color in STATUS_COLORS.items()}
+        self._batch_status_brushes = {key: QBrush(color) for key, color in _STATUS_COLORS.items()}
+        self._prep_log_filter = None
+        self._real_log_filter = None
+
         self._install_in_memory_glass_mask()
         self._install_in_place_single_tables()
         self._install_in_place_batch_tables()
+        self._install_progress_log_filters()
 
     def _install_in_memory_glass_mask(self) -> None:
         background = getattr(self.visual, "background", None)
@@ -97,16 +106,27 @@ class UiRuntimeOptimizations(QObject):
         background.schedule_mask_update()
 
     @staticmethod
-    def _ensure_item(table: QTableWidget, row: int, column: int, text: str) -> QTableWidgetItem:
+    def _ensure_item(
+        table: QTableWidget,
+        row: int,
+        column: int,
+        text: str,
+        *,
+        tooltip: str | None = None,
+    ) -> QTableWidgetItem:
         item = table.item(row, column)
         if item is None:
             item = QTableWidgetItem(text)
             table.setItem(row, column, item)
         elif item.text() != text:
             item.setText(text)
-        if item.toolTip() != text:
-            item.setToolTip(text)
+        expected_tooltip = text if tooltip is None else tooltip
+        if item.toolTip() != expected_tooltip:
+            item.setToolTip(expected_tooltip)
         return item
+
+    def _brush(self, brushes: dict[str, QBrush], key: str) -> QBrush:
+        return brushes.get(key, self._default_brush)
 
     def _install_in_place_single_tables(self) -> None:
         if not hasattr(self.window, "_populate_fields") or not hasattr(self.window, "_populate_web"):
@@ -135,13 +155,11 @@ class UiRuntimeOptimizations(QObject):
                     for column, value in enumerate(values):
                         item = controller._ensure_item(table, row_index, column, value)
                         if column == 1:
-                            color = _AI_STATUS_COLORS.get(row.ai_status)
-                            brush = QBrush(color) if color is not None else QBrush()
+                            brush = controller._brush(controller._ai_status_brushes, row.ai_status)
                             if item.foreground() != brush:
                                 item.setForeground(brush)
                         elif column == 3:
-                            color = STATUS_COLORS.get(row.final_status)
-                            brush = QBrush(color) if color is not None else QBrush()
+                            brush = controller._brush(controller._final_status_brushes, row.final_status)
                             if item.foreground() != brush:
                                 item.setForeground(brush)
             finally:
@@ -158,24 +176,28 @@ class UiRuntimeOptimizations(QObject):
             try:
                 if old_rows != new_rows:
                     table.setRowCount(new_rows)
-                if window.web_hint.text() != f"{new_rows} candidates":
-                    window.web_hint.setText(f"{new_rows} candidates")
+                hint = f"{new_rows} candidates"
+                if window.web_hint.text() != hint:
+                    window.web_hint.setText(hint)
                 for row_index, candidate in enumerate(candidates):
                     match_text = candidate.match.upper()
                     source_text = candidate.title or candidate.url
                     values = (match_text, source_text, candidate.reason)
                     for column, value in enumerate(values):
-                        item = controller._ensure_item(table, row_index, column, value)
                         tooltip = value
                         if column == 1:
                             tooltip = candidate.url
                         elif column == 2 and candidate.identity_evidence:
                             tooltip += "\n\nIdentity evidence:\n- " + "\n- ".join(candidate.identity_evidence)
-                        if item.toolTip() != tooltip:
-                            item.setToolTip(tooltip)
+                        item = controller._ensure_item(
+                            table,
+                            row_index,
+                            column,
+                            value,
+                            tooltip=tooltip,
+                        )
                         if column == 0:
-                            color = STATUS_COLORS.get(match_text)
-                            brush = QBrush(color) if color is not None else QBrush()
+                            brush = controller._brush(controller._final_status_brushes, match_text)
                             if item.foreground() != brush:
                                 item.setForeground(brush)
             finally:
@@ -236,8 +258,7 @@ class UiRuntimeOptimizations(QObject):
                 for column, value in enumerate(values):
                     item = self._ensure_item(table, row, column, value)
                     if column == 2:
-                        color = _STATUS_COLORS.get(job.status)
-                        brush = QBrush(color) if color is not None else QBrush()
+                        brush = self._brush(self._batch_status_brushes, job.status)
                         if item.foreground() != brush:
                             item.setForeground(brush)
         finally:
@@ -258,6 +279,69 @@ class UiRuntimeOptimizations(QObject):
         label = self.window.batch_workspace.state_label
         if label.text() != text:
             label.setText(text)
+
+    def _install_progress_log_filters(self) -> None:
+        activity = getattr(self.window, "_activity_presence_controller", None)
+        if activity is None:
+            return
+
+        prep = getattr(self.window, "runner", None)
+        prep_handler = getattr(activity, "_on_prep_log", None)
+        if prep is not None and callable(prep_handler):
+            disconnected = False
+            try:
+                prep.log.disconnect(prep_handler)
+                disconnected = True
+            except (RuntimeError, TypeError):
+                pass
+            if disconnected:
+                prep_markers = (
+                    "STEP 3 CURRENT RESOLVER · COLD",
+                    "STEP 3 CURRENT RESOLVER · HOT/CACHE",
+                    "STEP 3 CURRENT READ-ONLY FILL PLAN",
+                )
+
+                def prep_filter(line: str) -> None:
+                    text = str(line or "")
+                    if any(marker in text for marker in prep_markers):
+                        prep_handler(line)
+
+                self._prep_log_filter = prep_filter
+                prep.log.connect(prep_filter)
+
+        real = getattr(self.window, "execution_runner", None)
+        real_handler = getattr(activity, "_on_real_log", None)
+        if real is None or not callable(real_handler):
+            return
+        disconnected = False
+        try:
+            real.log.disconnect(real_handler)
+            disconnected = True
+        except (RuntimeError, TypeError):
+            pass
+        if not disconnected:
+            return
+
+        anchored_prefixes = (
+            "GUI_EXEC_FIELD\t",
+            "Price, Stock and Shipping Information:",
+            "Product Description:",
+            "Additional Description:",
+            "photos:",
+        )
+        loose_markers = (
+            "MAKRO STEP 3 DIRECT ACCEPTANCE",
+            "ACCEPTANCE COMPLETE",
+            "PREVIEW READY",
+        )
+
+        def real_filter(line: str) -> None:
+            text = str(line or "").strip()
+            if text.startswith(anchored_prefixes) or any(marker in text for marker in loose_markers):
+                real_handler(line)
+
+        self._real_log_filter = real_filter
+        real.log.connect(real_filter)
 
 
 def install_ui_runtime_optimizations(window: QMainWindow, visual: Any) -> UiRuntimeOptimizations:
