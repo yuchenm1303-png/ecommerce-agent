@@ -51,6 +51,30 @@ def test_one_pointer_sampler_remains_authoritative_without_per_child_filters() -
     assert "QMouseEvent" not in CARD_FX
 
 
+def test_motion_clock_touches_only_cards_that_are_actually_animating() -> None:
+    assert "self._moving_frames: set[QFrame] = set()" in CARD_FX
+    advance = _body(CARD_FX, "def _advance_motions", "def _animate_to")
+    assert "for frame in tuple(self._moving_frames):" in advance
+    assert "for state in self.states.values():" not in advance
+    assert "self._moving_frames.discard(frame)" in advance
+    animate = _body(CARD_FX, "def _animate_to", "def _normal")
+    assert "self._moving_frames.add(frame)" in animate
+
+
+def test_static_hover_and_held_press_avoid_discarded_full_window_hit_tests() -> None:
+    assert "def _hover_still_owns_global" in CARD_FX
+    hover_owner = _body(CARD_FX, "def _hover_still_owns_global", "def _advance_state")
+    assert "frame.mapFromGlobal(global_pos)" in hover_owner
+    assert "frame.childAt(local)" in hover_owner
+    assert "nested is None or nested is frame" in hover_owner
+
+    sample = _body(CARD_FX, "def _sample_pointer", "def suspend_for_modal")
+    held_guard = "if left_down and self._left_down and self.pressed is not None:"
+    assert held_guard in sample
+    assert sample.index(held_guard) < sample.index("current = self._card_at_global(global_pos)")
+    assert "self._hover_still_owns_global(self.hovered, global_pos)" in sample
+
+
 def test_press_and_release_follow_reference_hover_active_semantics() -> None:
     begin = _body(CARD_FX, "def _begin_press", "def _end_press")
     end = _body(CARD_FX, "def _end_press", "def _sample_pointer")
@@ -159,6 +183,18 @@ def test_complete_widget_content_subtree_gets_same_transform_without_layout_resi
     assert "self._scale_effect.set_scale(scale)" in proxy
 
 
+def test_card_effect_uses_fixed_active_bounds_instead_of_per_frame_geometry_churn() -> None:
+    effect = _body(NATIVE_VISUAL, "class _CardScaleEffect", "class NativeGlassProxy")
+    assert "_EFFECT_BOUND_SCALE = 1.04" in NATIVE_VISUAL
+    assert "if self.isEnabled() != active:" in effect
+    active_block = effect.split("if self.isEnabled() != active:", 1)[1].split("self.update()", 1)[0]
+    assert "self.setEnabled(active)" in active_block
+    assert "self.updateBoundingRect()" in active_block
+    assert effect.count("self.updateBoundingRect()") == 1
+    assert "source_rect.width() * _EFFECT_BOUND_SCALE" in effect
+    assert "source_rect.height() * _EFFECT_BOUND_SCALE" in effect
+
+
 def test_steady_state_disables_widget_content_scale_effect() -> None:
     effect = _body(NATIVE_VISUAL, "class _CardScaleEffect", "class NativeGlassProxy")
     assert "self.setEnabled(False)" in effect
@@ -189,6 +225,7 @@ def test_modal_suspend_returns_cards_to_exact_normal_state() -> None:
     resume = _body(CARD_FX, "def resume_from_modal", "def _cleanup")
     assert "self._pointer_timer.stop()" in suspend
     assert "self._motion_timer.stop()" in suspend
+    assert "self._moving_frames.clear()" in suspend
     assert "state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)" in suspend
     assert "state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)" in resume
     assert "current = self._card_at_global(QCursor.pos())" in resume
