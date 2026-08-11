@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
-from PySide6.QtCore import QElapsedTimer, QObject, Qt, QTimer
+from PySide6.QtCore import QEasingCurve, QObject, QPointF, Qt, QTimer
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QApplication, QFrame, QMainWindow, QWidget
 
@@ -11,49 +12,72 @@ from .visual_style import GlassBackdrop, VisualStyleController
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
 
+# Exact reference values from `.links .link-all .item.cards`:
+# normal inherits `.cards` background #00000040 and scale(1);
+# hover overrides to rgba(0, 0, 0, .4) and scale(1.02);
+# active returns transform to scale(1) while the hover background remains active.
+_NORMAL_SCALE = 1.00
+_HOVER_SCALE = 1.02
+_ACTIVE_SCALE = 1.00
 _NORMAL_ALPHA = 64.0
-_HOVER_ALPHA = 90.0
-_ACTIVE_ALPHA = 110.0
+_HOVER_ALPHA = 102.0
+_ACTIVE_ALPHA = 102.0
+_TRANSITION_MS = 300
 
-# Keep the existing 8 ms recovery cadence so input latency does not change. The
-# optimization is structural: one cheap local hit test replaces Python filters on
-# every descendant widget in every glass card.
+# Pointer ownership remains one cheap local sampler. Motion presentation gets its
+# own refresh-aware timer so a 165 Hz display is not limited by the hit-test rate.
 _POINTER_SAMPLE_MS = 8
 
-# A fast physical click can deliver press+release before QWidget's backing store is
-# presented. Keep the active tint alive long enough to cross at least one display
-# frame; business click delivery is never delayed by this visual hold.
-_MIN_PRESSED_MS = 24
+
+def _css_ease() -> QEasingCurve:
+    """CSS default `ease`: cubic-bezier(.25, .1, .25, 1)."""
+
+    curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
+    curve.addCubicBezierSegment(
+        QPointF(0.25, 0.10),
+        QPointF(0.25, 1.00),
+        QPointF(1.00, 1.00),
+    )
+    return curve
 
 
 @dataclass(slots=True)
 class _CardState:
     frame: QFrame
     surface: GlassBackdrop
+    current_scale: float = _NORMAL_SCALE
     current_alpha: float = _NORMAL_ALPHA
+    from_scale: float = _NORMAL_SCALE
+    from_alpha: float = _NORMAL_ALPHA
+    target_scale: float = _NORMAL_SCALE
+    target_alpha: float = _NORMAL_ALPHA
+    started_s: float = 0.0
+    moving: bool = False
 
-    def snap(self, alpha: float) -> None:
+    def snap(self, scale: float, alpha: float) -> None:
+        scale = float(scale)
         alpha = float(alpha)
-        if abs(alpha - self.current_alpha) < 0.1:
-            return
+        self.current_scale = scale
         self.current_alpha = alpha
-        self.surface.set_interaction(scale=1.0, overlay_alpha=alpha)
-
-    def republish(self) -> None:
-        self.surface.set_interaction(scale=1.0, overlay_alpha=self.current_alpha)
+        self.from_scale = scale
+        self.from_alpha = alpha
+        self.target_scale = scale
+        self.target_alpha = alpha
+        self.moving = False
+        self.surface.set_interaction(scale=scale, overlay_alpha=alpha)
 
 
 class NekroCardInteractionController(QObject):
-    """Single local hit-test sampler for all glass-card hover/press feedback.
+    """Reference-website interaction for every registered glass card.
 
-    The visible three-state presentation is unchanged:
-        NORMAL 64 -> HOVER 90 -> PRESSED 110.
+    The six website-list cards use one continuous 300 ms CSS transition:
+        normal  : scale 1.00, black alpha 64
+        hover   : scale 1.02, black alpha 102
+        active  : scale 1.00, black alpha 102
 
-    Earlier code installed a Python event filter and mouse tracking on every child
-    widget under every card, so ordinary pointer movement could cross Python many
-    times before one card state actually changed. The global cursor was already
-    the authority; this version uses that authority directly and performs one
-    local ``QMainWindow.childAt`` lookup per recovery sample instead.
+    Target changes never restart from a canned state. A press/release/leave samples
+    the current interpolated value and reverses from there, matching browser CSS
+    transform behavior. Business clicks remain owned by the real child widgets.
     """
 
     def __init__(self, window: QMainWindow, visual: VisualStyleController) -> None:
@@ -65,6 +89,7 @@ class NekroCardInteractionController(QObject):
         self.pressed: QFrame | None = None
         self._suspended = False
         self._left_down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
+        self._ease = _css_ease()
 
         for frame in window.findChildren(QFrame):
             if frame.objectName() not in _GLASS_NAMES:
@@ -74,12 +99,10 @@ class NekroCardInteractionController(QObject):
                 continue
             self.states[frame] = _CardState(frame=frame, surface=surface)
 
-        self._press_clock = QElapsedTimer()
-
-        self._release_timer = QTimer(self)
-        self._release_timer.setSingleShot(True)
-        self._release_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._release_timer.timeout.connect(self._finish_release)
+        self._motion_timer = QTimer(self)
+        self._motion_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._motion_timer.setInterval(self._frame_interval_ms())
+        self._motion_timer.timeout.connect(self._advance_motions)
 
         self._pointer_timer = QTimer(self)
         self._pointer_timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -88,6 +111,19 @@ class NekroCardInteractionController(QObject):
         self._pointer_timer.start()
 
         window.destroyed.connect(self._cleanup)
+
+    def _frame_interval_ms(self) -> int:
+        refresh_hz = 60.0
+        screen = self.window.screen()
+        if screen is not None:
+            try:
+                candidate = float(screen.refreshRate())
+                if 30.0 <= candidate <= 500.0:
+                    refresh_hz = candidate
+            except (RuntimeError, TypeError, ValueError):
+                pass
+        target_hz = max(60.0, min(240.0, refresh_hz))
+        return max(4, int(1000.0 / target_hz))
 
     def _nearest_card(self, widget: QWidget | None) -> QFrame | None:
         current = widget
@@ -141,76 +177,131 @@ class NekroCardInteractionController(QObject):
                 best_depth = depth
         return best
 
-    def _publish(self, frame: QFrame | None, alpha: float) -> None:
+    def _advance_state(self, state: _CardState, now_s: float) -> bool:
+        if not state.moving:
+            return False
+        elapsed_s = max(0.0, now_s - state.started_s)
+        linear = min(1.0, elapsed_s / (_TRANSITION_MS / 1000.0))
+        eased = float(self._ease.valueForProgress(linear))
+        state.current_scale = state.from_scale + (state.target_scale - state.from_scale) * eased
+        state.current_alpha = state.from_alpha + (state.target_alpha - state.from_alpha) * eased
+        state.surface.set_interaction(
+            scale=state.current_scale,
+            overlay_alpha=state.current_alpha,
+        )
+        if linear >= 1.0:
+            state.current_scale = state.target_scale
+            state.current_alpha = state.target_alpha
+            state.moving = False
+            state.surface.set_interaction(
+                scale=state.current_scale,
+                overlay_alpha=state.current_alpha,
+            )
+        return state.moving
+
+    def _advance_motions(self) -> None:
+        if self._suspended:
+            self._motion_timer.stop()
+            return
+        now_s = time.perf_counter()
+        any_moving = False
+        for state in self.states.values():
+            try:
+                any_moving = self._advance_state(state, now_s) or any_moving
+            except RuntimeError:
+                state.moving = False
+        if not any_moving:
+            self._motion_timer.stop()
+
+    def _animate_to(self, frame: QFrame | None, *, scale: float, alpha: float) -> None:
         if self._suspended or frame is None:
             return
         state = self.states.get(frame)
-        if state is not None:
-            state.snap(alpha)
+        if state is None:
+            return
+
+        now_s = time.perf_counter()
+        self._advance_state(state, now_s)
+        scale = float(scale)
+        alpha = float(alpha)
+        if (
+            abs(scale - state.target_scale) <= 1e-5
+            and abs(alpha - state.target_alpha) <= 0.05
+        ):
+            return
+
+        if (
+            abs(scale - state.current_scale) <= 1e-5
+            and abs(alpha - state.current_alpha) <= 0.05
+        ):
+            state.snap(scale, alpha)
+            return
+
+        state.from_scale = state.current_scale
+        state.from_alpha = state.current_alpha
+        state.target_scale = scale
+        state.target_alpha = alpha
+        state.started_s = now_s
+        state.moving = True
+        if not self._motion_timer.isActive():
+            self._motion_timer.setInterval(self._frame_interval_ms())
+            self._motion_timer.start()
+
+    def _normal(self, frame: QFrame | None) -> None:
+        self._animate_to(frame, scale=_NORMAL_SCALE, alpha=_NORMAL_ALPHA)
+
+    def _hover(self, frame: QFrame | None) -> None:
+        self._animate_to(frame, scale=_HOVER_SCALE, alpha=_HOVER_ALPHA)
+
+    def _active(self, frame: QFrame | None) -> None:
+        self._animate_to(frame, scale=_ACTIVE_SCALE, alpha=_ACTIVE_ALPHA)
 
     def _set_hover(self, frame: QFrame | None) -> None:
-        if self._suspended or self.pressed is not None or self._release_timer.isActive():
+        if self._suspended or self.pressed is not None:
             return
         previous = self.hovered
         if previous is frame:
             return
         self.hovered = frame
         if previous is not None:
-            self._publish(previous, _NORMAL_ALPHA)
+            self._normal(previous)
         if frame is not None:
-            self._publish(frame, _HOVER_ALPHA)
+            self._hover(frame)
 
     def _begin_press(self, frame: QFrame | None) -> None:
         if self._suspended:
             return
-
-        if self._release_timer.isActive():
-            self._release_timer.stop()
-            previous = self.pressed
+        if frame is None:
+            previous = self.hovered
+            self.hovered = None
             self.pressed = None
             if previous is not None:
-                self._publish(previous, _HOVER_ALPHA if previous is frame else _NORMAL_ALPHA)
-
-        if frame is None:
-            self.pressed = None
-            self._set_hover(None)
+                self._normal(previous)
             return
 
         previous_hover = self.hovered
         if previous_hover is not None and previous_hover is not frame:
-            self._publish(previous_hover, _NORMAL_ALPHA)
+            self._normal(previous_hover)
 
         self.hovered = frame
         self.pressed = frame
-        self._press_clock.start()
-        self._publish(frame, _ACTIVE_ALPHA)
+        self._active(frame)
 
     def _end_press(self) -> None:
-        if self._suspended:
-            return
-        if self.pressed is None:
-            self._set_hover(self._card_at_global(QCursor.pos()))
-            return
-
-        elapsed = self._press_clock.elapsed() if self._press_clock.isValid() else _MIN_PRESSED_MS
-        remaining = max(0, _MIN_PRESSED_MS - int(elapsed))
-        if remaining > 0:
-            self._release_timer.start(remaining)
-        else:
-            self._finish_release()
-
-    def _finish_release(self) -> None:
         if self._suspended:
             return
         previous = self.pressed
         self.pressed = None
         current = self._card_at_global(QCursor.pos())
-
-        if previous is not None and previous is not current:
-            self._publish(previous, _NORMAL_ALPHA)
         self.hovered = current
-        if current is not None:
-            self._publish(current, _HOVER_ALPHA)
+
+        if previous is not None:
+            if previous is current:
+                self._hover(previous)
+            else:
+                self._normal(previous)
+        if current is not None and current is not previous:
+            self._hover(current)
 
     def _sample_pointer(self) -> None:
         if self._suspended or not self.window.isVisible() or self.window.isMinimized():
@@ -234,20 +325,22 @@ class NekroCardInteractionController(QObject):
                 self._begin_press(current)
             return
 
-        if not self._release_timer.isActive():
-            self._set_hover(current)
+        self._set_hover(current)
 
     def suspend_for_modal(self) -> None:
         if self._suspended:
             return
         self._suspended = True
         self._pointer_timer.stop()
-        self._release_timer.stop()
+        self._motion_timer.stop()
         self._left_down = False
         self.hovered = None
         self.pressed = None
         for state in self.states.values():
-            state.republish()
+            try:
+                state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)
+            except RuntimeError:
+                state.moving = False
 
     def resume_from_modal(self) -> None:
         if not self._suspended:
@@ -257,19 +350,29 @@ class NekroCardInteractionController(QObject):
         self.hovered = None
         self.pressed = None
 
+        for state in self.states.values():
+            try:
+                state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)
+            except RuntimeError:
+                state.moving = False
+
         current = self._card_at_global(QCursor.pos())
-        for frame, state in self.states.items():
-            state.snap(_HOVER_ALPHA if frame is current else _NORMAL_ALPHA)
         self.hovered = current
+        if current is not None:
+            if self._left_down:
+                self.pressed = current
+                self._active(current)
+            else:
+                self._hover(current)
         self._pointer_timer.start()
 
     def _cleanup(self) -> None:
         self._pointer_timer.stop()
-        self._release_timer.stop()
+        self._motion_timer.stop()
         self._suspended = False
         for state in tuple(self.states.values()):
             try:
-                state.surface.set_interaction(scale=1.0, overlay_alpha=_NORMAL_ALPHA)
+                state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)
             except RuntimeError:
                 pass
         self.states.clear()
