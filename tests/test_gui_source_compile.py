@@ -11,6 +11,10 @@ GUI_SOURCES = [
     PROJECT_ROOT / "makro_batch_job.py",
     PROJECT_ROOT / "makro_execute_listing.py",
     PROJECT_ROOT / "app" / "browser_page_owner.py",
+    PROJECT_ROOT / "app" / "makro" / "runtime_contract.py",
+    PROJECT_ROOT / "app" / "makro" / "page_observation.py",
+    PROJECT_ROOT / "app" / "makro" / "interruption_monitor.py",
+    PROJECT_ROOT / "app" / "makro" / "recovery_agent.py",
     PROJECT_ROOT / "gui" / "main_window.py",
     PROJECT_ROOT / "gui" / "console_window.py",
     PROJECT_ROOT / "gui" / "workflow_console_window.py",
@@ -21,6 +25,8 @@ GUI_SOURCES = [
     PROJECT_ROOT / "gui" / "activity_presence.py",
     PROJECT_ROOT / "gui" / "browser_session_manager.py",
     PROJECT_ROOT / "gui" / "preparation_progress.py",
+    PROJECT_ROOT / "gui" / "runtime_event_bridge.py",
+    PROJECT_ROOT / "gui" / "runtime_assistant.py",
     PROJECT_ROOT / "gui" / "readonly_runner.py",
     PROJECT_ROOT / "gui" / "real_execution.py",
     PROJECT_ROOT / "gui" / "result_loader.py",
@@ -45,8 +51,6 @@ GUI_SOURCES = [
 
 
 def test_gui_python_sources_compile_without_importing_pyside() -> None:
-    """Catch syntax regressions even though core CI intentionally omits PySide6."""
-
     for path in GUI_SOURCES:
         source = path.read_text(encoding="utf-8")
         compile(source, str(path), "exec")

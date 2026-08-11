@@ -35,6 +35,7 @@ def main() -> int:
     from gui.preparation_progress import install_detailed_preparation_progress
     from gui.required_input_support import install_required_input_support
     from gui.restore_snapshot import install_restore_snapshot
+    from gui.runtime_assistant import install_runtime_assistant
     from gui.static_modal_interaction import install_static_modal_interaction
     from gui.ui_maturity import install_mature_ui
     from gui.ui_polish import install_ui_polish
@@ -48,16 +49,11 @@ def main() -> int:
     app.setApplicationName("ecommerce-agent Current Workflow")
     app.setOrganizationName("ecommerce-agent")
 
-    # Keep the native Fuji renderer compatible with the translucent QWidget
-    # child surface. Modal presentation itself now stays entirely in QWidget.
     QQuickWindow.setDefaultAlphaBuffer(True)
 
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_native_visual_style(window)
 
-    # Finish the proven Single workspace exactly as before. Batch wraps that
-    # complete workspace afterwards, so old layout/card plugins never reinterpret
-    # Batch controls as Single diagnostics.
     install_ui_polish(window)
     details = install_card_details(window)
     mature = install_mature_ui(window)
@@ -67,19 +63,12 @@ def main() -> int:
 
     window.install_mode_workspace()
     install_workspace_mode_switch(window)
-    # Formal GUI owns one dedicated Makro Edge/Profile. 9222 remains an internal
-    # transport detail; Single and Batch share one login session and Batch keeps
-    # per-job isolation through owned tabs/target ids.
     install_managed_makro_browser(window)
     install_required_input_support(window)
     install_activity_presence(window)
     install_detailed_preparation_progress(window)
     visual.refresh_glass_frames()
 
-    # Presentation-only hot-path optimizations are installed after both Single
-    # and Batch widgets exist, but still before the first event-loop paint. This
-    # keeps visible geometry/behavior identical while avoiding repeated item
-    # allocation and PNG round-trips during later UI updates.
     install_ui_runtime_optimizations(window, visual)
 
     smooth_wheel = SmoothWheelFilter(window)
@@ -91,10 +80,6 @@ def main() -> int:
     if quick_window is None:
         raise RuntimeError("Native Quick renderer was not created")
 
-    # Windows can discard the QWidget backing-store pixels while the native Quick
-    # owner is minimized even though every widget object remains alive. Keep one
-    # last-frame QWidget snapshot above the live surface during restore so the
-    # user never sees the backing store repaint card-by-card.
     install_restore_snapshot(window, quick_window)
 
     shell = install_native_window_shell(window, quick_window)
@@ -103,14 +88,15 @@ def main() -> int:
     install_buffered_logs(window)
     effects = install_nekro_effects(window, sakura_count=3)
 
-    # Single/Batch keeps the established business QStackedWidget, but its visible
-    # handoff is staged through two cached composite frames. The switch thumb and
-    # workspace transition share the same 300 ms interaction window; complex
-    # QWidget pages are never animated live.
     install_workspace_transition(window, visual)
 
     shell.show()
     effects.raise_()
+    # Runtime Assistant is installed after other overlay/effect surfaces so it
+    # remains visible without modifying modal/background animation ownership.
+    # Phase 1 is Shadow Mode: observe + explain only, never click Makro.
+    assistant = install_runtime_assistant(window)
+    assistant.raise_()
     return app.exec()
 
 
