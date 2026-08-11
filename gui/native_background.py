@@ -417,16 +417,19 @@ Window {{
     Repeater {{
         model: glassCardModel
         delegate: Item {{
-            x: clipX
-            y: clipY
-            width: clipW
-            height: clipH
-            clip: true
+            // Hover presentation intentionally lives in window coordinates. It
+            // may overflow workspace/splitter/host rectangles exactly like CSS
+            // overflow: visible; only the outer QQuickWindow clips the result.
+            x: 0
+            y: 0
+            width: root.width
+            height: root.height
+            clip: false
             visible: cardVisible
 
             Rectangle {{
-                x: cardX - clipX
-                y: cardY - clipY
+                x: cardX
+                y: cardY
                 width: cardW
                 height: cardH
                 scale: cardScale
