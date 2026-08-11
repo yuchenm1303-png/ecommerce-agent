@@ -21,6 +21,7 @@ def main() -> int:
         return 2
 
     from gui.activity_presence import install_activity_presence
+    from gui.browser_session_manager import install_managed_makro_browser
     from gui.card_details_fast import install_card_details
     from gui.console_summary_mode import install_console_summary_mode
     from gui.console_window import MainWindow
@@ -64,6 +65,10 @@ def main() -> int:
 
     window.install_mode_workspace()
     install_workspace_mode_switch(window)
+    # Formal GUI owns one dedicated Makro Edge/Profile. 9222 remains an internal
+    # transport detail; Single and Batch share one login session and Batch keeps
+    # per-job isolation through owned tabs/target ids.
+    install_managed_makro_browser(window)
     install_required_input_support(window)
     install_activity_presence(window)
     install_detailed_preparation_progress(window)
