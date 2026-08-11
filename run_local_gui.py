@@ -31,6 +31,7 @@ def main() -> int:
     from gui.native_window_shell import install_native_window_shell
     from gui.nekro_card_fx import install_nekro_card_fx
     from gui.nekro_effects import install_nekro_effects
+    from gui.preparation_progress import install_detailed_preparation_progress
     from gui.required_input_support import install_required_input_support
     from gui.static_modal_interaction import install_static_modal_interaction
     from gui.ui_maturity import install_mature_ui
@@ -65,6 +66,7 @@ def main() -> int:
     install_workspace_mode_switch(window)
     install_required_input_support(window)
     install_activity_presence(window)
+    install_detailed_preparation_progress(window)
     visual.refresh_glass_frames()
 
     # Presentation-only hot-path optimizations are installed after both Single
