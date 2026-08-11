@@ -104,6 +104,7 @@ class NekroCardInteractionController(QObject):
         self.window = window
         self.visual = visual
         self.states: dict[QFrame, _CardState] = {}
+        self._moving_frames: set[QFrame] = set()
         self.hovered: QFrame | None = None
         self.pressed: QFrame | None = None
         self._suspended = False
@@ -281,6 +282,23 @@ class NekroCardInteractionController(QObject):
                 best_depth = depth
         return best
 
+    def _hover_still_owns_global(self, frame: QFrame, global_pos) -> bool:  # noqa: ANN001
+        """Cheaply prove the current hover owner is still authoritative."""
+
+        if not frame.isVisibleTo(self.window) or not frame.isEnabled():
+            return False
+        try:
+            local = frame.mapFromGlobal(global_pos)
+        except RuntimeError:
+            return False
+        if not frame.rect().contains(local):
+            return False
+
+        # Preserve deepest-card semantics for nested glass cards without paying
+        # for a full-window hit test when the pointer remains in the same card.
+        nested = self._nearest_card(frame.childAt(local))
+        return nested is None or nested is frame
+
     def _advance_state(self, state: _CardState, now_s: float) -> bool:
         if not state.moving:
             return False
@@ -308,13 +326,18 @@ class NekroCardInteractionController(QObject):
             self._motion_timer.stop()
             return
         now_s = time.perf_counter()
-        any_moving = False
-        for state in self.states.values():
+        for frame in tuple(self._moving_frames):
+            state = self.states.get(frame)
+            if state is None:
+                self._moving_frames.discard(frame)
+                continue
             try:
-                any_moving = self._advance_state(state, now_s) or any_moving
+                if not self._advance_state(state, now_s):
+                    self._moving_frames.discard(frame)
             except RuntimeError:
                 state.moving = False
-        if not any_moving:
+                self._moving_frames.discard(frame)
+        if not self._moving_frames:
             self._motion_timer.stop()
 
     def _animate_to(self, frame: QFrame | None, *, scale: float, alpha: float) -> None:
@@ -325,7 +348,8 @@ class NekroCardInteractionController(QObject):
             return
 
         now_s = time.perf_counter()
-        self._advance_state(state, now_s)
+        if not self._advance_state(state, now_s):
+            self._moving_frames.discard(frame)
         scale = float(scale)
         alpha = float(alpha)
         if (
@@ -339,6 +363,7 @@ class NekroCardInteractionController(QObject):
             and abs(alpha - state.current_alpha) <= 0.05
         ):
             state.snap(scale, alpha)
+            self._moving_frames.discard(frame)
             return
 
         state.from_scale = state.current_scale
@@ -347,6 +372,7 @@ class NekroCardInteractionController(QObject):
         state.target_alpha = alpha
         state.started_s = now_s
         state.moving = True
+        self._moving_frames.add(frame)
         if not self._motion_timer.isActive():
             self._motion_timer.setInterval(self._frame_interval_ms())
             self._motion_timer.start()
@@ -417,17 +443,33 @@ class NekroCardInteractionController(QObject):
         if self._suspended or not self.window.isVisible() or self.window.isMinimized():
             return
 
-        current = self._card_at_global(QCursor.pos())
         left_down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
 
-        if left_down and not self._left_down:
-            self._left_down = True
-            self._begin_press(current)
+        # Once a press owner exists, intermediate hit tests cannot change press
+        # semantics; release performs one authoritative lookup. Avoid throwing
+        # away 8 ms hit-test work for the whole duration of a held click.
+        if left_down and self._left_down and self.pressed is not None:
             return
 
         if not left_down and self._left_down:
             self._left_down = False
             self._end_press()
+            return
+
+        global_pos = QCursor.pos()
+        if (
+            not left_down
+            and self.hovered is not None
+            and self.pressed is None
+            and self._hover_still_owns_global(self.hovered, global_pos)
+        ):
+            return
+
+        current = self._card_at_global(global_pos)
+
+        if left_down and not self._left_down:
+            self._left_down = True
+            self._begin_press(current)
             return
 
         if left_down:
@@ -443,6 +485,7 @@ class NekroCardInteractionController(QObject):
         self._suspended = True
         self._pointer_timer.stop()
         self._motion_timer.stop()
+        self._moving_frames.clear()
         self._left_down = False
         self.hovered = None
         self.pressed = None
@@ -456,6 +499,7 @@ class NekroCardInteractionController(QObject):
         if not self._suspended:
             return
         self._suspended = False
+        self._moving_frames.clear()
         self._left_down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
         self.hovered = None
         self.pressed = None
@@ -479,6 +523,7 @@ class NekroCardInteractionController(QObject):
     def _cleanup(self) -> None:
         self._pointer_timer.stop()
         self._motion_timer.stop()
+        self._moving_frames.clear()
         self._suspended = False
         for state in tuple(self.states.values()):
             try:
