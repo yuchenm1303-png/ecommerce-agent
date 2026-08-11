@@ -24,12 +24,12 @@ from app.makro.listing_creation import (
     infer_listing_bootstrap,
     is_brand_step,
     is_product_info_step,
-    select_vertical,
 )
 from app.makro.step3_transition import (
     dismiss_joyride_overlay,
     select_brand_to_product_info,
 )
+from app.makro.vertical_selection import select_vertical
 from app.providers.registry import (
     ProviderConfigurationError,
     build_semantic_provider,
