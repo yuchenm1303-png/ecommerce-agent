@@ -154,7 +154,17 @@ def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
 
     toggle = WorkspaceModeSwitch(root)
     toggle.set_checked_immediate(int(mode_stack.currentIndex()) == 1)
-    toggle.clicked.connect(lambda checked: set_mode(1 if checked else 0))
+
+    def request_mode(checked: bool) -> None:
+        target = 1 if checked else 0
+        transition = getattr(window, "_workspace_transition_controller", None)
+        request = getattr(transition, "request_mode", None)
+        if callable(request):
+            request(target)
+        else:
+            set_mode(target)
+
+    toggle.clicked.connect(request_mode)
 
     def sync_from_stack(index: int) -> None:
         target = int(index) == 1
