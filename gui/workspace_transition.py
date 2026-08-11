@@ -3,26 +3,66 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, QRect, Qt, QTimer
-from PySide6.QtGui import QPainter, QPixmap, QRegion
-from PySide6.QtWidgets import QMainWindow, QStackedWidget, QWidget
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, QRect, QRectF, Qt, QTimer
+from PySide6.QtGui import QColor, QPainter, QPixmap, QRegion
+from PySide6.QtWidgets import QGraphicsOpacityEffect, QMainWindow, QStackedWidget, QWidget
+
+from .native_background import _OVERSCAN
 
 
+# Large top-level workspaces get more time than the tiny 300 ms switch control.
+# The old workspace is fully gone before the new one is allowed to become readable.
 _PREPARE_MS = 30
-_TRANSITION_MS = 270
-_SLIDE_PX = 18.0
+_HOLD_MS = 40
+_EXIT_END_MS = 155
+_ENTER_START_MS = 175
+_TOTAL_MS = 390
+_ENTER_DURATION_MS = _TOTAL_MS - _ENTER_START_MS
+
+_HEADER_EXIT_START_MS = 45
+_HEADER_EXIT_END_MS = 125
+_HEADER_ENTER_START_MS = 150
+_HEADER_ENTER_END_MS = 270
+
+_VEIL_START_MS = 135
+_VEIL_PEAK_MS = 170
+_VEIL_END_MS = 220
+_VEIL_MAX_OPACITY = 0.06
+_VEIL_COLOR = QColor(228, 241, 250)
 
 
-def _workspace_easing() -> QEasingCurve:
-    """Fast, polished ease-out used by modern workspace navigation."""
-
+def _cubic_bezier(c1x: float, c1y: float, c2x: float, c2y: float) -> QEasingCurve:
     curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
     curve.addCubicBezierSegment(
-        QPointF(0.22, 1.0),
-        QPointF(0.36, 1.0),
+        QPointF(c1x, c1y),
+        QPointF(c2x, c2y),
         QPointF(1.0, 1.0),
     )
     return curve
+
+
+def _exit_easing() -> QEasingCurve:
+    # CSS cubic-bezier(.4, 0, 1, 1): old content accelerates away.
+    return _cubic_bezier(0.40, 0.00, 1.00, 1.00)
+
+
+def _enter_easing() -> QEasingCurve:
+    # Fast establishment, long gentle settle for the incoming workspace.
+    return _cubic_bezier(0.16, 1.00, 0.30, 1.00)
+
+
+def _smoothstep(value: float) -> float:
+    value = max(0.0, min(1.0, float(value)))
+    return value * value * (3.0 - 2.0 * value)
+
+
+def _segment_progress(elapsed_ms: float, start_ms: float, end_ms: float) -> float:
+    if elapsed_ms <= start_ms:
+        return 0.0
+    if elapsed_ms >= end_ms:
+        return 1.0
+    duration = max(1e-6, float(end_ms - start_ms))
+    return (float(elapsed_ms) - float(start_ms)) / duration
 
 
 def _empty_frame(widget: QWidget) -> QPixmap:
@@ -58,7 +98,7 @@ def _fit_frame(source: QPixmap, widget: QWidget) -> QPixmap:
 
 
 class _WorkspaceTransitionSurface(QWidget):
-    """Animate only two cached workspace frames, never the live QWidget trees."""
+    """Fade through a neutral Fuji frame without cross-fading readable dashboards."""
 
     def __init__(self, stack: QStackedWidget) -> None:
         super().__init__(stack)
@@ -68,10 +108,13 @@ class _WorkspaceTransitionSurface(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAutoFillBackground(False)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._from = QPixmap()
-        self._to = QPixmap()
-        self._progress = 0.0
-        self._direction = 1
+
+        self._neutral = QPixmap()
+        self._outgoing = QPixmap()
+        self._incoming = QPixmap()
+        self._outgoing_alpha = 1.0
+        self._incoming_alpha = 0.0
+        self._veil_alpha = 0.0
         self._capture_suppressed = False
         self.hide()
 
@@ -86,52 +129,62 @@ class _WorkspaceTransitionSurface(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self._capture_suppressed = False
 
-    def set_hold_frame(self, frame: QPixmap, direction: int) -> None:
-        self._from = _fit_frame(frame, self)
-        self._to = QPixmap()
-        self._progress = 0.0
-        self._direction = 1 if direction >= 0 else -1
+    def begin(self, neutral: QPixmap, outgoing: QPixmap) -> None:
+        self._neutral = _fit_frame(neutral, self)
+        self._outgoing = _fit_frame(outgoing, self)
+        self._incoming = QPixmap()
+        self._outgoing_alpha = 1.0
+        self._incoming_alpha = 0.0
+        self._veil_alpha = 0.0
         self.update()
 
-    def set_transition_frames(
+    def set_incoming(self, incoming: QPixmap) -> None:
+        self._incoming = _fit_frame(incoming, self)
+        self.update()
+
+    def set_mix(
         self,
-        old_frame: QPixmap,
-        new_frame: QPixmap,
-        direction: int,
+        *,
+        outgoing_alpha: float,
+        incoming_alpha: float,
+        veil_alpha: float,
     ) -> None:
-        self._from = _fit_frame(old_frame, self)
-        self._to = _fit_frame(new_frame, self)
-        self._direction = 1 if direction >= 0 else -1
-        self._progress = 0.0
-        self.update()
-
-    def set_progress(self, progress: float) -> None:
-        progress = max(0.0, min(1.0, float(progress)))
-        if abs(progress - self._progress) <= 1e-6:
-            return
-        self._progress = progress
-        self.update()
+        outgoing_alpha = max(0.0, min(1.0, float(outgoing_alpha)))
+        incoming_alpha = max(0.0, min(1.0, float(incoming_alpha)))
+        veil_alpha = max(0.0, min(_VEIL_MAX_OPACITY, float(veil_alpha)))
+        changed = (
+            abs(outgoing_alpha - self._outgoing_alpha) > 1e-5
+            or abs(incoming_alpha - self._incoming_alpha) > 1e-5
+            or abs(veil_alpha - self._veil_alpha) > 1e-5
+        )
+        self._outgoing_alpha = outgoing_alpha
+        self._incoming_alpha = incoming_alpha
+        self._veil_alpha = veil_alpha
+        if changed:
+            self.update()
 
     def clear_frames(self) -> None:
-        self._from = QPixmap()
-        self._to = QPixmap()
-        self._progress = 0.0
+        self._neutral = QPixmap()
+        self._outgoing = QPixmap()
+        self._incoming = QPixmap()
+        self._outgoing_alpha = 1.0
+        self._incoming_alpha = 0.0
+        self._veil_alpha = 0.0
         self.update()
 
-    def _draw_frame(self, painter: QPainter, frame: QPixmap, x: float = 0.0) -> None:
+    def _draw_fitted(self, painter: QPainter, frame: QPixmap) -> None:
         if frame.isNull():
+            painter.fillRect(self.rect(), QColor(23, 38, 58))
             return
         logical = frame.deviceIndependentSize()
         if (
             abs(float(logical.width()) - float(self.width())) <= 0.5
             and abs(float(logical.height()) - float(self.height())) <= 0.5
         ):
-            painter.drawPixmap(QPointF(x, 0.0), frame)
+            painter.drawPixmap(0, 0, frame)
             return
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        target = self.rect()
-        target.translate(int(round(x)), 0)
-        painter.drawPixmap(target, frame, frame.rect())
+        painter.drawPixmap(self.rect(), frame, frame.rect())
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
 
     def paintEvent(self, _event) -> None:  # type: ignore[override]
@@ -140,34 +193,28 @@ class _WorkspaceTransitionSurface(QWidget):
 
         painter = QPainter(self)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-        self._draw_frame(painter, self._from)
+        self._draw_fitted(painter, self._neutral)
 
-        if not self._to.isNull() and self._progress > 0.0:
-            if self._progress >= 1.0 - 1e-6:
-                painter.setOpacity(1.0)
-                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-                self._draw_frame(painter, self._to)
-            else:
-                # The old workspace remains a stable full-frame backing layer.
-                # The new workspace glides in by only 18px while dissolving over it,
-                # so there are no exposed strips and no live-widget repaint storms.
-                incoming_x = self._direction * _SLIDE_PX * (1.0 - self._progress)
-                alpha = self._progress * self._progress * (3.0 - 2.0 * self._progress)
-                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-                painter.setOpacity(alpha)
-                self._draw_frame(painter, self._to, incoming_x)
+        if self._outgoing_alpha > 1e-5 and not self._outgoing.isNull():
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            painter.setOpacity(self._outgoing_alpha)
+            self._draw_fitted(painter, self._outgoing)
+
+        if self._incoming_alpha > 1e-5 and not self._incoming.isNull():
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            painter.setOpacity(self._incoming_alpha)
+            self._draw_fitted(painter, self._incoming)
+
+        if self._veil_alpha > 1e-5:
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            painter.setOpacity(self._veil_alpha)
+            painter.fillRect(self.rect(), _VEIL_COLOR)
 
         painter.end()
 
 
 class WorkspaceTransitionController(QObject):
-    """Snapshot-based Single/Batch workspace transition.
-
-    The business state machine still owns ``mode_stack`` and mode selection.
-    This controller changes only presentation: it holds the outgoing workspace
-    while the target page, layout and native glass mask settle underneath, then
-    animates two precomposited pixmaps. No complex QWidget subtree is animated.
-    """
+    """Presentation-only Single/Batch top-level fade-through."""
 
     def __init__(self, window: QMainWindow, visual: Any) -> None:
         super().__init__(window)
@@ -186,19 +233,38 @@ class WorkspaceTransitionController(QObject):
 
         self._active = False
         self._target_index = int(self.stack.currentIndex())
-        self._direction = 1
         self._queued_index: int | None = None
         self._outgoing = QPixmap()
+        self._incoming = QPixmap()
+        self._neutral = QPixmap()
+        self._wallpaper = self._load_wallpaper()
         self._started_s = 0.0
+        self._incoming_enter_start_ms = float(_ENTER_START_MS)
         self._pointer_timer_was_active = False
         self._card_fx_suspended = False
 
-        self._easing = _workspace_easing()
+        self._phase_badge = getattr(window, "phase_badge", None)
+        self._phase_effect: QGraphicsOpacityEffect | None = None
+        self._phase_old_text = ""
+        self._phase_new_text = ""
+        self._phase_swapped = False
+
+        self._exit_easing = _exit_easing()
+        self._enter_easing = _enter_easing()
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.timeout.connect(self._advance)
         self.stack.installEventFilter(self)
         window.destroyed.connect(self.cleanup)
+
+    def _load_wallpaper(self) -> QPixmap:
+        path = getattr(self.background, "_sharp_path", None)
+        if path is None:
+            return QPixmap()
+        try:
+            return QPixmap(str(path))
+        except RuntimeError:
+            return QPixmap()
 
     def _frame_interval_ms(self) -> int:
         refresh_hz = 60.0
@@ -258,6 +324,64 @@ class WorkspaceTransitionController(QObject):
             max(1, int(round(self.stack.height() * dpr))),
         )
         cropped = full.copy(pixel_rect)
+        cropped.setDevicePixelRatio(dpr)
+        return _fit_frame(cropped, self.stack)
+
+    def _capture_neutral_background(self) -> QPixmap:
+        """Rebuild the sharp Fuji frame at the current parallax offset, without glass."""
+
+        quick = getattr(self.background, "quick_window", None)
+        wallpaper = self._wallpaper
+        if (
+            quick is None
+            or wallpaper.isNull()
+            or quick.width() <= 0
+            or quick.height() <= 0
+            or self.root.width() <= 0
+            or self.root.height() <= 0
+        ):
+            return self._capture_quick_for_stack()
+
+        root_frame = _empty_frame(self.root)
+        root_frame.fill(QColor(23, 38, 58))
+        painter = QPainter(root_frame)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        root_w = float(quick.width())
+        root_h = float(quick.height())
+        item_w = root_w * float(_OVERSCAN)
+        item_h = root_h * float(_OVERSCAN)
+        try:
+            item_x = float(quick.property("imageX"))
+            item_y = float(quick.property("imageY"))
+        except (TypeError, ValueError, RuntimeError):
+            item_x = (root_w - item_w) * 0.5
+            item_y = (root_h - item_h) * 0.5
+
+        source_w = max(1.0, float(wallpaper.width()))
+        source_h = max(1.0, float(wallpaper.height()))
+        scale = max(item_w / source_w, item_h / source_h)
+        visible_source_w = item_w / max(scale, 1e-9)
+        visible_source_h = item_h / max(scale, 1e-9)
+        source_rect = QRectF(
+            (source_w - visible_source_w) * 0.5,
+            (source_h - visible_source_h) * 0.5,
+            visible_source_w,
+            visible_source_h,
+        )
+        target_rect = QRectF(item_x, item_y, item_w, item_h)
+        painter.drawPixmap(target_rect, wallpaper, source_rect)
+        painter.end()
+
+        top_left = self.stack.mapTo(self.root, QPoint(0, 0))
+        dpr = max(1.0, float(root_frame.devicePixelRatio()))
+        pixel_rect = QRect(
+            int(round(top_left.x() * dpr)),
+            int(round(top_left.y() * dpr)),
+            max(1, int(round(self.stack.width() * dpr))),
+            max(1, int(round(self.stack.height() * dpr))),
+        )
+        cropped = root_frame.copy(pixel_rect)
         cropped.setDevicePixelRatio(dpr)
         return _fit_frame(cropped, self.stack)
 
@@ -341,6 +465,78 @@ class WorkspaceTransitionController(QObject):
             except RuntimeError:
                 pass
 
+    def _begin_phase_badge_transition(self, old_text: str, new_text: str) -> None:
+        badge = self._phase_badge
+        self._phase_old_text = str(old_text or "")
+        self._phase_new_text = str(new_text or "")
+        self._phase_swapped = False
+        if (
+            badge is None
+            or self._phase_old_text == self._phase_new_text
+            or badge.graphicsEffect() is not None
+        ):
+            self._phase_effect = None
+            return
+
+        badge.setText(self._phase_old_text)
+        effect = QGraphicsOpacityEffect(badge)
+        effect.setOpacity(1.0)
+        badge.setGraphicsEffect(effect)
+        self._phase_effect = effect
+
+    def _update_phase_badge(self, elapsed_ms: float) -> None:
+        badge = self._phase_badge
+        effect = self._phase_effect
+        if badge is None or effect is None:
+            return
+        try:
+            if elapsed_ms < _HEADER_EXIT_START_MS:
+                effect.setOpacity(1.0)
+                return
+
+            if elapsed_ms < _HEADER_EXIT_END_MS:
+                progress = _segment_progress(
+                    elapsed_ms,
+                    _HEADER_EXIT_START_MS,
+                    _HEADER_EXIT_END_MS,
+                )
+                effect.setOpacity(1.0 - float(self._exit_easing.valueForProgress(progress)))
+                return
+
+            if not self._phase_swapped:
+                badge.setText(self._phase_new_text)
+                self._phase_swapped = True
+
+            if elapsed_ms < _HEADER_ENTER_START_MS:
+                effect.setOpacity(0.0)
+                return
+
+            progress = _segment_progress(
+                elapsed_ms,
+                _HEADER_ENTER_START_MS,
+                _HEADER_ENTER_END_MS,
+            )
+            effect.setOpacity(float(self._enter_easing.valueForProgress(progress)))
+        except RuntimeError:
+            self._phase_effect = None
+
+    def _finish_phase_badge_transition(self) -> None:
+        badge = self._phase_badge
+        effect = self._phase_effect
+        self._phase_effect = None
+        if badge is not None:
+            try:
+                if self._phase_new_text:
+                    badge.setText(self._phase_new_text)
+                if effect is not None:
+                    effect.setOpacity(1.0)
+                    badge.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+        self._phase_old_text = ""
+        self._phase_new_text = ""
+        self._phase_swapped = False
+
     def _sync_toggle_to_stack(self) -> None:
         toggle = getattr(self.window, "_workspace_mode_switch", None)
         if toggle is None:
@@ -376,28 +572,48 @@ class WorkspaceTransitionController(QObject):
         self._sync_surface_geometry()
         self._suspend_presentation()
 
+        neutral = self._capture_neutral_background()
         outgoing = self._capture_composite()
         if outgoing.isNull():
             self._resume_presentation()
             self._set_mode(index)
             return
+        if neutral.isNull():
+            neutral = self._capture_quick_for_stack()
+        if neutral.isNull():
+            neutral = QPixmap(outgoing)
 
-        current = int(self.stack.currentIndex())
-        self._direction = 1 if index > current else -1
         self._target_index = index
         self._queued_index = None
         self._outgoing = outgoing
+        self._incoming = QPixmap()
+        self._neutral = neutral
+        self._incoming_enter_start_ms = float(_ENTER_START_MS)
         self._active = True
 
-        self._surface.set_hold_frame(outgoing, self._direction)
+        self._surface.begin(neutral, outgoing)
         self._surface.show()
         self._surface.raise_()
         self._surface.repaint()
 
-        # Change the real state immediately under the frozen frame. Header copy and
-        # switch state therefore respond in the same click turn, while the heavy
-        # workspace is allowed one short settle window before it becomes visible.
+        phase_old = ""
+        badge = self._phase_badge
+        if badge is not None:
+            try:
+                phase_old = str(badge.text())
+            except RuntimeError:
+                phase_old = ""
+
+        # Real state changes immediately underneath the opaque cached frame.
         self._set_mode(index)
+        phase_new = phase_old
+        if badge is not None:
+            try:
+                phase_new = str(badge.text())
+            except RuntimeError:
+                phase_new = phase_old
+        self._begin_phase_badge_transition(phase_old, phase_new)
+
         current_page = self.stack.currentWidget()
         page_layout = current_page.layout() if current_page is not None else None
         if page_layout is not None:
@@ -406,7 +622,14 @@ class WorkspaceTransitionController(QObject):
         schedule_mask = getattr(self.background, "schedule_mask_update", None)
         if callable(schedule_mask):
             schedule_mask()
+
+        self._started_s = time.perf_counter()
+        self._timer.setInterval(self._frame_interval_ms())
+        self._timer.start()
         QTimer.singleShot(_PREPARE_MS, self._prepare_incoming)
+
+    def _elapsed_ms(self) -> float:
+        return max(0.0, (time.perf_counter() - self._started_s) * 1000.0)
 
     def _prepare_incoming(self) -> None:
         if not self._active:
@@ -419,9 +642,6 @@ class WorkspaceTransitionController(QObject):
             self._finish_immediate()
             return
 
-        # Force any coalesced glass geometry work to land before the target frame
-        # is sampled. The transition surface is still holding the exact old frame,
-        # so this preparation is never visible.
         flush_geometry = getattr(self.background, "_flush_geometry", None)
         if callable(flush_geometry):
             try:
@@ -441,36 +661,92 @@ class WorkspaceTransitionController(QObject):
             self._finish_immediate()
             return
 
-        self._surface.set_transition_frames(
-            self._outgoing,
-            incoming,
-            self._direction,
-        )
+        self._incoming = incoming
+        self._surface.set_incoming(incoming)
         self._surface.raise_()
         self._surface.repaint()
-        self._started_s = time.perf_counter()
-        self._timer.setInterval(self._frame_interval_ms())
-        self._timer.start()
+        self._incoming_enter_start_ms = max(
+            float(_ENTER_START_MS),
+            self._elapsed_ms(),
+        )
+
+    def _mix_for_elapsed(self, elapsed_ms: float) -> tuple[float, float, float]:
+        if elapsed_ms <= _HOLD_MS:
+            outgoing_alpha = 1.0
+        elif elapsed_ms >= _EXIT_END_MS:
+            outgoing_alpha = 0.0
+        else:
+            progress = _segment_progress(elapsed_ms, _HOLD_MS, _EXIT_END_MS)
+            outgoing_alpha = 1.0 - float(self._exit_easing.valueForProgress(progress))
+
+        enter_start = self._incoming_enter_start_ms
+        enter_end = enter_start + float(_ENTER_DURATION_MS)
+        if self._incoming.isNull() or elapsed_ms <= enter_start:
+            incoming_alpha = 0.0
+        elif elapsed_ms >= enter_end:
+            incoming_alpha = 1.0
+        else:
+            progress = _segment_progress(elapsed_ms, enter_start, enter_end)
+            incoming_alpha = float(self._enter_easing.valueForProgress(progress))
+
+        if elapsed_ms <= _VEIL_START_MS or elapsed_ms >= _VEIL_END_MS:
+            veil_alpha = 0.0
+        elif elapsed_ms <= _VEIL_PEAK_MS:
+            rise = _segment_progress(elapsed_ms, _VEIL_START_MS, _VEIL_PEAK_MS)
+            veil_alpha = _VEIL_MAX_OPACITY * _smoothstep(rise)
+        else:
+            fall = _segment_progress(elapsed_ms, _VEIL_PEAK_MS, _VEIL_END_MS)
+            veil_alpha = _VEIL_MAX_OPACITY * (1.0 - _smoothstep(fall))
+
+        # Hard contract: two readable workspaces never coexist.
+        if outgoing_alpha > 1e-4:
+            incoming_alpha = 0.0
+
+        return outgoing_alpha, incoming_alpha, veil_alpha
 
     def _advance(self) -> None:
-        elapsed_s = max(0.0, time.perf_counter() - self._started_s)
-        linear = min(1.0, elapsed_s / max(0.001, _TRANSITION_MS / 1000.0))
-        eased = float(self._easing.valueForProgress(linear))
-        self._surface.set_progress(eased)
-        if linear >= 1.0:
+        elapsed_ms = self._elapsed_ms()
+        outgoing_alpha, incoming_alpha, veil_alpha = self._mix_for_elapsed(elapsed_ms)
+        self._surface.set_mix(
+            outgoing_alpha=outgoing_alpha,
+            incoming_alpha=incoming_alpha,
+            veil_alpha=veil_alpha,
+        )
+        self._update_phase_badge(elapsed_ms)
+
+        finish_ms = max(
+            float(_TOTAL_MS),
+            self._incoming_enter_start_ms + float(_ENTER_DURATION_MS),
+        )
+        if elapsed_ms >= finish_ms and not self._incoming.isNull():
             self._finish_transition()
+
+    def _refresh_phase_copy_for_current_mode(self) -> None:
+        # Recompute once so any status signal that landed during motion wins.
+        try:
+            self._set_mode(int(self.stack.currentIndex()))
+        except RuntimeError:
+            pass
 
     def _finish_transition(self) -> None:
         self._timer.stop()
         if not self._active:
             return
-        self._surface.set_progress(1.0)
+        self._surface.set_mix(
+            outgoing_alpha=0.0,
+            incoming_alpha=1.0,
+            veil_alpha=0.0,
+        )
         self._surface.repaint()
         self._surface.hide()
         self._surface.clear_frames()
         self._outgoing = QPixmap()
+        self._incoming = QPixmap()
+        self._neutral = QPixmap()
         self._active = False
+        self._finish_phase_badge_transition()
         self._resume_presentation()
+        self._refresh_phase_copy_for_current_mode()
 
         queued = self._queued_index
         self._queued_index = None
@@ -484,10 +760,14 @@ class WorkspaceTransitionController(QObject):
         self._surface.hide()
         self._surface.clear_frames()
         self._outgoing = QPixmap()
+        self._incoming = QPixmap()
+        self._neutral = QPixmap()
         was_active = self._active
         self._active = False
+        self._finish_phase_badge_transition()
         if was_active:
             self._resume_presentation()
+            self._refresh_phase_copy_for_current_mode()
         self._sync_toggle_to_stack()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
@@ -506,6 +786,7 @@ class WorkspaceTransitionController(QObject):
             pass
         if self._active:
             self._active = False
+            self._finish_phase_badge_transition()
             self._resume_presentation()
         self._surface.hide()
         self._surface.clear_frames()
