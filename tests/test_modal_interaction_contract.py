@@ -77,7 +77,7 @@ def test_drawer_content_is_primed_as_real_visible_tree_outside_parent_clip() -> 
     assert "WA_DontShowOnScreen" not in capture
 
 
-def test_cached_panel_contains_background_and_every_child_widget() -> None:
+def test_cached_panel_contains_only_real_child_widgets_not_outer_glass_shell() -> None:
     settle = _body(STATIC, "def _settle_drawer_tree", "def _render_drawer_frame")
     render = _body(STATIC, "def _render_drawer_frame", "def _capture_panel_offscreen")
     assert "drawer.findChildren(QWidget)" in settle
@@ -85,9 +85,27 @@ def test_cached_panel_contains_background_and_every_child_widget() -> None:
     assert "QCoreApplication.sendPostedEvents(None, QEvent.Type.PolishRequest)" in settle
     assert "QCoreApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)" in settle
     assert "layout.activate()" in settle
+    assert "for child in drawer.children()" in render
+    assert "child.parentWidget() is not drawer" in render
+    assert "child.render(" in render
+    assert "drawer.render(" not in render
     assert "QWidget.RenderFlag.DrawWindowBackground" in render
     assert "QWidget.RenderFlag.DrawChildren" in render
     assert "drawer.grab()" not in STATIC
+
+
+def test_compositor_paints_original_drawer_qss_shell_once() -> None:
+    compositor = _body(STATIC, "class _ModalTransitionCompositor", "class StaticModalInteractionController")
+    paint = _body(STATIC, "def paintEvent", "def mousePressEvent")
+    assert "_DRAWER_FILL_RGBA = (220, 228, 238, 74)" in STATIC
+    assert "_DRAWER_BORDER_RGBA = (255, 255, 255, 72)" in STATIC
+    assert "_DRAWER_RADIUS = 14.0" in STATIC
+    assert "def _draw_drawer_shell" in compositor
+    assert "painter.drawRoundedRect(shell, _DRAWER_RADIUS, _DRAWER_RADIUS)" in compositor
+    assert "self._draw_drawer_shell(painter, target.width(), target.height())" in paint
+    assert paint.index("self._draw_drawer_shell(") < paint.index(
+        "painter.drawPixmap(QPointF(0.0, 0.0), self._panel_frame)"
+    )
 
 
 def test_open_handoff_replaces_identical_100_percent_frame_atomically() -> None:
