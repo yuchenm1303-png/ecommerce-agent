@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import Any
 
 from PySide6.QtCore import QObject, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPen
+from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPen, QRadialGradient
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
 
@@ -26,82 +27,150 @@ _MODE_COLORS = {
 
 
 class ActivityPresence(QWidget):
-    """Small, low-cost heartbeat for real workflow progress.
+    """Compact time-driven heartbeat for real workflow progress.
 
-    The percentage is always supplied by the real runner. Only the shimmer and
-    pulse are decorative, so motion communicates liveness without inventing
-    progress. Repaints are confined to this 30px-high widget.
+    Runner events own the target percentage. The widget only eases the painted
+    fill toward that target and animates decorative liveness cues. No synthetic
+    progress is ever added. Rendering stays local to this tiny strip.
     """
+
+    _FRAME_MS = 16
+    _PROGRESS_TAU_S = 0.18
+    _SWEEP_PERIOD_S = 2.25
+    _PULSE_PERIOD_S = 1.75
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("activityPresence")
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setFixedHeight(30)
+        self.setFixedHeight(32)
         self.setMinimumWidth(320)
 
         self.mode = "STANDBY"
         self.detail = "等待任务"
-        self.percent = 0
+        self.target_percent = 0.0
+        self.display_percent = 0.0
         self.active = False
-        self._sweep = 0.0
-        self._pulse_phase = 0.0
+
+        self._motion_time_s = 0.0
+        self._last_frame_s = time.perf_counter()
 
         self._timer = QTimer(self)
-        self._timer.setInterval(90)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.setInterval(self._FRAME_MS)
         self._timer.timeout.connect(self._animate)
 
+    @property
+    def percent(self) -> int:
+        """Compatibility/readback: exact runner-owned target percentage."""
+        return int(round(self.target_percent))
+
     def set_activity(self, mode: str, detail: str, percent: int, *, active: bool) -> None:
+        next_target = float(max(0, min(100, int(percent))))
+        was_active = self.active
+
         self.mode = str(mode or "STANDBY").upper()
         self.detail = str(detail or "").strip() or "等待任务"
-        self.percent = max(0, min(100, int(percent)))
+        self.target_percent = next_target
         self.active = bool(active)
+
+        # A new run legitimately resets 100 -> 0. Do not animate backwards
+        # through stale progress from the previous product.
+        if self.active and (not was_active or self.target_percent + 0.5 < self.display_percent):
+            self.display_percent = self.target_percent
+            self._motion_time_s = 0.0
+
         if self.active:
+            self._last_frame_s = time.perf_counter()
             if not self._timer.isActive():
                 self._timer.start()
         else:
+            # Final/idle states are exact, static and cost zero CPU.
             self._timer.stop()
-            self._sweep = 0.0
-            self._pulse_phase = 0.0
+            self.display_percent = self.target_percent
+            self._motion_time_s = 0.0
+
         self.update()
 
     def _animate(self) -> None:
-        self._sweep = (self._sweep + 0.045) % 1.0
-        self._pulse_phase = (self._pulse_phase + 0.34) % math.tau
+        now = time.perf_counter()
+        dt = max(0.0, min(0.050, now - self._last_frame_s))
+        self._last_frame_s = now
+        self._motion_time_s += dt
+
+        # Frame-rate-independent exponential catch-up. The painted fill never
+        # advances beyond the runner's real target.
+        delta = self.target_percent - self.display_percent
+        if abs(delta) <= 0.015:
+            self.display_percent = self.target_percent
+        else:
+            alpha = 1.0 - math.exp(-dt / self._PROGRESS_TAU_S)
+            self.display_percent += delta * alpha
+            if delta > 0.0:
+                self.display_percent = min(self.display_percent, self.target_percent)
+            else:
+                self.display_percent = max(self.display_percent, self.target_percent)
+
         self.update()
 
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-        outer = QRectF(0.5, 0.5, max(1.0, self.width() - 1.0), max(1.0, self.height() - 1.0))
-        painter.setPen(QPen(QColor(255, 255, 255, 30), 1.0))
-        painter.setBrush(QColor(8, 18, 35, 74))
-        painter.drawRoundedRect(outer, 8.0, 8.0)
+        width = float(max(1, self.width()))
+        height = float(max(1, self.height()))
+        outer = QRectF(0.5, 0.5, width - 1.0, height - 1.0)
+
+        # Very restrained glass shell: one border and one shallow vertical tint.
+        shell = QLinearGradient(0.0, 0.0, 0.0, height)
+        shell.setColorAt(0.0, QColor(14, 29, 50, 76))
+        shell.setColorAt(1.0, QColor(5, 14, 29, 92))
+        painter.setPen(QPen(QColor(255, 255, 255, 28), 1.0))
+        painter.setBrush(shell)
+        painter.drawRoundedRect(outer, 9.0, 9.0)
 
         color = QColor(_MODE_COLORS.get(self.mode, QColor("#d8e8ff")))
-        pulse = 0.78
+
+        # Pulse is time-based, not tick-based, so it remains smooth if a frame
+        # is delayed by other GUI work.
+        pulse_phase = (self._motion_time_s / self._PULSE_PERIOD_S) * math.tau
+        pulse = 0.76 if not self.active else 0.72 + 0.22 * ((math.sin(pulse_phase) + 1.0) * 0.5)
+
         if self.active:
-            pulse = 0.68 + 0.30 * ((math.sin(self._pulse_phase) + 1.0) * 0.5)
+            halo_color = QColor(color)
+            halo_color.setAlpha(int(58 * pulse))
+            halo = QRadialGradient(14.0, 13.0, 9.5)
+            halo.setColorAt(0.0, halo_color)
+            halo_edge = QColor(halo_color)
+            halo_edge.setAlpha(0)
+            halo.setColorAt(1.0, halo_edge)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(halo)
+            painter.drawEllipse(QRectF(4.5, 3.5, 19.0, 19.0))
+
         dot = QColor(color)
-        dot.setAlpha(int(255 * pulse))
+        dot.setAlpha(int(245 * pulse))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(dot)
-        painter.drawEllipse(QRectF(10.0, 10.0, 8.0, 8.0))
+        painter.drawEllipse(QRectF(10.5, 9.5, 7.0, 7.0))
 
         font = painter.font()
         font.setBold(True)
         font.setPointSizeF(max(8.0, font.pointSizeF() - 0.5))
         painter.setFont(font)
         painter.setPen(color)
-        painter.drawText(QRectF(25.0, 2.0, 92.0, 22.0), Qt.AlignmentFlag.AlignVCenter, self.mode)
+        painter.drawText(
+            QRectF(25.0, 1.0, 94.0, 22.0),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            self.mode,
+        )
 
         detail_font = painter.font()
         detail_font.setBold(False)
         painter.setFont(detail_font)
         painter.setPen(QColor(255, 255, 255, 205))
-        detail_left = 112.0
-        detail_right = max(detail_left + 20.0, self.width() - 68.0)
+        detail_left = 114.0
+        detail_right = max(detail_left + 20.0, width - 73.0)
         detail_width = max(20, int(detail_right - detail_left))
         elided = painter.fontMetrics().elidedText(
             self.detail,
@@ -109,49 +178,93 @@ class ActivityPresence(QWidget):
             detail_width,
         )
         painter.drawText(
-            QRectF(detail_left, 2.0, float(detail_width), 22.0),
+            QRectF(detail_left, 1.0, float(detail_width), 22.0),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
             elided,
         )
 
-        painter.setPen(QColor(255, 255, 255, 185))
+        # Keep the text truthful to the runner target while the bar itself
+        # visually catches up over a few hundred milliseconds.
+        painter.setPen(QColor(255, 255, 255, 190))
         painter.drawText(
-            QRectF(max(0.0, self.width() - 61.0), 2.0, 50.0, 22.0),
+            QRectF(max(0.0, width - 66.0), 1.0, 55.0, 22.0),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
-            f"{self.percent}%",
+            f"{int(round(self.target_percent))}%",
         )
 
         track_x = 10.0
-        track_y = self.height() - 4.0
-        track_w = max(1.0, self.width() - 20.0)
-        track_h = 2.0
+        track_y = height - 5.5
+        track_w = max(1.0, width - 20.0)
+        track_h = 3.0
+        track = QRectF(track_x, track_y, track_w, track_h)
+
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 24))
-        painter.drawRoundedRect(QRectF(track_x, track_y, track_w, track_h), 1.0, 1.0)
+        track_bg = QLinearGradient(track_x, 0.0, track_x + track_w, 0.0)
+        track_bg.setColorAt(0.0, QColor(255, 255, 255, 16))
+        track_bg.setColorAt(0.5, QColor(255, 255, 255, 27))
+        track_bg.setColorAt(1.0, QColor(255, 255, 255, 16))
+        painter.setBrush(track_bg)
+        painter.drawRoundedRect(track, 1.5, 1.5)
 
-        completed_w = track_w * (self.percent / 100.0)
+        completed_w = track_w * (self.display_percent / 100.0)
         if completed_w > 0.0:
-            fill = QColor(color)
-            fill.setAlpha(120)
+            fill_rect = QRectF(track_x, track_y, completed_w, track_h)
+            fill = QLinearGradient(track_x, 0.0, track_x + max(1.0, completed_w), 0.0)
+            start_color = QColor(color)
+            start_color.setAlpha(112)
+            end_color = QColor(color)
+            end_color.setAlpha(205)
+            fill.setColorAt(0.0, start_color)
+            fill.setColorAt(0.72, end_color)
+            fill.setColorAt(1.0, end_color)
             painter.setBrush(fill)
-            painter.drawRoundedRect(QRectF(track_x, track_y, completed_w, track_h), 1.0, 1.0)
+            painter.drawRoundedRect(fill_rect, 1.5, 1.5)
 
+            # A tiny luminous leading edge makes progress changes feel continuous
+            # without a large blurred/glowing layer.
+            head_x = track_x + completed_w
+            head = QLinearGradient(max(track_x, head_x - 18.0), 0.0, head_x, 0.0)
+            head_clear = QColor(color)
+            head_clear.setAlpha(0)
+            head_bright = QColor(color)
+            head_bright.setAlpha(235)
+            head.setColorAt(0.0, head_clear)
+            head.setColorAt(1.0, head_bright)
+            painter.setBrush(head)
+            painter.drawRoundedRect(
+                QRectF(max(track_x, head_x - 18.0), track_y, min(18.0, completed_w), track_h),
+                1.5,
+                1.5,
+            )
+
+        # Independent activity shimmer: its position comes from elapsed time.
+        # It does not alter completed_w and therefore cannot fake progress.
         if self.active:
-            sweep_x = track_x + track_w * self._sweep
-            glow_w = 54.0
-            left = max(track_x, sweep_x - glow_w)
-            right = min(track_x + track_w, sweep_x + glow_w)
+            sweep_phase = (self._motion_time_s / self._SWEEP_PERIOD_S) % 1.0
+            glow_w = min(92.0, max(54.0, track_w * 0.075))
+            travel_w = track_w + glow_w * 2.0
+            center = track_x - glow_w + travel_w * sweep_phase
+            left = max(track_x, center - glow_w)
+            right = min(track_x + track_w, center + glow_w)
+
             if right > left:
                 shimmer = QLinearGradient(left, 0.0, right, 0.0)
-                transparent = QColor(color)
-                transparent.setAlpha(0)
-                bright = QColor(color)
-                bright.setAlpha(220)
-                shimmer.setColorAt(0.0, transparent)
+                clear = QColor(color)
+                clear.setAlpha(0)
+                soft = QColor(color)
+                soft.setAlpha(55)
+                bright = QColor(255, 255, 255, 185)
+                shimmer.setColorAt(0.0, clear)
+                shimmer.setColorAt(0.34, soft)
                 shimmer.setColorAt(0.5, bright)
-                shimmer.setColorAt(1.0, transparent)
+                shimmer.setColorAt(0.66, soft)
+                shimmer.setColorAt(1.0, clear)
                 painter.setBrush(shimmer)
-                painter.drawRoundedRect(QRectF(left, track_y, right - left, track_h), 1.0, 1.0)
+                painter.drawRoundedRect(
+                    QRectF(left, track_y - 0.5, right - left, track_h + 1.0),
+                    2.0,
+                    2.0,
+                )
 
         painter.end()
 

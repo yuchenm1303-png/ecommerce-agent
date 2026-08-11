@@ -17,19 +17,35 @@ def test_activity_presence_uses_real_runner_progress_not_fake_percent_growth() -
     assert "prep.progress_changed.connect(self._on_prep_progress)" in ACTIVITY
     assert "prep.phase_event.connect(self._on_phase_event)" in ACTIVITY
     assert "real.progress_changed.connect(self._on_real_progress)" in ACTIVITY
-    assert "self.percent = max(0, min(100, int(percent)))" in ACTIVITY
-    assert "self._sweep = (self._sweep + 0.045) % 1.0" in ACTIVITY
-    assert "self.percent +=" not in ACTIVITY
-    assert "self.percent = (self.percent" not in ACTIVITY
+    assert "self.target_percent = next_target" in ACTIVITY
+    assert "self.display_percent += delta * alpha" in ACTIVITY
+    assert "min(self.display_percent, self.target_percent)" in ACTIVITY
+    assert "self.target_percent +=" not in ACTIVITY
+    assert "self.target_percent = (self.target_percent" not in ACTIVITY
 
 
-def test_activity_presence_animation_is_local_and_stops_when_idle() -> None:
-    assert "self.setFixedHeight(30)" in ACTIVITY
-    assert "self._timer.setInterval(90)" in ACTIVITY
+def test_activity_presence_animation_is_time_driven_60fps_local_and_precise() -> None:
+    assert "self.setFixedHeight(32)" in ACTIVITY
+    assert "_FRAME_MS = 16" in ACTIVITY
+    assert "Qt.TimerType.PreciseTimer" in ACTIVITY
+    assert "time.perf_counter()" in ACTIVITY
+    assert "1.0 - math.exp(-dt / self._PROGRESS_TAU_S)" in ACTIVITY
+    assert "self._motion_time_s / self._SWEEP_PERIOD_S" in ACTIVITY
     assert "self.update()" in ACTIVITY
     assert "window.update()" not in ACTIVITY
     assert "self._timer.stop()" in ACTIVITY
     assert "WA_TransparentForMouseEvents" in ACTIVITY
+
+
+def test_activity_presence_has_refined_layered_progress_visuals_without_blur_effects() -> None:
+    assert "QLinearGradient" in ACTIVITY
+    assert "QRadialGradient" in ACTIVITY
+    assert "track_h = 3.0" in ACTIVITY
+    assert "display_percent / 100.0" in ACTIVITY
+    assert "luminous leading edge" in ACTIVITY
+    assert "Independent activity shimmer" in ACTIVITY
+    assert "QGraphicsBlurEffect" not in ACTIVITY
+    assert "QGraphicsOpacityEffect" not in ACTIVITY
 
 
 def test_activity_presence_covers_preparation_and_real_execution_states() -> None:
