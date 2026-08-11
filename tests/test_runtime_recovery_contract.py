@@ -46,3 +46,21 @@ def test_unknown_failure_stays_shadow_only() -> None:
     assert event.state is RuntimeState.FAILED
     assert event.action is RecoveryAction.NONE
     assert event.advisor == "shadow"
+
+
+def test_runtime_event_round_trip_supports_json_lines_bridge() -> None:
+    original = RuntimeEvent(
+        RuntimeState.AI_ANALYZING,
+        "AI analyzing",
+        detail="unknown modal",
+        progress=41,
+        action=RecoveryAction.CLOSE_POPUP,
+        confidence=0.87,
+        advisor="ai",
+    )
+    restored = RuntimeEvent.from_dict(original.as_dict())
+    assert restored.state is RuntimeState.AI_ANALYZING
+    assert restored.action is RecoveryAction.CLOSE_POPUP
+    assert restored.permission is RecoveryPermission.AUTO_VERIFY
+    assert restored.progress == 41
+    assert restored.advisor == "ai"

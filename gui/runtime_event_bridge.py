@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from PySide6.QtCore import QObject, Signal
@@ -212,9 +213,17 @@ class RuntimeEventBridge(QObject):
 
     def _on_log(self, line: str) -> None:
         text = str(line or "").strip()
-        lowered = text.casefold()
         if not text:
             return
+        if text.startswith("RUNTIME_EVENT "):
+            try:
+                payload = json.loads(text[len("RUNTIME_EVENT "):])
+                self._emit(RuntimeEvent.from_dict(payload))
+            except (ValueError, TypeError, json.JSONDecodeError):
+                # A malformed diagnostic line must never break the normal runner.
+                pass
+            return
+        lowered = text.casefold()
         markers = (
             "joyride-overlay",
             "intercepts pointer events",

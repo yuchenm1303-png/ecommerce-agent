@@ -127,6 +127,34 @@ class RuntimeEvent:
         }:
             object.__setattr__(self, "requires_user", True)
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RuntimeEvent":
+        if not isinstance(payload, dict):
+            raise ValueError("runtime event payload must be a JSON object")
+        return cls(
+            state=RuntimeState(str(payload.get("state") or "IDLE").upper()),
+            title=str(payload.get("title") or ""),
+            detail=str(payload.get("detail") or ""),
+            phase=str(payload.get("phase") or ""),
+            progress=int(payload.get("progress") or 0),
+            interruption=InterruptionKind(
+                str(payload.get("interruption") or "NONE").upper()
+            ),
+            suggestion=str(payload.get("suggestion") or ""),
+            action=RecoveryAction(str(payload.get("action") or "NONE").upper()),
+            confidence=float(payload.get("confidence") or 0.0),
+            requires_user=bool(payload.get("requires_user", False)),
+            advisor=str(payload.get("advisor") or "system"),
+            job_id=str(payload.get("job_id") or ""),
+            target_id=str(payload.get("target_id") or ""),
+            request_id=str(payload.get("request_id") or ""),
+            event_id=str(payload.get("event_id") or uuid4().hex),
+            created_at=str(
+                payload.get("created_at")
+                or datetime.now(timezone.utc).isoformat(timespec="seconds")
+            ),
+        )
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "event_id": self.event_id,
