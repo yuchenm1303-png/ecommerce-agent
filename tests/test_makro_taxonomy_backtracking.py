@@ -7,6 +7,9 @@ import pytest
 from app.makro.taxonomy_navigation import navigate_live_taxonomy
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 class FakePage:
     def __init__(self) -> None:
         self.selected: dict[int, str] = {}
@@ -116,12 +119,7 @@ def test_taxonomy_mechanical_click_failure_is_not_semantic_backtracking() -> Non
 
 
 def test_resilient_dom_reader_has_dedicated_singleton_extension_path() -> None:
-    source = (
-        Path(__file__).resolve().parents[1]
-        / "app"
-        / "makro"
-        / "taxonomy_resilient.py"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / "app" / "makro" / "taxonomy_resilient.py").read_text(encoding="utf-8")
 
     # Proven multi-row scrollable columns remain the primary detector.
     assert "p.scrollable && p.items.length >= 2" in source
@@ -131,3 +129,12 @@ def test_resilient_dom_reader_has_dedicated_singleton_extension_path() -> None:
     assert "p.x > rightmost.x + 360" in source
     # Read and click paths intentionally use the same column-building policy.
     assert source.count("for (let depth = 0; depth < 7 && kept.length; depth++)") == 2
+
+
+def test_formal_single_and_batch_use_resilient_vertical_selector() -> None:
+    single = (ROOT / "makro_gui_workflow.py").read_text(encoding="utf-8")
+    batch = (ROOT / "makro_batch_job.py").read_text(encoding="utf-8")
+
+    expected = "from app.makro.vertical_selection import select_vertical"
+    assert expected in single
+    assert expected in batch
