@@ -9,8 +9,8 @@ from PySide6.QtWidgets import QFrame, QLabel, QMainWindow, QWidget
 from .card_details_fast import FastCardDetailController
 
 
-# Match the reference webpage's visible timing. The transition architecture below
-# changes only presentation cost: complex QWidget content never animates live.
+# Match the reference webpage's visible timing. Complex QWidget content never
+# animates live; one transition surface owns presentation during motion.
 _OPEN_MS = 500
 _CLOSE_MS = 300
 
@@ -79,15 +79,13 @@ def _fit_frame(source: QPixmap, widget: QWidget) -> QPixmap:
 class _ModalTransitionSurface(QWidget):
     """The only animated visual owner for modal transitions.
 
-    The surface is a normal non-native child QWidget. It never owns business
-    controls and never snapshots individual drawer children. During motion it
-    paints only two already-composited full-window pixmaps:
+    Opening is an opaque cached A/B cross-fade because the real modal must be
+    prepared invisibly under an exact entry frame.
 
-      opening: workspace A + opacity(final modal B)
-      closing: latest workspace A + opacity(current modal B)
-
-    Because the surface is opaque, the complex QWidget tree underneath does not
-    need to repaint for every animation tick.
+    Closing is deliberately different: the *real live workspace* is restored
+    underneath first, then one captured current-modal frame fades from opacity
+    1 to 0. There is no synthetic workspace A frame and therefore no compositor
+    handoff from a QPainter approximation to native Quick + layered QWidget.
     """
 
     clicked = Signal()
@@ -103,30 +101,42 @@ class _ModalTransitionSurface(QWidget):
         self._top = QPixmap()
         self._progress = 0.0
         self._capture_suppressed = False
+        self._live_underlay = False
         self.hide()
+
+    def _sync_opaque_attribute(self) -> None:
+        opaque = not self._capture_suppressed and not self._live_underlay
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, opaque)
 
     def set_capture_suppressed(self, suppressed: bool) -> None:
         suppressed = bool(suppressed)
         if suppressed == self._capture_suppressed:
             return
-        if suppressed:
-            # During whole-root offscreen capture this topmost surface must not
-            # advertise itself as opaque, otherwise Qt may cull siblings beneath
-            # it before paintEvent() gets a chance to return without drawing.
-            self._capture_suppressed = True
-            self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
-            return
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-        self._capture_suppressed = False
+        self._capture_suppressed = suppressed
+        self._sync_opaque_attribute()
 
     def set_hold_frame(self, frame: QPixmap) -> None:
+        self._live_underlay = False
+        self._sync_opaque_attribute()
         self._base = _fit_frame(frame, self)
         self._top = QPixmap()
         self._progress = 0.0
         self.update()
 
     def set_transition_frames(self, base: QPixmap, top: QPixmap, progress: float) -> None:
+        self._live_underlay = False
+        self._sync_opaque_attribute()
         self._base = _fit_frame(base, self)
+        self._top = _fit_frame(top, self)
+        self._progress = max(0.0, min(1.0, float(progress)))
+        self.update()
+
+    def set_live_underlay_fade(self, top: QPixmap, progress: float) -> None:
+        """Fade one captured foreground over the actual live widgets beneath."""
+
+        self._live_underlay = True
+        self._sync_opaque_attribute()
+        self._base = QPixmap()
         self._top = _fit_frame(top, self)
         self._progress = max(0.0, min(1.0, float(progress)))
         self.update()
@@ -135,6 +145,8 @@ class _ModalTransitionSurface(QWidget):
         self._base = QPixmap()
         self._top = QPixmap()
         self._progress = 0.0
+        self._live_underlay = False
+        self._sync_opaque_attribute()
         self.update()
 
     def set_progress(self, value: float) -> None:
@@ -146,7 +158,6 @@ class _ModalTransitionSurface(QWidget):
 
     def _draw_fitted(self, painter: QPainter, frame: QPixmap) -> None:
         if frame.isNull():
-            painter.fillRect(self.rect(), Qt.GlobalColor.black)
             return
         logical = frame.deviceIndependentSize()
         if (
@@ -167,16 +178,26 @@ class _ModalTransitionSurface(QWidget):
             return
 
         painter = QPainter(self)
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        if self._live_underlay:
+            # Do not erase or synthesize a base frame. This child is non-opaque,
+            # so the already-painted real workspace below remains authoritative.
+            if self._progress > 0.0 and not self._top.isNull():
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+                painter.setOpacity(self._progress)
+                self._draw_fitted(painter, self._top)
+            painter.end()
+            return
 
-        # Endpoint frames are a single blit. Intermediate frames are exactly two
-        # cached full-surface blits and no live QWidget/layout/effect work.
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         if self._progress >= 1.0 - 1e-6 and not self._top.isNull():
             self._draw_fitted(painter, self._top)
             painter.end()
             return
 
-        self._draw_fitted(painter, self._base)
+        if not self._base.isNull():
+            self._draw_fitted(painter, self._base)
+        else:
+            painter.fillRect(self.rect(), Qt.GlobalColor.black)
         if self._progress > 0.0 and not self._top.isNull():
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
             painter.setOpacity(self._progress)
@@ -192,15 +213,7 @@ class _ModalTransitionSurface(QWidget):
 
 
 class StaticModalInteractionController(QObject):
-    """Final modal presentation architecture: one transition surface, one live modal.
-
-    Stable states use only real widgets:
-      - closed: live workspace;
-      - open: real final backdrop/scrim + the one real drawer.
-
-    Motion uses only `_ModalTransitionSurface`. The real drawer never receives an
-    opacity effect, transform, snapshot, child render or per-frame repaint.
-    """
+    """One transition surface plus one real interactive modal."""
 
     def __init__(self, window: QMainWindow, details: FastCardDetailController) -> None:
         super().__init__(window)
@@ -232,7 +245,6 @@ class StaticModalInteractionController(QObject):
         self._motion_easing = _css_ease()
 
         self._entry_workspace_frame = QPixmap()
-        self._quick_base_frame = QPixmap()
 
         self._original_show_prepared_modal = self.details._show_prepared_modal  # noqa: SLF001
         self._original_close = self.details.close
@@ -459,51 +471,6 @@ class StaticModalInteractionController(QObject):
             self._transition.set_capture_suppressed(False)
         return frame
 
-    def _capture_quick_base(self) -> QPixmap:
-        quick = getattr(self.background, "quick_window", None)
-        if quick is None:
-            return QPixmap()
-        try:
-            image = quick.grabWindow()
-        except RuntimeError:
-            return QPixmap()
-        if image.isNull():
-            return QPixmap()
-        return _fit_frame(QPixmap.fromImage(image), self.root)
-
-    def _cache_quick_base_if_open(self) -> None:
-        if self._state != _STATE_OPEN or not self._quick_base_frame.isNull():
-            return
-        captured = self._capture_quick_base()
-        if not captured.isNull():
-            self._quick_base_frame = captured
-
-    def _capture_workspace_frame(self) -> QPixmap:
-        """Compose the latest QWidget workspace over the frozen Quick scene once."""
-
-        quick_base = self._quick_base_frame
-        if quick_base.isNull():
-            quick_base = self._capture_quick_base()
-            if not quick_base.isNull():
-                self._quick_base_frame = quick_base
-
-        widget_overlay = self._render_root_without_transition()
-        if quick_base.isNull():
-            # Fail soft to the exact entry frame. This path is only used if a
-            # graphics readback fails; normal Windows runtime has a live Quick owner.
-            return QPixmap(self._entry_workspace_frame)
-        if widget_overlay.isNull():
-            return QPixmap(self._entry_workspace_frame)
-
-        result = _empty_surface_frame(self.root)
-        painter = QPainter(result)
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-        painter.drawPixmap(0, 0, _fit_frame(quick_base, self.root))
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-        painter.drawPixmap(0, 0, _fit_frame(widget_overlay, self.root))
-        painter.end()
-        return result
-
     def _frame_interval_ms(self) -> int:
         refresh_hz = 60.0
         screen = self.window.screen()
@@ -545,9 +512,6 @@ class StaticModalInteractionController(QObject):
         if linear >= 1.0:
             self._motion_timer.stop()
             self._set_progress(self._motion_to)
-            # Handoff immediately between pixel-equivalent states. Waiting for a
-            # guessed display interval can freeze the last partially visible
-            # outline because QWidget repaint completion is not presentation.
             self._finish_motion()
 
     def _prepare_open_transition(self, *, ratio: tuple[float, float]) -> None:
@@ -563,8 +527,7 @@ class StaticModalInteractionController(QObject):
         if blurred.isNull():
             raise RuntimeError("failed to prepare modal blur")
 
-        # Stage with an exact copy of the current screen. From this point forward
-        # the user cannot see preparation of the real modal underneath.
+        # Hold the exact current screen while the one real modal is prepared.
         self._transition.set_hold_frame(self._entry_workspace_frame)
         self._transition.show()
         self._transition.raise_()
@@ -575,8 +538,6 @@ class StaticModalInteractionController(QObject):
         if final_modal.isNull():
             raise RuntimeError("failed to capture final live modal frame")
 
-        # The real modal stays alive underneath. The opaque transition surface is
-        # now the sole visual owner until progress reaches 1.
         self._transition.set_transition_frames(
             self._entry_workspace_frame,
             final_modal,
@@ -615,35 +576,34 @@ class StaticModalInteractionController(QObject):
         self._state = _STATE_OPEN
         self.details.close_button.setFocus(Qt.FocusReason.OtherFocusReason)
 
-        # QQuickWindow::grabWindow is a one-time readback. Do it after the visible
-        # opening transition, not on its hot path, and reuse the frozen result on close.
-        QTimer.singleShot(60, self._cache_quick_base_if_open)
-
     def _prepare_close_transition(self) -> None:
-        # Steady state already displays the exact current modal, so capture what
-        # the user actually sees rather than repainting the complex QWidget tree.
+        # This works both from steady OPEN and an interrupted OPENING: capture the
+        # exact visual currently on screen, including the transition surface when
+        # necessary. It becomes the only foreground frame used on close.
         current_modal = self.details._capture_source()  # noqa: SLF001
         if current_modal.isNull():
             raise RuntimeError("failed to capture current modal frame")
+        current_modal = _fit_frame(current_modal, self.root)
 
-        # Hold the exact current modal while the real modal is removed underneath.
+        # Keep that exact image fully opaque while swapping what is underneath.
         self._sync_modal_geometry()
         self._transition.set_hold_frame(current_modal)
         self._transition.show()
         self._transition.raise_()
         self._transition.repaint()
 
-        self._original_close()
+        if not self.details.drawer.isHidden():
+            self._original_close()
         self._modal_closed_for_motion = True
 
-        latest_workspace = self._capture_workspace_frame()
-        if latest_workspace.isNull():
-            raise RuntimeError("failed to capture latest workspace frame")
+        # Restore the *real* native Quick + layered QWidget workspace while it is
+        # still completely hidden by current_modal. From the first visible fade
+        # frame onward there is no synthetic workspace and no later renderer swap.
+        self._resume_underlay()
+        self.root.update()
 
-        # closing = latest workspace A + current modal B * progress, from 1 -> 0.
-        self._transition.set_transition_frames(latest_workspace, current_modal, 1.0)
+        self._transition.set_live_underlay_fade(current_modal, 1.0)
         self._transition.raise_()
-        self._transition.repaint()
         self._progress = 1.0
 
     def request_close(self, *_args: object) -> None:
@@ -653,26 +613,19 @@ class StaticModalInteractionController(QObject):
         if self._state == _STATE_CLOSING:
             return
 
-        if self._state == _STATE_OPENING:
-            # Reverse the exact same A/B surface. The live modal stays underneath
-            # the opaque surface until the final p=0 frame is reached.
+        if self._state in {_STATE_OPENING, _STATE_OPEN}:
             self._stop_animation()
-            current = max(0.0, min(1.0, float(self._progress)))
-            self._state = _STATE_CLOSING
-            self._modal_closed_for_motion = False
-            duration = max(1, int(round(_CLOSE_MS * current)))
-            self._start_fade(end=0.0, duration_ms=duration, easing=_css_ease_in_out())
-            return
-
-        if self._state == _STATE_OPEN:
-            self._stop_animation()
+            prior_progress = max(0.0, min(1.0, float(self._progress)))
             try:
                 self._prepare_close_transition()
             except Exception:
                 self._fallback_close()
                 return
             self._state = _STATE_CLOSING
-            self._start_fade(end=0.0, duration_ms=_CLOSE_MS, easing=_css_ease_in_out())
+            duration = _CLOSE_MS
+            if prior_progress < 1.0:
+                duration = max(1, int(round(_CLOSE_MS * prior_progress)))
+            self._start_fade(end=0.0, duration_ms=duration, easing=_css_ease_in_out())
             return
 
         if self._state == _STATE_IDLE and not self.details.drawer.isHidden():
@@ -690,17 +643,16 @@ class StaticModalInteractionController(QObject):
             except RuntimeError:
                 pass
 
-        # The cached base frame and the live workspace are the same visual state.
-        # Drop the temporary surface directly; do not synchronously repaint the
-        # entire complex QWidget tree at the most latency-sensitive handoff point.
+        # At p=0 the user is already seeing the real live workspace underneath.
+        # Hiding this now-transparent child cannot change brightness/compositing.
         self._transition.hide()
         self._transition.clear_frames()
         self._entry_workspace_frame = QPixmap()
-        self._quick_base_frame = QPixmap()
         self._modal_closed_for_motion = False
         self._fallback_active = False
         self._state = _STATE_IDLE
-        self._resume_underlay()
+        if self._underlay_suspended:
+            self._resume_underlay()
         self.root.update()
 
     def _fallback_open(self, ratio: tuple[float, float]) -> None:
@@ -708,7 +660,6 @@ class StaticModalInteractionController(QObject):
         self._transition.hide()
         self._transition.clear_frames()
         self._entry_workspace_frame = QPixmap()
-        self._quick_base_frame = QPixmap()
         self._modal_closed_for_motion = False
         try:
             self._original_close()
@@ -728,7 +679,6 @@ class StaticModalInteractionController(QObject):
         self._transition.hide()
         self._transition.clear_frames()
         self._entry_workspace_frame = QPixmap()
-        self._quick_base_frame = QPixmap()
         self._modal_closed_for_motion = False
         try:
             self._original_close()
@@ -773,7 +723,6 @@ class StaticModalInteractionController(QObject):
         self._transition.hide()
         self._transition.clear_frames()
         self._entry_workspace_frame = QPixmap()
-        self._quick_base_frame = QPixmap()
         self._fallback_active = False
         self._modal_closed_for_motion = False
         self._state = _STATE_IDLE
