@@ -32,7 +32,7 @@ class WorkspaceModeSwitch(QAbstractButton):
 
     The visible core is the same 40x20 track used by Element Plus, centered in
     its native 32px interaction height. The 16px white action moves from left=1
-    to left=23 over 300ms and the inline prompt switches between × and ✓.
+    to left=23 over 300ms and the inline prompt cross-fades between × and ✓.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -101,12 +101,18 @@ class WorkspaceModeSwitch(QAbstractButton):
         icon_font.setWeight(QFont.Weight.DemiBold)
         painter.setFont(icon_font)
         painter.setPen(_WHITE)
-        if self.isChecked():
-            icon_rect = QRectF(core.left() + 2.0, core.top(), 18.0, core.height())
-            painter.drawText(icon_rect, Qt.AlignmentFlag.AlignCenter, "✓")
-        else:
-            icon_rect = QRectF(core.left() + 20.0, core.top(), 18.0, core.height())
-            painter.drawText(icon_rect, Qt.AlignmentFlag.AlignCenter, "×")
+
+        # The prompt follows the same animated position as the thumb. This keeps
+        # the tiny control itself continuous instead of snapping ✓/× at click time.
+        on_rect = QRectF(core.left() + 2.0, core.top(), 18.0, core.height())
+        off_rect = QRectF(core.left() + 20.0, core.top(), 18.0, core.height())
+        if self._action_position > 0.001:
+            painter.setOpacity(self._action_position)
+            painter.drawText(on_rect, Qt.AlignmentFlag.AlignCenter, "✓")
+        if self._action_position < 0.999:
+            painter.setOpacity(1.0 - self._action_position)
+            painter.drawText(off_rect, Qt.AlignmentFlag.AlignCenter, "×")
+        painter.setOpacity(1.0)
 
         action_left = _ACTION_LEFT_OFF + (
             _ACTION_LEFT_ON - _ACTION_LEFT_OFF
