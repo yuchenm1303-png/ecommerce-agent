@@ -34,8 +34,8 @@ class ManagedMakroBrowser(QObject):
 
     The manager never reads cookies/tokens and never closes the external Edge.
     Authentication remains inside Edge's dedicated profile. If Makro expires the
-    login, the user completes the normal Makro login page in that browser and
-    retries; every new tab in the same profile shares that authenticated session.
+    login, the normal Makro page stays open for the user to authenticate and the
+    GUI surfaces LOGIN REQUIRED instead of turning that into a CDP problem.
     """
 
     status_changed = Signal(str, str)
@@ -74,12 +74,15 @@ class ManagedMakroBrowser(QObject):
         window.runner.start = self._start_single
         window.execution_runner.start = self._start_real
         window.runner.completed.connect(self._single_prepared)
+        window.runner.failed.connect(self._observe_failure)
+        window.execution_runner.failed.connect(self._observe_failure)
 
         if self._batch_controller is not None:
             self._original_batch_prepare = self._batch_controller.start_prepare
             self._original_batch_execute = self._batch_controller.start_execution
             self._batch_controller.start_prepare = self._start_batch_prepare
             self._batch_controller.start_execution = self._start_batch_execute
+            self._batch_controller.failed.connect(self._observe_failure)
 
         token = self._cdp_instance_token()
         if token:
@@ -141,6 +144,7 @@ class ManagedMakroBrowser(QObject):
         color = {
             "READY": "#8fe1b9",
             "STARTING": "#f4cb7a",
+            "LOGIN": "#f4cb7a",
             "OFFLINE": "#f18da0",
             "ERROR": "#f18da0",
         }.get(state, "rgba(255,255,255,180)")
@@ -175,6 +179,28 @@ class ManagedMakroBrowser(QObject):
         if self._instance_token and token != self._instance_token:
             self._generation += 1
         self._instance_token = token
+
+    @staticmethod
+    def _looks_like_login_failure(message: str) -> bool:
+        text = str(message or "").casefold()
+        return any(
+            marker in text
+            for marker in (
+                "登录",
+                "login",
+                "authentication",
+                "authenticated",
+                "sign in",
+                "signin",
+            )
+        )
+
+    def _observe_failure(self, message: str) -> None:
+        if self._looks_like_login_failure(message):
+            self._emit_status(
+                "LOGIN",
+                "需要登录 · 请在已打开的 Makro Browser 完成正常登录后直接重试",
+            )
 
     def _is_busy(self) -> bool:
         if self.window.runner.is_running or self.window.execution_runner.is_running:
@@ -217,7 +243,7 @@ class ManagedMakroBrowser(QObject):
             except Exception as exc:
                 self._emit_status("ERROR", f"Makro Browser 启动失败：{exc}")
                 raise RuntimeError(
-                    "无法自动启动 Makro Browser。请确认 Microsoft Edge 已安装且 9222 未被其他程序占用。"
+                    "无法自动启动 Makro Browser。请确认 Microsoft Edge 已安装且内部浏览器端口未被其他程序占用。"
                 ) from exc
 
     def ensure_async(self) -> None:
@@ -252,7 +278,7 @@ class ManagedMakroBrowser(QObject):
                     "READY",
                     "Makro Browser 已重新连接 · 旧准备页/owned tab 已失效",
                 )
-            elif self._state != "READY":
+            elif self._state not in {"READY", "LOGIN"}:
                 self._emit_status("READY", "Makro Browser 已连接 · 复用专用 Profile")
             return
 
@@ -275,6 +301,7 @@ class ManagedMakroBrowser(QObject):
     def _single_prepared(self, result: Any) -> None:
         if getattr(result, "plan_summary", None):
             self._single_prepared_generation = self._generation
+        self._emit_status("READY", "Makro Browser 已连接 · 当前商品准备完成")
 
     def _start_real(self, config: Any) -> Any:
         self.ensure_ready("Real execution")
