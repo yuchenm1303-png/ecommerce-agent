@@ -61,37 +61,36 @@ def test_all_registered_big_and_small_glass_cards_share_the_same_interaction() -
     assert "if frame.objectName() not in _GLASS_NAMES:" in CARD_FX
 
 
-def test_complete_widget_subtree_scales_while_native_blur_mask_stays_stable() -> None:
+def test_quick_glass_shell_and_widget_content_share_the_same_transform() -> None:
     assert "class NativeGlassProxy(QObject)" in ADAPTER
-    assert "class _CardInteractionTint(QWidget)" in ADAPTER
     assert "class _CardScaleEffect(QGraphicsEffect)" in ADAPTER
     assert "frame.setGraphicsEffect(self._scale_effect)" in ADAPTER
     assert "painter.scale(scale, scale)" in ADAPTER
     assert "self.drawSource(painter)" in ADAPTER
-    assert "self._interaction_tint.set_target_alpha(overlay_alpha)" in ADAPTER
+    assert "self.background.set_card_presentation(" in ADAPTER
     assert "self._scale_effect.set_scale(scale)" in ADAPTER
-    assert "self.update()" in ADAPTER
-    assert "self.repaint()" not in ADAPTER.split("class _CardInteractionTint(QWidget)", 1)[1].split(
-        "class _CardScaleEffect", 1
-    )[0]
-
-    proxy = ADAPTER.split("class NativeGlassProxy(QObject)", 1)[1].split(
-        "class NativeVisualStyleController(QObject)", 1
-    )[0]
-    assert "background.set_card_alpha" not in proxy
-    assert "schedule_mask_update" not in proxy.split("def set_interaction", 1)[1].split(
-        "def sync_geometry", 1
-    )[0]
-    assert "QGraphicsBlurEffect" not in ADAPTER
+    assert "class _CardInteractionTint" not in ADAPTER
+    assert "_interaction_overlay_alpha" not in ADAPTER
 
     assert "class GlassCardModel(QAbstractListModel)" in NATIVE
-    assert 'setContextProperty("glassCardModel", self.card_model)' in NATIVE
-    assert "def render_mask" in NATIVE
-    assert "property url maskUrl" in NATIVE
-    assert "id: maskImg" in NATIVE
-    assert "maskSource: maskImg" in NATIVE
+    assert "SCALE_ROLE = _ROLE_BASE + 11" in NATIVE
+    assert 'SCALE_ROLE: "cardScale"' in NATIVE
+    assert 'self.SCALE_ROLE: QByteArray(b"cardScale")' in NATIVE
+    assert '"cardScale": 1.0' in NATIVE
+    assert "scale: cardScale" in NATIVE
+    assert "transformOrigin: Item.Center" in NATIVE
+    assert "def set_presentation" in NATIVE
+    assert "def set_card_presentation" in NATIVE
     assert "cardAlpha / 255.0" in NATIVE
-    assert "_GEOMETRY_SYNC_MS = 24" in NATIVE
+
+    # The expensive full-window blur mask remains a geometry surface, not a
+    # per-frame hover surface. The visible Quick glass shell itself scales in the
+    # scene graph while the static mask can absorb the current scale on its next
+    # ordinary geometry refresh.
+    assert "def render_mask" in NATIVE
+    assert 'scale = float(state.get("cardScale", 1.0))' in NATIVE
+    presentation = NATIVE.split("def set_card_presentation", 1)[1].split("def _sample_pointer", 1)[0]
+    assert "schedule_mask_update" not in presentation
 
 
 def test_runtime_glass_mask_avoids_png_round_trip_without_changing_mask_pixels() -> None:
@@ -108,6 +107,7 @@ def test_batch_cards_join_the_existing_native_glass_model_after_workspace_instal
     assert "def refresh_glass_frames(self) -> int:" in ADAPTER
     assert "model.beginInsertRows" in ADAPTER
     assert "model.cards.append(frame)" in ADAPTER
+    assert '"cardScale": 1.0' in ADAPTER
     assert "self.background._geometry_watch.add(current)" in ADAPTER
     assert "mode_stack.currentChanged.connect" in ADAPTER
     assert "window.install_mode_workspace()" in RUNNER
