@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TOGGLE = (ROOT / "gui" / "mode_toggle.py").read_text(encoding="utf-8")
 RUNNER = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 WORKFLOW = (ROOT / "gui" / "workflow_console_window.py").read_text(encoding="utf-8")
+TRANSITION = (ROOT / "gui" / "workspace_transition.py").read_text(encoding="utf-8")
 
 
 def test_switch_matches_reference_el_switch_geometry() -> None:
@@ -42,14 +43,18 @@ def test_switch_replaces_only_the_legacy_mode_row_presentation() -> None:
     assert "legacy_card.setObjectName(\"\")" in TOGGLE
     assert "legacy_card.hide()" in TOGGLE
     assert "header.addWidget(toggle, 0, Qt.AlignmentFlag.AlignBottom)" in TOGGLE
-    assert "toggle.clicked.connect(lambda checked: set_mode(1 if checked else 0))" in TOGGLE
+    assert 'transition = getattr(window, "_workspace_transition_controller", None)' in TOGGLE
+    assert 'request = getattr(transition, "request_mode", None)' in TOGGLE
+    assert "toggle.clicked.connect(request_mode)" in TOGGLE
     assert "mode_stack.currentChanged.connect(sync_from_stack)" in TOGGLE
     assert "install_workspace_mode_switch(window)" in RUNNER
+    assert "install_workspace_transition(window, visual)" in RUNNER
 
     # The established business state machine remains the source of truth.
     assert 'self.single_mode_button = QPushButton("SINGLE")' in WORKFLOW
     assert 'self.batch_mode_button = QPushButton("BATCH")' in WORKFLOW
     assert "def _set_workspace_mode" in WORKFLOW
+    assert 'self._set_mode = getattr(window, "_set_workspace_mode", None)' in TRANSITION
 
 
 def test_switch_does_not_create_another_workspace_or_business_controller() -> None:
@@ -60,4 +65,5 @@ def test_switch_does_not_create_another_workspace_or_business_controller() -> No
 
 def test_mode_toggle_sources_compile_without_importing_pyside() -> None:
     compile(TOGGLE, str(ROOT / "gui" / "mode_toggle.py"), "exec")
+    compile(TRANSITION, str(ROOT / "gui" / "workspace_transition.py"), "exec")
     compile(RUNNER, str(ROOT / "run_local_gui.py"), "exec")
