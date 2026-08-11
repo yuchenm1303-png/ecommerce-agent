@@ -310,14 +310,7 @@ class StaticModalInteractionController(QObject):
         self._progress_animation.start()
 
     def _settle_drawer_tree(self) -> None:
-        """Synchronously realize style/layout for every child before capture.
-
-        A newly shown complex QWidget can have posted polish/layout work pending
-        even though show() has already returned. Capturing in that gap produced a
-        panel-only frame and made the real text pop in at handoff. Flush only the
-        non-input polish/layout queues, then activate every nested layout twice so
-        scroll-area viewports, tables, labels and buttons have final geometry.
-        """
+        """Synchronously realize style/layout for every child before capture."""
 
         drawer = self.details.drawer
         widgets = (drawer, *drawer.findChildren(QWidget))
@@ -364,12 +357,12 @@ class StaticModalInteractionController(QObject):
         drawer = self.details.drawer
 
         updates_were_enabled = self.root.updatesEnabled()
+        previous_dont_show = drawer.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
+        frame = QPixmap()
+
         if updates_were_enabled:
             self.root.setUpdatesEnabled(False)
-
-        previous_dont_show = drawer.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
         drawer.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
-        frame = QPixmap()
 
         try:
             self.details.backdrop.setPixmap(backdrop)
@@ -379,30 +372,30 @@ class StaticModalInteractionController(QObject):
             self.details.scroll.verticalScrollBar().setValue(0)
             self.details.ghost.hide()
 
-            # Enter a real visible QWidget state so every nested child receives
-            # its normal show/polish/layout lifecycle, but WA_DontShowOnScreen
-            # guarantees this priming frame can never reach the user's display.
             drawer.show()
             frame = self._render_drawer_frame()
             if frame.isNull():
                 raise RuntimeError("failed to render modal drawer frame")
-        finally:
+
             drawer.hide()
             drawer.setAttribute(
                 Qt.WidgetAttribute.WA_DontShowOnScreen,
                 previous_dont_show,
             )
 
-        try:
             self.details.backdrop.show()
             self.details.backdrop.raise_()
             self.details.scrim.show()
             self.details.scrim.raise_()
-
             self._compositor.set_frame(frame, target, progress=0.0)
             self._compositor.show()
             self._compositor.raise_()
         finally:
+            drawer.hide()
+            drawer.setAttribute(
+                Qt.WidgetAttribute.WA_DontShowOnScreen,
+                previous_dont_show,
+            )
             if updates_were_enabled:
                 self.root.setUpdatesEnabled(True)
 
