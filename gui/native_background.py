@@ -74,7 +74,7 @@ def _blur_wallpaper(source: QImage, radius: float = 10.0) -> QImage:
 
 
 class GlassCardModel(QAbstractListModel):
-    """Card geometry plus lightweight tint state consumed by the Quick scene."""
+    """Card geometry plus lightweight interaction state consumed by Quick."""
 
     _ROLE_BASE = int(Qt.ItemDataRole.UserRole)
     CARD_X_ROLE = _ROLE_BASE + 1
@@ -87,6 +87,7 @@ class GlassCardModel(QAbstractListModel):
     CLIP_H_ROLE = _ROLE_BASE + 8
     ALPHA_ROLE = _ROLE_BASE + 9
     VISIBLE_ROLE = _ROLE_BASE + 10
+    SCALE_ROLE = _ROLE_BASE + 11
 
     _GEOMETRY_ROLES = [
         CARD_X_ROLE,
@@ -110,6 +111,7 @@ class GlassCardModel(QAbstractListModel):
         CLIP_H_ROLE: "clipH",
         ALPHA_ROLE: "cardAlpha",
         VISIBLE_ROLE: "cardVisible",
+        SCALE_ROLE: "cardScale",
     }
 
     def __init__(self, overlay: QMainWindow, cards: list[QFrame], parent: QObject) -> None:
@@ -128,6 +130,7 @@ class GlassCardModel(QAbstractListModel):
                 "clipW": 0.0,
                 "clipH": 0.0,
                 "cardAlpha": _NORMAL_GLASS_ALPHA,
+                "cardScale": 1.0,
                 "cardVisible": False,
             }
             for _ in cards
@@ -146,6 +149,7 @@ class GlassCardModel(QAbstractListModel):
             self.CLIP_H_ROLE: QByteArray(b"clipH"),
             self.ALPHA_ROLE: QByteArray(b"cardAlpha"),
             self.VISIBLE_ROLE: QByteArray(b"cardVisible"),
+            self.SCALE_ROLE: QByteArray(b"cardScale"),
         }
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802, B008
@@ -262,17 +266,37 @@ class GlassCardModel(QAbstractListModel):
             return True
         return False
 
+    def set_presentation(self, frame: QFrame, *, scale: float, alpha: float) -> None:
+        row = self._rows.get(frame)
+        if row is None:
+            return
+
+        scale = max(0.96, min(1.04, float(scale)))
+        alpha = max(0.0, min(255.0, float(alpha)))
+        state = self._states[row]
+        changed_roles: list[int] = []
+
+        if abs(float(state["cardScale"]) - scale) >= 0.0001:
+            state["cardScale"] = scale
+            changed_roles.append(self.SCALE_ROLE)
+        if abs(float(state["cardAlpha"]) - alpha) >= 0.1:
+            state["cardAlpha"] = alpha
+            changed_roles.append(self.ALPHA_ROLE)
+
+        if not changed_roles:
+            return
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index, changed_roles)
+
     def set_alpha(self, frame: QFrame, alpha: float) -> None:
         row = self._rows.get(frame)
         if row is None:
             return
-        alpha = max(0.0, min(255.0, float(alpha)))
-        state = self._states[row]
-        if abs(float(state["cardAlpha"]) - alpha) < 0.1:
-            return
-        state["cardAlpha"] = alpha
-        index = self.index(row, 0)
-        self.dataChanged.emit(index, index, [self.ALPHA_ROLE])
+        self.set_presentation(
+            frame,
+            scale=float(self._states[row].get("cardScale", 1.0)),
+            alpha=alpha,
+        )
 
     def render_mask(self, width: int, height: int) -> QImage:
         image = QImage(
@@ -301,6 +325,17 @@ class GlassCardModel(QAbstractListModel):
                 float(state["cardW"]),
                 float(state["cardH"]),
             )
+            scale = float(state.get("cardScale", 1.0))
+            if abs(scale - 1.0) > 1e-5 and not card.isEmpty():
+                center = card.center()
+                half_w = card.width() * scale * 0.5
+                half_h = card.height() * scale * 0.5
+                card = QRectF(
+                    center.x() - half_w,
+                    center.y() - half_h,
+                    half_w * 2.0,
+                    half_h * 2.0,
+                )
             if clip.isEmpty() or card.isEmpty():
                 continue
             painter.save()
@@ -405,6 +440,8 @@ Window {{
                 y: cardY - clipY
                 width: cardW
                 height: cardH
+                scale: cardScale
+                transformOrigin: Item.Center
                 radius: {_GLASS_RADIUS:.1f}
                 antialiasing: true
                 color: Qt.rgba(0, 0, 0, cardAlpha / 255.0)
@@ -528,6 +565,11 @@ class NativeQuickBackground(QObject):
 
     def set_card_alpha(self, frame: QFrame, alpha: float) -> None:
         self.card_model.set_alpha(frame, alpha)
+
+    def set_card_presentation(self, frame: QFrame, *, scale: float, alpha: float) -> None:
+        """Update the GPU glass shell without rebuilding the global blur mask."""
+
+        self.card_model.set_presentation(frame, scale=scale, alpha=alpha)
 
     def _sample_pointer(self) -> None:
         quick = self.quick_window
