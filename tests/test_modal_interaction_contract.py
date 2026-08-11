@@ -77,21 +77,24 @@ def test_drawer_content_is_primed_as_real_visible_tree_outside_parent_clip() -> 
     assert "WA_DontShowOnScreen" not in capture
 
 
-def test_cached_panel_contains_only_real_child_widgets_not_outer_glass_shell() -> None:
-    settle = _body(STATIC, "def _settle_drawer_tree", "def _render_drawer_frame")
+def test_cached_panel_preserves_native_widget_hierarchy_and_suppresses_only_shell() -> None:
     render = _body(STATIC, "def _render_drawer_frame", "def _capture_panel_offscreen")
-    assert "drawer.findChildren(QWidget)" in settle
-    assert "widget.ensurePolished()" in settle
-    assert "QCoreApplication.sendPostedEvents(None, QEvent.Type.PolishRequest)" in settle
-    assert "QCoreApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)" in settle
-    assert "layout.activate()" in settle
-    assert "for child in drawer.children()" in render
-    assert "child.parentWidget() is not drawer" in render
-    assert "child.render(" in render
-    assert "drawer.render(" not in render
-    assert "QWidget.RenderFlag.DrawWindowBackground" in render
+    event_filter = _body(STATIC, "def eventFilter", "def cleanup")
+
+    assert "drawer.render(" in render
     assert "QWidget.RenderFlag.DrawChildren" in render
-    assert "drawer.grab()" not in STATIC
+    assert "QWidget.RenderFlag.DrawWindowBackground" not in render
+    assert "for child in drawer.children()" not in render
+    assert "child.render(" not in render
+    assert "drawer.grab()" not in render
+
+    assert "self._suppress_drawer_paint_for_capture = True" in render
+    assert "finally:" in render
+    assert "self._suppress_drawer_paint_for_capture = False" in render
+    assert "watched is self.details.drawer" in event_filter
+    assert "event.type() == QEvent.Type.Paint" in event_filter
+    assert "return True" in event_filter
+    assert "self.details.drawer.installEventFilter(self)" in STATIC
 
 
 def test_compositor_paints_original_drawer_qss_shell_once() -> None:
@@ -118,7 +121,7 @@ def test_open_handoff_replaces_identical_100_percent_frame_atomically() -> None:
     assert "self.root.repaint()" in finish
 
 
-def test_close_first_covers_real_modal_with_identical_compositor_then_reverses() -> None:
+def test_close_recaptures_current_real_tree_then_reverses_same_compositor() -> None:
     prepare = _body(STATIC, "def _prepare_close_state", "def _show_with_animation")
     assert "panel_frame = self._render_drawer_frame()" in prepare
     assert "self._compositor.set_panel_frame(panel_frame, target)" in prepare
@@ -191,6 +194,12 @@ def test_fail_soft_keeps_static_modal_available() -> None:
     fallback_close = _body(STATIC, "def _fallback_close", "def eventFilter")
     assert "self._original_close()" in fallback_close
     assert "self._resume_underlay()" in fallback_close
+
+
+def test_cleanup_removes_root_and_drawer_capture_filters() -> None:
+    cleanup = _body(STATIC, "def cleanup", "def install_static_modal_interaction")
+    assert "self.root.removeEventFilter(self)" in cleanup
+    assert "self.details.drawer.removeEventFilter(self)" in cleanup
 
 
 def test_real_modal_remains_existing_qwidget_content_after_handoff() -> None:
