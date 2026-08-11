@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = (ROOT / "gui" / "static_modal_interaction.py").read_text(encoding="utf-8")
 DETAILS = (ROOT / "gui" / "card_details_fast.py").read_text(encoding="utf-8")
+BASE_DETAILS = (ROOT / "gui" / "card_details.py").read_text(encoding="utf-8")
 REQUIRED = (ROOT / "gui" / "required_input_support.py").read_text(encoding="utf-8")
 RUNNER = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
@@ -116,6 +117,20 @@ def test_whole_root_capture_excludes_only_the_transition_surface() -> None:
     assert "drawer.grab(" not in capture
 
 
+def test_detail_body_retirement_removes_old_glass_from_same_turn_capture() -> None:
+    retire = _body(BASE_DETAILS, "def _retire_widget", "def _clear_body")
+    assert retire.index("widget.hide()") < retire.index("widget.setParent(None)")
+    assert retire.index("widget.setParent(None)") < retire.index("widget.deleteLater()")
+
+    clear = _body(BASE_DETAILS, "def _clear_body", "@classmethod")
+    assert "self._retire_widget(widget)" in clear
+    assert "widget.deleteLater()" not in clear
+
+    delete_layout = _body(BASE_DETAILS, "def _delete_layout", "def _section")
+    assert "cls._retire_widget(widget)" in delete_layout
+    assert "widget.deleteLater()" not in delete_layout
+
+
 def test_opening_is_entry_a_to_final_live_modal_b() -> None:
     prepare = _body(STATIC, "def _prepare_open_transition", "def _show_with_animation")
     assert "entry = self.details._capture_source()" in prepare
@@ -136,9 +151,36 @@ def test_opening_is_entry_a_to_final_live_modal_b() -> None:
     assert "setOpacity" not in real
 
 
+def test_endpoint_frame_is_presented_before_live_widget_handoff() -> None:
+    assert "self._handoff_timer = QTimer(self)" in STATIC
+    assert "self._handoff_timer.setSingleShot(True)" in STATIC
+    assert "Qt.TimerType.PreciseTimer" in STATIC
+    assert "self._handoff_timer.timeout.connect(self._finish_motion)" in STATIC
+
+    delay = _body(STATIC, "def _handoff_delay_ms", "def _stop_animation")
+    assert "return max(8, self._frame_interval_ms() + 2)" in delay
+
+    stop = _body(STATIC, "def _stop_animation", "def _start_fade")
+    assert "self._motion_timer.stop()" in stop
+    assert "self._handoff_timer.stop()" in stop
+
+    advance = _body(STATIC, "def _advance_motion", "def _prepare_open_transition")
+    endpoint = advance.split("if linear >= 1.0:", 1)[1]
+    assert endpoint.index("self._set_progress(self._motion_to)") < endpoint.index(
+        "self._transition.repaint()"
+    )
+    assert endpoint.index("self._transition.repaint()") < endpoint.index(
+        "self._handoff_timer.start(self._handoff_delay_ms())"
+    )
+    assert "self._finish_motion()" not in endpoint
+
+
 def test_open_handoff_reveals_the_same_live_widgets_that_generated_b() -> None:
     finish = _body(STATIC, "def _finish_open", "def _prepare_close_transition")
     assert "self._transition.hide()" in finish
+    assert finish.index("self._transition.hide()") < finish.index("self.details.backdrop.repaint()")
+    assert "self.details.scrim.repaint()" in finish
+    assert "self.details.drawer.repaint()" in finish
     assert "self._transition.clear_frames()" in finish
     assert "self.details.close_button.setFocus" in finish
     assert "self.details.drawer.hide()" not in finish
@@ -157,6 +199,15 @@ def test_close_uses_exact_current_screen_then_latest_workspace() -> None:
     assert "_render_root_without_transition()" not in close.split(
         "current_modal = self.details._capture_source()", 1
     )[0]
+
+
+def test_close_handoff_occurs_only_after_presented_p0_and_refreshes_live_workspace() -> None:
+    finish = _body(STATIC, "def _finish_close", "def _fallback_open")
+    assert "self._progress = 0.0" in finish
+    assert "self._transition.set_progress(0.0)" in finish
+    assert "self._transition.hide()" in finish
+    assert finish.index("self._transition.hide()") < finish.index("self.root.repaint()")
+    assert finish.index("self.root.repaint()") < finish.index("self._transition.clear_frames()")
 
 
 def test_latest_workspace_is_quick_scene_plus_current_widget_overlay() -> None:
@@ -309,4 +360,5 @@ def test_cleanup_restores_original_controller_and_deletes_only_surface() -> None
 def test_sources_compile_without_importing_pyside() -> None:
     compile(STATIC, str(ROOT / "gui" / "static_modal_interaction.py"), "exec")
     compile(DETAILS, str(ROOT / "gui" / "card_details_fast.py"), "exec")
+    compile(BASE_DETAILS, str(ROOT / "gui" / "card_details.py"), "exec")
     compile(REQUIRED, str(ROOT / "gui" / "required_input_support.py"), "exec")
