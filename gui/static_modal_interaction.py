@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, QRegion, Qt, QTimer, Signal
-from PySide6.QtGui import QKeyEvent, QMouseEvent, QPainter, QPixmap
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, Qt, QTimer, Signal
+from PySide6.QtGui import QKeyEvent, QMouseEvent, QPainter, QPixmap, QRegion
 from PySide6.QtWidgets import QFrame, QLabel, QMainWindow, QWidget
 
 from .card_details_fast import FastCardDetailController
@@ -606,7 +606,9 @@ class StaticModalInteractionController(QObject):
         QTimer.singleShot(60, self._cache_quick_base_if_open)
 
     def _prepare_close_transition(self) -> None:
-        current_modal = self._render_root_without_transition()
+        # Steady state already displays the exact current modal, so capture what
+        # the user actually sees rather than repainting the complex QWidget tree.
+        current_modal = self.details._capture_source()  # noqa: SLF001
         if current_modal.isNull():
             raise RuntimeError("failed to capture current modal frame")
 
@@ -638,8 +640,8 @@ class StaticModalInteractionController(QObject):
             return
 
         if self._state == _STATE_OPENING:
-            # Reverse the exact same A/B surface. The live modal remains hidden
-            # behind the opaque surface until the final p=0 frame is reached.
+            # Reverse the exact same A/B surface. The live modal stays underneath
+            # the opaque surface until the final p=0 frame is reached.
             self._stop_animation()
             current = max(0.0, min(1.0, float(self._progress)))
             self._state = _STATE_CLOSING
