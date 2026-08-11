@@ -21,39 +21,29 @@ from PySide6.QtWidgets import QGraphicsOpacityEffect, QMainWindow, QStackedWidge
 from .native_background import _OVERSCAN
 
 
-# Large top-level workspaces get more time than the tiny 300 ms switch control.
-# The workspace pixels themselves never receive full-frame opacity animation: a
-# narrow soft curtain replaces them with the neutral Fuji frame, then reveals the
-# target frame. This keeps dark editors, table viewports and text at native
-# luminance until the curtain actually passes over that location.
+# Preserve the approved fade-through motion exactly.
 _PREPARE_MS = 30
-_HOLD_MS = 44
-_EXIT_END_MS = 178
-_ENTER_START_MS = 208
-_TOTAL_MS = 438
+_HOLD_MS = 40
+_EXIT_END_MS = 155
+_ENTER_START_MS = 175
+_TOTAL_MS = 390
 _ENTER_DURATION_MS = _TOTAL_MS - _ENTER_START_MS
-_HANDOFF_SETTLE_MS = 34
 
-_CURTAIN_EDGE_PX = 32.0
-_CURTAIN_EDGE_STEPS = 6
+_HEADER_EXIT_START_MS = 45
+_HEADER_EXIT_END_MS = 125
+_HEADER_ENTER_START_MS = 150
+_HEADER_ENTER_END_MS = 270
 
-_HEADER_EXIT_START_MS = 50
-_HEADER_EXIT_END_MS = 130
-_HEADER_ENTER_START_MS = 155
-_HEADER_ENTER_END_MS = 285
-
-# The veil belongs to the neutral background only. It is painted before either
-# cached workspace, so it never changes the brightness of readable content.
-_VEIL_START_MS = 158
-_VEIL_PEAK_MS = 194
-_VEIL_END_MS = 232
-_VEIL_MAX_OPACITY = 0.045
+_VEIL_START_MS = 135
+_VEIL_PEAK_MS = 170
+_VEIL_END_MS = 220
+_VEIL_MAX_OPACITY = 0.06
 _VEIL_COLOR = QColor(228, 241, 250)
 
-# Quick uses the threaded render loop in the formal runner. The new card geometry
-# must reach at least one presented Quick frame before the incoming composite is
-# sampled; otherwise the QWidget page can be combined with the previous glass mask.
+# Presentation synchronization only; these do not change the visible motion.
 _QUICK_SYNC_TIMEOUT_MS = 64
+_WIDGET_SETTLE_MS = 24
+_HANDOFF_SETTLE_MS = 34
 
 
 def _cubic_bezier(c1x: float, c1y: float, c2x: float, c2y: float) -> QEasingCurve:
@@ -121,13 +111,7 @@ def _fit_frame(source: QPixmap, widget: QWidget) -> QPixmap:
 
 
 class _WorkspaceTransitionSurface(QWidget):
-    """Root-level single owner with a luminance-stable soft curtain.
-
-    Readable workspace pixels are always drawn at opacity 1.0. Only a narrow
-    32px feather at the moving curtain edge uses partial opacity, eliminating the
-    broad luminance pulse that was visible in QPlainTextEdit backgrounds and
-    small status labels when the entire cached frame was cross-faded.
-    """
+    """Opaque root-level owner for the approved Single/Batch fade-through."""
 
     def __init__(self, root: QWidget) -> None:
         super().__init__(root)
@@ -141,21 +125,21 @@ class _WorkspaceTransitionSurface(QWidget):
         self._neutral = QPixmap()
         self._outgoing = QPixmap()
         self._incoming = QPixmap()
-        self._outgoing_visible = 1.0
-        self._incoming_visible = 0.0
+        self._outgoing_alpha = 1.0
+        self._incoming_alpha = 0.0
         self._veil_alpha = 0.0
         self.hide()
 
+    def set_opaque_hint(self, opaque: bool) -> None:
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, bool(opaque))
+
     def begin(self, neutral: QPixmap, outgoing: QPixmap) -> None:
-        # During motion the overlay is opaque to QWidget's occlusion machinery so
-        # no live child can leak through. The flag is relaxed only for the final
-        # hidden-page backing-store warmup.
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.set_opaque_hint(True)
         self._neutral = _fit_frame(neutral, self)
         self._outgoing = _fit_frame(outgoing, self)
         self._incoming = QPixmap()
-        self._outgoing_visible = 1.0
-        self._incoming_visible = 0.0
+        self._outgoing_alpha = 1.0
+        self._incoming_alpha = 0.0
         self._veil_alpha = 0.0
         self.update()
 
@@ -163,42 +147,34 @@ class _WorkspaceTransitionSurface(QWidget):
         self._incoming = _fit_frame(incoming, self)
         self.update()
 
-    def set_reveal(
+    def set_mix(
         self,
         *,
-        outgoing_visible: float,
-        incoming_visible: float,
+        outgoing_alpha: float,
+        incoming_alpha: float,
         veil_alpha: float,
     ) -> None:
-        outgoing_visible = max(0.0, min(1.0, float(outgoing_visible)))
-        incoming_visible = max(0.0, min(1.0, float(incoming_visible)))
+        outgoing_alpha = max(0.0, min(1.0, float(outgoing_alpha)))
+        incoming_alpha = max(0.0, min(1.0, float(incoming_alpha)))
         veil_alpha = max(0.0, min(_VEIL_MAX_OPACITY, float(veil_alpha)))
         changed = (
-            abs(outgoing_visible - self._outgoing_visible) > 1e-5
-            or abs(incoming_visible - self._incoming_visible) > 1e-5
+            abs(outgoing_alpha - self._outgoing_alpha) > 1e-5
+            or abs(incoming_alpha - self._incoming_alpha) > 1e-5
             or abs(veil_alpha - self._veil_alpha) > 1e-5
         )
-        self._outgoing_visible = outgoing_visible
-        self._incoming_visible = incoming_visible
+        self._outgoing_alpha = outgoing_alpha
+        self._incoming_alpha = incoming_alpha
         self._veil_alpha = veil_alpha
         if changed:
             self.update()
 
-    def prepare_live_handoff(self) -> None:
-        # Tell the QWidget backing-store that this sibling is no longer an opaque
-        # occluder while we still paint the exact incoming snapshot above it. That
-        # gives dark viewports, labels and headers time to repaint underneath
-        # without becoming visible before the final handoff.
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
-        self.update()
-
     def clear_frames(self) -> None:
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.set_opaque_hint(True)
         self._neutral = QPixmap()
         self._outgoing = QPixmap()
         self._incoming = QPixmap()
-        self._outgoing_visible = 1.0
-        self._incoming_visible = 0.0
+        self._outgoing_alpha = 1.0
+        self._incoming_alpha = 0.0
         self._veil_alpha = 0.0
         self.update()
 
@@ -217,121 +193,31 @@ class _WorkspaceTransitionSurface(QWidget):
         painter.drawPixmap(self.rect(), frame, frame.rect())
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
 
-    def _draw_clipped(
-        self,
-        painter: QPainter,
-        frame: QPixmap,
-        clip_rect: QRectF,
-        *,
-        opacity: float = 1.0,
-    ) -> None:
-        if frame.isNull() or clip_rect.isEmpty() or opacity <= 1e-5:
-            return
-        painter.save()
-        painter.setClipRect(clip_rect)
-        if opacity < 0.9999:
-            painter.setOpacity(opacity)
-        self._draw_fitted(painter, frame)
-        painter.restore()
-
-    def _draw_outgoing_curtain(self, painter: QPainter) -> None:
-        visible = self._outgoing_visible
-        if self._outgoing.isNull() or visible <= 1e-5:
-            return
-        if visible >= 1.0 - 1e-5:
-            self._draw_fitted(painter, self._outgoing)
-            return
-
-        height = float(self.height())
-        width = float(self.width())
-        boundary = (1.0 - visible) * height
-        edge = min(_CURTAIN_EDGE_PX, height)
-        soft_end = min(height, boundary + edge)
-
-        # Everything below the feather stays at native opacity. Only the narrow
-        # leading edge blends against the neutral Fuji base.
-        if soft_end < height:
-            self._draw_clipped(
-                painter,
-                self._outgoing,
-                QRectF(0.0, soft_end, width, height - soft_end),
-            )
-
-        span = max(0.0, soft_end - boundary)
-        if span <= 1e-5:
-            return
-        step_h = span / float(_CURTAIN_EDGE_STEPS)
-        for step in range(_CURTAIN_EDGE_STEPS):
-            top = boundary + step_h * step
-            bottom = boundary + step_h * (step + 1)
-            opacity = (step + 0.5) / float(_CURTAIN_EDGE_STEPS)
-            self._draw_clipped(
-                painter,
-                self._outgoing,
-                QRectF(0.0, top, width, max(0.0, bottom - top)),
-                opacity=opacity,
-            )
-
-    def _draw_incoming_curtain(self, painter: QPainter) -> None:
-        visible = self._incoming_visible
-        if self._incoming.isNull() or visible <= 1e-5:
-            return
-        if visible >= 1.0 - 1e-5:
-            self._draw_fitted(painter, self._incoming)
-            return
-
-        height = float(self.height())
-        width = float(self.width())
-        boundary = visible * height
-        edge = min(_CURTAIN_EDGE_PX, height)
-        soft_start = max(0.0, boundary - edge)
-
-        if soft_start > 0.0:
-            self._draw_clipped(
-                painter,
-                self._incoming,
-                QRectF(0.0, 0.0, width, soft_start),
-            )
-
-        span = max(0.0, boundary - soft_start)
-        if span <= 1e-5:
-            return
-        step_h = span / float(_CURTAIN_EDGE_STEPS)
-        for step in range(_CURTAIN_EDGE_STEPS):
-            top = soft_start + step_h * step
-            bottom = soft_start + step_h * (step + 1)
-            opacity = 1.0 - (step + 0.5) / float(_CURTAIN_EDGE_STEPS)
-            self._draw_clipped(
-                painter,
-                self._incoming,
-                QRectF(0.0, top, width, max(0.0, bottom - top)),
-                opacity=opacity,
-            )
-
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         painter = QPainter(self)
-
-        # The neutral base is the single opaque backing image for the whole
-        # transition. Live QWidget/Quick pixels can never leak through.
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         self._draw_fitted(painter, self._neutral)
 
-        # The veil is under readable content. It can breathe the neutral handoff
-        # without changing a QPlainTextEdit shadow or QLabel glyph luminance.
+        if self._outgoing_alpha > 1e-5 and not self._outgoing.isNull():
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            painter.setOpacity(self._outgoing_alpha)
+            self._draw_fitted(painter, self._outgoing)
+
+        if self._incoming_alpha > 1e-5 and not self._incoming.isNull():
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            painter.setOpacity(self._incoming_alpha)
+            self._draw_fitted(painter, self._incoming)
+
         if self._veil_alpha > 1e-5:
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
             painter.setOpacity(self._veil_alpha)
             painter.fillRect(self.rect(), _VEIL_COLOR)
-            painter.setOpacity(1.0)
 
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-        self._draw_outgoing_curtain(painter)
-        self._draw_incoming_curtain(painter)
         painter.end()
 
 
 class WorkspaceTransitionController(QObject):
-    """Presentation-only Single/Batch transition with single pixel ownership."""
+    """Presentation-only Single/Batch fade-through with flicker-safe sampling."""
 
     def __init__(self, window: QMainWindow, visual: Any) -> None:
         super().__init__(window)
@@ -358,6 +244,7 @@ class WorkspaceTransitionController(QObject):
         self._wallpaper = self._load_wallpaper()
         self._started_s = 0.0
         self._incoming_enter_start_ms = float(_ENTER_START_MS)
+
         self._pointer_timer_was_active = False
         self._card_fx_suspended = False
 
@@ -368,11 +255,19 @@ class WorkspaceTransitionController(QObject):
         self._phase_swapped = False
 
         self._awaiting_quick_frame = False
+        self._quick_ready = False
+        self._widget_ready = False
         self._quick_frame_connected = False
+
         self._quick_sync_timeout = QTimer(self)
         self._quick_sync_timeout.setSingleShot(True)
         self._quick_sync_timeout.setTimerType(Qt.TimerType.PreciseTimer)
-        self._quick_sync_timeout.timeout.connect(self._capture_incoming_after_quick_sync)
+        self._quick_sync_timeout.timeout.connect(self._mark_quick_ready)
+
+        self._widget_settle_timer = QTimer(self)
+        self._widget_settle_timer.setSingleShot(True)
+        self._widget_settle_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._widget_settle_timer.timeout.connect(self._mark_widget_ready)
 
         self._handoff_timer = QTimer(self)
         self._handoff_timer.setSingleShot(True)
@@ -440,7 +335,9 @@ class WorkspaceTransitionController(QObject):
             except RuntimeError:
                 pass
 
-    def _render_current_page(self) -> QPixmap:
+    def _grab_current_page_widgets(self) -> QPixmap:
+        """Capture exactly the visible stacked page through QWidget.grab()."""
+
         page = self.stack.currentWidget()
         if (
             page is None
@@ -451,14 +348,18 @@ class WorkspaceTransitionController(QObject):
         ):
             return QPixmap()
 
+        try:
+            page_pixmap = page.grab()
+        except RuntimeError:
+            return QPixmap()
+        if page_pixmap.isNull():
+            return QPixmap()
+
         frame = _empty_frame(self.stack)
+        painter = QPainter(frame)
         target_offset = page.mapTo(self.stack, QPoint(0, 0))
-        page.render(
-            frame,
-            target_offset,
-            QRegion(),
-            QWidget.RenderFlag.DrawChildren,
-        )
+        painter.drawPixmap(target_offset, page_pixmap)
+        painter.end()
         return frame
 
     def _capture_quick_for_stack(self) -> QPixmap:
@@ -489,6 +390,8 @@ class WorkspaceTransitionController(QObject):
         return _fit_frame(cropped, self.stack)
 
     def _capture_neutral_background(self) -> QPixmap:
+        """Rebuild the sharp Fuji frame at the current parallax offset, without glass."""
+
         quick = getattr(self.background, "quick_window", None)
         wallpaper = self._wallpaper
         if (
@@ -499,7 +402,9 @@ class WorkspaceTransitionController(QObject):
             or self.root.width() <= 0
             or self.root.height() <= 0
         ):
-            return self._capture_quick_for_stack()
+            fallback = _empty_frame(self.stack)
+            fallback.fill(QColor(23, 38, 58))
+            return fallback
 
         root_frame = _empty_frame(self.root)
         root_frame.fill(QColor(23, 38, 58))
@@ -546,7 +451,7 @@ class WorkspaceTransitionController(QObject):
 
     def _capture_composite(self) -> QPixmap:
         quick_frame = self._capture_quick_for_stack()
-        widget_frame = self._render_current_page()
+        widget_frame = self._grab_current_page_widgets()
         if quick_frame.isNull():
             return _fit_frame(widget_frame, self.stack)
         if widget_frame.isNull():
@@ -652,6 +557,7 @@ class WorkspaceTransitionController(QObject):
             if elapsed_ms < _HEADER_EXIT_START_MS:
                 effect.setOpacity(1.0)
                 return
+
             if elapsed_ms < _HEADER_EXIT_END_MS:
                 progress = _segment_progress(
                     elapsed_ms,
@@ -728,18 +634,15 @@ class WorkspaceTransitionController(QObject):
             return
 
         self._sync_surface_geometry()
-        self._suspend_presentation()
 
+        # Capture the exact visible endpoint BEFORE suspend_for_modal() normalizes
+        # hover/tint state. The normalization happens only after the frozen frame
+        # has become the sole visible owner.
         neutral = self._capture_neutral_background()
         outgoing = self._capture_composite()
         if outgoing.isNull():
-            self._resume_presentation()
             self._set_mode(index)
             return
-        if neutral.isNull():
-            neutral = self._capture_quick_for_stack()
-        if neutral.isNull():
-            neutral = QPixmap(outgoing)
 
         self._target_index = index
         self._queued_index = None
@@ -754,6 +657,10 @@ class WorkspaceTransitionController(QObject):
         self._surface.show()
         self._raise_transition_surface()
         self._surface.repaint()
+
+        # Presentation paths can now normalize/suspend invisibly behind the exact
+        # outgoing snapshot.
+        self._suspend_presentation()
 
         phase_old = ""
         badge = self._phase_badge
@@ -791,6 +698,30 @@ class WorkspaceTransitionController(QObject):
     def _elapsed_ms(self) -> float:
         return max(0.0, (time.perf_counter() - self._started_s) * 1000.0)
 
+    def _prime_target_widget_tree(self) -> None:
+        page = self.stack.currentWidget()
+        if page is None:
+            return
+        try:
+            page.ensurePolished()
+            layout = page.layout()
+            if layout is not None:
+                layout.activate()
+
+            # Force one complete child paint while still fully hidden by the
+            # transition surface. The pixmap is intentionally discarded: this is
+            # a style/font/viewport warm-up, not an animation frame.
+            warm = page.grab()
+            del warm
+
+            page.update()
+            for child in page.findChildren(QWidget):
+                if child.isVisibleTo(page):
+                    child.update()
+            self.root.update(self._surface.geometry())
+        except RuntimeError:
+            pass
+
     def _prepare_incoming(self) -> None:
         if not self._active:
             return
@@ -802,6 +733,16 @@ class WorkspaceTransitionController(QObject):
             self._finish_immediate()
             return
 
+        # Let Qt repaint the live target underneath the still-opaque snapshot.
+        # This changes only occlusion bookkeeping; the user continues to see the
+        # cached outgoing/Fuji frame.
+        self._surface.set_opaque_hint(False)
+        self._prime_target_widget_tree()
+
+        self._widget_ready = False
+        self._quick_ready = False
+        self._widget_settle_timer.start(max(_WIDGET_SETTLE_MS, self._frame_interval_ms()))
+
         flush_geometry = getattr(self.background, "_flush_geometry", None)
         if callable(flush_geometry):
             try:
@@ -811,7 +752,8 @@ class WorkspaceTransitionController(QObject):
 
         quick = getattr(self.background, "quick_window", None)
         if quick is None:
-            self._capture_incoming_after_quick_sync()
+            self._quick_ready = True
+            self._maybe_capture_incoming()
             return
 
         self._awaiting_quick_frame = True
@@ -819,7 +761,8 @@ class WorkspaceTransitionController(QObject):
             quick.update()
         except RuntimeError:
             self._awaiting_quick_frame = False
-            self._capture_incoming_after_quick_sync()
+            self._quick_ready = True
+            self._maybe_capture_incoming()
             return
 
         self._quick_sync_timeout.start(
@@ -832,14 +775,31 @@ class WorkspaceTransitionController(QObject):
             return
         self._awaiting_quick_frame = False
         self._quick_sync_timeout.stop()
-        self._capture_incoming_after_quick_sync()
+        self._quick_ready = True
+        self._maybe_capture_incoming()
 
-    def _capture_incoming_after_quick_sync(self) -> None:
+    def _mark_quick_ready(self) -> None:
         if not self._active:
             return
         self._awaiting_quick_frame = False
-        self._quick_sync_timeout.stop()
+        self._quick_ready = True
+        self._maybe_capture_incoming()
 
+    def _mark_widget_ready(self) -> None:
+        if not self._active:
+            return
+        self._prime_target_widget_tree()
+        self._widget_ready = True
+        self._maybe_capture_incoming()
+
+    def _maybe_capture_incoming(self) -> None:
+        if (
+            not self._active
+            or not self._quick_ready
+            or not self._widget_ready
+            or not self._incoming.isNull()
+        ):
+            return
         if (
             self.window.isMinimized()
             or not self.window.isVisible()
@@ -855,6 +815,7 @@ class WorkspaceTransitionController(QObject):
 
         self._incoming = incoming
         self._surface.set_incoming(incoming)
+        self._surface.set_opaque_hint(True)
         self._raise_transition_surface()
         self._surface.repaint()
         self._incoming_enter_start_ms = max(
@@ -862,24 +823,24 @@ class WorkspaceTransitionController(QObject):
             self._elapsed_ms(),
         )
 
-    def _reveal_for_elapsed(self, elapsed_ms: float) -> tuple[float, float, float]:
+    def _mix_for_elapsed(self, elapsed_ms: float) -> tuple[float, float, float]:
         if elapsed_ms <= _HOLD_MS:
-            outgoing_visible = 1.0
+            outgoing_alpha = 1.0
         elif elapsed_ms >= _EXIT_END_MS:
-            outgoing_visible = 0.0
+            outgoing_alpha = 0.0
         else:
             progress = _segment_progress(elapsed_ms, _HOLD_MS, _EXIT_END_MS)
-            outgoing_visible = 1.0 - float(self._exit_easing.valueForProgress(progress))
+            outgoing_alpha = 1.0 - float(self._exit_easing.valueForProgress(progress))
 
         enter_start = self._incoming_enter_start_ms
         enter_end = enter_start + float(_ENTER_DURATION_MS)
         if self._incoming.isNull() or elapsed_ms <= enter_start:
-            incoming_visible = 0.0
+            incoming_alpha = 0.0
         elif elapsed_ms >= enter_end:
-            incoming_visible = 1.0
+            incoming_alpha = 1.0
         else:
             progress = _segment_progress(elapsed_ms, enter_start, enter_end)
-            incoming_visible = float(self._enter_easing.valueForProgress(progress))
+            incoming_alpha = float(self._enter_easing.valueForProgress(progress))
 
         if elapsed_ms <= _VEIL_START_MS or elapsed_ms >= _VEIL_END_MS:
             veil_alpha = 0.0
@@ -890,21 +851,20 @@ class WorkspaceTransitionController(QObject):
             fall = _segment_progress(elapsed_ms, _VEIL_PEAK_MS, _VEIL_END_MS)
             veil_alpha = _VEIL_MAX_OPACITY * (1.0 - _smoothstep(fall))
 
-        # Two readable workspaces never occupy the same pixel field. The outgoing
-        # curtain must be fully closed before incoming pixels are revealed.
-        if outgoing_visible > 1e-4:
-            incoming_visible = 0.0
+        if outgoing_alpha > 1e-4:
+            incoming_alpha = 0.0
 
-        return outgoing_visible, incoming_visible, veil_alpha
+        return outgoing_alpha, incoming_alpha, veil_alpha
 
     def _advance(self) -> None:
         if self._handoff_pending:
             return
+
         elapsed_ms = self._elapsed_ms()
-        outgoing_visible, incoming_visible, veil_alpha = self._reveal_for_elapsed(elapsed_ms)
-        self._surface.set_reveal(
-            outgoing_visible=outgoing_visible,
-            incoming_visible=incoming_visible,
+        outgoing_alpha, incoming_alpha, veil_alpha = self._mix_for_elapsed(elapsed_ms)
+        self._surface.set_mix(
+            outgoing_alpha=outgoing_alpha,
+            incoming_alpha=incoming_alpha,
             veil_alpha=veil_alpha,
         )
         self._update_phase_badge(elapsed_ms)
@@ -916,38 +876,23 @@ class WorkspaceTransitionController(QObject):
         if elapsed_ms >= finish_ms and not self._incoming.isNull():
             self._begin_live_handoff()
 
-    def _prime_live_page_backing_store(self) -> None:
-        page = self.stack.currentWidget()
-        if page is None:
-            return
-        try:
-            page.update()
-            # update() is coalesced by Qt; requesting visible descendants here is
-            # inexpensive at this one boundary and specifically warms scroll-area
-            # viewports, labels and table headers that otherwise showed one-frame
-            # dark/text flashes when the opaque snapshot disappeared.
-            for child in page.findChildren(QWidget):
-                if child.isVisibleTo(page):
-                    child.update()
-            self.root.update(self._surface.geometry())
-        except RuntimeError:
-            pass
-
     def _begin_live_handoff(self) -> None:
         if not self._active or self._handoff_pending:
             return
         self._handoff_pending = True
         self._timer.stop()
-        self._surface.set_reveal(
-            outgoing_visible=0.0,
-            incoming_visible=1.0,
+
+        # Keep the approved animation's exact final frame on screen. The only
+        # thing that changes for ~34 ms is Qt's occlusion hint underneath it.
+        self._surface.set_mix(
+            outgoing_alpha=0.0,
+            incoming_alpha=1.0,
             veil_alpha=0.0,
         )
+        self._surface.set_opaque_hint(False)
         self._raise_transition_surface()
         self._surface.repaint()
-
-        self._surface.prepare_live_handoff()
-        self._prime_live_page_backing_store()
+        self._prime_target_widget_tree()
         self._handoff_timer.start(_HANDOFF_SETTLE_MS)
 
     def _refresh_phase_copy_for_current_mode(self) -> None:
@@ -958,9 +903,12 @@ class WorkspaceTransitionController(QObject):
 
     def _finish_transition(self) -> None:
         self._timer.stop()
+        self._widget_settle_timer.stop()
         self._handoff_timer.stop()
         self._quick_sync_timeout.stop()
         self._awaiting_quick_frame = False
+        self._quick_ready = False
+        self._widget_ready = False
         self._handoff_pending = False
         if not self._active:
             return
@@ -984,9 +932,12 @@ class WorkspaceTransitionController(QObject):
 
     def _finish_immediate(self) -> None:
         self._timer.stop()
+        self._widget_settle_timer.stop()
         self._handoff_timer.stop()
         self._quick_sync_timeout.stop()
         self._awaiting_quick_frame = False
+        self._quick_ready = False
+        self._widget_ready = False
         self._handoff_pending = False
         self._surface.hide()
         self._surface.clear_frames()
@@ -1026,9 +977,12 @@ class WorkspaceTransitionController(QObject):
 
     def cleanup(self) -> None:
         self._timer.stop()
+        self._widget_settle_timer.stop()
         self._handoff_timer.stop()
         self._quick_sync_timeout.stop()
         self._awaiting_quick_frame = False
+        self._quick_ready = False
+        self._widget_ready = False
         self._handoff_pending = False
 
         try:
