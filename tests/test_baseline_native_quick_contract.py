@@ -83,12 +83,10 @@ def test_quick_glass_shell_and_widget_content_share_the_same_transform() -> None
     assert "def set_card_presentation" in NATIVE
     assert "cardAlpha / 255.0" in NATIVE
 
-    # The expensive full-window blur mask remains a geometry surface, not a
-    # per-frame hover surface. The visible Quick glass shell itself scales in the
-    # scene graph while the static mask can absorb the current scale on its next
-    # ordinary geometry refresh.
-    assert "def render_mask" in NATIVE
-    assert 'scale = float(state.get("cardScale", 1.0))' in NATIVE
+    # Hover stays cheap: the full-window blur mask remains geometry-only while
+    # Quick's GPU rectangle supplies the visible scaled glass shell.
+    render_mask = NATIVE.split("def render_mask", 1)[1].split("def _qml_source", 1)[0]
+    assert 'state.get("cardScale"' not in render_mask
     presentation = NATIVE.split("def set_card_presentation", 1)[1].split("def _sample_pointer", 1)[0]
     assert "schedule_mask_update" not in presentation
 
