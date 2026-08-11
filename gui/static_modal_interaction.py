@@ -25,6 +25,9 @@ _CLOSE_MS = 250
 _OPEN_RISE_PX = 18.0
 _START_SCALE = 0.992
 _SCRIM_ALPHA = 94
+_DRAWER_FILL_RGBA = (220, 228, 238, 74)
+_DRAWER_BORDER_RGBA = (255, 255, 255, 72)
+_DRAWER_RADIUS = 14.0
 
 _STATE_IDLE = "idle"
 _STATE_OPENING = "opening"
@@ -37,8 +40,15 @@ class _ModalTransitionCompositor(QWidget):
 
     The live application remains underneath and is frozen for the transition.
     This compositor cross-fades directly from the clear live UI to the final
-    blurred backdrop while the scrim and one cached complete drawer frame share
-    the same float progress and frame clock.
+    blurred backdrop while the scrim, drawer shell and cached drawer children
+    share the same float progress and frame clock.
+
+    The outer drawer glass is intentionally *not* baked into the cached pixmap.
+    Rendering the semi-transparent QWidget background into an intermediate
+    QPixmap on Windows can flatten it against an implicit palette/background;
+    drawing that flattened frame a second time creates a pale rectangle during
+    motion. The compositor therefore paints the exact QSS shell itself and the
+    cache contains only the real child widgets (text, tables, buttons, etc.).
     """
 
     def __init__(self, parent: QWidget) -> None:
@@ -107,6 +117,13 @@ class _ModalTransitionCompositor(QWidget):
             return
         painter.drawPixmap(target, pixmap, QRectF(pixmap.rect()))
 
+    @staticmethod
+    def _draw_drawer_shell(painter: QPainter, width: float, height: float) -> None:
+        shell = QRectF(0.5, 0.5, max(0.0, width - 1.0), max(0.0, height - 1.0))
+        painter.setPen(QColor(*_DRAWER_BORDER_RGBA))
+        painter.setBrush(QColor(*_DRAWER_FILL_RGBA))
+        painter.drawRoundedRect(shell, _DRAWER_RADIUS, _DRAWER_RADIUS)
+
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         progress = max(0.0, min(1.0, self._progress))
         painter = QPainter(self)
@@ -122,13 +139,12 @@ class _ModalTransitionCompositor(QWidget):
             painter.end()
             return
 
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         viewport = QRectF(self.rect())
 
         # Cross-fade directly from the clear live UI underneath to the exact
-        # final blurred frame. The former intermediate downsampled "soft blur"
-        # layer created a pale haze around bright text and borders on both open
-        # and close transitions, so it is deliberately absent here.
+        # final blurred frame. There is no intermediate pale/soft backdrop.
         painter.setOpacity(progress)
         self._draw_scaled(painter, self._full_blur, viewport)
 
@@ -149,6 +165,10 @@ class _ModalTransitionCompositor(QWidget):
             painter.translate(center.x(), center.y() + y_offset)
             painter.scale(scale, scale)
             painter.translate(-target.width() / 2.0, -target.height() / 2.0)
+
+            # Paint the translucent outer shell exactly once in the final scene.
+            # The cached pixmap below contains only the real child widget tree.
+            self._draw_drawer_shell(painter, target.width(), target.height())
             painter.drawPixmap(QPointF(0.0, 0.0), self._panel_frame)
             painter.restore()
 
@@ -396,6 +416,14 @@ class StaticModalInteractionController(QObject):
                     pass
 
     def _render_drawer_frame(self) -> QPixmap:
+        """Render only the drawer's child widget tree into a transparent frame.
+
+        The outer QFrame background/border is intentionally excluded. Its QSS
+        rgba shell is painted directly by _ModalTransitionCompositor so the
+        translucent glass is composited exactly once against the animated
+        backdrop instead of being flattened into an intermediate pixmap.
+        """
+
         drawer = self.details.drawer
         self._settle_drawer_tree()
 
@@ -405,12 +433,21 @@ class StaticModalInteractionController(QObject):
         frame = QPixmap(width, height)
         frame.setDevicePixelRatio(dpr)
         frame.fill(Qt.GlobalColor.transparent)
-        drawer.render(
-            frame,
-            QPoint(0, 0),
-            QRegion(),
-            QWidget.RenderFlag.DrawWindowBackground | QWidget.RenderFlag.DrawChildren,
-        )
+
+        painter = QPainter(frame)
+        flags = QWidget.RenderFlag.DrawWindowBackground | QWidget.RenderFlag.DrawChildren
+        for child in drawer.children():
+            if not isinstance(child, QWidget):
+                continue
+            if child.parentWidget() is not drawer or child.isHidden():
+                continue
+            child.render(
+                painter,
+                child.pos(),
+                QRegion(),
+                flags,
+            )
+        painter.end()
         return frame
 
     def _capture_panel_offscreen(self, target: QRect) -> QPixmap:
