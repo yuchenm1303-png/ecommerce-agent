@@ -14,7 +14,7 @@ from PySide6.QtCore import (
     Qt,
     QPropertyAnimation,
 )
-from PySide6.QtGui import QKeyEvent, QPainter, QPixmap, QRegion
+from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QPainter, QPixmap, QRegion
 from PySide6.QtWidgets import QFrame, QLabel, QMainWindow, QWidget
 
 from .card_details_fast import FastCardDetailController
@@ -24,7 +24,8 @@ _OPEN_MS = 300
 _CLOSE_MS = 250
 _OPEN_RISE_PX = 18.0
 _START_SCALE = 0.992
-_COMPOSITOR_PAD = 24
+_SOFT_BLUR_CROSSOVER = 0.42
+_SCRIM_ALPHA = 94
 
 _STATE_IDLE = "idle"
 _STATE_OPENING = "opening"
@@ -32,24 +33,27 @@ _STATE_OPEN = "open"
 _STATE_CLOSING = "closing"
 
 
-class _PanelCompositor(QWidget):
-    """Paint one cached drawer frame with float transforms only.
+class _ModalTransitionCompositor(QWidget):
+    """One QWidget layer owns every visual part of the modal transition.
 
-    This is a normal non-native QWidget child. It never accepts input and covers
-    only the panel transition bounds instead of the full application surface.
+    The live application remains underneath and is frozen for the transition.
+    This compositor progressively overlays a softened backdrop, the final blur,
+    the scrim and one cached complete drawer frame. All four layers therefore
+    share one float progress and one frame clock.
     """
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
         self.setObjectName("cardDetailTransitionCompositor")
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setAutoFillBackground(False)
 
-        self._frame = QPixmap()
-        self._target_local = QRectF()
+        self._soft_blur = QPixmap()
+        self._full_blur = QPixmap()
+        self._panel_frame = QPixmap()
+        self._target = QRectF()
         self._progress = 0.0
         self.hide()
 
@@ -65,56 +69,101 @@ class _PanelCompositor(QWidget):
 
     progress = Property(float, _get_progress, _set_progress)
 
-    def set_frame(self, frame: QPixmap, target: QRect, *, progress: float) -> None:
-        self._frame = frame
+    def set_frames(
+        self,
+        *,
+        soft_blur: QPixmap,
+        full_blur: QPixmap,
+        panel_frame: QPixmap,
+        target: QRect,
+        progress: float,
+    ) -> None:
+        self._soft_blur = soft_blur
+        self._full_blur = full_blur
+        self._panel_frame = panel_frame
+        self._target = QRectF(target)
         parent = self.parentWidget()
-        parent_rect = parent.rect() if parent is not None else target
-        bounds = target.adjusted(
-            -_COMPOSITOR_PAD,
-            -_COMPOSITOR_PAD,
-            _COMPOSITOR_PAD,
-            _COMPOSITOR_PAD + int(_OPEN_RISE_PX),
-        ).intersected(parent_rect)
-        self.setGeometry(bounds)
-        translated = target.translated(QPoint(-bounds.x(), -bounds.y()))
-        self._target_local = QRectF(translated)
+        if parent is not None:
+            self.setGeometry(parent.rect())
         self._progress = max(0.0, min(1.0, float(progress)))
         self.update()
 
-    def clear_frame(self) -> None:
-        self._frame = QPixmap()
-        self._target_local = QRectF()
+    def set_panel_frame(self, panel_frame: QPixmap, target: QRect) -> None:
+        self._panel_frame = panel_frame
+        self._target = QRectF(target)
+        parent = self.parentWidget()
+        if parent is not None:
+            self.setGeometry(parent.rect())
+        self.update()
+
+    def has_backdrop_frames(self) -> bool:
+        return not self._soft_blur.isNull() and not self._full_blur.isNull()
+
+    def clear_frames(self) -> None:
+        self._soft_blur = QPixmap()
+        self._full_blur = QPixmap()
+        self._panel_frame = QPixmap()
+        self._target = QRectF()
         self._progress = 0.0
 
-    def paintEvent(self, _event) -> None:  # type: ignore[override]
-        if self._frame.isNull() or self._target_local.isEmpty():
+    @staticmethod
+    def _draw_scaled(painter: QPainter, pixmap: QPixmap, target: QRectF) -> None:
+        if pixmap.isNull():
             return
+        painter.drawPixmap(target, pixmap, QRectF(pixmap.rect()))
 
+    def paintEvent(self, _event) -> None:  # type: ignore[override]
         progress = max(0.0, min(1.0, self._progress))
-        scale = _START_SCALE + (1.0 - _START_SCALE) * progress
-        y_offset = _OPEN_RISE_PX * (1.0 - progress)
+        if progress <= 0.0:
+            return
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.setOpacity(progress)
+        viewport = QRectF(self.rect())
 
-        target = self._target_local
-        center = target.center()
-        painter.translate(center.x(), center.y() + y_offset)
-        painter.scale(scale, scale)
-        painter.translate(-target.width() / 2.0, -target.height() / 2.0)
-        painter.drawPixmap(QPointF(0.0, 0.0), self._frame)
+        # The clear live UI is underneath. First blend toward a downsampled soft
+        # frame, then blend that toward the exact final blurred backdrop.
+        if progress <= _SOFT_BLUR_CROSSOVER:
+            soft_mix = progress / _SOFT_BLUR_CROSSOVER
+            painter.setOpacity(soft_mix)
+            self._draw_scaled(painter, self._soft_blur, viewport)
+        else:
+            painter.setOpacity(1.0)
+            self._draw_scaled(painter, self._soft_blur, viewport)
+            full_mix = (progress - _SOFT_BLUR_CROSSOVER) / (1.0 - _SOFT_BLUR_CROSSOVER)
+            painter.setOpacity(full_mix)
+            self._draw_scaled(painter, self._full_blur, viewport)
+
+        painter.setOpacity(1.0)
+        painter.fillRect(
+            viewport,
+            QColor(12, 17, 26, int(round(_SCRIM_ALPHA * progress))),
+        )
+
+        if not self._panel_frame.isNull() and not self._target.isEmpty():
+            scale = _START_SCALE + (1.0 - _START_SCALE) * progress
+            y_offset = _OPEN_RISE_PX * (1.0 - progress)
+            target = self._target
+            center = target.center()
+
+            painter.save()
+            painter.setOpacity(progress)
+            painter.translate(center.x(), center.y() + y_offset)
+            painter.scale(scale, scale)
+            painter.translate(-target.width() / 2.0, -target.height() / 2.0)
+            painter.drawPixmap(QPointF(0.0, 0.0), self._panel_frame)
+            painter.restore()
+
         painter.end()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        # The transition layer is also the short-lived input shield. It is an
+        # ordinary QWidget child, not a native child window.
+        event.accept()
 
 
 class StaticModalInteractionController(QObject):
-    """Composited QWidget modal transition with no per-frame child-tree paint.
-
-    The real detail drawer is fully laid out and synchronously rendered once.
-    Opening/closing then animates only one cached pixmap in a mouse-transparent
-    child compositor with float translation/scale/opacity. The real drawer is
-    shown only after the final cached frame is already on screen.
-    """
+    """Unified composited transition for the existing QWidget detail modal."""
 
     def __init__(self, window: QMainWindow, details: FastCardDetailController) -> None:
         super().__init__(window)
@@ -141,7 +190,7 @@ class StaticModalInteractionController(QObject):
         self.details.drawer.setGraphicsEffect(None)
         self.details.drawer_effect = None  # type: ignore[assignment]
 
-        self._compositor = _PanelCompositor(self.root)
+        self._compositor = _ModalTransitionCompositor(self.root)
         self._progress_animation = QPropertyAnimation(self._compositor, b"progress", self)
         self._progress_animation.finished.connect(self._finish_motion)
 
@@ -309,9 +358,37 @@ class StaticModalInteractionController(QObject):
         self._progress_animation.setEasingCurve(easing)
         self._progress_animation.start()
 
-    def _settle_drawer_tree(self) -> None:
-        """Synchronously realize style/layout for every child before capture."""
+    def _capture_source_frame(self) -> QPixmap:
+        screen = self.window.screen()
+        pixmap = QPixmap()
+        if screen is not None:
+            global_pos = self.root.mapToGlobal(QPoint(0, 0))
+            screen_origin = screen.geometry().topLeft()
+            local_pos = global_pos - screen_origin
+            pixmap = screen.grabWindow(
+                0,
+                local_pos.x(),
+                local_pos.y(),
+                self.root.width(),
+                self.root.height(),
+            )
+        if pixmap.isNull():
+            pixmap = self.root.grab()
+        return pixmap
 
+    @staticmethod
+    def _soften_source(source: QPixmap, target_size) -> QPixmap:
+        if source.isNull():
+            return source
+        softened = source.scaled(
+            target_size,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        softened.setDevicePixelRatio(1.0)
+        return softened
+
+    def _settle_drawer_tree(self) -> None:
         drawer = self.details.drawer
         widgets = (drawer, *drawer.findChildren(QWidget))
         for widget in widgets:
@@ -350,80 +427,77 @@ class StaticModalInteractionController(QObject):
         )
         return frame
 
-    def _prepare_open_state(self, *, ratio: tuple[float, float]) -> QRect:
-        self.details._modal_ratio = ratio  # noqa: SLF001
-        backdrop = self.details._capture_backdrop()  # noqa: SLF001
-        target = self.details._drawer_rect()  # noqa: SLF001
+    def _capture_panel_offscreen(self, target: QRect) -> QPixmap:
         drawer = self.details.drawer
-
-        updates_were_enabled = self.root.updatesEnabled()
-        previous_dont_show = drawer.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
-        frame = QPixmap()
-
-        if updates_were_enabled:
-            self.root.setUpdatesEnabled(False)
-        drawer.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
-
+        offscreen = QRect(
+            self.root.width() + 64,
+            target.y(),
+            target.width(),
+            target.height(),
+        )
+        drawer.setGeometry(offscreen)
+        drawer.show()
         try:
-            self.details.backdrop.setPixmap(backdrop)
-            self.details.backdrop.setGeometry(self.root.rect())
-            self.details.scrim.setGeometry(self.root.rect())
-            drawer.setGeometry(target)
-            self.details.scroll.verticalScrollBar().setValue(0)
-            self.details.ghost.hide()
-
-            drawer.show()
+            self._settle_drawer_tree()
             frame = self._render_drawer_frame()
-            if frame.isNull():
-                raise RuntimeError("failed to render modal drawer frame")
-
-            drawer.hide()
-            drawer.setAttribute(
-                Qt.WidgetAttribute.WA_DontShowOnScreen,
-                previous_dont_show,
-            )
-
-            self.details.backdrop.show()
-            self.details.backdrop.raise_()
-            self.details.scrim.show()
-            self.details.scrim.raise_()
-            self._compositor.set_frame(frame, target, progress=0.0)
-            self._compositor.show()
-            self._compositor.raise_()
         finally:
             drawer.hide()
-            drawer.setAttribute(
-                Qt.WidgetAttribute.WA_DontShowOnScreen,
-                previous_dont_show,
-            )
-            if updates_were_enabled:
-                self.root.setUpdatesEnabled(True)
+            drawer.setGeometry(target)
+        return frame
 
-        self.root.repaint()
+    def _prepare_open_state(self, *, ratio: tuple[float, float]) -> QRect:
+        self.details._modal_ratio = ratio  # noqa: SLF001
+        target = self.details._drawer_rect()  # noqa: SLF001
+
+        source = self._capture_source_frame()
+        full_blur = self.details._blur_pixmap(source)  # noqa: SLF001
+        if source.isNull() or full_blur.isNull():
+            raise RuntimeError("failed to capture modal backdrop")
+        soft_blur = self._soften_source(source, full_blur.size())
+
+        self.details.scroll.verticalScrollBar().setValue(0)
+        self.details.ghost.hide()
+        panel_frame = self._capture_panel_offscreen(target)
+        if panel_frame.isNull():
+            raise RuntimeError("failed to render complete modal drawer frame")
+
+        self.details.backdrop.setPixmap(full_blur)
+        self.details.backdrop.setGeometry(self.root.rect())
+        self.details.scrim.setGeometry(self.root.rect())
+        self.details.backdrop.hide()
+        self.details.scrim.hide()
+        self.details.drawer.hide()
+
+        self._compositor.set_frames(
+            soft_blur=soft_blur,
+            full_blur=full_blur,
+            panel_frame=panel_frame,
+            target=target,
+            progress=0.0,
+        )
+        self._compositor.show()
+        self._compositor.raise_()
         self._compositor.repaint()
         return target
 
     def _prepare_close_state(self) -> QRect:
         target = self.details._drawer_rect()  # noqa: SLF001
         self.details.drawer.setGeometry(target)
-        frame = self._render_drawer_frame()
-        if frame.isNull():
+        panel_frame = self._render_drawer_frame()
+        if panel_frame.isNull():
             raise RuntimeError("failed to render modal close frame")
+        if not self._compositor.has_backdrop_frames():
+            raise RuntimeError("modal transition backdrop cache is unavailable")
 
-        updates_were_enabled = self.root.updatesEnabled()
-        if updates_were_enabled:
-            self.root.setUpdatesEnabled(False)
-        try:
-            self._compositor.set_frame(frame, target, progress=1.0)
-            self._compositor.show()
-            self._compositor.raise_()
-            self.details.drawer.hide()
-        finally:
-            if updates_were_enabled:
-                self.root.setUpdatesEnabled(True)
-
-        self.root.repaint()
+        self._compositor.set_panel_frame(panel_frame, target)
+        self._compositor.setProperty("progress", 1.0)
+        self._compositor.show()
+        self._compositor.raise_()
         self._compositor.repaint()
+
+        # The compositor now owns an identical 100% modal frame. Remove the real
+        # static layers underneath it before starting the reverse transition.
+        self._original_close()
         return target
 
     def _show_with_animation(self, *, ratio: tuple[float, float]) -> None:
@@ -459,11 +533,17 @@ class StaticModalInteractionController(QObject):
             self.root.setUpdatesEnabled(False)
 
         try:
+            self.details.backdrop.setGeometry(self.root.rect())
+            self.details.scrim.setGeometry(self.root.rect())
             self.details.drawer.setGeometry(target)
+
+            self.details.backdrop.show()
+            self.details.backdrop.raise_()
+            self.details.scrim.show()
+            self.details.scrim.raise_()
             self.details.drawer.show()
             self.details.drawer.raise_()
             self._compositor.hide()
-            self._compositor.clear_frame()
         finally:
             if updates_were_enabled:
                 self.root.setUpdatesEnabled(True)
@@ -479,25 +559,25 @@ class StaticModalInteractionController(QObject):
             return
 
         if self.details.drawer.isHidden() and self.details.scrim.isHidden():
+            if self._state == _STATE_OPENING:
+                self._stop_animation()
+                self._state = _STATE_CLOSING
+                self._set_motion_active(True)
+                current = float(self._compositor.property("progress") or 0.0)
+                duration = max(1, int(round(_CLOSE_MS * current)))
+                self._start_progress_animation(
+                    end=0.0,
+                    duration_ms=duration,
+                    easing=QEasingCurve.Type.InCubic,
+                )
+                return
+
             self._stop_animation()
             self._compositor.hide()
-            self._compositor.clear_frame()
+            self._compositor.clear_frames()
             self._state = _STATE_IDLE
             self._set_motion_active(False)
             self._resume_underlay()
-            return
-
-        if self._state == _STATE_OPENING:
-            self._stop_animation()
-            self._state = _STATE_CLOSING
-            self._set_motion_active(True)
-            current = float(self._compositor.property("progress") or 0.0)
-            duration = max(1, int(round(_CLOSE_MS * current)))
-            self._start_progress_animation(
-                end=0.0,
-                duration_ms=duration,
-                easing=QEasingCurve.Type.InCubic,
-            )
             return
 
         if self._state not in {_STATE_OPEN, _STATE_IDLE}:
@@ -520,17 +600,8 @@ class StaticModalInteractionController(QObject):
         if self._state != _STATE_CLOSING:
             return
 
-        updates_were_enabled = self.root.updatesEnabled()
-        if updates_were_enabled:
-            self.root.setUpdatesEnabled(False)
-        try:
-            self._compositor.hide()
-            self._original_close()
-            self._compositor.clear_frame()
-        finally:
-            if updates_were_enabled:
-                self.root.setUpdatesEnabled(True)
-
+        self._compositor.hide()
+        self._compositor.clear_frames()
         self.root.repaint()
         self._state = _STATE_IDLE
         self._set_motion_active(False)
@@ -539,7 +610,7 @@ class StaticModalInteractionController(QObject):
     def _fallback_open(self, ratio: tuple[float, float]) -> None:
         self._stop_animation()
         self._compositor.hide()
-        self._compositor.clear_frame()
+        self._compositor.clear_frames()
         self._state = _STATE_IDLE
         self._set_motion_active(False)
         try:
@@ -556,7 +627,7 @@ class StaticModalInteractionController(QObject):
     def _fallback_close(self) -> None:
         self._stop_animation()
         self._compositor.hide()
-        self._compositor.clear_frame()
+        self._compositor.clear_frames()
         self._state = _STATE_IDLE
         self._set_motion_active(False)
         self._original_close()
@@ -584,7 +655,7 @@ class StaticModalInteractionController(QObject):
     def cleanup(self) -> None:
         self._stop_animation()
         self._compositor.hide()
-        self._compositor.clear_frame()
+        self._compositor.clear_frames()
         self._state = _STATE_IDLE
         self._set_motion_active(False)
         self._resume_underlay()
