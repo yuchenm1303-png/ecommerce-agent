@@ -24,6 +24,14 @@ _HOVER_ALPHA = 102.0
 _ACTIVE_ALPHA = 102.0
 _TRANSITION_MS = 300
 
+# The reference link cards are roughly 300 px on their long edge. A centered
+# scale(1.02) moves that edge about 3 px outward. Preserve that visible lift in
+# pixels instead of applying a raw 2% expansion to very large desktop cards.
+_REFERENCE_CARD_SPAN_PX = 300.0
+_REFERENCE_EDGE_GROWTH_PX = (
+    _REFERENCE_CARD_SPAN_PX * (_HOVER_SCALE - _NORMAL_SCALE) * 0.5
+)
+
 # Pointer ownership remains one cheap local sampler. Motion presentation gets its
 # own refresh-aware timer so a 165 Hz display is not limited by the hit-test rate.
 _POINTER_SAMPLE_MS = 8
@@ -70,10 +78,10 @@ class _CardState:
 class NekroCardInteractionController(QObject):
     """Reference-website interaction for every registered glass card.
 
-    The six website-list cards use one continuous 300 ms CSS transition:
-        normal  : scale 1.00, black alpha 64
-        hover   : scale 1.02, black alpha 102
-        active  : scale 1.00, black alpha 102
+    The website-list cards use one continuous 300 ms CSS transition. Their
+    original 1.02 hover scale is retained as the reference maximum, while larger
+    application cards normalize the same transform so the visible edge lift stays
+    near the reference site's ~3 px instead of growing with the card dimensions.
 
     Target changes never restart from a canned state. A press/release/leave samples
     the current interpolated value and reverses from there, matching browser CSS
@@ -124,6 +132,14 @@ class NekroCardInteractionController(QObject):
                 pass
         target_hz = max(60.0, min(240.0, refresh_hz))
         return max(4, int(1000.0 / target_hz))
+
+    @staticmethod
+    def _hover_scale_for(frame: QFrame) -> float:
+        """Keep hover edge displacement visually stable across card sizes."""
+
+        span = max(1.0, float(frame.width()), float(frame.height()))
+        normalized = _NORMAL_SCALE + (2.0 * _REFERENCE_EDGE_GROWTH_PX / span)
+        return max(_NORMAL_SCALE, min(_HOVER_SCALE, normalized))
 
     def _nearest_card(self, widget: QWidget | None) -> QFrame | None:
         current = widget
@@ -251,7 +267,13 @@ class NekroCardInteractionController(QObject):
         self._animate_to(frame, scale=_NORMAL_SCALE, alpha=_NORMAL_ALPHA)
 
     def _hover(self, frame: QFrame | None) -> None:
-        self._animate_to(frame, scale=_HOVER_SCALE, alpha=_HOVER_ALPHA)
+        if frame is None:
+            return
+        self._animate_to(
+            frame,
+            scale=self._hover_scale_for(frame),
+            alpha=_HOVER_ALPHA,
+        )
 
     def _active(self, frame: QFrame | None) -> None:
         self._animate_to(frame, scale=_ACTIVE_SCALE, alpha=_ACTIVE_ALPHA)
