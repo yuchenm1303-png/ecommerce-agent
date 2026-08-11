@@ -34,6 +34,35 @@ def test_glass_mask_uses_in_memory_provider_with_png_fallback() -> None:
     assert "image.save(" not in RUNTIME
 
 
+def test_minimize_restore_keeps_quick_resources_and_last_complete_glass_mask() -> None:
+    assert "class _MinimizeRestoreKeeper(QObject)" in RUNTIME
+    assert "self.quick.setPersistentGraphics(True)" in RUNTIME
+    assert "self.quick.setPersistentSceneGraph(True)" in RUNTIME
+    assert "QEvent.Type.WindowStateChange" in RUNTIME
+    assert "QEvent.Type.Expose" in RUNTIME
+    assert "not quick.isExposed()" in RUNTIME
+    assert "self.background._geometry_dirty = True" in RUNTIME
+    assert "self._original_flush()" in RUNTIME
+    assert "self.background._last_pointer_norm = None" in RUNTIME
+
+    suspend = RUNTIME.split("    def _suspend(self) -> None:", 1)[1].split(
+        "    def _modal_holds_underlay", 1
+    )[0]
+    assert "geometry_timer.stop()" in suspend
+    assert "pointer_timer.stop()" in suspend
+    assert 'setProperty("animationRunning", False)' in suspend
+    assert "_mask_ready = False" not in suspend
+    assert "card_model.sync_geometry" not in suspend
+
+    flush = RUNTIME.split("    def _flush_geometry(self) -> None:", 1)[1].split(
+        "    def eventFilter", 1
+    )[0]
+    assert "if self._should_suspend():" in flush
+    assert "self._suspend()" in flush
+    assert "return" in flush
+    assert "self._original_flush()" in flush
+
+
 def test_tables_reuse_items_and_cached_brushes() -> None:
     assert "item = table.item(row, column)" in RUNTIME
     assert "if item is None:" in RUNTIME
