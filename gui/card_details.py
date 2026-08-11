@@ -474,13 +474,29 @@ class CardDetailController(QObject):
         self.drawer_effect.setOpacity(0.0)
         self._selected = None
 
+    @staticmethod
+    def _retire_widget(widget: QWidget) -> None:
+        """Remove a detail widget from the paint tree before deferred deletion.
+
+        The fast modal captures its final QWidget tree synchronously in the same
+        event turn as population. ``deleteLater()`` alone leaves the previous
+        translucent section paintable until DeferredDelete is delivered, which
+        makes the captured transition frame contain old + new glass sections.
+        Hide and detach first so logical layout membership and paint membership
+        become identical immediately; destruction can remain safely deferred.
+        """
+
+        widget.hide()
+        widget.setParent(None)
+        widget.deleteLater()
+
     def _clear_body(self) -> None:
         while self.body_layout.count():
             item = self.body_layout.takeAt(0)
             widget = item.widget()
             child_layout = item.layout()
             if widget is not None:
-                widget.deleteLater()
+                self._retire_widget(widget)
             elif child_layout is not None:
                 self._delete_layout(child_layout)
 
@@ -491,7 +507,7 @@ class CardDetailController(QObject):
             widget = item.widget()
             child = item.layout()
             if widget is not None:
-                widget.deleteLater()
+                cls._retire_widget(widget)
             elif child is not None:
                 cls._delete_layout(child)
         layout.deleteLater()
