@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLay
 
 from app.makro.runtime_contract import RuntimeEvent, RuntimeState
 from .runtime_event_bridge import install_runtime_event_bridge
+from .runtime_shadow_recovery import install_runtime_shadow_recovery
 
 
 _URGENT_STATES = {
@@ -236,8 +237,10 @@ def install_runtime_assistant(window: Any) -> RuntimeAssistant:
     if isinstance(existing, RuntimeAssistant):
         return existing
     bridge = install_runtime_event_bridge(window)
+    shadow = install_runtime_shadow_recovery(window)
     assistant = RuntimeAssistant(window)
     bridge.event_emitted.connect(assistant.present)
+    shadow.event_emitted.connect(assistant.present)
     window._runtime_assistant = assistant
     window.destroyed.connect(assistant.cleanup)
     return assistant

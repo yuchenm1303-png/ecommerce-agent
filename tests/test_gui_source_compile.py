@@ -26,6 +26,7 @@ GUI_SOURCES = [
     PROJECT_ROOT / "gui" / "browser_session_manager.py",
     PROJECT_ROOT / "gui" / "preparation_progress.py",
     PROJECT_ROOT / "gui" / "runtime_event_bridge.py",
+    PROJECT_ROOT / "gui" / "runtime_shadow_recovery.py",
     PROJECT_ROOT / "gui" / "runtime_assistant.py",
     PROJECT_ROOT / "gui" / "readonly_runner.py",
     PROJECT_ROOT / "gui" / "real_execution.py",
