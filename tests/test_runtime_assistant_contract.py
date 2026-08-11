@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSISTANT = (ROOT / "gui" / "runtime_assistant.py").read_text(encoding="utf-8")
+TOGGLE = (ROOT / "gui" / "runtime_assistant_toggle.py").read_text(encoding="utf-8")
 BRIDGE = (ROOT / "gui" / "runtime_event_bridge.py").read_text(encoding="utf-8")
 LAUNCHER = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
@@ -22,19 +23,20 @@ def test_runtime_assistant_is_independent_non_modal_tool_window() -> None:
     assert "WA_TranslucentBackground" not in ASSISTANT
     assert "WA_ShowWithoutActivating" in ASSISTANT
     assert "background-color: #0b1a2b" in ASSISTANT
+    assert "border: none" in ASSISTANT
     assert "setWindowOpacity(0.96)" in ASSISTANT
 
 
 def test_runtime_assistant_is_draggable_and_remembers_position() -> None:
-    assert "QSettings(\"ecommerce-agent\", \"RuntimeAssistant\")" in ASSISTANT
+    assert 'QSettings("ecommerce-agent", "RuntimeAssistant")' in ASSISTANT
     assert "def mousePressEvent" in ASSISTANT
     assert "def mouseMoveEvent" in ASSISTANT
     assert "def mouseReleaseEvent" in ASSISTANT
     assert "self.grabMouse()" in ASSISTANT
     assert "self.releaseMouse()" in ASSISTANT
     assert "WA_TransparentForMouseEvents" in ASSISTANT
-    assert "self._settings.setValue(\"position\", self.pos())" in ASSISTANT
-    assert "self._settings.setValue(\"position_version\", self._POSITION_VERSION)" in ASSISTANT
+    assert 'self._settings.setValue("position", self.pos())' in ASSISTANT
+    assert 'self._settings.setValue("position_version", self._POSITION_VERSION)' in ASSISTANT
     assert "QApplication.screens()" in ASSISTANT
     assert "QApplication.screenAt" in ASSISTANT
     assert "self._COMPACT_WIDTH" in ASSISTANT
@@ -46,6 +48,26 @@ def test_runtime_assistant_defaults_to_top_right_and_migrates_old_position() -> 
     assert "version == self._POSITION_VERSION" in ASSISTANT
     assert "y = area.top() + self._SCREEN_MARGIN" in ASSISTANT
     assert "area.bottom() - self.height()" not in ASSISTANT
+
+
+def test_runtime_assistant_float_window_is_default_off_but_monitoring_stays_installed() -> None:
+    assert "self._user_visible = False" in ASSISTANT
+    assert "def set_user_visible" in ASSISTANT
+    assert "if self._user_visible:" in ASSISTANT
+    assert "install_runtime_event_bridge(window)" in ASSISTANT
+    assert "install_runtime_shadow_recovery(window)" in ASSISTANT
+    assert "install_runtime_assistant_toggle(window, assistant)" in ASSISTANT
+    assert "self.show()" not in ASSISTANT.split("QTimer.singleShot(0, self._restore_or_place)", 1)[0]
+
+
+def test_runtime_assistant_switch_reuses_workspace_switch_and_defaults_off() -> None:
+    assert "class RuntimeAssistantSwitch(WorkspaceModeSwitch)" in TOGGLE
+    assert 'label = QLabel("浮窗", root)' in TOGGLE
+    assert "toggle.set_checked_immediate(False)" in TOGGLE
+    assert "setter(False)" in TOGGLE
+    assert "toggle.toggled.connect(setter)" in TOGGLE
+    assert "header.addWidget(toggle" in TOGGLE
+    assert "QSettings" not in TOGGLE
 
 
 def test_phase_one_is_explicit_shadow_mode() -> None:

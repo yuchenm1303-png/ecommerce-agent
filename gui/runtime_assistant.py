@@ -9,6 +9,7 @@ from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 
 from app.makro.runtime_contract import RuntimeEvent, RuntimeState
+from .runtime_assistant_toggle import install_runtime_assistant_toggle
 from .runtime_event_bridge import install_runtime_event_bridge
 from .runtime_shadow_recovery import install_runtime_shadow_recovery
 
@@ -27,7 +28,8 @@ class RuntimeAssistant(QFrame):
 
     It is deliberately not parented to the main GUI's central widget. The user
     can drag it anywhere on the desktop (including another monitor), and its
-    saved position is restored on the next launch.
+    saved position is restored on the next launch. Visibility is user-controlled;
+    runtime/recovery monitoring continues even while the tool window is hidden.
     """
 
     user_response = Signal(object)
@@ -51,6 +53,7 @@ class RuntimeAssistant(QFrame):
         self._last_event: RuntimeEvent | None = None
         self._drag_offset: QPoint | None = None
         self._settings = QSettings("ecommerce-agent", "RuntimeAssistant")
+        self._user_visible = False
 
         self.setWindowTitle("Runtime Assistant")
         self.setObjectName("runtimeAssistant")
@@ -63,7 +66,7 @@ class RuntimeAssistant(QFrame):
             """
             QFrame#runtimeAssistant {
                 background-color: #0b1a2b;
-                border: 1px solid rgba(204, 229, 255, 52);
+                border: none;
                 border-radius: 14px;
             }
             QLabel#runtimeAssistantState { color: #dcecff; font-weight: 700; }
@@ -165,7 +168,8 @@ class RuntimeAssistant(QFrame):
         self._settle_timer.setSingleShot(True)
         self._settle_timer.timeout.connect(self._compact_after_recovery)
 
-        self.show()
+        # Position is prepared even while hidden so the first user activation
+        # appears in the expected place without a visible jump.
         QTimer.singleShot(0, self._restore_or_place)
 
     @staticmethod
@@ -199,7 +203,8 @@ class RuntimeAssistant(QFrame):
             # Version 2 intentionally discards the previous bottom-right default.
             self._place_default()
         self._ensure_visible()
-        self.raise_()
+        if self._user_visible:
+            self.raise_()
 
     def _place_default(self) -> None:
         try:
@@ -234,6 +239,18 @@ class RuntimeAssistant(QFrame):
                 self._settings.sync()
         except RuntimeError:
             pass
+
+    def set_user_visible(self, enabled: bool) -> None:
+        """Show/hide only the OS surface; monitoring remains installed."""
+
+        self._user_visible = bool(enabled)
+        if self._user_visible:
+            self._ensure_visible()
+            self.show()
+            self.raise_()
+        else:
+            self._save_position()
+            self.hide()
 
     @staticmethod
     def _is_button_child(widget: Any) -> bool:
@@ -335,8 +352,10 @@ class RuntimeAssistant(QFrame):
             self._settle_timer.start(2200)
         else:
             self.set_expanded(False)
-        self.show()
-        self.raise_()
+
+        if self._user_visible:
+            self.show()
+            self.raise_()
 
     def _compact_after_recovery(self) -> None:
         if self._last_event is not None and self._last_event.state is RuntimeState.RECOVERED:
@@ -369,16 +388,20 @@ def install_runtime_assistant(window: Any) -> RuntimeAssistant:
     existing = getattr(window, "_runtime_assistant", None)
     if isinstance(existing, RuntimeAssistant):
         return existing
+
     bridge = install_runtime_event_bridge(window)
     shadow = install_runtime_shadow_recovery(window)
     assistant = RuntimeAssistant(window)
     bridge.event_emitted.connect(assistant.present)
     shadow.event_emitted.connect(assistant.present)
+
     window._runtime_assistant = assistant
     window.destroyed.connect(assistant.cleanup)
     app = QApplication.instance()
     if app is not None:
         app.aboutToQuit.connect(assistant.cleanup)
+
+    install_runtime_assistant_toggle(window, assistant)
     return assistant
 
 
