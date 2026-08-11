@@ -8,11 +8,14 @@ existing Makro search fallback.
 
 from __future__ import annotations
 
+import time
+
 from playwright.sync_api import Page
 
 from .listing_creation import (
     JSONTaskProvider,
     ListingBootstrapHints,
+    MAKRO_NEW_LISTING_URL,
     _complete_vertical_leaf,
     _select_vertical_via_search,
     _vertical_confirmation_content,
@@ -21,8 +24,44 @@ from .listing_creation import (
     is_brand_step,
     is_vertical_step,
 )
+from .step3_transition import dismiss_joyride_overlay
 from .taxonomy_navigation import navigate_live_taxonomy
 from .taxonomy_resilient import ResilientMakroTaxonomyBrowser
+
+
+def _reset_partial_taxonomy_if_needed(
+    page: Page,
+    taxonomy: ResilientMakroTaxonomyBrowser,
+    *,
+    wait_ms: int,
+) -> list[list[str]]:
+    """Discard a stale partially selected Step 1 path before a fresh run.
+
+    A failed acceptance intentionally leaves the browser现场 intact. A retry can
+    therefore start with multiple taxonomy columns already open. Re-clicking the
+    already-selected parent would leave the same child signature and look like a
+    failed transition. Reloading the same Step 1 route is safe because no
+    vertical has been confirmed yet; Step 2/3 pages never enter this function.
+    """
+
+    initial = taxonomy.columns()
+    if len(initial) <= 1:
+        return initial
+
+    page.goto(MAKRO_NEW_LISTING_URL, wait_until="domcontentloaded", timeout=45_000)
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        if is_vertical_step(page):
+            break
+        page.wait_for_timeout(250)
+    if not is_vertical_step(page):
+        raise RuntimeError("Makro Step 1 could not reset a stale partial taxonomy path")
+
+    dismiss_joyride_overlay(page)
+    search = _vertical_search_input(page)
+    search.fill("")
+    page.wait_for_timeout(wait_ms)
+    return taxonomy.columns()
 
 
 def select_vertical(
@@ -42,7 +81,11 @@ def select_vertical(
     page.wait_for_timeout(wait_ms)
 
     taxonomy = ResilientMakroTaxonomyBrowser(page)
-    initial = taxonomy.columns()
+    initial = _reset_partial_taxonomy_if_needed(
+        page,
+        taxonomy,
+        wait_ms=wait_ms,
+    )
     if initial:
         selected = navigate_live_taxonomy(
             page,
