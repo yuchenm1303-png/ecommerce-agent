@@ -148,6 +148,7 @@ class StaticModalInteractionController(QObject):
         self._state = _STATE_IDLE
         self._progress = 0.0
         self._underlay_suspended = False
+        self._fallback_active = False
         self._pointer_timer_was_active = False
         self._effects_timer_was_active = False
         self._activity_timer_was_active = False
@@ -156,8 +157,6 @@ class StaticModalInteractionController(QObject):
         self._original_show_prepared_modal = self.details._show_prepared_modal  # noqa: SLF001
         self._original_close = self.details.close
 
-        # Keep the original backdrop/scrim available only for the fail-soft path.
-        # The normal path uses one custom opaque frozen backdrop plus the real drawer.
         self.details.backdrop.hide()
         self.details.scrim.hide()
         self.details.ghost.hide()
@@ -332,7 +331,7 @@ class StaticModalInteractionController(QObject):
         activity_timer = getattr(activity_widget, "_timer", None)
         if self._activity_timer_was_active and activity_timer is not None:
             try:
-                if not activity_timer.isActive():
+                if bool(getattr(activity_widget, "active", False)) and not activity_timer.isActive():
                     activity_widget._last_frame_s = time.perf_counter()  # noqa: SLF001
                     activity_timer.start()
             except RuntimeError:
@@ -388,8 +387,6 @@ class StaticModalInteractionController(QObject):
         self._drawer_effect.setEnabled(True)
         self._set_progress(0.0)
 
-        # The opaque frozen surface immediately replaces live underlay painting.
-        # Its p=0 image is pixel-identical to the just-captured application.
         self._frozen_backdrop.show()
         self._frozen_backdrop.raise_()
         self.details.drawer.show()
@@ -402,6 +399,7 @@ class StaticModalInteractionController(QObject):
             return
 
         self._suspend_underlay()
+        self._fallback_active = False
         self._state = _STATE_OPENING
         try:
             self._prepare_live_modal(ratio=ratio)
@@ -426,6 +424,9 @@ class StaticModalInteractionController(QObject):
         self.details._schedule_geometry()  # noqa: SLF001
 
     def request_close(self, *_args: object) -> None:
+        if self._fallback_active:
+            self._fallback_close()
+            return
         if self._state == _STATE_CLOSING:
             return
 
@@ -464,6 +465,7 @@ class StaticModalInteractionController(QObject):
             self._frozen_backdrop.clear_frames()
             self._drawer_effect.setEnabled(False)
             self._drawer_effect.setOpacity(1.0)
+            self._fallback_active = False
             self._state = _STATE_IDLE
             self._resume_underlay()
             self.root.update()
@@ -480,8 +482,10 @@ class StaticModalInteractionController(QObject):
             pass
         try:
             self._original_show_prepared_modal(ratio=ratio)
+            self._fallback_active = True
             self._state = _STATE_OPEN
         except Exception:
+            self._fallback_active = False
             self._state = _STATE_IDLE
             self._resume_underlay()
 
@@ -492,6 +496,7 @@ class StaticModalInteractionController(QObject):
         self._drawer_effect.setEnabled(False)
         self._drawer_effect.setOpacity(1.0)
         self._original_close()
+        self._fallback_active = False
         self._state = _STATE_IDLE
         self._resume_underlay()
 
@@ -517,6 +522,7 @@ class StaticModalInteractionController(QObject):
             pass
         self._frozen_backdrop.hide()
         self._frozen_backdrop.clear_frames()
+        self._fallback_active = False
         self._state = _STATE_IDLE
         self._resume_underlay()
 
