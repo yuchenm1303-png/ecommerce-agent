@@ -54,6 +54,7 @@ class RuntimeAssistant(QFrame):
         self._drag_offset: QPoint | None = None
         self._settings = QSettings("ecommerce-agent", "RuntimeAssistant")
         self._user_visible = False
+        self._recovered_compacted_while_hidden = False
 
         self.setWindowTitle("Runtime Assistant")
         self.setObjectName("runtimeAssistant")
@@ -256,7 +257,6 @@ class RuntimeAssistant(QFrame):
             self.show()
             self.raise_()
         else:
-            self._settle_timer.stop()
             self._save_position()
             self.hide()
 
@@ -361,11 +361,16 @@ class RuntimeAssistant(QFrame):
         urgent = state in _URGENT_STATES
         if urgent:
             self._settle_timer.stop()
+            self._recovered_compacted_while_hidden = False
             self.set_expanded(True)
         elif state is RuntimeState.RECOVERED:
-            self.set_expanded(True)
-            self._settle_timer.start(2200)
+            if self._recovered_compacted_while_hidden:
+                self.set_expanded(False)
+            else:
+                self.set_expanded(True)
+                self._settle_timer.start(2200)
         else:
+            self._recovered_compacted_while_hidden = False
             self.set_expanded(False)
 
     def present(self, event: RuntimeEvent) -> None:
@@ -374,17 +379,29 @@ class RuntimeAssistant(QFrame):
         # work to normal runs. Opening it materializes the latest event once.
         self._last_event = event
         if not self._user_visible:
-            self._settle_timer.stop()
+            if event.state is RuntimeState.RECOVERED:
+                self._recovered_compacted_while_hidden = False
+                self._settle_timer.start(2200)
+            else:
+                self._recovered_compacted_while_hidden = False
+                self._settle_timer.stop()
             return
 
+        self._recovered_compacted_while_hidden = False
         self._apply_event_to_widgets(event)
         if not self.isVisible():
             self.show()
             self.raise_()
 
     def _compact_after_recovery(self) -> None:
-        if self._last_event is not None and self._last_event.state is RuntimeState.RECOVERED:
-            self.set_expanded(False)
+        if self._last_event is None or self._last_event.state is not RuntimeState.RECOVERED:
+            return
+        if not self._user_visible:
+            # Preserve the original 2.2 s semantic clock without touching any
+            # hidden QWidget. A later user-open materializes the compact state.
+            self._recovered_compacted_while_hidden = True
+            return
+        self.set_expanded(False)
 
     def _stop_current_task(self) -> None:
         if getattr(self.window.runner, "is_running", False):
