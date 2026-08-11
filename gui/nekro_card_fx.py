@@ -41,6 +41,10 @@ _WINDOW_EDGE_GAP_PX = 1.0
 # Pointer ownership remains one cheap local sampler. Motion presentation gets its
 # own refresh-aware timer so a 165 Hz display is not limited by the hit-test rate.
 _POINTER_SAMPLE_MS = 8
+# Crossing a tiny layout gap often produces A -> None -> B on consecutive samples.
+# Absorb exactly one None sample so browser-like card traversal becomes A -> B,
+# while a real pointer leave is delayed by at most 8 ms and remains imperceptible.
+_HOVER_NONE_GRACE_SAMPLES = 1
 
 
 def _css_ease() -> QEasingCurve:
@@ -105,6 +109,9 @@ class NekroCardInteractionController(QObject):
         self.visual = visual
         self.states: dict[QFrame, _CardState] = {}
         self._moving_frames: set[QFrame] = set()
+        self._hover_scale_cache: dict[QFrame, float] = {}
+        self._hover_scale_cache_key: tuple[int, int, int, int] | None = None
+        self._none_samples = 0
         self.hovered: QFrame | None = None
         self.pressed: QFrame | None = None
         self._suspended = False
@@ -157,10 +164,28 @@ class NekroCardInteractionController(QObject):
             float(frame.height()),
         )
 
-    def _available_edge_growth(self, frame: QFrame, desired_growth: float) -> float:
-        """Cap centered hover growth without reintroducing any clipping layer."""
+    def _geometry_cache_key(self) -> tuple[int, int, int, int]:
+        # Native Quick already increments _mask_revision whenever card geometry is
+        # republished. Reuse that existing revision instead of installing another
+        # event filter or recomputing all neighbour geometry on every hover entry.
+        background = getattr(self.visual, "background", None)
+        revision = int(getattr(background, "_mask_revision", -1))
+        return (
+            revision,
+            int(self.window.width()),
+            int(self.window.height()),
+            len(self.states),
+        )
 
-        rect = self._card_rect_in_window(frame)
+    def _available_edge_growth(
+        self,
+        frame: QFrame,
+        desired_growth: float,
+        rects: dict[QFrame, QRectF],
+    ) -> float:
+        """Cap centered hover growth from one cached geometry snapshot."""
+
+        rect = rects.get(frame)
         if rect is None or rect.isEmpty():
             return 0.0
 
@@ -176,16 +201,10 @@ class NekroCardInteractionController(QObject):
         if allowed <= 0.0:
             return 0.0
 
-        for other in self.states:
+        for other, other_rect in rects.items():
             if other is frame:
                 continue
             if frame.isAncestorOf(other) or other.isAncestorOf(frame):
-                continue
-            if not other.isVisibleTo(self.window):
-                continue
-
-            other_rect = self._card_rect_in_window(other)
-            if other_rect is None or other_rect.isEmpty():
                 continue
 
             horizontal_overlap = min(rect.right(), other_rect.right()) - max(
@@ -218,17 +237,36 @@ class NekroCardInteractionController(QObject):
 
         return allowed
 
-    def _hover_scale_for(self, frame: QFrame) -> float:
-        """Normalize hover lift by size, window edge and neighbouring cards."""
+    def _rebuild_hover_scale_cache(self) -> None:
+        rects: dict[QFrame, QRectF] = {}
+        for frame in self.states:
+            if not frame.isVisibleTo(self.window) or not frame.isEnabled():
+                continue
+            rect = self._card_rect_in_window(frame)
+            if rect is not None and not rect.isEmpty():
+                rects[frame] = rect
 
-        span = max(1.0, float(frame.width()), float(frame.height()))
-        reference_growth = min(
-            _REFERENCE_EDGE_GROWTH_PX,
-            span * (_HOVER_SCALE - _NORMAL_SCALE) * 0.5,
-        )
-        growth = self._available_edge_growth(frame, reference_growth)
-        normalized = _NORMAL_SCALE + (2.0 * growth / span)
-        return max(_NORMAL_SCALE, min(_HOVER_SCALE, normalized))
+        cache: dict[QFrame, float] = {}
+        for frame, rect in rects.items():
+            span = max(1.0, rect.width(), rect.height())
+            reference_growth = min(
+                _REFERENCE_EDGE_GROWTH_PX,
+                span * (_HOVER_SCALE - _NORMAL_SCALE) * 0.5,
+            )
+            growth = self._available_edge_growth(frame, reference_growth, rects)
+            normalized = _NORMAL_SCALE + (2.0 * growth / span)
+            cache[frame] = max(_NORMAL_SCALE, min(_HOVER_SCALE, normalized))
+
+        self._hover_scale_cache = cache
+        self._hover_scale_cache_key = self._geometry_cache_key()
+
+    def _hover_scale_for(self, frame: QFrame) -> float:
+        """Return one cached size/clearance-normalized hover scale."""
+
+        key = self._geometry_cache_key()
+        if key != self._hover_scale_cache_key:
+            self._rebuild_hover_scale_cache()
+        return self._hover_scale_cache.get(frame, _NORMAL_SCALE)
 
     def _nearest_card(self, widget: QWidget | None) -> QFrame | None:
         current = widget
@@ -305,20 +343,17 @@ class NekroCardInteractionController(QObject):
         elapsed_s = max(0.0, now_s - state.started_s)
         linear = min(1.0, elapsed_s / (_TRANSITION_MS / 1000.0))
         eased = float(self._ease.valueForProgress(linear))
-        state.current_scale = state.from_scale + (state.target_scale - state.from_scale) * eased
-        state.current_alpha = state.from_alpha + (state.target_alpha - state.from_alpha) * eased
-        state.surface.set_interaction(
-            scale=state.current_scale,
-            overlay_alpha=state.current_alpha,
-        )
         if linear >= 1.0:
             state.current_scale = state.target_scale
             state.current_alpha = state.target_alpha
             state.moving = False
-            state.surface.set_interaction(
-                scale=state.current_scale,
-                overlay_alpha=state.current_alpha,
-            )
+        else:
+            state.current_scale = state.from_scale + (state.target_scale - state.from_scale) * eased
+            state.current_alpha = state.from_alpha + (state.target_alpha - state.from_alpha) * eased
+        state.surface.set_interaction(
+            scale=state.current_scale,
+            overlay_alpha=state.current_alpha,
+        )
         return state.moving
 
     def _advance_motions(self) -> None:
@@ -407,6 +442,7 @@ class NekroCardInteractionController(QObject):
     def _begin_press(self, frame: QFrame | None) -> None:
         if self._suspended:
             return
+        self._none_samples = 0
         if frame is None:
             previous = self.hovered
             self.hovered = None
@@ -426,6 +462,7 @@ class NekroCardInteractionController(QObject):
     def _end_press(self) -> None:
         if self._suspended:
             return
+        self._none_samples = 0
         previous = self.pressed
         self.pressed = None
         current = self._card_at_global(QCursor.pos())
@@ -463,6 +500,7 @@ class NekroCardInteractionController(QObject):
             and self.pressed is None
             and self._hover_still_owns_global(self.hovered, global_pos)
         ):
+            self._none_samples = 0
             return
 
         current = self._card_at_global(global_pos)
@@ -477,6 +515,14 @@ class NekroCardInteractionController(QObject):
                 self._begin_press(current)
             return
 
+        if current is None and self.hovered is not None:
+            self._none_samples += 1
+            if self._none_samples <= _HOVER_NONE_GRACE_SAMPLES:
+                return
+            self._none_samples = 0
+        else:
+            self._none_samples = 0
+
         self._set_hover(current)
 
     def suspend_for_modal(self) -> None:
@@ -486,6 +532,7 @@ class NekroCardInteractionController(QObject):
         self._pointer_timer.stop()
         self._motion_timer.stop()
         self._moving_frames.clear()
+        self._none_samples = 0
         self._left_down = False
         self.hovered = None
         self.pressed = None
@@ -500,6 +547,9 @@ class NekroCardInteractionController(QObject):
             return
         self._suspended = False
         self._moving_frames.clear()
+        self._hover_scale_cache.clear()
+        self._hover_scale_cache_key = None
+        self._none_samples = 0
         self._left_down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
         self.hovered = None
         self.pressed = None
@@ -524,6 +574,9 @@ class NekroCardInteractionController(QObject):
         self._pointer_timer.stop()
         self._motion_timer.stop()
         self._moving_frames.clear()
+        self._hover_scale_cache.clear()
+        self._hover_scale_cache_key = None
+        self._none_samples = 0
         self._suspended = False
         for state in tuple(self.states.values()):
             try:
