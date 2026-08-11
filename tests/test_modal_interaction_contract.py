@@ -100,6 +100,13 @@ def test_transition_hot_path_is_only_cached_pixmap_compositing() -> None:
 
 def test_whole_root_capture_excludes_only_the_transition_surface() -> None:
     assert "from PySide6.QtGui import QKeyEvent, QMouseEvent, QPainter, QPixmap, QRegion" in STATIC
+
+    suppress = _body(STATIC, "def set_capture_suppressed", "def set_hold_frame")
+    assert "self._capture_suppressed = True" in suppress
+    assert "WA_OpaquePaintEvent, False" in suppress
+    assert "WA_OpaquePaintEvent, True" in suppress
+    assert "self._capture_suppressed = False" in suppress
+
     capture = _body(STATIC, "def _render_root_without_transition", "def _capture_quick_base")
     assert "self._transition.set_capture_suppressed(True)" in capture
     assert "self.root.render(" in capture
