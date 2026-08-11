@@ -28,6 +28,7 @@ GUI_SOURCES = [
     PROJECT_ROOT / "gui" / "native_window_shell.py",
     PROJECT_ROOT / "gui" / "ui_polish.py",
     PROJECT_ROOT / "gui" / "ui_maturity.py",
+    PROJECT_ROOT / "gui" / "ui_runtime_optimizations.py",
     PROJECT_ROOT / "gui" / "card_details.py",
     PROJECT_ROOT / "gui" / "card_details_fast.py",
     PROJECT_ROOT / "gui" / "modal_interaction.py",
