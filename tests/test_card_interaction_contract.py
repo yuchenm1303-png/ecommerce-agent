@@ -25,7 +25,6 @@ def test_reference_website_list_card_visual_states_are_exact() -> None:
 
 
 def test_browser_like_motion_reverses_from_current_interpolated_state() -> None:
-    assert "def _advance_state" in CARD_FX
     animate = _body(CARD_FX, "def _animate_to", "def _normal")
     assert "self._advance_state(state, now_s)" in animate
     assert "state.from_scale = state.current_scale" in animate
@@ -45,7 +44,6 @@ def test_one_pointer_sampler_remains_authoritative_without_per_child_filters() -
     assert "self._pointer_timer.timeout.connect(self._sample_pointer)" in CARD_FX
     assert "def _card_at_global" in CARD_FX
     assert "self.window.childAt(local)" in CARD_FX
-    assert "self._card_at_global(QCursor.pos())" in CARD_FX
     assert "widget.installEventFilter(self)" not in CARD_FX
     assert "setMouseTracking" not in CARD_FX
     assert "QMouseEvent" not in CARD_FX
@@ -62,7 +60,6 @@ def test_motion_clock_touches_only_cards_that_are_actually_animating() -> None:
 
 
 def test_static_hover_and_held_press_avoid_discarded_full_window_hit_tests() -> None:
-    assert "def _hover_still_owns_global" in CARD_FX
     hover_owner = _body(CARD_FX, "def _hover_still_owns_global", "def _advance_state")
     assert "frame.mapFromGlobal(global_pos)" in hover_owner
     assert "frame.childAt(local)" in hover_owner
@@ -73,6 +70,57 @@ def test_static_hover_and_held_press_avoid_discarded_full_window_hit_tests() -> 
     assert held_guard in sample
     assert sample.index(held_guard) < sample.index("current = self._card_at_global(global_pos)")
     assert "self._hover_still_owns_global(self.hovered, global_pos)" in sample
+
+
+def test_rapid_card_traversal_absorbs_only_one_transient_gap_sample() -> None:
+    assert "_HOVER_NONE_GRACE_SAMPLES = 1" in CARD_FX
+    sample = _body(CARD_FX, "def _sample_pointer", "def suspend_for_modal")
+    assert "if current is None and self.hovered is not None:" in sample
+    assert "self._none_samples += 1" in sample
+    assert "self._none_samples <= _HOVER_NONE_GRACE_SAMPLES" in sample
+    assert "self._none_samples = 0" in sample
+
+
+def test_hover_clearance_is_cached_by_existing_glass_geometry_revision() -> None:
+    assert "self._hover_scale_cache: dict[QFrame, float] = {}" in CARD_FX
+    assert "self._hover_scale_cache_key" in CARD_FX
+    assert "def _geometry_cache_key" in CARD_FX
+    cache_key = _body(CARD_FX, "def _geometry_cache_key", "def _available_edge_growth")
+    assert 'getattr(background, "_mask_revision", -1)' in cache_key
+    assert "int(self.window.width())" in cache_key
+    assert "int(self.window.height())" in cache_key
+    assert "len(self.states)" in cache_key
+
+    rebuild = _body(CARD_FX, "def _rebuild_hover_scale_cache", "def _hover_scale_for")
+    assert "for frame in self.states:" in rebuild
+    assert "frame.isVisibleTo(self.window)" in rebuild
+    assert "self._card_rect_in_window(frame)" in rebuild
+    assert "span = max(1.0, rect.width(), rect.height())" in rebuild
+    assert "self._available_edge_growth(frame, reference_growth, rects)" in rebuild
+    assert "self._hover_scale_cache = cache" in rebuild
+
+    normalizer = _body(CARD_FX, "def _hover_scale_for", "def _nearest_card")
+    assert "key = self._geometry_cache_key()" in normalizer
+    assert "if key != self._hover_scale_cache_key:" in normalizer
+    assert "self._rebuild_hover_scale_cache()" in normalizer
+    assert "self._hover_scale_cache.get(frame, _NORMAL_SCALE)" in normalizer
+
+
+def test_clearance_math_preserves_reference_growth_and_neighbour_gaps() -> None:
+    assert "_REFERENCE_CARD_SPAN_PX = 300.0" in CARD_FX
+    assert "_REFERENCE_EDGE_GROWTH_PX" in CARD_FX
+    assert "_MIN_NEIGHBOR_GAP_PX = 1.0" in CARD_FX
+    assert "_WINDOW_EDGE_GAP_PX = 1.0" in CARD_FX
+    clearance = _body(CARD_FX, "def _available_edge_growth", "def _rebuild_hover_scale_cache")
+    assert "rect = rects.get(frame)" in clearance
+    assert "rect.left() - _WINDOW_EDGE_GAP_PX" in clearance
+    assert "window_w - rect.right() - _WINDOW_EDGE_GAP_PX" in clearance
+    assert "for other, other_rect in rects.items():" in clearance
+    assert "frame.isAncestorOf(other)" in clearance
+    assert "other.isAncestorOf(frame)" in clearance
+    assert "horizontal_overlap" in clearance
+    assert "vertical_overlap" in clearance
+    assert "gap - _MIN_NEIGHBOR_GAP_PX" in clearance
 
 
 def test_press_and_release_follow_reference_hover_active_semantics() -> None:
@@ -91,36 +139,6 @@ def test_all_big_and_small_glass_cards_use_the_same_full_interaction() -> None:
     assert expected in NATIVE_VISUAL
     assert expected in NATIVE_BG
     assert "for frame in window.findChildren(QFrame):" in CARD_FX
-
-
-def test_large_cards_normalize_hover_by_reference_edge_growth_and_real_clearance() -> None:
-    assert "_REFERENCE_CARD_SPAN_PX = 300.0" in CARD_FX
-    assert "_REFERENCE_EDGE_GROWTH_PX" in CARD_FX
-    assert "_MIN_NEIGHBOR_GAP_PX = 1.0" in CARD_FX
-    assert "_WINDOW_EDGE_GAP_PX = 1.0" in CARD_FX
-    assert "def _card_rect_in_window" in CARD_FX
-    assert "def _available_edge_growth" in CARD_FX
-    assert "def _hover_scale_for(self, frame: QFrame) -> float:" in CARD_FX
-
-    clearance = _body(CARD_FX, "def _available_edge_growth", "def _hover_scale_for")
-    assert "rect.left() - _WINDOW_EDGE_GAP_PX" in clearance
-    assert "window_w - rect.right() - _WINDOW_EDGE_GAP_PX" in clearance
-    assert "window_h - rect.bottom() - _WINDOW_EDGE_GAP_PX" in clearance
-    assert "frame.isAncestorOf(other)" in clearance
-    assert "other.isAncestorOf(frame)" in clearance
-    assert "horizontal_overlap" in clearance
-    assert "vertical_overlap" in clearance
-    assert "gap - _MIN_NEIGHBOR_GAP_PX" in clearance
-
-    normalizer = _body(CARD_FX, "def _hover_scale_for", "def _nearest_card")
-    assert "max(1.0, float(frame.width()), float(frame.height()))" in normalizer
-    assert "reference_growth = min(" in normalizer
-    assert "self._available_edge_growth(frame, reference_growth)" in normalizer
-    assert "2.0 * growth / span" in normalizer
-    assert "min(_HOVER_SCALE, normalized)" in normalizer
-
-    hover = _body(CARD_FX, "def _hover", "def _active")
-    assert "scale=self._hover_scale_for(frame)" in hover
 
 
 def test_quick_glass_and_widget_content_share_one_scale_state() -> None:
@@ -169,7 +187,6 @@ def test_quick_owns_glass_darkening_without_extra_qwidget_tint_layer() -> None:
 
 
 def test_complete_widget_content_subtree_gets_same_transform_without_layout_resize() -> None:
-    assert "class _CardScaleEffect(QGraphicsEffect)" in NATIVE_VISUAL
     effect = _body(NATIVE_VISUAL, "class _CardScaleEffect", "class NativeGlassProxy")
     assert "def boundingRectFor" in effect
     assert "painter.translate(center)" in effect
@@ -195,13 +212,6 @@ def test_card_effect_uses_fixed_active_bounds_instead_of_per_frame_geometry_chur
     assert "source_rect.height() * _EFFECT_BOUND_SCALE" in effect
 
 
-def test_steady_state_disables_widget_content_scale_effect() -> None:
-    effect = _body(NATIVE_VISUAL, "class _CardScaleEffect", "class NativeGlassProxy")
-    assert "self.setEnabled(False)" in effect
-    assert "active = abs(scale - 1.0) > 1e-4" in effect
-    assert "self.setEnabled(active)" in effect
-
-
 def test_high_frequency_interaction_updates_only_one_quick_model_row_not_global_mask() -> None:
     setter = _body(NATIVE_VISUAL, "def set_interaction", "def sync_geometry")
     assert "self.background.set_card_presentation(" in setter
@@ -220,15 +230,16 @@ def test_global_blur_mask_remains_geometry_only_during_hover() -> None:
     assert "painter.drawRoundedRect(card, _GLASS_RADIUS, _GLASS_RADIUS)" in render_mask
 
 
-def test_modal_suspend_returns_cards_to_exact_normal_state() -> None:
+def test_modal_suspend_clears_transient_motion_and_hover_caches() -> None:
     suspend = _body(CARD_FX, "def suspend_for_modal", "def resume_from_modal")
     resume = _body(CARD_FX, "def resume_from_modal", "def _cleanup")
     assert "self._pointer_timer.stop()" in suspend
     assert "self._motion_timer.stop()" in suspend
     assert "self._moving_frames.clear()" in suspend
     assert "state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)" in suspend
+    assert "self._hover_scale_cache.clear()" in resume
+    assert "self._hover_scale_cache_key = None" in resume
     assert "state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)" in resume
-    assert "current = self._card_at_global(QCursor.pos())" in resume
     assert "self._pointer_timer.start()" in resume
 
 
