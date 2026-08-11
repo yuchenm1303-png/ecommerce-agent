@@ -28,10 +28,37 @@ def test_reference_detail_model_freezes_old_cards_instead_of_repainting_them() -
     assert "class _FrozenBackdrop(QWidget):" in STATIC
     assert 'self.setObjectName("cardDetailFrozenBackdrop")' in STATIC
     assert "WA_OpaquePaintEvent" in STATIC
+    assert "WA_NoSystemBackground" in STATIC
     assert "self._clear" in STATIC
-    assert "self._blurred" in STATIC
-    assert "painter.drawPixmap" in STATIC
+    assert "self._final_blur" in STATIC
     assert "94.0 * self._progress" in STATIC
+
+
+def test_backdrop_scaling_and_full_blur_composition_are_prepared_once() -> None:
+    fit = _body(STATIC, "def _fit_frame", "def set_frames")
+    assert "devicePixelRatioF()" in fit
+    assert "Qt.TransformationMode.SmoothTransformation" in fit
+    assert "source.scaled(" in fit
+
+    frames = _body(STATIC, "def set_frames", "def clear_frames")
+    assert "fitted_clear = self._fit_frame(clear)" in frames
+    assert "fitted_blur = self._fit_frame(blurred)" in frames
+    assert "CompositionMode_Source" in frames
+    assert "CompositionMode_SourceOver" in frames
+    assert "self._final_blur = final_blur" in frames
+
+    paint = _body(STATIC, "def paintEvent", "def mousePressEvent")
+    assert "self._final_blur" in paint
+    assert "SmoothTransformation" not in paint
+    assert "scaled(" not in paint
+
+
+def test_smooth_pixmap_scaling_exists_only_as_rare_resize_fallback() -> None:
+    draw = _body(STATIC, "def _draw_frame", "def paintEvent")
+    assert "self._frame_matches_surface(frame)" in draw
+    assert "painter.drawPixmap(0, 0, frame)" in draw
+    assert "SmoothPixmapTransform" in draw
+    assert "painter.drawPixmap(self.rect(), frame, frame.rect())" in draw
 
 
 def test_no_fullscreen_graphics_opacity_or_modal_parent_compositor_remains() -> None:
@@ -43,12 +70,34 @@ def test_no_fullscreen_graphics_opacity_or_modal_parent_compositor_remains() -> 
     assert "setGraphicsEffect(self._drawer_effect)" in STATIC
 
 
-def test_one_scalar_progress_drives_background_and_live_drawer_together() -> None:
-    assert 'QPropertyAnimation(self, b"progress", self)' in STATIC
-    setter = _body(STATIC, "def _set_progress", "progress = Property")
+def test_precise_refresh_aware_elapsed_time_driver_replaces_property_animation() -> None:
+    assert "QPropertyAnimation" not in STATIC
+    assert "QAbstractAnimation" not in STATIC
+    assert "Property(float" not in STATIC
+    assert "self._motion_timer = QTimer(self)" in STATIC
+    assert "Qt.TimerType.PreciseTimer" in STATIC
+    assert "self._motion_timer.timeout.connect(self._advance_motion)" in STATIC
+    assert "screen.refreshRate()" in STATIC
+    assert "min(165.0, refresh_hz)" in STATIC
+
+    start = _body(STATIC, "def _start_fade", "def _advance_motion")
+    assert "time.perf_counter()" in start
+    assert "self._motion_timer.setInterval(self._frame_interval_ms())" in start
+    assert "self._motion_timer.start()" in start
+
+    advance = _body(STATIC, "def _advance_motion", "def _prepare_live_modal")
+    assert "time.perf_counter() - self._motion_started_s" in advance
+    assert "self._motion_easing.valueForProgress(linear)" in advance
+    assert "self._set_progress(value)" in advance
+    assert "self._finish_motion()" in advance
+
+
+def test_one_scalar_progress_still_drives_background_and_live_drawer_together() -> None:
+    setter = _body(STATIC, "def _set_progress", "@staticmethod")
     assert "self._frozen_backdrop.set_progress(value)" in setter
     assert "self._drawer_effect.setOpacity(value)" in setter
-    assert "progress = Property(float, _get_progress, _set_progress)" in STATIC
+    assert "_blur_pixmap" not in setter
+    assert "_capture_source" not in setter
 
 
 def test_modal_animation_has_no_drawer_snapshot_or_handoff_pipeline() -> None:
@@ -73,11 +122,13 @@ def test_modal_animation_has_no_drawer_snapshot_or_handoff_pipeline() -> None:
         assert token not in STATIC
 
 
-def test_open_captures_clear_once_blurs_once_then_animates_cached_frames() -> None:
+def test_open_captures_once_blurs_once_and_fits_before_first_visible_frame() -> None:
     prepare = _body(STATIC, "def _prepare_live_modal", "def _show_with_animation")
     assert "source = self.details._capture_source()" in prepare
     assert "blurred = self.details._blur_pixmap(source)" in prepare
-    assert "self._frozen_backdrop.set_frames(source, blurred)" in prepare
+    assert prepare.index("self._sync_modal_geometry()") < prepare.index(
+        "self._frozen_backdrop.set_frames(source, blurred)"
+    )
     assert "self.details.backdrop.hide()" in prepare
     assert "self.details.scrim.hide()" in prepare
     assert "self._drawer_effect.setEnabled(True)" in prepare
@@ -85,12 +136,8 @@ def test_open_captures_clear_once_blurs_once_then_animates_cached_frames() -> No
     assert "self._frozen_backdrop.show()" in prepare
     assert "self.details.drawer.show()" in prepare
 
-    setter = _body(STATIC, "def _set_progress", "progress = Property")
-    assert "_blur_pixmap" not in setter
-    assert "_capture_source" not in setter
 
-
-def test_reference_web_fade_timing_and_curves_are_locked() -> None:
+def test_reference_web_fade_timing_and_curves_are_unchanged() -> None:
     assert "_OPEN_MS = 500" in STATIC
     assert "_CLOSE_MS = 300" in STATIC
     assert "cubic-bezier(.25, .1, .25, 1)" in STATIC
@@ -99,29 +146,25 @@ def test_reference_web_fade_timing_and_curves_are_locked() -> None:
     assert "addCubicBezierSegment" in STATIC
 
 
-def test_steady_open_disables_only_drawer_effect() -> None:
-    finish = _body(STATIC, "def _finish_open", "def request_close")
-    assert "self._set_progress(1.0)" in finish
-    assert "self._drawer_effect.setEnabled(False)" in finish
-    assert "self.details.drawer.repaint()" in finish
-    assert "self._frozen_backdrop.hide()" not in finish
+def test_drawer_effect_keeps_one_visible_lifetime_ownership() -> None:
+    finish_open = _body(STATIC, "def _finish_open", "def request_close")
+    assert "self._set_progress(1.0)" in finish_open
+    assert "self._drawer_effect.setEnabled(False)" not in finish_open
+    assert "self.details.drawer.repaint()" not in finish_open
 
-
-def test_close_reuses_same_frozen_background_and_live_drawer() -> None:
     close = _body(STATIC, "def request_close", "def _finish_close")
-    assert "self._drawer_effect.setEnabled(True)" in close
+    assert "self._drawer_effect.setEnabled(True)" not in close
+    assert "self.details.drawer.repaint()" not in close
     assert "end=0.0" in close
     assert "duration_ms=_CLOSE_MS" in close
     assert "_capture_source" not in close
     assert "_blur_pixmap" not in close
     assert "render(" not in close
 
-    finish = _body(STATIC, "def _finish_close", "def _fallback_open")
-    assert "self._set_progress(0.0)" in finish
-    assert "self._original_close()" in finish
-    assert "self._frozen_backdrop.hide()" in finish
-    assert "self._frozen_backdrop.clear_frames()" in finish
-    assert "self._resume_underlay()" in finish
+    finish_close = _body(STATIC, "def _finish_close", "def _fallback_open")
+    assert finish_close.index("self._original_close()") < finish_close.index(
+        "self._drawer_effect.setEnabled(False)"
+    )
 
 
 def test_interrupted_open_reverses_from_current_progress() -> None:
@@ -132,8 +175,21 @@ def test_interrupted_open_reverses_from_current_progress() -> None:
     assert "end=0.0" in close
 
 
+def test_close_reuses_same_frozen_background_and_live_drawer() -> None:
+    close = _body(STATIC, "def request_close", "def _finish_close")
+    assert "_capture_source" not in close
+    assert "_blur_pixmap" not in close
+
+    finish = _body(STATIC, "def _finish_close", "def _fallback_open")
+    assert "self._set_progress(0.0)" in finish
+    assert "self._original_close()" in finish
+    assert "self._frozen_backdrop.hide()" in finish
+    assert "self._frozen_backdrop.clear_frames()" in finish
+    assert "self._resume_underlay()" in finish
+
+
 def test_resize_only_updates_frozen_backdrop_and_real_drawer_geometry() -> None:
-    sync = _body(STATIC, "def _sync_modal_geometry", "def _stop_animation")
+    sync = _body(STATIC, "def _sync_modal_geometry", "def _frame_interval_ms")
     assert "self._frozen_backdrop.setGeometry(self.root.rect())" in sync
     assert "self.details.drawer.setGeometry(self.details._drawer_rect())" in sync
     assert "self.details.backdrop.setGeometry" not in sync
