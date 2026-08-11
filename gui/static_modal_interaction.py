@@ -19,17 +19,12 @@ from PySide6.QtWidgets import (
 from .card_details_fast import FastCardDetailController
 
 
-# QWidget positions are integer pixels. The old 12/9 px travel left only a
-# handful of distinct positions across the whole transition, so easing produced
-# repeated coordinates that looked like dropped frames. A slightly broader path
-# plus gentler quadratic easing gives almost every display frame a new position
-# while deliberately slowing the overall open/close cadence.
-_OPEN_MS = 300
-_OPEN_FADE_MS = 285
-_CLOSE_MS = 240
-_CLOSE_FADE_MS = 220
-_OPEN_RISE_PX = 28
-_CLOSE_DROP_PX = 22
+_OPEN_MS = 220
+_OPEN_FADE_MS = 205
+_CLOSE_MS = 170
+_CLOSE_FADE_MS = 150
+_OPEN_RISE_PX = 12
+_CLOSE_DROP_PX = 9
 
 _STATE_IDLE = "idle"
 _STATE_OPENING = "opening"
@@ -338,7 +333,7 @@ class StaticModalInteractionController(QObject):
                 end_opacity=1.0,
                 motion_ms=_OPEN_MS,
                 fade_ms=_OPEN_FADE_MS,
-                motion_easing=QEasingCurve.Type.OutQuad,
+                motion_easing=QEasingCurve.Type.OutQuart,
                 fade_easing=QEasingCurve.Type.OutCubic,
             )
             self._motion_group.start()
@@ -401,7 +396,7 @@ class StaticModalInteractionController(QObject):
                 end_opacity=0.0,
                 motion_ms=_CLOSE_MS,
                 fade_ms=_CLOSE_FADE_MS,
-                motion_easing=QEasingCurve.Type.InQuad,
+                motion_easing=QEasingCurve.Type.InCubic,
                 fade_easing=QEasingCurve.Type.InCubic,
             )
             self._motion_group.start()
