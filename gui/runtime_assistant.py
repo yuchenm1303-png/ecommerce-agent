@@ -37,6 +37,7 @@ class RuntimeAssistant(QFrame):
     _COMPACT_HEIGHT = 68
     _EXPANDED_HEIGHT = 246
     _SCREEN_MARGIN = 20
+    _POSITION_VERSION = 2
 
     def __init__(self, window: Any) -> None:
         flags = (
@@ -54,25 +55,25 @@ class RuntimeAssistant(QFrame):
         self.setWindowTitle("Runtime Assistant")
         self.setObjectName("runtimeAssistant")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setFixedSize(self._COMPACT_WIDTH, self._COMPACT_HEIGHT)
-        self.setToolTip("拖动空白区域可移动 Runtime Assistant")
+        self.setWindowOpacity(0.96)
+        self.setToolTip("拖动浮窗任意非按钮区域可移动 Runtime Assistant")
         self.setStyleSheet(
             """
             QFrame#runtimeAssistant {
-                background-color: rgba(8, 20, 36, 232);
+                background-color: #0b1a2b;
                 border: 1px solid rgba(204, 229, 255, 52);
                 border-radius: 14px;
             }
             QLabel#runtimeAssistantState { color: #dcecff; font-weight: 700; }
-            QLabel#runtimeAssistantMeta { color: rgba(222, 236, 252, 172); }
+            QLabel#runtimeAssistantMeta { color: rgba(222, 236, 252, 190); }
             QLabel#runtimeAssistantAlert { color: #f5d38c; font-weight: 700; }
             QPushButton#runtimeAssistantQuiet {
                 min-height: 28px;
                 padding: 0 10px;
                 border-radius: 8px;
-                color: rgba(235, 244, 255, 220);
+                color: rgba(235, 244, 255, 230);
                 background: rgba(255, 255, 255, 18);
                 border: 1px solid rgba(255, 255, 255, 30);
             }
@@ -125,6 +126,19 @@ class RuntimeAssistant(QFrame):
         self.confidence_label.setObjectName("runtimeAssistantMeta")
         layout.addWidget(self.confidence_label)
 
+        # Labels are informational only. Making them transparent to mouse events
+        # lets the top-level tool window receive drag gestures over the text too.
+        for label in (
+            self.state_label,
+            self.progress_label,
+            self.detail_label,
+            self.alert_label,
+            self.suggestion_title,
+            self.suggestion_label,
+            self.confidence_label,
+        ):
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
         actions = QHBoxLayout()
         self.collapse_button = QPushButton("收起")
         self.collapse_button.setObjectName("runtimeAssistantQuiet")
@@ -170,10 +184,19 @@ class RuntimeAssistant(QFrame):
         return False
 
     def _restore_or_place(self) -> None:
+        try:
+            version = int(self._settings.value("position_version", 0) or 0)
+        except (TypeError, ValueError):
+            version = 0
         saved = self._settings.value("position")
-        if isinstance(saved, QPoint) and self._position_is_visible(saved):
+        if (
+            version == self._POSITION_VERSION
+            and isinstance(saved, QPoint)
+            and self._position_is_visible(saved)
+        ):
             self.move(saved)
         else:
+            # Version 2 intentionally discards the previous bottom-right default.
             self._place_default()
         self._ensure_visible()
         self.raise_()
@@ -188,7 +211,7 @@ class RuntimeAssistant(QFrame):
             return
         area = screen.availableGeometry()
         x = area.right() - self.width() - self._SCREEN_MARGIN + 1
-        y = area.bottom() - self.height() - self._SCREEN_MARGIN + 1
+        y = area.top() + self._SCREEN_MARGIN
         self.move(x, y)
 
     def _ensure_visible(self) -> None:
@@ -207,6 +230,7 @@ class RuntimeAssistant(QFrame):
         try:
             if self.isVisible():
                 self._settings.setValue("position", self.pos())
+                self._settings.setValue("position_version", self._POSITION_VERSION)
                 self._settings.sync()
         except RuntimeError:
             pass
@@ -226,15 +250,16 @@ class RuntimeAssistant(QFrame):
             if not self._is_button_child(child):
                 self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                try:
+                    self.grabMouse()
+                except RuntimeError:
+                    pass
                 event.accept()
                 return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
-        if (
-            self._drag_offset is not None
-            and event.buttons() & Qt.MouseButton.LeftButton
-        ):
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self.move(event.globalPosition().toPoint() - self._drag_offset)
             event.accept()
             return
@@ -243,6 +268,10 @@ class RuntimeAssistant(QFrame):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         if event.button() == Qt.MouseButton.LeftButton and self._drag_offset is not None:
             self._drag_offset = None
+            try:
+                self.releaseMouse()
+            except RuntimeError:
+                pass
             self.unsetCursor()
             self._ensure_visible()
             self._save_position()
