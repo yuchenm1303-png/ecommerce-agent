@@ -60,6 +60,33 @@ def test_runtime_assistant_float_window_is_default_off_but_monitoring_stays_inst
     assert "self.show()" not in ASSISTANT.split("QTimer.singleShot(0, self._restore_or_place)", 1)[0]
 
 
+def test_hidden_runtime_assistant_defers_all_widget_mutation_until_opened() -> None:
+    assert "def _apply_event_to_widgets" in ASSISTANT
+    assert "def _set_label_text" in ASSISTANT
+    present = ASSISTANT.split("    def present(self, event: RuntimeEvent) -> None:", 1)[1].split(
+        "    def _compact_after_recovery", 1
+    )[0]
+    assert "self._last_event = event" in present
+    assert "if not self._user_visible:" in present
+    assert "self._settle_timer.stop()" in present
+    assert "return" in present
+    assert "self._apply_event_to_widgets(event)" in present
+
+    visibility = ASSISTANT.split("    def set_user_visible", 1)[1].split(
+        "    @staticmethod\n    def _is_button_child", 1
+    )[0]
+    assert "if self._last_event is not None:" in visibility
+    assert "self._apply_event_to_widgets(self._last_event)" in visibility
+
+
+def test_runtime_assistant_avoids_redundant_label_and_layout_churn_when_visible() -> None:
+    assert "if label.text() != text:" in ASSISTANT
+    assert "if self._expanded is expanded:" in ASSISTANT
+    assert "return" in ASSISTANT.split("if self._expanded is expanded:", 1)[1].split(
+        "self._expanded = expanded", 1
+    )[0]
+
+
 def test_runtime_assistant_switch_reuses_workspace_switch_and_defaults_off() -> None:
     assert "class RuntimeAssistantSwitch(WorkspaceModeSwitch)" in TOGGLE
     assert 'label = QLabel("浮窗", root)' in TOGGLE
