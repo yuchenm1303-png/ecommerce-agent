@@ -19,6 +19,7 @@ GUI_SOURCES = [
     PROJECT_ROOT / "gui" / "batch_workspace.py",
     PROJECT_ROOT / "gui" / "acceptance_console.py",
     PROJECT_ROOT / "gui" / "activity_presence.py",
+    PROJECT_ROOT / "gui" / "preparation_progress.py",
     PROJECT_ROOT / "gui" / "readonly_runner.py",
     PROJECT_ROOT / "gui" / "real_execution.py",
     PROJECT_ROOT / "gui" / "result_loader.py",
