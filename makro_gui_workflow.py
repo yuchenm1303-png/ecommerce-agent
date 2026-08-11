@@ -24,8 +24,11 @@ from app.makro.listing_creation import (
     infer_listing_bootstrap,
     is_brand_step,
     is_product_info_step,
-    select_brand,
     select_vertical,
+)
+from app.makro.step3_transition import (
+    dismiss_joyride_overlay,
+    select_brand_to_product_info,
 )
 from app.providers.registry import (
     ProviderConfigurationError,
@@ -338,6 +341,7 @@ def main() -> int:
                 current = "step1"
                 _phase("step1", "START")
                 page = _prepare_step1_page(harness)
+                dismiss_joyride_overlay(page)
                 vertical = select_vertical(page, provider, hints)
                 manifest["vertical"] = vertical
                 manifest["page_url"] = page.url
@@ -347,9 +351,8 @@ def main() -> int:
 
                 current = "step2"
                 _phase("step2", "START")
-                brand = select_brand(page, provider, hints)
-                if not is_product_info_step(page):
-                    raise RuntimeError("Makro did not reach Step 3 after Step 2")
+                brand, page = select_brand_to_product_info(page, provider, hints)
+                harness.page = page
                 manifest["brand"] = brand
                 manifest["page_url"] = page.url
                 manifest["status"] = "step2_complete"
@@ -367,6 +370,7 @@ def main() -> int:
                 current = "step1"
                 _phase("step1", "START")
                 page = _prepare_step1_page(harness)
+                dismiss_joyride_overlay(page)
                 vertical = select_vertical(page, provider, hints)
                 manifest["vertical"] = vertical
                 manifest["page_url"] = page.url
@@ -378,9 +382,8 @@ def main() -> int:
                 current = "step2"
                 _phase("step2", "START")
                 page = _listing_page(harness, is_brand_step, "Step 2")
-                brand = select_brand(page, provider, hints)
-                if not is_product_info_step(page):
-                    raise RuntimeError("Makro did not reach Step 3 after Step 2")
+                brand, page = select_brand_to_product_info(page, provider, hints)
+                harness.page = page
                 vertical, actual_brand = _target_values(page)
                 manifest["vertical"] = vertical
                 manifest["brand"] = actual_brand or brand
