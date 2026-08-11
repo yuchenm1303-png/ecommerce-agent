@@ -1,16 +1,28 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QAbstractAnimation, QEasingCurve, QEvent, QObject, QPointF, Qt, QPropertyAnimation
-from PySide6.QtGui import QKeyEvent
+import time
+
+from PySide6.QtCore import (
+    QAbstractAnimation,
+    QEasingCurve,
+    QEvent,
+    QObject,
+    QPointF,
+    Property,
+    Qt,
+    QPropertyAnimation,
+    Signal,
+)
+from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import QFrame, QGraphicsOpacityEffect, QLabel, QMainWindow, QWidget
 
 from .card_details_fast import FastCardDetailController
 
 
-# The reference webpage uses a single live overlay whose whole subtree fades in.
-# Its expanded detail box and settings overlay both use a 0.5 s fade.  The global
-# Vue fade transition uses 0.3 s on leave, so the desktop port keeps the same
-# simple rhythm while adding a graceful close instead of disappearing instantly.
+# The reference webpage swaps the normal card group out when boxOpenState opens,
+# then lets the real expanded box run a simple .5 s fade. QWidget cannot use the
+# browser's backdrop-filter, so the desktop port freezes the old surface into one
+# clear/blurred backdrop pair and animates one shared progress value.
 _OPEN_MS = 500
 _CLOSE_MS = 300
 
@@ -44,14 +56,81 @@ def _css_ease_in_out() -> QEasingCurve:
     return curve
 
 
-class StaticModalInteractionController(QObject):
-    """Reference-web-style fade for the existing live QWidget detail modal.
+class _FrozenBackdrop(QWidget):
+    """Opaque frozen underlay: clear -> blurred + scrim, driven by one progress."""
 
-    There is exactly one visual owner for modal content: the real QWidget tree.
-    Backdrop, scrim, drawer, text, tables and controls live under one transparent
-    parent and share one opacity effect.  The final blurred backdrop is captured
-    once before opening; no drawer snapshot, compositor, manual glass copy,
-    transform, off-screen render or handoff exists in this path.
+    clicked = Signal()
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("cardDetailFrozenBackdrop")
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAutoFillBackground(False)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._clear = QPixmap()
+        self._blurred = QPixmap()
+        self._progress = 0.0
+        self.hide()
+
+    def set_frames(self, clear: QPixmap, blurred: QPixmap) -> None:
+        self._clear = QPixmap(clear)
+        self._blurred = QPixmap(blurred)
+        self.update()
+
+    def clear_frames(self) -> None:
+        self._clear = QPixmap()
+        self._blurred = QPixmap()
+        self._progress = 0.0
+        self.update()
+
+    def set_progress(self, value: float) -> None:
+        value = max(0.0, min(1.0, float(value)))
+        if abs(value - self._progress) <= 1e-6:
+            return
+        self._progress = value
+        self.update()
+
+    def paintEvent(self, _event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        target = self.rect()
+        if not self._clear.isNull():
+            painter.setOpacity(1.0)
+            painter.drawPixmap(target, self._clear, self._clear.rect())
+        else:
+            painter.fillRect(target, QColor(0, 0, 0))
+
+        if self._progress > 0.0 and not self._blurred.isNull():
+            painter.setOpacity(self._progress)
+            painter.drawPixmap(target, self._blurred, self._blurred.rect())
+
+        painter.setOpacity(1.0)
+        if self._progress > 0.0:
+            painter.fillRect(
+                target,
+                QColor(12, 17, 26, int(round(94.0 * self._progress))),
+            )
+        painter.end()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class StaticModalInteractionController(QObject):
+    """Reference-web-style detail fade without a full-screen opacity effect.
+
+    The real drawer is never copied. A single scalar progress drives:
+      - one opaque frozen backdrop (clear -> final blur + scrim);
+      - one opacity effect attached only to the much smaller real drawer.
+
+    Because the backdrop is opaque, the large workspace beneath it does not
+    participate in transition repainting, matching the reference page's
+    `v-show(!boxOpenState)` behavior without destroying live business widgets.
     """
 
     def __init__(self, window: QMainWindow, details: FastCardDetailController) -> None:
@@ -67,35 +146,31 @@ class StaticModalInteractionController(QObject):
 
         self._passive_labels: dict[QLabel, bool] = {}
         self._state = _STATE_IDLE
+        self._progress = 0.0
         self._underlay_suspended = False
         self._pointer_timer_was_active = False
         self._effects_timer_was_active = False
+        self._activity_timer_was_active = False
         self._quick_animation_was_running = False
 
         self._original_show_prepared_modal = self.details._show_prepared_modal  # noqa: SLF001
         self._original_close = self.details.close
 
-        # FastCardDetailController already owns the real drawer and all business
-        # content.  Reparent its three visible modal surfaces under one live layer
-        # so a single opacity is equivalent to the webpage's parent overlay fade.
-        self._modal_layer = QWidget(self.root)
-        self._modal_layer.setObjectName("cardDetailFadeLayer")
-        self._modal_layer.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self._modal_layer.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self._modal_layer.setAutoFillBackground(False)
-        self._modal_layer.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._modal_layer.hide()
+        # Keep the original backdrop/scrim available only for the fail-soft path.
+        # The normal path uses one custom opaque frozen backdrop plus the real drawer.
+        self.details.backdrop.hide()
+        self.details.scrim.hide()
+        self.details.ghost.hide()
 
-        for widget in (self.details.backdrop, self.details.scrim, self.details.drawer):
-            widget.hide()
-            widget.setParent(self._modal_layer)
+        self._frozen_backdrop = _FrozenBackdrop(self.root)
+        self._frozen_backdrop.clicked.connect(self.request_close)
 
-        self._fade_effect = QGraphicsOpacityEffect(self._modal_layer)
-        self._fade_effect.setOpacity(1.0)
-        self._fade_effect.setEnabled(False)
-        self._modal_layer.setGraphicsEffect(self._fade_effect)
+        self._drawer_effect = QGraphicsOpacityEffect(self.details.drawer)
+        self._drawer_effect.setOpacity(1.0)
+        self._drawer_effect.setEnabled(False)
+        self.details.drawer.setGraphicsEffect(self._drawer_effect)
 
-        self._fade_animation = QPropertyAnimation(self._fade_effect, b"opacity", self)
+        self._fade_animation = QPropertyAnimation(self, b"progress", self)
         self._fade_animation.finished.connect(self._finish_motion)
 
         self.details._show_prepared_modal = self._show_with_animation  # type: ignore[method-assign]  # noqa: SLF001
@@ -104,6 +179,17 @@ class StaticModalInteractionController(QObject):
         self._install_card_surfaces()
         self.root.installEventFilter(self)
         window.destroyed.connect(self.cleanup)
+
+    def _get_progress(self) -> float:
+        return self._progress
+
+    def _set_progress(self, value: float) -> None:
+        value = max(0.0, min(1.0, float(value)))
+        self._progress = value
+        self._frozen_backdrop.set_progress(value)
+        self._drawer_effect.setOpacity(value)
+
+    progress = Property(float, _get_progress, _set_progress)
 
     @staticmethod
     def _label_is_passive(label: QLabel) -> bool:
@@ -163,6 +249,21 @@ class StaticModalInteractionController(QObject):
         if self._effects_timer_was_active:
             try:
                 effects_timer.stop()
+            except RuntimeError:
+                pass
+
+        activity = getattr(self.window, "_activity_presence_controller", None)
+        activity_widget = getattr(activity, "widget", None)
+        activity_timer = getattr(activity_widget, "_timer", None)
+        try:
+            self._activity_timer_was_active = bool(
+                activity_timer is not None and activity_timer.isActive()
+            )
+        except RuntimeError:
+            self._activity_timer_was_active = False
+        if self._activity_timer_was_active:
+            try:
+                activity_timer.stop()
             except RuntimeError:
                 pass
 
@@ -226,6 +327,18 @@ class StaticModalInteractionController(QObject):
                 pass
         self._effects_timer_was_active = False
 
+        activity = getattr(self.window, "_activity_presence_controller", None)
+        activity_widget = getattr(activity, "widget", None)
+        activity_timer = getattr(activity_widget, "_timer", None)
+        if self._activity_timer_was_active and activity_timer is not None:
+            try:
+                if not activity_timer.isActive():
+                    activity_widget._last_frame_s = time.perf_counter()  # noqa: SLF001
+                    activity_timer.start()
+            except RuntimeError:
+                pass
+        self._activity_timer_was_active = False
+
         quick = getattr(self.background, "quick_window", None)
         if self._quick_animation_was_running and quick is not None:
             try:
@@ -235,9 +348,7 @@ class StaticModalInteractionController(QObject):
         self._quick_animation_was_running = False
 
     def _sync_modal_geometry(self) -> None:
-        self._modal_layer.setGeometry(self.root.rect())
-        self.details.backdrop.setGeometry(self._modal_layer.rect())
-        self.details.scrim.setGeometry(self._modal_layer.rect())
+        self._frozen_backdrop.setGeometry(self.root.rect())
         self.details.drawer.setGeometry(self.details._drawer_rect())  # noqa: SLF001
         self.details.body_layout.activate()
         drawer_layout = self.details.drawer.layout()
@@ -250,7 +361,7 @@ class StaticModalInteractionController(QObject):
 
     def _start_fade(self, *, end: float, duration_ms: int, easing: QEasingCurve) -> None:
         self._fade_animation.stop()
-        current = float(self._fade_effect.opacity())
+        current = float(self._progress)
         self._fade_animation.setStartValue(current)
         self._fade_animation.setEndValue(max(0.0, min(1.0, float(end))))
         self._fade_animation.setDuration(max(1, int(duration_ms)))
@@ -260,32 +371,31 @@ class StaticModalInteractionController(QObject):
     def _prepare_live_modal(self, *, ratio: tuple[float, float]) -> None:
         self.details._modal_ratio = ratio  # noqa: SLF001
 
-        # QWidget has no native CSS backdrop-filter.  Mirror the reference site
-        # by preparing one *final* blurred backdrop, then fading that real overlay
-        # over the still-clear application.  Blur is never recomputed per frame.
-        snapshot = self.details._capture_backdrop()  # noqa: SLF001
-        if snapshot.isNull():
-            raise RuntimeError("failed to capture modal backdrop")
+        source = self.details._capture_source()  # noqa: SLF001
+        if source.isNull():
+            raise RuntimeError("failed to capture modal source")
+        blurred = self.details._blur_pixmap(source)  # noqa: SLF001
+        if blurred.isNull():
+            raise RuntimeError("failed to prepare modal blur")
 
-        self.details.backdrop.setPixmap(snapshot)
+        self._frozen_backdrop.set_frames(source, blurred)
         self.details.scroll.verticalScrollBar().setValue(0)
+        self.details.backdrop.hide()
+        self.details.scrim.hide()
         self.details.ghost.hide()
         self._sync_modal_geometry()
 
-        # Everything is already in its final live geometry before the first
-        # visible frame.  The single parent opacity is the only animated value.
-        self._fade_effect.setEnabled(True)
-        self._fade_effect.setOpacity(0.0)
+        self._drawer_effect.setEnabled(True)
+        self._set_progress(0.0)
 
-        self.details.backdrop.show()
-        self.details.backdrop.raise_()
-        self.details.scrim.show()
-        self.details.scrim.raise_()
+        # The opaque frozen surface immediately replaces live underlay painting.
+        # Its p=0 image is pixel-identical to the just-captured application.
+        self._frozen_backdrop.show()
+        self._frozen_backdrop.raise_()
         self.details.drawer.show()
         self.details.drawer.raise_()
-        self._modal_layer.show()
-        self._modal_layer.raise_()
-        self._modal_layer.repaint()
+        self._frozen_backdrop.repaint()
+        self.details.drawer.repaint()
 
     def _show_with_animation(self, *, ratio: tuple[float, float]) -> None:
         if self._state != _STATE_IDLE or not self.details.drawer.isHidden():
@@ -308,11 +418,9 @@ class StaticModalInteractionController(QObject):
     def _finish_open(self) -> None:
         if self._state != _STATE_OPENING:
             return
-        self._fade_effect.setOpacity(1.0)
-        # At steady state the live widgets draw directly.  The expensive full
-        # overlay opacity composition exists only during the short transition.
-        self._fade_effect.setEnabled(False)
-        self._modal_layer.repaint()
+        self._set_progress(1.0)
+        self._drawer_effect.setEnabled(False)
+        self.details.drawer.repaint()
         self._state = _STATE_OPEN
         self.details.close_button.setFocus(Qt.FocusReason.OtherFocusReason)
         self.details._schedule_geometry()  # noqa: SLF001
@@ -323,7 +431,9 @@ class StaticModalInteractionController(QObject):
 
         if self._state == _STATE_OPENING:
             self._stop_animation()
-            current = max(0.0, min(1.0, float(self._fade_effect.opacity())))
+            current = max(0.0, min(1.0, float(self._progress)))
+            self._drawer_effect.setEnabled(True)
+            self._drawer_effect.setOpacity(current)
             self._state = _STATE_CLOSING
             duration = max(1, int(round(_CLOSE_MS * current)))
             self._start_fade(end=0.0, duration_ms=duration, easing=_css_ease_in_out())
@@ -331,12 +441,10 @@ class StaticModalInteractionController(QObject):
 
         if self._state == _STATE_OPEN:
             self._stop_animation()
-            # Re-enable one parent opacity at 1.0.  No visual copy or second
-            # drawer is introduced; the same live subtree simply enters fade-out.
-            self._fade_effect.setOpacity(1.0)
-            self._fade_effect.setEnabled(True)
-            self._modal_layer.raise_()
-            self._modal_layer.repaint()
+            self._set_progress(1.0)
+            self._drawer_effect.setEnabled(True)
+            self._drawer_effect.setOpacity(1.0)
+            self.details.drawer.repaint()
             self._state = _STATE_CLOSING
             self._start_fade(end=0.0, duration_ms=_CLOSE_MS, easing=_css_ease_in_out())
             return
@@ -348,42 +456,42 @@ class StaticModalInteractionController(QObject):
         if self._state != _STATE_CLOSING:
             return
 
-        self._fade_effect.setOpacity(0.0)
+        self._set_progress(0.0)
         try:
             self._original_close()
         finally:
-            self._modal_layer.hide()
-            self._fade_effect.setEnabled(False)
-            self._fade_effect.setOpacity(1.0)
+            self._frozen_backdrop.hide()
+            self._frozen_backdrop.clear_frames()
+            self._drawer_effect.setEnabled(False)
+            self._drawer_effect.setOpacity(1.0)
             self._state = _STATE_IDLE
             self._resume_underlay()
+            self.root.update()
 
     def _fallback_open(self, ratio: tuple[float, float]) -> None:
         self._stop_animation()
-        self._fade_effect.setEnabled(False)
-        self._fade_effect.setOpacity(1.0)
-        self._sync_modal_geometry()
-        self._modal_layer.show()
-        self._modal_layer.raise_()
+        self._frozen_backdrop.hide()
+        self._frozen_backdrop.clear_frames()
+        self._drawer_effect.setEnabled(False)
+        self._drawer_effect.setOpacity(1.0)
         try:
             self._original_close()
         except RuntimeError:
             pass
         try:
             self._original_show_prepared_modal(ratio=ratio)
-            self._modal_layer.raise_()
             self._state = _STATE_OPEN
         except Exception:
-            self._modal_layer.hide()
             self._state = _STATE_IDLE
             self._resume_underlay()
 
     def _fallback_close(self) -> None:
         self._stop_animation()
-        self._fade_effect.setEnabled(False)
-        self._fade_effect.setOpacity(1.0)
+        self._frozen_backdrop.hide()
+        self._frozen_backdrop.clear_frames()
+        self._drawer_effect.setEnabled(False)
+        self._drawer_effect.setOpacity(1.0)
         self._original_close()
-        self._modal_layer.hide()
         self._state = _STATE_IDLE
         self._resume_underlay()
 
@@ -397,7 +505,7 @@ class StaticModalInteractionController(QObject):
                 }:
                     self.request_close()
                     return True
-            elif event_type == QEvent.Type.Resize and self._modal_layer.isVisible():
+            elif event_type == QEvent.Type.Resize and self._frozen_backdrop.isVisible():
                 self._sync_modal_geometry()
         return False
 
@@ -407,7 +515,8 @@ class StaticModalInteractionController(QObject):
             self._original_close()
         except RuntimeError:
             pass
-        self._modal_layer.hide()
+        self._frozen_backdrop.hide()
+        self._frozen_backdrop.clear_frames()
         self._state = _STATE_IDLE
         self._resume_underlay()
 
@@ -421,6 +530,10 @@ class StaticModalInteractionController(QObject):
             pass
         try:
             self.details.scrim.clicked.disconnect(self.request_close)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            self._frozen_backdrop.clicked.disconnect(self.request_close)
         except (RuntimeError, TypeError):
             pass
         try:
@@ -442,17 +555,9 @@ class StaticModalInteractionController(QObject):
                 pass
         self._passive_labels.clear()
 
-        # Leave FastCardDetailController structurally valid if this presentation
-        # adapter is ever torn down independently.
-        for widget in (self.details.backdrop, self.details.scrim, self.details.drawer):
-            try:
-                widget.hide()
-                widget.setParent(self.root)
-            except RuntimeError:
-                pass
         try:
-            self._modal_layer.setGraphicsEffect(None)
-            self._modal_layer.deleteLater()
+            self.details.drawer.setGraphicsEffect(None)
+            self._frozen_backdrop.deleteLater()
         except RuntimeError:
             pass
 
