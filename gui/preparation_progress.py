@@ -266,26 +266,35 @@ class DetailedPreparationProgress(QObject):
             self._set_target(100, "准备完成 · 等待真实填写授权")
             return
 
+        # Most subprocess lines are ordinary diagnostics. Avoid running four
+        # regular expressions for every one of them; only actual AI telemetry
+        # can match the patterns below. This changes no progress semantics.
+        if "AI " not in text:
+            return
         if "AI request started;" in text:
             self._nudge_ai("request")
             return
-        match = _AI_CONNECTION.search(text)
-        if match is not None:
-            self._nudge_ai("connection", match.group(1))
+        if "AI connection established at" in text:
+            match = _AI_CONNECTION.search(text)
+            if match is not None:
+                self._nudge_ai("connection", match.group(1))
             return
-        match = _AI_FIRST_OUTPUT.search(text)
-        if match is not None:
-            self._nudge_ai("first_output", match.group(1))
+        if "AI first output received at" in text:
+            match = _AI_FIRST_OUTPUT.search(text)
+            if match is not None:
+                self._nudge_ai("first_output", match.group(1))
             return
-        match = _AI_STILL_RUNNING.search(text)
-        if match is not None:
-            self.console.progress_detail.setText(
-                f"准备 {self._target}/100 · {self._work_label()} · AI处理中 {match.group(1)}s"
-            )
+        if "AI still running:" in text:
+            match = _AI_STILL_RUNNING.search(text)
+            if match is not None:
+                self.console.progress_detail.setText(
+                    f"准备 {self._target}/100 · {self._work_label()} · AI处理中 {match.group(1)}s"
+                )
             return
-        match = _AI_RESPONSE_COMPLETE.search(text)
-        if match is not None:
-            self._nudge_ai("complete", match.group(1))
+        if "AI response complete at" in text:
+            match = _AI_RESPONSE_COMPLETE.search(text)
+            if match is not None:
+                self._nudge_ai("complete", match.group(1))
 
     def _on_completed(self, _result: Any) -> None:
         if self._full_mode():
