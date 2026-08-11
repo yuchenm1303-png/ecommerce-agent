@@ -36,19 +36,17 @@ _STATE_CLOSING = "closing"
 
 
 class _ModalTransitionCompositor(QWidget):
-    """One QWidget layer owns every visual part of the modal transition.
+    """One lightweight QWidget owns every visual part of the modal transition.
 
-    The live application remains underneath and is frozen for the transition.
-    This compositor cross-fades directly from the clear live UI to the final
-    blurred backdrop while the scrim, drawer shell and cached drawer children
-    share the same float progress and frame clock.
+    The live application remains frozen underneath. A single float progress
+    cross-fades to the final blurred backdrop, fades the scrim, and transforms
+    one cached drawer-content frame together with the outer glass shell.
 
-    The outer drawer glass is intentionally *not* baked into the cached pixmap.
-    Rendering the semi-transparent QWidget background into an intermediate
-    QPixmap on Windows can flatten it against an implicit palette/background;
-    drawing that flattened frame a second time creates a pale rectangle during
-    motion. The compositor therefore paints the exact QSS shell itself and the
-    cache contains only the real child widgets (text, tables, buttons, etc.).
+    The outer drawer shell is never baked into the cached pixmap. The cache is
+    produced by rendering the *whole real drawer tree* while suppressing only
+    the drawer's own paint event. That preserves Qt's native parent/child,
+    viewport, clipping and transparent-background semantics for every label,
+    table, scroll area and button without flattening the translucent shell.
     """
 
     def __init__(self, parent: QWidget) -> None:
@@ -129,8 +127,8 @@ class _ModalTransitionCompositor(QWidget):
         painter = QPainter(self)
 
         # A freshly shown translucent child can expose an uninitialised backing
-        # store for one frame on Windows. Always clear our complete surface to
-        # transparent, including progress == 0, before painting transition data.
+        # store for one frame on Windows. Always clear the complete compositor
+        # surface to transparent, including progress == 0.
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
@@ -166,8 +164,8 @@ class _ModalTransitionCompositor(QWidget):
             painter.scale(scale, scale)
             painter.translate(-target.width() / 2.0, -target.height() / 2.0)
 
-            # Paint the translucent outer shell exactly once in the final scene.
-            # The cached pixmap below contains only the real child widget tree.
+            # The exact translucent shell is composed once against the animated
+            # backdrop; the cached frame contains the complete real child tree.
             self._draw_drawer_shell(painter, target.width(), target.height())
             painter.drawPixmap(QPointF(0.0, 0.0), self._panel_frame)
             painter.restore()
@@ -175,8 +173,7 @@ class _ModalTransitionCompositor(QWidget):
         painter.end()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
-        # The transition layer is also the short-lived input shield. It is an
-        # ordinary QWidget child, not a native child window.
+        # Ordinary QWidget input shield used only during the short transition.
         event.accept()
 
 
@@ -200,6 +197,7 @@ class StaticModalInteractionController(QObject):
         self._underlay_suspended = False
         self._pointer_timer_was_active = False
         self._effects_timer_was_active = False
+        self._suppress_drawer_paint_for_capture = False
 
         self._original_show_prepared_modal = self.details._show_prepared_modal  # noqa: SLF001
         self._original_close = self.details.close
@@ -218,6 +216,7 @@ class StaticModalInteractionController(QObject):
         self._rewire_close_inputs()
         self._install_card_surfaces()
         self.root.installEventFilter(self)
+        self.details.drawer.installEventFilter(self)
         window.destroyed.connect(self.cleanup)
 
     @staticmethod
@@ -416,12 +415,12 @@ class StaticModalInteractionController(QObject):
                     pass
 
     def _render_drawer_frame(self) -> QPixmap:
-        """Render only the drawer's child widget tree into a transparent frame.
+        """Render the complete real drawer hierarchy without its outer shell.
 
-        The outer QFrame background/border is intentionally excluded. Its QSS
-        rgba shell is painted directly by _ModalTransitionCompositor so the
-        translucent glass is composited exactly once against the animated
-        backdrop instead of being flattened into an intermediate pixmap.
+        The render starts at the drawer itself so Qt retains the exact native
+        parent/child composition, viewport clipping and transparency semantics.
+        During this synchronous render only the drawer's own Paint event is
+        suppressed; descendants still paint normally through DrawChildren.
         """
 
         drawer = self.details.drawer
@@ -434,20 +433,16 @@ class StaticModalInteractionController(QObject):
         frame.setDevicePixelRatio(dpr)
         frame.fill(Qt.GlobalColor.transparent)
 
-        painter = QPainter(frame)
-        flags = QWidget.RenderFlag.DrawWindowBackground | QWidget.RenderFlag.DrawChildren
-        for child in drawer.children():
-            if not isinstance(child, QWidget):
-                continue
-            if child.parentWidget() is not drawer or child.isHidden():
-                continue
-            child.render(
-                painter,
-                child.pos(),
+        self._suppress_drawer_paint_for_capture = True
+        try:
+            drawer.render(
+                frame,
+                QPoint(0, 0),
                 QRegion(),
-                flags,
+                QWidget.RenderFlag.DrawChildren,
             )
-        painter.end()
+        finally:
+            self._suppress_drawer_paint_for_capture = False
         return frame
 
     def _capture_panel_offscreen(self, target: QRect) -> QPixmap:
@@ -517,7 +512,7 @@ class StaticModalInteractionController(QObject):
         self._compositor.repaint()
 
         # The compositor now owns an identical 100% modal frame. Remove the real
-        # static layers underneath it before starting the reverse transition.
+        # static layers underneath before starting the exact reverse transition.
         self._original_close()
         return target
 
@@ -655,6 +650,13 @@ class StaticModalInteractionController(QObject):
         self._resume_underlay()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if (
+            watched is self.details.drawer
+            and self._suppress_drawer_paint_for_capture
+            and event.type() == QEvent.Type.Paint
+        ):
+            return True
+
         if watched is self.root:
             event_type = event.type()
             if event_type == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
@@ -683,6 +685,10 @@ class StaticModalInteractionController(QObject):
 
         try:
             self.root.removeEventFilter(self)
+        except RuntimeError:
+            pass
+        try:
+            self.details.drawer.removeEventFilter(self)
         except RuntimeError:
             pass
         try:
