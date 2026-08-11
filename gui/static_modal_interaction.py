@@ -24,7 +24,6 @@ _OPEN_MS = 300
 _CLOSE_MS = 250
 _OPEN_RISE_PX = 18.0
 _START_SCALE = 0.992
-_SOFT_BLUR_CROSSOVER = 0.42
 _SCRIM_ALPHA = 94
 
 _STATE_IDLE = "idle"
@@ -37,9 +36,9 @@ class _ModalTransitionCompositor(QWidget):
     """One QWidget layer owns every visual part of the modal transition.
 
     The live application remains underneath and is frozen for the transition.
-    This compositor progressively overlays a softened backdrop, the final blur,
-    the scrim and one cached complete drawer frame. All four layers therefore
-    share one float progress and one frame clock.
+    This compositor cross-fades directly from the clear live UI to the final
+    blurred backdrop while the scrim and one cached complete drawer frame share
+    the same float progress and frame clock.
     """
 
     def __init__(self, parent: QWidget) -> None:
@@ -50,7 +49,6 @@ class _ModalTransitionCompositor(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setAutoFillBackground(False)
 
-        self._soft_blur = QPixmap()
         self._full_blur = QPixmap()
         self._panel_frame = QPixmap()
         self._target = QRectF()
@@ -72,13 +70,11 @@ class _ModalTransitionCompositor(QWidget):
     def set_frames(
         self,
         *,
-        soft_blur: QPixmap,
         full_blur: QPixmap,
         panel_frame: QPixmap,
         target: QRect,
         progress: float,
     ) -> None:
-        self._soft_blur = soft_blur
         self._full_blur = full_blur
         self._panel_frame = panel_frame
         self._target = QRectF(target)
@@ -97,10 +93,9 @@ class _ModalTransitionCompositor(QWidget):
         self.update()
 
     def has_backdrop_frames(self) -> bool:
-        return not self._soft_blur.isNull() and not self._full_blur.isNull()
+        return not self._full_blur.isNull()
 
     def clear_frames(self) -> None:
-        self._soft_blur = QPixmap()
         self._full_blur = QPixmap()
         self._panel_frame = QPixmap()
         self._target = QRectF()
@@ -114,25 +109,28 @@ class _ModalTransitionCompositor(QWidget):
 
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         progress = max(0.0, min(1.0, self._progress))
+        painter = QPainter(self)
+
+        # A freshly shown translucent child can expose an uninitialised backing
+        # store for one frame on Windows. Always clear our complete surface to
+        # transparent, including progress == 0, before painting transition data.
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+
         if progress <= 0.0:
+            painter.end()
             return
 
-        painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         viewport = QRectF(self.rect())
 
-        # The clear live UI is underneath. First blend toward a downsampled soft
-        # frame, then blend that toward the exact final blurred backdrop.
-        if progress <= _SOFT_BLUR_CROSSOVER:
-            soft_mix = progress / _SOFT_BLUR_CROSSOVER
-            painter.setOpacity(soft_mix)
-            self._draw_scaled(painter, self._soft_blur, viewport)
-        else:
-            painter.setOpacity(1.0)
-            self._draw_scaled(painter, self._soft_blur, viewport)
-            full_mix = (progress - _SOFT_BLUR_CROSSOVER) / (1.0 - _SOFT_BLUR_CROSSOVER)
-            painter.setOpacity(full_mix)
-            self._draw_scaled(painter, self._full_blur, viewport)
+        # Cross-fade directly from the clear live UI underneath to the exact
+        # final blurred frame. The former intermediate downsampled "soft blur"
+        # layer created a pale haze around bright text and borders on both open
+        # and close transitions, so it is deliberately absent here.
+        painter.setOpacity(progress)
+        self._draw_scaled(painter, self._full_blur, viewport)
 
         painter.setOpacity(1.0)
         painter.fillRect(
@@ -376,18 +374,6 @@ class StaticModalInteractionController(QObject):
             pixmap = self.root.grab()
         return pixmap
 
-    @staticmethod
-    def _soften_source(source: QPixmap, target_size) -> QPixmap:
-        if source.isNull():
-            return source
-        softened = source.scaled(
-            target_size,
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        softened.setDevicePixelRatio(1.0)
-        return softened
-
     def _settle_drawer_tree(self) -> None:
         drawer = self.details.drawer
         widgets = (drawer, *drawer.findChildren(QWidget))
@@ -453,7 +439,6 @@ class StaticModalInteractionController(QObject):
         full_blur = self.details._blur_pixmap(source)  # noqa: SLF001
         if source.isNull() or full_blur.isNull():
             raise RuntimeError("failed to capture modal backdrop")
-        soft_blur = self._soften_source(source, full_blur.size())
 
         self.details.scroll.verticalScrollBar().setValue(0)
         self.details.ghost.hide()
@@ -469,7 +454,6 @@ class StaticModalInteractionController(QObject):
         self.details.drawer.hide()
 
         self._compositor.set_frames(
-            soft_blur=soft_blur,
             full_blur=full_blur,
             panel_frame=panel_frame,
             target=target,
