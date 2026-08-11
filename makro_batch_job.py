@@ -20,10 +20,12 @@ from app.browser_session import EdgeHarness, is_cdp_ready
 from app.makro.listing_creation import (
     MAKRO_NEW_LISTING_URL,
     infer_listing_bootstrap,
-    is_product_info_step,
     is_vertical_step,
-    select_brand,
     select_vertical,
+)
+from app.makro.step3_transition import (
+    dismiss_joyride_overlay,
+    select_brand_to_product_info,
 )
 from app.providers.registry import ProviderConfigurationError, build_semantic_provider
 from app.source_capture import SourceAccessBlocked, capture_product_source
@@ -137,6 +139,7 @@ def main() -> int:
             current = "step1"
             _phase("step1", "START")
             _prepare_owned_step1_page(page)
+            dismiss_joyride_overlay(page)
             vertical = select_vertical(page, provider, hints)
             manifest["vertical"] = vertical
             manifest["page_url"] = page.url
@@ -146,9 +149,12 @@ def main() -> int:
 
             current = "step2"
             _phase("step2", "START")
-            brand = select_brand(page, provider, hints)
-            if not is_product_info_step(page):
-                raise RuntimeError("Makro did not reach Step 3 after Step 2")
+            brand, page = select_brand_to_product_info(page, provider, hints)
+            harness.page = page
+            # The portal normally stays in the same tab, but if Create New
+            # Listing replaces the Chromium target, ownership must follow the
+            # recovered Step 3 Page rather than preserving a stale Step 1 id.
+            manifest["makro_target_id"] = page_target_id(page)
             manifest["brand"] = brand
             manifest["page_url"] = page.url
             manifest["status"] = "step2_complete"
