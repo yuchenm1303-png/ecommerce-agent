@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEasingCurve, QObject, QPointF, Qt, QTimer
+from PySide6.QtCore import QEasingCurve, QObject, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QApplication, QFrame, QMainWindow, QWidget
 
@@ -31,6 +31,12 @@ _REFERENCE_CARD_SPAN_PX = 300.0
 _REFERENCE_EDGE_GROWTH_PX = (
     _REFERENCE_CARD_SPAN_PX * (_HOVER_SCALE - _NORMAL_SCALE) * 0.5
 )
+
+# Hover remains overflow-visible, but it must not visually cover a neighbouring
+# card or be clipped by the outer window. Keep a small optical gap to adjacent
+# cards and one antialiasing pixel inside the window edge.
+_MIN_NEIGHBOR_GAP_PX = 1.0
+_WINDOW_EDGE_GAP_PX = 1.0
 
 # Pointer ownership remains one cheap local sampler. Motion presentation gets its
 # own refresh-aware timer so a 165 Hz display is not limited by the hit-test rate.
@@ -83,6 +89,11 @@ class NekroCardInteractionController(QObject):
     application cards normalize the same transform so the visible edge lift stays
     near the reference site's ~3 px instead of growing with the card dimensions.
 
+    The final hover target also respects the real visual clearance around a card:
+    no internal layout/host clipping is reintroduced, but a card will reduce its
+    scale when needed to stay inside the outer window and avoid covering an
+    adjacent glass card.
+
     Target changes never restart from a canned state. A press/release/leave samples
     the current interpolated value and reverses from there, matching browser CSS
     transform behavior. Business clicks remain owned by the real child widgets.
@@ -133,12 +144,89 @@ class NekroCardInteractionController(QObject):
         target_hz = max(60.0, min(240.0, refresh_hz))
         return max(4, int(1000.0 / target_hz))
 
-    @staticmethod
-    def _hover_scale_for(frame: QFrame) -> float:
-        """Keep hover edge displacement visually stable across card sizes."""
+    def _card_rect_in_window(self, frame: QFrame) -> QRectF | None:
+        try:
+            top_left = frame.mapTo(self.window, frame.rect().topLeft())
+        except RuntimeError:
+            return None
+        return QRectF(
+            float(top_left.x()),
+            float(top_left.y()),
+            float(frame.width()),
+            float(frame.height()),
+        )
+
+    def _available_edge_growth(self, frame: QFrame, desired_growth: float) -> float:
+        """Cap centered hover growth without reintroducing any clipping layer."""
+
+        rect = self._card_rect_in_window(frame)
+        if rect is None or rect.isEmpty():
+            return 0.0
+
+        window_w = max(0.0, float(self.window.width()))
+        window_h = max(0.0, float(self.window.height()))
+        edge_cap = min(
+            max(0.0, rect.left() - _WINDOW_EDGE_GAP_PX),
+            max(0.0, rect.top() - _WINDOW_EDGE_GAP_PX),
+            max(0.0, window_w - rect.right() - _WINDOW_EDGE_GAP_PX),
+            max(0.0, window_h - rect.bottom() - _WINDOW_EDGE_GAP_PX),
+        )
+        allowed = min(max(0.0, desired_growth), edge_cap)
+        if allowed <= 0.0:
+            return 0.0
+
+        for other in self.states:
+            if other is frame:
+                continue
+            if frame.isAncestorOf(other) or other.isAncestorOf(frame):
+                continue
+            if not other.isVisibleTo(self.window):
+                continue
+
+            other_rect = self._card_rect_in_window(other)
+            if other_rect is None or other_rect.isEmpty():
+                continue
+
+            horizontal_overlap = min(rect.right(), other_rect.right()) - max(
+                rect.left(), other_rect.left()
+            )
+            vertical_overlap = min(rect.bottom(), other_rect.bottom()) - max(
+                rect.top(), other_rect.top()
+            )
+
+            # A neighbour above/below only constrains vertical growth when the
+            # cards overlap horizontally. Likewise for left/right neighbours.
+            if horizontal_overlap > 0.0:
+                if other_rect.top() >= rect.bottom():
+                    gap = other_rect.top() - rect.bottom()
+                    allowed = min(allowed, max(0.0, gap - _MIN_NEIGHBOR_GAP_PX))
+                elif rect.top() >= other_rect.bottom():
+                    gap = rect.top() - other_rect.bottom()
+                    allowed = min(allowed, max(0.0, gap - _MIN_NEIGHBOR_GAP_PX))
+
+            if vertical_overlap > 0.0:
+                if other_rect.left() >= rect.right():
+                    gap = other_rect.left() - rect.right()
+                    allowed = min(allowed, max(0.0, gap - _MIN_NEIGHBOR_GAP_PX))
+                elif rect.left() >= other_rect.right():
+                    gap = rect.left() - other_rect.right()
+                    allowed = min(allowed, max(0.0, gap - _MIN_NEIGHBOR_GAP_PX))
+
+            if allowed <= 0.0:
+                return 0.0
+
+        return allowed
+
+    def _hover_scale_for(self, frame: QFrame) -> float:
+        """Normalize hover lift by size, window edge and neighbouring cards."""
 
         span = max(1.0, float(frame.width()), float(frame.height()))
-        normalized = _NORMAL_SCALE + (2.0 * _REFERENCE_EDGE_GROWTH_PX / span)
+        reference_growth = min(
+            _REFERENCE_EDGE_GROWTH_PX,
+            span * (_HOVER_SCALE - _NORMAL_SCALE) * 0.5,
+        )
+        growth = self._available_edge_growth(frame, reference_growth)
+        normalized = _NORMAL_SCALE + (2.0 * growth / span)
         return max(_NORMAL_SCALE, min(_HOVER_SCALE, normalized))
 
     def _nearest_card(self, widget: QWidget | None) -> QFrame | None:
