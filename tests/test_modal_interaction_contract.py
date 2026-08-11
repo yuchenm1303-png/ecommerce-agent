@@ -42,7 +42,7 @@ def test_final_architecture_has_exactly_one_non_native_transition_surface() -> N
         assert token not in STATIC
 
 
-def test_complex_live_widgets_never_receive_animation_effects_or_transforms() -> None:
+def test_complex_live_modal_widgets_never_receive_animation_effects_or_transforms() -> None:
     forbidden = (
         "QGraphicsOpacityEffect",
         "QGraphicsEffect",
@@ -78,14 +78,33 @@ def test_no_drawer_or_child_snapshot_pipeline_can_return() -> None:
         assert token not in STATIC
 
 
-def test_transition_hot_path_is_only_cached_pixmap_compositing() -> None:
+def test_transition_surface_has_opaque_open_mode_and_live_underlay_close_mode() -> None:
+    assert "self._live_underlay = False" in STATIC
+    assert "def set_live_underlay_fade" in STATIC
+    opaque = _body(STATIC, "def _sync_opaque_attribute", "def set_capture_suppressed")
+    assert "not self._capture_suppressed and not self._live_underlay" in opaque
+    assert "WA_OpaquePaintEvent" in opaque
+
+    live = _body(STATIC, "def set_live_underlay_fade", "def clear_frames")
+    assert "self._live_underlay = True" in live
+    assert "self._base = QPixmap()" in live
+    assert "self._top = _fit_frame(top, self)" in live
+
+
+def test_transition_hot_path_never_renders_live_complex_widgets() -> None:
     paint = _body(STATIC, "def paintEvent", "def mousePressEvent")
-    assert "self._draw_fitted(painter, self._base)" in paint
-    assert "self._draw_fitted(painter, self._top)" in paint
+    assert "if self._live_underlay:" in paint
     assert "painter.setOpacity(self._progress)" in paint
+    assert "self._draw_fitted(painter, self._top)" in paint
     assert "CompositionMode_Source" in paint
     assert "CompositionMode_SourceOver" in paint
-    assert "if self._progress >= 1.0 - 1e-6" in paint
+
+    # Close mode must not draw a cached/synthetic base at all.
+    live_branch = paint.split("if self._live_underlay:", 1)[1].split(
+        "painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)", 1
+    )[0]
+    assert "self._draw_fitted(painter, self._base)" not in live_branch
+    assert "fillRect" not in live_branch
 
     for token in (
         "self.details",
@@ -99,16 +118,14 @@ def test_transition_hot_path_is_only_cached_pixmap_compositing() -> None:
         assert token not in paint
 
 
-def test_whole_root_capture_excludes_only_the_transition_surface() -> None:
+def test_whole_root_capture_is_open_preparation_only_and_excludes_surface() -> None:
     assert "from PySide6.QtGui import QKeyEvent, QMouseEvent, QPainter, QPixmap, QRegion" in STATIC
 
     suppress = _body(STATIC, "def set_capture_suppressed", "def set_hold_frame")
-    assert "self._capture_suppressed = True" in suppress
-    assert "WA_OpaquePaintEvent, False" in suppress
-    assert "WA_OpaquePaintEvent, True" in suppress
-    assert "self._capture_suppressed = False" in suppress
+    assert "self._capture_suppressed = suppressed" in suppress
+    assert "self._sync_opaque_attribute()" in suppress
 
-    capture = _body(STATIC, "def _render_root_without_transition", "def _capture_quick_base")
+    capture = _body(STATIC, "def _render_root_without_transition", "def _frame_interval_ms")
     assert "self._transition.set_capture_suppressed(True)" in capture
     assert "self.root.render(" in capture
     assert "QWidget.RenderFlag.DrawChildren" in capture
@@ -136,7 +153,6 @@ def test_opening_is_entry_a_to_final_live_modal_b() -> None:
     assert "entry = self.details._capture_source()" in prepare
     assert "blurred = self.details._blur_pixmap(entry)" in prepare
     assert "self._transition.set_hold_frame(self._entry_workspace_frame)" in prepare
-    assert "self._transition.repaint()" in prepare
     assert "self._show_real_modal(blurred)" in prepare
     assert "final_modal = self._render_root_without_transition()" in prepare
     assert "self._transition.set_transition_frames(" in prepare
@@ -155,10 +171,6 @@ def test_endpoint_handoff_is_immediate_without_guessed_present_fence() -> None:
     assert "_handoff_timer" not in STATIC
     assert "_handoff_delay_ms" not in STATIC
 
-    stop = _body(STATIC, "def _stop_animation", "def _start_fade")
-    assert "self._motion_timer.stop()" in stop
-    assert "handoff" not in stop.lower()
-
     advance = _body(STATIC, "def _advance_motion", "def _prepare_open_transition")
     endpoint = advance.split("if linear >= 1.0:", 1)[1]
     assert endpoint.index("self._set_progress(self._motion_to)") < endpoint.index(
@@ -175,57 +187,62 @@ def test_open_handoff_reveals_the_same_live_widgets_without_sync_repaint() -> No
     assert "self.details.close_button.setFocus" in finish
     assert "self.details.drawer.hide()" not in finish
     assert "setGraphicsEffect" not in finish
-    assert "self.details.backdrop.repaint()" not in finish
-    assert "self.details.scrim.repaint()" not in finish
-    assert "self.details.drawer.repaint()" not in finish
+    assert "repaint()" not in finish
+    assert "_cache_quick_base" not in finish
 
 
-def test_close_uses_exact_current_screen_then_latest_workspace() -> None:
+def test_close_fades_current_modal_over_the_real_live_workspace() -> None:
     close = _body(STATIC, "def _prepare_close_transition", "def request_close")
     assert "current_modal = self.details._capture_source()" in close
     assert "self._transition.set_hold_frame(current_modal)" in close
-    assert "self._transition.repaint()" in close
     assert "self._original_close()" in close
-    assert "latest_workspace = self._capture_workspace_frame()" in close
-    assert "self._transition.set_transition_frames(latest_workspace, current_modal, 1.0)" in close
+    assert "self._resume_underlay()" in close
+    assert "self.root.update()" in close
+    assert "self._transition.set_live_underlay_fade(current_modal, 1.0)" in close
     assert "self._modal_closed_for_motion = True" in close
-    assert "_render_root_without_transition()" not in close.split(
-        "current_modal = self.details._capture_source()", 1
-    )[0]
+
+    # The real workspace must be restored before the first transparent close frame.
+    assert close.index("self._original_close()") < close.index("self._resume_underlay()")
+    assert close.index("self._resume_underlay()") < close.index(
+        "self._transition.set_live_underlay_fade(current_modal, 1.0)"
+    )
 
 
-def test_close_handoff_drops_surface_without_blocking_full_root_repaint() -> None:
+def test_close_has_no_fake_workspace_capture_or_quick_widget_composition() -> None:
+    forbidden = (
+        "_capture_workspace_frame",
+        "_capture_quick_base",
+        "_cache_quick_base_if_open",
+        "_quick_base_frame",
+        "quick.grabWindow()",
+        "latest_workspace",
+    )
+    for token in forbidden:
+        assert token not in STATIC
+
+    close = _body(STATIC, "def _prepare_close_transition", "def request_close")
+    assert "_render_root_without_transition" not in close
+    assert "CompositionMode_Source" not in close
+    assert "CompositionMode_SourceOver" not in close
+
+
+def test_close_handoff_surface_is_already_transparent_before_hide() -> None:
     finish = _body(STATIC, "def _finish_close", "def _fallback_open")
     assert "self._progress = 0.0" in finish
     assert "self._transition.set_progress(0.0)" in finish
-    assert "self._transition.hide()" in finish
+    assert finish.index("self._transition.set_progress(0.0)") < finish.index(
+        "self._transition.hide()"
+    )
     assert "self._transition.clear_frames()" in finish
     assert "self.root.repaint()" not in finish
     assert "self.root.update()" in finish
+    assert "if self._underlay_suspended:" in finish
 
 
-def test_latest_workspace_is_quick_scene_plus_current_widget_overlay() -> None:
-    quick = _body(STATIC, "def _capture_quick_base", "def _cache_quick_base_if_open")
-    assert "quick.grabWindow()" in quick
-    assert "QPixmap.fromImage(image)" in quick
-
-    workspace = _body(STATIC, "def _capture_workspace_frame", "def _frame_interval_ms")
-    assert "quick_base = self._quick_base_frame" in workspace
-    assert "widget_overlay = self._render_root_without_transition()" in workspace
-    assert "CompositionMode_Source" in workspace
-    assert "CompositionMode_SourceOver" in workspace
-    assert "painter.drawPixmap" in workspace
-    assert "return QPixmap(self._entry_workspace_frame)" in workspace
-
-
-def test_expensive_capture_work_is_outside_the_visible_animation_hot_path() -> None:
-    finish = _body(STATIC, "def _finish_open", "def _prepare_close_transition")
-    assert "QTimer.singleShot(60, self._cache_quick_base_if_open)" in finish
-
+def test_expensive_capture_work_is_outside_visible_animation_hot_path() -> None:
     advance = _body(STATIC, "def _advance_motion", "def _prepare_open_transition")
     for token in (
         "grabWindow",
-        "_capture_quick_base",
         "_capture_source",
         "_render_root_without_transition",
         "_blur_pixmap",
@@ -267,17 +284,13 @@ def test_reference_web_visible_timing_and_curves_are_unchanged() -> None:
     assert "cubic-bezier(.42, 0, .58, 1)" in STATIC
 
 
-def test_interrupted_open_reverses_the_same_surface_without_new_capture() -> None:
+def test_interrupted_open_converts_current_visible_frame_to_live_underlay_close() -> None:
     close = _body(STATIC, "def request_close", "def _finish_close")
-    branch = close.split("if self._state == _STATE_OPENING:", 1)[1].split(
-        "if self._state == _STATE_OPEN:", 1
-    )[0]
-    assert "float(self._progress)" in branch
-    assert "self._modal_closed_for_motion = False" in branch
-    assert "duration = max(1, int(round(_CLOSE_MS * current)))" in branch
-    assert "end=0.0" in branch
-    assert "_capture" not in branch
-    assert "_blur_pixmap" not in branch
+    assert "if self._state in {_STATE_OPENING, _STATE_OPEN}:" in close
+    assert "prior_progress = max(0.0, min(1.0, float(self._progress)))" in close
+    assert "self._prepare_close_transition()" in close
+    assert "duration = max(1, int(round(_CLOSE_MS * prior_progress)))" in close
+    assert "end=0.0" in close
 
 
 def test_resize_during_motion_snaps_instead_of_rebuilding_frames() -> None:
@@ -290,7 +303,7 @@ def test_resize_during_motion_snaps_instead_of_rebuilding_frames() -> None:
     assert "_blur_pixmap" not in snap
 
 
-def test_underlay_animation_sources_are_suspended_for_modal_lifetime() -> None:
+def test_underlay_is_suspended_while_modal_is_open_but_resumes_before_close_fade() -> None:
     suspend = _body(STATIC, "def _suspend_underlay", "def _resume_underlay")
     resume = _body(STATIC, "def _resume_underlay", "def _sync_modal_geometry")
     assert "effects_timer.stop()" in suspend
@@ -303,6 +316,9 @@ def test_underlay_animation_sources_are_suspended_for_modal_lifetime() -> None:
     assert "activity_timer.start()" in resume
     assert 'quick.setProperty("animationRunning", True)' in resume
     assert "schedule_mask()" in resume
+
+    close = _body(STATIC, "def _prepare_close_transition", "def request_close")
+    assert "self._resume_underlay()" in close
 
 
 def test_fail_soft_keeps_existing_static_modal_available() -> None:
