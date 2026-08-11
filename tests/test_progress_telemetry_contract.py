@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DOMAIN = (ROOT / "app" / "makro" / "domain.py").read_text(encoding="utf-8")
 ACTIVITY = (ROOT / "gui" / "activity_presence.py").read_text(encoding="utf-8")
+PREPARATION = (ROOT / "gui" / "preparation_progress.py").read_text(encoding="utf-8")
 
 
 def test_domain_emits_field_telemetry_around_the_existing_fill_call() -> None:
@@ -46,3 +47,15 @@ def test_waiting_animation_does_not_advance_business_progress() -> None:
     assert "self.target_percent" in animate
     assert "self.target_percent +=" not in animate
     assert "_motion_time_s" in animate
+
+
+def test_preparation_log_parser_skips_regexes_for_ordinary_diagnostics() -> None:
+    log_handler = PREPARATION.split("    def _on_log(self, line: str)", 1)[1].split(
+        "    def _on_completed", 1
+    )[0]
+    assert 'if "AI " not in text:' in log_handler
+    assert log_handler.index('if "AI " not in text:') < log_handler.index("_AI_CONNECTION.search(text)")
+    assert 'if "AI connection established at" in text:' in log_handler
+    assert 'if "AI first output received at" in text:' in log_handler
+    assert 'if "AI still running:" in text:' in log_handler
+    assert 'if "AI response complete at" in text:' in log_handler
