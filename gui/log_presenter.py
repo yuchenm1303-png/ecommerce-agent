@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import deque
+
 from PySide6.QtCore import QEvent, QObject, QTimer
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QMainWindow, QPlainTextEdit
@@ -20,7 +22,7 @@ class BufferedLogPresenter(QObject):
         super().__init__(window)
         self.runner = window.runner  # type: ignore[attr-defined]
         self.view: QPlainTextEdit = window.log_view  # type: ignore[attr-defined]
-        self.pending: list[str] = []
+        self.pending: deque[str] = deque()
         self._dropped_hidden = 0
 
         self.view.setUndoRedoEnabled(False)
@@ -48,7 +50,8 @@ class BufferedLogPresenter(QObject):
         if not self.view.isVisible():
             if len(self.pending) > _MAX_HIDDEN_PENDING:
                 drop = len(self.pending) - _MAX_HIDDEN_PENDING
-                del self.pending[:drop]
+                for _ in range(drop):
+                    self.pending.popleft()
                 self._dropped_hidden += drop
             if self.timer.isActive():
                 self.timer.stop()
@@ -74,8 +77,8 @@ class BufferedLogPresenter(QObject):
             )
             self._dropped_hidden = 0
 
-        batch = self.pending[:_MAX_CATCHUP_LINES]
-        del self.pending[: len(batch)]
+        batch_count = min(_MAX_CATCHUP_LINES, len(self.pending))
+        batch = [self.pending.popleft() for _ in range(batch_count)]
         lines = [*prefix, *batch]
 
         bar = self.view.verticalScrollBar()
