@@ -4,7 +4,7 @@ from threading import RLock
 from types import MethodType
 from typing import Any
 
-from PySide6.QtCore import QObject, QUrl
+from PySide6.QtCore import QEvent, QObject, QTimer, QUrl, Qt
 from PySide6.QtGui import QBrush, QImage
 from PySide6.QtQuick import QQuickImageProvider
 from PySide6.QtWidgets import QMainWindow, QTableWidget, QTableWidgetItem
@@ -45,6 +45,175 @@ class _GlassMaskImageProvider(QQuickImageProvider):
         return image
 
 
+class _MinimizeRestoreKeeper(QObject):
+    """Keep the last complete Quick/glass frame intact while the window is hidden.
+
+    The QWidget tree is never rebuilt during minimize/restore, but the native
+    Quick owner can temporarily become unexposed and the embedded QWidget surface
+    can emit Hide events. If the glass geometry timer flushes during that gap,
+    ``GlassCardModel`` legitimately observes every card as invisible and publishes
+    an empty mask. The restore path then has to rebuild the glass card-by-card.
+
+    This controller freezes geometry publication while the top-level presentation
+    is hidden/minimized, retains the Quick scene graph/GPU resources for the whole
+    app lifetime, and performs one coalesced geometry refresh only after both the
+    Quick owner and QWidget overlay are visible again.
+    """
+
+    def __init__(self, window: QMainWindow, background: Any) -> None:
+        super().__init__(window)
+        self.window = window
+        self.background = background
+        self.quick = getattr(background, "quick_window", None)
+        self._original_flush = getattr(background, "_flush_geometry", None)
+        self._suspended = True
+
+        if self.quick is None or not callable(self._original_flush):
+            return
+
+        # The visible scene is small enough that retaining its resources is far
+        # cheaper than recreating textures, scene-graph nodes and glass delegates
+        # every time the user restores the app from the taskbar.
+        self.quick.setPersistentGraphics(True)
+        self.quick.setPersistentSceneGraph(True)
+        self.quick.installEventFilter(self)
+        self.window.installEventFilter(self)
+
+        timer = getattr(background, "_geometry_timer", None)
+        if timer is not None:
+            try:
+                timer.timeout.disconnect(self._original_flush)
+            except (RuntimeError, TypeError):
+                pass
+            timer.timeout.connect(self._flush_geometry)
+
+        self._sync_state()
+
+    def _should_suspend(self) -> bool:
+        quick = self.quick
+        if quick is None:
+            return True
+        try:
+            minimized = bool(quick.windowState() & Qt.WindowState.WindowMinimized)
+            return (
+                minimized
+                or not quick.isVisible()
+                or not quick.isExposed()
+                or not self.window.isVisible()
+            )
+        except RuntimeError:
+            return True
+
+    def _suspend(self) -> None:
+        self._suspended = True
+        self.background._geometry_dirty = True  # noqa: SLF001
+
+        geometry_timer = getattr(self.background, "_geometry_timer", None)
+        if geometry_timer is not None:
+            try:
+                geometry_timer.stop()
+            except RuntimeError:
+                pass
+
+        pointer_timer = getattr(self.background, "_pointer_timer", None)
+        if pointer_timer is not None:
+            try:
+                pointer_timer.stop()
+            except RuntimeError:
+                pass
+
+        if self.quick is not None:
+            try:
+                self.quick.setProperty("animationRunning", False)
+            except RuntimeError:
+                pass
+
+    def _modal_holds_underlay(self) -> bool:
+        modal = getattr(self.window, "_static_modal_interaction", None)
+        return bool(getattr(modal, "_underlay_suspended", False))
+
+    def _resume_pointer_if_allowed(self) -> None:
+        if self._modal_holds_underlay():
+            return
+        pointer_timer = getattr(self.background, "_pointer_timer", None)
+        if pointer_timer is None:
+            return
+        try:
+            if not pointer_timer.isActive():
+                pointer_timer.start()
+        except RuntimeError:
+            pass
+
+    def _resume(self) -> None:
+        if self._should_suspend():
+            self._suspend()
+            return
+
+        was_suspended = self._suspended
+        self._suspended = False
+        self.background._last_pointer_norm = None  # noqa: SLF001
+        self._resume_pointer_if_allowed()
+
+        # Keep the old mask on screen until this one coalesced refresh is ready.
+        # Never clear _mask_ready or card_model state during restore.
+        if was_suspended or bool(getattr(self.background, "_geometry_dirty", False)):
+            self.background._geometry_dirty = True  # noqa: SLF001
+            geometry_timer = getattr(self.background, "_geometry_timer", None)
+            if geometry_timer is not None:
+                try:
+                    if not geometry_timer.isActive():
+                        geometry_timer.start()
+                except RuntimeError:
+                    pass
+
+    def _sync_state(self) -> None:
+        if self._should_suspend():
+            self._suspend()
+        else:
+            self._resume()
+
+    def _flush_geometry(self) -> None:
+        # This guard is the key to preventing a transient all-hidden QWidget tree
+        # from replacing the previously complete glass mask with an empty one.
+        if self._should_suspend():
+            self._suspend()
+            return
+
+        if self._suspended:
+            self._suspended = False
+            self.background._last_pointer_norm = None  # noqa: SLF001
+            self._resume_pointer_if_allowed()
+        self._original_flush()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        event_type = event.type()
+
+        if watched is self.quick:
+            if event_type == QEvent.Type.Hide:
+                self._suspend()
+            elif event_type == QEvent.Type.WindowStateChange:
+                try:
+                    minimized = bool(
+                        self.quick.windowState() & Qt.WindowState.WindowMinimized
+                    )
+                except RuntimeError:
+                    minimized = True
+                if minimized:
+                    self._suspend()
+                else:
+                    QTimer.singleShot(0, self._sync_state)
+            elif event_type in {QEvent.Type.Show, QEvent.Type.Expose}:
+                QTimer.singleShot(0, self._sync_state)
+
+        elif watched is self.window:
+            if event_type == QEvent.Type.Hide:
+                self._suspend()
+            elif event_type == QEvent.Type.Show:
+                QTimer.singleShot(0, self._sync_state)
+
+        return False
+
+
 class UiRuntimeOptimizations(QObject):
     """Presentation-only hot-path optimizations for the formal QWidget/Quick UI.
 
@@ -66,11 +235,19 @@ class UiRuntimeOptimizations(QObject):
         self._batch_status_brushes = {key: QBrush(color) for key, color in _STATUS_COLORS.items()}
         self._prep_log_filter = None
         self._real_log_filter = None
+        self._minimize_restore_keeper = None
 
+        self._install_minimize_restore_keeper()
         self._install_in_memory_glass_mask()
         self._install_in_place_single_tables()
         self._install_in_place_batch_tables()
         self._install_progress_log_filters()
+
+    def _install_minimize_restore_keeper(self) -> None:
+        background = getattr(self.visual, "background", None)
+        if background is None:
+            return
+        self._minimize_restore_keeper = _MinimizeRestoreKeeper(self.window, background)
 
     def _install_in_memory_glass_mask(self) -> None:
         background = getattr(self.visual, "background", None)
