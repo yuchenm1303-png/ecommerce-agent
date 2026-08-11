@@ -16,13 +16,31 @@ SCROLL = (ROOT / "gui" / "smooth_scroll.py").read_text(encoding="utf-8")
 RUNNER = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
-def test_baseline_card_interaction_visual_is_preserved() -> None:
+def test_reference_website_list_card_interaction_is_locked() -> None:
+    assert "_NORMAL_SCALE = 1.00" in CARD_FX
+    assert "_HOVER_SCALE = 1.02" in CARD_FX
+    assert "_ACTIVE_SCALE = 1.00" in CARD_FX
     assert "_NORMAL_ALPHA = 64.0" in CARD_FX
-    assert "_HOVER_ALPHA = 90.0" in CARD_FX
-    assert "_ACTIVE_ALPHA = 110.0" in CARD_FX
-    assert "_MIN_PRESSED_MS = 24" in CARD_FX
-    assert "scale=1.0" in CARD_FX
+    assert "_HOVER_ALPHA = 102.0" in CARD_FX
+    assert "_ACTIVE_ALPHA = 102.0" in CARD_FX
+    assert "_TRANSITION_MS = 300" in CARD_FX
+    assert "cubic-bezier(.25, .1, .25, 1)" in CARD_FX
+    assert "_MIN_PRESSED_MS" not in CARD_FX
+    assert "QElapsedTimer" not in CARD_FX
     assert "install_nekro_card_fx(window, visual)" in RUNNER
+
+
+def test_card_motion_is_continuous_reversible_and_refresh_aware() -> None:
+    assert "time.perf_counter()" in CARD_FX
+    assert "self._motion_timer = QTimer(self)" in CARD_FX
+    assert "Qt.TimerType.PreciseTimer" in CARD_FX
+    assert "screen.refreshRate()" in CARD_FX
+    assert "self._motion_easing" not in CARD_FX
+    assert "self._ease.valueForProgress(linear)" in CARD_FX
+    assert "state.from_scale = state.current_scale" in CARD_FX
+    assert "state.from_alpha = state.current_alpha" in CARD_FX
+    assert "self._active(frame)" in CARD_FX
+    assert "self._hover(previous)" in CARD_FX
 
 
 def test_card_hit_test_uses_one_local_sampler_not_per_widget_filters() -> None:
@@ -36,14 +54,34 @@ def test_card_hit_test_uses_one_local_sampler_not_per_widget_filters() -> None:
     assert "_inline_card_motion_active" not in CARD_FX
 
 
-def test_glass_blur_mask_is_static_while_interaction_tint_stays_widget_local() -> None:
+def test_all_registered_big_and_small_glass_cards_share_the_same_interaction() -> None:
+    assert '_GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}' in CARD_FX
+    assert '_GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}' in ADAPTER
+    assert "for frame in window.findChildren(QFrame):" in CARD_FX
+    assert "if frame.objectName() not in _GLASS_NAMES:" in CARD_FX
+
+
+def test_complete_widget_subtree_scales_while_native_blur_mask_stays_stable() -> None:
     assert "class NativeGlassProxy(QObject)" in ADAPTER
     assert "class _CardInteractionTint(QWidget)" in ADAPTER
+    assert "class _CardScaleEffect(QGraphicsEffect)" in ADAPTER
+    assert "frame.setGraphicsEffect(self._scale_effect)" in ADAPTER
+    assert "painter.scale(scale, scale)" in ADAPTER
+    assert "self.drawSource(painter)" in ADAPTER
     assert "self._interaction_tint.set_target_alpha(overlay_alpha)" in ADAPTER
+    assert "self._scale_effect.set_scale(scale)" in ADAPTER
+    assert "self.update()" in ADAPTER
+    assert "self.repaint()" not in ADAPTER.split("class _CardInteractionTint(QWidget)", 1)[1].split(
+        "class _CardScaleEffect", 1
+    )[0]
+
     proxy = ADAPTER.split("class NativeGlassProxy(QObject)", 1)[1].split(
         "class NativeVisualStyleController(QObject)", 1
     )[0]
     assert "background.set_card_alpha" not in proxy
+    assert "schedule_mask_update" not in proxy.split("def set_interaction", 1)[1].split(
+        "def sync_geometry", 1
+    )[0]
     assert "QGraphicsBlurEffect" not in ADAPTER
 
     assert "class GlassCardModel(QAbstractListModel)" in NATIVE
