@@ -69,14 +69,32 @@ def test_all_big_and_small_glass_cards_use_the_same_full_interaction() -> None:
     assert "for frame in window.findChildren(QFrame):" in CARD_FX
 
 
-def test_large_cards_normalize_hover_by_reference_edge_growth() -> None:
+def test_large_cards_normalize_hover_by_reference_edge_growth_and_real_clearance() -> None:
     assert "_REFERENCE_CARD_SPAN_PX = 300.0" in CARD_FX
     assert "_REFERENCE_EDGE_GROWTH_PX" in CARD_FX
-    assert "def _hover_scale_for(frame: QFrame) -> float:" in CARD_FX
+    assert "_MIN_NEIGHBOR_GAP_PX = 1.0" in CARD_FX
+    assert "_WINDOW_EDGE_GAP_PX = 1.0" in CARD_FX
+    assert "def _card_rect_in_window" in CARD_FX
+    assert "def _available_edge_growth" in CARD_FX
+    assert "def _hover_scale_for(self, frame: QFrame) -> float:" in CARD_FX
+
+    clearance = _body(CARD_FX, "def _available_edge_growth", "def _hover_scale_for")
+    assert "rect.left() - _WINDOW_EDGE_GAP_PX" in clearance
+    assert "window_w - rect.right() - _WINDOW_EDGE_GAP_PX" in clearance
+    assert "window_h - rect.bottom() - _WINDOW_EDGE_GAP_PX" in clearance
+    assert "frame.isAncestorOf(other)" in clearance
+    assert "other.isAncestorOf(frame)" in clearance
+    assert "horizontal_overlap" in clearance
+    assert "vertical_overlap" in clearance
+    assert "gap - _MIN_NEIGHBOR_GAP_PX" in clearance
+
     normalizer = _body(CARD_FX, "def _hover_scale_for", "def _nearest_card")
     assert "max(1.0, float(frame.width()), float(frame.height()))" in normalizer
-    assert "2.0 * _REFERENCE_EDGE_GROWTH_PX / span" in normalizer
+    assert "reference_growth = min(" in normalizer
+    assert "self._available_edge_growth(frame, reference_growth)" in normalizer
+    assert "2.0 * growth / span" in normalizer
     assert "min(_HOVER_SCALE, normalized)" in normalizer
+
     hover = _body(CARD_FX, "def _hover", "def _active")
     assert "scale=self._hover_scale_for(frame)" in hover
 
