@@ -27,9 +27,7 @@ def test_one_progress_clock_owns_blur_scrim_panel_and_text() -> None:
     assert "class _ModalTransitionCompositor(QWidget)" in STATIC
     assert 'QPropertyAnimation(self._compositor, b"progress", self)' in STATIC
     paint = _body(STATIC, "def paintEvent", "def mousePressEvent")
-    assert "_soft_blur" in paint
     assert "_full_blur" in paint
-    assert "_SOFT_BLUR_CROSSOVER" in paint
     assert "_SCRIM_ALPHA * progress" in paint
     assert "painter.setOpacity(progress)" in paint
     assert "_panel_frame" in paint
@@ -37,15 +35,35 @@ def test_one_progress_clock_owns_blur_scrim_panel_and_text() -> None:
     assert "painter.scale(scale, scale)" in paint
 
 
+def test_transition_has_no_intermediate_white_haze_layer() -> None:
+    assert "_soft_blur" not in STATIC
+    assert "_soften_source" not in STATIC
+    assert "_SOFT_BLUR_CROSSOVER" not in STATIC
+    paint = _body(STATIC, "def paintEvent", "def mousePressEvent")
+    assert "self._draw_scaled(painter, self._full_blur, viewport)" in paint
+    assert "painter.setOpacity(progress)" in paint
+
+
+def test_zero_progress_explicitly_clears_translucent_backing_store() -> None:
+    paint = _body(STATIC, "def paintEvent", "def mousePressEvent")
+    assert "QPainter.CompositionMode.CompositionMode_Source" in paint
+    assert "painter.fillRect(self.rect(), QColor(0, 0, 0, 0))" in paint
+    assert "QPainter.CompositionMode.CompositionMode_SourceOver" in paint
+    assert paint.index("painter.fillRect(self.rect(), QColor(0, 0, 0, 0))") < paint.index(
+        "if progress <= 0.0:"
+    )
+
+
 def test_background_blur_is_progressive_not_switched_before_animation() -> None:
     prepare = _body(STATIC, "def _prepare_open_state", "def _prepare_close_state")
     assert "source = self._capture_source_frame()" in prepare
     assert "full_blur = self.details._blur_pixmap(source)" in prepare
-    assert "soft_blur = self._soften_source(source, full_blur.size())" in prepare
     assert "self.details.backdrop.hide()" in prepare
     assert "self.details.scrim.hide()" in prepare
     assert "self._compositor.set_frames(" in prepare
+    assert "full_blur=full_blur" in prepare
     assert "progress=0.0" in prepare
+    assert "soft_blur=" not in prepare
     assert "self.details.backdrop.show()" not in prepare
     assert "self.details.scrim.show()" not in prepare
 
