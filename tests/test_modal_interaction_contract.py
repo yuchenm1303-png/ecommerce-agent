@@ -40,16 +40,15 @@ def test_real_drawer_owns_motion_and_text_fade_without_snapshot_handoff() -> Non
     assert "drawer.grab()" not in STATIC
 
 
-def test_visual_timing_uses_more_integer_positions_at_a_slower_cadence() -> None:
-    assert "_OPEN_MS = 300" in STATIC
-    assert "_OPEN_FADE_MS = 285" in STATIC
-    assert "_CLOSE_MS = 240" in STATIC
-    assert "_CLOSE_FADE_MS = 220" in STATIC
-    assert "_OPEN_RISE_PX = 28" in STATIC
-    assert "_CLOSE_DROP_PX = 22" in STATIC
-    assert "QEasingCurve.Type.OutQuad" in STATIC
+def test_visual_timing_and_motion_constants_are_unchanged() -> None:
+    assert "_OPEN_MS = 220" in STATIC
+    assert "_OPEN_FADE_MS = 205" in STATIC
+    assert "_CLOSE_MS = 170" in STATIC
+    assert "_CLOSE_FADE_MS = 150" in STATIC
+    assert "_OPEN_RISE_PX = 12" in STATIC
+    assert "_CLOSE_DROP_PX = 9" in STATIC
+    assert "QEasingCurve.Type.OutQuart" in STATIC
     assert "QEasingCurve.Type.OutCubic" in STATIC
-    assert "QEasingCurve.Type.InQuad" in STATIC
     assert "QEasingCurve.Type.InCubic" in STATIC
     assert 'b"geometry"' not in STATIC
 
