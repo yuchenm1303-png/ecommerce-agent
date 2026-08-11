@@ -325,17 +325,6 @@ class GlassCardModel(QAbstractListModel):
                 float(state["cardW"]),
                 float(state["cardH"]),
             )
-            scale = float(state.get("cardScale", 1.0))
-            if abs(scale - 1.0) > 1e-5 and not card.isEmpty():
-                center = card.center()
-                half_w = card.width() * scale * 0.5
-                half_h = card.height() * scale * 0.5
-                card = QRectF(
-                    center.x() - half_w,
-                    center.y() - half_h,
-                    half_w * 2.0,
-                    half_h * 2.0,
-                )
             if clip.isEmpty() or card.isEmpty():
                 continue
             painter.save()
@@ -567,7 +556,7 @@ class NativeQuickBackground(QObject):
         self.card_model.set_alpha(frame, alpha)
 
     def set_card_presentation(self, frame: QFrame, *, scale: float, alpha: float) -> None:
-        """Update the GPU glass shell without rebuilding the global blur mask."""
+        """Update only the GPU glass shell/tint; the blur mask stays geometry-only."""
 
         self.card_model.set_presentation(frame, scale=scale, alpha=alpha)
 
