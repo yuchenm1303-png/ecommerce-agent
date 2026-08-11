@@ -54,3 +54,12 @@ def test_auto_recovery_does_not_restart_browser_mid_task() -> None:
     assert "if self._is_busy():" in poll
     assert "当前任务会安全失败，空闲后自动恢复" in poll
     assert "self.ensure_async()" in poll
+
+
+def test_login_failure_is_presented_as_user_action_not_browser_failure() -> None:
+    assert "window.runner.failed.connect(self._observe_failure)" in MANAGER
+    assert "window.execution_runner.failed.connect(self._observe_failure)" in MANAGER
+    assert "self._batch_controller.failed.connect(self._observe_failure)" in MANAGER
+    assert '"LOGIN": "#f4cb7a"' in MANAGER
+    assert "请在已打开的 Makro Browser 完成正常登录后直接重试" in MANAGER
+    assert 'self._state not in {"READY", "LOGIN"}' in MANAGER
