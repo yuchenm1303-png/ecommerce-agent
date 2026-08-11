@@ -2,27 +2,15 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import (
-    QAbstractAnimation,
-    QEasingCurve,
-    QEvent,
-    QObject,
-    QPointF,
-    Property,
-    Qt,
-    QPropertyAnimation,
-    Signal,
-)
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import QFrame, QGraphicsOpacityEffect, QLabel, QMainWindow, QWidget
 
 from .card_details_fast import FastCardDetailController
 
 
-# The reference webpage swaps the normal card group out when boxOpenState opens,
-# then lets the real expanded box run a simple .5 s fade. QWidget cannot use the
-# browser's backdrop-filter, so the desktop port freezes the old surface into one
-# clear/blurred backdrop pair and animates one shared progress value.
+# Keep the reference webpage's visible timing exactly: .5 s enter, .3 s leave.
+# The hot path below changes only how frames are prepared/scheduled.
 _OPEN_MS = 500
 _CLOSE_MS = 300
 
@@ -57,7 +45,14 @@ def _css_ease_in_out() -> QEasingCurve:
 
 
 class _FrozenBackdrop(QWidget):
-    """Opaque frozen underlay: clear -> blurred + scrim, driven by one progress."""
+    """Opaque frozen underlay with all expensive scaling prepared once.
+
+    The original implementation smoothly scaled the low-resolution blurred
+    pixmap to the entire window on every animation paint.  This version fits the
+    clear/blurred frames once and pre-composites the p=1 blur result.  Normal
+    animation frames are therefore two same-size pixmap blits plus one scrim
+    fill; smooth scaling remains only as a rare resize fallback.
+    """
 
     clicked = Signal()
 
@@ -65,21 +60,62 @@ class _FrozenBackdrop(QWidget):
         super().__init__(parent)
         self.setObjectName("cardDetailFrozenBackdrop")
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAutoFillBackground(False)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._clear = QPixmap()
-        self._blurred = QPixmap()
+        self._final_blur = QPixmap()
         self._progress = 0.0
         self.hide()
 
+    def _fit_frame(self, source: QPixmap) -> QPixmap:
+        if source.isNull() or self.width() <= 0 or self.height() <= 0:
+            return QPixmap(source)
+
+        dpr = max(1.0, float(self.devicePixelRatioF()))
+        target_width = max(1, int(round(self.width() * dpr)))
+        target_height = max(1, int(round(self.height() * dpr)))
+        same_pixels = source.width() == target_width and source.height() == target_height
+        same_dpr = abs(float(source.devicePixelRatio()) - dpr) <= 1e-3
+
+        if same_pixels and same_dpr:
+            return QPixmap(source)
+
+        fitted = source.scaled(
+            target_width,
+            target_height,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        fitted.setDevicePixelRatio(dpr)
+        return fitted
+
     def set_frames(self, clear: QPixmap, blurred: QPixmap) -> None:
-        self._clear = QPixmap(clear)
-        self._blurred = QPixmap(blurred)
+        fitted_clear = self._fit_frame(clear)
+        fitted_blur = self._fit_frame(blurred)
+        if fitted_clear.isNull() or fitted_blur.isNull():
+            self._clear = fitted_clear
+            self._final_blur = fitted_blur
+            self.update()
+            return
+
+        final_blur = QPixmap(fitted_clear.size())
+        final_blur.setDevicePixelRatio(fitted_clear.devicePixelRatio())
+        final_blur.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(final_blur)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.drawPixmap(0, 0, fitted_clear)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        painter.drawPixmap(0, 0, fitted_blur)
+        painter.end()
+
+        self._clear = fitted_clear
+        self._final_blur = final_blur
         self.update()
 
     def clear_frames(self) -> None:
         self._clear = QPixmap()
-        self._blurred = QPixmap()
+        self._final_blur = QPixmap()
         self._progress = 0.0
         self.update()
 
@@ -90,25 +126,46 @@ class _FrozenBackdrop(QWidget):
         self._progress = value
         self.update()
 
+    def _frame_matches_surface(self, frame: QPixmap) -> bool:
+        if frame.isNull():
+            return False
+        logical = frame.deviceIndependentSize()
+        return (
+            abs(float(logical.width()) - float(self.width())) <= 0.5
+            and abs(float(logical.height()) - float(self.height())) <= 0.5
+        )
+
+    def _draw_frame(self, painter: QPainter, frame: QPixmap) -> None:
+        if frame.isNull():
+            painter.fillRect(self.rect(), QColor(0, 0, 0))
+            return
+        if self._frame_matches_surface(frame):
+            painter.drawPixmap(0, 0, frame)
+            return
+
+        # Window resizing while the modal is already visible is uncommon.  Keep
+        # it correct without charging every normal animation frame for scaling.
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawPixmap(self.rect(), frame, frame.rect())
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        self._draw_frame(painter, self._clear)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
 
-        target = self.rect()
-        if not self._clear.isNull():
+        if self._progress >= 1.0 - 1e-6:
             painter.setOpacity(1.0)
-            painter.drawPixmap(target, self._clear, self._clear.rect())
-        else:
-            painter.fillRect(target, QColor(0, 0, 0))
-
-        if self._progress > 0.0 and not self._blurred.isNull():
+            self._draw_frame(painter, self._final_blur)
+        elif self._progress > 0.0 and not self._final_blur.isNull():
             painter.setOpacity(self._progress)
-            painter.drawPixmap(target, self._blurred, self._blurred.rect())
+            self._draw_frame(painter, self._final_blur)
 
         painter.setOpacity(1.0)
         if self._progress > 0.0:
             painter.fillRect(
-                target,
+                self.rect(),
                 QColor(12, 17, 26, int(round(94.0 * self._progress))),
             )
         painter.end()
@@ -122,15 +179,16 @@ class _FrozenBackdrop(QWidget):
 
 
 class StaticModalInteractionController(QObject):
-    """Reference-web-style detail fade without a full-screen opacity effect.
+    """Reference-web-style detail fade with a minimal QWidget hot path.
 
-    The real drawer is never copied. A single scalar progress drives:
-      - one opaque frozen backdrop (clear -> final blur + scrim);
-      - one opacity effect attached only to the much smaller real drawer.
+    One scalar progress still drives exactly the same visible result:
+      - opaque frozen underlay: clear -> final blur + scrim;
+      - the one real drawer: opacity 0 -> 1 and back to 0.
 
-    Because the backdrop is opaque, the large workspace beneath it does not
-    participate in transition repainting, matching the reference page's
-    `v-show(!boxOpenState)` behavior without destroying live business widgets.
+    The workspace below the opaque frozen surface is not repainted.  The drawer
+    is never copied and its opacity effect keeps one ownership for the entire
+    visible modal lifetime, avoiding enable/disable handoffs at the open/close
+    boundary.
     """
 
     def __init__(self, window: QMainWindow, details: FastCardDetailController) -> None:
@@ -154,6 +212,12 @@ class StaticModalInteractionController(QObject):
         self._activity_timer_was_active = False
         self._quick_animation_was_running = False
 
+        self._motion_started_s = 0.0
+        self._motion_duration_s = 0.001
+        self._motion_from = 0.0
+        self._motion_to = 0.0
+        self._motion_easing = _css_ease()
+
         self._original_show_prepared_modal = self.details._show_prepared_modal  # noqa: SLF001
         self._original_close = self.details.close
 
@@ -169,8 +233,9 @@ class StaticModalInteractionController(QObject):
         self._drawer_effect.setEnabled(False)
         self.details.drawer.setGraphicsEffect(self._drawer_effect)
 
-        self._fade_animation = QPropertyAnimation(self, b"progress", self)
-        self._fade_animation.finished.connect(self._finish_motion)
+        self._motion_timer = QTimer(self)
+        self._motion_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._motion_timer.timeout.connect(self._advance_motion)
 
         self.details._show_prepared_modal = self._show_with_animation  # type: ignore[method-assign]  # noqa: SLF001
         self.details.close = self.request_close  # type: ignore[method-assign]
@@ -179,16 +244,12 @@ class StaticModalInteractionController(QObject):
         self.root.installEventFilter(self)
         window.destroyed.connect(self.cleanup)
 
-    def _get_progress(self) -> float:
-        return self._progress
-
     def _set_progress(self, value: float) -> None:
         value = max(0.0, min(1.0, float(value)))
         self._progress = value
         self._frozen_backdrop.set_progress(value)
-        self._drawer_effect.setOpacity(value)
-
-    progress = Property(float, _get_progress, _set_progress)
+        if abs(float(self._drawer_effect.opacity()) - value) > 1e-6:
+            self._drawer_effect.setOpacity(value)
 
     @staticmethod
     def _label_is_passive(label: QLabel) -> bool:
@@ -354,18 +415,43 @@ class StaticModalInteractionController(QObject):
         if drawer_layout is not None:
             drawer_layout.activate()
 
+    def _frame_interval_ms(self) -> int:
+        refresh_hz = 60.0
+        screen = self.window.screen()
+        if screen is not None:
+            try:
+                candidate = float(screen.refreshRate())
+                if 30.0 <= candidate <= 500.0:
+                    refresh_hz = candidate
+            except (RuntimeError, TypeError, ValueError):
+                pass
+        target_hz = max(60.0, min(165.0, refresh_hz))
+        return max(5, int(1000.0 / target_hz))
+
     def _stop_animation(self) -> None:
-        if self._fade_animation.state() != QAbstractAnimation.State.Stopped:
-            self._fade_animation.stop()
+        self._motion_timer.stop()
 
     def _start_fade(self, *, end: float, duration_ms: int, easing: QEasingCurve) -> None:
-        self._fade_animation.stop()
-        current = float(self._progress)
-        self._fade_animation.setStartValue(current)
-        self._fade_animation.setEndValue(max(0.0, min(1.0, float(end))))
-        self._fade_animation.setDuration(max(1, int(duration_ms)))
-        self._fade_animation.setEasingCurve(easing)
-        self._fade_animation.start()
+        self._motion_timer.stop()
+        self._motion_from = float(self._progress)
+        self._motion_to = max(0.0, min(1.0, float(end)))
+        self._motion_duration_s = max(0.001, float(duration_ms) / 1000.0)
+        self._motion_easing = easing
+        self._motion_started_s = time.perf_counter()
+        self._motion_timer.setInterval(self._frame_interval_ms())
+        self._motion_timer.start()
+
+    def _advance_motion(self) -> None:
+        elapsed_s = max(0.0, time.perf_counter() - self._motion_started_s)
+        linear = min(1.0, elapsed_s / self._motion_duration_s)
+        eased = float(self._motion_easing.valueForProgress(linear))
+        value = self._motion_from + (self._motion_to - self._motion_from) * eased
+        self._set_progress(value)
+
+        if linear >= 1.0:
+            self._motion_timer.stop()
+            self._set_progress(self._motion_to)
+            self._finish_motion()
 
     def _prepare_live_modal(self, *, ratio: tuple[float, float]) -> None:
         self.details._modal_ratio = ratio  # noqa: SLF001
@@ -377,12 +463,14 @@ class StaticModalInteractionController(QObject):
         if blurred.isNull():
             raise RuntimeError("failed to prepare modal blur")
 
+        # Geometry is final before set_frames(), so expensive smooth scaling and
+        # p=1 blur composition happen once here rather than inside paintEvent().
+        self._sync_modal_geometry()
         self._frozen_backdrop.set_frames(source, blurred)
         self.details.scroll.verticalScrollBar().setValue(0)
         self.details.backdrop.hide()
         self.details.scrim.hide()
         self.details.ghost.hide()
-        self._sync_modal_geometry()
 
         self._drawer_effect.setEnabled(True)
         self._set_progress(0.0)
@@ -417,8 +505,8 @@ class StaticModalInteractionController(QObject):
         if self._state != _STATE_OPENING:
             return
         self._set_progress(1.0)
-        self._drawer_effect.setEnabled(False)
-        self.details.drawer.repaint()
+        # Keep the same live effect owner at opacity 1.0.  Disabling it here and
+        # re-enabling it on close forces an avoidable off-screen source rebuild.
         self._state = _STATE_OPEN
         self.details.close_button.setFocus(Qt.FocusReason.OtherFocusReason)
         self.details._schedule_geometry()  # noqa: SLF001
@@ -433,8 +521,6 @@ class StaticModalInteractionController(QObject):
         if self._state == _STATE_OPENING:
             self._stop_animation()
             current = max(0.0, min(1.0, float(self._progress)))
-            self._drawer_effect.setEnabled(True)
-            self._drawer_effect.setOpacity(current)
             self._state = _STATE_CLOSING
             duration = max(1, int(round(_CLOSE_MS * current)))
             self._start_fade(end=0.0, duration_ms=duration, easing=_css_ease_in_out())
@@ -442,10 +528,6 @@ class StaticModalInteractionController(QObject):
 
         if self._state == _STATE_OPEN:
             self._stop_animation()
-            self._set_progress(1.0)
-            self._drawer_effect.setEnabled(True)
-            self._drawer_effect.setOpacity(1.0)
-            self.details.drawer.repaint()
             self._state = _STATE_CLOSING
             self._start_fade(end=0.0, duration_ms=_CLOSE_MS, easing=_css_ease_in_out())
             return
@@ -461,6 +543,8 @@ class StaticModalInteractionController(QObject):
         try:
             self._original_close()
         finally:
+            # Drawer is hidden before its effect is disabled, so the visible
+            # transition never changes rendering ownership at a frame boundary.
             self._frozen_backdrop.hide()
             self._frozen_backdrop.clear_frames()
             self._drawer_effect.setEnabled(False)
@@ -522,6 +606,8 @@ class StaticModalInteractionController(QObject):
             pass
         self._frozen_backdrop.hide()
         self._frozen_backdrop.clear_frames()
+        self._drawer_effect.setEnabled(False)
+        self._drawer_effect.setOpacity(1.0)
         self._fallback_active = False
         self._state = _STATE_IDLE
         self._resume_underlay()
