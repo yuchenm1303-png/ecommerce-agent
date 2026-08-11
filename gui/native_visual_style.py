@@ -57,8 +57,7 @@ class _CardScaleEffect(QGraphicsEffect):
             return
         self._scale = scale
         active = abs(scale - 1.0) > 1e-4
-        was_active = self.isEnabled()
-        if was_active != active:
+        if self.isEnabled() != active:
             if active:
                 self._clear_source_cache()
             self.setEnabled(active)
