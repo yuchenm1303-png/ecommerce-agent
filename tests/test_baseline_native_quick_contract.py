@@ -36,10 +36,14 @@ def test_card_hit_test_uses_one_local_sampler_not_per_widget_filters() -> None:
     assert "_inline_card_motion_active" not in CARD_FX
 
 
-def test_glass_blur_mask_is_static_until_geometry_changes() -> None:
+def test_glass_blur_mask_is_static_while_interaction_tint_stays_widget_local() -> None:
     assert "class NativeGlassProxy(QObject)" in ADAPTER
-    assert "background.set_card_alpha(self.frame, overlay_alpha)" in ADAPTER
-    assert "paintEvent" not in ADAPTER
+    assert "class _CardInteractionTint(QWidget)" in ADAPTER
+    assert "self._interaction_tint.set_target_alpha(overlay_alpha)" in ADAPTER
+    proxy = ADAPTER.split("class NativeGlassProxy(QObject)", 1)[1].split(
+        "class NativeVisualStyleController(QObject)", 1
+    )[0]
+    assert "background.set_card_alpha" not in proxy
     assert "QGraphicsBlurEffect" not in ADAPTER
 
     assert "class GlassCardModel(QAbstractListModel)" in NATIVE
