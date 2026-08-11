@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CARD_FX = (ROOT / "gui" / "nekro_card_fx.py").read_text(encoding="utf-8")
 NATIVE_VISUAL = (ROOT / "gui" / "native_visual_style.py").read_text(encoding="utf-8")
+NATIVE_BG = (ROOT / "gui" / "native_background.py").read_text(encoding="utf-8")
 
 
 def _body(source: str, start: str, end: str) -> str:
@@ -64,34 +65,40 @@ def test_all_big_and_small_glass_cards_use_the_same_full_interaction() -> None:
     expected = '_GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}'
     assert expected in CARD_FX
     assert expected in NATIVE_VISUAL
+    assert expected in NATIVE_BG
     assert "for frame in window.findChildren(QFrame):" in CARD_FX
 
 
-def test_interaction_tint_is_local_mouse_transparent_and_continuous() -> None:
-    assert "class _CardInteractionTint(QWidget)" in NATIVE_VISUAL
-    tint = _body(NATIVE_VISUAL, "class _CardInteractionTint", "class _CardScaleEffect")
-    assert "WA_TransparentForMouseEvents" in tint
-    assert "WA_TranslucentBackground" in tint
-    assert "self.lower()" in tint
-    assert "self.update()" in tint
-    assert "self.repaint()" not in tint
-    assert "QColor(0, 0, 0, self._alpha)" in tint
-    assert "drawRoundedRect" in tint
+def test_quick_glass_and_widget_content_share_one_scale_state() -> None:
+    assert "SCALE_ROLE = _ROLE_BASE + 11" in NATIVE_BG
+    assert 'SCALE_ROLE: "cardScale"' in NATIVE_BG
+    assert 'self.SCALE_ROLE: QByteArray(b"cardScale")' in NATIVE_BG
+    assert '"cardScale": 1.0' in NATIVE_BG
+    assert "scale: cardScale" in NATIVE_BG
+    assert "transformOrigin: Item.Center" in NATIVE_BG
+
+    proxy = _body(NATIVE_VISUAL, "class NativeGlassProxy", "class NativeVisualStyleController")
+    assert "self.background.set_card_presentation(" in proxy
+    assert "scale=scale" in proxy
+    assert "alpha=overlay_alpha" in proxy
+    assert "self._scale_effect.set_scale(scale)" in proxy
 
 
-def test_local_tint_composes_reference_hover_black_alpha_102_from_base_64() -> None:
-    assert "def _interaction_overlay_alpha" in NATIVE_VISUAL
-    helper = _body(
-        NATIVE_VISUAL,
-        "def _interaction_overlay_alpha",
-        "class _CardInteractionTint",
-    )
-    assert "255.0 * (target - _NORMAL_GLASS_ALPHA) / denominator" in helper
-    assert "_NORMAL_GLASS_ALPHA = 64.0" in NATIVE_VISUAL
-    assert "_HOVER_ALPHA = 102.0" in CARD_FX
+def test_quick_owns_glass_darkening_without_extra_qwidget_tint_layer() -> None:
+    assert "class _CardInteractionTint" not in NATIVE_VISUAL
+    assert "_interaction_overlay_alpha" not in NATIVE_VISUAL
+    assert "nativeCardInteractionTint" not in NATIVE_VISUAL
+    assert "QColor" not in NATIVE_VISUAL
+
+    model = _body(NATIVE_BG, "class GlassCardModel", "def _qml_source")
+    assert "def set_presentation" in model
+    assert "changed_roles.append(self.SCALE_ROLE)" in model
+    assert "changed_roles.append(self.ALPHA_ROLE)" in model
+    assert "self.dataChanged.emit(index, index, changed_roles)" in model
+    assert "cardAlpha / 255.0" in NATIVE_BG
 
 
-def test_complete_card_subtree_gets_one_transform_without_layout_resize() -> None:
+def test_complete_widget_content_subtree_gets_same_transform_without_layout_resize() -> None:
     assert "class _CardScaleEffect(QGraphicsEffect)" in NATIVE_VISUAL
     effect = _body(NATIVE_VISUAL, "class _CardScaleEffect", "class NativeGlassProxy")
     assert "def boundingRectFor" in effect
@@ -103,30 +110,33 @@ def test_complete_card_subtree_gets_one_transform_without_layout_resize() -> Non
 
     proxy = _body(NATIVE_VISUAL, "class NativeGlassProxy", "class NativeVisualStyleController")
     assert "frame.setGraphicsEffect(self._scale_effect)" in proxy
-    assert "self._interaction_tint.set_target_alpha(overlay_alpha)" in proxy
     assert "self._scale_effect.set_scale(scale)" in proxy
 
 
-def test_steady_state_disables_card_scale_effect() -> None:
+def test_steady_state_disables_widget_content_scale_effect() -> None:
     effect = _body(NATIVE_VISUAL, "class _CardScaleEffect", "class NativeGlassProxy")
     assert "self.setEnabled(False)" in effect
     assert "active = abs(scale - 1.0) > 1e-4" in effect
     assert "self.setEnabled(active)" in effect
 
 
-def test_high_frequency_interaction_never_rebuilds_quick_glass_mask() -> None:
+def test_high_frequency_interaction_updates_only_one_quick_model_row_not_global_mask() -> None:
     setter = _body(NATIVE_VISUAL, "def set_interaction", "def sync_geometry")
-    assert "self._interaction_tint.set_target_alpha(overlay_alpha)" in setter
+    assert "self.background.set_card_presentation(" in setter
     assert "self._scale_effect.set_scale(scale)" in setter
-    assert "self.background.set_card_alpha" not in setter
     assert "schedule_mask_update" not in setter
     assert "quick.requestUpdate" not in setter
-    assert "dataChanged" not in setter
+
+    presentation = _body(NATIVE_BG, "def set_card_presentation", "def _sample_pointer")
+    assert "self.card_model.set_presentation(frame, scale=scale, alpha=alpha)" in presentation
+    assert "schedule_mask_update" not in presentation
 
 
-def test_quick_model_keeps_stable_base_glass_alpha() -> None:
-    assert '"cardAlpha": _NORMAL_GLASS_ALPHA' in NATIVE_VISUAL
-    assert "self._glass[frame] = NativeGlassProxy(frame, self.background)" in NATIVE_VISUAL
+def test_static_blur_mask_can_reflect_current_scale_when_geometry_refreshes() -> None:
+    render_mask = _body(NATIVE_BG, "def render_mask", "def _qml_source")
+    assert 'scale = float(state.get("cardScale", 1.0))' in render_mask
+    assert "half_w = card.width() * scale * 0.5" in render_mask
+    assert "half_h = card.height() * scale * 0.5" in render_mask
 
 
 def test_modal_suspend_returns_cards_to_exact_normal_state() -> None:
@@ -143,3 +153,4 @@ def test_modal_suspend_returns_cards_to_exact_normal_state() -> None:
 def test_sources_compile_without_importing_pyside() -> None:
     compile(CARD_FX, str(ROOT / "gui" / "nekro_card_fx.py"), "exec")
     compile(NATIVE_VISUAL, str(ROOT / "gui" / "native_visual_style.py"), "exec")
+    compile(NATIVE_BG, str(ROOT / "gui" / "native_background.py"), "exec")
