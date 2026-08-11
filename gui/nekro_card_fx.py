@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QElapsedTimer, QEvent, QObject, Qt, QTimer
-from PySide6.QtGui import QCursor, QMouseEvent
+from PySide6.QtCore import QElapsedTimer, QObject, Qt, QTimer
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QApplication, QFrame, QMainWindow, QWidget
 
 from .visual_style import GlassBackdrop, VisualStyleController
@@ -15,9 +15,9 @@ _NORMAL_ALPHA = 64.0
 _HOVER_ALPHA = 90.0
 _ACTIVE_ALPHA = 110.0
 
-# This is input sampling, not presentation animation. Eight milliseconds keeps the
-# pointer/card relationship fresher than one 60 Hz display frame even when Qt
-# coalesces or skips sibling Enter/Leave traffic in the layered child window.
+# Keep the existing 8 ms recovery cadence so input latency does not change. The
+# optimization is structural: one cheap local hit test replaces Python filters on
+# every descendant widget in every glass card.
 _POINTER_SAMPLE_MS = 8
 
 # A fast physical click can deliver press+release before QWidget's backing store is
@@ -44,20 +44,16 @@ class _CardState:
 
 
 class NekroCardInteractionController(QObject):
-    """One pointer router for all glass-card hover and press feedback.
+    """Single local hit-test sampler for all glass-card hover/press feedback.
 
-    Card interaction no longer depends on every nested QWidget producing a
-    perfectly paired Enter/Leave/Press/Release sequence. The current global cursor
-    position is the authority. Existing card-local mouse events trigger an
-    immediate resample, while one tiny 8 ms sampler closes any gaps left by Qt or
-    Windows event coalescing in the manually embedded layered QWidget surface.
-
-    Presentation remains a deterministic three-state model:
+    The visible three-state presentation is unchanged:
         NORMAL 64 -> HOVER 90 -> PRESSED 110.
 
-    Pressed tint is held for at least 24 ms purely so a fast press/release pair
-    cannot collapse into one backing-store present. No business click, card open,
-    or child-control event is consumed or delayed.
+    Earlier code installed a Python event filter and mouse tracking on every child
+    widget under every card, so ordinary pointer movement could cross Python many
+    times before one card state actually changed. The global cursor was already
+    the authority; this version uses that authority directly and performs one
+    local ``QMainWindow.childAt`` lookup per recovery sample instead.
     """
 
     def __init__(self, window: QMainWindow, visual: VisualStyleController) -> None:
@@ -68,7 +64,6 @@ class NekroCardInteractionController(QObject):
         self.hovered: QFrame | None = None
         self.pressed: QFrame | None = None
         self._suspended = False
-        self._watched_to_card: dict[QObject, QFrame] = {}
         self._left_down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
 
         for frame in window.findChildren(QFrame):
@@ -78,9 +73,6 @@ class NekroCardInteractionController(QObject):
             if surface is None:
                 continue
             self.states[frame] = _CardState(frame=frame, surface=surface)
-
-        for frame in self.states:
-            self._register_widget_tree(frame)
 
         self._press_clock = QElapsedTimer()
 
@@ -102,65 +94,41 @@ class NekroCardInteractionController(QObject):
         while current is not None:
             if isinstance(current, QFrame) and current in self.states:
                 return current
+            if current is self.window:
+                break
             current = current.parentWidget()
         return None
 
-    def _watch_widget(self, widget: QWidget, frame: QFrame) -> None:
-        previous = self._watched_to_card.get(widget)
-        if previous is frame:
-            return
-        if previous is not None:
-            try:
-                widget.removeEventFilter(self)
-            except RuntimeError:
-                pass
-        widget.setMouseTracking(True)
-        widget.installEventFilter(self)
-        self._watched_to_card[widget] = frame
-
-    def _register_widget_tree(self, root: QWidget) -> None:
-        for widget in [root, *root.findChildren(QWidget)]:
-            frame = self._nearest_card(widget)
-            if frame is not None:
-                self._watch_widget(widget, frame)
-
-    def _belongs_to_window(self, widget: QWidget | None) -> bool:
-        current = widget
-        while current is not None:
-            if current is self.window:
-                return True
-            current = current.parentWidget()
-        return False
-
     def _card_at_global(self, global_pos) -> QFrame | None:  # noqa: ANN001
-        """Resolve the actual card below a global cursor point.
+        """Resolve the deepest visible glass card under one global point locally."""
 
-        QApplication.widgetAt() is preferred because it respects real QWidget
-        stacking and clipping. The geometry fallback exists only for the unusual
-        layered-child case where Qt cannot resolve a widget for an otherwise valid
-        point inside this application window.
-        """
+        try:
+            local = self.window.mapFromGlobal(global_pos)
+        except RuntimeError:
+            return None
+        if not self.window.rect().contains(local):
+            return None
 
-        widget = QApplication.widgetAt(global_pos)
+        widget = self.window.childAt(local)
+        card = self._nearest_card(widget)
+        if card is not None and card.isVisibleTo(self.window) and card.isEnabled():
+            return card
+
+        # childAt can return None through a transparent/native gap. The fallback
+        # remains local to this one window and is only used for that unusual case.
         if widget is not None:
-            card = self._nearest_card(widget)
-            if card is not None:
-                return card
-            if self._belongs_to_window(widget):
-                return None
-
+            return None
         best: QFrame | None = None
         best_depth = -1
         for frame in self.states:
             if not frame.isVisibleTo(self.window) or not frame.isEnabled():
                 continue
             try:
-                local = frame.mapFromGlobal(global_pos)
+                point = frame.mapFrom(self.window, local)
             except RuntimeError:
                 continue
-            if not frame.rect().contains(local):
+            if not frame.rect().contains(point):
                 continue
-
             depth = 0
             parent = frame.parentWidget()
             while parent is not None:
@@ -196,17 +164,12 @@ class NekroCardInteractionController(QObject):
         if self._suspended:
             return
 
-        # A new physical press supersedes any visual release still waiting to
-        # finish. Normalize the previous card first, then start the new pulse.
         if self._release_timer.isActive():
             self._release_timer.stop()
             previous = self.pressed
             self.pressed = None
             if previous is not None:
-                if previous is frame:
-                    self._publish(previous, _HOVER_ALPHA)
-                else:
-                    self._publish(previous, _NORMAL_ALPHA)
+                self._publish(previous, _HOVER_ALPHA if previous is frame else _NORMAL_ALPHA)
 
         if frame is None:
             self.pressed = None
@@ -267,8 +230,6 @@ class NekroCardInteractionController(QObject):
             return
 
         if left_down:
-            # Recovery path: if a native transition caused the edge event to be
-            # missed, the sampled current button state still restores PRESSED.
             if self.pressed is None:
                 self._begin_press(current)
             return
@@ -302,57 +263,10 @@ class NekroCardInteractionController(QObject):
         self.hovered = current
         self._pointer_timer.start()
 
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        frame = self._watched_to_card.get(watched)
-        if frame is None:
-            return False
-
-        event_type = event.type()
-
-        if event_type == QEvent.Type.ChildAdded:
-            child_getter = getattr(event, "child", None)
-            child = child_getter() if callable(child_getter) else None
-            if isinstance(child, QWidget):
-                self._register_widget_tree(child)
-            return False
-
-        if self._suspended:
-            return False
-
-        # Existing widget events are zero-latency hints. The pointer sampler is
-        # still the authority and guarantees correction when sibling events are
-        # coalesced or skipped during fast movement.
-        if event_type in {QEvent.Type.Enter, QEvent.Type.MouseMove, QEvent.Type.Leave}:
-            self._sample_pointer()
-        elif event_type == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
-            if event.button() == Qt.MouseButton.LeftButton:
-                self._left_down = True
-                self._begin_press(self._card_at_global(QCursor.pos()))
-        elif event_type == QEvent.Type.MouseButtonRelease and isinstance(event, QMouseEvent):
-            if event.button() == Qt.MouseButton.LeftButton:
-                self._left_down = False
-                self._end_press()
-        elif watched is frame and event_type in {QEvent.Type.Hide, QEvent.Type.EnabledChange}:
-            if not frame.isVisible() or not frame.isEnabled():
-                if self.hovered is frame:
-                    self.hovered = None
-                if self.pressed is frame:
-                    self.pressed = None
-                    self._release_timer.stop()
-                self._publish(frame, _NORMAL_ALPHA)
-        return False
-
     def _cleanup(self) -> None:
         self._pointer_timer.stop()
         self._release_timer.stop()
         self._suspended = False
-        for watched in tuple(self._watched_to_card):
-            try:
-                watched.removeEventFilter(self)
-            except RuntimeError:
-                pass
-        self._watched_to_card.clear()
-
         for state in tuple(self.states.values()):
             try:
                 state.surface.set_interaction(scale=1.0, overlay_alpha=_NORMAL_ALPHA)
