@@ -25,6 +25,7 @@ def main() -> int:
     from gui.console_window import MainWindow
     from gui.workflow_console_window import WorkflowMainWindow
     from gui.log_presenter import install_buffered_logs
+    from gui.mode_toggle import install_workspace_mode_switch
     from gui.native_visual_style import install_native_visual_style
     from gui.native_window_shell import install_native_window_shell
     from gui.nekro_card_fx import install_nekro_card_fx
@@ -59,6 +60,7 @@ def main() -> int:
     install_static_modal_interaction(window, details)
 
     window.install_mode_workspace()
+    install_workspace_mode_switch(window)
     install_required_input_support(window)
     visual.refresh_glass_frames()
 
