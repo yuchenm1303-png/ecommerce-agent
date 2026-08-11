@@ -3,7 +3,18 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, QRect, QRectF, Qt, QTimer
+from PySide6.QtCore import (
+    QEasingCurve,
+    QEvent,
+    QObject,
+    QPoint,
+    QPointF,
+    QRect,
+    QRectF,
+    Qt,
+    QTimer,
+    Slot,
+)
 from PySide6.QtGui import QColor, QPainter, QPixmap, QRegion
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QMainWindow, QStackedWidget, QWidget
 
@@ -29,6 +40,11 @@ _VEIL_PEAK_MS = 170
 _VEIL_END_MS = 220
 _VEIL_MAX_OPACITY = 0.06
 _VEIL_COLOR = QColor(228, 241, 250)
+
+# Quick uses the threaded render loop in the formal runner. The new card geometry
+# must reach at least one presented Quick frame before the incoming composite is
+# sampled; otherwise the QWidget page can be combined with the previous glass mask.
+_QUICK_SYNC_TIMEOUT_MS = 64
 
 
 def _cubic_bezier(c1x: float, c1y: float, c2x: float, c2y: float) -> QEasingCurve:
@@ -98,12 +114,20 @@ def _fit_frame(source: QPixmap, widget: QWidget) -> QPixmap:
 
 
 class _WorkspaceTransitionSurface(QWidget):
-    """Fade through a neutral Fuji frame without cross-fading readable dashboards."""
+    """Root-level opaque owner for the complete modeStack image during motion.
 
-    def __init__(self, stack: QStackedWidget) -> None:
-        super().__init__(stack)
+    The surface intentionally lives under the central widget, not under
+    QStackedWidget. Switching the current page can raise children inside the stack,
+    but can never raise them above this sibling overlay. That makes one object the
+    sole owner of every visible modeStack pixel until the final handoff.
+    """
+
+    def __init__(self, root: QWidget) -> None:
+        super().__init__(root)
         self.setObjectName("workspaceTransitionSurface")
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        # Block pointer input to the hidden live workspace while the header switch
+        # remains available above/outside this geometry.
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAutoFillBackground(False)
@@ -115,19 +139,7 @@ class _WorkspaceTransitionSurface(QWidget):
         self._outgoing_alpha = 1.0
         self._incoming_alpha = 0.0
         self._veil_alpha = 0.0
-        self._capture_suppressed = False
         self.hide()
-
-    def set_capture_suppressed(self, suppressed: bool) -> None:
-        suppressed = bool(suppressed)
-        if suppressed == self._capture_suppressed:
-            return
-        if suppressed:
-            self._capture_suppressed = True
-            self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
-            return
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-        self._capture_suppressed = False
 
     def begin(self, neutral: QPixmap, outgoing: QPixmap) -> None:
         self._neutral = _fit_frame(neutral, self)
@@ -183,15 +195,19 @@ class _WorkspaceTransitionSurface(QWidget):
         ):
             painter.drawPixmap(0, 0, frame)
             return
+
+        # Geometry changes during an active transition normally snap immediately,
+        # so this is only a defensive fallback.
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.drawPixmap(self.rect(), frame, frame.rect())
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
 
     def paintEvent(self, _event) -> None:  # type: ignore[override]
-        if self._capture_suppressed:
-            return
-
         painter = QPainter(self)
+
+        # CompositionMode_Source is deliberate: the neutral Fuji base writes
+        # opaque pixels into the translucent top-level backing store. Nothing from
+        # the live QStackedWidget or native Quick glass can leak through.
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         self._draw_fitted(painter, self._neutral)
 
@@ -227,8 +243,10 @@ class WorkspaceTransitionController(QObject):
         if self.root is None or not isinstance(self.stack, QStackedWidget) or not callable(self._set_mode):
             raise RuntimeError("workspace transition requires installed mode workspace")
 
-        self._surface = _WorkspaceTransitionSurface(self.stack)
-        self._surface.setGeometry(self.stack.rect())
+        # Root-level ownership is the key anti-overlap invariant. A current page
+        # can be raised inside QStackedWidget without ever overtaking this overlay.
+        self._surface = _WorkspaceTransitionSurface(self.root)
+        self._sync_surface_geometry()
         self._surface.hide()
 
         self._active = False
@@ -249,12 +267,32 @@ class WorkspaceTransitionController(QObject):
         self._phase_new_text = ""
         self._phase_swapped = False
 
+        self._awaiting_quick_frame = False
+        self._quick_frame_connected = False
+        self._quick_sync_timeout = QTimer(self)
+        self._quick_sync_timeout.setSingleShot(True)
+        self._quick_sync_timeout.setTimerType(Qt.TimerType.PreciseTimer)
+        self._quick_sync_timeout.timeout.connect(self._capture_incoming_after_quick_sync)
+
+        quick = getattr(self.background, "quick_window", None)
+        if quick is not None:
+            try:
+                quick.frameSwapped.connect(
+                    self._on_quick_frame_swapped,
+                    type=Qt.ConnectionType.QueuedConnection,
+                )
+                self._quick_frame_connected = True
+            except (RuntimeError, TypeError):
+                self._quick_frame_connected = False
+
         self._exit_easing = _exit_easing()
         self._enter_easing = _enter_easing()
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.timeout.connect(self._advance)
+
         self.stack.installEventFilter(self)
+        self.root.installEventFilter(self)
         window.destroyed.connect(self.cleanup)
 
     def _load_wallpaper(self) -> QPixmap:
@@ -279,25 +317,48 @@ class WorkspaceTransitionController(QObject):
         target_hz = max(60.0, min(240.0, refresh_hz))
         return max(4, int(1000.0 / target_hz))
 
+    def _surface_geometry(self) -> QRect:
+        top_left = self.stack.mapTo(self.root, QPoint(0, 0))
+        return QRect(top_left, self.stack.size())
+
     def _sync_surface_geometry(self) -> None:
-        geometry = self.stack.rect()
+        geometry = self._surface_geometry()
         if self._surface.geometry() != geometry:
             self._surface.setGeometry(geometry)
 
-    def _render_stack_widgets(self) -> QPixmap:
-        if self.stack.width() <= 0 or self.stack.height() <= 0:
+    def _raise_transition_surface(self) -> None:
+        self._surface.raise_()
+
+        # Sakura is an independent ambient layer. Keep it above the workspace
+        # transition so the background world never appears frozen.
+        effects = getattr(self.window, "_nekro_effects", None)
+        if isinstance(effects, QWidget):
+            try:
+                effects.raise_()
+            except RuntimeError:
+                pass
+
+    def _render_current_page(self) -> QPixmap:
+        """Render exactly one QStackedWidget page into stack coordinates."""
+
+        page = self.stack.currentWidget()
+        if (
+            page is None
+            or self.stack.width() <= 0
+            or self.stack.height() <= 0
+            or page.width() <= 0
+            or page.height() <= 0
+        ):
             return QPixmap()
+
         frame = _empty_frame(self.stack)
-        self._surface.set_capture_suppressed(True)
-        try:
-            self.stack.render(
-                frame,
-                QPoint(0, 0),
-                QRegion(),
-                QWidget.RenderFlag.DrawChildren,
-            )
-        finally:
-            self._surface.set_capture_suppressed(False)
+        target_offset = page.mapTo(self.stack, QPoint(0, 0))
+        page.render(
+            frame,
+            target_offset,
+            QRegion(),
+            QWidget.RenderFlag.DrawChildren,
+        )
         return frame
 
     def _capture_quick_for_stack(self) -> QPixmap:
@@ -387,7 +448,7 @@ class WorkspaceTransitionController(QObject):
 
     def _capture_composite(self) -> QPixmap:
         quick_frame = self._capture_quick_for_stack()
-        widget_frame = self._render_stack_widgets()
+        widget_frame = self._render_current_page()
         if quick_frame.isNull():
             return _fit_frame(widget_frame, self.stack)
         if widget_frame.isNull():
@@ -593,7 +654,7 @@ class WorkspaceTransitionController(QObject):
 
         self._surface.begin(neutral, outgoing)
         self._surface.show()
-        self._surface.raise_()
+        self._raise_transition_surface()
         self._surface.repaint()
 
         phase_old = ""
@@ -604,8 +665,12 @@ class WorkspaceTransitionController(QObject):
             except RuntimeError:
                 phase_old = ""
 
-        # Real state changes immediately underneath the opaque cached frame.
+        # Real state changes underneath a root-level opaque surface. Calling
+        # setCurrentIndex can raise the new page only inside QStackedWidget; it
+        # cannot overtake the transition surface anymore.
         self._set_mode(index)
+        self._raise_transition_surface()
+
         phase_new = phase_old
         if badge is not None:
             try:
@@ -650,11 +715,46 @@ class WorkspaceTransitionController(QObject):
                 pass
 
         quick = getattr(self.background, "quick_window", None)
-        if quick is not None:
-            try:
-                quick.update()
-            except RuntimeError:
-                pass
+        if quick is None:
+            self._capture_incoming_after_quick_sync()
+            return
+
+        # Do not grab immediately after quick.update(). With the threaded render
+        # loop that can sample the previous glass mask and combine it with the new
+        # QWidget page. Wait for the next queued/presented Quick frame instead.
+        self._awaiting_quick_frame = True
+        try:
+            quick.update()
+        except RuntimeError:
+            self._awaiting_quick_frame = False
+            self._capture_incoming_after_quick_sync()
+            return
+
+        self._quick_sync_timeout.start(
+            max(_QUICK_SYNC_TIMEOUT_MS, self._frame_interval_ms() * 3)
+        )
+
+    @Slot()
+    def _on_quick_frame_swapped(self) -> None:
+        if not self._active or not self._awaiting_quick_frame:
+            return
+        self._awaiting_quick_frame = False
+        self._quick_sync_timeout.stop()
+        self._capture_incoming_after_quick_sync()
+
+    def _capture_incoming_after_quick_sync(self) -> None:
+        if not self._active:
+            return
+        self._awaiting_quick_frame = False
+        self._quick_sync_timeout.stop()
+
+        if (
+            self.window.isMinimized()
+            or not self.window.isVisible()
+            or int(self.stack.currentIndex()) != self._target_index
+        ):
+            self._finish_immediate()
+            return
 
         incoming = self._capture_composite()
         if incoming.isNull():
@@ -663,7 +763,7 @@ class WorkspaceTransitionController(QObject):
 
         self._incoming = incoming
         self._surface.set_incoming(incoming)
-        self._surface.raise_()
+        self._raise_transition_surface()
         self._surface.repaint()
         self._incoming_enter_start_ms = max(
             float(_ENTER_START_MS),
@@ -698,7 +798,7 @@ class WorkspaceTransitionController(QObject):
             fall = _segment_progress(elapsed_ms, _VEIL_PEAK_MS, _VEIL_END_MS)
             veil_alpha = _VEIL_MAX_OPACITY * (1.0 - _smoothstep(fall))
 
-        # Hard contract: two readable workspaces never coexist.
+        # Hard contract: two readable workspace snapshots never coexist.
         if outgoing_alpha > 1e-4:
             incoming_alpha = 0.0
 
@@ -730,14 +830,22 @@ class WorkspaceTransitionController(QObject):
 
     def _finish_transition(self) -> None:
         self._timer.stop()
+        self._quick_sync_timeout.stop()
+        self._awaiting_quick_frame = False
         if not self._active:
             return
+
+        # Paint the exact incoming endpoint once, then hand ownership to the live
+        # page in the same GUI turn. The Quick frame used for this pixmap was
+        # captured only after frameSwapped, eliminating old-mask/new-page flashes.
         self._surface.set_mix(
             outgoing_alpha=0.0,
             incoming_alpha=1.0,
             veil_alpha=0.0,
         )
+        self._raise_transition_surface()
         self._surface.repaint()
+
         self._surface.hide()
         self._surface.clear_frames()
         self._outgoing = QPixmap()
@@ -757,6 +865,8 @@ class WorkspaceTransitionController(QObject):
 
     def _finish_immediate(self) -> None:
         self._timer.stop()
+        self._quick_sync_timeout.stop()
+        self._awaiting_quick_frame = False
         self._surface.hide()
         self._surface.clear_frames()
         self._outgoing = QPixmap()
@@ -771,23 +881,55 @@ class WorkspaceTransitionController(QObject):
         self._sync_toggle_to_stack()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        event_type = event.type()
+
         if watched is self.stack:
-            if event.type() == QEvent.Type.Resize:
-                self._sync_surface_geometry()
-            elif event.type() == QEvent.Type.Hide and self._active:
+            if event_type in {QEvent.Type.Move, QEvent.Type.Resize, QEvent.Type.Show}:
+                if self._active and event_type in {QEvent.Type.Move, QEvent.Type.Resize}:
+                    self._finish_immediate()
+                else:
+                    self._sync_surface_geometry()
+            elif event_type == QEvent.Type.Hide and self._active:
                 self._finish_immediate()
+
+        elif watched is self.root:
+            if event_type == QEvent.Type.Resize:
+                if self._active:
+                    self._finish_immediate()
+                else:
+                    self._sync_surface_geometry()
+            elif event_type == QEvent.Type.Hide and self._active:
+                self._finish_immediate()
+
         return False
 
     def cleanup(self) -> None:
         self._timer.stop()
+        self._quick_sync_timeout.stop()
+        self._awaiting_quick_frame = False
+
         try:
             self.stack.removeEventFilter(self)
         except RuntimeError:
             pass
+        try:
+            self.root.removeEventFilter(self)
+        except RuntimeError:
+            pass
+
+        quick = getattr(self.background, "quick_window", None)
+        if self._quick_frame_connected and quick is not None:
+            try:
+                quick.frameSwapped.disconnect(self._on_quick_frame_swapped)
+            except (RuntimeError, TypeError):
+                pass
+        self._quick_frame_connected = False
+
         if self._active:
             self._active = False
             self._finish_phase_badge_transition()
             self._resume_presentation()
+
         self._surface.hide()
         self._surface.clear_frames()
 
