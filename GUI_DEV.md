@@ -1,6 +1,6 @@
-# Windows Local Read-only GUI
+# Windows Local GUI
 
-This GUI is a development shell around the existing production read-only acceptance chain. It does **not** replace or reinterpret product parsing logic.
+This GUI is a development shell around the existing production acceptance chain. It does **not** replace or reinterpret product parsing logic.
 
 ## Branch / worktree safety
 
@@ -53,37 +53,49 @@ python run_local_gui.py
 
 The GUI is intentionally **not** packaged into a single-file EXE during active development. Editing Python files and restarting the launcher is enough.
 
-## What “只读测试” runs
+## Formal Makro browser session
 
-One click executes the existing canonical acceptance order:
+The formal GUI owns one dedicated Microsoft Edge session for the Makro seller account.
 
-1. `makro_plan_listing.py --scan-live-schema`
-2. cold `makro_resolve_ai.py`
-3. hot `makro_resolve_ai.py`
-4. `makro_plan_listing.py --decision-packet ...` read-only Fill Plan
+Normal users do not need to launch a `9222` browser or manage a CDP port. `run_local_gui.py` installs `ManagedMakroBrowser`, which:
 
-Each GUI run gets its own directory:
+- uses the persistent `browser_profiles/makro-edge` profile;
+- automatically launches the dedicated Edge when it is not running;
+- automatically restores that browser after an idle-time close/crash;
+- keeps authentication inside the Edge profile without reading/logging cookies or tokens;
+- lets Single and Batch share the same authenticated browser session;
+- lets Batch open multiple owned tabs in that same browser instead of one browser/login per product;
+- keeps the existing `makro_target_id` ownership boundary for every Batch job;
+- never closes the external Edge process itself.
 
-`logs/gui-runs/readonly-YYYYMMDD-HHMMSS/`
+If Makro authentication expires, the browser remains open on the normal Makro login flow. The GUI reports `LOGIN` and asks the user to complete the normal login, then retry. New tabs in the same browser/profile share that login state.
 
-and its own temporary caches:
+If the browser is restarted **after** a Single product or Batch has already been prepared, the previous Step 3 page / Chromium target IDs are no longer trusted. The GUI automatically restores the browser but refuses stale real execution and requires preparation to run again. This preserves exact tab/draft ownership rather than guessing a replacement page.
 
-- `_cache/source`
-- `_cache/semantic`
+The underlying localhost CDP transport remains available to development CLI/tests as an implementation detail; the formal GUI hides it from normal controls.
 
-The cold resolver uses `--refresh-source`. The hot resolver reuses the exact run-local source and semantic caches, so cache behavior is visible without depending on older unrelated tests.
-
-## Makro browser safety
-
-The GUI checks `http://127.0.0.1:9222/json/version` before starting.
-
-If the Makro CDP endpoint is absent, the GUI stops. It does not intentionally start/restart the long-lived Makro Edge profile.
-
-Source capture remains on the existing independent source CDP port (default `9333`). If the supplier site requires legitimate manual verification/login, enable:
+Source capture remains on the independent source browser/CDP path (default `9333`). If the supplier site requires legitimate manual verification/login, enable:
 
 `Source Edge 已人工验证：采集当前页`
 
 then retry after completing the verification in the source browser.
+
+## What preparation runs
+
+The formal Single preparation follows the current staged workflow:
+
+1. supplier Source Capture
+2. Makro Step 1 / Vertical
+3. Makro Step 2 / Brand
+4. Step 3 live schema + current Resolver cold/hot + read-only Fill Plan
+
+Preparation itself performs no Step 3 field writes, Save, or Send to QC. The separate real-execution gate is unlocked from the resulting Fill Plan.
+
+Each GUI run gets its own directory under:
+
+`logs/gui-runs/`
+
+and its own run-local source/semantic cache directories.
 
 ## Safety indicators
 
@@ -93,30 +105,28 @@ The UI reads the existing manifests and displays:
 - Save clicked
 - Send to QC clicked
 
-The GUI runner never invokes `makro_execute_listing.py`.
+Preparation remains zero-write. Real execution is separately authorized and keeps the repository-wide rule:
 
-Expected result for every GUI read-only run:
-
-- `writes_performed = 0`
-- `save_clicked = false`
-- `send_to_qc_clicked = false`
+- Save is explicit
+- Product Photos are explicit
+- `Send to QC` is locked and must remain false
 
 ## UI result sources
 
 The GUI displays:
 
 - READY count from the final Fill Plan
-- MISSING / CONFLICT from the hot final AI decision packet
+- MISSING / CONFLICT from the final AI decision packet
 - BLOCKED count and reasons from the final Fill Plan
 - field name / AI result / final status / blocked reason / source
-- cold/hot Local batch counts, model calls, cache hits and failures
-- cold/hot source cache and Web cache hits
+- cold/hot model calls and cache behavior
 - Web candidate `same_product / different_product / uncertain` judgments
 - realtime subprocess log
-- direct open of the current result/log directory
+- real browser execution result/report
+- direct open of current result/log directories
 
-Web candidate judgments are read from this GUI run's isolated `web-product-research-*.json` semantic cache. This only surfaces the existing `app/web_enrichment.py` model output; it does not add a second product-matching layer.
+Web candidate judgments are read from this GUI run's semantic cache. This surfaces the existing `app/web_enrichment.py` model output; it does not add a second product-matching layer.
 
 ## Visual style
 
-The first version deliberately favors test usability over animation. It uses a modern glass-card shell inspired by the earlier `nekro.top`-style personal homepage: large atmospheric background, translucent rounded panels, soft pink/lilac accents, and clear status cards. It does not use the later Win98/pixel homepage style.
+The current formal GUI keeps the native Quick Fuji/Sakura background with QWidget business controls and lightweight local progress/interaction effects. Browser-session management is independent from those rendering paths.
