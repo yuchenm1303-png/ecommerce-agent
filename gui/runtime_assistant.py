@@ -49,7 +49,7 @@ class RuntimeAssistant(QFrame):
         )
         super().__init__(None, flags)
         self.window = window
-        self._expanded = False
+        self._expanded: bool | None = None
         self._last_event: RuntimeEvent | None = None
         self._drag_offset: QPoint | None = None
         self._settings = QSettings("ecommerce-agent", "RuntimeAssistant")
@@ -240,15 +240,23 @@ class RuntimeAssistant(QFrame):
         except RuntimeError:
             pass
 
+    @staticmethod
+    def _set_label_text(label: QLabel, text: str) -> None:
+        if label.text() != text:
+            label.setText(text)
+
     def set_user_visible(self, enabled: bool) -> None:
         """Show/hide only the OS surface; monitoring remains installed."""
 
         self._user_visible = bool(enabled)
         if self._user_visible:
+            if self._last_event is not None:
+                self._apply_event_to_widgets(self._last_event)
             self._ensure_visible()
             self.show()
             self.raise_()
         else:
+            self._settle_timer.stop()
             self._save_position()
             self.hide()
 
@@ -297,18 +305,20 @@ class RuntimeAssistant(QFrame):
         super().mouseReleaseEvent(event)
 
     def set_expanded(self, expanded: bool) -> None:
-        self._expanded = bool(expanded)
+        expanded = bool(expanded)
+        if self._expanded is expanded:
+            return
+        self._expanded = expanded
         for widget in self._expanded_widgets:
-            widget.setVisible(self._expanded)
-        if self._expanded:
+            widget.setVisible(expanded)
+        if expanded:
             self.setFixedSize(self._EXPANDED_WIDTH, self._EXPANDED_HEIGHT)
         else:
             self.setFixedSize(self._COMPACT_WIDTH, self._COMPACT_HEIGHT)
         if self.isVisible():
             self._ensure_visible()
 
-    def present(self, event: RuntimeEvent) -> None:
-        self._last_event = event
+    def _apply_event_to_widgets(self, event: RuntimeEvent) -> None:
         state = event.state
         state_text = {
             RuntimeState.IDLE: "● IDLE",
@@ -322,26 +332,31 @@ class RuntimeAssistant(QFrame):
             RuntimeState.FAILED: "× SAFE STOP",
             RuntimeState.COMPLETE: "✓ COMPLETE",
         }.get(state, f"● {state.value}")
-        self.state_label.setText(state_text)
-        self.progress_label.setText(f"{event.progress}%")
+        self._set_label_text(self.state_label, state_text)
+        self._set_label_text(self.progress_label, f"{event.progress}%")
         detail = event.title
         if event.phase:
             detail = f"{event.phase} · {detail}"
-        self.detail_label.setText(detail)
-        self.alert_label.setText(event.detail)
+        self._set_label_text(self.detail_label, detail)
+        self._set_label_text(self.alert_label, event.detail)
         advisor = str(event.advisor or "system").casefold()
-        self.suggestion_title.setText("AI 建议" if advisor == "ai" else "Recovery 建议")
-        self.suggestion_label.setText(event.suggestion or "当前没有额外恢复动作。")
+        self._set_label_text(
+            self.suggestion_title,
+            "AI 建议" if advisor == "ai" else "Recovery 建议",
+        )
+        self._set_label_text(
+            self.suggestion_label,
+            event.suggestion or "当前没有额外恢复动作。",
+        )
         if event.confidence > 0:
-            self.confidence_label.setText(
-                f"Confidence {event.confidence * 100:.0f}% · {event.permission.value}"
-            )
+            confidence_text = f"Confidence {event.confidence * 100:.0f}% · {event.permission.value}"
         else:
-            self.confidence_label.setText(
+            confidence_text = (
                 f"{event.permission.value} · Shadow Mode"
                 if advisor in {"shadow", "rules"}
                 else event.permission.value
             )
+        self._set_label_text(self.confidence_label, confidence_text)
 
         urgent = state in _URGENT_STATES
         if urgent:
@@ -353,7 +368,17 @@ class RuntimeAssistant(QFrame):
         else:
             self.set_expanded(False)
 
-        if self._user_visible:
+    def present(self, event: RuntimeEvent) -> None:
+        # Monitoring remains fully active while hidden. Only QWidget mutation is
+        # deferred, so the default-off assistant adds effectively no layout/paint
+        # work to normal runs. Opening it materializes the latest event once.
+        self._last_event = event
+        if not self._user_visible:
+            self._settle_timer.stop()
+            return
+
+        self._apply_event_to_widgets(event)
+        if not self.isVisible():
             self.show()
             self.raise_()
 
