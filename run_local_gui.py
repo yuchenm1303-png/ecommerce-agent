@@ -34,6 +34,7 @@ def main() -> int:
     from gui.nekro_effects import install_nekro_effects
     from gui.preparation_progress import install_detailed_preparation_progress
     from gui.required_input_support import install_required_input_support
+    from gui.restore_snapshot import install_restore_snapshot
     from gui.static_modal_interaction import install_static_modal_interaction
     from gui.ui_maturity import install_mature_ui
     from gui.ui_polish import install_ui_polish
@@ -88,6 +89,13 @@ def main() -> int:
     quick_window = visual.background.quick_window
     if quick_window is None:
         raise RuntimeError("Native Quick renderer was not created")
+
+    # Windows can discard the QWidget backing-store pixels while the native Quick
+    # owner is minimized even though every widget object remains alive. Keep one
+    # last-frame QWidget snapshot above the live surface during restore so the
+    # user never sees the backing store repaint card-by-card.
+    install_restore_snapshot(window, quick_window)
+
     shell = install_native_window_shell(window, quick_window)
 
     install_nekro_card_fx(window, visual)
