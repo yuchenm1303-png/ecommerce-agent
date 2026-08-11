@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
-from .ai_decisions import READY as AI_READY, FieldDecision, field_id
+from .ai_decisions import (
+    READY as AI_READY,
+    FieldDecision,
+    field_id,
+    field_options,
+    field_qualifier_options,
+)
 from .fill_plan import (
     BLOCKED,
     READY,
@@ -14,6 +21,26 @@ from .fill_plan import (
     _hard_guard_values,
 )
 from .resolution_types import RESOLVED
+
+
+FALLBACK_TEXT_VALUE = "N/A"
+FALLBACK_NUMERIC_VALUE = "1"
+FALLBACK_SOURCE_REFERENCE = "system:required-placeholder"
+_OPTION_PLACEHOLDERS = {
+    "select",
+    "select one",
+    "choose",
+    "choose one",
+    "please select",
+    "-- select --",
+}
+_NUMERIC_HINT = re.compile(
+    r"(?:^|\b)(?:price|cost|qty|quantity|stock|weight|length|width|height|depth|volume|capacity|"
+    r"size|moq|minimum order|warranty|power|voltage|current|frequency|diameter|thickness|"
+    r"count|number of|pack size)(?:\b|$)|"
+    r"(?:^|\s)(?:kg|g|mg|cm|mm|ml|l|m|w|v|hz|mah|wh|gb|mb|tb)(?:\s|$)",
+    re.IGNORECASE,
+)
 
 
 class RequiredOverrideError(ValueError):
@@ -40,11 +67,68 @@ def _field_identity(field: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def _usable_option(values: Iterable[str]) -> str:
+    cleaned = [str(value).strip() for value in values if str(value).strip()]
+    for value in cleaned:
+        if value.casefold() not in _OPTION_PLACEHOLDERS:
+            return value
+    return cleaned[0] if cleaned else ""
+
+
+def _looks_numeric(field: dict[str, Any]) -> bool:
+    text = " | ".join(
+        str(field.get(key) or "")
+        for key in ("attribute_key", "label", "help_text", "context_text")
+    )
+    return bool(_NUMERIC_HINT.search(text))
+
+
+def required_fallback_override(field: dict[str, Any]) -> dict[str, Any]:
+    """Build one deterministic, non-AI fallback for a required Makro field.
+
+    The normal Resolver gets first chance. This helper is used only for required
+    fields that remain BLOCKED at real-execution time. It never calls a model or
+    the network:
+    - option/radio/select -> first usable live Makro option;
+    - numeric/unit field -> ``1`` and the first usable live qualifier when present;
+    - remaining free text -> ``N/A``.
+
+    The production executor still rebinds the value to the current live field and
+    runs the existing Makro option/unit hard guards before any browser write.
+    """
+
+    options = field_options(field)
+    option = _usable_option(options)
+    if option:
+        return {
+            "field_id": field_id(field),
+            "values": [option],
+            "source_type": "fallback",
+            "reason": "deterministic first valid Makro option for unresolved required field",
+        }
+
+    qualifiers = field_qualifier_options(field)
+    qualifier = _usable_option(qualifiers)
+    if qualifier:
+        return {
+            "field_id": field_id(field),
+            "values": [FALLBACK_NUMERIC_VALUE],
+            "qualifier": qualifier,
+            "source_type": "fallback",
+            "reason": "deterministic numeric placeholder with first valid Makro qualifier",
+        }
+
+    value = FALLBACK_NUMERIC_VALUE if _looks_numeric(field) else FALLBACK_TEXT_VALUE
+    return {
+        "field_id": field_id(field),
+        "values": [value],
+        "source_type": "fallback",
+        "reason": "deterministic placeholder for unresolved required field",
+    }
+
+
 def _source_metadata(override: dict[str, Any]) -> tuple[str, str, float, str]:
     source_type = str(override.get("source_type") or "user").strip().casefold()
-    if source_type not in {"user", "model"}:
-        raise RequiredOverrideError(f"不支持 required override source_type={source_type!r}。")
-
     if source_type == "user":
         return (
             "user",
@@ -52,23 +136,14 @@ def _source_metadata(override: dict[str, Any]) -> tuple[str, str, float, str]:
             1.0,
             "Explicit value supplied by the user for an unresolved required Makro field.",
         )
-
-    source_reference = str(
-        override.get("source_reference") or "model-inference:required-completion"
-    ).strip()
-    if source_reference != "model-inference:required-completion":
-        raise RequiredOverrideError("AI 必填补齐只能使用 required-completion provenance。")
-    try:
-        confidence = float(override.get("confidence", 0.6))
-    except (TypeError, ValueError):
-        confidence = 0.6
-    confidence = max(0.0, min(0.82, confidence))
-    reason = str(override.get("reason") or "").strip()
-    evidence = (
-        "Targeted model completion for a required Makro field after the normal Resolver pass."
-        + (f" Reason: {reason}" if reason else "")
-    )
-    return ("model", source_reference, confidence, evidence)
+    if source_type == "fallback":
+        return (
+            "fallback",
+            FALLBACK_SOURCE_REFERENCE,
+            0.0,
+            "Deterministic non-AI placeholder used only because the required field remained unresolved.",
+        )
+    raise RequiredOverrideError(f"不支持 required override source_type={source_type!r}。")
 
 
 def apply_required_overrides(
@@ -76,19 +151,20 @@ def apply_required_overrides(
     semantic_fields: Iterable[dict[str, Any]],
     overrides: Iterable[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Promote only unresolved required fields using guarded completion values.
+    """Promote unresolved required fields using user or deterministic fallback values.
 
-    Manual values remain the strongest fallback. The GUI may also persist values
-    from its one targeted required-completion model pass. Both paths bind only
-    required BLOCKED fields and are revalidated against the current live Makro
-    option/unit hard guards. Existing READY items are never replaced here.
+    No AI/search pass exists here. User-entered values remain optional and take
+    precedence in the GUI; otherwise the GUI writes a deterministic fallback.
+    Both paths bind only required BLOCKED fields and are revalidated against the
+    current live Makro option/unit hard guards. Existing READY items are never
+    replaced here.
     """
 
     fields = list(semantic_fields)
     fields_by_id = {field_id(field): field for field in fields}
     items_by_identity = {_item_identity(item): item for item in plan.items}
     applied: list[str] = []
-    source_counts = {"user": 0, "model": 0}
+    source_counts = {"user": 0, "fallback": 0}
 
     for index, override in enumerate(overrides, start=1):
         identifier = str(override.get("field_id") or "").strip()
@@ -116,15 +192,6 @@ def apply_required_overrides(
             raise RequiredOverrideError(f"{item.label} 的补充值为空。")
 
         source_type, source_reference, confidence, evidence = _source_metadata(override)
-        if source_type == "model":
-            lowered = [value.casefold().strip() for value in values]
-            if any(
-                value.startswith("placeholder")
-                or value in {"unknown", "n/a", "na", "tbd", "not applicable"}
-                for value in lowered
-            ):
-                raise RequiredOverrideError(f"{item.label}: 拒绝 AI placeholder/unknown 必填值。")
-
         reason = str(override.get("reason") or "").strip()
         decision = FieldDecision(
             field_id=identifier,
@@ -135,8 +202,8 @@ def apply_required_overrides(
             reason=(
                 reason
                 or (
-                    "targeted AI completion for unresolved required field"
-                    if source_type == "model"
+                    "deterministic fallback for unresolved required field"
+                    if source_type == "fallback"
                     else "explicit user value for unresolved required field"
                 )
             ),
@@ -155,8 +222,8 @@ def apply_required_overrides(
         record.source_reference = source_reference
         record.evidence = evidence
         record.detail = (
-            "targeted AI required-field completion"
-            if source_type == "model"
+            "deterministic required-field fallback"
+            if source_type == "fallback"
             else "explicit user input"
         )
         record.eligible_for_autofill = True
@@ -172,16 +239,13 @@ def apply_required_overrides(
         ]
         item.action = READY
         item.reason = (
-            "AI 在真实填写前的必填补齐阶段给出了通过当前 Makro hard guard 的值。"
-            if source_type == "model"
+            "未解决的 Makro 必填项已使用非 AI 的固定兜底值。"
+            if source_type == "fallback"
             else "用户补充了 Resolver 未能确定的 Makro 必填值。"
         )
         applied.append(identifier)
         source_counts[source_type] += 1
 
-    # Completion values still obey the existing cross-field price/MOQ
-    # relationships. This is a mechanical hard boundary, not another semantic
-    # decision layer.
     _apply_business_relations(plan.items)
     return {
         "applied": len(applied),
