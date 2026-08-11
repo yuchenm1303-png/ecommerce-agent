@@ -36,11 +36,20 @@ def test_transition_animates_one_cached_panel_layer_not_the_real_drawer_tree() -
     assert 'b"geometry"' not in STATIC
 
 
-def test_cached_frame_is_rendered_from_the_fully_laid_out_real_drawer() -> None:
+def test_drawer_tree_is_fully_realized_before_transition_capture() -> None:
+    settle = _body(STATIC, "def _settle_drawer_tree", "def _render_drawer_frame")
+    assert "drawer.findChildren(QWidget)" in settle
+    assert "widget.ensurePolished()" in settle
+    assert "QCoreApplication.sendPostedEvents(None, QEvent.Type.PolishRequest)" in settle
+    assert "QCoreApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)" in settle
+    assert "self.details.body_layout.activate()" in settle
+    assert "layout.activate()" in settle
+    assert "for _ in range(2)" in settle
+
+
+def test_cached_frame_contains_panel_background_and_all_children() -> None:
     render = _body(STATIC, "def _render_drawer_frame", "def _prepare_open_state")
-    assert "drawer.ensurePolished()" in render
-    assert "self.details.body_layout.activate()" in render
-    assert "drawer.layout().activate()" in render
+    assert "self._settle_drawer_tree()" in render
     assert "drawer.devicePixelRatioF()" in render
     assert "frame.setDevicePixelRatio(dpr)" in render
     assert "drawer.render(" in render
@@ -49,16 +58,20 @@ def test_cached_frame_is_rendered_from_the_fully_laid_out_real_drawer() -> None:
     assert "drawer.grab()" not in STATIC
 
 
-def test_open_builds_snapshot_without_exposing_intermediate_real_drawer() -> None:
+def test_open_primes_real_children_without_exposing_them_on_screen() -> None:
     prepare = _body(STATIC, "def _prepare_open_state", "def _prepare_close_state")
     assert "self.root.setUpdatesEnabled(False)" in prepare
-    assert "self.details.drawer.setGeometry(target)" in prepare
-    assert prepare.index("self.details.drawer.show()") < prepare.index("self._render_drawer_frame()")
-    assert prepare.index("self._render_drawer_frame()") < prepare.index("self.details.drawer.hide()")
+    assert "drawer.setGeometry(target)" in prepare
+    assert "drawer.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)" in prepare
+    assert "drawer.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)" in prepare
+    assert prepare.index("drawer.show()") < prepare.index("self._render_drawer_frame()")
+    assert prepare.index("self._render_drawer_frame()") < prepare.index("drawer.hide()")
+    assert "previous_dont_show" in prepare
     assert "self.details.backdrop.show()" in prepare
     assert "self.details.scrim.show()" in prepare
     assert "self._compositor.set_frame(frame, target, progress=0.0)" in prepare
     assert "self._compositor.show()" in prepare
+    assert "self._compositor.repaint()" in prepare
 
 
 def test_open_handoff_is_atomic_and_final_interaction_returns_to_real_drawer() -> None:
