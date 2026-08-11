@@ -13,7 +13,7 @@ def _body(source: str, start: str, end: str) -> str:
     return source.split(start, 1)[1].split(end, 1)[0]
 
 
-def test_runtime_stays_in_one_widget_modal_tree_without_second_quick_window() -> None:
+def test_runtime_stays_in_existing_qwidget_tree_without_second_quick_window() -> None:
     assert "from gui.static_modal_interaction import install_static_modal_interaction" in RUNNER
     assert "install_static_modal_interaction(window, details)" in RUNNER
     assert "from gui.modal_interaction import install_modal_interaction" not in RUNNER
@@ -23,74 +23,91 @@ def test_runtime_stays_in_one_widget_modal_tree_without_second_quick_window() ->
     assert "QQuickItem" not in STATIC
 
 
-def test_transition_animates_one_cached_panel_layer_not_the_real_drawer_tree() -> None:
-    assert "class _PanelCompositor(QWidget)" in STATIC
-    assert "QPropertyAnimation(self._compositor, b\"progress\", self)" in STATIC
-    assert "QPainter.RenderHint.SmoothPixmapTransform" in STATIC
-    assert "painter.translate(" in STATIC
-    assert "painter.scale(scale, scale)" in STATIC
-    assert "painter.setOpacity(progress)" in STATIC
-    assert "QGraphicsOpacityEffect" not in STATIC
-    assert "QParallelAnimationGroup" not in STATIC
-    assert 'QPropertyAnimation(self.details.drawer, b"pos")' not in STATIC
-    assert 'b"geometry"' not in STATIC
+def test_one_progress_clock_owns_blur_scrim_panel_and_text() -> None:
+    assert "class _ModalTransitionCompositor(QWidget)" in STATIC
+    assert 'QPropertyAnimation(self._compositor, b"progress", self)' in STATIC
+    paint = _body(STATIC, "def paintEvent", "def mousePressEvent")
+    assert "_soft_blur" in paint
+    assert "_full_blur" in paint
+    assert "_SOFT_BLUR_CROSSOVER" in paint
+    assert "_SCRIM_ALPHA * progress" in paint
+    assert "painter.setOpacity(progress)" in paint
+    assert "_panel_frame" in paint
+    assert "painter.translate(" in paint
+    assert "painter.scale(scale, scale)" in paint
 
 
-def test_drawer_tree_is_fully_realized_before_transition_capture() -> None:
+def test_background_blur_is_progressive_not_switched_before_animation() -> None:
+    prepare = _body(STATIC, "def _prepare_open_state", "def _prepare_close_state")
+    assert "source = self._capture_source_frame()" in prepare
+    assert "full_blur = self.details._blur_pixmap(source)" in prepare
+    assert "soft_blur = self._soften_source(source, full_blur.size())" in prepare
+    assert "self.details.backdrop.hide()" in prepare
+    assert "self.details.scrim.hide()" in prepare
+    assert "self._compositor.set_frames(" in prepare
+    assert "progress=0.0" in prepare
+    assert "self.details.backdrop.show()" not in prepare
+    assert "self.details.scrim.show()" not in prepare
+
+
+def test_drawer_content_is_primed_as_real_visible_tree_outside_parent_clip() -> None:
+    capture = _body(STATIC, "def _capture_panel_offscreen", "def _prepare_open_state")
+    assert "self.root.width() + 64" in capture
+    assert "drawer.setGeometry(offscreen)" in capture
+    assert capture.index("drawer.show()") < capture.index("self._render_drawer_frame()")
+    assert capture.index("self._render_drawer_frame()") < capture.index("drawer.hide()")
+    assert "WA_DontShowOnScreen" not in capture
+
+
+def test_cached_panel_contains_background_and_every_child_widget() -> None:
     settle = _body(STATIC, "def _settle_drawer_tree", "def _render_drawer_frame")
+    render = _body(STATIC, "def _render_drawer_frame", "def _capture_panel_offscreen")
     assert "drawer.findChildren(QWidget)" in settle
     assert "widget.ensurePolished()" in settle
     assert "QCoreApplication.sendPostedEvents(None, QEvent.Type.PolishRequest)" in settle
     assert "QCoreApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)" in settle
-    assert "self.details.body_layout.activate()" in settle
     assert "layout.activate()" in settle
-    assert "for _ in range(2)" in settle
-
-
-def test_cached_frame_contains_panel_background_and_all_children() -> None:
-    render = _body(STATIC, "def _render_drawer_frame", "def _prepare_open_state")
-    assert "self._settle_drawer_tree()" in render
-    assert "drawer.devicePixelRatioF()" in render
-    assert "frame.setDevicePixelRatio(dpr)" in render
-    assert "drawer.render(" in render
     assert "QWidget.RenderFlag.DrawWindowBackground" in render
     assert "QWidget.RenderFlag.DrawChildren" in render
     assert "drawer.grab()" not in STATIC
 
 
-def test_open_primes_real_children_without_exposing_them_on_screen() -> None:
-    prepare = _body(STATIC, "def _prepare_open_state", "def _prepare_close_state")
-    assert "self.root.setUpdatesEnabled(False)" in prepare
-    assert "drawer.setGeometry(target)" in prepare
-    assert "drawer.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)" in prepare
-    assert "drawer.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)" in prepare
-    assert prepare.index("drawer.show()") < prepare.index("self._render_drawer_frame()")
-    assert prepare.index("self._render_drawer_frame()") < prepare.index("drawer.hide()")
-    assert "previous_dont_show" in prepare
-    assert "self.details.backdrop.show()" in prepare
-    assert "self.details.scrim.show()" in prepare
-    assert "self._compositor.set_frame(frame, target, progress=0.0)" in prepare
-    assert "self._compositor.show()" in prepare
-    assert "self._compositor.repaint()" in prepare
-
-
-def test_open_handoff_is_atomic_and_final_interaction_returns_to_real_drawer() -> None:
+def test_open_handoff_replaces_identical_100_percent_frame_atomically() -> None:
     finish = _body(STATIC, "def _finish_open", "def request_close")
     assert "self.root.setUpdatesEnabled(False)" in finish
+    assert "self.details.backdrop.show()" in finish
+    assert "self.details.scrim.show()" in finish
+    assert "self.details.drawer.show()" in finish
     assert finish.index("self.details.drawer.show()") < finish.index("self._compositor.hide()")
-    assert "self._compositor.clear_frame()" in finish
     assert "self.root.repaint()" in finish
-    assert "self.details.close_button.setFocus" in finish
 
 
-def test_close_captures_current_real_content_before_hiding_it() -> None:
+def test_close_first_covers_real_modal_with_identical_compositor_then_reverses() -> None:
     prepare = _body(STATIC, "def _prepare_close_state", "def _show_with_animation")
-    assert prepare.index("self._render_drawer_frame()") < prepare.index("self.details.drawer.hide()")
-    assert "self._compositor.set_frame(frame, target, progress=1.0)" in prepare
-    assert "self._compositor.repaint()" in prepare
+    assert "panel_frame = self._render_drawer_frame()" in prepare
+    assert "self._compositor.set_panel_frame(panel_frame, target)" in prepare
+    assert 'self._compositor.setProperty("progress", 1.0)' in prepare
+    assert prepare.index("self._compositor.repaint()") < prepare.index("self._original_close()")
+    assert "self._original_close()" in prepare
+
+    close = _body(STATIC, "def request_close", "def _finish_close")
+    assert "end=0.0" in close
+    assert "duration_ms=_CLOSE_MS" in close
+    assert "QEasingCurve.Type.InCubic" in close
 
 
-def test_motion_uses_float_transform_and_slower_presentation_timing() -> None:
+def test_transition_is_fullscreen_qwidget_only_during_motion_and_blocks_stray_input() -> None:
+    compositor = _body(STATIC, "class _ModalTransitionCompositor", "class StaticModalInteractionController")
+    assert "self.setGeometry(parent.rect())" in compositor
+    assert "WA_NoSystemBackground" in compositor
+    assert "WA_TranslucentBackground" in compositor
+    assert "WA_TransparentForMouseEvents" not in compositor
+    assert "def mousePressEvent" in compositor
+    assert "event.accept()" in compositor
+    assert "QWindow" not in compositor
+
+
+def test_motion_timing_and_float_panel_transform_are_preserved() -> None:
     assert "_OPEN_MS = 300" in STATIC
     assert "_CLOSE_MS = 250" in STATIC
     assert "_OPEN_RISE_PX = 18.0" in STATIC
@@ -98,18 +115,10 @@ def test_motion_uses_float_transform_and_slower_presentation_timing() -> None:
     assert "QPointF" in STATIC
     assert "QEasingCurve.Type.OutCubic" in STATIC
     assert "QEasingCurve.Type.InCubic" in STATIC
-
-
-def test_compositor_is_small_mouse_transparent_widget_not_fullscreen_native_overlay() -> None:
-    init = _body(STATIC, "class _PanelCompositor", "class StaticModalInteractionController")
-    assert "WA_TransparentForMouseEvents" in init
-    assert "WA_NoSystemBackground" in init
-    assert "WA_TranslucentBackground" in init
-    assert "target.adjusted(" in init
-    assert "_COMPOSITOR_PAD" in init
-    assert "self.setGeometry(bounds)" in init
-    assert "self.parentWidget()" in init
-    assert "QWindow" not in init
+    assert "QGraphicsOpacityEffect" not in STATIC
+    assert "QParallelAnimationGroup" not in STATIC
+    assert 'QPropertyAnimation(self.details.drawer, b"pos")' not in STATIC
+    assert 'b"geometry"' not in STATIC
 
 
 def test_geometry_timer_and_obscured_underlay_cannot_compete_with_transition() -> None:
@@ -131,15 +140,12 @@ def test_geometry_timer_and_obscured_underlay_cannot_compete_with_transition() -
     assert 'quick.setProperty("animationRunning", False)' in suspend
 
 
-def test_close_inputs_and_escape_work_even_while_real_drawer_is_hidden_for_animation() -> None:
-    assert "self.details.close = self.request_close" in STATIC
-    assert "self.details.close_button.clicked.connect(self.request_close)" in STATIC
-    assert "self.details.scrim.clicked.connect(self.request_close)" in STATIC
-    assert "self.root.installEventFilter(self)" in STATIC
-    event_filter = _body(STATIC, "def eventFilter", "def cleanup")
-    assert "Qt.Key.Key_Escape" in event_filter
-    assert "_STATE_OPENING" in event_filter
-    assert "self.request_close()" in event_filter
+def test_interrupted_open_reverses_same_complete_frame_instead_of_handoff() -> None:
+    close = _body(STATIC, "def request_close", "def _finish_close")
+    assert "if self._state == _STATE_OPENING:" in close
+    assert "current = float(self._compositor.property" in close
+    assert "duration = max(1, int(round(_CLOSE_MS * current)))" in close
+    assert "end=0.0" in close
 
 
 def test_fail_soft_keeps_static_modal_available() -> None:
@@ -151,12 +157,10 @@ def test_fail_soft_keeps_static_modal_available() -> None:
     assert "self._resume_underlay()" in fallback_close
 
 
-def test_real_modal_stays_in_existing_qwidget_tree() -> None:
+def test_real_modal_remains_existing_qwidget_content_after_handoff() -> None:
     assert "self.backdrop = QLabel(self.root)" in DETAILS
     assert "self.scrim.setGeometry(self.root.rect())" in DETAILS
     assert "self.drawer.setGeometry(self._drawer_rect())" in DETAILS
-    assert "self.drawer.show()" in DETAILS
-    assert "self.drawer.hide()" in DETAILS
     assert "self.window.hide()" not in DETAILS
     assert "self.window.show()" not in DETAILS
 
