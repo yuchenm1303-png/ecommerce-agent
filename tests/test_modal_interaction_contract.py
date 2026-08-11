@@ -151,40 +151,33 @@ def test_opening_is_entry_a_to_final_live_modal_b() -> None:
     assert "setOpacity" not in real
 
 
-def test_endpoint_frame_is_presented_before_live_widget_handoff() -> None:
-    assert "self._handoff_timer = QTimer(self)" in STATIC
-    assert "self._handoff_timer.setSingleShot(True)" in STATIC
-    assert "Qt.TimerType.PreciseTimer" in STATIC
-    assert "self._handoff_timer.timeout.connect(self._finish_motion)" in STATIC
-
-    delay = _body(STATIC, "def _handoff_delay_ms", "def _stop_animation")
-    assert "return max(8, self._frame_interval_ms() + 2)" in delay
+def test_endpoint_handoff_is_immediate_without_guessed_present_fence() -> None:
+    assert "_handoff_timer" not in STATIC
+    assert "_handoff_delay_ms" not in STATIC
 
     stop = _body(STATIC, "def _stop_animation", "def _start_fade")
     assert "self._motion_timer.stop()" in stop
-    assert "self._handoff_timer.stop()" in stop
+    assert "handoff" not in stop.lower()
 
     advance = _body(STATIC, "def _advance_motion", "def _prepare_open_transition")
     endpoint = advance.split("if linear >= 1.0:", 1)[1]
     assert endpoint.index("self._set_progress(self._motion_to)") < endpoint.index(
-        "self._transition.repaint()"
+        "self._finish_motion()"
     )
-    assert endpoint.index("self._transition.repaint()") < endpoint.index(
-        "self._handoff_timer.start(self._handoff_delay_ms())"
-    )
-    assert "self._finish_motion()" not in endpoint
+    assert "self._transition.repaint()" not in endpoint
+    assert "singleShot" not in endpoint
 
 
-def test_open_handoff_reveals_the_same_live_widgets_that_generated_b() -> None:
+def test_open_handoff_reveals_the_same_live_widgets_without_sync_repaint() -> None:
     finish = _body(STATIC, "def _finish_open", "def _prepare_close_transition")
     assert "self._transition.hide()" in finish
-    assert finish.index("self._transition.hide()") < finish.index("self.details.backdrop.repaint()")
-    assert "self.details.scrim.repaint()" in finish
-    assert "self.details.drawer.repaint()" in finish
     assert "self._transition.clear_frames()" in finish
     assert "self.details.close_button.setFocus" in finish
     assert "self.details.drawer.hide()" not in finish
     assert "setGraphicsEffect" not in finish
+    assert "self.details.backdrop.repaint()" not in finish
+    assert "self.details.scrim.repaint()" not in finish
+    assert "self.details.drawer.repaint()" not in finish
 
 
 def test_close_uses_exact_current_screen_then_latest_workspace() -> None:
@@ -201,13 +194,14 @@ def test_close_uses_exact_current_screen_then_latest_workspace() -> None:
     )[0]
 
 
-def test_close_handoff_occurs_only_after_presented_p0_and_refreshes_live_workspace() -> None:
+def test_close_handoff_drops_surface_without_blocking_full_root_repaint() -> None:
     finish = _body(STATIC, "def _finish_close", "def _fallback_open")
     assert "self._progress = 0.0" in finish
     assert "self._transition.set_progress(0.0)" in finish
     assert "self._transition.hide()" in finish
-    assert finish.index("self._transition.hide()") < finish.index("self.root.repaint()")
-    assert finish.index("self.root.repaint()") < finish.index("self._transition.clear_frames()")
+    assert "self._transition.clear_frames()" in finish
+    assert "self.root.repaint()" not in finish
+    assert "self.root.update()" in finish
 
 
 def test_latest_workspace_is_quick_scene_plus_current_widget_overlay() -> None:
