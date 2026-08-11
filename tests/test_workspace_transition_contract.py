@@ -21,6 +21,33 @@ def test_workspace_transition_uses_asymmetric_top_level_fade_through_timing() ->
     assert ".move(" not in TRANSITION
 
 
+def test_transition_surface_is_root_level_so_stack_pages_cannot_overtake_it() -> None:
+    assert "def __init__(self, root: QWidget)" in TRANSITION
+    assert "super().__init__(root)" in TRANSITION
+    assert "self._surface = _WorkspaceTransitionSurface(self.root)" in TRANSITION
+    assert "top_left = self.stack.mapTo(self.root, QPoint(0, 0))" in TRANSITION
+    assert "return QRect(top_left, self.stack.size())" in TRANSITION
+    assert "self._set_mode(index)" in TRANSITION
+    assert "self._raise_transition_surface()" in TRANSITION
+
+    # Regression: parenting the transition surface to QStackedWidget allowed a
+    # newly selected page to be raised over the old cached frame for one turn.
+    assert "super().__init__(stack)" not in TRANSITION
+    assert "_WorkspaceTransitionSurface(self.stack)" not in TRANSITION
+
+
+def test_snapshot_capture_renders_only_the_current_workspace_page() -> None:
+    assert "def _render_current_page" in TRANSITION
+    assert "page = self.stack.currentWidget()" in TRANSITION
+    assert "target_offset = page.mapTo(self.stack, QPoint(0, 0))" in TRANSITION
+    assert "page.render(" in TRANSITION
+    assert "widget_frame = self._render_current_page()" in TRANSITION
+
+    # Never recursively render the whole stacked widget: only the current page is
+    # allowed into either outgoing or incoming cached image.
+    assert "self.stack.render(" not in TRANSITION
+
+
 def test_two_readable_workspace_frames_are_never_cross_faded_together() -> None:
     assert "self._neutral = QPixmap()" in TRANSITION
     assert "self._outgoing = QPixmap()" in TRANSITION
@@ -31,6 +58,32 @@ def test_two_readable_workspace_frames_are_never_cross_faded_together() -> None:
     assert "_ENTER_START_MS = 175" in TRANSITION
     assert "painter.setOpacity(self._outgoing_alpha)" in TRANSITION
     assert "painter.setOpacity(self._incoming_alpha)" in TRANSITION
+
+
+def test_root_surface_owns_opaque_pixels_and_blocks_hidden_workspace_input() -> None:
+    assert "WA_TransparentForMouseEvents, False" in TRANSITION
+    assert "WA_OpaquePaintEvent, True" in TRANSITION
+    assert "CompositionMode_Source" in TRANSITION
+    assert "Nothing from" in TRANSITION
+    assert "native Quick glass can leak through" in TRANSITION
+
+
+def test_incoming_capture_waits_for_a_presented_quick_frame() -> None:
+    assert "_QUICK_SYNC_TIMEOUT_MS = 64" in TRANSITION
+    assert "quick.frameSwapped.connect(" in TRANSITION
+    assert "type=Qt.ConnectionType.QueuedConnection" in TRANSITION
+    assert "@Slot()" in TRANSITION
+    assert "def _on_quick_frame_swapped" in TRANSITION
+    assert "self._awaiting_quick_frame = True" in TRANSITION
+    assert "quick.update()" in TRANSITION
+    assert "def _capture_incoming_after_quick_sync" in TRANSITION
+
+    prepare = TRANSITION.split("def _prepare_incoming", 1)[1].split(
+        "@Slot()", 1
+    )[0]
+    # Regression: grabbing Quick immediately after update() can combine the new
+    # QWidget page with the previous glass mask under the threaded render loop.
+    assert "self._capture_composite()" not in prepare
 
 
 def test_handoff_uses_clean_fuji_background_and_subtle_static_veil() -> None:
@@ -47,34 +100,12 @@ def test_handoff_uses_clean_fuji_background_and_subtle_static_veil() -> None:
 
 def test_workspace_transition_animates_cached_frames_not_live_widget_trees() -> None:
     assert "class _WorkspaceTransitionSurface(QWidget)" in TRANSITION
-    assert "self.stack.render(" in TRANSITION
     assert "quick.grabWindow()" in TRANSITION
     assert "def _capture_composite" in TRANSITION
     assert "self.stack.setGraphicsEffect" not in TRANSITION
     assert "QPropertyAnimation" not in TRANSITION
     assert ".move(" not in TRANSITION
     assert ".resize(" not in TRANSITION
-
-
-def test_target_workspace_is_prepared_behind_opaque_old_frame() -> None:
-    assert "self._surface.begin(neutral, outgoing)" in TRANSITION
-    assert "self._surface.repaint()" in TRANSITION
-    assert "self._set_mode(index)" in TRANSITION
-    assert "page_layout.activate()" in TRANSITION
-    assert "QTimer.singleShot(_PREPARE_MS, self._prepare_incoming)" in TRANSITION
-    assert 'flush_geometry = getattr(self.background, "_flush_geometry", None)' in TRANSITION
-    assert "self._surface.set_incoming(incoming)" in TRANSITION
-
-
-def test_transition_is_frame_rate_independent_and_uses_separate_exit_enter_easing() -> None:
-    assert "time.perf_counter()" in TRANSITION
-    assert "screen.refreshRate()" in TRANSITION
-    assert "Qt.TimerType.PreciseTimer" in TRANSITION
-    assert "def _exit_easing()" in TRANSITION
-    assert "0.40, 0.00, 1.00, 1.00" in TRANSITION
-    assert "def _enter_easing()" in TRANSITION
-    assert "0.16, 1.00, 0.30, 1.00" in TRANSITION
-    assert "_incoming_enter_start_ms" in TRANSITION
 
 
 def test_header_mode_copy_uses_small_independent_fade_through_only() -> None:
@@ -97,13 +128,16 @@ def test_transition_preserves_business_mode_state_machine_and_handles_repeated_c
     assert 'request = getattr(transition, "request_mode", None)' in TOGGLE
 
 
-def test_transition_suspends_only_hot_presentation_paths_but_leaves_sakura_independent() -> None:
+def test_transition_leaves_sakura_independent_and_above_workspace_surface() -> None:
     assert 'suspend_cards = getattr(card_fx, "suspend_for_modal", None)' in TRANSITION
     assert 'pointer_timer = getattr(self.background, "_pointer_timer", None)' in TRANSITION
     assert 'quick.setProperty("animationRunning", False)' in TRANSITION
-    assert 'resume_cards = getattr(card_fx, "resume_from_modal", None)' in TRANSITION
-    assert "self.background._last_pointer_norm = None" in TRANSITION
-    assert "_nekro_effects" not in TRANSITION
+    assert 'effects = getattr(self.window, "_nekro_effects", None)' in TRANSITION
+    assert "effects.raise_()" in TRANSITION
+
+    # Sakura is not stopped by this controller.
+    assert "effects.timer.stop" not in TRANSITION
+    assert "_effects_timer_was_active" not in TRANSITION
 
 
 def test_formal_runner_installs_transition_after_interaction_controllers_exist() -> None:
