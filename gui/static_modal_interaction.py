@@ -106,7 +106,18 @@ class _ModalTransitionSurface(QWidget):
         self.hide()
 
     def set_capture_suppressed(self, suppressed: bool) -> None:
-        self._capture_suppressed = bool(suppressed)
+        suppressed = bool(suppressed)
+        if suppressed == self._capture_suppressed:
+            return
+        if suppressed:
+            # During whole-root offscreen capture this topmost surface must not
+            # advertise itself as opaque, otherwise Qt may cull siblings beneath
+            # it before paintEvent() gets a chance to return without drawing.
+            self._capture_suppressed = True
+            self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+            return
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self._capture_suppressed = False
 
     def set_hold_frame(self, frame: QPixmap) -> None:
         self._base = _fit_frame(frame, self)
