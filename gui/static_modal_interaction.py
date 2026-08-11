@@ -328,7 +328,7 @@ class StaticModalInteractionController(QObject):
             frame,
             QPoint(0, 0),
             QRegion(),
-            QWidget.RenderFlag.DrawChildren,
+            QWidget.RenderFlag.DrawWindowBackground | QWidget.RenderFlag.DrawChildren,
         )
         return frame
 
