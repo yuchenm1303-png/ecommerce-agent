@@ -14,7 +14,9 @@ from app.makro.photos import (
     _photo_surface,
     _select_file_input,
     _stage_accepted,
+    _uploading_visible,
     _visible_upload_photo_button,
+    _wait_for_target_slot_completion,
     _wait_for_upload_photo_button,
 )
 from app.makro.sections import save_section
@@ -170,16 +172,18 @@ def test_product_photos_uses_real_thumbnail_ids_and_shared_input_surface():
     assert "AddProductImage" not in next_slot_source
 
 
-def test_dynamic_photo_target_selects_whole_role_card_then_clicks_upload_photo():
+def test_dynamic_photo_target_bypasses_banner_stability_then_clicks_upload_once():
     source = inspect.getsource(_DynamicPhotoFileTarget.set_input_files)
 
-    slot_click = source.index("slot.click(timeout=1_500)")
+    slot_click = source.index("slot.click(timeout=1_500, force=True)")
     button_lookup = source.index("_wait_for_upload_photo_button", slot_click)
-    chooser = source.index("expect_file_chooser(timeout=700)", button_lookup)
-    upload_click = source.index("upload_button.click(timeout=1_500)", chooser)
+    chooser = source.index("expect_file_chooser(timeout=1_500)", button_lookup)
+    upload_click = source.index("upload_button.click(timeout=1_500, force=True)", chooser)
+    completion_wait = source.index("_wait_for_target_slot_completion", upload_click)
 
-    assert slot_click < button_lookup < chooser < upload_click
+    assert slot_click < button_lookup < chooser < upload_click < completion_wait
     assert 'locator(f"#{self.slot_id}")' in source
+    assert "scroll_into_view_if_needed" not in source
     assert "role_selector.click()" not in source
     assert "i.fa-plus" not in source
     assert "set_files" in source
@@ -187,26 +191,33 @@ def test_dynamic_photo_target_selects_whole_role_card_then_clicks_upload_photo()
     assert "shared.set_input_files" in source
 
 
-def test_upload_photo_button_is_exact_active_role_control():
+def test_upload_photo_button_is_exact_visible_enabled_active_role_control():
     source = inspect.getsource(_visible_upload_photo_button)
 
     assert 'get_by_text("Upload Photo", exact=True)' in source
     assert "is_visible" in source
+    assert "is_enabled" in source
     assert "ancestor-or-self::button" in source
     assert "len(visible) > 1" in source
 
 
-def test_photo_upload_fast_path_replaces_old_long_fixed_waits():
+def test_photo_upload_waits_on_real_uploading_state_not_page_stability():
     target_source = inspect.getsource(_DynamicPhotoFileTarget.set_input_files)
     button_wait_source = inspect.getsource(_wait_for_upload_photo_button)
+    uploading_source = inspect.getsource(_uploading_visible)
+    completion_source = inspect.getsource(_wait_for_target_slot_completion)
 
     assert "wait_for_timeout(250)" not in target_source
-    assert "expect_file_chooser(timeout=2_500)" not in target_source
-    assert "time.monotonic() + 3.0" not in target_source
-    assert "expect_file_chooser(timeout=700)" in target_source
-    assert "time.monotonic() + 1.0" in target_source
-    assert "timeout_ms: int = 900" in button_wait_source
+    assert "force=True" in target_source
+    assert "expect_file_chooser(timeout=1_500)" in target_source
+    assert "timeout_ms: int = 2_000" in button_wait_source
     assert "wait_for_timeout(50)" in button_wait_source
+    assert "Uploading" in uploading_source
+    assert "soft_timeout_ms: int = 12_000" in completion_source
+    assert "uploading_timeout_ms: int = 60_000" in completion_source
+    assert "uploading_seen" in completion_source
+    assert "wait_for_timeout(100)" in completion_source
+    assert "slot_id not in empty_slots" in completion_source
 
 
 def test_photo_acceptance_can_be_proved_by_target_thumbnail_losing_plus():
