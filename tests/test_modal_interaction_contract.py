@@ -44,6 +44,7 @@ def test_cached_frame_is_rendered_from_the_fully_laid_out_real_drawer() -> None:
     assert "drawer.devicePixelRatioF()" in render
     assert "frame.setDevicePixelRatio(dpr)" in render
     assert "drawer.render(" in render
+    assert "QWidget.RenderFlag.DrawWindowBackground" in render
     assert "QWidget.RenderFlag.DrawChildren" in render
     assert "drawer.grab()" not in STATIC
 
