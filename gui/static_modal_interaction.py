@@ -249,6 +249,15 @@ class StaticModalInteractionController(QObject):
         self._motion_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._motion_timer.timeout.connect(self._advance_motion)
 
+        # update() is deferred. If the surface is hidden in the same callback that
+        # first sets p=0/p=1, the exact endpoint is never presented and the last
+        # visible outline/highlight snaps away. Keep the endpoint surface alive
+        # for at least one nominal refresh before handing ownership to live UI.
+        self._handoff_timer = QTimer(self)
+        self._handoff_timer.setSingleShot(True)
+        self._handoff_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._handoff_timer.timeout.connect(self._finish_motion)
+
         self.details._show_prepared_modal = self._show_with_animation  # type: ignore[method-assign]  # noqa: SLF001
         self.details.close = self.request_close  # type: ignore[method-assign]
         self._rewire_close_inputs()
@@ -517,11 +526,19 @@ class StaticModalInteractionController(QObject):
         target_hz = max(60.0, min(240.0, refresh_hz))
         return max(4, int(1000.0 / target_hz))
 
+    def _handoff_delay_ms(self) -> int:
+        # Give the endpoint update slightly more than one nominal refresh period.
+        # 60 Hz -> 18 ms; 120/144/165 Hz -> 10/8/8 ms. This is not extra motion:
+        # p is already exactly 0 or 1 while the endpoint frame is presented.
+        return max(8, self._frame_interval_ms() + 2)
+
     def _stop_animation(self) -> None:
         self._motion_timer.stop()
+        self._handoff_timer.stop()
 
     def _start_fade(self, *, end: float, duration_ms: int, easing: QEasingCurve) -> None:
         self._motion_timer.stop()
+        self._handoff_timer.stop()
         self._motion_from = float(self._progress)
         self._motion_to = max(0.0, min(1.0, float(end)))
         self._motion_duration_s = max(0.001, float(duration_ms) / 1000.0)
@@ -545,7 +562,10 @@ class StaticModalInteractionController(QObject):
         if linear >= 1.0:
             self._motion_timer.stop()
             self._set_progress(self._motion_to)
-            self._finish_motion()
+            # set_progress() queues update(); repaint the exact endpoint now and
+            # keep it alive through at least one display interval before handoff.
+            self._transition.repaint()
+            self._handoff_timer.start(self._handoff_delay_ms())
 
     def _prepare_open_transition(self, *, ratio: tuple[float, float]) -> None:
         self.details._modal_ratio = ratio  # noqa: SLF001
@@ -598,6 +618,7 @@ class StaticModalInteractionController(QObject):
             self._fallback_open(ratio)
 
     def _finish_motion(self) -> None:
+        self._handoff_timer.stop()
         if self._state == _STATE_OPENING:
             self._finish_open()
         elif self._state == _STATE_CLOSING:
@@ -608,6 +629,12 @@ class StaticModalInteractionController(QObject):
             return
         self._progress = 1.0
         self._transition.hide()
+        # The endpoint B has already been visible for one refresh. Repaint the
+        # exact live widgets that generated B before releasing cached frames so
+        # there is no one-turn backing-store mismatch at ownership handoff.
+        self.details.backdrop.repaint()
+        self.details.scrim.repaint()
+        self.details.drawer.repaint()
         self._transition.clear_frames()
         self._state = _STATE_OPEN
         self.details.close_button.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -688,6 +715,10 @@ class StaticModalInteractionController(QObject):
                 pass
 
         self._transition.hide()
+        # The p=0 cached workspace has already been presented. Refresh the live
+        # QWidget tree synchronously in the same handoff turn before dropping the
+        # cached frames, so the disappearing outline cannot survive one extra frame.
+        self.root.repaint()
         self._transition.clear_frames()
         self._entry_workspace_frame = QPixmap()
         self._quick_base_frame = QPixmap()
