@@ -35,6 +35,7 @@ def main() -> int:
     from gui.static_modal_interaction import install_static_modal_interaction
     from gui.ui_maturity import install_mature_ui
     from gui.ui_polish import install_ui_polish
+    from gui.ui_runtime_optimizations import install_ui_runtime_optimizations
     from gui.smooth_scroll import SmoothWheelFilter
 
     MainWindow = WorkflowMainWindow
@@ -65,6 +66,12 @@ def main() -> int:
     install_required_input_support(window)
     install_activity_presence(window)
     visual.refresh_glass_frames()
+
+    # Presentation-only hot-path optimizations are installed after both Single
+    # and Batch widgets exist, but still before the first event-loop paint. This
+    # keeps visible geometry/behavior identical while avoiding repeated item
+    # allocation and PNG round-trips during later UI updates.
+    install_ui_runtime_optimizations(window, visual)
 
     smooth_wheel = SmoothWheelFilter(window)
     smooth_wheel.install(window)
