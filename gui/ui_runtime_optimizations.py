@@ -5,7 +5,7 @@ from types import MethodType
 from typing import Any
 
 from PySide6.QtCore import QEvent, QObject, QTimer, QUrl, Qt
-from PySide6.QtGui import QBrush, QImage
+from PySide6.QtGui import QBrush, QCursor, QImage
 from PySide6.QtQuick import QQuickImageProvider
 from PySide6.QtWidgets import QMainWindow, QTableWidget, QTableWidgetItem
 
@@ -229,15 +229,20 @@ class UiRuntimeOptimizations(QObject):
         self.visual = visual
         self._mask_provider: _GlassMaskImageProvider | None = None
         self._original_mask_update = None
+        self._original_pointer_sample = None
+        self._last_pointer_global: tuple[int, int] | None = None
+        self._last_pointer_quick_geometry: tuple[int, int, int, int] | None = None
         self._default_brush = QBrush()
         self._ai_status_brushes = {key: QBrush(color) for key, color in _AI_STATUS_COLORS.items()}
         self._final_status_brushes = {key: QBrush(color) for key, color in STATUS_COLORS.items()}
         self._batch_status_brushes = {key: QBrush(color) for key, color in _STATUS_COLORS.items()}
+        self._batch_row_fingerprints: list[tuple[str, ...]] = []
         self._prep_log_filter = None
         self._real_log_filter = None
         self._minimize_restore_keeper = None
 
         self._install_minimize_restore_keeper()
+        self._install_idle_pointer_fast_path()
         self._install_in_memory_glass_mask()
         self._install_in_place_single_tables()
         self._install_in_place_batch_tables()
@@ -248,6 +253,55 @@ class UiRuntimeOptimizations(QObject):
         if background is None:
             return
         self._minimize_restore_keeper = _MinimizeRestoreKeeper(self.window, background)
+
+    def _install_idle_pointer_fast_path(self) -> None:
+        """Keep 8 ms sampling but skip coordinate work while pointer/owner are static."""
+
+        background = getattr(self.visual, "background", None)
+        timer = getattr(background, "_pointer_timer", None)
+        original = getattr(background, "_sample_pointer", None)
+        if background is None or timer is None or not callable(original):
+            return
+
+        try:
+            timer.timeout.disconnect(original)
+        except (RuntimeError, TypeError):
+            return
+
+        self._original_pointer_sample = original
+        controller = self
+
+        def sample_pointer(bg) -> None:  # noqa: ANN001
+            quick = getattr(bg, "quick_window", None)
+            if bool(getattr(bg, "_shutting_down", False)) or quick is None:
+                return
+            try:
+                if not quick.isVisible() or quick.windowState() & Qt.WindowState.WindowMinimized:
+                    return
+                global_pos = QCursor.pos()
+                point = (global_pos.x(), global_pos.y())
+                geometry = (
+                    int(quick.x()),
+                    int(quick.y()),
+                    int(quick.width()),
+                    int(quick.height()),
+                )
+            except RuntimeError:
+                return
+
+            if (
+                getattr(bg, "_last_pointer_norm", None) is not None
+                and controller._last_pointer_global == point
+                and controller._last_pointer_quick_geometry == geometry
+            ):
+                return
+
+            controller._last_pointer_global = point
+            controller._last_pointer_quick_geometry = geometry
+            original()
+
+        background._sample_pointer = MethodType(sample_pointer, background)  # type: ignore[method-assign]  # noqa: SLF001
+        timer.timeout.connect(background._sample_pointer)  # noqa: SLF001
 
     def _install_in_memory_glass_mask(self) -> None:
         background = getattr(self.visual, "background", None)
@@ -416,30 +470,43 @@ class UiRuntimeOptimizations(QObject):
         old_rows = table.rowCount()
         new_rows = len(jobs)
 
-        table.setUpdatesEnabled(False)
-        try:
-            if old_rows != new_rows:
-                table.setRowCount(new_rows)
-            for row, job in enumerate(jobs):
-                values = (
-                    job.job_id,
-                    job.product_name or _product_label(job.product_url),
-                    _STAGE_LABELS.get(job.status, job.status),
-                    job.vertical or "—",
-                    job.brand or "—",
-                    str(job.ready),
-                    str(job.blocked),
-                    f"{max(0, min(100, job.progress))}%",
-                    job.error or job.stage_detail,
-                )
-                for column, value in enumerate(values):
-                    item = self._ensure_item(table, row, column, value)
-                    if column == 2:
-                        brush = self._brush(self._batch_status_brushes, job.status)
-                        if item.foreground() != brush:
-                            item.setForeground(brush)
-        finally:
-            table.setUpdatesEnabled(True)
+        payload: list[tuple[tuple[str, ...], str]] = []
+        new_fingerprints: list[tuple[str, ...]] = []
+        for job in jobs:
+            values = (
+                job.job_id,
+                job.product_name or _product_label(job.product_url),
+                _STAGE_LABELS.get(job.status, job.status),
+                job.vertical or "—",
+                job.brand or "—",
+                str(job.ready),
+                str(job.blocked),
+                f"{max(0, min(100, job.progress))}%",
+                job.error or job.stage_detail,
+            )
+            fingerprint = (*values, str(job.status))
+            payload.append((values, str(job.status)))
+            new_fingerprints.append(fingerprint)
+
+        previous = self._batch_row_fingerprints
+        table_changed = old_rows != new_rows or previous != new_fingerprints
+        if table_changed:
+            table.setUpdatesEnabled(False)
+            try:
+                if old_rows != new_rows:
+                    table.setRowCount(new_rows)
+                for row, (values, status) in enumerate(payload):
+                    if row < len(previous) and previous[row] == new_fingerprints[row]:
+                        continue
+                    for column, value in enumerate(values):
+                        item = self._ensure_item(table, row, column, value)
+                        if column == 2:
+                            brush = self._brush(self._batch_status_brushes, status)
+                            if item.foreground() != brush:
+                                item.setForeground(brush)
+            finally:
+                table.setUpdatesEnabled(True)
+            self._batch_row_fingerprints = new_fingerprints
 
         enabled = not workspace.controller.is_running and any(job.status == "READY" for job in jobs)
         if workspace.execute_button.isEnabled() != enabled:
