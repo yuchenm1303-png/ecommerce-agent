@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QModelIndex, QObject, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QCursor, QPainter, QPixmap
+from PySide6.QtGui import QCursor, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QApplication,
     QFrame,
     QGraphicsEffect,
     QMainWindow,
-    QWidget,
 )
 
 from .native_background import NativeQuickBackground
@@ -17,96 +16,15 @@ from .visual_style import NEKRO_STYLE
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
 _NORMAL_GLASS_ALPHA = 64.0
-_GLASS_RADIUS = 6.0
-
-
-def _interaction_overlay_alpha(target_alpha: float) -> int:
-    """Return the local black overlay that composes base 64 to target alpha.
-
-    Quick owns the stable base glass tint (64). The reference website's link
-    cards deepen to rgba(0, 0, 0, .4) on hover, so interaction darkness remains
-    local to the QWidget card rather than crossing the QWidget -> QML boundary.
-    """
-
-    target = max(_NORMAL_GLASS_ALPHA, min(255.0, float(target_alpha)))
-    if target <= _NORMAL_GLASS_ALPHA:
-        return 0
-    denominator = 255.0 - _NORMAL_GLASS_ALPHA
-    return max(
-        0,
-        min(
-            255,
-            int(round(255.0 * (target - _NORMAL_GLASS_ALPHA) / denominator)),
-        ),
-    )
-
-
-class _CardInteractionTint(QWidget):
-    """Mouse-transparent darkening layer inside one native-glass card."""
-
-    def __init__(self, frame: QFrame) -> None:
-        super().__init__(frame)
-        self.frame = frame
-        self._alpha = 0
-        self.setObjectName("nativeCardInteractionTint")
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.setAutoFillBackground(False)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.sync_geometry()
-        self.show()
-        self.lower()
-        frame.installEventFilter(self)
-
-    def set_target_alpha(self, target_alpha: float) -> None:
-        alpha = _interaction_overlay_alpha(target_alpha)
-        if alpha == self._alpha:
-            return
-        self._alpha = alpha
-        # Interaction is now a continuous 300 ms motion. Let Qt coalesce these
-        # tiny card-local updates instead of synchronously blocking on repaint().
-        self.update()
-
-    def sync_geometry(self) -> None:
-        geometry = self.frame.rect()
-        if self.geometry() != geometry:
-            self.setGeometry(geometry)
-        self.lower()
-
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if watched is self.frame and event.type() in {
-            QEvent.Type.Resize,
-            QEvent.Type.Show,
-        }:
-            self.sync_geometry()
-        return False
-
-    def paintEvent(self, _event) -> None:  # type: ignore[override]
-        if self._alpha <= 0 or self.width() <= 0 or self.height() <= 0:
-            return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(0, 0, 0, self._alpha))
-        painter.drawRoundedRect(QRectF(self.rect()), _GLASS_RADIUS, _GLASS_RADIUS)
-        painter.end()
-
-    def cleanup(self) -> None:
-        try:
-            self.frame.removeEventFilter(self)
-        except RuntimeError:
-            pass
 
 
 class _CardScaleEffect(QGraphicsEffect):
-    """CSS-transform analogue for one complete QWidget card subtree.
+    """Scale the complete QWidget content subtree around the card center.
 
-    The reference website transforms the card as a single DOM layer, so text,
-    icons and the hover glass tint must move together. QWidget has no native CSS
-    transform; this effect transforms the already composed widget source without
-    resizing layouts or touching any child geometry. At scale 1 it is disabled,
-    so steady-state cards remain on the normal QWidget paint path.
+    Quick owns the glass shell itself. This effect owns only the QWidget content
+    painted above that shell. Both receive the same scale value from one card
+    interaction state, so the two renderers reproduce one CSS card transform
+    without resizing layouts or animating individual children.
     """
 
     def __init__(self, parent: QObject) -> None:
@@ -161,7 +79,7 @@ class _CardScaleEffect(QGraphicsEffect):
 
 
 class NativeGlassProxy(QObject):
-    """Stable Quick glass plus reference-web QWidget interaction presentation."""
+    """Synchronize one reference-web interaction across Quick glass and QWidget content."""
 
     def __init__(self, frame: QFrame, background: NativeQuickBackground) -> None:
         super().__init__(frame)
@@ -169,7 +87,6 @@ class NativeGlassProxy(QObject):
         self.background = background
         self._surface_scale = 1.0
         self._overlay_alpha = _NORMAL_GLASS_ALPHA
-        self._interaction_tint = _CardInteractionTint(frame)
         self._scale_effect = _CardScaleEffect(frame)
         frame.setGraphicsEffect(self._scale_effect)
 
@@ -182,10 +99,6 @@ class NativeGlassProxy(QObject):
         return self._overlay_alpha
 
     def set_interaction(self, *, scale: float, overlay_alpha: float) -> None:
-        # Keep the expensive native Quick blur/mask stable. The small interactive
-        # delta stays entirely in QWidget: the local dark tint deepens the glass,
-        # and one card-local effect scales the complete composed subtree exactly
-        # like the reference site's `.item.cards` transform.
         scale = max(0.96, min(1.04, float(scale)))
         overlay_alpha = max(_NORMAL_GLASS_ALPHA, min(255.0, float(overlay_alpha)))
         if (
@@ -195,20 +108,30 @@ class NativeGlassProxy(QObject):
             return
         self._surface_scale = scale
         self._overlay_alpha = overlay_alpha
-        self._interaction_tint.set_target_alpha(overlay_alpha)
+
+        # One state drives both visual owners. Quick transforms the actual glass
+        # shell/tint, while QWidget transforms every title/icon/control above it.
+        self.background.set_card_presentation(
+            self.frame,
+            scale=scale,
+            alpha=overlay_alpha,
+        )
         self._scale_effect.set_scale(scale)
 
     def sync_geometry(self) -> None:
-        self._interaction_tint.sync_geometry()
         self.background.schedule_mask_update()
 
     def cleanup(self) -> None:
         try:
+            self.background.set_card_presentation(
+                self.frame,
+                scale=1.0,
+                alpha=_NORMAL_GLASS_ALPHA,
+            )
             self._scale_effect.set_scale(1.0)
             self.frame.setGraphicsEffect(None)
         except RuntimeError:
             pass
-        self._interaction_tint.cleanup()
 
 
 class NativeVisualStyleController(QObject):
@@ -284,6 +207,7 @@ class NativeVisualStyleController(QObject):
                         "clipW": 0.0,
                         "clipH": 0.0,
                         "cardAlpha": _NORMAL_GLASS_ALPHA,
+                        "cardScale": 1.0,
                         "cardVisible": False,
                     }
                 )
