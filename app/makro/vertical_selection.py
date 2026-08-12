@@ -42,6 +42,27 @@ from .taxonomy_navigation import navigate_live_taxonomy
 from .taxonomy_resilient import ResilientMakroTaxonomyBrowser
 
 
+_VERTICAL_INPUT_TOKENS = (
+    "vertical",
+    "category",
+    "categories",
+    "垂直",
+    "类别",
+    "分类",
+    "类目",
+    "品类",
+)
+_VERTICAL_BODY_MARKERS = (
+    "select the vertical for your product",
+    "browse verticals",
+    "select vertical",
+    "选择待产品的垂直领域",
+    "浏览垂直栏目",
+    "选择垂直领域",
+    "进入垂直类别",
+)
+
+
 def _singularize_vertical_token(token: str) -> str:
     """Normalize ordinary English display pluralisation for URL slug comparison."""
 
@@ -86,6 +107,39 @@ def _selected_label_visible(page: Page, selected: str) -> bool:
         return selected_key in normalize_label(_body_text(page))
     except Exception:
         return False
+
+
+def _vertical_search_semantics_visible(page: Page) -> bool:
+    """Require Step-1-specific evidence around the fallback search control.
+
+    ``MakroPortalAdapter.find_search_input`` intentionally has a one-visible-input
+    fallback. That is useful once the stage is already known, but it must not be
+    used as independent evidence that an UNKNOWN SPA state is Step 1, otherwise a
+    lone Step 2 Brand input could be misclassified as Vertical.
+    """
+
+    try:
+        search = _vertical_search_input(page)
+    except Exception:
+        return False
+
+    attributes: list[str] = []
+    for name in ("placeholder", "name", "id", "aria-label", "title", "data-testid", "class"):
+        try:
+            value = search.get_attribute(name)
+        except Exception:
+            value = None
+        if value:
+            attributes.append(str(value))
+    attribute_blob = normalize_label(" ".join(attributes))
+    if any(normalize_label(token) in attribute_blob for token in _VERTICAL_INPUT_TOKENS):
+        return True
+
+    try:
+        body = normalize_label(_body_text(page))
+    except Exception:
+        body = ""
+    return any(normalize_label(marker) in body for marker in _VERTICAL_BODY_MARKERS)
 
 
 def _complete_exact_live_vertical(
@@ -194,10 +248,9 @@ def _select_via_search_with_context(
 def is_vertical_interaction_ready(page: Page) -> bool:
     """Return True when Step 1 can be safely operated, not merely stage-labelled.
 
-    ``MakroPortalAdapter.detect_stage`` remains useful, but a SPA can briefly lag
-    between URL/React state updates. A visible live taxonomy or a usable vertical
-    search control is sufficient structural evidence as long as the page is not
-    already Step 2/3.
+    A live taxonomy is decisive structural evidence. If only the search control
+    is available while the coarse stage detector lags, its own attributes or the
+    surrounding page copy must still identify it specifically as Vertical.
     """
 
     try:
@@ -218,11 +271,7 @@ def is_vertical_interaction_ready(page: Page) -> bool:
     except Exception:
         pass
 
-    try:
-        _vertical_search_input(page)
-    except Exception:
-        return False
-    return True
+    return _vertical_search_semantics_visible(page)
 
 
 def select_vertical(
