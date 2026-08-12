@@ -20,9 +20,9 @@ from .fill_plan import (
     _apply_business_relations,
     _hard_guard_values,
 )
-from .hard_field_validators import is_numeric_semantic_field
+from .hard_field_validators import is_numeric_semantic_field, validate_resolved_answer
 from .live_schema import schema_field_signature
-from .resolution_types import RESOLVED
+from .resolution_types import RESOLVED, ResolvedAnswer
 
 
 FALLBACK_TEXT_VALUE = "N/A"
@@ -343,6 +343,25 @@ def apply_required_overrides(
         canonical_values, qualifier, hard_error = _hard_guard_values(live_field, decision)
         if hard_error:
             raise RequiredOverrideError(f"{item.label}: {hard_error}")
+
+        hard_validation = validate_resolved_answer(
+            live_field,
+            ResolvedAnswer(
+                attribute_key=item.attribute_key,
+                label=item.label,
+                status=RESOLVED,
+                answer=" + ".join(canonical_values),
+                answer_values=list(canonical_values),
+                qualifier=qualifier or None,
+                confidence=confidence,
+                source_type=source_type,
+                source_reference=source_reference,
+                evidence=evidence,
+                detail=reason,
+            ),
+        )
+        if not hard_validation.valid:
+            raise RequiredOverrideError(f"{item.label}: {hard_validation.detail}")
 
         record = item.resolution
         record.status = RESOLVED
