@@ -1,4 +1,4 @@
-"""Continuous inertial wheel scrolling without a QApplication-wide event filter."""
+"""Continuous universal wheel scrolling without a QApplication-wide event filter."""
 
 from __future__ import annotations
 
@@ -14,29 +14,35 @@ from PySide6.QtWidgets import QAbstractItemView, QAbstractScrollArea, QWidget
 class _ScrollMotion:
     bar: object
     position: float
+    target: float
     velocity: float
 
 
 class SmoothScroller(QObject):
-    """Short-lived inertial scroll integrator.
+    """Short-lived continuous target follower for discrete mouse wheels.
 
-    Wheel notches add velocity instead of moving a fixed target. The integrator
-    keeps a floating-point position and publishes only the final integer value
-    required by QScrollBar, removing the old target/rounding staircase.
+    A classic wheel still emits discrete notches, but those notches only move one
+    persistent target. The visible scrollbar follows that target through a
+    critically damped continuous motion, so successive notches extend the same
+    glide instead of starting separate inertial bursts.
+
+    Precision touchpads already emit pixelDelta() at high frequency. Those remain
+    native/direct so the universal smoothing layer never adds latency to devices
+    that are already continuous.
     """
 
     _STEP_MS = 16
-    _FRICTION_PER_S = 8.5
-    _WHEEL_IMPULSE_PX_S = 560.0
-    _MAX_SPEED_PX_S = 2200.0
-    _STOP_SPEED_PX_S = 12.0
-    _REVERSE_RETENTION = 0.20
+    _WHEEL_TRAVEL_PX = 92.0
+    _SPRING_OMEGA = 13.0
+    _STOP_DISTANCE_PX = 0.45
+    _STOP_SPEED_PX_S = 5.0
+    _REVERSE_VELOCITY_RETENTION = 0.30
     _EXTERNAL_SYNC_TOLERANCE_PX = 3.0
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
-        # Keep the legacy attribute name because cleanup/tests in older launchers
-        # may still introspect it. Entries now hold continuous motion state.
+        # Keep the legacy attribute name because older launchers/tests may still
+        # introspect it. Entries now hold one continuous spring state per bar.
         self._animations: dict[int, _ScrollMotion] = {}
         self._last_tick_s = time.perf_counter()
         self._timer = QTimer(self)
@@ -47,11 +53,6 @@ class SmoothScroller(QObject):
     @staticmethod
     def _clamp_position(bar, position: float) -> float:  # noqa: ANN001
         return float(max(bar.minimum(), min(bar.maximum(), position)))
-
-    @staticmethod
-    def _clamp_velocity(velocity: float) -> float:
-        limit = SmoothScroller._MAX_SPEED_PX_S
-        return max(-limit, min(limit, velocity))
 
     def _ensure_timer(self) -> None:
         if self._timer.isActive():
@@ -68,12 +69,7 @@ class SmoothScroller(QObject):
         self._stop_if_idle()
 
     def scroll_pixels(self, bar, delta_px: float) -> None:  # noqa: ANN001
-        """Apply native high-resolution pixel input without re-quantizing it.
-
-        Precision touchpads already deliver continuous motion and momentum through
-        pixelDelta(), so layering synthetic inertia on top would make them floaty.
-        Any stale wheel inertia for the same scrollbar is dropped first.
-        """
+        """Apply native high-resolution pixel input without re-quantizing it."""
 
         self.cancel(bar)
         try:
@@ -83,8 +79,8 @@ class SmoothScroller(QObject):
         except RuntimeError:
             return
 
-    def push_impulse(self, bar, notch_delta: float) -> None:  # noqa: ANN001
-        """Add mouse-wheel momentum in scrollbar-positive coordinates."""
+    def add_wheel_delta(self, bar, notch_delta: float) -> None:  # noqa: ANN001
+        """Extend one persistent smooth-scroll target by a fractional wheel notch."""
 
         if abs(notch_delta) <= 1e-6:
             return
@@ -96,28 +92,36 @@ class SmoothScroller(QObject):
 
         motion = self._animations.get(key)
         if motion is None:
-            motion = _ScrollMotion(bar=bar, position=actual, velocity=0.0)
+            motion = _ScrollMotion(
+                bar=bar,
+                position=actual,
+                target=actual,
+                velocity=0.0,
+            )
             self._animations[key] = motion
         elif abs(actual - round(motion.position)) > self._EXTERNAL_SYNC_TOLERANCE_PX:
-            # Scrollbar drag, keyboard navigation, or another owner moved it.
+            # Scrollbar drag, keyboard navigation, or another controller moved it.
             motion.position = actual
+            motion.target = actual
+            motion.velocity = 0.0
 
-        impulse = float(notch_delta) * self._WHEEL_IMPULSE_PX_S
-        if motion.velocity * impulse < 0.0:
-            # Reversal should brake immediately instead of fighting a long tail.
-            motion.velocity *= self._REVERSE_RETENTION
-        motion.velocity = self._clamp_velocity(motion.velocity + impulse)
+        delta_px = float(notch_delta) * self._WHEEL_TRAVEL_PX
+        remaining = motion.target - motion.position
+        if remaining * delta_px < 0.0:
+            # Reversing direction should feel like braking, not like waiting for a
+            # queued distance in the old direction to drain first.
+            motion.target = motion.position
+            motion.velocity *= self._REVERSE_VELOCITY_RETENTION
+
+        motion.target = self._clamp_position(bar, motion.target + delta_px)
         self._ensure_timer()
 
     def _tick(self) -> None:
         now = time.perf_counter()
         dt = max(0.001, min(0.050, now - self._last_tick_s))
         self._last_tick_s = now
-
-        # Exact exponential integration makes displacement independent of timer
-        # jitter while still giving the wheel a short, controllable inertial tail.
-        decay = math.exp(-self._FRICTION_PER_S * dt)
-        distance_factor = (1.0 - decay) / self._FRICTION_PER_S
+        omega = self._SPRING_OMEGA
+        decay = math.exp(-omega * dt)
 
         for key, motion in list(self._animations.items()):
             bar = motion.bar
@@ -132,10 +136,16 @@ class SmoothScroller(QObject):
             expected = round(motion.position)
             if abs(actual - expected) > self._EXTERNAL_SYNC_TOLERANCE_PX:
                 motion.position = actual
+                motion.target = max(minimum, min(maximum, motion.target))
 
-            old_velocity = motion.velocity
-            next_position = motion.position + old_velocity * distance_factor
-            next_velocity = old_velocity * decay
+            # Exact critically-damped spring integration for a fixed target over
+            # this frame. Unlike target easing, this preserves velocity when new
+            # wheel events extend the target and is insensitive to timer jitter.
+            offset = motion.position - motion.target
+            c2 = motion.velocity + omega * offset
+            next_offset = (offset + c2 * dt) * decay
+            next_velocity = (motion.velocity - omega * c2 * dt) * decay
+            next_position = motion.target + next_offset
             clamped = max(minimum, min(maximum, next_position))
             hit_boundary = clamped != next_position
 
@@ -143,14 +153,20 @@ class SmoothScroller(QObject):
             motion.velocity = next_velocity
             bar.setValue(round(clamped))
 
-            if hit_boundary or abs(next_velocity) < self._STOP_SPEED_PX_S:
+            distance = abs(motion.target - motion.position)
+            if hit_boundary or (
+                distance <= self._STOP_DISTANCE_PX
+                and abs(motion.velocity) <= self._STOP_SPEED_PX_S
+            ):
+                final = max(minimum, min(maximum, motion.target))
+                bar.setValue(round(final))
                 del self._animations[key]
 
         self._stop_if_idle()
 
 
 class SmoothWheelFilter(QObject):
-    """Continuous nested scrolling with native touchpad precision and wheel inertia."""
+    """Universal nested scrolling: smooth mouse notches, native touchpad pixels."""
 
     _ANGLE_UNITS_PER_NOTCH = 120.0
 
@@ -165,7 +181,7 @@ class SmoothWheelFilter(QObject):
 
     def _attach(self, area: QAbstractScrollArea) -> None:
         # Item views otherwise quantize their own scrollbar to whole rows, which
-        # defeats a continuous wheel integrator even when the outer page is smooth.
+        # defeats continuous scrolling even when the outer page is smooth.
         if isinstance(area, QAbstractItemView):
             area.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         for watched in (area, area.viewport()):
@@ -216,8 +232,9 @@ class SmoothWheelFilter(QObject):
         if area is None:
             return False
 
-        # Precision touchpads / high-resolution devices already provide true pixel
-        # motion. Preserve it exactly and let the OS keep ownership of its inertia.
+        # Precision touchpads / free-spin high-resolution devices can provide true
+        # pixel motion. Preserve it directly rather than smoothing already-smooth
+        # system input a second time.
         pixel_y = event.pixelDelta().y()
         if pixel_y:
             scroll_delta = -float(pixel_y)
@@ -231,14 +248,14 @@ class SmoothWheelFilter(QObject):
         if angle_y == 0:
             return False
 
-        # Keep fractional high-resolution wheel deltas; never round to 120-unit
-        # notches or a fixed pixel target. One notch is an impulse, not a jump.
+        # Mechanical wheels commonly emit +/-120. Fractional angle deltas are kept
+        # intact as well, but all of them extend one continuous damped target.
         notch_delta = -float(angle_y) / self._ANGLE_UNITS_PER_NOTCH
         owner = self._scroll_owner(area, notch_delta)
         if owner is None:
             return False
 
-        self._scroller.push_impulse(owner.verticalScrollBar(), notch_delta)
+        self._scroller.add_wheel_delta(owner.verticalScrollBar(), notch_delta)
         return True
 
     def cleanup(self) -> None:
