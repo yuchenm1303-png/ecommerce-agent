@@ -33,6 +33,7 @@ def main() -> int:
     from gui.native_window_shell import install_native_window_shell
     from gui.nekro_card_fx import install_nekro_card_fx
     from gui.nekro_effects import install_nekro_effects
+    from gui.page_scroll_layout import install_page_scroll_layout
     from gui.preparation_progress import install_detailed_preparation_progress
     from gui.required_input_support import install_required_input_support
     from gui.restore_snapshot import install_restore_snapshot
@@ -86,6 +87,11 @@ def main() -> int:
                 ancestor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
                 break
             ancestor = ancestor.parentWidget()
+
+    # The Single body is content-driven instead of viewport-driven: Product Source,
+    # status cards, field workspace and the full console live on one scrollable
+    # page. The common application header remains fixed above it.
+    install_page_scroll_layout(window, visual)
 
     details = install_card_details(window)
     mature = install_mature_ui(window)
