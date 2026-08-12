@@ -42,6 +42,19 @@ def _is_single_listing_route(url: str) -> bool:
         return False
 
 
+def _is_safe_pre_step1_single_route(page: Any) -> bool:
+    """True only for an empty Single Listing route with no draft identity yet."""
+
+    try:
+        target = parse_makro_listing_url(str(getattr(page, "url", "") or ""))
+    except (ValueError, AttributeError):
+        return False
+    return not any(
+        str(value or "").strip()
+        for value in (target.vertical, target.brand, target.request_id, target.vid)
+    )
+
+
 def _has_password(page: Any) -> bool:
     try:
         return page.locator('input[type="password"]').count() > 0
@@ -169,6 +182,7 @@ def _diagnostics(page: Any) -> str:
         "dashboard": _is_dashboard(page),
         "listing_creation": _is_listing_creation(page),
         "step1_operable": _is_step1_operable(page),
+        "safe_pre_step1_single_route": _is_safe_pre_step1_single_route(page),
     }
     try:
         payload["stage"] = MakroPortalAdapter(page).detect_stage().value
@@ -307,10 +321,17 @@ def _prepare_new_listing_step1_page(page: Any) -> None:
             continue
 
         # A newly-created Chromium tab is normally about:blank. Likewise, a
-        # stale non-listing Seller Portal location may be left over from the
-        # previous session. For a new/owned page it is safe to normalize only
-        # that pre-Step-1 location back to Home, then use the real UI path.
-        if not _is_makro_host(page) or not _is_single_listing_route(getattr(page, "url", "")):
+        # stale non-listing Seller Portal location or a completely empty
+        # single-listing shell may be left over from the previous session. With
+        # no Vertical/Brand/requestId/vid there is no draft identity to lose, so
+        # it is safe to normalize that pre-Step-1 state back to Home and then
+        # traverse the real portal UI.
+        current_url = str(getattr(page, "url", "") or "")
+        if (
+            not _is_makro_host(page)
+            or not _is_single_listing_route(current_url)
+            or _is_safe_pre_step1_single_route(page)
+        ):
             page.goto(MAKRO_HOME_URL, wait_until="domcontentloaded", timeout=45_000)
             if not _wait_until(
                 page,
@@ -362,6 +383,9 @@ def prepare_single_step1_page(harness: Any):
                 "当前唯一 Add Listing 标签页已经进入 Step 2/3。为避免接管未知 draft，程序不会自动改动它；"
                 "请先处理/关闭该 draft，再开始新的商品。"
             )
+        if _is_safe_pre_step1_single_route(page):
+            _prepare_new_listing_step1_page(page)
+            return page
         raise RuntimeError(
             "当前 Add Listing 标签页未出现可安全操作的 Step 1 Vertical 界面。"
             f" diagnostics={_diagnostics(page)}"
