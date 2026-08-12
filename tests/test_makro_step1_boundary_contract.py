@@ -23,6 +23,24 @@ class FakeInput:
         return self.attributes.get(name)
 
 
+class ConfirmationPage(FakePage):
+    def __init__(self) -> None:
+        self.brand_ready = False
+        self.canonical = ""
+
+
+class SelectBrandButton:
+    def __init__(self, page: ConfirmationPage) -> None:
+        self.page = page
+        self.clicked = False
+
+    def click(self, timeout: int = 0) -> None:
+        assert timeout == 5000
+        self.clicked = True
+        self.page.brand_ready = True
+        self.page.canonical = "air_purifier"
+
+
 def _brand_ready(monkeypatch, canonical: str) -> None:
     monkeypatch.setattr(vertical_selection, "_wait_for", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(vertical_selection, "is_brand_step", lambda _page: True)
@@ -58,6 +76,47 @@ def test_repeated_unrelated_vertical_is_not_accepted(monkeypatch) -> None:
             "Coffee Bean Grinder",
             previous_canonical="air_purifier",
         )
+
+
+def test_vertical_confirmation_may_precede_canonical_url_commit(monkeypatch) -> None:
+    page = ConfirmationPage()
+    button = SelectBrandButton(page)
+
+    monkeypatch.setattr(
+        vertical_selection,
+        "_wait_for",
+        lambda predicate, current, **_kwargs: bool(predicate(current)),
+    )
+    monkeypatch.setattr(vertical_selection, "is_brand_step", lambda current: current.brand_ready)
+    monkeypatch.setattr(
+        vertical_selection,
+        "_vertical_confirmation_content",
+        lambda current: not current.brand_ready,
+    )
+    monkeypatch.setattr(
+        vertical_selection,
+        "_current_target_values",
+        lambda current: (current.canonical, ""),
+    )
+    monkeypatch.setattr(
+        vertical_selection,
+        "_body_text",
+        lambda _current: "VERTICAL Air Purifiers Please select a brand to start selling in this vertical.",
+    )
+    monkeypatch.setattr(
+        vertical_selection,
+        "_vertical_select_brand_button",
+        lambda _current: button,
+    )
+
+    selected = vertical_selection._complete_exact_live_vertical(
+        page,
+        "Air Purifiers",
+        previous_canonical="",
+    )
+
+    assert button.clicked is True
+    assert selected == "air_purifier"
 
 
 def test_lone_brand_input_is_not_independent_step1_evidence(monkeypatch) -> None:
