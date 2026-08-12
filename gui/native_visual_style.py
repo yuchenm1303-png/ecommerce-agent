@@ -20,30 +20,52 @@ _EFFECT_BOUND_SCALE = 1.04
 
 
 class _CardScaleEffect(QGraphicsEffect):
-    """Scale a fresh composite of the complete QWidget card subtree.
+    """Scale one QWidget card subtree with live/current and frozen/outgoing modes.
 
     Quick owns the glass shell itself. This effect owns the QWidget content painted
-    above that shell. Both receive the same scale value from one interaction state,
-    reproducing one CSS-like card transform without resizing layouts or animating
-    individual children.
+    above that shell. The currently hovered/pressed card stays LIVE: every actual
+    redraw asks Qt for a fresh logical sourcePixmap(), preserving child hover,
+    press, focus, selection and cursor feedback while the complete card content
+    still scales as one composite.
 
-    A direct drawSource() transform does not reliably reproduce the same flattened
-    QWidget-subtree transform for every complex child combination. A retained
-    source-pixmap cache, on the other hand, freezes QPushButton/QLineEdit hover,
-    press and focus feedback. The compromise is deliberate: each effect redraw
-    asks Qt for a fresh logical-coordinate sourcePixmap(), then scales that complete
-    current composite. Child state changes therefore remain live while text, icons,
-    editors, buttons and tables still move as one card image.
+    A card that has just LOST interaction ownership may switch to FROZEN mode for
+    its short return-to-rest animation. Its first outgoing draw captures one final
+    composite and later scale ticks reuse that same pixmap. This is safe because an
+    outgoing card no longer needs live child interaction, and it removes repeated
+    full-subtree rasterization from rapid A -> B -> C traversal. Returning to live
+    ownership, exact scale 1.0, modal reset or cleanup releases the frozen image.
     """
 
     def __init__(self, parent: QObject) -> None:
         super().__init__(parent)
         self._scale = 1.0
+        self._frozen = False
+        self._freeze_requested = False
+        self._frozen_source: QPixmap | None = None
+        self._frozen_offset = QPoint()
         self.setEnabled(False)
 
     @property
     def scale(self) -> float:
         return self._scale
+
+    @property
+    def frozen(self) -> bool:
+        return self._frozen
+
+    def _clear_frozen_source(self) -> None:
+        self._frozen_source = None
+        self._frozen_offset = QPoint()
+
+    def set_frozen(self, frozen: bool) -> None:
+        frozen = bool(frozen)
+        if frozen == self._frozen:
+            return
+        self._frozen = frozen
+        self._freeze_requested = frozen
+        self._clear_frozen_source()
+        if self.isEnabled():
+            self.update()
 
     def set_scale(self, scale: float) -> None:
         scale = max(0.96, min(_EFFECT_BOUND_SCALE, float(scale)))
@@ -56,6 +78,12 @@ class _CardScaleEffect(QGraphicsEffect):
             # Keep one fixed maximum bound for the whole active lifetime. Only
             # pixels change on intermediate scale frames; child geometry does not.
             self.updateBoundingRect()
+        if not active:
+            # At exact rest QWidget can paint normally again. Never retain an
+            # outgoing full-card image beyond the transition that needed it.
+            self._frozen = False
+            self._freeze_requested = False
+            self._clear_frozen_source()
         self.update()
 
     def boundingRectFor(self, source_rect: QRectF) -> QRectF:  # noqa: N802
@@ -71,11 +99,14 @@ class _CardScaleEffect(QGraphicsEffect):
             half_h * 2.0,
         )
 
-    def draw(self, painter: QPainter) -> None:  # type: ignore[override]
-        scale = self._scale
-        if abs(scale - 1.0) <= 1e-4:
-            self.drawSource(painter)
-            return
+    def _current_composite(self) -> tuple[QPixmap | None, QPoint]:
+        if (
+            self._frozen
+            and not self._freeze_requested
+            and self._frozen_source is not None
+            and not self._frozen_source.isNull()
+        ):
+            return self._frozen_source, self._frozen_offset
 
         offset = QPoint()
         pixmap = self.sourcePixmap(
@@ -84,6 +115,22 @@ class _CardScaleEffect(QGraphicsEffect):
             QGraphicsEffect.PixmapPadMode.NoPad,
         )
         if pixmap.isNull():
+            return None, QPoint()
+
+        if self._frozen:
+            self._frozen_source = pixmap
+            self._frozen_offset = QPoint(offset)
+            self._freeze_requested = False
+        return pixmap, offset
+
+    def draw(self, painter: QPainter) -> None:  # type: ignore[override]
+        scale = self._scale
+        if abs(scale - 1.0) <= 1e-4:
+            self.drawSource(painter)
+            return
+
+        pixmap, offset = self._current_composite()
+        if pixmap is None:
             self.drawSource(painter)
             return
 
@@ -148,6 +195,7 @@ class NativeGlassProxy(QObject):
                 scale=1.0,
                 alpha=_NORMAL_GLASS_ALPHA,
             )
+            self._scale_effect.set_frozen(False)
             self._scale_effect.set_scale(1.0)
             self.frame.setGraphicsEffect(None)
         except RuntimeError:
