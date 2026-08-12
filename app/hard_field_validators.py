@@ -37,6 +37,25 @@ def _primary_control(semantic_field: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def is_numeric_semantic_field(semantic_field: dict[str, Any]) -> bool:
+    """Return True when the current live control itself is numeric.
+
+    This is the shared DOM contract for both hard validation and deterministic
+    required-field fallbacks.  Field labels are not authoritative: Makro can use
+    names such as ``Pick Pack SLA`` or ``Air Flow Level`` for real number inputs.
+    """
+
+    control = _primary_control(semantic_field)
+    if control is None:
+        return False
+    return (
+        str(control.get("type") or "").casefold() == "number"
+        or str(control.get("inputmode") or "").casefold() in {"numeric", "decimal"}
+        or str(control.get("role") or "").casefold() == "spinbutton"
+        or str(control.get("field_kind") or "") in {"custom_spinbutton", "custom_slider"}
+    )
+
+
 def _float(value: str) -> float | None:
     try:
         number = float(value.strip())
@@ -50,15 +69,7 @@ def _numeric_constraint_validation(
     answer: ResolvedAnswer,
 ) -> FieldValidationResult:
     control = _primary_control(semantic_field)
-    if control is None:
-        return FieldValidationResult(True)
-
-    numeric = (
-        str(control.get("type") or "").casefold() == "number"
-        or str(control.get("inputmode") or "").casefold() in {"numeric", "decimal"}
-        or str(control.get("field_kind") or "") in {"custom_spinbutton", "custom_slider"}
-    )
-    if not numeric:
+    if control is None or not is_numeric_semantic_field(semantic_field):
         return FieldValidationResult(True)
 
     for raw in answer.answer_values:
