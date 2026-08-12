@@ -7,6 +7,7 @@ import pytest
 
 from app.makro.network_schema_probe import (
     MakroNetworkProbeError,
+    MakroNetworkSchemaProbe,
     analyze_json_payload,
     assert_safe_makro_listing_url,
     sanitize_url,
@@ -91,6 +92,35 @@ def test_safe_listing_url_accepts_current_single_listing_routes(url):
 def test_safe_listing_url_rejects_unknown_navigation(url):
     with pytest.raises(MakroNetworkProbeError):
         assert_safe_makro_listing_url(url)
+
+
+class _PlaywrightStyleEmitter:
+    """Reproduce the sync Playwright wrapper mutation that caught the real bug."""
+
+    def __init__(self):
+        self.handler = None
+        self.removed = None
+
+    def on(self, event, handler):
+        owner = getattr(handler, "__self__", None)
+        if owner is not None:
+            setattr(owner, f"_pw_impl_instance_on_{event}", handler)
+        self.handler = handler
+
+    def remove_listener(self, event, handler):
+        self.removed = (event, handler)
+
+
+def test_probe_listener_owner_accepts_playwright_runtime_wrapper_attribute():
+    page = _PlaywrightStyleEmitter()
+    probe = MakroNetworkSchemaProbe(page)  # type: ignore[arg-type]
+
+    probe.start()
+    assert page.handler is not None
+    assert getattr(probe, "_pw_impl_instance_on_response") is page.handler
+
+    probe.stop()
+    assert page.removed == ("response", page.handler)
 
 
 def test_cli_contract_never_reloads_or_clicks_original_listing():
