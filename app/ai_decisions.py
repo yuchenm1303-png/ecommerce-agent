@@ -47,17 +47,44 @@ def _clean_options(items: Iterable[object]) -> list[str]:
 
 
 def field_options(field: dict[str, Any]) -> list[str]:
-    output = _clean_options(field.get("options") or [])
-    seen = {normalize_key(value) for value in output}
-    for control in field.get("controls") or []:
+    """Return only executable value options, never qualifier/unit options.
+
+    Raw Makro semantic fields keep a convenience aggregate ``field.options``.
+    For numeric+unit controls that aggregate can contain only the qualifier
+    selector (cm/kg/...), which is not a legal value option. Prefer options from
+    non-qualifier controls. If live controls prove this is a value input plus a
+    qualifier control and the value input has no options, return no value options
+    instead of falling back to the polluted aggregate list.
+
+    This deliberately mirrors the live-schema contract so planning, field ids,
+    required fallbacks and production hard guards all interpret the same field
+    shape.
+    """
+
+    controls = [
+        control
+        for control in field.get("controls") or []
+        if isinstance(control, dict)
+    ]
+    output: list[str] = []
+    seen: set[str] = set()
+    has_qualifier_control = False
+
+    for control in controls:
         if str(control.get("name") or "").endswith("_qualifier"):
+            has_qualifier_control = True
             continue
         for value in _clean_options(control.get("options") or []):
             key = normalize_key(value)
             if key not in seen:
                 seen.add(key)
                 output.append(value)
-    return output
+
+    if output:
+        return output
+    if controls and has_qualifier_control:
+        return []
+    return _clean_options(field.get("options") or [])
 
 
 def field_qualifier_options(field: dict[str, Any]) -> list[str]:
