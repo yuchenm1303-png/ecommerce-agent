@@ -58,6 +58,14 @@ def build_parser():
     parser = build_one_link_parser()
     parser.description = "GUI staged acceptance runner backed by the current Makro one-link implementation."
     parser.add_argument("--mode", choices=WORKFLOW_MODES, required=True)
+    parser.add_argument(
+        "--resume-current-url",
+        default="",
+        help=(
+            "GUI immediate-retry token. Full mode may resume only the exact unique Step 2/3 "
+            "page URL recorded by the immediately preceding failed run."
+        ),
+    )
     return parser
 
 
@@ -92,6 +100,56 @@ def _listing_page(
     if len(candidates) != 1:
         raise RuntimeError(f"{label} requires exactly one matching Makro tab; found {len(candidates)}")
     return candidates[0]
+
+
+def _resume_current_page(harness: EdgeHarness, expected_url: str):
+    """Return only the exact unique Step 2/3 page from the prior failed run.
+
+    A fresh full run never calls this helper. The GUI supplies ``expected_url``
+    only for an immediate retry of the same supplier URL after the preceding full
+    run failed in Step 2 or Step 3. Exact URL + unique listing-tab ownership keeps
+    the retry from adopting an unrelated draft. If the browser was restarted or
+    the page moved, retry fails closed instead of guessing.
+    """
+
+    if harness.context is None:
+        raise RuntimeError("Makro Edge context is unavailable")
+    wanted = str(expected_url or "").strip()
+    if not wanted:
+        raise RuntimeError("resume-current requires the prior failed page URL")
+
+    listing_pages: list[Any] = []
+    exact: list[Any] = []
+    for page in harness.context.pages:
+        url = str(getattr(page, "url", "") or "").strip()
+        try:
+            parse_makro_listing_url(url)
+        except (ValueError, AttributeError):
+            continue
+        listing_pages.append(page)
+        if url == wanted:
+            exact.append(page)
+
+    if len(listing_pages) != 1:
+        raise RuntimeError(
+            "Immediate retry requires exactly one Add Listing tab from the failed run; "
+            f"found {len(listing_pages)}. Refusing to guess a draft."
+        )
+    if len(exact) != 1:
+        raise RuntimeError(
+            "The exact Step 2/3 page from the failed run is no longer present. "
+            "Browser/page ownership changed, so automatic resume was refused."
+        )
+
+    page = exact[0]
+    page.set_default_timeout(15_000)
+    page.wait_for_timeout(250)
+    if not (is_brand_step(page) or is_product_info_step(page)):
+        raise RuntimeError(
+            "The exact prior page is no longer a safely operable Step 2 or Step 3 surface; "
+            "automatic resume was refused."
+        )
+    return page
 
 
 def _target_values(page: Any) -> tuple[str, str]:
@@ -254,6 +312,8 @@ def main() -> int:
         raise SystemExit("GUI staged acceptance does not upload listing photos; use explicit real execution")
     if args.vertical or args.brand:
         raise SystemExit("GUI normal workflow does not accept diagnostic --vertical/--brand overrides")
+    if args.resume_current_url and args.mode != "full":
+        raise SystemExit("--resume-current-url is accepted only with --mode full")
     if args.source_cache_ttl_seconds <= 0:
         raise SystemExit("source cache TTL must be > 0")
     if not is_cdp_ready(args.cdp_port):
@@ -275,6 +335,7 @@ def main() -> int:
         "product_url": args.product_url,
         "vertical": "",
         "brand": "",
+        "resume_current_url": str(args.resume_current_url or ""),
         "writes_performed": 0,
         "save_clicked": False,
         "send_to_qc_clicked": False,
@@ -289,6 +350,7 @@ def main() -> int:
         "full": {"source", "step1", "step2", "step3"},
     }[args.mode]
     current = "source"
+    page: Any | None = None
 
     try:
         for phase_name in ("source", "step1", "step2", "step3"):
@@ -338,29 +400,63 @@ def main() -> int:
                 raise RuntimeError("Makro Edge unexpectedly entered launch path; aborted")
 
             if args.mode == "full":
-                current = "step1"
-                _phase("step1", "START")
-                page = prepare_single_step1_page(harness)
-                dismiss_joyride_overlay(page)
-                vertical = select_vertical(page, provider, hints)
-                manifest["vertical"] = vertical
-                manifest["page_url"] = page.url
-                manifest["status"] = "step1_complete"
-                _write_manifest(manifest_path, manifest)
-                _phase("step1", "COMPLETE", vertical)
+                if args.resume_current_url:
+                    page = _resume_current_page(harness, args.resume_current_url)
+                    manifest["resumed_from_page_url"] = page.url
+                    _write_manifest(manifest_path, manifest)
 
-                current = "step2"
-                _phase("step2", "START")
-                brand, page = select_brand_to_product_info(page, provider, hints)
-                harness.page = page
-                manifest["brand"] = brand
-                manifest["page_url"] = page.url
-                manifest["status"] = "step2_complete"
-                _write_manifest(manifest_path, manifest)
-                _phase("step2", "COMPLETE", brand)
+                    if is_product_info_step(page):
+                        vertical, brand = _target_values(page)
+                        manifest["vertical"] = vertical
+                        manifest["brand"] = brand
+                        manifest["page_url"] = page.url
+                        _phase("step1", "START", "resume-current")
+                        _phase("step1", "COMPLETE", f"resume-current vertical={vertical}")
+                        _phase("step2", "START", "resume-current")
+                        _phase("step2", "COMPLETE", f"resume-current brand={brand}")
+                    elif is_brand_step(page):
+                        vertical, _ = _target_values(page)
+                        manifest["vertical"] = vertical
+                        manifest["page_url"] = page.url
+                        _phase("step1", "START", "resume-current")
+                        _phase("step1", "COMPLETE", f"resume-current vertical={vertical}")
+
+                        current = "step2"
+                        _phase("step2", "START", "resume-current")
+                        brand, page = select_brand_to_product_info(page, provider, hints)
+                        harness.page = page
+                        manifest["brand"] = brand
+                        manifest["page_url"] = page.url
+                        manifest["status"] = "step2_complete"
+                        _write_manifest(manifest_path, manifest)
+                        _phase("step2", "COMPLETE", brand)
+                    else:  # guarded by _resume_current_page; defensive fail-closed branch
+                        raise RuntimeError("resume-current page is neither Step 2 nor Step 3")
+                else:
+                    current = "step1"
+                    _phase("step1", "START")
+                    page = prepare_single_step1_page(harness)
+                    dismiss_joyride_overlay(page)
+                    vertical = select_vertical(page, provider, hints)
+                    manifest["vertical"] = vertical
+                    manifest["page_url"] = page.url
+                    manifest["status"] = "step1_complete"
+                    _write_manifest(manifest_path, manifest)
+                    _phase("step1", "COMPLETE", vertical)
+
+                    current = "step2"
+                    _phase("step2", "START")
+                    brand, page = select_brand_to_product_info(page, provider, hints)
+                    harness.page = page
+                    manifest["brand"] = brand
+                    manifest["page_url"] = page.url
+                    manifest["status"] = "step2_complete"
+                    _write_manifest(manifest_path, manifest)
+                    _phase("step2", "COMPLETE", brand)
 
                 current = "step3"
                 _phase("step3", "START")
+                assert page is not None
                 _prepare_step3(args, run_dir=run_dir, page=page, manifest=manifest)
                 harness.detach()
                 manifest["status"] = "prepare_complete"
@@ -409,6 +505,7 @@ def main() -> int:
         return 0
     except SourceAccessBlocked as exc:
         manifest["status"] = "source_access_blocked"
+        manifest["failed_phase"] = current
         manifest["error"] = str(exc)
         _write_manifest(manifest_path, manifest)
         _phase(current, "FAILED", str(exc))
@@ -417,6 +514,13 @@ def main() -> int:
         return 2
     except Exception as exc:
         manifest["status"] = "failed"
+        manifest["failed_phase"] = current
+        try:
+            failed_page_url = str(getattr(page, "url", "") or "").strip()
+        except Exception:
+            failed_page_url = ""
+        if failed_page_url:
+            manifest["failed_page_url"] = failed_page_url
         manifest["error"] = str(exc)
         _write_manifest(manifest_path, manifest)
         _phase(current, "FAILED", str(exc))
