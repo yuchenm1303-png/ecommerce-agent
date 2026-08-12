@@ -20,6 +20,7 @@ from .fill_plan import (
     _apply_business_relations,
     _hard_guard_values,
 )
+from .hard_field_validators import is_numeric_semantic_field
 from .live_schema import schema_field_signature
 from .resolution_types import RESOLVED
 
@@ -123,6 +124,11 @@ def _usable_option(values: Iterable[str]) -> str:
 
 
 def _looks_numeric(field: dict[str, Any]) -> bool:
+    # Current live DOM control metadata is authoritative. The label regex remains
+    # only as backward compatibility for serialized schemas that predate control
+    # metadata or diagnostic fixtures without controls.
+    if is_numeric_semantic_field(field):
+        return True
     text = " | ".join(
         str(field.get(key) or "")
         for key in ("attribute_key", "label", "help_text", "context_text")
@@ -209,6 +215,12 @@ def apply_required_overrides(
     current live Makro option/unit hard guards. Existing READY items are never
     replaced here.
 
+    A persisted ``source_type=fallback`` is an instruction to use the deterministic
+    fallback policy, not an immutable value. After safe rebind the value is rebuilt
+    from the *current* live DOM field, so an old ``N/A`` cannot survive when Makro
+    now proves that control is ``input[type=number]``. Explicit user values are
+    never recomputed.
+
     Binding is deliberately two-stage. Exact current ``field_id`` wins. If that
     presentation-sensitive id changed while the production live-schema drift gate
     still considers the field equivalent, the stable schema signature may rebind
@@ -235,6 +247,8 @@ def apply_required_overrides(
     applied: list[str] = []
     source_counts = {"user": 0, "fallback": 0}
     rebound_by_schema_signature = 0
+    skipped_current_ready = 0
+    fallback_recomputed_live = 0
 
     for index, override in enumerate(overrides, start=1):
         identifier = str(override.get("field_id") or "").strip()
@@ -289,24 +303,33 @@ def apply_required_overrides(
         if not item.required:
             raise RequiredOverrideError(f"{item.label} 不是 required 字段；补充值只用于未解决必填项。")
         if item.action != BLOCKED:
-            raise RequiredOverrideError(f"{item.label} 已经是 READY；拒绝用补充值覆盖现有决策。")
+            # The current Resolver/live-control contract already has a READY
+            # answer. A stale persisted override must never replace it and must
+            # not turn an otherwise valid run into a preflight failure.
+            skipped_current_ready += 1
+            continue
 
-        raw_values = override.get("values")
+        source_type, source_reference, confidence, evidence = _source_metadata(override)
+        effective_override = override
+        if source_type == "fallback":
+            effective_override = required_fallback_override(live_field)
+            fallback_recomputed_live += 1
+
+        raw_values = effective_override.get("values")
         if raw_values is None:
-            raw_values = [override.get("value")]
+            raw_values = [effective_override.get("value")]
         if not isinstance(raw_values, list):
             raise RequiredOverrideError(f"{item.label} 的 values 必须是数组。")
         values = [str(value).strip() for value in raw_values if str(value or "").strip()]
         if not values:
             raise RequiredOverrideError(f"{item.label} 的补充值为空。")
 
-        source_type, source_reference, confidence, evidence = _source_metadata(override)
-        reason = str(override.get("reason") or "").strip()
+        reason = str(effective_override.get("reason") or "").strip()
         decision = FieldDecision(
             field_id=current_identifier,
             status=AI_READY,
             values=values,
-            qualifier=str(override.get("qualifier") or "").strip(),
+            qualifier=str(effective_override.get("qualifier") or "").strip(),
             confidence=confidence,
             reason=(
                 reason
@@ -361,4 +384,6 @@ def apply_required_overrides(
         "field_ids": applied,
         "sources": source_counts,
         "rebound_by_schema_signature": rebound_by_schema_signature,
+        "skipped_current_ready": skipped_current_ready,
+        "fallback_recomputed_live": fallback_recomputed_live,
     }
