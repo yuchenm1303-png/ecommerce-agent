@@ -59,14 +59,13 @@ def main() -> int:
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_native_visual_style(window)
 
-    # Finish the proven Single workspace exactly as before. Batch wraps that
-    # complete workspace afterwards, so old layout/card plugins never reinterpret
-    # Batch controls as Single diagnostics.
+    # Finish the proven Single workspace presentation before wrapping it in the
+    # final page scroll. Existing business widgets/signals are preserved and only
+    # their presentation ownership changes.
     install_ui_polish(window)
 
     # Keep the right-side Telemetry/Web/Safety card at one stable non-scrolling
-    # height. It must not grow with the outer side viewport or drift toward the
-    # lower console as the window becomes taller.
+    # height. It must not grow with the old side viewport.
     side_tabs = getattr(window, "side_detail_tabs", None)
     if side_tabs is not None:
         side_tabs.setFixedHeight(300)
@@ -88,14 +87,16 @@ def main() -> int:
                 break
             ancestor = ancestor.parentWidget()
 
-    # The Single body is content-driven instead of viewport-driven: Product Source,
-    # status cards, field workspace and the full console live on one scrollable
-    # page. The common application header remains fixed above it.
-    install_page_scroll_layout(window, visual)
-
     details = install_card_details(window)
     mature = install_mature_ui(window)
     details.attach_mature(mature)
+
+    # ui_maturity gets the last compact/responsive pass first. Then the final
+    # Single geometry owner replaces the viewport-competing body splitter with one
+    # content-driven vertical page: Product Source → statuses → fields → console.
+    # The common application header remains fixed above this scroll area.
+    install_page_scroll_layout(window, visual)
+
     install_console_summary_mode(window)
     install_static_modal_interaction(window, details)
 
@@ -129,9 +130,9 @@ def main() -> int:
 
     shell = install_native_window_shell(window, quick_window)
 
-    # Card performance budgeting is now native to the controller/effect hot path:
+    # Card performance budgeting is native to the controller/effect hot path:
     # one live interactive card, one frozen outgoing card, 90 Hz maximum motion
-    # clock, and sub-pixel QWidget raster publication. No runtime monkey-patching.
+    # clock, and sub-pixel QWidget raster publication.
     install_nekro_card_fx(window, visual)
     install_buffered_logs(window)
     effects = install_nekro_effects(window, sakura_count=3)
