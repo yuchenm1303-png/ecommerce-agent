@@ -38,6 +38,7 @@ def main() -> int:
     from gui.required_input_support import install_required_input_support
     from gui.restore_snapshot import install_restore_snapshot
     from gui.runtime_assistant import install_runtime_assistant
+    from gui.scroll_local_glass import install_scroll_local_glass
     from gui.startup_entrance import install_startup_entrance
     from gui.static_modal_interaction import install_static_modal_interaction
     from gui.ui_maturity import install_mature_ui
@@ -95,10 +96,7 @@ def main() -> int:
     # ui_maturity gets the last compact/responsive pass first. Then the final
     # Single geometry owner replaces the viewport-competing body splitter with one
     # content-driven vertical page: Product Source → statuses → fields → console.
-    # The common application header remains fixed above this scroll area. Glass
-    # remains entirely in the native Quick scene; the outer scrollbar publishes
-    # one scene-group Y offset instead of repainting QWidget glass or rebuilding a
-    # per-card mask during continuous scroll.
+    # The common application header remains fixed above this scroll area.
     install_page_scroll_layout(window, visual)
 
     install_console_summary_mode(window)
@@ -114,6 +112,12 @@ def main() -> int:
     install_activity_presence(window)
     install_detailed_preparation_progress(window)
     visual.refresh_glass_frames()
+
+    # A/B prototype: Product Source + Single status cards keep the same pre-blurred
+    # Fuji/tint look but paint their shell inside the QWidget tree. They therefore
+    # scroll in the same backing-store turn as their text instead of waiting for
+    # the independent threaded Quick card scene. All lower cards remain unchanged.
+    install_scroll_local_glass(window, visual)
 
     # Presentation-only hot-path optimizations are installed after both Single
     # and Batch widgets exist, but still before the first event-loop paint.
