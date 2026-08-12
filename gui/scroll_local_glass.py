@@ -77,6 +77,10 @@ class _ViewportGlassLayer(QWidget):
         )
         return QRegion(padded.toAlignedRect())
 
+    def card_rect(self, frame: QFrame) -> QRectF:
+        rect = self._last_rects.get(frame)
+        return QRectF(rect) if rect is not None else QRectF()
+
     def sync_frame_geometry(self, frame: QFrame) -> None:
         current = self.controller.card_rect_in_viewport(frame)
         previous = self._last_rects.get(frame, QRectF())
@@ -105,8 +109,8 @@ class _ViewportGlassLayer(QWidget):
 
     def refresh_visible_cards(self) -> None:
         dirty = QRegion()
-        for frame, _proxy in self.controller.targets:
-            dirty = dirty.united(self._padded_region(self.controller.card_rect_in_viewport(frame)))
+        for rect in self._last_rects.values():
+            dirty = dirty.united(self._padded_region(rect))
         if not dirty.isEmpty():
             self.update(dirty)
 
@@ -141,6 +145,7 @@ class ScrollLocalGlassController(QObject):
         self._scaled_item = QPixmap()
         self._scaled_key: tuple[int, int] | None = None
         self._targets: list[tuple[QFrame, Any]] = []
+        self._proxy_by_frame: dict[QFrame, Any] = {}
         self._target_frames: set[QFrame] = set()
         self._layer: _ViewportGlassLayer | None = None
         self._last_quick_offset: tuple[float, float] | None = None
@@ -168,8 +173,9 @@ class ScrollLocalGlassController(QObject):
             return
 
         self._targets = targets
-        self._target_frames = {frame for frame, _proxy in targets}
-        self._detach_from_quick_model([frame for frame, _proxy in targets])
+        self._proxy_by_frame = {frame: proxy for frame, proxy in targets}
+        self._target_frames = set(self._proxy_by_frame)
+        self._detach_from_quick_model(list(self._target_frames))
 
         layer = _ViewportGlassLayer(self, self.viewport)
         self._layer = layer
@@ -214,8 +220,8 @@ class ScrollLocalGlassController(QObject):
         QTimer.singleShot(0, self._sync_initial_state)
 
     @property
-    def targets(self) -> tuple[tuple[QFrame, Any], ...]:
-        return tuple(self._targets)
+    def targets(self) -> list[tuple[QFrame, Any]]:
+        return self._targets
 
     @property
     def active_count(self) -> int:
@@ -321,14 +327,8 @@ class ScrollLocalGlassController(QObject):
         except (RuntimeError, TypeError, ValueError):
             return 0.0, 0.0
 
-    def _proxy_for(self, frame: QFrame) -> Any | None:
-        for candidate, proxy in self._targets:
-            if candidate is frame:
-                return proxy
-        return None
-
     def card_rect_in_viewport(self, frame: QFrame) -> QRectF:
-        proxy = self._proxy_for(frame)
+        proxy = self._proxy_by_frame.get(frame)
         if proxy is None:
             return QRectF()
         try:
@@ -383,7 +383,7 @@ class ScrollLocalGlassController(QObject):
 
         viewport_rect = QRectF(layer.rect())
         for frame, proxy in self._targets:
-            card_rect = self.card_rect_in_viewport(frame)
+            card_rect = layer.card_rect(frame)
             if card_rect.isEmpty() or not card_rect.intersects(viewport_rect):
                 continue
             try:
