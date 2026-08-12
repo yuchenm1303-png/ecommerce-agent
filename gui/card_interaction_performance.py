@@ -23,11 +23,13 @@ _MAX_CONCURRENT_MOTIONS = 2
 _NORMAL_SCALE = 1.0
 _NORMAL_ALPHA = 64.0
 
-# Large application cards are often normalized to only ~0.5-1.0% total lift.
-# Re-rasterizing a thousand-pixel-wide QWidget subtree for a <0.025% scale delta
-# cannot produce a meaningful visible difference. Accumulate those tiny deltas
-# and publish them together; exact scale 1.0 is always forced on return-to-rest.
-_CONTENT_SCALE_EPSILON = 0.00025
+# The visible hover lift is normalized to roughly three edge pixels. Re-capturing
+# a complete QWidget subtree for a fraction of a pixel is wasted work, regardless
+# of the card's absolute size. Accumulate scale until the card edge would move by
+# at least this amount, then publish one fresh composite. 0.18 px is deliberately
+# sub-pixel, so the content motion remains visually continuous while a full hover
+# normally needs only ~15-20 expensive QWidget captures instead of 30-70+.
+_CONTENT_EDGE_STEP_PX = 0.18
 _NORMAL_SCALE_EPSILON = 1e-5
 
 
@@ -41,8 +43,8 @@ class CardInteractionPerformanceController(QObject):
     The expensive path is bounded in three ways:
       * card motion updates never exceed 90 Hz on high-refresh displays;
       * at most two cards may keep an unfinished transform at once;
-      * QWidget content re-rasterization ignores sub-pixel scale deltas until they
-        accumulate to a visible amount, while Quick glass can keep its own state.
+      * QWidget content re-rasterization ignores sub-pixel edge movement until it
+        accumulates to a visible amount, while the Quick glass state stays smooth.
     """
 
     def __init__(self, window: QMainWindow, visual: Any, card_fx: Any) -> None:
@@ -136,6 +138,16 @@ class CardInteractionPerformanceController(QObject):
             self.card_fx,
         )
 
+    @staticmethod
+    def _effect_span(effect: Any) -> float:
+        frame = effect.parent()
+        if frame is None:
+            return 1.0
+        try:
+            return max(1.0, float(frame.width()), float(frame.height()))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return 1.0
+
     def _install_content_scale_quantization(self) -> None:
         surfaces = getattr(self.visual, "_glass", None)
         if not isinstance(surfaces, dict):
@@ -147,14 +159,21 @@ class CardInteractionPerformanceController(QObject):
             if effect is None or not callable(original):
                 continue
 
+            performance = self
+
             def set_scale(effect_self, scale: float, _original=original) -> None:  # noqa: ANN001
                 requested = float(scale)
                 current = float(getattr(effect_self, "scale", _NORMAL_SCALE))
 
                 if abs(requested - _NORMAL_SCALE) <= _NORMAL_SCALE_EPSILON:
+                    # Exact rest is never quantized away; this also disables the
+                    # QGraphicsEffect and returns QWidget to its cheapest path.
                     requested = _NORMAL_SCALE
-                elif abs(requested - current) < _CONTENT_SCALE_EPSILON:
-                    return
+                else:
+                    span = performance._effect_span(effect_self)
+                    edge_delta_px = span * abs(requested - current) * 0.5
+                    if edge_delta_px < _CONTENT_EDGE_STEP_PX:
+                        return
 
                 _original(requested)
 
