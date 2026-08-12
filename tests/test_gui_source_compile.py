@@ -18,6 +18,7 @@ GUI_SOURCES = [
     PROJECT_ROOT / "app" / "makro" / "taxonomy_navigation.py",
     PROJECT_ROOT / "app" / "makro" / "taxonomy_resilient.py",
     PROJECT_ROOT / "app" / "makro" / "vertical_selection.py",
+    PROJECT_ROOT / "app" / "makro" / "step1_entry.py",
     PROJECT_ROOT / "gui" / "main_window.py",
     PROJECT_ROOT / "gui" / "console_window.py",
     PROJECT_ROOT / "gui" / "workflow_console_window.py",
