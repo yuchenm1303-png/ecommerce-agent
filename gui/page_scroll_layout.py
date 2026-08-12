@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QBoxLayout,
     QFrame,
@@ -25,10 +25,6 @@ from PySide6.QtWidgets import (
 )
 
 
-# The field table already owns its own scroll viewport, so the surrounding row
-# does not need to grow vertically with the page. Keeping this row compact makes
-# the Telemetry/Web/Safety column visually terminate close to its real content
-# instead of leaving a large empty strip under the diagnostics card.
 _WORKSPACE_HEIGHT = 350
 _FIELD_TABLE_MIN_HEIGHT = 255
 _SIDE_TABS_HEIGHT = 320
@@ -77,10 +73,6 @@ def _take_layout(layout: QBoxLayout, target: QLayout) -> None:
 
 
 def _restore_console_view(window: QMainWindow, console: QWidget) -> None:
-    # ui_polish historically compressed the console into the same vertical
-    # splitter as the field workspace. Once the page itself scrolls, that
-    # competition for viewport height is unnecessary: keep the useful diagnostic
-    # content visible and give it a real reading height.
     toggle = getattr(window, "console_detail_toggle", None)
     if isinstance(toggle, QPushButton):
         was_blocked = toggle.blockSignals(True)
@@ -117,6 +109,10 @@ def install_page_scroll_layout(window: QMainWindow, visual: Any | None = None) -
     field workspace and acceptance console move into one content-driven page. The
     old body QSplitter stays detached/hidden only long enough for legacy signal
     closures to remain harmless; it no longer controls any visible geometry.
+
+    Glass is still rendered by the native Quick scene. Once the page exists we bind
+    this outer scrollbar to one Quick scene-group offset; continuous scrolling does
+    not trigger per-card geometry scans or blur-mask rebuilds.
     """
 
     existing = getattr(window, "_single_page_scroll", None)
@@ -157,7 +153,6 @@ def install_page_scroll_layout(window: QMainWindow, visual: Any | None = None) -
     if workspace is None or body_console is not console:
         raise RuntimeError("page scroll layout found an unexpected polished body structure")
 
-    # Detach the old root items before constructing the new page.
     _take_widget(outer, input_card)
     _take_layout(outer, status_layout)
     _take_widget(outer, body)
@@ -198,8 +193,6 @@ def install_page_scroll_layout(window: QMainWindow, visual: Any | None = None) -
     status_host.setLayout(status_layout)
     page_layout.addWidget(status_host)
 
-    # Reparenting removes the widgets from the legacy splitter without rebuilding
-    # any business-owned controls or reconnecting signals.
     workspace.setParent(page)
     console.setParent(page)
 
@@ -217,10 +210,6 @@ def install_page_scroll_layout(window: QMainWindow, visual: Any | None = None) -
         side_tabs.setMaximumHeight(_SIDE_TABS_HEIGHT)
         side_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        # ui_polish used a bottom clearance while the sidebar itself scrolled.
-        # The final page now owns scrolling, so that old clearance only appears as
-        # a visibly empty column under Telemetry. Remove it here, after maturity,
-        # without touching the diagnostic cards themselves.
         side_host = side_tabs.parentWidget()
         side_layout = side_host.layout() if side_host is not None else None
         if isinstance(side_layout, QVBoxLayout):
@@ -236,43 +225,19 @@ def install_page_scroll_layout(window: QMainWindow, visual: Any | None = None) -
     scroll.setWidget(page)
     outer.addWidget(scroll, 1)
 
-    # The old splitter is no longer a layout owner. Keep the QObject alive but
-    # invisible so any already-connected presentation-only closure cannot target
-    # a deleted C++ object. Mature UI sees None and therefore stops resizing it.
     body.hide()
     body.setParent(root)
     setattr(window, "_ui_polish_body_splitter", None)
 
+    # Publish the page identity/layout once, then the background owns the O(1)
+    # scroll-value -> QML group-transform hot path. This deliberately replaces the
+    # old valueChanged -> card_model.sync_geometry() -> mask rebuild chain.
     background = getattr(visual, "background", None)
     if background is None:
         background = getattr(getattr(window, "_visual_style", None), "background", None)
-    schedule_mask = getattr(background, "schedule_mask_update", None)
-    card_model = getattr(background, "card_model", None)
-    if callable(schedule_mask):
-        def sync_scroll_glass(*_args: object) -> None:
-            # QWidget page motion is published every smooth-scroll tick (~16 ms),
-            # while the global Quick glass pass intentionally coalesces heavier
-            # mask texture work. Publish the cheap card geometry immediately so
-            # the QML glass shell cannot lag a frame or two behind its QWidget
-            # text/content. Mark the mask stale so the existing coalesced pass
-            # still refreshes the blur region from the latest geometry.
-            changed = False
-            sync_geometry = getattr(card_model, "sync_geometry", None)
-            if callable(sync_geometry):
-                try:
-                    changed = bool(sync_geometry())
-                except RuntimeError:
-                    return
-            if changed and background is not None:
-                try:
-                    background._mask_ready = False  # noqa: SLF001
-                except (AttributeError, RuntimeError):
-                    pass
-            schedule_mask()
-
-        scroll.verticalScrollBar().valueChanged.connect(sync_scroll_glass)
-        setattr(scroll, "_glass_scroll_sync", sync_scroll_glass)
-        QTimer.singleShot(0, sync_scroll_glass)
+    bind_scroll = getattr(background, "bind_single_page_scroll", None)
+    if callable(bind_scroll):
+        bind_scroll(scroll, page)
 
     setattr(window, "_single_page_scroll", scroll)
     setattr(window, "_single_page_scroll_content", page)

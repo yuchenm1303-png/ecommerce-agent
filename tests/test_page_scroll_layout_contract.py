@@ -30,9 +30,6 @@ def test_header_stays_fixed_while_single_body_becomes_one_scroll_page() -> None:
     assert "ScrollBarAlwaysOff" in PAGE
     assert "ScrollBarAsNeeded" in PAGE
     assert "outer.addWidget(scroll, 1)" in PAGE
-
-    # The installer removes only Product Source/status/body. Root item 0 remains
-    # the common application header and therefore stays fixed above the page.
     assert "_take_widget(outer, input_card)" in PAGE
     assert "_take_layout(outer, status_layout)" in PAGE
     assert "_take_widget(outer, body)" in PAGE
@@ -47,7 +44,6 @@ def test_existing_business_widgets_are_reparented_not_rebuilt() -> None:
     assert "page_layout.addWidget(workspace)" in PAGE
     assert "page_layout.addWidget(console)" in PAGE
     assert 'setattr(window, "_ui_polish_body_splitter", None)' in PAGE
-
     assert "ReadOnlyRunner(" not in PAGE
     assert "RealExecutionRunner(" not in PAGE
     assert "AcceptanceConsole(" not in PAGE
@@ -60,7 +56,6 @@ def test_workspace_is_compact_while_console_keeps_real_reading_height() -> None:
     assert "_CONSOLE_MIN_HEIGHT = 420" in PAGE
     assert "_CONSOLE_TABS_MIN_HEIGHT = 250" in PAGE
     assert "_CONSOLE_LOG_MIN_HEIGHT = 180" in PAGE
-
     assert "workspace.setMinimumHeight(_WORKSPACE_HEIGHT)" in PAGE
     assert "workspace.setMaximumHeight(_WORKSPACE_HEIGHT)" in PAGE
     assert "field_table.setMinimumHeight(_FIELD_TABLE_MIN_HEIGHT)" in PAGE
@@ -74,17 +69,17 @@ def test_workspace_is_compact_while_console_keeps_real_reading_height() -> None:
 def test_side_diagnostics_removes_legacy_bottom_clearance() -> None:
     assert "side_layout = side_host.layout()" in PAGE
     assert "side_layout.setContentsMargins(margins.left(), margins.top(), margins.right(), 0)" in PAGE
-    assert "visibly empty column under Telemetry" in PAGE
 
 
-def test_page_scroll_republishes_quick_glass_geometry_without_visual_lag() -> None:
-    assert "def sync_scroll_glass" in PAGE
-    assert 'sync_geometry = getattr(card_model, "sync_geometry", None)' in PAGE
-    assert "changed = bool(sync_geometry())" in PAGE
-    assert "background._mask_ready = False" in PAGE
-    assert "scroll.verticalScrollBar().valueChanged.connect(sync_scroll_glass)" in PAGE
-    assert "QTimer.singleShot(0, sync_scroll_glass)" in PAGE
-    assert "scroll.verticalScrollBar().valueChanged.connect(schedule_mask)" not in PAGE
+def test_page_scroll_binds_one_quick_group_transform_without_per_card_sync() -> None:
+    assert 'bind_scroll = getattr(background, "bind_single_page_scroll", None)' in PAGE
+    assert "bind_scroll(scroll, page)" in PAGE
+    assert "sync_scroll_glass" not in PAGE
+    assert "card_model" not in PAGE
+    assert "sync_geometry" not in PAGE
+    assert "background._mask_ready" not in PAGE
+    assert "schedule_mask" not in PAGE
+    assert "QTimer" not in PAGE
 
 
 def test_nested_wheel_scroll_chains_outward_at_inner_boundaries() -> None:
