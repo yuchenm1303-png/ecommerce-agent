@@ -8,22 +8,35 @@ SOURCE = (ROOT / "gui" / "startup_entrance.py").read_text(encoding="utf-8")
 RUN = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
-def test_reference_timing_and_scale_tokens_are_preserved() -> None:
+def test_reference_entrance_keeps_curtain_camera_choreography_without_loader() -> None:
     for token in (
-        "_LOADER_FADE_MS = 300",
-        "_CURTAIN_DELAY_MS = 300",
+        "_UI_FADE_MS = 300",
+        "_CURTAIN_DELAY_MS = 0",
         "_CURTAIN_MS = 500",
-        "_BACKGROUND_DELAY_MS = 450",
+        "_BACKGROUND_DELAY_MS = 150",
         "_BACKGROUND_MS = 800",
-        "_UI_SCALE_DELAY_MS = 500",
+        "_UI_SCALE_DELAY_MS = 200",
         "_UI_SCALE_MS = 650",
-        "_TOTAL_MS = 1300",
+        "_TOTAL_MS = 1000",
         "_BG_START_SCALE = 1.60",
         "_UI_START_SCALE = 1.20",
         "_CURTAIN_FRACTION = 0.51",
         'QColor("#333333")',
     ):
         assert token in SOURCE
+
+    # The spinner/text loading phase is intentionally not part of our copy.
+    for obsolete in (
+        "_HOLD_MIN_MS",
+        "_HOLD_MAX_MS",
+        "_LOADER_FADE_MS",
+        "def _paint_loader",
+        '"LOADING"',
+        '"ecommerce-agent")',
+        "random.randint",
+        "_capture_and_hold",
+    ):
+        assert obsolete not in SOURCE
 
 
 def test_reference_easing_curves_are_explicit() -> None:
@@ -37,6 +50,12 @@ def test_startup_is_one_snapshot_not_per_card_widget_animation() -> None:
     assert "for record in self._glass_records:" in SOURCE
     assert "QPropertyAnimation" not in SOURCE
     assert "setGraphicsEffect" not in SOURCE
+
+
+def test_capture_reveals_immediately_instead_of_waiting_on_loader() -> None:
+    assert "QTimer.singleShot(_CAPTURE_DELAY_MS, self._capture_and_reveal)" in SOURCE
+    assert "self.overlay.begin_reveal()" in SOURCE
+    assert "random" not in SOURCE
 
 
 def test_startup_freezes_runtime_only_while_cover_is_visible() -> None:
