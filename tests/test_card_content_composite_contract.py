@@ -12,12 +12,15 @@ def _body(source: str, start: str, end: str) -> str:
     return source.split(start, 1)[1].split(end, 1)[0]
 
 
-def test_complex_card_content_is_scaled_as_one_live_composite() -> None:
+def test_complex_card_content_is_freshly_flattened_and_scaled_as_one_composite() -> None:
     effect = _body(NATIVE_VISUAL, "class _CardScaleEffect", "class NativeGlassProxy")
 
+    assert "self.sourcePixmap(" in effect
+    assert "Qt.CoordinateSystem.LogicalCoordinates" in effect
+    assert "QGraphicsEffect.PixmapPadMode.NoPad" in effect
+    assert "painter.drawPixmap(offset, pixmap)" in effect
     assert "painter.translate(center)" in effect
     assert "painter.scale(scale, scale)" in effect
-    assert "self.drawSource(painter)" in effect
 
     # Whole-card presentation must stay compositor-like. Never reimplement the
     # effect by resizing/repositioning every QLabel/button/editor/table child.
@@ -27,17 +30,18 @@ def test_complex_card_content_is_scaled_as_one_live_composite() -> None:
     assert ".grab(" not in effect
 
 
-def test_child_hover_press_focus_visuals_remain_live_during_card_scale() -> None:
+def test_child_hover_press_focus_visuals_remain_live_without_retained_source_cache() -> None:
     effect = _body(NATIVE_VISUAL, "class _CardScaleEffect", "class NativeGlassProxy")
-    draw = _body(effect, "def draw", "class NativeGlassProxy") if "class NativeGlassProxy" in effect else effect.split("def draw", 1)[1]
+    draw = effect.split("def draw", 1)[1]
 
-    # A retained whole-card pixmap freezes QPushButton/QLineEdit hover, press and
-    # focus styling while the parent card remains scaled. The effect must always
-    # transform Qt's current live source instead.
+    # Every effect redraw obtains Qt's current source composite. A retained
+    # whole-card pixmap would freeze QPushButton/QLineEdit hover, press and focus.
     assert "_cached_source" not in effect
     assert "_source_snapshot" not in effect
-    assert "sourcePixmap(" not in effect
-    assert "painter.drawPixmap(" not in effect
+    assert "sourceChanged" not in effect
+    assert "self.sourcePixmap(" in draw
+    assert "painter.drawPixmap(offset, pixmap)" in draw
+    assert "if pixmap.isNull():" in draw
     assert "self.drawSource(painter)" in draw
 
 
@@ -54,7 +58,7 @@ def test_scale_animation_does_not_mutate_child_layout_or_input_geometry() -> Non
     assert "move(" not in set_scale
 
 
-def test_quick_glass_and_complete_widget_content_share_exact_scale() -> None:
+def test_quick_glass_and_complete_widget_composite_share_exact_scale() -> None:
     proxy = _body(NATIVE_VISUAL, "class NativeGlassProxy", "class NativeVisualStyleController")
 
     assert "self.background.set_card_presentation(" in proxy
