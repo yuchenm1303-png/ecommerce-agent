@@ -33,6 +33,7 @@ from app.makro.direct_visual_hold import is_listing_attribute_field
 from app.makro.domain import MakroDomainAdapter
 from app.makro.execution import PRODUCT_PHOTOS, fill_one_section as _fill_one_section, run_photos as _run_photos
 from app.makro.listing_preflight import CORE_FORM_SECTIONS
+from app.makro.marketplace_constraints import apply_makro_decision_constraints
 from app.required_overrides import apply_required_overrides, load_required_overrides
 from app.semantic_grounding import build_grounding_catalog
 from makro_preview_listing import (
@@ -172,6 +173,10 @@ def main() -> int:
         grounding,
         expected_identity=ProductIdentity(),
     )
+    makro_constraint_summary = apply_makro_decision_constraints(
+        decision_packet,
+        planned_live_fields,
+    )
     business_bundle = generated_business_bundle(args.product_url)
     generated_sku = generate_listing_sku(args.product_url)
 
@@ -281,6 +286,7 @@ def main() -> int:
         print(f"product_url={args.product_url}")
         print(f"generated_listing_sku={generated_sku}")
         print(f"user_required_overrides={override_summary['applied']}")
+        print(f"makro_constraints={makro_constraint_summary}")
         print(
             f"live_fields={summary['live_field_count']}, ready={summary['ready']}, "
             f"preview_eligible={summary['preview_eligible']}, blocked={summary['blocked']}, "
@@ -378,6 +384,7 @@ def main() -> int:
             "live_schema": str(Path(args.live_schema).resolve()),
             "required_override_file": str(override_path) if override_path.is_file() else "",
             "required_overrides": override_summary,
+            "makro_constraints": makro_constraint_summary,
             "source_snapshots": [str(Path(path).resolve()) for path in args.supplier_snapshot],
             "evidence_images": [str(Path(path).resolve()) for path in args.image],
             "live_schema_verified": True,
@@ -435,6 +442,13 @@ def main() -> int:
         print(f"最终截图：{final_screenshot.resolve()}")
 
         harness.detach()
+        if args.all_step3 and completion is not None:
+            acceptance_ok = bool(completion.get("draft_persisted_complete")) and bool(
+                completion.get("autofill_safe_complete")
+            )
+            if not acceptance_ok:
+                print("Full Step 3 persisted acceptance 未完整通过；进程返回非零状态。")
+                return 2
         return 0
 
 
