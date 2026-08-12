@@ -37,10 +37,10 @@ def test_restore_snapshot_is_mouse_transparent_and_exact_size() -> None:
     assert "self.snapshot.raise_()" in SNAPSHOT
 
 
-def test_formal_runner_installs_snapshot_before_native_shell_show() -> None:
+def test_formal_runner_keeps_snapshot_before_single_window_show() -> None:
     assert "from gui.restore_snapshot import install_restore_snapshot" in RUN
-    assert "install_restore_snapshot(window, quick_window)" in RUN
-    assert RUN.index("install_restore_snapshot(window, quick_window)") < RUN.index(
-        "shell = install_native_window_shell(window, quick_window)"
+    assert "install_restore_snapshot(window, quick_surface)" in RUN
+    assert RUN.index("install_restore_snapshot(window, quick_surface)") < RUN.index(
+        "window.showMaximized()"
     )
-    assert RUN.index("install_restore_snapshot(window, quick_window)") < RUN.index("shell.show()")
+    assert "install_native_window_shell" not in RUN
