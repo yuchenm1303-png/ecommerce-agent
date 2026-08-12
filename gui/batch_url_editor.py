@@ -19,8 +19,11 @@ from .batch_model import normalize_batch_urls
 
 
 _URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
-_VISIBLE_ROWS = 3
-_ROW_HEIGHT = 46
+_VISIBLE_ROWS = 5
+_ROW_HEIGHT = 40
+_ROW_SPACING = 5
+_LIST_HEIGHT = (_VISIBLE_ROWS * _ROW_HEIGHT) + ((_VISIBLE_ROWS - 1) * _ROW_SPACING) + 4
+_EDITOR_MIN_HEIGHT = _LIST_HEIGHT + 72
 
 
 def _extract_urls(text: str) -> list[str]:
@@ -39,19 +42,19 @@ class BatchUrlRow(QFrame):
         self.setFixedHeight(_ROW_HEIGHT)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 6, 8, 6)
-        layout.setSpacing(8)
+        layout.setContentsMargins(7, 4, 7, 4)
+        layout.setSpacing(7)
 
         self.index_label = QLabel(f"{index:02d}")
         self.index_label.setObjectName("batchUrlIndex")
-        self.index_label.setFixedWidth(28)
+        self.index_label.setFixedWidth(30)
         self.index_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.toggle = QPushButton("启用")
         self.toggle.setObjectName("batchUrlToggle")
         self.toggle.setCheckable(True)
         self.toggle.setChecked(True)
-        self.toggle.setFixedWidth(68)
+        self.toggle.setFixedWidth(58)
         self.toggle.toggled.connect(self._on_toggled)
 
         self.input = QLineEdit(url)
@@ -61,7 +64,7 @@ class BatchUrlRow(QFrame):
 
         self.remove_button = QPushButton("删除")
         self.remove_button.setObjectName("batchUrlRemoveButton")
-        self.remove_button.setFixedWidth(58)
+        self.remove_button.setFixedWidth(50)
         self.remove_button.clicked.connect(lambda: self.editor.remove_row(self))
 
         layout.addWidget(self.index_label)
@@ -71,43 +74,51 @@ class BatchUrlRow(QFrame):
 
         self.setStyleSheet(
             "QFrame#batchUrlRow {"
-            "  background: rgba(9, 27, 45, 72);"
-            "  border: 1px solid rgba(255, 255, 255, 34);"
-            "  border-radius: 9px;"
+            "  background: rgba(8, 27, 48, 76);"
+            "  border: 1px solid rgba(255, 255, 255, 31);"
+            "  border-radius: 8px;"
+            "}"
+            "QFrame#batchUrlRow:hover {"
+            "  background: rgba(11, 34, 58, 91);"
+            "  border-color: rgba(180, 224, 255, 52);"
             "}"
             "QLabel#batchUrlIndex {"
-            "  color: rgba(235, 245, 255, 150);"
-            "  font-weight: 700;"
+            "  color: rgba(235, 245, 255, 142);"
+            "  font-weight: 720;"
             "}"
             "QPushButton#batchUrlToggle {"
-            "  border: 1px solid rgba(255, 255, 255, 38);"
-            "  border-radius: 10px;"
-            "  background: rgba(10, 27, 43, 110);"
-            "  color: rgba(235, 245, 255, 170);"
-            "  padding: 4px 9px;"
+            "  border: 1px solid rgba(255, 255, 255, 34);"
+            "  border-radius: 8px;"
+            "  background: rgba(10, 27, 43, 104);"
+            "  color: rgba(235, 245, 255, 165);"
+            "  padding: 3px 6px;"
             "  font-weight: 700;"
             "}"
             "QPushButton#batchUrlToggle:checked {"
-            "  background: rgba(77, 179, 132, 115);"
-            "  border-color: rgba(143, 225, 185, 150);"
+            "  background: rgba(77, 179, 132, 112);"
+            "  border-color: rgba(143, 225, 185, 142);"
             "  color: rgb(226, 255, 241);"
             "}"
             "QLineEdit#batchUrlLineEdit {"
-            "  background: rgba(7, 21, 36, 90);"
-            "  border: 1px solid rgba(255, 255, 255, 30);"
-            "  border-radius: 8px;"
-            "  padding: 6px 9px;"
+            "  background: rgba(6, 21, 38, 86);"
+            "  border: 1px solid rgba(255, 255, 255, 27);"
+            "  border-radius: 7px;"
+            "  padding: 5px 9px;"
+            "}"
+            "QLineEdit#batchUrlLineEdit:focus {"
+            "  border-color: rgba(150, 220, 255, 116);"
+            "  background: rgba(7, 24, 43, 103);"
             "}"
             "QPushButton#batchUrlRemoveButton {"
             "  border: 0;"
             "  background: transparent;"
-            "  color: rgba(255, 205, 214, 190);"
-            "  padding: 4px 6px;"
+            "  color: rgba(255, 205, 214, 184);"
+            "  padding: 3px 5px;"
             "}"
             "QPushButton#batchUrlRemoveButton:hover {"
             "  color: rgb(255, 225, 231);"
             "  background: rgba(205, 75, 98, 55);"
-            "  border-radius: 7px;"
+            "  border-radius: 6px;"
             "}"
         )
         self._on_toggled(True)
@@ -134,21 +145,23 @@ class BatchUrlRow(QFrame):
 
 
 class BatchUrlEditor(QWidget):
-    """Compact per-link Batch editor with independent enable/disable controls."""
+    """Per-link Batch editor with a stable five-row working viewport."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.rows: list[BatchUrlRow] = []
         self.locked = False
+        self.setMinimumHeight(_EDITOR_MIN_HEIGHT)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(7)
+        root.setSpacing(6)
 
         toolbar = QHBoxLayout()
         toolbar.setSpacing(8)
-        self.summary = QLabel("0 条链接 · 启用 0")
+        self.summary = QLabel("链接 0 · 启用 0")
         self.summary.setObjectName("cardHint")
+        self.summary.setStyleSheet("font-weight: 650;")
         toolbar.addWidget(self.summary)
         toolbar.addStretch(1)
 
@@ -162,16 +175,42 @@ class BatchUrlEditor(QWidget):
         toolbar.addWidget(self.add_button)
         root.addLayout(toolbar)
 
+        columns = QHBoxLayout()
+        columns.setContentsMargins(7, 0, 7, 0)
+        columns.setSpacing(7)
+        index_head = QLabel("NO.")
+        index_head.setObjectName("sectionEyebrow")
+        index_head.setFixedWidth(30)
+        index_head.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        state_head = QLabel("状态")
+        state_head.setObjectName("sectionEyebrow")
+        state_head.setFixedWidth(58)
+        state_head.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        url_head = QLabel("SUPPLIER PRODUCT URL")
+        url_head.setObjectName("sectionEyebrow")
+        action_head = QLabel("操作")
+        action_head.setObjectName("sectionEyebrow")
+        action_head.setFixedWidth(50)
+        action_head.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        columns.addWidget(index_head)
+        columns.addWidget(state_head)
+        columns.addWidget(url_head, 1)
+        columns.addWidget(action_head)
+        root.addLayout(columns)
+
         self.scroll = QScrollArea(self)
         self.scroll.setObjectName("batchUrlScroll")
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.scroll.setMinimumHeight(_ROW_HEIGHT + 8)
-        self.scroll.setMaximumHeight(_VISIBLE_ROWS * _ROW_HEIGHT + 22)
+        self.scroll.setFixedHeight(_LIST_HEIGHT)
         self.scroll.setStyleSheet(
-            "QScrollArea#batchUrlScroll { background: transparent; border: 0; }"
+            "QScrollArea#batchUrlScroll {"
+            "  background: rgba(5, 18, 33, 36);"
+            "  border: 1px solid rgba(255, 255, 255, 18);"
+            "  border-radius: 10px;"
+            "}"
             "QScrollArea#batchUrlScroll > QWidget > QWidget { background: transparent; }"
         )
         self.scroll.viewport().setAutoFillBackground(False)
@@ -182,8 +221,8 @@ class BatchUrlEditor(QWidget):
         self.content.setAutoFillBackground(False)
         self.content.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.rows_layout = QVBoxLayout(self.content)
-        self.rows_layout.setContentsMargins(0, 0, 4, 0)
-        self.rows_layout.setSpacing(6)
+        self.rows_layout.setContentsMargins(3, 3, 4, 3)
+        self.rows_layout.setSpacing(_ROW_SPACING)
         self.rows_layout.addStretch(1)
         self.scroll.setWidget(self.content)
         root.addWidget(self.scroll)
@@ -193,11 +232,14 @@ class BatchUrlEditor(QWidget):
     def _refresh_summary(self) -> None:
         nonempty = [row for row in self.rows if row.url()]
         enabled = [row for row in nonempty if row.is_enabled()]
-        self.summary.setText(f"{len(nonempty)} 条链接 · 启用 {len(enabled)}")
+        self.summary.setText(f"链接 {len(nonempty)} · 启用 {len(enabled)}")
 
     def _renumber(self) -> None:
         for index, row in enumerate(self.rows, start=1):
             row.set_index(index)
+
+    def _scroll_to_row(self, row: BatchUrlRow) -> None:
+        self.scroll.ensureWidgetVisible(row, 0, 6)
 
     def add_row(self, url: str = "", *, enabled: bool = True) -> BatchUrlRow:
         row = BatchUrlRow(self, len(self.rows) + 1, url)
@@ -206,6 +248,8 @@ class BatchUrlEditor(QWidget):
         self.rows_layout.insertWidget(self.rows_layout.count() - 1, row)
         row.set_locked(self.locked)
         self._refresh_summary()
+        if len(self.rows) > _VISIBLE_ROWS:
+            self._scroll_to_row(row)
         return row
 
     def add_urls(self, urls: list[str]) -> None:
@@ -215,6 +259,7 @@ class BatchUrlEditor(QWidget):
 
         existing = {row.url().casefold() for row in self.rows if row.url()}
         target_rows = [row for row in self.rows if not row.url()]
+        last_row: BatchUrlRow | None = None
         for url in cleaned:
             key = url.casefold()
             if key in existing:
@@ -225,9 +270,12 @@ class BatchUrlEditor(QWidget):
                 row.input.setText(url)
                 row.toggle.setChecked(True)
             else:
-                self.add_row(url)
+                row = self.add_row(url)
+            last_row = row
         self._renumber()
         self._refresh_summary()
+        if last_row is not None and len(self.rows) > _VISIBLE_ROWS:
+            self._scroll_to_row(last_row)
 
     def paste_urls(self) -> None:
         clipboard = QApplication.clipboard()
