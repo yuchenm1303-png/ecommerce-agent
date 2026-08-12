@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "gui" / "startup_entrance.py").read_text(encoding="utf-8")
+STABILITY = (ROOT / "gui" / "startup_entrance_stability.py").read_text(encoding="utf-8")
 RUN = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
@@ -52,30 +53,57 @@ def test_startup_is_one_snapshot_not_per_card_widget_animation() -> None:
     assert "setGraphicsEffect" not in SOURCE
 
 
-def test_capture_reveals_immediately_instead_of_waiting_on_loader() -> None:
+def test_capture_still_reveals_immediately_once_stable_snapshot_exists() -> None:
     assert "QTimer.singleShot(_CAPTURE_DELAY_MS, self._capture_and_reveal)" in SOURCE
     assert "self.overlay.begin_reveal()" in SOURCE
     assert "random" not in SOURCE
 
 
-def test_startup_freezes_runtime_only_while_cover_is_visible() -> None:
+def test_startup_stability_gate_waits_for_maximized_layout_before_capture() -> None:
+    assert "_LAYOUT_POLL_MS = 16" in STABILITY
+    assert "_LAYOUT_STABLE_SAMPLES = 3" in STABILITY
+    assert "_LAYOUT_SETTLE_TIMEOUT_MS = 240" in STABILITY
+    assert "def _geometry_signature" in STABILITY
+    assert "frame.mapTo(self.window, QPoint(0, 0))" in STABILITY
+    assert "self._stable_samples >= _LAYOUT_STABLE_SAMPLES" in STABILITY
+    assert "start = getattr(self.entrance, \"start\", None)" in STABILITY
+
+
+def test_final_snapshot_to_live_handoff_is_split_across_frames() -> None:
+    assert "self.overlay.finished.disconnect(self.entrance._finish)" in STABILITY
+    assert "self._prime_static_runtime()" in STABILITY
+    assert "QTimer.singleShot(_HANDOFF_FRAME_MS, self._commit_overlay_handoff)" in STABILITY
+    assert "overlay.hide()" in STABILITY
+    assert "QTimer.singleShot(_HANDOFF_FRAME_MS, self._resume_effects)" in STABILITY
+    assert "QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_card_fx)" in STABILITY
+    assert "QTimer.singleShot(_HANDOFF_FRAME_MS * 3, self._resume_pointer)" in STABILITY
+    assert STABILITY.index("layer.show()") < STABILITY.index("overlay.hide()")
+    assert STABILITY.index("overlay.hide()") < STABILITY.index("def _resume_card_fx")
+    assert STABILITY.index("def _resume_card_fx") < STABILITY.index("def _resume_pointer")
+
+
+def test_startup_freezes_runtime_until_staged_handoff_finishes() -> None:
     assert 'quick.setProperty("animationRunning", False)' in SOURCE
     assert 'quick.setProperty("offsetX", 0.0)' in SOURCE
     assert "suspend_for_modal" in SOURCE
-    assert "resume_from_modal" in SOURCE
     assert "pointer_timer.stop()" in SOURCE
-    assert "pointer_timer.start()" in SOURCE
+    assert "resume_from_modal" in STABILITY
+    assert "pointer_timer.start()" in STABILITY
 
 
-def test_formal_launcher_covers_first_frame_then_starts_after_show() -> None:
+def test_formal_launcher_covers_first_frame_then_uses_stability_gate_after_show() -> None:
     assert "from gui.startup_entrance import install_startup_entrance" in RUN
+    assert "from gui.startup_entrance_stability import install_startup_entrance_stability" in RUN
     assert "entrance = install_startup_entrance(window, visual)" in RUN
+    assert "entrance_stability = install_startup_entrance_stability(window, entrance)" in RUN
     assert "shell.show()" in RUN
     assert "entrance.raise_overlay()" in RUN
-    assert "entrance.start()" in RUN
+    assert "entrance_stability.start()" in RUN
     assert RUN.index("entrance = install_startup_entrance(window, visual)") < RUN.index("shell.show()")
-    assert RUN.index("shell.show()") < RUN.index("entrance.start()")
+    assert RUN.index("shell.show()") < RUN.index("entrance_stability.start()")
+    assert "entrance.start()" not in RUN
 
 
-def test_startup_source_compiles_without_importing_pyside() -> None:
+def test_startup_sources_compile_without_importing_pyside() -> None:
     compile(SOURCE, str(ROOT / "gui" / "startup_entrance.py"), "exec")
+    compile(STABILITY, str(ROOT / "gui" / "startup_entrance_stability.py"), "exec")
