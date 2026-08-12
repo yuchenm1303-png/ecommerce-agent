@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
 from .errors import JSONTaskResponseError, JSONTaskTransportError
+from .transient_retry import run_with_transient_retry
 
 
 _PROGRESS_INTERVAL_SECONDS = 15.0
@@ -120,14 +121,7 @@ def _dedupe_sources(items: Iterable[WebSearchSource]) -> list[WebSearchSource]:
 
 
 class DashScopeWebSearchProvider:
-    """One bounded Qwen Responses API call with built-in sourced web search.
-
-    Qwen3.6 Plus/Flash web search is supported through the OpenAI-compatible
-    Responses API. We intentionally do not send response_format here because
-    DashScope rejects JSON response_format together with the search tool for
-    these models. The model is instructed to emit JSON text and we parse it
-    locally; provenance comes only from web_search_call.action.sources.
-    """
+    """Bounded sourced Qwen Responses API search with transient recovery."""
 
     name = "dashscope-qwen-responses-web-search"
 
@@ -199,7 +193,7 @@ class DashScopeWebSearchProvider:
             request_id=str(_get(response, "id", "") or ""),
         )
 
-    def search_json(self, prompt: str) -> WebSearchJSONResult:
+    def _search_json_once(self, prompt: str) -> WebSearchJSONResult:
         result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
         started = time.monotonic()
 
@@ -246,3 +240,10 @@ class DashScopeWebSearchProvider:
             if isinstance(value, (JSONTaskTransportError, JSONTaskResponseError)):
                 raise value
             raise JSONTaskTransportError(f"DashScope Responses web search 调用失败：{value}") from value
+
+    def search_json(self, prompt: str) -> WebSearchJSONResult:
+        return run_with_transient_retry(
+            lambda: self._search_json_once(prompt),
+            progress=self._progress,
+            label="Web AI request",
+        )
