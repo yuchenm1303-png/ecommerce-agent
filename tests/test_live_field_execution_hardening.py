@@ -86,6 +86,18 @@ def test_numeric_fallback_uses_live_control_type_not_field_name(label, key, cont
     assert FALLBACK_NUMERIC_VALUE == "1"
 
 
+def test_numeric_detection_prefers_control_whose_id_is_attribute_key():
+    field = _field(
+        "Unfamiliar Metric",
+        "mystery_metric",
+        controls=[
+            {"id": "decorative_helper", "name": "helper", "type": "text", "field_kind": "input"},
+            {"id": "mystery_metric", "name": "mystery_metric", "type": "number", "field_kind": "input"},
+        ],
+    )
+    assert required_fallback_override(field)["values"] == ["1"]
+
+
 def test_plain_text_control_still_uses_na_fallback():
     fallback = required_fallback_override(
         _field("Unfamiliar Text", "unfamiliar_text", controls=[{"name": "unfamiliar_text", "type": "text", "field_kind": "input"}])
