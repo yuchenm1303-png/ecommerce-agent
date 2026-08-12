@@ -24,6 +24,7 @@ def main() -> int:
     from gui.activity_presence import install_activity_presence
     from gui.batch_job_controls import install_batch_job_controls
     from gui.batch_url_editor import install_batch_url_editor
+    from gui.batch_workspace_density import install_batch_workspace_density
     from gui.browser_session_manager import install_managed_makro_browser
     from gui.card_details_fast import install_card_details
     from gui.console_summary_mode import install_console_summary_mode
@@ -105,10 +106,10 @@ def main() -> int:
     install_static_modal_interaction(window, details)
 
     window.install_mode_workspace()
-    # Batch source URLs stay business-compatible with the original multiline
-    # interface, but the presentation is now one independently switchable row per
-    # product. Only enabled rows are exposed to the existing start_prepare path.
+    # Batch input is a thin rail by default; detailed per-link editing opens only
+    # on demand so the owned-job workspace keeps the majority of vertical space.
     install_batch_url_editor(window.batch_workspace)
+    install_batch_workspace_density(window.batch_workspace)
     # Each owned product card gets its own scheduler controls. The control layer
     # only selects existing canonical queues/executor paths; it never duplicates
     # Resolver, Makro execution or Product Photos business logic.
