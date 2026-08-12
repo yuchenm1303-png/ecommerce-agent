@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 OWNER = (ROOT / "app" / "browser_page_owner.py").read_text(encoding="utf-8")
 SOURCE = (ROOT / "makro_batch_source.py").read_text(encoding="utf-8")
 JOB = (ROOT / "makro_batch_job.py").read_text(encoding="utf-8")
+WORKFLOW = (ROOT / "makro_gui_workflow.py").read_text(encoding="utf-8")
 EXECUTOR = (ROOT / "makro_execute_listing.py").read_text(encoding="utf-8")
 RUNNER = (ROOT / "gui" / "batch_runner.py").read_text(encoding="utf-8")
 WORKSPACE = (ROOT / "gui" / "batch_workspace.py").read_text(encoding="utf-8")
@@ -33,13 +34,22 @@ def test_batch_source_navigation_is_prefetched_before_parallel_prepare() -> None
 
 def test_batch_reuses_canonical_business_pipeline_and_executor() -> None:
     assert "infer_listing_bootstrap" in JOB
-    assert "select_vertical(page, provider, hints)" in JOB
-    assert "select_brand(page, provider, hints)" in JOB
+    assert "_advance_listing_to_step3" in JOB
+    assert "select_vertical(page, provider, hints)" in WORKFLOW
+    assert "select_brand_to_product_info(page, provider, hints)" in WORKFLOW
     assert "_prepare_step3(args, run_dir=run_dir, page=page, manifest=manifest)" in JOB
     assert '"makro_execute_listing.py"' in RUNNER
     assert '"--all-step3"' in RUNNER
     assert '"--allow-section-save"' in RUNNER
     assert '"--upload-image"' in RUNNER
+
+
+def test_batch_and_single_share_page_progress_reconciliation() -> None:
+    assert "def _advance_listing_to_step3(" in WORKFLOW
+    assert "state-machine reconcile" in WORKFLOW
+    assert "allow_initial_later_stage" in WORKFLOW
+    assert "_advance_listing_to_step3(" in JOB
+    assert "_listing_stage(page)" in JOB
 
 
 def test_batch_and_single_are_separate_full_workspaces_in_one_window() -> None:
