@@ -65,12 +65,30 @@ def test_scroll_hot_path_is_widget_only_and_single_pass() -> None:
     assert "QTimer.singleShot(0, sync_scroll_glass)" not in PAGE_SOURCE
 
 
-def test_glass_background_remains_live_in_viewport_coordinates() -> None:
+def test_scroll_geometry_is_cached_and_reused_by_paint_and_parallax() -> None:
+    assert "self._last_rects: dict[QFrame, QRectF]" in SOURCE
+    assert "def card_rect(self, frame: QFrame) -> QRectF:" in SOURCE
+    assert "self._proxy_by_frame = {frame: proxy for frame, proxy in targets}" in SOURCE
+    assert "proxy = self._proxy_by_frame.get(frame)" in SOURCE
+
     paint = SOURCE.split("def paint_glass", 1)[1].split(
         "def _sync_initial_state", 1
     )[0]
     assert "for frame, proxy in self._targets:" in paint
-    assert "card_rect_in_viewport(frame)" in paint
+    assert "card_rect = layer.card_rect(frame)" in paint
+    assert "card_rect_in_viewport(frame)" not in paint
+
+    refresh = SOURCE.split("def refresh_visible_cards", 1)[1].split(
+        "def resize_to_viewport", 1
+    )[0]
+    assert "for rect in self._last_rects.values():" in refresh
+    assert "card_rect_in_viewport" not in refresh
+
+
+def test_glass_background_remains_live_in_viewport_coordinates() -> None:
+    paint = SOURCE.split("def paint_glass", 1)[1].split(
+        "def _sync_initial_state", 1
+    )[0]
     assert "self.viewport.mapTo(self.window, QPoint(0, 0))" in paint
     assert "self._quick_offset()" in paint
     assert "painter.drawPixmap(card_rect, item, source)" in paint
