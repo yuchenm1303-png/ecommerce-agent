@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from PySide6.QtCore import QEasingCurve, QObject, QVariantAnimation
+from PySide6.QtWidgets import QSizePolicy
 
 
 _PHASE_START = {
@@ -88,6 +89,20 @@ class DetailedPreparationProgress(QObject):
         self.console.progress.setRange(0, 100)
         self.console.progress.setValue(0)
         self.console.progress.setFormat("%p%")
+
+        # Failure payloads can contain very long provider messages/URLs. The
+        # Single workspace lives in a vertically scrolling QScrollArea whose
+        # content layout uses SetMinimumSize. If this label contributes its full
+        # text width, one long API error can inflate the whole page minimum width
+        # and every expanding card is then clipped beyond the right edge while
+        # the horizontal scrollbar is intentionally disabled. Keep the full text
+        # available in the label/tooltip, but never let its sizeHint own page
+        # geometry.
+        self.console.progress_detail.setMinimumWidth(0)
+        self.console.progress_detail.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         self.console.progress_detail.setText("准备 0/100 · 等待任务")
 
         self.runner.running_changed.connect(self._on_running_changed)
@@ -96,6 +111,11 @@ class DetailedPreparationProgress(QObject):
         self.runner.log.connect(self._on_log)
         self.runner.completed.connect(self._on_completed)
         self.runner.failed.connect(self._on_failed)
+
+    def _set_progress_detail(self, text: str) -> None:
+        value = str(text or "")
+        self.console.progress_detail.setText(value)
+        self.console.progress_detail.setToolTip(value)
 
     def _full_mode(self) -> bool:
         return str(getattr(self.runner, "mode", "full") or "full") == "full"
@@ -118,7 +138,7 @@ class DetailedPreparationProgress(QObject):
         self._animation.stop()
         self._target = bounded
         self.console.progress.setValue(bounded)
-        self.console.progress_detail.setText(f"准备 {bounded}/100 · {detail}")
+        self._set_progress_detail(f"准备 {bounded}/100 · {detail}")
         self._sync_overall(bounded, detail)
 
     def _set_target(self, value: int, detail: str, *, force: bool = False) -> None:
@@ -127,12 +147,12 @@ class DetailedPreparationProgress(QObject):
             bounded = max(self._target, bounded)
 
         if bounded == self._target and not force:
-            self.console.progress_detail.setText(f"准备 {bounded}/100 · {detail}")
+            self._set_progress_detail(f"准备 {bounded}/100 · {detail}")
             return
 
         current = int(self.console.progress.value())
         self._target = bounded
-        self.console.progress_detail.setText(f"准备 {bounded}/100 · {detail}")
+        self._set_progress_detail(f"准备 {bounded}/100 · {detail}")
 
         if bounded < current:
             self._set_direct(bounded, detail)
@@ -192,7 +212,7 @@ class DetailedPreparationProgress(QObject):
 
         if status == "failed":
             message = str(event.get("error") or _PHASE_DETAIL[phase])
-            self.console.progress_detail.setText(
+            self._set_progress_detail(
                 f"准备 {self._target}/100 · FAILED · {message}"
             )
 
@@ -287,7 +307,7 @@ class DetailedPreparationProgress(QObject):
         if "AI still running:" in text:
             match = _AI_STILL_RUNNING.search(text)
             if match is not None:
-                self.console.progress_detail.setText(
+                self._set_progress_detail(
                     f"准备 {self._target}/100 · {self._work_label()} · AI处理中 {match.group(1)}s"
                 )
             return
@@ -304,7 +324,7 @@ class DetailedPreparationProgress(QObject):
         if not self._full_mode():
             return
         self._animation.stop()
-        self.console.progress_detail.setText(
+        self._set_progress_detail(
             f"准备 {self._target}/100 · FAILED · {str(message or '准备流程失败')}"
         )
 
