@@ -14,37 +14,35 @@ from PySide6.QtWidgets import QFrame, QMainWindow
 _MAX_MOTION_HZ = 90.0
 _MIN_MOTION_FRAME_MS = max(1, round(1000.0 / _MAX_MOTION_HZ))
 
-# During rapid A -> B -> C traversal, browser CSS lets every old card finish its
-# transition. That is cheap in a browser compositor but pathological here because
-# each active QWidget effect may rasterize a large subtree. Only the current card
-# and one immediately previous card are visually useful; older outgoing motions
-# are stale and can be snapped back to rest.
+# During rapid A -> B -> C traversal, only the current interactive card and one
+# immediately previous outgoing card are useful. The previous card may finish its
+# return animation from one frozen composite; anything older is stale work.
 _MAX_CONCURRENT_MOTIONS = 2
 _NORMAL_SCALE = 1.0
 _NORMAL_ALPHA = 64.0
 
 # The visible hover lift is normalized to roughly three edge pixels. Re-capturing
-# a complete QWidget subtree for a fraction of a pixel is wasted work, regardless
-# of the card's absolute size. Accumulate scale until the card edge would move by
-# at least this amount, then publish one fresh composite. 0.18 px is deliberately
-# sub-pixel, so the content motion remains visually continuous while a full hover
-# normally needs only ~15-20 expensive QWidget captures instead of 30-70+.
+# a complete LIVE QWidget subtree for a fraction of a pixel is wasted work.
+# Accumulate until the edge would move by at least this sub-pixel amount.
 _CONTENT_EDGE_STEP_PX = 0.18
 _NORMAL_SCALE_EPSILON = 1e-5
 
 
 class CardInteractionPerformanceController(QObject):
-    """Bound the cost of continuous cross-card hover without changing semantics.
+    """Reduce continuous cross-card hover to one live raster owner.
 
-    This is intentionally a scheduling layer around the proven card interaction
-    implementation. It does not change hover targets, the 300 ms easing curve,
-    pointer ownership, child-widget events, glass geometry, or business controls.
+    The proven card interaction controller still owns pointer semantics, targets,
+    the 300 ms easing curve and Quick glass presentation. This scheduler changes
+    only how expensive QWidget content transforms are paid for:
 
-    The expensive path is bounded in three ways:
-      * card motion updates never exceed 90 Hz on high-refresh displays;
-      * at most two cards may keep an unfinished transform at once;
-      * QWidget content re-rasterization ignores sub-pixel edge movement until it
-        accumulates to a visible amount, while the Quick glass state stays smooth.
+      * motion ticks are capped at 90 Hz on high-refresh displays;
+      * the hovered/pressed card is always LIVE and keeps fresh child feedback;
+      * the immediately previous outgoing card is FROZEN after one composite;
+      * older outgoing cards snap to exact rest and release their images;
+      * LIVE content re-rasterization skips imperceptible sub-pixel scale deltas.
+
+    No child event filters, layout mutations or business-control interception are
+    introduced. The interaction owner remains the real QWidget tree.
     """
 
     def __init__(self, window: QMainWindow, visual: Any, card_fx: Any) -> None:
@@ -56,8 +54,16 @@ class CardInteractionPerformanceController(QObject):
         self._original_frame_interval = getattr(card_fx, "_frame_interval_ms", None)
         self._original_animate_to = getattr(card_fx, "_animate_to", None)
         self._effect_originals: list[tuple[Any, Any]] = []
+        self._effects_by_frame: dict[QFrame, Any] = {}
         self._motion_order: dict[QFrame, int] = {}
         self._motion_serial = 0
+
+        surfaces = getattr(self.visual, "_glass", None)
+        if isinstance(surfaces, dict):
+            for frame, surface in surfaces.items():
+                effect = getattr(surface, "_scale_effect", None)
+                if isinstance(frame, QFrame) and effect is not None:
+                    self._effects_by_frame[frame] = effect
 
         self._install_motion_rate_cap()
         self._install_motion_budget()
@@ -87,13 +93,38 @@ class CardInteractionPerformanceController(QObject):
             except RuntimeError:
                 pass
 
+    def _set_frame_frozen(self, frame: QFrame | None, frozen: bool) -> None:
+        if frame is None:
+            return
+        effect = self._effects_by_frame.get(frame)
+        setter = getattr(effect, "set_frozen", None)
+        if callable(setter):
+            try:
+                setter(bool(frozen))
+            except RuntimeError:
+                pass
+
+    def _should_freeze_outgoing(self, frame: QFrame, controller: Any) -> bool:
+        if frame is getattr(controller, "hovered", None):
+            return False
+        if frame is getattr(controller, "pressed", None):
+            return False
+
+        states = getattr(controller, "states", None)
+        state = states.get(frame) if isinstance(states, dict) else None
+        if state is None:
+            return False
+        return bool(getattr(state, "moving", False)) or (
+            abs(float(getattr(state, "current_scale", _NORMAL_SCALE)) - _NORMAL_SCALE)
+            > _NORMAL_SCALE_EPSILON
+        )
+
     def _retire_stale_motions(self) -> None:
         moving = getattr(self.card_fx, "_moving_frames", None)
         states = getattr(self.card_fx, "states", None)
         if not isinstance(moving, set) or not isinstance(states, dict):
             return
 
-        # Drop order metadata for motions that already completed naturally.
         for frame in tuple(self._motion_order):
             if frame not in moving:
                 self._motion_order.pop(frame, None)
@@ -110,11 +141,10 @@ class CardInteractionPerformanceController(QObject):
             state = states.get(stale)
             if state is not None:
                 try:
-                    # A card that is neither hovered nor pressed has only one
-                    # semantically correct terminal state: exact normal/rest.
                     state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)
                 except RuntimeError:
                     state.moving = False
+            self._set_frame_frozen(stale, False)
             moving.discard(stale)
             self._motion_order.pop(stale, None)
 
@@ -126,11 +156,36 @@ class CardInteractionPerformanceController(QObject):
         performance = self
 
         def animate_to(controller, frame, *, scale: float, alpha: float) -> None:  # noqa: ANN001
+            # Ownership is already updated by NekroCardInteractionController before
+            # it asks a card to animate. Keep the active owner live; an outgoing
+            # card may freeze before its first return-frame rasterization.
+            if frame is not None:
+                if frame is getattr(controller, "hovered", None) or frame is getattr(
+                    controller, "pressed", None
+                ):
+                    performance._set_frame_frozen(frame, False)
+                elif performance._should_freeze_outgoing(frame, controller):
+                    performance._set_frame_frozen(frame, True)
+
             original(frame, scale=scale, alpha=alpha)
+
             moving = getattr(controller, "_moving_frames", None)
+            states = getattr(controller, "states", None)
             if frame is not None and isinstance(moving, set) and frame in moving:
                 performance._motion_serial += 1
                 performance._motion_order[frame] = performance._motion_serial
+            elif frame is not None and isinstance(states, dict):
+                state = states.get(frame)
+                if state is not None and (
+                    not bool(getattr(state, "moving", False))
+                    and abs(
+                        float(getattr(state, "current_scale", _NORMAL_SCALE))
+                        - _NORMAL_SCALE
+                    )
+                    <= _NORMAL_SCALE_EPSILON
+                ):
+                    performance._set_frame_frozen(frame, False)
+
             performance._retire_stale_motions()
 
         self.card_fx._animate_to = MethodType(  # type: ignore[method-assign]  # noqa: SLF001
@@ -149,14 +204,9 @@ class CardInteractionPerformanceController(QObject):
             return 1.0
 
     def _install_content_scale_quantization(self) -> None:
-        surfaces = getattr(self.visual, "_glass", None)
-        if not isinstance(surfaces, dict):
-            return
-
-        for surface in tuple(surfaces.values()):
-            effect = getattr(surface, "_scale_effect", None)
+        for effect in tuple(self._effects_by_frame.values()):
             original = getattr(effect, "set_scale", None)
-            if effect is None or not callable(original):
+            if not callable(original):
                 continue
 
             performance = self
@@ -166,8 +216,8 @@ class CardInteractionPerformanceController(QObject):
                 current = float(getattr(effect_self, "scale", _NORMAL_SCALE))
 
                 if abs(requested - _NORMAL_SCALE) <= _NORMAL_SCALE_EPSILON:
-                    # Exact rest is never quantized away; this also disables the
-                    # QGraphicsEffect and returns QWidget to its cheapest path.
+                    # Exact rest is never quantized away; this disables the effect
+                    # and releases any frozen outgoing source immediately.
                     requested = _NORMAL_SCALE
                 else:
                     span = performance._effect_span(effect_self)
@@ -187,7 +237,10 @@ class CardInteractionPerformanceController(QObject):
                 timer.stop()
             except RuntimeError:
                 pass
+        for frame in tuple(self._effects_by_frame):
+            self._set_frame_frozen(frame, False)
         self._motion_order.clear()
+        self._effects_by_frame.clear()
         self._effect_originals.clear()
 
 
