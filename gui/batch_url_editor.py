@@ -271,12 +271,72 @@ class BatchUrlEditor(QWidget):
         for row in self.rows:
             row.set_locked(self.locked)
 
-    # Compatibility with the old QPlainTextEdit attribute used by a few callers.
+    # Compatibility with the old QPlainTextEdit attribute used by BatchWorkspace.
+    # Only enabled rows are exposed through this legacy text interface, so the
+    # existing normalize_batch_urls()/start_prepare path automatically ignores
+    # paused links without any runner changes.
     def setReadOnly(self, read_only: bool) -> None:  # noqa: N802
         self.set_locked(bool(read_only))
 
     def toPlainText(self) -> str:  # noqa: N802
-        return "\n".join(row.url() for row in self.rows if row.url())
+        return "\n".join(
+            row.url()
+            for row in self.rows
+            if row.is_enabled() and row.url()
+        )
 
 
-__all__ = ["BatchUrlEditor", "BatchUrlRow"]
+def install_batch_url_editor(workspace: QWidget) -> BatchUrlEditor:
+    """Replace the legacy multiline Batch input in-place, preserving its API."""
+
+    existing = getattr(workspace, "_batch_url_editor", None)
+    if isinstance(existing, BatchUrlEditor):
+        return existing
+
+    old = getattr(workspace, "url_input", None)
+    if not isinstance(old, QWidget):
+        raise RuntimeError("Batch URL editor requires the existing url_input widget")
+    host = old.parentWidget()
+    layout = host.layout() if host is not None else None
+    if host is None or not isinstance(layout, QVBoxLayout):
+        raise RuntimeError("Batch URL editor could not resolve the source-card layout")
+
+    try:
+        initial_text = str(old.toPlainText())
+    except (AttributeError, RuntimeError):
+        initial_text = ""
+    insert_at = layout.indexOf(old)
+    if insert_at < 0:
+        raise RuntimeError("Batch URL editor could not locate the legacy input")
+
+    layout.removeWidget(old)
+    old.hide()
+    editor = BatchUrlEditor(host)
+    layout.insertWidget(insert_at, editor)
+    if initial_text.strip():
+        editor.add_urls(_extract_urls(initial_text))
+
+    # Keep the public attribute intact so existing BatchWorkspace methods continue
+    # to call toPlainText()/setReadOnly() without knowing the presentation changed.
+    setattr(workspace, "_legacy_batch_url_input", old)
+    setattr(workspace, "url_input", editor)
+    setattr(workspace, "_batch_url_editor", editor)
+
+    clear_button = getattr(workspace, "clear_button", None)
+    if isinstance(clear_button, QPushButton):
+        try:
+            clear_button.clicked.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        clear_button.clicked.connect(editor.clear)
+
+    is_running = bool(getattr(workspace, "is_running", False))
+    editor.set_locked(is_running)
+    return editor
+
+
+__all__ = [
+    "BatchUrlEditor",
+    "BatchUrlRow",
+    "install_batch_url_editor",
+]
