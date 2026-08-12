@@ -7,17 +7,18 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "gui" / "scroll_local_glass.py").read_text(encoding="utf-8")
 
 
-def test_single_domain_scroll_glass_source_compiles() -> None:
+def test_viewport_glass_source_compiles() -> None:
     compile(SOURCE, str(ROOT / "gui" / "scroll_local_glass.py"), "exec")
 
 
-def test_product_source_owns_one_widget_composite_without_child_glass_layer() -> None:
-    assert "class _SingleDomainGlassEffect(QGraphicsEffect)" in SOURCE
-    assert "class _LocalGlassLayer" not in SOURCE
+def test_product_source_uses_viewport_owned_widget_glass() -> None:
+    assert "class _ViewportGlassLayer(QWidget)" in SOURCE
+    assert "class _ViewportContentScaleEffect(_CardScaleEffect)" in SOURCE
+    assert 'setObjectName("singlePageViewportGlass")' in SOURCE
+    assert "layer.stackUnder(page)" in SOURCE
+    assert "page.raise_()" in SOURCE
     assert '"heroCard"' in SOURCE
     assert '"statusRowHost"' not in SOURCE
-    assert "proxy._scale_effect = effect" in SOURCE
-    assert "frame.setGraphicsEffect(effect)" in SOURCE
 
 
 def test_product_source_leaves_the_quick_card_model() -> None:
@@ -26,30 +27,41 @@ def test_product_source_leaves_the_quick_card_model() -> None:
     assert "del states[row]" in SOURCE
 
 
-def test_scroll_hot_path_never_repaints_or_waits_for_quick_frames() -> None:
+def test_scroll_hot_path_updates_only_widget_glass_geometry() -> None:
     assert "frameSwapped" not in SOURCE
     assert ".repaint(" not in SOURCE
-    assert "valueChanged.connect(self._mark_scrolling)" in SOURCE
-    assert "_SCROLL_SETTLE_MS = 84" in SOURCE
+    assert "_SCROLL_SETTLE_MS" not in SOURCE
+    assert "valueChanged.connect(self._sync_scroll_position)" in SOURCE
 
-    block = SOURCE.split("def _mark_scrolling", 1)[1].split("def _finish_scroll", 1)[0]
-    assert "self._scrolling = True" in block
-    assert "self._settle_timer.start()" in block
+    block = SOURCE.split("def _sync_scroll_position", 1)[1].split(
+        "def _invalidate_card_region", 1
+    )[0]
+    assert "layer.sync_card_geometry()" in block
     for forbidden in (
-        "_refresh_backdrop",
-        ".update(",
-        ".repaint(",
-        "sync_geometry",
         "schedule_mask_update",
+        "card_model.sync_geometry",
+        "_refresh_backdrop",
         "frameSwapped",
+        ".repaint(",
     ):
         assert forbidden not in block
 
 
-def test_backdrop_is_resampled_only_after_scroll_settles() -> None:
-    finish = SOURCE.split("def _finish_scroll", 1)[1].split("def _invalidate_scene_cache", 1)[0]
-    assert "self._scrolling = False" in finish
-    assert "self._refresh_backdrop()" in finish
+def test_glass_background_stays_live_in_viewport_coordinates() -> None:
+    paint = SOURCE.split("def paint_glass", 1)[1].split(
+        "def _sync_initial_state", 1
+    )[0]
+    assert "card_rect_in_viewport()" in paint
+    assert "self.viewport.mapTo(self.window, QPoint(0, 0))" in paint
+    assert "self._quick_offset()" in paint
+    assert "painter.drawPixmap(card_rect, item, source)" in paint
 
     assert "animationRunningChanged" in SOURCE
-    assert "if not running:" in SOURCE
+    assert "_PARALLAX_REPAINT_MS = 16" in SOURCE
+    assert "self._parallax_timer.timeout.connect(self._parallax_tick)" in SOURCE
+
+
+def test_content_hover_scale_reuses_existing_native_effect_contract() -> None:
+    assert "from .native_visual_style import _CardScaleEffect" in SOURCE
+    assert "proxy._scale_effect = effect" in SOURCE
+    assert "frame.setGraphicsEffect(effect)" in SOURCE
