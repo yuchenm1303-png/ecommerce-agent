@@ -1,24 +1,24 @@
 from __future__ import annotations
 
+import re
+from collections import deque
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QCheckBox,
     QFrame,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -27,14 +27,6 @@ from .batch_model import BatchJob, normalize_batch_urls
 from .batch_runner import BatchController
 from .readonly_runner import RunnerConfig
 
-
-_STATUS_COLORS = {
-    "READY": QColor("#8fe1b9"),
-    "DONE": QColor("#8fe1b9"),
-    "REVIEW": QColor("#f4cb7a"),
-    "FAILED": QColor("#f18da0"),
-    "STOPPED": QColor("#f4cb7a"),
-}
 
 _STAGE_LABELS = {
     "QUEUED": "排队",
@@ -54,15 +46,335 @@ _STAGE_LABELS = {
     "STOPPED": "已停止",
 }
 
-_BATCH_DETAIL_RATIO = (0.84, 0.82)
+_STATUS_PALETTE = {
+    "READY": ("#b4f1cf", "rgba(40, 150, 105, 0.24)"),
+    "DONE": ("#b4f1cf", "rgba(40, 150, 105, 0.24)"),
+    "REVIEW": ("#ffe0a0", "rgba(190, 132, 37, 0.24)"),
+    "FAILED": ("#ffb2c0", "rgba(190, 63, 87, 0.25)"),
+    "STOPPED": ("#ffe0a0", "rgba(190, 132, 37, 0.22)"),
+}
+
+_PHASES = (
+    ("SOURCE", 8),
+    ("PRODUCT", 25),
+    ("VERTICAL", 42),
+    ("BRAND", 58),
+    ("RESOLVE", 76),
+    ("EXECUTE", 82),
+    ("VERIFY", 94),
+)
+
+_JOB_LOG_LINE = re.compile(r"^\[(JOB-\d+)(?:\s*·[^\]]+)?\]\s?(.*)$")
+_BATCH_DETAIL_RATIO = (0.88, 0.86)
+_MAX_JOB_LOG_LINES = 180
+
+
+class BatchJobCard(QFrame):
+    """Lightweight persistent card for one supplier URL / owned Makro tab."""
+
+    def __init__(
+        self,
+        job_id: str,
+        *,
+        details_callback: Callable[[str], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.job_id = job_id
+        self._job: BatchJob | None = None
+        self._details_callback = details_callback
+        self._logs: deque[str] = deque(maxlen=_MAX_JOB_LOG_LINES)
+        self._log_view: QPlainTextEdit | None = None
+        self._expanded = False
+
+        self.setObjectName("batchJobCard")
+        self.setStyleSheet(
+            """
+            QFrame#batchJobCard {
+                background: rgba(13, 29, 52, 82);
+                border: 1px solid rgba(255, 255, 255, 32);
+                border-radius: 14px;
+            }
+            QFrame#batchJobDetails {
+                background: rgba(5, 15, 30, 72);
+                border: 1px solid rgba(255, 255, 255, 22);
+                border-radius: 10px;
+            }
+            """
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        heading = QVBoxLayout()
+        heading.setSpacing(1)
+        self.job_label = QLabel(job_id)
+        self.job_label.setObjectName("sectionEyebrow")
+        self.product_label = QLabel("等待商品信息")
+        self.product_label.setObjectName("cardTitle")
+        self.product_label.setTextFormat(Qt.PlainText)
+        self.product_label.setWordWrap(True)
+        heading.addWidget(self.job_label)
+        heading.addWidget(self.product_label)
+        header.addLayout(heading, 1)
+
+        self.progress_text = QLabel("0%")
+        self.progress_text.setObjectName("cardHint")
+        self.progress_text.setStyleSheet("font-weight: 700;")
+        self.status_chip = QLabel("排队")
+        self.status_chip.setTextFormat(Qt.PlainText)
+        self.status_chip.setAlignment(Qt.AlignCenter)
+        self.status_chip.setMinimumWidth(82)
+        header.addWidget(self.progress_text, 0, Qt.AlignTop)
+        header.addWidget(self.status_chip, 0, Qt.AlignTop)
+        layout.addLayout(header)
+
+        self.url_label = QLabel("—")
+        self.url_label.setObjectName("cardHint")
+        self.url_label.setTextFormat(Qt.PlainText)
+        self.url_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.url_label.setToolTip("Supplier URL")
+        layout.addWidget(self.url_label)
+
+        self.phase_label = QLabel()
+        self.phase_label.setTextFormat(Qt.RichText)
+        self.phase_label.setObjectName("cardHint")
+        layout.addWidget(self.phase_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(7)
+        self.progress_bar.setStyleSheet(
+            """
+            QProgressBar {
+                border: 0;
+                border-radius: 3px;
+                background: rgba(255, 255, 255, 24);
+            }
+            QProgressBar::chunk {
+                border-radius: 3px;
+                background: rgba(150, 220, 255, 190);
+            }
+            """
+        )
+        layout.addWidget(self.progress_bar)
+
+        self.meta_label = QLabel("Vertical —   ·   Brand —   ·   READY 0   ·   BLOCKED 0")
+        self.meta_label.setObjectName("cardHint")
+        self.meta_label.setTextFormat(Qt.PlainText)
+        self.meta_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.meta_label.setWordWrap(True)
+        layout.addWidget(self.meta_label)
+
+        self.detail_label = QLabel("等待调度")
+        self.detail_label.setTextFormat(Qt.PlainText)
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setStyleSheet("font-weight: 650; color: rgba(255,255,255,220);")
+        layout.addWidget(self.detail_label)
+
+        self.error_label = QLabel()
+        self.error_label.setTextFormat(Qt.PlainText)
+        self.error_label.setWordWrap(True)
+        self.error_label.setStyleSheet(
+            "color: #ffc1cc; background: rgba(180,45,72,45);"
+            "border-radius: 7px; padding: 5px 8px;"
+        )
+        self.error_label.hide()
+        layout.addWidget(self.error_label)
+
+        log_row = QHBoxLayout()
+        log_row.setSpacing(8)
+        log_tag = QLabel("LIVE")
+        log_tag.setObjectName("sectionEyebrow")
+        self.log_preview = QLabel("等待任务日志…")
+        self.log_preview.setTextFormat(Qt.PlainText)
+        self.log_preview.setObjectName("cardHint")
+        self.log_preview.setToolTip("最近一条任务日志")
+        self.log_preview.setStyleSheet(
+            "font-family: Consolas, 'Cascadia Mono', monospace; font-size: 11px;"
+        )
+        log_row.addWidget(log_tag)
+        log_row.addWidget(self.log_preview, 1)
+        layout.addLayout(log_row)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self.open_url_button = QPushButton("商品链接")
+        self.open_url_button.setObjectName("quietButton")
+        self.open_url_button.clicked.connect(self._open_url)
+        self.open_dir_button = QPushButton("Job 目录")
+        self.open_dir_button.setObjectName("quietButton")
+        self.open_dir_button.clicked.connect(self._open_dir)
+        self.modal_button = QPushButton("详情窗口")
+        self.modal_button.setObjectName("quietButton")
+        self.modal_button.clicked.connect(
+            lambda: self._details_callback(self.job_id)
+        )
+        self.toggle_button = QPushButton("展开详情 / 日志")
+        self.toggle_button.setObjectName("quietButton")
+        self.toggle_button.clicked.connect(self._toggle_details)
+        actions.addWidget(self.open_url_button)
+        actions.addWidget(self.open_dir_button)
+        actions.addWidget(self.modal_button)
+        actions.addStretch(1)
+        actions.addWidget(self.toggle_button)
+        layout.addLayout(actions)
+
+        self.details_box = QFrame()
+        self.details_box.setObjectName("batchJobDetails")
+        self.details_box.hide()
+        self.details_layout = QVBoxLayout(self.details_box)
+        self.details_layout.setContentsMargins(11, 9, 11, 10)
+        self.details_layout.setSpacing(7)
+
+        self.details_meta = QLabel()
+        self.details_meta.setTextFormat(Qt.PlainText)
+        self.details_meta.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.details_meta.setWordWrap(True)
+        self.details_meta.setObjectName("cardHint")
+        self.details_layout.addWidget(self.details_meta)
+        layout.addWidget(self.details_box)
+
+        self._render_phase(0)
+        self._render_status("QUEUED")
+
+    def update_job(self, job: BatchJob) -> None:
+        self._job = job
+        progress = max(0, min(100, int(job.progress)))
+        product = job.product_name or _product_label(job.product_url)
+
+        self.job_label.setText(f"{job.job_id} · OWNED PRODUCT TASK")
+        self.product_label.setText(product)
+        self.product_label.setToolTip(job.product_name or job.product_url)
+        self.url_label.setText(job.product_url)
+        self.url_label.setToolTip(job.product_url)
+        self.progress_text.setText(f"{progress}%")
+        self.progress_bar.setValue(progress)
+        self._render_status(job.status)
+        self._render_phase(progress)
+
+        self.meta_label.setText(
+            f"Vertical  {job.vertical or '—'}    ·    "
+            f"Brand  {job.brand or '—'}    ·    "
+            f"READY  {job.ready}    ·    "
+            f"BLOCKED  {job.blocked}    ·    "
+            f"Required  {job.required_blocked}    ·    "
+            f"Images  {job.image_count}"
+        )
+        detail = job.stage_detail or _STAGE_LABELS.get(job.status, job.status)
+        updated = _short_timestamp(job.updated_at)
+        self.detail_label.setText(
+            f"{_STAGE_LABELS.get(job.status, job.status)}  ·  {detail}"
+            + (f"  ·  {updated}" if updated else "")
+        )
+        self.error_label.setVisible(bool(job.error))
+        self.error_label.setText(job.error or "")
+        self.open_dir_button.setEnabled(bool(job.run_dir))
+        self.open_url_button.setEnabled(bool(job.product_url))
+        self._update_details_meta()
+
+    def append_log(self, line: str) -> None:
+        clean = str(line or "").strip()
+        if not clean:
+            return
+        self._logs.append(clean)
+        preview = clean if len(clean) <= 190 else clean[:187] + "..."
+        self.log_preview.setText(preview)
+        self.log_preview.setToolTip(clean)
+        if self._log_view is not None:
+            self._log_view.appendPlainText(clean)
+
+    def log_text(self) -> str:
+        return "\n".join(self._logs)
+
+    def _render_status(self, status: str) -> None:
+        label = _STAGE_LABELS.get(status, status)
+        foreground, background = _STATUS_PALETTE.get(
+            status,
+            ("#ccecff", "rgba(69, 151, 201, 0.22)"),
+        )
+        self.status_chip.setText(label)
+        self.status_chip.setStyleSheet(
+            f"color: {foreground}; background: {background};"
+            "border: 1px solid rgba(255,255,255,30);"
+            "border-radius: 9px; padding: 4px 9px; font-weight: 720;"
+        )
+
+    def _render_phase(self, progress: int) -> None:
+        active = 0
+        for index, (_label, threshold) in enumerate(_PHASES):
+            if progress >= threshold:
+                active = index
+        pieces: list[str] = []
+        for index, (label, threshold) in enumerate(_PHASES):
+            if progress >= min(100, threshold + 14):
+                color = "rgba(180,241,207,0.94)"
+                marker = "●"
+            elif index == active:
+                color = "rgba(183,226,255,0.98)"
+                marker = "●"
+            else:
+                color = "rgba(255,255,255,0.38)"
+                marker = "○"
+            pieces.append(
+                f'<span style="color:{color}; font-weight:650;">{marker} {label}</span>'
+            )
+        self.phase_label.setText("&nbsp;&nbsp;&nbsp;".join(pieces))
+
+    def _update_details_meta(self) -> None:
+        job = self._job
+        if job is None:
+            return
+        self.details_meta.setText(
+            "\n".join(
+                (
+                    f"Supplier URL: {job.product_url}",
+                    f"Makro targetId: {job.makro_target_id or '—'}",
+                    f"Run directory: {job.run_dir or '—'}",
+                    f"Execution report: {job.execution_report or '—'}",
+                    f"Created: {job.created_at or '—'}",
+                    f"Updated: {job.updated_at or '—'}",
+                    f"Error / review reason: {job.error or '—'}",
+                )
+            )
+        )
+
+    def _ensure_log_view(self) -> None:
+        if self._log_view is not None:
+            return
+        viewer = QPlainTextEdit()
+        viewer.setObjectName("cardDetailTextView")
+        viewer.setReadOnly(True)
+        viewer.setMinimumHeight(170)
+        viewer.document().setMaximumBlockCount(_MAX_JOB_LOG_LINES)
+        viewer.setPlainText(self.log_text())
+        self.details_layout.addWidget(viewer)
+        self._log_view = viewer
+
+    def _toggle_details(self) -> None:
+        self._expanded = not self._expanded
+        if self._expanded:
+            self._ensure_log_view()
+        self.details_box.setVisible(self._expanded)
+        self.toggle_button.setText(
+            "收起详情 / 日志" if self._expanded else "展开详情 / 日志"
+        )
+
+    def _open_url(self) -> None:
+        if self._job is not None and self._job.product_url:
+            QDesktopServices.openUrl(QUrl(self._job.product_url))
+
+    def _open_dir(self) -> None:
+        if self._job is not None and self._job.run_dir:
+            _open_path(Path(self._job.run_dir).parent)
 
 
 class BatchWorkspace(QWidget):
-    """Production-oriented multi-product control tower.
-
-    It deliberately keeps the main surface job-centric. Field traces and raw
-    logs stay inside per-job artifacts instead of overwhelming the queue view.
-    """
+    """Multi-product control tower with one persistent surface per supplier URL."""
 
     def __init__(
         self,
@@ -76,6 +388,9 @@ class BatchWorkspace(QWidget):
         self.busy_guard = busy_guard or (lambda: False)
         self.controller = BatchController(self.project_root, self)
         self._jobs: list[BatchJob] = []
+        self._job_cards: dict[str, BatchJobCard] = {}
+        self._pending_logs: dict[str, deque[str]] = {}
+        self._batch_id = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -89,6 +404,7 @@ class BatchWorkspace(QWidget):
         self.controller.summary_changed.connect(self._apply_summary)
         self.controller.running_changed.connect(self._set_running)
         self.controller.state_changed.connect(self._set_state)
+        self.controller.log.connect(self._append_controller_log)
         self.controller.failed.connect(self._show_failure)
 
     @property
@@ -111,7 +427,10 @@ class BatchWorkspace(QWidget):
         title.setObjectName("cardTitle")
         title_box.addWidget(eyebrow)
         title_box.addWidget(title)
-        hint = QLabel("每行一个 1688 / supplier URL。Source 串行预取；准备完成后最多 2 个 owned Makro Tab 并行工作。")
+        hint = QLabel(
+            "每行一个 1688 / supplier URL。Source 串行预取；每个商品独立 owned Makro Tab，"
+            "准备和真实填写按 Worker 上限并行。"
+        )
         hint.setObjectName("cardHint")
         hint.setWordWrap(True)
         top.addLayout(title_box)
@@ -191,45 +510,65 @@ class BatchWorkspace(QWidget):
         card.setObjectName("glassCard")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(15, 13, 15, 14)
-        layout.setSpacing(8)
+        layout.setSpacing(9)
 
         header_row = QHBoxLayout()
         title_box = QVBoxLayout()
         title_box.setSpacing(0)
-        eyebrow = QLabel("JOB QUEUE · OWNED TAB ISOLATION")
+        eyebrow = QLabel("JOB CONTROL · OWNED TAB ISOLATION · LIVE TELEMETRY")
         eyebrow.setObjectName("sectionEyebrow")
         title = QLabel("商品任务")
         title.setObjectName("cardTitle")
         title_box.addWidget(eyebrow)
         title_box.addWidget(title)
+        self.job_count_label = QLabel("0 JOBS")
+        self.job_count_label.setObjectName("sectionEyebrow")
         self.state_label = QLabel("Idle · 等待批量链接")
         self.state_label.setObjectName("cardHint")
         header_row.addLayout(title_box)
         header_row.addStretch(1)
-        header_row.addWidget(self.state_label)
+        header_row.addWidget(self.job_count_label, 0, Qt.AlignTop)
+        header_row.addSpacing(12)
+        header_row.addWidget(self.state_label, 0, Qt.AlignTop)
         layout.addLayout(header_row)
 
-        self.table = QTableWidget(0, 9)
-        self.table.setHorizontalHeaderLabels(
-            ["Job", "Product", "Stage", "Vertical", "Brand", "READY", "BLOCKED", "Progress", "Reason"]
+        self.job_scroll = QScrollArea()
+        self.job_scroll.setObjectName("batchJobScroll")
+        self.job_scroll.setWidgetResizable(True)
+        self.job_scroll.setFrameShape(QFrame.NoFrame)
+        self.job_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.job_scroll.setStyleSheet(
+            """
+            QScrollArea#batchJobScroll {
+                background: transparent;
+                border: none;
+            }
+            QScrollArea#batchJobScroll > QWidget > QWidget {
+                background: transparent;
+            }
+            """
         )
-        self.table.setAlternatingRowColors(True)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setSortingEnabled(False)
-        self.table.verticalHeader().setVisible(False)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(8, QHeaderView.Stretch)
-        self.table.doubleClicked.connect(self._open_selected_job)
-        layout.addWidget(self.table, 1)
+
+        self.jobs_host = QWidget()
+        self.jobs_host.setObjectName("batchJobsHost")
+        self.jobs_host.setStyleSheet("QWidget#batchJobsHost { background: transparent; }")
+        self.jobs_layout = QVBoxLayout(self.jobs_host)
+        self.jobs_layout.setContentsMargins(2, 2, 2, 2)
+        self.jobs_layout.setSpacing(10)
+
+        self.empty_state = QLabel(
+            "尚未创建商品任务\n"
+            "批量准备后，每个链接会生成独立任务卡、owned tab 状态、实时进度和独立日志。"
+        )
+        self.empty_state.setObjectName("cardHint")
+        self.empty_state.setAlignment(Qt.AlignCenter)
+        self.empty_state.setWordWrap(True)
+        self.empty_state.setMinimumHeight(220)
+        self.jobs_layout.addWidget(self.empty_state)
+        self.jobs_layout.addStretch(1)
+
+        self.job_scroll.setWidget(self.jobs_host)
+        layout.addWidget(self.job_scroll, 1)
         return card
 
     def _build_action_card(self) -> QFrame:
@@ -312,7 +651,7 @@ class BatchWorkspace(QWidget):
             "确认批量真实填写",
             f"即将执行 {len(ready)} 个 READY 商品。\n\n"
             f"Makro workers: {self.worker_count.value()}\n"
-            f"Save + reopen: ON\n"
+            "Save + reopen: ON\n"
             f"Product Photos: {'ON' if self.images_check.isChecked() else 'OFF'}\n"
             "Send to QC: LOCKED / FALSE\n\n"
             "确认开始？",
@@ -332,32 +671,64 @@ class BatchWorkspace(QWidget):
 
     def _apply_jobs(self, jobs: list[BatchJob]) -> None:
         self._jobs = list(jobs)
-        self.table.setUpdatesEnabled(False)
-        try:
-            self.table.setRowCount(len(jobs))
-            for row, job in enumerate(jobs):
-                values = (
+        batch_id = self.controller.batch.batch_id if self.controller.batch is not None else ""
+        if batch_id != self._batch_id:
+            self._batch_id = batch_id
+            self._clear_job_cards()
+
+        seen: set[str] = set()
+        for job in jobs:
+            seen.add(job.job_id)
+            card = self._job_cards.get(job.job_id)
+            if card is None:
+                card = BatchJobCard(
                     job.job_id,
-                    job.product_name or _product_label(job.product_url),
-                    _STAGE_LABELS.get(job.status, job.status),
-                    job.vertical or "—",
-                    job.brand or "—",
-                    str(job.ready),
-                    str(job.blocked),
-                    f"{max(0, min(100, job.progress))}%",
-                    job.error or job.stage_detail,
+                    details_callback=self._open_job_detail,
+                    parent=self.jobs_host,
                 )
-                for column, value in enumerate(values):
-                    item = QTableWidgetItem(value)
-                    item.setToolTip(value)
-                    if column == 2 and job.status in _STATUS_COLORS:
-                        item.setForeground(_STATUS_COLORS[job.status])
-                    self.table.setItem(row, column, item)
-        finally:
-            self.table.setUpdatesEnabled(True)
+                self._job_cards[job.job_id] = card
+                self.jobs_layout.insertWidget(self.jobs_layout.count() - 1, card)
+                pending = self._pending_logs.pop(job.job_id, deque())
+                for line in pending:
+                    card.append_log(line)
+            card.update_job(job)
+
+        for job_id in list(self._job_cards):
+            if job_id in seen:
+                continue
+            card = self._job_cards.pop(job_id)
+            card.setParent(None)
+            card.deleteLater()
+
+        self.empty_state.setVisible(not jobs)
+        self.job_count_label.setText(f"{len(jobs)} JOBS")
         self.execute_button.setEnabled(
             not self.controller.is_running and any(job.status == "READY" for job in jobs)
         )
+
+    def _append_controller_log(self, text: str) -> None:
+        match = _JOB_LOG_LINE.match(str(text or "").strip())
+        if not match:
+            return
+        job_id, line = match.groups()
+        card = self._job_cards.get(job_id)
+        if card is not None:
+            card.append_log(line)
+            return
+        pending = self._pending_logs.setdefault(
+            job_id,
+            deque(maxlen=_MAX_JOB_LOG_LINES),
+        )
+        pending.append(line)
+
+    def _clear_job_cards(self) -> None:
+        for card in self._job_cards.values():
+            card.setParent(None)
+            card.deleteLater()
+        self._job_cards.clear()
+        self._pending_logs.clear()
+        self.empty_state.setVisible(True)
+        self.job_count_label.setText("0 JOBS")
 
     def _apply_summary(self, summary: dict[str, int]) -> None:
         for key, label in self.summary_labels.items():
@@ -389,32 +760,48 @@ class BatchWorkspace(QWidget):
         return "\n".join(
             (
                 f"Supplier URL\n{job.product_url}",
+                f"\nStatus\n{_STAGE_LABELS.get(job.status, job.status)}",
+                f"\nProgress\n{max(0, min(100, job.progress))}%",
                 f"\nVertical\n{job.vertical or '—'}",
                 f"\nBrand\n{job.brand or '—'}",
+                f"\nREADY / BLOCKED\n{job.ready} / {job.blocked}",
                 f"\nRequired blocked\n{job.required_blocked}",
                 f"\nProduct images\n{job.image_count}",
                 f"\nMakro targetId\n{job.makro_target_id or '—'}",
                 f"\nRun directory\n{job.run_dir or '—'}",
                 f"\nExecution report\n{job.execution_report or '—'}",
+                f"\nCreated / Updated\n{job.created_at or '—'} / {job.updated_at or '—'}",
                 f"\nLast detail\n{job.stage_detail or '—'}",
                 f"\nError / review reason\n{job.error or '—'}",
             )
         )
 
+    def _open_job_detail(self, job_id: str) -> None:
+        job = next((item for item in self._jobs if item.job_id == job_id), None)
+        if job is None:
+            return
+        if self._open_job_in_shared_modal(job):
+            return
+        QMessageBox.information(
+            self,
+            f"{job.job_id} · Batch Job",
+            self._job_detail_text(job),
+        )
+
     def _open_job_in_shared_modal(self, job: BatchJob) -> bool:
-        # The formal GUI installs one FastCardDetailController on the top-level
-        # window before BatchWorkspace is created. Reuse that exact modal so
-        # Batch details get the same Quick snapshot transition, scrim, blur and
-        # close lifecycle as Single cards / Console / settings.
         details = getattr(self.window(), "_card_details", None)
         open_custom = getattr(details, "open_custom", None)
         body_layout = getattr(details, "body_layout", None)
         if not callable(open_custom) or not isinstance(body_layout, QVBoxLayout):
             return False
 
+        card = self._job_cards.get(job.job_id)
+        live_log = card.log_text() if card is not None else ""
+
         def populate() -> None:
             summary = QLabel(
                 f"{job.job_id}   ·   {_STAGE_LABELS.get(job.status, job.status)}   ·   "
+                f"{max(0, min(100, job.progress))}%   ·   "
                 f"READY {job.ready}   ·   BLOCKED {job.blocked}"
             )
             summary.setObjectName("modalMetaLabel")
@@ -423,11 +810,20 @@ class BatchWorkspace(QWidget):
             detail = QPlainTextEdit()
             detail.setObjectName("cardDetailTextView")
             detail.setReadOnly(True)
-            detail.setPlainText(self._job_detail_text(job))
-            detail.setMinimumHeight(360)
+            text = self._job_detail_text(job)
+            if live_log:
+                text += "\n\nLIVE JOB LOG\n" + live_log
+            detail.setPlainText(text)
+            detail.setMinimumHeight(420)
             body_layout.addWidget(detail, 1)
 
             row = QHBoxLayout()
+            open_url = QPushButton("打开商品链接")
+            open_url.setObjectName("quietButton")
+            open_url.clicked.connect(
+                lambda: QDesktopServices.openUrl(QUrl(job.product_url))
+            )
+            row.addWidget(open_url)
             row.addStretch(1)
             open_dir = QPushButton("打开 Job 目录")
             open_dir.setObjectName("modalPrimaryButton")
@@ -437,32 +833,24 @@ class BatchWorkspace(QWidget):
 
         open_custom(
             title=job.product_name or _product_label(job.product_url),
-            eyebrow=f"BATCH JOB · {job.job_id}",
+            eyebrow=f"BATCH JOB · {job.job_id} · OWNED TAB",
             populate=populate,
             ratio=_BATCH_DETAIL_RATIO,
         )
         return True
 
-    def _open_selected_job(self) -> None:
-        row = self.table.currentRow()
-        if not (0 <= row < len(self._jobs)):
-            return
-        job = self._jobs[row]
-        if self._open_job_in_shared_modal(job):
-            return
-        # This path is only for standalone BatchWorkspace use without the formal
-        # application shell. Production run_local_gui always has the shared
-        # glass detail controller installed.
-        QMessageBox.information(
-            self,
-            f"{job.job_id} · Batch Job",
-            self._job_detail_text(job),
-        )
-
     def _open_batch_dir(self) -> None:
         batch = self.controller.batch
         if batch is not None:
             _open_path(Path(batch.root_dir))
+
+
+def _short_timestamp(value: str) -> str:
+    text = str(value or "")
+    if "T" not in text:
+        return text
+    tail = text.split("T", 1)[1]
+    return tail.split("+", 1)[0]
 
 
 def _product_label(url: str) -> str:
@@ -477,4 +865,4 @@ def _open_path(path: Path) -> None:
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
 
-__all__ = ["BatchWorkspace"]
+__all__ = ["BatchJobCard", "BatchWorkspace"]
