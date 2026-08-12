@@ -138,9 +138,47 @@ def test_taxonomy_mechanical_click_failure_is_not_semantic_backtracking() -> Non
         )
 
 
+def test_display_label_and_canonical_vertical_slug_are_distinct(monkeypatch) -> None:
+    page = RetryPage()
+
+    monkeypatch.setattr(vertical_selection, "_wait_for", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(vertical_selection, "is_brand_step", lambda _page: True)
+    monkeypatch.setattr(
+        vertical_selection,
+        "_current_target_values",
+        lambda _page: ("air_purifier", ""),
+    )
+
+    selected = vertical_selection._complete_exact_live_vertical(
+        page,
+        "Air Purifiers",
+    )
+
+    assert selected == "air_purifier"
+
+
+def test_stage_enum_can_lag_while_taxonomy_is_structurally_operable(monkeypatch) -> None:
+    page = RetryPage()
+
+    class ReadyTaxonomy:
+        def __init__(self, _page) -> None:
+            pass
+
+        def columns(self) -> list[list[str]]:
+            return [["Home Appliances", "Electronics"]]
+
+    monkeypatch.setattr(vertical_selection, "is_product_info_step", lambda _page: False)
+    monkeypatch.setattr(vertical_selection, "is_brand_step", lambda _page: False)
+    monkeypatch.setattr(vertical_selection, "is_vertical_step", lambda _page: False)
+    monkeypatch.setattr(vertical_selection, "ResilientMakroTaxonomyBrowser", ReadyTaxonomy)
+
+    assert vertical_selection.is_vertical_interaction_ready(page) is True
+
+
 def test_stale_partial_taxonomy_uses_exact_live_search_without_spa_reset(monkeypatch) -> None:
     page = RetryPage()
     search = FakeSearch()
+    observed: dict[str, str] = {}
 
     class StaleTaxonomy:
         def __init__(self, _page) -> None:
@@ -156,7 +194,7 @@ def test_stale_partial_taxonomy_uses_exact_live_search_without_spa_reset(monkeyp
         def click_node(self, _level: int, _node: str) -> bool:
             raise AssertionError("stale partial path should use search before tree traversal")
 
-    monkeypatch.setattr(vertical_selection, "is_vertical_step", lambda _page: True)
+    monkeypatch.setattr(vertical_selection, "is_vertical_interaction_ready", lambda _page: True)
     monkeypatch.setattr(vertical_selection, "_vertical_search_input", lambda _page: search)
     monkeypatch.setattr(vertical_selection, "ResilientMakroTaxonomyBrowser", StaleTaxonomy)
     monkeypatch.setattr(
@@ -166,11 +204,12 @@ def test_stale_partial_taxonomy_uses_exact_live_search_without_spa_reset(monkeyp
             AssertionError("stale partial path must not enter tree traversal")
         ),
     )
-    monkeypatch.setattr(
-        vertical_selection,
-        "_select_vertical_via_search",
-        lambda _page, _provider, _hints, *, wait_ms: "Air Purifiers",
-    )
+
+    def search_fallback(_page, _provider, _hints, *, wait_ms, reason):
+        observed["reason"] = reason
+        return "air_purifier"
+
+    monkeypatch.setattr(vertical_selection, "_select_via_search_with_context", search_fallback)
 
     selected = vertical_selection.select_vertical(
         page,
@@ -179,20 +218,18 @@ def test_stale_partial_taxonomy_uses_exact_live_search_without_spa_reset(monkeyp
         wait_ms=0,
     )
 
-    assert selected == "Air Purifiers"
+    assert selected == "air_purifier"
     assert search.values == [""]
+    assert "stale partial taxonomy path" in observed["reason"]
 
 
 def test_resilient_dom_reader_has_dedicated_singleton_extension_path() -> None:
     source = (ROOT / "app" / "makro" / "taxonomy_resilient.py").read_text(encoding="utf-8")
 
-    # Proven multi-row scrollable columns remain the primary detector.
     assert "p.scrollable && p.items.length >= 2" in source
-    # Singleton columns are admitted only as clickable, right-aligned extensions.
     assert "p.clickableCount < 1 || p.items.length < 1" in source
     assert "p.x <= rightmost.x + 24" in source
     assert "p.x > rightmost.x + 360" in source
-    # Read and click paths intentionally use the same column-building policy.
     assert source.count("for (let depth = 0; depth < 7 && kept.length; depth++)") == 2
 
 
@@ -204,10 +241,13 @@ def test_retry_selector_never_hard_resets_same_spa_route() -> None:
     assert "stale partial taxonomy path from a previous attempt" in source
 
 
-def test_formal_single_and_batch_use_resilient_vertical_selector() -> None:
+def test_formal_single_and_batch_share_step1_entry_and_vertical_selector() -> None:
     single = (ROOT / "makro_gui_workflow.py").read_text(encoding="utf-8")
     batch = (ROOT / "makro_batch_job.py").read_text(encoding="utf-8")
 
-    expected = "from app.makro.vertical_selection import select_vertical"
-    assert expected in single
-    assert expected in batch
+    assert "from app.makro.vertical_selection import select_vertical" in single
+    assert "from app.makro.vertical_selection import select_vertical" in batch
+    assert "from app.makro.step1_entry import prepare_single_step1_page" in single
+    assert "from app.makro.step1_entry import prepare_owned_step1_page" in batch
+    assert "_prepare_step1_page" not in single
+    assert "def _prepare_owned_step1_page" not in batch
