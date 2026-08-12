@@ -24,7 +24,6 @@ def main() -> int:
     from gui.activity_presence import install_activity_presence
     from gui.browser_session_manager import install_managed_makro_browser
     from gui.card_details_fast import install_card_details
-    from gui.card_interaction_performance import install_card_interaction_performance
     from gui.console_summary_mode import install_console_summary_mode
     from gui.console_window import MainWindow
     from gui.workflow_console_window import WorkflowMainWindow
@@ -97,9 +96,7 @@ def main() -> int:
     visual.refresh_glass_frames()
 
     # Presentation-only hot-path optimizations are installed after both Single
-    # and Batch widgets exist, but still before the first event-loop paint. This
-    # keeps visible geometry/behavior identical while avoiding repeated item
-    # allocation and PNG round-trips during later UI updates.
+    # and Batch widgets exist, but still before the first event-loop paint.
     install_ui_runtime_optimizations(window, visual)
 
     smooth_wheel = SmoothWheelFilter(window)
@@ -112,33 +109,26 @@ def main() -> int:
         raise RuntimeError("Native Quick renderer was not created")
 
     # Windows can discard the QWidget backing-store pixels while the native Quick
-    # owner is minimized even though every widget object remains alive. Keep one
-    # last-frame QWidget snapshot above the live surface during restore so the
-    # user never sees the backing store repaint card-by-card.
+    # owner is minimized even though every widget object remains alive.
     install_restore_snapshot(window, quick_window)
 
     shell = install_native_window_shell(window, quick_window)
 
-    card_fx = install_nekro_card_fx(window, visual)
-    # Continuous A -> B -> C card traversal is a worst-case QWidget raster path:
-    # old 300 ms transitions can overlap while every scale frame captures a full
-    # card subtree. Bound that presentation-only cost without touching the proven
-    # interaction semantics, controls, layout geometry or Quick glass ownership.
-    install_card_interaction_performance(window, visual, card_fx)
+    # Card performance budgeting is now native to the controller/effect hot path:
+    # one live interactive card, one frozen outgoing card, 90 Hz maximum motion
+    # clock, and sub-pixel QWidget raster publication. No runtime monkey-patching.
+    install_nekro_card_fx(window, visual)
     install_buffered_logs(window)
     effects = install_nekro_effects(window, sakura_count=3)
 
     # Keep the stabilized workspace transition implementation unchanged. Only its
-    # presentation timing tokens are tuned here: the large workspace now takes
-    # 480 ms while the tiny 300 ms switch remains quick to acknowledge input.
+    # presentation timing tokens are tuned here.
     apply_workspace_transition_tuning()
     install_workspace_transition(window, visual)
 
     shell.show()
     effects.raise_()
-    # Runtime Assistant is installed after other overlay/effect surfaces so it
-    # remains visible without modifying modal/background animation ownership.
-    # Phase 1 is Shadow Mode: observe + explain only, never click Makro.
+    # Runtime Assistant remains Phase 1 Shadow Mode: observe + explain only.
     assistant = install_runtime_assistant(window)
     assistant.raise_()
     return app.exec()
