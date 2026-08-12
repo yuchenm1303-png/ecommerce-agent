@@ -9,7 +9,7 @@ from PySide6.QtGui import QBrush, QCursor, QImage
 from PySide6.QtQuick import QQuickImageProvider
 from PySide6.QtWidgets import QMainWindow, QTableWidget, QTableWidgetItem
 
-from .batch_workspace import _STAGE_LABELS, _STATUS_COLORS, _product_label
+from .batch_workspace import _STAGE_LABELS, _STATUS_PALETTE, _product_label
 from .console_window import _AI_STATUS_COLORS
 from .main_window import STATUS_COLORS
 from .result_loader import RunResult
@@ -235,7 +235,9 @@ class UiRuntimeOptimizations(QObject):
         self._default_brush = QBrush()
         self._ai_status_brushes = {key: QBrush(color) for key, color in _AI_STATUS_COLORS.items()}
         self._final_status_brushes = {key: QBrush(color) for key, color in STATUS_COLORS.items()}
-        self._batch_status_brushes = {key: QBrush(color) for key, color in _STATUS_COLORS.items()}
+        self._batch_status_brushes = {
+            key: QBrush(foreground) for key, (foreground, _background) in _STATUS_PALETTE.items()
+        }
         self._batch_row_fingerprints: list[tuple[str, ...]] = []
         self._prep_log_filter = None
         self._real_log_filter = None
