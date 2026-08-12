@@ -36,10 +36,13 @@ _OPTION_PLACEHOLDERS = {
     "please select",
     "-- select --",
 }
-_NUMERIC_HINT = re.compile(
+_NUMERIC_NAME_HINT = re.compile(
     r"(?:^|\b)(?:price|cost|qty|quantity|stock|weight|length|width|height|depth|volume|capacity|"
     r"size|moq|minimum order|warranty|power|voltage|current|frequency|diameter|thickness|"
-    r"count|number of|pack size)(?:\b|$)|"
+    r"count|number of|pack size)(?:\b|$)",
+    re.IGNORECASE,
+)
+_NUMERIC_UNIT_HINT = re.compile(
     r"(?:^|\s)(?:kg|g|mg|cm|mm|ml|l|m|w|v|hz|mah|wh|gb|mb|tb)(?:\s|$)",
     re.IGNORECASE,
 )
@@ -123,17 +126,49 @@ def _usable_option(values: Iterable[str]) -> str:
     return cleaned[0] if cleaned else ""
 
 
+def _has_typed_live_value_control(field: dict[str, Any]) -> bool:
+    """Return True once the current value control exposes its mechanical type.
+
+    Modern live scans always include ``field_kind/type/role/inputmode``. When
+    those facts exist they are authoritative even when the control is *not*
+    numeric; legacy label heuristics must not overrule a proven text/select DOM
+    control merely because prose help text contains words such as ``current``.
+    """
+
+    for control in field.get("controls") or []:
+        if not isinstance(control, dict):
+            continue
+        if str(control.get("name") or "").endswith("_qualifier"):
+            continue
+        if any(
+            str(control.get(key) or "").strip()
+            for key in ("field_kind", "type", "role", "inputmode")
+        ):
+            return True
+    return False
+
+
 def _looks_numeric(field: dict[str, Any]) -> bool:
-    # Current live DOM control metadata is authoritative. The label regex remains
-    # only as backward compatibility for serialized schemas that predate control
-    # metadata or diagnostic fixtures without controls.
+    # Current live DOM control metadata is authoritative. Stable field identity
+    # is only a backward-compatibility fallback for old serialized schemas that
+    # predate control metadata. Free-form help/context prose is never allowed to
+    # turn a named text field numeric; it may contribute only an explicit unit.
     if is_numeric_semantic_field(field):
         return True
-    text = " | ".join(
-        str(field.get(key) or "")
-        for key in ("attribute_key", "label", "help_text", "context_text")
+    if _has_typed_live_value_control(field):
+        return False
+
+    identity_text = " | ".join(
+        re.sub(r"[_-]+", " ", str(field.get(key) or ""))
+        for key in ("attribute_key", "label")
     )
-    return bool(_NUMERIC_HINT.search(text))
+    if _NUMERIC_NAME_HINT.search(identity_text):
+        return True
+
+    unit_text = " | ".join(
+        str(field.get(key) or "") for key in ("help_text", "context_text")
+    )
+    return bool(_NUMERIC_UNIT_HINT.search(unit_text))
 
 
 def required_fallback_override(field: dict[str, Any]) -> dict[str, Any]:
