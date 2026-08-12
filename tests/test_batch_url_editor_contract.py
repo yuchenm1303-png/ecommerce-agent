@@ -19,21 +19,24 @@ def test_each_batch_link_has_independent_row_switch_and_delete_control() -> None
     assert "self.input = QLineEdit(url)" in SOURCE
 
 
-def test_compact_batch_rail_is_default_and_management_drawer_is_on_demand() -> None:
-    assert "_COMPACT_HEIGHT = 42" in SOURCE
-    assert "self.setFixedHeight(_COMPACT_HEIGHT)" in SOURCE
-    assert "self.drawer.hide()" in SOURCE
-    assert 'self.quick_input.setPlaceholderText("输入 supplier URL，Enter 加入任务队列…")' in SOURCE
+def test_multiple_link_boxes_are_always_visible_without_large_source_card() -> None:
+    assert "_VISIBLE_ROWS = 4" in SOURCE
+    assert "_ROW_HEIGHT = 32" in SOURCE
+    assert "self.setFixedHeight(_EDITOR_HEIGHT)" in SOURCE
+    assert "self._ensure_min_rows()" in SOURCE
+    assert 'hint = QLabel("每个链接独立任务 · 第 5 条起滚动")' in SOURCE
+    assert 'self.add_button = QPushButton("+ 添加链接")' in SOURCE
     assert 'self.paste_button = QPushButton("批量粘贴")' in SOURCE
-    assert 'self.manage_button = QPushButton("管理 0 ▾")' in SOURCE
-    assert "def set_expanded(self, expanded: bool)" in SOURCE
-    assert "_EXPANDED_HEIGHT if self.expanded else _COMPACT_HEIGHT" in SOURCE
+    assert "quick_input" not in SOURCE
+    assert "manage_button" not in SOURCE
 
 
-def test_multi_paste_is_split_into_individual_rows() -> None:
+def test_multi_paste_fills_existing_empty_link_boxes_before_adding_rows() -> None:
     assert '_URL_RE = re.compile(r"https?://[^\\s]+"' in SOURCE
-    assert "urls = _extract_urls(text)" in SOURCE
-    assert "self.add_urls(urls)" in SOURCE
+    assert "self.add_urls(_extract_urls(text))" in SOURCE
+    assert "target_rows = [row for row in self.rows if not row.url()]" in SOURCE
+    assert "if target_rows:" in SOURCE
+    assert "row.input.setText(url)" in SOURCE
     assert "self.rows_layout.insertWidget" in SOURCE
 
 
@@ -43,14 +46,21 @@ def test_disabled_rows_are_excluded_from_legacy_batch_prepare_input() -> None:
     assert "urls = normalize_batch_urls(self.url_input.toPlainText())" in BATCH
 
 
-def test_running_batch_collapses_and_locks_link_management() -> None:
+def test_running_batch_locks_rows_without_hiding_the_multi_link_surface() -> None:
     assert "def setReadOnly(self, read_only: bool)" in SOURCE
     assert "self.set_locked(bool(read_only))" in SOURCE
     assert "self.toggle.setEnabled(not locked)" in SOURCE
     assert "self.remove_button.setEnabled(not locked)" in SOURCE
     assert "self.paste_button.setEnabled(not self.locked)" in SOURCE
     assert "self.add_button.setEnabled(not self.locked)" in SOURCE
-    assert "if self.locked:\n            self.set_expanded(False)" in SOURCE
+    assert "set_expanded" not in SOURCE
+    assert "drawer.hide" not in SOURCE
+
+
+def test_clear_and_delete_keep_four_independent_input_slots_available() -> None:
+    assert "while len(self.rows) < _VISIBLE_ROWS:" in SOURCE
+    assert "self._ensure_min_rows()" in SOURCE
+    assert "self.rows.clear()" in SOURCE
 
 
 def test_batch_density_keeps_detailed_summary_cards_and_expanding_job_surface() -> None:
@@ -64,7 +74,7 @@ def test_batch_density_keeps_detailed_summary_cards_and_expanding_job_surface() 
     assert "root.setStretch(2, 1)" in DENSITY
 
 
-def test_formal_launcher_installs_compact_batch_density_after_editor() -> None:
+def test_formal_launcher_installs_batch_density_after_editor() -> None:
     assert "from gui.batch_url_editor import install_batch_url_editor" in RUN
     assert "from gui.batch_workspace_density import install_batch_workspace_density" in RUN
     assert "window.install_mode_workspace()" in RUN
