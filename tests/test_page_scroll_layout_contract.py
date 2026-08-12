@@ -97,12 +97,27 @@ def test_nested_wheel_scroll_chains_outward_at_inner_boundaries() -> None:
     assert "def _scroll_owner" in SMOOTH
     owner = SMOOTH.split("def _scroll_owner", 1)[1].split("def eventFilter", 1)[0]
     assert "while current is not None:" in owner
-    assert "if self._can_move(current, pixel_delta):" in owner
+    assert "if self._can_move(current, scroll_delta):" in owner
     assert "current = self._parent_scroll_area(current)" in owner
 
     event = SMOOTH.split("def eventFilter", 1)[1].split("def cleanup", 1)[0]
-    assert "owner = self._scroll_owner(area, pixel_delta)" in event
-    assert "self._scroller.push(owner.verticalScrollBar(), pixel_delta)" in event
+    assert "owner = self._scroll_owner(area, scroll_delta)" in event
+    assert "self._scroller.scroll_pixels(owner.verticalScrollBar(), scroll_delta)" in event
+    assert "self._scroller.push_impulse(owner.verticalScrollBar(), notch_delta)" in event
+
+
+def test_wheel_scrolling_is_continuous_not_fixed_step_target_easing() -> None:
+    assert "event.pixelDelta().y()" in SMOOTH
+    assert "event.angleDelta().y()" in SMOOTH
+    assert "_WHEEL_IMPULSE_PX_S" in SMOOTH
+    assert "_FRICTION_PER_S" in SMOOTH
+    assert "math.exp(-self._FRICTION_PER_S * dt)" in SMOOTH
+    assert "_ScrollMotion" in SMOOTH
+    assert "position: float" in SMOOTH
+    assert "velocity: float" in SMOOTH
+    assert "ScrollPerPixel" in SMOOTH
+    assert "PIXELS_PER_NOTCH" not in SMOOTH
+    assert "round(delta / 120" not in SMOOTH
 
 
 def test_console_summary_has_native_page_scroll_mode_and_keeps_detail_modal() -> None:
