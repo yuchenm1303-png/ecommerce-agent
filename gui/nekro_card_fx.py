@@ -89,7 +89,7 @@ class NekroCardInteractionController(QObject):
         self.states: dict[QFrame, _CardState] = {}
         self._moving_frames: set[QFrame] = set()
         self._hover_scale_cache: dict[QFrame, float] = {}
-        self._hover_scale_cache_key: tuple[int, int, int, int] | None = None
+        self._hover_scale_cache_key: tuple[int, int, int, int, int] | None = None
         self._none_samples = 0
         self.hovered: QFrame | None = None
         self.pressed: QFrame | None = None
@@ -170,14 +170,22 @@ class NekroCardInteractionController(QObject):
             float(frame.height()),
         )
 
-    def _geometry_cache_key(self) -> tuple[int, int, int, int]:
+    def _geometry_cache_key(self) -> tuple[int, int, int, int, int]:
         background = getattr(self.visual, "background", None)
         revision = int(getattr(background, "_mask_revision", -1))
+        scroll_y = 0
+        single_scroll = getattr(self.window, "_single_page_scroll", None)
+        if single_scroll is not None:
+            try:
+                scroll_y = int(single_scroll.verticalScrollBar().value())
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                scroll_y = 0
         return (
             revision,
             int(self.window.width()),
             int(self.window.height()),
             len(self.states),
+            scroll_y,
         )
 
     def _available_edge_growth(
