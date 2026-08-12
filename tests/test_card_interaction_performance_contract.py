@@ -40,18 +40,26 @@ def test_rapid_cross_card_traversal_never_keeps_unbounded_old_motions() -> None:
     assert "state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)" in retire
     assert "moving.discard(stale)" in retire
 
-    install = _body(PERF, "def _install_motion_budget", "def _install_content_scale_quantization")
+    install = _body(PERF, "def _install_motion_budget", "def _effect_span")
     assert "performance._motion_serial += 1" in install
     assert "performance._motion_order[frame] = performance._motion_serial" in install
     assert "performance._retire_stale_motions()" in install
 
 
-def test_widget_subtree_scale_skips_only_invisible_subpixel_deltas() -> None:
-    assert "_CONTENT_SCALE_EPSILON = 0.00025" in PERF
+def test_widget_subtree_rasterization_is_quantized_by_subpixel_edge_motion() -> None:
+    assert "_CONTENT_EDGE_STEP_PX = 0.18" in PERF
     assert "_NORMAL_SCALE_EPSILON = 1e-5" in PERF
+
+    span = _body(PERF, "def _effect_span", "def _install_content_scale_quantization")
+    assert "effect.parent()" in span
+    assert "float(frame.width())" in span
+    assert "float(frame.height())" in span
+
     body = _body(PERF, "def _install_content_scale_quantization", "def _cleanup")
     assert "current = float(getattr(effect_self, \"scale\", _NORMAL_SCALE))" in body
-    assert "abs(requested - current) < _CONTENT_SCALE_EPSILON" in body
+    assert "span = performance._effect_span(effect_self)" in body
+    assert "edge_delta_px = span * abs(requested - current) * 0.5" in body
+    assert "if edge_delta_px < _CONTENT_EDGE_STEP_PX:" in body
     assert "return" in body
     assert "abs(requested - _NORMAL_SCALE) <= _NORMAL_SCALE_EPSILON" in body
     assert "requested = _NORMAL_SCALE" in body
