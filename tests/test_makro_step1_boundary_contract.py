@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import app.makro.step1_entry as step1_entry
 import app.makro.vertical_selection as vertical_selection
 
 
@@ -84,16 +85,19 @@ def test_vertical_confirmation_may_precede_canonical_url_commit(monkeypatch) -> 
 def test_canonical_url_may_lag_step2_dom(monkeypatch) -> None:
     page = FakePage()
     calls = {"count": 0}
+
     def target_values(_page):
         calls["count"] += 1
         if calls["count"] < 3:
             return "", ""
         return "air_purifier", ""
+
     def bounded_wait(predicate, current, **_kwargs):
         for _ in range(5):
             if predicate(current):
                 return True
         return False
+
     monkeypatch.setattr(vertical_selection, "_current_target_values", target_values)
     monkeypatch.setattr(vertical_selection, "_wait_for", bounded_wait)
     assert vertical_selection._wait_for_canonical_vertical(page) == "air_purifier"
@@ -124,9 +128,30 @@ def test_vertical_specific_input_can_prove_step1_when_stage_enum_lags(monkeypatc
     assert vertical_selection.is_vertical_interaction_ready(page) is True
 
 
+def test_entry_gate_rejects_false_step1_without_real_vertical_input(monkeypatch) -> None:
+    page = FakePage()
+    monkeypatch.setattr(step1_entry, "is_vertical_interaction_ready", lambda _page: True)
+
+    def missing_vertical_input(_page):
+        raise RuntimeError("Makro Step 1 vertical/category search input not found")
+
+    monkeypatch.setattr(step1_entry, "_vertical_search_input", missing_vertical_input)
+    assert step1_entry._is_step1_operable(page) is False
+
+
+def test_entry_gate_accepts_ready_step1_with_real_vertical_input(monkeypatch) -> None:
+    page = FakePage()
+    vertical_input = FakeInput(placeholder="Search Vertical", name="verticalSearch")
+    monkeypatch.setattr(step1_entry, "is_vertical_interaction_ready", lambda _page: True)
+    monkeypatch.setattr(step1_entry, "_vertical_search_input", lambda _page: vertical_input)
+    assert step1_entry._is_step1_operable(page) is True
+
+
 def test_step1_entry_uses_structural_operability_and_real_portal_entry_path() -> None:
     source = (ROOT / "app" / "makro" / "step1_entry.py").read_text(encoding="utf-8")
     assert "is_vertical_interaction_ready(page)" in source
+    assert "_vertical_search_input(page)" in source
+    assert "_is_step1_operable(page)" in source
     assert "timeout_s: float = 30.0" in source
     assert "taxonomy_columns" in source
     assert "detect_stage().value" in source
