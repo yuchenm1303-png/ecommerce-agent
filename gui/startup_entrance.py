@@ -1,51 +1,48 @@
 from __future__ import annotations
 
 import math
-import random
 import time
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap, QRegion
-from PySide6.QtWidgets import QApplication, QFrame, QMainWindow, QWidget
+from PySide6.QtCore import (
+    QEasingCurve,
+    QEvent,
+    QObject,
+    QPoint,
+    QPointF,
+    QRectF,
+    Qt,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPixmap, QRegion
+from PySide6.QtWidgets import QFrame, QMainWindow, QWidget
 
 from .native_background import _GLASS_RADIUS, _NORMAL_GLASS_ALPHA, _OVERSCAN
 
 
 _FRAME_MS = 16
 _CAPTURE_DELAY_MS = 48
-_HOLD_MIN_MS = 300
-_HOLD_MAX_MS = 600
-_LOADER_FADE_MS = 300
-_CURTAIN_DELAY_MS = 300
+
+# Reference entrance with the loader phase removed. These are the original
+# choreography offsets rebased by -300 ms: curtains start immediately after the
+# first stable GUI composite is captured, while background/UI keep their relative
+# 150/200 ms stagger.
+_UI_FADE_MS = 300
+_CURTAIN_DELAY_MS = 0
 _CURTAIN_MS = 500
-_BACKGROUND_DELAY_MS = 450
+_BACKGROUND_DELAY_MS = 150
 _BACKGROUND_MS = 800
-_UI_SCALE_DELAY_MS = 500
+_UI_SCALE_DELAY_MS = 200
 _UI_SCALE_MS = 650
-_TOTAL_MS = 1300
+_TOTAL_MS = 1000
+
 _BG_START_SCALE = 1.60
 _UI_START_SCALE = 1.20
 _BG_START_DIM = 0.70
 _CURTAIN_FRACTION = 0.51
 _CURTAIN_COLOR = QColor("#333333")
-
-
-def _cubic_curve(c1x: float, c1y: float, c2x: float, c2y: float) -> QEasingCurve:
-    curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
-    curve.addCubicBezierSegment(
-        QPoint(int(c1x * 1000), int(c1y * 1000)),
-        QPoint(int(c2x * 1000), int(c2y * 1000)),
-        QPoint(1000, 1000),
-    )
-    return curve
-
-
-# QEasingCurve's cubic API wants QPointF, but constructing the control points lazily
-# keeps this module import-only in source-compile tests. Replace the integer helper
-# above with proper floating points once PySide is imported at runtime.
-from PySide6.QtCore import QPointF  # noqa: E402
 
 
 def _curve(c1x: float, c1y: float, c2x: float, c2y: float) -> QEasingCurve:
@@ -87,12 +84,12 @@ class _GlassRecord:
 
 
 class _StartupEntranceOverlay(QWidget):
-    """One-shot painter reproducing the reference page entrance choreography.
+    """One-shot curtain + camera entrance inspired by the reference page.
 
-    The overlay is intentionally self-contained and short-lived. During its 1.3 s
-    reveal it owns the visible wallpaper, frozen UI composite and loading curtains.
-    The real Quick/WWidget presentation keeps its normal architecture underneath and
-    is never rebuilt, reparented or individually animated.
+    There is deliberately no loading spinner/text phase. Before the first stable
+    GUI composite is captured, the two 51% #333 curtains simply cover the window.
+    As soon as that composite exists, the curtains open immediately while the
+    wallpaper focus/scale and frozen UI scale run on the original relative timing.
     """
 
     finished = Signal()
@@ -110,7 +107,6 @@ class _StartupEntranceOverlay(QWidget):
         self._ui_snapshot = QPixmap()
         self._ui_rect = QRectF()
         self._glass_records: list[_GlassRecord] = []
-        self._started_s = time.perf_counter()
         self._reveal_started_s: float | None = None
 
         self.setObjectName("startupEntranceOverlay")
@@ -138,7 +134,6 @@ class _StartupEntranceOverlay(QWidget):
         self.update()
 
     def begin(self) -> None:
-        self._started_s = time.perf_counter()
         if not self._timer.isActive():
             self._timer.start()
         self.update()
@@ -184,7 +179,11 @@ class _StartupEntranceOverlay(QWidget):
         width = max(1, round(float(self.width()) * _OVERSCAN))
         height = max(1, round(float(self.height()) * _OVERSCAN))
         key = (width, height)
-        if self._scene_key != key or self._sharp_scene.isNull() or self._blur_scene.isNull():
+        if (
+            self._scene_key != key
+            or self._sharp_scene.isNull()
+            or self._blur_scene.isNull()
+        ):
             self._sharp_scene = self._cover(self._sharp_source, width, height)
             self._blur_scene = self._cover(self._blur_source, width, height)
             self._scene_key = key
@@ -206,7 +205,7 @@ class _StartupEntranceOverlay(QWidget):
         return scale, blur_mix, dim
 
     def _ui_state(self, elapsed_ms: float) -> tuple[float, float]:
-        opacity_raw = _unit_progress(elapsed_ms, 0.0, _LOADER_FADE_MS)
+        opacity_raw = _unit_progress(elapsed_ms, 0.0, _UI_FADE_MS)
         opacity = float(_OPACITY_EASE.valueForProgress(opacity_raw))
         scale_raw = _unit_progress(elapsed_ms, _UI_SCALE_DELAY_MS, _UI_SCALE_MS)
         scale_eased = float(_SOFT_EASE.valueForProgress(scale_raw))
@@ -251,8 +250,16 @@ class _StartupEntranceOverlay(QWidget):
         return blur, target
 
     @staticmethod
-    def _mapped_source_rect(target: QRectF, background_target: QRectF, source: QPixmap) -> QRectF:
-        if source.isNull() or background_target.width() <= 0.0 or background_target.height() <= 0.0:
+    def _mapped_source_rect(
+        target: QRectF,
+        background_target: QRectF,
+        source: QPixmap,
+    ) -> QRectF:
+        if (
+            source.isNull()
+            or background_target.width() <= 0.0
+            or background_target.height() <= 0.0
+        ):
             return QRectF()
         sx = float(source.width()) / background_target.width()
         sy = float(source.height()) / background_target.height()
@@ -276,7 +283,11 @@ class _StartupEntranceOverlay(QWidget):
         for record in self._glass_records:
             target = _scaled_about(record.rect, ui_scale, ui_center)
             clip = _scaled_about(record.clip_rect, ui_scale, ui_center)
-            if target.isEmpty() or clip.isEmpty() or not target.intersects(QRectF(self.rect())):
+            if (
+                target.isEmpty()
+                or clip.isEmpty()
+                or not target.intersects(QRectF(self.rect()))
+            ):
                 continue
             source = self._mapped_source_rect(target, background_target, blur)
             if source.isEmpty():
@@ -320,59 +331,15 @@ class _StartupEntranceOverlay(QWidget):
         target = _scaled_about(self._ui_rect, ui_scale, center)
         painter.save()
         painter.setOpacity(opacity)
-        self._paint_glass_records(painter, blur, background_target, ui_scale, center)
+        self._paint_glass_records(
+            painter,
+            blur,
+            background_target,
+            ui_scale,
+            center,
+        )
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.drawPixmap(target, self._ui_snapshot, QRectF(self._ui_snapshot.rect()))
-        painter.restore()
-
-    def _paint_loader(self, painter: QPainter, elapsed_ms: float) -> None:
-        if self._reveal_started_s is None:
-            opacity = 1.0
-        else:
-            raw = _unit_progress(elapsed_ms, 0.0, _LOADER_FADE_MS)
-            opacity = 1.0 - float(_OPACITY_EASE.valueForProgress(raw))
-        if opacity <= 0.001:
-            return
-
-        runtime_s = time.perf_counter() - self._started_s
-        center = QRectF(self.rect()).center()
-        painter.save()
-        painter.setOpacity(opacity)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        rings = (
-            (44.0, 1.8, 1.0, 104.0),
-            (34.0, 0.6, -1.0, 82.0),
-            (24.0, 1.0, 1.0, 68.0),
-        )
-        for radius, period_s, direction, span_deg in rings:
-            rect = QRectF(
-                center.x() - radius,
-                center.y() - radius,
-                radius * 2.0,
-                radius * 2.0,
-            )
-            painter.setPen(QPen(QColor(255, 255, 255, 40), 1.5))
-            painter.drawEllipse(rect)
-            angle = direction * ((runtime_s / period_s) * 360.0)
-            painter.setPen(QPen(QColor(255, 255, 255, 215), 2.2))
-            painter.drawArc(rect, round(angle * 16.0), round(span_deg * 16.0))
-
-        title_font = QFont(self.font())
-        title_font.setPointSizeF(max(10.0, title_font.pointSizeF() + 2.0))
-        title_font.setWeight(QFont.Weight.Medium)
-        painter.setFont(title_font)
-        painter.setPen(QColor(255, 255, 255, 230))
-        title_rect = QRectF(center.x() - 150.0, center.y() + 62.0, 300.0, 28.0)
-        painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter, "ecommerce-agent")
-
-        sub_font = QFont(self.font())
-        sub_font.setPointSizeF(max(7.5, sub_font.pointSizeF() - 1.0))
-        sub_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.0)
-        painter.setFont(sub_font)
-        painter.setPen(QColor(255, 255, 255, 145))
-        sub_rect = QRectF(center.x() - 120.0, center.y() + 88.0, 240.0, 20.0)
-        painter.drawText(sub_rect, Qt.AlignmentFlag.AlignCenter, "LOADING")
         painter.restore()
 
     def _paint_curtains(self, painter: QPainter, elapsed_ms: float) -> None:
@@ -386,7 +353,10 @@ class _StartupEntranceOverlay(QWidget):
         height = float(self.height())
         panel_w = math.ceil(width * _CURTAIN_FRACTION)
         displacement = panel_w * progress
-        painter.fillRect(QRectF(-displacement, 0.0, panel_w + 1.0, height), _CURTAIN_COLOR)
+        painter.fillRect(
+            QRectF(-displacement, 0.0, panel_w + 1.0, height),
+            _CURTAIN_COLOR,
+        )
         painter.fillRect(
             QRectF(width - panel_w + displacement, 0.0, panel_w + 1.0, height),
             _CURTAIN_COLOR,
@@ -398,12 +368,11 @@ class _StartupEntranceOverlay(QWidget):
         blur, background_target = self._paint_background(painter, elapsed_ms)
         self._paint_ui(painter, elapsed_ms, blur, background_target)
         self._paint_curtains(painter, elapsed_ms)
-        self._paint_loader(painter, elapsed_ms)
         painter.end()
 
 
 class StartupEntranceController(QObject):
-    """Coordinate the reference-site entrance without changing runtime UI ownership."""
+    """Coordinate the one-shot entrance without changing runtime UI ownership."""
 
     def __init__(self, window: QMainWindow, visual: Any) -> None:
         super().__init__(window)
@@ -447,7 +416,9 @@ class StartupEntranceController(QObject):
         suspend = getattr(card_fx, "suspend_for_modal", None)
         if callable(suspend):
             try:
-                self._card_fx_was_suspended = bool(getattr(card_fx, "_suspended", False))
+                self._card_fx_was_suspended = bool(
+                    getattr(card_fx, "_suspended", False)
+                )
                 if not self._card_fx_was_suspended:
                     suspend()
             except RuntimeError:
@@ -474,11 +445,15 @@ class StartupEntranceController(QObject):
         self._started = True
         self.overlay.begin()
         self.raise_overlay()
-        QTimer.singleShot(_CAPTURE_DELAY_MS, self._capture_and_hold)
+        QTimer.singleShot(_CAPTURE_DELAY_MS, self._capture_and_reveal)
 
     def _visible_clip(self, frame: QFrame) -> tuple[QRectF, QRectF] | None:
         try:
-            if not frame.isVisibleTo(self.window) or frame.width() <= 0 or frame.height() <= 0:
+            if (
+                not frame.isVisibleTo(self.window)
+                or frame.width() <= 0
+                or frame.height() <= 0
+            ):
                 return None
             top_left = frame.mapTo(self.window, QPoint(0, 0))
             rect = QRectF(
@@ -520,10 +495,18 @@ class StartupEntranceController(QObject):
                 continue
             rect, clip = geometry
             try:
-                alpha = float(getattr(proxy, "overlay_alpha", _NORMAL_GLASS_ALPHA))
+                alpha = float(
+                    getattr(proxy, "overlay_alpha", _NORMAL_GLASS_ALPHA)
+                )
             except (RuntimeError, TypeError, ValueError):
                 alpha = _NORMAL_GLASS_ALPHA
-            records.append(_GlassRecord(rect=rect, clip_rect=clip, alpha=alpha))
+            records.append(
+                _GlassRecord(
+                    rect=rect,
+                    clip_rect=clip,
+                    alpha=alpha,
+                )
+            )
         return records
 
     def _capture_central(self) -> tuple[QPixmap, QRectF]:
@@ -551,7 +534,7 @@ class StartupEntranceController(QObject):
         )
         return pixmap, rect
 
-    def _capture_and_hold(self) -> None:
+    def _capture_and_reveal(self) -> None:
         if self._finished:
             return
         try:
@@ -560,8 +543,7 @@ class StartupEntranceController(QObject):
             self.overlay.set_snapshot(pixmap, rect, records)
         except RuntimeError:
             pass
-        delay = random.randint(_HOLD_MIN_MS, _HOLD_MAX_MS)
-        QTimer.singleShot(delay, self.overlay.begin_reveal)
+        self.overlay.begin_reveal()
 
     def _restore_runtime_presentation(self) -> None:
         if self._hidden_local_glass is not None:
@@ -627,7 +609,10 @@ class StartupEntranceController(QObject):
         return False
 
 
-def install_startup_entrance(window: QMainWindow, visual: Any) -> StartupEntranceController:
+def install_startup_entrance(
+    window: QMainWindow,
+    visual: Any,
+) -> StartupEntranceController:
     existing = getattr(window, "_startup_entrance", None)
     if isinstance(existing, StartupEntranceController):
         return existing
