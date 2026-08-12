@@ -30,18 +30,25 @@ def is_valid_gtin(value: str) -> bool:
 
 
 def _primary_control(semantic_field: dict[str, Any]) -> dict[str, Any] | None:
-    for control in semantic_field.get("controls") or []:
-        if str(control.get("name") or "").endswith("_qualifier"):
-            continue
-        return control
-    return None
+    controls = [
+        control
+        for control in semantic_field.get("controls") or []
+        if isinstance(control, dict)
+        and not str(control.get("name") or "").endswith("_qualifier")
+    ]
+    key = str(semantic_field.get("attribute_key") or "")
+    if key:
+        for control in controls:
+            if str(control.get("id") or "") == key:
+                return control
+    return controls[0] if controls else None
 
 
 def is_numeric_semantic_field(semantic_field: dict[str, Any]) -> bool:
     """Return True when the current live control itself is numeric.
 
     This is the shared DOM contract for both hard validation and deterministic
-    required-field fallbacks.  Field labels are not authoritative: Makro can use
+    required-field fallbacks. Field labels are not authoritative: Makro can use
     names such as ``Pick Pack SLA`` or ``Air Flow Level`` for real number inputs.
     """
 
