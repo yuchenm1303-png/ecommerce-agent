@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RUN = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 PAGE = (ROOT / "gui" / "page_scroll_layout.py").read_text(encoding="utf-8")
+FAST = (ROOT / "gui" / "single_scroll_glass_fastpath.py").read_text(encoding="utf-8")
 SMOOTH = (ROOT / "gui" / "smooth_scroll.py").read_text(encoding="utf-8")
 SUMMARY = (ROOT / "gui" / "console_summary_mode.py").read_text(encoding="utf-8")
 
@@ -31,8 +32,6 @@ def test_header_stays_fixed_while_single_body_becomes_one_scroll_page() -> None:
     assert "ScrollBarAsNeeded" in PAGE
     assert "outer.addWidget(scroll, 1)" in PAGE
 
-    # The installer removes only Product Source/status/body. Root item 0 remains
-    # the common application header and therefore stays fixed above the page.
     assert "_take_widget(outer, input_card)" in PAGE
     assert "_take_layout(outer, status_layout)" in PAGE
     assert "_take_widget(outer, body)" in PAGE
@@ -77,14 +76,19 @@ def test_side_diagnostics_removes_legacy_bottom_clearance() -> None:
     assert "visibly empty column under Telemetry" in PAGE
 
 
-def test_page_scroll_republishes_quick_glass_geometry_without_visual_lag() -> None:
-    assert "def sync_scroll_glass" in PAGE
-    assert 'sync_geometry = getattr(card_model, "sync_geometry", None)' in PAGE
-    assert "changed = bool(sync_geometry())" in PAGE
-    assert "background._mask_ready = False" in PAGE
-    assert "scroll.verticalScrollBar().valueChanged.connect(sync_scroll_glass)" in PAGE
-    assert "QTimer.singleShot(0, sync_scroll_glass)" in PAGE
-    assert "scroll.verticalScrollBar().valueChanged.connect(schedule_mask)" not in PAGE
+def test_page_scroll_uses_cached_fastpath_not_per_tick_widget_geometry_scan() -> None:
+    assert "install_single_scroll_glass_fastpath" in PAGE
+    assert "install_single_scroll_glass_fastpath(window, resolved_visual, scroll, page)" in PAGE
+    assert "def sync_scroll_glass" not in PAGE
+    assert "sync_geometry" not in PAGE
+    assert "schedule_mask" not in PAGE
+    assert "QTimer.singleShot(0, sync_scroll_glass)" not in PAGE
+
+    hot = FAST.split("def _on_scroll", 1)[1].split("def _on_scroll_range_changed", 1)[0]
+    assert "_apply_cached_scroll" in hot
+    assert "mapTo(" not in hot
+    assert "sync_geometry" not in hot
+    assert "schedule_mask" not in hot
 
 
 def test_nested_wheel_scroll_chains_outward_at_inner_boundaries() -> None:
@@ -113,6 +117,7 @@ def test_scroll_layout_sources_compile_without_importing_pyside() -> None:
     for path, source in (
         (ROOT / "run_local_gui.py", RUN),
         (ROOT / "gui" / "page_scroll_layout.py", PAGE),
+        (ROOT / "gui" / "single_scroll_glass_fastpath.py", FAST),
         (ROOT / "gui" / "smooth_scroll.py", SMOOTH),
         (ROOT / "gui" / "console_summary_mode.py", SUMMARY),
     ):
