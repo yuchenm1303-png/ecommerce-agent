@@ -39,6 +39,7 @@ from .sections import (
     scan_sections,
     visible_section_errors,
 )
+from .semantic_normalize import coalesce_radio_semantic_fields
 
 
 def _value_controls(field: dict[str, Any]) -> list[dict[str, Any]]:
@@ -192,7 +193,7 @@ class MakroDomainAdapter:
         )
 
     def build_semantic_fields(self, controls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return build_semantic_fields(controls)
+        return coalesce_radio_semantic_fields(build_semantic_fields(controls))
 
     def selector_for(self, control: dict[str, Any]) -> str:
         return selector_for_control(control)
@@ -287,7 +288,8 @@ class MakroDomainAdapter:
             recheck_wait_ms=recheck_wait_ms,
         )
         print(
-            f"GUI_EXEC_FIELD\tCOMPLETE\t{safe_section}\t{safe_label}\t{verification.status}",
+            f"GUI_EXEC_FIELD\tCOMPLETE\t{safe_section}\t{safe_label}\t"
+            f"{verification.status}\t{verification.execution_family or 'unknown'}",
             flush=True,
         )
         return verification
