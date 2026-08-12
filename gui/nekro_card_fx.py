@@ -12,10 +12,6 @@ from .visual_style import GlassBackdrop, VisualStyleController
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
 
-# Exact reference values from `.links .link-all .item.cards`:
-# normal inherits `.cards` background #00000040 and scale(1);
-# hover overrides to rgba(0, 0, 0, .4) and scale(1.02);
-# active returns transform to scale(1) while the hover background remains active.
 _NORMAL_SCALE = 1.00
 _HOVER_SCALE = 1.02
 _ACTIVE_SCALE = 1.00
@@ -24,27 +20,17 @@ _HOVER_ALPHA = 102.0
 _ACTIVE_ALPHA = 102.0
 _TRANSITION_MS = 300
 
-# The reference link cards are roughly 300 px on their long edge. A centered
-# scale(1.02) moves that edge about 3 px outward. Preserve that visible lift in
-# pixels instead of applying a raw 2% expansion to very large desktop cards.
 _REFERENCE_CARD_SPAN_PX = 300.0
 _REFERENCE_EDGE_GROWTH_PX = (
     _REFERENCE_CARD_SPAN_PX * (_HOVER_SCALE - _NORMAL_SCALE) * 0.5
 )
-
-# Hover remains overflow-visible, but it must not visually cover a neighbouring
-# card or be clipped by the outer window. Keep a small optical gap to adjacent
-# cards and one antialiasing pixel inside the window edge.
 _MIN_NEIGHBOR_GAP_PX = 1.0
 _WINDOW_EDGE_GAP_PX = 1.0
 
-# Pointer ownership remains one cheap local sampler. Motion presentation gets its
-# own refresh-aware timer so a 165 Hz display is not limited by the hit-test rate.
 _POINTER_SAMPLE_MS = 8
-# Crossing a tiny layout gap often produces A -> None -> B on consecutive samples.
-# Absorb exactly one None sample so browser-like card traversal becomes A -> B,
-# while a real pointer leave is delayed by at most 8 ms and remains imperceptible.
 _HOVER_NONE_GRACE_SAMPLES = 1
+_MAX_MOTION_HZ = 90.0
+_MAX_CONCURRENT_MOTIONS = 2
 
 
 def _css_ease() -> QEasingCurve:
@@ -86,21 +72,14 @@ class _CardState:
 
 
 class NekroCardInteractionController(QObject):
-    """Reference-website interaction for every registered glass card.
+    """Reference-site card motion with a bounded QWidget raster budget.
 
-    The website-list cards use one continuous 300 ms CSS transition. Their
-    original 1.02 hover scale is retained as the reference maximum, while larger
-    application cards normalize the same transform so the visible edge lift stays
-    near the reference site's ~3 px instead of growing with the card dimensions.
-
-    The final hover target also respects the real visual clearance around a card:
-    no internal layout/host clipping is reintroduced, but a card will reduce its
-    scale when needed to stay inside the outer window and avoid covering an
-    adjacent glass card.
-
-    Target changes never restart from a canned state. A press/release/leave samples
-    the current interpolated value and reverses from there, matching browser CSS
-    transform behavior. Business clicks remain owned by the real child widgets.
+    The current hovered/pressed card remains live so its complete QWidget subtree
+    can scale together while child hover/press/focus feedback stays current. The
+    immediately previous card may finish its 300 ms return using one frozen
+    composite, and anything older is retired immediately. This gives browser-like
+    continuity without allowing rapid A -> B -> C traversal to accumulate several
+    expensive live QWidget effects.
     """
 
     def __init__(self, window: QMainWindow, visual: VisualStyleController) -> None:
@@ -149,8 +128,35 @@ class NekroCardInteractionController(QObject):
                     refresh_hz = candidate
             except (RuntimeError, TypeError, ValueError):
                 pass
-        target_hz = max(60.0, min(240.0, refresh_hz))
+        target_hz = max(60.0, min(_MAX_MOTION_HZ, refresh_hz))
         return max(4, int(1000.0 / target_hz))
+
+    @staticmethod
+    def _set_content_frozen(state: _CardState | None, frozen: bool) -> None:
+        if state is None:
+            return
+        setter = getattr(state.surface, "set_content_frozen", None)
+        if callable(setter):
+            try:
+                setter(bool(frozen))
+            except RuntimeError:
+                pass
+
+    def _retire_stale_motions(self) -> None:
+        while len(self._moving_frames) > _MAX_CONCURRENT_MOTIONS:
+            protected = {frame for frame in (self.hovered, self.pressed) if frame is not None}
+            candidates = [frame for frame in self._moving_frames if frame not in protected]
+            if not candidates:
+                break
+            stale = min(candidates, key=lambda frame: self.states[frame].started_s)
+            state = self.states.get(stale)
+            if state is not None:
+                try:
+                    state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)
+                except RuntimeError:
+                    state.moving = False
+                self._set_content_frozen(state, False)
+            self._moving_frames.discard(stale)
 
     def _card_rect_in_window(self, frame: QFrame) -> QRectF | None:
         try:
@@ -165,9 +171,6 @@ class NekroCardInteractionController(QObject):
         )
 
     def _geometry_cache_key(self) -> tuple[int, int, int, int]:
-        # Native Quick already increments _mask_revision whenever card geometry is
-        # republished. Reuse that existing revision instead of installing another
-        # event filter or recomputing all neighbour geometry on every hover entry.
         background = getattr(self.visual, "background", None)
         revision = int(getattr(background, "_mask_revision", -1))
         return (
@@ -183,8 +186,6 @@ class NekroCardInteractionController(QObject):
         desired_growth: float,
         rects: dict[QFrame, QRectF],
     ) -> float:
-        """Cap centered hover growth from one cached geometry snapshot."""
-
         rect = rects.get(frame)
         if rect is None or rect.isEmpty():
             return 0.0
@@ -214,8 +215,6 @@ class NekroCardInteractionController(QObject):
                 rect.top(), other_rect.top()
             )
 
-            # A neighbour above/below only constrains vertical growth when the
-            # cards overlap horizontally. Likewise for left/right neighbours.
             if horizontal_overlap > 0.0:
                 if other_rect.top() >= rect.bottom():
                     gap = other_rect.top() - rect.bottom()
@@ -261,8 +260,6 @@ class NekroCardInteractionController(QObject):
         self._hover_scale_cache_key = self._geometry_cache_key()
 
     def _hover_scale_for(self, frame: QFrame) -> float:
-        """Return one cached size/clearance-normalized hover scale."""
-
         key = self._geometry_cache_key()
         if key != self._hover_scale_cache_key:
             self._rebuild_hover_scale_cache()
@@ -279,8 +276,6 @@ class NekroCardInteractionController(QObject):
         return None
 
     def _card_at_global(self, global_pos) -> QFrame | None:  # noqa: ANN001
-        """Resolve the deepest visible glass card under one global point locally."""
-
         try:
             local = self.window.mapFromGlobal(global_pos)
         except RuntimeError:
@@ -293,8 +288,6 @@ class NekroCardInteractionController(QObject):
         if card is not None and card.isVisibleTo(self.window) and card.isEnabled():
             return card
 
-        # childAt can return None through a transparent/native gap. The fallback
-        # remains local to this one window and is only used for that unusual case.
         if widget is not None:
             return None
         best: QFrame | None = None
@@ -321,8 +314,6 @@ class NekroCardInteractionController(QObject):
         return best
 
     def _hover_still_owns_global(self, frame: QFrame, global_pos) -> bool:  # noqa: ANN001
-        """Cheaply prove the current hover owner is still authoritative."""
-
         if not frame.isVisibleTo(self.window) or not frame.isEnabled():
             return False
         try:
@@ -332,8 +323,6 @@ class NekroCardInteractionController(QObject):
         if not frame.rect().contains(local):
             return False
 
-        # Preserve deepest-card semantics for nested glass cards without paying
-        # for a full-window hit test when the pointer remains in the same card.
         nested = self._nearest_card(frame.childAt(local))
         return nested is None or nested is frame
 
@@ -408,16 +397,22 @@ class NekroCardInteractionController(QObject):
         state.started_s = now_s
         state.moving = True
         self._moving_frames.add(frame)
+        self._retire_stale_motions()
         if not self._motion_timer.isActive():
             self._motion_timer.setInterval(self._frame_interval_ms())
             self._motion_timer.start()
 
     def _normal(self, frame: QFrame | None) -> None:
+        if frame is not None:
+            state = self.states.get(frame)
+            if frame is not self.hovered and frame is not self.pressed:
+                self._set_content_frozen(state, True)
         self._animate_to(frame, scale=_NORMAL_SCALE, alpha=_NORMAL_ALPHA)
 
     def _hover(self, frame: QFrame | None) -> None:
         if frame is None:
             return
+        self._set_content_frozen(self.states.get(frame), False)
         self._animate_to(
             frame,
             scale=self._hover_scale_for(frame),
@@ -425,6 +420,8 @@ class NekroCardInteractionController(QObject):
         )
 
     def _active(self, frame: QFrame | None) -> None:
+        if frame is not None:
+            self._set_content_frozen(self.states.get(frame), False)
         self._animate_to(frame, scale=_ACTIVE_SCALE, alpha=_ACTIVE_ALPHA)
 
     def _set_hover(self, frame: QFrame | None) -> None:
@@ -452,11 +449,10 @@ class NekroCardInteractionController(QObject):
             return
 
         previous_hover = self.hovered
-        if previous_hover is not None and previous_hover is not frame:
-            self._normal(previous_hover)
-
         self.hovered = frame
         self.pressed = frame
+        if previous_hover is not None and previous_hover is not frame:
+            self._normal(previous_hover)
         self._active(frame)
 
     def _end_press(self) -> None:
@@ -482,9 +478,6 @@ class NekroCardInteractionController(QObject):
 
         left_down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
 
-        # Once a press owner exists, intermediate hit tests cannot change press
-        # semantics; release performs one authoritative lookup. Avoid throwing
-        # away 8 ms hit-test work for the whole duration of a held click.
         if left_down and self._left_down and self.pressed is not None:
             return
 
@@ -538,6 +531,7 @@ class NekroCardInteractionController(QObject):
         self.pressed = None
         for state in self.states.values():
             try:
+                self._set_content_frozen(state, False)
                 state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)
             except RuntimeError:
                 state.moving = False
@@ -556,6 +550,7 @@ class NekroCardInteractionController(QObject):
 
         for state in self.states.values():
             try:
+                self._set_content_frozen(state, False)
                 state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)
             except RuntimeError:
                 state.moving = False
@@ -580,6 +575,7 @@ class NekroCardInteractionController(QObject):
         self._suspended = False
         for state in tuple(self.states.values()):
             try:
+                self._set_content_frozen(state, False)
                 state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)
             except RuntimeError:
                 pass
