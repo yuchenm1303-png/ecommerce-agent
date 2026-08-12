@@ -65,9 +65,14 @@ def test_workspace_and_console_get_real_reading_height_instead_of_competing() ->
     assert "field_table.setMinimumHeight(285)" in PAGE
 
 
-def test_page_scroll_republishes_quick_glass_geometry() -> None:
-    assert "scroll.verticalScrollBar().valueChanged.connect(schedule_mask)" in PAGE
-    assert "QTimer.singleShot(0, schedule_mask)" in PAGE
+def test_page_scroll_republishes_quick_glass_geometry_without_visual_lag() -> None:
+    assert "def sync_scroll_glass" in PAGE
+    assert 'sync_geometry = getattr(card_model, "sync_geometry", None)' in PAGE
+    assert "changed = bool(sync_geometry())" in PAGE
+    assert "background._mask_ready = False" in PAGE
+    assert "scroll.verticalScrollBar().valueChanged.connect(sync_scroll_glass)" in PAGE
+    assert "QTimer.singleShot(0, sync_scroll_glass)" in PAGE
+    assert "scroll.verticalScrollBar().valueChanged.connect(schedule_mask)" not in PAGE
 
 
 def test_nested_wheel_scroll_chains_outward_at_inner_boundaries() -> None:
