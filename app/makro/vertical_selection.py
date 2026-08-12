@@ -7,13 +7,13 @@ Batch flows:
 - stale partially-open taxonomy paths use Makro's own Vertical Search rather
   than attempting to reset the SPA;
 - a live display label and Makro's canonical URL vertical are intentionally
-  different identities.  For example ``Air Purifiers`` may become
-  ``air_purifier`` in the hash URL.  A verified exact-live click plus the portal
+  different identities. For example ``Air Purifiers`` may become
+  ``air_purifier`` in the hash URL. A verified exact-live click plus the portal
   confirmation/Step-2 transition proves the selection; the resulting non-empty
   URL value is then retained as the canonical vertical id.
 
-Brand verification remains strict in ``listing_creation``.  This module does
-not weaken Step 2 or any Step 3 safety gate.
+Brand verification remains strict in ``listing_creation``. This module does not
+weaken Step 2 or any Step 3 safety gate.
 """
 
 from __future__ import annotations
@@ -42,6 +42,42 @@ from .taxonomy_navigation import navigate_live_taxonomy
 from .taxonomy_resilient import ResilientMakroTaxonomyBrowser
 
 
+def _singularize_vertical_token(token: str) -> str:
+    """Normalize ordinary English display pluralisation for URL slug comparison."""
+
+    value = str(token or "").strip().casefold()
+    if len(value) > 4 and value.endswith("ies"):
+        return value[:-3] + "y"
+    if len(value) > 4 and value.endswith(("ches", "shes", "xes", "zes")):
+        return value[:-2]
+    if len(value) > 4 and value.endswith("sses"):
+        return value[:-2]
+    if len(value) > 3 and value.endswith("s") and not value.endswith("ss"):
+        return value[:-1]
+    return value
+
+
+def _vertical_identity_tokens(value: str) -> tuple[str, ...]:
+    normalized = normalize_label(value)
+    return tuple(
+        _singularize_vertical_token(token)
+        for token in normalized.split()
+        if _singularize_vertical_token(token)
+    )
+
+
+def _display_slug_equivalent(display_label: str, canonical: str) -> bool:
+    """Compare a human Vertical label with Makro's machine URL slug.
+
+    This is deliberately narrow: punctuation/space/underscore differences and
+    ordinary English pluralisation are tolerated. It is not used for Brand.
+    """
+
+    left = _vertical_identity_tokens(display_label)
+    right = _vertical_identity_tokens(canonical)
+    return bool(left and right and left == right)
+
+
 def _selected_label_visible(page: Page, selected: str) -> bool:
     selected_key = normalize_label(selected)
     if not selected_key:
@@ -60,15 +96,16 @@ def _complete_exact_live_vertical(
 ) -> str:
     """Finish one exact-live Vertical click and return Makro's canonical id.
 
-    The display label is *not* compared literally with the URL value. Makro is
+    The display label is not compared literally with the URL value. Makro is
     free to encode a singular snake_case machine id for a plural human label.
     Safety comes from the evidence chain instead:
 
     1. ``selected`` was copied from the live Makro UI and exact-clicked;
     2. Makro reaches its vertical confirmation or Step 2;
     3. the resulting listing URL exposes a non-empty canonical vertical;
-    4. when a stale canonical value existed before the click, either the value
-       changes or the exact selected label remains visible in the confirmed UI.
+    4. on a retry where the same canonical id already existed, the selected live
+       label must either be label/slug-equivalent or remain visible in the
+       confirmed UI.
     """
 
     transitioned = _wait_for(
@@ -89,7 +126,8 @@ def _complete_exact_live_vertical(
 
     previous = str(previous_canonical or "").strip()
     if previous and normalize_label(previous) == normalize_label(actual_vertical):
-        if not _selected_label_visible(page, selected):
+        equivalent = _display_slug_equivalent(selected, actual_vertical)
+        if not equivalent and not _selected_label_visible(page, selected):
             raise RuntimeError(
                 "Makro Step 1 exact-live click did not produce independently verifiable vertical state: "
                 f"selected={selected!r}, canonical={actual_vertical!r}"
@@ -206,7 +244,7 @@ def select_vertical(
     search.fill("")
     page.wait_for_timeout(wait_ms)
 
-    # A failed acceptance intentionally leaves the browser现场 intact.  If
+    # A failed acceptance intentionally leaves the browser现场 intact. If
     # multiple taxonomy columns are already open, re-clicking an already selected
     # parent cannot be distinguished reliably from a stale React child column.
     # Use Makro's own exact-live search from that state instead of resetting the
