@@ -1,0 +1,98 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+RUN = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
+PAGE = (ROOT / "gui" / "page_scroll_layout.py").read_text(encoding="utf-8")
+SMOOTH = (ROOT / "gui" / "smooth_scroll.py").read_text(encoding="utf-8")
+SUMMARY = (ROOT / "gui" / "console_summary_mode.py").read_text(encoding="utf-8")
+
+
+def test_formal_single_installs_page_scroll_after_polish_before_mode_workspace() -> None:
+    assert "from gui.page_scroll_layout import install_page_scroll_layout" in RUN
+    assert "install_ui_polish(window)" in RUN
+    assert "install_page_scroll_layout(window, visual)" in RUN
+    assert "window.install_mode_workspace()" in RUN
+    assert RUN.index("install_ui_polish(window)") < RUN.index("install_page_scroll_layout(window, visual)")
+    assert RUN.index("install_page_scroll_layout(window, visual)") < RUN.index("window.install_mode_workspace()")
+
+
+def test_header_stays_fixed_while_single_body_becomes_one_scroll_page() -> None:
+    assert 'scroll.setObjectName("singlePageScroll")' in PAGE
+    assert "scroll.setWidgetResizable(True)" in PAGE
+    assert "ScrollBarAlwaysOff" in PAGE
+    assert "ScrollBarAsNeeded" in PAGE
+    assert "outer.addWidget(scroll, 1)" in PAGE
+
+    # The installer removes only the Product Source/status/body items. It never
+    # takes root item 0, which remains the common fixed application header.
+    assert "_take_widget(outer, input_card)" in PAGE
+    assert "_take_layout(outer, status_layout)" in PAGE
+    assert "_take_widget(outer, body)" in PAGE
+    assert "outer.takeAt(0)" not in PAGE
+
+
+def test_existing_business_widgets_are_reparented_not_rebuilt() -> None:
+    assert "input_card.setParent(page)" in PAGE
+    assert "workspace.setParent(page)" in PAGE
+    assert "console.setParent(page)" in PAGE
+    assert "page_layout.addWidget(input_card)" in PAGE
+    assert "page_layout.addWidget(workspace)" in PAGE
+    assert "page_layout.addWidget(console)" in PAGE
+    assert 'setattr(window, "_ui_polish_body_splitter", None)' in PAGE
+
+    # Never manufacture replacement business widgets/runners in a presentation
+    # layout installer.
+    assert "ReadOnlyRunner(" not in PAGE
+    assert "RealExecutionRunner(" not in PAGE
+    assert "AcceptanceConsole(" not in PAGE
+
+
+def test_workspace_and_console_get_real_reading_height_instead_of_competing() -> None:
+    assert "_WORKSPACE_MIN_HEIGHT = 420" in PAGE
+    assert "_CONSOLE_MIN_HEIGHT = 420" in PAGE
+    assert "_CONSOLE_TABS_MIN_HEIGHT = 250" in PAGE
+    assert "_CONSOLE_LOG_MIN_HEIGHT = 180" in PAGE
+    assert "workspace.setMinimumHeight(_WORKSPACE_MIN_HEIGHT)" in PAGE
+    assert "console.setMinimumHeight(_CONSOLE_MIN_HEIGHT)" in PAGE
+    assert "tabs.setMinimumHeight(_CONSOLE_TABS_MIN_HEIGHT)" in PAGE
+    assert "log_view.setMinimumHeight(_CONSOLE_LOG_MIN_HEIGHT)" in PAGE
+    assert "field_table.setMinimumHeight(285)" in PAGE
+
+
+def test_page_scroll_republishes_quick_glass_geometry() -> None:
+    assert "scroll.verticalScrollBar().valueChanged.connect(schedule_mask)" in PAGE
+    assert "QTimer.singleShot(0, schedule_mask)" in PAGE
+
+
+def test_nested_wheel_scroll_chains_outward_at_inner_boundaries() -> None:
+    assert "def _can_move" in SMOOTH
+    assert "def _parent_scroll_area" in SMOOTH
+    assert "def _scroll_owner" in SMOOTH
+    owner = SMOOTH.split("def _scroll_owner", 1)[1].split("def eventFilter", 1)[0]
+    assert "while current is not None:" in owner
+    assert "if self._can_move(current, pixel_delta):" in owner
+    assert "current = self._parent_scroll_area(current)" in owner
+
+    event = SMOOTH.split("def eventFilter", 1)[1].split("def cleanup", 1)[0]
+    assert "owner = self._scroll_owner(area, pixel_delta)" in event
+    assert "self._scroller.push(owner.verticalScrollBar(), pixel_delta)" in event
+
+
+def test_console_summary_has_native_page_scroll_mode() -> None:
+    assert 'self.page_scroll = getattr(window, "_single_page_scroll", None)' in SUMMARY
+    assert "if isinstance(self.page_scroll, QScrollArea):" in SUMMARY
+    assert "self.console.setMinimumHeight(_PAGE_SUMMARY_MIN)" in SUMMARY
+    assert "self.details.open_console_details()" in SUMMARY
+
+
+def test_scroll_layout_sources_compile_without_importing_pyside() -> None:
+    for path, source in (
+        (ROOT / "run_local_gui.py", RUN),
+        (ROOT / "gui" / "page_scroll_layout.py", PAGE),
+        (ROOT / "gui" / "smooth_scroll.py", SMOOTH),
+        (ROOT / "gui" / "console_summary_mode.py", SUMMARY),
+    ):
+        compile(source, str(path), "exec")
