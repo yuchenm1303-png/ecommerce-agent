@@ -19,14 +19,16 @@ from app.browser_page_owner import page_target_id
 from app.browser_session import EdgeHarness, is_cdp_ready
 from app.makro.listing_creation import MAKRO_NEW_LISTING_URL, infer_listing_bootstrap
 from app.makro.step1_entry import prepare_owned_step1_page
-from app.makro.step3_transition import (
-    dismiss_joyride_overlay,
-    select_brand_to_product_info,
-)
-from app.makro.vertical_selection import select_vertical
 from app.providers.registry import ProviderConfigurationError, build_semantic_provider
 from app.source_capture import SourceAccessBlocked, capture_product_source
-from makro_gui_workflow import _phase, _prepare_step3, _write_manifest, build_parser
+from makro_gui_workflow import (
+    _advance_listing_to_step3,
+    _listing_stage,
+    _phase,
+    _prepare_step3,
+    _write_manifest,
+    build_parser,
+)
 from makro_one_link import _provider_config
 
 
@@ -66,6 +68,10 @@ def main() -> int:
     }
     _write_manifest(manifest_path, manifest)
     current = "source"
+
+    def set_current_phase(name: str) -> None:
+        nonlocal current
+        current = name
 
     try:
         _phase("source", "START")
@@ -119,30 +125,33 @@ def main() -> int:
             manifest["makro_target_id"] = target_id
             _write_manifest(manifest_path, manifest)
 
-            current = "step1"
-            _phase("step1", "START")
-            prepare_owned_step1_page(page)
-            dismiss_joyride_overlay(page)
-            vertical = select_vertical(page, provider, hints)
-            manifest["vertical"] = vertical
-            manifest["page_url"] = page.url
-            manifest["status"] = "step1_complete"
-            _write_manifest(manifest_path, manifest)
-            _phase("step1", "COMPLETE", vertical)
+            def prepare_owned_current_page():
+                try:
+                    prepare_owned_step1_page(page)
+                except RuntimeError:
+                    # The owned tab may legitimately advance while the pre-Step1
+                    # helper is waiting. Once this exact invocation moved the tab,
+                    # the shared state machine can reconcile Step 2/3 safely.
+                    if _listing_stage(page) not in {"step2", "step3"}:
+                        raise
+                return page
 
-            current = "step2"
-            _phase("step2", "START")
-            brand, page = select_brand_to_product_info(page, provider, hints)
+            page, _vertical, _brand = _advance_listing_to_step3(
+                page=page,
+                prepare_step1=prepare_owned_current_page,
+                provider=provider,
+                hints=hints,
+                manifest=manifest,
+                manifest_path=manifest_path,
+                allow_initial_later_stage=False,
+                set_current=set_current_phase,
+            )
             harness.page = page
-            # The portal normally stays in the same tab, but if Create New
-            # Listing replaces the Chromium target, ownership must follow the
-            # recovered Step 3 Page rather than preserving a stale Step 1 id.
+            # Step 2 -> Step 3 may replace the Chromium target. Ownership must
+            # follow the exact recovered Step 3 page before Resolver starts.
             manifest["makro_target_id"] = page_target_id(page)
-            manifest["brand"] = brand
             manifest["page_url"] = page.url
-            manifest["status"] = "step2_complete"
             _write_manifest(manifest_path, manifest)
-            _phase("step2", "COMPLETE", brand)
 
             current = "step3"
             _phase("step3", "START")
