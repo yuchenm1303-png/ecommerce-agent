@@ -22,6 +22,7 @@ def main() -> int:
         return 2
 
     from gui.activity_presence import install_activity_presence
+    from gui.batch_job_controls import install_batch_job_controls
     from gui.batch_url_editor import install_batch_url_editor
     from gui.browser_session_manager import install_managed_makro_browser
     from gui.card_details_fast import install_card_details
@@ -108,6 +109,10 @@ def main() -> int:
     # interface, but the presentation is now one independently switchable row per
     # product. Only enabled rows are exposed to the existing start_prepare path.
     install_batch_url_editor(window.batch_workspace)
+    # Each owned product card gets its own scheduler controls. The control layer
+    # only selects existing canonical queues/executor paths; it never duplicates
+    # Resolver, Makro execution or Product Photos business logic.
+    install_batch_job_controls(window.batch_workspace)
     install_workspace_mode_switch(window)
     # Formal GUI owns one dedicated Makro Edge/Profile. 9222 remains an internal
     # transport detail; Single and Batch share one login session and Batch keeps
