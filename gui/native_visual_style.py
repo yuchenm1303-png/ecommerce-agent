@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QRectF, Qt, QTimer
+from PySide6.QtCore import QEvent, QModelIndex, QObject, QRectF, Qt, QTimer
 from PySide6.QtGui import QCursor, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
@@ -20,36 +20,28 @@ _EFFECT_BOUND_SCALE = 1.04
 
 
 class _CardScaleEffect(QGraphicsEffect):
-    """Scale one cached QWidget subtree image around the card center.
+    """Scale the complete live QWidget content subtree around the card center.
 
-    Quick owns the live glass shell. QWidget content is rasterized once when a
-    scale interaction becomes active, then the same pixmap is transformed for the
-    remaining 300 ms motion. If the real source changes, Qt calls sourceChanged()
-    and the cache is rebuilt on the next draw. This matches browser compositor
-    behavior much more closely than repainting every child on every scale tick.
+    Quick owns the glass shell itself. This effect owns only the QWidget content
+    painted above that shell. Both receive the same scale value from one card
+    interaction state, so the two renderers reproduce one CSS card transform
+    without resizing layouts or animating individual children.
+
+    The source must remain live while the card is scaled. Child widgets such as
+    buttons and editors keep changing their own paint state for hover, press,
+    focus, selection and cursor feedback while the parent card remains hovered.
+    Keeping a manual source-pixmap cache here freezes those local visual states,
+    so draw() always transforms Qt's current source instead of a retained image.
     """
 
     def __init__(self, parent: QObject) -> None:
         super().__init__(parent)
         self._scale = 1.0
-        self._cached_source: QPixmap | None = None
-        self._cached_offset = QPoint()
         self.setEnabled(False)
 
     @property
     def scale(self) -> float:
         return self._scale
-
-    def _clear_source_cache(self) -> None:
-        self._cached_source = None
-        self._cached_offset = QPoint()
-
-    def sourceChanged(self, flags) -> None:  # noqa: ANN001, N802
-        # QGraphicsEffect explicitly requires custom caches to be purged whenever
-        # the source appearance or bounds change. Animation-only update() calls do
-        # not invalidate the source, so steady transform frames keep the pixmap.
-        self._clear_source_cache()
-        super().sourceChanged(flags)
 
     def set_scale(self, scale: float) -> None:
         scale = max(0.96, min(_EFFECT_BOUND_SCALE, float(scale)))
@@ -58,14 +50,10 @@ class _CardScaleEffect(QGraphicsEffect):
         self._scale = scale
         active = abs(scale - 1.0) > 1e-4
         if self.isEnabled() != active:
-            if active:
-                self._clear_source_cache()
             self.setEnabled(active)
             # The effect uses one fixed maximum bounding rect for its whole active
             # lifetime. Intermediate hover frames invalidate pixels only.
             self.updateBoundingRect()
-            if not active:
-                self._clear_source_cache()
         self.update()
 
     def boundingRectFor(self, source_rect: QRectF) -> QRectF:  # noqa: N802
@@ -81,32 +69,9 @@ class _CardScaleEffect(QGraphicsEffect):
             half_h * 2.0,
         )
 
-    def _source_snapshot(self) -> tuple[QPixmap | None, QPoint]:
-        pixmap = self._cached_source
-        if pixmap is not None and not pixmap.isNull():
-            return pixmap, self._cached_offset
-
-        offset = QPoint()
-        pixmap = self.sourcePixmap(
-            Qt.CoordinateSystem.LogicalCoordinates,
-            offset,
-            QGraphicsEffect.PixmapPadMode.NoPad,
-        )
-        if pixmap.isNull():
-            return None, QPoint()
-
-        self._cached_source = pixmap
-        self._cached_offset = QPoint(offset)
-        return pixmap, self._cached_offset
-
     def draw(self, painter: QPainter) -> None:  # type: ignore[override]
         scale = self._scale
         if abs(scale - 1.0) <= 1e-4:
-            self.drawSource(painter)
-            return
-
-        pixmap, offset = self._source_snapshot()
-        if pixmap is None:
             self.drawSource(painter)
             return
 
@@ -117,7 +82,9 @@ class _CardScaleEffect(QGraphicsEffect):
         painter.translate(center)
         painter.scale(scale, scale)
         painter.translate(-center)
-        painter.drawPixmap(offset, pixmap)
+        # Keep the complete QWidget subtree live. This preserves every child's
+        # own hover/pressed/focus paint while still applying one parent transform.
+        self.drawSource(painter)
         painter.restore()
 
 
