@@ -127,7 +127,7 @@ def test_vertical_specific_input_can_prove_step1_when_stage_enum_lags(monkeypatc
 def test_step1_entry_uses_structural_operability_and_real_portal_entry_path() -> None:
     source = (ROOT / "app" / "makro" / "step1_entry.py").read_text(encoding="utf-8")
     assert "is_vertical_interaction_ready(page)" in source
-    assert "timeout_s=30.0" in source
+    assert "timeout_s: float = 30.0" in source
     assert "taxonomy_columns" in source
     assert "detect_stage().value" in source
     assert "page.goto(MAKRO_HOME_URL" in source
