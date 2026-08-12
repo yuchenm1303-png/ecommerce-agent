@@ -6,12 +6,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "gui" / "scroll_local_glass.py").read_text(encoding="utf-8")
 PAGE_SOURCE = (ROOT / "gui" / "page_scroll_layout.py").read_text(encoding="utf-8")
+CARD_FX_SOURCE = (ROOT / "gui" / "nekro_card_fx.py").read_text(encoding="utf-8")
 RUN_SOURCE = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
 def test_final_viewport_glass_sources_compile() -> None:
     compile(SOURCE, str(ROOT / "gui" / "scroll_local_glass.py"), "exec")
     compile(PAGE_SOURCE, str(ROOT / "gui" / "page_scroll_layout.py"), "exec")
+    compile(CARD_FX_SOURCE, str(ROOT / "gui" / "nekro_card_fx.py"), "exec")
 
 
 def test_one_viewport_compositor_owns_all_registered_scrolling_cards() -> None:
@@ -107,6 +109,16 @@ def test_every_migrated_card_keeps_existing_hover_press_content_effect() -> None
     assert "frame.setGraphicsEffect(effect)" in SOURCE
     assert "proxy._scale_effect = effect" in SOURCE
     assert "self._invalidate_glass(self._frame)" in SOURCE
+
+
+def test_hover_clearance_cache_tracks_widget_scroll_without_quick_mask_churn() -> None:
+    key = CARD_FX_SOURCE.split("def _geometry_cache_key", 1)[1].split(
+        "def _available_edge_growth", 1
+    )[0]
+    assert 'getattr(self.window, "_single_page_scroll", None)' in key
+    assert "single_scroll.verticalScrollBar().value()" in key
+    assert "scroll_y" in key
+    assert 'getattr(background, "_mask_revision", -1)' in key
 
 
 def test_launcher_installs_final_viewport_glass_after_all_single_cards_exist() -> None:
