@@ -13,6 +13,8 @@ from .semantic_grounding import GroundedSource, IMAGE_KIND
 
 IMAGE_EVIDENCE_CONTRACT_VERSION = 1
 IMAGE_EVIDENCE_CACHE_VERSION = 1
+_IMAGE_BATCH_MAX_ATTEMPTS = 3
+_IMAGE_BATCH_BACKOFF_SECONDS = (0.35, 0.85)
 
 
 class ImageEvidenceError(ValueError):
@@ -227,27 +229,88 @@ class _BatchResult:
     warning: str = ""
 
 
+def _exception_text(exc: BaseException) -> str:
+    parts: list[str] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        parts.append(str(current))
+        cause = getattr(current, "__cause__", None)
+        current = cause if isinstance(cause, BaseException) else None
+    return " ".join(parts).casefold()
+
+
+def _is_retryable_image_batch_error(exc: BaseException) -> bool:
+    """Retry only model-output/structured-response failures, never account/config errors."""
+
+    if isinstance(exc, ImageEvidenceError):
+        # These errors happen after a model response arrived but its image partition
+        # or per-image JSON shape did not satisfy the deterministic contract.
+        return True
+
+    text = _exception_text(exc)
+    if "openai-compatible api 未返回可解析的 json object" in text:
+        return True
+    if "openai-compatible api 返回空文本" in text:
+        return True
+
+    # DashScope/Qwen occasionally aborts native response_format generation when
+    # the partial model output becomes invalid JSON. The service itself labels
+    # this as retryable, despite returning HTTP 400 / invalid_parameter_error.
+    return (
+        "response_format" in text
+        and (
+            "model output became abnormal" in text
+            or "partial output may be incomplete or invalid json" in text
+        )
+    )
+
+
 def _run_batch(provider: JSONTaskProvider, index: int, images: list[GroundedSource]) -> _BatchResult:
     try:
-        raw = provider.extract_json(build_image_evidence_request(images))
-        keyed = raw.get("images") if isinstance(raw, dict) else None
-        if not isinstance(keyed, dict) or set(keyed) != {source.source_id for source in images}:
-            raise ImageEvidenceError("image observation response did not contain the exact image_id partition")
-        observations = [
-            ImageObservation.from_mapping(keyed[source.source_id], source=source)
-            for source in images
-            if isinstance(keyed.get(source.source_id), dict)
-        ]
-        if len(observations) != len(images):
-            raise ImageEvidenceError("image observation response omitted an image")
-        return _BatchResult(index=index, observations=observations, model_calls=1)
+        request = build_image_evidence_request(images)
     except Exception as exc:
         return _BatchResult(
             index=index,
             observations=[],
-            model_calls=1,
-            warning=f"image evidence batch {index} failed: {exc}",
+            model_calls=0,
+            warning=f"image evidence batch {index} failed before model call: {exc}",
         )
+
+    model_calls = 0
+    last_error: BaseException | None = None
+    for attempt in range(1, _IMAGE_BATCH_MAX_ATTEMPTS + 1):
+        try:
+            model_calls += 1
+            raw = provider.extract_json(request)
+            keyed = raw.get("images") if isinstance(raw, dict) else None
+            if not isinstance(keyed, dict) or set(keyed) != {source.source_id for source in images}:
+                raise ImageEvidenceError("image observation response did not contain the exact image_id partition")
+            observations = [
+                ImageObservation.from_mapping(keyed[source.source_id], source=source)
+                for source in images
+                if isinstance(keyed.get(source.source_id), dict)
+            ]
+            if len(observations) != len(images):
+                raise ImageEvidenceError("image observation response omitted an image")
+            return _BatchResult(index=index, observations=observations, model_calls=model_calls)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= _IMAGE_BATCH_MAX_ATTEMPTS or not _is_retryable_image_batch_error(exc):
+                break
+            delay = _IMAGE_BATCH_BACKOFF_SECONDS[min(attempt - 1, len(_IMAGE_BATCH_BACKOFF_SECONDS) - 1)]
+            time.sleep(delay)
+
+    attempts = model_calls
+    return _BatchResult(
+        index=index,
+        observations=[],
+        model_calls=model_calls,
+        warning=(
+            f"image evidence batch {index} failed after {attempts} model attempt(s): {last_error}"
+        ),
+    )
 
 
 @dataclass(slots=True)
