@@ -13,10 +13,12 @@ Batch flows:
   URL value is then retained as the canonical vertical id.
 
 Makro may delay writing that canonical URL value until the user advances from
-the Vertical confirmation card into Step 2. The confirmation state is therefore
-verified from the live UI first; canonical URL verification happens after the
-Step-2 transition. Brand verification remains strict in ``listing_creation``.
-This module does not weaken Step 2 or any Step 3 safety gate.
+the Vertical confirmation card into Step 2, and the URL update itself may lag
+slightly behind the Step-2 DOM render. The confirmation state is therefore
+verified from the live UI first; canonical URL verification happens only after
+the Step-2 transition and uses a bounded wait. Brand verification remains strict
+in ``listing_creation``. This module does not weaken Step 2 or any Step 3 safety
+gate.
 """
 
 from __future__ import annotations
@@ -167,6 +169,20 @@ def _verify_retry_canonical(
     )
 
 
+def _wait_for_canonical_vertical(page: Page, *, timeout_s: float = 10.0) -> str:
+    """Wait for Makro's URL machine vertical after the Step-2 UI appears."""
+
+    ready = _wait_for(
+        lambda current: bool(_current_target_values(current)[0]),
+        page,
+        timeout_s=timeout_s,
+    )
+    if not ready:
+        return ""
+    actual, _ = _current_target_values(page)
+    return str(actual or "").strip()
+
+
 def _complete_exact_live_vertical(
     page: Page,
     selected: str,
@@ -178,11 +194,12 @@ def _complete_exact_live_vertical(
     Makro has two observed transition shapes:
 
     1. the exact live click goes directly to Step 2, where the canonical URL
-       vertical must already be present;
+       vertical is required, but may arrive shortly after the Step-2 DOM;
     2. the click first opens the Vertical confirmation card (with Select Brand),
        while the URL can still contain no canonical vertical at all. In that
        shape the selected live label is verified in the confirmation UI, Select
-       Brand is clicked, and only then is the canonical URL value required.
+       Brand is clicked, Step 2 is reached, and only then is the canonical URL
+       value required.
 
     This deliberately separates human display labels from Makro machine ids and
     avoids requiring URL state before the portal itself commits that state.
@@ -200,11 +217,11 @@ def _complete_exact_live_vertical(
 
     selected_visible = _selected_label_visible(page, selected)
 
-    # Direct Step-2 transition: canonical URL state must now exist.
+    # Direct Step-2 transition: wait separately for the canonical URL update.
     if is_brand_step(page):
-        canonical_after, _ = _current_target_values(page)
+        canonical_after = _wait_for_canonical_vertical(page)
         if not canonical_after:
-            raise RuntimeError("Makro Step 1 reached Step 2 without a canonical vertical in the listing URL")
+            raise RuntimeError("Makro Step 1 reached Step 2 but no canonical vertical appeared in the listing URL")
         _verify_retry_canonical(
             page,
             selected,
@@ -235,9 +252,9 @@ def _complete_exact_live_vertical(
             "Makro Step 1 clicked the vertical confirmation Select Brand button, but Step 2 did not appear"
         )
 
-    canonical_after, _ = _current_target_values(page)
+    canonical_after = _wait_for_canonical_vertical(page)
     if not canonical_after:
-        raise RuntimeError("Makro Step 1 reached Step 2 without a canonical vertical in the listing URL")
+        raise RuntimeError("Makro Step 1 reached Step 2 but no canonical vertical appeared in the listing URL")
 
     _verify_retry_canonical(
         page,
