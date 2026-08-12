@@ -1,21 +1,23 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, QTimer
-from PySide6.QtWidgets import QFrame, QMainWindow, QPushButton, QSplitter, QTabWidget, QWidget
+from PySide6.QtWidgets import QFrame, QMainWindow, QPushButton, QScrollArea, QSplitter, QTabWidget, QWidget
 
 
 _SUMMARY_MIN = 300
 _SUMMARY_MAX = 460
+_PAGE_SUMMARY_MIN = 420
+_PAGE_SUMMARY_MAX = 560
 _COALESCE_MS = 40
 
 
 class ConsoleSummaryMode(QObject):
     """Keep the rich console summary permanent and open detail as a modal.
 
-    The former tiny collapsed strip is not part of the interaction model.  Four
-    phase cards, tabs and the current viewport stay visible in the main layout.
-    Clicking the header detail action opens the shared blurred glass modal and
-    therefore never resizes the body splitter.
+    Legacy layouts may still own the console through ``bodySplitter``. The formal
+    Single UI now uses one outer page scroll instead; in that mode the console owns
+    its natural reading height and this controller never tries to resize a hidden
+    splitter.
     """
 
     def __init__(self, window: QMainWindow) -> None:
@@ -25,6 +27,7 @@ class ConsoleSummaryMode(QObject):
         self.console = getattr(window, "console", None)
         self.toggle = getattr(window, "console_detail_toggle", None)
         self.body = getattr(window, "_ui_polish_body_splitter", None)
+        self.page_scroll = getattr(window, "_single_page_scroll", None)
         self.details = getattr(window, "_card_details", None)
         self._mature_apply = None
 
@@ -34,14 +37,14 @@ class ConsoleSummaryMode(QObject):
             raise RuntimeError("console summary mode requires the acceptance console")
         if not isinstance(self.toggle, QPushButton):
             raise RuntimeError("console summary mode requires console_detail_toggle")
-        if not isinstance(self.body, QSplitter):
-            raise RuntimeError("console summary mode requires bodySplitter")
+        if not isinstance(self.body, QSplitter) and not isinstance(self.page_scroll, QScrollArea):
+            raise RuntimeError("console summary mode requires bodySplitter or singlePageScroll")
         if self.details is None or not hasattr(self.details, "open_console_details"):
             raise RuntimeError("console summary mode requires the shared glass detail controller")
 
         # Remove ui_polish/ui_maturity's old expand/collapse state machine. Keep
-        # the logical checked bit true so any direct maturity pass continues to
-        # treat this permanently-rich summary as an expanded/usable console.
+        # the logical checked bit true; the action now opens the shared detail
+        # modal and never resizes the visible workspace.
         try:
             self.toggle.toggled.disconnect()
         except (RuntimeError, TypeError):
@@ -52,6 +55,8 @@ class ConsoleSummaryMode(QObject):
             pass
         self.toggle.setCheckable(True)
         self.toggle.setChecked(True)
+        self.toggle.setEnabled(True)
+        self.toggle.show()
         self.toggle.setText("展开详情")
         self.toggle.clicked.connect(self._open_detail)
 
@@ -62,9 +67,6 @@ class ConsoleSummaryMode(QObject):
         if isinstance(tabs, QTabWidget):
             tabs.show()
 
-        # MatureResponsiveController continues to own the rest of the workspace.
-        # Our pass runs immediately after it and only restores the fixed rich
-        # summary geometry, never an expanded detail geometry.
         mature = getattr(window, "_mature_ui", None)
         timer = getattr(mature, "_timer", None)
         apply = getattr(mature, "apply", None)
@@ -97,6 +99,13 @@ class ConsoleSummaryMode(QObject):
         return min(target, max(_SUMMARY_MIN, available - 260))
 
     def apply(self) -> None:
+        if isinstance(self.page_scroll, QScrollArea):
+            self.console.setMinimumHeight(_PAGE_SUMMARY_MIN)
+            self.console.setMaximumHeight(_PAGE_SUMMARY_MAX)
+            return
+
+        if not isinstance(self.body, QSplitter):
+            return
         available = max(1, self.body.height() - self.body.handleWidth())
         self.console.setMinimumHeight(_SUMMARY_MIN)
         self.console.setMaximumHeight(_SUMMARY_MAX)
@@ -112,8 +121,6 @@ class ConsoleSummaryMode(QObject):
         self.apply()
 
     def _open_detail(self, *_args: object) -> None:
-        # QAbstractButton flips a checkable button before clicked(). Restore the
-        # legacy checked bit immediately, but do not resize anything.
         if not self.toggle.isChecked():
             self.toggle.setChecked(True)
         self.toggle.setText("展开详情")
