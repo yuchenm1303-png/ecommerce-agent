@@ -25,6 +25,7 @@ from app.makro.listing_creation import (
     is_brand_step,
     is_product_info_step,
 )
+from app.makro.step1_entry import prepare_single_step1_page
 from app.makro.step3_transition import (
     dismiss_joyride_overlay,
     select_brand_to_product_info,
@@ -36,7 +37,6 @@ from app.providers.registry import (
 )
 from app.source_capture import SourceAccessBlocked, capture_product_source
 from makro_one_link import (
-    _prepare_step1_page,
     _provider_config,
     _resolver_command,
     _run,
@@ -340,7 +340,7 @@ def main() -> int:
             if args.mode == "full":
                 current = "step1"
                 _phase("step1", "START")
-                page = _prepare_step1_page(harness)
+                page = prepare_single_step1_page(harness)
                 dismiss_joyride_overlay(page)
                 vertical = select_vertical(page, provider, hints)
                 manifest["vertical"] = vertical
@@ -369,7 +369,7 @@ def main() -> int:
             elif args.mode == "step1":
                 current = "step1"
                 _phase("step1", "START")
-                page = _prepare_step1_page(harness)
+                page = prepare_single_step1_page(harness)
                 dismiss_joyride_overlay(page)
                 vertical = select_vertical(page, provider, hints)
                 manifest["vertical"] = vertical
