@@ -1,24 +1,27 @@
-"""QWidget-local glass prototype for the first scrolling Single-page cards.
+"""Single-render-domain glass experiment for the scrolling Product Source card.
 
-This is deliberately narrow: Product Source and the top status cards move their
-blur/tint shell out of the independent Quick card scene while the rest of the GUI
-keeps the proven native Quick glass path. The experiment lets Windows validate
-whether one-render-domain ownership removes continuous-scroll lag before any
-broader migration is considered.
+Only Product Source leaves the independent Quick card scene. Its blurred Fuji
+sample, tint and QWidget contents are composited by one QGraphicsEffect attached to
+the card itself. During scrolling the cached composite moves with QScrollArea; no
+per-scroll repaint, Quick geometry publication or frameSwapped callback participates.
+The blurred sample is refreshed once after scrolling settles.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QRectF, Qt, Slot
+from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPixmap
-from PySide6.QtWidgets import QFrame, QMainWindow, QScrollArea, QWidget
+from PySide6.QtWidgets import QFrame, QGraphicsEffect, QMainWindow, QScrollArea, QWidget
 
 from .native_background import _GLASS_RADIUS, _NORMAL_GLASS_ALPHA, _OVERSCAN
 
 
-_LOCAL_LAYER_NAME = "localScrollableGlassLayer"
+_EFFECT_BOUND_SCALE = 1.04
+_CONTENT_EDGE_STEP_PX = 0.18
+_NORMAL_SCALE_EPSILON = 1e-5
+_SCROLL_SETTLE_MS = 84
 
 
 def _ancestor_card(widget: QWidget | None, object_name: str) -> QFrame | None:
@@ -30,49 +33,172 @@ def _ancestor_card(widget: QWidget | None, object_name: str) -> QFrame | None:
     return None
 
 
-class _LocalGlassLayer(QWidget):
-    """Cheap blurred-wallpaper crop painted inside one moving QWidget card."""
+class _SingleDomainGlassEffect(QGraphicsEffect):
+    """Composite cached glass + live card contents in one QWidget render domain."""
 
-    def __init__(self, frame: QFrame, controller: "ScrollLocalGlassController", proxy: Any) -> None:
+    def __init__(self, frame: QFrame, proxy: Any) -> None:
         super().__init__(frame)
         self.frame = frame
-        self.controller = controller
         self.proxy = proxy
-        self.setObjectName(_LOCAL_LAYER_NAME)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAutoFillBackground(False)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setGeometry(frame.rect())
-        self.lower()
-        self.show()
+        self._scale = 1.0
+        self._frozen = False
+        self._freeze_requested = False
+        self._frozen_source: QPixmap | None = None
+        self._frozen_offset = QPoint()
+        self._backdrop = QPixmap()
+        self._last_alpha = _NORMAL_GLASS_ALPHA
+        # The effect stays enabled at rest because it now owns the card backdrop,
+        # not merely the temporary hover scale.
+        self.setEnabled(True)
 
-    def paintEvent(self, _event) -> None:  # noqa: ANN001, N802
-        if self.width() <= 0 or self.height() <= 0:
+    @property
+    def scale(self) -> float:
+        return self._scale
+
+    @property
+    def frozen(self) -> bool:
+        return self._frozen
+
+    def _overlay_alpha(self) -> float:
+        try:
+            alpha = float(getattr(self.proxy, "overlay_alpha", _NORMAL_GLASS_ALPHA))
+        except (RuntimeError, TypeError, ValueError):
+            alpha = _NORMAL_GLASS_ALPHA
+        return max(_NORMAL_GLASS_ALPHA, min(255.0, alpha))
+
+    def set_backdrop(self, pixmap: QPixmap) -> None:
+        if pixmap.isNull():
+            return
+        if not self._backdrop.isNull() and self._backdrop.cacheKey() == pixmap.cacheKey():
+            return
+        self._backdrop = QPixmap(pixmap)
+        self.update()
+
+    def _clear_frozen_source(self) -> None:
+        self._frozen_source = None
+        self._frozen_offset = QPoint()
+
+    def _content_span(self) -> float:
+        try:
+            return max(1.0, float(self.frame.width()), float(self.frame.height()))
+        except (RuntimeError, TypeError, ValueError):
+            return 1.0
+
+    def set_frozen(self, frozen: bool) -> None:
+        frozen = bool(frozen)
+        if frozen == self._frozen:
+            return
+        self._frozen = frozen
+        self._freeze_requested = frozen
+        self._clear_frozen_source()
+        self.update()
+
+    def set_scale(self, scale: float) -> None:
+        requested = max(0.96, min(_EFFECT_BOUND_SCALE, float(scale)))
+        exact_rest = abs(requested - 1.0) <= _NORMAL_SCALE_EPSILON
+        if exact_rest:
+            requested = 1.0
+        else:
+            edge_delta_px = self._content_span() * abs(requested - self._scale) * 0.5
+            if edge_delta_px < _CONTENT_EDGE_STEP_PX:
+                requested = self._scale
+
+        alpha = self._overlay_alpha()
+        alpha_changed = abs(alpha - self._last_alpha) >= 0.1
+        self._last_alpha = alpha
+
+        if abs(requested - self._scale) <= _NORMAL_SCALE_EPSILON:
+            if exact_rest and self._frozen:
+                self._frozen = False
+                self._freeze_requested = False
+                self._clear_frozen_source()
+            if alpha_changed:
+                self.update()
             return
 
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self._scale = requested
+        if exact_rest:
+            self._frozen = False
+            self._freeze_requested = False
+            self._clear_frozen_source()
+        self.update()
+
+    def boundingRectFor(self, source_rect: QRectF) -> QRectF:  # noqa: N802
+        center = source_rect.center()
+        half_w = source_rect.width() * _EFFECT_BOUND_SCALE * 0.5
+        half_h = source_rect.height() * _EFFECT_BOUND_SCALE * 0.5
+        return QRectF(
+            center.x() - half_w,
+            center.y() - half_h,
+            half_w * 2.0,
+            half_h * 2.0,
+        )
+
+    def _current_composite(self) -> tuple[QPixmap | None, QPoint]:
+        if (
+            self._frozen
+            and not self._freeze_requested
+            and self._frozen_source is not None
+            and not self._frozen_source.isNull()
+        ):
+            return self._frozen_source, self._frozen_offset
+
+        offset = QPoint()
+        pixmap = self.sourcePixmap(
+            Qt.CoordinateSystem.LogicalCoordinates,
+            offset,
+            QGraphicsEffect.PixmapPadMode.NoPad,
+        )
+        if pixmap.isNull():
+            return None, QPoint()
+
+        if self._frozen:
+            self._frozen_source = pixmap
+            self._frozen_offset = QPoint(offset)
+            self._freeze_requested = False
+        return pixmap, offset
+
+    def _draw_backdrop(self, painter: QPainter, rect: QRectF) -> None:
+        if rect.isEmpty():
+            return
+        painter.save()
+        path = QPainterPath()
+        path.addRoundedRect(rect, _GLASS_RADIUS, _GLASS_RADIUS)
+        painter.setClipPath(path)
+        if not self._backdrop.isNull():
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            painter.drawPixmap(rect, self._backdrop, QRectF(self._backdrop.rect()))
+        painter.fillRect(rect, QColor(0, 0, 0, round(self._overlay_alpha())))
+        painter.restore()
+
+    def draw(self, painter: QPainter) -> None:  # type: ignore[override]
+        source_rect = self.sourceBoundingRect(Qt.CoordinateSystem.LogicalCoordinates)
+        scale = self._scale
+
+        if abs(scale - 1.0) <= 1e-4:
+            self._draw_backdrop(painter, source_rect)
+            self.drawSource(painter)
+            return
+
+        pixmap, offset = self._current_composite()
+        if pixmap is None:
+            self._draw_backdrop(painter, source_rect)
+            self.drawSource(painter)
+            return
+
+        center = source_rect.center()
+        painter.save()
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-
-        bounds = QRectF(self.rect())
-        clip = QPainterPath()
-        clip.addRoundedRect(bounds, _GLASS_RADIUS, _GLASS_RADIUS)
-        painter.setClipPath(clip)
-
-        self.controller.paint_blurred_wallpaper(painter, self.frame, bounds)
-        try:
-            overlay_alpha = float(getattr(self.proxy, "overlay_alpha", _NORMAL_GLASS_ALPHA))
-        except (RuntimeError, TypeError, ValueError):
-            overlay_alpha = _NORMAL_GLASS_ALPHA
-        overlay_alpha = max(_NORMAL_GLASS_ALPHA, min(255.0, overlay_alpha))
-        painter.fillRect(bounds, QColor(0, 0, 0, round(overlay_alpha)))
-        painter.end()
+        painter.translate(center)
+        painter.scale(scale, scale)
+        painter.translate(-center)
+        self._draw_backdrop(painter, source_rect)
+        painter.drawPixmap(offset, pixmap)
+        painter.restore()
 
 
 class ScrollLocalGlassController(QObject):
-    """Own the first local-glass cards and keep their crop aligned to the window."""
+    """Keep only Product Source on the single-domain cached-glass path."""
 
     def __init__(self, window: QMainWindow, visual: Any, scroll: QScrollArea) -> None:
         super().__init__(window)
@@ -84,71 +210,71 @@ class ScrollLocalGlassController(QObject):
         self._source = QPixmap(str(getattr(self.background, "_blur_path", "")))
         self._scaled_item = QPixmap()
         self._scaled_key: tuple[int, int] | None = None
-        self._last_quick_offset: tuple[float, float] | None = None
-        self._layers: dict[QFrame, _LocalGlassLayer] = {}
+        self._frame: QFrame | None = None
+        self._proxy: Any = None
+        self._effect: _SingleDomainGlassEffect | None = None
+        self._scrolling = False
+
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.setInterval(_SCROLL_SETTLE_MS)
+        self._settle_timer.timeout.connect(self._finish_scroll)
 
         if self.background is None or self.quick is None or self._source.isNull():
             return
 
+        url_input = getattr(self.window, "url_input", None)
+        frame = _ancestor_card(url_input if isinstance(url_input, QWidget) else None, "heroCard")
+        if frame is None:
+            return
+
         surface_for = getattr(self.visual, "surface_for", None)
-        if not callable(surface_for):
+        proxy = surface_for(frame) if callable(surface_for) else None
+        if proxy is None:
             return
 
-        targets: list[tuple[QFrame, Any]] = []
-        for frame in self._resolve_frames():
-            proxy = surface_for(frame)
-            if proxy is not None:
-                targets.append((frame, proxy))
-        if not targets:
+        backdrop = self._build_backdrop(frame)
+        if backdrop is None or backdrop.isNull():
             return
 
-        frames = [frame for frame, _proxy in targets]
-        self._detach_from_quick_model(frames)
-        for frame, proxy in targets:
-            layer = _LocalGlassLayer(frame, self, proxy)
-            self._layers[frame] = layer
-            frame.installEventFilter(self)
+        effect = _SingleDomainGlassEffect(frame, proxy)
+        effect.set_backdrop(backdrop)
+        frame.setGraphicsEffect(effect)
+        # NativeGlassProxy is intentionally duck-typed by the interaction layer.
+        # Re-point its scale effect so hover/press keeps exactly the existing motion.
+        proxy._scale_effect = effect  # noqa: SLF001
 
-        self.scroll.verticalScrollBar().valueChanged.connect(self._repaint_for_scroll)
-        self.quick.widthChanged.connect(self._invalidate_scaled_item)
-        self.quick.heightChanged.connect(self._invalidate_scaled_item)
-        self.quick.frameSwapped.connect(
-            self._sync_parallax_crop,
-            Qt.ConnectionType.QueuedConnection,
-        )
+        self._frame = frame
+        self._proxy = proxy
+        self._effect = effect
+        frame.installEventFilter(self)
+        self._detach_from_quick_model(frame)
 
-        # Remove the old Quick blur/tint shell once, then keep all local cards out
-        # of the model permanently. Other cards continue using the existing path.
+        # During scroll this callback ONLY restarts an idle timer. No QWidget
+        # repaint, no Quick geometry sync and no render-thread callback runs.
+        self.scroll.verticalScrollBar().valueChanged.connect(self._mark_scrolling)
+        self.quick.widthChanged.connect(self._invalidate_scene_cache)
+        self.quick.heightChanged.connect(self._invalidate_scene_cache)
+
+        # A parallax cycle may change the correct blurred sample while idle. Refresh
+        # only once after that cycle ends; never listen to frameSwapped.
+        animation_signal = getattr(self.quick, "animationRunningChanged", None)
+        if animation_signal is not None and hasattr(animation_signal, "connect"):
+            try:
+                animation_signal.connect(self._on_parallax_state_changed)
+            except (RuntimeError, TypeError):
+                pass
+
         try:
             self.background.schedule_mask_update()
         except RuntimeError:
             pass
 
-        self._repaint_visible_layers(sync=True)
-
     @property
     def active_count(self) -> int:
-        return len(self._layers)
+        return 1 if self._frame is not None and self._effect is not None else 0
 
-    def _resolve_frames(self) -> list[QFrame]:
-        resolved: list[QFrame] = []
-
-        url_input = getattr(self.window, "url_input", None)
-        hero = _ancestor_card(url_input if isinstance(url_input, QWidget) else None, "heroCard")
-        if hero is not None:
-            resolved.append(hero)
-
-        status_host = self.window.findChild(QWidget, "statusRowHost")
-        if status_host is not None:
-            for frame in status_host.findChildren(QFrame):
-                if frame.objectName() == "statusCard" and frame not in resolved:
-                    resolved.append(frame)
-
-        return resolved
-
-    def _detach_from_quick_model(self, frames: list[QFrame]) -> None:
-        """Remove only the prototype cards from the Quick repeater/mask model."""
-
+    def _detach_from_quick_model(self, frame: QFrame) -> None:
         model = getattr(self.background, "card_model", None)
         cards = getattr(model, "cards", None)
         states = getattr(model, "_states", None)
@@ -156,21 +282,20 @@ class ScrollLocalGlassController(QObject):
         if model is None or not isinstance(cards, list) or not isinstance(states, list) or not isinstance(rows, dict):
             return
 
-        removal_rows = sorted(
-            {int(rows[frame]) for frame in frames if frame in rows},
-            reverse=True,
-        )
-        for row in removal_rows:
-            if row < 0 or row >= len(cards):
-                continue
-            model.beginRemoveRows(QModelIndex(), row, row)
-            try:
-                del cards[row]
-                del states[row]
-            finally:
-                model.endRemoveRows()
+        row = rows.get(frame)
+        if row is None:
+            return
+        row = int(row)
+        if row < 0 or row >= len(cards):
+            return
 
-        model._rows = {frame: row for row, frame in enumerate(cards)}  # noqa: SLF001
+        model.beginRemoveRows(QModelIndex(), row, row)
+        try:
+            del cards[row]
+            del states[row]
+        finally:
+            model.endRemoveRows()
+        model._rows = {card: index for index, card in enumerate(cards)}  # noqa: SLF001
 
     def _ensure_scaled_item(self) -> QPixmap | None:
         quick = self.quick
@@ -210,16 +335,11 @@ class ScrollLocalGlassController(QObject):
         except (RuntimeError, TypeError, ValueError):
             return 0.0, 0.0
 
-    def paint_blurred_wallpaper(
-        self,
-        painter: QPainter,
-        frame: QFrame,
-        target: QRectF,
-    ) -> None:
+    def _build_backdrop(self, frame: QFrame) -> QPixmap | None:
         item = self._ensure_scaled_item()
         quick = self.quick
-        if item is None or quick is None:
-            return
+        if item is None or quick is None or frame.width() <= 0 or frame.height() <= 0:
+            return None
 
         try:
             quick_width = float(quick.width())
@@ -228,8 +348,9 @@ class ScrollLocalGlassController(QObject):
             image_x = (quick_width - float(item.width())) * 0.5 + offset_x
             image_y = (quick_height - float(item.height())) * 0.5 + offset_y
             top_left = frame.mapTo(self.window, QPoint(0, 0))
-        except RuntimeError:
-            return
+            dpr = max(1.0, float(frame.devicePixelRatioF()))
+        except (RuntimeError, TypeError, ValueError):
+            return None
 
         source = QRectF(
             float(top_left.x()) - image_x,
@@ -237,60 +358,61 @@ class ScrollLocalGlassController(QObject):
             float(frame.width()),
             float(frame.height()),
         )
-        painter.drawPixmap(target, item, source)
+        result = QPixmap(
+            max(1, round(frame.width() * dpr)),
+            max(1, round(frame.height() * dpr)),
+        )
+        result.setDevicePixelRatio(dpr)
+        result.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawPixmap(QRectF(0.0, 0.0, float(frame.width()), float(frame.height())), item, source)
+        painter.end()
+        return result
 
-    def _repaint_visible_layers(self, *, sync: bool) -> None:
-        for layer in self._layers.values():
-            try:
-                if not layer.isVisible() or layer.visibleRegion().isEmpty():
-                    continue
-                if sync:
-                    layer.repaint()
-                else:
-                    layer.update()
-            except RuntimeError:
-                continue
+    def _refresh_backdrop(self) -> None:
+        frame = self._frame
+        effect = self._effect
+        if frame is None or effect is None:
+            return
+        backdrop = self._build_backdrop(frame)
+        if backdrop is not None and not backdrop.isNull():
+            effect.set_backdrop(backdrop)
 
-    def _repaint_for_scroll(self, _value: int) -> None:
-        # This is intentionally synchronous, but only for the five small prototype
-        # layers. Their glass pixels and QWidget contents therefore belong to the
-        # same scroll/backing-store turn instead of two independent render loops.
-        self._repaint_visible_layers(sync=True)
+    def _mark_scrolling(self, _value: int) -> None:
+        self._scrolling = True
+        self._settle_timer.start()
 
-    def _invalidate_scaled_item(self, *_args: object) -> None:
+    def _finish_scroll(self) -> None:
+        self._scrolling = False
+        self._refresh_backdrop()
+
+    def _invalidate_scene_cache(self, *_args: object) -> None:
         self._scaled_item = QPixmap()
         self._scaled_key = None
-        self._repaint_visible_layers(sync=False)
+        if not self._scrolling:
+            QTimer.singleShot(0, self._refresh_backdrop)
 
-    @Slot()
-    def _sync_parallax_crop(self) -> None:
-        offset = self._quick_offset()
-        previous = self._last_quick_offset
-        if previous is not None and abs(previous[0] - offset[0]) < 0.02 and abs(previous[1] - offset[1]) < 0.02:
+    def _on_parallax_state_changed(self, *_args: object) -> None:
+        if self._scrolling or self.quick is None:
             return
-        self._last_quick_offset = offset
-        self._repaint_visible_layers(sync=False)
+        try:
+            running = bool(self.quick.property("animationRunning"))
+        except RuntimeError:
+            return
+        if not running:
+            QTimer.singleShot(0, self._refresh_backdrop)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if not isinstance(watched, QFrame):
+        if watched is not self._frame:
             return False
-        layer = self._layers.get(watched)
-        if layer is None:
-            return False
-
-        event_type = event.type()
-        if event_type == QEvent.Type.Resize:
-            layer.setGeometry(watched.rect())
-            layer.lower()
-            layer.update()
-        elif event_type in {QEvent.Type.Move, QEvent.Type.Show}:
-            layer.lower()
-            layer.update()
+        if event.type() in {QEvent.Type.Resize, QEvent.Type.Show} and not self._scrolling:
+            QTimer.singleShot(0, self._refresh_backdrop)
         return False
 
 
 def install_scroll_local_glass(window: QMainWindow, visual: Any) -> ScrollLocalGlassController | None:
-    """Install the narrow Product Source/status local-glass A/B experiment."""
+    """Install the one-card Product Source single-domain A/B experiment."""
 
     scroll = getattr(window, "_single_page_scroll", None)
     if not isinstance(scroll, QScrollArea):
