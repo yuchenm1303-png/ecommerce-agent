@@ -41,7 +41,7 @@ def _field_options(field: dict[str, Any]) -> tuple[str, ...]:
     The raw semantic-field aggregator keeps a convenience union in ``field.options``.
     On Makro numeric+unit attributes that union can contain only the unit selector
     options (kg/g/cm/...), which previously made Fill Plan compare the numeric value
-    itself against the unit list.  When live controls are available, reconstruct the
+    itself against the unit list. When live controls are available, reconstruct the
     value-option contract from non-qualifier controls and use the aggregate list only
     as a legacy/final fallback.
     """
@@ -169,7 +169,14 @@ def load_live_schema(path: str | Path) -> list[dict[str, Any]]:
     return [item for item in fields if isinstance(item, dict)]
 
 
-def _drift_signature(field: dict[str, Any]) -> tuple[object, ...]:
+def schema_field_signature(field: dict[str, Any]) -> tuple[object, ...]:
+    """Return the stable field identity used by the production schema drift gate.
+
+    Presentation-only wording and current render state are intentionally excluded.
+    Callers that need to rebind a previously planned field must use this same
+    identity and still require a unique match on the current live schema.
+    """
+
     return (
         normalize_key(field.get("attribute_key")),
         normalize_key(field.get("label")),
@@ -179,6 +186,11 @@ def _drift_signature(field: dict[str, Any]) -> tuple[object, ...]:
         tuple(sorted(normalize_key(item) for item in _field_options(field))),
         tuple(sorted(normalize_key(item) for item in _qualifier_options(field))),
     )
+
+
+# Backward-compatible private alias for existing internal/tests that may still
+# import the old helper name.
+_drift_signature = schema_field_signature
 
 
 def assert_live_schema_matches(
@@ -192,8 +204,8 @@ def assert_live_schema_matches(
     option contracts must match.
     """
 
-    planned = Counter(_drift_signature(field) for field in planned_fields)
-    current = Counter(_drift_signature(field) for field in current_fields)
+    planned = Counter(schema_field_signature(field) for field in planned_fields)
+    current = Counter(schema_field_signature(field) for field in current_fields)
     if planned == current:
         return
 
