@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QBoxLayout,
     QFrame,
@@ -243,36 +243,10 @@ def install_page_scroll_layout(window: QMainWindow, visual: Any | None = None) -
     body.setParent(root)
     setattr(window, "_ui_polish_body_splitter", None)
 
-    background = getattr(visual, "background", None)
-    if background is None:
-        background = getattr(getattr(window, "_visual_style", None), "background", None)
-    schedule_mask = getattr(background, "schedule_mask_update", None)
-    card_model = getattr(background, "card_model", None)
-    if callable(schedule_mask):
-        def sync_scroll_glass(*_args: object) -> None:
-            # QWidget page motion is published every smooth-scroll tick (~16 ms),
-            # while the global Quick glass pass intentionally coalesces heavier
-            # mask texture work. Publish the cheap card geometry immediately so
-            # the QML glass shell cannot lag a frame or two behind its QWidget
-            # text/content. Mark the mask stale so the existing coalesced pass
-            # still refreshes the blur region from the latest geometry.
-            changed = False
-            sync_geometry = getattr(card_model, "sync_geometry", None)
-            if callable(sync_geometry):
-                try:
-                    changed = bool(sync_geometry())
-                except RuntimeError:
-                    return
-            if changed and background is not None:
-                try:
-                    background._mask_ready = False  # noqa: SLF001
-                except (AttributeError, RuntimeError):
-                    pass
-            schedule_mask()
-
-        scroll.verticalScrollBar().valueChanged.connect(sync_scroll_glass)
-        setattr(scroll, "_glass_scroll_sync", sync_scroll_glass)
-        QTimer.singleShot(0, sync_scroll_glass)
+    # Scrolling glass is now owned by one QWidget compositor in the viewport.
+    # Deliberately do NOT publish outer-page scroll geometry/masks back to Quick;
+    # Quick owns the wallpaper/parallax, not the moving card shells.
+    _ = visual
 
     setattr(window, "_single_page_scroll", scroll)
     setattr(window, "_single_page_scroll_content", page)
