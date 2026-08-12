@@ -241,9 +241,10 @@ def main() -> int:
         )
 
         # Resolver has already done its work. If it could not solve a required
-        # field, the GUI may provide one explicit user value. This is applied
-        # once to the plan; there is no second AI/search pass and no placeholder
-        # string is ever sent to Makro.
+        # field, the GUI may provide one explicit user/fallback value. Required
+        # overrides first bind by exact current field_id; if presentation-only
+        # representation changed, they may rebind only through the same stable
+        # schema identity that already passed assert_live_schema_matches above.
         override_path = _required_override_path(args.live_schema)
         override_summary: dict[str, Any] = {"applied": 0, "field_ids": []}
         if override_path.is_file():
@@ -251,6 +252,7 @@ def main() -> int:
                 plan,
                 semantic_fields,
                 load_required_overrides(override_path),
+                planned_fields=planned_live_fields,
             )
 
         summary = plan.summary()
