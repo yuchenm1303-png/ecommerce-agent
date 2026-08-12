@@ -1,14 +1,14 @@
 """Shared portal entry gate for Makro Step 1 / Select Vertical.
 
 The normal listing workflow starts at Step 1, but a fresh Makro tab may land on
-the Seller Portal Dashboard instead of the Add a Single Listing route.  Single
+the Seller Portal Dashboard instead of the Add a Single Listing route. Single
 and Batch therefore share the same bounded pre-Step-1 navigation:
 
 Dashboard -> Listings -> Add New Listings -> Listing Creation
           -> Add New Listing -> Add Single Listing -> Step 1
 
 Once Step 1 is reached, the existing structural operability contract remains the
-source of truth.  This module does not select a Vertical and does not resume a
+source of truth. This module does not select a Vertical and does not resume a
 known Step 2/3 draft; those states still fail closed here.
 """
 
@@ -20,7 +20,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .listing import MAKRO_HOME_URL, MAKRO_HOST, MAKRO_SINGLE_LISTING_ROUTE, parse_makro_listing_url
-from .listing_creation import is_brand_step, is_product_info_step
+from .listing_creation import _vertical_search_input, is_brand_step, is_product_info_step
 from .portal_adapter import MakroPortalAdapter
 from .taxonomy_resilient import ResilientMakroTaxonomyBrowser
 from .vertical_selection import is_vertical_interaction_ready
@@ -45,6 +45,27 @@ def _is_single_listing_route(url: str) -> bool:
 def _has_password(page: Any) -> bool:
     try:
         return page.locator('input[type="password"]').count() > 0
+    except Exception:
+        return False
+
+
+def _is_step1_operable(page: Any) -> bool:
+    """Return True only when Step 1 readiness implies select_vertical can run.
+
+    ``is_vertical_interaction_ready`` deliberately accepts several structural
+    signals because Makro's SPA stage enum can lag. Some non-Step-1 portal
+    surfaces, however, can resemble taxonomy columns closely enough to trigger
+    those broad signals. The production selector always requires the actual
+    Vertical search input, so the entry gate must require it too. This keeps the
+    readiness contract aligned with ``select_vertical`` and prevents Dashboard
+    or Listing Creation chrome from being accepted as Step 1.
+    """
+
+    try:
+        if not is_vertical_interaction_ready(page):
+            return False
+        _vertical_search_input(page)
+        return True
     except Exception:
         return False
 
@@ -131,11 +152,8 @@ def _is_dashboard(page: Any) -> bool:
 
 def _is_listing_creation(page: Any) -> bool:
     # The Step 1 page is also a listing-creation flow, so rule it out first.
-    try:
-        if is_vertical_interaction_ready(page):
-            return False
-    except Exception:
-        pass
+    if _is_step1_operable(page):
+        return False
     return bool(
         _visible_exact_text(page, _LISTING_CREATION)
         and (
@@ -150,6 +168,7 @@ def _diagnostics(page: Any) -> str:
         "url": str(getattr(page, "url", "") or ""),
         "dashboard": _is_dashboard(page),
         "listing_creation": _is_listing_creation(page),
+        "step1_operable": _is_step1_operable(page),
     }
     try:
         payload["stage"] = MakroPortalAdapter(page).detect_stage().value
@@ -178,7 +197,7 @@ def _wait_until_vertical_operable(page: Any, *, timeout_s: float = 30.0) -> bool
     while time.monotonic() < deadline:
         if _has_password(page):
             raise RuntimeError("Makro 登录状态无效；请先在长期 Edge 中人工登录，再重试。")
-        if is_vertical_interaction_ready(page):
+        if _is_step1_operable(page):
             return True
         try:
             if is_product_info_step(page) or is_brand_step(page):
@@ -186,7 +205,7 @@ def _wait_until_vertical_operable(page: Any, *, timeout_s: float = 30.0) -> bool
         except Exception:
             pass
         page.wait_for_timeout(250)
-    return is_vertical_interaction_ready(page)
+    return _is_step1_operable(page)
 
 
 def _reject_later_listing_stage(page: Any) -> None:
@@ -202,7 +221,7 @@ def _reject_later_listing_stage(page: Any) -> None:
 
 
 def _open_listing_creation_from_dashboard(page: Any) -> None:
-    if _is_listing_creation(page) or is_vertical_interaction_ready(page):
+    if _is_listing_creation(page) or _is_step1_operable(page):
         return
 
     if not _is_dashboard(page):
@@ -223,7 +242,7 @@ def _open_listing_creation_from_dashboard(page: Any) -> None:
     _click_exact_action(page, _ADD_NEW_LISTINGS)
     if not _wait_until(
         page,
-        lambda: _is_listing_creation(page) or is_vertical_interaction_ready(page),
+        lambda: _is_listing_creation(page) or _is_step1_operable(page),
         timeout_s=15.0,
     ):
         raise RuntimeError(
@@ -233,7 +252,7 @@ def _open_listing_creation_from_dashboard(page: Any) -> None:
 
 
 def _open_step1_from_listing_creation(page: Any) -> None:
-    if is_vertical_interaction_ready(page):
+    if _is_step1_operable(page):
         return
     if not _is_listing_creation(page):
         raise RuntimeError(
@@ -253,7 +272,7 @@ def _open_step1_from_listing_creation(page: Any) -> None:
     _click_exact_action(page, _ADD_SINGLE_LISTING)
     if not _wait_until(
         page,
-        lambda: is_vertical_interaction_ready(page) or _is_dashboard(page),
+        lambda: _is_step1_operable(page) or _is_dashboard(page),
         timeout_s=20.0,
     ):
         raise RuntimeError(
@@ -267,25 +286,19 @@ def _prepare_new_listing_step1_page(page: Any) -> None:
 
     page.set_default_timeout(15_000)
 
-    # Bound the recovery to the pre-Step-1 chain only.  This intentionally does
+    # Bound the recovery to the pre-Step-1 chain only. This intentionally does
     # not become the later task-state machine.
     for _ in range(6):
         if _has_password(page):
             raise RuntimeError("Makro 登录状态无效；请先在长期 Edge 中人工登录，再重试。")
-        try:
-            if is_vertical_interaction_ready(page):
-                return
-        except Exception:
-            pass
+        if _is_step1_operable(page):
+            return
         _reject_later_listing_stage(page)
 
         if _is_listing_creation(page):
             _open_step1_from_listing_creation(page)
-            try:
-                if is_vertical_interaction_ready(page):
-                    return
-            except Exception:
-                pass
+            if _is_step1_operable(page):
+                return
             _reject_later_listing_stage(page)
             continue
 
@@ -293,9 +306,9 @@ def _prepare_new_listing_step1_page(page: Any) -> None:
             _open_listing_creation_from_dashboard(page)
             continue
 
-        # A newly-created Chromium tab is normally about:blank.  Likewise, a
+        # A newly-created Chromium tab is normally about:blank. Likewise, a
         # stale non-listing Seller Portal location may be left over from the
-        # previous session.  For a new/owned page it is safe to normalize only
+        # previous session. For a new/owned page it is safe to normalize only
         # that pre-Step-1 location back to Home, then use the real UI path.
         if not _is_makro_host(page) or not _is_single_listing_route(getattr(page, "url", "")):
             page.goto(MAKRO_HOME_URL, wait_until="domcontentloaded", timeout=45_000)
@@ -304,7 +317,7 @@ def _prepare_new_listing_step1_page(page: Any) -> None:
                 lambda: (
                     _is_dashboard(page)
                     or _is_listing_creation(page)
-                    or is_vertical_interaction_ready(page)
+                    or _is_step1_operable(page)
                 ),
                 timeout_s=15.0,
             ):
