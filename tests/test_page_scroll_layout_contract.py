@@ -53,16 +53,28 @@ def test_existing_business_widgets_are_reparented_not_rebuilt() -> None:
     assert "AcceptanceConsole(" not in PAGE
 
 
-def test_workspace_and_console_get_real_reading_height_instead_of_competing() -> None:
-    assert "_WORKSPACE_MIN_HEIGHT = 420" in PAGE
+def test_workspace_is_compact_while_console_keeps_real_reading_height() -> None:
+    assert "_WORKSPACE_HEIGHT = 350" in PAGE
+    assert "_FIELD_TABLE_MIN_HEIGHT = 255" in PAGE
+    assert "_SIDE_TABS_HEIGHT = 320" in PAGE
     assert "_CONSOLE_MIN_HEIGHT = 420" in PAGE
     assert "_CONSOLE_TABS_MIN_HEIGHT = 250" in PAGE
     assert "_CONSOLE_LOG_MIN_HEIGHT = 180" in PAGE
-    assert "workspace.setMinimumHeight(_WORKSPACE_MIN_HEIGHT)" in PAGE
+
+    assert "workspace.setMinimumHeight(_WORKSPACE_HEIGHT)" in PAGE
+    assert "workspace.setMaximumHeight(_WORKSPACE_HEIGHT)" in PAGE
+    assert "field_table.setMinimumHeight(_FIELD_TABLE_MIN_HEIGHT)" in PAGE
+    assert "side_tabs.setMinimumHeight(_SIDE_TABS_HEIGHT)" in PAGE
+    assert "side_tabs.setMaximumHeight(_SIDE_TABS_HEIGHT)" in PAGE
     assert "console.setMinimumHeight(_CONSOLE_MIN_HEIGHT)" in PAGE
     assert "tabs.setMinimumHeight(_CONSOLE_TABS_MIN_HEIGHT)" in PAGE
     assert "log_view.setMinimumHeight(_CONSOLE_LOG_MIN_HEIGHT)" in PAGE
-    assert "field_table.setMinimumHeight(285)" in PAGE
+
+
+def test_side_diagnostics_removes_legacy_bottom_clearance() -> None:
+    assert "side_layout = side_host.layout()" in PAGE
+    assert "side_layout.setContentsMargins(margins.left(), margins.top(), margins.right(), 0)" in PAGE
+    assert "visibly empty column under Telemetry" in PAGE
 
 
 def test_page_scroll_republishes_quick_glass_geometry_without_visual_lag() -> None:
