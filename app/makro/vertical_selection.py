@@ -114,6 +114,45 @@ def _selected_label_visible(page: Page, selected: str) -> bool:
         return False
 
 
+def _search_result_delta(
+    before: list[str],
+    after: list[str],
+    taxonomy_columns: list[list[str]],
+) -> list[str]:
+    """Return only labels newly exposed by one Vertical Search operation.
+
+    ``visible_text_candidates`` intentionally scans the whole page because it is
+    also used by older compatibility paths. That is too broad for Step 1 search:
+    root departments and already-open taxonomy branches remain visible beside the
+    search box and must never masquerade as leaf search results. Treat every label
+    that existed before the query, plus every structurally identified taxonomy
+    node, as navigation chrome. Only newly appeared live labels may reach the AI
+    search-result chooser.
+    """
+
+    blocked = {
+        normalize_label(value)
+        for value in before
+        if normalize_label(value)
+    }
+    for column in taxonomy_columns:
+        for value in column:
+            key = normalize_label(value)
+            if key:
+                blocked.add(key)
+
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw in after:
+        value = str(raw or "").strip()
+        key = normalize_label(value)
+        if not key or key in blocked or key in seen:
+            continue
+        seen.add(key)
+        output.append(value)
+    return output
+
+
 def _vertical_search_semantics_visible(page: Page) -> bool:
     """Require Step-1-specific evidence around the fallback search control.
 
@@ -274,18 +313,47 @@ def _select_via_search_with_context(
     wait_ms: int,
     reason: str,
 ) -> str:
-    """Resolve a Vertical through Makro's live search without label/slug conflation."""
+    """Resolve a Vertical through Makro's live search without page-wide false candidates."""
 
     search = _vertical_search_input(page)
+    taxonomy = ResilientMakroTaxonomyBrowser(page)
     attempted: list[str] = []
     for term in hints.vertical_search_terms:
         attempted.append(term)
+
+        # Establish a per-query baseline after clearing the search. Existing root
+        # departments/open child columns are navigation state, not search results.
         search.fill("")
+        page.wait_for_timeout(wait_ms)
+        before = _visible_text_candidates(page)
+        baseline_columns = taxonomy.columns()
+
         search.fill(term)
         page.wait_for_timeout(wait_ms)
 
-        candidates = _visible_text_candidates(page)
-        selected = choose_vertical_candidate(provider, hints, term, candidates)
+        selected = ""
+        for submit in (False, True):
+            if submit:
+                # Some Makro builds do not publish search results on input alone;
+                # Enter is the same bounded search intent without touching any
+                # taxonomy node or resetting the SPA.
+                try:
+                    search.press("Enter")
+                except Exception:
+                    pass
+                page.wait_for_timeout(wait_ms)
+
+            candidates = _search_result_delta(
+                before,
+                _visible_text_candidates(page),
+                baseline_columns,
+            )
+            if not candidates:
+                continue
+            selected = choose_vertical_candidate(provider, hints, term, candidates)
+            if selected:
+                break
+
         if not selected:
             continue
 
@@ -355,8 +423,8 @@ def select_vertical(
     # A failed acceptance intentionally leaves the browser现场 intact. If
     # multiple taxonomy columns are already open, re-clicking an already selected
     # parent cannot be distinguished reliably from a stale React child column.
-    # Use Makro's own exact-live search from that state instead of resetting the
-    # SPA or guessing which row is selected.
+    # Use Makro's own search from that state, but admit only labels that actually
+    # appear because of the query; pre-existing broad taxonomy nodes are blocked.
     if len(before_clear) > 1:
         return _select_via_search_with_context(
             page,
