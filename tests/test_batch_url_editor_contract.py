@@ -25,6 +25,16 @@ def test_multi_paste_is_split_into_individual_rows() -> None:
     assert "self.rows_layout.insertWidget" in SOURCE
 
 
+def test_batch_editor_reserves_a_real_five_link_working_viewport() -> None:
+    assert "_VISIBLE_ROWS = 5" in SOURCE
+    assert "_ROW_HEIGHT = 40" in SOURCE
+    assert "self.setMinimumHeight(_EDITOR_MIN_HEIGHT)" in SOURCE
+    assert "self.scroll.setFixedHeight(_LIST_HEIGHT)" in SOURCE
+    assert 'url_head = QLabel("SUPPLIER PRODUCT URL")' in SOURCE
+    assert "if len(self.rows) > _VISIBLE_ROWS:" in SOURCE
+    assert "self.scroll.ensureWidgetVisible(row" in SOURCE
+
+
 def test_disabled_rows_are_excluded_from_legacy_batch_prepare_input() -> None:
     assert "def toPlainText(self) -> str:" in SOURCE
     assert "if row.is_enabled() and row.url()" in SOURCE
