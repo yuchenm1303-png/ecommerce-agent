@@ -17,11 +17,8 @@ from playwright.sync_api import sync_playwright
 
 from app.browser_page_owner import page_target_id
 from app.browser_session import EdgeHarness, is_cdp_ready
-from app.makro.listing_creation import (
-    MAKRO_NEW_LISTING_URL,
-    infer_listing_bootstrap,
-    is_vertical_step,
-)
+from app.makro.listing_creation import MAKRO_NEW_LISTING_URL, infer_listing_bootstrap
+from app.makro.step1_entry import prepare_owned_step1_page
 from app.makro.step3_transition import (
     dismiss_joyride_overlay,
     select_brand_to_product_info,
@@ -31,20 +28,6 @@ from app.providers.registry import ProviderConfigurationError, build_semantic_pr
 from app.source_capture import SourceAccessBlocked, capture_product_source
 from makro_gui_workflow import _phase, _prepare_step3, _write_manifest, build_parser
 from makro_one_link import _provider_config
-
-
-def _prepare_owned_step1_page(page) -> None:
-    page.set_default_timeout(15_000)
-    page.goto(MAKRO_NEW_LISTING_URL, wait_until="domcontentloaded", timeout=45_000)
-    elapsed = 0
-    while elapsed < 20_000:
-        if is_vertical_step(page):
-            return
-        if page.locator('input[type="password"]').count() > 0:
-            raise RuntimeError("Makro 登录状态无效；请先在长期 Edge 中人工登录，再重试。")
-        page.wait_for_timeout(500)
-        elapsed += 500
-    raise RuntimeError("Batch owned Makro tab did not reach Step 1 / Select Vertical")
 
 
 def main() -> int:
@@ -138,7 +121,7 @@ def main() -> int:
 
             current = "step1"
             _phase("step1", "START")
-            _prepare_owned_step1_page(page)
+            prepare_owned_step1_page(page)
             dismiss_joyride_overlay(page)
             vertical = select_vertical(page, provider, hints)
             manifest["vertical"] = vertical
