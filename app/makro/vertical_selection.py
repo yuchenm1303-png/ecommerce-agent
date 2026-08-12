@@ -4,8 +4,8 @@ This module owns the production Step 1 selection contract used by the GUI and
 Batch flows:
 - AI may select only exact live Makro taxonomy/search labels;
 - taxonomy branches are boundedly backtracked;
-- stale partially-open taxonomy paths use Makro's own Vertical Search rather
-  than attempting to reset the SPA;
+- stale partially-open taxonomy paths resume from the deepest live column and
+  backtrack structurally before search is considered;
 - a live display label and Makro's canonical URL vertical are intentionally
   different identities. For example ``Air Purifiers`` may become
   ``air_purifier`` in the hash URL. A verified exact-live click plus the portal
@@ -256,7 +256,6 @@ def _complete_exact_live_vertical(
 
     selected_visible = _selected_label_visible(page, selected)
 
-    # Direct Step-2 transition: wait separately for the canonical URL update.
     if is_brand_step(page):
         canonical_after = _wait_for_canonical_vertical(page)
         if not canonical_after:
@@ -270,9 +269,6 @@ def _complete_exact_live_vertical(
         )
         return canonical_after
 
-    # Confirmation-card transition: the URL is allowed to remain uncommitted
-    # here. The live selected label must still be represented on the confirmed
-    # page before we advance to Brand.
     canonical_before_brand, _ = _current_target_values(page)
     if not canonical_before_brand and not selected_visible:
         raise RuntimeError(
@@ -305,6 +301,67 @@ def _complete_exact_live_vertical(
     return canonical_after
 
 
+def _resume_partial_taxonomy(
+    page: Page,
+    provider: JSONTaskProvider,
+    hints: ListingBootstrapHints,
+    taxonomy: ResilientMakroTaxonomyBrowser,
+    initial_columns: list[list[str]],
+    *,
+    wait_ms: int,
+) -> str:
+    """Resume an already-open taxonomy from deepest visible column outward.
+
+    A partially-open Step 1 is valid live state, not a reason to require the user
+    to reset the page. The deepest currently rendered column is the most specific
+    safe continuation point. ``navigate_live_taxonomy`` already owns bounded
+    child settling/backtracking, so expose a shifted view of the live columns and
+    translate its relative click levels back to the real Makro column indexes.
+
+    If the deepest branch has no semantically usable route, retry one level
+    outward. That lets the chooser replace a stale parent without guessing which
+    row was highlighted by the previous attempt. Search remains only a final
+    compatibility fallback after all visible structural recovery points fail.
+    """
+
+    depth = len(initial_columns)
+    if depth < 2:
+        return ""
+
+    for start_level in range(depth - 1, -1, -1):
+        def shifted_columns(base: int = start_level) -> list[list[str]]:
+            current = taxonomy.columns()
+            if base >= len(current):
+                return []
+            return [list(column) for column in current[base:]]
+
+        def shifted_click(relative_level: int, text: str, base: int = start_level) -> bool:
+            return taxonomy.click_node(base + int(relative_level), text)
+
+        selected = navigate_live_taxonomy(
+            page,
+            columns_fn=shifted_columns,
+            click_fn=shifted_click,
+            choose_fn=lambda path, candidates: choose_taxonomy_candidate(
+                provider,
+                hints,
+                path,
+                candidates,
+            ),
+            leaf_ready_fn=lambda: is_brand_step(page) or _vertical_confirmation_content(page),
+            complete_leaf_fn=lambda node: _complete_exact_live_vertical(page, node),
+            wait_ms=wait_ms,
+            max_depth=max(1, 7 - start_level),
+            max_node_attempts=12,
+            max_backtracks=5,
+            transition_polls=18,
+        )
+        if selected:
+            return selected
+
+    return ""
+
+
 def _select_via_search_with_context(
     page: Page,
     provider: JSONTaskProvider,
@@ -321,8 +378,6 @@ def _select_via_search_with_context(
     for term in hints.vertical_search_terms:
         attempted.append(term)
 
-        # Establish a per-query baseline after clearing the search. Existing root
-        # departments/open child columns are navigation state, not search results.
         search.fill("")
         page.wait_for_timeout(wait_ms)
         before = _visible_text_candidates(page)
@@ -334,9 +389,6 @@ def _select_via_search_with_context(
         selected = ""
         for submit in (False, True):
             if submit:
-                # Some Makro builds do not publish search results on input alone;
-                # Enter is the same bounded search intent without touching any
-                # taxonomy node or resetting the SPA.
                 try:
                     search.press("Enter")
                 except Exception:
@@ -420,22 +472,25 @@ def select_vertical(
     search.fill("")
     page.wait_for_timeout(wait_ms)
 
-    # A failed acceptance intentionally leaves the browser现场 intact. If
-    # multiple taxonomy columns are already open, re-clicking an already selected
-    # parent cannot be distinguished reliably from a stale React child column.
-    # Use Makro's own search from that state, but admit only labels that actually
-    # appear because of the query; pre-existing broad taxonomy nodes are blocked.
     if len(before_clear) > 1:
+        recovered = _resume_partial_taxonomy(
+            page,
+            provider,
+            hints,
+            taxonomy,
+            before_clear,
+            wait_ms=wait_ms,
+        )
+        if recovered:
+            return recovered
         return _select_via_search_with_context(
             page,
             provider,
             hints,
             wait_ms=wait_ms,
-            reason="detected a stale partial taxonomy path from a previous attempt",
+            reason="could not resume the stale partial taxonomy structurally",
         )
 
-    # Clearing the search can repaint the root taxonomy; read it again before
-    # starting the bounded traversal.
     initial = taxonomy.columns()
     if initial:
         selected = navigate_live_taxonomy(
