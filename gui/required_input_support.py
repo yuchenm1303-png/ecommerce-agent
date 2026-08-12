@@ -22,9 +22,10 @@ class RequiredInputSupport(QObject):
     ``N/A``/``1``/first-option placeholders in the formal GUI.
 
     Full Step 3 remains locked until every unresolved required field has an
-    explicit user value. Those values are persisted only as per-run overrides,
-    rebound to the current live schema, and still pass the existing mechanical
-    option/unit/hard-field guards before any browser write.
+    explicit user value and Product Photos has been explicitly authorized. User
+    values are persisted only as per-run overrides, rebound to the current live
+    schema, and still pass the existing mechanical option/unit/hard-field guards
+    before any browser write.
     """
 
     def __init__(self, window: Any) -> None:
@@ -39,6 +40,7 @@ class RequiredInputSupport(QObject):
         window.runner.completed.connect(lambda _result: self._sync_button())
         window.execution_runner.running_changed.connect(lambda _running: self._sync_button())
         window.real_scope_combo.currentIndexChanged.connect(lambda _index: self._sync_button())
+        window.real_upload_check.toggled.connect(lambda _checked: self._sync_button())
 
         try:
             window.real_start_button.clicked.disconnect()
@@ -173,17 +175,25 @@ class RequiredInputSupport(QObject):
             return
 
         scope = self.window.real_scope_combo.currentData()
-        if scope == FULL_STEP3 and self.inputs:
+        if scope == FULL_STEP3:
+            photos_authorized = self.window.real_upload_check.isChecked()
             missing = self._missing_input_ids()
-            self.window.real_start_button.setEnabled(not missing)
-            if missing:
+            enabled = photos_authorized and not missing and (result.ready > 0 or bool(self.inputs))
+            self.window.real_start_button.setEnabled(enabled)
+            if not photos_authorized:
+                self.window.real_start_button.setToolTip(
+                    "Full Step 3 是完整 draft persistence 验收，必须显式勾选“上传本次商品图”。"
+                )
+            elif missing:
                 names = [self.labels.get(identifier, identifier) for identifier in missing]
                 self.window.real_start_button.setToolTip(
                     "Full Step 3 仍缺少必填真实值：" + " | ".join(names)
                 )
+            elif result.ready <= 0 and not self.inputs:
+                self.window.real_start_button.setToolTip("当前 Fill Plan 没有 READY 字段。")
             else:
                 self.window.real_start_button.setToolTip(
-                    f"{len(self.inputs)} 个 unresolved required 字段已显式补齐；可以进入真实写入预检。"
+                    "required 输入与 Product Photos 授权已齐全；可以进入真实写入预检。"
                 )
             return
 
@@ -233,7 +243,7 @@ class RequiredInputSupport(QObject):
         return path
 
     def request_start(self, _checked: bool = False) -> None:
-        """Run canonical preflight after every unresolved required field is explicit."""
+        """Run canonical preflight after every production acceptance gate is explicit."""
 
         result = getattr(self.window, "current_result", None)
         if self.window.runner.is_running or self.window.execution_runner.is_running:
@@ -249,6 +259,14 @@ class RequiredInputSupport(QObject):
         scope = self.window.real_scope_combo.currentData()
         try:
             if scope == FULL_STEP3:
+                if not self.window.real_upload_check.isChecked():
+                    QMessageBox.warning(
+                        self.window,
+                        "Full Step 3 需要图片授权",
+                        "完整 draft persistence 验收包含 Product Photos。"
+                        "请显式勾选“上传本次商品图”；系统会优先复用本次 Resolver 抓取的真实商品图。",
+                    )
+                    return
                 missing = self._missing_input_ids()
                 if missing:
                     names = [self.labels.get(identifier, identifier) for identifier in missing]
@@ -263,14 +281,14 @@ class RequiredInputSupport(QObject):
                     count = len(self.inputs)
                     self.window.fields_hint.setText(f"必填预检完成 · 显式用户值 {count}")
                     self.window.real_policy_hint.setText(
-                        "Full Step 3 将继续使用你明确填写的 required 值。"
+                        "Full Step 3 将继续使用你明确填写的 required 值和已授权的 Product Photos。"
                         "执行器仍会在浏览器写入前校验当前 Makro option / unit / hard-field 约束。"
                     )
                     append = getattr(self.window, "_append_log", None)
                     if callable(append):
                         append(
                             f"[required-user-input] overrides={path or 'none'} "
-                            f"manual={count} ai_calls=0 fallback=0"
+                            f"manual={count} ai_calls=0 fallback=0 photos_authorized=true"
                         )
             else:
                 schema_path = latest_live_schema(result.run_dir)
