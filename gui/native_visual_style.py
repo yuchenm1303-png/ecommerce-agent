@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QModelIndex, QObject, QRectF, Qt, QTimer
+from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QRectF, Qt, QTimer
 from PySide6.QtGui import QCursor, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
@@ -20,18 +20,20 @@ _EFFECT_BOUND_SCALE = 1.04
 
 
 class _CardScaleEffect(QGraphicsEffect):
-    """Scale the complete live QWidget content subtree around the card center.
+    """Scale a fresh composite of the complete QWidget card subtree.
 
-    Quick owns the glass shell itself. This effect owns only the QWidget content
-    painted above that shell. Both receive the same scale value from one card
-    interaction state, so the two renderers reproduce one CSS card transform
-    without resizing layouts or animating individual children.
+    Quick owns the glass shell itself. This effect owns the QWidget content painted
+    above that shell. Both receive the same scale value from one interaction state,
+    reproducing one CSS-like card transform without resizing layouts or animating
+    individual children.
 
-    The source must remain live while the card is scaled. Child widgets such as
-    buttons and editors keep changing their own paint state for hover, press,
-    focus, selection and cursor feedback while the parent card remains hovered.
-    Keeping a manual source-pixmap cache here freezes those local visual states,
-    so draw() always transforms Qt's current source instead of a retained image.
+    A direct drawSource() transform does not reliably reproduce the same flattened
+    QWidget-subtree transform for every complex child combination. A retained
+    source-pixmap cache, on the other hand, freezes QPushButton/QLineEdit hover,
+    press and focus feedback. The compromise is deliberate: each effect redraw
+    asks Qt for a fresh logical-coordinate sourcePixmap(), then scales that complete
+    current composite. Child state changes therefore remain live while text, icons,
+    editors, buttons and tables still move as one card image.
     """
 
     def __init__(self, parent: QObject) -> None:
@@ -51,8 +53,8 @@ class _CardScaleEffect(QGraphicsEffect):
         active = abs(scale - 1.0) > 1e-4
         if self.isEnabled() != active:
             self.setEnabled(active)
-            # The effect uses one fixed maximum bounding rect for its whole active
-            # lifetime. Intermediate hover frames invalidate pixels only.
+            # Keep one fixed maximum bound for the whole active lifetime. Only
+            # pixels change on intermediate scale frames; child geometry does not.
             self.updateBoundingRect()
         self.update()
 
@@ -75,6 +77,16 @@ class _CardScaleEffect(QGraphicsEffect):
             self.drawSource(painter)
             return
 
+        offset = QPoint()
+        pixmap = self.sourcePixmap(
+            Qt.CoordinateSystem.LogicalCoordinates,
+            offset,
+            QGraphicsEffect.PixmapPadMode.NoPad,
+        )
+        if pixmap.isNull():
+            self.drawSource(painter)
+            return
+
         source_rect = self.sourceBoundingRect(Qt.CoordinateSystem.LogicalCoordinates)
         center = source_rect.center()
         painter.save()
@@ -82,9 +94,7 @@ class _CardScaleEffect(QGraphicsEffect):
         painter.translate(center)
         painter.scale(scale, scale)
         painter.translate(-center)
-        # Keep the complete QWidget subtree live. This preserves every child's
-        # own hover/pressed/focus paint while still applying one parent transform.
-        self.drawSource(painter)
+        painter.drawPixmap(offset, pixmap)
         painter.restore()
 
 
