@@ -600,10 +600,11 @@ class StartupEntranceController(QObject):
                 pass
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if watched is self.window and event.type() in {
-            QEvent.Type.Resize,
-            QEvent.Type.Show,
-        }:
+        if (
+            not self._finished
+            and watched is self.window
+            and event.type() in {QEvent.Type.Resize, QEvent.Type.Show}
+        ):
             QTimer.singleShot(0, self.overlay.resize_to_window)
             QTimer.singleShot(0, self.raise_overlay)
         return False
