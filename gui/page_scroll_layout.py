@@ -25,8 +25,13 @@ from PySide6.QtWidgets import (
 )
 
 
-_WORKSPACE_MIN_HEIGHT = 420
-_WORKSPACE_MAX_HEIGHT = 560
+# The field table already owns its own scroll viewport, so the surrounding row
+# does not need to grow vertically with the page. Keeping this row compact makes
+# the Telemetry/Web/Safety column visually terminate close to its real content
+# instead of leaving a large empty strip under the diagnostics card.
+_WORKSPACE_HEIGHT = 350
+_FIELD_TABLE_MIN_HEIGHT = 255
+_SIDE_TABS_HEIGHT = 320
 _CONSOLE_MIN_HEIGHT = 420
 _CONSOLE_MAX_HEIGHT = 560
 _CONSOLE_TABS_MIN_HEIGHT = 250
@@ -198,17 +203,29 @@ def install_page_scroll_layout(window: QMainWindow, visual: Any | None = None) -
     workspace.setParent(page)
     console.setParent(page)
 
-    workspace.setMinimumHeight(_WORKSPACE_MIN_HEIGHT)
-    workspace.setMaximumHeight(_WORKSPACE_MAX_HEIGHT)
-    workspace.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+    workspace.setMinimumHeight(_WORKSPACE_HEIGHT)
+    workspace.setMaximumHeight(_WORKSPACE_HEIGHT)
+    workspace.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     field_table = getattr(window, "field_table", None)
     if isinstance(field_table, QWidget):
-        field_table.setMinimumHeight(285)
+        field_table.setMinimumHeight(_FIELD_TABLE_MIN_HEIGHT)
 
     side_tabs = getattr(window, "side_detail_tabs", None)
     if isinstance(side_tabs, QTabWidget):
-        side_tabs.setMinimumHeight(270)
+        side_tabs.setMinimumHeight(_SIDE_TABS_HEIGHT)
+        side_tabs.setMaximumHeight(_SIDE_TABS_HEIGHT)
+        side_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        # ui_polish used a bottom clearance while the sidebar itself scrolled.
+        # The final page now owns scrolling, so that old clearance only appears as
+        # a visibly empty column under Telemetry. Remove it here, after maturity,
+        # without touching the diagnostic cards themselves.
+        side_host = side_tabs.parentWidget()
+        side_layout = side_host.layout() if side_host is not None else None
+        if isinstance(side_layout, QVBoxLayout):
+            margins = side_layout.contentsMargins()
+            side_layout.setContentsMargins(margins.left(), margins.top(), margins.right(), 0)
 
     _restore_console_view(window, console)
 
