@@ -81,8 +81,8 @@ def _restore_console_view(window: QMainWindow, console: QWidget) -> None:
         was_blocked = toggle.blockSignals(True)
         try:
             toggle.setChecked(True)
-            toggle.hide()
-            toggle.setEnabled(False)
+            toggle.setEnabled(True)
+            toggle.show()
         finally:
             toggle.blockSignals(was_blocked)
 
