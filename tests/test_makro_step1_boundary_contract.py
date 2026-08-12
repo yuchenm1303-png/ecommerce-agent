@@ -119,6 +119,29 @@ def test_vertical_confirmation_may_precede_canonical_url_commit(monkeypatch) -> 
     assert selected == "air_purifier"
 
 
+def test_canonical_url_may_lag_step2_dom(monkeypatch) -> None:
+    page = FakePage()
+    calls = {"count": 0}
+
+    def target_values(_page):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            return "", ""
+        return "air_purifier", ""
+
+    def bounded_wait(predicate, current, **_kwargs):
+        for _ in range(5):
+            if predicate(current):
+                return True
+        return False
+
+    monkeypatch.setattr(vertical_selection, "_current_target_values", target_values)
+    monkeypatch.setattr(vertical_selection, "_wait_for", bounded_wait)
+
+    assert vertical_selection._wait_for_canonical_vertical(page) == "air_purifier"
+    assert calls["count"] >= 3
+
+
 def test_lone_brand_input_is_not_independent_step1_evidence(monkeypatch) -> None:
     page = FakePage()
     brand_input = FakeInput(placeholder="Enter Brand Name", name="brand")
