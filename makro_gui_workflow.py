@@ -166,6 +166,173 @@ def _target_values(page: Any) -> tuple[str, str]:
     return vertical, brand
 
 
+def _listing_stage(page: Any | None) -> str:
+    """Return the highest verified Makro listing stage currently visible."""
+
+    if page is None:
+        return "pre_step1"
+    try:
+        if is_product_info_step(page):
+            return "step3"
+    except Exception:
+        pass
+    try:
+        if is_brand_step(page):
+            return "step2"
+    except Exception:
+        pass
+    return "pre_step1"
+
+
+def _record_listing_checkpoint(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    *,
+    page: Any,
+    status: str,
+    vertical: str,
+    brand: str = "",
+) -> None:
+    manifest["vertical"] = str(vertical or "").strip()
+    if brand:
+        manifest["brand"] = str(brand).strip()
+    manifest["page_url"] = str(getattr(page, "url", "") or "")
+    manifest["status"] = status
+    _write_manifest(manifest_path, manifest)
+
+
+def _advance_listing_to_step3(
+    *,
+    page: Any | None,
+    prepare_step1: Callable[[], Any],
+    provider: Any,
+    hints: Any,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    allow_initial_later_stage: bool,
+    set_current: Callable[[str], None] | None = None,
+) -> tuple[Any, str, str]:
+    """Reconcile the current page/progress and advance only the missing stages.
+
+    The state machine is shared by Single and Batch. A later Step 2/3 page may be
+    adopted at function entry only when the caller has independent ownership /
+    same-task resume proof. Later stages reached *during* this invocation are
+    safe to continue because they originate from this exact controlled flow.
+    """
+
+    def current(name: str) -> None:
+        if set_current is not None:
+            set_current(name)
+
+    initial_stage = _listing_stage(page)
+    current("step1")
+    if initial_stage in {"step2", "step3"} and not allow_initial_later_stage:
+        _phase("step1", "START", f"state-machine current={initial_stage}")
+        raise RuntimeError(
+            "Current Makro page is already Step 2/3, but this run has no verified same-task "
+            "resume/ownership proof. Refusing to adopt an unknown draft."
+        )
+
+    vertical = ""
+    brand = ""
+
+    if initial_stage in {"step2", "step3"}:
+        assert page is not None
+        vertical, brand = _target_values(page)
+        current("step1")
+        _phase("step1", "START", f"state-machine current={initial_stage}")
+        _record_listing_checkpoint(
+            manifest_path,
+            manifest,
+            page=page,
+            status="step1_complete",
+            vertical=vertical,
+        )
+        _phase("step1", "COMPLETE", f"resume vertical={vertical}")
+    else:
+        current("step1")
+        _phase("step1", "START", "state-machine reconcile")
+        prepared = prepare_step1()
+        if prepared is not None:
+            page = prepared
+        if page is None:
+            raise RuntimeError("Step 1 preparation returned no Makro page")
+
+        stage_after_prepare = _listing_stage(page)
+        if stage_after_prepare in {"step2", "step3"}:
+            vertical, brand = _target_values(page)
+        else:
+            dismiss_joyride_overlay(page)
+            vertical = select_vertical(page, provider, hints)
+            stage_after_prepare = _listing_stage(page)
+            if stage_after_prepare not in {"step2", "step3"}:
+                raise RuntimeError(
+                    "Makro Step 1 completed but the page did not reconcile to Step 2/3."
+                )
+
+        _record_listing_checkpoint(
+            manifest_path,
+            manifest,
+            page=page,
+            status="step1_complete",
+            vertical=vertical,
+        )
+        _phase("step1", "COMPLETE", vertical)
+        initial_stage = stage_after_prepare
+
+    stage = _listing_stage(page)
+    if stage == "step3":
+        actual_vertical, actual_brand = _target_values(page)
+        if vertical and actual_vertical.casefold() != vertical.casefold():
+            raise RuntimeError(
+                "Makro state-machine vertical changed unexpectedly before Step 3: "
+                f"expected={vertical!r}, actual={actual_vertical!r}"
+            )
+        vertical = actual_vertical
+        brand = actual_brand or brand
+        current("step2")
+        _phase("step2", "START", "state-machine current=step3")
+        _record_listing_checkpoint(
+            manifest_path,
+            manifest,
+            page=page,
+            status="step2_complete",
+            vertical=vertical,
+            brand=brand,
+        )
+        _phase("step2", "COMPLETE", f"resume brand={brand}")
+        return page, vertical, brand
+
+    if stage != "step2":
+        raise RuntimeError(
+            f"Makro state-machine expected Step 2 after Vertical reconciliation; current={stage}"
+        )
+
+    current("step2")
+    _phase("step2", "START", "state-machine reconcile")
+    selected_brand, page = select_brand_to_product_info(page, provider, hints)
+    actual_vertical, actual_brand = _target_values(page)
+    if vertical and actual_vertical.casefold() != vertical.casefold():
+        raise RuntimeError(
+            "Makro state-machine vertical changed during Step 2 transition: "
+            f"expected={vertical!r}, actual={actual_vertical!r}"
+        )
+    vertical = actual_vertical
+    brand = actual_brand or selected_brand
+    if _listing_stage(page) != "step3":
+        raise RuntimeError("Makro Step 2 completed but Step 3 is not safely operable")
+    _record_listing_checkpoint(
+        manifest_path,
+        manifest,
+        page=page,
+        status="step2_complete",
+        vertical=vertical,
+        brand=brand,
+    )
+    _phase("step2", "COMPLETE", brand)
+    return page, vertical, brand
+
+
 def _plan_command(
     args: Any,
     *,
@@ -352,6 +519,10 @@ def main() -> int:
     current = "source"
     page: Any | None = None
 
+    def set_current_phase(name: str) -> None:
+        nonlocal current
+        current = name
+
     try:
         for phase_name in ("source", "step1", "step2", "step3"):
             if phase_name not in active:
@@ -404,59 +575,26 @@ def main() -> int:
                     page = _resume_current_page(harness, args.resume_current_url)
                     manifest["resumed_from_page_url"] = page.url
                     _write_manifest(manifest_path, manifest)
-
-                    if is_product_info_step(page):
-                        vertical, brand = _target_values(page)
-                        manifest["vertical"] = vertical
-                        manifest["brand"] = brand
-                        manifest["page_url"] = page.url
-                        _phase("step1", "START", "resume-current")
-                        _phase("step1", "COMPLETE", f"resume-current vertical={vertical}")
-                        _phase("step2", "START", "resume-current")
-                        _phase("step2", "COMPLETE", f"resume-current brand={brand}")
-                    elif is_brand_step(page):
-                        vertical, _ = _target_values(page)
-                        manifest["vertical"] = vertical
-                        manifest["page_url"] = page.url
-                        _phase("step1", "START", "resume-current")
-                        _phase("step1", "COMPLETE", f"resume-current vertical={vertical}")
-
-                        current = "step2"
-                        _phase("step2", "START", "resume-current")
-                        brand, page = select_brand_to_product_info(page, provider, hints)
-                        harness.page = page
-                        manifest["brand"] = brand
-                        manifest["page_url"] = page.url
-                        manifest["status"] = "step2_complete"
-                        _write_manifest(manifest_path, manifest)
-                        _phase("step2", "COMPLETE", brand)
-                    else:  # guarded by _resume_current_page; defensive fail-closed branch
-                        raise RuntimeError("resume-current page is neither Step 2 nor Step 3")
+                    prepare_step1 = lambda: page
+                    allow_initial_later_stage = True
                 else:
-                    current = "step1"
-                    _phase("step1", "START")
-                    page = prepare_single_step1_page(harness)
-                    dismiss_joyride_overlay(page)
-                    vertical = select_vertical(page, provider, hints)
-                    manifest["vertical"] = vertical
-                    manifest["page_url"] = page.url
-                    manifest["status"] = "step1_complete"
-                    _write_manifest(manifest_path, manifest)
-                    _phase("step1", "COMPLETE", vertical)
+                    prepare_step1 = lambda: prepare_single_step1_page(harness)
+                    allow_initial_later_stage = False
 
-                    current = "step2"
-                    _phase("step2", "START")
-                    brand, page = select_brand_to_product_info(page, provider, hints)
-                    harness.page = page
-                    manifest["brand"] = brand
-                    manifest["page_url"] = page.url
-                    manifest["status"] = "step2_complete"
-                    _write_manifest(manifest_path, manifest)
-                    _phase("step2", "COMPLETE", brand)
+                page, _vertical, _brand = _advance_listing_to_step3(
+                    page=page,
+                    prepare_step1=prepare_step1,
+                    provider=provider,
+                    hints=hints,
+                    manifest=manifest,
+                    manifest_path=manifest_path,
+                    allow_initial_later_stage=allow_initial_later_stage,
+                    set_current=set_current_phase,
+                )
+                harness.page = page
 
                 current = "step3"
                 _phase("step3", "START")
-                assert page is not None
                 _prepare_step3(args, run_dir=run_dir, page=page, manifest=manifest)
                 harness.detach()
                 manifest["status"] = "prepare_complete"
