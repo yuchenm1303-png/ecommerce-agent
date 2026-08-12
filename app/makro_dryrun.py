@@ -82,6 +82,27 @@ def _single_locator(
     return locator, selector
 
 
+def _commit_select_like(locator: Any, *, native_select: bool) -> None:
+    """Commit visible selection into the framework-owned form state.
+
+    Makro can render a default/selected label even when the React form model has
+    never observed a user change. Playwright's visible readback alone therefore
+    cannot prove that Save will receive the value. For native selects, explicitly
+    dispatch both events after selection (including re-selecting the same default
+    value); for all select-like controls, blur when supported so onBlur-backed
+    state/validation also commits before readback.
+    """
+
+    if native_select:
+        dispatch = getattr(locator, "dispatch_event", None)
+        if callable(dispatch):
+            dispatch("input")
+            dispatch("change")
+    blur = getattr(locator, "blur", None)
+    if callable(blur):
+        blur()
+
+
 def _fill_control(
     page: Page, control: dict[str, Any], value: str, section_path: str | None = None
 ) -> str:
@@ -104,6 +125,7 @@ def _fill_control(
             locator.select_option(label=value)
         except Exception:
             locator.select_option(value=value)
+        _commit_select_like(locator, native_select=True)
         return selector
     if kind in {"checkbox", "custom_checkbox"}:
         should_check = _norm(value) in {"1", "true", "yes", "y", "是", "有", "checked"}
@@ -115,6 +137,7 @@ def _fill_control(
     if kind in {"dropdown", "autocomplete", "listbox"}:
         locator.click()
         page.get_by_text(value, exact=True).last.click()
+        _commit_select_like(locator, native_select=False)
         return selector
 
     raise ValueError(f"暂不支持 Makro 控件类型：{kind}")
