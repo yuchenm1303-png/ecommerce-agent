@@ -130,7 +130,9 @@ def test_vertical_specific_input_can_prove_step1_when_stage_enum_lags(monkeypatc
 
 def test_entry_gate_rejects_false_step1_without_real_vertical_input(monkeypatch) -> None:
     page = FakePage()
+    page.url = "https://seller.makro.co.za/#dashboard/addListings/single"
     monkeypatch.setattr(step1_entry, "is_vertical_interaction_ready", lambda _page: True)
+    monkeypatch.setattr(step1_entry, "_vertical_search_semantics_visible", lambda _page: True)
 
     def missing_vertical_input(_page):
         raise RuntimeError("Makro Step 1 vertical/category search input not found")
@@ -141,10 +143,22 @@ def test_entry_gate_rejects_false_step1_without_real_vertical_input(monkeypatch)
 
 def test_entry_gate_accepts_ready_step1_with_real_vertical_input(monkeypatch) -> None:
     page = FakePage()
+    page.url = "https://seller.makro.co.za/#dashboard/addListings/single"
     vertical_input = FakeInput(placeholder="Search Vertical", name="verticalSearch")
     monkeypatch.setattr(step1_entry, "is_vertical_interaction_ready", lambda _page: True)
+    monkeypatch.setattr(step1_entry, "_vertical_search_semantics_visible", lambda _page: True)
     monkeypatch.setattr(step1_entry, "_vertical_search_input", lambda _page: vertical_input)
     assert step1_entry._is_step1_operable(page) is True
+
+
+def test_dashboard_can_never_masquerade_as_step1_even_with_generic_input(monkeypatch) -> None:
+    page = FakePage()
+    page.url = "https://seller.makro.co.za/#dashboard/home-page"
+    generic_input = FakeInput(placeholder="Search", name="search")
+    monkeypatch.setattr(step1_entry, "is_vertical_interaction_ready", lambda _page: True)
+    monkeypatch.setattr(step1_entry, "_vertical_search_semantics_visible", lambda _page: True)
+    monkeypatch.setattr(step1_entry, "_vertical_search_input", lambda _page: generic_input)
+    assert step1_entry._is_step1_operable(page) is False
 
 
 def test_empty_single_listing_route_is_safe_pre_step1_state() -> None:
@@ -162,6 +176,7 @@ def test_identified_single_listing_route_is_not_safe_to_reset() -> None:
 def test_step1_entry_uses_structural_operability_and_real_portal_entry_path() -> None:
     source = (ROOT / "app" / "makro" / "step1_entry.py").read_text(encoding="utf-8")
     assert "is_vertical_interaction_ready(page)" in source
+    assert "_vertical_search_semantics_visible(page)" in source
     assert "_vertical_search_input(page)" in source
     assert "_is_step1_operable(page)" in source
     assert "_is_safe_pre_step1_single_route(page)" in source
