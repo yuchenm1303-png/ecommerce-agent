@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .errors import JSONTaskProviderError, JSONTaskResponseError, JSONTaskTransportError
+from .transient_retry import run_with_transient_retry
 
 
 class OpenAICompatibleProviderError(JSONTaskProviderError):
@@ -381,7 +382,14 @@ class OpenAICompatibleSemanticProvider:
             kwargs["stream_options"] = {"include_usage": True}
             kwargs["modalities"] = ["text"]
 
-        output_text = self._network_text(kwargs, streaming=streaming)
-        payload = _parse_json_object(output_text)
+        def attempt() -> dict[str, Any]:
+            output_text = self._network_text(kwargs, streaming=streaming)
+            return _parse_json_object(output_text)
+
+        payload = run_with_transient_retry(
+            attempt,
+            progress=self._progress,
+            label="AI JSON task",
+        )
         payload["extractor"] = self.name
         return payload
