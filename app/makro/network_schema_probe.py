@@ -277,8 +277,16 @@ class NetworkResponseRecord:
         }
 
 
-@dataclass(slots=True)
+@dataclass
 class MakroNetworkSchemaProbe:
+    """Read-only response observer attached to a temporary Makro probe page.
+
+    This class intentionally does not use ``slots=True``. Playwright's sync
+    EventEmitter annotates bound-method owners with a private wrapper attribute
+    when ``page.on(...)`` is registered. A slotted owner rejects that runtime
+    attribute before any response can be observed.
+    """
+
     page: Page
     records: list[NetworkResponseRecord] = field(default_factory=list)
 
