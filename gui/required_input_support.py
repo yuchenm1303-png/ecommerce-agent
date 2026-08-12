@@ -8,7 +8,7 @@ from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QLineEdit, QMessageBox
 
 from app.ai_decisions import field_id
-from app.required_overrides import required_fallback_override
+from app.required_overrides import required_fallback_override, required_override_binding
 from .real_execution import FULL_STEP3
 from .result_loader import RunResult, latest_fill_plan, latest_live_schema
 
@@ -196,16 +196,18 @@ class RequiredInputSupport(QObject):
         overrides: list[dict[str, Any]] = []
         for identifier, editor in self.inputs.items():
             value = editor.text().strip()
+            field = self.fields.get(identifier)
             if value:
+                if field is None:
+                    raise RuntimeError(f"必填字段绑定信息已失效：{identifier}")
                 overrides.append(
                     {
-                        "field_id": identifier,
+                        **required_override_binding(field),
                         "values": [value],
                         "source_type": "user",
                     }
                 )
                 continue
-            field = self.fields.get(identifier)
             if field is not None:
                 overrides.append(required_fallback_override(field))
         return overrides
