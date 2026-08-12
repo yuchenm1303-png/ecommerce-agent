@@ -41,8 +41,6 @@ class SmoothScroller(QObject):
         now = time.perf_counter()
         dt = max(0.001, min(0.050, now - self._last_tick_s))
         self._last_tick_s = now
-        # Exactly the old 0.18 easing at 16 ms, but frame-rate independent when
-        # the GUI misses a frame. Delayed ticks catch up instead of slowing down.
         alpha = 1.0 - math.pow(1.0 - self._EASE, dt / self._REFERENCE_DT_S)
 
         for key, entry in list(self._animations.items()):
@@ -71,8 +69,6 @@ class SmoothScroller(QObject):
                 next_value = max(next_value, round(target))
 
             bar.setValue(next_value)
-            # A changing scrollbar range or a platform clamp must never leave a
-            # 16 ms timer spinning forever at an unreachable target.
             if bar.value() == current:
                 del self._animations[key]
 
@@ -81,7 +77,7 @@ class SmoothScroller(QObject):
 
 
 class SmoothWheelFilter(QObject):
-    """Filter Wheel only on real scroll areas/viewports, never on QApplication."""
+    """Smooth nested scroll areas and hand wheel input to the page at boundaries."""
 
     PIXELS_PER_NOTCH = 36
 
@@ -101,6 +97,38 @@ class SmoothWheelFilter(QObject):
             self._areas[watched] = area
             watched.installEventFilter(self)
 
+    @staticmethod
+    def _can_move(area: QAbstractScrollArea, pixel_delta: int) -> bool:
+        bar = area.verticalScrollBar()
+        if not bar.isVisible() or bar.maximum() <= bar.minimum():
+            return False
+        if pixel_delta > 0:
+            return bar.value() < bar.maximum()
+        if pixel_delta < 0:
+            return bar.value() > bar.minimum()
+        return False
+
+    @staticmethod
+    def _parent_scroll_area(area: QAbstractScrollArea) -> QAbstractScrollArea | None:
+        parent = area.parentWidget()
+        while parent is not None:
+            if isinstance(parent, QAbstractScrollArea):
+                return parent
+            parent = parent.parentWidget()
+        return None
+
+    def _scroll_owner(
+        self,
+        area: QAbstractScrollArea,
+        pixel_delta: int,
+    ) -> QAbstractScrollArea | None:
+        current: QAbstractScrollArea | None = area
+        while current is not None:
+            if self._can_move(current, pixel_delta):
+                return current
+            current = self._parent_scroll_area(current)
+        return None
+
     def eventFilter(self, watched: QObject, event) -> bool:  # noqa: ANN001, N802
         if event.type() != QEvent.Type.Wheel:
             return False
@@ -114,14 +142,12 @@ class SmoothWheelFilter(QObject):
         if delta == 0:
             return False
 
-        bar = area.verticalScrollBar()
-        if not bar.isVisible() or bar.maximum() <= bar.minimum():
+        pixel_delta = -round(delta / 120 * self.PIXELS_PER_NOTCH)
+        owner = self._scroll_owner(area, pixel_delta)
+        if owner is None:
             return False
 
-        self._scroller.push(
-            bar,
-            -round(delta / 120 * self.PIXELS_PER_NOTCH),
-        )
+        self._scroller.push(owner.verticalScrollBar(), pixel_delta)
         return True
 
     def cleanup(self) -> None:
