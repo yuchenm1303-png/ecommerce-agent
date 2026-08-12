@@ -112,10 +112,10 @@ def main() -> int:
     install_detailed_preparation_progress(window)
     visual.refresh_glass_frames()
 
-    # Final scrolling-card renderer: every registered glass frame inside the
-    # Single page leaves the independent Quick card scene and is painted by one
-    # viewport-owned QWidget compositor. Quick remains the Fuji/parallax owner;
-    # scrolling card geometry, glass and content stay in one QWidget backing store.
+    # A/B prototype: Product Source + Single status cards keep the same pre-blurred
+    # Fuji/tint look but paint their shell inside the QWidget tree. They therefore
+    # scroll in the same backing-store turn as their text instead of waiting for
+    # the independent threaded Quick card scene. All lower cards remain unchanged.
     install_scroll_local_glass(window, visual)
 
     # Presentation-only hot-path optimizations are installed after both Single
