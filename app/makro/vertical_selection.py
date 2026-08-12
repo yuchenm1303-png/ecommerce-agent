@@ -4,18 +4,21 @@ This keeps product semantics in ``listing_creation`` while replacing only the
 live taxonomy traversal mechanics. Exact live-node AI choices remain mandatory;
 wrong branches are boundedly backtracked and exhausted trees fall through to the
 existing Makro search fallback.
+
+A retry can begin with a partially opened taxonomy path left by an earlier
+failed acceptance. Makro is a SPA, so navigating to the same route is not a
+reliable way to reset that React state. Such retries therefore use Makro's own
+Vertical Search instead of forcing a page reset. The search path still selects
+only exact live Makro results and keeps the existing vertical verification.
 """
 
 from __future__ import annotations
-
-import time
 
 from playwright.sync_api import Page
 
 from .listing_creation import (
     JSONTaskProvider,
     ListingBootstrapHints,
-    MAKRO_NEW_LISTING_URL,
     _complete_vertical_leaf,
     _select_vertical_via_search,
     _vertical_confirmation_content,
@@ -24,44 +27,31 @@ from .listing_creation import (
     is_brand_step,
     is_vertical_step,
 )
-from .step3_transition import dismiss_joyride_overlay
 from .taxonomy_navigation import navigate_live_taxonomy
 from .taxonomy_resilient import ResilientMakroTaxonomyBrowser
 
 
-def _reset_partial_taxonomy_if_needed(
+def _select_via_search_with_context(
     page: Page,
-    taxonomy: ResilientMakroTaxonomyBrowser,
+    provider: JSONTaskProvider,
+    hints: ListingBootstrapHints,
     *,
     wait_ms: int,
-) -> list[list[str]]:
-    """Discard a stale partially selected Step 1 path before a fresh run.
+    reason: str,
+) -> str:
+    """Run the existing exact-live search fallback with a useful failure cause."""
 
-    A failed acceptance intentionally leaves the browser现场 intact. A retry can
-    therefore start with multiple taxonomy columns already open. Re-clicking the
-    already-selected parent would leave the same child signature and look like a
-    failed transition. Reloading the same Step 1 route is safe because no
-    vertical has been confirmed yet; Step 2/3 pages never enter this function.
-    """
-
-    initial = taxonomy.columns()
-    if len(initial) <= 1:
-        return initial
-
-    page.goto(MAKRO_NEW_LISTING_URL, wait_until="domcontentloaded", timeout=45_000)
-    deadline = time.monotonic() + 20.0
-    while time.monotonic() < deadline:
-        if is_vertical_step(page):
-            break
-        page.wait_for_timeout(250)
-    if not is_vertical_step(page):
-        raise RuntimeError("Makro Step 1 could not reset a stale partial taxonomy path")
-
-    dismiss_joyride_overlay(page)
-    search = _vertical_search_input(page)
-    search.fill("")
-    page.wait_for_timeout(wait_ms)
-    return taxonomy.columns()
+    try:
+        return _select_vertical_via_search(
+            page,
+            provider,
+            hints,
+            wait_ms=wait_ms,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Makro Step 1 {reason}; the exact-live Vertical Search fallback also failed: {exc}"
+        ) from exc
 
 
 def select_vertical(
@@ -71,21 +61,37 @@ def select_vertical(
     *,
     wait_ms: int = 800,
 ) -> str:
-    """Select one verified Makro vertical with bounded branch backtracking."""
+    """Select one verified Makro vertical with bounded branch backtracking.
+
+    Fresh Step 1 pages use the live taxonomy tree. If an earlier failed run left
+    multiple taxonomy columns open, do not reload or otherwise mutate the SPA in
+    an attempt to reset it. Use the portal's own bounded Vertical Search instead;
+    that route is specifically designed to resolve a vertical from an arbitrary
+    Step 1 browsing state and still verifies the exact live Makro result.
+    """
 
     if not is_vertical_step(page):
         raise RuntimeError("Makro is not on Step 1 / Select Vertical")
+
+    taxonomy = ResilientMakroTaxonomyBrowser(page)
+    before_clear = taxonomy.columns()
 
     search = _vertical_search_input(page)
     search.fill("")
     page.wait_for_timeout(wait_ms)
 
-    taxonomy = ResilientMakroTaxonomyBrowser(page)
-    initial = _reset_partial_taxonomy_if_needed(
-        page,
-        taxonomy,
-        wait_ms=wait_ms,
-    )
+    if len(before_clear) > 1:
+        return _select_via_search_with_context(
+            page,
+            provider,
+            hints,
+            wait_ms=wait_ms,
+            reason="detected a stale partial taxonomy path from a previous attempt",
+        )
+
+    # Clearing the search box may repaint the root taxonomy, so read it again
+    # before starting a fresh bounded traversal.
+    initial = taxonomy.columns()
     if initial:
         selected = navigate_live_taxonomy(
             page,
@@ -108,21 +114,16 @@ def select_vertical(
         if selected:
             return selected
 
-    # A readable taxonomy that contains no semantically valid bounded path is
-    # not a fatal portal error. Reset through the existing exact-live search
-    # fallback using the canonical Product Identity search term.
-    try:
-        return _select_vertical_via_search(
-            page,
-            provider,
-            hints,
-            wait_ms=wait_ms,
-        )
-    except RuntimeError as exc:
-        raise RuntimeError(
-            "Makro Step 1 exhausted the bounded live taxonomy and the live search fallback also failed: "
-            f"{exc}"
-        ) from exc
+    # No readable tree, or all bounded tree branches were semantically rejected.
+    # Search remains exact-live and is therefore a safe fallback rather than an
+    # invented category shortcut.
+    return _select_via_search_with_context(
+        page,
+        provider,
+        hints,
+        wait_ms=wait_ms,
+        reason="could not resolve a verified vertical through the bounded live taxonomy",
+    )
 
 
 __all__ = ["select_vertical"]
