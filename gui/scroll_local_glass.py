@@ -1,4 +1,4 @@
-"""WWidget-local glass prototype for the first scrolling Single-page cards.
+"""QWidget-local glass prototype for the first scrolling Single-page cards.
 
 This is deliberately narrow: Product Source and the top status cards move their
 blur/tint shell out of the independent Quick card scene while the rest of the GUI
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRectF, Qt, Slot
+from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QRectF, Qt, Slot
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import QFrame, QMainWindow, QScrollArea, QWidget
 
@@ -33,11 +33,11 @@ def _ancestor_card(widget: QWidget | None, object_name: str) -> QFrame | None:
 class _LocalGlassLayer(QWidget):
     """Cheap blurred-wallpaper crop painted inside one moving QWidget card."""
 
-    def __init__(self, frame: QFrame, controller: "ScrollLocalGlassController") -> None:
+    def __init__(self, frame: QFrame, controller: "ScrollLocalGlassController", proxy: Any) -> None:
         super().__init__(frame)
         self.frame = frame
         self.controller = controller
-        self._overlay_alpha = _NORMAL_GLASS_ALPHA
+        self.proxy = proxy
         self.setObjectName(_LOCAL_LAYER_NAME)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
@@ -47,13 +47,6 @@ class _LocalGlassLayer(QWidget):
         self.setGeometry(frame.rect())
         self.lower()
         self.show()
-
-    def set_overlay_alpha(self, alpha: float) -> None:
-        alpha = max(_NORMAL_GLASS_ALPHA, min(255.0, float(alpha)))
-        if abs(alpha - self._overlay_alpha) < 0.1:
-            return
-        self._overlay_alpha = alpha
-        self.update()
 
     def paintEvent(self, _event) -> None:  # noqa: ANN001, N802
         if self.width() <= 0 or self.height() <= 0:
@@ -69,7 +62,12 @@ class _LocalGlassLayer(QWidget):
         painter.setClipPath(clip)
 
         self.controller.paint_blurred_wallpaper(painter, self.frame, bounds)
-        painter.fillRect(bounds, QColor(0, 0, 0, round(self._overlay_alpha)))
+        try:
+            overlay_alpha = float(getattr(self.proxy, "overlay_alpha", _NORMAL_GLASS_ALPHA))
+        except (RuntimeError, TypeError, ValueError):
+            overlay_alpha = _NORMAL_GLASS_ALPHA
+        overlay_alpha = max(_NORMAL_GLASS_ALPHA, min(255.0, overlay_alpha))
+        painter.fillRect(bounds, QColor(0, 0, 0, round(overlay_alpha)))
         painter.end()
 
 
@@ -92,22 +90,24 @@ class ScrollLocalGlassController(QObject):
         if self.background is None or self.quick is None or self._source.isNull():
             return
 
-        frames = self._resolve_frames()
-        if not frames:
+        surface_for = getattr(self.visual, "surface_for", None)
+        if not callable(surface_for):
             return
 
+        targets: list[tuple[QFrame, Any]] = []
+        for frame in self._resolve_frames():
+            proxy = surface_for(frame)
+            if proxy is not None:
+                targets.append((frame, proxy))
+        if not targets:
+            return
+
+        frames = [frame for frame, _proxy in targets]
         self._detach_from_quick_model(frames)
-        for frame in frames:
-            layer = _LocalGlassLayer(frame, self)
-            use_local = getattr(self.visual, "use_local_glass", None)
-            if not callable(use_local) or not bool(use_local(frame, layer)):
-                layer.deleteLater()
-                continue
+        for frame, proxy in targets:
+            layer = _LocalGlassLayer(frame, self, proxy)
             self._layers[frame] = layer
             frame.installEventFilter(self)
-
-        if not self._layers:
-            return
 
         self.scroll.verticalScrollBar().valueChanged.connect(self._repaint_for_scroll)
         self.quick.widthChanged.connect(self._invalidate_scaled_item)
@@ -120,7 +120,6 @@ class ScrollLocalGlassController(QObject):
         # Remove the old Quick blur/tint shell once, then keep all local cards out
         # of the model permanently. Other cards continue using the existing path.
         try:
-            self.background.card_model.sync_geometry()
             self.background.schedule_mask_update()
         except RuntimeError:
             pass
@@ -164,7 +163,7 @@ class ScrollLocalGlassController(QObject):
         for row in removal_rows:
             if row < 0 or row >= len(cards):
                 continue
-            model.beginRemoveRows(model.index(-1, -1), row, row)
+            model.beginRemoveRows(QModelIndex(), row, row)
             try:
                 del cards[row]
                 del states[row]
