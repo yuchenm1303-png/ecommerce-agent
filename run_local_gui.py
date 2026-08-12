@@ -23,6 +23,7 @@ def main() -> int:
     from gui.activity_presence import install_activity_presence
     from gui.browser_session_manager import install_managed_makro_browser
     from gui.card_details_fast import install_card_details
+    from gui.card_interaction_performance import install_card_interaction_performance
     from gui.console_summary_mode import install_console_summary_mode
     from gui.console_window import MainWindow
     from gui.workflow_console_window import WorkflowMainWindow
@@ -101,7 +102,12 @@ def main() -> int:
 
     shell = install_native_window_shell(window, quick_window)
 
-    install_nekro_card_fx(window, visual)
+    card_fx = install_nekro_card_fx(window, visual)
+    # Continuous A -> B -> C card traversal is a worst-case QWidget raster path:
+    # old 300 ms transitions can overlap while every scale frame captures a full
+    # card subtree. Bound that presentation-only cost without touching the proven
+    # interaction semantics, controls, layout geometry or Quick glass ownership.
+    install_card_interaction_performance(window, visual, card_fx)
     install_buffered_logs(window)
     effects = install_nekro_effects(window, sakura_count=3)
 
