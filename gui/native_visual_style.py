@@ -17,6 +17,8 @@ from .visual_style import NEKRO_STYLE
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
 _NORMAL_GLASS_ALPHA = 64.0
 _EFFECT_BOUND_SCALE = 1.04
+_CONTENT_EDGE_STEP_PX = 0.18
+_NORMAL_SCALE_EPSILON = 1e-5
 
 
 class _CardScaleEffect(QGraphicsEffect):
@@ -30,10 +32,13 @@ class _CardScaleEffect(QGraphicsEffect):
 
     A card that has just LOST interaction ownership may switch to FROZEN mode for
     its short return-to-rest animation. Its first outgoing draw captures one final
-    composite and later scale ticks reuse that same pixmap. This is safe because an
-    outgoing card no longer needs live child interaction, and it removes repeated
-    full-subtree rasterization from rapid A -> B -> C traversal. Returning to live
+    composite and later scale ticks reuse that same pixmap. Returning to live
     ownership, exact scale 1.0, modal reset or cleanup releases the frozen image.
+
+    Scale publication is also pixel-budgeted here, at the actual renderer boundary:
+    a full live QWidget subtree is not re-rasterized until the card edge would move
+    by at least ~0.18 px. This keeps the hot path local instead of wrapping
+    set_scale() at runtime.
     """
 
     def __init__(self, parent: QObject) -> None:
@@ -57,6 +62,13 @@ class _CardScaleEffect(QGraphicsEffect):
         self._frozen_source = None
         self._frozen_offset = QPoint()
 
+    def _content_span(self) -> float:
+        frame = self.parent()
+        try:
+            return max(1.0, float(frame.width()), float(frame.height()))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return 1.0
+
     def set_frozen(self, frozen: bool) -> None:
         frozen = bool(frozen)
         if frozen == self._frozen:
@@ -68,19 +80,28 @@ class _CardScaleEffect(QGraphicsEffect):
             self.update()
 
     def set_scale(self, scale: float) -> None:
-        scale = max(0.96, min(_EFFECT_BOUND_SCALE, float(scale)))
-        if abs(scale - self._scale) <= 1e-5:
+        requested = max(0.96, min(_EFFECT_BOUND_SCALE, float(scale)))
+        exact_rest = abs(requested - 1.0) <= _NORMAL_SCALE_EPSILON
+        if exact_rest:
+            requested = 1.0
+        else:
+            edge_delta_px = self._content_span() * abs(requested - self._scale) * 0.5
+            if edge_delta_px < _CONTENT_EDGE_STEP_PX:
+                return
+
+        if abs(requested - self._scale) <= _NORMAL_SCALE_EPSILON:
+            if exact_rest and self._frozen:
+                self._frozen = False
+                self._freeze_requested = False
+                self._clear_frozen_source()
             return
-        self._scale = scale
-        active = abs(scale - 1.0) > 1e-4
+
+        self._scale = requested
+        active = abs(requested - 1.0) > 1e-4
         if self.isEnabled() != active:
             self.setEnabled(active)
-            # Keep one fixed maximum bound for the whole active lifetime. Only
-            # pixels change on intermediate scale frames; child geometry does not.
             self.updateBoundingRect()
         if not active:
-            # At exact rest QWidget can paint normally again. Never retain an
-            # outgoing full-card image beyond the transition that needed it.
             self._frozen = False
             self._freeze_requested = False
             self._clear_frozen_source()
@@ -165,6 +186,9 @@ class NativeGlassProxy(QObject):
     def overlay_alpha(self) -> float:
         return self._overlay_alpha
 
+    def set_content_frozen(self, frozen: bool) -> None:
+        self._scale_effect.set_frozen(frozen)
+
     def set_interaction(self, *, scale: float, overlay_alpha: float) -> None:
         scale = max(0.96, min(1.04, float(scale)))
         overlay_alpha = max(_NORMAL_GLASS_ALPHA, min(255.0, float(overlay_alpha)))
@@ -176,8 +200,6 @@ class NativeGlassProxy(QObject):
         self._surface_scale = scale
         self._overlay_alpha = overlay_alpha
 
-        # One state drives both visual owners. Quick transforms the actual glass
-        # shell/tint, while QWidget transforms every title/icon/control above it.
         self.background.set_card_presentation(
             self.frame,
             scale=scale,
@@ -212,8 +234,6 @@ class NativeVisualStyleController(QObject):
         self._cursor_installed = False
         self._mode_stack_glass_connected = False
 
-        # The QWidget tree remains the baseline UI. Only the top-level client
-        # surface is translucent so the native Quick scene can present below it.
         window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         window.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         window.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
@@ -221,12 +241,8 @@ class NativeVisualStyleController(QObject):
         if self.central is not None:
             self.central.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
             self.central.setAutoFillBackground(False)
-            # This filter only suppresses AtmosphereWidget's legacy wallpaper
-            # paint. Installing it globally made every Qt event cross Python.
             self.central.installEventFilter(self)
 
-        # Reuse baseline style constants verbatim. No replacement card border is
-        # introduced; only the reference site's interaction presentation differs.
         window.setStyleSheet(window.styleSheet() + "\n" + NEKRO_STYLE)
 
         self.background = NativeQuickBackground(window)
@@ -283,9 +299,6 @@ class NativeVisualStyleController(QObject):
         finally:
             model.endInsertRows()
 
-        # NativeQuickBackground intentionally watches only relevant widgets, not
-        # the whole QApplication. Extend that same scoped watch set to Batch card
-        # ancestors so stack changes, layout changes and resizes refresh the mask.
         for frame in new_frames:
             current = frame
             while current is not None:
@@ -296,8 +309,6 @@ class NativeVisualStyleController(QObject):
                     break
                 current = current.parentWidget()
 
-        # Batch owns its own tables/scroll areas, created after background init.
-        # Connect only scroll areas under the newly registered cards.
         scroll_areas: set[QAbstractScrollArea] = set()
         for frame in new_frames:
             scroll_areas.update(frame.findChildren(QAbstractScrollArea))
@@ -333,8 +344,6 @@ class NativeVisualStyleController(QObject):
         self.background.schedule_mask_update()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        # Suppress only the baseline AtmosphereWidget wallpaper paint. Card
-        # content/controls remain the original QWidget implementation.
         if watched is self.central and event.type() == QEvent.Type.Paint:
             return True
         return False
