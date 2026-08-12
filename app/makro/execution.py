@@ -19,6 +19,114 @@ from makro_preview_listing import (
 )
 
 PRODUCT_PHOTOS = "Product Photos"
+DIAGNOSTIC_SCREENSHOT_TIMEOUT_MS = 5_000
+
+
+def _capture_diagnostic_screenshot(
+    adapter: MakroDomainAdapter,
+    path: Path,
+    report: dict[str, Any],
+    key: str,
+) -> None:
+    """Capture a best-effort diagnostic without changing transaction outcome."""
+
+    try:
+        adapter.page.screenshot(
+            path=str(path),
+            full_page=True,
+            timeout=DIAGNOSTIC_SCREENSHOT_TIMEOUT_MS,
+        )
+        report[key] = str(path.resolve())
+    except Exception as exc:
+        report[f"{key}_error"] = str(exc)
+
+
+def _collect_save_failure_diagnostics(
+    adapter: MakroDomainAdapter,
+    section_title: str,
+) -> dict[str, Any]:
+    """Collect cheap live evidence after Makro rejects a section Save."""
+
+    diagnostics: dict[str, Any] = {
+        "visible_errors": [],
+        "error_text_candidates": [],
+        "invalid_controls": [],
+    }
+    live = adapter.find_section(section_title)
+    if live is None:
+        diagnostics["detail"] = "Save 失败后找不到目标 section。"
+        return diagnostics
+
+    path = str(live.get("path") or "")
+    if not path:
+        diagnostics["detail"] = "Save 失败后的 section 缺少稳定 DOM path。"
+        return diagnostics
+
+    diagnostics["visible_errors"] = adapter.visible_section_errors(path)
+    card = adapter.page.locator(path)
+
+    try:
+        text = card.inner_text(timeout=3_000)
+        keywords = (
+            "error",
+            "required",
+            "invalid",
+            "please",
+            "must",
+            "cannot",
+            "can't",
+            "minimum",
+            "maximum",
+            "greater",
+            "less than",
+            "upload",
+        )
+        lines: list[str] = []
+        for raw in str(text or "").splitlines():
+            clean = " ".join(raw.split()).strip()
+            if not clean:
+                continue
+            folded = clean.casefold()
+            if any(token in folded for token in keywords) and clean not in lines:
+                lines.append(clean)
+        diagnostics["error_text_candidates"] = lines[:40]
+    except Exception as exc:
+        diagnostics["section_text_error"] = str(exc)
+
+    try:
+        invalid = card.locator(
+            'input:invalid, textarea:invalid, select:invalid, [aria-invalid="true"]'
+        )
+        count = min(invalid.count(), 40)
+        controls: list[dict[str, Any]] = []
+        for index in range(count):
+            node = invalid.nth(index)
+            item: dict[str, Any] = {
+                "name": node.get_attribute("name"),
+                "id": node.get_attribute("id"),
+                "type": node.get_attribute("type"),
+                "aria_invalid": node.get_attribute("aria-invalid"),
+                "aria_describedby": node.get_attribute("aria-describedby"),
+            }
+            try:
+                item["value"] = node.input_value(timeout=1_000)
+            except Exception:
+                try:
+                    item["value"] = node.get_attribute("value")
+                except Exception:
+                    item["value"] = None
+            try:
+                item["validation_message"] = node.evaluate(
+                    "el => el.validationMessage || ''"
+                )
+            except Exception:
+                item["validation_message"] = ""
+            controls.append(item)
+        diagnostics["invalid_controls"] = controls
+    except Exception as exc:
+        diagnostics["invalid_control_scan_error"] = str(exc)
+
+    return diagnostics
 
 
 def fill_one_section(
@@ -129,8 +237,12 @@ def fill_one_section(
         )
 
     before_save = run_dir / f"{_safe_name(section_title)}-before-save.png"
-    adapter.page.screenshot(path=str(before_save), full_page=True)
-    report["screenshot_before_save"] = str(before_save.resolve())
+    _capture_diagnostic_screenshot(
+        adapter,
+        before_save,
+        report,
+        "screenshot_before_save",
+    )
 
     if not persist:
         report["status"] = "preview_open"
@@ -161,39 +273,53 @@ def fill_one_section(
         )
         report["persisted_validation_failed"] = len(persisted) - report["persisted_verified"]
         report["post_save_errors"] = errors
-
-        after_save = run_dir / f"{_safe_name(section_title)}-after-save-reopen.png"
-        adapter.page.screenshot(path=str(after_save), full_page=True)
-        report["screenshot_after_save"] = str(after_save.resolve())
-        adapter.cancel_section(section_title)
-
-        execution_incomplete = bool(
-            report["validation_failed"]
-            or report["fill_error"]
-            or report["skipped_live_match"]
-        )
-        if errors or report["persisted_validation_failed"]:
-            report["status"] = "persisted_validation_failed"
-        elif execution_incomplete:
-            report["status"] = "partial_persisted"
-        else:
-            report["status"] = "persisted_verified"
     except Exception as exc:
         report["status"] = "save_failed"
         report["save_error"] = str(exc)
-        live_section = adapter.find_section(section_title)
-        if live_section is not None and not live_section.get("has_edit"):
-            path = str(live_section.get("path") or "")
-            if path:
-                report["visible_errors_after_save_failure"] = adapter.visible_section_errors(path)
-            failed_shot = run_dir / f"{_safe_name(section_title)}-save-failed.png"
-            adapter.page.screenshot(path=str(failed_shot), full_page=True)
-            report["screenshot_save_failed"] = str(failed_shot.resolve())
-            try:
+        diagnostics = _collect_save_failure_diagnostics(adapter, section_title)
+        report["save_failure_diagnostics"] = diagnostics
+        report["visible_errors_after_save_failure"] = diagnostics.get(
+            "visible_errors", []
+        )
+        failed_shot = run_dir / f"{_safe_name(section_title)}-save-failed.png"
+        _capture_diagnostic_screenshot(
+            adapter,
+            failed_shot,
+            report,
+            "screenshot_save_failed",
+        )
+        try:
+            live_section = adapter.find_section(section_title)
+            if live_section is not None and not live_section.get("has_edit"):
                 adapter.cancel_section(section_title)
                 report["cancelled_unsaved_after_failure"] = True
-            except Exception as cleanup_exc:
-                report["cleanup_error"] = str(cleanup_exc)
+        except Exception as cleanup_exc:
+            report["cleanup_error"] = str(cleanup_exc)
+        return report
+
+    execution_incomplete = bool(
+        report["validation_failed"]
+        or report["fill_error"]
+        or report["skipped_live_match"]
+    )
+    if errors or report["persisted_validation_failed"]:
+        report["status"] = "persisted_validation_failed"
+    elif execution_incomplete:
+        report["status"] = "partial_persisted"
+    else:
+        report["status"] = "persisted_verified"
+
+    after_save = run_dir / f"{_safe_name(section_title)}-after-save-reopen.png"
+    _capture_diagnostic_screenshot(
+        adapter,
+        after_save,
+        report,
+        "screenshot_after_save",
+    )
+    try:
+        adapter.cancel_section(section_title)
+    except Exception as cleanup_exc:
+        report["post_save_cleanup_error"] = str(cleanup_exc)
     return report
 
 
@@ -459,8 +585,12 @@ def run_photos(
             break
 
     staged_shot = run_dir / "Product-Photos-staged.png"
-    adapter.page.screenshot(path=str(staged_shot), full_page=True)
-    report["screenshot_staged"] = str(staged_shot.resolve())
+    _capture_diagnostic_screenshot(
+        adapter,
+        staged_shot,
+        report,
+        "screenshot_staged",
+    )
 
     expected_new = len(pending)
     if int(report["staged"]) != expected_new:
@@ -488,7 +618,20 @@ def run_photos(
     except Exception as exc:
         report["status"] = "save_failed"
         report["save_error"] = str(exc)
-        report["detail"] = "5 个固定图片槽已填写，但 Product Photos Save 被 Makro 拒绝。"
+        report["save_failure_diagnostics"] = _collect_save_failure_diagnostics(
+            adapter,
+            PRODUCT_PHOTOS,
+        )
+        report["detail"] = (
+            f"{expected_new} 个固定图片槽已填写，但 Product Photos Save 被 Makro 拒绝。"
+        )
+        failed_shot = run_dir / "Product-Photos-save-failed.png"
+        _capture_diagnostic_screenshot(
+            adapter,
+            failed_shot,
+            report,
+            "screenshot_save_failed",
+        )
         return report
 
     persistence = adapter.verify_persisted_photo_count(
@@ -521,7 +664,14 @@ def run_photos(
             "remaining_empty_slots": reopened.get("add_image_tile_count"),
         }
         saved_shot = run_dir / "Product-Photos-after-save-reopen.png"
-        adapter.page.screenshot(path=str(saved_shot), full_page=True)
-        report["screenshot_after_save"] = str(saved_shot.resolve())
-        adapter.cancel_section(PRODUCT_PHOTOS)
+        _capture_diagnostic_screenshot(
+            adapter,
+            saved_shot,
+            report,
+            "screenshot_after_save",
+        )
+        try:
+            adapter.cancel_section(PRODUCT_PHOTOS)
+        except Exception as cleanup_exc:
+            report["post_save_cleanup_error"] = str(cleanup_exc)
     return report
