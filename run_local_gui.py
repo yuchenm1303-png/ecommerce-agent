@@ -9,8 +9,9 @@ os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
 
 def main() -> int:
     try:
+        from PySide6.QtCore import Qt
         from PySide6.QtQuick import QQuickWindow
-        from PySide6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication, QSizePolicy
     except ImportError:
         print(
             "缺少开发 GUI 依赖 PySide6。\n"
@@ -62,6 +63,22 @@ def main() -> int:
     # complete workspace afterwards, so old layout/card plugins never reinterpret
     # Batch controls as Single diagnostics.
     install_ui_polish(window)
+
+    # The right-side Telemetry/Web/Safety host already lives inside SmoothScrollArea.
+    # Do not stretch its tab widget to fill the viewport: keep the current card at
+    # its content-driven height and let the remaining space sit below it. If a
+    # detail page later grows taller, the existing outer scroll area still owns
+    # overflow and remains fully scrollable.
+    side_tabs = getattr(window, "side_detail_tabs", None)
+    if side_tabs is not None:
+        side_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        side_host = side_tabs.parentWidget()
+        side_layout = side_host.layout() if side_host is not None else None
+        if side_layout is not None:
+            side_layout.setStretchFactor(side_tabs, 0)
+            side_layout.setAlignment(side_tabs, Qt.AlignmentFlag.AlignTop)
+            side_layout.addStretch(1)
+
     details = install_card_details(window)
     mature = install_mature_ui(window)
     details.attach_mature(mature)
