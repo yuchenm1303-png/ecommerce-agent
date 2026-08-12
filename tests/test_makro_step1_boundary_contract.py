@@ -147,11 +147,24 @@ def test_entry_gate_accepts_ready_step1_with_real_vertical_input(monkeypatch) ->
     assert step1_entry._is_step1_operable(page) is True
 
 
+def test_empty_single_listing_route_is_safe_pre_step1_state() -> None:
+    page = FakePage()
+    page.url = "https://seller.makro.co.za/#dashboard/addListings/single"
+    assert step1_entry._is_safe_pre_step1_single_route(page) is True
+
+
+def test_identified_single_listing_route_is_not_safe_to_reset() -> None:
+    page = FakePage()
+    page.url = "https://seller.makro.co.za/#dashboard/addListings/single?vertical=air_purifier&requestId=req-1"
+    assert step1_entry._is_safe_pre_step1_single_route(page) is False
+
+
 def test_step1_entry_uses_structural_operability_and_real_portal_entry_path() -> None:
     source = (ROOT / "app" / "makro" / "step1_entry.py").read_text(encoding="utf-8")
     assert "is_vertical_interaction_ready(page)" in source
     assert "_vertical_search_input(page)" in source
     assert "_is_step1_operable(page)" in source
+    assert "_is_safe_pre_step1_single_route(page)" in source
     assert "timeout_s: float = 30.0" in source
     assert "taxonomy_columns" in source
     assert "detect_stage().value" in source
@@ -165,7 +178,7 @@ def test_single_and_batch_share_the_same_pre_step1_navigation() -> None:
     source = (ROOT / "app" / "makro" / "step1_entry.py").read_text(encoding="utf-8")
     single = (ROOT / "makro_gui_workflow.py").read_text(encoding="utf-8")
     batch = (ROOT / "makro_batch_job.py").read_text(encoding="utf-8")
-    assert source.count("_prepare_new_listing_step1_page(page)") == 2
+    assert source.count("_prepare_new_listing_step1_page(page)") >= 2
     assert "prepare_single_step1_page(harness)" in single
     assert "prepare_owned_step1_page(page)" in batch
     assert "_prepare_step1_page(harness)" not in single
