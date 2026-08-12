@@ -616,6 +616,10 @@ def _tabify_side_panel(window: QMainWindow, workspace_splitter: QSplitter) -> No
     while side_layout.count():
         side_layout.takeAt(0)
 
+    # Keep the right-side detail card clear of the lower console and leave enough
+    # room for the existing hover lift without visually touching the next card.
+    side_layout.setContentsMargins(0, 0, 0, 10)
+
     tabs = QTabWidget(host)
     tabs.setObjectName("sideDetailTabs")
     tabs.setDocumentMode(True)
