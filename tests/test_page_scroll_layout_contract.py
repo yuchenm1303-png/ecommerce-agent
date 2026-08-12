@@ -10,13 +10,18 @@ SMOOTH = (ROOT / "gui" / "smooth_scroll.py").read_text(encoding="utf-8")
 SUMMARY = (ROOT / "gui" / "console_summary_mode.py").read_text(encoding="utf-8")
 
 
-def test_formal_single_installs_page_scroll_after_polish_before_mode_workspace() -> None:
+def test_formal_single_installs_final_page_scroll_after_maturity_before_summary_and_modes() -> None:
     assert "from gui.page_scroll_layout import install_page_scroll_layout" in RUN
     assert "install_ui_polish(window)" in RUN
+    assert "install_mature_ui(window)" in RUN
     assert "install_page_scroll_layout(window, visual)" in RUN
+    assert "install_console_summary_mode(window)" in RUN
     assert "window.install_mode_workspace()" in RUN
-    assert RUN.index("install_ui_polish(window)") < RUN.index("install_page_scroll_layout(window, visual)")
-    assert RUN.index("install_page_scroll_layout(window, visual)") < RUN.index("window.install_mode_workspace()")
+
+    assert RUN.index("install_ui_polish(window)") < RUN.index("install_mature_ui(window)")
+    assert RUN.index("install_mature_ui(window)") < RUN.index("install_page_scroll_layout(window, visual)")
+    assert RUN.index("install_page_scroll_layout(window, visual)") < RUN.index("install_console_summary_mode(window)")
+    assert RUN.index("install_console_summary_mode(window)") < RUN.index("window.install_mode_workspace()")
 
 
 def test_header_stays_fixed_while_single_body_becomes_one_scroll_page() -> None:
@@ -26,8 +31,8 @@ def test_header_stays_fixed_while_single_body_becomes_one_scroll_page() -> None:
     assert "ScrollBarAsNeeded" in PAGE
     assert "outer.addWidget(scroll, 1)" in PAGE
 
-    # The installer removes only the Product Source/status/body items. It never
-    # takes root item 0, which remains the common fixed application header.
+    # The installer removes only Product Source/status/body. Root item 0 remains
+    # the common application header and therefore stays fixed above the page.
     assert "_take_widget(outer, input_card)" in PAGE
     assert "_take_layout(outer, status_layout)" in PAGE
     assert "_take_widget(outer, body)" in PAGE
@@ -43,8 +48,6 @@ def test_existing_business_widgets_are_reparented_not_rebuilt() -> None:
     assert "page_layout.addWidget(console)" in PAGE
     assert 'setattr(window, "_ui_polish_body_splitter", None)' in PAGE
 
-    # Never manufacture replacement business widgets/runners in a presentation
-    # layout installer.
     assert "ReadOnlyRunner(" not in PAGE
     assert "RealExecutionRunner(" not in PAGE
     assert "AcceptanceConsole(" not in PAGE
@@ -81,10 +84,11 @@ def test_nested_wheel_scroll_chains_outward_at_inner_boundaries() -> None:
     assert "self._scroller.push(owner.verticalScrollBar(), pixel_delta)" in event
 
 
-def test_console_summary_has_native_page_scroll_mode() -> None:
+def test_console_summary_has_native_page_scroll_mode_and_keeps_detail_modal() -> None:
     assert 'self.page_scroll = getattr(window, "_single_page_scroll", None)' in SUMMARY
     assert "if isinstance(self.page_scroll, QScrollArea):" in SUMMARY
     assert "self.console.setMinimumHeight(_PAGE_SUMMARY_MIN)" in SUMMARY
+    assert "self.console.setMaximumHeight(_PAGE_SUMMARY_MAX)" in SUMMARY
     assert "self.details.open_console_details()" in SUMMARY
 
 
