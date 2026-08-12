@@ -38,6 +38,7 @@ def main() -> int:
     from gui.required_input_support import install_required_input_support
     from gui.restore_snapshot import install_restore_snapshot
     from gui.runtime_assistant import install_runtime_assistant
+    from gui.scroll_local_glass import install_scroll_local_glass
     from gui.static_modal_interaction import install_static_modal_interaction
     from gui.ui_maturity import install_mature_ui
     from gui.ui_polish import install_ui_polish
@@ -110,6 +111,12 @@ def main() -> int:
     install_activity_presence(window)
     install_detailed_preparation_progress(window)
     visual.refresh_glass_frames()
+
+    # A/B prototype: Product Source + Single status cards keep the same pre-blurred
+    # Fuji/tint look but paint their shell inside the QWidget tree. They therefore
+    # scroll in the same backing-store turn as their text instead of waiting for
+    # the independent threaded Quick card scene. All lower cards remain unchanged.
+    install_scroll_local_glass(window, visual)
 
     # Presentation-only hot-path optimizations are installed after both Single
     # and Batch widgets exist, but still before the first event-loop paint.
