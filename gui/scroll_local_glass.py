@@ -1,27 +1,31 @@
-"""Single-render-domain glass experiment for the scrolling Product Source card.
+"""Viewport-owned QWidget glass for the scrolling Product Source card.
 
-Only Product Source leaves the independent Quick card scene. Its blurred Fuji
-sample, tint and QWidget contents are composited by one QGraphicsEffect attached to
-the card itself. During scrolling the cached composite moves with QScrollArea; no
-per-scroll repaint, Quick geometry publication or frameSwapped callback participates.
-The blurred sample is refreshed once after scrolling settles.
+Product Source leaves the independent Quick card scene, but its glass is not frozen
+into the card. A transparent QWidget compositor is attached to QScrollArea.viewport()
+behind the scrolling page. It samples the already-preblurred Fuji in viewport/window
+coordinates and paints only the card shell, while the card's text/controls remain in
+the normal scrolling QWidget tree.
+
+Because both the scrolling page and glass compositor use the same QWidget backing
+store, card motion no longer crosses the Quick render loop. The Quick window remains
+responsible only for the Fuji wallpaper/parallax and for cards that have not yet been
+migrated.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPixmap
-from PySide6.QtWidgets import QFrame, QGraphicsEffect, QMainWindow, QScrollArea, QWidget
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPixmap, QRegion
+from PySide6.QtWidgets import QFrame, QMainWindow, QScrollArea, QWidget
 
 from .native_background import _GLASS_RADIUS, _NORMAL_GLASS_ALPHA, _OVERSCAN
+from .native_visual_style import _CardScaleEffect
 
 
-_EFFECT_BOUND_SCALE = 1.04
-_CONTENT_EDGE_STEP_PX = 0.18
-_NORMAL_SCALE_EPSILON = 1e-5
-_SCROLL_SETTLE_MS = 84
+_PARALLAX_REPAINT_MS = 16
+_DIRTY_PAD_PX = 8
 
 
 def _ancestor_card(widget: QWidget | None, object_name: str) -> QFrame | None:
@@ -33,172 +37,75 @@ def _ancestor_card(widget: QWidget | None, object_name: str) -> QFrame | None:
     return None
 
 
-class _SingleDomainGlassEffect(QGraphicsEffect):
-    """Composite cached glass + live card contents in one QWidget render domain."""
+class _ViewportContentScaleEffect(_CardScaleEffect):
+    """Keep the existing card-content scale path and invalidate local glass with it."""
 
-    def __init__(self, frame: QFrame, proxy: Any) -> None:
+    def __init__(self, frame: QFrame, invalidate: Callable[[], None]) -> None:
         super().__init__(frame)
-        self.frame = frame
-        self.proxy = proxy
-        self._scale = 1.0
-        self._frozen = False
-        self._freeze_requested = False
-        self._frozen_source: QPixmap | None = None
-        self._frozen_offset = QPoint()
-        self._backdrop = QPixmap()
-        self._last_alpha = _NORMAL_GLASS_ALPHA
-        # The effect stays enabled at rest because it now owns the card backdrop,
-        # not merely the temporary hover scale.
-        self.setEnabled(True)
-
-    @property
-    def scale(self) -> float:
-        return self._scale
-
-    @property
-    def frozen(self) -> bool:
-        return self._frozen
-
-    def _overlay_alpha(self) -> float:
-        try:
-            alpha = float(getattr(self.proxy, "overlay_alpha", _NORMAL_GLASS_ALPHA))
-        except (RuntimeError, TypeError, ValueError):
-            alpha = _NORMAL_GLASS_ALPHA
-        return max(_NORMAL_GLASS_ALPHA, min(255.0, alpha))
-
-    def set_backdrop(self, pixmap: QPixmap) -> None:
-        if pixmap.isNull():
-            return
-        if not self._backdrop.isNull() and self._backdrop.cacheKey() == pixmap.cacheKey():
-            return
-        self._backdrop = QPixmap(pixmap)
-        self.update()
-
-    def _clear_frozen_source(self) -> None:
-        self._frozen_source = None
-        self._frozen_offset = QPoint()
-
-    def _content_span(self) -> float:
-        try:
-            return max(1.0, float(self.frame.width()), float(self.frame.height()))
-        except (RuntimeError, TypeError, ValueError):
-            return 1.0
-
-    def set_frozen(self, frozen: bool) -> None:
-        frozen = bool(frozen)
-        if frozen == self._frozen:
-            return
-        self._frozen = frozen
-        self._freeze_requested = frozen
-        self._clear_frozen_source()
-        self.update()
+        self._invalidate_glass = invalidate
 
     def set_scale(self, scale: float) -> None:
-        requested = max(0.96, min(_EFFECT_BOUND_SCALE, float(scale)))
-        exact_rest = abs(requested - 1.0) <= _NORMAL_SCALE_EPSILON
-        if exact_rest:
-            requested = 1.0
-        else:
-            edge_delta_px = self._content_span() * abs(requested - self._scale) * 0.5
-            if edge_delta_px < _CONTENT_EDGE_STEP_PX:
-                requested = self._scale
+        super().set_scale(scale)
+        # NativeGlassProxy stores alpha before calling set_scale(), so this also
+        # republishes alpha-only hover/press changes when scale itself stays 1.0.
+        self._invalidate_glass()
 
-        alpha = self._overlay_alpha()
-        alpha_changed = abs(alpha - self._last_alpha) >= 0.1
-        self._last_alpha = alpha
 
-        if abs(requested - self._scale) <= _NORMAL_SCALE_EPSILON:
-            if exact_rest and self._frozen:
-                self._frozen = False
-                self._freeze_requested = False
-                self._clear_frozen_source()
-            if alpha_changed:
-                self.update()
-            return
+class _ViewportGlassLayer(QWidget):
+    """One fixed viewport-space glass compositor behind the scrolling page."""
 
-        self._scale = requested
-        if exact_rest:
-            self._frozen = False
-            self._freeze_requested = False
-            self._clear_frozen_source()
-        self.update()
+    def __init__(self, controller: "ScrollLocalGlassController", viewport: QWidget) -> None:
+        super().__init__(viewport)
+        self.controller = controller
+        self._last_card_rect = QRectF()
+        self.setObjectName("singlePageViewportGlass")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAutoFillBackground(False)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setGeometry(viewport.rect())
+        self.show()
 
-    def boundingRectFor(self, source_rect: QRectF) -> QRectF:  # noqa: N802
-        center = source_rect.center()
-        half_w = source_rect.width() * _EFFECT_BOUND_SCALE * 0.5
-        half_h = source_rect.height() * _EFFECT_BOUND_SCALE * 0.5
-        return QRectF(
-            center.x() - half_w,
-            center.y() - half_h,
-            half_w * 2.0,
-            half_h * 2.0,
-        )
-
-    def _current_composite(self) -> tuple[QPixmap | None, QPoint]:
-        if (
-            self._frozen
-            and not self._freeze_requested
-            and self._frozen_source is not None
-            and not self._frozen_source.isNull()
-        ):
-            return self._frozen_source, self._frozen_offset
-
-        offset = QPoint()
-        pixmap = self.sourcePixmap(
-            Qt.CoordinateSystem.LogicalCoordinates,
-            offset,
-            QGraphicsEffect.PixmapPadMode.NoPad,
-        )
-        if pixmap.isNull():
-            return None, QPoint()
-
-        if self._frozen:
-            self._frozen_source = pixmap
-            self._frozen_offset = QPoint(offset)
-            self._freeze_requested = False
-        return pixmap, offset
-
-    def _draw_backdrop(self, painter: QPainter, rect: QRectF) -> None:
+    @staticmethod
+    def _padded_region(rect: QRectF) -> QRegion:
         if rect.isEmpty():
+            return QRegion()
+        padded = rect.adjusted(-_DIRTY_PAD_PX, -_DIRTY_PAD_PX, _DIRTY_PAD_PX, _DIRTY_PAD_PX)
+        return QRegion(padded.toAlignedRect())
+
+    def sync_card_geometry(self) -> None:
+        current = self.controller.card_rect_in_viewport()
+        dirty = self._padded_region(self._last_card_rect)
+        dirty = dirty.united(self._padded_region(current))
+        self._last_card_rect = QRectF(current)
+        if dirty.isEmpty():
             return
-        painter.save()
-        path = QPainterPath()
-        path.addRoundedRect(rect, _GLASS_RADIUS, _GLASS_RADIUS)
-        painter.setClipPath(path)
-        if not self._backdrop.isNull():
-            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-            painter.drawPixmap(rect, self._backdrop, QRectF(self._backdrop.rect()))
-        painter.fillRect(rect, QColor(0, 0, 0, round(self._overlay_alpha())))
-        painter.restore()
+        self.update(dirty)
 
-    def draw(self, painter: QPainter) -> None:  # type: ignore[override]
-        source_rect = self.sourceBoundingRect(Qt.CoordinateSystem.LogicalCoordinates)
-        scale = self._scale
+    def refresh_current_card(self) -> None:
+        current = self.controller.card_rect_in_viewport()
+        self._last_card_rect = QRectF(current)
+        dirty = self._padded_region(current)
+        if not dirty.isEmpty():
+            self.update(dirty)
 
-        if abs(scale - 1.0) <= 1e-4:
-            self._draw_backdrop(painter, source_rect)
-            self.drawSource(painter)
+    def resize_to_viewport(self) -> None:
+        viewport = self.parentWidget()
+        if viewport is None:
             return
+        self.setGeometry(viewport.rect())
+        self.sync_card_geometry()
 
-        pixmap, offset = self._current_composite()
-        if pixmap is None:
-            self._draw_backdrop(painter, source_rect)
-            self.drawSource(painter)
-            return
-
-        center = source_rect.center()
-        painter.save()
+    def paintEvent(self, _event) -> None:  # noqa: ANN001, N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.translate(center)
-        painter.scale(scale, scale)
-        painter.translate(-center)
-        self._draw_backdrop(painter, source_rect)
-        painter.drawPixmap(offset, pixmap)
-        painter.restore()
+        self.controller.paint_glass(painter)
+        painter.end()
 
 
 class ScrollLocalGlassController(QObject):
-    """Keep only Product Source on the single-domain cached-glass path."""
+    """Own Product Source glass in QScrollArea.viewport() instead of QQuickWindow."""
 
     def __init__(self, window: QMainWindow, visual: Any, scroll: QScrollArea) -> None:
         super().__init__(window)
@@ -206,19 +113,19 @@ class ScrollLocalGlassController(QObject):
         self.visual = visual
         self.background = getattr(visual, "background", None)
         self.scroll = scroll
+        self.viewport = scroll.viewport()
         self.quick = getattr(self.background, "quick_window", None)
         self._source = QPixmap(str(getattr(self.background, "_blur_path", "")))
         self._scaled_item = QPixmap()
         self._scaled_key: tuple[int, int] | None = None
         self._frame: QFrame | None = None
         self._proxy: Any = None
-        self._effect: _SingleDomainGlassEffect | None = None
-        self._scrolling = False
+        self._layer: _ViewportGlassLayer | None = None
 
-        self._settle_timer = QTimer(self)
-        self._settle_timer.setSingleShot(True)
-        self._settle_timer.setInterval(_SCROLL_SETTLE_MS)
-        self._settle_timer.timeout.connect(self._finish_scroll)
+        self._parallax_timer = QTimer(self)
+        self._parallax_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._parallax_timer.setInterval(_PARALLAX_REPAINT_MS)
+        self._parallax_timer.timeout.connect(self._parallax_tick)
 
         if self.background is None or self.quick is None or self._source.isNull():
             return
@@ -233,31 +140,31 @@ class ScrollLocalGlassController(QObject):
         if proxy is None:
             return
 
-        backdrop = self._build_backdrop(frame)
-        if backdrop is None or backdrop.isNull():
-            return
-
-        effect = _SingleDomainGlassEffect(frame, proxy)
-        effect.set_backdrop(backdrop)
-        frame.setGraphicsEffect(effect)
-        # NativeGlassProxy is intentionally duck-typed by the interaction layer.
-        # Re-point its scale effect so hover/press keeps exactly the existing motion.
-        proxy._scale_effect = effect  # noqa: SLF001
-
         self._frame = frame
         self._proxy = proxy
-        self._effect = effect
-        frame.installEventFilter(self)
         self._detach_from_quick_model(frame)
 
-        # During scroll this callback ONLY restarts an idle timer. No QWidget
-        # repaint, no Quick geometry sync and no render-thread callback runs.
-        self.scroll.verticalScrollBar().valueChanged.connect(self._mark_scrolling)
+        layer = _ViewportGlassLayer(self, self.viewport)
+        self._layer = layer
+
+        page = scroll.widget()
+        if isinstance(page, QWidget) and page.parentWidget() is self.viewport:
+            # The transparent scrolling page stays above the glass compositor so
+            # its inputs/buttons keep normal paint order and hit testing.
+            layer.stackUnder(page)
+            page.raise_()
+
+        effect = _ViewportContentScaleEffect(frame, self._invalidate_card_region)
+        frame.setGraphicsEffect(effect)
+        # NativeGlassProxy is intentionally duck-typed by the card FX controller.
+        proxy._scale_effect = effect  # noqa: SLF001
+
+        self.viewport.installEventFilter(self)
+        frame.installEventFilter(self)
+        self.scroll.verticalScrollBar().valueChanged.connect(self._sync_scroll_position)
         self.quick.widthChanged.connect(self._invalidate_scene_cache)
         self.quick.heightChanged.connect(self._invalidate_scene_cache)
 
-        # A parallax cycle may change the correct blurred sample while idle. Refresh
-        # only once after that cycle ends; never listen to frameSwapped.
         animation_signal = getattr(self.quick, "animationRunningChanged", None)
         if animation_signal is not None and hasattr(animation_signal, "connect"):
             try:
@@ -265,14 +172,20 @@ class ScrollLocalGlassController(QObject):
             except (RuntimeError, TypeError):
                 pass
 
-        try:
-            self.background.schedule_mask_update()
-        except RuntimeError:
-            pass
+        # Remove the old Quick shell/mask region once. No Quick card geometry is
+        # published from this controller during scrolling.
+        schedule_mask = getattr(self.background, "schedule_mask_update", None)
+        if callable(schedule_mask):
+            try:
+                schedule_mask()
+            except RuntimeError:
+                pass
+
+        QTimer.singleShot(0, self._sync_initial_state)
 
     @property
     def active_count(self) -> int:
-        return 1 if self._frame is not None and self._effect is not None else 0
+        return 1 if self._frame is not None and self._layer is not None else 0
 
     def _detach_from_quick_model(self, frame: QFrame) -> None:
         model = getattr(self.background, "card_model", None)
@@ -335,11 +248,48 @@ class ScrollLocalGlassController(QObject):
         except (RuntimeError, TypeError, ValueError):
             return 0.0, 0.0
 
-    def _build_backdrop(self, frame: QFrame) -> QPixmap | None:
+    def card_rect_in_viewport(self) -> QRectF:
+        frame = self._frame
+        proxy = self._proxy
+        if frame is None or proxy is None:
+            return QRectF()
+        try:
+            if not frame.isVisibleTo(self.viewport) or frame.width() <= 0 or frame.height() <= 0:
+                return QRectF()
+            top_left = frame.mapTo(self.viewport, QPoint(0, 0))
+            rect = QRectF(
+                float(top_left.x()),
+                float(top_left.y()),
+                float(frame.width()),
+                float(frame.height()),
+            )
+            scale = max(0.96, min(1.04, float(getattr(proxy, "surface_scale", 1.0))))
+        except (RuntimeError, TypeError, ValueError):
+            return QRectF()
+
+        if abs(scale - 1.0) > 1e-5:
+            center = rect.center()
+            width = rect.width() * scale
+            height = rect.height() * scale
+            rect = QRectF(
+                center.x() - width * 0.5,
+                center.y() - height * 0.5,
+                width,
+                height,
+            )
+        return rect
+
+    def paint_glass(self, painter: QPainter) -> None:
         item = self._ensure_scaled_item()
         quick = self.quick
-        if item is None or quick is None or frame.width() <= 0 or frame.height() <= 0:
-            return None
+        proxy = self._proxy
+        layer = self._layer
+        if item is None or quick is None or proxy is None or layer is None:
+            return
+
+        card_rect = self.card_rect_in_viewport()
+        if card_rect.isEmpty() or not card_rect.intersects(QRectF(layer.rect())):
+            return
 
         try:
             quick_width = float(quick.width())
@@ -347,72 +297,116 @@ class ScrollLocalGlassController(QObject):
             offset_x, offset_y = self._quick_offset()
             image_x = (quick_width - float(item.width())) * 0.5 + offset_x
             image_y = (quick_height - float(item.height())) * 0.5 + offset_y
-            top_left = frame.mapTo(self.window, QPoint(0, 0))
-            dpr = max(1.0, float(frame.devicePixelRatioF()))
+            viewport_origin = self.viewport.mapTo(self.window, QPoint(0, 0))
+            overlay_alpha = float(getattr(proxy, "overlay_alpha", _NORMAL_GLASS_ALPHA))
         except (RuntimeError, TypeError, ValueError):
-            return None
+            return
 
         source = QRectF(
-            float(top_left.x()) - image_x,
-            float(top_left.y()) - image_y,
-            float(frame.width()),
-            float(frame.height()),
+            float(viewport_origin.x()) + card_rect.x() - image_x,
+            float(viewport_origin.y()) + card_rect.y() - image_y,
+            card_rect.width(),
+            card_rect.height(),
         )
-        result = QPixmap(
-            max(1, round(frame.width() * dpr)),
-            max(1, round(frame.height() * dpr)),
-        )
-        result.setDevicePixelRatio(dpr)
-        result.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(result)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.drawPixmap(QRectF(0.0, 0.0, float(frame.width()), float(frame.height())), item, source)
-        painter.end()
-        return result
 
-    def _refresh_backdrop(self) -> None:
-        frame = self._frame
-        effect = self._effect
-        if frame is None or effect is None:
+        painter.save()
+        path = QPainterPath()
+        path.addRoundedRect(card_rect, _GLASS_RADIUS, _GLASS_RADIUS)
+        painter.setClipPath(path)
+        painter.drawPixmap(card_rect, item, source)
+        painter.fillRect(
+            card_rect,
+            QColor(
+                0,
+                0,
+                0,
+                round(max(_NORMAL_GLASS_ALPHA, min(255.0, overlay_alpha))),
+            ),
+        )
+        painter.restore()
+
+    def _sync_initial_state(self) -> None:
+        layer = self._layer
+        if layer is None:
             return
-        backdrop = self._build_backdrop(frame)
-        if backdrop is not None and not backdrop.isNull():
-            effect.set_backdrop(backdrop)
+        layer.resize_to_viewport()
+        layer.sync_card_geometry()
 
-    def _mark_scrolling(self, _value: int) -> None:
-        self._scrolling = True
-        self._settle_timer.start()
+    def _sync_scroll_position(self, _value: int) -> None:
+        # QScrollArea has already moved its content widget when valueChanged fires.
+        # Repaint only the old/new glass shell regions in the SAME QWidget backing
+        # store. No Quick geometry, mask upload or frameSwapped handoff is involved.
+        layer = self._layer
+        if layer is not None:
+            layer.sync_card_geometry()
 
-    def _finish_scroll(self) -> None:
-        self._scrolling = False
-        self._refresh_backdrop()
+    def _invalidate_card_region(self) -> None:
+        layer = self._layer
+        if layer is not None:
+            layer.sync_card_geometry()
 
     def _invalidate_scene_cache(self, *_args: object) -> None:
         self._scaled_item = QPixmap()
         self._scaled_key = None
-        if not self._scrolling:
-            QTimer.singleShot(0, self._refresh_backdrop)
+        layer = self._layer
+        if layer is not None:
+            layer.resize_to_viewport()
 
     def _on_parallax_state_changed(self, *_args: object) -> None:
-        if self._scrolling or self.quick is None:
+        if self.quick is None:
             return
         try:
             running = bool(self.quick.property("animationRunning"))
         except RuntimeError:
             return
+        if running:
+            if not self._parallax_timer.isActive():
+                self._parallax_timer.start()
+        else:
+            self._parallax_timer.stop()
+            layer = self._layer
+            if layer is not None:
+                layer.refresh_current_card()
+
+    def _parallax_tick(self) -> None:
+        quick = self.quick
+        layer = self._layer
+        if quick is None or layer is None:
+            self._parallax_timer.stop()
+            return
+        try:
+            running = bool(quick.property("animationRunning"))
+        except RuntimeError:
+            self._parallax_timer.stop()
+            return
+        layer.refresh_current_card()
         if not running:
-            QTimer.singleShot(0, self._refresh_backdrop)
+            self._parallax_timer.stop()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if watched is not self._frame:
+        event_type = event.type()
+        layer = self._layer
+        if layer is None:
             return False
-        if event.type() in {QEvent.Type.Resize, QEvent.Type.Show} and not self._scrolling:
-            QTimer.singleShot(0, self._refresh_backdrop)
+
+        if watched is self.viewport and event_type in {QEvent.Type.Resize, QEvent.Type.Show}:
+            layer.resize_to_viewport()
+        elif watched is self._frame and event_type in {
+            QEvent.Type.Move,
+            QEvent.Type.Resize,
+            QEvent.Type.Show,
+            QEvent.Type.Hide,
+            QEvent.Type.LayoutRequest,
+        }:
+            layer.sync_card_geometry()
         return False
 
 
-def install_scroll_local_glass(window: QMainWindow, visual: Any) -> ScrollLocalGlassController | None:
-    """Install the one-card Product Source single-domain A/B experiment."""
+def install_scroll_local_glass(
+    window: QMainWindow,
+    visual: Any,
+) -> ScrollLocalGlassController | None:
+    """Install Product Source glass as a viewport-space QWidget compositor."""
 
     scroll = getattr(window, "_single_page_scroll", None)
     if not isinstance(scroll, QScrollArea):
