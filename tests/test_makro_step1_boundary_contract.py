@@ -15,6 +15,14 @@ class FakePage:
         return None
 
 
+class FakeInput:
+    def __init__(self, **attributes: str) -> None:
+        self.attributes = attributes
+
+    def get_attribute(self, name: str):
+        return self.attributes.get(name)
+
+
 def _brand_ready(monkeypatch, canonical: str) -> None:
     monkeypatch.setattr(vertical_selection, "_wait_for", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(vertical_selection, "is_brand_step", lambda _page: True)
@@ -38,6 +46,7 @@ def test_repeated_air_purifier_selection_accepts_display_slug_equivalence(monkey
     assert selected == "air_purifier"
     assert vertical_selection._display_slug_equivalent("Air Purifiers", "air_purifier")
     assert vertical_selection._display_slug_equivalent("Home Appliances", "home_appliance")
+    assert vertical_selection._display_slug_equivalent("Cases & Covers", "cases_covers")
 
 
 def test_repeated_unrelated_vertical_is_not_accepted(monkeypatch) -> None:
@@ -49,6 +58,42 @@ def test_repeated_unrelated_vertical_is_not_accepted(monkeypatch) -> None:
             "Coffee Bean Grinder",
             previous_canonical="air_purifier",
         )
+
+
+def test_lone_brand_input_is_not_independent_step1_evidence(monkeypatch) -> None:
+    page = FakePage()
+    brand_input = FakeInput(placeholder="Enter Brand Name", name="brand")
+
+    monkeypatch.setattr(vertical_selection, "is_product_info_step", lambda _page: False)
+    monkeypatch.setattr(vertical_selection, "is_brand_step", lambda _page: False)
+    monkeypatch.setattr(vertical_selection, "is_vertical_step", lambda _page: False)
+    monkeypatch.setattr(
+        vertical_selection,
+        "ResilientMakroTaxonomyBrowser",
+        lambda _page: type("NoTaxonomy", (), {"columns": lambda self: []})(),
+    )
+    monkeypatch.setattr(vertical_selection, "_vertical_search_input", lambda _page: brand_input)
+    monkeypatch.setattr(vertical_selection, "_body_text", lambda _page: "Check for the brand you want to sell")
+
+    assert vertical_selection.is_vertical_interaction_ready(page) is False
+
+
+def test_vertical_specific_input_can_prove_step1_when_stage_enum_lags(monkeypatch) -> None:
+    page = FakePage()
+    vertical_input = FakeInput(placeholder="Search Vertical", name="verticalSearch")
+
+    monkeypatch.setattr(vertical_selection, "is_product_info_step", lambda _page: False)
+    monkeypatch.setattr(vertical_selection, "is_brand_step", lambda _page: False)
+    monkeypatch.setattr(vertical_selection, "is_vertical_step", lambda _page: False)
+    monkeypatch.setattr(
+        vertical_selection,
+        "ResilientMakroTaxonomyBrowser",
+        lambda _page: type("NoTaxonomy", (), {"columns": lambda self: []})(),
+    )
+    monkeypatch.setattr(vertical_selection, "_vertical_search_input", lambda _page: vertical_input)
+    monkeypatch.setattr(vertical_selection, "_body_text", lambda _page: "")
+
+    assert vertical_selection.is_vertical_interaction_ready(page) is True
 
 
 def test_step1_entry_uses_structural_operability_contract() -> None:
