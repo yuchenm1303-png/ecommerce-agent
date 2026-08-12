@@ -22,6 +22,7 @@ def main() -> int:
         return 2
 
     from gui.activity_presence import install_activity_presence
+    from gui.batch_url_editor import install_batch_url_editor
     from gui.browser_session_manager import install_managed_makro_browser
     from gui.card_details_fast import install_card_details
     from gui.console_summary_mode import install_console_summary_mode
@@ -103,6 +104,10 @@ def main() -> int:
     install_static_modal_interaction(window, details)
 
     window.install_mode_workspace()
+    # Batch source URLs stay business-compatible with the original multiline
+    # interface, but the presentation is now one independently switchable row per
+    # product. Only enabled rows are exposed to the existing start_prepare path.
+    install_batch_url_editor(window.batch_workspace)
     install_workspace_mode_switch(window)
     # Formal GUI owns one dedicated Makro Edge/Profile. 9222 remains an internal
     # transport detail; Single and Batch share one login session and Batch keeps
