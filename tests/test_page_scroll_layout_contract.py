@@ -103,20 +103,24 @@ def test_nested_wheel_scroll_chains_outward_at_inner_boundaries() -> None:
     event = SMOOTH.split("def eventFilter", 1)[1].split("def cleanup", 1)[0]
     assert "owner = self._scroll_owner(area, scroll_delta)" in event
     assert "self._scroller.scroll_pixels(owner.verticalScrollBar(), scroll_delta)" in event
-    assert "self._scroller.push_impulse(owner.verticalScrollBar(), notch_delta)" in event
+    assert "self._scroller.add_wheel_delta(owner.verticalScrollBar(), notch_delta)" in event
 
 
-def test_wheel_scrolling_is_continuous_not_fixed_step_target_easing() -> None:
+def test_wheel_scrolling_uses_one_continuous_damped_target_for_discrete_notches() -> None:
     assert "event.pixelDelta().y()" in SMOOTH
     assert "event.angleDelta().y()" in SMOOTH
-    assert "_WHEEL_IMPULSE_PX_S" in SMOOTH
-    assert "_FRICTION_PER_S" in SMOOTH
-    assert "math.exp(-self._FRICTION_PER_S * dt)" in SMOOTH
+    assert "_WHEEL_TRAVEL_PX" in SMOOTH
+    assert "_SPRING_OMEGA" in SMOOTH
     assert "_ScrollMotion" in SMOOTH
     assert "position: float" in SMOOTH
+    assert "target: float" in SMOOTH
     assert "velocity: float" in SMOOTH
+    assert "motion.target = self._clamp_position" in SMOOTH
+    assert "c2 = motion.velocity + omega * offset" in SMOOTH
+    assert "next_offset = (offset + c2 * dt) * decay" in SMOOTH
     assert "ScrollPerPixel" in SMOOTH
-    assert "PIXELS_PER_NOTCH" not in SMOOTH
+    assert "push_impulse" not in SMOOTH
+    assert "_WHEEL_IMPULSE_PX_S" not in SMOOTH
     assert "round(delta / 120" not in SMOOTH
 
 
