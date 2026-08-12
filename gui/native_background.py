@@ -74,7 +74,12 @@ def _blur_wallpaper(source: QImage, radius: float = 10.0) -> QImage:
 
 
 class GlassCardModel(QAbstractListModel):
-    """Card geometry plus lightweight interaction state consumed by Quick."""
+    """Card geometry plus lightweight interaction state consumed by Quick.
+
+    Single-page cards keep stable base coordinates. Continuous page scrolling is
+    represented by one QML group offset, so a scrollbar tick never walks the card
+    list, repaints a CPU mask, or republishes per-card geometry.
+    """
 
     _ROLE_BASE = int(Qt.ItemDataRole.UserRole)
     CARD_X_ROLE = _ROLE_BASE + 1
@@ -88,7 +93,7 @@ class GlassCardModel(QAbstractListModel):
     ALPHA_ROLE = _ROLE_BASE + 9
     VISIBLE_ROLE = _ROLE_BASE + 10
     SCALE_ROLE = _ROLE_BASE + 11
-    SCROLLABLE_ROLE = _ROLE_BASE + 12
+    SCROLL_GROUP_ROLE = _ROLE_BASE + 12
 
     _GEOMETRY_ROLES = [
         CARD_X_ROLE,
@@ -100,7 +105,7 @@ class GlassCardModel(QAbstractListModel):
         CLIP_W_ROLE,
         CLIP_H_ROLE,
         VISIBLE_ROLE,
-        SCROLLABLE_ROLE,
+        SCROLL_GROUP_ROLE,
     ]
     _ROLE_KEYS = {
         CARD_X_ROLE: "cardX",
@@ -114,7 +119,7 @@ class GlassCardModel(QAbstractListModel):
         ALPHA_ROLE: "cardAlpha",
         VISIBLE_ROLE: "cardVisible",
         SCALE_ROLE: "cardScale",
-        SCROLLABLE_ROLE: "cardScrollable",
+        SCROLL_GROUP_ROLE: "cardScrolls",
     }
 
     def __init__(self, overlay: QMainWindow, cards: list[QFrame], parent: QObject) -> None:
@@ -124,24 +129,25 @@ class GlassCardModel(QAbstractListModel):
         self._rows = {frame: row for row, frame in enumerate(cards)}
         self._scroll_area: QAbstractScrollArea | None = None
         self._scroll_page: QWidget | None = None
-        self._states = [
-            {
-                "cardX": 0.0,
-                "cardY": 0.0,
-                "cardW": 0.0,
-                "cardH": 0.0,
-                "clipX": 0.0,
-                "clipY": 0.0,
-                "clipW": 0.0,
-                "clipH": 0.0,
-                "cardAlpha": _NORMAL_GLASS_ALPHA,
-                "cardScale": 1.0,
-                "cardVisible": False,
-                "cardScrollable": False,
-            }
-            for _ in cards
-        ]
+        self._states = [self._new_state() for _ in cards]
         self.sync_geometry()
+
+    @staticmethod
+    def _new_state() -> dict[str, float | bool]:
+        return {
+            "cardX": 0.0,
+            "cardY": 0.0,
+            "cardW": 0.0,
+            "cardH": 0.0,
+            "clipX": 0.0,
+            "clipY": 0.0,
+            "clipW": 0.0,
+            "clipH": 0.0,
+            "cardAlpha": _NORMAL_GLASS_ALPHA,
+            "cardScale": 1.0,
+            "cardVisible": False,
+            "cardScrolls": False,
+        }
 
     def roleNames(self) -> dict[int, QByteArray]:  # noqa: N802
         return {
@@ -156,7 +162,7 @@ class GlassCardModel(QAbstractListModel):
             self.ALPHA_ROLE: QByteArray(b"cardAlpha"),
             self.VISIBLE_ROLE: QByteArray(b"cardVisible"),
             self.SCALE_ROLE: QByteArray(b"cardScale"),
-            self.SCROLLABLE_ROLE: QByteArray(b"cardScrollable"),
+            self.SCROLL_GROUP_ROLE: QByteArray(b"cardScrolls"),
         }
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802, B008
@@ -168,6 +174,12 @@ class GlassCardModel(QAbstractListModel):
         key = self._ROLE_KEYS.get(role)
         return self._states[index.row()].get(key) if key is not None else None
 
+    def append_card(self, frame: QFrame) -> None:
+        row = len(self.cards)
+        self.cards.append(frame)
+        self._rows[frame] = row
+        self._states.append(self._new_state())
+
     def set_scroll_context(
         self,
         area: QAbstractScrollArea | None,
@@ -175,103 +187,29 @@ class GlassCardModel(QAbstractListModel):
     ) -> None:
         self._scroll_area = area
         self._scroll_page = page
+        self.sync_geometry()
 
     def _is_scroll_card(self, frame: QFrame) -> bool:
         page = self._scroll_page
-        if page is None:
-            return False
-        try:
-            return page.isAncestorOf(frame)
-        except RuntimeError:
-            return False
+        return bool(page is not None and (frame is page or page.isAncestorOf(frame)))
 
-    @staticmethod
-    def _hidden_snapshot(*, scrollable: bool = False) -> dict[str, float | bool]:
-        return {
-            "cardX": 0.0,
-            "cardY": 0.0,
-            "cardW": 0.0,
-            "cardH": 0.0,
-            "clipX": 0.0,
-            "clipY": 0.0,
-            "clipW": 0.0,
-            "clipH": 0.0,
-            "cardVisible": False,
-            "cardScrollable": scrollable,
-        }
-
-    def _scroll_snapshot(self, frame: QFrame) -> dict[str, float | bool]:
+    def _scroll_value(self) -> float:
         area = self._scroll_area
-        page = self._scroll_page
-        if area is None or page is None:
-            return self._hidden_snapshot(scrollable=True)
-
+        if area is None:
+            return 0.0
         try:
-            if (
-                not frame.isVisibleTo(self.overlay)
-                or frame.width() <= 0
-                or frame.height() <= 0
-                or self.overlay.width() <= 0
-                or self.overlay.height() <= 0
-            ):
-                return self._hidden_snapshot(scrollable=True)
-
-            scroll_y = float(area.verticalScrollBar().value())
-            top_left = frame.mapTo(self.overlay, QPoint(0, 0))
-            card_rect = QRectF(
-                float(top_left.x()),
-                float(top_left.y()) + scroll_y,
-                float(frame.width()),
-                float(frame.height()),
-            )
-
-            moving_clip: QRectF | None = None
-            ancestor = frame.parentWidget()
-            while ancestor is not None:
-                if not ancestor.isVisibleTo(self.overlay):
-                    return self._hidden_snapshot(scrollable=True)
-                if ancestor is area.viewport() or ancestor is area or ancestor is self.overlay:
-                    break
-
-                ancestor_top_left = ancestor.mapTo(self.overlay, QPoint(0, 0))
-                ancestor_rect = QRectF(
-                    float(ancestor_top_left.x()),
-                    float(ancestor_top_left.y()) + scroll_y,
-                    float(ancestor.width()),
-                    float(ancestor.height()),
-                )
-                moving_clip = (
-                    QRectF(ancestor_rect)
-                    if moving_clip is None
-                    else moving_clip.intersected(ancestor_rect)
-                )
-                if ancestor is page:
-                    break
-                ancestor = ancestor.parentWidget()
-
-            if moving_clip is None:
-                moving_clip = QRectF(card_rect)
-
-            visible = not moving_clip.isEmpty()
-            return {
-                "cardX": card_rect.x(),
-                "cardY": card_rect.y(),
-                "cardW": card_rect.width(),
-                "cardH": card_rect.height(),
-                "clipX": moving_clip.x() if visible else 0.0,
-                "clipY": moving_clip.y() if visible else 0.0,
-                "clipW": moving_clip.width() if visible else 0.0,
-                "clipH": moving_clip.height() if visible else 0.0,
-                "cardVisible": visible,
-                "cardScrollable": True,
-            }
+            return float(area.verticalScrollBar().value())
         except RuntimeError:
-            return self._hidden_snapshot(scrollable=True)
+            return 0.0
+
+    @classmethod
+    def _empty_snapshot(cls, *, scrolls: bool = False) -> dict[str, float | bool]:
+        state = cls._new_state()
+        state["cardScrolls"] = scrolls
+        return state
 
     def _snapshot(self, frame: QFrame) -> dict[str, float | bool]:
-        if self._is_scroll_card(frame):
-            return self._scroll_snapshot(frame)
-
+        scrolls = self._is_scroll_card(frame)
         if (
             not frame.isVisibleTo(self.overlay)
             or frame.width() <= 0
@@ -279,7 +217,7 @@ class GlassCardModel(QAbstractListModel):
             or self.overlay.width() <= 0
             or self.overlay.height() <= 0
         ):
-            return self._hidden_snapshot(scrollable=False)
+            return self._empty_snapshot(scrolls=scrolls)
 
         top_left = frame.mapTo(self.overlay, QPoint(0, 0))
         card_rect = QRectF(
@@ -288,31 +226,57 @@ class GlassCardModel(QAbstractListModel):
             float(frame.width()),
             float(frame.height()),
         )
+        if scrolls:
+            # Normalize today's screen-space position back into a stable page-base
+            # coordinate. QML subtracts singleScrollY from the whole group.
+            card_rect.translate(0.0, self._scroll_value())
+
         clip_rect = QRectF(
             0.0,
             0.0,
             float(self.overlay.width()),
             float(self.overlay.height()),
         )
+        page = self._scroll_page if scrolls else None
 
         ancestor = frame.parentWidget()
         while ancestor is not None:
             if not ancestor.isVisibleTo(self.overlay):
-                return self._hidden_snapshot(scrollable=False)
-            ancestor_top_left = ancestor.mapTo(self.overlay, QPoint(0, 0))
-            ancestor_rect = QRectF(
-                float(ancestor_top_left.x()),
-                float(ancestor_top_left.y()),
-                float(ancestor.width()),
-                float(ancestor.height()),
+                hidden = self._empty_snapshot(scrolls=scrolls)
+                hidden.update(
+                    {
+                        "cardX": card_rect.x(),
+                        "cardY": card_rect.y(),
+                        "cardW": card_rect.width(),
+                        "cardH": card_rect.height(),
+                    }
+                )
+                return hidden
+
+            # Ancestors inside the moving page are layout structure. Their current
+            # screen-space rectangles move with the page and therefore must not be
+            # baked into a clip that is supposed to survive future scroll values.
+            # Fixed ancestors above the page (notably the scroll viewport) remain
+            # the real clip boundary for the GPU mask.
+            inside_scroll_page = bool(
+                page is not None and (ancestor is page or page.isAncestorOf(ancestor))
             )
-            clip_rect = clip_rect.intersected(ancestor_rect)
-            if clip_rect.isEmpty() or ancestor is self.overlay:
-                break
+            if not inside_scroll_page:
+                ancestor_top_left = ancestor.mapTo(self.overlay, QPoint(0, 0))
+                ancestor_rect = QRectF(
+                    float(ancestor_top_left.x()),
+                    float(ancestor_top_left.y()),
+                    float(ancestor.width()),
+                    float(ancestor.height()),
+                )
+                clip_rect = clip_rect.intersected(ancestor_rect)
+                if clip_rect.isEmpty() or ancestor is self.overlay:
+                    break
             ancestor = ancestor.parentWidget()
 
-        visible_rect = card_rect.intersected(clip_rect)
-        visible = not visible_rect.isEmpty()
+        visible = not clip_rect.isEmpty()
+        if not scrolls:
+            visible = visible and not card_rect.intersected(clip_rect).isEmpty()
         return {
             "cardX": card_rect.x(),
             "cardY": card_rect.y(),
@@ -323,7 +287,7 @@ class GlassCardModel(QAbstractListModel):
             "clipW": clip_rect.width() if visible else 0.0,
             "clipH": clip_rect.height() if visible else 0.0,
             "cardVisible": visible,
-            "cardScrollable": False,
+            "cardScrolls": scrolls,
         }
 
     @staticmethod
@@ -342,6 +306,8 @@ class GlassCardModel(QAbstractListModel):
             state = self._states[row]
             changed = False
             for key, value in snapshot.items():
+                if key in {"cardAlpha", "cardScale"}:
+                    continue
                 if self._different(state.get(key), value):
                     state[key] = value
                     changed = True
@@ -389,16 +355,44 @@ class GlassCardModel(QAbstractListModel):
             alpha=alpha,
         )
 
-    def render_mask(self, _width: int, _height: int) -> QImage:
-        """Compatibility shim for the old image-provider optimization.
+    def render_mask(self, width: int, height: int) -> QImage:
+        """Legacy/debug CPU mask renderer; the formal runtime no longer calls it."""
 
-        The formal renderer now builds the mask directly in the Quick scene graph,
-        so no full-window CPU mask is produced. Keeping this tiny image avoids
-        breaking older optional runtime hooks while making their cost negligible.
-        """
-
-        image = QImage(1, 1, QImage.Format.Format_ARGB32_Premultiplied)
+        image = QImage(
+            max(1, int(width)),
+            max(1, int(height)),
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
         image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(Qt.GlobalColor.white)
+        scroll_y = self._scroll_value()
+
+        for state in self._states:
+            if not bool(state["cardVisible"]):
+                continue
+            clip = QRectF(
+                float(state["clipX"]),
+                float(state["clipY"]),
+                float(state["clipW"]),
+                float(state["clipH"]),
+            )
+            card = QRectF(
+                float(state["cardX"]),
+                float(state["cardY"]) - (scroll_y if bool(state.get("cardScrolls")) else 0.0),
+                float(state["cardW"]),
+                float(state["cardH"]),
+            )
+            if clip.isEmpty() or card.isEmpty():
+                continue
+            painter.save()
+            painter.setClipRect(clip)
+            painter.drawRoundedRect(card, _GLASS_RADIUS, _GLASS_RADIUS)
+            painter.restore()
+
+        painter.end()
         return image
 
 
@@ -416,19 +410,12 @@ Window {{
 
     property url sharpUrl
     property url blurUrl
-    property url maskUrl
     property real pointerX: 0.0
     property real pointerY: 0.0
     property real offsetX: 0.0
     property real offsetY: 0.0
-    property bool animationRunning: false
-
-    property bool singleScrollActive: false
     property real singleScrollY: 0.0
-    property real singleViewportX: 0.0
-    property real singleViewportY: 0.0
-    property real singleViewportW: 0.0
-    property real singleViewportH: 0.0
+    property bool animationRunning: false
 
     readonly property real maxX: width * {max_x:.9f}
     readonly property real maxY: height * {max_y:.9f}
@@ -436,16 +423,6 @@ Window {{
     readonly property real targetY: -pointerY * maxY
     readonly property real imageX: (width - width * {_OVERSCAN}) * 0.5 + offsetX
     readonly property real imageY: (height - height * {_OVERSCAN}) * 0.5 + offsetY
-
-    function scrollCardIntersectsViewport(cardXValue, cardYValue, cardWValue, cardHValue) {{
-        if (!singleScrollActive)
-            return false
-        var y = cardYValue - singleScrollY
-        return cardXValue + cardWValue > singleViewportX &&
-               cardXValue < singleViewportX + singleViewportW &&
-               y + cardHValue > singleViewportY &&
-               y < singleViewportY + singleViewportH
-    }}
 
     Image {{
         id: sharpImg
@@ -479,6 +456,9 @@ Window {{
         }}
     }}
 
+    // GPU-resident mask. Geometry/layout changes update model rows, while smooth
+    // scrolling only changes root.singleScrollY, transforming every scrolling
+    // mask rectangle together in the scene graph. No QImage/PNG/upload loop.
     Item {{
         id: glassMask
         anchors.fill: parent
@@ -489,62 +469,22 @@ Window {{
         Repeater {{
             model: glassCardModel
             delegate: Item {{
-                visible: cardVisible && !cardScrollable && clipW > 0 && clipH > 0
+                readonly property real visualY: cardY - (cardScrolls ? root.singleScrollY : 0.0)
                 x: clipX
                 y: clipY
                 width: clipW
                 height: clipH
                 clip: true
+                visible: cardVisible && width > 0 && height > 0
 
                 Rectangle {{
                     x: cardX - clipX
-                    y: cardY - clipY
+                    y: parent.visualY - clipY
                     width: cardW
                     height: cardH
                     radius: {_GLASS_RADIUS:.1f}
                     antialiasing: true
                     color: "white"
-                }}
-            }}
-        }}
-
-        Item {{
-            id: singleMaskClip
-            visible: root.singleScrollActive
-            x: root.singleViewportX
-            y: root.singleViewportY
-            width: root.singleViewportW
-            height: root.singleViewportH
-            clip: true
-
-            Item {{
-                id: singleMaskGroup
-                x: -root.singleViewportX
-                y: -root.singleViewportY - root.singleScrollY
-                width: root.width
-                height: root.height
-                clip: false
-
-                Repeater {{
-                    model: glassCardModel
-                    delegate: Item {{
-                        visible: cardVisible && cardScrollable && clipW > 0 && clipH > 0
-                        x: clipX
-                        y: clipY
-                        width: clipW
-                        height: clipH
-                        clip: true
-
-                        Rectangle {{
-                            x: cardX - clipX
-                            y: cardY - clipY
-                            width: cardW
-                            height: cardH
-                            radius: {_GLASS_RADIUS:.1f}
-                            antialiasing: true
-                            color: "white"
-                        }}
-                    }}
                 }}
             }}
         }}
@@ -561,16 +501,22 @@ Window {{
     Repeater {{
         model: glassCardModel
         delegate: Item {{
-            x: 0
-            y: 0
-            width: root.width
-            height: root.height
-            clip: false
-            visible: cardVisible && !cardScrollable
+            // Resting cards obey their fixed viewport/ancestor clip. During the
+            // existing hover/return transform the shell intentionally switches to
+            // window coordinates (overflow visible), preserving the proven hover
+            // behaviour instead of clipping at the scroll viewport.
+            readonly property real visualY: cardY - (cardScrolls ? root.singleScrollY : 0.0)
+            readonly property bool overflowVisible: Math.abs(cardScale - 1.0) > 0.0001
+            x: overflowVisible ? 0 : clipX
+            y: overflowVisible ? 0 : clipY
+            width: overflowVisible ? root.width : clipW
+            height: overflowVisible ? root.height : clipH
+            clip: !overflowVisible
+            visible: cardVisible && (overflowVisible || (width > 0 && height > 0))
 
             Rectangle {{
-                x: cardX
-                y: cardY
+                x: cardX - (parent.overflowVisible ? 0 : clipX)
+                y: parent.visualY - (parent.overflowVisible ? 0 : clipY)
                 width: cardW
                 height: cardH
                 scale: cardScale
@@ -578,41 +524,6 @@ Window {{
                 radius: {_GLASS_RADIUS:.1f}
                 antialiasing: true
                 color: Qt.rgba(0, 0, 0, cardAlpha / 255.0)
-            }}
-        }}
-    }}
-
-    Item {{
-        id: singlePresentationGroup
-        x: 0
-        y: -root.singleScrollY
-        width: root.width
-        height: root.height
-        clip: false
-        visible: root.singleScrollActive
-
-        Repeater {{
-            model: glassCardModel
-            delegate: Item {{
-                x: 0
-                y: 0
-                width: root.width
-                height: root.height
-                clip: false
-                visible: cardVisible && cardScrollable &&
-                         root.scrollCardIntersectsViewport(cardX, cardY, cardW, cardH)
-
-                Rectangle {{
-                    x: cardX
-                    y: cardY
-                    width: cardW
-                    height: cardH
-                    scale: cardScale
-                    transformOrigin: Item.Center
-                    radius: {_GLASS_RADIUS:.1f}
-                    antialiasing: true
-                    color: Qt.rgba(0, 0, 0, cardAlpha / 255.0)
-                }}
             }}
         }}
     }}
@@ -638,20 +549,19 @@ Window {{
 
 
 class NativeQuickBackground(QObject):
-    """Native Quick wallpaper, glass and parallax renderer under baseline widgets."""
+    """Native Quick wallpaper, GPU glass and parallax renderer under widgets."""
 
     def __init__(self, overlay: QMainWindow) -> None:
         super().__init__(overlay)
         self.overlay = overlay
         self._shutting_down = False
-        self._gpu_scene_mask = True
         self._mask_revision = 0
         self._mask_ready = False
         self._geometry_dirty = False
-        self._last_pointer_norm: tuple[float, float] | None = None
+        self._gpu_mask_enabled = True
         self._single_scroll_area: QAbstractScrollArea | None = None
         self._single_scroll_page: QWidget | None = None
-        self._single_scroll_viewport: QWidget | None = None
+        self._last_pointer_norm: tuple[float, float] | None = None
         self._temp = tempfile.TemporaryDirectory(prefix="ecommerce-agent-bg-")
         self._temp_dir = Path(self._temp.name)
         self._cards = [
@@ -693,6 +603,7 @@ class NativeQuickBackground(QObject):
         self.quick_window.setMinimumSize(overlay.minimumSize())
         self.quick_window.setProperty("sharpUrl", QUrl.fromLocalFile(str(self._sharp_path)))
         self.quick_window.setProperty("blurUrl", QUrl.fromLocalFile(str(self._blur_path)))
+        self.quick_window.setProperty("singleScrollY", 0.0)
         self.quick_window.setPersistentGraphics(False)
         self.quick_window.setPersistentSceneGraph(False)
 
@@ -714,6 +625,9 @@ class NativeQuickBackground(QObject):
         if app is not None:
             app.aboutToQuit.connect(self.shutdown)
 
+        # Nested/static scroll areas may genuinely change individual card layout or
+        # clipping. The final outer Single page is created later and gets a special
+        # O(1) transform binding via bind_single_page_scroll().
         for area in overlay.findChildren(QAbstractScrollArea):
             area.verticalScrollBar().valueChanged.connect(self.schedule_mask_update)
             area.horizontalScrollBar().valueChanged.connect(self.schedule_mask_update)
@@ -735,72 +649,44 @@ class NativeQuickBackground(QObject):
         if blurred.isNull() or not blurred.save(str(self._blur_path), "JPG", 92):
             raise RuntimeError("Failed to create the pre-blurred wallpaper")
 
-    def set_card_alpha(self, frame: QFrame, alpha: float) -> None:
-        self.card_model.set_alpha(frame, alpha)
-
-    def set_card_presentation(self, frame: QFrame, *, scale: float, alpha: float) -> None:
-        """Update only the GPU glass shell/tint; the blur mask stays geometry-only."""
-
-        self.card_model.set_presentation(frame, scale=scale, alpha=alpha)
-
-    def attach_single_page_scroll(
-        self,
-        area: QAbstractScrollArea,
-        page: QWidget,
-    ) -> None:
-        """Bind Single scrolling to one Quick scene transform."""
+    def bind_single_page_scroll(self, area: QAbstractScrollArea, page: QWidget) -> None:
+        """Bind the outer Single scroll to one Quick scene transform."""
 
         if self._shutting_down:
             return
-
         if self._single_scroll_area is area and self._single_scroll_page is page:
             self._publish_single_scroll(area.verticalScrollBar().value())
-            self._sync_single_viewport()
             return
 
         self._single_scroll_area = area
         self._single_scroll_page = page
-        self._single_scroll_viewport = area.viewport()
         self.card_model.set_scroll_context(area, page)
-
-        for watched in (area, area.viewport(), page):
-            if watched not in self._geometry_watch:
-                self._geometry_watch.add(watched)
-                watched.installEventFilter(self)
-
         area.verticalScrollBar().valueChanged.connect(self._publish_single_scroll)
-        self._sync_single_viewport()
         self._publish_single_scroll(area.verticalScrollBar().value())
-        if self.card_model.sync_geometry():
-            self._update_mask_texture()
-        else:
-            self._mask_ready = True
+        self.schedule_mask_update()
 
     def _publish_single_scroll(self, value: int) -> None:
+        """The complete continuous-scroll hot path: publish one scalar to Quick."""
+
         quick = self.quick_window
         if self._shutting_down or quick is None:
             return
         try:
             quick.setProperty("singleScrollY", float(value))
+            # Hover neighbour geometry uses this cheap revision as its cache key.
+            # Incrementing it is O(1) and intentionally does not schedule geometry
+            # scans or rebuild any mask surface.
             self._mask_revision += 1
         except RuntimeError:
             return
 
-    def _sync_single_viewport(self) -> None:
-        quick = self.quick_window
-        area = self._single_scroll_area
-        viewport = self._single_scroll_viewport
-        if self._shutting_down or quick is None or area is None or viewport is None:
-            return
-        try:
-            top_left = viewport.mapTo(self.overlay, QPoint(0, 0))
-            quick.setProperty("singleScrollActive", True)
-            quick.setProperty("singleViewportX", float(top_left.x()))
-            quick.setProperty("singleViewportY", float(top_left.y()))
-            quick.setProperty("singleViewportW", float(viewport.width()))
-            quick.setProperty("singleViewportH", float(viewport.height()))
-        except RuntimeError:
-            return
+    def set_card_alpha(self, frame: QFrame, alpha: float) -> None:
+        self.card_model.set_alpha(frame, alpha)
+
+    def set_card_presentation(self, frame: QFrame, *, scale: float, alpha: float) -> None:
+        """Update only the GPU shell/tint; mask geometry stays independent."""
+
+        self.card_model.set_presentation(frame, scale=scale, alpha=alpha)
 
     def _sample_pointer(self) -> None:
         quick = self.quick_window
@@ -819,14 +705,8 @@ class NativeQuickBackground(QObject):
             nx = 0.0
             ny = 0.0
         else:
-            nx = max(
-                -1.0,
-                min(1.0, (local.x() / max(1.0, float(quick.width())) - 0.5) * 2.0),
-            )
-            ny = max(
-                -1.0,
-                min(1.0, (local.y() / max(1.0, float(quick.height())) - 0.5) * 2.0),
-            )
+            nx = max(-1.0, min(1.0, (local.x() / max(1.0, float(quick.width())) - 0.5) * 2.0))
+            ny = max(-1.0, min(1.0, (local.y() / max(1.0, float(quick.height())) - 0.5) * 2.0))
 
         previous = self._last_pointer_norm
         if previous is not None and (
@@ -841,7 +721,7 @@ class NativeQuickBackground(QObject):
         quick.setProperty("animationRunning", True)
 
     def schedule_mask_update(self, *_args: object) -> None:
-        """Coalesce real layout churn; the visible mask is scene-graph native."""
+        """Coalesce actual layout/visibility changes, never continuous page scroll."""
 
         if self._shutting_down:
             return
@@ -855,36 +735,22 @@ class NativeQuickBackground(QObject):
         self._geometry_dirty = False
         changed = self.card_model.sync_geometry()
         if changed or not self._mask_ready:
-            self._update_mask_texture()
+            # QML Repeater roles are already live GPU mask geometry. Revision is
+            # retained only as a cheap cache invalidator for QWidget hover logic.
+            self._mask_revision += 1
+            self._mask_ready = True
 
         if self._geometry_dirty and not self._geometry_timer.isActive():
             self._geometry_timer.start()
 
     def _update_mask_texture(self) -> None:
-        """Compatibility revision hook; the visible mask is already in QML."""
+        """Compatibility hook: formal runtime uses QML geometry, not mask textures."""
 
-        if self._shutting_down:
-            return
         self._mask_revision += 1
         self._mask_ready = True
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        event_type = event.type()
-
-        if watched is self._single_scroll_page and event_type == QEvent.Type.Move:
-            return False
-
-        if watched in {self._single_scroll_area, self._single_scroll_viewport} and event_type in {
-            QEvent.Type.Move,
-            QEvent.Type.Resize,
-            QEvent.Type.Show,
-            QEvent.Type.LayoutRequest,
-        }:
-            self._sync_single_viewport()
-            self.schedule_mask_update()
-            return False
-
-        if watched in self._geometry_watch and event_type in {
+        if watched in self._geometry_watch and event.type() in {
             QEvent.Type.Move,
             QEvent.Type.Resize,
             QEvent.Type.Show,

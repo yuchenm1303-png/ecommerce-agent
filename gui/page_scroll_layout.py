@@ -109,6 +109,10 @@ def install_page_scroll_layout(window: QMainWindow, visual: Any | None = None) -
     field workspace and acceptance console move into one content-driven page. The
     old body QSplitter stays detached/hidden only long enough for legacy signal
     closures to remain harmless; it no longer controls any visible geometry.
+
+    Glass is still rendered by the native Quick scene. Once the page exists we bind
+    this outer scrollbar to one Quick scene-group offset; continuous scrolling does
+    not trigger per-card geometry scans or blur-mask rebuilds.
     """
 
     existing = getattr(window, "_single_page_scroll", None)
@@ -224,17 +228,17 @@ def install_page_scroll_layout(window: QMainWindow, visual: Any | None = None) -
     body.hide()
     body.setParent(root)
     setattr(window, "_ui_polish_body_splitter", None)
-    setattr(window, "_single_page_scroll", scroll)
-    setattr(window, "_single_page_scroll_content", page)
 
-    # The Quick renderer keeps Single-page card geometry in page/base coordinates.
-    # Smooth scrolling therefore publishes ONE scrollbar value into a QML parent
-    # transform instead of mapping every card and rebuilding a mask each tick.
+    # Publish the page identity/layout once, then the background owns the O(1)
+    # scroll-value -> QML group-transform hot path. This deliberately replaces the
+    # old valueChanged -> card_model.sync_geometry() -> mask rebuild chain.
     background = getattr(visual, "background", None)
     if background is None:
         background = getattr(getattr(window, "_visual_style", None), "background", None)
-    attach_scroll = getattr(background, "attach_single_page_scroll", None)
-    if callable(attach_scroll):
-        attach_scroll(scroll, page)
+    bind_scroll = getattr(background, "bind_single_page_scroll", None)
+    if callable(bind_scroll):
+        bind_scroll(scroll, page)
 
+    setattr(window, "_single_page_scroll", scroll)
+    setattr(window, "_single_page_scroll_content", page)
     return scroll
