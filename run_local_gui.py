@@ -43,6 +43,7 @@ def main() -> int:
     from gui.runtime_assistant import install_runtime_assistant
     from gui.scroll_local_glass import install_scroll_local_glass
     from gui.startup_entrance import install_startup_entrance
+    from gui.startup_entrance_stability import install_startup_entrance_stability
     from gui.static_modal_interaction import install_static_modal_interaction
     from gui.ui_maturity import install_mature_ui
     from gui.ui_polish import install_ui_polish
@@ -162,9 +163,12 @@ def main() -> int:
     install_workspace_transition(window, visual)
 
     # Reference-site startup choreography is a one-shot presentation surface. It
-    # freezes pointer/card effects while visible, captures the already-built QWidget
-    # UI once, and never changes business ownership or the normal runtime renderer.
+    # freezes pointer/card effects while visible and keeps the original visual
+    # timeline. A separate handoff gate waits for the maximized QWidget geometry
+    # to settle before capture, then restores runtime presentation over separate
+    # frames so the final snapshot/live swap cannot jump or stall.
     entrance = install_startup_entrance(window, visual)
+    entrance_stability = install_startup_entrance_stability(window, entrance)
 
     shell.show()
     effects.raise_()
@@ -172,7 +176,7 @@ def main() -> int:
     assistant = install_runtime_assistant(window)
     assistant.raise_()
     entrance.raise_overlay()
-    entrance.start()
+    entrance_stability.start()
     return app.exec()
 
 
