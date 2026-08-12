@@ -53,20 +53,13 @@ def main() -> int:
     app.setApplicationName("ecommerce-agent Current Workflow")
     app.setOrganizationName("ecommerce-agent")
 
-    # Keep the native Fuji renderer compatible with the translucent QWidget
-    # child surface. Modal presentation itself now stays entirely in QWidget.
     QQuickWindow.setDefaultAlphaBuffer(True)
 
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_native_visual_style(window)
 
-    # Finish the proven Single workspace presentation before wrapping it in the
-    # final page scroll. Existing business widgets/signals are preserved and only
-    # their presentation ownership changes.
     install_ui_polish(window)
 
-    # Keep the right-side Telemetry/Web/Safety card at one stable non-scrolling
-    # height. It must not grow with the old side viewport.
     side_tabs = getattr(window, "side_detail_tabs", None)
     if side_tabs is not None:
         side_tabs.setFixedHeight(300)
@@ -92,13 +85,6 @@ def main() -> int:
     mature = install_mature_ui(window)
     details.attach_mature(mature)
 
-    # ui_maturity gets the last compact/responsive pass first. Then the final
-    # Single geometry owner replaces the viewport-competing body splitter with one
-    # content-driven vertical page: Product Source → statuses → fields → console.
-    # The common application header remains fixed above this scroll area. Glass
-    # remains entirely in the native Quick scene; the outer scrollbar publishes
-    # one scene-group Y offset instead of repainting QWidget glass or rebuilding a
-    # per-card mask during continuous scroll.
     install_page_scroll_layout(window, visual)
 
     install_console_summary_mode(window)
@@ -106,17 +92,16 @@ def main() -> int:
 
     window.install_mode_workspace()
     install_workspace_mode_switch(window)
-    # Formal GUI owns one dedicated Makro Edge/Profile. 9222 remains an internal
-    # transport detail; Single and Batch share one login session and Batch keeps
-    # per-job isolation through owned tabs/target ids.
     install_managed_makro_browser(window)
     install_required_input_support(window)
     install_activity_presence(window)
     install_detailed_preparation_progress(window)
     visual.refresh_glass_frames()
 
-    # Presentation-only hot-path optimizations are installed after both Single
-    # and Batch widgets exist, but still before the first event-loop paint.
+    # Single-page glass stays in the native Quick scene. The page-scroll bridge
+    # publishes one scroll offset into a shared GPU transform, so there is no
+    # QWidget all-card repaint path and no per-scroll card geometry/mask rebuild.
+
     install_ui_runtime_optimizations(window, visual)
 
     smooth_wheel = SmoothWheelFilter(window)
@@ -128,32 +113,21 @@ def main() -> int:
     if quick_window is None:
         raise RuntimeError("Native Quick renderer was not created")
 
-    # Windows can discard the QWidget backing-store pixels while the native Quick
-    # owner is minimized even though every widget object remains alive.
     install_restore_snapshot(window, quick_window)
 
     shell = install_native_window_shell(window, quick_window)
 
-    # Card performance budgeting is native to the controller/effect hot path:
-    # one live interactive card, one frozen outgoing card, 90 Hz maximum motion
-    # clock, and sub-pixel QWidget raster publication.
     install_nekro_card_fx(window, visual)
     install_buffered_logs(window)
     effects = install_nekro_effects(window, sakura_count=3)
 
-    # Keep the stabilized workspace transition implementation unchanged. Only its
-    # presentation timing tokens are tuned here.
     apply_workspace_transition_tuning()
     install_workspace_transition(window, visual)
 
-    # Reference-site startup choreography is a one-shot presentation surface. It
-    # freezes pointer/card effects while visible, captures the already-built QWidget
-    # UI once, and never changes business ownership or the normal runtime renderer.
     entrance = install_startup_entrance(window, visual)
 
     shell.show()
     effects.raise_()
-    # Runtime Assistant remains Phase 1 Shadow Mode: observe + explain only.
     assistant = install_runtime_assistant(window)
     assistant.raise_()
     entrance.raise_overlay()
