@@ -23,7 +23,7 @@ from .listing import MAKRO_HOME_URL, MAKRO_HOST, MAKRO_SINGLE_LISTING_ROUTE, par
 from .listing_creation import _vertical_search_input, is_brand_step, is_product_info_step
 from .portal_adapter import MakroPortalAdapter
 from .taxonomy_resilient import ResilientMakroTaxonomyBrowser
-from .vertical_selection import is_vertical_interaction_ready
+from .vertical_selection import _vertical_search_semantics_visible, is_vertical_interaction_ready
 
 
 _LISTINGS = "Listings"
@@ -63,19 +63,20 @@ def _has_password(page: Any) -> bool:
 
 
 def _is_step1_operable(page: Any) -> bool:
-    """Return True only when Step 1 readiness implies select_vertical can run.
+    """Return True only when the exact surface needed by select_vertical exists.
 
-    ``is_vertical_interaction_ready`` deliberately accepts several structural
-    signals because Makro's SPA stage enum can lag. Some non-Step-1 portal
-    surfaces, however, can resemble taxonomy columns closely enough to trigger
-    those broad signals. The production selector always requires the actual
-    Vertical search input, so the entry gate must require it too. This keeps the
-    readiness contract aligned with ``select_vertical`` and prevents Dashboard
-    or Listing Creation chrome from being accepted as Step 1.
+    Step 1 must be on the Single Listing route, pass the broad structural
+    readiness contract, expose Vertical-specific search semantics, and provide
+    the actual search input. Requiring all four prevents Dashboard/Listing
+    Creation menus or a lone generic text box from masquerading as Step 1.
     """
 
     try:
+        if not _is_single_listing_route(getattr(page, "url", "")):
+            return False
         if not is_vertical_interaction_ready(page):
+            return False
+        if not _vertical_search_semantics_visible(page):
             return False
         _vertical_search_input(page)
         return True
