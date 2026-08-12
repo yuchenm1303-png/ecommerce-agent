@@ -61,24 +61,6 @@ def _is_business(field: dict[str, Any]) -> bool:
     return is_business_question(contract["attribute_key"]) or is_business_question(contract["label"])
 
 
-def _production_evidence_only(packet: AIDecisionPacket) -> bool:
-    """Detect the canonical production resolver packet without changing dev helpers.
-
-    Production product facts are emitted by ``run_product_facts`` with the
-    ``batched-product-facts`` extractor marker. Web enrichment appends its own
-    marker to that same chain. Once that evidence-first pipeline reaches this
-    function, unresolved fields must stay MISSING so optional fields remain empty
-    and required fields can be surfaced to the explicit user-input gate.
-
-    Compatibility/unit callers that construct other extractor names can still
-    exercise the historical best-effort helper directly; production simply no
-    longer promotes category guesses to READY.
-    """
-
-    extractor = str(packet.extractor or "").casefold()
-    return "batched-product-facts" in extractor
-
-
 def _target(field: dict[str, Any]) -> dict[str, Any]:
     contract = field_contract(field)
     section = contract["section_heading"].casefold()
@@ -317,21 +299,6 @@ def run_best_effort_inference(
         site_name="local-model",
         content=INFERENCE_CONTENT,
     )
-
-    if _production_evidence_only(packet):
-        return BestEffortInferenceResult(
-            packet,
-            inference_source,
-            0,
-            0,
-            0,
-            0,
-            False,
-            False,
-            time.monotonic() - started,
-            "production evidence-only policy: unresolved fields remain MISSING after Web",
-        )
-
     request = build_best_effort_inference_request(
         packet,
         field_list,

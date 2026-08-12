@@ -106,22 +106,18 @@ class BatchController(QObject):
             raise RuntimeError("Batch 当前仍在运行。")
         if not allow_save:
             raise ValueError("批量 Full Step 3 必须显式授权 Save + reopen。")
-        if not upload_images:
-            raise ValueError(
-                "批量 Full Step 3 是完整 draft persistence 验收，必须显式授权 Product Photos。"
-            )
         ready = [job for job in self.batch.jobs if job.status == "READY"]
         if not ready:
-            raise ValueError("当前 Batch 没有通过 required / Product Photos 预检的 READY 商品。")
+            raise ValueError("当前 Batch 没有 READY 商品。")
 
         self.batch.execute_concurrency = max(1, min(4, int(execute_concurrency)))
         self.batch.save_authorized = True
-        self.batch.images_authorized = True
+        self.batch.images_authorized = bool(upload_images)
         self.batch.send_to_qc = False
         self.batch.status = "EXECUTING"
         self._mode = "execute"
         self._stopping = False
-        self._execution_images = True
+        self._execution_images = bool(upload_images)
         self._execute_queue = [job.job_id for job in ready]
         self.running_changed.emit(True)
         self.state_changed.emit("批量真实填写中")
@@ -426,19 +422,8 @@ class BatchController(QObject):
                     identity = hints.get("product_identity") or {} if isinstance(hints, dict) else {}
                     if isinstance(identity, dict):
                         job.product_name = str(identity.get("product_type_en") or identity.get("product_name") or "")
-
-                    if job.required_blocked > 0:
-                        job.status = "REVIEW"
-                        job.stage_detail = f"需补充 {job.required_blocked} 个必填项"
-                    elif job.image_count <= 0:
-                        job.status = "REVIEW"
-                        job.stage_detail = "缺少可上传的真实商品图"
-                    elif job.ready > 0:
-                        job.status = "READY"
-                        job.stage_detail = "准备完成"
-                    else:
-                        job.status = "REVIEW"
-                        job.stage_detail = "没有 READY 字段"
+                    job.status = "READY" if job.ready > 0 else "REVIEW"
+                    job.stage_detail = "准备完成" if job.ready > 0 else "没有 READY 字段"
                     job.progress = 100
                     job.error = ""
                 except Exception as exc:
