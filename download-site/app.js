@@ -36,20 +36,13 @@ function applyConfig() {
     li.textContent = note;
     releaseNotes.appendChild(li);
   }
-
-  if (config.wallpaperUrl) {
-    document.documentElement.style.setProperty(
-      "--wallpaper-image",
-      `url(${JSON.stringify(config.wallpaperUrl).slice(1, -1)})`
-    );
-  }
 }
 
 function showToast(message) {
   toast.textContent = message;
   toast.classList.add("show");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toast.classList.remove("show"), 2600);
+  toastTimer = setTimeout(() => toast.classList.remove("show"), 2400);
 }
 
 function setSession(nextSession) {
@@ -71,7 +64,7 @@ function setSession(nextSession) {
 
 async function initAuth() {
   if (!authConfig.supabaseUrl || !authConfig.supabaseAnonKey) {
-    loginMessage.textContent = "视觉预览已就绪；登录服务等待 Supabase 配置。";
+    loginMessage.textContent = "页面预览已就绪；登录服务等待 Supabase 配置。";
     setSession(null);
     return;
   }
@@ -110,8 +103,8 @@ loginForm.addEventListener("submit", async (event) => {
 
   const submitButton = loginForm.querySelector("button[type='submit']");
   submitButton.disabled = true;
-  submitButton.textContent = "登录中…";
-  loginMessage.textContent = "正在验证账号…";
+  submitButton.textContent = "验证中…";
+  loginMessage.textContent = "正在验证账户…";
 
   try {
     const { data, error } = await supabase.auth.signInWithPassword({
@@ -119,6 +112,7 @@ loginForm.addEventListener("submit", async (event) => {
       password: passwordInput.value
     });
     if (error) throw error;
+
     setSession(data.session);
     passwordInput.value = "";
     showToast("登录成功");
@@ -128,7 +122,7 @@ loginForm.addEventListener("submit", async (event) => {
     showToast("登录失败");
   } finally {
     submitButton.disabled = false;
-    submitButton.textContent = "登录";
+    submitButton.textContent = "登录账户";
   }
 });
 
@@ -146,7 +140,7 @@ downloadButton.addEventListener("click", async () => {
 
   downloadButton.disabled = true;
   const originalHint = downloadButtonHint.textContent;
-  downloadButtonHint.textContent = "正在生成链接";
+  downloadButtonHint.textContent = "正在生成安全链接";
 
   try {
     let url = release.downloadUrl || "";
@@ -181,61 +175,5 @@ downloadButton.addEventListener("click", async () => {
   }
 });
 
-function installPetals() {
-  const host = $("petals");
-  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  if (reduced) return;
-
-  const fragment = document.createDocumentFragment();
-  const count = Math.min(18, Math.max(10, Math.floor(window.innerWidth / 95)));
-
-  for (let index = 0; index < count; index += 1) {
-    const petal = document.createElement("i");
-    petal.className = "petal";
-    petal.style.setProperty("--size", `${8 + Math.random() * 8}px`);
-    petal.style.setProperty("--x", `${Math.random() * 100}vw`);
-    petal.style.setProperty("--drift", `${-14 + Math.random() * 28}vw`);
-    petal.style.setProperty("--duration", `${10 + Math.random() * 10}s`);
-    petal.style.setProperty("--delay", `${-Math.random() * 16}s`);
-    petal.style.setProperty("--opacity", `${0.42 + Math.random() * 0.45}`);
-    fragment.appendChild(petal);
-  }
-
-  host.replaceChildren(fragment);
-}
-
-function installCursor() {
-  if (!window.matchMedia("(pointer: fine)").matches) return;
-
-  const cursor = $("cursor");
-  let targetX = -40;
-  let targetY = -40;
-  let currentX = -40;
-  let currentY = -40;
-  let frame = 0;
-
-  const tick = () => {
-    currentX += (targetX - currentX) * 0.34;
-    currentY += (targetY - currentY) * 0.34;
-    cursor.style.transform = `translate3d(${currentX - 9}px, ${currentY - 9}px, 0)`;
-    if (Math.abs(targetX - currentX) > 0.1 || Math.abs(targetY - currentY) > 0.1) {
-      frame = requestAnimationFrame(tick);
-    } else {
-      frame = 0;
-    }
-  };
-
-  window.addEventListener("pointermove", (event) => {
-    targetX = event.clientX;
-    targetY = event.clientY;
-    if (!frame) frame = requestAnimationFrame(tick);
-  }, { passive: true });
-
-  document.addEventListener("pointerdown", () => cursor.classList.add("active"), { passive: true });
-  document.addEventListener("pointerup", () => cursor.classList.remove("active"), { passive: true });
-}
-
 applyConfig();
-installPetals();
-installCursor();
 await initAuth();
