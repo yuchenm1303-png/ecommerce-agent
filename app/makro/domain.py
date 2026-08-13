@@ -7,6 +7,7 @@ expansion, real field fill/readback, photo persistence and post-Save checks.
 
 from __future__ import annotations
 
+from copy import copy
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,6 +23,7 @@ from .listing import (
     wait_for_authenticated_listing,
 )
 from .locators import click_add_value_for_control, selector_for_control
+from .marketplace_constraints import _is_model_name_field, _strip_known_brand
 from .photos import (
     PhotoUploadResult,
     inspect_product_photos,
@@ -221,6 +223,59 @@ class MakroDomainAdapter:
             )
         return matches[0]
 
+    def _constrained_execution_answer(
+        self,
+        semantic_field: dict[str, Any],
+        answer: Any,
+    ) -> Any:
+        """Apply final DOM-known Makro mechanics without changing product semantics.
+
+        The committed Brand lives in the current listing URL even when an older
+        decision packet does not carry product_identity.brand. Makro rejects that
+        exact Brand token inside Model Name, so remove it at the final write and
+        verification boundary. The original plan/answer object is never mutated.
+        """
+
+        if not _is_model_name_field(semantic_field):
+            return answer
+        target = self.current_target()
+        brand = str((target.brand if target else None) or "").strip()
+        if not brand:
+            return answer
+
+        values = [
+            str(value).strip()
+            for value in list(getattr(answer, "answer_values", []) or [])
+            if str(value).strip()
+        ]
+        if not values:
+            scalar = str(getattr(answer, "answer", "") or "").strip()
+            if scalar:
+                values = [scalar]
+        if not values:
+            return answer
+
+        cleaned = [_strip_known_brand(value, brand) for value in values]
+        if cleaned == values:
+            return answer
+        meaningful = [value for value in cleaned if value]
+        if not meaningful:
+            raise RuntimeError(
+                "Makro Model Name 去除当前 Brand 后为空；拒绝编造替代型号。"
+            )
+
+        constrained = copy(answer)
+        constrained.answer_values = meaningful
+        constrained.answer = meaningful[0]
+        detail = str(getattr(constrained, "detail", "") or "").strip()
+        suffix = f"Makro Model Name removed committed Brand {brand!r}."
+        constrained.detail = f"{detail} | {suffix}" if detail else suffix
+        print(
+            f"GUI_EXEC_CONSTRAINT\tModel Name\tbrand_removed\t{brand}",
+            flush=True,
+        )
+        return constrained
+
     def _ensure_answer_value_slots(
         self,
         semantic_field: dict[str, Any],
@@ -275,15 +330,16 @@ class MakroDomainAdapter:
         safe_section = section.replace("\t", " ").replace("\n", " ")
         safe_label = label.replace("\t", " ").replace("\n", " ")
         print(f"GUI_EXEC_FIELD\tSTART\t{safe_section}\t{safe_label}", flush=True)
+        constrained_answer = self._constrained_execution_answer(semantic_field, answer)
         expanded = self._ensure_answer_value_slots(
             semantic_field,
-            answer,
+            constrained_answer,
             section_path,
         )
         verification = fill_resolved_field(
             self.page,
             expanded,
-            answer,
+            constrained_answer,
             section_path=section_path,
             recheck_wait_ms=recheck_wait_ms,
         )
@@ -301,9 +357,10 @@ class MakroDomainAdapter:
         *,
         section_path: str | None = None,
     ) -> FillVerification:
+        constrained_answer = self._constrained_execution_answer(semantic_field, answer)
         return verify_resolved_field(
             self.page,
             semantic_field,
-            answer,
+            constrained_answer,
             section_path=section_path,
         )
