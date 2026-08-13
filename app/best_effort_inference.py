@@ -12,6 +12,7 @@ from .ai_decisions import (
     CONFLICT,
     MISSING,
     READY,
+    REVIEW,
     AIDecisionPacket,
     DecisionCitation,
     FieldDecision,
@@ -31,8 +32,8 @@ from .semantic_grounding import GroundingCatalog
 from .web_enrichment import PersistedWebSource, WebEvidence
 
 
-INFERENCE_CONTRACT_VERSION = 5
-INFERENCE_CACHE_VERSION = 5
+INFERENCE_CONTRACT_VERSION = 6
+INFERENCE_CACHE_VERSION = 6
 INFERENCE_REFERENCE = "model-inference:category-knowledge"
 INFERENCE_URL = "model-inference://category-knowledge"
 INFERENCE_CONTENT = (
@@ -141,6 +142,67 @@ def _web_context(evidence: Iterable[WebEvidence], *, max_chars: int = 4_000) -> 
         )
         used += len(clipped)
     return output
+
+
+def _policy_handoff_from_web(
+    packet: AIDecisionPacket,
+    fields: Iterable[dict[str, Any]],
+) -> AIDecisionPacket:
+    """Route policy-sensitive Web answers through the policy-aware final stage.
+
+    Product-fact READY values grounded in the supplier remain frozen. Web remains
+    useful evidence, but Web-written copy is regenerated with the seller content
+    policy. Exact-only fields are downgraded to MISSING so they cannot inherit a
+    comparable-product identifier/compliance/package answer and are also excluded
+    from best-effort inference by ``allow_best_effort_inference``.
+    """
+
+    by_id = {field_id(field): field for field in fields}
+    decisions: list[FieldDecision] = []
+    rerouted: list[str] = []
+    for decision in packet.decisions:
+        field = by_id.get(decision.field_id)
+        policy = field_content_policy(field) if field is not None else {}
+        web_sourced = any(
+            citation.source_reference.startswith("web-search:")
+            for citation in decision.citations
+        )
+        mode = str(policy.get("generation_mode") or "")
+        should_reroute = (
+            web_sourced
+            and decision.status in {READY, REVIEW}
+            and mode in {"grounded_synthesis", "grounded_only"}
+        )
+        if not should_reroute:
+            decisions.append(decision)
+            continue
+        rerouted.append(decision.field_id)
+        decisions.append(
+            FieldDecision(
+                field_id=decision.field_id,
+                status=MISSING,
+                reason=(
+                    "Web result retained as context but rerouted through seller content policy"
+                    if allow_best_effort_inference(field)
+                    else "Exact-only field rejected comparable/Web synthesis; direct exact product evidence required"
+                ),
+            )
+        )
+
+    if not rerouted:
+        return packet
+    return AIDecisionPacket(
+        identity=packet.identity,
+        schema_sha256=packet.schema_sha256,
+        source_manifest_sha256=packet.source_manifest_sha256,
+        decisions=decisions,
+        model_summary=packet.model_summary,
+        warnings=[
+            *packet.warnings,
+            "Content policy rerouted Web-authored fields: " + ", ".join(rerouted),
+        ],
+        extractor=packet.extractor,
+    )
 
 
 def _json_schema(targets: list[dict[str, Any]]) -> dict[str, Any]:
@@ -305,6 +367,7 @@ def run_best_effort_inference(
     field_list = list(fields)
     source_list = list(web_sources)
     evidence_list = list(web_evidence)
+    policy_packet = _policy_handoff_from_web(packet, field_list)
     inference_source = PersistedWebSource(
         source_reference=INFERENCE_REFERENCE,
         url=INFERENCE_URL,
@@ -313,7 +376,7 @@ def run_best_effort_inference(
         content=INFERENCE_CONTENT,
     )
     request = build_best_effort_inference_request(
-        packet,
+        policy_packet,
         field_list,
         product_fingerprint=product_fingerprint,
         web_evidence=evidence_list,
@@ -321,7 +384,7 @@ def run_best_effort_inference(
     target_ids = {item["field_id"] for item in request["target_fields"]}
     if not target_ids:
         return BestEffortInferenceResult(
-            packet, inference_source, 0, 0, 0, 0, False, False, time.monotonic() - started
+            policy_packet, inference_source, 0, 0, 0, 0, False, False, time.monotonic() - started
         )
 
     key = _cache_key(provider, request, cache_namespace)
@@ -343,7 +406,7 @@ def run_best_effort_inference(
         updates = _parse_updates(raw, target_ids)
     except Exception as exc:
         return BestEffortInferenceResult(
-            packet,
+            policy_packet,
             inference_source,
             len(target_ids),
             0,
@@ -359,19 +422,19 @@ def run_best_effort_inference(
     external[INFERENCE_REFERENCE] = INFERENCE_CONTENT
     updates_by_id = {item.field_id: item for item in updates}
     merged = AIDecisionPacket(
-        identity=packet.identity,
-        schema_sha256=packet.schema_sha256,
-        source_manifest_sha256=packet.source_manifest_sha256,
-        decisions=[updates_by_id.get(item.field_id, item) for item in packet.decisions],
-        model_summary=(packet.model_summary + "\nBest-effort text-only inference filled policy-eligible remaining product fields.").strip(),
-        warnings=list(packet.warnings),
-        extractor=(packet.extractor + "+best-effort-inference").strip("+"),
+        identity=policy_packet.identity,
+        schema_sha256=policy_packet.schema_sha256,
+        source_manifest_sha256=policy_packet.source_manifest_sha256,
+        decisions=[updates_by_id.get(item.field_id, item) for item in policy_packet.decisions],
+        model_summary=(policy_packet.model_summary + "\nBest-effort text-only inference filled policy-eligible remaining product fields.").strip(),
+        warnings=list(policy_packet.warnings),
+        extractor=(policy_packet.extractor + "+best-effort-inference").strip("+"),
     )
     final_packet = validate_ai_decision_packet(
         merged,
         field_list,
         grounding,
-        expected_identity=packet.identity,
+        expected_identity=policy_packet.identity,
         external_sources=external,
     )
     inferred = [item for item in final_packet.decisions if item.field_id in target_ids]
