@@ -10,7 +10,7 @@ SMOOTH = (ROOT / "gui" / "smooth_scroll.py").read_text(encoding="utf-8")
 SUMMARY = (ROOT / "gui" / "console_summary_mode.py").read_text(encoding="utf-8")
 
 
-def test_formal_single_installs_final_page_scroll_after_maturity_before_summary_and_modes() -> None:
+def test_formal_single_installs_fixed_layout_after_maturity_before_summary_and_modes() -> None:
     assert "from gui.page_scroll_layout import install_page_scroll_layout" in RUN
     assert "install_ui_polish(window)" in RUN
     assert "install_mature_ui(window)" in RUN
@@ -24,66 +24,69 @@ def test_formal_single_installs_final_page_scroll_after_maturity_before_summary_
     assert RUN.index("install_console_summary_mode(window)") < RUN.index("window.install_mode_workspace()")
 
 
-def test_header_stays_fixed_while_single_body_becomes_one_scroll_page() -> None:
-    assert 'scroll.setObjectName("singlePageScroll")' in PAGE
-    assert "scroll.setWidgetResizable(True)" in PAGE
-    assert "ScrollBarAlwaysOff" in PAGE
-    assert "ScrollBarAsNeeded" in PAGE
-    assert "outer.addWidget(scroll, 1)" in PAGE
+def test_single_keeps_original_root_ownership_and_has_no_outer_scroll_page() -> None:
+    assert "QScrollArea" not in PAGE
+    assert 'setObjectName("singlePageScroll")' not in PAGE
+    assert "scroll.setWidget" not in PAGE
+    assert "_single_page_scroll" not in PAGE
+    assert "setParent(page)" not in PAGE
+    assert "outer.addWidget(scroll" not in PAGE
 
-    assert "_take_widget(outer, input_card)" in PAGE
-    assert "_take_layout(outer, status_layout)" in PAGE
-    assert "_take_widget(outer, body)" in PAGE
-    assert "outer.takeAt(0)" not in PAGE
+    assert 'body = getattr(window, "_ui_polish_body_splitter", None)' in PAGE
+    assert 'setattr(window, "_single_fixed_body", body)' in PAGE
 
 
-def test_existing_business_widgets_are_reparented_not_rebuilt() -> None:
-    assert "input_card.setParent(page)" in PAGE
-    assert "workspace.setParent(page)" in PAGE
-    assert "console.setParent(page)" in PAGE
-    assert "page_layout.addWidget(input_card)" in PAGE
-    assert "page_layout.addWidget(workspace)" in PAGE
-    assert "page_layout.addWidget(console)" in PAGE
-    assert 'setattr(window, "_ui_polish_body_splitter", None)' in PAGE
+def test_single_compacts_existing_input_rows_without_rebuilding_widgets() -> None:
+    assert "def _compact_input_rows" in PAGE
+    assert 'for name in ("makro_port", "source_port", "vertical_input", "current_page_check")' in PAGE
+    assert "settings_row.removeWidget(widget)" in PAGE
+    assert "stage_row.addWidget(widget)" in PAGE
+    assert "_INPUT_CARD_MAX_HEIGHT = 176" in PAGE
+    assert "layout.setContentsMargins(16, 8, 16, 9)" in PAGE
+    assert "layout.setSpacing(4)" in PAGE
 
     assert "ReadOnlyRunner(" not in PAGE
     assert "RealExecutionRunner(" not in PAGE
     assert "AcceptanceConsole(" not in PAGE
 
 
-def test_workspace_is_compact_while_console_keeps_real_reading_height() -> None:
-    assert "_WORKSPACE_HEIGHT = 350" in PAGE
-    assert "_FIELD_TABLE_MIN_HEIGHT = 255" in PAGE
-    assert "_SIDE_TABS_HEIGHT = 320" in PAGE
-    assert "_CONSOLE_MIN_HEIGHT = 420" in PAGE
-    assert "_CONSOLE_TABS_MIN_HEIGHT = 250" in PAGE
-    assert "_CONSOLE_LOG_MIN_HEIGHT = 180" in PAGE
+def test_single_uses_compact_fixed_height_budgets() -> None:
+    assert "_STATUS_CARD_MIN_HEIGHT = 68" in PAGE
+    assert "_STATUS_CARD_MAX_HEIGHT = 72" in PAGE
+    assert "_WORKSPACE_MIN_HEIGHT = 292" in PAGE
+    assert "_FIELD_TABLE_MIN_HEIGHT = 205" in PAGE
+    assert "_SIDE_TABS_HEIGHT = 300" in PAGE
+    assert "_CONSOLE_MIN_HEIGHT = 120" in PAGE
+    assert "_CONSOLE_MAX_HEIGHT = 136" in PAGE
+    assert "_CONSOLE_TARGET_HEIGHT = 128" in PAGE
 
-    assert "workspace.setMinimumHeight(_WORKSPACE_HEIGHT)" in PAGE
-    assert "workspace.setMaximumHeight(_WORKSPACE_HEIGHT)" in PAGE
-    assert "field_table.setMinimumHeight(_FIELD_TABLE_MIN_HEIGHT)" in PAGE
-    assert "side_tabs.setMinimumHeight(_SIDE_TABS_HEIGHT)" in PAGE
-    assert "side_tabs.setMaximumHeight(_SIDE_TABS_HEIGHT)" in PAGE
-    assert "console.setMinimumHeight(_CONSOLE_MIN_HEIGHT)" in PAGE
-    assert "tabs.setMinimumHeight(_CONSOLE_TABS_MIN_HEIGHT)" in PAGE
-    assert "log_view.setMinimumHeight(_CONSOLE_LOG_MIN_HEIGHT)" in PAGE
+    assert "workspace.setMaximumHeight(16777215)" in PAGE
+    assert "body.setStretchFactor(0, 1)" in PAGE
+    assert "body.setStretchFactor(1, 0)" in PAGE
 
 
-def test_side_diagnostics_removes_legacy_bottom_clearance() -> None:
-    assert "side_layout = side_host.layout()" in PAGE
-    assert "side_layout.setContentsMargins(margins.left(), margins.top(), margins.right(), 0)" in PAGE
-    assert "visibly empty column under Telemetry" in PAGE
-
-
-def test_page_scroll_uses_original_native_quick_mask_schedule() -> None:
-    assert "install_single_scroll_glass_fastpath" not in PAGE
-    assert "def sync_scroll_glass" not in PAGE
+def test_fixed_single_has_no_per_scroll_quick_geometry_path() -> None:
+    assert "valueChanged.connect" not in PAGE
     assert "sync_geometry" not in PAGE
-    assert 'scroll.verticalScrollBar().valueChanged.connect(schedule_mask)' in PAGE
-    assert "QTimer.singleShot(0, schedule_mask)" in PAGE
+    assert "render_mask" not in PAGE
+    assert "install_single_scroll_glass_fastpath" not in PAGE
+    assert "install_scroll_local_glass" not in PAGE
+    assert "QTimer.singleShot(0, schedule)" in PAGE
 
 
-def test_nested_wheel_scroll_chains_outward_at_inner_boundaries() -> None:
+def test_console_keeps_phase_summary_and_opens_full_detail_as_modal() -> None:
+    assert "QScrollArea" not in SUMMARY
+    assert 'self.body = getattr(window, "_ui_polish_body_splitter", None)' in SUMMARY
+    assert "self.toggle.setCheckable(False)" in SUMMARY
+    assert "unit.show()" in SUMMARY
+    assert "tabs.hide()" in SUMMARY
+    assert "_SUMMARY_MIN = 120" in SUMMARY
+    assert "_SUMMARY_MAX = 136" in SUMMARY
+    assert "_SUMMARY_TARGET = 128" in SUMMARY
+    assert "self.details.open_console_details()" in SUMMARY
+
+
+def test_nested_internal_scroll_still_uses_continuous_wheel_behavior() -> None:
     assert "def _can_move" in SMOOTH
     assert "def _parent_scroll_area" in SMOOTH
     assert "def _scroll_owner" in SMOOTH
@@ -98,33 +101,7 @@ def test_nested_wheel_scroll_chains_outward_at_inner_boundaries() -> None:
     assert "self._scroller.add_wheel_delta(owner.verticalScrollBar(), notch_delta)" in event
 
 
-def test_wheel_scrolling_uses_one_continuous_damped_target_for_discrete_notches() -> None:
-    assert "event.pixelDelta().y()" in SMOOTH
-    assert "event.angleDelta().y()" in SMOOTH
-    assert "_WHEEL_TRAVEL_PX" in SMOOTH
-    assert "_SPRING_OMEGA" in SMOOTH
-    assert "_ScrollMotion" in SMOOTH
-    assert "position: float" in SMOOTH
-    assert "target: float" in SMOOTH
-    assert "velocity: float" in SMOOTH
-    assert "motion.target = self._clamp_position" in SMOOTH
-    assert "c2 = motion.velocity + omega * offset" in SMOOTH
-    assert "next_offset = (offset + c2 * dt) * decay" in SMOOTH
-    assert "ScrollPerPixel" in SMOOTH
-    assert "push_impulse" not in SMOOTH
-    assert "_WHEEL_IMPULSE_PX_S" not in SMOOTH
-    assert "round(delta / 120" not in SMOOTH
-
-
-def test_console_summary_has_native_page_scroll_mode_and_keeps_detail_modal() -> None:
-    assert 'self.page_scroll = getattr(window, "_single_page_scroll", None)' in SUMMARY
-    assert "if isinstance(self.page_scroll, QScrollArea):" in SUMMARY
-    assert "self.console.setMinimumHeight(_PAGE_SUMMARY_MIN)" in SUMMARY
-    assert "self.console.setMaximumHeight(_PAGE_SUMMARY_MAX)" in SUMMARY
-    assert "self.details.open_console_details()" in SUMMARY
-
-
-def test_scroll_layout_sources_compile_without_importing_pyside() -> None:
+def test_layout_sources_compile_without_importing_pyside() -> None:
     for path, source in (
         (ROOT / "run_local_gui.py", RUN),
         (ROOT / "gui" / "page_scroll_layout.py", PAGE),
