@@ -1,0 +1,184 @@
+name: Publish Update
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Source branch/tag/commit to publish"
+        required: true
+        default: "feat/local-test-gui"
+        type: string
+      version:
+        description: "Release version (for example 0.2.0)"
+        required: true
+        default: "0.1.2"
+        type: string
+      update_type:
+        description: "Update policy"
+        required: true
+        default: optional
+        type: choice
+        options:
+          - optional
+          - required
+      min_supported_version:
+        description: "Versions below this are forced to update"
+        required: true
+        default: "0.1.2"
+        type: string
+      title:
+        description: "Update title"
+        required: false
+        default: "Stable Update"
+        type: string
+      release_notes:
+        description: "User-facing update notes"
+        required: true
+        default: "稳定性与上架流程优化。"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish-stable-update:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    env:
+      SOURCE_REF: ${{ inputs.source_ref }}
+      UPDATE_VERSION: ${{ inputs.version }}
+      UPDATE_TYPE: ${{ inputs.update_type }}
+      MIN_SUPPORTED_VERSION: ${{ inputs.min_supported_version }}
+      UPDATE_TITLE: ${{ inputs.title }}
+      UPDATE_NOTES: ${{ inputs.release_notes }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout selected source revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Capture source commit
+        id: source
+        shell: pwsh
+        run: |
+          $sha = (git rev-parse HEAD).Trim()
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          Write-Host "Publishing source $env:SOURCE_REF at $sha"
+
+      - name: Validate release inputs
+        shell: pwsh
+        run: |
+          if ($env:UPDATE_VERSION -notmatch '^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') {
+            throw "Invalid update version: $env:UPDATE_VERSION"
+          }
+          if ($env:MIN_SUPPORTED_VERSION -notmatch '^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') {
+            throw "Invalid minimum supported version: $env:MIN_SUPPORTED_VERSION"
+          }
+          if ($env:UPDATE_TYPE -notin @('optional', 'required')) {
+            throw "Invalid update type: $env:UPDATE_TYPE"
+          }
+          $tag = "v$env:UPDATE_VERSION"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) { throw "Release already exists: $tag" }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-gui.txt -r requirements-build.txt
+
+      - name: Update delivery contracts
+        shell: pwsh
+        run: python -m pytest -q tests/test_windows_packaging_contract.py tests/test_update_delivery_contract.py
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build exact release version
+        shell: pwsh
+        run: .\scripts\build_windows.ps1 -Version $env:UPDATE_VERSION
+
+      - name: Silent installer smoke test
+        shell: pwsh
+        run: |
+          $setup = Join-Path $PWD "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe"
+          if (-not (Test-Path $setup)) { throw "Installer artifact not found: $setup" }
+          $installDir = Join-Path $env:RUNNER_TEMP "EcommerceAgentReleaseSmoke"
+          if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
+          $process = Start-Process -FilePath $setup -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir"
+          ) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Silent install failed: $($process.ExitCode)" }
+          $worker = Join-Path $installDir "EcommerceAgentWorker.exe"
+          if (-not (Test-Path $worker)) { throw "Installed worker missing: $worker" }
+          & $worker --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
+          $versionFile = Join-Path $installDir "_internal\packaging\VERSION"
+          if (-not (Test-Path $versionFile)) { throw "Embedded package version missing: $versionFile" }
+          $embedded = (Get-Content $versionFile -Raw).Trim()
+          if ($embedded -ne $env:UPDATE_VERSION) {
+            throw "Embedded version mismatch: expected=$env:UPDATE_VERSION actual=$embedded"
+          }
+
+      - name: Generate stable update manifest
+        shell: pwsh
+        run: |
+          $setupName = "EcommerceAgent-Setup-$env:UPDATE_VERSION.exe"
+          $portableName = "EcommerceAgent-$env:UPDATE_VERSION-portable.zip"
+          $setup = Join-Path $PWD "artifacts\$setupName"
+          $portable = Join-Path $PWD "artifacts\$portableName"
+          if (-not (Test-Path $setup)) { throw "Setup missing: $setup" }
+          if (-not (Test-Path $portable)) { throw "Portable package missing: $portable" }
+          $sha = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          $required = $env:UPDATE_TYPE -eq 'required'
+          $title = $env:UPDATE_TITLE.Trim()
+          if ([string]::IsNullOrWhiteSpace($title)) { $title = "EcommerceAgent $env:UPDATE_VERSION" }
+          $downloadUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$env:UPDATE_VERSION/$setupName"
+          [ordered]@{
+            schema_version = 1
+            channel = "stable"
+            version = $env:UPDATE_VERSION
+            required = $required
+            min_supported_version = $env:MIN_SUPPORTED_VERSION
+            title = $title
+            notes = $env:UPDATE_NOTES
+            installer_url = $downloadUrl
+            installer_sha256 = $sha
+            published_at = (Get-Date).ToUniversalTime().ToString("o")
+          } | ConvertTo-Json -Depth 4 | Set-Content "artifacts\update.json" -Encoding utf8
+          @("# $title", "", $env:UPDATE_NOTES, "", "Update policy: $env:UPDATE_TYPE", "Minimum supported version: $env:MIN_SUPPORTED_VERSION") |
+            Set-Content "artifacts\release-notes.md" -Encoding utf8
+
+      - name: Publish stable release
+        shell: pwsh
+        run: |
+          $tag = "v$env:UPDATE_VERSION"
+          gh release create $tag `
+            "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe" `
+            "artifacts\EcommerceAgent-$env:UPDATE_VERSION-portable.zip" `
+            "artifacts\update.json" `
+            --target "${{ steps.source.outputs.sha }}" `
+            --title "EcommerceAgent $env:UPDATE_VERSION" `
+            --notes-file "artifacts\release-notes.md" `
+            --latest
+
+      - name: Upload published files to workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: EcommerceAgent-Stable-${{ inputs.version }}
+          path: |
+            artifacts/EcommerceAgent-Setup-${{ inputs.version }}.exe
+            artifacts/EcommerceAgent-${{ inputs.version }}-portable.zip
+            artifacts/update.json
+          if-no-files-found: error
+          retention-days: 30
