@@ -9,10 +9,29 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QByteArray, QFile, QIODevice, QObject, QProcess, QTimer, QUrl, QUrlQuery
+from PySide6.QtCore import (
+    QByteArray,
+    QFile,
+    QIODevice,
+    QObject,
+    QProcess,
+    Qt,
+    QTimer,
+    QUrl,
+    QUrlQuery,
+)
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
-from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QProgressDialog
+from PySide6.QtWidgets import (
+    QApplication,
+    QBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QProgressDialog,
+    QPushButton,
+    QWidget,
+)
 
 
 _REPOSITORY = "yuchenm1303-png/ecommerce-agent"
@@ -27,6 +46,7 @@ _PRIVATE_DOWNLOAD_HOSTS = {
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[.-].*)?$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _CHECK_DELAY_MS = 1800
+_AUTO_CHECK_INTERVAL_MS = 60 * 60 * 1000
 _NETWORK_TIMEOUT_MS = 10_000
 
 
@@ -80,6 +100,14 @@ class ApplicationUpdater(QObject):
         self._download_path: Path | None = None
         self._progress: QProgressDialog | None = None
         self._pending_manifest: dict[str, Any] | None = None
+        self._manual_check = False
+        self._last_prompted_version: str | None = None
+        self._version_label: QLabel | None = None
+        self._check_button: QPushButton | None = None
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(_AUTO_CHECK_INTERVAL_MS)
+        self._auto_timer.timeout.connect(self.check_for_updates)
+        self._install_header_controls()
 
     @staticmethod
     def enabled() -> bool:
@@ -87,13 +115,119 @@ class ApplicationUpdater(QObject):
             "ECOMMERCE_AGENT_DISABLE_UPDATE_CHECK", ""
         ).strip().lower() not in {"1", "true", "yes"}
 
+    def _install_header_controls(self) -> None:
+        root = self.window.centralWidget()
+        outer = root.layout() if isinstance(root, QWidget) else None
+        header = outer.itemAt(0).layout() if outer is not None and outer.count() else None
+        if not isinstance(header, QBoxLayout):
+            return
+
+        version_label = QLabel(f"v{self.current_version}  ·  STABLE", self.window)
+        version_label.setObjectName("appVersionBadge")
+        version_label.setFixedHeight(32)
+        version_label.setToolTip(f"当前版本 v{self.current_version} · Stable channel")
+        version_label.setStyleSheet(
+            "QLabel#appVersionBadge {"
+            " padding: 0 10px;"
+            " color: rgba(255,255,255,194);"
+            " background: rgba(20,24,34,70);"
+            " border: 1px solid rgba(255,255,255,28);"
+            " border-radius: 10px;"
+            " font-size: 11px;"
+            " font-weight: 650;"
+            "}"
+        )
+
+        check_button = QPushButton("检查更新", self.window)
+        check_button.setObjectName("checkUpdateButton")
+        check_button.setFixedHeight(32)
+        check_button.setToolTip("检查 Stable 更新通道")
+        check_button.setStyleSheet(
+            "QPushButton#checkUpdateButton {"
+            " min-height: 30px; max-height: 30px;"
+            " padding: 0 12px;"
+            " color: rgba(255,255,255,220);"
+            " background: rgba(20,24,34,62);"
+            " border: 1px solid rgba(255,255,255,26);"
+            " border-radius: 10px;"
+            " font-size: 11px;"
+            " font-weight: 650;"
+            "}"
+            "QPushButton#checkUpdateButton:hover {"
+            " background: rgba(255,255,255,30);"
+            " border-color: rgba(255,255,255,44);"
+            "}"
+            "QPushButton#checkUpdateButton:pressed {"
+            " background: rgba(255,255,255,20);"
+            "}"
+        )
+        check_button.clicked.connect(self.manual_check_for_updates)
+
+        phase_badge = getattr(self.window, "phase_badge", None)
+        index = header.indexOf(phase_badge) if isinstance(phase_badge, QWidget) else -1
+        if index < 0:
+            index = header.count()
+        header.insertWidget(index, version_label, 0, Qt.AlignmentFlag.AlignBottom)
+        header.insertWidget(index + 1, check_button, 0, Qt.AlignmentFlag.AlignBottom)
+
+        self._version_label = version_label
+        self._check_button = check_button
+        self.window.app_version_label = version_label  # type: ignore[attr-defined]
+        self.window.check_update_button = check_button  # type: ignore[attr-defined]
+
+    def _set_manual_check_busy(self, busy: bool) -> None:
+        button = self._check_button
+        if button is None:
+            return
+        try:
+            button.setEnabled(not busy)
+            button.setText("检查中…" if busy else "检查更新")
+        except RuntimeError:
+            pass
+
+    def _finish_check(self, message: str | None = None, *, warning: bool = False) -> None:
+        manual = self._manual_check
+        self._manual_check = False
+        if manual:
+            self._set_manual_check_busy(False)
+            if message:
+                if warning:
+                    QMessageBox.warning(self.window, "Software Update", message)
+                else:
+                    QMessageBox.information(self.window, "Software Update", message)
+
     def schedule_startup_check(self) -> None:
         if self.enabled():
             QTimer.singleShot(_CHECK_DELAY_MS, self.check_for_updates)
+            if not self._auto_timer.isActive():
+                self._auto_timer.start()
 
-    def check_for_updates(self) -> None:
-        if not self.enabled() or self._reply is not None:
+    def manual_check_for_updates(self) -> None:
+        if not self.enabled():
+            QMessageBox.information(
+                self.window,
+                "Software Update",
+                f"当前版本 v{self.current_version}\n\n源码开发模式不连接 Stable 更新通道。",
+            )
             return
+        if self._reply is not None:
+            QMessageBox.information(self.window, "Software Update", "更新检查或下载正在进行。")
+            return
+        self.check_for_updates(manual=True)
+
+    def check_for_updates(self, *, manual: bool = False) -> None:
+        if not self.enabled():
+            if manual:
+                self.manual_check_for_updates()
+            return
+        if self._reply is not None:
+            if manual:
+                QMessageBox.information(self.window, "Software Update", "更新检查或下载正在进行。")
+            return
+
+        self._manual_check = manual
+        if manual:
+            self._set_manual_check_busy(True)
         reply = self.network.get(_request(_LATEST_RELEASE_API, self.current_version))
         self._reply = reply
         reply.finished.connect(lambda: self._release_finished(reply))
@@ -102,22 +236,28 @@ class ApplicationUpdater(QObject):
         if reply is not self._reply:
             return
         self._reply = None
+        manifest_url = ""
+        error_message: str | None = None
         try:
             if reply.error() != QNetworkReply.NetworkError.NoError:
-                return
-            payload = json.loads(bytes(reply.readAll()).decode("utf-8"))
-            assets = payload.get("assets", []) if isinstance(payload, dict) else []
-            manifest_url = ""
-            for asset in assets if isinstance(assets, list) else []:
-                if isinstance(asset, dict) and asset.get("name") == _MANIFEST_ASSET:
-                    manifest_url = str(asset.get("browser_download_url") or "")
-                    break
-            if not manifest_url:
-                return
+                error_message = "检查更新失败，请检查网络后重试。"
+            else:
+                payload = json.loads(bytes(reply.readAll()).decode("utf-8"))
+                assets = payload.get("assets", []) if isinstance(payload, dict) else []
+                for asset in assets if isinstance(assets, list) else []:
+                    if isinstance(asset, dict) and asset.get("name") == _MANIFEST_ASSET:
+                        manifest_url = str(asset.get("browser_download_url") or "")
+                        break
+                if not manifest_url:
+                    error_message = "当前 Stable Release 没有有效的更新清单。"
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
-            return
+            error_message = "更新信息解析失败，请稍后重试。"
         finally:
             reply.deleteLater()
+
+        if error_message:
+            self._finish_check(error_message, warning=True)
+            return
 
         manifest_reply = self.network.get(_request(manifest_url, self.current_version))
         self._reply = manifest_reply
@@ -127,55 +267,85 @@ class ApplicationUpdater(QObject):
         if reply is not self._reply:
             return
         self._reply = None
+        manifest: dict[str, Any] | None = None
+        latest = ""
+        error_message: str | None = None
+        up_to_date = False
         try:
             if reply.error() != QNetworkReply.NetworkError.NoError:
-                return
-            manifest = json.loads(bytes(reply.readAll()).decode("utf-8"))
-            if not isinstance(manifest, dict) or manifest.get("channel") != "stable":
-                return
-            latest = str(manifest.get("version") or "").strip()
-            latest_key = _version_key(latest)
-            current_key = _version_key(self.current_version)
-            if latest_key is None or current_key is None or latest_key <= current_key:
-                return
-
-            checksum = str(manifest.get("installer_sha256") or "").strip().lower()
-            if not _SHA256_RE.match(checksum):
-                return
-
-            delivery = str(manifest.get("delivery") or "github").strip().lower()
-            manifest["version"] = latest
-            manifest["installer_sha256"] = checksum
-
-            if delivery == "portal":
-                portal_url = str(manifest.get("portal_url") or _PORTAL_URL).strip()
-                url = QUrl(portal_url)
-                if (
-                    not url.isValid()
-                    or url.scheme().lower() != "https"
-                    or url.host().lower() not in _PORTAL_HOSTS
-                ):
-                    return
-                manifest["delivery"] = "portal"
-                manifest["portal_url"] = portal_url
+                error_message = "更新清单下载失败，请稍后重试。"
             else:
-                installer_url = str(manifest.get("installer_url") or "").strip()
-                url = QUrl(installer_url)
-                if (
-                    not url.isValid()
-                    or url.scheme().lower() != "https"
-                    or url.host().lower() != "github.com"
-                ):
-                    return
-                manifest["delivery"] = "github"
-                manifest["installer_url"] = installer_url
+                payload = json.loads(bytes(reply.readAll()).decode("utf-8"))
+                if not isinstance(payload, dict) or payload.get("channel") != "stable":
+                    error_message = "Stable 更新清单无效。"
+                else:
+                    latest = str(payload.get("version") or "").strip()
+                    latest_key = _version_key(latest)
+                    current_key = _version_key(self.current_version)
+                    if latest_key is None or current_key is None:
+                        error_message = "更新版本信息无效。"
+                    elif latest_key <= current_key:
+                        up_to_date = True
+                    else:
+                        checksum = str(payload.get("installer_sha256") or "").strip().lower()
+                        if not _SHA256_RE.match(checksum):
+                            error_message = "更新文件校验信息无效。"
+                        else:
+                            delivery = str(payload.get("delivery") or "github").strip().lower()
+                            payload["version"] = latest
+                            payload["installer_sha256"] = checksum
 
-            self._pending_manifest = manifest
+                            if delivery == "portal":
+                                portal_url = str(payload.get("portal_url") or _PORTAL_URL).strip()
+                                url = QUrl(portal_url)
+                                if (
+                                    not url.isValid()
+                                    or url.scheme().lower() != "https"
+                                    or url.host().lower() not in _PORTAL_HOSTS
+                                ):
+                                    error_message = "更新下载地址无效。"
+                                else:
+                                    payload["delivery"] = "portal"
+                                    payload["portal_url"] = portal_url
+                            else:
+                                installer_url = str(payload.get("installer_url") or "").strip()
+                                url = QUrl(installer_url)
+                                if (
+                                    not url.isValid()
+                                    or url.scheme().lower() != "https"
+                                    or url.host().lower() != "github.com"
+                                ):
+                                    error_message = "更新下载地址无效。"
+                                else:
+                                    payload["delivery"] = "github"
+                                    payload["installer_url"] = installer_url
+
+                            if error_message is None:
+                                manifest = payload
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
-            return
+            error_message = "更新信息解析失败，请稍后重试。"
         finally:
             reply.deleteLater()
 
+        if error_message:
+            self._finish_check(error_message, warning=True)
+            return
+        if up_to_date:
+            self._pending_manifest = None
+            self._finish_check(f"当前已是最新版本 v{self.current_version}。")
+            return
+        if manifest is None:
+            self._finish_check("没有找到可用更新。", warning=True)
+            return
+
+        manual = self._manual_check
+        if not manual and latest == self._last_prompted_version:
+            self._finish_check()
+            return
+
+        self._pending_manifest = manifest
+        self._last_prompted_version = latest
+        self._finish_check()
         self._prompt_for_update(manifest)
 
     def _prompt_for_update(self, manifest: dict[str, Any]) -> None:
