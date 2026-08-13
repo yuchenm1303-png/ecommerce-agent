@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
 
 _INPUT_CARD_MIN_HEIGHT = 222
 _INPUT_CARD_MAX_HEIGHT = 238
+_INPUT_CARD_OFFER_MIN_HEIGHT = 278
+_INPUT_CARD_OFFER_MAX_HEIGHT = 296
 _STATUS_CARD_MIN_HEIGHT = 54
 _STATUS_CARD_MAX_HEIGHT = 58
 _WORKSPACE_MIN_HEIGHT = 220
@@ -80,38 +82,111 @@ def _remove_spacers(layout: QBoxLayout) -> None:
             layout.takeAt(index)
 
 
-def _compact_input_rows(window: QMainWindow, input_card: QFrame) -> None:
-    """Keep URL, stage actions and source controls as visually separate rows.
+def _set_width_band(widget: object, minimum: int, maximum: int) -> None:
+    if not isinstance(widget, QWidget):
+        return
+    widget.setMinimumWidth(minimum)
+    widget.setMaximumWidth(maximum)
 
-    The controls are already separate business widgets. The fixed Single layout
-    only gives them enough vertical budget and explicit row spacing so Qt never
-    compresses the three interaction bands into one dense block.
+
+def _compact_input_rows(window: QMainWindow, input_card: QFrame) -> None:
+    """Give every Product Source interaction band its own visual rhythm.
+
+    Business widgets stay untouched. Only spacing and width bands are normalized
+    so the URL action, preparation stages and source controls read as separate
+    groups instead of one compressed toolbar.
     """
 
-    if getattr(window, "_single_fixed_input_rows", False):
-        return
     layout = input_card.layout()
     if not isinstance(layout, QVBoxLayout):
         return
 
+    url_anchor = getattr(window, "url_input", None)
     stage_anchor = getattr(window, "step1_button", None)
     settings_anchor = getattr(window, "source_port", None)
-    if not isinstance(stage_anchor, QWidget) or not isinstance(settings_anchor, QWidget):
-        return
 
-    stage_row = _direct_box_layout_containing(layout, stage_anchor)
-    settings_row = _direct_box_layout_containing(layout, settings_anchor)
-    if stage_row is None or settings_row is None or stage_row is settings_row:
-        return
+    url_row = _direct_box_layout_containing(
+        layout, url_anchor if isinstance(url_anchor, QWidget) else None
+    )
+    stage_row = _direct_box_layout_containing(
+        layout, stage_anchor if isinstance(stage_anchor, QWidget) else None
+    )
+    settings_row = _direct_box_layout_containing(
+        layout, settings_anchor if isinstance(settings_anchor, QWidget) else None
+    )
 
-    _remove_spacers(stage_row)
-    stage_row.addStretch(1)
-    stage_row.setSpacing(10)
-    stage_row.setContentsMargins(0, 1, 0, 1)
+    if url_row is not None:
+        url_row.setSpacing(12)
+        url_row.setContentsMargins(0, 1, 0, 2)
+        _set_width_band(getattr(window, "start_button", None), 176, 216)
+        _set_width_band(getattr(window, "stop_button", None), 62, 76)
 
-    settings_row.setSpacing(10)
-    settings_row.setContentsMargins(0, 2, 0, 1)
+    if stage_row is not None:
+        _remove_spacers(stage_row)
+        for name in ("step1_button", "step2_button", "step3_button"):
+            _set_width_band(getattr(window, name, None), 148, 176)
+        stage_row.addStretch(1)
+        stage_row.setSpacing(12)
+        stage_row.setContentsMargins(0, 2, 0, 2)
+
+    if settings_row is not None:
+        settings_row.setSpacing(14)
+        settings_row.setContentsMargins(0, 3, 0, 2)
+        _set_width_band(getattr(window, "source_port", None), 188, 212)
+        _set_width_band(getattr(window, "vertical_input", None), 210, 250)
+
     setattr(window, "_single_fixed_input_rows", True)
+
+
+def refresh_single_source_layout(window: QMainWindow) -> None:
+    """Reflow Product Source after optional feature rows have been installed.
+
+    ``listing_offer_support`` is intentionally layered after the fixed Single
+    workspace. Its optional sales-offer row therefore appears only after the
+    first geometry pass. This zero-time refresh runs once the event loop starts,
+    when all decorators already exist, and expands the card instead of squeezing
+    the new row into the historical 238 px budget.
+    """
+
+    url_input = getattr(window, "url_input", None)
+    input_card = _ancestor_card(
+        url_input if isinstance(url_input, QWidget) else None,
+        "heroCard",
+    )
+    if not isinstance(input_card, QFrame):
+        return
+
+    _compact_input_rows(window, input_card)
+    layout = input_card.layout()
+    if not isinstance(layout, QVBoxLayout):
+        return
+
+    offer_input = getattr(window, "listing_intent_input", None)
+    has_offer_row = isinstance(offer_input, QWidget)
+    if has_offer_row:
+        offer_row = _direct_box_layout_containing(layout, offer_input)
+        if offer_row is not None:
+            offer_row.setSpacing(12)
+            offer_row.setContentsMargins(0, 2, 0, 2)
+            offer_input.setMinimumWidth(280)
+
+    settings_toggle = getattr(window, "real_settings_toggle", None)
+    if isinstance(settings_toggle, QWidget):
+        summary_row = _direct_box_layout_containing(layout, settings_toggle)
+        if summary_row is not None:
+            summary_row.setSpacing(14)
+            summary_row.setContentsMargins(0, 5, 0, 0)
+        _set_width_band(settings_toggle, 104, 128)
+
+    layout.setContentsMargins(16, 11, 38, 12)
+    layout.setSpacing(9 if has_offer_row else 8)
+    input_card.setMinimumHeight(
+        _INPUT_CARD_OFFER_MIN_HEIGHT if has_offer_row else _INPUT_CARD_MIN_HEIGHT
+    )
+    input_card.setMaximumHeight(
+        _INPUT_CARD_OFFER_MAX_HEIGHT if has_offer_row else _INPUT_CARD_MAX_HEIGHT
+    )
+    input_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
 
 def _compact_input_card(window: QMainWindow, input_card: QFrame) -> None:
@@ -305,6 +380,12 @@ def install_page_scroll_layout(
     _compact_input_card(window, input_card)
     _compact_status_cards(window)
     _configure_workspace(window, body)
+
+    # Optional Single decorators (notably listing_offer_support) are installed
+    # later in run_local_gui.py, before app.exec(). The callback therefore sees
+    # the final widget set and performs one presentation-only reflow without
+    # adding a permanent resize/layout hot path.
+    QTimer.singleShot(0, lambda: refresh_single_source_layout(window))
 
     background = getattr(visual, "background", None)
     if background is None:
