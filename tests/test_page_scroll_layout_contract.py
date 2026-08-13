@@ -57,7 +57,7 @@ def test_single_gives_source_controls_distinct_vertical_bands() -> None:
 
 
 def test_single_aligns_field_glass_bottom_with_right_panel_without_rebuilding_table() -> None:
-    assert "_FIELD_CARD_BOTTOM_INSET = 28" in PAGE
+    assert "_FIELD_CARD_BOTTOM_INSET = 14" in PAGE
     assert "def _align_field_card_to_side_panel" in PAGE
     assert 'host.setObjectName("fieldReviewHost")' in PAGE
     assert "host_layout.setContentsMargins(0, 0, 0, _FIELD_CARD_BOTTOM_INSET)" in PAGE
