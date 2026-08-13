@@ -11,7 +11,7 @@ def main() -> int:
     try:
         from PySide6.QtCore import Qt
         from PySide6.QtQuick import QQuickWindow
-        from PySide6.QtWidgets import QApplication, QAbstractScrollArea, QSizePolicy
+        from PySide6.QtWidgets import QApplication, QAbstractScrollArea, QLabel, QSizePolicy
     except ImportError:
         print(
             "缺少开发 GUI 依赖 PySide6。\n"
@@ -164,6 +164,14 @@ def main() -> int:
     # The product copy layer is presentation-only. Install it before the startup
     # snapshot so the first visible frame already uses release-quality wording.
     product_copy = install_product_copy(window)
+    legacy_headings = {
+        "BATCH LISTING · MULTI PRODUCT QUEUE": "批量商品",
+        "JOB CONTROL · OWNED TAB ISOLATION · LIVE TELEMETRY": "商品任务",
+    }
+    for label in window.findChildren(QLabel):
+        replacement = legacy_headings.get(label.text())
+        if replacement is not None:
+            label.setText(replacement)
 
     # Reference-site startup choreography is a one-shot presentation surface. It
     # freezes pointer/card effects while visible and keeps the original visual
