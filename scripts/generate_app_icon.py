@@ -23,12 +23,25 @@ ICON_SIZES = (
     (128, 128),
     (256, 256),
 )
+ICON_VISUAL_SCALE = 1.12
+
+
+def _enlarge_icon_artwork(source: Image.Image) -> Image.Image:
+    rgba = source.convert("RGBA")
+    width, height = rgba.size
+    scaled = rgba.resize(
+        (round(width * ICON_VISUAL_SCALE), round(height * ICON_VISUAL_SCALE)),
+        Image.Resampling.LANCZOS,
+    )
+    left = max(0, (scaled.width - width) // 2)
+    top = max(0, (scaled.height - height) // 2)
+    return scaled.crop((left, top, left + width, top + height))
 
 
 def build_icon(output: Path) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(io.BytesIO(application_icon_bytes())) as source:
-        source.convert("RGBA").save(output, format="ICO", sizes=ICON_SIZES)
+        _enlarge_icon_artwork(source).save(output, format="ICO", sizes=ICON_SIZES)
     return output
 
 
