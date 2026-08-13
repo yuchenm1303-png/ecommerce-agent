@@ -7,8 +7,11 @@ from PyInstaller.utils.hooks import collect_all
 
 ROOT = Path(SPECPATH).resolve().parent
 APP_ICON = ROOT / "packaging" / "app_icon.ico"
+APP_ACCESS_SOURCE = ROOT / "gui" / "app_access.py"
 if not APP_ICON.is_file():
     raise RuntimeError(f"Application icon was not generated: {APP_ICON}")
+if not APP_ACCESS_SOURCE.is_file():
+    raise RuntimeError(f"Application access source missing: {APP_ACCESS_SOURCE}")
 
 BUILD_VERSION = os.environ.get("ECOMMERCE_AGENT_BUILD_VERSION", "").strip()
 if not BUILD_VERSION:
@@ -21,6 +24,10 @@ playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all("p
 
 gui_datas = [
     (str(ROOT / "gui" / "assets"), "gui/assets"),
+    # Keep the account/access module as transparent source instead of embedding
+    # it into PyInstaller's PYZ bytecode archive. This preserves the exact runtime
+    # behavior while avoiding the false-positive-prone compiled module shape.
+    (str(APP_ACCESS_SOURCE), "gui"),
     (str(ROOT / "THIRD_PARTY_NOTICES.md"), "."),
     (str(BUILD_METADATA / "VERSION"), "packaging"),
 ]
@@ -34,7 +41,7 @@ gui_a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["pytest"],
+    excludes=["pytest", "gui.app_access"],
     noarchive=False,
     optimize=0,
 )
