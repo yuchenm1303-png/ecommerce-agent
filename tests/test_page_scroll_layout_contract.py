@@ -61,16 +61,19 @@ def test_single_gives_source_controls_distinct_vertical_bands() -> None:
     assert "AcceptanceConsole(" not in PAGE
 
 
-def test_single_aligns_field_glass_bottom_with_right_panel_without_rebuilding_table() -> None:
-    assert "_FIELD_CARD_BOTTOM_INSET = 14" in PAGE
-    assert "def _align_field_card_to_side_panel" in PAGE
-    assert 'host.setObjectName("fieldReviewHost")' in PAGE
-    assert "host_layout.setContentsMargins(0, 0, 0, _FIELD_CARD_BOTTOM_INSET)" in PAGE
-    assert "field_card.setParent(host)" in PAGE
-    assert "host_layout.addWidget(field_card, 1)" in PAGE
-    assert "workspace_splitter.insertWidget(index, host)" in PAGE
-    assert 'setattr(window, "_single_field_alignment_host", host)' in PAGE
-    assert "_align_field_card_to_side_panel(window, workspace_splitter)" in PAGE
+def test_single_unifies_field_and_side_outer_glass_card_structure() -> None:
+    assert "_FIELD_CARD_BOTTOM_INSET" not in PAGE
+    assert "fieldReviewHost" not in PAGE
+    assert "def _unregister_nested_glass_pages" in PAGE
+    assert "def _unify_workspace_card_structure" in PAGE
+    assert 'frame.setObjectName("sideDetailPage")' in PAGE
+    assert 'side_card = QFrame(workspace_splitter)' in PAGE
+    assert 'side_card.setObjectName("glassCard")' in PAGE
+    assert "side_tabs.setParent(side_card)" in PAGE
+    assert "side_layout.addWidget(side_tabs, 1)" in PAGE
+    assert "workspace_splitter.insertWidget(max(0, index), side_card)" in PAGE
+    assert 'setattr(window, "_single_side_panel_card", side_card)' in PAGE
+    assert "_unify_workspace_card_structure(window, workspace_splitter)" in PAGE
 
 
 def test_single_uses_console_first_one_screen_height_budget() -> None:
@@ -91,7 +94,6 @@ def test_single_uses_console_first_one_screen_height_budget() -> None:
     assert "workspace.setMaximumHeight(16777215)" in PAGE
     assert "side_tabs.setMaximumHeight(16777215)" in PAGE
     assert "side_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)" in PAGE
-    assert "_strip_trailing_spacers(side_layout)" in PAGE
     assert "body.setStretchFactor(0, 1)" in PAGE
     assert "body.setStretchFactor(1, 0)" in PAGE
 
