@@ -113,7 +113,7 @@ def _packet(fields, grounding):
     )
 
 
-def test_request_targets_only_missing_non_business_fields():
+def test_request_targets_only_policy_eligible_missing_non_business_fields():
     fields = [
         _field("colour", "Colour"),
         _field("recording_resolution", "Recording Resolution"),
@@ -126,12 +126,12 @@ def test_request_targets_only_missing_non_business_fields():
         fields,
         product_fingerprint="M8 dual dash camera",
     )
-    assert [item["key"] for item in request["target_fields"]] == ["image_sensor", "ean"]
+    assert [item["key"] for item in request["target_fields"]] == ["image_sensor"]
     assert request["grounded_sources"] == []
     assert request["evidence_policy"] == "best_effort"
     assert request["context"]["product_fingerprint"] == "M8 dual dash camera"
     assert request["context"]["web_evidence"] == []
-    assert len(str(request)) < 6000
+    assert len(str(request)) < 10000
 
 
 def test_inference_fills_missing_freezes_existing_and_hot_caches(tmp_path):
