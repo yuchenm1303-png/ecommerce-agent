@@ -1,0 +1,75 @@
+name: Windows Package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/local-test-gui
+    tags:
+      - "v*"
+    paths:
+      - "app/runtime_paths.py"
+      - "gui/frozen_process_router.py"
+      - "run_packaged_worker.py"
+      - "run_local_gui.py"
+      - "packaging/**"
+      - "scripts/build_windows.ps1"
+      - "requirements.txt"
+      - "requirements-gui.txt"
+      - "requirements-build.txt"
+      - "tests/test_windows_packaging_contract.py"
+      - ".github/workflows/windows-package.yml"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-gui.txt -r requirements-build.txt
+
+      - name: Packaging contracts
+        shell: pwsh
+        run: python -m pytest -q tests/test_windows_packaging_contract.py
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer and portable package
+        shell: powershell
+        run: .\scripts\build_windows.ps1
+
+      - name: Silent installer smoke test
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem artifacts\EcommerceAgent-Setup-*.exe | Select-Object -First 1
+          if (-not $setup) { throw "Installer artifact not found" }
+          $installDir = Join-Path $env:RUNNER_TEMP "EcommerceAgentInstalled"
+          & $setup.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/DIR=$installDir"
+          if ($LASTEXITCODE -ne 0) { throw "Silent install failed with exit code $LASTEXITCODE" }
+          $worker = Join-Path $installDir "EcommerceAgentWorker.exe"
+          if (-not (Test-Path $worker)) { throw "Installed worker missing: $worker" }
+          & $worker --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed with exit code $LASTEXITCODE" }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: EcommerceAgent-Windows-${{ github.sha }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
