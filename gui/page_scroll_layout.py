@@ -23,12 +23,13 @@ from PySide6.QtWidgets import (
 )
 
 
-_INPUT_CARD_MIN_HEIGHT = 176
-_INPUT_CARD_MAX_HEIGHT = 190
+_INPUT_CARD_MIN_HEIGHT = 222
+_INPUT_CARD_MAX_HEIGHT = 238
 _STATUS_CARD_MIN_HEIGHT = 54
 _STATUS_CARD_MAX_HEIGHT = 58
 _WORKSPACE_MIN_HEIGHT = 220
 _FIELD_TABLE_MIN_HEIGHT = 136
+_FIELD_CARD_BOTTOM_INSET = 28
 _SIDE_MIN_WIDTH = 360
 _SIDE_MAX_WIDTH = 480
 _SIDE_TARGET_RATIO = 0.29
@@ -80,12 +81,11 @@ def _remove_spacers(layout: QBoxLayout) -> None:
 
 
 def _compact_input_rows(window: QMainWindow, input_card: QFrame) -> None:
-    """Keep stage actions and source controls on separate compact rows.
+    """Keep URL, stage actions and source controls as visually separate rows.
 
-    The first fixed-page pass forced every source control beside the stage
-    buttons. That saved one row but produced the visible crowding at 1600 px.
-    Two shallow rows remain compact while preserving every existing widget,
-    signal and execution path without horizontal contention.
+    The controls are already separate business widgets. The fixed Single layout
+    only gives them enough vertical budget and explicit row spacing so Qt never
+    compresses the three interaction bands into one dense block.
     """
 
     if getattr(window, "_single_fixed_input_rows", False):
@@ -106,9 +106,11 @@ def _compact_input_rows(window: QMainWindow, input_card: QFrame) -> None:
 
     _remove_spacers(stage_row)
     stage_row.addStretch(1)
-    stage_row.setSpacing(8)
-    settings_row.setSpacing(8)
-    settings_row.setContentsMargins(0, 0, 0, 0)
+    stage_row.setSpacing(10)
+    stage_row.setContentsMargins(0, 1, 0, 1)
+
+    settings_row.setSpacing(10)
+    settings_row.setContentsMargins(0, 2, 0, 1)
     setattr(window, "_single_fixed_input_rows", True)
 
 
@@ -116,8 +118,8 @@ def _compact_input_card(window: QMainWindow, input_card: QFrame) -> None:
     _compact_input_rows(window, input_card)
     layout = input_card.layout()
     if isinstance(layout, QVBoxLayout):
-        layout.setContentsMargins(14, 8, 14, 9)
-        layout.setSpacing(4)
+        layout.setContentsMargins(14, 9, 14, 10)
+        layout.setSpacing(7)
     input_card.setMinimumHeight(_INPUT_CARD_MIN_HEIGHT)
     input_card.setMaximumHeight(_INPUT_CARD_MAX_HEIGHT)
     input_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -141,6 +143,46 @@ def _strip_trailing_spacers(layout: QBoxLayout) -> None:
         item = layout.itemAt(index)
         if item.spacerItem() is not None:
             layout.takeAt(index)
+
+
+def _align_field_card_to_side_panel(
+    window: QMainWindow,
+    workspace_splitter: QSplitter,
+) -> None:
+    """Trim only the left glass card so its bottom matches the right panel.
+
+    ui_polish intentionally keeps 28 px of bottom breathing room under the
+    Runtime/Reference/Safety tab group. The field card used to fill the complete
+    splitter cross-axis, which made its glass shell visibly longer. A transparent
+    host mirrors that same bottom inset without rebuilding the field table.
+    """
+
+    if isinstance(getattr(window, "_single_field_alignment_host", None), QWidget):
+        return
+
+    field_table = getattr(window, "field_table", None)
+    field_card = field_table.parentWidget() if isinstance(field_table, QWidget) else None
+    if not isinstance(field_card, QFrame):
+        return
+
+    index = workspace_splitter.indexOf(field_card)
+    if index < 0:
+        return
+
+    host = QWidget()
+    host.setObjectName("fieldReviewHost")
+    host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    host_layout = QVBoxLayout(host)
+    host_layout.setContentsMargins(0, 0, 0, _FIELD_CARD_BOTTOM_INSET)
+    host_layout.setSpacing(0)
+
+    field_card.setParent(host)
+    host_layout.addWidget(field_card, 1)
+    workspace_splitter.insertWidget(index, host)
+    field_card.show()
+
+    setattr(window, "_single_field_alignment_host", host)
 
 
 def _compact_workspace_cards(window: QMainWindow) -> None:
@@ -184,6 +226,8 @@ def _configure_workspace(window: QMainWindow, body: QSplitter) -> None:
 
     workspace_splitter = workspace.findChild(QSplitter, "workspaceSplitter")
     if isinstance(workspace_splitter, QSplitter) and workspace_splitter.count() > 1:
+        _align_field_card_to_side_panel(window, workspace_splitter)
+
         side = workspace_splitter.widget(1)
         side.setMinimumWidth(_SIDE_MIN_WIDTH)
         side.setMaximumWidth(_SIDE_MAX_WIDTH)
