@@ -60,3 +60,58 @@ Name: "{autodesktop}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExe
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 EcommerceAgent Listing Studio"; Flags: nowait postinstall skipifsilent
 Filename: "{app}\{#MyAppExeName}"; Flags: nowait skipifdoesntexist; Check: FileExists(ExpandConstant('{localappdata}\ListingStudio\update-complete.json'))
+
+[Code]
+const
+  WM_CLOSE = $0010;
+  ListingStudioWindowTitle = 'ecommerce-agent · Listing Automation';
+  LegacyWindowTitle = 'ecommerce-agent · Acceptance Control Console';
+
+function FindListingStudioWindow: HWND;
+begin
+  Result := FindWindowByWindowName(ListingStudioWindowTitle);
+  if Result = 0 then
+    Result := FindWindowByWindowName(LegacyWindowTitle);
+end;
+
+function CloseListingStudioBeforeUninstall: Boolean;
+var
+  Wnd: HWND;
+  Attempt: Integer;
+begin
+  Wnd := FindListingStudioWindow;
+  if Wnd = 0 then
+  begin
+    Result := True;
+    exit;
+  end;
+
+  { Ask the Qt main window to follow its normal close path. This lets the GUI
+    tear down owned QProcess workers before Uninstall touches the onedir files. }
+  PostMessage(Wnd, WM_CLOSE, 0, 0);
+  for Attempt := 1 to 50 do
+  begin
+    Sleep(100);
+    if FindListingStudioWindow = 0 then
+    begin
+      { Give QApplication/QProcess destruction a short final settle before file deletion. }
+      Sleep(1000);
+      Result := True;
+      exit;
+    end;
+  end;
+
+  MsgBox(
+    'Listing Studio 仍在运行，卸载已停止。' + #13#10 + #13#10 +
+    '请先关闭程序并等待当前任务结束，然后重新卸载。' + #13#10 +
+    '卸载器不会在程序仍占用安装文件时继续删除。',
+    mbError,
+    MB_OK
+  );
+  Result := False;
+end;
+
+function InitializeUninstall: Boolean;
+begin
+  Result := CloseListingStudioBeforeUninstall;
+end;
