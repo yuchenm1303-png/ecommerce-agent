@@ -103,7 +103,7 @@ _EXACT_COPY = {
     "LIVE CONSOLE": "任务记录",
     "实时运行日志": "运行记录",
     "ACCEPTANCE CONTROL CONSOLE": "任务进度",
-    "运行控制台 · 真实阶段 / 命令 / 产物 / 日志": "查看准备、填写和验证过程",
+    "运行控制台 · 真实阶段 / 命令 / 产物 / 日志": "指示器",
     "REAL BROWSER ACCEPTANCE · EXPLICIT PERMISSIONS": "填写设置",
     "真实网页填写验收": "填写设置",
     "Live Console": "运行记录",
@@ -297,7 +297,7 @@ class ProductCopyController(QObject):
         self._apply_batch_static()
 
     def _apply_controls(self) -> None:
-        _set_text(getattr(self.window, "start_button", None), "一键准备商品")
+        _set_text(getattr(self.window, "start_button", None), "启动单链接任务")
         start = getattr(self.window, "start_button", None)
         if start is not None:
             start.setToolTip("自动采集商品信息并生成可填写方案。")
