@@ -4,6 +4,8 @@ from PySide6.QtCore import Property, QEasingCurve, QPointF, QRectF, Qt, QPropert
 from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import QAbstractButton, QHBoxLayout, QMainWindow, QVBoxLayout, QWidget
 
+from .settings_page import install_ai_settings
+
 
 _CORE_WIDTH = 40.0
 _CORE_HEIGHT = 20.0
@@ -130,10 +132,11 @@ class WorkspaceModeSwitch(QAbstractButton):
 
 
 def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
-    """Replace only the presentation of the existing Single/Batch state machine."""
+    """Install the common header mode switch and settings entry."""
 
     existing = getattr(window, "_workspace_mode_switch", None)
     if isinstance(existing, WorkspaceModeSwitch):
+        install_ai_settings(window)
         return existing
 
     mode_stack = getattr(window, "mode_stack", None)
@@ -180,4 +183,5 @@ def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
     mode_stack.currentChanged.connect(sync_from_stack)
     header.addWidget(toggle, 0, Qt.AlignmentFlag.AlignBottom)
     window._workspace_mode_switch = toggle  # type: ignore[attr-defined]
+    install_ai_settings(window)
     return toggle
