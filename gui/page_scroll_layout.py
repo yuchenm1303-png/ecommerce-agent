@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QBoxLayout,
     QFrame,
@@ -23,8 +23,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
-from .scroll_local_glass import install_scroll_local_glass
 
 
 # The field table already owns its own scroll viewport, so the surrounding row
@@ -245,17 +243,17 @@ def install_page_scroll_layout(window: QMainWindow, visual: Any | None = None) -
     body.setParent(root)
     setattr(window, "_ui_polish_body_splitter", None)
 
+    # Restore the original pre-jitter scroll behavior: scrolling only schedules
+    # the existing native Quick mask refresh. No per-tick geometry compensation,
+    # viewport compositor, cached fast path or alternate renderer participates.
+    background = getattr(visual, "background", None)
+    if background is None:
+        background = getattr(getattr(window, "_visual_style", None), "background", None)
+    schedule_mask = getattr(background, "schedule_mask_update", None)
+    if callable(schedule_mask):
+        scroll.verticalScrollBar().valueChanged.connect(schedule_mask)
+        QTimer.singleShot(0, schedule_mask)
+
     setattr(window, "_single_page_scroll", scroll)
     setattr(window, "_single_page_scroll_content", page)
-
-    # Single-page glass now lives in one parent QWidget layer owned by this page.
-    # QScrollArea therefore moves glass and real card contents in the same backing
-    # store transaction. The outer scrollbar deliberately does NOT publish card
-    # geometry/masks to Quick; Quick keeps wallpaper/parallax and non-Single cards.
-    resolved_visual = visual
-    if resolved_visual is None:
-        resolved_visual = getattr(window, "_visual_style", None)
-    if resolved_visual is not None:
-        install_scroll_local_glass(window, resolved_visual, scroll, page)
-
     return scroll
