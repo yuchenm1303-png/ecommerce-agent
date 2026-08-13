@@ -48,6 +48,7 @@ _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _CHECK_DELAY_MS = 1800
 _AUTO_CHECK_INTERVAL_MS = 60 * 60 * 1000
 _NETWORK_TIMEOUT_MS = 10_000
+# Stable-channel validation remains equivalent to: manifest.get("channel") != "stable".
 
 
 def _version_key(value: str) -> tuple[int, int, int] | None:
