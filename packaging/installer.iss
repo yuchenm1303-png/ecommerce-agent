@@ -62,3 +62,4 @@ Name: "{autodesktop}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExe
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 EcommerceAgent Listing Studio"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait skipifdoesntexist; Check: FileExists(ExpandConstant('{localappdata}\ListingStudio\update-complete.json'))
