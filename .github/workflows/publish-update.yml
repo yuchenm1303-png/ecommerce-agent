@@ -3,6 +3,11 @@ name: Publish Update
 on:
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: "Source branch/tag/commit to publish"
+        required: true
+        default: "feat/local-test-gui"
+        type: string
       version:
         description: "Release version (for example 0.2.0)"
         required: true
@@ -19,7 +24,7 @@ on:
       min_supported_version:
         description: "Versions below this are forced to update"
         required: true
-        default: "0.1.1"
+        default: "0.1.2"
         type: string
       title:
         description: "Update title"
@@ -40,6 +45,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 50
     env:
+      SOURCE_REF: ${{ inputs.source_ref }}
       UPDATE_VERSION: ${{ inputs.version }}
       UPDATE_TYPE: ${{ inputs.update_type }}
       MIN_SUPPORTED_VERSION: ${{ inputs.min_supported_version }}
@@ -48,8 +54,19 @@ jobs:
       GH_TOKEN: ${{ github.token }}
 
     steps:
-      - name: Checkout selected revision
+      - name: Checkout selected source revision
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Capture source commit
+        id: source
+        shell: pwsh
+        run: |
+          $sha = (git rev-parse HEAD).Trim()
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          Write-Host "Publishing source $env:SOURCE_REF at $sha"
 
       - name: Validate release inputs
         shell: pwsh
@@ -63,11 +80,25 @@ jobs:
           if ($env:UPDATE_TYPE -notin @('optional', 'required')) {
             throw "Invalid update type: $env:UPDATE_TYPE"
           }
+
           $tag = "v$env:UPDATE_VERSION"
           gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
+          $releaseExists = ($LASTEXITCODE -eq 0)
+          $global:LASTEXITCODE = 0
+          if ($releaseExists) {
             throw "Release already exists: $tag"
           }
+          Write-Host "Release tag is available: $tag"
+
+      - name: Stamp package version
+        shell: pwsh
+        run: |
+          Set-Content -Path "packaging\VERSION" -Value $env:UPDATE_VERSION -Encoding ascii -NoNewline
+          $stamped = (Get-Content "packaging\VERSION" -Raw).Trim()
+          if ($stamped -ne $env:UPDATE_VERSION) {
+            throw "Failed to stamp package version: expected=$env:UPDATE_VERSION actual=$stamped"
+          }
+          Write-Host "Stamped packaging/VERSION = $stamped"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -83,8 +114,7 @@ jobs:
 
       - name: Update delivery contracts
         shell: pwsh
-        run: |
-          python -m pytest -q tests/test_windows_packaging_contract.py tests/test_update_delivery_contract.py
+        run: python -m pytest -q tests/test_windows_packaging_contract.py tests/test_update_delivery_contract.py
 
       - name: Install Inno Setup
         shell: pwsh
@@ -102,10 +132,7 @@ jobs:
           $installDir = Join-Path $env:RUNNER_TEMP "EcommerceAgentReleaseSmoke"
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
           $process = Start-Process -FilePath $setup -ArgumentList @(
-            "/VERYSILENT",
-            "/SUPPRESSMSGBOXES",
-            "/NORESTART",
-            "/DIR=$installDir"
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir"
           ) -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Silent install failed: $($process.ExitCode)" }
           $worker = Join-Path $installDir "EcommerceAgentWorker.exe"
@@ -119,7 +146,7 @@ jobs:
             throw "Embedded version mismatch: expected=$env:UPDATE_VERSION actual=$embedded"
           }
 
-      - name: Generate signed-by-hash update manifest
+      - name: Generate stable update manifest
         shell: pwsh
         run: |
           $setupName = "EcommerceAgent-Setup-$env:UPDATE_VERSION.exe"
@@ -128,14 +155,12 @@ jobs:
           $portable = Join-Path $PWD "artifacts\$portableName"
           if (-not (Test-Path $setup)) { throw "Setup missing: $setup" }
           if (-not (Test-Path $portable)) { throw "Portable package missing: $portable" }
-
           $sha = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant()
           $required = $env:UPDATE_TYPE -eq 'required'
           $title = $env:UPDATE_TITLE.Trim()
           if ([string]::IsNullOrWhiteSpace($title)) { $title = "EcommerceAgent $env:UPDATE_VERSION" }
           $downloadUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$env:UPDATE_VERSION/$setupName"
-
-          $manifest = [ordered]@{
+          [ordered]@{
             schema_version = 1
             channel = "stable"
             version = $env:UPDATE_VERSION
@@ -146,29 +171,19 @@ jobs:
             installer_url = $downloadUrl
             installer_sha256 = $sha
             published_at = (Get-Date).ToUniversalTime().ToString("o")
-          }
-          $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path "artifacts\update.json" -Encoding utf8
-
-          @(
-            "# $title",
-            "",
-            $env:UPDATE_NOTES,
-            "",
-            "Update policy: $env:UPDATE_TYPE",
-            "Minimum supported version: $env:MIN_SUPPORTED_VERSION"
-          ) | Set-Content -Path "artifacts\release-notes.md" -Encoding utf8
+          } | ConvertTo-Json -Depth 4 | Set-Content "artifacts\update.json" -Encoding utf8
+          @("# $title", "", $env:UPDATE_NOTES, "", "Update policy: $env:UPDATE_TYPE", "Minimum supported version: $env:MIN_SUPPORTED_VERSION") |
+            Set-Content "artifacts\release-notes.md" -Encoding utf8
 
       - name: Publish stable release
         shell: pwsh
         run: |
           $tag = "v$env:UPDATE_VERSION"
-          $setup = "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe"
-          $portable = "artifacts\EcommerceAgent-$env:UPDATE_VERSION-portable.zip"
           gh release create $tag `
-            $setup `
-            $portable `
+            "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe" `
+            "artifacts\EcommerceAgent-$env:UPDATE_VERSION-portable.zip" `
             "artifacts\update.json" `
-            --target "$env:GITHUB_SHA" `
+            --target "${{ steps.source.outputs.sha }}" `
             --title "EcommerceAgent $env:UPDATE_VERSION" `
             --notes-file "artifacts\release-notes.md" `
             --latest
