@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 
+from app.app_branding import apply_qt_application_icon
 from app.runtime_paths import runtime_root
 
 os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
@@ -63,6 +64,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("ecommerce-agent Listing Studio")
     app.setOrganizationName("ecommerce-agent")
+    apply_qt_application_icon(app)
 
     # Keep the native Fuji renderer compatible with the translucent QWidget
     # child surface. Modal presentation itself now stays entirely in QWidget.
