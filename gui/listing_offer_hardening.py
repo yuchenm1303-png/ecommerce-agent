@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 from PySide6.QtWidgets import QComboBox, QLineEdit, QMessageBox
 
+from .batch_lifecycle import install_batch_lifecycle
 from .readonly_runner import RunnerConfig
 
 
@@ -257,9 +258,11 @@ class ListingOfferHardening:
 def install_listing_offer_hardening(window: Any) -> ListingOfferHardening:
     existing = getattr(window, "_listing_offer_hardening", None)
     if isinstance(existing, ListingOfferHardening):
+        install_batch_lifecycle(window.batch_workspace)
         return existing
     hardening = ListingOfferHardening(window)
     window._listing_offer_hardening = hardening
+    install_batch_lifecycle(window.batch_workspace)
     return hardening
 
 
