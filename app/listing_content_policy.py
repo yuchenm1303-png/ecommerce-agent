@@ -277,10 +277,17 @@ def allow_best_effort_inference(field: dict[str, Any]) -> bool:
 
 
 def allow_required_fallback(field: dict[str, Any]) -> bool:
-    """Return whether unresolved required fields may use the generic placeholder path."""
+    """Keep unresolved required fields on the established deterministic fallback path.
 
-    policy = field_content_policy(field)
-    return policy.get("required_fallback") != "manual_only"
+    Content policy still controls what AI may infer and how seller-facing copy is
+    generated. It must not turn a missing required value into a GUI execution lock.
+    If AI/evidence cannot resolve a required field and the user supplies no manual
+    value, the existing required-overrides path remains responsible for completing
+    the form with its live-schema-bound deterministic fallback.
+    """
+
+    del field
+    return True
 
 
 def requires_exact_web_identity(field: dict[str, Any]) -> bool:
