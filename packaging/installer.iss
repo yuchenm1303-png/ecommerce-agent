@@ -58,7 +58,7 @@ Source: "{#IconFile}"; DestDir: "{app}\icons"; DestName: "{#InstalledIconName}";
 
 [Icons]
 Name: "{autoprograms}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icons\{#InstalledIconName}"; IconIndex: 0
-Name: "{autodesktop}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icons\{#InstalledIconName}"; IconIndex: 0; Tasks: desktopicon
+Name: "{autodesktop}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icons\{#InstalledIconName}"; IconIndex: 0; Check: ShouldCreateDesktopShortcut
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 EcommerceAgent Listing Studio"; Flags: nowait postinstall skipifsilent
@@ -69,6 +69,14 @@ const
   WM_CLOSE = $0010;
   ListingStudioWindowTitle = 'ecommerce-agent · Listing Automation';
   LegacyWindowTitle = 'ecommerce-agent · Acceptance Control Console';
+
+function ShouldCreateDesktopShortcut: Boolean;
+begin
+  { Keep desktop shortcut creation optional for new installs, but always refresh
+    an existing shortcut during upgrades so it cannot keep a stale icon path. }
+  Result := WizardIsTaskSelected('desktopicon') or
+    FileExists(ExpandConstant('{autodesktop}\EcommerceAgent Listing Studio.lnk'));
+end;
 
 function FindListingStudioWindow: HWND;
 begin
