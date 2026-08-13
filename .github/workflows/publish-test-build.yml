@@ -1,0 +1,144 @@
+name: Publish Test Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Source branch/tag/commit to build"
+        required: true
+        default: "feat/local-test-gui"
+        type: string
+      package_version:
+        description: "Current Stable package version to validate (for example 0.1.4)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish-test-build:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    env:
+      SOURCE_REF: ${{ inputs.source_ref }}
+      PACKAGE_VERSION: ${{ inputs.package_version }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout selected source revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Resolve test build identity
+        id: build
+        shell: pwsh
+        run: |
+          $sha = (git rev-parse HEAD).Trim()
+          $short = $sha.Substring(0, 8)
+          $version = $env:PACKAGE_VERSION.Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') {
+            throw "Invalid package version: $version"
+          }
+          $tag = "test-$version-$short-${{ github.run_number }}"
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "short=$short" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "Test build source: $env:SOURCE_REF at $sha"
+          Write-Host "Package version remains: $version"
+          Write-Host "Prerelease tag: $tag"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-gui.txt -r requirements-build.txt
+
+      - name: Packaging contracts
+        shell: pwsh
+        run: python -m pytest -q tests/test_windows_packaging_contract.py tests/test_update_delivery_contract.py
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build unchanged package version
+        shell: pwsh
+        run: .\scripts\build_windows.ps1 -Version "${{ steps.build.outputs.version }}"
+
+      - name: Silent installer smoke test
+        shell: pwsh
+        run: |
+          $version = "${{ steps.build.outputs.version }}"
+          $setup = Join-Path $PWD "artifacts\EcommerceAgent-Setup-$version.exe"
+          if (-not (Test-Path $setup)) { throw "Installer artifact not found: $setup" }
+
+          $installDir = Join-Path $env:RUNNER_TEMP "EcommerceAgentTestReleaseSmoke"
+          if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
+
+          $process = Start-Process -FilePath $setup -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir"
+          ) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Silent install failed: $($process.ExitCode)" }
+
+          $worker = Join-Path $installDir "EcommerceAgentWorker.exe"
+          if (-not (Test-Path $worker)) { throw "Installed worker missing: $worker" }
+          & $worker --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
+
+          $versionFile = Join-Path $installDir "_internal\packaging\VERSION"
+          if (-not (Test-Path $versionFile)) { throw "Embedded package version missing: $versionFile" }
+          $embedded = (Get-Content $versionFile -Raw).Trim()
+          if ($embedded -ne $version) {
+            throw "Embedded version mismatch: expected=$version actual=$embedded"
+          }
+
+      - name: Publish prerelease test assets
+        shell: pwsh
+        run: |
+          $version = "${{ steps.build.outputs.version }}"
+          $tag = "${{ steps.build.outputs.tag }}"
+          $short = "${{ steps.build.outputs.short }}"
+          $setup = "artifacts\EcommerceAgent-Setup-$version.exe"
+          $portable = "artifacts\EcommerceAgent-$version-portable.zip"
+          if (-not (Test-Path $setup)) { throw "Setup missing: $setup" }
+          if (-not (Test-Path $portable)) { throw "Portable package missing: $portable" }
+
+          $sha256 = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          $notes = @(
+            "Pre-release validation build.",
+            "",
+            "Package version: $version (unchanged)",
+            "Source commit: ${{ steps.build.outputs.sha }}",
+            "Installer SHA256: $sha256",
+            "",
+            "This release intentionally contains no update.json and is not a Stable update."
+          ) -join "`n"
+          $notes | Set-Content "artifacts\test-release-notes.md" -Encoding utf8
+
+          gh release create $tag `
+            $setup `
+            $portable `
+            --target "${{ steps.build.outputs.sha }}" `
+            --title "EcommerceAgent Test $version ($short)" `
+            --notes-file "artifacts\test-release-notes.md" `
+            --prerelease
+
+      - name: Upload test build files to workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: EcommerceAgent-Test-${{ steps.build.outputs.tag }}
+          path: |
+            artifacts/EcommerceAgent-Setup-${{ steps.build.outputs.version }}.exe
+            artifacts/EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip
+          if-no-files-found: error
+          retention-days: 7
