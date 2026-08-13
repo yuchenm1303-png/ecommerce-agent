@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import sys
+
+
+_PACKAGE_IMPORT_PROBE = "ECOMMERCE_AGENT_PACKAGE_IMPORT_PROBE"
 
 
 def _install_account_controls_hook() -> None:
@@ -28,3 +32,9 @@ def _install_account_controls_hook() -> None:
 
 
 _install_account_controls_hook()
+
+# Packaging CI launches the real windowed executable with this flag. Reaching
+# this point proves gui.app_access and its top-level runtime dependencies loaded
+# successfully from the built onedir package; normal application runs are unchanged.
+if os.environ.get(_PACKAGE_IMPORT_PROBE) == "1":
+    os._exit(0)
