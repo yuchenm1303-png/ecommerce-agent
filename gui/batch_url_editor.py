@@ -20,8 +20,9 @@ from .batch_model import normalize_batch_urls
 
 _URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 _VISIBLE_ROWS = 4
-_ROW_HEIGHT = 32
-_ROW_SPACING = 3
+_ROW_HEIGHT = 38
+_CONTROL_HEIGHT = 30
+_ROW_SPACING = 4
 _LIST_HEIGHT = (_VISIBLE_ROWS * _ROW_HEIGHT) + ((_VISIBLE_ROWS - 1) * _ROW_SPACING) + 8
 _TOOLBAR_HEIGHT = 34
 _EDITOR_HEIGHT = _TOOLBAR_HEIGHT + _LIST_HEIGHT + 7
@@ -43,30 +44,31 @@ class BatchUrlRow(QFrame):
         self.setFixedHeight(_ROW_HEIGHT)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(6, 2, 6, 2)
+        layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(6)
 
         self.index_label = QLabel(f"{index:02d}")
         self.index_label.setObjectName("batchUrlIndex")
-        self.index_label.setFixedWidth(27)
+        self.index_label.setFixedSize(34, _CONTROL_HEIGHT)
         self.index_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.toggle = QPushButton("启用")
         self.toggle.setObjectName("batchUrlToggle")
         self.toggle.setCheckable(True)
         self.toggle.setChecked(True)
-        self.toggle.setFixedWidth(52)
+        self.toggle.setFixedSize(58, _CONTROL_HEIGHT)
         self.toggle.toggled.connect(self._on_toggled)
 
         self.input = QLineEdit(url)
         self.input.setObjectName("batchUrlLineEdit")
-        self.input.setPlaceholderText("supplier product URL")
+        self.input.setFixedHeight(_CONTROL_HEIGHT)
+        self.input.setPlaceholderText("粘贴 supplier product URL")
         self.input.textChanged.connect(lambda _text: self.editor._refresh_summary())
 
-        self.remove_button = QPushButton("×")
+        self.remove_button = QPushButton("删除")
         self.remove_button.setObjectName("batchUrlRemoveButton")
         self.remove_button.setToolTip("删除此链接")
-        self.remove_button.setFixedWidth(28)
+        self.remove_button.setFixedSize(48, _CONTROL_HEIGHT)
         self.remove_button.clicked.connect(lambda: self.editor.remove_row(self))
 
         layout.addWidget(self.index_label)
@@ -76,52 +78,75 @@ class BatchUrlRow(QFrame):
 
         self.setStyleSheet(
             "QFrame#batchUrlRow {"
-            "  background: rgba(7, 23, 42, 84);"
-            "  border: 1px solid rgba(255, 255, 255, 24);"
-            "  border-radius: 7px;"
+            "  background: rgba(6, 22, 40, 80);"
+            "  border: 1px solid rgba(255,255,255,24);"
+            "  border-radius: 9px;"
             "}"
             "QFrame#batchUrlRow:hover {"
-            "  background: rgba(10, 31, 53, 100);"
-            "  border-color: rgba(164, 219, 255, 52);"
+            "  background: rgba(9, 31, 54, 98);"
+            "  border-color: rgba(164,219,255,58);"
             "}"
             "QLabel#batchUrlIndex {"
-            "  color: rgba(230, 243, 255, 145);"
-            "  font-weight: 720;"
+            "  color: rgba(230,244,255,180);"
+            "  background: rgba(130,182,218,28);"
+            "  border: 1px solid rgba(184,224,249,28);"
+            "  border-radius: 7px;"
+            "  font-weight: 760;"
             "}"
             "QPushButton#batchUrlToggle {"
-            "  border: 1px solid rgba(255, 255, 255, 28);"
-            "  border-radius: 6px;"
-            "  background: rgba(9, 27, 44, 105);"
-            "  color: rgba(235, 245, 255, 170);"
-            "  padding: 1px 5px;"
-            "  font-weight: 700;"
+            "  min-height: 30px; max-height: 30px;"
+            "  border: 1px solid rgba(255,255,255,32);"
+            "  border-radius: 8px;"
+            "  background: rgba(10,28,46,112);"
+            "  color: rgba(235,245,255,190);"
+            "  padding: 0 8px;"
+            "  font-weight: 720;"
             "}"
             "QPushButton#batchUrlToggle:checked {"
-            "  background: rgba(73, 176, 129, 115);"
-            "  border-color: rgba(143, 225, 185, 135);"
-            "  color: rgb(226, 255, 241);"
+            "  background: rgba(68,177,128,122);"
+            "  border-color: rgba(148,229,190,145);"
+            "  color: rgb(230,255,242);"
+            "}"
+            "QPushButton#batchUrlToggle:hover {"
+            "  border-color: rgba(184,224,249,72);"
             "}"
             "QLineEdit#batchUrlLineEdit {"
-            "  background: rgba(4, 17, 31, 92);"
-            "  border: 1px solid rgba(255, 255, 255, 22);"
-            "  border-radius: 6px;"
-            "  padding: 3px 8px;"
+            "  min-height: 30px; max-height: 30px;"
+            "  background: rgba(3,16,30,104);"
+            "  border: 1px solid rgba(255,255,255,26);"
+            "  border-radius: 8px;"
+            "  padding: 0 11px;"
+            "  selection-background-color: rgba(86,170,224,150);"
+            "}"
+            "QLineEdit#batchUrlLineEdit:hover {"
+            "  border-color: rgba(160,210,244,52);"
             "}"
             "QLineEdit#batchUrlLineEdit:focus {"
-            "  border-color: rgba(150, 220, 255, 110);"
-            "  background: rgba(6, 22, 39, 110);"
+            "  border-color: rgba(139,214,255,132);"
+            "  background: rgba(4,20,37,120);"
             "}"
             "QPushButton#batchUrlRemoveButton {"
-            "  border: 0;"
-            "  background: transparent;"
-            "  color: rgba(255, 199, 211, 195);"
-            "  font-size: 15px;"
-            "  font-weight: 700;"
+            "  min-height: 30px; max-height: 30px;"
+            "  border: 1px solid rgba(255,145,164,48);"
+            "  border-radius: 8px;"
+            "  background: rgba(128,42,58,54);"
+            "  color: rgba(255,213,220,220);"
+            "  padding: 0 7px;"
+            "  font-size: 11px;"
+            "  font-weight: 720;"
             "}"
             "QPushButton#batchUrlRemoveButton:hover {"
-            "  color: rgb(255, 232, 237);"
-            "  background: rgba(205, 75, 98, 58);"
-            "  border-radius: 6px;"
+            "  background: rgba(191,55,79,92);"
+            "  border-color: rgba(255,164,180,105);"
+            "  color: rgb(255,240,243);"
+            "}"
+            "QPushButton#batchUrlRemoveButton:pressed {"
+            "  background: rgba(160,43,65,120);"
+            "}"
+            "QPushButton#batchUrlRemoveButton:disabled {"
+            "  background: rgba(70,45,52,34);"
+            "  border-color: rgba(255,255,255,16);"
+            "  color: rgba(255,220,226,80);"
             "}"
         )
         self._on_toggled(True)
@@ -165,13 +190,13 @@ class BatchUrlEditor(QWidget):
         toolbar.setFixedHeight(_TOOLBAR_HEIGHT)
         toolbar.setStyleSheet(
             "QFrame#batchUrlToolbar {"
-            "  background: rgba(5, 20, 37, 74);"
-            "  border: 1px solid rgba(255, 255, 255, 23);"
+            "  background: rgba(5,20,37,74);"
+            "  border: 1px solid rgba(255,255,255,23);"
             "  border-radius: 8px;"
             "}"
         )
         toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(8, 4, 7, 4)
+        toolbar_layout.setContentsMargins(8, 3, 7, 3)
         toolbar_layout.setSpacing(7)
 
         self.summary = QLabel("0 LINKS · 0 ON")
@@ -180,9 +205,9 @@ class BatchUrlEditor(QWidget):
         self.summary.setMinimumWidth(104)
         self.summary.setStyleSheet(
             "QLabel#batchUrlSummaryChip {"
-            "  color: rgba(220, 240, 255, 210);"
-            "  background: rgba(90, 168, 215, 36);"
-            "  border: 1px solid rgba(154, 215, 250, 40);"
+            "  color: rgba(220,240,255,210);"
+            "  background: rgba(90,168,215,36);"
+            "  border: 1px solid rgba(154,215,250,40);"
             "  border-radius: 6px;"
             "  padding: 3px 8px;"
             "  font-size: 11px;"
@@ -194,9 +219,11 @@ class BatchUrlEditor(QWidget):
 
         self.paste_button = QPushButton("批量粘贴")
         self.paste_button.setObjectName("quietButton")
+        self.paste_button.setFixedHeight(28)
         self.paste_button.clicked.connect(self.paste_urls)
         self.add_button = QPushButton("+ 添加链接")
         self.add_button.setObjectName("quietButton")
+        self.add_button.setFixedHeight(28)
         self.add_button.clicked.connect(lambda: self.add_row())
 
         toolbar_layout.addWidget(self.summary)
@@ -215,9 +242,9 @@ class BatchUrlEditor(QWidget):
         self.scroll.setFixedHeight(_LIST_HEIGHT)
         self.scroll.setStyleSheet(
             "QScrollArea#batchUrlScroll {"
-            "  background: rgba(4, 17, 31, 34);"
-            "  border: 1px solid rgba(255,255,255,15);"
-            "  border-radius: 8px;"
+            "  background: rgba(4,17,31,30);"
+            "  border: 1px solid rgba(255,255,255,14);"
+            "  border-radius: 9px;"
             "}"
             "QScrollArea#batchUrlScroll > QWidget > QWidget { background: transparent; }"
         )
