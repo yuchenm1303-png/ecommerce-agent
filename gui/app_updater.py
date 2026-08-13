@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QFile, QIODevice, QObject, QProcess, QTimer, QUrl, QUrlQuery
+from PySide6.QtCore import QByteArray, QFile, QIODevice, QObject, QProcess, QTimer, QUrl, QUrlQuery
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QProgressDialog
@@ -20,6 +20,10 @@ _LATEST_RELEASE_API = f"https://api.github.com/repos/{_REPOSITORY}/releases/late
 _MANIFEST_ASSET = "update.json"
 _PORTAL_URL = "https://smirel.com/download/"
 _PORTAL_HOSTS = {"smirel.com", "www.smirel.com"}
+_PRIVATE_DOWNLOAD_HOSTS = {
+    "nfzkphjbelyltrzgkdwt.supabase.co",
+    "nfzkphjbelyltrzgkdwt.storage.supabase.co",
+}
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[.-].*)?$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _CHECK_DELAY_MS = 1800
@@ -63,11 +67,12 @@ def _request(url: str, version: str) -> QNetworkRequest:
 
 
 class ApplicationUpdater(QObject):
-    """Stable-channel updater driven only by manually published GitHub Releases."""
+    """Stable-channel updater driven only by manually published releases."""
 
-    def __init__(self, window: QMainWindow) -> None:
+    def __init__(self, window: QMainWindow, *, access_controller: Any | None = None) -> None:
         super().__init__(window)
         self.window = window
+        self.access_controller = access_controller
         self.current_version = installed_application_version()
         self.network = QNetworkAccessManager(self)
         self._reply: QNetworkReply | None = None
@@ -190,15 +195,14 @@ class ApplicationUpdater(QObject):
         box.setText(f"发现新版本 {latest}")
         detail = notes or "包含稳定性与功能更新。"
         if delivery == "portal":
-            detail = f"{detail}\n\n更新安装包通过安全下载门户提供。"
+            detail = f"{detail}\n\n更新安装包将使用当前已授权账号安全下载。"
         if required:
             detail = f"这是关键更新，需要更新后继续使用。\n\n{detail}"
         box.setInformativeText(detail)
         box.setDetailedText(
             f"Current: {self.current_version}\nLatest: {latest}\nChannel: stable\nDelivery: {delivery}"
         )
-        action_label = "打开下载页" if delivery == "portal" else "立即更新"
-        update_button = box.addButton(action_label, QMessageBox.ButtonRole.AcceptRole)
+        update_button = box.addButton("立即更新", QMessageBox.ButtonRole.AcceptRole)
         if required:
             fallback_button = box.addButton("退出程序", QMessageBox.ButtonRole.RejectRole)
         else:
@@ -208,11 +212,105 @@ class ApplicationUpdater(QObject):
 
         if box.clickedButton() is update_button:
             if delivery == "portal":
-                self._open_portal_update(manifest, required=required)
+                self._download_portal_update(manifest, required=required)
             else:
                 self._download_update(manifest)
         elif required and box.clickedButton() is fallback_button:
             QApplication.quit()
+
+    def _download_portal_update(self, manifest: dict[str, Any], *, required: bool) -> None:
+        access = self.access_controller
+        token = ""
+        if access is not None and hasattr(access, "bearer_token"):
+            try:
+                token = str(access.bearer_token() or "")
+            except Exception:
+                token = ""
+        if not token:
+            self._open_portal_update(manifest, required=required)
+            return
+
+        function_url = str(getattr(access, "download_function_url", "") or "")
+        publishable_key = str(getattr(access, "publishable_key", "") or "")
+        endpoint = QUrl(function_url)
+        if (
+            not endpoint.isValid()
+            or endpoint.scheme().lower() != "https"
+            or endpoint.host().lower() not in _PRIVATE_DOWNLOAD_HOSTS
+            or not publishable_key.startswith("sb_publishable_")
+        ):
+            self._portal_failure("安全下载服务配置无效。", required=required)
+            return
+
+        request = QNetworkRequest(endpoint)
+        request.setRawHeader(b"Content-Type", b"application/json")
+        request.setRawHeader(b"Accept", b"application/json")
+        request.setRawHeader(b"Authorization", f"Bearer {token}".encode("utf-8"))
+        request.setRawHeader(b"apikey", publishable_key.encode("utf-8"))
+        request.setRawHeader(
+            b"User-Agent",
+            f"EcommerceAgent/{self.current_version}".encode("ascii", "ignore"),
+        )
+        request.setTransferTimeout(_NETWORK_TIMEOUT_MS)
+
+        payload = QByteArray(
+            json.dumps(
+                {"action": "download", "version": str(manifest["version"])},
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        reply = self.network.post(request, payload)
+        self._reply = reply
+        reply.finished.connect(
+            lambda: self._portal_download_finished(reply, manifest, required=required)
+        )
+
+    def _portal_download_finished(
+        self,
+        reply: QNetworkReply,
+        manifest: dict[str, Any],
+        *,
+        required: bool,
+    ) -> None:
+        if reply is not self._reply:
+            return
+        self._reply = None
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                self._portal_failure("授权下载请求失败，请稍后重试。", required=required)
+                return
+            payload = json.loads(bytes(reply.readAll()).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("invalid response")
+            signed_url = str(payload.get("url") or "").strip()
+            remote_version = str(payload.get("version") or "").strip().lstrip("v")
+            remote_sha = str(payload.get("sha256") or "").strip().lower()
+            url = QUrl(signed_url)
+            if (
+                not url.isValid()
+                or url.scheme().lower() != "https"
+                or url.host().lower() not in _PRIVATE_DOWNLOAD_HOSTS
+                or remote_version != str(manifest["version"]).lstrip("v")
+                or remote_sha != str(manifest["installer_sha256"]).lower()
+            ):
+                raise ValueError("private release mismatch")
+            private_manifest = dict(manifest)
+            private_manifest["installer_url"] = signed_url
+            private_manifest["installer_sha256"] = remote_sha
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            self._portal_failure("安全下载信息校验失败。", required=required)
+            return
+        finally:
+            reply.deleteLater()
+
+        self._download_update(private_manifest)
+
+    def _portal_failure(self, message: str, *, required: bool) -> None:
+        if required:
+            QMessageBox.critical(self.window, "Software Update", message)
+            QApplication.quit()
+        else:
+            QMessageBox.warning(self.window, "Software Update", message)
 
     def _open_portal_update(self, manifest: dict[str, Any], *, required: bool) -> None:
         url = QUrl(str(manifest.get("portal_url") or _PORTAL_URL))
@@ -337,11 +435,15 @@ class ApplicationUpdater(QObject):
         QApplication.quit()
 
 
-def install_application_updater(window: QMainWindow) -> ApplicationUpdater:
+def install_application_updater(
+    window: QMainWindow,
+    *,
+    access_controller: Any | None = None,
+) -> ApplicationUpdater:
     existing = getattr(window, "_application_updater", None)
     if isinstance(existing, ApplicationUpdater):
         return existing
-    updater = ApplicationUpdater(window)
+    updater = ApplicationUpdater(window, access_controller=access_controller)
     window._application_updater = updater  # type: ignore[attr-defined]
     updater.schedule_startup_check()
     return updater
