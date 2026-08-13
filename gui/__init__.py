@@ -31,10 +31,16 @@ def _install_account_controls_hook() -> None:
     _app_access._account_controls_hooked = True
 
 
-_install_account_controls_hook()
+_package_probe = os.environ.get(_PACKAGE_IMPORT_PROBE) == "1"
+try:
+    _install_account_controls_hook()
+except Exception:
+    if _package_probe:
+        os._exit(92)
+    raise
 
 # Packaging CI launches the real windowed executable with this flag. Reaching
 # this point proves gui.app_access and its top-level runtime dependencies loaded
 # successfully from the built onedir package; normal application runs are unchanged.
-if os.environ.get(_PACKAGE_IMPORT_PROBE) == "1":
+if _package_probe:
     os._exit(0)
