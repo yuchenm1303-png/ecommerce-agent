@@ -48,6 +48,7 @@ _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _CHECK_DELAY_MS = 1800
 _AUTO_CHECK_INTERVAL_MS = 60 * 60 * 1000
 _NETWORK_TIMEOUT_MS = 10_000
+_UPDATE_MARKER_NAME = "update-complete.json"
 # Stable-channel validation remains equivalent to: manifest.get("channel") != "stable".
 
 
@@ -87,6 +88,60 @@ def _request(url: str, version: str) -> QNetworkRequest:
     return request
 
 
+def _update_marker_path() -> Path:
+    base = Path(os.getenv("LOCALAPPDATA") or tempfile.gettempdir()) / "ListingStudio"
+    return base / _UPDATE_MARKER_NAME
+
+
+def _write_update_marker(version: str) -> bool:
+    path = _update_marker_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"version": version}, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        return True
+    except OSError:
+        return False
+
+
+def _consume_completed_update_marker(current_version: str) -> bool:
+    path = _update_marker_path()
+    if not path.exists():
+        return False
+    matched = False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        matched = str(payload.get("version") or "").strip().lstrip("v") == current_version.lstrip("v")
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        matched = False
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return matched
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            while True:
+                block = stream.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def _expected_github_installer_path(version: str) -> str:
+    clean = version.strip().lstrip("v")
+    return f"/{_REPOSITORY}/releases/download/v{clean}/EcommerceAgent-Setup-{clean}.exe"
+
+
 class ApplicationUpdater(QObject):
     """Stable-channel updater driven only by manually published releases."""
 
@@ -110,11 +165,21 @@ class ApplicationUpdater(QObject):
         self._auto_timer.timeout.connect(self.check_for_updates)
         self._install_header_controls()
 
+        if _consume_completed_update_marker(self.current_version):
+            QTimer.singleShot(900, self._show_completed_update)
+
     @staticmethod
     def enabled() -> bool:
         return bool(getattr(sys, "frozen", False)) and os.getenv(
             "ECOMMERCE_AGENT_DISABLE_UPDATE_CHECK", ""
         ).strip().lower() not in {"1", "true", "yes"}
+
+    def _show_completed_update(self) -> None:
+        QMessageBox.information(
+            self.window,
+            "Listing Studio 更新",
+            f"更新已完成。\n\n当前版本：v{self.current_version}",
+        )
 
     def _install_header_controls(self) -> None:
         root = self.window.centralWidget()
@@ -193,9 +258,41 @@ class ApplicationUpdater(QObject):
             self._set_manual_check_busy(False)
             if message:
                 if warning:
-                    QMessageBox.warning(self.window, "Software Update", message)
+                    QMessageBox.warning(self.window, "Listing Studio 更新", message)
                 else:
-                    QMessageBox.information(self.window, "Software Update", message)
+                    QMessageBox.information(self.window, "Listing Studio 更新", message)
+
+    def _ensure_progress(self, label: str, *, cancellable: bool = True) -> QProgressDialog:
+        progress = self._progress
+        if progress is None:
+            progress = QProgressDialog(label, "取消" if cancellable else "", 0, 0, self.window)
+            progress.setWindowTitle("Listing Studio 更新")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+            progress.setMinimumDuration(0)
+            progress.setMinimumWidth(440)
+            self._progress = progress
+        else:
+            progress.setLabelText(label)
+            progress.setRange(0, 0)
+            progress.setCancelButtonText("取消" if cancellable else "")
+        progress.show()
+        progress.raise_()
+        progress.activateWindow()
+        return progress
+
+    def _set_progress_phase(self, label: str, *, cancellable: bool = False) -> None:
+        progress = self._ensure_progress(label, cancellable=cancellable)
+        progress.setRange(0, 0)
+        progress.setValue(0)
+
+    def _close_progress(self) -> None:
+        progress = self._progress
+        self._progress = None
+        if progress is not None:
+            progress.close()
+            progress.deleteLater()
 
     def schedule_startup_check(self) -> None:
         if self.enabled():
@@ -207,12 +304,12 @@ class ApplicationUpdater(QObject):
         if not self.enabled():
             QMessageBox.information(
                 self.window,
-                "Software Update",
+                "Listing Studio 更新",
                 f"当前版本 v{self.current_version}\n\n源码开发模式不连接 Stable 更新通道。",
             )
             return
         if self._reply is not None:
-            QMessageBox.information(self.window, "Software Update", "更新检查或下载正在进行。")
+            QMessageBox.information(self.window, "Listing Studio 更新", "更新检查或下载正在进行。")
             return
         self.check_for_updates(manual=True)
 
@@ -223,7 +320,7 @@ class ApplicationUpdater(QObject):
             return
         if self._reply is not None:
             if manual:
-                QMessageBox.information(self.window, "Software Update", "更新检查或下载正在进行。")
+                QMessageBox.information(self.window, "Listing Studio 更新", "更新检查或下载正在进行。")
             return
 
         self._manual_check = manual
@@ -361,12 +458,17 @@ class ApplicationUpdater(QObject):
         delivery = str(manifest.get("delivery") or "github")
 
         box = QMessageBox(self.window)
-        box.setWindowTitle("Software Update")
+        box.setWindowTitle("Listing Studio 更新")
         box.setIcon(QMessageBox.Icon.Warning if required else QMessageBox.Icon.Information)
-        box.setText(f"发现新版本 {latest}")
+        box.setText(f"发现新版本 v{latest.lstrip('v')}")
         detail = notes or "包含稳定性与功能更新。"
+        detail = (
+            f"{detail}\n\n"
+            "更新会自动下载并安装，期间 Listing Studio 会关闭一次；"
+            "安装完成后会自动重新打开。请先确认当前没有正在执行的上架任务。"
+        )
         if delivery == "portal":
-            detail = f"{detail}\n\n更新安装包将使用当前已授权账号安全下载。"
+            detail = f"{detail}\n\n更新包会使用当前已授权账号进行安全下载。"
         if required:
             detail = f"这是关键更新，需要更新后继续使用。\n\n{detail}"
         box.setInformativeText(detail)
@@ -390,6 +492,7 @@ class ApplicationUpdater(QObject):
             QApplication.quit()
 
     def _download_portal_update(self, manifest: dict[str, Any], *, required: bool) -> None:
+        self._set_progress_phase("正在验证更新权限…", cancellable=True)
         access = self.access_controller
         token = ""
         if access is not None and hasattr(access, "bearer_token"):
@@ -398,6 +501,7 @@ class ApplicationUpdater(QObject):
             except Exception:
                 token = ""
         if not token:
+            self._close_progress()
             self._open_portal_update(manifest, required=required)
             return
 
@@ -432,6 +536,8 @@ class ApplicationUpdater(QObject):
         )
         reply = self.network.post(request, payload)
         self._reply = reply
+        if self._progress is not None:
+            self._progress.canceled.connect(reply.abort)
         reply.finished.connect(
             lambda: self._portal_download_finished(reply, manifest, required=required)
         )
@@ -446,42 +552,47 @@ class ApplicationUpdater(QObject):
         if reply is not self._reply:
             return
         self._reply = None
+        error = reply.error()
         try:
-            if reply.error() != QNetworkReply.NetworkError.NoError:
+            if error == QNetworkReply.NetworkError.OperationCanceledError:
+                self._close_progress()
+                return
+            if error != QNetworkReply.NetworkError.NoError:
                 self._portal_failure("授权下载请求失败，请稍后重试。", required=required)
                 return
             payload = json.loads(bytes(reply.readAll()).decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("invalid response")
-            signed_url = str(payload.get("url") or "").strip()
+            installer_url = str(payload.get("url") or "").strip()
             remote_version = str(payload.get("version") or "").strip().lstrip("v")
-            remote_sha = str(payload.get("sha256") or "").strip().lower()
-            url = QUrl(signed_url)
+            expected_version = str(manifest["version"]).strip().lstrip("v")
+            url = QUrl(installer_url)
             if (
                 not url.isValid()
                 or url.scheme().lower() != "https"
-                or url.host().lower() not in _PRIVATE_DOWNLOAD_HOSTS
-                or remote_version != str(manifest["version"]).lstrip("v")
-                or remote_sha != str(manifest["installer_sha256"]).lower()
+                or url.host().lower() != "github.com"
+                or url.path() != _expected_github_installer_path(expected_version)
+                or remote_version != expected_version
             ):
-                raise ValueError("private release mismatch")
+                raise ValueError("authorized release mismatch")
             private_manifest = dict(manifest)
-            private_manifest["installer_url"] = signed_url
-            private_manifest["installer_sha256"] = remote_sha
+            private_manifest["installer_url"] = installer_url
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             self._portal_failure("安全下载信息校验失败。", required=required)
             return
         finally:
             reply.deleteLater()
 
+        self._set_progress_phase("授权完成，正在准备下载…", cancellable=True)
         self._download_update(private_manifest)
 
     def _portal_failure(self, message: str, *, required: bool) -> None:
+        self._close_progress()
         if required:
-            QMessageBox.critical(self.window, "Software Update", message)
+            QMessageBox.critical(self.window, "Listing Studio 更新", message)
             QApplication.quit()
         else:
-            QMessageBox.warning(self.window, "Software Update", message)
+            QMessageBox.warning(self.window, "Listing Studio 更新", message)
 
     def _open_portal_update(self, manifest: dict[str, Any], *, required: bool) -> None:
         url = QUrl(str(manifest.get("portal_url") or _PORTAL_URL))
@@ -489,7 +600,7 @@ class ApplicationUpdater(QObject):
         query.addQueryItem("version", str(manifest["version"]))
         url.setQuery(query)
         if not QDesktopServices.openUrl(url):
-            QMessageBox.warning(self.window, "Software Update", "无法打开安全下载页，请访问 smirel.com/download/。")
+            QMessageBox.warning(self.window, "Listing Studio 更新", "无法打开安全下载页，请访问 smirel.com/download/。")
             return
         if required:
             QApplication.quit()
@@ -507,21 +618,21 @@ class ApplicationUpdater(QObject):
 
         file = QFile(str(target))
         if not file.open(QIODevice.OpenModeFlag.WriteOnly | QIODevice.OpenModeFlag.Truncate):
-            QMessageBox.warning(self.window, "Software Update", "无法创建更新安装文件。")
+            self._close_progress()
+            QMessageBox.warning(self.window, "Listing Studio 更新", "无法创建更新安装文件。")
             return
 
-        progress = QProgressDialog("正在下载更新…", "取消", 0, 100, self.window)
-        progress.setWindowTitle("Software Update")
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-        progress.setMinimumDuration(0)
+        progress = self._ensure_progress(
+            f"正在下载 v{version.lstrip('v')} 更新包…",
+            cancellable=True,
+        )
+        progress.setRange(0, 100)
         progress.setValue(0)
 
         reply = self.network.get(_request(str(manifest["installer_url"]), self.current_version))
         self._reply = reply
         self._download_file = file
         self._download_path = target
-        self._progress = progress
 
         reply.readyRead.connect(lambda: self._write_download(reply))
         reply.downloadProgress.connect(self._download_progress)
@@ -542,9 +653,17 @@ class ApplicationUpdater(QObject):
         if progress is None:
             return
         if total > 0:
-            progress.setValue(max(0, min(100, round(received * 100 / total))))
+            percent = max(0, min(100, round(received * 100 / total)))
+            received_mb = received / 1024 / 1024
+            total_mb = total / 1024 / 1024
+            progress.setRange(0, 100)
+            progress.setValue(percent)
+            progress.setLabelText(
+                f"正在下载更新… {percent}%   ·   {received_mb:.1f} / {total_mb:.1f} MB"
+            )
         else:
             progress.setRange(0, 0)
+            progress.setLabelText("正在下载更新…")
 
     def _download_finished(self, reply: QNetworkReply, manifest: dict[str, Any]) -> None:
         if reply is not self._reply:
@@ -557,12 +676,6 @@ class ApplicationUpdater(QObject):
             file.close()
         self._download_file = None
 
-        progress = self._progress
-        self._progress = None
-        if progress is not None:
-            progress.close()
-            progress.deleteLater()
-
         path = self._download_path
         self._download_path = None
         error = reply.error()
@@ -574,36 +687,56 @@ class ApplicationUpdater(QObject):
                     path.unlink(missing_ok=True)
                 except OSError:
                     pass
+            self._close_progress()
             if error != QNetworkReply.NetworkError.OperationCanceledError:
-                QMessageBox.warning(self.window, "Software Update", "更新下载失败，请稍后重试。")
+                QMessageBox.warning(self.window, "Listing Studio 更新", "更新下载失败，请稍后重试。")
             return
 
-        try:
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
-            digest = ""
+        self._set_progress_phase("下载完成，正在校验更新包完整性…", cancellable=False)
+        QTimer.singleShot(0, lambda: self._verify_and_install(path, manifest))
+
+    def _verify_and_install(self, path: Path, manifest: dict[str, Any]) -> None:
+        digest = _sha256_file(path)
         if digest.lower() != str(manifest["installer_sha256"]).lower():
             try:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
-            QMessageBox.critical(self.window, "Software Update", "更新文件校验失败，已取消安装。")
+            self._close_progress()
+            QMessageBox.critical(self.window, "Listing Studio 更新", "更新文件校验失败，已取消安装。")
             return
 
+        version = str(manifest["version"]).strip().lstrip("v")
+        self._set_progress_phase(
+            "校验通过，正在启动安装程序…\n接下来会显示安装进度，完成后 Listing Studio 将自动重新打开。",
+            cancellable=False,
+        )
+        _write_update_marker(version)
+
         arguments = [
-            "/VERYSILENT",
+            "/SILENT",
             "/SUPPRESSMSGBOXES",
             "/NORESTART",
             "/CLOSEAPPLICATIONS",
-            "/RESTARTAPPLICATIONS",
+            "/NORESTARTAPPLICATIONS",
+            "/RELAUNCHAPP=1",
         ]
         started = QProcess.startDetached(str(path), arguments)
         ok = bool(started[0]) if isinstance(started, tuple) else bool(started)
         if not ok:
-            QMessageBox.critical(self.window, "Software Update", "无法启动更新安装程序。")
+            try:
+                _update_marker_path().unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._close_progress()
+            QMessageBox.critical(self.window, "Listing Studio 更新", "无法启动更新安装程序。")
             return
 
-        QApplication.quit()
+        self._set_progress_phase(
+            "安装程序已启动。Listing Studio 即将关闭；更新完成后会自动重新打开。",
+            cancellable=False,
+        )
+        QTimer.singleShot(450, QApplication.quit)
 
 
 def install_application_updater(
