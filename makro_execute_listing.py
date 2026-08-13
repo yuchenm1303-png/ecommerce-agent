@@ -177,8 +177,8 @@ def main() -> int:
         decision_packet,
         planned_live_fields,
     )
-    business_bundle = generated_business_bundle(args.product_url)
     generated_sku = generate_listing_sku(args.product_url)
+    business_bundle = generated_business_bundle(args.product_url, sku=generated_sku)
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = Path(args.output_dir) / f"execute-{stamp}"
