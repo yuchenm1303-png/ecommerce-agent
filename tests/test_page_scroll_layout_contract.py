@@ -36,32 +36,39 @@ def test_single_keeps_original_root_ownership_and_has_no_outer_scroll_page() -> 
     assert 'setattr(window, "_single_fixed_body", body)' in PAGE
 
 
-def test_single_compacts_existing_input_rows_without_rebuilding_widgets() -> None:
+def test_single_keeps_source_controls_on_a_separate_compact_row() -> None:
     assert "def _compact_input_rows" in PAGE
-    assert 'for name in ("makro_port", "source_port", "vertical_input", "current_page_check")' in PAGE
-    assert "settings_row.removeWidget(widget)" in PAGE
-    assert "stage_row.addWidget(widget)" in PAGE
-    assert "_INPUT_CARD_MAX_HEIGHT = 160" in PAGE
-    assert "layout.setContentsMargins(14, 7, 14, 8)" in PAGE
-    assert "layout.setSpacing(3)" in PAGE
+    assert 'stage_anchor = getattr(window, "step1_button", None)' in PAGE
+    assert 'settings_anchor = getattr(window, "source_port", None)' in PAGE
+    assert "settings_row.removeWidget" not in PAGE
+    assert "stage_row.addWidget(widget)" not in PAGE
+    assert "stage_row.setSpacing(8)" in PAGE
+    assert "settings_row.setSpacing(8)" in PAGE
+    assert "_INPUT_CARD_MIN_HEIGHT = 176" in PAGE
+    assert "_INPUT_CARD_MAX_HEIGHT = 190" in PAGE
+    assert "layout.setContentsMargins(14, 8, 14, 9)" in PAGE
+    assert "layout.setSpacing(4)" in PAGE
 
     assert "ReadOnlyRunner(" not in PAGE
     assert "RealExecutionRunner(" not in PAGE
     assert "AcceptanceConsole(" not in PAGE
 
 
-def test_single_uses_balanced_one_screen_height_and_width_budgets() -> None:
-    assert "_STATUS_CARD_MIN_HEIGHT = 60" in PAGE
-    assert "_STATUS_CARD_MAX_HEIGHT = 64" in PAGE
-    assert "_WORKSPACE_MIN_HEIGHT = 260" in PAGE
-    assert "_FIELD_TABLE_MIN_HEIGHT = 170" in PAGE
+def test_single_uses_console_first_one_screen_height_budget() -> None:
+    assert "_STATUS_CARD_MIN_HEIGHT = 54" in PAGE
+    assert "_STATUS_CARD_MAX_HEIGHT = 58" in PAGE
+    assert "_WORKSPACE_MIN_HEIGHT = 220" in PAGE
+    assert "_FIELD_TABLE_MIN_HEIGHT = 136" in PAGE
     assert "_SIDE_MIN_WIDTH = 360" in PAGE
     assert "_SIDE_MAX_WIDTH = 480" in PAGE
     assert "_SIDE_TARGET_RATIO = 0.29" in PAGE
-    assert "_CONSOLE_MIN_HEIGHT = 218" in PAGE
-    assert "_CONSOLE_MAX_HEIGHT = 242" in PAGE
-    assert "_CONSOLE_TARGET_HEIGHT = 230" in PAGE
+    assert "_CONSOLE_MIN_HEIGHT = 292" in PAGE
+    assert "_CONSOLE_MAX_HEIGHT = 336" in PAGE
+    assert "_CONSOLE_TARGET_HEIGHT = 310" in PAGE
 
+    assert "def _compact_workspace_cards" in PAGE
+    assert "layout.setContentsMargins(14, 8, 14, 10)" in PAGE
+    assert "layout.setContentsMargins(14, 9, 14, 10)" in PAGE
     assert "workspace.setMaximumHeight(16777215)" in PAGE
     assert "side_tabs.setMaximumHeight(16777215)" in PAGE
     assert "side_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)" in PAGE
@@ -128,18 +135,20 @@ def test_fixed_single_has_no_per_scroll_quick_geometry_path() -> None:
     assert "QTimer.singleShot(0, schedule)" in PAGE
 
 
-def test_console_keeps_phase_and_embedded_tabs_visible_with_full_detail_modal() -> None:
+def test_console_gets_real_working_space_without_changing_idle_hot_path() -> None:
     assert "QScrollArea" not in SUMMARY
     assert 'self.body = getattr(window, "_ui_polish_body_splitter", None)' in SUMMARY
     assert "self.toggle.setCheckable(False)" in SUMMARY
     assert "unit.show()" in SUMMARY
     assert "tabs.show()" in SUMMARY
     assert "tabs.hide()" not in SUMMARY
-    assert "_SUMMARY_MIN = 218" in SUMMARY
-    assert "_SUMMARY_MAX = 242" in SUMMARY
-    assert "_SUMMARY_TARGET = 230" in SUMMARY
-    assert "_CONSOLE_TABS_MIN = 88" in SUMMARY
-    assert "_CONSOLE_TABS_MAX = 112" in SUMMARY
+    assert "_SUMMARY_MIN = 292" in SUMMARY
+    assert "_SUMMARY_MAX = 336" in SUMMARY
+    assert "_SUMMARY_TARGET = 310" in SUMMARY
+    assert "_WORKSPACE_MIN = 220" in SUMMARY
+    assert "_CONSOLE_TABS_MIN = 132" in SUMMARY
+    assert "_CONSOLE_TABS_MAX = 176" in SUMMARY
+    assert "proportional = round(available * 0.52)" in SUMMARY
     assert "self.details.open_console_details()" in SUMMARY
 
 
