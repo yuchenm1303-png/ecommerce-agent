@@ -52,19 +52,15 @@ _GLOBAL_BASE_RULES: tuple[str, ...] = (
 )
 
 _intent = current_listing_intent()
-GLOBAL_CONTENT_RULES: tuple[str, ...] = (
-    *_GLOBAL_BASE_RULES,
-    *(
-        (
-            "The seller explicitly selected this listing offer/variant scope for the current run: "
-            + repr(_intent)
-            + ". Use it only to disambiguate the sold colour/variant/bundle/quantity among supplier-supported choices. "
-            "It is authoritative for what this listing is intended to sell, but it must not create unrelated product specifications or override a real contradiction."
-        ),
-    )
-    if _intent
-    else (),
-)
+_INTENT_RULES: tuple[str, ...] = (
+    (
+        "The seller explicitly selected this listing offer/variant scope for the current run: "
+        + repr(_intent)
+        + ". Use it only to disambiguate the sold colour/variant/bundle/quantity among supplier-supported choices. "
+        "It is authoritative for what this listing is intended to sell, but it must not create unrelated product specifications or override a real contradiction."
+    ),
+) if _intent else ()
+GLOBAL_CONTENT_RULES: tuple[str, ...] = _GLOBAL_BASE_RULES + _INTENT_RULES
 
 
 def _names(field: dict[str, Any]) -> set[str]:
@@ -93,10 +89,7 @@ def _with_intent(policy: dict[str, Any]) -> dict[str, Any]:
     intent = current_listing_intent()
     if not intent:
         return policy
-    return {
-        **policy,
-        "listing_intent": intent,
-    }
+    return {**policy, "listing_intent": intent}
 
 
 def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
