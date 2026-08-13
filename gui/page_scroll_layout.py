@@ -295,6 +295,60 @@ def _unregister_nested_glass_pages(window: QMainWindow, pages: list[QFrame]) -> 
         )
 
 
+def _polish_side_tabs(side_tabs: QTabWidget) -> None:
+    """Use the right card width as a calm three-segment navigation bar."""
+
+    if getattr(side_tabs, "_single_tabs_polished", False):
+        return
+
+    for index, label in enumerate(("运行状态", "参考信息", "安全检查")):
+        if index < side_tabs.count():
+            side_tabs.setTabText(index, label)
+
+    tab_bar = side_tabs.tabBar()
+    tab_bar.setExpanding(True)
+    tab_bar.setUsesScrollButtons(False)
+    tab_bar.setElideMode(Qt.TextElideMode.ElideNone)
+    tab_bar.setDrawBase(False)
+
+    side_tabs.setStyleSheet(
+        side_tabs.styleSheet()
+        + r"""
+QTabWidget#sideDetailTabs::pane {
+    border: 0;
+    background: transparent;
+    top: 0px;
+}
+QTabWidget#sideDetailTabs QTabBar {
+    background: transparent;
+}
+QTabWidget#sideDetailTabs QTabBar::tab {
+    min-height: 34px;
+    max-height: 34px;
+    padding: 0 10px;
+    margin: 0 4px 8px 0;
+    color: rgba(255,255,255,172);
+    background: rgba(0,0,0,30);
+    border: 1px solid rgba(255,255,255,12);
+    border-radius: 8px;
+    font-size: 11px;
+    font-weight: 650;
+}
+QTabWidget#sideDetailTabs QTabBar::tab:selected {
+    color: #ffffff;
+    background: rgba(255,255,255,42);
+    border-color: rgba(255,255,255,28);
+}
+QTabWidget#sideDetailTabs QTabBar::tab:hover:!selected {
+    color: #ffffff;
+    background: rgba(255,255,255,22);
+    border-color: rgba(255,255,255,20);
+}
+"""
+    )
+    setattr(side_tabs, "_single_tabs_polished", True)
+
+
 def _unify_workspace_card_structure(
     window: QMainWindow,
     workspace_splitter: QSplitter,
@@ -329,13 +383,14 @@ def _unify_workspace_card_structure(
     side_card.setObjectName("glassCard")
     side_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
     side_layout = QVBoxLayout(side_card)
-    side_layout.setContentsMargins(0, 0, 0, 0)
+    side_layout.setContentsMargins(8, 8, 8, 8)
     side_layout.setSpacing(0)
 
     side_tabs.setParent(side_card)
     side_tabs.setMinimumHeight(0)
     side_tabs.setMaximumHeight(16777215)
     side_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    _polish_side_tabs(side_tabs)
     side_layout.addWidget(side_tabs, 1)
 
     index = workspace_splitter.indexOf(old_side)
@@ -411,6 +466,7 @@ def _configure_workspace(window: QMainWindow, body: QSplitter) -> None:
         side_tabs.setMinimumHeight(0)
         side_tabs.setMaximumHeight(16777215)
         side_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        _polish_side_tabs(side_tabs)
 
     console.setMinimumHeight(_CONSOLE_MIN_HEIGHT)
     console.setMaximumHeight(_CONSOLE_MAX_HEIGHT)
