@@ -24,7 +24,9 @@ from app.compact_evidence import CompactEvidence
 from app.evidence_contract import ProductIdentity
 from app.listing_content_policy import (
     GLOBAL_CONTENT_RULES,
+    LISTING_INTENT_ENV,
     allow_best_effort_inference,
+    allow_required_fallback,
     field_content_policy,
     requires_exact_web_identity,
 )
@@ -92,6 +94,7 @@ def test_content_policy_keeps_high_value_copy_rules_and_safe_exceptions() -> Non
     assert model["policy_id"] == "model_name"
     assert "South African" in model["instruction"]
     assert "Omit brand names" in model["instruction"]
+    assert model["required_fallback"] == "manual_only"
     assert description["policy_id"] == "description"
     assert "medical-style claims" in description["instruction"]
     assert keywords["policy_id"] == "keywords"
@@ -110,7 +113,64 @@ def test_exact_identity_compliance_and_package_fields_disable_best_effort() -> N
     for target in fields:
         assert requires_exact_web_identity(target) is True
         assert allow_best_effort_inference(target) is False
+        assert allow_required_fallback(target) is False
         assert field_content_policy(target)["evidence_mode"] == "exact_product_only"
+
+
+def test_listing_intent_turns_sales_package_into_offer_aware_synthesis(monkeypatch) -> None:
+    monkeypatch.setenv(LISTING_INTENT_ENV, "黑色净化器 + 2瓶香薰精油")
+    sales_package = _field("sales_package", "Sales Package", required=True)
+    colour = _field("colour", "Colour")
+
+    package_policy = field_content_policy(sales_package)
+    colour_policy = field_content_policy(colour)
+
+    assert package_policy["listing_intent"] == "黑色净化器 + 2瓶香薰精油"
+    assert package_policy["generation_mode"] == "grounded_synthesis"
+    assert package_policy["best_effort"] == "listing_intent_allowed"
+    assert allow_best_effort_inference(sales_package) is True
+    assert allow_required_fallback(sales_package) is False
+    assert colour_policy["policy_id"] == "listing_intent_scope"
+    assert colour_policy["listing_intent"] == "黑色净化器 + 2瓶香薰精油"
+
+
+def test_listing_intent_allows_sales_package_in_final_policy_stage(monkeypatch) -> None:
+    monkeypatch.setenv(LISTING_INTENT_ENV, "Black purifier + 2 fragrance oil bottles")
+    fields = [
+        _field("model_name", "Model Name"),
+        _field("sales_package", "Sales Package"),
+        _field("ean", "EAN"),
+    ]
+    grounding = _grounding()
+    packet = AIDecisionPacket(
+        identity=ProductIdentity(),
+        schema_sha256=schema_digest(fields),
+        source_manifest_sha256=source_manifest_digest(grounding),
+        decisions=[FieldDecision(field_id=field_id(field), status=MISSING) for field in fields],
+        extractor="test",
+    )
+
+    request = build_best_effort_inference_request(
+        packet,
+        fields,
+        product_fingerprint="portable air purifier ionizer",
+    )
+    targets = {item["key"]: item for item in request["target_fields"]}
+
+    assert set(targets) == {"model_name", "sales_package"}
+    assert targets["sales_package"]["content_policy"]["listing_intent"].startswith("Black purifier")
+    assert "ean" not in targets
+
+
+def test_title_contributing_field_cannot_use_generic_required_placeholder() -> None:
+    target = _field("type", "Type", required=True)
+    target["context_text"] = "Attributes that can make up title"
+    policy = field_content_policy(target)
+
+    assert policy["policy_id"] == "title_contributor"
+    assert policy["required_fallback"] == "manual_only"
+    assert allow_required_fallback(target) is False
+    assert "Never use N/A" in policy["instruction"]
 
 
 def test_local_product_fact_request_carries_policy_but_excludes_warranty_business_fields() -> None:
