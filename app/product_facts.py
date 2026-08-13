@@ -24,12 +24,13 @@ from .ai_decisions import (
 from .business_fields import is_business_question
 from .compact_evidence import CompactEvidence
 from .evidence_contract import ProductIdentity
+from .listing_content_policy import CONTENT_POLICY_VERSION, GLOBAL_CONTENT_RULES, field_content_policy
 from .semantic_grounding import GroundingCatalog
 from .source_bundle import normalize_key
 
 
-PRODUCT_FACT_CONTRACT_VERSION = 3
-PRODUCT_FACT_CACHE_VERSION = 6
+PRODUCT_FACT_CONTRACT_VERSION = 4
+PRODUCT_FACT_CACHE_VERSION = 7
 
 
 class JSONTaskProvider(Protocol):
@@ -57,6 +58,8 @@ RULES = [
     "Keep front, cabin and rear cameras separate; keep documentation language and device capability separate.",
     "Use only citation aliases shown in brackets and return aliases without brackets.",
     "Never answer seller-operated business fields.",
+    "When a target includes content_policy, follow it after the evidence and live-field contract; content policy never makes unsupported product claims READY.",
+    *GLOBAL_CONTENT_RULES,
 ]
 
 
@@ -132,6 +135,9 @@ def _target(field: dict[str, Any]) -> dict[str, Any]:
     for key in ("options", "qualifier_options", "help_text", "context_text"):
         if contract.get(key):
             output[key] = contract[key]
+    content_policy = field_content_policy(field)
+    if content_policy:
+        output["content_policy"] = content_policy
     return output
 
 
@@ -154,7 +160,7 @@ def build_product_fact_request(
             "Return only fields with direct evidence. For READY, values and citations must be non-empty and "
             "alternatives empty. For CONFLICT, values and citations must be empty and alternatives must contain "
             "at least two distinct grounded values. Check every source for disagreement before READY. "
-            "Follow the target field's multi_value/options/qualifier contract exactly."
+            "Follow the target field's multi_value/options/qualifier contract and content_policy exactly."
         ),
         "product_identity": {"source_product_url": product_url.strip()},
         "target_fields": [_target(field) for field in targets],
@@ -170,6 +176,7 @@ def _contract_digest() -> str:
     raw = json.dumps(
         {
             "version": PRODUCT_FACT_CONTRACT_VERSION,
+            "content_policy_version": CONTENT_POLICY_VERSION,
             "system": SYSTEM_INSTRUCTION,
             "rules": RULES,
         },
