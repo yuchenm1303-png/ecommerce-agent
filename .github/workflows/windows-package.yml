@@ -11,6 +11,7 @@ on:
       - "app/runtime_paths.py"
       - "app/app_branding.py"
       - "app/app_icon_data.py"
+      - "gui/app_updater.py"
       - "gui/frozen_process_router.py"
       - "run_packaged_worker.py"
       - "run_local_gui.py"
@@ -21,6 +22,7 @@ on:
       - "requirements-gui.txt"
       - "requirements-build.txt"
       - "tests/test_windows_packaging_contract.py"
+      - "tests/test_update_delivery_contract.py"
       - ".github/workflows/windows-package.yml"
 
 jobs:
@@ -46,7 +48,7 @@ jobs:
 
       - name: Packaging contracts
         shell: pwsh
-        run: python -m pytest -q tests/test_windows_packaging_contract.py
+        run: python -m pytest -q tests/test_windows_packaging_contract.py tests/test_update_delivery_contract.py
 
       - name: Install Inno Setup
         shell: pwsh
@@ -102,8 +104,10 @@ jobs:
 
           $worker = Join-Path $installDir "EcommerceAgentWorker.exe"
           $internal = Join-Path $installDir "_internal"
+          $versionFile = Join-Path $internal "packaging\VERSION"
           if (-not (Test-Path $worker)) { throw "Installed worker missing: $worker" }
           if (-not (Test-Path $internal)) { throw "Installed _internal directory missing: $internal" }
+          if (-not (Test-Path $versionFile)) { throw "Installed version metadata missing: $versionFile" }
 
           & $worker --self-test
           if ($LASTEXITCODE -ne 0) {
