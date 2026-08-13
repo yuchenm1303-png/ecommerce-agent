@@ -1,12 +1,8 @@
 window.DOWNLOAD_PORTAL_CONFIG = {
   brand: {
     name: "Listing Studio",
-    domain: "download portal"
+    domain: "Distribution Center"
   },
-
-  // Put a licensed wallpaper under download-site/assets/ and set it here, e.g.
-  // "./assets/wallpaper.jpg". Empty uses the built-in gradient preview.
-  wallpaperUrl: "",
 
   release: {
     version: "v0.1.0",
