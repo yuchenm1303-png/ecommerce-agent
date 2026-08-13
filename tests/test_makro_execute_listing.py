@@ -71,7 +71,9 @@ def test_direct_executor_rebinds_before_any_fill_and_has_no_semantic_context():
     source = inspect.getsource(makro_execute_listing.main)
     assert "load_ai_decision_packet(" in source
     assert "assert_live_schema_matches(planned_live_fields, semantic_fields)" in source
-    assert "generated_business_bundle(args.product_url)" in source
+    assert "generated_sku = generate_listing_sku(args.product_url)" in source
+    assert "generated_business_bundle(args.product_url, sku=generated_sku)" in source
+    assert source.count("generate_listing_sku(args.product_url)") == 1
     assert "build_ai_product_context" not in source
     assert "ResolutionInputSpec" not in source
     assert "load_question_catalog" not in source
