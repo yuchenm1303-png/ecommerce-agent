@@ -34,11 +34,12 @@ def test_packaging_python_sources_compile() -> None:
 
 def test_approved_application_icon_is_embedded_and_integrity_checked() -> None:
     raw = application_icon_bytes()
-    assert raw.startswith(b"\xff\xd8\xff")
-    assert len(raw) > 8_000
+    assert raw.startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(raw) > 5_000
+    assert "APP_ICON_PNG_BASE64" in ICON_DATA
     assert "APP_ICON_SHA256" in ICON_DATA
     assert "hashlib.sha256(raw).hexdigest()" in BRANDING
-    assert 'pixmap.loadFromData(application_icon_bytes(), "JPG")' in BRANDING
+    assert 'pixmap.loadFromData(application_icon_bytes(), "PNG")' in BRANDING
     assert "apply_qt_application_icon(app)" in RUN
     assert "SetCurrentProcessExplicitAppUserModelID" in BRANDING
 
