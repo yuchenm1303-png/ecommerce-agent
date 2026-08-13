@@ -1,23 +1,22 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, QTimer
-from PySide6.QtWidgets import QFrame, QMainWindow, QPushButton, QScrollArea, QSplitter, QTabWidget, QWidget
+from PySide6.QtWidgets import QFrame, QMainWindow, QPushButton, QSplitter, QTabWidget, QWidget
 
 
-_SUMMARY_MIN = 300
-_SUMMARY_MAX = 460
-_PAGE_SUMMARY_MIN = 420
-_PAGE_SUMMARY_MAX = 560
+_SUMMARY_MIN = 120
+_SUMMARY_MAX = 136
+_SUMMARY_TARGET = 128
+_WORKSPACE_MIN = 292
 _COALESCE_MS = 40
 
 
 class ConsoleSummaryMode(QObject):
-    """Keep the rich console summary permanent and open detail as a modal.
+    """Keep only the compact phase summary on the fixed Single page.
 
-    Legacy layouts may still own the console through ``bodySplitter``. The formal
-    Single UI now uses one outer page scroll instead; in that mode the console owns
-    its natural reading height and this controller never tries to resize a hidden
-    splitter.
+    Full console tabs remain available through the existing detail modal. The
+    visible Single workspace therefore stays one screen tall and never expands
+    when the user asks for diagnostics.
     """
 
     def __init__(self, window: QMainWindow) -> None:
@@ -27,7 +26,6 @@ class ConsoleSummaryMode(QObject):
         self.console = getattr(window, "console", None)
         self.toggle = getattr(window, "console_detail_toggle", None)
         self.body = getattr(window, "_ui_polish_body_splitter", None)
-        self.page_scroll = getattr(window, "_single_page_scroll", None)
         self.details = getattr(window, "_card_details", None)
         self._mature_apply = None
 
@@ -37,14 +35,14 @@ class ConsoleSummaryMode(QObject):
             raise RuntimeError("console summary mode requires the acceptance console")
         if not isinstance(self.toggle, QPushButton):
             raise RuntimeError("console summary mode requires console_detail_toggle")
-        if not isinstance(self.body, QSplitter) and not isinstance(self.page_scroll, QScrollArea):
-            raise RuntimeError("console summary mode requires bodySplitter or singlePageScroll")
+        if not isinstance(self.body, QSplitter):
+            raise RuntimeError("console summary mode requires the fixed bodySplitter")
         if self.details is None or not hasattr(self.details, "open_console_details"):
             raise RuntimeError("console summary mode requires the shared glass detail controller")
 
-        # Remove ui_polish/ui_maturity's old expand/collapse state machine. Keep
-        # the logical checked bit true; the action now opens the shared detail
-        # modal and never resizes the visible workspace.
+        # The old button changed splitter height. In the fixed Single layout it is
+        # a plain action: detailed diagnostics open in the existing modal and the
+        # main workspace never reflows.
         try:
             self.toggle.toggled.disconnect()
         except (RuntimeError, TypeError):
@@ -53,8 +51,7 @@ class ConsoleSummaryMode(QObject):
             self.toggle.clicked.disconnect()
         except (RuntimeError, TypeError):
             pass
-        self.toggle.setCheckable(True)
-        self.toggle.setChecked(True)
+        self.toggle.setCheckable(False)
         self.toggle.setEnabled(True)
         self.toggle.show()
         self.toggle.setText("展开详情")
@@ -63,9 +60,12 @@ class ConsoleSummaryMode(QObject):
         for unit in getattr(self.console, "phase_units", {}).values():
             if isinstance(unit, QWidget):
                 unit.show()
+
+        # The phase cards + progress bar are the permanent one-screen summary.
+        # Full logs/timeline/artifacts/diagnostics are cloned into the detail modal.
         tabs = getattr(self.console, "tabs", None)
         if isinstance(tabs, QTabWidget):
-            tabs.show()
+            tabs.hide()
 
         mature = getattr(window, "_mature_ui", None)
         timer = getattr(mature, "_timer", None)
@@ -93,26 +93,16 @@ class ConsoleSummaryMode(QObject):
         if len(current) != len(target) or any(abs(a - b) > 3 for a, b in zip(current, target)):
             splitter.setSizes(target)
 
-    @staticmethod
-    def _summary_target(available: int) -> int:
-        target = min(440, max(340, available - 300))
-        return min(target, max(_SUMMARY_MIN, available - 260))
-
     def apply(self) -> None:
-        if isinstance(self.page_scroll, QScrollArea):
-            self.console.setMinimumHeight(_PAGE_SUMMARY_MIN)
-            self.console.setMaximumHeight(_PAGE_SUMMARY_MAX)
-            return
-
         if not isinstance(self.body, QSplitter):
             return
         available = max(1, self.body.height() - self.body.handleWidth())
+        target = min(_SUMMARY_MAX, max(_SUMMARY_MIN, _SUMMARY_TARGET))
         self.console.setMinimumHeight(_SUMMARY_MIN)
         self.console.setMaximumHeight(_SUMMARY_MAX)
-        target = self._summary_target(available)
         self._set_sizes_if_needed(
             self.body,
-            [max(260, available - target), target],
+            [max(_WORKSPACE_MIN, available - target), target],
         )
 
     def _apply_after_mature(self) -> None:
@@ -121,8 +111,6 @@ class ConsoleSummaryMode(QObject):
         self.apply()
 
     def _open_detail(self, *_args: object) -> None:
-        if not self.toggle.isChecked():
-            self.toggle.setChecked(True)
         self.toggle.setText("展开详情")
         self.details.open_console_details()
 
