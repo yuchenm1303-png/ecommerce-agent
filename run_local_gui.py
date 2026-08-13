@@ -4,6 +4,8 @@ import os
 import sys
 from pathlib import Path
 
+from app.runtime_paths import runtime_root
+
 os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
 
 
@@ -31,6 +33,7 @@ def main() -> int:
     from gui.console_summary_mode import install_console_summary_mode
     from gui.console_window import MainWindow
     from gui.workflow_console_window import WorkflowMainWindow
+    from gui.frozen_process_router import install_frozen_process_router
     from gui.log_presenter import install_buffered_logs
     from gui.mode_toggle import install_workspace_mode_switch
     from gui.native_visual_style import install_native_visual_style
@@ -64,7 +67,7 @@ def main() -> int:
     # child surface. Modal presentation itself now stays entirely in QWidget.
     QQuickWindow.setDefaultAlphaBuffer(True)
 
-    window = MainWindow(Path(__file__).resolve().parent)
+    window = MainWindow(runtime_root())
     visual = install_native_visual_style(window)
 
     # Finish the proven Single workspace presentation before wrapping it in the
@@ -122,6 +125,10 @@ def main() -> int:
     # actions and per-job controls remain visible without horizontal scrolling.
     install_batch_card_responsive(window.batch_workspace)
     install_workspace_mode_switch(window)
+    # Source runs keep their existing Python subprocess behavior. Frozen builds
+    # switch those exact canonical helpers to the packaged console worker before
+    # browser/session wrappers capture any execution entry points.
+    install_frozen_process_router(window)
     # Formal GUI owns one dedicated Makro Edge/Profile. 9222 remains an internal
     # transport detail; Single and Batch share one login session and Batch keeps
     # per-job isolation through owned tabs/target ids.
