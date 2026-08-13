@@ -113,7 +113,11 @@ def test_installer_is_stable_per_user_upgrade_and_uses_branded_icon() -> None:
     assert "PrivilegesRequired=lowest" in INSTALLER
     assert "UsePreviousAppDir=yes" in INSTALLER
     assert "SetupIconFile={#IconFile}" in INSTALLER
-    assert "UninstallDisplayIcon={app}\\{#MyAppExeName}" in INSTALLER
+    assert '#define InstalledIconName "EcommerceAgent-" + AppVersion + ".ico"' in INSTALLER
+    assert 'Source: "{#IconFile}"; DestDir: "{app}\\icons"; DestName: "{#InstalledIconName}"' in INSTALLER
+    assert 'IconFilename: "{app}\\icons\\{#InstalledIconName}"' in INSTALLER
+    assert "UninstallDisplayIcon={app}\\icons\\{#InstalledIconName}" in INSTALLER
+    assert 'Type: files; Name: "{app}\\icons\\EcommerceAgent-*.ico"' in INSTALLER
     assert "EcommerceAgentWorker.exe" not in INSTALLER  # copied by wildcard, not user-facing
     assert "browser_profiles" not in INSTALLER
     assert "logs\\" not in INSTALLER
