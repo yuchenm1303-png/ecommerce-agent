@@ -14,8 +14,6 @@
   #define IconFile "app_icon.ico"
 #endif
 
-#define InstalledIconName "EcommerceAgent-" + AppVersion + ".ico"
-
 [Setup]
 AppId={{84E09CC8-51F4-4409-BC73-B5EBC9A4D84A}
 AppName={#MyAppName}
@@ -40,7 +38,7 @@ SolidCompression=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 WizardStyle=modern
-UninstallDisplayIcon={app}\icons\{#InstalledIconName}
+UninstallDisplayIcon={app}\{#MyAppExeName}
 CloseApplications=yes
 RestartApplications=yes
 SetupLogging=yes
@@ -54,11 +52,10 @@ Type: files; Name: "{app}\icons\EcommerceAgent-*.ico"
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#IconFile}"; DestDir: "{app}\icons"; DestName: "{#InstalledIconName}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icons\{#InstalledIconName}"; IconIndex: 0
-Name: "{autodesktop}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icons\{#InstalledIconName}"; IconIndex: 0; Tasks: desktopicon
+Name: "{autoprograms}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; IconIndex: 0
+Name: "{autodesktop}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; IconIndex: 0; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 EcommerceAgent Listing Studio"; Flags: nowait postinstall skipifsilent
