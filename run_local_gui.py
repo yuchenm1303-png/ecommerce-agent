@@ -25,6 +25,7 @@ def main() -> int:
         return 2
 
     from gui.activity_presence import install_activity_presence
+    from gui.app_updater import install_application_updater
     from gui.background_render_optimizations import (
         install_background_pointer_hotpath,
         install_preblur_cache,
@@ -229,6 +230,10 @@ def main() -> int:
     assistant.raise_()
     entrance.raise_overlay()
     entrance_stability.start()
+
+    # Installed builds check only the manually published Stable GitHub Release.
+    # Ordinary Windows Package actions/artifacts never enter the update channel.
+    install_application_updater(window)
     return app.exec()
 
 
