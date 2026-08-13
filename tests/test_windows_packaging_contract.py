@@ -126,6 +126,11 @@ def test_installer_is_stable_per_user_upgrade_and_uses_branded_icon() -> None:
     assert 'IconFilename: "{app}\\icons\\{#InstalledIconName}"' in INSTALLER
     assert "UninstallDisplayIcon={app}\\icons\\{#InstalledIconName}" in INSTALLER
     assert 'Type: files; Name: "{app}\\icons\\EcommerceAgent-*.ico"' in INSTALLER
+    assert 'Check: ShouldCreateDesktopShortcut' in INSTALLER
+    assert "function ShouldCreateDesktopShortcut: Boolean;" in INSTALLER
+    assert "WizardIsTaskSelected('desktopicon')" in INSTALLER
+    assert "FileExists(ExpandConstant('{autodesktop}\\EcommerceAgent Listing Studio.lnk'))" in INSTALLER
+    assert 'IconIndex: 0; Tasks: desktopicon' not in INSTALLER
     assert "EcommerceAgentWorker.exe" not in INSTALLER  # copied by wildcard, not user-facing
     assert "browser_profiles" not in INSTALLER
     assert "logs\\" not in INSTALLER
