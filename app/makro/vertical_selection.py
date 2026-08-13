@@ -16,9 +16,11 @@ Makro may delay writing that canonical URL value until the user advances from
 the Vertical confirmation card into Step 2, and the URL update itself may lag
 slightly behind the Step-2 DOM render. The confirmation state is therefore
 verified from the live UI first; canonical URL verification happens only after
-the Step-2 transition and uses a bounded wait. Brand verification remains strict
-in ``listing_creation``. This module does not weaken Step 2 or any Step 3 safety
-gate.
+the Step-2 transition and uses a bounded wait. If the unique owned workflow page
+is already Step 2/3, Step 1 is treated as completed and its committed canonical
+vertical is read back rather than attempting to operate a vanished Step-1 input.
+Brand verification remains strict in ``listing_creation``. This module does not
+weaken Step 2 or any Step 3 safety gate.
 """
 
 from __future__ import annotations
@@ -453,6 +455,29 @@ def is_vertical_interaction_ready(page: Page) -> bool:
     return _vertical_search_semantics_visible(page)
 
 
+def _committed_vertical_from_later_stage(page: Page) -> str:
+    """Read Step 1's committed result from a page that already reached Step 2/3."""
+
+    try:
+        later = is_product_info_step(page) or is_brand_step(page)
+    except Exception:
+        later = False
+    if not later:
+        return ""
+    try:
+        canonical, _ = _current_target_values(page)
+    except Exception as exc:
+        raise RuntimeError(
+            "Makro page is already Step 2/3 but its committed canonical vertical cannot be read"
+        ) from exc
+    value = str(canonical or "").strip()
+    if not value:
+        raise RuntimeError(
+            "Makro page is already Step 2/3 but its listing URL has no committed canonical vertical"
+        )
+    return value
+
+
 def select_vertical(
     page: Page,
     provider: JSONTaskProvider,
@@ -460,7 +485,11 @@ def select_vertical(
     *,
     wait_ms: int = 800,
 ) -> str:
-    """Select one verified Makro Vertical and return its canonical URL id."""
+    """Select or read one verified Makro Vertical and return its canonical URL id."""
+
+    committed = _committed_vertical_from_later_stage(page)
+    if committed:
+        return committed
 
     if not is_vertical_interaction_ready(page):
         raise RuntimeError("Makro Step 1 / Select Vertical is not safely operable")
