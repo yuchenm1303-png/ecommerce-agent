@@ -9,9 +9,8 @@ on:
         default: "feat/local-test-gui"
         type: string
       package_version:
-        description: "Package version to keep unchanged during validation"
+        description: "Current Stable package version to validate (for example 0.1.4)"
         required: true
-        default: "0.1.3"
         type: string
 
 permissions:
