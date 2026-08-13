@@ -443,6 +443,8 @@ def run_photos(
             "saved": False,
         }
 
+    initial_section = adapter.find_section(PRODUCT_PHOTOS)
+    initial_was_collapsed = bool(initial_section and initial_section.get("has_edit"))
     try:
         _initial_path, initial_state = _fresh_photo_state(adapter)
     except Exception as exc:
@@ -470,10 +472,10 @@ def run_photos(
 
     resume_prefix = 0
     pending = list(resolved)
-    if capacity is not None and requested == capacity and 0 < initial_count < capacity:
-        # Direct re-runs commonly revisit the same draft after one or more photo
-        # slots were already persisted. The authorized list is ordered, so skip
-        # that already-persisted prefix and continue with the remaining slots.
+    if capacity is not None and requested == capacity and 0 < initial_count <= capacity:
+        # Direct re-runs revisit the same authorized five-slot gallery. Treat
+        # every already-persisted prefix — including a full 5/5 gallery — as
+        # completed work instead of trying to upload into zero remaining slots.
         resume_prefix = initial_count
         pending = resolved[initial_count:]
     elif requested > available:
@@ -517,6 +519,12 @@ def run_photos(
         report["saved"] = True
         report["status"] = "persisted_verified"
         report["detail"] = f"Product Photos 已是 {initial_count}/{capacity or requested}，无需再次上传。"
+        if initial_was_collapsed:
+            try:
+                _cancel_open_photo_transaction(adapter)
+                report["restored_collapsed_state"] = True
+            except Exception as cleanup_exc:
+                report["post_resume_cleanup_error"] = str(cleanup_exc)
         return report
 
     for offset, image in enumerate(pending, start=1):
