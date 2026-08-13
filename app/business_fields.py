@@ -6,6 +6,12 @@ from urllib.parse import urlsplit
 from .source_bundle import ProductSourceBundle, normalize_key
 
 
+WARRANTY_SUMMARY_POLICY = "Manufacturing Quality Support"
+WARRANTY_SERVICE_TYPE_POLICY = (
+    "12-month limited quality support covers only inherent factory manufacturing defects. "
+    "Any damage caused by daily wear, accidental impact, improper assembly or wrong usage will not be supported."
+)
+
 BUSINESS_ATTRIBUTE_ALIASES: dict[str, tuple[str, ...]] = {
     "sku_id": ("sku", "sku id", "sku_id", "商品sku", "商品编码"),
     "listing_status": ("listing status", "listing_status", "status", "上架状态"),
@@ -45,6 +51,14 @@ BUSINESS_ATTRIBUTE_ALIASES: dict[str, tuple[str, ...]] = {
         "selling region",
         "shipping region",
         "forbid_shipping",
+    ),
+    "warranty_summary": (
+        "warranty summary",
+        "warranty_summary",
+    ),
+    "warranty_service_type": (
+        "warranty service type",
+        "warranty_service_type",
     ),
 }
 
@@ -114,7 +128,7 @@ def generated_business_bundle(
     *,
     sku: str | None = None,
 ) -> ProductSourceBundle:
-    """Return only mechanical business defaults that do not require product reasoning."""
+    """Return only mechanical seller/business policy that needs no product reasoning."""
 
     bundle = ProductSourceBundle(product_url=product_url or None)
     if not product_url.strip():
@@ -129,5 +143,25 @@ def generated_business_bundle(
         confidence=1.0,
         evidence_text=f"Automatically generated fresh seller SKU={resolved_sku} for this listing attempt.",
         note="mechanical seller identifier; not a product attribute",
+    )
+    bundle.add_evidence(
+        key="Warranty Summary",
+        value=WARRANTY_SUMMARY_POLICY,
+        source_type="rule",
+        source_reference="policy:listing-content:warranty-summary",
+        priority=10,
+        confidence=1.0,
+        evidence_text=f"Seller warranty policy Warranty Summary={WARRANTY_SUMMARY_POLICY}.",
+        note="seller policy supplied for all products; not inferred from product evidence",
+    )
+    bundle.add_evidence(
+        key="Warranty Service Type",
+        value=WARRANTY_SERVICE_TYPE_POLICY,
+        source_type="rule",
+        source_reference="policy:listing-content:warranty-service-type",
+        priority=10,
+        confidence=1.0,
+        evidence_text=f"Seller warranty policy Warranty Service Type={WARRANTY_SERVICE_TYPE_POLICY}",
+        note="seller policy supplied for all products; not inferred from product evidence",
     )
     return bundle
