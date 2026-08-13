@@ -39,6 +39,7 @@ def main() -> int:
     from gui.console_window import MainWindow
     from gui.workflow_console_window import WorkflowMainWindow
     from gui.frozen_process_router import install_frozen_process_router
+    from gui.listing_offer_hardening import install_listing_offer_hardening
     from gui.listing_offer_support import install_listing_offer_support
     from gui.log_presenter import install_buffered_logs
     from gui.mode_toggle import install_workspace_mode_switch
@@ -150,6 +151,10 @@ def main() -> int:
     # fields (title/package/identifier/compliance) can opt out of generic N/A/1
     # fallback without replacing the ordinary required-field mechanism.
     install_listing_offer_support(window)
+    # Freeze offer ownership after the main support layer exists: duplicate
+    # supplier URLs may represent different sold bundles in Batch, while Single
+    # execution is invalidated if the offer is edited after preparation.
+    install_listing_offer_hardening(window)
     install_activity_presence(window)
     install_detailed_preparation_progress(window)
     visual.refresh_glass_frames()
