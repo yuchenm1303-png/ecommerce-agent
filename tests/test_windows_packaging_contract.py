@@ -113,6 +113,13 @@ def test_installer_is_stable_per_user_upgrade_and_uses_branded_icon() -> None:
     assert "PrivilegesRequired=lowest" in INSTALLER
     assert "UsePreviousAppDir=yes" in INSTALLER
     assert "SetupIconFile={#IconFile}" in INSTALLER
+    assert "AppVerName={#MyAppName} {#AppVersion}" in INSTALLER
+    assert "VersionInfoCompany=ecommerce-agent" in INSTALLER
+    assert "VersionInfoDescription={#MyAppName} Setup" in INSTALLER
+    assert "VersionInfoProductName={#MyAppName}" in INSTALLER
+    assert "VersionInfoVersion={#AppVersion}" in INSTALLER
+    assert "VersionInfoProductVersion={#AppVersion}" in INSTALLER
+    assert "VersionInfoProductTextVersion={#AppVersion}" in INSTALLER
     assert '#define InstalledIconName "EcommerceAgent-" + AppVersion + ".ico"' in INSTALLER
     assert 'Source: "{#IconFile}"; DestDir: "{app}\\icons"; DestName: "{#InstalledIconName}"' in INSTALLER
     assert 'IconFilename: "{app}\\icons\\{#InstalledIconName}"' in INSTALLER
