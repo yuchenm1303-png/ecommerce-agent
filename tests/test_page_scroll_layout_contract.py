@@ -76,9 +76,21 @@ def test_single_unifies_field_and_side_outer_glass_card_structure() -> None:
     assert "_unify_workspace_card_structure(window, workspace_splitter)" in PAGE
 
 
+def test_single_status_cards_keep_three_text_levels_readable() -> None:
+    assert "_STATUS_CARD_MIN_HEIGHT = 64" in PAGE
+    assert "_STATUS_CARD_MAX_HEIGHT = 68" in PAGE
+    assert "def _apply_status_card_typography" in PAGE
+    assert 'replace("font-size: 26px", "font-size: 22px")' in PAGE
+    assert '"font-size: 10px; font-weight: 720; color: rgba(255,255,255,218);"' in PAGE
+    assert '"font-size: 9px; color: rgba(255,255,255,150);"' in PAGE
+    assert "layout.setContentsMargins(13, 4, 13, 4)" in PAGE
+    assert "layout.setSpacing(1)" in PAGE
+    assert 'result_updated.connect(lambda *_: _compact_status_cards(window))' in PAGE
+
+
 def test_single_uses_console_first_one_screen_height_budget() -> None:
-    assert "_STATUS_CARD_MIN_HEIGHT = 54" in PAGE
-    assert "_STATUS_CARD_MAX_HEIGHT = 58" in PAGE
+    assert "_STATUS_CARD_MIN_HEIGHT = 64" in PAGE
+    assert "_STATUS_CARD_MAX_HEIGHT = 68" in PAGE
     assert "_WORKSPACE_MIN_HEIGHT = 220" in PAGE
     assert "_FIELD_TABLE_MIN_HEIGHT = 136" in PAGE
     assert "_SIDE_MIN_WIDTH = 360" in PAGE
