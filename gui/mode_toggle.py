@@ -4,7 +4,7 @@ from PySide6.QtCore import Property, QEasingCurve, QPointF, QRectF, Qt, QPropert
 from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import QAbstractButton, QHBoxLayout, QMainWindow, QVBoxLayout, QWidget
 
-from .settings_page import install_ai_settings
+from .settings_modal_surface import install_ai_settings_modal
 
 
 _CORE_WIDTH = 40.0
@@ -18,8 +18,6 @@ _WHITE = QColor(255, 255, 255, 255)
 
 
 def _original_switch_easing() -> QEasingCurve:
-    """Element Plus' --el-transition-function-ease-in-out-bezier."""
-
     curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
     curve.addCubicBezierSegment(
         QPointF(0.645, 0.045),
@@ -30,13 +28,6 @@ def _original_switch_easing() -> QEasingCurve:
 
 
 class WorkspaceModeSwitch(QAbstractButton):
-    """Single/Batch boolean switch matching the reference site's el-switch.
-
-    The visible core is the same 40x20 track used by Element Plus, centered in
-    its native 32px interaction height. The 16px white action moves from left=1
-    to left=23 over 300ms and the inline prompt cross-fades between × and ✓.
-    """
-
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("workspaceModeSwitch")
@@ -45,7 +36,6 @@ class WorkspaceModeSwitch(QAbstractButton):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setFixedSize(int(_CORE_WIDTH), 32)
         self.setAccessibleName("Single / Batch mode")
-
         self._action_position = 0.0
         self._animation = QPropertyAnimation(self, b"actionPosition", self)
         self._animation.setDuration(_TRANSITION_MS)
@@ -84,28 +74,20 @@ class WorkspaceModeSwitch(QAbstractButton):
         self._animation.start()
 
     def _sync_tooltip(self, checked: bool) -> None:
-        if checked:
-            self.setToolTip("Batch 模式 · 点击切换 Single")
-        else:
-            self.setToolTip("Single 模式 · 点击切换 Batch")
+        self.setToolTip("Batch 模式 · 点击切换 Single" if checked else "Single 模式 · 点击切换 Batch")
 
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
         core = QRectF(0.0, (self.height() - _CORE_HEIGHT) / 2.0, _CORE_WIDTH, _CORE_HEIGHT)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(_TRACK)
         painter.drawRoundedRect(core, 10.0, 10.0)
-
         icon_font = QFont(self.font())
         icon_font.setPixelSize(11)
         icon_font.setWeight(QFont.Weight.DemiBold)
         painter.setFont(icon_font)
         painter.setPen(_WHITE)
-
-        # The prompt follows the same animated position as the thumb. This keeps
-        # the tiny control itself continuous instead of snapping ✓/× at click time.
         on_rect = QRectF(core.left() + 2.0, core.top(), 18.0, core.height())
         off_rect = QRectF(core.left() + 20.0, core.top(), 18.0, core.height())
         if self._action_position > 0.001:
@@ -115,16 +97,8 @@ class WorkspaceModeSwitch(QAbstractButton):
             painter.setOpacity(1.0 - self._action_position)
             painter.drawText(off_rect, Qt.AlignmentFlag.AlignCenter, "×")
         painter.setOpacity(1.0)
-
-        action_left = _ACTION_LEFT_OFF + (
-            _ACTION_LEFT_ON - _ACTION_LEFT_OFF
-        ) * self._action_position
-        action = QRectF(
-            core.left() + action_left,
-            core.top() + 2.0,
-            _ACTION_SIZE,
-            _ACTION_SIZE,
-        )
+        action_left = _ACTION_LEFT_OFF + (_ACTION_LEFT_ON - _ACTION_LEFT_OFF) * self._action_position
+        action = QRectF(core.left() + action_left, core.top() + 2.0, _ACTION_SIZE, _ACTION_SIZE)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(_WHITE)
         painter.drawEllipse(action)
@@ -132,11 +106,9 @@ class WorkspaceModeSwitch(QAbstractButton):
 
 
 def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
-    """Install the common header mode switch and settings entry."""
-
     existing = getattr(window, "_workspace_mode_switch", None)
     if isinstance(existing, WorkspaceModeSwitch):
-        install_ai_settings(window)
+        install_ai_settings_modal(window)
         return existing
 
     mode_stack = getattr(window, "mode_stack", None)
@@ -183,5 +155,5 @@ def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
     mode_stack.currentChanged.connect(sync_from_stack)
     header.addWidget(toggle, 0, Qt.AlignmentFlag.AlignBottom)
     window._workspace_mode_switch = toggle  # type: ignore[attr-defined]
-    install_ai_settings(window)
+    install_ai_settings_modal(window)
     return toggle
