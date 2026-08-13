@@ -38,14 +38,27 @@ if (-not (Test-Path $IconFile)) {
 }
 
 Write-Host "[2/5] Building PyInstaller onedir package $Version"
-& python -m PyInstaller `
-    --noconfirm `
-    --clean `
-    --distpath $DistRoot `
-    --workpath $WorkDir `
-    (Join-Path $Root "packaging\EcommerceAgent.spec")
-if ($LASTEXITCODE -ne 0) {
-    throw "PyInstaller failed with exit code $LASTEXITCODE"
+$PreviousBuildVersion = $env:ECOMMERCE_AGENT_BUILD_VERSION
+$env:ECOMMERCE_AGENT_BUILD_VERSION = $Version
+try {
+    & python -m PyInstaller `
+        --noconfirm `
+        --clean `
+        --distpath $DistRoot `
+        --workpath $WorkDir `
+        (Join-Path $Root "packaging\EcommerceAgent.spec")
+    $PyInstallerExitCode = $LASTEXITCODE
+}
+finally {
+    if ($null -eq $PreviousBuildVersion) {
+        Remove-Item Env:ECOMMERCE_AGENT_BUILD_VERSION -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:ECOMMERCE_AGENT_BUILD_VERSION = $PreviousBuildVersion
+    }
+}
+if ($PyInstallerExitCode -ne 0) {
+    throw "PyInstaller failed with exit code $PyInstallerExitCode"
 }
 
 $GuiExe = Join-Path $AppDir "EcommerceAgent.exe"
