@@ -313,15 +313,18 @@ def cancel_section(page: Page, section_title: str, *, wait_ms: int = 450) -> Non
         raise RuntimeError(f"section {section_title!r} Cancel 后未恢复折叠态。")
 
 
-def save_section(page: Page, section_title: str, *, timeout_s: float = 15.0) -> None:
+def save_section(page: Page, section_title: str, *, timeout_s: float = 45.0) -> None:
     """Click one Step 3 card's Save and prove Makro accepted persistence.
 
-    The browser executor deliberately does not veto Save because stale inline
-    validation text is still rendered before the click. Makro owns the actual
-    section validation transaction; success is determined only by what happens
-    after Save: the card must collapse back to EDIT and expose no error badge.
+    Makro persists Step 3 cards asynchronously. A card can remain expanded for
+    noticeably longer than the field-write transaction, and React can briefly
+    render a stale aggregate ``N Error`` badge while the accepted save is still
+    settling. Treat neither transient state as an immediate rejection.
 
-    This function never clicks Send to QC.
+    Success requires two consecutive observations of the collapsed ``EDIT``
+    state with no validation badge. Persistent badges or an editor that never
+    collapses are reported only after the bounded hard timeout. This function
+    never clicks Send to QC.
     """
 
     section = find_section(page, section_title)
@@ -341,41 +344,61 @@ def save_section(page: Page, section_title: str, *, timeout_s: float = 15.0) -> 
     save.first.click()
 
     deadline = time.monotonic() + timeout_s
+    clean_collapsed_samples = 0
+    last_badges: list[str] = []
     while time.monotonic() < deadline:
         page.wait_for_timeout(250)
         live = find_section(page, section_title)
-        if live is not None and live.get("has_edit"):
-            page.wait_for_timeout(300)
-            badges = collapsed_error_badges(page, section_title)
-            if badges:
-                # Makro sometimes collapses the card while retaining only an
-                # aggregate "N Error" badge. Reopen that exact card solely to
-                # expose Makro's real field-level rejection so the caller can
-                # report the root cause instead of guessing business rules.
-                field_errors: list[str] = []
-                try:
-                    open_section_for_edit(page, live)
-                    page.wait_for_timeout(400)
-                    expanded = find_section(page, section_title)
-                    expanded_path = str((expanded or {}).get("path") or "")
-                    if expanded_path:
-                        field_errors = visible_section_errors(page, expanded_path)
-                except Exception:
-                    pass
-                detail = (
-                    "；字段错误：" + " | ".join(field_errors)
-                    if field_errors
-                    else ""
-                )
-                raise RuntimeError(
-                    f"{section_title} 保存后仍有 Makro validation error："
-                    + " | ".join(badges)
-                    + detail
-                )
+        if live is None or not live.get("has_edit"):
+            clean_collapsed_samples = 0
+            continue
+
+        last_badges = collapsed_error_badges(page, section_title)
+        if last_badges:
+            # Do not reopen on the first transient badge. Makro/React can expose
+            # the previous validation summary for a short period after an
+            # accepted asynchronous save. Only a badge that survives the whole
+            # bounded settle window is treated as a real rejection.
+            clean_collapsed_samples = 0
+            continue
+
+        clean_collapsed_samples += 1
+        if clean_collapsed_samples >= 2:
             return
 
     live = find_section(page, section_title)
+    if live is not None and live.get("has_edit"):
+        badges = collapsed_error_badges(page, section_title)
+        if not badges:
+            # The hard deadline may land between the first and second clean
+            # sample. A final clean collapsed state is still direct evidence
+            # that Makro accepted the transaction.
+            return
+
+        field_errors: list[str] = []
+        try:
+            open_section_for_edit(page, live)
+            page.wait_for_timeout(400)
+            expanded = find_section(page, section_title)
+            expanded_path = str((expanded or {}).get("path") or "")
+            if expanded_path:
+                field_errors = visible_section_errors(page, expanded_path)
+        except Exception:
+            pass
+        detail = (
+            "；字段错误：" + " | ".join(field_errors)
+            if field_errors
+            else ""
+        )
+        raise RuntimeError(
+            f"{section_title} 保存后仍有 Makro validation error："
+            + " | ".join(badges or last_badges)
+            + detail
+        )
+
     live_path = str((live or {}).get("path") or path)
     errors = visible_section_errors(page, live_path)
     detail = " | ".join(errors) if errors else "未读取到可见 validation error"
-    raise RuntimeError(f"{section_title} 点击 Save 后未恢复 EDIT：{detail}")
+    raise RuntimeError(
+        f"{section_title} 点击 Save 后 {timeout_s:.0f}s 内未恢复 EDIT：{detail}"
+    )
