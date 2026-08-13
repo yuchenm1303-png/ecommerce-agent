@@ -40,6 +40,7 @@ def main() -> int:
     from gui.page_scroll_layout import install_page_scroll_layout
     from gui.preparation_progress import install_detailed_preparation_progress
     from gui.product_copy import install_product_copy
+    from gui.premium_copy import install_premium_copy
     from gui.required_input_support import install_required_input_support
     from gui.restore_snapshot import install_restore_snapshot
     from gui.runtime_assistant import install_runtime_assistant
@@ -56,7 +57,7 @@ def main() -> int:
     MainWindow = WorkflowMainWindow
 
     app = QApplication(sys.argv)
-    app.setApplicationName("ecommerce-agent 商品上架助手")
+    app.setApplicationName("ecommerce-agent Listing Studio")
     app.setOrganizationName("ecommerce-agent")
 
     # Keep the native Fuji renderer compatible with the translucent QWidget
@@ -161,17 +162,18 @@ def main() -> int:
     apply_workspace_transition_tuning()
     install_workspace_transition(window, visual)
 
-    # The product copy layer is presentation-only. Install it before the startup
-    # snapshot so the first visible frame already uses release-quality wording.
+    # Product copy owns user-facing wording. The premium layer keeps concise
+    # Chinese actions while restoring English hierarchy/status labels.
     product_copy = install_product_copy(window)
     legacy_headings = {
-        "BATCH LISTING · MULTI PRODUCT QUEUE": "批量商品",
-        "JOB CONTROL · OWNED TAB ISOLATION · LIVE TELEMETRY": "商品任务",
+        "BATCH LISTING · MULTI PRODUCT QUEUE": "BATCH QUEUE",
+        "JOB CONTROL · OWNED TAB ISOLATION · LIVE TELEMETRY": "LISTING TASK",
     }
     for label in window.findChildren(QLabel):
         replacement = legacy_headings.get(label.text())
         if replacement is not None:
             label.setText(replacement)
+    premium_copy = install_premium_copy(window)
 
     # Reference-site startup choreography is a one-shot presentation surface. It
     # freezes pointer/card effects while visible and keeps the original visual
@@ -185,6 +187,7 @@ def main() -> int:
     effects.raise_()
     assistant = install_runtime_assistant(window)
     product_copy.attach_runtime_assistant(assistant)
+    premium_copy.attach_runtime_assistant(assistant)
     assistant.raise_()
     entrance.raise_overlay()
     entrance_stability.start()
