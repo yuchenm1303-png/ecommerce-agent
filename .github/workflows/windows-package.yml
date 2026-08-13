@@ -11,6 +11,8 @@ on:
       - "app/runtime_paths.py"
       - "app/app_branding.py"
       - "app/app_icon_data.py"
+      - "gui/__init__.py"
+      - "gui/app_access.py"
       - "gui/app_updater.py"
       - "gui/frozen_process_router.py"
       - "run_packaged_worker.py"
