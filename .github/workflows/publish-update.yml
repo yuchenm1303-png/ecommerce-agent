@@ -80,9 +80,25 @@ jobs:
           if ($env:UPDATE_TYPE -notin @('optional', 'required')) {
             throw "Invalid update type: $env:UPDATE_TYPE"
           }
+
           $tag = "v$env:UPDATE_VERSION"
           gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) { throw "Release already exists: $tag" }
+          $releaseExists = ($LASTEXITCODE -eq 0)
+          $global:LASTEXITCODE = 0
+          if ($releaseExists) {
+            throw "Release already exists: $tag"
+          }
+          Write-Host "Release tag is available: $tag"
+
+      - name: Stamp package version
+        shell: pwsh
+        run: |
+          Set-Content -Path "packaging\VERSION" -Value $env:UPDATE_VERSION -Encoding ascii -NoNewline
+          $stamped = (Get-Content "packaging\VERSION" -Raw).Trim()
+          if ($stamped -ne $env:UPDATE_VERSION) {
+            throw "Failed to stamp package version: expected=$env:UPDATE_VERSION actual=$stamped"
+          }
+          Write-Host "Stamped packaging/VERSION = $stamped"
 
       - name: Set up Python
         uses: actions/setup-python@v5
