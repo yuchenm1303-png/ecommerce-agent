@@ -1,0 +1,46 @@
+#define MyAppName "EcommerceAgent Listing Studio"
+#define MyAppExeName "EcommerceAgent.exe"
+
+#ifndef AppVersion
+  #define AppVersion "0.1.0"
+#endif
+#ifndef SourceDir
+  #define SourceDir "..\dist\EcommerceAgent"
+#endif
+#ifndef OutputDir
+  #define OutputDir "..\artifacts"
+#endif
+
+[Setup]
+AppId={{84E09CC8-51F4-4409-BC73-B5EBC9A4D84A}
+AppName={#MyAppName}
+AppVersion={#AppVersion}
+AppPublisher=ecommerce-agent
+DefaultDirName={localappdata}\Programs\EcommerceAgent
+DefaultGroupName=EcommerceAgent
+DisableProgramGroupPage=yes
+OutputDir={#OutputDir}
+OutputBaseFilename=EcommerceAgent-Setup-{#AppVersion}
+Compression=lzma2
+SolidCompression=yes
+PrivilegesRequired=lowest
+ArchitecturesAllowed=x64compatible
+WizardStyle=modern
+UninstallDisplayIcon={app}\{#MyAppExeName}
+CloseApplications=yes
+RestartApplications=no
+SetupLogging=yes
+UsePreviousAppDir=yes
+
+[Tasks]
+Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式:"; Flags: unchecked
+
+[Files]
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Icons]
+Name: "{autoprograms}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExeName}"
+Name: "{autodesktop}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+
+[Run]
+Filename: "{app}\{#MyAppExeName}"; Description: "启动 EcommerceAgent Listing Studio"; Flags: nowait postinstall skipifsilent
