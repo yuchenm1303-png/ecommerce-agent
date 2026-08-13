@@ -32,7 +32,7 @@ def test_batch_copy_is_customer_facing() -> None:
         '"填写此商品"',
         '"任务目录"',
         '"查看详情"',
-        '"个链接 · "',
+        '个链接 · {len(enabled)} 个启用',
     ):
         assert token in COPY
 
