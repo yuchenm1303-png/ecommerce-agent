@@ -41,28 +41,44 @@ def test_single_compacts_existing_input_rows_without_rebuilding_widgets() -> Non
     assert 'for name in ("makro_port", "source_port", "vertical_input", "current_page_check")' in PAGE
     assert "settings_row.removeWidget(widget)" in PAGE
     assert "stage_row.addWidget(widget)" in PAGE
-    assert "_INPUT_CARD_MAX_HEIGHT = 176" in PAGE
-    assert "layout.setContentsMargins(16, 8, 16, 9)" in PAGE
-    assert "layout.setSpacing(4)" in PAGE
+    assert "_INPUT_CARD_MAX_HEIGHT = 160" in PAGE
+    assert "layout.setContentsMargins(14, 7, 14, 8)" in PAGE
+    assert "layout.setSpacing(3)" in PAGE
 
     assert "ReadOnlyRunner(" not in PAGE
     assert "RealExecutionRunner(" not in PAGE
     assert "AcceptanceConsole(" not in PAGE
 
 
-def test_single_uses_compact_fixed_height_budgets() -> None:
-    assert "_STATUS_CARD_MIN_HEIGHT = 68" in PAGE
-    assert "_STATUS_CARD_MAX_HEIGHT = 72" in PAGE
-    assert "_WORKSPACE_MIN_HEIGHT = 292" in PAGE
-    assert "_FIELD_TABLE_MIN_HEIGHT = 205" in PAGE
-    assert "_SIDE_TABS_HEIGHT = 300" in PAGE
-    assert "_CONSOLE_MIN_HEIGHT = 120" in PAGE
-    assert "_CONSOLE_MAX_HEIGHT = 136" in PAGE
-    assert "_CONSOLE_TARGET_HEIGHT = 128" in PAGE
+def test_single_uses_balanced_one_screen_height_and_width_budgets() -> None:
+    assert "_STATUS_CARD_MIN_HEIGHT = 60" in PAGE
+    assert "_STATUS_CARD_MAX_HEIGHT = 64" in PAGE
+    assert "_WORKSPACE_MIN_HEIGHT = 260" in PAGE
+    assert "_FIELD_TABLE_MIN_HEIGHT = 170" in PAGE
+    assert "_SIDE_MIN_WIDTH = 360" in PAGE
+    assert "_SIDE_MAX_WIDTH = 480" in PAGE
+    assert "_SIDE_TARGET_RATIO = 0.29" in PAGE
+    assert "_CONSOLE_MIN_HEIGHT = 218" in PAGE
+    assert "_CONSOLE_MAX_HEIGHT = 242" in PAGE
+    assert "_CONSOLE_TARGET_HEIGHT = 230" in PAGE
 
     assert "workspace.setMaximumHeight(16777215)" in PAGE
+    assert "side_tabs.setMaximumHeight(16777215)" in PAGE
+    assert "side_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)" in PAGE
+    assert "_strip_trailing_spacers(side_layout)" in PAGE
     assert "body.setStretchFactor(0, 1)" in PAGE
     assert "body.setStretchFactor(1, 0)" in PAGE
+
+
+def test_fixed_single_rebalances_workspace_after_mature_responsive_pass() -> None:
+    assert "def _apply_workspace_width" in SUMMARY
+    assert "_SIDE_MIN = 360" in SUMMARY
+    assert "_SIDE_MAX = 480" in SUMMARY
+    assert "_SIDE_RATIO = 0.29" in SUMMARY
+    assert 'self.root.findChild(QSplitter, "workspaceSplitter")' in SUMMARY
+    assert "self._apply_workspace_width()" in SUMMARY
+    assert "self._mature_apply()" in SUMMARY
+    assert "self.apply()" in SUMMARY
 
 
 def test_fixed_single_has_no_per_scroll_quick_geometry_path() -> None:
@@ -74,15 +90,18 @@ def test_fixed_single_has_no_per_scroll_quick_geometry_path() -> None:
     assert "QTimer.singleShot(0, schedule)" in PAGE
 
 
-def test_console_keeps_phase_summary_and_opens_full_detail_as_modal() -> None:
+def test_console_keeps_phase_and_embedded_tabs_visible_with_full_detail_modal() -> None:
     assert "QScrollArea" not in SUMMARY
     assert 'self.body = getattr(window, "_ui_polish_body_splitter", None)' in SUMMARY
     assert "self.toggle.setCheckable(False)" in SUMMARY
     assert "unit.show()" in SUMMARY
-    assert "tabs.hide()" in SUMMARY
-    assert "_SUMMARY_MIN = 120" in SUMMARY
-    assert "_SUMMARY_MAX = 136" in SUMMARY
-    assert "_SUMMARY_TARGET = 128" in SUMMARY
+    assert "tabs.show()" in SUMMARY
+    assert "tabs.hide()" not in SUMMARY
+    assert "_SUMMARY_MIN = 218" in SUMMARY
+    assert "_SUMMARY_MAX = 242" in SUMMARY
+    assert "_SUMMARY_TARGET = 230" in SUMMARY
+    assert "_CONSOLE_TABS_MIN = 88" in SUMMARY
+    assert "_CONSOLE_TABS_MAX = 112" in SUMMARY
     assert "self.details.open_console_details()" in SUMMARY
 
 
