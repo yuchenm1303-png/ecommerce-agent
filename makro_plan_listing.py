@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,8 @@ from app.makro.direct_visual_hold import is_listing_attribute_field
 from app.makro.domain import MakroDomainAdapter
 from app.makro.listing_preflight import CORE_FORM_SECTIONS
 from app.semantic_grounding import build_grounding_catalog
+
+_BATCH_TARGET_ENV = "MAKRO_BATCH_TARGET_ID"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT)
     parser.add_argument(
         "--makro-target-id",
-        default="",
+        default=os.environ.get(_BATCH_TARGET_ENV, ""),
         help=(
             "Batch-only owned-tab token. When supplied, plan only that exact Chromium tab; "
             "single-mode unique-tab safety remains unchanged when omitted."
