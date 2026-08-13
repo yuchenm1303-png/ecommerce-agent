@@ -45,3 +45,4 @@ test-results/
 /build/
 /dist/
 /artifacts/
+/packaging/app_icon.ico
