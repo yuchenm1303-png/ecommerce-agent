@@ -25,6 +25,7 @@ def main() -> int:
         return 2
 
     from gui.activity_presence import install_activity_presence
+    from gui.app_access import ensure_application_access, install_application_access
     from gui.app_updater import install_application_updater
     from gui.background_render_optimizations import (
         install_background_pointer_hotpath,
@@ -74,6 +75,12 @@ def main() -> int:
     app.setOrganizationName("ecommerce-agent")
     apply_qt_application_icon(app)
 
+    # Formal packaged builds are account- and device-gated before any business
+    # workspace is constructed. Source runs bypass this gate for development.
+    access_session = ensure_application_access(app)
+    if access_session is None:
+        return 0
+
     # Keep the native Fuji renderer compatible with the translucent QWidget
     # child surface. Modal presentation itself now stays entirely in QWidget.
     QQuickWindow.setDefaultAlphaBuffer(True)
@@ -84,6 +91,7 @@ def main() -> int:
     install_preblur_cache()
 
     window = MainWindow(runtime_root())
+    access_controller = install_application_access(window, access_session)
     visual = install_native_visual_style(window)
 
     # Finish the proven Single workspace presentation before wrapping it in the
@@ -231,9 +239,10 @@ def main() -> int:
     entrance.raise_overlay()
     entrance_stability.start()
 
-    # Installed builds check only the manually published Stable GitHub Release.
-    # Ordinary Windows Package actions/artifacts never enter the update channel.
-    install_application_updater(window)
+    # Installed builds check only manually published Stable releases. Portal
+    # delivery reuses the already authenticated application session so authorized
+    # users can update without logging in a second time.
+    install_application_updater(window, access_controller=access_controller)
     return app.exec()
 
 
