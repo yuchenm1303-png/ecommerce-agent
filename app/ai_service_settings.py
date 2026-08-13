@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .providers.registry import ProviderConfig, ProviderConfigurationError, validate_provider_config
+from .runtime_paths import is_frozen
 
 
 CONFIG_DIR_ENV = "ECOMMERCE_AGENT_CONFIG_DIR"
@@ -152,6 +153,14 @@ def load_ai_service_key(settings: AIServiceSettings | None = None) -> str:
     runtime = str(os.getenv(RUNTIME_AI_KEY_ENV, "") or "").strip()
     if runtime:
         return runtime
+
+    # Packaged clients must be explicit BYOK. Never let a developer/service
+    # environment variable silently become the customer's runtime credential.
+    if is_frozen():
+        return ""
+
+    # Source development keeps the historical environment-variable workflow so
+    # existing local tests and developer terminals do not need migration first.
     return str(os.getenv(_legacy_key_env(configured.provider), "") or "").strip()
 
 
