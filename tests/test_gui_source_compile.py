@@ -44,7 +44,6 @@ GUI_SOURCES = [
     PROJECT_ROOT / "gui" / "ui_polish.py",
     PROJECT_ROOT / "gui" / "ui_maturity.py",
     PROJECT_ROOT / "gui" / "page_scroll_layout.py",
-    PROJECT_ROOT / "gui" / "scroll_local_glass.py",
     PROJECT_ROOT / "gui" / "startup_entrance.py",
     PROJECT_ROOT / "gui" / "startup_entrance_stability.py",
     PROJECT_ROOT / "gui" / "ui_runtime_optimizations.py",

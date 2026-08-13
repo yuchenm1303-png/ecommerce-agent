@@ -26,6 +26,7 @@ def test_reference_entrance_keeps_curtain_camera_choreography_without_loader() -
     ):
         assert token in SOURCE
 
+    # The spinner/text loading phase is intentionally not part of our copy.
     for obsolete in (
         "_HOLD_MIN_MS",
         "_HOLD_MAX_MS",
@@ -65,7 +66,7 @@ def test_startup_stability_gate_waits_for_maximized_layout_before_capture() -> N
     assert "def _geometry_signature" in STABILITY
     assert "frame.mapTo(self.window, QPoint(0, 0))" in STABILITY
     assert "self._stable_samples >= _LAYOUT_STABLE_SAMPLES" in STABILITY
-    assert 'start = getattr(self.entrance, "start", None)' in STABILITY
+    assert "start = getattr(self.entrance, \"start\", None)" in STABILITY
 
 
 def test_final_snapshot_to_live_handoff_is_split_across_frames() -> None:
@@ -90,17 +91,16 @@ def test_startup_freezes_runtime_until_staged_handoff_finishes() -> None:
     assert "pointer_timer.start()" in STABILITY
 
 
-def test_formal_launcher_covers_first_frame_then_uses_stability_gate_after_single_window_show() -> None:
+def test_formal_launcher_covers_first_frame_then_uses_stability_gate_after_show() -> None:
     assert "from gui.startup_entrance import install_startup_entrance" in RUN
     assert "from gui.startup_entrance_stability import install_startup_entrance_stability" in RUN
     assert "entrance = install_startup_entrance(window, visual)" in RUN
     assert "entrance_stability = install_startup_entrance_stability(window, entrance)" in RUN
-    assert "window.showMaximized()" in RUN
+    assert "shell.show()" in RUN
     assert "entrance.raise_overlay()" in RUN
     assert "entrance_stability.start()" in RUN
-    assert RUN.index("entrance = install_startup_entrance(window, visual)") < RUN.index("window.showMaximized()")
-    assert RUN.index("window.showMaximized()") < RUN.index("entrance_stability.start()")
-    assert "shell.show()" not in RUN
+    assert RUN.index("entrance = install_startup_entrance(window, visual)") < RUN.index("shell.show()")
+    assert RUN.index("shell.show()") < RUN.index("entrance_stability.start()")
     assert "entrance.start()" not in RUN
 
 

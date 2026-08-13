@@ -29,6 +29,9 @@ def test_transition_surface_is_root_level_so_stack_pages_cannot_overtake_it() ->
     assert "return QRect(top_left, self.stack.size())" in TRANSITION
     assert "self._set_mode(index)" in TRANSITION
     assert "self._raise_transition_surface()" in TRANSITION
+
+    # Regression: parenting the transition surface to QStackedWidget allowed a
+    # newly selected page to be raised over the old cached frame for one turn.
     assert "super().__init__(stack)" not in TRANSITION
     assert "_WorkspaceTransitionSurface(self.stack)" not in TRANSITION
 
@@ -39,6 +42,9 @@ def test_snapshot_capture_renders_only_the_current_workspace_page() -> None:
     assert "target_offset = page.mapTo(self.stack, QPoint(0, 0))" in TRANSITION
     assert "page.render(" in TRANSITION
     assert "widget_frame = self._render_current_page()" in TRANSITION
+
+    # Never recursively render the whole stacked widget: only the current page is
+    # allowed into either outgoing or incoming cached image.
     assert "self.stack.render(" not in TRANSITION
 
 
@@ -48,6 +54,8 @@ def test_two_readable_workspace_frames_are_never_cross_faded_together() -> None:
     assert "self._incoming = QPixmap()" in TRANSITION
     assert "if outgoing_alpha > 1e-4:" in TRANSITION
     assert "incoming_alpha = 0.0" in TRANSITION
+    assert "_EXIT_END_MS = 155" in TRANSITION
+    assert "_ENTER_START_MS = 175" in TRANSITION
     assert "painter.setOpacity(self._outgoing_alpha)" in TRANSITION
     assert "painter.setOpacity(self._incoming_alpha)" in TRANSITION
 
@@ -56,11 +64,11 @@ def test_root_surface_owns_opaque_pixels_and_blocks_hidden_workspace_input() -> 
     assert "WA_TransparentForMouseEvents, False" in TRANSITION
     assert "WA_OpaquePaintEvent, True" in TRANSITION
     assert "CompositionMode_Source" in TRANSITION
+    assert "Nothing from" in TRANSITION
+    assert "native Quick glass can leak through" in TRANSITION
 
 
 def test_incoming_capture_waits_for_a_presented_quick_frame() -> None:
-    # The QQuickWidget compatibility surface forwards its internal Quick
-    # frameSwapped signal, so the proven transition handoff stays unchanged.
     assert "_QUICK_SYNC_TIMEOUT_MS = 64" in TRANSITION
     assert "quick.frameSwapped.connect(" in TRANSITION
     assert "type=Qt.ConnectionType.QueuedConnection" in TRANSITION
@@ -73,6 +81,8 @@ def test_incoming_capture_waits_for_a_presented_quick_frame() -> None:
     prepare = TRANSITION.split("def _prepare_incoming", 1)[1].split(
         "@Slot()", 1
     )[0]
+    # Regression: grabbing Quick immediately after update() can combine the new
+    # QWidget page with the previous glass mask under the threaded render loop.
     assert "self._capture_composite()" not in prepare
 
 
@@ -124,11 +134,13 @@ def test_transition_leaves_sakura_independent_and_above_workspace_surface() -> N
     assert 'quick.setProperty("animationRunning", False)' in TRANSITION
     assert 'effects = getattr(self.window, "_nekro_effects", None)' in TRANSITION
     assert "effects.raise_()" in TRANSITION
+
+    # Sakura is not stopped by this controller.
     assert "effects.timer.stop" not in TRANSITION
     assert "_effects_timer_was_active" not in TRANSITION
 
 
-def test_formal_runner_installs_transition_before_single_widget_window_show() -> None:
+def test_formal_runner_installs_transition_after_interaction_controllers_exist() -> None:
     assert "from gui.workspace_transition import install_workspace_transition" in RUNNER
     assert "install_workspace_transition(window, visual)" in RUNNER
     assert RUNNER.index("install_nekro_card_fx(window, visual)") < RUNNER.index(
@@ -137,10 +149,7 @@ def test_formal_runner_installs_transition_before_single_widget_window_show() ->
     assert RUNNER.index("install_nekro_effects(window, sakura_count=3)") < RUNNER.index(
         "install_workspace_transition(window, visual)"
     )
-    assert RUNNER.index("install_workspace_transition(window, visual)") < RUNNER.index(
-        "window.showMaximized()"
-    )
-    assert "install_native_window_shell" not in RUNNER
+    assert RUNNER.index("install_workspace_transition(window, visual)") < RUNNER.index("shell.show()")
 
 
 def test_workspace_transition_source_compiles_without_importing_pyside() -> None:

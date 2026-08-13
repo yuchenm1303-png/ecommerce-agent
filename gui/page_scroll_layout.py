@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QBoxLayout,
     QFrame,
@@ -23,8 +23,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
-from .single_scroll_glass_fastpath import install_single_scroll_glass_fastpath
 
 
 # The field table already owns its own scroll viewport, so the surrounding row
@@ -245,14 +243,16 @@ def install_page_scroll_layout(window: QMainWindow, visual: Any | None = None) -
     body.setParent(root)
     setattr(window, "_ui_polish_body_splitter", None)
 
-    # Preserve the proven Quick blur/mask renderer exactly. Only replace the
-    # continuous outer-scroll data path with cached geometry + reusable mask
-    # buffers; layout changes still fall back to the existing authoritative model.
-    resolved_visual = visual
-    if resolved_visual is None:
-        resolved_visual = getattr(window, "_visual_style", None)
-    if resolved_visual is not None:
-        install_single_scroll_glass_fastpath(window, resolved_visual, scroll, page)
+    # Restore the original pre-jitter scroll behavior: scrolling only schedules
+    # the existing native Quick mask refresh. No per-tick geometry compensation,
+    # viewport compositor, cached fast path or alternate renderer participates.
+    background = getattr(visual, "background", None)
+    if background is None:
+        background = getattr(getattr(window, "_visual_style", None), "background", None)
+    schedule_mask = getattr(background, "schedule_mask_update", None)
+    if callable(schedule_mask):
+        scroll.verticalScrollBar().valueChanged.connect(schedule_mask)
+        QTimer.singleShot(0, schedule_mask)
 
     setattr(window, "_single_page_scroll", scroll)
     setattr(window, "_single_page_scroll_content", page)

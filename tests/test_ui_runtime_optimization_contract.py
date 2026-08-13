@@ -19,9 +19,7 @@ def test_runtime_optimization_source_compiles_without_importing_pyside() -> None
 def test_runtime_layer_is_presentation_only_and_installed_before_event_loop() -> None:
     assert "Business runners, permission gates, values, geometry, colors and transition" in RUNTIME
     assert "install_ui_runtime_optimizations(window, visual)" in RUN
-    assert RUN.index("install_ui_runtime_optimizations(window, visual)") < RUN.index(
-        "window.showMaximized()"
-    )
+    assert RUN.index("install_ui_runtime_optimizations(window, visual)") < RUN.index("shell.show()")
     assert RUN.index("visual.refresh_glass_frames()") < RUN.index(
         "install_ui_runtime_optimizations(window, visual)"
     )
@@ -36,7 +34,7 @@ def test_glass_mask_uses_in_memory_provider_with_png_fallback() -> None:
     assert "image.save(" not in RUNTIME
 
 
-def test_minimize_restore_keeper_remains_compatible_with_quick_surface_facade() -> None:
+def test_minimize_restore_keeps_quick_resources_and_last_complete_glass_mask() -> None:
     assert "class _MinimizeRestoreKeeper(QObject)" in RUNTIME
     assert "self.quick.setPersistentGraphics(True)" in RUNTIME
     assert "self.quick.setPersistentSceneGraph(True)" in RUNTIME
@@ -55,6 +53,14 @@ def test_minimize_restore_keeper_remains_compatible_with_quick_surface_facade() 
     assert 'setProperty("animationRunning", False)' in suspend
     assert "_mask_ready = False" not in suspend
     assert "card_model.sync_geometry" not in suspend
+
+    flush = RUNTIME.split("    def _flush_geometry(self) -> None:", 1)[1].split(
+        "    def eventFilter", 1
+    )[0]
+    assert "if self._should_suspend():" in flush
+    assert "self._suspend()" in flush
+    assert "return" in flush
+    assert "self._original_flush()" in flush
 
 
 def test_idle_background_pointer_sampling_keeps_8ms_semantics_but_skips_static_work() -> None:

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
 
 
 def main() -> int:
     try:
         from PySide6.QtCore import Qt
+        from PySide6.QtQuick import QQuickWindow
         from PySide6.QtWidgets import QApplication, QAbstractScrollArea, QSizePolicy
     except ImportError:
         print(
@@ -25,11 +29,11 @@ def main() -> int:
     from gui.card_details_fast import install_card_details
     from gui.console_summary_mode import install_console_summary_mode
     from gui.console_window import MainWindow
-    from gui.embedded_quick_background import activate_embedded_quick_background
     from gui.workflow_console_window import WorkflowMainWindow
     from gui.log_presenter import install_buffered_logs
     from gui.mode_toggle import install_workspace_mode_switch
     from gui.native_visual_style import install_native_visual_style
+    from gui.native_window_shell import install_native_window_shell
     from gui.nekro_card_fx import install_nekro_card_fx
     from gui.nekro_effects import install_nekro_effects
     from gui.page_scroll_layout import install_page_scroll_layout
@@ -37,7 +41,6 @@ def main() -> int:
     from gui.required_input_support import install_required_input_support
     from gui.restore_snapshot import install_restore_snapshot
     from gui.runtime_assistant import install_runtime_assistant
-    from gui.scroll_local_glass import install_scroll_local_glass
     from gui.startup_entrance import install_startup_entrance
     from gui.startup_entrance_stability import install_startup_entrance_stability
     from gui.static_modal_interaction import install_static_modal_interaction
@@ -54,8 +57,11 @@ def main() -> int:
     app.setApplicationName("ecommerce-agent Current Workflow")
     app.setOrganizationName("ecommerce-agent")
 
+    # Keep the native Fuji renderer compatible with the translucent QWidget
+    # child surface. Modal presentation itself now stays entirely in QWidget.
+    QQuickWindow.setDefaultAlphaBuffer(True)
+
     window = MainWindow(Path(__file__).resolve().parent)
-    activate_embedded_quick_background()
     visual = install_native_visual_style(window)
 
     # Finish the proven Single workspace presentation before wrapping it in the
@@ -118,11 +124,6 @@ def main() -> int:
     install_detailed_preparation_progress(window)
     visual.refresh_glass_frames()
 
-    # Preserve the already-approved Product Source local glass presentation for
-    # this architecture trial. It now composes in the same QWidget top-level as
-    # the embedded Quick background, so it no longer crosses a native surface.
-    install_scroll_local_glass(window, visual)
-
     # Presentation-only hot-path optimizations are installed after both Single
     # and Batch widgets exist, but still before the first event-loop paint.
     install_ui_runtime_optimizations(window, visual)
@@ -132,14 +133,15 @@ def main() -> int:
     window._smooth_wheel_filter = smooth_wheel  # type: ignore[attr-defined]
     window.destroyed.connect(smooth_wheel.cleanup)
 
-    quick_surface = visual.background.quick_window
-    if quick_surface is None:
-        raise RuntimeError("Embedded Quick renderer was not created")
+    quick_window = visual.background.quick_window
+    if quick_window is None:
+        raise RuntimeError("Native Quick renderer was not created")
 
-    # Keep the existing restore snapshot as a presentation safety net. The Quick
-    # object is now a QWidget-domain compatibility surface rather than a native
-    # owner window, so no extra HWND is introduced by this controller.
-    install_restore_snapshot(window, quick_surface)
+    # Windows can discard the QWidget backing-store pixels while the native Quick
+    # owner is minimized even though every widget object remains alive.
+    install_restore_snapshot(window, quick_window)
+
+    shell = install_native_window_shell(window, quick_window)
 
     # Card performance budgeting is native to the controller/effect hot path:
     # one live interactive card, one frozen outgoing card, 90 Hz maximum motion
@@ -153,15 +155,15 @@ def main() -> int:
     apply_workspace_transition_tuning()
     install_workspace_transition(window, visual)
 
-    # Reference-site startup choreography stays visually unchanged. The stability
-    # gate still waits for the maximized QWidget geometry to settle before capture;
-    # only the obsolete native Quick owner/child-HWND shell has been removed.
+    # Reference-site startup choreography is a one-shot presentation surface. It
+    # freezes pointer/card effects while visible and keeps the original visual
+    # timeline. A separate handoff gate waits for the maximized QWidget geometry
+    # to settle before capture, then restores runtime presentation over separate
+    # frames so the final snapshot/live swap cannot jump or stall.
     entrance = install_startup_entrance(window, visual)
     entrance_stability = install_startup_entrance_stability(window, entrance)
 
-    # One native top-level window owns both the embedded Quick texture and all
-    # business widgets. No QQuickWindow owner / child-HWND handoff remains.
-    window.showMaximized()
+    shell.show()
     effects.raise_()
     # Runtime Assistant remains Phase 1 Shadow Mode: observe + explain only.
     assistant = install_runtime_assistant(window)
