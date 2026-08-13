@@ -72,9 +72,19 @@ def test_single_rows_leave_quick_but_batch_refresh_still_uses_original_native_mo
     assert "visual.refresh_glass_frames()" in RUNNER
 
 
-def test_shared_layer_reuses_preblur_and_tracks_presented_parallax_without_stale_pixels() -> None:
+def test_shared_painter_culls_to_dirty_region_and_reuses_one_preblur_source() -> None:
+    paint_event = _body(GLASS, "def paintEvent", "class ScrollLocalGlassController")
+    paint = _body(GLASS, "def paint_glass", "def _on_scroll")
+
+    assert "self.controller.paint_glass(painter, QRectF(event.rect()))" in paint_event
+    assert "dirty_rect = layer_rect if dirty is None" in paint
+    assert "not target.intersects(dirty_rect)" in paint
+    assert "frame.isVisibleTo(self.viewport)" not in paint
     assert 'self._source = QPixmap(str(getattr(self.background, "_blur_path", "")))' in GLASS
     assert "self._cover_key" in GLASS
+
+
+def test_shared_layer_tracks_presented_parallax_without_stale_pixels() -> None:
     assert "self.quick.frameSwapped.connect(self._on_quick_frame)" in GLASS
     assert "CompositionMode_Source" in GLASS
     assert "painter.fillRect(event.rect(), Qt.GlobalColor.transparent)" in GLASS
