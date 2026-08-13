@@ -73,8 +73,8 @@ Write-Host "[3/6] Verifying packaged GUI import path"
 $PreviousImportProbe = $env:ECOMMERCE_AGENT_PACKAGE_IMPORT_PROBE
 $env:ECOMMERCE_AGENT_PACKAGE_IMPORT_PROBE = "1"
 try {
-    & $GuiExe
-    $GuiProbeExitCode = $LASTEXITCODE
+    $GuiProbe = Start-Process -FilePath $GuiExe -Wait -PassThru
+    $GuiProbeExitCode = $GuiProbe.ExitCode
 }
 finally {
     if ($null -eq $PreviousImportProbe) {
