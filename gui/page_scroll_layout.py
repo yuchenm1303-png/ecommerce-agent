@@ -29,7 +29,7 @@ _STATUS_CARD_MIN_HEIGHT = 54
 _STATUS_CARD_MAX_HEIGHT = 58
 _WORKSPACE_MIN_HEIGHT = 220
 _FIELD_TABLE_MIN_HEIGHT = 136
-_FIELD_CARD_BOTTOM_INSET = 28
+_FIELD_CARD_BOTTOM_INSET = 14
 _SIDE_MIN_WIDTH = 360
 _SIDE_MAX_WIDTH = 480
 _SIDE_TARGET_RATIO = 0.29
@@ -151,10 +151,10 @@ def _align_field_card_to_side_panel(
 ) -> None:
     """Trim only the left glass card so its bottom matches the right panel.
 
-    ui_polish intentionally keeps 28 px of bottom breathing room under the
-    Runtime/Reference/Safety tab group. The field card used to fill the complete
-    splitter cross-axis, which made its glass shell visibly longer. A transparent
-    host mirrors that same bottom inset without rebuilding the field table.
+    The right Runtime/Reference/Safety panel keeps a small bottom breathing room.
+    The field card used to fill the complete splitter cross-axis, which made its
+    glass shell visibly longer. A transparent host mirrors that visual inset
+    without rebuilding the field table.
     """
 
     if isinstance(getattr(window, "_single_field_alignment_host", None), QWidget):
