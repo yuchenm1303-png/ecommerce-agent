@@ -25,6 +25,10 @@ def main() -> int:
         return 2
 
     from gui.activity_presence import install_activity_presence
+    from gui.background_render_optimizations import (
+        install_background_pointer_hotpath,
+        install_preblur_cache,
+    )
     from gui.batch_card_responsive import install_batch_card_responsive
     from gui.batch_job_controls import install_batch_job_controls
     from gui.batch_url_editor import install_batch_url_editor
@@ -69,6 +73,11 @@ def main() -> int:
     # Keep the native Fuji renderer compatible with the translucent QWidget
     # child surface. Modal presentation itself now stays entirely in QWidget.
     QQuickWindow.setDefaultAlphaBuffer(True)
+
+    # Preserve the exact established blur pixels while avoiding repeated
+    # QGraphicsBlurEffect work on later launches. The native renderer still writes
+    # the same JPG92 texture and keeps the same QML glass/mask pipeline.
+    install_preblur_cache()
 
     window = MainWindow(runtime_root())
     visual = install_native_visual_style(window)
@@ -148,6 +157,9 @@ def main() -> int:
     # Presentation-only hot-path optimizations are installed after both Single
     # and Batch widgets exist, but still before the first event-loop paint.
     install_ui_runtime_optimizations(window, visual)
+    # Keep the established 8 ms parallax semantics but replace the temporary
+    # runtime wrapper with a one-cursor-read, geometry-signal-cached bridge.
+    install_background_pointer_hotpath(window, visual)
 
     smooth_wheel = SmoothWheelFilter(window)
     smooth_wheel.install(window)
