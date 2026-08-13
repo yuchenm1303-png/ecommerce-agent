@@ -9,7 +9,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QFile, QIODevice, QObject, QProcess, QTimer, QUrl
+from PySide6.QtCore import QFile, QIODevice, QObject, QProcess, QTimer, QUrl, QUrlQuery
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QProgressDialog
 
@@ -17,6 +18,8 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QProgressD
 _REPOSITORY = "yuchenm1303-png/ecommerce-agent"
 _LATEST_RELEASE_API = f"https://api.github.com/repos/{_REPOSITORY}/releases/latest"
 _MANIFEST_ASSET = "update.json"
+_PORTAL_URL = "https://smirel.com/download/"
+_PORTAL_HOSTS = {"smirel.com", "www.smirel.com"}
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[.-].*)?$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _CHECK_DELAY_MS = 1800
@@ -130,19 +133,38 @@ class ApplicationUpdater(QObject):
             current_key = _version_key(self.current_version)
             if latest_key is None or current_key is None or latest_key <= current_key:
                 return
-            installer_url = str(manifest.get("installer_url") or "").strip()
+
             checksum = str(manifest.get("installer_sha256") or "").strip().lower()
-            url = QUrl(installer_url)
-            if (
-                not url.isValid()
-                or url.scheme().lower() != "https"
-                or url.host().lower() != "github.com"
-                or not _SHA256_RE.match(checksum)
-            ):
+            if not _SHA256_RE.match(checksum):
                 return
+
+            delivery = str(manifest.get("delivery") or "github").strip().lower()
             manifest["version"] = latest
-            manifest["installer_url"] = installer_url
             manifest["installer_sha256"] = checksum
+
+            if delivery == "portal":
+                portal_url = str(manifest.get("portal_url") or _PORTAL_URL).strip()
+                url = QUrl(portal_url)
+                if (
+                    not url.isValid()
+                    or url.scheme().lower() != "https"
+                    or url.host().lower() not in _PORTAL_HOSTS
+                ):
+                    return
+                manifest["delivery"] = "portal"
+                manifest["portal_url"] = portal_url
+            else:
+                installer_url = str(manifest.get("installer_url") or "").strip()
+                url = QUrl(installer_url)
+                if (
+                    not url.isValid()
+                    or url.scheme().lower() != "https"
+                    or url.host().lower() != "github.com"
+                ):
+                    return
+                manifest["delivery"] = "github"
+                manifest["installer_url"] = installer_url
+
             self._pending_manifest = manifest
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             return
@@ -160,20 +182,23 @@ class ApplicationUpdater(QObject):
             minimum_key is not None and current_key < minimum_key
         )
         notes = str(manifest.get("notes") or "").strip()
-        title = str(manifest.get("title") or "Software Update").strip()
+        delivery = str(manifest.get("delivery") or "github")
 
         box = QMessageBox(self.window)
         box.setWindowTitle("Software Update")
         box.setIcon(QMessageBox.Icon.Warning if required else QMessageBox.Icon.Information)
         box.setText(f"发现新版本 {latest}")
         detail = notes or "包含稳定性与功能更新。"
+        if delivery == "portal":
+            detail = f"{detail}\n\n更新安装包通过安全下载门户提供。"
         if required:
             detail = f"这是关键更新，需要更新后继续使用。\n\n{detail}"
         box.setInformativeText(detail)
         box.setDetailedText(
-            f"Current: {self.current_version}\nLatest: {latest}\nChannel: stable"
+            f"Current: {self.current_version}\nLatest: {latest}\nChannel: stable\nDelivery: {delivery}"
         )
-        update_button = box.addButton("立即更新", QMessageBox.ButtonRole.AcceptRole)
+        action_label = "打开下载页" if delivery == "portal" else "立即更新"
+        update_button = box.addButton(action_label, QMessageBox.ButtonRole.AcceptRole)
         if required:
             fallback_button = box.addButton("退出程序", QMessageBox.ButtonRole.RejectRole)
         else:
@@ -182,8 +207,22 @@ class ApplicationUpdater(QObject):
         box.exec()
 
         if box.clickedButton() is update_button:
-            self._download_update(manifest)
+            if delivery == "portal":
+                self._open_portal_update(manifest, required=required)
+            else:
+                self._download_update(manifest)
         elif required and box.clickedButton() is fallback_button:
+            QApplication.quit()
+
+    def _open_portal_update(self, manifest: dict[str, Any], *, required: bool) -> None:
+        url = QUrl(str(manifest.get("portal_url") or _PORTAL_URL))
+        query = QUrlQuery(url)
+        query.addQueryItem("version", str(manifest["version"]))
+        url.setQuery(query)
+        if not QDesktopServices.openUrl(url):
+            QMessageBox.warning(self.window, "Software Update", "无法打开安全下载页，请访问 smirel.com/download/。")
+            return
+        if required:
             QApplication.quit()
 
     def _download_update(self, manifest: dict[str, Any]) -> None:
