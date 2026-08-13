@@ -3,11 +3,13 @@
 import os
 from pathlib import Path
 
+from PyInstaller.building.datastruct import TOC
 from PyInstaller.utils.hooks import collect_all
 
 ROOT = Path(SPECPATH).resolve().parent
 APP_ICON = ROOT / "packaging" / "app_icon.ico"
 APP_ACCESS_SOURCE = ROOT / "gui" / "app_access.py"
+APP_ACCESS_MODULE = "gui.app_access"
 if not APP_ICON.is_file():
     raise RuntimeError(f"Application icon was not generated: {APP_ICON}")
 if not APP_ACCESS_SOURCE.is_file():
@@ -24,9 +26,9 @@ playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all("p
 
 gui_datas = [
     (str(ROOT / "gui" / "assets"), "gui/assets"),
-    # Keep the account/access module as transparent source instead of embedding
-    # it into PyInstaller's PYZ bytecode archive. This preserves the exact runtime
-    # behavior while avoiding the false-positive-prone compiled module shape.
+    # Ship account/access as transparent source. PyInstaller still analyzes the
+    # module normally below so every current and future dependency is collected;
+    # only the module bytecode itself is removed from PYZ after analysis.
     (str(APP_ACCESS_SOURCE), "gui"),
     (str(ROOT / "THIRD_PARTY_NOTICES.md"), "."),
     (str(BUILD_METADATA / "VERSION"), "packaging"),
@@ -37,16 +39,24 @@ gui_a = Analysis(
     pathex=[str(ROOT)],
     binaries=[],
     datas=gui_datas,
-    # app_access is shipped as source data, so its Windows-only stdlib imports
-    # are not visible to PyInstaller's static analysis and must be explicit.
-    hiddenimports=["ctypes.wintypes"],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["pytest", "gui.app_access"],
+    excludes=["pytest"],
     noarchive=False,
     optimize=0,
 )
+
+# Keep dependency discovery intact while preventing gui.app_access from being
+# embedded as compiled PYZ bytecode. This avoids maintaining a brittle manual
+# hidden-import list and guarantees newly added app_access imports are analyzed.
+app_access_pure = [entry for entry in gui_a.pure if entry[0] == APP_ACCESS_MODULE]
+if len(app_access_pure) != 1:
+    raise RuntimeError(
+        f"Expected exactly one analyzed {APP_ACCESS_MODULE} module, found {len(app_access_pure)}"
+    )
+gui_a.pure = TOC(entry for entry in gui_a.pure if entry[0] != APP_ACCESS_MODULE)
 
 worker_a = Analysis(
     [str(ROOT / "run_packaged_worker.py")],
