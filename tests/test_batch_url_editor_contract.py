@@ -15,13 +15,30 @@ def test_each_batch_link_has_independent_row_switch_and_delete_control() -> None
     assert 'self.toggle = QPushButton("启用")' in SOURCE
     assert "self.toggle.setCheckable(True)" in SOURCE
     assert 'self.toggle.setText("启用" if checked else "停用")' in SOURCE
-    assert 'self.remove_button = QPushButton("×")' in SOURCE
+    assert 'self.remove_button = QPushButton("删除")' in SOURCE
     assert "self.input = QLineEdit(url)" in SOURCE
+
+
+def test_link_row_controls_have_explicit_non_clipping_geometry() -> None:
+    assert "_ROW_HEIGHT = 38" in SOURCE
+    assert "_CONTROL_HEIGHT = 30" in SOURCE
+    assert "self.toggle.setFixedSize(58, _CONTROL_HEIGHT)" in SOURCE
+    assert "self.input.setFixedHeight(_CONTROL_HEIGHT)" in SOURCE
+    assert "self.remove_button.setFixedSize(48, _CONTROL_HEIGHT)" in SOURCE
+    assert '"  padding: 0 11px;"' in SOURCE
+    assert '"  min-height: 30px; max-height: 30px;"' in SOURCE
+
+
+def test_delete_control_has_visible_danger_button_treatment() -> None:
+    assert 'self.remove_button.setToolTip("删除此链接")' in SOURCE
+    assert "QPushButton#batchUrlRemoveButton" in SOURCE
+    assert "background: rgba(128,42,58,54)" in SOURCE
+    assert "border: 1px solid rgba(255,145,164,48)" in SOURCE
+    assert "QPushButton#batchUrlRemoveButton:hover" in SOURCE
 
 
 def test_multiple_link_boxes_are_always_visible_without_large_source_card() -> None:
     assert "_VISIBLE_ROWS = 4" in SOURCE
-    assert "_ROW_HEIGHT = 32" in SOURCE
     assert "self.setFixedHeight(_EDITOR_HEIGHT)" in SOURCE
     assert "self._ensure_min_rows()" in SOURCE
     assert 'hint = QLabel("每个链接独立任务 · 第 5 条起滚动")' in SOURCE
