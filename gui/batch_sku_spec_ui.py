@@ -4,7 +4,7 @@ from types import MethodType
 from typing import Any
 
 from PySide6.QtCore import QObject, Qt
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit
 
 
 _SKU_PLACEHOLDER = "SKU规格（可选）"
@@ -30,6 +30,7 @@ class BatchSkuSpecUi(QObject):
         self.controller = self.workspace.controller
         self.editor = getattr(self.workspace, "_batch_url_editor", None)
         self.support = getattr(window, "_listing_offer_support", None)
+        self._releasing_legacy_review = False
         if self.editor is None or self.support is None:
             raise RuntimeError("Batch SKU UI requires BatchUrlEditor + ListingOfferSupport")
 
@@ -46,13 +47,12 @@ class BatchSkuSpecUi(QObject):
         self.editor.add_row = MethodType(add_row, self.editor)
         self._update_toolbar_hint()
 
-        # ListingOfferSupport owns the confirmation semantics. Its panel creator
-        # already creates and wires the confirm button, but the current source
-        # forgot to add that button to the panel layout. Repair presentation only:
-        # after ListingOfferSupport handles jobs_changed and creates/rebuilds a
-        # panel, attach the existing wired button to the visible panel.
-        self.controller.jobs_changed.connect(lambda _jobs: self._ensure_confirm_buttons())
-        self._ensure_confirm_buttons()
+        # Older builds could persist a REVIEW state solely because a protected
+        # required field was left blank. The established required-fallback path is
+        # authoritative again, so release only that obsolete review reason. Other
+        # REVIEW states keep their existing fail-closed/manual semantics.
+        self.controller.jobs_changed.connect(self._release_legacy_required_reviews)
+        self._release_legacy_required_reviews(list(getattr(self.workspace, "_jobs", [])))
 
     def _polish_row(self, row: Any) -> None:
         offer = getattr(row, "offer_input", None)
@@ -141,19 +141,33 @@ class BatchSkuSpecUi(QObject):
                 label.setToolTip(_SKU_TOOLTIP)
                 break
 
-    def _ensure_confirm_buttons(self) -> None:
-        panels = getattr(self.support, "_batch_required_panels", None)
-        if not isinstance(panels, dict):
+    def _release_legacy_required_reviews(self, jobs: list[Any]) -> None:
+        if self._releasing_legacy_review:
             return
-        for panel in panels.values():
-            host = getattr(panel, "host", None)
-            layout = host.layout() if isinstance(host, QWidget) else None
-            button = getattr(host, "_confirm_button", None) if host is not None else None
-            if not isinstance(layout, QVBoxLayout) or not isinstance(button, QPushButton):
+
+        changed = False
+        for job in jobs:
+            if str(getattr(job, "status", "")) != "REVIEW":
                 continue
-            if layout.indexOf(button) < 0:
-                layout.addWidget(button, 0, Qt.AlignmentFlag.AlignRight)
-            button.show()
+            detail = str(getattr(job, "stage_detail", "") or "")
+            error = str(getattr(job, "error", "") or "")
+            if detail != "需确认关键字段" and not error.startswith("关键必填待确认："):
+                continue
+            job.status = "READY"
+            job.stage_detail = "准备完成 · 缺失必填按原路径自动兜底"
+            job.error = ""
+            touch = getattr(job, "touch", None)
+            if callable(touch):
+                touch()
+            changed = True
+
+        if not changed:
+            return
+        self._releasing_legacy_review = True
+        try:
+            self.controller._persist_emit()
+        finally:
+            self._releasing_legacy_review = False
 
 
 def install_batch_sku_spec_ui(window: Any) -> BatchSkuSpecUi:
