@@ -36,22 +36,36 @@ def test_single_keeps_original_root_ownership_and_has_no_outer_scroll_page() -> 
     assert 'setattr(window, "_single_fixed_body", body)' in PAGE
 
 
-def test_single_keeps_source_controls_on_a_separate_compact_row() -> None:
+def test_single_gives_source_controls_distinct_vertical_bands() -> None:
     assert "def _compact_input_rows" in PAGE
     assert 'stage_anchor = getattr(window, "step1_button", None)' in PAGE
     assert 'settings_anchor = getattr(window, "source_port", None)' in PAGE
     assert "settings_row.removeWidget" not in PAGE
     assert "stage_row.addWidget(widget)" not in PAGE
-    assert "stage_row.setSpacing(8)" in PAGE
-    assert "settings_row.setSpacing(8)" in PAGE
-    assert "_INPUT_CARD_MIN_HEIGHT = 176" in PAGE
-    assert "_INPUT_CARD_MAX_HEIGHT = 190" in PAGE
-    assert "layout.setContentsMargins(14, 8, 14, 9)" in PAGE
-    assert "layout.setSpacing(4)" in PAGE
+    assert "stage_row.setSpacing(10)" in PAGE
+    assert "stage_row.setContentsMargins(0, 1, 0, 1)" in PAGE
+    assert "settings_row.setSpacing(10)" in PAGE
+    assert "settings_row.setContentsMargins(0, 2, 0, 1)" in PAGE
+    assert "_INPUT_CARD_MIN_HEIGHT = 222" in PAGE
+    assert "_INPUT_CARD_MAX_HEIGHT = 238" in PAGE
+    assert "layout.setContentsMargins(14, 9, 14, 10)" in PAGE
+    assert "layout.setSpacing(7)" in PAGE
 
     assert "ReadOnlyRunner(" not in PAGE
     assert "RealExecutionRunner(" not in PAGE
     assert "AcceptanceConsole(" not in PAGE
+
+
+def test_single_aligns_field_glass_bottom_with_right_panel_without_rebuilding_table() -> None:
+    assert "_FIELD_CARD_BOTTOM_INSET = 28" in PAGE
+    assert "def _align_field_card_to_side_panel" in PAGE
+    assert 'host.setObjectName("fieldReviewHost")' in PAGE
+    assert "host_layout.setContentsMargins(0, 0, 0, _FIELD_CARD_BOTTOM_INSET)" in PAGE
+    assert "field_card.setParent(host)" in PAGE
+    assert "host_layout.addWidget(field_card, 1)" in PAGE
+    assert "workspace_splitter.insertWidget(index, host)" in PAGE
+    assert 'setattr(window, "_single_field_alignment_host", host)' in PAGE
+    assert "_align_field_card_to_side_panel(window, workspace_splitter)" in PAGE
 
 
 def test_single_uses_console_first_one_screen_height_budget() -> None:
