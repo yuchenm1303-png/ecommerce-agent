@@ -36,9 +36,18 @@ def test_update_policy_supports_optional_required_and_minimum_supported_versions
     assert '"退出程序"' in UPDATER
 
 
+def test_updater_supports_legacy_github_and_secure_portal_delivery() -> None:
+    assert '_PORTAL_URL = "https://smirel.com/download/"' in UPDATER
+    assert 'manifest.get("delivery") or "github"' in UPDATER
+    assert 'delivery == "portal"' in UPDATER
+    assert 'QDesktopServices.openUrl' in UPDATER
+    assert '"打开下载页"' in UPDATER
+    assert 'url.host().lower() not in _PORTAL_HOSTS' in UPDATER
+    assert 'url.host().lower() != "github.com"' in UPDATER
+
+
 def test_download_is_https_hash_verified_and_runs_existing_installer() -> None:
     assert 'url.scheme().lower() != "https"' in UPDATER
-    assert 'url.host().lower() != "github.com"' in UPDATER
     assert 'hashlib.sha256(path.read_bytes()).hexdigest()' in UPDATER
     assert 'installer_sha256' in UPDATER
     assert 'QProcess.startDetached' in UPDATER
