@@ -34,7 +34,7 @@ ArchitecturesAllowed=x64compatible
 WizardStyle=modern
 UninstallDisplayIcon={app}\icons\{#InstalledIconName}
 CloseApplications=yes
-RestartApplications=no
+RestartApplications=yes
 SetupLogging=yes
 UsePreviousAppDir=yes
 
