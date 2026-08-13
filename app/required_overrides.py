@@ -21,13 +21,14 @@ from .fill_plan import (
     _hard_guard_values,
 )
 from .hard_field_validators import is_numeric_semantic_field, validate_resolved_answer
-from .live_schema import schema_field_signature
+from .live_schema import load_live_schema, schema_field_signature
 from .resolution_types import RESOLVED, ResolvedAnswer
 
 
 FALLBACK_TEXT_VALUE = "N/A"
 FALLBACK_NUMERIC_VALUE = "1"
 FALLBACK_SOURCE_REFERENCE = "system:required-placeholder"
+REQUIRED_OVERRIDES_FILENAME = "required-overrides.json"
 _OPTION_PLACEHOLDERS = {
     "select",
     "select one",
@@ -216,6 +217,176 @@ def required_fallback_override(field: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _bind_plan_items_to_fields(
+    plan: LiveFillPlan,
+    semantic_fields: Iterable[dict[str, Any]],
+) -> dict[str, LiveFillPlanItem]:
+    """Bind every current field to its Fill Plan item without collapsing duplicates.
+
+    Some Makro verticals expose repeated labels such as several ``Length`` fields.
+    A dict keyed only by attribute/label/section silently overwrites those items.
+    Plan construction and semantic-field scanning preserve occurrence order, so
+    repeated identities are bound one-by-one inside their identity bucket.
+    """
+
+    item_buckets: dict[tuple[str, str, str], list[LiveFillPlanItem]] = {}
+    for item in plan.items:
+        item_buckets.setdefault(_item_identity(item), []).append(item)
+
+    positions: dict[tuple[str, str, str], int] = {}
+    by_field_id: dict[str, LiveFillPlanItem] = {}
+    for field in semantic_fields:
+        identity = _field_identity(field)
+        bucket = item_buckets.get(identity, [])
+        position = positions.get(identity, 0)
+        if position >= len(bucket):
+            raise RequiredOverrideError(
+                "当前 live field 无法按出现顺序绑定到 Fill Plan；"
+                f" identity={identity!r} occurrence={position + 1}。"
+            )
+        identifier = field_id(field)
+        if identifier in by_field_id:
+            raise RequiredOverrideError(
+                f"当前 live schema field_id={identifier} 不唯一；required override 拒绝猜目标。"
+            )
+        by_field_id[identifier] = bucket[position]
+        positions[identity] = position + 1
+
+    for identity, bucket in item_buckets.items():
+        if positions.get(identity, 0) != len(bucket):
+            raise RequiredOverrideError(
+                "Fill Plan 与当前 live fields 的重复字段数量不一致；"
+                f" identity={identity!r} plan={len(bucket)} live={positions.get(identity, 0)}。"
+            )
+    return by_field_id
+
+
+def load_required_blocked_fields(
+    fill_plan_path: str | Path,
+    live_schema_path: str | Path,
+) -> list[dict[str, Any]]:
+    """Return unresolved required fields using occurrence-aware schema binding.
+
+    This is shared by Single GUI and Batch. It reads only the existing read-only
+    Fill Plan plus its live schema and never calls AI or touches the browser.
+    """
+
+    payload = json.loads(Path(fill_plan_path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        raise RequiredOverrideError("fill-plan.json 缺少 items 数组。")
+    fields = load_live_schema(live_schema_path)
+
+    field_buckets: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for field in fields:
+        field_buckets.setdefault(_field_identity(field), []).append(field)
+
+    positions: dict[tuple[str, str, str], int] = {}
+    output: list[dict[str, Any]] = []
+    valid_items = 0
+    for index, raw_item in enumerate(payload.get("items") or [], start=1):
+        if not isinstance(raw_item, dict):
+            raise RequiredOverrideError(f"fill-plan item[{index}] 不是对象。")
+        valid_items += 1
+        identity = _field_identity(raw_item)
+        bucket = field_buckets.get(identity, [])
+        position = positions.get(identity, 0)
+        if position >= len(bucket):
+            raise RequiredOverrideError(
+                "Fill Plan 字段无法按出现顺序绑定到 live schema；"
+                f" identity={identity!r} occurrence={position + 1}。"
+            )
+        field = bucket[position]
+        positions[identity] = position + 1
+        if bool(raw_item.get("required")) != bool(field.get("required")):
+            raise RequiredOverrideError(
+                "Fill Plan required 标记与 live schema 不一致；"
+                f" identity={identity!r} occurrence={position + 1}。"
+            )
+        if not bool(raw_item.get("required")):
+            continue
+        if str(raw_item.get("action") or "").casefold() != BLOCKED:
+            continue
+
+        resolution = raw_item.get("resolution") or {}
+        if not isinstance(resolution, dict):
+            resolution = {}
+        output.append(
+            {
+                "field_id": field_id(field),
+                "field": field,
+                "label": str(raw_item.get("label") or raw_item.get("attribute_key") or "必填字段"),
+                "reason": str(raw_item.get("reason") or resolution.get("detail") or "").strip(),
+                "options": [
+                    str(value).strip()
+                    for value in resolution.get("question_options") or []
+                    if str(value).strip()
+                    and str(value).strip().casefold() not in {"select one", "select"}
+                ],
+            }
+        )
+
+    if valid_items != len(fields):
+        raise RequiredOverrideError(
+            f"Fill Plan/live schema 字段数量不一致：plan={valid_items}, live={len(fields)}。"
+        )
+    for identity, bucket in field_buckets.items():
+        if positions.get(identity, 0) != len(bucket):
+            raise RequiredOverrideError(
+                "Fill Plan/live schema 的重复字段数量不一致；"
+                f" identity={identity!r} plan={positions.get(identity, 0)} live={len(bucket)}。"
+            )
+    return output
+
+
+def build_required_fallback_overrides(
+    fill_plan_path: str | Path,
+    live_schema_path: str | Path,
+) -> list[dict[str, Any]]:
+    """Build the same deterministic required fallbacks used by Single Full Step 3."""
+
+    return [
+        required_fallback_override(item["field"])
+        for item in load_required_blocked_fields(fill_plan_path, live_schema_path)
+    ]
+
+
+def write_required_fallback_overrides(
+    fill_plan_path: str | Path,
+    live_schema_path: str | Path,
+    *,
+    output_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Persist Batch/Single-compatible fallback instructions beside live schema.
+
+    The executor deliberately recomputes every fallback against the current DOM
+    before writing, so this file is a bounded instruction set rather than trusted
+    product data. If no required fields remain blocked, a stale file is removed.
+    """
+
+    schema_path = Path(live_schema_path).resolve()
+    target = (
+        Path(output_path).resolve()
+        if output_path is not None
+        else schema_path.with_name(REQUIRED_OVERRIDES_FILENAME)
+    )
+    overrides = build_required_fallback_overrides(fill_plan_path, schema_path)
+    if not overrides:
+        if target.exists():
+            target.unlink()
+        return {"path": "", "count": 0, "field_ids": []}
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps({"overrides": overrides}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "path": str(target),
+        "count": len(overrides),
+        "field_ids": [str(item.get("field_id") or "") for item in overrides],
+    }
+
+
 def _source_metadata(override: dict[str, Any]) -> tuple[str, str, float, str]:
     source_type = str(override.get("source_type") or "user").strip().casefold()
     if source_type == "user":
@@ -278,7 +449,7 @@ def apply_required_overrides(
     for field in planned:
         planned_by_id.setdefault(field_id(field), []).append(field)
 
-    items_by_identity = {_item_identity(item): item for item in plan.items}
+    items_by_field_id = _bind_plan_items_to_fields(plan, fields)
     applied: list[str] = []
     source_counts = {"user": 0, "fallback": 0}
     rebound_by_schema_signature = 0
@@ -330,7 +501,7 @@ def apply_required_overrides(
             rebound_by_schema_signature += 1
 
         current_identifier = field_id(live_field)
-        item = items_by_identity.get(_field_identity(live_field))
+        item = items_by_field_id.get(current_identifier)
         if item is None:
             raise RequiredOverrideError(
                 f"override[{index}] 无法绑定到当前 Fill Plan：{identifier}"
