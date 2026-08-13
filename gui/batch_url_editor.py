@@ -24,7 +24,7 @@ _ROW_HEIGHT = 40
 _CONTROL_HEIGHT = 28
 _ROW_SPACING = 4
 _LIST_HEIGHT = (_VISIBLE_ROWS * _ROW_HEIGHT) + ((_VISIBLE_ROWS - 1) * _ROW_SPACING) + 8
-_TOOLBAR_HEIGHT = 34
+_TOOLBAR_HEIGHT = 40
 _EDITOR_HEIGHT = _TOOLBAR_HEIGHT + _LIST_HEIGHT + 7
 
 
@@ -196,22 +196,45 @@ class BatchUrlEditor(QWidget):
             "  border: 1px solid rgba(255,255,255,23);"
             "  border-radius: 8px;"
             "}"
+            "QPushButton#batchToolbarButton {"
+            "  min-height: 26px; max-height: 26px;"
+            "  padding: 0 12px;"
+            "  border-radius: 7px;"
+            "  border: 1px solid rgba(255,255,255,22);"
+            "  background: rgba(13,28,48,112);"
+            "  color: rgba(235,245,255,205);"
+            "  font-weight: 720;"
+            "}"
+            "QPushButton#batchToolbarButton:hover {"
+            "  background: rgba(20,42,70,136);"
+            "  border-color: rgba(170,220,250,62);"
+            "}"
+            "QPushButton#batchToolbarButton:pressed {"
+            "  background: rgba(9,22,38,148);"
+            "}"
+            "QPushButton#batchToolbarButton:disabled {"
+            "  background: rgba(35,45,58,52);"
+            "  color: rgba(230,240,250,82);"
+            "  border-color: rgba(255,255,255,12);"
+            "}"
         )
         toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(8, 3, 7, 3)
-        toolbar_layout.setSpacing(7)
+        toolbar_layout.setContentsMargins(8, 5, 8, 5)
+        toolbar_layout.setSpacing(8)
+        toolbar_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self.summary = QLabel("0 LINKS · 0 ON")
         self.summary.setObjectName("batchUrlSummaryChip")
         self.summary.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.summary.setMinimumWidth(104)
+        self.summary.setFixedHeight(26)
         self.summary.setStyleSheet(
             "QLabel#batchUrlSummaryChip {"
             "  color: rgba(220,240,255,210);"
             "  background: rgba(90,168,215,36);"
             "  border: 1px solid rgba(154,215,250,40);"
             "  border-radius: 6px;"
-            "  padding: 3px 8px;"
+            "  padding: 0 8px;"
             "  font-size: 11px;"
             "  font-weight: 760;"
             "}"
@@ -220,19 +243,20 @@ class BatchUrlEditor(QWidget):
         hint.setObjectName("cardHint")
 
         self.paste_button = QPushButton("批量粘贴")
-        self.paste_button.setObjectName("quietButton")
-        self.paste_button.setFixedHeight(28)
+        self.paste_button.setObjectName("batchToolbarButton")
+        self.paste_button.setFixedHeight(26)
         self.paste_button.clicked.connect(self.paste_urls)
         self.add_button = QPushButton("+ 添加链接")
-        self.add_button.setObjectName("quietButton")
-        self.add_button.setFixedHeight(28)
+        self.add_button.setObjectName("batchToolbarButton")
+        self.add_button.setFixedHeight(26)
         self.add_button.clicked.connect(lambda: self.add_row())
 
-        toolbar_layout.addWidget(self.summary)
-        toolbar_layout.addWidget(hint)
+        toolbar_center = Qt.AlignmentFlag.AlignVCenter
+        toolbar_layout.addWidget(self.summary, 0, toolbar_center)
+        toolbar_layout.addWidget(hint, 0, toolbar_center)
         toolbar_layout.addStretch(1)
-        toolbar_layout.addWidget(self.paste_button)
-        toolbar_layout.addWidget(self.add_button)
+        toolbar_layout.addWidget(self.paste_button, 0, toolbar_center)
+        toolbar_layout.addWidget(self.add_button, 0, toolbar_center)
         root.addWidget(toolbar)
 
         self.scroll = QScrollArea(self)
