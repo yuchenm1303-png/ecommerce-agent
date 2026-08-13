@@ -42,14 +42,19 @@ def test_single_gives_source_controls_distinct_vertical_bands() -> None:
     assert 'settings_anchor = getattr(window, "source_port", None)' in PAGE
     assert "settings_row.removeWidget" not in PAGE
     assert "stage_row.addWidget(widget)" not in PAGE
-    assert "stage_row.setSpacing(10)" in PAGE
-    assert "stage_row.setContentsMargins(0, 1, 0, 1)" in PAGE
-    assert "settings_row.setSpacing(10)" in PAGE
-    assert "settings_row.setContentsMargins(0, 2, 0, 1)" in PAGE
+    assert "url_row.setSpacing(12)" in PAGE
+    assert "stage_row.setSpacing(12)" in PAGE
+    assert "stage_row.setContentsMargins(0, 2, 0, 2)" in PAGE
+    assert "settings_row.setSpacing(14)" in PAGE
+    assert "settings_row.setContentsMargins(0, 3, 0, 2)" in PAGE
     assert "_INPUT_CARD_MIN_HEIGHT = 222" in PAGE
     assert "_INPUT_CARD_MAX_HEIGHT = 238" in PAGE
+    assert "_INPUT_CARD_OFFER_MIN_HEIGHT = 278" in PAGE
+    assert "_INPUT_CARD_OFFER_MAX_HEIGHT = 296" in PAGE
     assert "layout.setContentsMargins(14, 9, 14, 10)" in PAGE
     assert "layout.setSpacing(7)" in PAGE
+    assert "def refresh_single_source_layout" in PAGE
+    assert "QTimer.singleShot(0, lambda: refresh_single_source_layout(window))" in PAGE
 
     assert "ReadOnlyRunner(" not in PAGE
     assert "RealExecutionRunner(" not in PAGE
