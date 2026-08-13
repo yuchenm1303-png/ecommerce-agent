@@ -34,6 +34,7 @@ def main() -> int:
     from gui.console_window import MainWindow
     from gui.workflow_console_window import WorkflowMainWindow
     from gui.frozen_process_router import install_frozen_process_router
+    from gui.listing_offer_support import install_listing_offer_support
     from gui.log_presenter import install_buffered_logs
     from gui.mode_toggle import install_workspace_mode_switch
     from gui.native_visual_style import install_native_visual_style
@@ -134,6 +135,10 @@ def main() -> int:
     # per-job isolation through owned tabs/target ids.
     install_managed_makro_browser(window)
     install_required_input_support(window)
+    # Offer intent is layered after required-input support so high-risk required
+    # fields (title/package/identifier/compliance) can opt out of generic N/A/1
+    # fallback without replacing the ordinary required-field mechanism.
+    install_listing_offer_support(window)
     install_activity_presence(window)
     install_detailed_preparation_progress(window)
     visual.refresh_glass_frames()
