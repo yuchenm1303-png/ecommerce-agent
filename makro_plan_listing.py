@@ -1,8 +1,9 @@
 """Read-only Makro live-schema scanner and Fill Plan builder.
 
 The final plan rebinds the AI packet only to the exact sources captured from the
-supplier URL.  Old QA answers and manually supplied seller SKU are not product
-identity inputs.  SKU is generated mechanically from the source URL.
+supplier URL. Old QA answers and manually supplied seller SKU are not product
+identity inputs. SKU is generated mechanically as a fresh seller identifier for
+each planning attempt.
 """
 
 from __future__ import annotations
@@ -127,6 +128,7 @@ def main() -> int:
 
     decision_packet = None
     business_bundle = None
+    generated_sku: str | None = None
     planned_live_fields: list[dict[str, Any]] | None = None
     if not args.scan_live_schema:
         planned_live_fields = load_live_schema(args.live_schema)
@@ -143,7 +145,11 @@ def main() -> int:
             grounding,
             expected_identity=ProductIdentity(),
         )
-        business_bundle = generated_business_bundle(str(args.product_url))
+        generated_sku = generate_listing_sku(str(args.product_url))
+        business_bundle = generated_business_bundle(
+            str(args.product_url),
+            sku=generated_sku,
+        )
 
     with sync_playwright() as playwright:
         harness = EdgeHarness(
@@ -215,6 +221,7 @@ def main() -> int:
         assert planned_live_fields is not None
         assert decision_packet is not None
         assert business_bundle is not None
+        assert generated_sku is not None
         assert_live_schema_matches(planned_live_fields, semantic_fields)
         plan = build_live_fill_plan(
             decision_packet,
@@ -232,7 +239,7 @@ def main() -> int:
                     "page_url": page.url,
                     "expected_vertical": args.expected_vertical,
                     "product_url": str(args.product_url),
-                    "generated_listing_sku": generate_listing_sku(str(args.product_url)),
+                    "generated_listing_sku": generated_sku,
                     "decision_packet": str(Path(args.decision_packet).resolve()),
                     "input_live_schema": str(Path(args.live_schema).resolve()),
                     "output_live_schema": str(live_schema_path.resolve()),
@@ -256,7 +263,7 @@ def main() -> int:
         summary = plan.summary()
         print("===== MAKRO AI-DECISION FILL PLAN =====")
         print(f"page={page.url}")
-        print(f"generated_listing_sku={generate_listing_sku(str(args.product_url))}")
+        print(f"generated_listing_sku={generated_sku}")
         print(
             f"live_fields={summary['live_field_count']}, ready={summary['ready']}, "
             f"preview_eligible={summary['preview_eligible']}, blocked={summary['blocked']}"
