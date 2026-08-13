@@ -15,12 +15,12 @@ from PySide6.QtWidgets import (
 )
 
 
-_SUMMARY_MIN = 218
-_SUMMARY_MAX = 242
-_SUMMARY_TARGET = 230
-_WORKSPACE_MIN = 260
-_CONSOLE_TABS_MIN = 88
-_CONSOLE_TABS_MAX = 112
+_SUMMARY_MIN = 292
+_SUMMARY_MAX = 336
+_SUMMARY_TARGET = 310
+_WORKSPACE_MIN = 220
+_CONSOLE_TABS_MIN = 132
+_CONSOLE_TABS_MAX = 176
 _SIDE_MIN = 360
 _SIDE_MAX = 480
 _SIDE_RATIO = 0.29
@@ -216,7 +216,17 @@ class ConsoleSummaryMode(QObject):
 
     def _apply_body_height(self) -> bool:
         available = max(1, self.body.height() - self.body.handleWidth())
-        target = min(_SUMMARY_MAX, max(_SUMMARY_MIN, _SUMMARY_TARGET))
+        # The workflow indicator carries phase cards plus live Console/Timeline
+        # content, so it receives roughly half of the body while the field/runtime
+        # pair remains a compact preview with its own internal scroll areas.
+        proportional = round(available * 0.52)
+        target = min(
+            _SUMMARY_MAX,
+            max(
+                _SUMMARY_MIN,
+                min(proportional, max(0, available - _WORKSPACE_MIN)),
+            ),
+        )
         return self._set_sizes_if_needed(
             self.body,
             [max(_WORKSPACE_MIN, available - target), target],
