@@ -1,22 +1,35 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, QTimer
-from PySide6.QtWidgets import QFrame, QMainWindow, QPushButton, QSplitter, QTabWidget, QWidget
+from PySide6.QtWidgets import (
+    QFrame,
+    QMainWindow,
+    QPushButton,
+    QSizePolicy,
+    QSplitter,
+    QTabWidget,
+    QWidget,
+)
 
 
-_SUMMARY_MIN = 120
-_SUMMARY_MAX = 136
-_SUMMARY_TARGET = 128
-_WORKSPACE_MIN = 292
+_SUMMARY_MIN = 218
+_SUMMARY_MAX = 242
+_SUMMARY_TARGET = 230
+_WORKSPACE_MIN = 260
+_CONSOLE_TABS_MIN = 88
+_CONSOLE_TABS_MAX = 112
+_SIDE_MIN = 360
+_SIDE_MAX = 480
+_SIDE_RATIO = 0.29
 _COALESCE_MS = 40
 
 
 class ConsoleSummaryMode(QObject):
-    """Keep only the compact phase summary on the fixed Single page.
+    """Keep a compact but complete console on the fixed Single page.
 
-    Full console tabs remain available through the existing detail modal. The
-    visible Single workspace therefore stays one screen tall and never expands
-    when the user asks for diagnostics.
+    Phase summary and a shallow live tab viewport remain visible. The existing
+    detail modal still provides the full-height console when deeper inspection is
+    needed, without resizing the main Single workspace.
     """
 
     def __init__(self, window: QMainWindow) -> None:
@@ -61,11 +74,14 @@ class ConsoleSummaryMode(QObject):
             if isinstance(unit, QWidget):
                 unit.show()
 
-        # The phase cards + progress bar are the permanent one-screen summary.
-        # Full logs/timeline/artifacts/diagnostics are cloned into the detail modal.
+        # Keep the lower console surface visible instead of hiding it. Its shallow
+        # viewport is enough for live context; the modal remains the full reader.
         tabs = getattr(self.console, "tabs", None)
         if isinstance(tabs, QTabWidget):
-            tabs.hide()
+            tabs.show()
+            tabs.setMinimumHeight(_CONSOLE_TABS_MIN)
+            tabs.setMaximumHeight(_CONSOLE_TABS_MAX)
+            tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         mature = getattr(window, "_mature_ui", None)
         timer = getattr(mature, "_timer", None)
@@ -93,13 +109,41 @@ class ConsoleSummaryMode(QObject):
         if len(current) != len(target) or any(abs(a - b) > 3 for a, b in zip(current, target)):
             splitter.setSizes(target)
 
+    def _apply_workspace_width(self) -> None:
+        splitter = self.root.findChild(QSplitter, "workspaceSplitter")
+        if not isinstance(splitter, QSplitter) or splitter.count() < 2:
+            return
+        total = max(1, splitter.width() - splitter.handleWidth())
+        side_target = min(
+            _SIDE_MAX,
+            max(_SIDE_MIN, round(total * _SIDE_RATIO)),
+        )
+        side = splitter.widget(1)
+        if isinstance(side, QWidget):
+            side.setMinimumWidth(_SIDE_MIN)
+            side.setMaximumWidth(_SIDE_MAX)
+        self._set_sizes_if_needed(
+            splitter,
+            [max(620, total - side_target), side_target],
+        )
+
     def apply(self) -> None:
         if not isinstance(self.body, QSplitter):
             return
+
+        self._apply_workspace_width()
+
         available = max(1, self.body.height() - self.body.handleWidth())
         target = min(_SUMMARY_MAX, max(_SUMMARY_MIN, _SUMMARY_TARGET))
         self.console.setMinimumHeight(_SUMMARY_MIN)
         self.console.setMaximumHeight(_SUMMARY_MAX)
+
+        tabs = getattr(self.console, "tabs", None)
+        if isinstance(tabs, QTabWidget):
+            tabs.show()
+            tabs.setMinimumHeight(_CONSOLE_TABS_MIN)
+            tabs.setMaximumHeight(_CONSOLE_TABS_MAX)
+
         self._set_sizes_if_needed(
             self.body,
             [max(_WORKSPACE_MIN, available - target), target],
@@ -108,6 +152,8 @@ class ConsoleSummaryMode(QObject):
     def _apply_after_mature(self) -> None:
         if callable(self._mature_apply):
             self._mature_apply()
+        # ui_maturity still carries the old 330 px side-width and collapsed
+        # console heuristics. Re-assert the fixed Single budgets after it runs.
         self.apply()
 
     def _open_detail(self, *_args: object) -> None:
