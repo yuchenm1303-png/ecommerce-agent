@@ -63,23 +63,40 @@ def test_updater_supports_legacy_github_and_authorized_private_delivery() -> Non
     assert 'QDesktopServices.openUrl' in UPDATER
     assert 'url.host().lower() not in _PORTAL_HOSTS' in UPDATER
     assert 'url.host().lower() != "github.com"' in UPDATER
+    assert '_expected_github_installer_path' in UPDATER
     assert 'install_application_updater(window, access_controller=access_controller)' in RUN
 
 
-def test_download_is_https_hash_verified_and_runs_existing_installer() -> None:
+def test_update_has_continuous_visible_download_verify_install_and_relaunch_flow() -> None:
+    assert 'QProgressDialog' in UPDATER
+    assert '正在验证更新权限' in UPDATER
+    assert '正在下载更新' in UPDATER
+    assert '正在校验更新包完整性' in UPDATER
+    assert '正在启动安装程序' in UPDATER
+    assert '更新完成后会自动重新打开' in UPDATER
+    assert '_write_update_marker' in UPDATER
+    assert '_consume_completed_update_marker' in UPDATER
+    assert '更新已完成' in UPDATER
+    assert "update-complete.json" in UPDATER
+    assert "update-complete.json" in INSTALLER
+
+
+def test_download_is_https_stream_hash_verified_and_runs_visible_installer_progress() -> None:
     assert 'url.scheme().lower() != "https"' in UPDATER
-    assert 'hashlib.sha256(path.read_bytes()).hexdigest()' in UPDATER
+    assert 'hashlib.sha256()' in UPDATER
+    assert 'stream.read(1024 * 1024)' in UPDATER
     assert 'installer_sha256' in UPDATER
     assert 'QProcess.startDetached' in UPDATER
     for flag in (
-        '"/VERYSILENT"',
+        '"/SILENT"',
         '"/SUPPRESSMSGBOXES"',
         '"/NORESTART"',
         '"/CLOSEAPPLICATIONS"',
-        '"/RESTARTAPPLICATIONS"',
+        '"/NORESTARTAPPLICATIONS"',
     ):
         assert flag in UPDATER
     assert "RestartApplications=yes" in INSTALLER
+    assert "FileExists(ExpandConstant('{localappdata}\\ListingStudio\\update-complete.json'))" in INSTALLER
 
 
 def test_frozen_package_embeds_the_exact_build_version() -> None:
