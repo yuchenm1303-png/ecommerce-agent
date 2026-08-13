@@ -8,10 +8,13 @@ from PyInstaller.utils.hooks import collect_all
 
 ROOT = Path(SPECPATH).resolve().parent
 APP_ICON = ROOT / "packaging" / "app_icon.ico"
+RUNTIME_MUTEX_HOOK = ROOT / "packaging" / "runtime_mutex_hook.py"
 APP_ACCESS_SOURCE = ROOT / "gui" / "app_access.py"
 APP_ACCESS_MODULE = "gui.app_access"
 if not APP_ICON.is_file():
     raise RuntimeError(f"Application icon was not generated: {APP_ICON}")
+if not RUNTIME_MUTEX_HOOK.is_file():
+    raise RuntimeError(f"Runtime mutex hook missing: {RUNTIME_MUTEX_HOOK}")
 if not APP_ACCESS_SOURCE.is_file():
     raise RuntimeError(f"Application access source missing: {APP_ACCESS_SOURCE}")
 
@@ -42,7 +45,7 @@ gui_a = Analysis(
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(RUNTIME_MUTEX_HOOK)],
     excludes=["pytest"],
     noarchive=False,
     optimize=0,
@@ -66,7 +69,7 @@ worker_a = Analysis(
     hiddenimports=playwright_hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(RUNTIME_MUTEX_HOOK)],
     excludes=["PySide6", "pytest"],
     noarchive=False,
     optimize=0,
