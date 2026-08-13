@@ -21,17 +21,23 @@ from .ai_decisions import (
     validate_ai_decision_packet,
 )
 from .business_fields import is_business_question
+from .listing_content_policy import (
+    CONTENT_POLICY_VERSION,
+    GLOBAL_CONTENT_RULES,
+    allow_best_effort_inference,
+    field_content_policy,
+)
 from .semantic_grounding import GroundingCatalog
 from .web_enrichment import PersistedWebSource, WebEvidence
 
 
-INFERENCE_CONTRACT_VERSION = 4
-INFERENCE_CACHE_VERSION = 4
+INFERENCE_CONTRACT_VERSION = 5
+INFERENCE_CACHE_VERSION = 5
 INFERENCE_REFERENCE = "model-inference:category-knowledge"
 INFERENCE_URL = "model-inference://category-knowledge"
 INFERENCE_CONTENT = (
     "Best-effort model inference from the captured product fingerprint, already resolved product facts, "
-    "real comparable-product Web evidence, and ordinary product-category knowledge."
+    "real comparable-product Web evidence, ordinary product-category knowledge, and seller content policy."
 )
 
 
@@ -83,6 +89,9 @@ def _target(field: dict[str, Any]) -> dict[str, Any]:
         output["qualifier_options"] = contract["qualifier_options"]
     if contract["context_text"]:
         output["context_text"] = contract["context_text"]
+    content_policy = field_content_policy(field)
+    if content_policy:
+        output["content_policy"] = content_policy
     return output
 
 
@@ -177,20 +186,23 @@ def build_best_effort_inference_request(
         if decision.status == MISSING
         and decision.field_id in by_id
         and not _is_business(by_id[decision.field_id])
+        and allow_best_effort_inference(by_id[decision.field_id])
     ]
     targets = [_target(field) for field in target_fields]
     return {
         "task": "best_effort_infer_remaining_marketplace_fields",
         "system_instruction": (
-            "Fill remaining product fields using compact product context, comparable-product evidence, "
-            "and ordinary product knowledge. Return JSON only."
+            "Improve remaining marketplace product fields using already resolved facts, real comparable-product "
+            "evidence and ordinary product knowledge without inventing unsupported identifiers, compliance facts, "
+            "package contents or seller promises. Return JSON only."
         ),
         "prompt_instruction": (
-            "Return exactly one decision per target. Prefer a practical READY estimate over MISSING. "
-            "Use lower confidence for inference. Preserve physical scope and obey each target's "
-            "multi_value/options/qualifier contract exactly."
+            "Return exactly one decision per target. Prefer a useful READY answer only when the available context "
+            "and target content_policy can responsibly support it; otherwise return MISSING. Use lower confidence "
+            "for inference. Preserve physical scope and obey each target's multi_value/options/qualifier/content_policy contract exactly."
         ),
         "evidence_policy": "best_effort",
+        "content_policy_version": CONTENT_POLICY_VERSION,
         "context": {
             "product_fingerprint": product_fingerprint,
             "resolved_fields": _resolved_context(packet, field_list),
@@ -198,18 +210,19 @@ def build_best_effort_inference_request(
         },
         "target_fields": targets,
         "rules": [
-            "Use direct facts first, then comparable-product consensus, then reasonable category defaults.",
-            "Negative Yes/No values may be inferred from normal package contents and consistent comparable-product patterns.",
+            "Use direct/resolved facts first, then real comparable-product evidence, then reasonable category knowledge only when the target content_policy does not forbid inference.",
+            "Negative Yes/No values may be inferred only when the target policy allows best-effort inference and the resolved/comparable context supports the conclusion.",
             "Do not contradict resolved READY or CONFLICT fields.",
             "Never assert either alternative of a resolved CONFLICT inside a generated description or neighboring field.",
             "Keep packaging/product body/mount dimensions and front/cabin/rear scopes separate. Packaging dimensions may fill only section S logistics fields, never product-body Width/Height/Depth or mount dimensions.",
             "For scoped dimensions, map keys literally without rotating axes: length->length, breadth->breadth, height->height, weight->weight.",
             "An unscoped viewing angle must not be assigned to Exterior or Interior Field of View.",
-            "If multi_value=false, return exactly one value string. If several compatible facets belong in a free-text field, combine them into one concise string rather than returning several values.",
+            "If multi_value=false, return exactly one value string. If several compatible facets belong in a free-text field, combine them into one concise readable string rather than returning several values.",
             "For options, return one exact allowed value. For qualifier_options, qualifier must be one exact allowed qualifier. If qualifier_options are absent, qualifier must be empty unless context_text explicitly renders a fixed physical unit.",
             "qualifier is only a marketplace unit/qualifier, never explanation, scope commentary, confidence text or field description.",
             "For numeric targets with a qualifier option or fixed unit in context_text, return a bare finite number in values and the unit in qualifier; never embed the unit token inside the numeric value.",
-            "Return MISSING only for identifiers or legal/seller facts that cannot be responsibly invented, such as EAN or importer identity.",
+            "Never invent exact identifiers, certifications/compliance claims, exact package contents, legal entities, seller policies or seller-operated facts. If a target policy requires exact evidence, it will not be present in this best-effort target set.",
+            *GLOBAL_CONTENT_RULES,
         ],
         "grounded_sources": [],
         "all_marketplace_fields": [],
@@ -350,7 +363,7 @@ def run_best_effort_inference(
         schema_sha256=packet.schema_sha256,
         source_manifest_sha256=packet.source_manifest_sha256,
         decisions=[updates_by_id.get(item.field_id, item) for item in packet.decisions],
-        model_summary=(packet.model_summary + "\nBest-effort text-only inference filled remaining product fields.").strip(),
+        model_summary=(packet.model_summary + "\nBest-effort text-only inference filled policy-eligible remaining product fields.").strip(),
         warnings=list(packet.warnings),
         extractor=(packet.extractor + "+best-effort-inference").strip("+"),
     )
