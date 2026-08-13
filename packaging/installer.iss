@@ -20,7 +20,15 @@
 AppId={{84E09CC8-51F4-4409-BC73-B5EBC9A4D84A}
 AppName={#MyAppName}
 AppVersion={#AppVersion}
+AppVerName={#MyAppName} {#AppVersion}
 AppPublisher=ecommerce-agent
+VersionInfoCompany=ecommerce-agent
+VersionInfoDescription={#MyAppName} Setup
+VersionInfoProductName={#MyAppName}
+VersionInfoVersion={#AppVersion}
+VersionInfoProductVersion={#AppVersion}
+VersionInfoTextVersion={#AppVersion}
+VersionInfoProductTextVersion={#AppVersion}
 DefaultDirName={localappdata}\Programs\EcommerceAgent
 DefaultGroupName=EcommerceAgent
 DisableProgramGroupPage=yes
