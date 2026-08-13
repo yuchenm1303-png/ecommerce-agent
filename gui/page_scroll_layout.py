@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QBoxLayout,
     QFrame,
+    QLabel,
     QLayout,
     QMainWindow,
     QSizePolicy,
@@ -27,8 +28,8 @@ _INPUT_CARD_MIN_HEIGHT = 222
 _INPUT_CARD_MAX_HEIGHT = 238
 _INPUT_CARD_OFFER_MIN_HEIGHT = 278
 _INPUT_CARD_OFFER_MAX_HEIGHT = 296
-_STATUS_CARD_MIN_HEIGHT = 54
-_STATUS_CARD_MAX_HEIGHT = 58
+_STATUS_CARD_MIN_HEIGHT = 64
+_STATUS_CARD_MAX_HEIGHT = 68
 _WORKSPACE_MIN_HEIGHT = 220
 _FIELD_TABLE_MIN_HEIGHT = 136
 _SIDE_MIN_WIDTH = 360
@@ -187,6 +188,35 @@ def _compact_input_card(window: QMainWindow, input_card: QFrame) -> None:
     input_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
 
+def _apply_status_card_typography(card: QFrame) -> None:
+    """Keep the three status lines legible inside the compact dashboard row."""
+
+    layout = card.layout()
+    if not isinstance(layout, QBoxLayout):
+        return
+
+    value = getattr(card, "value", None)
+    if isinstance(value, QLabel):
+        value.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        style = value.styleSheet()
+        if "font-size: 26px" in style:
+            value.setStyleSheet(style.replace("font-size: 26px", "font-size: 22px"))
+
+    title = layout.itemAt(1).widget() if layout.count() > 1 else None
+    if isinstance(title, QLabel):
+        title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        title.setStyleSheet(
+            "font-size: 10px; font-weight: 720; color: rgba(255,255,255,218);"
+        )
+
+    caption = layout.itemAt(2).widget() if layout.count() > 2 else None
+    if isinstance(caption, QLabel):
+        caption.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        caption.setStyleSheet(
+            "font-size: 9px; color: rgba(255,255,255,150);"
+        )
+
+
 def _compact_status_cards(window: QMainWindow) -> None:
     for name in ("ready_card", "missing_card", "conflict_card", "blocked_card"):
         card = getattr(window, name, None)
@@ -196,8 +226,16 @@ def _compact_status_cards(window: QMainWindow) -> None:
         card.setMaximumHeight(_STATUS_CARD_MAX_HEIGHT)
         layout = card.layout()
         if isinstance(layout, QBoxLayout):
-            layout.setContentsMargins(12, 2, 12, 2)
-            layout.setSpacing(0)
+            layout.setContentsMargins(13, 4, 13, 4)
+            layout.setSpacing(1)
+        _apply_status_card_typography(card)
+
+    if not getattr(window, "_single_status_typography_refresh", False):
+        runner = getattr(window, "runner", None)
+        result_updated = getattr(runner, "result_updated", None)
+        if result_updated is not None and hasattr(result_updated, "connect"):
+            result_updated.connect(lambda *_: _compact_status_cards(window))
+        setattr(window, "_single_status_typography_refresh", True)
 
 
 def _strip_trailing_spacers(layout: QBoxLayout) -> None:
