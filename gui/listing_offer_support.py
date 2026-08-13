@@ -235,7 +235,7 @@ class ListingOfferSupport(QObject):
         label.setMinimumWidth(96)
         editor = QLineEdit()
         editor.setObjectName("listingIntentInput")
-        editor.setPlaceholderText("可选：黑色净化器 + 2瓶香薰精油")
+        editor.setPlaceholderText("sku规格")
         editor.setToolTip(
             "只描述本次实际上架的颜色 / 规格 / 数量 / 套装。"
             "它用于消除供应商多 SKU 歧义，不是 Makro 的 12 位 Seller SKU。"
