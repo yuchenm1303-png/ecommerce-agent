@@ -104,7 +104,7 @@ def test_content_policy_keeps_high_value_copy_rules_and_safe_exceptions() -> Non
     assert any("medical-style" in rule for rule in GLOBAL_CONTENT_RULES)
 
 
-def test_exact_identity_compliance_and_package_fields_disable_best_effort() -> None:
+def test_exact_identity_compliance_and_package_fields_keep_ai_strict_but_do_not_lock_required_fallback() -> None:
     fields = [
         _field("ean", "EAN"),
         _field("certifications", "Certifications"),
@@ -113,7 +113,7 @@ def test_exact_identity_compliance_and_package_fields_disable_best_effort() -> N
     for target in fields:
         assert requires_exact_web_identity(target) is True
         assert allow_best_effort_inference(target) is False
-        assert allow_required_fallback(target) is False
+        assert allow_required_fallback(target) is True
         assert field_content_policy(target)["evidence_mode"] == "exact_product_only"
 
 
@@ -129,7 +129,7 @@ def test_listing_intent_turns_sales_package_into_offer_aware_synthesis(monkeypat
     assert package_policy["generation_mode"] == "grounded_synthesis"
     assert package_policy["best_effort"] == "listing_intent_allowed"
     assert allow_best_effort_inference(sales_package) is True
-    assert allow_required_fallback(sales_package) is False
+    assert allow_required_fallback(sales_package) is True
     assert colour_policy["policy_id"] == "listing_intent_scope"
     assert colour_policy["listing_intent"] == "黑色净化器 + 2瓶香薰精油"
 
@@ -162,14 +162,14 @@ def test_listing_intent_allows_sales_package_in_final_policy_stage(monkeypatch) 
     assert "ean" not in targets
 
 
-def test_title_contributing_field_cannot_use_generic_required_placeholder() -> None:
+def test_title_contributing_field_keeps_copy_policy_but_does_not_lock_required_fallback() -> None:
     target = _field("type", "Type", required=True)
     target["context_text"] = "Attributes that can make up title"
     policy = field_content_policy(target)
 
     assert policy["policy_id"] == "title_contributor"
     assert policy["required_fallback"] == "manual_only"
-    assert allow_required_fallback(target) is False
+    assert allow_required_fallback(target) is True
     assert "Never use N/A" in policy["instruction"]
 
 
