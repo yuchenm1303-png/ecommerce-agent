@@ -21,6 +21,7 @@ from .fill_plan import (
     _hard_guard_values,
 )
 from .hard_field_validators import is_numeric_semantic_field, validate_resolved_answer
+from .listing_content_policy import allow_required_fallback
 from .live_schema import load_live_schema, schema_field_signature
 from .resolution_types import RESOLVED, ResolvedAnswer
 
@@ -173,11 +174,15 @@ def _looks_numeric(field: dict[str, Any]) -> bool:
 
 
 def required_fallback_override(field: dict[str, Any]) -> dict[str, Any]:
-    """Build one deterministic, non-AI fallback for a required Makro field.
+    """Build one deterministic, non-AI fallback for an ordinary required field.
 
-    The normal Resolver gets first chance. This helper is used only for required
-    fields that remain BLOCKED at real-execution time. It never calls a model or
-    the network:
+    Seller-critical listing/title/package/identifier/compliance fields are
+    explicitly excluded by ``listing_content_policy``. Those fields must be
+    resolved from evidence/offer intent or explicitly confirmed by the user;
+    they may never become ``N/A``, ``1`` or an arbitrary first option merely to
+    complete the form.
+
+    For ordinary required fields that remain BLOCKED after the normal Resolver:
     - option/radio/select -> first usable live Makro option;
     - numeric/unit field -> ``1`` and the first usable live qualifier when present;
     - remaining free text -> ``N/A``.
@@ -185,6 +190,12 @@ def required_fallback_override(field: dict[str, Any]) -> dict[str, Any]:
     The production executor still rebinds the value to the current live field and
     runs the existing Makro option/unit hard guards before any browser write.
     """
+
+    if not allow_required_fallback(field):
+        label = str(field.get("label") or field.get("attribute_key") or "required field")
+        raise RequiredOverrideError(
+            f"{label} 是关键 listing 必填字段，禁止使用 N/A / 1 / 随机 option 兜底；请提供准确值。"
+        )
 
     binding = required_override_binding(field)
     options = field_options(field)
@@ -194,7 +205,7 @@ def required_fallback_override(field: dict[str, Any]) -> dict[str, Any]:
             **binding,
             "values": [option],
             "source_type": "fallback",
-            "reason": "deterministic first valid Makro option for unresolved required field",
+            "reason": "deterministic first valid Makro option for unresolved ordinary required field",
         }
 
     qualifiers = field_qualifier_options(field)
@@ -213,7 +224,7 @@ def required_fallback_override(field: dict[str, Any]) -> dict[str, Any]:
         **binding,
         "values": [value],
         "source_type": "fallback",
-        "reason": "deterministic placeholder for unresolved required field",
+        "reason": "deterministic placeholder for unresolved ordinary required field",
     }
 
 
@@ -342,11 +353,16 @@ def build_required_fallback_overrides(
     fill_plan_path: str | Path,
     live_schema_path: str | Path,
 ) -> list[dict[str, Any]]:
-    """Build the same deterministic required fallbacks used by Single Full Step 3."""
+    """Build deterministic fallbacks only for ordinary unresolved required fields.
+
+    Protected fields are intentionally omitted. Their unresolved state remains a
+    real execution gate until an explicit user override is provided.
+    """
 
     return [
         required_fallback_override(item["field"])
         for item in load_required_blocked_fields(fill_plan_path, live_schema_path)
+        if allow_required_fallback(item["field"])
     ]
 
 
@@ -356,11 +372,12 @@ def write_required_fallback_overrides(
     *,
     output_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Persist Batch/Single-compatible fallback instructions beside live schema.
+    """Persist ordinary Batch/Single deterministic fallback instructions.
 
-    The executor deliberately recomputes every fallback against the current DOM
-    before writing, so this file is a bounded instruction set rather than trusted
-    product data. If no required fields remain blocked, a stale file is removed.
+    Protected required fields never appear in this file. The executor recomputes
+    every persisted ordinary fallback against the current DOM before writing, so
+    this file remains a bounded instruction set rather than trusted product data.
+    If no ordinary fallback remains, a stale fallback file is removed.
     """
 
     schema_path = Path(live_schema_path).resolve()
@@ -401,7 +418,7 @@ def _source_metadata(override: dict[str, Any]) -> tuple[str, str, float, str]:
             "fallback",
             FALLBACK_SOURCE_REFERENCE,
             0.0,
-            "Deterministic non-AI placeholder used only because the required field remained unresolved.",
+            "Deterministic non-AI placeholder used only because the ordinary required field remained unresolved.",
         )
     raise RequiredOverrideError(f"不支持 required override source_type={source_type!r}。")
 
@@ -413,19 +430,18 @@ def apply_required_overrides(
     *,
     planned_fields: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Promote unresolved required fields using user or deterministic fallback values.
+    """Promote unresolved required fields using explicit user or safe ordinary fallback values.
 
-    No AI/search pass exists here. User-entered values remain optional and take
-    precedence in the GUI; otherwise the GUI writes a deterministic fallback.
-    Both paths bind only required BLOCKED fields and are revalidated against the
-    current live Makro option/unit hard guards. Existing READY items are never
-    replaced here.
+    No AI/search pass exists here. Explicit user values may resolve protected or
+    ordinary required fields. A ``source_type=fallback`` override is accepted only
+    when the current live field is still eligible for generic fallback; otherwise
+    it fails closed. Both paths are revalidated against the current live Makro
+    option/unit hard guards. Existing READY items are never replaced here.
 
-    A persisted ``source_type=fallback`` is an instruction to use the deterministic
-    fallback policy, not an immutable value. After safe rebind the value is rebuilt
-    from the *current* live DOM field, so an old ``N/A`` cannot survive when Makro
-    now proves that control is ``input[type=number]``. Explicit user values are
-    never recomputed.
+    A persisted ordinary fallback is an instruction to recompute the deterministic
+    value from the *current* live DOM field, so an old ``N/A`` cannot survive when
+    Makro now proves that control is numeric. Explicit user values are never
+    recomputed.
 
     Binding is deliberately two-stage. Exact current ``field_id`` wins. If that
     presentation-sensitive id changed while the production live-schema drift gate
@@ -518,6 +534,8 @@ def apply_required_overrides(
         source_type, source_reference, confidence, evidence = _source_metadata(override)
         effective_override = override
         if source_type == "fallback":
+            # required_fallback_override performs the current protected-field
+            # policy check before recomputing any placeholder.
             effective_override = required_fallback_override(live_field)
             fallback_recomputed_live += 1
 
@@ -540,7 +558,7 @@ def apply_required_overrides(
             reason=(
                 reason
                 or (
-                    "deterministic fallback for unresolved required field"
+                    "deterministic fallback for unresolved ordinary required field"
                     if source_type == "fallback"
                     else "explicit user value for unresolved required field"
                 )
@@ -596,7 +614,7 @@ def apply_required_overrides(
         ]
         item.action = READY
         item.reason = (
-            "未解决的 Makro 必填项已使用非 AI 的固定兜底值。"
+            "未解决的普通 Makro 必填项已使用非 AI 的固定兜底值。"
             if source_type == "fallback"
             else "用户补充了 Resolver 未能确定的 Makro 必填值。"
         )
