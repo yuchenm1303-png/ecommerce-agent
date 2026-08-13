@@ -5,6 +5,9 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 ROOT = Path(SPECPATH).resolve().parent
+APP_ICON = ROOT / "packaging" / "app_icon.ico"
+if not APP_ICON.is_file():
+    raise RuntimeError(f"Application icon was not generated: {APP_ICON}")
 
 playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all("playwright")
 
@@ -52,6 +55,7 @@ gui_exe = EXE(
     [],
     exclude_binaries=True,
     name="EcommerceAgent",
+    icon=str(APP_ICON),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -73,6 +77,7 @@ worker_exe = EXE(
     [],
     exclude_binaries=True,
     name="EcommerceAgentWorker",
+    icon=str(APP_ICON),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
