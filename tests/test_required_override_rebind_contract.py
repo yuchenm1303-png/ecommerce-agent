@@ -18,9 +18,11 @@ from app.resolution_types import MISSING, ResolutionRecord
 
 
 def _field(**updates):
+    # Rebind mechanics are tested on an ordinary required field. Protected
+    # listing/title fields intentionally cannot use deterministic fallback now.
     field = {
-        "attribute_key": "model_name",
-        "label": "Model Name",
+        "attribute_key": "required_note",
+        "label": "Required Note",
         "section_heading": "Product Description (0/10)",
         "required": True,
         "multi_value": False,
