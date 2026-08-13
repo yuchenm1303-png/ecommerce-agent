@@ -1,6 +1,5 @@
 #define MyAppName "EcommerceAgent Listing Studio"
 #define MyAppExeName "EcommerceAgent.exe"
-#define InstalledIconName "EcommerceAgent-" + AppVersion + ".ico"
 
 #ifndef AppVersion
   #define AppVersion "0.1.0"
@@ -14,6 +13,8 @@
 #ifndef IconFile
   #define IconFile "app_icon.ico"
 #endif
+
+#define InstalledIconName "EcommerceAgent-" + AppVersion + ".ico"
 
 [Setup]
 AppId={{84E09CC8-51F4-4409-BC73-B5EBC9A4D84A}
