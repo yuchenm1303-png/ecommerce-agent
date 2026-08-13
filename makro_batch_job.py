@@ -11,6 +11,7 @@ No Step 3 writes, Save, image upload, or Send to QC happen here.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -30,6 +31,8 @@ from makro_gui_workflow import (
     build_parser,
 )
 from makro_one_link import _provider_config
+
+_BATCH_TARGET_ENV = "MAKRO_BATCH_TARGET_ID"
 
 
 def main() -> int:
@@ -148,14 +151,27 @@ def main() -> int:
             )
             harness.page = page
             # Step 2 -> Step 3 may replace the Chromium target. Ownership must
-            # follow the exact recovered Step 3 page before Resolver starts.
-            manifest["makro_target_id"] = page_target_id(page)
+            # follow the exact recovered Step 3 page before Resolver/planner starts.
+            owned_target_id = page_target_id(page)
+            manifest["makro_target_id"] = owned_target_id
             manifest["page_url"] = page.url
             _write_manifest(manifest_path, manifest)
 
             current = "step3"
             _phase("step3", "START")
-            _prepare_step3(args, run_dir=run_dir, page=page, manifest=manifest)
+            # Each batch job is its own OS process. Propagate this job's refreshed
+            # Chromium target through the process environment so the nested
+            # read-only planner binds the exact owned tab instead of applying the
+            # Single-mode unique-tab rule to all concurrent Batch tabs.
+            previous_target = os.environ.get(_BATCH_TARGET_ENV)
+            os.environ[_BATCH_TARGET_ENV] = owned_target_id
+            try:
+                _prepare_step3(args, run_dir=run_dir, page=page, manifest=manifest)
+            finally:
+                if previous_target is None:
+                    os.environ.pop(_BATCH_TARGET_ENV, None)
+                else:
+                    os.environ[_BATCH_TARGET_ENV] = previous_target
             manifest["page_url"] = page.url
             manifest["status"] = "prepare_complete"
             _write_manifest(manifest_path, manifest)
