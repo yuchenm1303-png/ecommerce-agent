@@ -112,7 +112,7 @@ class _SinglePageGlassLayer(QWidget):
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        self.controller.paint_glass(painter)
+        self.controller.paint_glass(painter, QRectF(event.rect()))
         painter.end()
 
 
@@ -139,7 +139,7 @@ class ScrollLocalGlassController(QObject):
         self._cover_key: tuple[int, int] | None = None
         self._records: list[_GlassRecord] = []
         self._record_by_frame: dict[QFrame, _GlassRecord] = {}
-        self._hooked_proxies: set[QObject] = set()
+        self._hooked_proxies: set[int] = set()
         self._last_quick_offset: tuple[float, float] | None = None
         self._original_refresh = getattr(visual, "refresh_glass_frames", None)
 
@@ -263,7 +263,8 @@ class ScrollLocalGlassController(QObject):
 
     def _hook_proxy(self, frame: QFrame) -> None:
         proxy = getattr(self.visual, "_glass", {}).get(frame)
-        if proxy is None or proxy in self._hooked_proxies:
+        proxy_key = id(proxy)
+        if proxy is None or proxy_key in self._hooked_proxies:
             return
         original = getattr(proxy, "set_interaction", None)
         if not callable(original):
@@ -277,7 +278,7 @@ class ScrollLocalGlassController(QObject):
                 layer.update_record(controller._record_by_frame.get(frame))
 
         proxy.set_interaction = MethodType(set_interaction, proxy)
-        self._hooked_proxies.add(proxy)
+        self._hooked_proxies.add(proxy_key)
 
     def _migrate_existing_page_cards(self) -> None:
         frames = self._page_glass_frames()
@@ -319,7 +320,11 @@ class ScrollLocalGlassController(QObject):
 
     def _record_for(self, frame: QFrame) -> _GlassRecord | None:
         try:
-            if frame.width() <= 0 or frame.height() <= 0:
+            if (
+                not frame.isVisibleTo(self.page)
+                or frame.width() <= 0
+                or frame.height() <= 0
+            ):
                 return None
             rect = self._page_rect(frame)
             clip = QRectF(self.page.rect())
@@ -386,7 +391,7 @@ class ScrollLocalGlassController(QObject):
         self._cover_key = key
         return self._cover
 
-    def paint_glass(self, painter: QPainter) -> None:
+    def paint_glass(self, painter: QPainter, dirty: QRectF | None = None) -> None:
         layer = self._layer
         cover = self._ensure_cover()
         quick = self.quick
@@ -404,17 +409,15 @@ class ScrollLocalGlassController(QObject):
             return
 
         layer_rect = QRectF(layer.rect())
+        dirty_rect = layer_rect if dirty is None else QRectF(dirty).intersected(layer_rect)
+        if dirty_rect.isEmpty():
+            return
+
         for record in self._records:
             frame = record.frame
-            try:
-                if not frame.isVisibleTo(self.viewport):
-                    continue
-            except RuntimeError:
-                continue
-
             scale = self.scale_for(frame)
             target = self.scaled_rect(record.rect, scale)
-            if target.isEmpty() or not target.intersects(layer_rect):
+            if target.isEmpty() or not target.intersects(dirty_rect):
                 continue
 
             source = QRectF(
