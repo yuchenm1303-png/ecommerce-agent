@@ -10,10 +10,16 @@ from typing import Any
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
+from app.required_overrides import write_required_fallback_overrides
 from .batch_model import BatchJob, BatchRun, create_batch_run, save_batch_run
 from .readonly_runner import RunnerConfig
 from .real_execution import resolver_evidence_images
-from .result_loader import latest_live_schema, latest_resolver_manifest, load_run_result
+from .result_loader import (
+    latest_fill_plan,
+    latest_live_schema,
+    latest_resolver_manifest,
+    load_run_result,
+)
 
 
 _PHASE_LINE = re.compile(
@@ -258,9 +264,24 @@ class BatchController(QObject):
     def _execution_args(self, job: BatchJob) -> list[str]:
         run_dir = Path(job.run_dir)
         live_schema = latest_live_schema(run_dir)
+        fill_plan = latest_fill_plan(run_dir)
         resolver_manifest_path = latest_resolver_manifest(run_dir, "03-hot-resolver")
-        if live_schema is None or resolver_manifest_path is None:
-            raise RuntimeError(f"{job.job_id} 缺少 live schema / resolver manifest")
+        if live_schema is None or fill_plan is None or resolver_manifest_path is None:
+            raise RuntimeError(f"{job.job_id} 缺少 live schema / fill plan / resolver manifest")
+
+        # Batch must use the exact same required-field completion policy as Single.
+        # Persist deterministic fallback instructions beside this job's planned
+        # live schema before starting the canonical executor. The executor then
+        # rebinds/recomputes them against the current owned tab and keeps its
+        # existing pre-write hard guards. No AI call happens here.
+        fallback_summary = write_required_fallback_overrides(fill_plan, live_schema)
+        if int(fallback_summary.get("count") or 0) > 0:
+            self.log.emit(
+                f"[{job.job_id}] [required-fallback] "
+                f"overrides={fallback_summary.get('path') or 'none'} "
+                f"automatic={fallback_summary.get('count')} ai_calls=0"
+            )
+
         manifest = json.loads(resolver_manifest_path.read_text(encoding="utf-8"))
         outputs = manifest.get("outputs") or {}
         decision_packet = Path(str(outputs.get("final_decisions") or ""))
