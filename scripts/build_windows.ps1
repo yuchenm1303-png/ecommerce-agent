@@ -19,15 +19,25 @@ $WorkDir = Join-Path $Root "build\pyinstaller"
 $ArtifactDir = Join-Path $Root "artifacts"
 $PortableZip = Join-Path $ArtifactDir "EcommerceAgent-$Version-portable.zip"
 $SetupExe = Join-Path $ArtifactDir "EcommerceAgent-Setup-$Version.exe"
+$IconFile = Join-Path $Root "packaging\app_icon.ico"
 
-foreach ($Path in @($AppDir, $WorkDir, $PortableZip, $SetupExe)) {
+foreach ($Path in @($AppDir, $WorkDir, $PortableZip, $SetupExe, $IconFile)) {
     if (Test-Path $Path) {
         Remove-Item $Path -Recurse -Force
     }
 }
 New-Item -ItemType Directory -Force -Path $DistRoot, $WorkDir, $ArtifactDir | Out-Null
 
-Write-Host "[1/4] Building PyInstaller onedir package $Version"
+Write-Host "[1/5] Generating application icon"
+& python (Join-Path $Root "scripts\generate_app_icon.py") --output $IconFile
+if ($LASTEXITCODE -ne 0) {
+    throw "Application icon generation failed with exit code $LASTEXITCODE"
+}
+if (-not (Test-Path $IconFile)) {
+    throw "Generated application icon missing: $IconFile"
+}
+
+Write-Host "[2/5] Building PyInstaller onedir package $Version"
 & python -m PyInstaller `
     --noconfirm `
     --clean `
@@ -46,13 +56,13 @@ foreach ($Required in @($GuiExe, $WorkerExe)) {
     }
 }
 
-Write-Host "[2/4] Verifying packaged Playwright worker"
+Write-Host "[3/5] Verifying packaged Playwright worker"
 & $WorkerExe --self-test
 if ($LASTEXITCODE -ne 0) {
     throw "Packaged worker self-test failed with exit code $LASTEXITCODE"
 }
 
-Write-Host "[3/4] Creating portable archive"
+Write-Host "[4/5] Creating portable archive"
 Compress-Archive -Path (Join-Path $AppDir "*") -DestinationPath $PortableZip -CompressionLevel Optimal
 
 $IsccFromPath = Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1
@@ -68,11 +78,12 @@ if (-not $Iscc) {
     throw "Inno Setup compiler (ISCC.exe) was not found. Install Inno Setup 6+ and rerun."
 }
 
-Write-Host "[4/4] Building installer"
+Write-Host "[5/5] Building installer"
 & $Iscc `
     "/DAppVersion=$Version" `
     "/DSourceDir=$AppDir" `
     "/DOutputDir=$ArtifactDir" `
+    "/DIconFile=$IconFile" `
     (Join-Path $Root "packaging\installer.iss")
 if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup failed with exit code $LASTEXITCODE"
@@ -86,3 +97,4 @@ Write-Host "Windows package ready:"
 Write-Host "  Installer: $SetupExe"
 Write-Host "  Portable : $PortableZip"
 Write-Host "  App dir  : $AppDir"
+Write-Host "  Icon     : $IconFile"
