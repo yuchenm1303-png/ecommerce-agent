@@ -22,6 +22,7 @@ def main() -> int:
         return 2
 
     from gui.activity_presence import install_activity_presence
+    from gui.batch_card_responsive import install_batch_card_responsive
     from gui.batch_job_controls import install_batch_job_controls
     from gui.batch_url_editor import install_batch_url_editor
     from gui.batch_workspace_density import install_batch_workspace_density
@@ -114,6 +115,10 @@ def main() -> int:
     # only selects existing canonical queues/executor paths; it never duplicates
     # Resolver, Makro execution or Product Photos business logic.
     install_batch_job_controls(window.batch_workspace)
+    # Long supplier URLs/logs are display data, not minimum-width constraints.
+    # Keep every owned-job card capped to the real Batch viewport so right-side
+    # actions and per-job controls remain visible without horizontal scrolling.
+    install_batch_card_responsive(window.batch_workspace)
     install_workspace_mode_switch(window)
     # Formal GUI owns one dedicated Makro Edge/Profile. 9222 remains an internal
     # transport detail; Single and Batch share one login session and Batch keeps
