@@ -28,7 +28,7 @@ foreach ($Path in @($AppDir, $WorkDir, $PortableZip, $SetupExe, $IconFile)) {
 }
 New-Item -ItemType Directory -Force -Path $DistRoot, $WorkDir, $ArtifactDir | Out-Null
 
-Write-Host "[1/5] Generating application icon"
+Write-Host "[1/6] Generating application icon"
 & python (Join-Path $Root "scripts\generate_app_icon.py") --output $IconFile
 if ($LASTEXITCODE -ne 0) {
     throw "Application icon generation failed with exit code $LASTEXITCODE"
@@ -37,7 +37,7 @@ if (-not (Test-Path $IconFile)) {
     throw "Generated application icon missing: $IconFile"
 }
 
-Write-Host "[2/5] Building PyInstaller onedir package $Version"
+Write-Host "[2/6] Building PyInstaller onedir package $Version"
 $PreviousBuildVersion = $env:ECOMMERCE_AGENT_BUILD_VERSION
 $env:ECOMMERCE_AGENT_BUILD_VERSION = $Version
 try {
@@ -69,13 +69,32 @@ foreach ($Required in @($GuiExe, $WorkerExe)) {
     }
 }
 
-Write-Host "[3/5] Verifying packaged Playwright worker"
+Write-Host "[3/6] Verifying packaged GUI import path"
+$PreviousImportProbe = $env:ECOMMERCE_AGENT_PACKAGE_IMPORT_PROBE
+$env:ECOMMERCE_AGENT_PACKAGE_IMPORT_PROBE = "1"
+try {
+    & $GuiExe
+    $GuiProbeExitCode = $LASTEXITCODE
+}
+finally {
+    if ($null -eq $PreviousImportProbe) {
+        Remove-Item Env:ECOMMERCE_AGENT_PACKAGE_IMPORT_PROBE -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:ECOMMERCE_AGENT_PACKAGE_IMPORT_PROBE = $PreviousImportProbe
+    }
+}
+if ($GuiProbeExitCode -ne 0) {
+    throw "Packaged GUI import probe failed with exit code $GuiProbeExitCode"
+}
+
+Write-Host "[4/6] Verifying packaged Playwright worker"
 & $WorkerExe --self-test
 if ($LASTEXITCODE -ne 0) {
     throw "Packaged worker self-test failed with exit code $LASTEXITCODE"
 }
 
-Write-Host "[4/5] Creating portable archive"
+Write-Host "[5/6] Creating portable archive"
 Compress-Archive -Path (Join-Path $AppDir "*") -DestinationPath $PortableZip -CompressionLevel Optimal
 
 $IsccFromPath = Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1
@@ -91,7 +110,7 @@ if (-not $Iscc) {
     throw "Inno Setup compiler (ISCC.exe) was not found. Install Inno Setup 6+ and rerun."
 }
 
-Write-Host "[5/5] Building installer"
+Write-Host "[6/6] Building installer"
 & $Iscc `
     "/DAppVersion=$Version" `
     "/DSourceDir=$AppDir" `
