@@ -19,14 +19,21 @@ def test_each_batch_link_has_independent_row_switch_and_delete_control() -> None
     assert "self.input = QLineEdit(url)" in SOURCE
 
 
-def test_link_row_controls_have_explicit_non_clipping_geometry() -> None:
-    assert "_ROW_HEIGHT = 38" in SOURCE
-    assert "_CONTROL_HEIGHT = 30" in SOURCE
+def test_link_row_controls_have_explicit_centered_non_clipping_geometry() -> None:
+    assert "_ROW_HEIGHT = 40" in SOURCE
+    assert "_CONTROL_HEIGHT = 28" in SOURCE
+    assert "layout.setContentsMargins(7, 5, 7, 5)" in SOURCE
+    assert "layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)" in SOURCE
+    assert "center = Qt.AlignmentFlag.AlignVCenter" in SOURCE
+    assert "layout.addWidget(self.index_label, 0, center)" in SOURCE
+    assert "layout.addWidget(self.toggle, 0, center)" in SOURCE
+    assert "layout.addWidget(self.input, 1, center)" in SOURCE
+    assert "layout.addWidget(self.remove_button, 0, center)" in SOURCE
     assert "self.toggle.setFixedSize(58, _CONTROL_HEIGHT)" in SOURCE
     assert "self.input.setFixedHeight(_CONTROL_HEIGHT)" in SOURCE
     assert "self.remove_button.setFixedSize(48, _CONTROL_HEIGHT)" in SOURCE
     assert '"  padding: 0 11px;"' in SOURCE
-    assert '"  min-height: 30px; max-height: 30px;"' in SOURCE
+    assert '"  min-height: 28px; max-height: 28px;"' in SOURCE
 
 
 def test_delete_control_has_visible_danger_button_treatment() -> None:
