@@ -70,15 +70,53 @@ def test_single_uses_balanced_one_screen_height_and_width_budgets() -> None:
     assert "body.setStretchFactor(1, 0)" in PAGE
 
 
-def test_fixed_single_rebalances_workspace_after_mature_responsive_pass() -> None:
-    assert "def _apply_workspace_width" in SUMMARY
-    assert "_SIDE_MIN = 360" in SUMMARY
-    assert "_SIDE_MAX = 480" in SUMMARY
-    assert "_SIDE_RATIO = 0.29" in SUMMARY
-    assert 'self.root.findChild(QSplitter, "workspaceSplitter")' in SUMMARY
-    assert "self._apply_workspace_width()" in SUMMARY
-    assert "self._mature_apply()" in SUMMARY
-    assert "self.apply()" in SUMMARY
+def test_fixed_single_sleeps_old_mature_geometry_owner() -> None:
+    assert "from types import MethodType" in SUMMARY
+    assert "_COALESCE_MS = 16" in SUMMARY
+    assert "def _install_mature_single_fast_path" in SUMMARY
+    assert "timer.stop()" in SUMMARY
+    assert "timer.timeout.disconnect()" in SUMMARY
+    assert "timer.timeout.connect(self._dispatch_mature_apply)" in SUMMARY
+    assert "mature.schedule = MethodType(fixed_aware_schedule, mature)" in SUMMARY
+    assert "if controller._single_active():" in SUMMARY
+    assert "original_schedule()" in SUMMARY
+    assert "if self._single_active():" in SUMMARY
+    assert "self._mature_original_apply()" in SUMMARY
+    assert "_apply_after_mature" not in SUMMARY
+
+
+def test_fixed_single_only_recomputes_for_real_geometry_changes() -> None:
+    assert "def _geometry_signature" in SUMMARY
+    assert "if signature == self._last_geometry_signature:" in SUMMARY
+    assert "self.root.installEventFilter(self)" in SUMMARY
+    assert "self.body.installEventFilter(self)" in SUMMARY
+
+    event = SUMMARY.split("def eventFilter", 1)[1].split("def cleanup", 1)[0]
+    assert "QEvent.Type.Resize" in event
+    assert "QEvent.Type.Show" in event
+    assert "QEvent.Type.LayoutRequest" not in event
+
+    apply_body = SUMMARY.split("def apply(self)", 1)[1].split("def _open_detail", 1)[0]
+    assert "background.schedule_mask_update" not in apply_body
+    assert "_schedule_mask_after_geometry" not in SUMMARY
+    assert "self._apply_workspace_width()" in apply_body
+    assert "self._apply_body_height()" in apply_body
+
+
+def test_fixed_single_restores_mature_responsive_behavior_for_batch() -> None:
+    assert "def _on_mode_changed" in SUMMARY
+    mode = SUMMARY.split("def _on_mode_changed", 1)[1].split(
+        "def _install_mature_single_fast_path", 1
+    )[0]
+    assert "if int(index) == 0:" in mode
+    assert "self.schedule()" in mode
+    assert "self._mature_original_schedule()" in mode
+
+    dispatch = SUMMARY.split("def _dispatch_mature_apply", 1)[1].split(
+        "@staticmethod", 1
+    )[0]
+    assert "if self._single_active():" in dispatch
+    assert "self._mature_original_apply()" in dispatch
 
 
 def test_fixed_single_has_no_per_scroll_quick_geometry_path() -> None:
