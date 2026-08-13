@@ -8,6 +8,11 @@ on:
         required: true
         default: "feat/local-test-gui"
         type: string
+      package_version:
+        description: "Package version to keep unchanged during validation"
+        required: true
+        default: "0.1.3"
+        type: string
 
 permissions:
   contents: write
@@ -18,6 +23,7 @@ jobs:
     timeout-minutes: 50
     env:
       SOURCE_REF: ${{ inputs.source_ref }}
+      PACKAGE_VERSION: ${{ inputs.package_version }}
       GH_TOKEN: ${{ github.token }}
 
     steps:
@@ -33,7 +39,7 @@ jobs:
         run: |
           $sha = (git rev-parse HEAD).Trim()
           $short = $sha.Substring(0, 8)
-          $version = (Get-Content "packaging\VERSION" -Raw).Trim()
+          $version = $env:PACKAGE_VERSION.Trim()
           if ($version -notmatch '^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') {
             throw "Invalid package version: $version"
           }
