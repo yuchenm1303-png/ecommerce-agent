@@ -101,8 +101,7 @@ def main() -> int:
     # ui_maturity gets the last compact/responsive pass first. Then the final
     # Single geometry owner replaces the viewport-competing body splitter with one
     # content-driven vertical page: Product Source → statuses → fields → console.
-    # The common application header remains fixed above this scroll area. The page
-    # installer also moves Single glass into one shared page-owned QWidget layer.
+    # The common application header remains fixed above this scroll area.
     install_page_scroll_layout(window, visual)
 
     install_console_summary_mode(window)
