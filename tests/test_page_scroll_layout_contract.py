@@ -75,12 +75,15 @@ def test_side_diagnostics_removes_legacy_bottom_clearance() -> None:
     assert "visibly empty column under Telemetry" in PAGE
 
 
-def test_page_scroll_uses_original_native_quick_mask_schedule() -> None:
+def test_page_scroll_uses_shared_parent_glass_without_quick_scroll_sync() -> None:
+    assert "from .scroll_local_glass import install_scroll_local_glass" in PAGE
+    assert "install_scroll_local_glass(window, resolved_visual, scroll, page)" in PAGE
     assert "install_single_scroll_glass_fastpath" not in PAGE
     assert "def sync_scroll_glass" not in PAGE
     assert "sync_geometry" not in PAGE
-    assert 'scroll.verticalScrollBar().valueChanged.connect(schedule_mask)' in PAGE
-    assert "QTimer.singleShot(0, schedule_mask)" in PAGE
+    assert "valueChanged.connect(schedule_mask)" not in PAGE
+    assert "QTimer.singleShot(0, schedule_mask)" not in PAGE
+    assert "same backing" in PAGE
 
 
 def test_nested_wheel_scroll_chains_outward_at_inner_boundaries() -> None:
