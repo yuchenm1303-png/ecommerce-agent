@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
@@ -9,11 +10,19 @@ APP_ICON = ROOT / "packaging" / "app_icon.ico"
 if not APP_ICON.is_file():
     raise RuntimeError(f"Application icon was not generated: {APP_ICON}")
 
+BUILD_VERSION = os.environ.get("ECOMMERCE_AGENT_BUILD_VERSION", "").strip()
+if not BUILD_VERSION:
+    BUILD_VERSION = (ROOT / "packaging" / "VERSION").read_text(encoding="utf-8").strip()
+BUILD_METADATA = ROOT / "build" / "package_metadata"
+BUILD_METADATA.mkdir(parents=True, exist_ok=True)
+(BUILD_METADATA / "VERSION").write_text(BUILD_VERSION + "\n", encoding="utf-8")
+
 playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all("playwright")
 
 gui_datas = [
     (str(ROOT / "gui" / "assets"), "gui/assets"),
     (str(ROOT / "THIRD_PARTY_NOTICES.md"), "."),
+    (str(BUILD_METADATA / "VERSION"), "packaging"),
 ]
 
 gui_a = Analysis(
