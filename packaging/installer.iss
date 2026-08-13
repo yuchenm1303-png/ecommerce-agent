@@ -10,6 +10,9 @@
 #ifndef OutputDir
   #define OutputDir "..\artifacts"
 #endif
+#ifndef IconFile
+  #define IconFile "app_icon.ico"
+#endif
 
 [Setup]
 AppId={{84E09CC8-51F4-4409-BC73-B5EBC9A4D84A}
@@ -21,6 +24,7 @@ DefaultGroupName=EcommerceAgent
 DisableProgramGroupPage=yes
 OutputDir={#OutputDir}
 OutputBaseFilename=EcommerceAgent-Setup-{#AppVersion}
+SetupIconFile={#IconFile}
 Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=lowest
