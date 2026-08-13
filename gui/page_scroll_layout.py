@@ -1,22 +1,20 @@
-"""Scrollable Single-workspace page layout for the formal GUI.
+"""Fixed Single-workspace layout for the formal GUI.
 
-Presentation only: this module rearranges already-created QWidget objects. It does
-not rebuild runners, change permissions, or touch Resolver / Fill Plan / executor
-logic.
+Presentation only: keep the existing Single widgets and business wiring, but stop
+wrapping the whole page in an outer QScrollArea. The field table and diagnostic
+views keep their own native scroll areas; top-level glass cards remain stationary.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QBoxLayout,
     QFrame,
     QLayout,
     QMainWindow,
-    QPushButton,
-    QScrollArea,
     QSizePolicy,
     QSplitter,
     QTabWidget,
@@ -25,17 +23,15 @@ from PySide6.QtWidgets import (
 )
 
 
-# The field table already owns its own scroll viewport, so the surrounding row
-# does not need to grow vertically with the page. Keeping this row compact makes
-# the Telemetry/Web/Safety column visually terminate close to its real content
-# instead of leaving a large empty strip under the diagnostics card.
-_WORKSPACE_HEIGHT = 350
-_FIELD_TABLE_MIN_HEIGHT = 255
-_SIDE_TABS_HEIGHT = 320
-_CONSOLE_MIN_HEIGHT = 420
-_CONSOLE_MAX_HEIGHT = 560
-_CONSOLE_TABS_MIN_HEIGHT = 250
-_CONSOLE_LOG_MIN_HEIGHT = 180
+_INPUT_CARD_MAX_HEIGHT = 176
+_STATUS_CARD_MIN_HEIGHT = 68
+_STATUS_CARD_MAX_HEIGHT = 72
+_WORKSPACE_MIN_HEIGHT = 292
+_FIELD_TABLE_MIN_HEIGHT = 205
+_SIDE_TABS_HEIGHT = 300
+_CONSOLE_MIN_HEIGHT = 120
+_CONSOLE_MAX_HEIGHT = 136
+_CONSOLE_TARGET_HEIGHT = 128
 
 
 def _ancestor_card(widget: QWidget | None, object_name: str) -> QFrame | None:
@@ -60,152 +56,105 @@ def _contains_widget(layout: QLayout | None, target: QWidget) -> bool:
     return False
 
 
-def _take_widget(layout: QBoxLayout, target: QWidget) -> None:
-    for index in range(layout.count()):
+def _direct_box_layout_containing(
+    parent: QVBoxLayout,
+    target: QWidget | None,
+) -> QBoxLayout | None:
+    if target is None:
+        return None
+    for index in range(parent.count()):
+        candidate = parent.itemAt(index).layout()
+        if isinstance(candidate, QBoxLayout) and _contains_widget(candidate, target):
+            return candidate
+    return None
+
+
+def _remove_spacers(layout: QBoxLayout) -> None:
+    for index in range(layout.count() - 1, -1, -1):
         item = layout.itemAt(index)
-        if item.widget() is target:
+        if item.spacerItem() is not None:
             layout.takeAt(index)
-            return
 
 
-def _take_layout(layout: QBoxLayout, target: QLayout) -> None:
-    for index in range(layout.count()):
-        item = layout.itemAt(index)
-        if item.layout() is target:
-            layout.takeAt(index)
-            return
+def _compact_input_rows(window: QMainWindow, input_card: QFrame) -> None:
+    """Put stage buttons and connection controls on one row.
 
-
-def _restore_console_view(window: QMainWindow, console: QWidget) -> None:
-    # ui_polish historically compressed the console into the same vertical
-    # splitter as the field workspace. Once the page itself scrolls, that
-    # competition for viewport height is unnecessary: keep the useful diagnostic
-    # content visible and give it a real reading height.
-    toggle = getattr(window, "console_detail_toggle", None)
-    if isinstance(toggle, QPushButton):
-        was_blocked = toggle.blockSignals(True)
-        try:
-            toggle.setChecked(True)
-            toggle.setEnabled(True)
-            toggle.show()
-        finally:
-            toggle.blockSignals(was_blocked)
-
-    for unit in getattr(console, "phase_units", {}).values():
-        if isinstance(unit, QWidget):
-            unit.show()
-
-    tabs = getattr(console, "tabs", None)
-    if isinstance(tabs, QTabWidget):
-        tabs.show()
-        tabs.setMinimumHeight(_CONSOLE_TABS_MIN_HEIGHT)
-        tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
-    log_view = getattr(console, "log_view", None)
-    if isinstance(log_view, QWidget):
-        log_view.setMinimumHeight(_CONSOLE_LOG_MIN_HEIGHT)
-
-    console.setMinimumHeight(_CONSOLE_MIN_HEIGHT)
-    console.setMaximumHeight(_CONSOLE_MAX_HEIGHT)
-    console.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-
-
-def install_page_scroll_layout(window: QMainWindow, visual: Any | None = None) -> QScrollArea:
-    """Make the preserved Single body one vertically scrollable page.
-
-    The application header remains fixed at the root. Product source, status cards,
-    field workspace and acceptance console move into one content-driven page. The
-    old body QSplitter stays detached/hidden only long enough for legacy signal
-    closures to remain harmless; it no longer controls any visible geometry.
+    This removes one complete 33 px control row without rebuilding any business
+    widgets or reconnecting signals. The real-execution summary row remains below
+    it exactly as before.
     """
 
-    existing = getattr(window, "_single_page_scroll", None)
-    if isinstance(existing, QScrollArea):
-        return existing
+    if getattr(window, "_single_fixed_input_rows", False):
+        return
+    layout = input_card.layout()
+    if not isinstance(layout, QVBoxLayout):
+        return
 
-    root = window.centralWidget()
-    outer = root.layout() if root is not None else None
-    if root is None or not isinstance(outer, QVBoxLayout):
-        raise RuntimeError("page scroll layout requires the preserved root QVBoxLayout")
+    stage_anchor = getattr(window, "step1_button", None)
+    settings_anchor = getattr(window, "source_port", None)
+    if not isinstance(stage_anchor, QWidget) or not isinstance(settings_anchor, QWidget):
+        return
 
-    url_input = getattr(window, "url_input", None)
-    input_card = _ancestor_card(url_input if isinstance(url_input, QWidget) else None, "heroCard")
-    ready_card = getattr(window, "ready_card", None)
-    body = getattr(window, "_ui_polish_body_splitter", None)
-    console = getattr(window, "console", None)
+    stage_row = _direct_box_layout_containing(layout, stage_anchor)
+    settings_row = _direct_box_layout_containing(layout, settings_anchor)
+    if stage_row is None or settings_row is None or stage_row is settings_row:
+        return
 
-    if not isinstance(input_card, QFrame):
-        raise RuntimeError("page scroll layout could not resolve the Product Source card")
-    if not isinstance(ready_card, QWidget):
-        raise RuntimeError("page scroll layout could not resolve the status row")
-    if not isinstance(body, QSplitter) or body.count() < 2:
-        raise RuntimeError("page scroll layout requires the polished body splitter")
-    if not isinstance(console, QWidget):
-        raise RuntimeError("page scroll layout could not resolve the acceptance console")
+    _remove_spacers(stage_row)
+    _remove_spacers(settings_row)
 
-    status_layout: QLayout | None = None
-    for index in range(outer.count()):
-        candidate = outer.itemAt(index).layout()
-        if candidate is not None and _contains_widget(candidate, ready_card):
-            status_layout = candidate
-            break
-    if status_layout is None:
-        raise RuntimeError("page scroll layout could not resolve the status layout")
+    moved = False
+    for name in ("makro_port", "source_port", "vertical_input", "current_page_check"):
+        widget = getattr(window, name, None)
+        if not isinstance(widget, QWidget) or not _contains_widget(settings_row, widget):
+            continue
+        settings_row.removeWidget(widget)
+        if not moved:
+            stage_row.addSpacing(8)
+            moved = True
+        stage_row.addWidget(widget)
 
-    workspace = body.widget(0)
-    body_console = body.widget(1)
-    if workspace is None or body_console is not console:
-        raise RuntimeError("page scroll layout found an unexpected polished body structure")
+    if moved:
+        stage_row.addStretch(1)
+        stage_row.setSpacing(7)
+        settings_row.setSpacing(0)
+        settings_row.setContentsMargins(0, 0, 0, 0)
+        setattr(window, "_single_fixed_input_rows", True)
 
-    # Detach the old root items before constructing the new page.
-    _take_widget(outer, input_card)
-    _take_layout(outer, status_layout)
-    _take_widget(outer, body)
 
-    scroll = QScrollArea(root)
-    scroll.setObjectName("singlePageScroll")
-    scroll.setFrameShape(QFrame.Shape.NoFrame)
-    scroll.setWidgetResizable(True)
-    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-    scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-    scroll.setStyleSheet(
-        "QScrollArea#singlePageScroll { background: transparent; border: 0; }"
-        "QScrollArea#singlePageScroll > QWidget > QWidget { background: transparent; }"
-    )
-    scroll.viewport().setAutoFillBackground(False)
-    scroll.viewport().setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+def _compact_input_card(window: QMainWindow, input_card: QFrame) -> None:
+    _compact_input_rows(window, input_card)
+    layout = input_card.layout()
+    if isinstance(layout, QVBoxLayout):
+        layout.setContentsMargins(16, 8, 16, 9)
+        layout.setSpacing(4)
+    input_card.setMinimumHeight(0)
+    input_card.setMaximumHeight(_INPUT_CARD_MAX_HEIGHT)
+    input_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
-    page = QWidget()
-    page.setObjectName("singlePageScrollContent")
-    page.setAutoFillBackground(False)
-    page.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-    page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
 
-    page_layout = QVBoxLayout(page)
-    page_layout.setContentsMargins(0, 0, 8, 20)
-    page_layout.setSpacing(10)
-    page_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+def _compact_status_cards(window: QMainWindow) -> None:
+    for name in ("ready_card", "missing_card", "conflict_card", "blocked_card"):
+        card = getattr(window, name, None)
+        if not isinstance(card, QFrame):
+            continue
+        card.setMinimumHeight(_STATUS_CARD_MIN_HEIGHT)
+        card.setMaximumHeight(_STATUS_CARD_MAX_HEIGHT)
+        layout = card.layout()
+        if isinstance(layout, QBoxLayout):
+            layout.setContentsMargins(14, 5, 14, 5)
+            layout.setSpacing(0)
 
-    input_card.setParent(page)
-    page_layout.addWidget(input_card)
 
-    status_host = QWidget(page)
-    status_host.setObjectName("statusRowHost")
-    status_host.setAutoFillBackground(False)
-    status_host.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-    status_layout.setParent(None)
-    status_host.setLayout(status_layout)
-    page_layout.addWidget(status_host)
+def _configure_workspace(window: QMainWindow, body: QSplitter) -> None:
+    workspace = body.widget(0) if body.count() > 0 else None
+    console = body.widget(1) if body.count() > 1 else None
+    if not isinstance(workspace, QWidget) or not isinstance(console, QWidget):
+        raise RuntimeError("fixed Single layout requires workspace + console in bodySplitter")
 
-    # Reparenting removes the widgets from the legacy splitter without rebuilding
-    # any business-owned controls or reconnecting signals.
-    workspace.setParent(page)
-    console.setParent(page)
-
-    workspace.setMinimumHeight(_WORKSPACE_HEIGHT)
-    workspace.setMaximumHeight(_WORKSPACE_HEIGHT)
-    workspace.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    workspace.setMinimumHeight(_WORKSPACE_MIN_HEIGHT)
+    workspace.setMaximumHeight(16777215)
+    workspace.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     field_table = getattr(window, "field_table", None)
     if isinstance(field_table, QWidget):
@@ -217,43 +166,65 @@ def install_page_scroll_layout(window: QMainWindow, visual: Any | None = None) -
         side_tabs.setMaximumHeight(_SIDE_TABS_HEIGHT)
         side_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        # ui_polish used a bottom clearance while the sidebar itself scrolled.
-        # The final page now owns scrolling, so that old clearance only appears as
-        # a visibly empty column under Telemetry. Remove it here, after maturity,
-        # without touching the diagnostic cards themselves.
-        side_host = side_tabs.parentWidget()
-        side_layout = side_host.layout() if side_host is not None else None
-        if isinstance(side_layout, QVBoxLayout):
-            margins = side_layout.contentsMargins()
-            side_layout.setContentsMargins(margins.left(), margins.top(), margins.right(), 0)
+    console.setMinimumHeight(_CONSOLE_MIN_HEIGHT)
+    console.setMaximumHeight(_CONSOLE_MAX_HEIGHT)
+    console.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
-    _restore_console_view(window, console)
+    body.setHandleWidth(7)
+    body.setChildrenCollapsible(False)
+    body.setStretchFactor(0, 1)
+    body.setStretchFactor(1, 0)
+    available = max(1, body.height() - body.handleWidth())
+    target = min(_CONSOLE_MAX_HEIGHT, max(_CONSOLE_MIN_HEIGHT, _CONSOLE_TARGET_HEIGHT))
+    body.setSizes([max(_WORKSPACE_MIN_HEIGHT, available - target), target])
 
-    page_layout.addWidget(workspace)
-    page_layout.addWidget(console)
-    page_layout.addStretch(1)
 
-    scroll.setWidget(page)
-    outer.addWidget(scroll, 1)
+def install_page_scroll_layout(
+    window: QMainWindow,
+    visual: Any | None = None,
+) -> QSplitter:
+    """Keep Single as a fixed one-screen workspace.
 
-    # The old splitter is no longer a layout owner. Keep the QObject alive but
-    # invisible so any already-connected presentation-only closure cannot target
-    # a deleted C++ object. Mature UI sees None and therefore stops resizing it.
-    body.hide()
-    body.setParent(root)
-    setattr(window, "_ui_polish_body_splitter", None)
+    The historical function name is retained so ``run_local_gui.py`` and existing
+    callers do not need a migration. No outer Single QScrollArea is created.
+    """
 
-    # Restore the original pre-jitter scroll behavior: scrolling only schedules
-    # the existing native Quick mask refresh. No per-tick geometry compensation,
-    # viewport compositor, cached fast path or alternate renderer participates.
+    existing = getattr(window, "_single_fixed_body", None)
+    if isinstance(existing, QSplitter):
+        return existing
+
+    root = window.centralWidget()
+    outer = root.layout() if root is not None else None
+    if root is None or not isinstance(outer, QVBoxLayout):
+        raise RuntimeError("fixed Single layout requires the preserved root QVBoxLayout")
+
+    url_input = getattr(window, "url_input", None)
+    input_card = _ancestor_card(
+        url_input if isinstance(url_input, QWidget) else None,
+        "heroCard",
+    )
+    body = getattr(window, "_ui_polish_body_splitter", None)
+    if not isinstance(input_card, QFrame):
+        raise RuntimeError("fixed Single layout could not resolve the Product Source card")
+    if not isinstance(body, QSplitter) or body.count() < 2:
+        raise RuntimeError("fixed Single layout requires the polished bodySplitter")
+
+    # Keep the original root ownership. This is the important architectural
+    # difference from the previous scroll page: no card is reparented into an
+    # outer viewport, so top-level glass geometry is stationary during normal use.
+    outer.setSpacing(8)
+    _compact_input_card(window, input_card)
+    _compact_status_cards(window)
+    _configure_workspace(window, body)
+
+    # One deferred refresh is enough after the compact geometry settles. There is
+    # deliberately no scrollbar -> Quick geometry/mask synchronization path.
     background = getattr(visual, "background", None)
     if background is None:
         background = getattr(getattr(window, "_visual_style", None), "background", None)
-    schedule_mask = getattr(background, "schedule_mask_update", None)
-    if callable(schedule_mask):
-        scroll.verticalScrollBar().valueChanged.connect(schedule_mask)
-        QTimer.singleShot(0, schedule_mask)
+    schedule = getattr(background, "schedule_mask_update", None)
+    if callable(schedule):
+        QTimer.singleShot(0, schedule)
 
-    setattr(window, "_single_page_scroll", scroll)
-    setattr(window, "_single_page_scroll_content", page)
-    return scroll
+    setattr(window, "_single_fixed_body", body)
+    return body
