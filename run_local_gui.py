@@ -54,6 +54,7 @@ def main() -> int:
     from gui.required_input_support import install_required_input_support
     from gui.restore_snapshot import install_restore_snapshot
     from gui.runtime_assistant import install_runtime_assistant
+    from gui.single_top_compact import install_single_top_compact
     from gui.startup_entrance import install_startup_entrance
     from gui.startup_entrance_stability import install_startup_entrance_stability
     from gui.static_modal_interaction import install_static_modal_interaction
@@ -155,6 +156,7 @@ def main() -> int:
     # supplier URLs may represent different sold bundles in Batch, while Single
     # execution is invalidated if the offer is edited after preparation.
     install_listing_offer_hardening(window)
+    install_single_top_compact(window)
     install_activity_presence(window)
     install_detailed_preparation_progress(window)
     visual.refresh_glass_frames()
