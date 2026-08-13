@@ -37,7 +37,9 @@ gui_a = Analysis(
     pathex=[str(ROOT)],
     binaries=[],
     datas=gui_datas,
-    hiddenimports=[],
+    # app_access is shipped as source data, so its Windows-only stdlib imports
+    # are not visible to PyInstaller's static analysis and must be explicit.
+    hiddenimports=["ctypes.wintypes"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
