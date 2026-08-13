@@ -65,13 +65,7 @@ def _has_password(page: Any) -> bool:
 
 
 def _is_step1_operable(page: Any) -> bool:
-    """Return True only when the exact surface needed by select_vertical exists.
-
-    Step 1 must be on the Single Listing route, pass the broad structural
-    readiness contract, expose Vertical-specific search semantics, and provide
-    the actual search input. Requiring all four prevents Dashboard/Listing
-    Creation menus or a lone generic text box from masquerading as Step 1.
-    """
+    """Return True only when the exact surface needed by select_vertical exists."""
 
     try:
         if not _is_single_listing_route(getattr(page, "url", "")):
@@ -167,7 +161,6 @@ def _is_dashboard(page: Any) -> bool:
 
 
 def _is_listing_creation(page: Any) -> bool:
-    # The Step 1 page is also a listing-creation flow, so rule it out first.
     if _is_step1_operable(page):
         return False
     return bool(
@@ -186,6 +179,8 @@ def _diagnostics(page: Any) -> str:
         "listing_creation": _is_listing_creation(page),
         "step1_operable": _is_step1_operable(page),
         "safe_pre_step1_single_route": _is_safe_pre_step1_single_route(page),
+        "listings_action": _has_exact_action(page, _LISTINGS),
+        "add_new_listings_action": _has_exact_action(page, _ADD_NEW_LISTINGS),
     }
     try:
         payload["stage"] = MakroPortalAdapter(page).detect_stage().value
@@ -237,6 +232,12 @@ def _reject_later_listing_stage(page: Any) -> None:
         )
 
 
+def _dashboard_navigation_ready(page: Any) -> bool:
+    if _has_password(page):
+        raise RuntimeError("Makro 登录状态无效；请先在长期 Edge 中人工登录，再重试。")
+    return _has_exact_action(page, _ADD_NEW_LISTINGS) or _has_exact_action(page, _LISTINGS)
+
+
 def _open_listing_creation_from_dashboard(page: Any) -> None:
     if _is_listing_creation(page) or _is_step1_operable(page):
         return
@@ -247,20 +248,32 @@ def _open_listing_creation_from_dashboard(page: Any) -> None:
             f"diagnostics={_diagnostics(page)}"
         )
 
+    # Makro is a hash-routed SPA: #dashboard/home-page can appear before the
+    # React navigation controls are mounted. Route readiness is therefore not
+    # enough to click. Wait for the exact business action to become visible.
+    if not _wait_until(page, lambda: _dashboard_navigation_ready(page), timeout_s=15.0):
+        raise RuntimeError(
+            "Makro Dashboard route 已打开，但 Listings 导航在等待窗口内仍未就绪。 "
+            f"diagnostics={_diagnostics(page)}"
+        )
+
     if not _has_exact_action(page, _ADD_NEW_LISTINGS):
         _click_exact_action(page, _LISTINGS)
         if not _wait_until(
             page,
             lambda: _has_exact_action(page, _ADD_NEW_LISTINGS),
-            timeout_s=5.0,
+            timeout_s=8.0,
         ):
-            raise RuntimeError("点击 Listings 后没有出现唯一可见的 Add New Listings。")
+            raise RuntimeError(
+                "点击 Listings 后没有出现唯一可见的 Add New Listings。 "
+                f"diagnostics={_diagnostics(page)}"
+            )
 
     _click_exact_action(page, _ADD_NEW_LISTINGS)
     if not _wait_until(
         page,
         lambda: _is_listing_creation(page) or _is_step1_operable(page),
-        timeout_s=15.0,
+        timeout_s=20.0,
     ):
         raise RuntimeError(
             "点击 Add New Listings 后没有进入 Listing Creation。 "
@@ -282,7 +295,7 @@ def _open_step1_from_listing_creation(page: Any) -> None:
         if not _wait_until(
             page,
             lambda: _has_exact_action(page, _ADD_SINGLE_LISTING),
-            timeout_s=5.0,
+            timeout_s=8.0,
         ):
             raise RuntimeError("点击 Add New Listing 后没有出现唯一可见的 Add Single Listing。")
 
@@ -303,8 +316,6 @@ def _prepare_new_listing_step1_page(page: Any) -> None:
 
     page.set_default_timeout(15_000)
 
-    # Bound the recovery to the pre-Step-1 chain only. This intentionally does
-    # not become the later task-state machine.
     for _ in range(6):
         if _has_password(page):
             raise RuntimeError("Makro 登录状态无效；请先在长期 Edge 中人工登录，再重试。")
@@ -323,12 +334,6 @@ def _prepare_new_listing_step1_page(page: Any) -> None:
             _open_listing_creation_from_dashboard(page)
             continue
 
-        # A newly-created Chromium tab is normally about:blank. Likewise, a
-        # stale non-listing Seller Portal location or a completely empty
-        # single-listing shell may be left over from the previous session. With
-        # no Vertical/Brand/requestId/vid there is no draft identity to lose, so
-        # it is safe to normalize that pre-Step-1 state back to Home and then
-        # traverse the real portal UI.
         current_url = str(getattr(page, "url", "") or "")
         if (
             not _is_makro_host(page)
@@ -363,13 +368,7 @@ def _prepare_new_listing_step1_page(page: Any) -> None:
 
 
 def prepare_single_step1_page(harness: Any):
-    """Return the unique Single Listing workflow page.
-
-    A unique Step 1 page is prepared as before. A unique Step 2/3 page is also
-    returned unchanged so the caller's workflow state machine can recognize that
-    earlier stages have already completed. Multiple listing tabs remain an
-    ownership ambiguity and fail closed.
-    """
+    """Return the unique Single Listing workflow page."""
 
     if harness.context is None:
         raise RuntimeError("Makro Edge context is unavailable")
