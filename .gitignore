@@ -40,3 +40,8 @@ data/*.xlsx
 # Playwright
 playwright-report/
 test-results/
+
+# Windows packaging output
+/build/
+/dist/
+/artifacts/
