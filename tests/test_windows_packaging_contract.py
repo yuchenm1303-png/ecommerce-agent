@@ -2,25 +2,45 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.app_branding import application_icon_bytes
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = (ROOT / "app" / "runtime_paths.py").read_text(encoding="utf-8")
+BRANDING = (ROOT / "app" / "app_branding.py").read_text(encoding="utf-8")
+ICON_DATA = (ROOT / "app" / "app_icon_data.py").read_text(encoding="utf-8")
+ICON_GENERATOR = (ROOT / "scripts" / "generate_app_icon.py").read_text(encoding="utf-8")
 ROUTER = (ROOT / "gui" / "frozen_process_router.py").read_text(encoding="utf-8")
 WORKER = (ROOT / "run_packaged_worker.py").read_text(encoding="utf-8")
 RUN = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 SPEC = (ROOT / "packaging" / "EcommerceAgent.spec").read_text(encoding="utf-8")
 INSTALLER = (ROOT / "packaging" / "installer.iss").read_text(encoding="utf-8")
 BUILD = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
+BUILD_REQUIREMENTS = (ROOT / "requirements-build.txt").read_text(encoding="utf-8")
 
 
 def test_packaging_python_sources_compile() -> None:
     for path, source in (
         (ROOT / "app" / "runtime_paths.py", RUNTIME),
+        (ROOT / "app" / "app_branding.py", BRANDING),
+        (ROOT / "app" / "app_icon_data.py", ICON_DATA),
+        (ROOT / "scripts" / "generate_app_icon.py", ICON_GENERATOR),
         (ROOT / "gui" / "frozen_process_router.py", ROUTER),
         (ROOT / "run_packaged_worker.py", WORKER),
         (ROOT / "run_local_gui.py", RUN),
     ):
         compile(source, str(path), "exec")
+
+
+def test_approved_application_icon_is_embedded_and_integrity_checked() -> None:
+    raw = application_icon_bytes()
+    assert raw.startswith(b"\xff\xd8\xff")
+    assert len(raw) > 8_000
+    assert "APP_ICON_SHA256" in ICON_DATA
+    assert "hashlib.sha256(raw).hexdigest()" in BRANDING
+    assert 'pixmap.loadFromData(application_icon_bytes(), "JPG")' in BRANDING
+    assert "apply_qt_application_icon(app)" in RUN
+    assert "SetCurrentProcessExplicitAppUserModelID" in BRANDING
 
 
 def test_frozen_runtime_moves_mutable_state_out_of_install_dir() -> None:
@@ -74,27 +94,37 @@ def test_gui_uses_runtime_root_and_installs_router_before_browser_wrappers() -> 
     assert route < browser < show
 
 
-def test_pyinstaller_build_is_onedir_with_windowed_gui_and_console_worker() -> None:
+def test_pyinstaller_build_is_onedir_with_windowed_gui_console_worker_and_icon() -> None:
     assert 'name="EcommerceAgent"' in SPEC
     assert 'name="EcommerceAgentWorker"' in SPEC
     assert "console=False" in SPEC
     assert "console=True" in SPEC
     assert 'collect_all("playwright")' in SPEC
     assert '(str(ROOT / "gui" / "assets"), "gui/assets")' in SPEC
+    assert 'APP_ICON = ROOT / "packaging" / "app_icon.ico"' in SPEC
+    assert SPEC.count("icon=str(APP_ICON)") == 2
     assert 'name="EcommerceAgent"' in SPEC[SPEC.index("coll = COLLECT"):]
 
 
-def test_installer_is_stable_per_user_upgrade_and_does_not_own_runtime_data() -> None:
+def test_installer_is_stable_per_user_upgrade_and_uses_branded_icon() -> None:
     assert "AppId={{84E09CC8-51F4-4409-BC73-B5EBC9A4D84A}" in INSTALLER
     assert "DefaultDirName={localappdata}\\Programs\\EcommerceAgent" in INSTALLER
     assert "PrivilegesRequired=lowest" in INSTALLER
     assert "UsePreviousAppDir=yes" in INSTALLER
+    assert "SetupIconFile={#IconFile}" in INSTALLER
+    assert "UninstallDisplayIcon={app}\\{#MyAppExeName}" in INSTALLER
     assert "EcommerceAgentWorker.exe" not in INSTALLER  # copied by wildcard, not user-facing
     assert "browser_profiles" not in INSTALLER
     assert "logs\\" not in INSTALLER
 
 
-def test_one_command_build_emits_worker_verified_installer_and_portable_zip() -> None:
+def test_one_command_build_generates_icon_and_emits_verified_packages() -> None:
+    assert "Pillow" in BUILD_REQUIREMENTS
+    assert "generate_app_icon.py" in BUILD
+    assert 'packaging\\app_icon.ico' in BUILD
+    assert '"/DIconFile=$IconFile"' in BUILD
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        assert f"({size}, {size})" in ICON_GENERATOR
     assert "python -m PyInstaller" in BUILD
     assert "EcommerceAgentWorker.exe" in BUILD
     assert "--self-test" in BUILD
