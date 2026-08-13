@@ -23,17 +23,18 @@ from PySide6.QtWidgets import (
 )
 
 
-_INPUT_CARD_MAX_HEIGHT = 160
-_STATUS_CARD_MIN_HEIGHT = 60
-_STATUS_CARD_MAX_HEIGHT = 64
-_WORKSPACE_MIN_HEIGHT = 260
-_FIELD_TABLE_MIN_HEIGHT = 170
+_INPUT_CARD_MIN_HEIGHT = 176
+_INPUT_CARD_MAX_HEIGHT = 190
+_STATUS_CARD_MIN_HEIGHT = 54
+_STATUS_CARD_MAX_HEIGHT = 58
+_WORKSPACE_MIN_HEIGHT = 220
+_FIELD_TABLE_MIN_HEIGHT = 136
 _SIDE_MIN_WIDTH = 360
 _SIDE_MAX_WIDTH = 480
 _SIDE_TARGET_RATIO = 0.29
-_CONSOLE_MIN_HEIGHT = 218
-_CONSOLE_MAX_HEIGHT = 242
-_CONSOLE_TARGET_HEIGHT = 230
+_CONSOLE_MIN_HEIGHT = 292
+_CONSOLE_MAX_HEIGHT = 336
+_CONSOLE_TARGET_HEIGHT = 310
 
 
 def _ancestor_card(widget: QWidget | None, object_name: str) -> QFrame | None:
@@ -79,10 +80,12 @@ def _remove_spacers(layout: QBoxLayout) -> None:
 
 
 def _compact_input_rows(window: QMainWindow, input_card: QFrame) -> None:
-    """Put stage buttons and connection controls on one row.
+    """Keep stage actions and source controls on separate compact rows.
 
-    This removes one complete control row without rebuilding any business widget
-    or reconnecting signals. The real-execution summary row remains below it.
+    The first fixed-page pass forced every source control beside the stage
+    buttons. That saved one row but produced the visible crowding at 1600 px.
+    Two shallow rows remain compact while preserving every existing widget,
+    signal and execution path without horizontal contention.
     """
 
     if getattr(window, "_single_fixed_input_rows", False):
@@ -102,34 +105,20 @@ def _compact_input_rows(window: QMainWindow, input_card: QFrame) -> None:
         return
 
     _remove_spacers(stage_row)
-    _remove_spacers(settings_row)
-
-    moved = False
-    for name in ("makro_port", "source_port", "vertical_input", "current_page_check"):
-        widget = getattr(window, name, None)
-        if not isinstance(widget, QWidget) or not _contains_widget(settings_row, widget):
-            continue
-        settings_row.removeWidget(widget)
-        if not moved:
-            stage_row.addSpacing(8)
-            moved = True
-        stage_row.addWidget(widget)
-
-    if moved:
-        stage_row.addStretch(1)
-        stage_row.setSpacing(7)
-        settings_row.setSpacing(0)
-        settings_row.setContentsMargins(0, 0, 0, 0)
-        setattr(window, "_single_fixed_input_rows", True)
+    stage_row.addStretch(1)
+    stage_row.setSpacing(8)
+    settings_row.setSpacing(8)
+    settings_row.setContentsMargins(0, 0, 0, 0)
+    setattr(window, "_single_fixed_input_rows", True)
 
 
 def _compact_input_card(window: QMainWindow, input_card: QFrame) -> None:
     _compact_input_rows(window, input_card)
     layout = input_card.layout()
     if isinstance(layout, QVBoxLayout):
-        layout.setContentsMargins(14, 7, 14, 8)
-        layout.setSpacing(3)
-    input_card.setMinimumHeight(0)
+        layout.setContentsMargins(14, 8, 14, 9)
+        layout.setSpacing(4)
+    input_card.setMinimumHeight(_INPUT_CARD_MIN_HEIGHT)
     input_card.setMaximumHeight(_INPUT_CARD_MAX_HEIGHT)
     input_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
@@ -143,7 +132,7 @@ def _compact_status_cards(window: QMainWindow) -> None:
         card.setMaximumHeight(_STATUS_CARD_MAX_HEIGHT)
         layout = card.layout()
         if isinstance(layout, QBoxLayout):
-            layout.setContentsMargins(12, 4, 12, 4)
+            layout.setContentsMargins(12, 2, 12, 2)
             layout.setSpacing(0)
 
 
@@ -152,6 +141,29 @@ def _strip_trailing_spacers(layout: QBoxLayout) -> None:
         item = layout.itemAt(index)
         if item.spacerItem() is not None:
             layout.takeAt(index)
+
+
+def _compact_workspace_cards(window: QMainWindow) -> None:
+    """Reduce middle-card chrome so the workflow console gets useful height."""
+
+    field_table = getattr(window, "field_table", None)
+    field_card = field_table.parentWidget() if isinstance(field_table, QWidget) else None
+    if isinstance(field_card, QFrame):
+        layout = field_card.layout()
+        if isinstance(layout, QBoxLayout):
+            layout.setContentsMargins(14, 8, 14, 10)
+            layout.setSpacing(5)
+
+    side_tabs = getattr(window, "side_detail_tabs", None)
+    if isinstance(side_tabs, QTabWidget):
+        for index in range(side_tabs.count()):
+            card = side_tabs.widget(index)
+            if not isinstance(card, QFrame):
+                continue
+            layout = card.layout()
+            if isinstance(layout, QBoxLayout):
+                layout.setContentsMargins(14, 9, 14, 10)
+                layout.setSpacing(4)
 
 
 def _configure_workspace(window: QMainWindow, body: QSplitter) -> None:
@@ -163,6 +175,8 @@ def _configure_workspace(window: QMainWindow, body: QSplitter) -> None:
     workspace.setMinimumHeight(_WORKSPACE_MIN_HEIGHT)
     workspace.setMaximumHeight(16777215)
     workspace.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    _compact_workspace_cards(window)
 
     field_table = getattr(window, "field_table", None)
     if isinstance(field_table, QWidget):
@@ -182,9 +196,6 @@ def _configure_workspace(window: QMainWindow, body: QSplitter) -> None:
 
     side_tabs = getattr(window, "side_detail_tabs", None)
     if isinstance(side_tabs, QTabWidget):
-        # The old scroll-page launcher forced this panel to 300 px and inserted a
-        # stretch below it. In the fixed page it should fill the workspace height
-        # exactly like the field card beside it.
         side_tabs.setMinimumHeight(0)
         side_tabs.setMaximumHeight(16777215)
         side_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -204,7 +215,13 @@ def _configure_workspace(window: QMainWindow, body: QSplitter) -> None:
     body.setStretchFactor(0, 1)
     body.setStretchFactor(1, 0)
     available = max(1, body.height() - body.handleWidth())
-    target = min(_CONSOLE_MAX_HEIGHT, max(_CONSOLE_MIN_HEIGHT, _CONSOLE_TARGET_HEIGHT))
+    target = min(
+        _CONSOLE_MAX_HEIGHT,
+        max(
+            _CONSOLE_MIN_HEIGHT,
+            min(_CONSOLE_TARGET_HEIGHT, max(0, available - _WORKSPACE_MIN_HEIGHT)),
+        ),
+    )
     body.setSizes([max(_WORKSPACE_MIN_HEIGHT, available - target), target])
 
 
@@ -238,9 +255,9 @@ def install_page_scroll_layout(
     if not isinstance(body, QSplitter) or body.count() < 2:
         raise RuntimeError("fixed Single layout requires the polished bodySplitter")
 
-    # Keep the original root ownership. No card is reparented into an outer
-    # viewport, so top-level glass geometry remains stationary during normal use.
-    outer.setSpacing(7)
+    # Keep original widget ownership: the cards stay stationary and only their
+    # one-time/resize geometry changes reach the native Quick glass compositor.
+    outer.setSpacing(6)
     _compact_input_card(window, input_card)
     _compact_status_cards(window)
     _configure_workspace(window, body)
