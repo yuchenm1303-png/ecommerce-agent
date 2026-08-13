@@ -8,8 +8,10 @@ Dashboard -> Listings -> Add New Listings -> Listing Creation
           -> Add New Listing -> Add Single Listing -> Step 1
 
 Once Step 1 is reached, the existing structural operability contract remains the
-source of truth. This module does not select a Vertical and does not resume a
-known Step 2/3 draft; those states still fail closed here.
+source of truth. For Single mode, exactly one existing Add Listing tab is also a
+stable ownership boundary: if that unique tab has already advanced to Step 2/3,
+it is returned to the shared workflow state machine instead of being pushed
+backward. Multiple listing tabs still fail closed.
 """
 
 from __future__ import annotations
@@ -231,7 +233,7 @@ def _reject_later_listing_stage(page: Any) -> None:
     if later:
         raise RuntimeError(
             "当前 Add Listing 页面已经进入 Step 2/3。第一阶段入口导航不会接管或倒退未知 draft；"
-            "请保留现场，后续由独立的任务恢复状态机处理。"
+            "请保留现场，后续由共享任务状态机处理。"
         )
 
 
@@ -361,7 +363,13 @@ def _prepare_new_listing_step1_page(page: Any) -> None:
 
 
 def prepare_single_step1_page(harness: Any):
-    """Return the unique Single Listing page when Step 1 is structurally usable."""
+    """Return the unique Single Listing workflow page.
+
+    A unique Step 1 page is prepared as before. A unique Step 2/3 page is also
+    returned unchanged so the caller's workflow state machine can recognize that
+    earlier stages have already completed. Multiple listing tabs remain an
+    ownership ambiguity and fail closed.
+    """
 
     if harness.context is None:
         raise RuntimeError("Makro Edge context is unavailable")
@@ -380,15 +388,12 @@ def prepare_single_step1_page(harness: Any):
         if _wait_until_vertical_operable(page, timeout_s=5.0):
             return page
         if is_product_info_step(page) or is_brand_step(page):
-            raise RuntimeError(
-                "当前唯一 Add Listing 标签页已经进入 Step 2/3。为避免接管未知 draft，程序不会自动改动它；"
-                "请先处理/关闭该 draft，再开始新的商品。"
-            )
+            return page
         if _is_safe_pre_step1_single_route(page):
             _prepare_new_listing_step1_page(page)
             return page
         raise RuntimeError(
-            "当前 Add Listing 标签页未出现可安全操作的 Step 1 Vertical 界面。"
+            "当前 Add Listing 标签页未形成可识别的 Step 1/2/3 工作流界面。"
             f" diagnostics={_diagnostics(page)}"
         )
 
