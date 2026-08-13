@@ -26,6 +26,7 @@ GUI_SOURCES = [
     PROJECT_ROOT / "gui" / "batch_runner.py",
     PROJECT_ROOT / "gui" / "batch_workspace.py",
     PROJECT_ROOT / "gui" / "batch_url_editor.py",
+    PROJECT_ROOT / "gui" / "batch_card_responsive.py",
     PROJECT_ROOT / "gui" / "acceptance_console.py",
     PROJECT_ROOT / "gui" / "activity_presence.py",
     PROJECT_ROOT / "gui" / "browser_session_manager.py",
