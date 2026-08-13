@@ -31,7 +31,6 @@ _STATUS_CARD_MIN_HEIGHT = 54
 _STATUS_CARD_MAX_HEIGHT = 58
 _WORKSPACE_MIN_HEIGHT = 220
 _FIELD_TABLE_MIN_HEIGHT = 136
-_FIELD_CARD_BOTTOM_INSET = 14
 _SIDE_MIN_WIDTH = 360
 _SIDE_MAX_WIDTH = 480
 _SIDE_TARGET_RATIO = 0.29
@@ -90,12 +89,7 @@ def _set_width_band(widget: object, minimum: int, maximum: int) -> None:
 
 
 def _compact_input_rows(window: QMainWindow, input_card: QFrame) -> None:
-    """Give every Product Source interaction band its own visual rhythm.
-
-    Business widgets stay untouched. Only spacing and width bands are normalized
-    so the URL action, preparation stages and source controls read as separate
-    groups instead of one compressed toolbar.
-    """
+    """Give every Product Source interaction band its own visual rhythm."""
 
     layout = input_card.layout()
     if not isinstance(layout, QVBoxLayout):
@@ -139,14 +133,7 @@ def _compact_input_rows(window: QMainWindow, input_card: QFrame) -> None:
 
 
 def refresh_single_source_layout(window: QMainWindow) -> None:
-    """Reflow Product Source after optional feature rows have been installed.
-
-    ``listing_offer_support`` is intentionally layered after the fixed Single
-    workspace. Its optional sales-offer row therefore appears only after the
-    first geometry pass. This zero-time refresh runs once the event loop starts,
-    when all decorators already exist, and expands the card instead of squeezing
-    the new row into the historical 238 px budget.
-    """
+    """Reflow Product Source after optional feature rows have been installed."""
 
     url_input = getattr(window, "url_input", None)
     input_card = _ancestor_card(
@@ -220,44 +207,112 @@ def _strip_trailing_spacers(layout: QBoxLayout) -> None:
             layout.takeAt(index)
 
 
-def _align_field_card_to_side_panel(
+def _unregister_nested_glass_pages(window: QMainWindow, pages: list[QFrame]) -> None:
+    """Turn old nested glass cards into plain pages inside one outer glass card."""
+
+    visual = getattr(window, "_visual_style", None)
+    glass = getattr(visual, "_glass", None)
+    background = getattr(visual, "background", None)
+    model = getattr(background, "card_model", None)
+    targets = set(pages)
+
+    if isinstance(glass, dict):
+        for frame in pages:
+            surface = glass.pop(frame, None)
+            if surface is not None:
+                try:
+                    surface.cleanup()
+                except RuntimeError:
+                    pass
+
+    cards = list(getattr(model, "cards", [])) if model is not None else []
+    states = list(getattr(model, "_states", [])) if model is not None else []
+    if model is not None and len(cards) == len(states) and any(card in targets for card in cards):
+        kept = [(card, state) for card, state in zip(cards, states) if card not in targets]
+        model.beginResetModel()
+        try:
+            model.cards[:] = [card for card, _ in kept]
+            model._states[:] = [state for _, state in kept]
+            model._rows = {card: row for row, card in enumerate(model.cards)}
+        finally:
+            model.endResetModel()
+
+    geometry_watch = getattr(background, "_geometry_watch", None)
+    if isinstance(geometry_watch, set):
+        for frame in pages:
+            if frame in geometry_watch:
+                try:
+                    frame.removeEventFilter(background)
+                except RuntimeError:
+                    pass
+                geometry_watch.discard(frame)
+
+    for frame in pages:
+        frame.setObjectName("sideDetailPage")
+        frame.setGraphicsEffect(None)
+        frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        frame.setStyleSheet(
+            frame.styleSheet()
+            + "\nQFrame#sideDetailPage { background: transparent; border: 0; }"
+        )
+
+
+def _unify_workspace_card_structure(
     window: QMainWindow,
     workspace_splitter: QSplitter,
 ) -> None:
-    """Trim only the left glass card so its bottom matches the right panel.
+    """Make Field Review and diagnostics siblings with the same outer QFrame shell."""
 
-    The right Runtime/Reference/Safety panel keeps a small bottom breathing room.
-    The field card used to fill the complete splitter cross-axis, which made its
-    glass shell visibly longer. A transparent host mirrors that visual inset
-    without rebuilding the field table.
-    """
-
-    if isinstance(getattr(window, "_single_field_alignment_host", None), QWidget):
+    existing = getattr(window, "_single_side_panel_card", None)
+    if isinstance(existing, QFrame):
         return
 
-    field_table = getattr(window, "field_table", None)
-    field_card = field_table.parentWidget() if isinstance(field_table, QWidget) else None
-    if not isinstance(field_card, QFrame):
+    side_tabs = getattr(window, "side_detail_tabs", None)
+    if not isinstance(side_tabs, QTabWidget) or workspace_splitter.count() < 2:
         return
 
-    index = workspace_splitter.indexOf(field_card)
-    if index < 0:
+    pages = [
+        page
+        for index in range(side_tabs.count())
+        if isinstance((page := side_tabs.widget(index)), QFrame)
+    ]
+    if not pages:
         return
 
-    host = QWidget()
-    host.setObjectName("fieldReviewHost")
-    host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    old_side = workspace_splitter.widget(1)
+    old_host = side_tabs.parentWidget()
+    old_layout = old_host.layout() if old_host is not None else None
+    if isinstance(old_layout, QBoxLayout):
+        old_layout.removeWidget(side_tabs)
 
-    host_layout = QVBoxLayout(host)
-    host_layout.setContentsMargins(0, 0, 0, _FIELD_CARD_BOTTOM_INSET)
-    host_layout.setSpacing(0)
+    _unregister_nested_glass_pages(window, pages)
 
-    field_card.setParent(host)
-    host_layout.addWidget(field_card, 1)
-    workspace_splitter.insertWidget(index, host)
-    field_card.show()
+    side_card = QFrame(workspace_splitter)
+    side_card.setObjectName("glassCard")
+    side_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    side_layout = QVBoxLayout(side_card)
+    side_layout.setContentsMargins(0, 0, 0, 0)
+    side_layout.setSpacing(0)
 
-    setattr(window, "_single_field_alignment_host", host)
+    side_tabs.setParent(side_card)
+    side_tabs.setMinimumHeight(0)
+    side_tabs.setMaximumHeight(16777215)
+    side_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    side_layout.addWidget(side_tabs, 1)
+
+    index = workspace_splitter.indexOf(old_side)
+    old_side.setParent(None)
+    workspace_splitter.insertWidget(max(0, index), side_card)
+    old_side.hide()
+    old_side.deleteLater()
+    side_card.show()
+
+    setattr(window, "_single_side_panel_card", side_card)
+
+    visual = getattr(window, "_visual_style", None)
+    refresh = getattr(visual, "refresh_glass_frames", None)
+    if callable(refresh):
+        refresh()
 
 
 def _compact_workspace_cards(window: QMainWindow) -> None:
@@ -301,7 +356,7 @@ def _configure_workspace(window: QMainWindow, body: QSplitter) -> None:
 
     workspace_splitter = workspace.findChild(QSplitter, "workspaceSplitter")
     if isinstance(workspace_splitter, QSplitter) and workspace_splitter.count() > 1:
-        _align_field_card_to_side_panel(window, workspace_splitter)
+        _unify_workspace_card_structure(window, workspace_splitter)
 
         side = workspace_splitter.widget(1)
         side.setMinimumWidth(_SIDE_MIN_WIDTH)
@@ -318,12 +373,6 @@ def _configure_workspace(window: QMainWindow, body: QSplitter) -> None:
         side_tabs.setMinimumHeight(0)
         side_tabs.setMaximumHeight(16777215)
         side_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        side_host = side_tabs.parentWidget()
-        side_layout = side_host.layout() if side_host is not None else None
-        if isinstance(side_layout, QVBoxLayout):
-            _strip_trailing_spacers(side_layout)
-            side_layout.setStretchFactor(side_tabs, 1)
-            side_layout.setAlignment(side_tabs, Qt.AlignmentFlag(0))
 
     console.setMinimumHeight(_CONSOLE_MIN_HEIGHT)
     console.setMaximumHeight(_CONSOLE_MAX_HEIGHT)
@@ -348,11 +397,7 @@ def install_page_scroll_layout(
     window: QMainWindow,
     visual: Any | None = None,
 ) -> QSplitter:
-    """Keep Single as a fixed one-screen workspace.
-
-    The historical function name is retained so ``run_local_gui.py`` and existing
-    callers do not need a migration. No outer Single QScrollArea is created.
-    """
+    """Keep Single as a fixed one-screen workspace."""
 
     existing = getattr(window, "_single_fixed_body", None)
     if isinstance(existing, QSplitter):
@@ -374,17 +419,11 @@ def install_page_scroll_layout(
     if not isinstance(body, QSplitter) or body.count() < 2:
         raise RuntimeError("fixed Single layout requires the polished bodySplitter")
 
-    # Keep original widget ownership: the cards stay stationary and only their
-    # one-time/resize geometry changes reach the native Quick glass compositor.
     outer.setSpacing(6)
     _compact_input_card(window, input_card)
     _compact_status_cards(window)
     _configure_workspace(window, body)
 
-    # Optional Single decorators (notably listing_offer_support) are installed
-    # later in run_local_gui.py, before app.exec(). The callback therefore sees
-    # the final widget set and performs one presentation-only reflow without
-    # adding a permanent resize/layout hot path.
     QTimer.singleShot(0, lambda: refresh_single_source_layout(window))
 
     background = getattr(visual, "background", None)
