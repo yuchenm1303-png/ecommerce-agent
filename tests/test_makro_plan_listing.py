@@ -123,7 +123,9 @@ def test_live_planner_contains_no_browser_fill_or_save_path():
     assert "write_live_schema(" in source
     assert "load_ai_decision_packet(" in source
     assert "assert_live_schema_matches(" in source
-    assert "generated_business_bundle" in source
+    assert "generated_sku = generate_listing_sku(str(args.product_url))" in source
+    assert "sku=generated_sku" in source
+    assert source.count("generate_listing_sku(str(args.product_url))") == 1
 
 
 def test_live_planner_blocks_unsaved_expanded_section():
