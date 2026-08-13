@@ -7,8 +7,11 @@ from typing import Any
 from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QLineEdit, QMessageBox
 
-from app.ai_decisions import field_id
-from app.required_overrides import required_fallback_override, required_override_binding
+from app.required_overrides import (
+    load_required_blocked_fields,
+    required_fallback_override,
+    required_override_binding,
+)
 from .real_execution import FULL_STEP3
 from .result_loader import RunResult, latest_fill_plan, latest_live_schema
 
@@ -50,55 +53,12 @@ class RequiredInputSupport(QObject):
         window.real_start_button.clicked.connect(self.request_start)
         window._request_real_execution = self.request_start
 
-    @staticmethod
-    def _identity(payload: dict[str, Any]) -> tuple[str, str, str]:
-        return (
-            str(payload.get("attribute_key") or ""),
-            str(payload.get("label") or payload.get("attribute_key") or ""),
-            str(payload.get("section_heading") or ""),
-        )
-
     def _required_blocked(self, result: RunResult) -> list[dict[str, Any]]:
         plan_path = latest_fill_plan(result.run_dir)
         schema_path = latest_live_schema(result.run_dir)
         if plan_path is None or schema_path is None or not plan_path.is_file() or not schema_path.is_file():
             return []
-
-        plan_payload = json.loads(plan_path.read_text(encoding="utf-8"))
-        raw_schema = json.loads(schema_path.read_text(encoding="utf-8"))
-        fields = (
-            raw_schema.get("fields") or raw_schema.get("items") or []
-            if isinstance(raw_schema, dict)
-            else raw_schema
-        )
-        fields = [item for item in fields if isinstance(item, dict)]
-        by_identity = {self._identity(field): field for field in fields}
-
-        output: list[dict[str, Any]] = []
-        for item in plan_payload.get("items") or []:
-            if not isinstance(item, dict):
-                continue
-            if not bool(item.get("required")) or str(item.get("action") or "").casefold() != "blocked":
-                continue
-            field = by_identity.get(self._identity(item))
-            if field is None:
-                continue
-            resolution = item.get("resolution") or {}
-            output.append(
-                {
-                    "field_id": field_id(field),
-                    "field": field,
-                    "label": str(item.get("label") or item.get("attribute_key") or "必填字段"),
-                    "reason": str(item.get("reason") or resolution.get("detail") or "").strip(),
-                    "options": [
-                        str(value).strip()
-                        for value in resolution.get("question_options") or []
-                        if str(value).strip()
-                        and str(value).strip().casefold() not in {"select one", "select"}
-                    ],
-                }
-            )
-        return output
+        return load_required_blocked_fields(plan_path, schema_path)
 
     def _table_row_for_field_id(self, identifier: str) -> int | None:
         table = self.window.field_table
