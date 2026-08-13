@@ -27,6 +27,7 @@ from app.ai_service_settings import (
 
 
 _RUNTIME_KEY_ENV = "AI_API_KEY"
+_MASKED_KEY = "••••••••••••••••"
 
 _CONTENT_STYLE = r"""
 QWidget#aiSettingsContent { background: transparent; }
@@ -49,6 +50,11 @@ QLineEdit#aiSettingsInput:focus {
     background-color: rgba(11,23,37,122);
     border-color: rgba(176,220,249,92);
 }
+QLineEdit#aiSettingsInput:read-only {
+    color: rgba(255,255,255,174);
+    background-color: rgba(10,20,32,58);
+    border-color: rgba(255,255,255,16);
+}
 QLineEdit#aiSettingsInput::placeholder { color: rgba(255,255,255,108); }
 """
 
@@ -60,6 +66,8 @@ class AISettingsContent(QWidget):
         super().__init__(parent)
         self.setObjectName("aiSettingsContent")
         self.setStyleSheet(_CONTENT_STYLE)
+        self._key_configured = False
+        self._editing_key = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -89,19 +97,18 @@ class AISettingsContent(QWidget):
         self.model = self._input("主模型，例如 qwen3.7-plus")
         self.fact_model = self._input("事实提取模型")
         self.web_model = self._input("Web 搜索模型")
-        self.api_key = self._input("留空 = 保留已经保存的密钥")
+        self.api_key = self._input("输入你自己的 API Key")
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
 
-        self.show_key = QPushButton("显示")
-        self.show_key.setObjectName("modalPrimaryButton")
-        self.show_key.setCheckable(True)
-        self.show_key.setMaximumWidth(72)
-        self.show_key.toggled.connect(self._toggle_key_visibility)
+        self.key_action = QPushButton("显示")
+        self.key_action.setObjectName("modalPrimaryButton")
+        self.key_action.setMaximumWidth(72)
+        self.key_action.clicked.connect(self._key_action_clicked)
         key_row = QHBoxLayout()
         key_row.setContentsMargins(0, 0, 0, 0)
         key_row.setSpacing(8)
         key_row.addWidget(self.api_key, 1)
-        key_row.addWidget(self.show_key)
+        key_row.addWidget(self.key_action)
 
         rows: list[tuple[str, Any]] = [
             ("API 类型", provider),
@@ -167,26 +174,58 @@ class AISettingsContent(QWidget):
         self.model.setText(settings.model)
         self.fact_model.setText(settings.fact_model)
         self.web_model.setText(settings.web_model)
-        self.api_key.clear()
-        self.show_key.setChecked(False)
+        self._set_key_state(has_ai_service_key(settings))
         self._refresh_key_status(settings)
+
+    def _set_key_state(self, configured: bool) -> None:
+        self._key_configured = bool(configured)
+        self._editing_key = not self._key_configured
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        if self._key_configured:
+            self.api_key.setReadOnly(True)
+            self.api_key.setText(_MASKED_KEY)
+            self.api_key.setPlaceholderText("")
+            self.key_action.setText("更改")
+            self.key_action.setToolTip("输入新的 API Key 并在保存后覆盖当前密钥")
+        else:
+            self.api_key.setReadOnly(False)
+            self.api_key.clear()
+            self.api_key.setPlaceholderText("输入你自己的 API Key")
+            self.key_action.setText("显示")
+            self.key_action.setToolTip("显示 / 隐藏当前正在输入的新密钥")
+
+    def _begin_key_edit(self) -> None:
+        self._editing_key = True
+        self.api_key.setReadOnly(False)
+        self.api_key.clear()
+        self.api_key.setPlaceholderText("输入新的 API Key，保存后覆盖当前密钥")
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_action.setText("显示")
+        self.key_action.setToolTip("显示 / 隐藏当前正在输入的新密钥")
+        self.api_key.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.key_status.setText("API Key · 正在更改。输入新密钥后点击“保存设置”即可覆盖旧密钥。")
+        self.key_status.setStyleSheet("color: #b9d9f2; font-weight: 650;")
+
+    def _key_action_clicked(self) -> None:
+        if self._key_configured and not self._editing_key:
+            self._begin_key_edit()
+            return
+        visible = self.api_key.echoMode() == QLineEdit.EchoMode.Password
+        self.api_key.setEchoMode(
+            QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+        )
+        self.key_action.setText("隐藏" if visible else "显示")
 
     def _refresh_key_status(self, settings: AIServiceSettings | None = None) -> None:
         configured = settings or load_ai_service_settings()
         if has_ai_service_key(configured):
             self.key_status.setText(
-                "API Key · 已配置。界面不会回显原始密钥；新任务会从本机安全存储读取。"
+                "API Key · 已安全保存。需要替换时点击“更改”，旧密钥不会在界面中回显。"
             )
             self.key_status.setStyleSheet("color: #9fe2bd; font-weight: 650;")
         else:
             self.key_status.setText("API Key · 未配置。Single / Batch 的 AI 阶段将保持锁定。")
             self.key_status.setStyleSheet("color: #f4cb7a; font-weight: 650;")
-
-    def _toggle_key_visibility(self, visible: bool) -> None:
-        self.api_key.setEchoMode(
-            QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
-        )
-        self.show_key.setText("隐藏" if visible else "显示")
 
     def _save(self) -> None:
         settings = AIServiceSettings(
@@ -196,7 +235,22 @@ class AISettingsContent(QWidget):
             fact_model=self.fact_model.text().strip(),
             web_model=self.web_model.text().strip(),
         )
-        api_key = self.api_key.text().strip() or None
+
+        api_key: str | None = None
+        if self._editing_key:
+            value = self.api_key.text().strip()
+            if not value:
+                if self._key_configured:
+                    QMessageBox.warning(
+                        self,
+                        "API Key 尚未更改",
+                        "请输入新的 API Key；如不想更改当前密钥，关闭设置页即可。",
+                    )
+                    return
+                QMessageBox.warning(self, "API Key 未配置", "请填写你自己的 API Key。")
+                return
+            api_key = value
+
         try:
             normalized = save_ai_service_settings(settings, api_key=api_key)
             if not has_ai_service_key(normalized):
@@ -204,10 +258,9 @@ class AISettingsContent(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "AI 设置无法保存", str(exc))
             return
-        self.api_key.clear()
-        self.show_key.setChecked(False)
-        self._refresh_key_status(normalized)
-        self.key_status.setText("AI 服务配置已保存 · 下一次 Single / Batch 任务立即使用新配置。")
+
+        self._set_key_state(True)
+        self.key_status.setText("AI 服务配置已保存 · API Key 已安全保存，可随时点击“更改”进行替换。")
         self.key_status.setStyleSheet("color: #9fe2bd; font-weight: 700;")
 
     def _clear_key(self) -> None:
@@ -222,8 +275,7 @@ class AISettingsContent(QWidget):
             return
         clear_ai_service_key()
         os.environ.pop(_RUNTIME_KEY_ENV, None)
-        self.api_key.clear()
-        self.show_key.setChecked(False)
+        self._set_key_state(False)
         self._refresh_key_status()
 
 
