@@ -26,7 +26,6 @@ def test_reference_entrance_keeps_curtain_camera_choreography_without_loader() -
     ):
         assert token in SOURCE
 
-    # The spinner/text loading phase is intentionally not part of our copy.
     for obsolete in (
         "_HOLD_MIN_MS",
         "_HOLD_MAX_MS",
@@ -69,17 +68,31 @@ def test_startup_stability_gate_waits_for_maximized_layout_before_capture() -> N
     assert "start = getattr(self.entrance, \"start\", None)" in STABILITY
 
 
-def test_final_snapshot_to_live_handoff_is_split_across_frames() -> None:
+def test_final_snapshot_to_live_handoff_flushes_native_quick_before_overlay_hides() -> None:
     assert "self.overlay.finished.disconnect(self.entrance._finish)" in STABILITY
+    assert "_NATIVE_SETTLE_FRAMES = 2" in STABILITY
+    assert "def _flush_native_background" in STABILITY
+    assert 'geometry_timer = getattr(background, "_geometry_timer", None)' in STABILITY
+    assert "geometry_timer.stop()" in STABILITY
+    assert 'flush = getattr(background, "_flush_geometry", None)' in STABILITY
+    assert 'quick.setProperty("animationRunning", False)' in STABILITY
+    assert 'request_update = getattr(quick, "requestUpdate", None)' in STABILITY
     assert "self._prime_static_runtime()" in STABILITY
-    assert "QTimer.singleShot(_HANDOFF_FRAME_MS, self._commit_overlay_handoff)" in STABILITY
+    assert "QTimer.singleShot(_HANDOFF_FRAME_MS, self._settle_live_runtime)" in STABILITY
+    assert "self._flush_native_background()" in STABILITY
     assert "overlay.hide()" in STABILITY
+    assert STABILITY.index("def _flush_native_background") < STABILITY.index("overlay.hide()")
+    assert STABILITY.index("def _settle_live_runtime") < STABILITY.index("overlay.hide()")
+
+
+def test_runtime_effects_resume_only_after_live_surface_is_visible() -> None:
     assert "QTimer.singleShot(_HANDOFF_FRAME_MS, self._resume_effects)" in STABILITY
     assert "QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_card_fx)" in STABILITY
     assert "QTimer.singleShot(_HANDOFF_FRAME_MS * 3, self._resume_pointer)" in STABILITY
-    assert STABILITY.index("layer.show()") < STABILITY.index("overlay.hide()")
     assert STABILITY.index("overlay.hide()") < STABILITY.index("def _resume_card_fx")
     assert STABILITY.index("def _resume_card_fx") < STABILITY.index("def _resume_pointer")
+    assert "hotpath._last_global = None" in STABILITY
+    assert "hotpath._last_geometry = None" in STABILITY
 
 
 def test_startup_freezes_runtime_until_staged_handoff_finishes() -> None:
