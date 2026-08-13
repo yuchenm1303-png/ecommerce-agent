@@ -48,6 +48,7 @@ def main() -> int:
     from gui.ui_maturity import install_mature_ui
     from gui.ui_polish import install_ui_polish
     from gui.ui_runtime_optimizations import install_ui_runtime_optimizations
+    from gui.widget_card_rendering import install_widget_card_rendering
     from gui.workspace_transition import install_workspace_transition
     from gui.workspace_transition_tuning import apply_workspace_transition_tuning
     from gui.smooth_scroll import SmoothWheelFilter
@@ -64,6 +65,9 @@ def main() -> int:
 
     window = MainWindow(Path(__file__).resolve().parent)
     visual = install_native_visual_style(window)
+    # Trial: Quick keeps only the Fuji wallpaper/parallax. Every moving card shell
+    # is painted by its owning QWidget so scroll geometry cannot lag its contents.
+    install_widget_card_rendering(window, visual)
 
     # Finish the proven Single workspace presentation before wrapping it in the
     # final page scroll. Existing business widgets/signals are preserved and only
