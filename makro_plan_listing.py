@@ -17,6 +17,7 @@ from typing import Any
 from playwright.sync_api import sync_playwright
 
 from app.ai_decisions import load_ai_decision_packet
+from app.browser_page_owner import find_page_by_target_id
 from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness
 from app.business_fields import generate_listing_sku, generated_business_bundle
 from app.evidence_contract import ProductIdentity
@@ -55,6 +56,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-vertical", required=True)
     parser.add_argument("--profile-dir", default="browser_profiles/makro-edge")
     parser.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT)
+    parser.add_argument(
+        "--makro-target-id",
+        default="",
+        help=(
+            "Batch-only owned-tab token. When supplied, plan only that exact Chromium tab; "
+            "single-mode unique-tab safety remains unchanged when omitted."
+        ),
+    )
     parser.add_argument("--scroll-wait-ms", type=int, default=250)
     parser.add_argument("--max-scroll-steps", type=int, default=200)
     parser.add_argument("--max-text-chars", type=int, default=5000)
@@ -81,6 +90,23 @@ def _assert_single_listing_tab(context: Any) -> None:
     raise RuntimeError(
         "检测到多个 Add a Single Listing 标签页；只读 planner 拒绝猜目标页面。"
     )
+
+
+def _owned_listing_page(harness: EdgeHarness, target_id: str):
+    """Resolve one Batch-owned page without ever falling back to another tab."""
+
+    if harness.context is None:
+        raise RuntimeError("Makro Edge context is unavailable")
+    page = find_page_by_target_id(harness.context, target_id)
+    page.set_default_timeout(15_000)
+    adapter = MakroDomainAdapter(page)
+    if not adapter.is_listing_page():
+        raise RuntimeError(
+            "Batch owned Makro tab no longer points at an Add Listing page; "
+            "read-only planner refuses to navigate or adopt another tab."
+        )
+    harness.page = page
+    return page
 
 
 def _assert_no_unsaved_section(adapter: MakroDomainAdapter) -> None:
@@ -158,20 +184,32 @@ def main() -> int:
             port=args.cdp_port,
             start_url=MAKRO_HOME_URL,
         )
-        page = harness.page
-        page.set_default_timeout(15_000)
-        adapter = MakroDomainAdapter(page)
+        if harness.context is None:
+            raise RuntimeError("Makro Edge context is unavailable")
 
-        if not adapter.is_listing_page():
-            adapter.wait_for_authenticated_listing(
-                MAKRO_HOME_URL,
-                headless=False,
-                navigate_first=harness.launched_now,
-            )
+        if args.makro_target_id:
+            page = _owned_listing_page(harness, args.makro_target_id)
+        else:
+            page = harness.page
+            if page is None:
+                raise RuntimeError("Makro Edge did not expose a usable page")
+            page.set_default_timeout(15_000)
+            adapter = MakroDomainAdapter(page)
+            if not adapter.is_listing_page():
+                adapter.wait_for_authenticated_listing(
+                    MAKRO_HOME_URL,
+                    headless=False,
+                    navigate_first=harness.launched_now,
+                )
+            page = harness.ensure_page()
+            _assert_single_listing_tab(harness.context)
 
-        page = harness.ensure_page()
+        # Resolve the owned Batch page a second time immediately before the scan.
+        # A missing/closed target must fail closed rather than silently switching
+        # to another concurrent job's listing tab.
+        if args.makro_target_id:
+            page = _owned_listing_page(harness, args.makro_target_id)
         adapter = MakroDomainAdapter(page)
-        _assert_single_listing_tab(harness.context)
         adapter.assert_expected_vertical(args.expected_vertical)
         _assert_no_unsaved_section(adapter)
 
@@ -195,6 +233,7 @@ def main() -> int:
                     {
                         "mode": "read_only_live_schema_scan",
                         "page_url": page.url,
+                        "makro_target_id": str(args.makro_target_id or ""),
                         "expected_vertical": args.expected_vertical,
                         "live_schema": str(live_schema_path.resolve()),
                         "semantic_fields_before_filter": all_field_count,
@@ -212,6 +251,8 @@ def main() -> int:
             )
             print("===== MAKRO LIVE SCHEMA SCAN =====")
             print(f"page={page.url}")
+            if args.makro_target_id:
+                print(f"makro_target_id={args.makro_target_id}")
             print(f"live_fields={len(semantic_fields)}")
             print(f"Live schema={live_schema_path.resolve()}")
             print(f"Manifest={manifest.resolve()}")
@@ -237,6 +278,7 @@ def main() -> int:
                 {
                     "mode": "read_only_single_url_ai_decision_fill_plan",
                     "page_url": page.url,
+                    "makro_target_id": str(args.makro_target_id or ""),
                     "expected_vertical": args.expected_vertical,
                     "product_url": str(args.product_url),
                     "generated_listing_sku": generated_sku,
@@ -263,6 +305,8 @@ def main() -> int:
         summary = plan.summary()
         print("===== MAKRO AI-DECISION FILL PLAN =====")
         print(f"page={page.url}")
+        if args.makro_target_id:
+            print(f"makro_target_id={args.makro_target_id}")
         print(f"generated_listing_sku={generated_sku}")
         print(
             f"live_fields={summary['live_field_count']}, ready={summary['ready']}, "
