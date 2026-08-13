@@ -35,6 +35,8 @@ def test_batch_copy_is_customer_facing() -> None:
         '个链接 · {len(enabled)} 个启用',
     ):
         assert token in COPY
+    assert '"BATCH LISTING · MULTI PRODUCT QUEUE": "批量商品"' in RUN
+    assert '"JOB CONTROL · OWNED TAB ISOLATION · LIVE TELEMETRY": "商品任务"' in RUN
 
 
 def test_engineering_terms_are_translated_at_presentation_boundary() -> None:
