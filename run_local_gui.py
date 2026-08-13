@@ -39,6 +39,7 @@ def main() -> int:
     from gui.nekro_effects import install_nekro_effects
     from gui.page_scroll_layout import install_page_scroll_layout
     from gui.preparation_progress import install_detailed_preparation_progress
+    from gui.product_copy import install_product_copy
     from gui.required_input_support import install_required_input_support
     from gui.restore_snapshot import install_restore_snapshot
     from gui.runtime_assistant import install_runtime_assistant
@@ -55,7 +56,7 @@ def main() -> int:
     MainWindow = WorkflowMainWindow
 
     app = QApplication(sys.argv)
-    app.setApplicationName("ecommerce-agent Current Workflow")
+    app.setApplicationName("ecommerce-agent 商品上架助手")
     app.setOrganizationName("ecommerce-agent")
 
     # Keep the native Fuji renderer compatible with the translucent QWidget
@@ -161,6 +162,10 @@ def main() -> int:
     apply_workspace_transition_tuning()
     install_workspace_transition(window, visual)
 
+    # The product copy layer is presentation-only. Install it before the startup
+    # snapshot so the first visible frame already uses release-quality wording.
+    product_copy = install_product_copy(window)
+
     # Reference-site startup choreography is a one-shot presentation surface. It
     # freezes pointer/card effects while visible and keeps the original visual
     # timeline. A separate handoff gate waits for the maximized QWidget geometry
@@ -171,8 +176,8 @@ def main() -> int:
 
     shell.show()
     effects.raise_()
-    # Runtime Assistant remains Phase 1 Shadow Mode: observe + explain only.
     assistant = install_runtime_assistant(window)
+    product_copy.attach_runtime_assistant(assistant)
     assistant.raise_()
     entrance.raise_overlay()
     entrance_stability.start()
