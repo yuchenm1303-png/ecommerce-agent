@@ -3,12 +3,15 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
+import pytest
+
 from app.ai_decisions import field_id
 from app.fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem
 from app.required_overrides import (
     FALLBACK_NUMERIC_VALUE,
     FALLBACK_SOURCE_REFERENCE,
     FALLBACK_TEXT_VALUE,
+    RequiredOverrideError,
     apply_required_overrides,
     required_fallback_override,
 )
@@ -21,8 +24,8 @@ GUI_SOURCE = (ROOT / "gui" / "required_input_support.py").read_text(encoding="ut
 
 def _field(**updates):
     field = {
-        "attribute_key": "model_name",
-        "label": "Model Name",
+        "attribute_key": "required_note",
+        "label": "Required Note",
         "section_heading": "Product Description (0/10)",
         "required": True,
         "multi_value": False,
@@ -65,12 +68,31 @@ def _blocked_item(field):
     )
 
 
-def test_free_text_required_gap_uses_na_without_ai():
+def test_ordinary_free_text_required_gap_uses_na_without_ai():
     fallback = required_fallback_override(_field())
 
     assert fallback["values"] == [FALLBACK_TEXT_VALUE]
     assert FALLBACK_TEXT_VALUE == "N/A"
     assert fallback["source_type"] == "fallback"
+
+
+def test_protected_model_name_can_never_use_generic_placeholder():
+    with pytest.raises(RequiredOverrideError, match="关键 listing 必填字段"):
+        required_fallback_override(
+            _field(attribute_key="model_name", label="Model Name")
+        )
+
+
+def test_protected_title_contributor_can_never_take_arbitrary_first_option():
+    with pytest.raises(RequiredOverrideError, match="禁止使用 N/A / 1 / 随机 option"):
+        required_fallback_override(
+            _field(
+                attribute_key="type",
+                label="Type",
+                options=["Select One", "Room", "Car"],
+                context_text="Attributes that can make up title",
+            )
+        )
 
 
 def test_numeric_or_unit_required_gap_uses_one():
@@ -119,6 +141,20 @@ def test_deterministic_fallback_is_promoted_to_ready_through_existing_hard_guard
     assert item.resolution.eligible_for_autofill is True
 
 
+def test_stale_protected_fallback_instruction_fails_closed_on_recompute():
+    live = _field(attribute_key="model_name", label="Model Name")
+    item = _blocked_item(live)
+    plan = LiveFillPlan([item])
+    stale = {
+        "field_id": field_id(live),
+        "values": ["N/A"],
+        "source_type": "fallback",
+    }
+
+    with pytest.raises(RequiredOverrideError, match="关键 listing 必填字段"):
+        apply_required_overrides(plan, [live], [stale])
+
+
 def test_gui_required_preflight_has_no_second_ai_process_or_cli():
     assert "QProcess" not in GUI_SOURCE
     assert "makro_complete_required.py" not in GUI_SOURCE
@@ -129,7 +165,7 @@ def test_gui_required_preflight_has_no_second_ai_process_or_cli():
     assert "ai_calls=0" in GUI_SOURCE
 
 
-def test_gui_manual_value_is_optional_and_empty_value_gets_fallback():
+def test_gui_ordinary_manual_value_is_optional_and_empty_value_can_get_fallback():
     assert 'editor.setPlaceholderText(f"必填 · 留空将自动填 {fallback_text}")' in GUI_SOURCE
     assert 'if value:' in inspect.getsource(__import__("gui.required_input_support", fromlist=["RequiredInputSupport"]).RequiredInputSupport._merged_overrides)
     assert "required_fallback_override(field)" in GUI_SOURCE
