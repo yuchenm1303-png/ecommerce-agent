@@ -31,6 +31,7 @@ def main() -> int:
     )
     from gui.batch_card_responsive import install_batch_card_responsive
     from gui.batch_job_controls import install_batch_job_controls
+    from gui.batch_sku_spec_ui import install_batch_sku_spec_ui
     from gui.batch_url_editor import install_batch_url_editor
     from gui.batch_workspace_density import install_batch_workspace_density
     from gui.browser_session_manager import install_managed_makro_browser
@@ -152,6 +153,10 @@ def main() -> int:
     # fields (title/package/identifier/compliance) can opt out of generic N/A/1
     # fallback without replacing the ordinary required-field mechanism.
     install_listing_offer_support(window)
+    # Make the already-canonical per-row offer intent unmistakable in Batch:
+    # every supplier link gets its own visible SKU-spec label/input, while the
+    # semantic handoff remains owned by ListingOfferSupport.
+    install_batch_sku_spec_ui(window)
     # Freeze offer ownership after the main support layer exists: duplicate
     # supplier URLs may represent different sold bundles in Batch, while Single
     # execution is invalidated if the offer is edited after preparation.
