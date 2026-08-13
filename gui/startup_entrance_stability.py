@@ -11,23 +11,11 @@ _LAYOUT_POLL_MS = 16
 _LAYOUT_STABLE_SAMPLES = 3
 _LAYOUT_SETTLE_TIMEOUT_MS = 240
 _HANDOFF_FRAME_MS = 16
+_NATIVE_SETTLE_FRAMES = 2
 
 
 class StartupEntranceStabilityGate(QObject):
-    """Keep startup snapshot geometry and the live QWidget handoff frame-identical.
-
-    The native owner is maximized immediately before the entrance starts. Windows,
-    the embedded QWidget child and Qt layouts can therefore keep settling for a few
-    event-loop turns after ``shell.show()``. Capturing during that settle window
-    bakes stale card coordinates into the entrance snapshot and produces a visible
-    whole-page jump when the overlay disappears.
-
-    This gate waits for several identical geometry samples before allowing the
-    existing entrance controller to capture. At the other end it primes the static
-    glass layer while the final entrance frame is still covering the window, then
-    restores effects/card hover/pointer motion over separate frames instead of
-    doing all of that work in the same paint turn as overlay removal.
-    """
+    """Keep startup snapshot geometry and the live QWidget/Quick handoff identical."""
 
     def __init__(self, window: QMainWindow, entrance: Any) -> None:
         super().__init__(window)
@@ -44,9 +32,6 @@ class StartupEntranceStabilityGate(QObject):
         self._handoff_started = False
 
         if self.overlay is not None:
-            # Replace the eager one-turn restore in StartupEntranceController with
-            # the staged handoff below. Keep the original controller untouched so
-            # the entrance visual/timing code remains one stable implementation.
             try:
                 self.overlay.finished.disconnect(self.entrance._finish)  # noqa: SLF001
             except (AttributeError, RuntimeError, TypeError):
@@ -148,31 +133,72 @@ class StartupEntranceStabilityGate(QObject):
 
         QTimer.singleShot(_LAYOUT_POLL_MS, self._probe_layout)
 
-    def _prime_static_runtime(self) -> None:
-        """Prepare the exact live geometry while the final overlay frame hides it."""
+    def _flush_native_background(self) -> None:
+        """Publish final Quick card geometry/mask while the startup overlay hides it."""
 
+        background = self.background
+        if background is None:
+            return
+
+        geometry_timer = getattr(background, "_geometry_timer", None)
+        if geometry_timer is not None:
+            try:
+                geometry_timer.stop()
+            except RuntimeError:
+                pass
+
+        flush = getattr(background, "_flush_geometry", None)
+        if callable(flush):
+            try:
+                flush()
+            except RuntimeError:
+                pass
+
+        quick = getattr(background, "quick_window", None)
+        if quick is not None:
+            try:
+                quick.setProperty("animationRunning", False)
+                request_update = getattr(quick, "requestUpdate", None)
+                if callable(request_update):
+                    request_update()
+            except RuntimeError:
+                pass
+
+    def _prime_static_runtime(self) -> None:
+        """Prepare the exact live QWidget and Quick geometry under the final overlay frame."""
+
+        # Compatibility with older local-glass builds. Current production glass is
+        # owned by NativeQuickBackground, flushed synchronously below.
         local_glass = getattr(self.window, "_scroll_local_glass", None)
         layer = getattr(local_glass, "_layer", None)
         if isinstance(layer, QWidget):
             try:
                 layer.show()
-                resize = getattr(layer, "resize_to_viewport", None)
+                resize = getattr(local_glass, "resize_to_viewport", None)
                 if callable(resize):
                     resize()
-                sync = getattr(layer, "sync_card_geometry", None)
+                sync = getattr(local_glass, "sync_card_geometry", None)
                 if callable(sync):
                     sync()
                 layer.update()
             except RuntimeError:
                 pass
 
-        # StartupEntranceController tracks this exact widget for its normal
-        # restore path. We have already restored it under cover, so clear the
-        # marker and do not show it a second time during the staged resume.
         try:
             self.entrance._hidden_local_glass = None  # noqa: SLF001
         except (AttributeError, RuntimeError):
             pass
+
+        glass = getattr(self.visual, "_glass", None)
+        if isinstance(glass, dict):
+            for frame in glass:
+                if not isinstance(frame, QFrame):
+                    continue
+                try:
+                    if frame.isVisibleTo(self.window):
+                        frame.update()
+                except RuntimeError:
+                    continue
 
         central = self.window.centralWidget()
         if isinstance(central, QWidget):
@@ -180,6 +206,8 @@ class StartupEntranceStabilityGate(QObject):
                 central.update()
             except RuntimeError:
                 pass
+
+        self._flush_native_background()
 
     def _stage_finish(self) -> None:
         if self._handoff_started:
@@ -191,11 +219,24 @@ class StartupEntranceStabilityGate(QObject):
             pass
 
         self._prime_static_runtime()
-        # Give the backing store one complete event-loop frame to publish the
-        # final live card/glass geometry while it is still visually covered.
-        QTimer.singleShot(_HANDOFF_FRAME_MS, self._commit_overlay_handoff)
+        QTimer.singleShot(_HANDOFF_FRAME_MS, self._settle_live_runtime)
+
+    def _settle_live_runtime(self) -> None:
+        # A second native flush catches any geometry/layout request produced by the
+        # first covered QWidget paint. Keep the overlay visible until Quick has had
+        # another frame to consume the final mask texture.
+        self._flush_native_background()
+        QTimer.singleShot(
+            _HANDOFF_FRAME_MS * max(1, _NATIVE_SETTLE_FRAMES - 1),
+            self._commit_overlay_handoff,
+        )
 
     def _commit_overlay_handoff(self) -> None:
+        # One final cheap geometry flush is intentional here: it should be a no-op
+        # when the covered settle frames were stable, and prevents a queued 24 ms
+        # mask update from becoming the first visible post-entrance frame.
+        self._flush_native_background()
+
         overlay = self.overlay
         if isinstance(overlay, QWidget):
             try:
@@ -211,8 +252,6 @@ class StartupEntranceStabilityGate(QObject):
             except RuntimeError:
                 pass
 
-        # Do not wake every animated subsystem on the exact same frame that swaps
-        # the frozen entrance composite for the live QWidget tree.
         QTimer.singleShot(_HANDOFF_FRAME_MS, self._resume_effects)
         QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_card_fx)
         QTimer.singleShot(_HANDOFF_FRAME_MS * 3, self._resume_pointer)
@@ -252,6 +291,14 @@ class StartupEntranceStabilityGate(QObject):
         if self.background is not None:
             try:
                 self.background._last_pointer_norm = None  # noqa: SLF001
+            except (AttributeError, RuntimeError):
+                pass
+
+        hotpath = getattr(self.window, "_background_pointer_hotpath", None)
+        if hotpath is not None:
+            try:
+                hotpath._last_global = None  # noqa: SLF001
+                hotpath._last_geometry = None  # noqa: SLF001
             except (AttributeError, RuntimeError):
                 pass
 
