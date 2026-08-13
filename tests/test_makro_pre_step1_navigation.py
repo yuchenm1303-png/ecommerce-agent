@@ -37,18 +37,26 @@ class FakeLocator:
 
 
 class FakePortalPage:
-    def __init__(self, state: str, *, url: str = "https://seller.makro.co.za/#dashboard/home-page") -> None:
+    def __init__(
+        self,
+        state: str,
+        *,
+        url: str = "https://seller.makro.co.za/#dashboard/home-page",
+        dashboard_ready_after_waits: int = 0,
+    ) -> None:
         self.state = state
         self.url = url
         self.clicks: list[str] = []
         self.gotos: list[str] = []
         self.default_timeout = 0
+        self.wait_calls = 0
+        self.dashboard_ready_after_waits = max(0, int(dashboard_ready_after_waits))
 
     def set_default_timeout(self, value: int) -> None:
         self.default_timeout = value
 
     def wait_for_timeout(self, _milliseconds: int) -> None:
-        return None
+        self.wait_calls += 1
 
     def goto(self, url: str, **_kwargs) -> None:
         self.gotos.append(url)
@@ -61,6 +69,8 @@ class FakePortalPage:
 
     def _roles(self) -> dict[str, str]:
         if self.state == "dashboard":
+            if self.wait_calls < self.dashboard_ready_after_waits:
+                return {}
             return {"Listings": "link"}
         if self.state == "dashboard_menu":
             return {"Listings": "link", "Add New Listings": "link"}
@@ -97,6 +107,15 @@ def test_dashboard_walks_real_menu_chain_to_step1(monkeypatch) -> None:
     step1_entry._prepare_new_listing_step1_page(page)
     assert page.default_timeout == 15_000
     assert page.gotos == []
+    assert page.clicks == ["Listings", "Add New Listings", "Add New Listing", "Add Single Listing"]
+    assert page.state == "step1"
+
+
+def test_dashboard_waits_for_spa_navigation_controls_before_clicking(monkeypatch) -> None:
+    _install_stage_fakes(monkeypatch)
+    page = FakePortalPage("dashboard", dashboard_ready_after_waits=3)
+    step1_entry._prepare_new_listing_step1_page(page)
+    assert page.wait_calls >= 3
     assert page.clicks == ["Listings", "Add New Listings", "Add New Listing", "Add Single Listing"]
     assert page.state == "step1"
 
