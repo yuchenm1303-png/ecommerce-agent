@@ -1,23 +1,21 @@
 """Shared portal entry gate for Makro Step 1 / Select Vertical.
 
-The normal listing workflow starts at Step 1, but a fresh Makro tab may land on
-the Seller Portal Dashboard instead of the Add a Single Listing route. Single
-and Batch therefore share the same bounded pre-Step-1 navigation:
+Single and Batch share one bounded pre-Step-1 state machine. Makro currently
+exposes more than one legitimate navigation shape, so the state machine follows
+observed portal state rather than assuming one fixed menu label sequence:
 
-Dashboard -> Listings -> Add New Listings -> Listing Creation
-          -> Add New Listing -> Add Single Listing -> Step 1
+Legacy:
+    Dashboard -> Listings -> Add New Listings -> Listing Creation
+              -> Add New Listing -> Add Single Listing -> Step 1
 
-Once Step 1 is reached, the existing structural operability contract remains the
-source of truth. For Single mode, exactly one existing Add Listing tab is also a
-stable ownership boundary: if that unique tab has already advanced to Step 2/3,
-it is returned to the shared workflow state machine instead of being pushed
-backward. Multiple listing tabs still fail closed.
+Current:
+    Dashboard -> Listings -> Listings Management
+              -> Add New Listing -> Add Single Listing -> Step 1
 
-Makro occasionally routes a very fast SPA click sequence to
-``#dashboard/page-not-found`` even though the same manual navigation succeeds.
-That route is treated only as a bounded pre-Step-1 navigation fault: return to
-Home and retry the canonical UI path. It is not promoted into the listing task
-state machine and never relaxes login/ownership/unknown-page safety checks.
+A tab already sitting on Listings Management is a valid resumable pre-Step-1
+state. Step 2/3 ownership remains fail-closed and is never pushed backward.
+Known transient ``#dashboard/page-not-found`` faults retain bounded Home recovery.
+This module never clicks Send to QC.
 """
 
 from __future__ import annotations
@@ -36,10 +34,12 @@ from .vertical_selection import _vertical_search_semantics_visible, is_vertical_
 
 _LISTINGS = "Listings"
 _ADD_NEW_LISTINGS = "Add New Listings"
+_LISTINGS_MANAGEMENT = "Listings Management"
 _LISTING_CREATION = "Listing Creation"
 _ADD_NEW_LISTING = "Add New Listing"
 _ADD_SINGLE_LISTING = "Add Single Listing"
 _DASHBOARD = "Your Dashboard"
+_LISTINGS_MANAGEMENT_ROUTE = "#dashboard/listings-management"
 _PAGE_NOT_FOUND_ROUTE = "#dashboard/page-not-found"
 _MAX_PAGE_NOT_FOUND_RECOVERIES = 2
 _ACTION_STABLE_SAMPLES = 3
@@ -174,6 +174,27 @@ def _is_dashboard(page: Any) -> bool:
     return bool(_visible_exact_text(page, _DASHBOARD))
 
 
+def _is_listings_management(page: Any) -> bool:
+    """Recognize the current Listings Management hub structurally.
+
+    The route is the primary signal because the exact heading can render later
+    than the top-right Add New Listing control in Makro's SPA.
+    """
+
+    if not _is_makro_host(page):
+        return False
+    try:
+        url = str(getattr(page, "url", "") or "").casefold()
+    except Exception:
+        url = ""
+    if _LISTINGS_MANAGEMENT_ROUTE in url:
+        return True
+    return bool(
+        _visible_exact_text(page, _LISTINGS_MANAGEMENT)
+        and _has_exact_action(page, _ADD_NEW_LISTING)
+    )
+
+
 def _is_page_not_found(page: Any) -> bool:
     try:
         return _PAGE_NOT_FOUND_ROUTE in str(getattr(page, "url", "") or "").casefold()
@@ -193,16 +214,23 @@ def _is_listing_creation(page: Any) -> bool:
     )
 
 
+def _is_listing_hub(page: Any) -> bool:
+    return _is_listings_management(page) or _is_listing_creation(page)
+
+
 def _diagnostics(page: Any) -> str:
     payload: dict[str, Any] = {
         "url": str(getattr(page, "url", "") or ""),
         "dashboard": _is_dashboard(page),
+        "listings_management": _is_listings_management(page),
         "page_not_found": _is_page_not_found(page),
         "listing_creation": _is_listing_creation(page),
         "step1_operable": _is_step1_operable(page),
         "safe_pre_step1_single_route": _is_safe_pre_step1_single_route(page),
         "listings_action": _has_exact_action(page, _LISTINGS),
         "add_new_listings_action": _has_exact_action(page, _ADD_NEW_LISTINGS),
+        "add_new_listing_action": _has_exact_action(page, _ADD_NEW_LISTING),
+        "add_single_listing_action": _has_exact_action(page, _ADD_SINGLE_LISTING),
     }
     try:
         payload["stage"] = MakroPortalAdapter(page).detect_stage().value
@@ -300,23 +328,36 @@ def _reject_later_listing_stage(page: Any) -> None:
 def _dashboard_navigation_ready(page: Any) -> bool:
     if _has_password(page):
         raise RuntimeError("Makro 登录状态无效；请先在长期 Edge 中人工登录，再重试。")
-    return _has_exact_action(page, _ADD_NEW_LISTINGS) or _has_exact_action(page, _LISTINGS)
+    return bool(
+        _is_listing_hub(page)
+        or _is_step1_operable(page)
+        or _has_exact_action(page, _ADD_NEW_LISTINGS)
+        or _has_exact_action(page, _LISTINGS)
+    )
+
+
+def _dashboard_next_state_ready(page: Any) -> bool:
+    """Accept either legacy submenu or current Listings Management route."""
+
+    return bool(
+        _is_listing_hub(page)
+        or _is_step1_operable(page)
+        or _has_exact_action(page, _ADD_NEW_LISTINGS)
+    )
 
 
 def _open_listing_creation_from_dashboard(page: Any) -> None:
-    if _is_listing_creation(page) or _is_step1_operable(page):
+    """Advance Dashboard to whichever supported listing hub Makro renders."""
+
+    if _is_listing_hub(page) or _is_step1_operable(page):
         return
 
     if not _is_dashboard(page):
         raise RuntimeError(
-            "当前 Makro 页面不是可识别的 Dashboard，无法安全执行 Listings -> Add New Listings。 "
+            "当前 Makro 页面不是可识别的 Dashboard/Listings Management，无法安全进入新建商品。 "
             f"diagnostics={_diagnostics(page)}"
         )
 
-    # Makro is a hash-routed SPA: #dashboard/home-page can appear before the
-    # React navigation controls are mounted. Route readiness is therefore not
-    # enough to click. Wait for the business action, then require a short stable
-    # visibility window so automation does not outrun the internal router/store.
     if not _wait_until_or_page_not_found(
         page,
         lambda: _dashboard_navigation_ready(page),
@@ -327,6 +368,9 @@ def _open_listing_creation_from_dashboard(page: Any) -> None:
             f"diagnostics={_diagnostics(page)}"
         )
 
+    # Some portal builds expose Add New Listings directly from Dashboard. Keep
+    # that path, but do not require it after clicking Listings: current Makro
+    # navigates straight to Listings Management and exposes singular Add New Listing.
     if not _has_exact_action(page, _ADD_NEW_LISTINGS):
         if not _wait_for_stable_action(page, _LISTINGS, timeout_s=5.0):
             raise RuntimeError(
@@ -334,53 +378,62 @@ def _open_listing_creation_from_dashboard(page: Any) -> None:
                 f"diagnostics={_diagnostics(page)}"
             )
         _click_exact_action(page, _LISTINGS)
-        if not _wait_for_stable_action(page, _ADD_NEW_LISTINGS, timeout_s=8.0):
+        if not _wait_until_or_page_not_found(
+            page,
+            lambda: _dashboard_next_state_ready(page),
+            timeout_s=12.0,
+        ):
             raise RuntimeError(
-                "点击 Listings 后没有出现稳定且唯一可见的 Add New Listings。 "
+                "点击 Listings 后既没有进入 Listings Management，也没有出现 Add New Listings。 "
                 f"diagnostics={_diagnostics(page)}"
             )
-    elif not _wait_for_stable_action(page, _ADD_NEW_LISTINGS, timeout_s=5.0):
+
+    if _is_listing_hub(page) or _is_step1_operable(page):
+        return
+
+    if not _wait_for_stable_action(page, _ADD_NEW_LISTINGS, timeout_s=5.0):
         raise RuntimeError(
-            "Makro Dashboard 的 Add New Listings 没有形成稳定可点击状态。 "
+            "Makro 的 Add New Listings 没有形成稳定可点击状态。 "
             f"diagnostics={_diagnostics(page)}"
         )
-
     _click_exact_action(page, _ADD_NEW_LISTINGS)
     if not _wait_until_or_page_not_found(
         page,
-        lambda: _is_listing_creation(page) or _is_step1_operable(page),
+        lambda: _is_listing_hub(page) or _is_step1_operable(page),
         timeout_s=20.0,
     ):
         raise RuntimeError(
-            "点击 Add New Listings 后没有进入 Listing Creation。 "
+            "点击 Add New Listings 后没有进入 Listing Creation/Listings Management。 "
             f"diagnostics={_diagnostics(page)}"
         )
 
 
 def _open_step1_from_listing_creation(page: Any) -> None:
+    """Advance either Listing Creation or Listings Management to Single Step 1."""
+
     if _is_step1_operable(page):
         return
-    if not _is_listing_creation(page):
+    if not _is_listing_hub(page):
         raise RuntimeError(
-            "当前 Makro 页面不是可识别的 Listing Creation，无法安全创建 Single Listing。 "
+            "当前 Makro 页面不是可识别的 Listing Creation/Listings Management，无法安全创建 Single Listing。 "
             f"diagnostics={_diagnostics(page)}"
         )
 
     if not _has_exact_action(page, _ADD_SINGLE_LISTING):
-        if not _wait_for_stable_action(page, _ADD_NEW_LISTING, timeout_s=5.0):
+        if not _wait_for_stable_action(page, _ADD_NEW_LISTING, timeout_s=8.0):
             raise RuntimeError(
-                "Listing Creation 的 Add New Listing 没有形成稳定可点击状态。 "
+                "当前 listing hub 的 Add New Listing 没有形成稳定可点击状态。 "
                 f"diagnostics={_diagnostics(page)}"
             )
         _click_exact_action(page, _ADD_NEW_LISTING)
-        if not _wait_for_stable_action(page, _ADD_SINGLE_LISTING, timeout_s=8.0):
+        if not _wait_for_stable_action(page, _ADD_SINGLE_LISTING, timeout_s=10.0):
             raise RuntimeError(
                 "点击 Add New Listing 后没有出现稳定且唯一可见的 Add Single Listing。 "
                 f"diagnostics={_diagnostics(page)}"
             )
     elif not _wait_for_stable_action(page, _ADD_SINGLE_LISTING, timeout_s=5.0):
         raise RuntimeError(
-            "Listing Creation 的 Add Single Listing 没有形成稳定可点击状态。 "
+            "当前 listing hub 的 Add Single Listing 没有形成稳定可点击状态。 "
             f"diagnostics={_diagnostics(page)}"
         )
 
@@ -388,7 +441,7 @@ def _open_step1_from_listing_creation(page: Any) -> None:
     if not _wait_until_or_page_not_found(
         page,
         lambda: _is_step1_operable(page) or _is_dashboard(page),
-        timeout_s=20.0,
+        timeout_s=25.0,
     ):
         raise RuntimeError(
             "点击 Add Single Listing 后没有进入 Step 1 Vertical，也没有回到可恢复的 Dashboard。 "
@@ -397,20 +450,20 @@ def _open_step1_from_listing_creation(page: Any) -> None:
 
 
 def _recover_page_not_found_to_home(page: Any) -> None:
-    """Recover only Makro's known SPA 404 route back to the canonical Home."""
+    """Recover only Makro's known SPA 404 route back to a recognized pre-Step-1 state."""
 
     page.goto(MAKRO_HOME_URL, wait_until="domcontentloaded", timeout=45_000)
     if not _wait_until_or_page_not_found(
         page,
         lambda: (
             _is_dashboard(page)
-            or _is_listing_creation(page)
+            or _is_listing_hub(page)
             or _is_step1_operable(page)
         ),
         timeout_s=20.0,
     ):
         raise RuntimeError(
-            "从 Makro page-not-found 回到 Home 后仍没有形成可识别的 Dashboard/Listing Creation/Step 1。 "
+            "从 Makro page-not-found 回到 Home 后仍没有形成可识别的 Dashboard/listing hub/Step 1。 "
             f"diagnostics={_diagnostics(page)}"
         )
 
@@ -421,7 +474,7 @@ def _prepare_new_listing_step1_page(page: Any) -> None:
     page.set_default_timeout(15_000)
     page_not_found_recoveries = 0
 
-    for _ in range(10):
+    for _ in range(12):
         try:
             if _has_password(page):
                 raise RuntimeError("Makro 登录状态无效；请先在长期 Edge 中人工登录，再重试。")
@@ -433,7 +486,9 @@ def _prepare_new_listing_step1_page(page: Any) -> None:
                 return
             _reject_later_listing_stage(page)
 
-            if _is_listing_creation(page):
+            # Both old Listing Creation and current Listings Management are
+            # resumable hubs. Never send them backward through Home/Dashboard.
+            if _is_listing_hub(page):
                 _open_step1_from_listing_creation(page)
                 if _is_step1_operable(page):
                     return
@@ -455,13 +510,13 @@ def _prepare_new_listing_step1_page(page: Any) -> None:
                     page,
                     lambda: (
                         _is_dashboard(page)
-                        or _is_listing_creation(page)
+                        or _is_listing_hub(page)
                         or _is_step1_operable(page)
                     ),
                     timeout_s=15.0,
                 ):
                     raise RuntimeError(
-                        "打开 Makro Seller Portal Home 后没有形成可识别的 Dashboard/Listing Creation/Step 1。 "
+                        "打开 Makro Seller Portal Home 后没有形成可识别的 Dashboard/listing hub/Step 1。 "
                         f"diagnostics={_diagnostics(page)}"
                     )
                 continue
