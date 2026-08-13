@@ -4,7 +4,7 @@ from types import MethodType
 from typing import Any
 
 from PySide6.QtCore import QObject, Qt
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
 
 
 _SKU_PLACEHOLDER = "SKU规格（可选）"
@@ -27,6 +27,7 @@ class BatchSkuSpecUi(QObject):
         super().__init__(window)
         self.window = window
         self.workspace = window.batch_workspace
+        self.controller = self.workspace.controller
         self.editor = getattr(self.workspace, "_batch_url_editor", None)
         self.support = getattr(window, "_listing_offer_support", None)
         if self.editor is None or self.support is None:
@@ -44,6 +45,14 @@ class BatchSkuSpecUi(QObject):
 
         self.editor.add_row = MethodType(add_row, self.editor)
         self._update_toolbar_hint()
+
+        # ListingOfferSupport owns the confirmation semantics. Its panel creator
+        # already creates and wires the confirm button, but the current source
+        # forgot to add that button to the panel layout. Repair presentation only:
+        # after ListingOfferSupport handles jobs_changed and creates/rebuilds a
+        # panel, attach the existing wired button to the visible panel.
+        self.controller.jobs_changed.connect(lambda _jobs: self._ensure_confirm_buttons())
+        self._ensure_confirm_buttons()
 
     def _polish_row(self, row: Any) -> None:
         offer = getattr(row, "offer_input", None)
@@ -131,6 +140,20 @@ class BatchSkuSpecUi(QObject):
                 label.setText("每条链接独立 SKU规格 · 自然语言即可 · 第 5 条起滚动")
                 label.setToolTip(_SKU_TOOLTIP)
                 break
+
+    def _ensure_confirm_buttons(self) -> None:
+        panels = getattr(self.support, "_batch_required_panels", None)
+        if not isinstance(panels, dict):
+            return
+        for panel in panels.values():
+            host = getattr(panel, "host", None)
+            layout = host.layout() if isinstance(host, QWidget) else None
+            button = getattr(host, "_confirm_button", None) if host is not None else None
+            if not isinstance(layout, QVBoxLayout) or not isinstance(button, QPushButton):
+                continue
+            if layout.indexOf(button) < 0:
+                layout.addWidget(button, 0, Qt.AlignmentFlag.AlignRight)
+            button.show()
 
 
 def install_batch_sku_spec_ui(window: Any) -> BatchSkuSpecUi:
