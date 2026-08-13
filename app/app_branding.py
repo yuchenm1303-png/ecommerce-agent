@@ -7,6 +7,9 @@ import sys
 from app.app_icon_data import APP_ICON_PNG_BASE64, APP_ICON_SHA256
 
 
+ICON_VISUAL_SCALE = 1.12
+
+
 def application_icon_bytes() -> bytes:
     raw = base64.b64decode(APP_ICON_PNG_BASE64, validate=True)
     digest = hashlib.sha256(raw).hexdigest()
@@ -18,11 +21,22 @@ def application_icon_bytes() -> bytes:
 def apply_qt_application_icon(app) -> None:  # noqa: ANN001
     """Apply the approved app artwork to every top-level Qt window/taskbar entry."""
 
+    from PySide6.QtCore import Qt
     from PySide6.QtGui import QIcon, QPixmap
 
     pixmap = QPixmap()
     if not pixmap.loadFromData(application_icon_bytes(), "PNG"):
         raise RuntimeError("Qt could not decode the embedded application icon")
+
+    scaled = pixmap.scaled(
+        round(pixmap.width() * ICON_VISUAL_SCALE),
+        round(pixmap.height() * ICON_VISUAL_SCALE),
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    x = max(0, (scaled.width() - pixmap.width()) // 2)
+    y = max(0, (scaled.height() - pixmap.height()) // 2)
+    pixmap = scaled.copy(x, y, pixmap.width(), pixmap.height())
     app.setWindowIcon(QIcon(pixmap))
 
     if sys.platform == "win32":
