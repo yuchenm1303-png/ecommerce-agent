@@ -58,13 +58,54 @@ jobs:
         run: |
           $setup = Get-ChildItem artifacts\EcommerceAgent-Setup-*.exe | Select-Object -First 1
           if (-not $setup) { throw "Installer artifact not found" }
+
           $installDir = Join-Path $env:RUNNER_TEMP "EcommerceAgentInstalled"
-          & $setup.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/DIR=$installDir"
-          if ($LASTEXITCODE -ne 0) { throw "Silent install failed with exit code $LASTEXITCODE" }
+          if (Test-Path $installDir) {
+            Remove-Item $installDir -Recurse -Force
+          }
+
+          $setupLog = Join-Path $env:RUNNER_TEMP "ecommerce-agent-setup.log"
+          if (Test-Path $setupLog) {
+            Remove-Item $setupLog -Force
+          }
+
+          $arguments = @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/DIR=$installDir",
+            "/LOG=$setupLog"
+          )
+          $install = Start-Process -FilePath $setup.FullName -ArgumentList $arguments -Wait -PassThru
+          Write-Host "Installer exit code: $($install.ExitCode)"
+          if ($install.ExitCode -ne 0) {
+            if (Test-Path $setupLog) {
+              Write-Host "---- Inno Setup log (tail) ----"
+              Get-Content $setupLog -Tail 120
+            }
+            throw "Silent install failed with exit code $($install.ExitCode)"
+          }
+
+          if (-not (Test-Path $installDir)) {
+            if (Test-Path $setupLog) {
+              Write-Host "---- Inno Setup log (tail) ----"
+              Get-Content $setupLog -Tail 120
+            }
+            throw "Installer reported success but install directory is missing: $installDir"
+          }
+
+          Write-Host "Top-level installed files:"
+          Get-ChildItem $installDir | Format-Table Name, Length, Mode
+
           $worker = Join-Path $installDir "EcommerceAgentWorker.exe"
+          $internal = Join-Path $installDir "_internal"
           if (-not (Test-Path $worker)) { throw "Installed worker missing: $worker" }
+          if (-not (Test-Path $internal)) { throw "Installed _internal directory missing: $internal" }
+
           & $worker --self-test
-          if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed with exit code $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed worker self-test failed with exit code $LASTEXITCODE"
+          }
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
