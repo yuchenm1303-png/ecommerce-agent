@@ -389,7 +389,10 @@ class ApplicationUpdater(QObject):
                         if not _SHA256_RE.match(checksum):
                             error_message = "更新文件校验信息无效。"
                         else:
-                            delivery = str(payload.get("delivery") or "github").strip().lower()
+                            # Formal releases without an explicit delivery contract
+                            # are routed through the authenticated portal by default.
+                            # A manifest must explicitly opt into direct GitHub delivery.
+                            delivery = str(payload.get("delivery") or "portal").strip().lower()
                             payload["version"] = latest
                             payload["installer_sha256"] = checksum
 
@@ -405,7 +408,7 @@ class ApplicationUpdater(QObject):
                                 else:
                                     payload["delivery"] = "portal"
                                     payload["portal_url"] = portal_url
-                            else:
+                            elif delivery == "github":
                                 installer_url = str(payload.get("installer_url") or "").strip()
                                 url = QUrl(installer_url)
                                 if (
@@ -417,6 +420,8 @@ class ApplicationUpdater(QObject):
                                 else:
                                     payload["delivery"] = "github"
                                     payload["installer_url"] = installer_url
+                            else:
+                                error_message = "更新下载方式无效。"
 
                             if error_message is None:
                                 manifest = payload
@@ -455,7 +460,7 @@ class ApplicationUpdater(QObject):
             minimum_key is not None and current_key < minimum_key
         )
         notes = str(manifest.get("notes") or "").strip()
-        delivery = str(manifest.get("delivery") or "github")
+        delivery = str(manifest.get("delivery") or "portal")
 
         box = QMessageBox(self.window)
         box.setWindowTitle("Listing Studio 更新")
@@ -719,7 +724,6 @@ class ApplicationUpdater(QObject):
             "/NORESTART",
             "/CLOSEAPPLICATIONS",
             "/NORESTARTAPPLICATIONS",
-            "/RELAUNCHAPP=1",
         ]
         started = QProcess.startDetached(str(path), arguments)
         ok = bool(started[0]) if isinstance(started, tuple) else bool(started)
