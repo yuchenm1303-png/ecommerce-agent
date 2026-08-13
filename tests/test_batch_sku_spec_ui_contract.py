@@ -16,3 +16,11 @@ def test_batch_sku_spec_ui_installs_after_listing_offer_support() -> None:
     sku_ui = source.index("install_batch_sku_spec_ui(window)")
     hardening = source.index("install_listing_offer_hardening(window)")
     assert support < sku_ui < hardening
+
+
+def test_batch_required_confirmation_button_is_attached_to_visible_layout() -> None:
+    source = Path("gui/batch_sku_spec_ui.py").read_text(encoding="utf-8")
+    assert "_ensure_confirm_buttons" in source
+    assert "layout.indexOf(button) < 0" in source
+    assert "layout.addWidget(button" in source
+    assert "button.show()" in source
