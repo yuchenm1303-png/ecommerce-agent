@@ -20,6 +20,7 @@ from typing import Any
 
 from playwright.sync_api import Page
 
+from ..live_schema import schema_field_signature
 from .fields import (
     _JS_HELPERS,
     build_semantic_fields,
@@ -119,37 +120,13 @@ def _await_section_cards(
     return sections
 
 
-def _scan_option_tokens(values: Any) -> tuple[tuple[str, str], ...]:
-    tokens: list[tuple[str, str]] = []
-    for value in values or []:
-        if isinstance(value, dict):
-            tokens.append(
-                (
-                    str(value.get("text") or "").strip(),
-                    str(value.get("value") or "").strip(),
-                )
-            )
-        else:
-            tokens.append((str(value or "").strip(), ""))
-    return tuple(sorted(tokens))
+def _section_scan_signature(controls: list[dict[str, Any]]) -> tuple[tuple[object, ...], ...]:
+    """Return the exact production schema contract from one canonical pass."""
 
-
-def _section_scan_signature(controls: list[dict[str, Any]]) -> tuple[tuple[Any, ...], ...]:
-    """Return the semantic contract observed in one complete canonical pass."""
-
-    fields = build_semantic_fields(controls)
     return tuple(
         sorted(
-            (
-                str(field.get("attribute_key") or "").strip(),
-                str(field.get("label") or "").strip(),
-                str(field.get("section_heading") or "").strip(),
-                bool(field.get("required")),
-                bool(field.get("multi_value")),
-                _scan_option_tokens(field.get("options")),
-                _scan_option_tokens(field.get("qualifier_options")),
-            )
-            for field in fields
+            schema_field_signature(field)
+            for field in build_semantic_fields(controls)
         )
     )
 
@@ -227,10 +204,11 @@ def scan_section_fields(
     an arbitrary scroll offset after earlier scans. A single pass can therefore
     miss a suffix of one card and falsely look like schema drift. Every pass now
     starts from the same page/section/container origin and the result is accepted
-    only after two consecutive complete passes expose the same semantic contract.
+    only after two consecutive complete passes expose the exact same production
+    schema signature, including value options and qualifier/unit options.
     """
 
-    previous_signature: tuple[tuple[Any, ...], ...] | None = None
+    previous_signature: tuple[tuple[object, ...], ...] | None = None
     stable_samples = 0
     observed_counts: list[int] = []
     latest: list[dict[str, Any]] = []
@@ -245,6 +223,14 @@ def scan_section_fields(
         )
         signature = _section_scan_signature(latest)
         observed_counts.append(len(signature))
+        if not signature:
+            # The target card was known to contain fields before scanning. An
+            # empty pass is therefore a render/path race, never a valid stable
+            # contract. Keep trying and ultimately fail closed if it persists.
+            previous_signature = None
+            stable_samples = 0
+            page.wait_for_timeout(max(120, min(int(wait_ms), 400)))
+            continue
         if previous_signature is not None and signature == previous_signature:
             stable_samples += 1
             if stable_samples >= _SCAN_STABLE_SAMPLES - 1:
