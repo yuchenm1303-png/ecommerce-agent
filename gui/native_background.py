@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import tempfile
 from pathlib import Path
-from typing import Any
 
 from PySide6.QtCore import (
     QAbstractListModel,
@@ -138,6 +137,20 @@ class GlassCardModel(QAbstractListModel):
             "cardVisible": False,
         }
 
+    @classmethod
+    def _geometry_keys(cls) -> tuple[str, ...]:
+        return (
+            "cardX",
+            "cardY",
+            "cardW",
+            "cardH",
+            "clipX",
+            "clipY",
+            "clipW",
+            "clipH",
+            "cardVisible",
+        )
+
     def roleNames(self) -> dict[int, QByteArray]:  # noqa: N802
         return {
             self.CARD_X_ROLE: QByteArray(b"cardX"),
@@ -180,12 +193,7 @@ class GlassCardModel(QAbstractListModel):
             float(frame.width()),
             float(frame.height()),
         )
-        clip_rect = QRectF(
-            0.0,
-            0.0,
-            float(self.overlay.width()),
-            float(self.overlay.height()),
-        )
+        clip_rect = QRectF(0.0, 0.0, float(self.overlay.width()), float(self.overlay.height()))
 
         ancestor = frame.parentWidget()
         while ancestor is not None:
@@ -225,20 +233,6 @@ class GlassCardModel(QAbstractListModel):
             "clipH": clip_rect.height() if visible else 0.0,
             "cardVisible": visible,
         }
-
-    @classmethod
-    def _geometry_keys(cls) -> tuple[str, ...]:
-        return (
-            "cardX",
-            "cardY",
-            "cardW",
-            "cardH",
-            "clipX",
-            "clipY",
-            "clipW",
-            "clipH",
-            "cardVisible",
-        )
 
     @staticmethod
     def _different(old: object, new: object) -> bool:
@@ -354,15 +348,15 @@ Window {{
         }}
     }}
 
-    // The glass mask now lives entirely in the Quick scene graph. Scroll/layout
-    // only updates lightweight model geometry; Python never allocates, paints,
-    // serializes or uploads a full-window ARGB mask texture.
+    // Keep geometry generation in the scene graph, but make the mask texture
+    // ownership explicit. A direct hidden layered Item proved backend-dependent:
+    // on the Windows RHI path it could stay empty even while the card model was
+    // valid, which removed the backdrop blur. ShaderEffectSource is Qt's native
+    // texture-source contract and keeps this path GPU-only without any Python
+    // full-window mask allocation or upload.
     Item {{
-        id: glassMask
+        id: glassMaskScene
         anchors.fill: parent
-        visible: false
-        layer.enabled: true
-        layer.smooth: true
 
         Repeater {{
             model: glassCardModel
@@ -387,11 +381,21 @@ Window {{
         }}
     }}
 
+    ShaderEffectSource {{
+        id: glassMaskTexture
+        anchors.fill: parent
+        sourceItem: glassMaskScene
+        hideSource: true
+        live: true
+        smooth: true
+        visible: false
+    }}
+
     MultiEffect {{
         anchors.fill: parent
         source: blurSource
         maskEnabled: true
-        maskSource: glassMask
+        maskSource: glassMaskTexture
         autoPaddingEnabled: false
     }}
 
@@ -439,7 +443,7 @@ Window {{
 
 
 class NativeQuickBackground(QObject):
-    """Quick-owned wallpaper, GPU glass mask and parallax presentation."""
+    """Quick-owned wallpaper, GPU glass texture mask and parallax presentation."""
 
     def __init__(self, overlay: QMainWindow) -> None:
         super().__init__(overlay)
@@ -489,8 +493,6 @@ class NativeQuickBackground(QObject):
         self.quick_window.setMinimumSize(overlay.minimumSize())
         self.quick_window.setProperty("sharpUrl", QUrl.fromLocalFile(str(self._sharp_path)))
         self.quick_window.setProperty("blurUrl", QUrl.fromLocalFile(str(self._blur_path)))
-        # Minimize/restore should retain the scene graph instead of rebuilding GPU
-        # textures and delegates. Geometry publication is separately guarded below.
         self.quick_window.setPersistentGraphics(True)
         self.quick_window.setPersistentSceneGraph(True)
 
@@ -611,8 +613,6 @@ class NativeQuickBackground(QObject):
         if self._shutting_down:
             return
         if not self._presentation_available():
-            # Preserve the last complete geometry while Windows hides/unexposes
-            # either half of the native QWidget/Quick pair.
             self._geometry_dirty = True
             return
 
