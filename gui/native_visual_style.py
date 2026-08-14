@@ -24,10 +24,11 @@ _NORMAL_SCALE_EPSILON = 1e-5
 class _CardScaleEffect(QGraphicsEffect):
     """Transform one complete QWidget card composite without touching its layout.
 
-    At rest the native widget subtree remains live. During a short scale tween the
-    card controller asks this effect to freeze one current sourcePixmap; subsequent
-    scale steps reuse that same composite and only perform a cheap pixmap transform.
-    Exact rest, modal reset and cleanup release the frozen image immediately.
+    The effect stays enabled for the whole card lifetime and keeps one stable maximum
+    output bound. Transition start/end therefore never toggles QGraphicsEffect state
+    or its bounding rect, avoiding backing-store-wide invalidation. At rest drawSource
+    keeps the live QWidget subtree visible. During a short tween one current
+    sourcePixmap is frozen and reused until the card returns to rest.
     """
 
     def __init__(self, parent: QObject) -> None:
@@ -38,7 +39,6 @@ class _CardScaleEffect(QGraphicsEffect):
         self._frozen_source: QPixmap | None = None
         self._frozen_offset = QPoint()
         self._frozen_center: QPointF | None = None
-        self.setEnabled(False)
 
     @property
     def scale(self) -> float:
@@ -67,8 +67,7 @@ class _CardScaleEffect(QGraphicsEffect):
         self._frozen = frozen
         self._freeze_requested = frozen
         self._clear_frozen_source()
-        if self.isEnabled():
-            self.update()
+        self.update()
 
     def set_scale(self, scale: float) -> None:
         requested = max(0.96, min(_EFFECT_BOUND_SCALE, float(scale)))
@@ -85,22 +84,17 @@ class _CardScaleEffect(QGraphicsEffect):
                 self._frozen = False
                 self._freeze_requested = False
                 self._clear_frozen_source()
+                self.update()
             return
 
         self._scale = requested
-        active = abs(requested - 1.0) > 1e-4
-        if self.isEnabled() != active:
-            self.setEnabled(active)
-            self.updateBoundingRect()
-        if not active:
+        if exact_rest:
             self._frozen = False
             self._freeze_requested = False
             self._clear_frozen_source()
         self.update()
 
     def boundingRectFor(self, source_rect: QRectF) -> QRectF:  # noqa: N802
-        if not self.isEnabled():
-            return QRectF(source_rect)
         center = source_rect.center()
         half_w = source_rect.width() * _EFFECT_BOUND_SCALE * 0.5
         half_h = source_rect.height() * _EFFECT_BOUND_SCALE * 0.5
@@ -130,9 +124,6 @@ class _CardScaleEffect(QGraphicsEffect):
         if pixmap.isNull():
             return None, QPoint(), None
 
-        # sourceBoundingRect() can walk the effect source. During a frozen tween
-        # the source geometry cannot change, so resolve its transform origin once
-        # with the captured composite instead of asking Qt for it on every frame.
         center = self.sourceBoundingRect(Qt.CoordinateSystem.LogicalCoordinates).center()
         if self._frozen:
             self._frozen_source = pixmap
