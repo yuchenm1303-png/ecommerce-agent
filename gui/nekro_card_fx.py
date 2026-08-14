@@ -66,13 +66,12 @@ class _CardState:
 
 
 class NekroCardInteractionController(QObject):
-    """Card interaction with one shared input clock and bounded raster work.
+    """Card interaction with bounded raster work and exact reference motion.
 
-    Quick renders the glass shell every presentation step. QWidget card content is
-    captured once when an interaction transition starts and that frozen composite
-    is transformed throughout the 300 ms motion. At the endpoint the real content
-    is thawed again, so inputs remain fully live while steady but the expensive
-    QWidget subtree is not re-rasterized dozens of times during one scale tween.
+    A scale transition captures the QWidget subtree once and reuses that composite
+    for the whole motion, including an in-flight reversal.  Pure glass-alpha
+    transitions at native scale never capture the QWidget subtree.  The established
+    scale, alpha and 300 ms CSS easing remain unchanged.
     """
 
     def __init__(self, window: QMainWindow, visual: Any) -> None:
@@ -101,6 +100,14 @@ class NekroCardInteractionController(QObject):
 
         window.destroyed.connect(self._cleanup)
 
+    @property
+    def motion_active(self) -> bool:
+        return bool(self._moving_frames)
+
+    @property
+    def motion_interval_ms(self) -> int:
+        return max(4, int(round(self._motion_interval_s * 1000.0)))
+
     def _frame_interval_ms(self) -> int:
         refresh_hz = 60.0
         screen = self.window.screen()
@@ -126,9 +133,9 @@ class NekroCardInteractionController(QObject):
                 pass
 
     def _recapture_for_motion(self, state: _CardState) -> None:
-        # Switching False -> True clears the previous frozen source so the next
-        # effect draw captures the latest hover/press/focus pixels exactly once.
-        self._set_content_frozen(state, False)
+        # False -> True captures the latest live subtree.  If the same transition
+        # reverses while already frozen, set_frozen(True) is a no-op and the exact
+        # existing composite is reused rather than rasterizing the card again.
         self._set_content_frozen(state, True)
 
     def _retire_stale_motions(self) -> None:
@@ -383,7 +390,16 @@ class NekroCardInteractionController(QObject):
         state.target_alpha = alpha
         state.started_s = now_s
         state.moving = True
-        self._recapture_for_motion(state)
+
+        scale_motion = (
+            abs(state.target_scale - state.from_scale) > 1e-5
+            or abs(state.from_scale - _NORMAL_SCALE) > 1e-5
+        )
+        if scale_motion:
+            self._recapture_for_motion(state)
+        else:
+            self._set_content_frozen(state, False)
+
         self._moving_frames.add(frame)
         self._retire_stale_motions()
         self._next_motion_s = min(self._next_motion_s or now_s, now_s)
