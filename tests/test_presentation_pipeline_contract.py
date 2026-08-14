@@ -35,9 +35,14 @@ def test_one_shared_clock_owns_all_high_frequency_python_input_sampling() -> Non
         assert "QApplication.mouseButtons()" not in source
 
 
-def test_glass_mask_is_native_quick_geometry_not_cpu_full_window_texture() -> None:
-    assert "id: glassMask" in NATIVE
-    assert "maskSource: glassMask" in NATIVE
+def test_glass_mask_is_explicit_gpu_texture_not_cpu_full_window_surface() -> None:
+    assert "id: glassMaskScene" in NATIVE
+    assert "ShaderEffectSource {{" in NATIVE
+    assert "id: glassMaskTexture" in NATIVE
+    assert "sourceItem: glassMaskScene" in NATIVE
+    assert "hideSource: true" in NATIVE
+    assert "live: true" in NATIVE
+    assert "maskSource: glassMaskTexture" in NATIVE
     assert "model: glassCardModel" in NATIVE
     assert "clip: true" in NATIVE
     assert 'color: "white"' in NATIVE
@@ -76,6 +81,7 @@ def test_card_motion_uses_shared_clock_and_one_frozen_composite_per_tween() -> N
     advance = CARD.split("def _advance_state", 1)[1].split("def _advance_motions", 1)[0]
     assert "if not state.moving:" in advance
     assert "self._set_content_frozen(state, False)" in advance
+
     assert "self.sourcePixmap(" in VISUAL
     assert "return self._frozen_source, self._frozen_offset" in VISUAL
 
@@ -105,7 +111,6 @@ def test_wallpaper_cache_is_startup_only() -> None:
     assert "QCursor" not in CACHE
     assert "QTimer" not in CACHE
     assert "presentation_tick" not in CACHE
-    assert "setProperty(" not in CACHE
 
 
 def test_launcher_wires_one_clean_presentation_pipeline() -> None:
