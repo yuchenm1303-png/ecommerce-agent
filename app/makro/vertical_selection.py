@@ -155,6 +155,125 @@ def _search_result_delta(
     return output
 
 
+def _search_result_leaf(label: str) -> str:
+    """Return the leaf identity from one exact live Vertical Search breadcrumb."""
+
+    parts = [part.strip() for part in str(label or "").split("/") if part.strip()]
+    return parts[-1] if parts else str(label or "").strip()
+
+
+def _scoped_vertical_search_candidates(search) -> list[str]:
+    """Read visible candidates owned by the live search popup near its input.
+
+    Makro currently renders search results as full breadcrumbs such as
+    ``Home / Alternate Energy / Solar Charge Controller``. Generic page-wide
+    text scanning can miss those rows when they are nested, and can also see the
+    stale Browse taxonomy underneath the popup. This reader is presentation-only:
+    it uses the actual search input's geometry/ARIA relationship and returns the
+    exact rendered row text without interpreting product meaning.
+    """
+
+    try:
+        raw = search.evaluate(
+            r"""(input) => {
+              const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+              const visible = (el) => {
+                if (!el || !(el instanceof Element)) return false;
+                const s = getComputedStyle(el), r = el.getBoundingClientRect();
+                return s.display !== 'none' && s.visibility !== 'hidden'
+                  && Number(s.opacity || 1) !== 0 && r.width > 2 && r.height > 2;
+              };
+              const inputRect = input.getBoundingClientRect();
+              const roots = [];
+              const addRoot = (el) => {
+                if (el && !roots.includes(el) && visible(el)) roots.push(el);
+              };
+              for (const attr of ['aria-controls', 'aria-owns']) {
+                const id = input.getAttribute(attr);
+                if (id) addRoot(document.getElementById(id));
+              }
+              for (const el of document.querySelectorAll('[role="listbox"], [class*="autocomplete" i], [class*="suggest" i], [class*="search-result" i], [class*="searchResult" i]')) {
+                const r = el.getBoundingClientRect();
+                const horizontal = r.right >= inputRect.left - 24 && r.left <= inputRect.right + 24;
+                const vertical = r.bottom >= inputRect.bottom - 8 && r.top <= inputRect.bottom + 620;
+                if (horizontal && vertical) addRoot(el);
+              }
+
+              const selectors = [
+                '[role="option"]', 'li', 'a', 'button', '[role="menuitem"]',
+                '[tabindex]', '[class*="option" i]', '[class*="result" i]',
+                '[class*="suggest" i]'
+              ].join(',');
+              const nodes = [];
+              if (roots.length) {
+                for (const root of roots) nodes.push(...root.querySelectorAll(selectors));
+              } else {
+                nodes.push(...document.querySelectorAll(selectors));
+              }
+
+              const out = [], seen = new Set();
+              for (const el of nodes) {
+                if (!visible(el)) continue;
+                const r = el.getBoundingClientRect();
+                const horizontal = r.right >= inputRect.left - 24 && r.left <= inputRect.right + 24;
+                const vertical = r.top >= inputRect.bottom - 8 && r.top <= inputRect.bottom + 620;
+                if (!horizontal || !vertical) continue;
+                const text = clean(el.innerText || el.textContent || '');
+                if (!text || text.length < 2 || text.length > 260) continue;
+
+                const role = String(el.getAttribute('role') || '').toLowerCase();
+                const cls = String(el.className || '').toLowerCase();
+                const inListbox = !!el.closest('[role="listbox"]');
+                const semantic = role === 'option' || role === 'menuitem' || inListbox
+                  || /option|result|suggest|autocomplete/.test(cls) || text.includes('/');
+                if (!semantic) continue;
+
+                let duplicateChild = false;
+                for (const child of el.children || []) {
+                  if (clean(child.innerText || child.textContent || '') === text) {
+                    duplicateChild = true;
+                    break;
+                  }
+                }
+                if (duplicateChild) continue;
+
+                const key = text.toLocaleLowerCase();
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push(text);
+              }
+              return out;
+            }"""
+        )
+    except Exception:
+        return []
+    return [str(item or "").strip() for item in raw or [] if str(item or "").strip()]
+
+
+def _choose_vertical_search_candidate(
+    provider: JSONTaskProvider,
+    hints: ListingBootstrapHints,
+    term: str,
+    candidates: list[str],
+) -> str:
+    """Choose one exact live search row while treating breadcrumbs as paths.
+
+    A unique row whose *leaf* exactly equals the grounded search term is already
+    deterministic and needs no AI call. Ambiguous/non-exact live rows still go to
+    the existing constrained chooser, which may only return one supplied label.
+    """
+
+    wanted = normalize_label(term)
+    exact_leaf = [
+        candidate
+        for candidate in candidates
+        if wanted and normalize_label(_search_result_leaf(candidate)) == wanted
+    ]
+    if len(exact_leaf) == 1:
+        return exact_leaf[0]
+    return choose_vertical_candidate(provider, hints, term, candidates)
+
+
 def _vertical_search_semantics_visible(page: Page) -> bool:
     """Require Step-1-specific evidence around the fallback search control.
 
@@ -229,23 +348,17 @@ def _complete_exact_live_vertical(
     selected: str,
     *,
     previous_canonical: str = "",
+    verification_label: str = "",
 ) -> str:
     """Finish one exact-live Vertical click and return Makro's canonical id.
 
-    Makro has two observed transition shapes:
-
-    1. the exact live click goes directly to Step 2, where the canonical URL
-       vertical is required, but may arrive shortly after the Step-2 DOM;
-    2. the click first opens the Vertical confirmation card (with Select Brand),
-       while the URL can still contain no canonical vertical at all. In that
-       shape the selected live label is verified in the confirmation UI, Select
-       Brand is clicked, Step 2 is reached, and only then is the canonical URL
-       value required.
-
-    This deliberately separates human display labels from Makro machine ids and
-    avoids requiring URL state before the portal itself commits that state.
+    ``selected`` is always the exact live UI text that was clicked. Search rows
+    may be full breadcrumbs, while the confirmation card/URL represents only the
+    leaf Vertical. ``verification_label`` lets those two portal identities remain
+    separate without weakening either exact-live click or canonical verification.
     """
 
+    verify_as = str(verification_label or selected).strip()
     transitioned = _wait_for(
         lambda current: is_brand_step(current) or _vertical_confirmation_content(current),
         page,
@@ -256,7 +369,7 @@ def _complete_exact_live_vertical(
             f"Makro Step 1 selected live vertical {selected!r}, but neither Step 2 nor the vertical confirmation appeared"
         )
 
-    selected_visible = _selected_label_visible(page, selected)
+    selected_visible = _selected_label_visible(page, verify_as)
 
     if is_brand_step(page):
         canonical_after = _wait_for_canonical_vertical(page)
@@ -264,7 +377,7 @@ def _complete_exact_live_vertical(
             raise RuntimeError("Makro Step 1 reached Step 2 but no canonical vertical appeared in the listing URL")
         _verify_retry_canonical(
             page,
-            selected,
+            verify_as,
             previous_canonical=previous_canonical,
             actual_canonical=canonical_after,
             selected_visible=selected_visible,
@@ -274,8 +387,8 @@ def _complete_exact_live_vertical(
     canonical_before_brand, _ = _current_target_values(page)
     if not canonical_before_brand and not selected_visible:
         raise RuntimeError(
-            "Makro Step 1 vertical confirmation appeared without either the selected live label "
-            f"or a canonical URL value: selected={selected!r}"
+            "Makro Step 1 vertical confirmation appeared without either the selected live leaf "
+            f"or a canonical URL value: selected={selected!r}, verify_as={verify_as!r}"
         )
 
     button = _vertical_select_brand_button(page)
@@ -295,7 +408,7 @@ def _complete_exact_live_vertical(
 
     _verify_retry_canonical(
         page,
-        selected,
+        verify_as,
         previous_canonical=previous_canonical,
         actual_canonical=canonical_after,
         selected_visible=selected_visible,
@@ -397,14 +510,23 @@ def _select_via_search_with_context(
                     pass
                 page.wait_for_timeout(wait_ms)
 
+            live_text = [
+                *_scoped_vertical_search_candidates(search),
+                *_visible_text_candidates(page),
+            ]
             candidates = _search_result_delta(
                 before,
-                _visible_text_candidates(page),
+                live_text,
                 baseline_columns,
             )
             if not candidates:
                 continue
-            selected = choose_vertical_candidate(provider, hints, term, candidates)
+            selected = _choose_vertical_search_candidate(
+                provider,
+                hints,
+                term,
+                candidates,
+            )
             if selected:
                 break
 
@@ -418,6 +540,7 @@ def _select_via_search_with_context(
             page,
             selected,
             previous_canonical=previous_canonical,
+            verification_label=_search_result_leaf(selected),
         )
 
     raise RuntimeError(
