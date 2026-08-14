@@ -7,7 +7,9 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNNER = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
-def test_runtime_never_installs_native_modal_overlay_window() -> None:
+def test_legacy_quick_modal_runtime_is_deleted() -> None:
+    assert not (ROOT / "gui" / "modal_interaction.py").exists()
+    assert not (ROOT / "gui" / "modal_overlay_zorder.py").exists()
     assert "modal_overlay_zorder" not in RUNNER
     assert "install_modal_overlay_zorder" not in RUNNER
     assert "install_modal_interaction" not in RUNNER

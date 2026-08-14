@@ -33,6 +33,9 @@ private_data/
 logs/*
 !logs/.gitkeep
 
+# Local performance benchmark output
+/perf_results/
+
 # Generated local spreadsheets
 # Keep the CSV fixture in git; generated Excel files stay local.
 data/*.xlsx

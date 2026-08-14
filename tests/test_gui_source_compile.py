@@ -54,7 +54,6 @@ GUI_SOURCES = [
     PROJECT_ROOT / "gui" / "workspace_transition.py",
     PROJECT_ROOT / "gui" / "card_details.py",
     PROJECT_ROOT / "gui" / "card_details_fast.py",
-    PROJECT_ROOT / "gui" / "modal_interaction.py",
     PROJECT_ROOT / "gui" / "static_modal_interaction.py",
     PROJECT_ROOT / "gui" / "console_summary_mode.py",
     PROJECT_ROOT / "gui" / "nekro_card_fx.py",
