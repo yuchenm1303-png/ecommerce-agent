@@ -6,20 +6,15 @@ module only broadens that same HUD from Step 3 writes to every visible browser
 automation surface and provides best-effort status/target helpers.
 
 Visual calls are deliberately non-authoritative: failures are logged and never
-change browser business behavior.
+change browser business behavior.  The renderer import is deliberately lazy so
+``browser_session`` and ``app.makro.photos`` can both depend on this facade
+without creating an ``app.makro`` package-initialization cycle.
 """
 
 from __future__ import annotations
 
 from typing import Any
 from urllib.parse import urlsplit
-
-from app.makro.visual_execution_hud import (
-    HUD_API_KEY,
-    destroy_visual_execution_hud,
-    install_visual_execution_hud,
-    set_visual_execution_hud_capture_safe,
-)
 
 
 _ENHANCE_INTERACTION_SCRIPT = r"""
@@ -66,6 +61,18 @@ _TARGET_SCRIPT = r"""
 """
 
 
+def _visual_renderer():
+    """Resolve the single existing renderer only when a HUD operation runs."""
+
+    from app.makro import visual_execution_hud
+
+    return visual_execution_hud
+
+
+def _hud_api_key() -> str:
+    return str(_visual_renderer().HUD_API_KEY)
+
+
 def _evaluate(page: Any, script: str, payload: Any = None) -> Any:
     try:
         if payload is None:
@@ -91,17 +98,19 @@ def _page_matches_host(page: Any, host_suffix: str | None) -> bool:
 
 def _install_current(page: Any, *, title: str, thought: str, phase: int) -> bool:
     try:
-        installed = bool(install_visual_execution_hud(page))
+        renderer = _visual_renderer()
+        installed = bool(renderer.install_visual_execution_hud(page))
+        key = str(renderer.HUD_API_KEY)
     except Exception as exc:
         print(f"GUI_BROWSER_HUD\tINSTALL_ERROR\t{type(exc).__name__}: {exc}", flush=True)
         return False
     if not installed:
         return False
-    _evaluate(page, _ENHANCE_INTERACTION_SCRIPT, HUD_API_KEY)
+    _evaluate(page, _ENHANCE_INTERACTION_SCRIPT, key)
     _evaluate(
         page,
         _STATUS_SCRIPT,
-        [HUD_API_KEY, str(title), str(thought), max(0, min(4, int(phase)))],
+        [key, str(title), str(thought), max(0, min(4, int(phase)))],
     )
     return True
 
@@ -117,14 +126,13 @@ def arm_browser_visual_hud(
     """Keep one HUD lifecycle attached to a Playwright page across navigation.
 
     ``host_suffix`` scopes reinjection to the browser domain owned by this
-    automation.  This lets the long-lived Makro profile contain unrelated tabs
-    without painting Listing Studio visuals over them.  The page receives only
+    automation. This lets the long-lived Makro profile contain unrelated tabs
+    without painting Listing Studio visuals over them. The page receives only
     one DOMContentLoaded listener; repeated calls merely refresh the current HUD.
     """
 
     marker = "_listing_studio_browser_hud_armed"
     normalized_phase = max(0, min(4, int(phase)))
-    status_payload = [HUD_API_KEY, str(title), str(thought), normalized_phase]
     try:
         already_armed = bool(getattr(page, marker, False))
     except Exception:
@@ -134,10 +142,16 @@ def arm_browser_visual_hud(
     if already_armed:
         if not allowed_now:
             return False
+        try:
+            key = _hud_api_key()
+        except Exception as exc:
+            print(f"GUI_BROWSER_HUD\tINSTALL_ERROR\t{type(exc).__name__}: {exc}", flush=True)
+            return False
+        status_payload = [key, str(title), str(thought), normalized_phase]
         # Avoid tearing down/recreating the iframe every time a harness helper
-        # reacquires the same page.  Reinstall only when navigation removed it.
+        # reacquires the same page. Reinstall only when navigation removed it.
         if _evaluate(page, _STATUS_SCRIPT, status_payload):
-            _evaluate(page, _ENHANCE_INTERACTION_SCRIPT, HUD_API_KEY)
+            _evaluate(page, _ENHANCE_INTERACTION_SCRIPT, key)
             return True
         return _install_current(
             page,
@@ -182,7 +196,12 @@ def browser_visual_hud_status(
 ) -> None:
     """Show a high-level browser operation even when no DOM event is emitted."""
 
-    payload = [HUD_API_KEY, str(title), str(thought), max(0, min(4, int(phase)))]
+    try:
+        key = _hud_api_key()
+    except Exception as exc:
+        print(f"GUI_BROWSER_HUD\tERROR\t{type(exc).__name__}: {exc}", flush=True)
+        return
+    payload = [key, str(title), str(thought), max(0, min(4, int(phase)))]
     if not _evaluate(page, _STATUS_SCRIPT, payload):
         if _install_current(page, title=title, thought=thought, phase=phase):
             _evaluate(page, _STATUS_SCRIPT, payload)
@@ -199,10 +218,11 @@ def browser_visual_hud_target(
     """Move the visual cursor to one real locator without steering Playwright."""
 
     try:
+        key = _hud_api_key()
         locator.evaluate(
             _TARGET_SCRIPT,
             {
-                "key": HUD_API_KEY,
+                "key": key,
                 "verb": str(verb),
                 "detail": str(detail),
                 "phase": max(0, min(4, int(phase))),
@@ -215,7 +235,7 @@ def browser_visual_hud_target(
 
 def set_browser_visual_hud_capture_safe(page: Any, active: bool) -> None:
     try:
-        set_visual_execution_hud_capture_safe(page, bool(active))
+        _visual_renderer().set_visual_execution_hud_capture_safe(page, bool(active))
     except Exception as exc:
         print(
             f"GUI_BROWSER_HUD\tCAPTURE_SAFE_ERROR\t{type(exc).__name__}: {exc}",
@@ -246,7 +266,7 @@ def finish_browser_visual_hud(
             pass
     if destroy:
         try:
-            destroy_visual_execution_hud(page)
+            _visual_renderer().destroy_visual_execution_hud(page)
         except Exception as exc:
             print(f"GUI_BROWSER_HUD\tDESTROY_ERROR\t{type(exc).__name__}: {exc}", flush=True)
 
