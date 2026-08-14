@@ -105,6 +105,7 @@ def _assessment_for_path(
         with Image.open(path) as opened:
             width, height = (int(opened.width), int(opened.height))
             opened.verify()
+        sha256 = _file_sha256(path)
     except (UnidentifiedImageError, OSError, ValueError):
         return ListingImageAssessment(
             path=path,
@@ -115,7 +116,7 @@ def _assessment_for_path(
             pixel_area=None,
             aspect_ratio=None,
             sha256="",
-            reasons=("decode_error",),
+            reasons=("decode_or_read_error",),
         )
 
     if width <= 0 or height <= 0:
@@ -127,11 +128,10 @@ def _assessment_for_path(
             height=height,
             pixel_area=0,
             aspect_ratio=None,
-            sha256="",
+            sha256=sha256,
             reasons=("invalid_dimensions",),
         )
 
-    sha256 = _file_sha256(path)
     pixel_area = width * height
     short_edge = min(width, height)
     aspect_ratio = max(width, height) / short_edge
@@ -205,6 +205,8 @@ def listing_images_from_resolver_outputs(outputs: dict[str, Any]) -> tuple[Path,
         values = outputs.get("primary_source_listing_images") or []
     else:
         values = outputs.get("primary_source_product_images") or []
+    if not isinstance(values, (list, tuple)):
+        return ()
     return select_listing_images(values).selected
 
 
