@@ -13,6 +13,7 @@ _WORKER_EXE = "EcommerceAgentWorker.exe"
 _HELPER_SCRIPTS = frozenset(
     {
         "makro_gui_workflow.py",
+        "makro_product_pack_workflow.py",
         "makro_execute_listing.py",
         "makro_batch_source.py",
         "makro_batch_job.py",
