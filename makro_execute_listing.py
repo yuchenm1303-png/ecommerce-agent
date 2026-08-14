@@ -1,9 +1,9 @@
-"""Execute a validated single-product-URL Fill Plan against Makro Step 3.
+"""Execute a validated Fill Plan against Makro Step 3.
 
-This is the production browser entrypoint for the one-link workflow. It reuses
+This is the production browser entrypoint for the listing workflow. It reuses
 existing browser fill/Save/reopen helpers, but product rebind comes only from the
-same raw source snapshot/images used by makro_resolve_ai.py. It never consumes
-customer QA, a manual seller SKU, expected model/brand or product-table facts.
+same canonical source snapshot and optional images used by the Resolver. It
+never consumes customer QA, a manual seller SKU, expected model/brand or product-table facts.
 
 Single-section execution may stay as a no-save visual hold or, when
 ``--allow-section-save`` is explicitly supplied, persist and reopen-verify that
@@ -48,7 +48,7 @@ from makro_preview_listing import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "执行单一商品链接 Resolver 已验证的 Makro Step 3 计划；"
+            "执行 Resolver 已验证的 Makro Step 3 计划；"
             "不重新理解商品，不读取旧 QA/SKU，永不 Send to QC。"
         )
     )
@@ -61,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--image",
         action="append",
         default=[],
-        help="Resolver evidence image；用于 strict source rebind，不自动上传 Makro。",
+        help="Resolver evidence image；可为空，text/table-only 商品资料仍可 strict rebind。",
     )
     parser.add_argument(
         "--upload-image",
@@ -114,13 +114,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--overlap-chars 必须 >=0 且小于 --max-text-chars")
     if not args.supplier_snapshot:
         raise SystemExit(
-            "执行前必须传 Resolver 的 primary-source/source-snapshot.json；"
+            "执行前必须传 Resolver 的 canonical source snapshot；"
             "拒绝只凭 decision packet 写 Makro。"
-        )
-    if not args.image:
-        raise SystemExit(
-            "执行前必须传 Resolver 的 primary-source/source-page.png；"
-            "strict source rebind 需要与 Resolver 相同 evidence。"
         )
 
 
