@@ -12,6 +12,21 @@ WARRANTY_SERVICE_TYPE_POLICY = (
     "Any damage caused by daily wear, accidental impact, improper assembly or wrong usage will not be supported."
 )
 
+# Account-level seller defaults confirmed for this Makro account. These values are
+# operational policy, not product facts: they must bypass AI/Web resolution and be
+# injected through the shared business bundle used by both Single and Batch flows.
+MAKRO_ACCOUNT_FIXED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
+    ("minimum_order_quantity", "1", "account-default:min-order-quantity"),
+    ("max_order_quantity_allowed", "99", "account-default:max-order-quantity"),
+    ("service_profile", "FBS", "account-default:fulfilment-by"),
+    ("shipping_days", "14", "account-default:pick-pack-sla"),
+    ("forbid_shipping", "National", "account-default:selling-region"),
+    ("country_of_origin", "China", "account-default:country-of-origin"),
+    ("manufacturer_details", "LILI", "account-default:manufacturer-details"),
+    ("packer_details", "LILI", "account-default:packer-details"),
+    ("importer_details", "LILI", "account-default:importer-details"),
+)
+
 BUSINESS_ATTRIBUTE_ALIASES: dict[str, tuple[str, ...]] = {
     "sku_id": ("sku", "sku id", "sku_id", "商品sku", "商品编码"),
     "listing_status": ("listing status", "listing_status", "status", "上架状态"),
@@ -25,6 +40,8 @@ BUSINESS_ATTRIBUTE_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     "minimum_order_quantity": (
         "minimum order quantity",
+        "minimum order quantity (minoq)",
+        "minoq",
         "minmoq",
         "min moq",
         "minimum_order_quantity",
@@ -32,6 +49,7 @@ BUSINESS_ATTRIBUTE_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     "max_order_quantity_allowed": (
         "maximum order quantity",
+        "maximum order quantity (maxoq)",
         "maxoq",
         "max moq",
         "max_order_quantity_allowed",
@@ -51,6 +69,27 @@ BUSINESS_ATTRIBUTE_ALIASES: dict[str, tuple[str, ...]] = {
         "selling region",
         "shipping region",
         "forbid_shipping",
+    ),
+    "country_of_origin": (
+        "country of origin",
+        "country_of_origin",
+        "origin country",
+        "country of manufacture",
+    ),
+    "manufacturer_details": (
+        "manufacturer details",
+        "manufacturer detail",
+        "manufacturer_details",
+    ),
+    "packer_details": (
+        "packer details",
+        "packer detail",
+        "packer_details",
+    ),
+    "importer_details": (
+        "importer details",
+        "importer detail",
+        "importer_details",
     ),
     "warranty_summary": (
         "warranty summary",
@@ -123,6 +162,20 @@ def generate_listing_sku(product_url: str) -> str:
     return str(100_000_000_000 + secrets.randbelow(900_000_000_000))
 
 
+def _add_account_fixed_defaults(bundle: ProductSourceBundle) -> None:
+    for attribute_key, value, source_reference in MAKRO_ACCOUNT_FIXED_DEFAULTS:
+        bundle.add_evidence(
+            key=attribute_key,
+            value=value,
+            source_type="config",
+            source_reference=source_reference,
+            priority=5,
+            confidence=1.0,
+            evidence_text=f"Makro account fixed default {attribute_key}={value}.",
+            note="account-level seller default; fixed across listings; not inferred from product evidence",
+        )
+
+
 def generated_business_bundle(
     product_url: str,
     *,
@@ -144,6 +197,7 @@ def generated_business_bundle(
         evidence_text=f"Automatically generated fresh seller SKU={resolved_sku} for this listing attempt.",
         note="mechanical seller identifier; not a product attribute",
     )
+    _add_account_fixed_defaults(bundle)
     bundle.add_evidence(
         key="Warranty Summary",
         value=WARRANTY_SUMMARY_POLICY,
