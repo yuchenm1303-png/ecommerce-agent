@@ -24,11 +24,6 @@ from .native_background import _GLASS_RADIUS, _NORMAL_GLASS_ALPHA, _OVERSCAN
 
 _FRAME_MS = 16
 _CAPTURE_DELAY_MS = 48
-
-# Reference entrance with the loader phase removed. These are the original
-# choreography offsets rebased by -300 ms: curtains start immediately after the
-# first stable GUI composite is captured, while background/UI keep their relative
-# 150/200 ms stagger.
 _UI_FADE_MS = 300
 _CURTAIN_DELAY_MS = 0
 _CURTAIN_MS = 500
@@ -84,20 +79,13 @@ class _GlassRecord:
 
 
 class _StartupEntranceOverlay(QWidget):
-    """One-shot curtain + camera entrance inspired by the reference page.
-
-    There is deliberately no loading spinner/text phase. Before the first stable
-    GUI composite is captured, the two 51% #333 curtains simply cover the window.
-    As soon as that composite exists, the curtains open immediately while the
-    wallpaper focus/scale and frozen UI scale run on the original relative timing.
-    """
+    """One frozen UI snapshot plus the reference curtain/camera choreography."""
 
     finished = Signal()
 
     def __init__(self, window: QMainWindow, visual: Any) -> None:
         super().__init__(window)
         self.window = window
-        self.visual = visual
         self.background = getattr(visual, "background", None)
         self._sharp_source = QPixmap(str(getattr(self.background, "_sharp_path", "")))
         self._blur_source = QPixmap(str(getattr(self.background, "_blur_path", "")))
@@ -179,11 +167,7 @@ class _StartupEntranceOverlay(QWidget):
         width = max(1, round(float(self.width()) * _OVERSCAN))
         height = max(1, round(float(self.height()) * _OVERSCAN))
         key = (width, height)
-        if (
-            self._scene_key != key
-            or self._sharp_scene.isNull()
-            or self._blur_scene.isNull()
-        ):
+        if self._scene_key != key or self._sharp_scene.isNull() or self._blur_scene.isNull():
             self._sharp_scene = self._cover(self._sharp_source, width, height)
             self._blur_scene = self._cover(self._blur_source, width, height)
             self._scene_key = key
@@ -199,18 +183,18 @@ class _StartupEntranceOverlay(QWidget):
     def _background_state(self, elapsed_ms: float) -> tuple[float, float, float]:
         raw = _unit_progress(elapsed_ms, _BACKGROUND_DELAY_MS, _BACKGROUND_MS)
         eased = float(_SOFT_EASE.valueForProgress(raw))
-        scale = _BG_START_SCALE + (1.0 - _BG_START_SCALE) * eased
-        blur_mix = 1.0 - eased
-        dim = _BG_START_DIM * (1.0 - eased)
-        return scale, blur_mix, dim
+        return (
+            _BG_START_SCALE + (1.0 - _BG_START_SCALE) * eased,
+            1.0 - eased,
+            _BG_START_DIM * (1.0 - eased),
+        )
 
     def _ui_state(self, elapsed_ms: float) -> tuple[float, float]:
         opacity_raw = _unit_progress(elapsed_ms, 0.0, _UI_FADE_MS)
         opacity = float(_OPACITY_EASE.valueForProgress(opacity_raw))
         scale_raw = _unit_progress(elapsed_ms, _UI_SCALE_DELAY_MS, _UI_SCALE_MS)
         scale_eased = float(_SOFT_EASE.valueForProgress(scale_raw))
-        scale = _UI_START_SCALE + (1.0 - _UI_START_SCALE) * scale_eased
-        return scale, opacity
+        return _UI_START_SCALE + (1.0 - _UI_START_SCALE) * scale_eased, opacity
 
     def _background_target(self, scene: QPixmap, scale: float) -> QRectF:
         center = QRectF(self.rect()).center()
@@ -283,11 +267,7 @@ class _StartupEntranceOverlay(QWidget):
         for record in self._glass_records:
             target = _scaled_about(record.rect, ui_scale, ui_center)
             clip = _scaled_about(record.clip_rect, ui_scale, ui_center)
-            if (
-                target.isEmpty()
-                or clip.isEmpty()
-                or not target.intersects(QRectF(self.rect()))
-            ):
+            if target.isEmpty() or clip.isEmpty() or not target.intersects(QRectF(self.rect())):
                 continue
             source = self._mapped_source_rect(target, background_target, blur)
             if source.isEmpty():
@@ -343,12 +323,12 @@ class _StartupEntranceOverlay(QWidget):
         painter.restore()
 
     def _paint_curtains(self, painter: QPainter, elapsed_ms: float) -> None:
-        if self._reveal_started_s is None:
-            progress = 0.0
-        else:
-            raw = _unit_progress(elapsed_ms, _CURTAIN_DELAY_MS, _CURTAIN_MS)
-            progress = float(_CURTAIN_EASE.valueForProgress(raw))
-
+        raw = (
+            0.0
+            if self._reveal_started_s is None
+            else _unit_progress(elapsed_ms, _CURTAIN_DELAY_MS, _CURTAIN_MS)
+        )
+        progress = float(_CURTAIN_EASE.valueForProgress(raw))
         width = float(self.width())
         height = float(self.height())
         panel_w = math.ceil(width * _CURTAIN_FRACTION)
@@ -372,7 +352,7 @@ class _StartupEntranceOverlay(QWidget):
 
 
 class StartupEntranceController(QObject):
-    """Coordinate the one-shot entrance without changing runtime UI ownership."""
+    """Freeze normal presentation, run one snapshot animation, then hand back."""
 
     def __init__(self, window: QMainWindow, visual: Any) -> None:
         super().__init__(window)
@@ -383,44 +363,36 @@ class StartupEntranceController(QObject):
         self.overlay = _StartupEntranceOverlay(window, visual)
         self._started = False
         self._finished = False
-        self._pointer_was_active = False
         self._card_fx_was_suspended = False
         self._hidden_effects: QWidget | None = None
-        self._hidden_local_glass: QWidget | None = None
 
         window.installEventFilter(self)
         self.overlay.finished.connect(self._finish)
         self._freeze_runtime_presentation()
 
     def _freeze_runtime_presentation(self) -> None:
-        pointer_timer = getattr(self.background, "_pointer_timer", None)
-        if pointer_timer is not None:
-            try:
-                self._pointer_was_active = bool(pointer_timer.isActive())
-                pointer_timer.stop()
-            except RuntimeError:
-                self._pointer_was_active = False
+        clock = getattr(self.window, "_presentation_clock", None)
+        suspend_clock = getattr(clock, "suspend", None)
+        if callable(suspend_clock):
+            suspend_clock("startup")
 
-        quick = self.quick
-        if quick is not None:
+        if self.quick is not None:
             try:
-                quick.setProperty("animationRunning", False)
-                quick.setProperty("pointerX", 0.0)
-                quick.setProperty("pointerY", 0.0)
-                quick.setProperty("offsetX", 0.0)
-                quick.setProperty("offsetY", 0.0)
+                self.quick.setProperty("animationRunning", False)
+                self.quick.setProperty("pointerX", 0.0)
+                self.quick.setProperty("pointerY", 0.0)
+                self.quick.setProperty("offsetX", 0.0)
+                self.quick.setProperty("offsetY", 0.0)
             except RuntimeError:
                 pass
 
         card_fx = getattr(self.window, "_nekro_card_fx", None)
-        suspend = getattr(card_fx, "suspend_for_modal", None)
-        if callable(suspend):
+        suspend_cards = getattr(card_fx, "suspend_for_modal", None)
+        if callable(suspend_cards):
             try:
-                self._card_fx_was_suspended = bool(
-                    getattr(card_fx, "_suspended", False)
-                )
+                self._card_fx_was_suspended = bool(getattr(card_fx, "_suspended", False))
                 if not self._card_fx_was_suspended:
-                    suspend()
+                    suspend_cards()
             except RuntimeError:
                 pass
 
@@ -428,12 +400,6 @@ class StartupEntranceController(QObject):
         if isinstance(effects, QWidget) and effects.isVisible():
             self._hidden_effects = effects
             effects.hide()
-
-        local_glass = getattr(self.window, "_scroll_local_glass", None)
-        layer = getattr(local_glass, "_layer", None)
-        if isinstance(layer, QWidget) and layer.isVisible():
-            self._hidden_local_glass = layer
-            layer.hide()
 
     def raise_overlay(self) -> None:
         if not self._finished:
@@ -449,11 +415,7 @@ class StartupEntranceController(QObject):
 
     def _visible_clip(self, frame: QFrame) -> tuple[QRectF, QRectF] | None:
         try:
-            if (
-                not frame.isVisibleTo(self.window)
-                or frame.width() <= 0
-                or frame.height() <= 0
-            ):
+            if not frame.isVisibleTo(self.window) or frame.width() <= 0 or frame.height() <= 0:
                 return None
             top_left = frame.mapTo(self.window, QPoint(0, 0))
             rect = QRectF(
@@ -495,18 +457,10 @@ class StartupEntranceController(QObject):
                 continue
             rect, clip = geometry
             try:
-                alpha = float(
-                    getattr(proxy, "overlay_alpha", _NORMAL_GLASS_ALPHA)
-                )
+                alpha = float(getattr(proxy, "overlay_alpha", _NORMAL_GLASS_ALPHA))
             except (RuntimeError, TypeError, ValueError):
                 alpha = _NORMAL_GLASS_ALPHA
-            records.append(
-                _GlassRecord(
-                    rect=rect,
-                    clip_rect=clip,
-                    alpha=alpha,
-                )
-            )
+            records.append(_GlassRecord(rect=rect, clip_rect=clip, alpha=alpha))
         return records
 
     def _capture_central(self) -> tuple[QPixmap, QRectF]:
@@ -514,9 +468,10 @@ class StartupEntranceController(QObject):
         if central is None or central.width() <= 0 or central.height() <= 0:
             return QPixmap(), QRectF()
         dpr = max(1.0, float(central.devicePixelRatioF()))
-        pixel_w = max(1, round(float(central.width()) * dpr))
-        pixel_h = max(1, round(float(central.height()) * dpr))
-        pixmap = QPixmap(pixel_w, pixel_h)
+        pixmap = QPixmap(
+            max(1, round(float(central.width()) * dpr)),
+            max(1, round(float(central.height()) * dpr)),
+        )
         pixmap.setDevicePixelRatio(dpr)
         pixmap.fill(Qt.GlobalColor.transparent)
         central.render(
@@ -526,33 +481,24 @@ class StartupEntranceController(QObject):
             QWidget.RenderFlag.DrawWindowBackground | QWidget.RenderFlag.DrawChildren,
         )
         top_left = central.mapTo(self.window, QPoint(0, 0))
-        rect = QRectF(
+        return pixmap, QRectF(
             float(top_left.x()),
             float(top_left.y()),
             float(central.width()),
             float(central.height()),
         )
-        return pixmap, rect
 
     def _capture_and_reveal(self) -> None:
         if self._finished:
             return
         try:
             pixmap, rect = self._capture_central()
-            records = self._snapshot_glass_records()
-            self.overlay.set_snapshot(pixmap, rect, records)
+            self.overlay.set_snapshot(pixmap, rect, self._snapshot_glass_records())
         except RuntimeError:
             pass
         self.overlay.begin_reveal()
 
     def _restore_runtime_presentation(self) -> None:
-        if self._hidden_local_glass is not None:
-            try:
-                self._hidden_local_glass.show()
-            except RuntimeError:
-                pass
-            self._hidden_local_glass = None
-
         if self._hidden_effects is not None:
             try:
                 self._hidden_effects.show()
@@ -562,25 +508,17 @@ class StartupEntranceController(QObject):
             self._hidden_effects = None
 
         card_fx = getattr(self.window, "_nekro_card_fx", None)
-        resume = getattr(card_fx, "resume_from_modal", None)
-        if callable(resume) and not self._card_fx_was_suspended:
+        resume_cards = getattr(card_fx, "resume_from_modal", None)
+        if callable(resume_cards) and not self._card_fx_was_suspended:
             try:
-                resume()
+                resume_cards()
             except RuntimeError:
                 pass
 
-        pointer_timer = getattr(self.background, "_pointer_timer", None)
-        if self._pointer_was_active and pointer_timer is not None:
-            try:
-                if not pointer_timer.isActive():
-                    pointer_timer.start()
-            except RuntimeError:
-                pass
-        if self.background is not None:
-            try:
-                self.background._last_pointer_norm = None  # noqa: SLF001
-            except (AttributeError, RuntimeError):
-                pass
+        clock = getattr(self.window, "_presentation_clock", None)
+        resume_clock = getattr(clock, "resume", None)
+        if callable(resume_clock):
+            resume_clock("startup")
 
     def _finish(self) -> None:
         if self._finished:
@@ -620,3 +558,6 @@ def install_startup_entrance(
     controller = StartupEntranceController(window, visual)
     window._startup_entrance = controller  # type: ignore[attr-defined]
     return controller
+
+
+__all__ = ["StartupEntranceController", "install_startup_entrance"]
