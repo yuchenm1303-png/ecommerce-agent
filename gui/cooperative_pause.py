@@ -28,10 +28,13 @@ def _layout_containing(root: QLayout | None, widget: QWidget) -> QLayout | None:
         return None
     for index in range(root.count()):
         item = root.itemAt(index)
-        if item.widget() is widget:
+        child_widget = item.widget()
+        if child_widget is widget:
             return root
-        child = item.layout()
-        found = _layout_containing(child, widget) if child is not None else None
+        child_layout = item.layout()
+        found = _layout_containing(child_layout, widget) if child_layout is not None else None
+        if found is None and child_widget is not None:
+            found = _layout_containing(child_widget.layout(), widget)
         if found is not None:
             return found
     return None
