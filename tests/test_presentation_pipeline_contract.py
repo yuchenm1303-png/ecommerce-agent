@@ -19,10 +19,19 @@ def test_obsolete_runtime_patch_modules_are_gone() -> None:
     assert not (ROOT / "gui" / "ui_runtime_optimizations.py").exists()
 
 
-def test_one_shared_clock_owns_all_high_frequency_python_input_sampling() -> None:
-    assert "_PRESENTATION_TICK_MS = 8" in CLOCK
-    assert CLOCK.count("QCursor.pos()") == 1
-    assert CLOCK.count("QApplication.mouseButtons()") == 1
+def test_mouse_input_is_event_driven_and_visual_clock_is_adaptive() -> None:
+    assert "_IDLE_FRAME_MS = 16" in CLOCK
+    assert "QCursor.pos()" not in CLOCK
+    assert "QApplication.mouseButtons()" not in CLOCK
+    assert "app.installEventFilter(self)" in CLOCK
+    assert "QEvent.Type.MouseMove" in CLOCK
+    assert "QEvent.Type.MouseButtonPress" in CLOCK
+    assert "QEvent.Type.MouseButtonRelease" in CLOCK
+    assert "def _deliver_input" in CLOCK
+    assert "def _frame_tick" in CLOCK
+    assert "def _card_motion_interval_ms" in CLOCK
+    assert "self.timer.setInterval(target)" in CLOCK
+
     for consumer in (
         "self.background.presentation_tick(",
         "self.card_fx.presentation_tick(",
@@ -35,13 +44,16 @@ def test_one_shared_clock_owns_all_high_frequency_python_input_sampling() -> Non
         assert "QApplication.mouseButtons()" not in source
 
 
-def test_glass_mask_is_explicit_gpu_texture_not_cpu_full_window_surface() -> None:
+def test_glass_mask_texture_refreshes_only_when_geometry_changes() -> None:
     assert "id: glassMaskScene" in NATIVE
     assert "ShaderEffectSource {{" in NATIVE
     assert "id: glassMaskTexture" in NATIVE
     assert "sourceItem: glassMaskScene" in NATIVE
     assert "hideSource: true" in NATIVE
-    assert "live: true" in NATIVE
+    assert "live: false" in NATIVE
+    assert "property int geometryRevision: 0" in NATIVE
+    assert "onGeometryRevisionChanged: glassMaskTexture.scheduleUpdate()" in NATIVE
+    assert 'quick.setProperty("geometryRevision", self._geometry_revision)' in NATIVE
     assert "maskSource: glassMaskTexture" in NATIVE
     assert "model: glassCardModel" in NATIVE
     assert "clip: true" in NATIVE
