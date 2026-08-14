@@ -8,7 +8,7 @@ from .source_bundle import normalize_key
 
 
 LISTING_INTENT_ENV = "ECOMMERCE_LISTING_INTENT"
-_BASE_CONTENT_POLICY_VERSION = 2
+_BASE_CONTENT_POLICY_VERSION = 3
 
 
 def current_listing_intent() -> str:
@@ -47,7 +47,7 @@ _GLOBAL_BASE_RULES: tuple[str, ...] = (
     "Do not use emoji, decorative symbols, HTML tables or table-like markup. Standard punctuation needed for model numbers, specifications, units and ranges such as USB-C, 2-in-1 or 220-240 V is allowed.",
     "Avoid medical-style claims about diagnosis, treatment, cure, prevention, disease relief or medical efficacy. When grounded, describe physical functions such as heat, massage or kneading neutrally.",
     "Never invent EAN/GTIN values, certifications, package contents, compatibility, legal/compliance facts, seller promises or search-volume claims from convention or absence.",
-    "When several phrases belong in one free-text field, use concise readable wording or newline-separated phrases. When the live field is truly multi_value, obey that live value shape instead.",
+    "When several phrases belong in one ordinary free-text field, use concise readable wording or newline-separated phrases. For every live field with multi_value=true, return each independent value as a separate element of the decision values array; never join distinct values with commas, semicolons, '+', 'and', or newlines just to fit one input. The Makro execution layer will create one live row per value when the field exposes its + control.",
     "Only describe a keyword as high-volume or competitor-validated when real Web evidence from this run supports that claim; otherwise choose keywords by product relevance only.",
 )
 
@@ -92,6 +92,30 @@ def _with_intent(policy: dict[str, Any]) -> dict[str, Any]:
     return {**policy, "listing_intent": intent}
 
 
+def _sales_package_value_shape(field: dict[str, Any]) -> dict[str, str]:
+    if bool(field.get("multi_value")):
+        return {
+            "value_shape": "one_package_item_per_value",
+            "value_format": "<quantity> x <concise item name>",
+            "shape_instruction": (
+                "This live Sales Package field is multi-value. Return one delivered physical item per values[] "
+                "element so Makro can put each item on its own row. Use '<quantity> x <concise item name>' when the "
+                "listing intent or exact product evidence establishes the quantity, for example '1 x Inflatable "
+                "Pool', '1 x Electric Air Pump', '1 x Instruction Manual'. Never combine separate package items in "
+                "one values[] element with commas, semicolons, '+', 'and', or newlines. Keep model/specification text "
+                "that belongs to one physical item inside that same element. Do not invent a quantity."
+            ),
+        }
+    return {
+        "value_shape": "single_package_string",
+        "value_format": "concise package contents",
+        "shape_instruction": (
+            "This live Sales Package field is single-value. Return one concise string containing only the grounded "
+            "package contents; keep exact quantities when known and separate distinct items with '; '."
+        ),
+    }
+
+
 def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
     """Return seller content policy for one live field, without product reasoning."""
 
@@ -113,6 +137,7 @@ def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
 
     if _matches(field, "Sales Package", "sales_package"):
         intent = current_listing_intent()
+        shape = _sales_package_value_shape(field)
         if intent:
             return _with_intent(
                 {
@@ -121,12 +146,14 @@ def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
                     "evidence_mode": "exact_product_only",
                     "best_effort": "listing_intent_allowed",
                     "required_fallback": "manual_only",
+                    **shape,
                     "instruction": (
                         "Describe what the buyer receives for this exact selected listing offer. Treat listing_intent "
                         "as the seller's explicit sold bundle/variant scope. List the units/items named by that intent "
                         "and reconcile them with exact supplier evidence. Add a base accessory only when resolved or "
                         "exact-product evidence explicitly shows it is included with the selected variant. Never infer "
-                        "standard accessories or quantities from category convention. Never output N/A."
+                        "standard accessories or quantities from category convention. Never output N/A. "
+                        + shape["shape_instruction"]
                     ),
                 }
             )
@@ -136,10 +163,12 @@ def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
             "evidence_mode": "exact_product_only",
             "best_effort": "disabled",
             "required_fallback": "manual_only",
+            **shape,
             "instruction": (
                 "List only items explicitly supported as included in the sold package. Never infer standard "
                 "accessories or quantities from product category convention. If exact package contents are not "
-                "verified, keep this field MISSING. Never use N/A as Sales Package."
+                "verified, keep this field MISSING. Never use N/A as Sales Package. "
+                + shape["shape_instruction"]
             ),
         }
 
