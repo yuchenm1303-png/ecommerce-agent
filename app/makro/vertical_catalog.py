@@ -11,22 +11,21 @@ from typing import Any, Callable
 from playwright.sync_api import Page
 
 from .catalog_taxonomy import (
+    CATALOG_PROBE_STEP1_URL,
     CatalogTaxonomyBrowser,
     assert_catalog_probe_route,
     is_fresh_catalog_step1_url,
 )
 from .listing import parse_makro_listing_url
-from .listing_creation import (
-    MAKRO_NEW_LISTING_URL,
-    _vertical_confirmation_content,
-    is_brand_step,
-)
+from .listing_creation import _vertical_confirmation_content, is_brand_step
 
 
-# v1 used the page-global resilient taxonomy reader and could ingest Makro's
-# Dashboard sidebar as taxonomy. v2 checkpoints are created only from the
-# Step-1 Browse Verticals scoped reader and must never resume v1 state.
-CATALOG_SCHEMA_VERSION = 2
+# v1 scanned page-global clickable columns and could ingest Dashboard navigation.
+# v2 scoped the DOM but assumed a non-existent Browse Verticals heading and used
+# a URL form that Makro redirects to Dashboard home.  v3 is bound to the actual
+# live Step-1 route and observed "Select The Vertical For Your Product" surface.
+CATALOG_SCHEMA_VERSION = 3
+SURFACE_CONTRACT = "step1_select_vertical_scoped_v3"
 CHECKPOINT_NAME = "vertical-catalog-checkpoint.json"
 CATALOG_NAME = "makro-vertical-catalog.json"
 LEAVES_CSV_NAME = "makro-vertical-leaves.csv"
@@ -48,11 +47,11 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def new_catalog_state(*, source_url: str = MAKRO_NEW_LISTING_URL) -> dict[str, Any]:
+def new_catalog_state(*, source_url: str = CATALOG_PROBE_STEP1_URL) -> dict[str, Any]:
     now = _utc_now()
     return {
         "schema_version": CATALOG_SCHEMA_VERSION,
-        "surface_contract": "step1_browse_verticals_scoped_v2",
+        "surface_contract": SURFACE_CONTRACT,
         "source_url": str(source_url),
         "started_at": now,
         "updated_at": now,
@@ -114,11 +113,11 @@ def load_checkpoint(path: str | Path) -> dict[str, Any]:
         raise ValueError(
             "obsolete Makro vertical catalog checkpoint schema_version="
             f"{version}; current={CATALOG_SCHEMA_VERSION}. "
-            "The old checkpoint was produced before Browse Verticals DOM scoping; "
+            "The old checkpoint predates the verified Step-1 route/surface contract; "
             "rerun once with --no-resume."
         )
-    if str(payload.get("surface_contract") or "") != "step1_browse_verticals_scoped_v2":
-        raise ValueError("Makro vertical catalog checkpoint has no trusted scoped-surface contract")
+    if str(payload.get("surface_contract") or "") != SURFACE_CONTRACT:
+        raise ValueError("Makro vertical catalog checkpoint has no trusted Step-1 surface contract")
     return prepare_resume_state(payload)
 
 
@@ -192,9 +191,9 @@ def build_catalog_payload(state: dict[str, Any]) -> dict[str, Any]:
     failed_count = len(state.get("failed") or [])
     return {
         "schema_version": CATALOG_SCHEMA_VERSION,
-        "surface_contract": "step1_browse_verticals_scoped_v2",
+        "surface_contract": SURFACE_CONTRACT,
         "generated_at": _utc_now(),
-        "source_url": str(state.get("source_url") or MAKRO_NEW_LISTING_URL),
+        "source_url": str(state.get("source_url") or CATALOG_PROBE_STEP1_URL),
         "complete": pending_count == 0 and failed_count == 0,
         "stats": {
             "root_count": len(state.get("roots") or []),
@@ -211,7 +210,7 @@ def build_catalog_payload(state: dict[str, Any]) -> dict[str, Any]:
         "canonical_index": canonical_index,
         "safety": {
             "dedicated_probe_tab": True,
-            "taxonomy_surface": "Browse Verticals only",
+            "taxonomy_surface": "Select The Vertical For Your Product",
             "sidebar_navigation_eligible": False,
             "brand_selected": False,
             "listing_created": False,
@@ -293,10 +292,10 @@ def reset_probe_to_step1(
     timeout_s: float = 30.0,
     max_items_per_level: int = 200,
 ) -> None:
-    """Return the dedicated tab to a verified fresh Step-1 Browse Verticals surface."""
+    """Return the dedicated tab to the verified fresh Makro Step-1 route/surface."""
 
     page.goto(
-        MAKRO_NEW_LISTING_URL,
+        CATALOG_PROBE_STEP1_URL,
         wait_until="domcontentloaded",
         timeout=int(max(5.0, timeout_s) * 1000),
     )
@@ -309,9 +308,9 @@ def reset_probe_to_step1(
         return browser.ready(max_items_per_level=max_items_per_level)
 
     if not _wait_until(page, ready, timeout_s=timeout_s, poll_ms=250):
-        detail = browser.last_diagnostic or "fresh Step-1 Browse Verticals surface was not verified"
+        detail = browser.last_diagnostic or "fresh Step-1 Select Vertical surface was not verified"
         raise RuntimeError(
-            "dedicated Makro catalog probe tab did not reach the owned Browse Verticals surface: "
+            "dedicated Makro catalog probe tab did not reach the owned Select Vertical surface: "
             f"{detail}; url={getattr(page, 'url', '')!r}"
         )
 
@@ -327,8 +326,8 @@ def _wait_for_click_outcome(
 ) -> tuple[str, list[str], str]:
     deadline = time.monotonic() + max(1.0, float(timeout_s))
     while time.monotonic() < deadline:
-        # Critical fail-closed boundary: an Orders/Dashboard navigation caused by
-        # a bad DOM match is detected immediately before any further DOM scan.
+        # Any accidental Orders/Dashboard navigation becomes a hard stop before
+        # another DOM read or click can occur.
         assert_catalog_probe_route(page, allow_vertical=True)
 
         canonical = _canonical_vertical(page)
@@ -386,7 +385,7 @@ def inspect_taxonomy_path(
         ]
         if len(matches) != 1:
             raise RuntimeError(
-                "Makro taxonomy path node is not one unique live Browse Verticals candidate: "
+                "Makro taxonomy path node is not one unique live Select Vertical candidate: "
                 f"level={level}, wanted={wanted!r}, matches={matches!r}"
             )
 
@@ -403,7 +402,7 @@ def inspect_taxonomy_path(
         ):
             reason = browser.last_diagnostic or "unknown scoped-click failure"
             raise RuntimeError(
-                "Makro taxonomy probe could not click exact node inside Browse Verticals: "
+                "Makro taxonomy probe could not click exact node inside Select Vertical: "
                 f"level={level}, selected={selected!r}, reason={reason}"
             )
 
@@ -469,7 +468,7 @@ def _discover_live_roots(
     columns = browser.columns(max_items_per_level=max_items_per_level)
     if not columns or not columns[0]:
         detail = browser.last_diagnostic or "no root column"
-        raise RuntimeError(f"Makro Browse Verticals exposed no live root taxonomy nodes: {detail}")
+        raise RuntimeError(f"Makro Select Vertical exposed no live root taxonomy nodes: {detail}")
 
     roots: list[str] = []
     seen: set[str] = set()
@@ -503,9 +502,6 @@ def harvest_vertical_catalog(
 
     if resume and checkpoint.exists():
         state = load_checkpoint(checkpoint)
-        # A v2 resume is accepted only while the current live root surface still
-        # matches the root set captured by that checkpoint. This prevents stale
-        # or cross-surface state from being replayed after Makro UI changes.
         live_roots = _discover_live_roots(
             page,
             step1_timeout_s=step1_timeout_s,
@@ -515,7 +511,7 @@ def harvest_vertical_catalog(
         actual = {_clean_label(item).casefold() for item in live_roots}
         if not expected or expected != actual:
             raise RuntimeError(
-                "Makro live Browse Verticals roots no longer match this checkpoint; "
+                "Makro live Select Vertical roots no longer match this checkpoint; "
                 "refusing stale resume. Run once with --no-resume to create a fresh catalog."
             )
     else:
@@ -626,6 +622,7 @@ __all__ = [
     "CATALOG_SCHEMA_VERSION",
     "CHECKPOINT_NAME",
     "LEAVES_CSV_NAME",
+    "SURFACE_CONTRACT",
     "build_catalog_payload",
     "harvest_vertical_catalog",
     "inspect_taxonomy_path",
