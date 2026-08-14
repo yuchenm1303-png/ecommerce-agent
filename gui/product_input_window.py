@@ -1,10 +1,9 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from pathlib import Path
-from typing import Any
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -17,6 +16,7 @@ from PySide6.QtWidgets import (
 from app.product_pack import SUPPORTED_PRODUCT_PACK_SUFFIXES
 
 from .readonly_runner import RunnerConfig
+from .result_loader import RunResult
 from .workflow_console_window import WorkflowMainWindow
 
 
@@ -113,7 +113,11 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
         if not files:
             return
         paths = tuple(Path(value).resolve() for value in files)
-        unsupported = [path.name for path in paths if path.suffix.casefold() not in SUPPORTED_PRODUCT_PACK_SUFFIXES]
+        unsupported = [
+            path.name
+            for path in paths
+            if path.suffix.casefold() not in SUPPORTED_PRODUCT_PACK_SUFFIXES
+        ]
         if unsupported:
             QMessageBox.warning(
                 self,
@@ -157,15 +161,29 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
             button = getattr(self, name, None)
             if isinstance(button, QPushButton):
                 button.setEnabled(not pack_mode and not self.runner.is_running)
-                button.setToolTip(
-                    "客户资料包使用完整新建任务；阶段诊断仍用于 URL / 当前 Makro 页面。"
-                    if pack_mode
-                    else button.toolTip()
-                )
+                if pack_mode:
+                    button.setToolTip(
+                        "客户资料包使用完整新建任务；阶段诊断仍用于 URL / 当前 Makro 页面。"
+                    )
         if pack_mode:
             self.start_button.setText("新建任务 · 使用资料包")
         else:
             self.start_button.setText("新建任务 · 从 0 完整准备")
+
+    def _clear_staged_listing_images(self) -> None:
+        self._selected_upload_images = []
+        if hasattr(self, "real_image_count"):
+            self.real_image_count.setText("0 files")
+            self.real_image_count.setToolTip("")
+        if hasattr(self, "real_upload_check"):
+            self.real_upload_check.setChecked(False)
+
+    def _reset_result_views(self) -> None:
+        # Never let Listing Photos selected for a previous product leak into a
+        # newly prepared product. Product-pack candidates are re-seeded from the
+        # exact completed run below and still require explicit upload opt-in.
+        self._clear_staged_listing_images()
+        super()._reset_result_views()
 
     def _start_mode(self, mode: str) -> None:
         if not self._selected_product_files:
@@ -198,6 +216,62 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
             self.open_run_button.setEnabled(True)
         except Exception as exc:
             QMessageBox.critical(self, "无法开始资料包任务", str(exc))
+
+    @staticmethod
+    def _pack_listing_images(result: RunResult) -> tuple[Path, ...]:
+        workflow_path = result.run_dir / "run-manifest.json"
+        if not workflow_path.is_file():
+            return ()
+        try:
+            workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ()
+        if str(workflow.get("input_mode") or "") != "customer_product_pack":
+            return ()
+
+        product_input = workflow.get("product_input") or {}
+        values = product_input.get("listing_images") if isinstance(product_input, dict) else []
+        if not values:
+            bootstrap = workflow.get("bootstrap_source") or {}
+            values = bootstrap.get("listing_images") if isinstance(bootstrap, dict) else []
+        if not values:
+            outputs = result.resolver.get("outputs") or {}
+            values = (
+                outputs.get("primary_source_listing_images")
+                if isinstance(outputs, dict)
+                else []
+            )
+        if not isinstance(values, list):
+            return ()
+
+        output: list[Path] = []
+        seen: set[Path] = set()
+        for value in values:
+            path = Path(str(value)).resolve()
+            if not path.is_file() or path in seen:
+                continue
+            seen.add(path)
+            output.append(path)
+        return tuple(output)
+
+    def _unlock_real_execution(self, result: RunResult) -> None:
+        super()._unlock_real_execution(result)
+        images = self._pack_listing_images(result)
+        if not images:
+            return
+
+        self._selected_upload_images = list(images)
+        self.real_image_count.setText(f"{len(images)} files · from pack")
+        self.real_image_count.setToolTip("\n".join(str(path) for path in images))
+        # Keep upload authorization false. The pack supplies candidate bytes; the
+        # existing explicit checkbox + confirmation still owns the browser write.
+        self.real_upload_check.setChecked(False)
+        if result.ready > 0:
+            self.real_policy_hint.setText(
+                f"read-only acceptance 已通过：READY={result.ready}。资料包中有 {len(images)} 张"
+                "可用 Listing Photos 已预选；勾选“上传图片”后才会真正上传。"
+                "Save / 图片仍是显式授权，QC 继续锁定。"
+            )
 
     def _set_running(self, running: bool) -> None:
         super()._set_running(running)
