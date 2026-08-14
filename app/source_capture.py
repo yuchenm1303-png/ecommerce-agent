@@ -15,6 +15,7 @@ from playwright.sync_api import Error as PlaywrightError, sync_playwright
 from .browser_session import cdp_endpoint, is_cdp_ready, launch_detached_edge
 from .source_snapshot import (
     SourceAccessBlocked,
+    SourceCaptureError,
     SourceSnapshot,
     capture_page_snapshot,
     source_snapshot_from_json,
@@ -170,11 +171,6 @@ def _is_navigation_context_error(exc: BaseException) -> bool:
     return "execution context was destroyed" in text and "navigation" in text
 
 
-def _is_timeout_error(exc: BaseException) -> bool:
-    text = str(exc).casefold()
-    return "timeout" in text and "exceeded" in text
-
-
 def _wait_for_navigation_recovery(page, *, settle_ms: int) -> None:
     """Wait for a replacement execution context after a supplier-side navigation.
 
@@ -277,40 +273,42 @@ def _capture_snapshot_with_navigation_retry(
     raise RuntimeError("unreachable snapshot retry state")
 
 
+def _compact_playwright_error(exc: BaseException) -> str:
+    return re.sub(r"\s+", " ", str(exc or "")).strip()[:500]
+
+
 def _screenshot_with_navigation_retry(
     page,
     path: Path,
     *,
     settle_ms: int,
     attempts: int = 4,
-) -> None:
-    """Capture a useful screenshot without making full-page rendering a hard gate.
+) -> tuple[bool, str]:
+    """Capture screenshot evidence without making browser rendering a hard gate.
 
-    Very long/dynamic supplier pages can exceed Playwright's screenshot timeout
-    even after the source snapshot is already valid. Retry only navigation races;
-    on a plain full-page timeout, immediately fall back to the current viewport.
+    Product pages may be too long or too dynamic for Chrome's full-page bitmap
+    capture. Any Playwright/CDP screenshot failure therefore falls back to the
+    current viewport. If both modes fail, the caller can continue with downloaded
+    product images; only loss of *all* visual evidence is fatal.
     """
 
-    for attempt in range(max(1, attempts)):
-        try:
-            page.screenshot(path=str(path), full_page=True)
-            return
-        except PlaywrightError as exc:
-            if _is_navigation_context_error(exc) and attempt + 1 < attempts:
-                _wait_for_navigation_recovery(page, settle_ms=settle_ms)
-                continue
-            if not _is_timeout_error(exc):
-                raise
-            break
+    failures: list[str] = []
+    for full_page, mode in ((True, "full-page"), (False, "viewport")):
+        for attempt in range(max(1, attempts)):
+            try:
+                page.screenshot(path=str(path), full_page=full_page)
+                if failures:
+                    return True, f"{failures[-1]}; {mode} fallback succeeded"
+                return True, ""
+            except PlaywrightError as exc:
+                summary = _compact_playwright_error(exc)
+                if _is_navigation_context_error(exc) and attempt + 1 < attempts:
+                    _wait_for_navigation_recovery(page, settle_ms=settle_ms)
+                    continue
+                failures.append(f"{mode} screenshot failed: {summary}")
+                break
 
-    for attempt in range(max(1, attempts)):
-        try:
-            page.screenshot(path=str(path), full_page=False)
-            return
-        except PlaywrightError as exc:
-            if not _is_navigation_context_error(exc) or attempt + 1 >= attempts:
-                raise
-            _wait_for_navigation_recovery(page, settle_ms=settle_ms)
+    return False, " | ".join(failures)
 
 
 def _image_extension(content_type: str, url: str) -> str:
@@ -362,8 +360,8 @@ def _download_page_images(context, image_urls: list[str], output_dir: Path, *, m
             path.write_bytes(body)
             saved.append(path)
         except Exception:
-            # Image downloads are supplemental. The snapshot + screenshot remain
-            # valid evidence even when a CDN refuses an individual request.
+            # Individual CDN assets are supplemental. The source snapshot plus
+            # another visual artifact remains valid evidence when one image fails.
             continue
         finally:
             if response is not None:
@@ -386,22 +384,33 @@ def _cached_capture(
     slot = cache_dir / _source_cache_key(source_url)
     snapshot = slot / "source-snapshot.json"
     screenshot = slot / "source-page.png"
-    if not snapshot.is_file() or not screenshot.is_file():
+    cached_images = slot / "product-images"
+    cached_image_files = tuple(
+        sorted(path for path in cached_images.glob("*") if path.is_file())
+    ) if cached_images.is_dir() else ()
+    if not snapshot.is_file() or (not screenshot.is_file() and not cached_image_files):
         return None
     age = time.time() - snapshot.stat().st_mtime
     if age < 0 or age > cache_ttl_seconds:
         return None
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(snapshot, output_dir / snapshot.name)
-    shutil.copy2(screenshot, output_dir / screenshot.name)
-    cached_images = slot / "product-images"
-    if cached_images.is_dir():
-        shutil.copytree(cached_images, output_dir / "product-images", dirs_exist_ok=True)
-
     output_snapshot = output_dir / "source-snapshot.json"
     output_screenshot = output_dir / "source-page.png"
-    product_images = tuple(sorted((output_dir / "product-images").glob("*") if (output_dir / "product-images").is_dir() else []))
+    output_images = output_dir / "product-images"
+    shutil.copy2(snapshot, output_snapshot)
+    if output_screenshot.exists():
+        output_screenshot.unlink()
+    if screenshot.is_file():
+        shutil.copy2(screenshot, output_screenshot)
+    if output_images.exists():
+        shutil.rmtree(output_images)
+    if cached_image_files:
+        shutil.copytree(cached_images, output_images)
+
+    product_images = tuple(
+        sorted(path for path in output_images.glob("*") if path.is_file())
+    ) if output_images.is_dir() else ()
     return CapturedProductSource(
         snapshot_path=output_snapshot,
         screenshot_path=output_screenshot,
@@ -516,18 +525,35 @@ def capture_product_source(
                 separators=(",", ":"),
             )
             snapshot.meta["detail_image_count"] = str(len(detail_images))
-        snapshot_path = write_source_snapshot(snapshot, target_dir / "source-snapshot.json")
+
+        product_image_dir = target_dir / "product-images"
+        if product_image_dir.exists():
+            shutil.rmtree(product_image_dir)
+        product_images = _download_page_images(
+            context,
+            snapshot.image_urls,
+            product_image_dir,
+        )
+
         screenshot_path = target_dir / "source-page.png"
-        _screenshot_with_navigation_retry(
+        if screenshot_path.exists():
+            screenshot_path.unlink()
+        screenshot_ok, screenshot_note = _screenshot_with_navigation_retry(
             page,
             screenshot_path,
             settle_ms=int(scroll_wait_ms),
         )
-        product_images = _download_page_images(
-            context,
-            snapshot.image_urls,
-            target_dir / "product-images",
-        )
+        if screenshot_note:
+            snapshot.warnings.append(screenshot_note)
+        snapshot.meta["screenshot_available"] = "true" if screenshot_ok else "false"
+        snapshot.meta["product_images_downloaded"] = str(len(product_images))
+        snapshot_path = write_source_snapshot(snapshot, target_dir / "source-snapshot.json")
+
+        if not screenshot_ok and not product_images:
+            raise SourceCaptureError(
+                "商品页面结构化资料已采集，但没有获得可用视觉证据：商品原图下载为空，且浏览器整页/当前窗口截图均失败。"
+                + (f" screenshot={screenshot_note}" if screenshot_note else "")
+            )
 
     _refresh_capture_cache(source_url, target_dir, cache_root)
     return CapturedProductSource(
