@@ -7,18 +7,18 @@ from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer
 from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
 
 
+_INPUT_COALESCE_MS = 8
 _IDLE_FRAME_MS = 16
 
 
 class PresentationClock(QObject):
-    """One event-driven input path plus one adaptive presentation heartbeat.
+    """Event-driven input plus one adaptive presentation heartbeat.
 
-    Mouse position/button state is delivered directly from Qt mouse events instead
-    of polling QCursor at 125 Hz.  The remaining timer exists only because the
-    established visuals contain continuous sakura/cursor easing and short card
-    tweens.  It idles at the existing 60 Hz decorative cadence and temporarily
-    follows the card controller's display-aware motion cadence while a card is
-    actually animating.
+    Qt mouse events only update the latest pointer state.  A short-lived 8 ms
+    single-shot coalescer publishes that latest state at most as often as the old
+    125 Hz sampler, so a 500/1000 Hz mouse cannot flood Python while an idle mouse
+    causes no pointer wakeups at all.  Continuous sakura/cursor easing and card
+    tweens reuse the separate adaptive frame timer.
     """
 
     def __init__(
@@ -39,7 +39,16 @@ class PresentationClock(QObject):
         self._last_global = QPoint(-100_000, -100_000)
         self._last_left_down = False
         self._have_input = False
+        self._pending_global = QPoint(self._last_global)
+        self._pending_left_down = False
+        self._input_dirty = False
         self._pending_outside_resample = False
+
+        self._input_timer = QTimer(self)
+        self._input_timer.setSingleShot(True)
+        self._input_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._input_timer.setInterval(_INPUT_COALESCE_MS)
+        self._input_timer.timeout.connect(self._flush_input)
 
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -96,10 +105,13 @@ class PresentationClock(QObject):
             if not self.timer.isActive():
                 self.timer.start()
         else:
+            self._input_timer.stop()
             self.timer.stop()
 
     def _reset_input_identity(self) -> None:
+        self._input_timer.stop()
         self._have_input = False
+        self._input_dirty = False
         self._pending_outside_resample = False
         try:
             self.background.reset_pointer_identity()
@@ -109,6 +121,7 @@ class PresentationClock(QObject):
     def suspend(self, reason: str) -> None:
         token = str(reason or "presentation").strip() or "presentation"
         self._holds.add(token)
+        self._input_timer.stop()
         self.timer.stop()
         try:
             self.background.pause_pointer_animation()
@@ -159,9 +172,34 @@ class PresentationClock(QObject):
                 pass
         return self._last_left_down
 
-    def _deliver_input(self, global_pos: QPoint, *, left_down: bool, force: bool = False) -> None:
+    def _queue_input(
+        self,
+        global_pos: QPoint,
+        *,
+        left_down: bool,
+        immediate: bool = False,
+    ) -> None:
         if not self._can_run():
             return
+        self._pending_global = QPoint(global_pos)
+        self._pending_left_down = bool(left_down)
+        self._input_dirty = True
+        if immediate:
+            self._input_timer.stop()
+            self._flush_input()
+        elif not self._input_timer.isActive():
+            self._input_timer.start()
+
+    def _flush_input(self) -> None:
+        if not self._input_dirty or not self._can_run():
+            return
+        self._input_dirty = False
+        self._deliver_input(
+            QPoint(self._pending_global),
+            left_down=self._pending_left_down,
+        )
+
+    def _deliver_input(self, global_pos: QPoint, *, left_down: bool, force: bool = False) -> None:
         same = (
             self._have_input
             and global_pos == self._last_global
@@ -220,8 +258,6 @@ class PresentationClock(QObject):
 
         now_s = time.perf_counter()
         if self._pending_outside_resample:
-            # Polling used to naturally produce a second outside sample. Preserve
-            # the one-sample traversal grace without bringing polling back.
             self._pending_outside_resample = False
             try:
                 self.card_fx.presentation_tick(
@@ -279,25 +315,39 @@ class PresentationClock(QObject):
 
         if event_type in {
             QEvent.Type.MouseMove,
-            QEvent.Type.MouseButtonPress,
-            QEvent.Type.MouseButtonRelease,
             QEvent.Type.Enter,
         }:
             point = self._global_point(event)
             if point is not None:
-                self._deliver_input(
+                self._queue_input(
                     point,
                     left_down=self._left_state_from_event(event, event_type),
                 )
             return False
 
+        if event_type in {
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+        }:
+            point = self._global_point(event)
+            if point is not None:
+                self._queue_input(
+                    point,
+                    left_down=self._left_state_from_event(event, event_type),
+                    immediate=True,
+                )
+            return False
+
         if event_type == QEvent.Type.Leave and watched is self.window:
+            self._input_timer.stop()
+            self._input_dirty = False
             outside = QPoint(-100_000, -100_000)
             self._deliver_input(outside, left_down=self._last_left_down, force=True)
             self._pending_outside_resample = True
         return False
 
     def cleanup(self) -> None:
+        self._input_timer.stop()
         self.timer.stop()
         self._holds.clear()
         app = QApplication.instance()
