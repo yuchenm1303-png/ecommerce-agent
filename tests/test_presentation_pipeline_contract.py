@@ -19,14 +19,19 @@ def test_obsolete_runtime_patch_modules_are_gone() -> None:
     assert not (ROOT / "gui" / "ui_runtime_optimizations.py").exists()
 
 
-def test_mouse_input_is_event_driven_and_visual_clock_is_adaptive() -> None:
+def test_mouse_input_is_event_driven_coalesced_and_visual_clock_is_adaptive() -> None:
+    assert "_INPUT_COALESCE_MS = 8" in CLOCK
     assert "_IDLE_FRAME_MS = 16" in CLOCK
     assert "QCursor.pos()" not in CLOCK
     assert "QApplication.mouseButtons()" not in CLOCK
     assert "app.installEventFilter(self)" in CLOCK
+    assert "self._input_timer.setSingleShot(True)" in CLOCK
+    assert "self._input_timer.setInterval(_INPUT_COALESCE_MS)" in CLOCK
     assert "QEvent.Type.MouseMove" in CLOCK
     assert "QEvent.Type.MouseButtonPress" in CLOCK
     assert "QEvent.Type.MouseButtonRelease" in CLOCK
+    assert "def _queue_input" in CLOCK
+    assert "def _flush_input" in CLOCK
     assert "def _deliver_input" in CLOCK
     assert "def _frame_tick" in CLOCK
     assert "def _card_motion_interval_ms" in CLOCK
