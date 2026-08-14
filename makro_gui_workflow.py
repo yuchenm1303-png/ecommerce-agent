@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -37,10 +38,15 @@ from app.providers.registry import (
     build_semantic_provider,
 )
 from app.source_capture import SourceAccessBlocked, capture_product_source
+from app.workflow_diagnostics import (
+    diag_current_exception,
+    diag_event,
+    ensure_diagnostics,
+)
 from makro_one_link import (
     _provider_config,
     _resolver_command,
-    _run,
+    _run as _legacy_run,
     _scan_and_write_live_schema,
     _single_run_dir,
     build_parser as build_one_link_parser,
@@ -72,11 +78,33 @@ def build_parser():
 
 def _phase(name: str, state: str, detail: str = "") -> None:
     key = _PHASE_KEY[name]
+    normalized = str(state or "INFO").upper()
+    if normalized == "FAILED":
+        diag_current_exception(name, ui_phase=key, detail=detail)
+    else:
+        diag_event(name, normalized, ui_phase=key, detail=detail)
     suffix = f" detail={detail}" if detail else ""
     print(f"GUI_PHASE {key} {state}{suffix}", flush=True)
 
 
 def _write_manifest(path: Path, payload: dict[str, Any]) -> None:
+    ensure_diagnostics(
+        path.parent,
+        Path(sys.argv[0]).stem or "makro_gui_workflow",
+        mode=str(payload.get("mode") or ""),
+        input_mode=str(payload.get("input_mode") or "supplier_url"),
+        product_url=str(payload.get("product_url") or ""),
+    )
+    diag_event(
+        "manifest",
+        "WRITE",
+        path=str(path.resolve()),
+        status=str(payload.get("status") or ""),
+        vertical=str(payload.get("vertical") or ""),
+        brand=str(payload.get("brand") or ""),
+        makro_target_id=str(payload.get("makro_target_id") or ""),
+        ownership_mode=str(payload.get("ownership_mode") or ""),
+    )
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -87,8 +115,17 @@ def _listing_page(
 ):
     if harness.context is None:
         raise RuntimeError("Makro Edge context is unavailable")
+    pages = list(harness.context.pages)
+    diag_event(
+        "browser_page_selection",
+        "START",
+        label=label,
+        browser_page_count=len(pages),
+        page_urls=[str(getattr(item, "url", "") or "") for item in pages],
+    )
     candidates = []
-    for page in harness.context.pages:
+    inspection_errors = 0
+    for page in pages:
         try:
             if "seller.makro.co.za" not in str(page.url or ""):
                 continue
@@ -97,7 +134,16 @@ def _listing_page(
             if predicate(page):
                 candidates.append(page)
         except Exception:
+            inspection_errors += 1
             continue
+    diag_event(
+        "browser_page_selection",
+        "COMPLETE" if len(candidates) == 1 else "FAILED",
+        label=label,
+        matching_tabs=len(candidates),
+        inspection_errors=inspection_errors,
+        matching_urls=[str(getattr(item, "url", "") or "") for item in candidates],
+    )
     if len(candidates) != 1:
         raise RuntimeError(f"{label} requires exactly one matching Makro tab; found {len(candidates)}")
     return candidates[0]
@@ -114,12 +160,25 @@ def _create_fresh_owned_page(harness: EdgeHarness) -> tuple[Any, str]:
 
     if harness.context is None:
         raise RuntimeError("Makro Edge context is unavailable")
+    diag_event(
+        "owned_tab",
+        "START",
+        existing_page_count=len(harness.context.pages),
+        start_url=MAKRO_HOME_URL,
+    )
     page = harness.context.new_page()
     page.set_default_timeout(15_000)
     page.goto(MAKRO_HOME_URL, wait_until="commit", timeout=20_000)
     page.wait_for_timeout(250)
     target_id = page_target_id(page)
     harness.page = page
+    diag_event(
+        "owned_tab",
+        "COMPLETE",
+        page_url=str(page.url or ""),
+        makro_target_id=target_id,
+        browser_page_count=len(harness.context.pages),
+    )
     return page, target_id
 
 
@@ -138,16 +197,32 @@ def _resume_current_page(harness: EdgeHarness, expected_url: str):
     if not wanted:
         raise RuntimeError("resume-current requires the prior failed page URL")
 
+    diag_event(
+        "resume_page",
+        "START",
+        expected_url=wanted,
+        browser_page_count=len(harness.context.pages),
+    )
     exact: list[Any] = []
+    listing_urls: list[str] = []
     for page in harness.context.pages:
         url = str(getattr(page, "url", "") or "").strip()
         try:
             parse_makro_listing_url(url)
         except (ValueError, AttributeError):
             continue
+        listing_urls.append(url)
         if url == wanted:
             exact.append(page)
 
+    diag_event(
+        "resume_page",
+        "MATCH",
+        expected_url=wanted,
+        listing_tabs=len(listing_urls),
+        listing_urls=listing_urls,
+        exact_matches=len(exact),
+    )
     if len(exact) != 1:
         raise RuntimeError(
             "The exact Step 2/3 page from the failed run is no longer uniquely present. "
@@ -157,11 +232,13 @@ def _resume_current_page(harness: EdgeHarness, expected_url: str):
     page = exact[0]
     page.set_default_timeout(15_000)
     page.wait_for_timeout(250)
-    if not (is_brand_step(page) or is_product_info_step(page)):
+    stage = _listing_stage(page)
+    if stage not in {"step2", "step3"}:
         raise RuntimeError(
             "The exact prior page is no longer a safely operable Step 2 or Step 3 surface; "
             "automatic resume was refused."
         )
+    diag_event("resume_page", "COMPLETE", page_url=str(page.url or ""), detected_stage=stage)
     return page
 
 
@@ -176,6 +253,13 @@ def _target_values(page: Any) -> tuple[str, str]:
     brand = str(target.brand or "").strip()
     if not vertical:
         raise RuntimeError("Current Makro Step 3 URL does not contain a vertical")
+    diag_event(
+        "listing_target",
+        "PARSED",
+        page_url=str(getattr(page, "url", "") or ""),
+        vertical=vertical,
+        brand=brand,
+    )
     return vertical, brand
 
 
@@ -220,6 +304,15 @@ def _record_listing_checkpoint(
         manifest["makro_target_id"] = page_target_id(page)
     manifest["status"] = status
     _write_manifest(manifest_path, manifest)
+    diag_event(
+        "checkpoint",
+        "RECORDED",
+        status=status,
+        page_url=manifest.get("page_url", ""),
+        vertical=manifest.get("vertical", ""),
+        brand=manifest.get("brand", ""),
+        makro_target_id=manifest.get("makro_target_id", ""),
+    )
 
 
 def _advance_listing_to_step3(
@@ -246,6 +339,15 @@ def _advance_listing_to_step3(
             set_current(name)
 
     initial_stage = _listing_stage(page)
+    diag_event(
+        "state_machine",
+        "INSPECT",
+        initial_stage=initial_stage,
+        allow_initial_later_stage=allow_initial_later_stage,
+        page_url=str(getattr(page, "url", "") or "") if page is not None else "",
+        makro_target_id=str(manifest.get("makro_target_id") or ""),
+        ownership_mode=str(manifest.get("ownership_mode") or ""),
+    )
     current("step1")
     if initial_stage in {"step2", "step3"} and not allow_initial_later_stage:
         _phase("step1", "START", f"state-machine current={initial_stage}")
@@ -273,19 +375,34 @@ def _advance_listing_to_step3(
     else:
         current("step1")
         _phase("step1", "START", "state-machine reconcile")
+        diag_event("step1_prepare", "START", page_url=str(getattr(page, "url", "") or ""))
         prepared = prepare_step1()
         if prepared is not None:
             page = prepared
         if page is None:
             raise RuntimeError("Step 1 preparation returned no Makro page")
-
         stage_after_prepare = _listing_stage(page)
+        diag_event(
+            "step1_prepare",
+            "COMPLETE",
+            page_url=str(getattr(page, "url", "") or ""),
+            detected_stage=stage_after_prepare,
+        )
+
         if stage_after_prepare in {"step2", "step3"}:
             vertical, brand = _target_values(page)
         else:
             dismiss_joyride_overlay(page)
+            diag_event("vertical_selection", "START", page_url=str(page.url or ""))
             vertical = select_vertical(page, provider, hints)
             stage_after_prepare = _listing_stage(page)
+            diag_event(
+                "vertical_selection",
+                "COMPLETE",
+                vertical=vertical,
+                page_url=str(page.url or ""),
+                detected_stage=stage_after_prepare,
+            )
             if stage_after_prepare not in {"step2", "step3"}:
                 raise RuntimeError(
                     "Makro Step 1 completed but the page did not reconcile to Step 2/3."
@@ -302,6 +419,7 @@ def _advance_listing_to_step3(
         initial_stage = stage_after_prepare
 
     stage = _listing_stage(page)
+    diag_event("state_machine", "AFTER_STEP1", detected_stage=stage, vertical=vertical, brand=brand)
     if stage == "step3":
         actual_vertical, actual_brand = _target_values(page)
         if vertical and actual_vertical.casefold() != vertical.casefold():
@@ -331,6 +449,7 @@ def _advance_listing_to_step3(
 
     current("step2")
     _phase("step2", "START", "state-machine reconcile")
+    diag_event("brand_selection", "START", page_url=str(page.url or ""), vertical=vertical)
     selected_brand, page = select_brand_to_product_info(page, provider, hints)
     actual_vertical, actual_brand = _target_values(page)
     if vertical and actual_vertical.casefold() != vertical.casefold():
@@ -340,7 +459,17 @@ def _advance_listing_to_step3(
         )
     vertical = actual_vertical
     brand = actual_brand or selected_brand
-    if _listing_stage(page) != "step3":
+    stage_after_brand = _listing_stage(page)
+    diag_event(
+        "brand_selection",
+        "COMPLETE",
+        selected_brand=selected_brand,
+        actual_brand=actual_brand,
+        final_brand=brand,
+        page_url=str(page.url or ""),
+        detected_stage=stage_after_brand,
+    )
+    if stage_after_brand != "step3":
         raise RuntimeError("Makro Step 2 completed but Step 3 is not safely operable")
     _record_listing_checkpoint(
         manifest_path,
@@ -410,6 +539,37 @@ def _plan_command(
     return command
 
 
+def _run(command: list[str], label: str) -> None:
+    print(f"\n===== {label} =====", flush=True)
+    started = time.monotonic()
+    diag_event(
+        "subprocess",
+        "START",
+        label=label,
+        argv=command,
+        cwd=str(Path.cwd()),
+    )
+    try:
+        result = subprocess.run(command, check=False)
+    except Exception:
+        diag_current_exception(
+            "subprocess",
+            label=label,
+            elapsed_s=round(time.monotonic() - started, 3),
+        )
+        raise
+    elapsed = round(time.monotonic() - started, 3)
+    diag_event(
+        "subprocess",
+        "COMPLETE" if result.returncode == 0 else "FAILED",
+        label=label,
+        returncode=result.returncode,
+        elapsed_s=elapsed,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"{label} failed with exit code {result.returncode}")
+
+
 def _run_resolver_pair(
     args: Any,
     *,
@@ -421,17 +581,35 @@ def _run_resolver_pair(
     cold_root.mkdir(parents=True, exist_ok=True)
     hot_root.mkdir(parents=True, exist_ok=True)
 
+    diag_event("cold_resolver", "START", output_root=str(cold_root), live_schema=str(live_schema))
     cold_command = _resolver_command(args, live_schema, cold_root)
     _run(cold_command, "STEP 3 CURRENT RESOLVER · COLD")
     cold_run = _single_run_dir(cold_root, "resolve-ai-")
     cold_manifest_path = cold_run / "run-manifest.json"
     cold_manifest = json.loads(cold_manifest_path.read_text(encoding="utf-8"))
+    diag_event(
+        "cold_resolver",
+        "COMPLETE",
+        manifest=str(cold_manifest_path.resolve()),
+        decision_summary=cold_manifest.get("final_decision_summary") or {},
+        total_model_calls=cold_manifest.get("total_model_calls"),
+        wall_elapsed_seconds=cold_manifest.get("wall_elapsed_seconds"),
+    )
 
+    diag_event("hot_resolver", "START", output_root=str(hot_root), live_schema=str(live_schema))
     hot_command = _resolver_command(args, live_schema, hot_root)
     _run(hot_command, "STEP 3 CURRENT RESOLVER · HOT/CACHE")
     hot_run = _single_run_dir(hot_root, "resolve-ai-")
     hot_manifest_path = hot_run / "run-manifest.json"
     hot_manifest = json.loads(hot_manifest_path.read_text(encoding="utf-8"))
+    diag_event(
+        "hot_resolver",
+        "COMPLETE",
+        manifest=str(hot_manifest_path.resolve()),
+        decision_summary=hot_manifest.get("final_decision_summary") or {},
+        total_model_calls=hot_manifest.get("total_model_calls"),
+        wall_elapsed_seconds=hot_manifest.get("wall_elapsed_seconds"),
+    )
     return cold_manifest_path, cold_manifest, hot_manifest_path, hot_manifest
 
 
@@ -443,16 +621,40 @@ def _prepare_step3(
     manifest: dict[str, Any],
 ) -> None:
     vertical, brand = _target_values(page)
+    diag_event(
+        "step3_prepare",
+        "START",
+        page_url=str(page.url or ""),
+        vertical=vertical,
+        brand=brand,
+        makro_target_id=str(manifest.get("makro_target_id") or ""),
+    )
     adapter = MakroDomainAdapter(page)
     adapter.assert_expected_vertical(vertical)
 
     schema_root = run_dir / "01-live-schema" / "live-scan-current"
     schema_root.mkdir(parents=True, exist_ok=True)
+    diag_event(
+        "live_schema_scan",
+        "START",
+        target=str(schema_root / "live-schema.json"),
+        scroll_wait_ms=args.scroll_wait_ms,
+        max_scroll_steps=args.max_scroll_steps,
+    )
     live_schema, scan_info = _scan_and_write_live_schema(
         adapter,
         schema_root / "live-schema.json",
         wait_ms=args.scroll_wait_ms,
         max_scroll_steps=args.max_scroll_steps,
+    )
+    diag_event(
+        "live_schema_scan",
+        "COMPLETE",
+        live_schema=str(live_schema.resolve()),
+        listing_attribute_fields=scan_info.get("listing_attribute_fields"),
+        semantic_fields_before_filter=scan_info.get("semantic_fields_before_filter"),
+        sections=scan_info.get("sections") or [],
+        scan=scan_info.get("scan") or {},
     )
     manifest.update(
         {
@@ -471,9 +673,25 @@ def _prepare_step3(
     manifest["cold_resolver_manifest"] = str(cold_path.resolve())
     manifest["resolver_manifest"] = str(hot_path.resolve())
     manifest["resolver_summary"] = hot_manifest.get("final_decision_summary")
+    diag_event(
+        "resolver_pair",
+        "COMPLETE",
+        cold_manifest=str(cold_path.resolve()),
+        hot_manifest=str(hot_path.resolve()),
+        cold_summary=cold_manifest.get("final_decision_summary") or {},
+        hot_summary=hot_manifest.get("final_decision_summary") or {},
+    )
 
     plan_root = run_dir / "04-fill-plan"
     plan_root.mkdir(parents=True, exist_ok=True)
+    diag_event(
+        "fill_plan",
+        "START",
+        output_root=str(plan_root),
+        live_schema=str(live_schema.resolve()),
+        vertical=vertical,
+        makro_target_id=str(manifest.get("makro_target_id") or ""),
+    )
     _run(
         _plan_command(
             args,
@@ -492,6 +710,22 @@ def _prepare_step3(
     manifest["fill_plan"] = str(fill_plan.resolve())
     manifest["fill_plan_manifest"] = str(fill_plan_manifest.resolve())
     manifest["fill_plan_summary"] = plan_payload.get("summary") or {}
+    diag_event(
+        "fill_plan",
+        "COMPLETE",
+        fill_plan=str(fill_plan.resolve()),
+        fill_plan_manifest=str(fill_plan_manifest.resolve()),
+        summary=manifest["fill_plan_summary"],
+    )
+    diag_event(
+        "step3_prepare",
+        "COMPLETE",
+        page_url=str(page.url or ""),
+        vertical=vertical,
+        brand=brand,
+        live_schema=str(live_schema.resolve()),
+        fill_plan=str(fill_plan.resolve()),
+    )
 
 
 def main() -> int:
@@ -536,6 +770,19 @@ def main() -> int:
         "browser_closed": False,
     }
     _write_manifest(manifest_path, manifest)
+    diag_event(
+        "workflow",
+        "START",
+        mode=args.mode,
+        product_url=args.product_url,
+        makro_cdp_port=args.cdp_port,
+        source_cdp_port=args.source_cdp_port,
+        provider=args.provider,
+        model=args.model,
+        fact_model=args.fact_model,
+        web_search_model=args.web_search_model,
+        resume_current_url=str(args.resume_current_url or ""),
+    )
 
     active = {
         "step1": {"source", "step1"},
@@ -557,6 +804,18 @@ def main() -> int:
 
         current = "source"
         _phase("source", "START")
+        diag_event(
+            "source_capture",
+            "START",
+            product_url=args.product_url,
+            output_dir=str((run_dir / "bootstrap-source").resolve()),
+            cdp_port=args.source_cdp_port,
+            use_current_page=args.source_use_current_page,
+            force_refresh=args.refresh_source,
+            cache_dir=args.source_cache_dir,
+            cache_ttl_seconds=args.source_cache_ttl_seconds,
+            max_scroll_steps=args.source_max_scroll_steps,
+        )
         captured = capture_product_source(
             args.product_url,
             output_dir=run_dir / "bootstrap-source",
@@ -571,11 +830,27 @@ def main() -> int:
             cache_ttl_seconds=args.source_cache_ttl_seconds,
             force_refresh=args.refresh_source,
         )
+        diag_event(
+            "source_capture",
+            "COMPLETE",
+            snapshot=str(captured.snapshot_path.resolve()),
+            screenshot=str(captured.screenshot_path.resolve()),
+            cache_hit=bool(captured.cache_hit),
+            source_edge_launched=bool(captured.launched_now),
+            product_images=len(captured.product_image_paths),
+            visible_text_chars=len(captured.snapshot.visible_text),
+            table_rows=len(captured.snapshot.table_rows),
+            json_ld_items=len(captured.snapshot.json_ld),
+            embedded_data_items=len(captured.snapshot.embedded_data),
+            warnings=list(captured.snapshot.warnings),
+        )
+        diag_event("listing_bootstrap", "START", product_images=len(captured.product_image_paths))
         hints = infer_listing_bootstrap(
             provider,
             captured.snapshot,
             image_paths=captured.product_image_paths,
         )
+        diag_event("listing_bootstrap", "COMPLETE", hints=hints.as_dict())
         manifest["bootstrap_source"] = {
             "snapshot": str(captured.snapshot_path.resolve()),
             "screenshot": str(captured.screenshot_path.resolve()),
@@ -587,6 +862,13 @@ def main() -> int:
         _write_manifest(manifest_path, manifest)
         _phase("source", "COMPLETE", "supplier evidence ready")
 
+        diag_event(
+            "makro_browser",
+            "START",
+            cdp_port=args.cdp_port,
+            profile_dir=str(Path(args.profile_dir).resolve()),
+            start_url=MAKRO_NEW_LISTING_URL,
+        )
         with sync_playwright() as playwright:
             harness = EdgeHarness(
                 playwright,
@@ -596,6 +878,18 @@ def main() -> int:
             )
             if harness.launched_now:
                 raise RuntimeError("Makro Edge unexpectedly entered launch path; aborted")
+            diag_event(
+                "makro_browser",
+                "COMPLETE",
+                launched_now=bool(harness.launched_now),
+                context_available=harness.context is not None,
+                browser_page_count=len(harness.context.pages) if harness.context is not None else 0,
+                page_urls=(
+                    [str(getattr(item, "url", "") or "") for item in harness.context.pages]
+                    if harness.context is not None
+                    else []
+                ),
+            )
 
             if args.mode == "full":
                 if args.resume_current_url:
@@ -636,6 +930,7 @@ def main() -> int:
                 _phase("step3", "START")
                 _prepare_step3(args, run_dir=run_dir, page=page, manifest=manifest)
                 harness.detach()
+                diag_event("makro_browser", "DETACH", page_url=str(page.url or ""))
                 manifest["status"] = "prepare_complete"
                 _write_manifest(manifest_path, manifest)
                 _phase("step3", "COMPLETE", "current Resolver + Fill Plan")
@@ -643,27 +938,41 @@ def main() -> int:
                 current = "step1"
                 _phase("step1", "START")
                 page = prepare_single_step1_page(harness)
+                diag_event("step1_prepare", "COMPLETE", page_url=str(page.url or ""), detected_stage=_listing_stage(page))
                 dismiss_joyride_overlay(page)
+                diag_event("vertical_selection", "START", page_url=str(page.url or ""))
                 vertical = select_vertical(page, provider, hints)
+                diag_event("vertical_selection", "COMPLETE", vertical=vertical, page_url=str(page.url or ""))
                 manifest["vertical"] = vertical
                 manifest["page_url"] = page.url
                 manifest["status"] = "step1_complete"
                 _write_manifest(manifest_path, manifest)
                 harness.detach()
+                diag_event("makro_browser", "DETACH", page_url=str(page.url or ""))
                 _phase("step1", "COMPLETE", vertical)
             elif args.mode == "step2":
                 current = "step2"
                 _phase("step2", "START")
                 page = _listing_page(harness, is_brand_step, "Step 2")
+                diag_event("brand_selection", "START", page_url=str(page.url or ""))
                 brand, page = select_brand_to_product_info(page, provider, hints)
                 harness.page = page
                 vertical, actual_brand = _target_values(page)
+                diag_event(
+                    "brand_selection",
+                    "COMPLETE",
+                    selected_brand=brand,
+                    actual_brand=actual_brand,
+                    vertical=vertical,
+                    page_url=str(page.url or ""),
+                )
                 manifest["vertical"] = vertical
                 manifest["brand"] = actual_brand or brand
                 manifest["page_url"] = page.url
                 manifest["status"] = "step2_complete"
                 _write_manifest(manifest_path, manifest)
                 harness.detach()
+                diag_event("makro_browser", "DETACH", page_url=str(page.url or ""))
                 _phase("step2", "COMPLETE", manifest["brand"])
             else:
                 current = "step3"
@@ -671,10 +980,22 @@ def main() -> int:
                 page = _listing_page(harness, is_product_info_step, "Step 3")
                 _prepare_step3(args, run_dir=run_dir, page=page, manifest=manifest)
                 harness.detach()
+                diag_event("makro_browser", "DETACH", page_url=str(page.url or ""))
                 manifest["status"] = "prepare_complete"
                 _write_manifest(manifest_path, manifest)
                 _phase("step3", "COMPLETE", "current Resolver + Fill Plan")
 
+        diag_event(
+            "workflow",
+            "COMPLETE",
+            mode=args.mode,
+            status=manifest.get("status", ""),
+            vertical=manifest.get("vertical", ""),
+            brand=manifest.get("brand", ""),
+            makro_target_id=manifest.get("makro_target_id", ""),
+            fill_plan_summary=manifest.get("fill_plan_summary") or {},
+            send_to_qc=False,
+        )
         print(
             f"GUI WORKFLOW COMPLETE mode={args.mode} writes=0 save=False send_to_qc=False",
             flush=True,

@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 from app.source_capture import DEFAULT_SOURCE_CDP_PORT, capture_product_source
+from app.workflow_diagnostics import configure_diagnostics, diag_event
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,8 +36,27 @@ def main() -> int:
     cache_dir = Path(args.source_cache_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
+    configure_diagnostics(
+        output_dir,
+        "makro_batch_source",
+        product_url=args.product_url,
+        source_cdp_port=args.source_cdp_port,
+    )
 
     print("BATCH_SOURCE START", flush=True)
+    diag_event(
+        "batch_source_capture",
+        "START",
+        product_url=args.product_url,
+        output_dir=str(output_dir),
+        cache_dir=str(cache_dir),
+        source_profile_dir=str(Path(args.source_profile_dir).resolve()),
+        source_cdp_port=args.source_cdp_port,
+        initial_wait_ms=args.source_wait_ms,
+        scroll_wait_ms=args.source_scroll_wait_ms,
+        max_scroll_steps=args.source_max_scroll_steps,
+        max_visible_text_chars=args.source_max_visible_text_chars,
+    )
     captured = capture_product_source(
         args.product_url,
         output_dir=output_dir,
@@ -50,6 +70,20 @@ def main() -> int:
         cache_ttl_seconds=3600,
         force_refresh=False,
     )
+    diag_event(
+        "batch_source_capture",
+        "COMPLETE",
+        snapshot=str(captured.snapshot_path.resolve()),
+        screenshot=str(captured.screenshot_path.resolve()),
+        product_images=len(captured.product_image_paths),
+        cache_hit=bool(captured.cache_hit),
+        source_edge_launched=bool(captured.launched_now),
+        visible_text_chars=len(captured.snapshot.visible_text),
+        table_rows=len(captured.snapshot.table_rows),
+        json_ld_items=len(captured.snapshot.json_ld),
+        embedded_data_items=len(captured.snapshot.embedded_data),
+        warnings=list(captured.snapshot.warnings),
+    )
     payload = {
         "product_url": args.product_url,
         "snapshot": str(captured.snapshot_path.resolve()),
@@ -60,6 +94,13 @@ def main() -> int:
     }
     manifest = output_dir / "batch-source.json"
     manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    diag_event(
+        "batch_source_manifest",
+        "COMPLETE",
+        manifest=str(manifest.resolve()),
+        product_images=len(captured.product_image_paths),
+        cache_hit=bool(captured.cache_hit),
+    )
     print(f"BATCH_SOURCE COMPLETE images={len(captured.product_image_paths)}", flush=True)
     print(f"manifest={manifest}", flush=True)
     return 0
