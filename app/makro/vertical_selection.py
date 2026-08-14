@@ -12,6 +12,8 @@ The workflow never invents a Makro Vertical and never clicks Send to QC.
 
 from __future__ import annotations
 
+import json
+
 from playwright.sync_api import Page
 
 from .listing_creation import (
@@ -58,6 +60,19 @@ _VERTICAL_BODY_MARKERS = (
     "选择垂直领域",
     "进入垂直类别",
 )
+
+
+def _vertical_diag(event: str, payload: dict[str, object]) -> None:
+    print(
+        "MAKRO_VERTICAL_DIAG "
+        + json.dumps(
+            {"event": str(event or "unknown"), **payload},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        ),
+        flush=True,
+    )
 
 
 def _singularize_vertical_token(token: str) -> str:
@@ -189,15 +204,34 @@ def _verify_retry_canonical(
     actual_canonical: str,
     selected_visible: bool,
 ) -> None:
+    """Require independent proof that the resulting canonical is the clicked leaf.
+
+    A changed URL is not evidence of correctness. Direct search -> Step 2
+    transitions must have a display/slug equivalent canonical. A visible Step 1
+    confirmation may serve as independent proof for portals whose canonical slug
+    is not linguistically equivalent to the display label.
+    """
+
     previous = str(previous_canonical or "").strip()
     actual = str(actual_canonical or "").strip()
-    if not previous or normalize_label(previous) != normalize_label(actual):
-        return
-    if _display_slug_equivalent(selected, actual) or selected_visible:
+    equivalent = _display_slug_equivalent(selected, actual)
+    verified = bool(equivalent or selected_visible)
+    _vertical_diag(
+        "canonical_verify",
+        {
+            "selected_leaf": str(selected or "").strip(),
+            "previous_canonical": previous,
+            "actual_canonical": actual,
+            "display_slug_equivalent": equivalent,
+            "selected_visible_confirmation": bool(selected_visible),
+            "verified": verified,
+        },
+    )
+    if verified:
         return
     raise RuntimeError(
-        "Makro Step 1 exact-live click did not produce independently verifiable vertical state: "
-        f"selected={selected!r}, canonical={actual!r}"
+        "Makro Step 1 exact-live click produced a canonical Vertical that cannot be bound to the "
+        f"selected live leaf: selected={selected!r}, canonical={actual!r}, previous={previous!r}"
     )
 
 
@@ -236,21 +270,32 @@ def _complete_exact_live_vertical(
         canonical_after = _wait_for_canonical_vertical(page)
         if not canonical_after:
             raise RuntimeError("Makro Step 1 reached Step 2 but no canonical vertical appeared in the listing URL")
+        # A direct jump into Step 2 has no independent Step 1 confirmation
+        # surface. Require the canonical itself to bind to the exact selected leaf.
         _verify_retry_canonical(
             page,
             verify_as,
             previous_canonical=previous_canonical,
             actual_canonical=canonical_after,
-            selected_visible=selected_visible,
+            selected_visible=False,
         )
         return canonical_after
 
     canonical_before_brand, _ = _current_target_values(page)
-    if not canonical_before_brand and not selected_visible:
+    if canonical_before_brand:
+        _verify_retry_canonical(
+            page,
+            verify_as,
+            previous_canonical=previous_canonical,
+            actual_canonical=canonical_before_brand,
+            selected_visible=selected_visible,
+        )
+    elif not selected_visible:
         raise RuntimeError(
             "Makro Step 1 vertical confirmation appeared without either the selected live leaf "
             f"or a canonical URL value: selected={selected!r}, verify_as={verify_as!r}"
         )
+
     button = _vertical_select_brand_button(page)
     if button is None:
         raise RuntimeError("Makro Step 1 vertical confirmation appeared, but the exact Select Brand button was not found")
@@ -361,7 +406,7 @@ def _try_select_via_search(
         previous_canonical, _ = _current_target_values(page)
         if not click_search_row(search, live_selected):
             raise RuntimeError(
-                "Makro Step 1 re-found the globally selected query-owned Vertical but could not click it: "
+                "Makro Step 1 re-found the globally selected query-owned Vertical but could not bind an exact click target: "
                 f"{live_selected!r}; query={term!r}"
             )
         return (

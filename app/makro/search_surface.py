@@ -12,6 +12,7 @@ ARIA-owned popup rows. Reads and clicks use the same ownership rule.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -160,11 +161,11 @@ _CLICK_ROW_JS = r"""
   const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
   const normalize = (v) => clean(v).toLocaleLowerCase();
   const wantedKey = normalize(wanted);
-  if (!wantedKey) return false;
+  if (!wantedKey) return {clicked:false, reason:'empty_wanted'};
 
   const stateMap = window.__makroQuerySurfaceState;
   const state = stateMap && stateMap.get(input);
-  if (!state || !state.baseline) return false;
+  if (!state || !state.baseline) return {clicked:false, reason:'missing_query_state'};
   const baseline = state.baseline;
   const ir = input.getBoundingClientRect();
 
@@ -210,6 +211,14 @@ _CLICK_ROW_JS = r"""
       || !!el.getAttribute?.('data-value')
       || /autocomplete|suggest|result|option|brand/.test(cls);
   };
+  const actionable = (el) => {
+    if (!el || !visible(el)) return false;
+    const role = String(el.getAttribute?.('role') || '').toLowerCase();
+    const style = getComputedStyle(el);
+    return el.tagName === 'A' || el.tagName === 'BUTTON'
+      || ['option','menuitem','button','listitem','row'].includes(role)
+      || typeof el.onclick === 'function' || style.cursor === 'pointer';
+  };
   const rowAncestor = (start) => {
     let el = start;
     for (let depth = 0; el && el !== document.body && depth < 8; depth++, el = el.parentElement) {
@@ -236,22 +245,37 @@ _CLICK_ROW_JS = r"""
     seen.add(row);
     matches.push(row);
   }
-  if (matches.length !== 1) return false;
-
-  let target = matches[0];
-  for (let depth = 0; target && depth < 5; depth++, target = target.parentElement) {
-    if (!target || target === document.body || target.contains(input)) break;
-    const role = String(target.getAttribute?.('role') || '').toLowerCase();
-    const style = getComputedStyle(target);
-    if (target.tagName === 'A' || target.tagName === 'BUTTON'
-        || ['option','menuitem','button','listitem','row'].includes(role)
-        || typeof target.onclick === 'function' || style.cursor === 'pointer') {
-      target.click();
-      return true;
-    }
+  if (matches.length !== 1) {
+    return {clicked:false, reason:'non_unique_exact_row', match_count:matches.length};
   }
-  matches[0].click();
-  return true;
+
+  // The exact query-owned row is the semantic boundary. We may use an actionable
+  // wrapper only while that wrapper renders exactly the same row label. Never
+  // climb into a larger result/list/container whose text no longer equals the
+  // selected candidate: that can dispatch the wrong Vertical.
+  let target = matches[0];
+  for (let depth = 0; target && target !== document.body && depth < 5; depth++, target = target.parentElement) {
+    if (target === input || target.contains(input) || !visible(target)) break;
+    const targetText = label(target);
+    if (normalize(targetText) !== wantedKey) break;
+    if (!actionable(target)) continue;
+    const role = String(target.getAttribute?.('role') || '').toLowerCase();
+    const result = {
+      clicked:true,
+      strategy: depth === 0 ? 'exact_row' : 'same_label_wrapper',
+      depth,
+      row_label: label(matches[0]),
+      target_label: targetText,
+      target_tag: String(target.tagName || '').toLowerCase(),
+      target_role: role,
+      data_value: clean(target.getAttribute?.('data-value') || ''),
+      data_vertical: clean(target.getAttribute?.('data-vertical') || ''),
+      href: clean(target.getAttribute?.('href') || ''),
+    };
+    target.click();
+    return result;
+  }
+  return {clicked:false, reason:'no_exact_action_target', row_label:label(matches[0])};
 }
 """
 
@@ -302,12 +326,25 @@ def wait_for_search_rows(
 
 
 def click_search_row(search: Any, label: str) -> bool:
-    """Click exactly one row still owned by the active query."""
+    """Click one exact query-owned row without escaping its semantic boundary."""
 
     try:
-        return bool(search.evaluate(_CLICK_ROW_JS, str(label or "").strip()))
+        raw = search.evaluate(_CLICK_ROW_JS, str(label or "").strip())
     except Exception:
         return False
+    if isinstance(raw, dict):
+        payload = {
+            "event": "click_binding",
+            "requested_label": str(label or "").strip(),
+            **raw,
+        }
+        print(
+            "MAKRO_VERTICAL_DIAG "
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str),
+            flush=True,
+        )
+        return bool(raw.get("clicked"))
+    return bool(raw)
 
 
 __all__ = [
