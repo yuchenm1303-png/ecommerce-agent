@@ -25,7 +25,6 @@ from .listing_creation import (
     _vertical_search_input,
     _vertical_select_brand_button,
     _wait_for,
-    choose_taxonomy_candidate,
     choose_vertical_candidate,
     is_brand_step,
     is_product_info_step,
@@ -40,6 +39,10 @@ from .search_surface import (
 )
 from .taxonomy_navigation import navigate_live_taxonomy
 from .taxonomy_resilient import ResilientMakroTaxonomyBrowser
+from .taxonomy_resolution import (
+    choose_taxonomy_path_candidate,
+    validate_taxonomy_leaf_candidate,
+)
 from .vertical_resolution import (
     choose_vertical_candidate_pool,
     matched_queries_for_candidate,
@@ -270,8 +273,6 @@ def _complete_exact_live_vertical(
         canonical_after = _wait_for_canonical_vertical(page)
         if not canonical_after:
             raise RuntimeError("Makro Step 1 reached Step 2 but no canonical vertical appeared in the listing URL")
-        # A direct jump into Step 2 has no independent Step 1 confirmation
-        # surface. Require the canonical itself to bind to the exact selected leaf.
         _verify_retry_canonical(
             page,
             verify_as,
@@ -366,13 +367,7 @@ def _try_select_via_search(
     *,
     wait_ms: int,
 ) -> tuple[str, list[str], tuple[str, ...]]:
-    """Resolve from several Makro searches before mutating Browse taxonomy.
-
-    No query gets to decide on its own. All query-owned rows are first merged into
-    one live candidate pool; AI then chooses once using the complete product
-    identity and full candidate breadcrumbs. A chosen row is replayed through a
-    query that originally produced it before any click is authorized.
-    """
+    """Resolve from several Makro searches before mutating Browse taxonomy."""
 
     search = _vertical_search_input(page)
     planned_terms = plan_vertical_search_terms(provider, hints)
@@ -420,9 +415,6 @@ def _try_select_via_search(
             planned_terms,
         )
 
-    # Search results changed between aggregation and execution. Do not click a
-    # stale candidate; leave the page clean and let the independent taxonomy
-    # fallback resolve against the current live portal instead.
     _close_vertical_search(search, page, wait_ms=wait_ms)
     return "", observed, planned_terms
 
@@ -451,6 +443,39 @@ def _select_via_search_with_context(
     )
 
 
+def _taxonomy_navigation_callbacks(
+    page: Page,
+    provider: JSONTaskProvider,
+    hints: ListingBootstrapHints,
+):
+    selected_paths: dict[str, list[str]] = {}
+
+    def choose(path: list[str], candidates: list[str]) -> str:
+        selected = choose_taxonomy_path_candidate(provider, hints, path, candidates)
+        if selected:
+            selected_paths[normalize_label(selected)] = [*path, selected]
+        return selected
+
+    def complete(node: str) -> str:
+        breadcrumb = selected_paths.get(normalize_label(node), [node])
+        if not validate_taxonomy_leaf_candidate(provider, hints, breadcrumb):
+            _vertical_diag(
+                "taxonomy_leaf_rejected",
+                {
+                    "breadcrumb": breadcrumb,
+                    "leaf": node,
+                    "action": "fail_closed_before_step2",
+                },
+            )
+            raise RuntimeError(
+                "Makro Step 1 taxonomy fallback reached a live leaf that failed the final Product Identity semantic gate: "
+                + " / ".join(breadcrumb)
+            )
+        return _complete_exact_live_vertical(page, node)
+
+    return choose, complete
+
+
 def _resume_partial_taxonomy(
     page: Page,
     provider: JSONTaskProvider,
@@ -473,13 +498,14 @@ def _resume_partial_taxonomy(
         def shifted_click(relative_level: int, text: str, base: int = start_level) -> bool:
             return taxonomy.click_node(base + int(relative_level), text)
 
+        choose_node, complete_leaf = _taxonomy_navigation_callbacks(page, provider, hints)
         selected = navigate_live_taxonomy(
             page,
             columns_fn=shifted_columns,
             click_fn=shifted_click,
-            choose_fn=lambda path, candidates: choose_taxonomy_candidate(provider, hints, path, candidates),
+            choose_fn=choose_node,
             leaf_ready_fn=lambda: is_brand_step(page) or _vertical_confirmation_content(page),
-            complete_leaf_fn=lambda node: _complete_exact_live_vertical(page, node),
+            complete_leaf_fn=complete_leaf,
             wait_ms=wait_ms,
             max_depth=max(1, 7 - start_level),
             max_node_attempts=12,
@@ -504,13 +530,14 @@ def _select_via_taxonomy(
         return _resume_partial_taxonomy(page, provider, hints, taxonomy, columns, wait_ms=wait_ms)
     if not columns:
         return ""
+    choose_node, complete_leaf = _taxonomy_navigation_callbacks(page, provider, hints)
     return navigate_live_taxonomy(
         page,
         columns_fn=taxonomy.columns,
         click_fn=taxonomy.click_node,
-        choose_fn=lambda path, candidates: choose_taxonomy_candidate(provider, hints, path, candidates),
+        choose_fn=choose_node,
         leaf_ready_fn=lambda: is_brand_step(page) or _vertical_confirmation_content(page),
-        complete_leaf_fn=lambda node: _complete_exact_live_vertical(page, node),
+        complete_leaf_fn=complete_leaf,
         wait_ms=wait_ms,
         max_depth=7,
         max_node_attempts=16,
