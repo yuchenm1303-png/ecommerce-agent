@@ -36,6 +36,7 @@ from app.makro.listing_preflight import CORE_FORM_SECTIONS
 from app.makro.marketplace_constraints import apply_makro_decision_constraints
 from app.required_overrides import apply_required_overrides, load_required_overrides
 from app.semantic_grounding import build_grounding_catalog
+from app.task_control import initialize_task_control, safe_pause_point
 from makro_preview_listing import (
     _assert_clean_step3_start,
     _assert_single_listing_tab,
@@ -144,9 +145,45 @@ def _required_override_path(live_schema: str) -> Path:
     return Path(live_schema).resolve().with_name("required-overrides.json")
 
 
+def _pause_and_reconcile(
+    control_root: Path,
+    checkpoint: str,
+    *,
+    adapter: MakroDomainAdapter,
+    planned_live_fields: list[dict[str, Any]],
+    expected_vertical: str,
+    wait_ms: int,
+    max_scroll_steps: int,
+    context: dict[str, Any] | None = None,
+) -> None:
+    """Pause only between atomic persistence units, then revalidate live Step 3."""
+
+    resumed = safe_pause_point(control_root, checkpoint, context=context)
+    if not resumed:
+        return
+    adapter.assert_expected_vertical(expected_vertical)
+    semantic_fields, _sections, _scan = _scan_semantic_fields(
+        adapter,
+        wait_ms=wait_ms,
+        max_scroll_steps=max_scroll_steps,
+    )
+    assert_live_schema_matches(planned_live_fields, semantic_fields)
+    print(
+        "GUI_TASK_RECONCILE "
+        f"checkpoint={checkpoint} page={adapter.page.url} live_fields={len(semantic_fields)}",
+        flush=True,
+    )
+
+
 def main() -> int:
     args = build_parser().parse_args()
     _validate_args(args)
+    control_root = Path(args.output_dir).resolve()
+    initialize_task_control(
+        control_root,
+        workflow="makro_execute_listing",
+        product_url=args.product_url,
+    )
 
     if not is_cdp_ready(args.cdp_port):
         raise RuntimeError(
@@ -176,7 +213,7 @@ def main() -> int:
     business_bundle = generated_business_bundle(args.product_url, sku=generated_sku)
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = Path(args.output_dir) / f"execute-{stamp}"
+    run_dir = control_root / f"execute-{stamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as playwright:
@@ -231,8 +268,6 @@ def main() -> int:
             max_scroll_steps=args.max_scroll_steps,
         )
 
-        # Last pre-write boundaries are purely mechanical: current Makro schema
-        # and exact source manifest must still match the read-only plan.
         assert_live_schema_matches(planned_live_fields, semantic_fields)
         plan = build_live_fill_plan(
             decision_packet,
@@ -240,11 +275,6 @@ def main() -> int:
             business_bundle,
         )
 
-        # Resolver has already done its work. If it could not solve a required
-        # field, the GUI may provide one explicit user/fallback value. Required
-        # overrides first bind by exact current field_id; if presentation-only
-        # representation changed, they may rebind only through the same stable
-        # schema identity that already passed assert_live_schema_matches above.
         override_path = _required_override_path(args.live_schema)
         override_summary: dict[str, Any] = {"applied": 0, "field_ids": []}
         if override_path.is_file():
@@ -292,6 +322,17 @@ def main() -> int:
         else:
             print("单 section 只预览，不 Save / Send to QC。")
 
+        _pause_and_reconcile(
+            control_root,
+            "step3_prewrite",
+            adapter=adapter,
+            planned_live_fields=planned_live_fields,
+            expected_vertical=args.expected_vertical,
+            wait_ms=args.scroll_wait_ms,
+            max_scroll_steps=args.max_scroll_steps,
+            context={"page_url": page.url, "ready": summary.get("ready", 0)},
+        )
+
         section_reports: list[dict[str, Any]] = []
         photo_report: dict[str, Any] | None = None
 
@@ -315,12 +356,36 @@ def main() -> int:
                     f"validated={report.get('validated', 0)} "
                     f"persisted={report.get('persisted_verified', 0)}"
                 )
+                _pause_and_reconcile(
+                    control_root,
+                    f"section:{section_title}",
+                    adapter=adapter,
+                    planned_live_fields=planned_live_fields,
+                    expected_vertical=args.expected_vertical,
+                    wait_ms=args.scroll_wait_ms,
+                    max_scroll_steps=args.max_scroll_steps,
+                    context={
+                        "section": section_title,
+                        "status": report.get("status"),
+                        "persisted_verified": report.get("persisted_verified", 0),
+                    },
+                )
             photo_report = _run_photos(
                 adapter,
                 list(args.upload_image),
                 allow_save=True,
                 upload_timeout_ms=args.upload_timeout_ms,
                 run_dir=run_dir,
+            )
+            _pause_and_reconcile(
+                control_root,
+                "section:Product Photos",
+                adapter=adapter,
+                planned_live_fields=planned_live_fields,
+                expected_vertical=args.expected_vertical,
+                wait_ms=args.scroll_wait_ms,
+                max_scroll_steps=args.max_scroll_steps,
+                context={"photo_status": (photo_report or {}).get("status")},
             )
         else:
             section_title = base_section_title(str(args.section or ""))
@@ -331,6 +396,16 @@ def main() -> int:
                     allow_save=args.allow_section_save,
                     upload_timeout_ms=args.upload_timeout_ms,
                     run_dir=run_dir,
+                )
+                _pause_and_reconcile(
+                    control_root,
+                    "section:Product Photos",
+                    adapter=adapter,
+                    planned_live_fields=planned_live_fields,
+                    expected_vertical=args.expected_vertical,
+                    wait_ms=args.scroll_wait_ms,
+                    max_scroll_steps=args.max_scroll_steps,
+                    context={"photo_status": (photo_report or {}).get("status")},
                 )
             else:
                 report = _fill_one_section(
@@ -350,6 +425,16 @@ def main() -> int:
                     f"attempted={report.get('writes_attempted', 0)} "
                     f"validated={report.get('validated', 0)} "
                     f"persisted={report.get('persisted_verified', 0)}"
+                )
+                _pause_and_reconcile(
+                    control_root,
+                    f"section:{section_title}",
+                    adapter=adapter,
+                    planned_live_fields=planned_live_fields,
+                    expected_vertical=args.expected_vertical,
+                    wait_ms=args.scroll_wait_ms,
+                    max_scroll_steps=args.max_scroll_steps,
+                    context={"section": section_title, "status": report.get("status")},
                 )
 
         totals = _totals(section_reports)
