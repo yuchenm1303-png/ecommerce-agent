@@ -149,3 +149,22 @@ def test_one_command_build_generates_icon_and_emits_verified_packages() -> None:
     assert "Compress-Archive" in BUILD
     assert "EcommerceAgent-Setup-$Version.exe" in BUILD
     assert "ISCC.exe" in BUILD
+    assert "Updater.spec" in BUILD
+    assert 'updater\\updater.exe' in BUILD
+    assert "--self-check" in (
+        ROOT / ".github" / "workflows" / "windows-package.yml"
+    ).read_text(encoding="utf-8")
+
+
+def test_standalone_updater_is_a_windowed_single_file_build() -> None:
+    updater_spec = (ROOT / "packaging" / "Updater.spec").read_text(encoding="utf-8")
+    entry = (ROOT / "scripts" / "updater_main.py").read_text(encoding="utf-8")
+    core = (ROOT / "app" / "updater_core.py").read_text(encoding="utf-8")
+    assert 'name="updater"' in updater_spec
+    assert "console=False" in updater_spec
+    assert "exclude_binaries=False" in updater_spec
+    assert "updater_main.py" in updater_spec
+    assert "--job" in entry
+    assert "--self-check" in entry
+    assert "import ctypes" in core
+    assert "subprocess" in core

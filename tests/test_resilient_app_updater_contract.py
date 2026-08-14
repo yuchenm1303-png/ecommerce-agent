@@ -94,7 +94,13 @@ def test_portal_fallback_is_explained_before_opening_browser() -> None:
 def test_installer_handoff_waits_for_app_exit_and_closes_modal_progress() -> None:
     block = TRANSPORT.split("def _verify_and_install", 1)[1]
     assert "self._close_progress()" in block
-    assert "_launch_installer_waiter(path, arguments)" in block
+    assert '_handoff_installer(path, arguments, str(manifest["installer_sha256"]))' in block
     assert "QTimer.singleShot(120, QApplication.quit)" in block
     assert "QProcess.startDetached" not in block
     assert "_INSTALLER_HANDOFF_MS" not in TRANSPORT
+
+
+def test_resilient_updater_delegates_install_to_standalone_handoff() -> None:
+    assert "from gui.app_updater import" in TRANSPORT
+    assert "_handoff_installer" in TRANSPORT
+    assert "_launch_installer_waiter" not in TRANSPORT

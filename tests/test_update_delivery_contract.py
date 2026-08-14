@@ -62,7 +62,8 @@ def test_download_is_stream_hash_verified_before_install() -> None:
     assert "hashlib.sha256()" in UPDATER
     assert "stream.read(1024 * 1024)" in UPDATER
     assert "installer_sha256" in UPDATER
-    assert "_launch_installer_waiter" in UPDATER
+    assert "UpdaterJob" in UPDATER
+    assert "_handoff_installer" in UPDATER
     for flag in (
         '"/SILENT"',
         '"/SUPPRESSMSGBOXES"',
@@ -73,21 +74,30 @@ def test_download_is_stream_hash_verified_before_install() -> None:
         assert flag in UPDATER
 
 
-def test_installer_handoff_waits_for_app_exit_before_launching() -> None:
+def test_installer_handoff_prefers_standalone_updater_with_in_app_fallback() -> None:
+    assert "_handoff_installer" in UPDATER
+    assert "ensure_updater_installed" in UPDATER
+    assert "_launch_standalone_updater" in UPDATER
+    assert "pending-update.json" in UPDATER
+    assert "UpdaterJob" in UPDATER
+    assert "app_pid=os.getpid()" in UPDATER
+    assert "app_image_name=Path(sys.executable).stem" in UPDATER
+    # The in-app PowerShell waiter stays only as the source/dev fallback.
     assert "_launch_installer_waiter" in UPDATER
-    assert "_installer_waiter_script" in UPDATER
-    assert "Get-Process -Id" in UPDATER
-    assert "EcommerceAgentWorker" in UPDATER
-    assert "Start-Process -FilePath" in UPDATER
-    assert "CREATE_NO_WINDOW" in UPDATER
-    # Argument values are single-quote-escaped so embedded quotes parse in PS.
     assert "arg.replace(chr(39), chr(39) * 2)" in UPDATER
+
+
+def test_standalone_updater_lives_outside_the_install_directory() -> None:
+    assert "_updater_stable_dir" in UPDATER
+    assert "_bundled_updater_exe" in UPDATER
+    assert "LOCALAPPDATA" in UPDATER
+    assert '"updater"' in UPDATER
 
 
 def test_update_closes_modal_progress_before_handing_off_installer() -> None:
     block = UPDATER.split("def _verify_and_install", 1)[1]
     assert "self._close_progress()" in block
-    assert "_launch_installer_waiter(path, arguments)" in block
+    assert '_handoff_installer(path, arguments, str(manifest["installer_sha256"]))' in block
     assert "QTimer.singleShot(120, QApplication.quit)" in block
     assert "QProcess.startDetached" not in block
 
