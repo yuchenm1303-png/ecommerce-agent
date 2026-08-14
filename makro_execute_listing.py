@@ -34,6 +34,12 @@ from app.makro.domain import MakroDomainAdapter
 from app.makro.execution import PRODUCT_PHOTOS, fill_one_section as _fill_one_section, run_photos as _run_photos
 from app.makro.listing_preflight import CORE_FORM_SECTIONS
 from app.makro.marketplace_constraints import apply_makro_decision_constraints
+from app.makro.visual_execution_hud import (
+    destroy_visual_execution_hud,
+    finish_visual_execution_hud,
+    install_visual_execution_hud,
+    set_visual_execution_hud_capture_safe,
+)
 from app.required_overrides import apply_required_overrides, load_required_overrides
 from app.semantic_grounding import build_grounding_catalog
 from app.task_control import initialize_task_control, safe_pause_point
@@ -333,6 +339,7 @@ def main() -> int:
             context={"page_url": page.url, "ready": summary.get("ready", 0)},
         )
 
+        visual_hud_installed = install_visual_execution_hud(page)
         section_reports: list[dict[str, Any]] = []
         photo_report: dict[str, Any] | None = None
 
@@ -444,7 +451,11 @@ def main() -> int:
             else None
         )
         final_screenshot = run_dir / "step3-final.png"
-        page.screenshot(path=str(final_screenshot), full_page=True)
+        set_visual_execution_hud_capture_safe(page, True)
+        try:
+            page.screenshot(path=str(final_screenshot), full_page=True)
+        finally:
+            set_visual_execution_hud_capture_safe(page, False)
 
         if args.all_step3:
             mode = "single_url_all_step3_persisted_acceptance"
@@ -471,6 +482,7 @@ def main() -> int:
             "decision_packet_rebound": True,
             "include_review_candidates": args.include_review_candidates,
             "allow_section_save": args.allow_section_save,
+            "visual_execution_hud": visual_hud_installed,
             "plan_summary": summary,
             "blocked_reason_summary": _blocked_reason_summary(plan),
             "fill_plan": plan.as_dict(),
@@ -521,14 +533,22 @@ def main() -> int:
         print(f"报告：{report_path.resolve()}")
         print(f"最终截图：{final_screenshot.resolve()}")
 
-        harness.detach()
+        acceptance_ok = True
         if args.all_step3 and completion is not None:
             acceptance_ok = bool(completion.get("draft_persisted_complete")) and bool(
                 completion.get("autofill_safe_complete")
             )
-            if not acceptance_ok:
-                print("Full Step 3 persisted acceptance 未完整通过；进程返回非零状态。")
-                return 2
+        visual_success = acceptance_ok and not bool(
+            totals["fill_error"]
+            or totals["validation_failed"]
+            or totals["persisted_validation_failed"]
+        )
+        finish_visual_execution_hud(page, success=visual_success)
+        destroy_visual_execution_hud(page)
+        harness.detach()
+        if not acceptance_ok:
+            print("Full Step 3 persisted acceptance 未完整通过；进程返回非零状态。")
+            return 2
         return 0
 
 
