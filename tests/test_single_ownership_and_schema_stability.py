@@ -58,6 +58,29 @@ def test_fresh_full_run_creates_dedicated_owned_makro_tab(monkeypatch) -> None:
     assert page.goto_calls == [(workflow.MAKRO_HOME_URL, "commit", 20_000)]
 
 
+def test_owned_checkpoint_refreshes_target_after_page_replacement(monkeypatch, tmp_path: Path) -> None:
+    page = _FakePage()
+    page.url = "https://seller.makro.co.za/#dashboard/addListings/single?vertical=table_lamp&brand=Gritin"
+    manifest = {
+        "ownership_mode": "fresh_dedicated_tab",
+        "makro_target_id": "target-before-transition",
+    }
+    monkeypatch.setattr(workflow, "page_target_id", lambda current: "target-after-transition")
+
+    manifest_path = tmp_path / "run-manifest.json"
+    workflow._record_listing_checkpoint(
+        manifest_path,
+        manifest,
+        page=page,
+        status="step2_complete",
+        vertical="table_lamp",
+        brand="Gritin",
+    )
+
+    assert manifest["makro_target_id"] == "target-after-transition"
+    assert manifest["page_url"] == page.url
+
+
 def test_fill_plan_command_binds_exact_owned_target() -> None:
     args = SimpleNamespace(
         product_url="https://example.com/product",
