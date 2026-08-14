@@ -10,6 +10,7 @@ _TOP_CARD_MIN = 238
 _TOP_CARD_MAX = 248
 _CONTROL_HEIGHT = 30
 _SINGLE_PAGE_SPACING = 6
+_INTENT_DETAIL_EXTRA = 112
 
 
 def _contains_widget(layout: Any, target: QWidget) -> bool:
@@ -50,6 +51,24 @@ def _set_compact_height(widget: object) -> None:
         widget.setMaximumHeight(_CONTROL_HEIGHT)
 
 
+def set_single_top_detail_expanded(window: Any, expanded: bool) -> None:
+    """Resize the Single source card only while the explicit detail editor is open."""
+
+    url_input = getattr(window, "url_input", None)
+    card = _ancestor_card(url_input if isinstance(url_input, QWidget) else None)
+    if not isinstance(card, QFrame):
+        return
+    extra = _INTENT_DETAIL_EXTRA if bool(expanded) else 0
+    card.setMinimumHeight(_TOP_CARD_MIN + extra)
+    card.setMaximumHeight(_TOP_CARD_MAX + extra)
+    card.updateGeometry()
+
+    visual = getattr(window, "_visual_style", None)
+    refresh = getattr(visual, "refresh_glass_frames", None)
+    if callable(refresh):
+        refresh()
+
+
 def _apply(window: Any) -> None:
     url_input = getattr(window, "url_input", None)
     card = _ancestor_card(url_input if isinstance(url_input, QWidget) else None)
@@ -61,8 +80,6 @@ def _apply(window: Any) -> None:
     # historical page_scroll_layout zero-time refresh have both installed.
     layout.setContentsMargins(14, 8, 38, 9)
     layout.setSpacing(4)
-    card.setMinimumHeight(_TOP_CARD_MIN)
-    card.setMaximumHeight(_TOP_CARD_MAX)
 
     header = layout.itemAt(0).layout() if layout.count() else None
     if isinstance(header, QBoxLayout):
@@ -95,6 +112,7 @@ def _apply(window: Any) -> None:
         "start_button",
         "stop_button",
         "listing_intent_input",
+        "listing_intent_detail_button",
         "step1_button",
         "step2_button",
         "step3_button",
@@ -103,6 +121,12 @@ def _apply(window: Any) -> None:
         "real_settings_toggle",
     ):
         _set_compact_height(getattr(window, name, None))
+
+    detail_host = getattr(window, "listing_intent_detail_host", None)
+    set_single_top_detail_expanded(
+        window,
+        bool(isinstance(detail_host, QWidget) and detail_host.isVisible()),
+    )
 
     stack = getattr(window, "mode_stack", None)
     if stack is not None and stack.count() > 0:
@@ -118,9 +142,22 @@ def _apply(window: Any) -> None:
 
 
 def install_single_top_compact(window: Any) -> None:
-    """One-shot final Single geometry pass; presentation only, no business wiring."""
+    """Final Single top presentation, including the on-demand intent detail editor."""
 
     if getattr(window, "_single_top_compact_installed", False):
         return
     setattr(window, "_single_top_compact_installed", True)
+
+    # ListingOfferSupport already owns the canonical one-line business value.
+    # Add only an alternate editing surface here, then let this geometry owner
+    # resize the hero card while that surface is explicitly expanded.
+    from .listing_intent_detail import install_listing_intent_detail
+
+    install_listing_intent_detail(
+        window,
+        on_expanded=lambda expanded: set_single_top_detail_expanded(window, expanded),
+    )
     QTimer.singleShot(0, lambda: _apply(window))
+
+
+__all__ = ["install_single_top_compact", "set_single_top_detail_expanded"]
