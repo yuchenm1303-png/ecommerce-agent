@@ -88,10 +88,14 @@ def test_card_motion_uses_shared_clock_and_one_frozen_composite_per_tween() -> N
     assert "self.sourcePixmap(" in VISUAL
     assert "self._frozen_center: QPointF | None = None" in VISUAL
     assert "return self._frozen_source, self._frozen_offset, self._frozen_center" in VISUAL
-    draw = VISUAL.split("def draw(self, painter: QPainter)", 1)[1].split(
-        "class NativeGlassProxy", 1
-    )[0]
+    effect = VISUAL.split("class _CardScaleEffect", 1)[1].split("class NativeGlassProxy", 1)[0]
+    assert "setEnabled(" not in effect
+    assert "updateBoundingRect(" not in effect
+    assert "if not self.isEnabled()" not in effect
+    assert "source_rect.width() * _EFFECT_BOUND_SCALE" in effect
+    draw = effect.split("def draw(self, painter: QPainter)", 1)[1]
     assert "sourceBoundingRect" not in draw
+    assert "self.drawSource(painter)" in draw
 
 
 def test_decorative_effects_reuse_clock_and_keep_dirty_region_budget() -> None:
