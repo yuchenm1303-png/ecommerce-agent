@@ -4,8 +4,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QMessageBox, QPushButton, QWidget
+from PySide6.QtCore import QObject, QTimer
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QLayout, QMessageBox, QPushButton, QWidget
 
 from app.task_control import (
     PAUSED,
@@ -23,6 +23,20 @@ from .batch_job_controls import BatchJobControlManager, _PauseState
 _TASK_STATE_RE = re.compile(r"GUI_TASK_STATE\s+(PAUSED|RUNNING)\s+checkpoint=(.*)$")
 
 
+def _layout_containing(root: QLayout | None, widget: QWidget) -> QLayout | None:
+    if root is None:
+        return None
+    for index in range(root.count()):
+        item = root.itemAt(index)
+        if item.widget() is widget:
+            return root
+        child = item.layout()
+        found = _layout_containing(child, widget) if child is not None else None
+        if found is not None:
+            return found
+    return None
+
+
 class SingleCooperativePauseController(QObject):
     """One pause/resume surface shared by Single preparation and real execution."""
 
@@ -33,6 +47,7 @@ class SingleCooperativePauseController(QObject):
         self.execution_runner = getattr(window, "execution_runner", None)
         self.state = RUNNING
         self.checkpoint = ""
+        self._active_root: Path | None = None
         self._install_ui()
         self.runner.running_changed.connect(lambda _running: self._sync())
         self.runner.log.connect(self._observe_log)
@@ -42,7 +57,8 @@ class SingleCooperativePauseController(QObject):
         self._sync()
 
     def _install_ui(self) -> None:
-        row = self.window.start_button.parentWidget().layout()
+        root = self.window.centralWidget().layout() if self.window.centralWidget() is not None else None
+        row = _layout_containing(root, self.window.start_button)
         if not isinstance(row, QHBoxLayout):
             raise RuntimeError("Single source action row is unavailable for pause controls")
         self.pause_button = QPushButton("暂停")
@@ -53,12 +69,13 @@ class SingleCooperativePauseController(QObject):
         )
         self.pause_button.clicked.connect(self.toggle)
         stop_index = row.indexOf(self.window.stop_button)
-        row.insertWidget(stop_index if stop_index >= 0 else row.count(), self.pause_button)
+        insert_at = stop_index if stop_index >= 0 else row.count()
+        row.insertWidget(insert_at, self.pause_button)
 
         self.pause_hint = QLabel("安全点暂停")
         self.pause_hint.setObjectName("cardHint")
         self.pause_hint.setToolTip("恢复时后端重新读取真实页面状态，不直接相信暂停前进度。")
-        row.insertWidget((stop_index if stop_index >= 0 else row.count()) + 1, self.pause_hint)
+        row.insertWidget(insert_at + 1, self.pause_hint)
 
     def _active(self) -> tuple[Any | None, Path | None, str]:
         execution = self.execution_runner
@@ -118,13 +135,18 @@ class SingleCooperativePauseController(QObject):
     def _sync(self) -> None:
         _runner, root, _workflow = self._active()
         if root is None:
+            self._active_root = None
             self.state = RUNNING
             self.checkpoint = ""
             self.pause_button.setText("暂停")
             self.pause_button.setEnabled(False)
             self.pause_hint.setText("安全点暂停")
             return
-        initialize_task_control(root)
+        if self._active_root != root:
+            self._active_root = root
+            initialize_task_control(root, reset=True)
+        else:
+            initialize_task_control(root)
         payload = task_control_state(root)
         state = str(payload.get("state") or RUNNING).upper()
         self.state = state
@@ -154,6 +176,13 @@ class CooperativeBatchJobControlManager(BatchJobControlManager):
         super().__init__(workspace)
         self.controller.log.connect(self._observe_controller_log)
 
+    def _on_jobs_changed(self, jobs: list[Any]) -> None:
+        super()._on_jobs_changed(jobs)
+        if self.controller._mode == "prepare":
+            QTimer.singleShot(0, lambda: self._backfill("prepare"))
+        elif self.controller._mode == "execute":
+            QTimer.singleShot(0, lambda: self._backfill("execute"))
+
     def _control_root(self, job: Any, stage: str) -> Path:
         if stage == "execute":
             return self.controller._job_root(job) / "real-execution"
@@ -171,7 +200,12 @@ class CooperativeBatchJobControlManager(BatchJobControlManager):
             if job_id in self._pause_requested:
                 return
             root = self._control_root(job, active_stage)
-            initialize_task_control(root, task_id=job_id, workflow=f"batch_{active_stage}", product_url=job.product_url)
+            initialize_task_control(
+                root,
+                task_id=job_id,
+                workflow=f"batch_{active_stage}",
+                product_url=job.product_url,
+            )
             request_pause(root, reason="batch_gui_user", resume_kind=active_stage)
             self._pause_requested[job_id] = active_stage
             job.stage_detail = "正在暂停 · 当前原子步骤完成后停住"
@@ -275,7 +309,10 @@ class CooperativeBatchJobControlManager(BatchJobControlManager):
             payload = task_control_state(root)
             resume_kind = str(payload.get("resume_kind") or "")
             if resume_kind:
-                self._paused[str(job.job_id)] = _PauseState(resume_kind, str(payload.get("checkpoint") or ""))
+                self._paused[str(job.job_id)] = _PauseState(
+                    resume_kind,
+                    str(payload.get("checkpoint") or ""),
+                )
         super()._resume(job)
 
 
