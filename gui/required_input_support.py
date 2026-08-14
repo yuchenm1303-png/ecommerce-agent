@@ -23,14 +23,12 @@ class RequiredInputSupport(QObject):
     after that pass stay visible in the field table, but they never force the
     user to run another AI pass or manually type values before execution.
 
-    At Full Step 3 start, every still-empty required field receives a purely
-    deterministic fallback derived from the current live schema:
-    - select/radio fields: first usable Makro option;
-    - numeric/unit fields: ``1`` (plus first usable qualifier when applicable);
-    - other free-text fields: ``N/A``.
-
-    A value typed by the user remains an optional override and wins over the
-    deterministic fallback. Placeholder text itself is never copied as input.
+    At Full Step 3 start, every still-empty ordinary required field receives a
+    purely deterministic fallback derived from the current live schema. Critical
+    listing fields remain protected by the backend policy and require an explicit
+    user value. A Product Pack conflict review may also install one exact AI
+    alternative here as an explicit user confirmation; it still goes through the
+    same executor-side live option/unit validation before any browser write.
 
     Qt editors are presentation-only. QTableWidget owns and may destroy cell
     widgets whenever the table is rebuilt, so authoritative manual values and
@@ -46,6 +44,10 @@ class RequiredInputSupport(QObject):
         self.values: dict[str, str] = {}
         self.labels: dict[str, str] = {}
         self.fields: dict[str, dict[str, Any]] = {}
+        # Exact structured user confirmations (values + optional qualifier).
+        # This is intentionally separate from the text editor model so a value
+        # such as 10 + cm is not flattened into the invalid literal "10 cm".
+        self.explicit_overrides: dict[str, dict[str, Any]] = {}
         self._original_start = window._start_real_execution
 
         window.runner.result_updated.connect(self._on_result)
@@ -78,14 +80,17 @@ class RequiredInputSupport(QObject):
         return None
 
     def _on_result(self, result: RunResult) -> None:
-        # Preserve user-entered values from the Python model, never from old
+        # Preserve user-entered free text from the Python model, never from old
         # QLineEdit wrappers: QTableWidget may already have deleted those C++
-        # objects while rebuilding the result table.
+        # objects while rebuilding the result table. Structured confirmations do
+        # not cross result boundaries; a fresh Resolver result must be reviewed
+        # again instead of inheriting a previous product's choice.
         previous_values = dict(self.values)
         self.inputs = {}
         self.values = {}
         self.labels = {}
         self.fields = {}
+        self.explicit_overrides = {}
 
         required = self._required_blocked(result)
         for missing in required:
@@ -102,27 +107,38 @@ class RequiredInputSupport(QObject):
             if row is None:
                 continue
 
-            fallback = required_fallback_override(field)
-            fallback_values = [
-                str(value).strip()
-                for value in fallback.get("values") or []
-                if str(value).strip()
-            ]
-            fallback_text = " + ".join(fallback_values) or "N/A"
-            qualifier = str(fallback.get("qualifier") or "").strip()
-            if qualifier:
-                fallback_text = f"{fallback_text} {qualifier}".strip()
+            fallback_text = "需要准确值"
+            try:
+                fallback = required_fallback_override(field)
+                fallback_values = [
+                    str(value).strip()
+                    for value in fallback.get("values") or []
+                    if str(value).strip()
+                ]
+                fallback_text = " + ".join(fallback_values) or "N/A"
+                qualifier = str(fallback.get("qualifier") or "").strip()
+                if qualifier:
+                    fallback_text = f"{fallback_text} {qualifier}".strip()
+            except Exception:
+                # Critical protected fields intentionally have no generic fallback.
+                fallback = None
 
             editor = QLineEdit()
-            editor.setPlaceholderText(f"必填 · 留空将自动填 {fallback_text}")
+            if fallback is None:
+                editor.setPlaceholderText("必填 · 关键字段必须确认准确值")
+            else:
+                editor.setPlaceholderText(f"必填 · 留空将自动填 {fallback_text}")
             if self.values[identifier]:
                 editor.setText(self.values[identifier])
             options = missing.get("options") or []
             tooltip = missing.get("reason") or "正常 Resolver 未能确定该必填字段。"
-            tooltip += (
-                "\n\n无需再次运行 AI，也无需先手动补齐。"
-                f"Full Step 3 开始前若仍留空，将机械写入兜底值：{fallback_text}。"
-            )
+            if fallback is None:
+                tooltip += "\n\n该字段受关键 listing 内容策略保护，不能使用 N/A / 1 / 随机 option 兜底。"
+            else:
+                tooltip += (
+                    "\n\n无需再次运行 AI。"
+                    f"Full Step 3 开始前若仍留空，将机械写入兜底值：{fallback_text}。"
+                )
             if options:
                 tooltip += "\n\nMakro 可选值：\n" + " | ".join(options)
             editor.setToolTip(tooltip)
@@ -134,11 +150,11 @@ class RequiredInputSupport(QObject):
 
         if required:
             self.window.fields_hint.setText(
-                f"READY={result.ready} · {len(required)} 个必填缺口会在真实填写前自动兜底"
+                f"READY={result.ready} · {len(required)} 个 Makro 必填缺口等待确认 / 安全兜底"
             )
             self.window.real_policy_hint.setText(
-                f"还有 {len(required)} 个 Makro 必填项未由正常 Resolver 确定。可以直接开始 Full Step 3；"
-                "不会再调用 AI。留空项会自动使用固定兜底值：自由文本 N/A、数字 1、下拉/单选取第一个有效选项。"
+                f"还有 {len(required)} 个 Makro 必填项未由正常 Resolver 确定。普通字段可使用固定非 AI 兜底；"
+                "关键 listing 字段必须提供准确值。资料包冲突若有可验证的 AI alternatives，可在解析结果中直接确认其中一个。"
             )
         self._sync_button()
 
@@ -148,11 +164,57 @@ class RequiredInputSupport(QObject):
         if field_id not in self.fields:
             return
         self.values[field_id] = str(text or "")
+        # Manual editing deliberately replaces an earlier structured conflict
+        # confirmation for the same field.
+        self.explicit_overrides.pop(field_id, None)
         self._sync_button()
+
+    def set_explicit_override(
+        self,
+        field_id: str,
+        values: list[str] | tuple[str, ...],
+        *,
+        qualifier: str = "",
+        reason: str = "Explicit Product Pack conflict alternative confirmed by the user.",
+    ) -> bool:
+        """Install one exact user-confirmed Resolver alternative for a required field.
+
+        Returns False when the field is not one of the current unresolved required
+        fields. No browser write happens here; the canonical executor revalidates
+        the value against the current live control immediately before writing.
+        """
+
+        identifier = str(field_id or "").strip()
+        field = self.fields.get(identifier)
+        if field is None:
+            return False
+        cleaned = [str(value).strip() for value in values if str(value).strip()]
+        if not cleaned:
+            return False
+
+        display = " + ".join(cleaned)
+        if qualifier.strip():
+            display = f"{display} {qualifier.strip()}".strip()
+        editor = self.inputs.get(identifier)
+        if editor is not None:
+            # textChanged may clear an old explicit override; install the new
+            # structured record after the display editor has been synchronized.
+            editor.setText(display)
+        self.values[identifier] = display
+        self.explicit_overrides[identifier] = {
+            **required_override_binding(field),
+            "values": cleaned,
+            "qualifier": str(qualifier or "").strip(),
+            "source_type": "user",
+            "reason": str(reason or "").strip(),
+        }
+        self._sync_button()
+        return True
 
     def _manual_count(self) -> int:
         return sum(
-            bool(self.values.get(identifier, "").strip())
+            bool(self.explicit_overrides.get(identifier))
+            or bool(self.values.get(identifier, "").strip())
             for identifier in self.fields
         )
 
@@ -173,7 +235,7 @@ class RequiredInputSupport(QObject):
             manual = self._manual_count()
             automatic = len(self.fields) - manual
             self.window.real_start_button.setToolTip(
-                f"可直接开始；{manual} 个使用手动值，{automatic} 个留空必填项将自动使用固定兜底值。"
+                f"可直接开始预检；{manual} 个使用用户确认值，其余普通必填项尝试固定安全兜底。关键字段若未确认会在写入前停止。"
             )
             return
 
@@ -184,6 +246,10 @@ class RequiredInputSupport(QObject):
     def _merged_overrides(self) -> list[dict[str, Any]]:
         overrides: list[dict[str, Any]] = []
         for identifier, field in self.fields.items():
+            explicit = self.explicit_overrides.get(identifier)
+            if explicit is not None:
+                overrides.append(dict(explicit))
+                continue
             value = self.values.get(identifier, "").strip()
             if value:
                 overrides.append(
@@ -194,6 +260,9 @@ class RequiredInputSupport(QObject):
                     }
                 )
             else:
+                # Protected critical fields intentionally raise here. The request
+                # is then stopped before execution, rather than silently writing
+                # a generic placeholder.
                 overrides.append(required_fallback_override(field))
         return overrides
 
@@ -217,7 +286,7 @@ class RequiredInputSupport(QObject):
         return path
 
     def request_start(self, _checked: bool = False) -> None:
-        """Run the canonical preflight and automatically cover required gaps."""
+        """Run the canonical preflight and cover only safely resolvable required gaps."""
 
         result = getattr(self.window, "current_result", None)
         if self.window.runner.is_running or self.window.execution_runner.is_running:
@@ -227,7 +296,7 @@ class RequiredInputSupport(QObject):
             QMessageBox.warning(self.window, "无法开始真实填写", "请先完成 Step 3 Resolver + Fill Plan。")
             return
         if result.ready <= 0 and not self.fields:
-            QMessageBox.warning(self.window, "没有可填写字段", "当前 Fill Plan 没有 READY 或待兜底的必填字段，真实填写保持锁定。")
+            QMessageBox.warning(self.window, "没有可填写字段", "当前 Fill Plan 没有 READY 或待确认的必填字段，真实填写保持锁定。")
             return
 
         scope = self.window.real_scope_combo.currentData()
@@ -238,17 +307,17 @@ class RequiredInputSupport(QObject):
                     manual = self._manual_count()
                     automatic = len(self.fields) - manual
                     self.window.fields_hint.setText(
-                        f"必填预检完成 · 手动 {manual} · 固定兜底 {automatic}"
+                        f"必填预检完成 · 用户确认 {manual} · 待安全兜底 {automatic}"
                     )
                     self.window.real_policy_hint.setText(
-                        "Full Step 3 将直接继续。未解决必填项已用非 AI 的固定兜底策略补齐；"
-                        "执行器仍会在浏览器写入前校验当前 Makro option / unit 合法性。"
+                        "Full Step 3 将继续进入 canonical executor。用户确认值与普通固定兜底都会在当前 Makro DOM 上重新校验；"
+                        "关键字段没有准确值时会在任何浏览器写入前停止。"
                     )
                     append = getattr(self.window, "_append_log", None)
                     if callable(append):
                         append(
-                            f"[required-fallback] overrides={path or 'none'} "
-                            f"manual={manual} automatic={automatic} ai_calls=0"
+                            f"[required-preflight] overrides={path or 'none'} "
+                            f"user={manual} fallback_candidates={automatic} ai_calls=0"
                         )
             else:
                 schema_path = latest_live_schema(result.run_dir)
@@ -257,7 +326,7 @@ class RequiredInputSupport(QObject):
                     if stale.exists():
                         stale.unlink()
         except Exception as exc:
-            QMessageBox.critical(self.window, "无法生成必填兜底值", str(exc))
+            QMessageBox.critical(self.window, "必填字段仍需确认", str(exc))
             return
 
         self._original_start()
