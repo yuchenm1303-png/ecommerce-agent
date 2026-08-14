@@ -309,6 +309,7 @@ Window {{
     property real offsetX: 0.0
     property real offsetY: 0.0
     property bool animationRunning: false
+    property int geometryRevision: 0
 
     readonly property real maxX: width * {max_x:.9f}
     readonly property real maxY: height * {max_y:.9f}
@@ -348,12 +349,6 @@ Window {{
         }}
     }}
 
-    // Keep geometry generation in the scene graph, but make the mask texture
-    // ownership explicit. A direct hidden layered Item proved backend-dependent:
-    // on the Windows RHI path it could stay empty even while the card model was
-    // valid, which removed the backdrop blur. ShaderEffectSource is Qt's native
-    // texture-source contract and keeps this path GPU-only without any Python
-    // full-window mask allocation or upload.
     Item {{
         id: glassMaskScene
         anchors.fill: parent
@@ -386,10 +381,12 @@ Window {{
         anchors.fill: parent
         sourceItem: glassMaskScene
         hideSource: true
-        live: true
+        live: false
         smooth: true
         visible: false
     }}
+
+    onGeometryRevisionChanged: glassMaskTexture.scheduleUpdate()
 
     MultiEffect {{
         anchors.fill: parent
@@ -619,6 +616,12 @@ class NativeQuickBackground(QObject):
         self._geometry_dirty = False
         if self.card_model.sync_geometry():
             self._geometry_revision += 1
+            quick = self.quick_window
+            if quick is not None:
+                try:
+                    quick.setProperty("geometryRevision", self._geometry_revision)
+                except RuntimeError:
+                    pass
 
         if self._geometry_dirty and not self._geometry_timer.isActive():
             self._geometry_timer.start()
