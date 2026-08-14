@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from PySide6.QtCore import (
     QAbstractListModel,
@@ -16,7 +17,7 @@ from PySide6.QtCore import (
     QTimer,
     QUrl,
 )
-from PySide6.QtGui import QCursor, QImage, QPainter
+from PySide6.QtGui import QImage, QPainter
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickWindow
 from PySide6.QtWidgets import QApplication, QAbstractScrollArea, QFrame, QMainWindow, QWidget
@@ -28,8 +29,7 @@ _OVERSCAN = 1.06
 _TRAVEL = 0.90
 _GLASS_RADIUS = 6.0
 _NORMAL_GLASS_ALPHA = 64.0
-_GEOMETRY_SYNC_MS = 24
-_POINTER_SAMPLE_MS = 8
+_GEOMETRY_SYNC_MS = 16
 _POINTER_EPSILON = 0.0015
 
 
@@ -74,7 +74,7 @@ def _blur_wallpaper(source: QImage, radius: float = 10.0) -> QImage:
 
 
 class GlassCardModel(QAbstractListModel):
-    """Card geometry plus lightweight interaction state consumed by Quick."""
+    """Card geometry and interaction state consumed directly by the Quick scene."""
 
     _ROLE_BASE = int(Qt.ItemDataRole.UserRole)
     CARD_X_ROLE = _ROLE_BASE + 1
@@ -119,23 +119,24 @@ class GlassCardModel(QAbstractListModel):
         self.overlay = overlay
         self.cards = cards
         self._rows = {frame: row for row, frame in enumerate(cards)}
-        self._states = [
-            {
-                "cardX": 0.0,
-                "cardY": 0.0,
-                "cardW": 0.0,
-                "cardH": 0.0,
-                "clipX": 0.0,
-                "clipY": 0.0,
-                "clipW": 0.0,
-                "clipH": 0.0,
-                "cardAlpha": _NORMAL_GLASS_ALPHA,
-                "cardScale": 1.0,
-                "cardVisible": False,
-            }
-            for _ in cards
-        ]
+        self._states = [self.default_state() for _ in cards]
         self.sync_geometry()
+
+    @staticmethod
+    def default_state() -> dict[str, float | bool]:
+        return {
+            "cardX": 0.0,
+            "cardY": 0.0,
+            "cardW": 0.0,
+            "cardH": 0.0,
+            "clipX": 0.0,
+            "clipY": 0.0,
+            "clipW": 0.0,
+            "clipH": 0.0,
+            "cardAlpha": _NORMAL_GLASS_ALPHA,
+            "cardScale": 1.0,
+            "cardVisible": False,
+        }
 
     def roleNames(self) -> dict[int, QByteArray]:  # noqa: N802
         return {
@@ -169,17 +170,8 @@ class GlassCardModel(QAbstractListModel):
             or self.overlay.width() <= 0
             or self.overlay.height() <= 0
         ):
-            return {
-                "cardX": 0.0,
-                "cardY": 0.0,
-                "cardW": 0.0,
-                "cardH": 0.0,
-                "clipX": 0.0,
-                "clipY": 0.0,
-                "clipW": 0.0,
-                "clipH": 0.0,
-                "cardVisible": False,
-            }
+            state = self.default_state()
+            return {key: state[key] for key in self._geometry_keys()}
 
         top_left = frame.mapTo(self.overlay, QPoint(0, 0))
         card_rect = QRectF(
@@ -221,8 +213,7 @@ class GlassCardModel(QAbstractListModel):
                 break
             ancestor = ancestor.parentWidget()
 
-        visible_rect = card_rect.intersected(clip_rect)
-        visible = not visible_rect.isEmpty()
+        visible = not card_rect.intersected(clip_rect).isEmpty()
         return {
             "cardX": card_rect.x(),
             "cardY": card_rect.y(),
@@ -234,6 +225,20 @@ class GlassCardModel(QAbstractListModel):
             "clipH": clip_rect.height() if visible else 0.0,
             "cardVisible": visible,
         }
+
+    @classmethod
+    def _geometry_keys(cls) -> tuple[str, ...]:
+        return (
+            "cardX",
+            "cardY",
+            "cardW",
+            "cardH",
+            "clipX",
+            "clipY",
+            "clipW",
+            "clipH",
+            "cardVisible",
+        )
 
     @staticmethod
     def _different(old: object, new: object) -> bool:
@@ -249,44 +254,36 @@ class GlassCardModel(QAbstractListModel):
         for row, frame in enumerate(self.cards):
             snapshot = self._snapshot(frame)
             state = self._states[row]
-            changed = False
-            for key, value in snapshot.items():
-                if self._different(state.get(key), value):
-                    state[key] = value
-                    changed = True
-            if changed:
+            if any(self._different(state.get(key), value) for key, value in snapshot.items()):
+                state.update(snapshot)
                 changed_rows.append(row)
 
-        if changed_rows:
-            self.dataChanged.emit(
-                self.index(min(changed_rows), 0),
-                self.index(max(changed_rows), 0),
-                self._GEOMETRY_ROLES,
-            )
-            return True
-        return False
+        if not changed_rows:
+            return False
+        self.dataChanged.emit(
+            self.index(min(changed_rows), 0),
+            self.index(max(changed_rows), 0),
+            self._GEOMETRY_ROLES,
+        )
+        return True
 
     def set_presentation(self, frame: QFrame, *, scale: float, alpha: float) -> None:
         row = self._rows.get(frame)
         if row is None:
             return
-
         scale = max(0.96, min(1.04, float(scale)))
         alpha = max(0.0, min(255.0, float(alpha)))
         state = self._states[row]
-        changed_roles: list[int] = []
-
+        roles: list[int] = []
         if abs(float(state["cardScale"]) - scale) >= 0.0001:
             state["cardScale"] = scale
-            changed_roles.append(self.SCALE_ROLE)
+            roles.append(self.SCALE_ROLE)
         if abs(float(state["cardAlpha"]) - alpha) >= 0.1:
             state["cardAlpha"] = alpha
-            changed_roles.append(self.ALPHA_ROLE)
-
-        if not changed_roles:
-            return
-        index = self.index(row, 0)
-        self.dataChanged.emit(index, index, changed_roles)
+            roles.append(self.ALPHA_ROLE)
+        if roles:
+            index = self.index(row, 0)
+            self.dataChanged.emit(index, index, roles)
 
     def set_alpha(self, frame: QFrame, alpha: float) -> None:
         row = self._rows.get(frame)
@@ -297,43 +294,6 @@ class GlassCardModel(QAbstractListModel):
             scale=float(self._states[row].get("cardScale", 1.0)),
             alpha=alpha,
         )
-
-    def render_mask(self, width: int, height: int) -> QImage:
-        image = QImage(
-            max(1, int(width)),
-            max(1, int(height)),
-            QImage.Format.Format_ARGB32_Premultiplied,
-        )
-        image.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(image)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(Qt.GlobalColor.white)
-
-        for state in self._states:
-            if not bool(state["cardVisible"]):
-                continue
-            clip = QRectF(
-                float(state["clipX"]),
-                float(state["clipY"]),
-                float(state["clipW"]),
-                float(state["clipH"]),
-            )
-            card = QRectF(
-                float(state["cardX"]),
-                float(state["cardY"]),
-                float(state["cardW"]),
-                float(state["cardH"]),
-            )
-            if clip.isEmpty() or card.isEmpty():
-                continue
-            painter.save()
-            painter.setClipRect(clip)
-            painter.drawRoundedRect(card, _GLASS_RADIUS, _GLASS_RADIUS)
-            painter.restore()
-
-        painter.end()
-        return image
 
 
 def _qml_source() -> str:
@@ -350,7 +310,6 @@ Window {{
 
     property url sharpUrl
     property url blurUrl
-    property url maskUrl
     property real pointerX: 0.0
     property real pointerY: 0.0
     property real offsetX: 0.0
@@ -365,7 +324,6 @@ Window {{
     readonly property real imageY: (height - height * {_OVERSCAN}) * 0.5 + offsetY
 
     Image {{
-        id: sharpImg
         width: root.width * {_OVERSCAN}
         height: root.height * {_OVERSCAN}
         x: root.imageX
@@ -396,30 +354,50 @@ Window {{
         }}
     }}
 
-    Image {{
-        id: maskImg
+    // The glass mask now lives entirely in the Quick scene graph. Scroll/layout
+    // only updates lightweight model geometry; Python never allocates, paints,
+    // serializes or uploads a full-window ARGB mask texture.
+    Item {{
+        id: glassMask
         anchors.fill: parent
-        source: root.maskUrl
         visible: false
-        cache: false
-        asynchronous: false
-        smooth: true
+        layer.enabled: true
+        layer.smooth: true
+
+        Repeater {{
+            model: glassCardModel
+            delegate: Item {{
+                x: clipX
+                y: clipY
+                width: Math.max(0, clipW)
+                height: Math.max(0, clipH)
+                clip: true
+                visible: cardVisible && width > 0 && height > 0
+
+                Rectangle {{
+                    x: cardX - clipX
+                    y: cardY - clipY
+                    width: cardW
+                    height: cardH
+                    radius: {_GLASS_RADIUS:.1f}
+                    antialiasing: true
+                    color: "white"
+                }}
+            }}
+        }}
     }}
 
     MultiEffect {{
         anchors.fill: parent
         source: blurSource
         maskEnabled: true
-        maskSource: maskImg
+        maskSource: glassMask
         autoPaddingEnabled: false
     }}
 
     Repeater {{
         model: glassCardModel
         delegate: Item {{
-            // Hover presentation intentionally lives in window coordinates. It
-            // may overflow workspace/splitter/host rectangles exactly like CSS
-            // overflow: visible; only the outer QQuickWindow clips the result.
             x: 0
             y: 0
             width: root.width
@@ -442,7 +420,6 @@ Window {{
     }}
 
     FrameAnimation {{
-        id: frameDriver
         running: root.animationRunning
         onTriggered: {{
             var dt = Math.max(0.0, Math.min(frameTime, 0.05))
@@ -462,15 +439,14 @@ Window {{
 
 
 class NativeQuickBackground(QObject):
-    """Native Quick wallpaper, glass and parallax renderer under baseline widgets."""
+    """Quick-owned wallpaper, GPU glass mask and parallax presentation."""
 
     def __init__(self, overlay: QMainWindow) -> None:
         super().__init__(overlay)
         self.overlay = overlay
         self._shutting_down = False
-        self._mask_revision = 0
-        self._mask_ready = False
         self._geometry_dirty = False
+        self._geometry_revision = 0
         self._last_pointer_norm: tuple[float, float] | None = None
         self._temp = tempfile.TemporaryDirectory(prefix="ecommerce-agent-bg-")
         self._temp_dir = Path(self._temp.name)
@@ -513,26 +489,19 @@ class NativeQuickBackground(QObject):
         self.quick_window.setMinimumSize(overlay.minimumSize())
         self.quick_window.setProperty("sharpUrl", QUrl.fromLocalFile(str(self._sharp_path)))
         self.quick_window.setProperty("blurUrl", QUrl.fromLocalFile(str(self._blur_path)))
-        self.quick_window.setPersistentGraphics(False)
-        self.quick_window.setPersistentSceneGraph(False)
+        # Minimize/restore should retain the scene graph instead of rebuilding GPU
+        # textures and delegates. Geometry publication is separately guarded below.
+        self.quick_window.setPersistentGraphics(True)
+        self.quick_window.setPersistentSceneGraph(True)
 
         self._geometry_timer = QTimer(self)
         self._geometry_timer.setSingleShot(True)
         self._geometry_timer.setInterval(_GEOMETRY_SYNC_MS)
         self._geometry_timer.timeout.connect(self._flush_geometry)
 
-        self._pointer_timer = QTimer(self)
-        self._pointer_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._pointer_timer.setInterval(_POINTER_SAMPLE_MS)
-        self._pointer_timer.timeout.connect(self._sample_pointer)
-        self._pointer_timer.start()
-
         for watched in self._geometry_watch:
             watched.installEventFilter(self)
-
-        app = QApplication.instance()
-        if app is not None:
-            app.aboutToQuit.connect(self.shutdown)
+        self.quick_window.installEventFilter(self)
 
         for area in overlay.findChildren(QAbstractScrollArea):
             area.verticalScrollBar().valueChanged.connect(self.schedule_mask_update)
@@ -541,6 +510,9 @@ class NativeQuickBackground(QObject):
         overlay.destroyed.connect(self.shutdown)
         self.quick_window.widthChanged.connect(self.schedule_mask_update)
         self.quick_window.heightChanged.connect(self.schedule_mask_update)
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.shutdown)
         QTimer.singleShot(0, self.schedule_mask_update)
 
     def _prepare_assets(self) -> None:
@@ -559,35 +531,42 @@ class NativeQuickBackground(QObject):
         self.card_model.set_alpha(frame, alpha)
 
     def set_card_presentation(self, frame: QFrame, *, scale: float, alpha: float) -> None:
-        """Update only the GPU glass shell/tint; the blur mask stays geometry-only."""
-
         self.card_model.set_presentation(frame, scale=scale, alpha=alpha)
 
-    def _sample_pointer(self) -> None:
+    def reset_pointer_identity(self) -> None:
+        self._last_pointer_norm = None
+
+    def pause_pointer_animation(self) -> None:
         quick = self.quick_window
-        if self._shutting_down or quick is None or not quick.isVisible():
+        if quick is not None:
+            try:
+                quick.setProperty("animationRunning", False)
+            except RuntimeError:
+                pass
+
+    def presentation_tick(self, global_pos: QPoint, *, input_changed: bool) -> None:
+        if not input_changed and self._last_pointer_norm is not None:
             return
-        if quick.windowState() & Qt.WindowState.WindowMinimized:
+        quick = self.quick_window
+        if self._shutting_down or quick is None:
+            return
+        try:
+            if not quick.isVisible() or quick.windowState() & Qt.WindowState.WindowMinimized:
+                return
+            local = quick.mapFromGlobal(global_pos)
+            width = float(quick.width())
+            height = float(quick.height())
+        except RuntimeError:
             return
 
-        local = quick.mapFromGlobal(QCursor.pos())
-        if quick.width() <= 0 or quick.height() <= 0 or not QRectF(
-            0.0,
-            0.0,
-            float(quick.width()),
-            float(quick.height()),
-        ).contains(local):
+        lx = float(local.x())
+        ly = float(local.y())
+        if width <= 0.0 or height <= 0.0 or lx < 0.0 or ly < 0.0 or lx > width or ly > height:
             nx = 0.0
             ny = 0.0
         else:
-            nx = max(
-                -1.0,
-                min(1.0, (local.x() / max(1.0, float(quick.width())) - 0.5) * 2.0),
-            )
-            ny = max(
-                -1.0,
-                min(1.0, (local.y() / max(1.0, float(quick.height())) - 0.5) * 2.0),
-            )
+            nx = max(-1.0, min(1.0, (lx / max(1.0, width) - 0.5) * 2.0))
+            ny = max(-1.0, min(1.0, (ly / max(1.0, height) - 0.5) * 2.0))
 
         previous = self._last_pointer_norm
         if previous is not None and (
@@ -597,12 +576,15 @@ class NativeQuickBackground(QObject):
             return
 
         self._last_pointer_norm = (nx, ny)
-        quick.setProperty("pointerX", nx)
-        quick.setProperty("pointerY", ny)
-        quick.setProperty("animationRunning", True)
+        try:
+            quick.setProperty("pointerX", nx)
+            quick.setProperty("pointerY", ny)
+            quick.setProperty("animationRunning", True)
+        except RuntimeError:
+            pass
 
     def schedule_mask_update(self, *_args: object) -> None:
-        """Coalesce card/layout churn; the blur mask is not a per-frame surface."""
+        """Coalesce QWidget geometry churn before publishing model coordinates."""
 
         if self._shutting_down:
             return
@@ -610,33 +592,40 @@ class NativeQuickBackground(QObject):
         if not self._geometry_timer.isActive():
             self._geometry_timer.start()
 
+    def _presentation_available(self) -> bool:
+        quick = self.quick_window
+        if self._shutting_down or quick is None:
+            return False
+        try:
+            return bool(
+                self.overlay.isVisible()
+                and not self.overlay.isMinimized()
+                and quick.isVisible()
+                and quick.isExposed()
+                and not (quick.windowState() & Qt.WindowState.WindowMinimized)
+            )
+        except RuntimeError:
+            return False
+
     def _flush_geometry(self) -> None:
         if self._shutting_down:
             return
-        self._geometry_dirty = False
-        changed = self.card_model.sync_geometry()
-        if changed or not self._mask_ready:
-            self._update_mask_texture()
+        if not self._presentation_available():
+            # Preserve the last complete geometry while Windows hides/unexposes
+            # either half of the native QWidget/Quick pair.
+            self._geometry_dirty = True
+            return
 
-        # If another layout request landed while this pass was running, leave one
-        # trailing update queued so the final geometry always wins.
+        self._geometry_dirty = False
+        if self.card_model.sync_geometry():
+            self._geometry_revision += 1
+
         if self._geometry_dirty and not self._geometry_timer.isActive():
             self._geometry_timer.start()
 
-    def _update_mask_texture(self) -> None:
-        quick = self.quick_window
-        if self._shutting_down or quick is None:
-            return
-        image = self.card_model.render_mask(quick.width(), quick.height())
-        self._mask_revision += 1
-        mask_path = self._temp_dir / f"glass_mask_{self._mask_revision & 1}.png"
-        if not image.save(str(mask_path), "PNG"):
-            raise RuntimeError("Failed to update the global glass mask")
-        quick.setProperty("maskUrl", QUrl.fromLocalFile(str(mask_path)))
-        self._mask_ready = True
-
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if watched in self._geometry_watch and event.type() in {
+        event_type = event.type()
+        if watched in self._geometry_watch and event_type in {
             QEvent.Type.Move,
             QEvent.Type.Resize,
             QEvent.Type.Show,
@@ -645,6 +634,12 @@ class NativeQuickBackground(QObject):
             QEvent.Type.ParentChange,
         }:
             self.schedule_mask_update()
+        elif watched is self.quick_window and event_type in {
+            QEvent.Type.Show,
+            QEvent.Type.Expose,
+            QEvent.Type.WindowStateChange,
+        }:
+            QTimer.singleShot(0, self.schedule_mask_update)
         return False
 
     def shutdown(self) -> None:
@@ -652,7 +647,6 @@ class NativeQuickBackground(QObject):
             return
         self._shutting_down = True
         self._geometry_timer.stop()
-        self._pointer_timer.stop()
         for watched in tuple(self._geometry_watch):
             try:
                 watched.removeEventFilter(self)
@@ -661,6 +655,10 @@ class NativeQuickBackground(QObject):
         quick = self.quick_window
         self.quick_window = None
         if quick is not None:
+            try:
+                quick.removeEventFilter(self)
+            except RuntimeError:
+                pass
             quick.setProperty("animationRunning", False)
             quick.hide()
             quick.releaseResources()
@@ -672,3 +670,15 @@ class NativeQuickBackground(QObject):
         if app is not None:
             app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self._temp.cleanup()
+
+
+__all__ = [
+    "GlassCardModel",
+    "NativeQuickBackground",
+    "_GLASS_NAMES",
+    "_GLASS_RADIUS",
+    "_NORMAL_GLASS_ALPHA",
+    "_OVERSCAN",
+    "_WALLPAPER_ASSET",
+    "_blur_wallpaper",
+]
