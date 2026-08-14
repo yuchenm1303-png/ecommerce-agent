@@ -116,6 +116,13 @@ jobs:
             throw "Installed worker self-test failed with exit code $LASTEXITCODE"
           }
 
+          $updater = Join-Path $installDir "updater\updater.exe"
+          if (-not (Test-Path $updater)) { throw "Installed updater missing: $updater" }
+          & $updater --self-check
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed updater self-check failed with exit code $LASTEXITCODE"
+          }
+
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:

@@ -139,6 +139,10 @@ jobs:
           if (-not (Test-Path $worker)) { throw "Installed worker missing: $worker" }
           & $worker --self-test
           if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
+          $updater = Join-Path $installDir "updater\updater.exe"
+          if (-not (Test-Path $updater)) { throw "Installed updater missing: $updater" }
+          & $updater --self-check
+          if ($LASTEXITCODE -ne 0) { throw "Installed updater self-check failed: $LASTEXITCODE" }
           $versionFile = Join-Path $installDir "_internal\packaging\VERSION"
           if (-not (Test-Path $versionFile)) { throw "Embedded package version missing: $versionFile" }
           $embedded = (Get-Content $versionFile -Raw).Trim()

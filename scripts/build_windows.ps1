@@ -69,6 +69,25 @@ foreach ($Required in @($GuiExe, $WorkerExe)) {
     }
 }
 
+Write-Host "[2.5/6] Building standalone updater"
+$UpdaterWork = Join-Path $WorkDir "updater"
+& python -m PyInstaller `
+    --noconfirm `
+    --clean `
+    --distpath $DistRoot `
+    --workpath $UpdaterWork `
+    (Join-Path $Root "packaging\Updater.spec")
+if ($LASTEXITCODE -ne 0) {
+    throw "Updater build failed with exit code $LASTEXITCODE"
+}
+$UpdaterExe = Join-Path $DistRoot "updater.exe"
+if (-not (Test-Path $UpdaterExe)) {
+    throw "Updater build output missing: $UpdaterExe"
+}
+New-Item -ItemType Directory -Force -Path (Join-Path $AppDir "updater") | Out-Null
+Copy-Item $UpdaterExe (Join-Path $AppDir "updater\updater.exe") -Force
+Write-Host "  Standalone updater: $(Join-Path $AppDir "updater\updater.exe")"
+
 Write-Host "[3/6] Verifying packaged GUI import path"
 $PreviousImportProbe = $env:ECOMMERCE_AGENT_PACKAGE_IMPORT_PROBE
 $env:ECOMMERCE_AGENT_PACKAGE_IMPORT_PROBE = "1"
