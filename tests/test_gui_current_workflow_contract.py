@@ -14,7 +14,7 @@ REAL = (ROOT / "gui" / "real_execution.py").read_text(encoding="utf-8")
 def test_gui_workflow_uses_current_step1_step2_backend_without_category_hardcode() -> None:
     assert "infer_listing_bootstrap" in WORKFLOW
     assert "select_vertical(page, provider, hints)" in WORKFLOW
-    assert "select_brand(page, provider, hints)" in WORKFLOW
+    assert "select_brand_to_product_info(page, provider, hints)" in WORKFLOW
     assert "is_product_info_step" in WORKFLOW
     assert "vehicle_camera_system" not in WORKFLOW
     assert "--vertical" not in RUNNER
