@@ -62,6 +62,15 @@ def test_text_only_customer_evidence_is_valid_strict_rebind() -> None:
     assert "if not args.supplier_snapshot:" in validate
 
 
+def test_pack_listing_photos_are_preselected_but_never_auto_authorized() -> None:
+    assert "def _pack_listing_images" in WINDOW
+    assert 'outputs.get("primary_source_listing_images")' in WINDOW
+    assert "self._selected_upload_images = list(images)" in WINDOW
+    assert 'self.real_image_count.setText(f"{len(images)} files · from pack")' in WINDOW
+    assert "self.real_upload_check.setChecked(False)" in WINDOW
+    assert "勾选“上传图片”后才会真正上传" in WINDOW
+
+
 def test_new_product_pack_sources_compile() -> None:
     for relative in (
         "app/product_pack.py",
