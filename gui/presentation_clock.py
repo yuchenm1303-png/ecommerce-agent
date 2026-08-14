@@ -4,21 +4,25 @@ import time
 from typing import Any
 
 from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer
-from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
+from PySide6.QtGui import QCursor
+from PySide6.QtWidgets import QApplication, QMainWindow
 
 
-_INPUT_COALESCE_MS = 8
-_IDLE_FRAME_MS = 16
+_PRESENTATION_TICK_MS = 8
 
 
 class PresentationClock(QObject):
-    """Event-driven input plus one adaptive presentation heartbeat.
+    """One cursor read and one presentation heartbeat for the whole runtime UI.
 
-    Qt mouse events only update the latest pointer state.  A short-lived 8 ms
-    single-shot coalescer publishes that latest state at most as often as the old
-    125 Hz sampler, so a 500/1000 Hz mouse cannot flood Python while an idle mouse
-    causes no pointer wakeups at all.  Continuous sakura/cursor easing and card
-    tweens reuse the separate adaptive frame timer.
+    Background parallax, card hit-testing/motion and the lightweight particle /
+    cursor overlay used to own separate precise timers and separate QCursor reads.
+    That multiplied main-thread wakeups and coordinate work while the user moved
+    the mouse. This clock is the only high-frequency Python presentation source.
+
+    Consumers remain responsible for their own visual cadence: the background only
+    publishes pointer targets when input changes, card motion caps itself to the
+    display refresh rate, and decorative effects keep their established 60 Hz
+    budget. Business runners and QWidget input handling are completely separate.
     """
 
     def __init__(
@@ -36,54 +40,21 @@ class PresentationClock(QObject):
         self.effects = effects
         self._holds: set[str] = set()
         self._window_paused = False
-        self._last_global = QPoint(-100_000, -100_000)
-        self._last_left_down = False
-        self._have_input = False
-        self._pending_global = QPoint(self._last_global)
-        self._pending_left_down = False
-        self._input_dirty = False
-        self._pending_outside_resample = False
-
-        self._input_timer = QTimer(self)
-        self._input_timer.setSingleShot(True)
-        self._input_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._input_timer.setInterval(_INPUT_COALESCE_MS)
-        self._input_timer.timeout.connect(self._flush_input)
+        self._last_global: tuple[int, int] | None = None
+        self._last_left_down: bool | None = None
 
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self.timer.setInterval(_IDLE_FRAME_MS)
-        self.timer.timeout.connect(self._frame_tick)
+        self.timer.setInterval(_PRESENTATION_TICK_MS)
+        self.timer.timeout.connect(self._tick)
 
-        self._install_mouse_tracking(window)
-        app = QApplication.instance()
-        if app is not None:
-            app.installEventFilter(self)
+        window.installEventFilter(self)
         window.destroyed.connect(self.cleanup)
         self._sync_window_state()
 
     @property
     def running(self) -> bool:
         return bool(self.timer.isActive() and not self._holds and not self._window_paused)
-
-    def _belongs_to_window(self, widget: QWidget | None) -> bool:
-        current = widget
-        while current is not None:
-            if current is self.window:
-                return True
-            current = current.parentWidget()
-        return False
-
-    def _install_mouse_tracking(self, root: QWidget) -> None:
-        try:
-            root.setMouseTracking(True)
-        except RuntimeError:
-            return
-        for child in root.findChildren(QWidget):
-            try:
-                child.setMouseTracking(True)
-            except RuntimeError:
-                continue
 
     def _can_run(self) -> bool:
         if self._holds or self._window_paused:
@@ -103,16 +74,14 @@ class PresentationClock(QObject):
 
         if self._can_run():
             if not self.timer.isActive():
+                self._reset_input_identity()
                 self.timer.start()
         else:
-            self._input_timer.stop()
             self.timer.stop()
 
     def _reset_input_identity(self) -> None:
-        self._input_timer.stop()
-        self._have_input = False
-        self._input_dirty = False
-        self._pending_outside_resample = False
+        self._last_global = None
+        self._last_left_down = None
         try:
             self.background.reset_pointer_identity()
         except (AttributeError, RuntimeError):
@@ -121,7 +90,6 @@ class PresentationClock(QObject):
     def suspend(self, reason: str) -> None:
         token = str(reason or "presentation").strip() or "presentation"
         self._holds.add(token)
-        self._input_timer.stop()
         self.timer.stop()
         try:
             self.background.pause_pointer_animation()
@@ -134,87 +102,27 @@ class PresentationClock(QObject):
         self._reset_input_identity()
         self._sync_window_state()
 
-    @staticmethod
-    def _global_point(event: object) -> QPoint | None:
-        getter = getattr(event, "globalPosition", None)
-        if callable(getter):
-            try:
-                position = getter()
-                return QPoint(round(float(position.x())), round(float(position.y())))
-            except (AttributeError, RuntimeError, TypeError, ValueError):
-                pass
-        getter = getattr(event, "globalPos", None)
-        if callable(getter):
-            try:
-                return QPoint(getter())
-            except (AttributeError, RuntimeError, TypeError):
-                pass
-        return None
-
-    def _left_state_from_event(self, event: object, event_type: QEvent.Type) -> bool:
-        if event_type == QEvent.Type.MouseButtonPress:
-            try:
-                if event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
-                    return True
-            except (AttributeError, RuntimeError):
-                return self._last_left_down
-        elif event_type == QEvent.Type.MouseButtonRelease:
-            try:
-                if event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
-                    return False
-            except (AttributeError, RuntimeError):
-                return self._last_left_down
-        buttons = getattr(event, "buttons", None)
-        if callable(buttons):
-            try:
-                return bool(buttons() & Qt.MouseButton.LeftButton)
-            except (RuntimeError, TypeError):
-                pass
-        return self._last_left_down
-
-    def _queue_input(
-        self,
-        global_pos: QPoint,
-        *,
-        left_down: bool,
-        immediate: bool = False,
-    ) -> None:
+    def _tick(self) -> None:
         if not self._can_run():
+            self._sync_window_state()
             return
-        self._pending_global = QPoint(global_pos)
-        self._pending_left_down = bool(left_down)
-        self._input_dirty = True
-        if immediate:
-            self._input_timer.stop()
-            self._flush_input()
-        elif not self._input_timer.isActive():
-            self._input_timer.start()
-
-    def _flush_input(self) -> None:
-        if not self._input_dirty or not self._can_run():
-            return
-        self._input_dirty = False
-        self._deliver_input(
-            QPoint(self._pending_global),
-            left_down=self._pending_left_down,
-        )
-
-    def _deliver_input(self, global_pos: QPoint, *, left_down: bool, force: bool = False) -> None:
-        same = (
-            self._have_input
-            and global_pos == self._last_global
-            and bool(left_down) == self._last_left_down
-        )
-        if same and not force:
-            return
-
-        self._last_global = QPoint(global_pos)
-        self._last_left_down = bool(left_down)
-        self._have_input = True
-        now_s = time.perf_counter()
 
         try:
-            self.background.presentation_tick(global_pos, input_changed=True)
+            global_pos = QCursor.pos()
+            point = (int(global_pos.x()), int(global_pos.y()))
+            left_down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
+        except RuntimeError:
+            return
+
+        input_changed = point != self._last_global or left_down != self._last_left_down
+        self._last_global = point
+        self._last_left_down = left_down
+        now_s = time.perf_counter()
+
+        # These calls intentionally receive the same QPoint/button sample. No
+        # consumer is allowed to perform another high-frequency QCursor read.
+        try:
+            self.background.presentation_tick(global_pos, input_changed=input_changed)
         except RuntimeError:
             pass
         try:
@@ -222,7 +130,7 @@ class PresentationClock(QObject):
                 global_pos,
                 left_down=left_down,
                 now_s=now_s,
-                input_changed=True,
+                input_changed=input_changed,
             )
         except RuntimeError:
             pass
@@ -234,128 +142,25 @@ class PresentationClock(QObject):
             )
         except RuntimeError:
             pass
-        self._sync_frame_interval()
-
-    def _card_motion_interval_ms(self) -> int:
-        try:
-            moving = bool(self.card_fx.motion_active)
-            interval_ms = int(self.card_fx.motion_interval_ms)
-        except (AttributeError, RuntimeError, TypeError, ValueError):
-            return _IDLE_FRAME_MS
-        if not moving:
-            return _IDLE_FRAME_MS
-        return max(4, min(_IDLE_FRAME_MS, interval_ms))
-
-    def _sync_frame_interval(self) -> None:
-        target = self._card_motion_interval_ms()
-        if self.timer.interval() != target:
-            self.timer.setInterval(target)
-
-    def _frame_tick(self) -> None:
-        if not self._can_run():
-            self._sync_window_state()
-            return
-
-        now_s = time.perf_counter()
-        if self._pending_outside_resample:
-            self._pending_outside_resample = False
-            try:
-                self.card_fx.presentation_tick(
-                    self._last_global,
-                    left_down=self._last_left_down,
-                    now_s=now_s,
-                    input_changed=True,
-                )
-            except RuntimeError:
-                pass
-        else:
-            try:
-                self.card_fx.presentation_tick(
-                    self._last_global,
-                    left_down=self._last_left_down,
-                    now_s=now_s,
-                    input_changed=False,
-                )
-            except RuntimeError:
-                pass
-
-        try:
-            self.effects.presentation_tick(
-                self._last_global,
-                left_down=self._last_left_down,
-                now_s=now_s,
-            )
-        except RuntimeError:
-            pass
-        self._sync_frame_interval()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        event_type = event.type()
-
-        if event_type == QEvent.Type.ChildAdded:
-            child_getter = getattr(event, "child", None)
-            child = child_getter() if callable(child_getter) else None
-            if isinstance(child, QWidget):
-                parent = child.parentWidget()
-                if self._belongs_to_window(parent):
-                    self._install_mouse_tracking(child)
+        if watched is not self.window:
             return False
-
-        widget = watched if isinstance(watched, QWidget) else None
-        if not self._belongs_to_window(widget):
-            return False
-
-        if event_type in {
+        if event.type() in {
             QEvent.Type.Show,
             QEvent.Type.Hide,
             QEvent.Type.WindowStateChange,
-        } and watched is self.window:
+        }:
             QTimer.singleShot(0, self._sync_window_state)
-            return False
-
-        if event_type in {
-            QEvent.Type.MouseMove,
-            QEvent.Type.Enter,
-        }:
-            point = self._global_point(event)
-            if point is not None:
-                self._queue_input(
-                    point,
-                    left_down=self._left_state_from_event(event, event_type),
-                )
-            return False
-
-        if event_type in {
-            QEvent.Type.MouseButtonPress,
-            QEvent.Type.MouseButtonRelease,
-        }:
-            point = self._global_point(event)
-            if point is not None:
-                self._queue_input(
-                    point,
-                    left_down=self._left_state_from_event(event, event_type),
-                    immediate=True,
-                )
-            return False
-
-        if event_type == QEvent.Type.Leave and watched is self.window:
-            self._input_timer.stop()
-            self._input_dirty = False
-            outside = QPoint(-100_000, -100_000)
-            self._deliver_input(outside, left_down=self._last_left_down, force=True)
-            self._pending_outside_resample = True
         return False
 
     def cleanup(self) -> None:
-        self._input_timer.stop()
         self.timer.stop()
         self._holds.clear()
-        app = QApplication.instance()
-        if app is not None:
-            try:
-                app.removeEventFilter(self)
-            except RuntimeError:
-                pass
+        try:
+            self.window.removeEventFilter(self)
+        except RuntimeError:
+            pass
 
 
 def install_presentation_clock(

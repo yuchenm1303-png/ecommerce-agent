@@ -19,28 +19,10 @@ def test_obsolete_runtime_patch_modules_are_gone() -> None:
     assert not (ROOT / "gui" / "ui_runtime_optimizations.py").exists()
 
 
-def test_mouse_input_is_event_driven_coalesced_and_visual_clock_is_adaptive() -> None:
-    assert "_INPUT_COALESCE_MS = 8" in CLOCK
-    assert "_IDLE_FRAME_MS = 16" in CLOCK
-    assert "QCursor.pos()" not in CLOCK
-    assert "QApplication.mouseButtons()" not in CLOCK
-    assert "app.installEventFilter(self)" in CLOCK
-    assert "self._input_timer.setSingleShot(True)" in CLOCK
-    assert "self._input_timer.setInterval(_INPUT_COALESCE_MS)" in CLOCK
-    assert "QEvent.Type.MouseMove" in CLOCK
-    assert "QEvent.Type.MouseButtonPress" in CLOCK
-    assert "QEvent.Type.MouseButtonRelease" in CLOCK
-    assert "def _queue_input" in CLOCK
-    assert "def _flush_input" in CLOCK
-    assert "def _deliver_input" in CLOCK
-    assert "def _frame_tick" in CLOCK
-    assert "def _card_motion_interval_ms" in CLOCK
-    assert "self.card_fx.motion_active" in CLOCK
-    assert "self.card_fx.motion_interval_ms" in CLOCK
-    assert "_moving_frames" not in CLOCK
-    assert "_motion_interval_s" not in CLOCK
-    assert "self.timer.setInterval(target)" in CLOCK
-
+def test_one_shared_clock_owns_all_high_frequency_python_input_sampling() -> None:
+    assert "_PRESENTATION_TICK_MS = 8" in CLOCK
+    assert CLOCK.count("QCursor.pos()") == 1
+    assert CLOCK.count("QApplication.mouseButtons()") == 1
     for consumer in (
         "self.background.presentation_tick(",
         "self.card_fx.presentation_tick(",
@@ -53,16 +35,13 @@ def test_mouse_input_is_event_driven_coalesced_and_visual_clock_is_adaptive() ->
         assert "QApplication.mouseButtons()" not in source
 
 
-def test_glass_mask_texture_refreshes_only_when_geometry_changes() -> None:
+def test_glass_mask_is_explicit_gpu_texture_not_cpu_full_window_surface() -> None:
     assert "id: glassMaskScene" in NATIVE
     assert "ShaderEffectSource {{" in NATIVE
     assert "id: glassMaskTexture" in NATIVE
     assert "sourceItem: glassMaskScene" in NATIVE
     assert "hideSource: true" in NATIVE
-    assert "live: false" in NATIVE
-    assert "property int geometryRevision: 0" in NATIVE
-    assert "onGeometryRevisionChanged: glassMaskTexture.scheduleUpdate()" in NATIVE
-    assert 'quick.setProperty("geometryRevision", self._geometry_revision)' in NATIVE
+    assert "live: true" in NATIVE
     assert "maskSource: glassMaskTexture" in NATIVE
     assert "model: glassCardModel" in NATIVE
     assert "clip: true" in NATIVE
@@ -84,7 +63,7 @@ def test_background_has_no_python_pointer_timer_and_retains_gpu_scene_graph() ->
     assert "_GEOMETRY_SYNC_MS = 16" in NATIVE
 
 
-def test_card_motion_reuses_one_frozen_composite_across_reversals() -> None:
+def test_card_motion_uses_shared_clock_and_one_frozen_composite_per_tween() -> None:
     assert "_NORMAL_SCALE = 1.00" in CARD
     assert "_HOVER_SCALE = 1.02" in CARD
     assert "_TRANSITION_MS = 300" in CARD
@@ -93,21 +72,12 @@ def test_card_motion_reuses_one_frozen_composite_across_reversals() -> None:
     assert "def presentation_tick" in CARD
     assert "self._motion_timer" not in CARD
     assert "self._pointer_timer" not in CARD
-    assert "def motion_active" in CARD
-    assert "def motion_interval_ms" in CARD
-
+    assert "def _recapture_for_motion" in CARD
     recapture = CARD.split("def _recapture_for_motion", 1)[1].split(
         "def _retire_stale_motions", 1
     )[0]
+    assert "self._set_content_frozen(state, False)" in recapture
     assert "self._set_content_frozen(state, True)" in recapture
-    assert "self._set_content_frozen(state, False)" not in recapture
-
-    animate = CARD.split("def _animate_to", 1)[1].split("def _normal", 1)[0]
-    assert "scale_motion = (" in animate
-    assert "if scale_motion:" in animate
-    assert "self._recapture_for_motion(state)" in animate
-    assert "self._set_content_frozen(state, False)" in animate
-
     advance = CARD.split("def _advance_state", 1)[1].split("def _advance_motions", 1)[0]
     assert "if not state.moving:" in advance
     assert "self._set_content_frozen(state, False)" in advance

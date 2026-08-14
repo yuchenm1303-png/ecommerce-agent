@@ -145,8 +145,9 @@ def main() -> int:
     install_restore_snapshot(window, quick_window)
     shell = install_native_window_shell(window, quick_window)
 
-    # Mouse input is event-driven; the shared adaptive frame clock only advances
-    # continuous presentation (sakura/cursor easing and active card tweens).
+    # One shared 8 ms clock samples QCursor exactly once. Background parallax,
+    # card interaction and the lightweight sakura/cursor surface consume that
+    # same sample and apply their own cadence budgets.
     card_fx = install_nekro_card_fx(window, visual)
     install_buffered_logs(window)
     effects = install_nekro_effects(window, sakura_count=3)
