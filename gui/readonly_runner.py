@@ -14,12 +14,14 @@ from urllib.parse import urlparse
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
+from app.product_pack import SUPPORTED_PRODUCT_PACK_SUFFIXES
 from .result_loader import load_run_result
 
 
 @dataclass(slots=True)
 class RunnerConfig:
-    product_url: str
+    product_url: str = ""
+    product_files: tuple[str, ...] = ()
     expected_vertical: str = ""
     makro_cdp_port: int = 9222
     source_cdp_port: int = 9333
@@ -91,7 +93,7 @@ class ReadOnlyRunner(QObject):
             raise RuntimeError("Makro workflow 已在运行。")
         if mode not in _MODE_PHASES:
             raise ValueError(f"未知 workflow mode={mode!r}")
-        self._validate_config(config)
+        self._validate_config(config, mode=mode)
         self._assert_makro_cdp_available(config.makro_cdp_port)
 
         self.config = config
@@ -110,12 +112,13 @@ class ReadOnlyRunner(QObject):
         source_cache.mkdir(parents=True, exist_ok=True)
         semantic_cache.mkdir(parents=True, exist_ok=True)
 
+        product_files = tuple(str(Path(value).resolve()) for value in config.product_files)
+        is_pack = bool(product_files)
+        script = "makro_product_pack_workflow.py" if is_pack else "makro_gui_workflow.py"
         args = [
-            "makro_gui_workflow.py",
+            script,
             "--mode",
             mode,
-            "--product-url",
-            config.product_url,
             "--provider",
             config.provider,
             "--base-url",
@@ -142,15 +145,26 @@ class ReadOnlyRunner(QObject):
             "--output-dir",
             str(self.run_dir),
         ]
-        if config.source_use_current_page:
-            args.append("--source-use-current-page")
+        if is_pack:
+            for path in product_files:
+                args.extend(["--product-file", path])
+        else:
+            args.extend(["--product-url", config.product_url])
+            if config.source_use_current_page:
+                args.append("--source-use-current-page")
 
         self.running_changed.emit(True)
         self.progress_changed.emit(0, f"{mode} · preparing")
         self._emit_log("===== GUI CURRENT MAKRO WORKFLOW =====")
         self._emit_log(f"mode={mode}")
         self._emit_log(f"run_dir={self.run_dir}")
-        self._emit_log(f"product_url={config.product_url}")
+        self._emit_log(f"input_mode={'customer_product_pack' if is_pack else 'supplier_url'}")
+        if is_pack:
+            self._emit_log(f"product_files={len(product_files)}")
+            for path in product_files:
+                self._emit_log(f"product_file={path}")
+        else:
+            self._emit_log(f"product_url={config.product_url}")
         if mode == "full":
             self._emit_log(
                 "task_start=FRESH · GUI full run always creates a dedicated Makro tab; "
@@ -161,7 +175,7 @@ class ReadOnlyRunner(QObject):
                 f"diagnostic_mode={mode.upper()} · stage-only probe; this is not a new full listing task"
             )
         self._emit_log(
-            "Backend: current one-link Step 1/2 + current Resolver cold/hot + current read-only Fill Plan."
+            "Backend: normalized product input → current Step 1/2 → Resolver cold/hot → read-only Fill Plan."
         )
         self._emit_log("Safety: Step 3 writes=0 · Save=False · Send to QC=False.")
         self._start_process(args)
@@ -175,10 +189,26 @@ class ReadOnlyRunner(QObject):
         if not self.process.waitForFinished(2500):
             self.process.kill()
 
-    def _validate_config(self, config: RunnerConfig) -> None:
-        parsed = urlparse(config.product_url.strip())
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("请输入完整的 1688 / 供应商 http(s) 商品 URL。")
+    def _validate_config(self, config: RunnerConfig, *, mode: str) -> None:
+        url = config.product_url.strip()
+        files = tuple(str(value).strip() for value in config.product_files if str(value).strip())
+        if bool(url) == bool(files):
+            raise ValueError("请选择一种商品来源：供应商 URL 或客户资料包，不能同时为空或同时使用。")
+        if files:
+            if mode != "full":
+                raise ValueError("客户资料包当前走完整新建任务；阶段诊断仍使用供应商 URL / 当前 Makro 页面。")
+            for value in files:
+                path = Path(value)
+                if not path.is_file():
+                    raise ValueError(f"商品资料文件不存在：{path}")
+                if path.suffix.casefold() not in SUPPORTED_PRODUCT_PACK_SUFFIXES:
+                    raise ValueError(f"不支持的商品资料格式：{path.name}")
+            if config.source_use_current_page:
+                raise ValueError("客户资料包模式不使用 Source Edge 当前页。")
+        else:
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("请输入完整的 1688 / 供应商 http(s) 商品 URL。")
         if not os.getenv(config.api_key_env, "").strip():
             raise ValueError(
                 f"环境变量 {config.api_key_env} 未设置。GUI 不保存 API key，请先在当前终端/系统环境中设置。"
