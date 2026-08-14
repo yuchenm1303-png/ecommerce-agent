@@ -116,6 +116,9 @@ class RealExecutionRunner(QObject):
             "--output-dir",
             str(self.output_root),
         ]
+        makro_target_id = str(prepared.get("makro_target_id") or "").strip()
+        if makro_target_id:
+            args.extend(["--makro-target-id", makro_target_id])
         for image in prepared["evidence_images"]:
             args.extend(["--image", str(image)])
 
@@ -151,6 +154,7 @@ class RealExecutionRunner(QObject):
                 "scope": config.scope,
                 "allow_save": config.allow_save,
                 "upload_images": [str(path) for path in config.upload_images],
+                "makro_target_id": makro_target_id,
                 "send_to_qc": False,
             }
         )
@@ -160,6 +164,7 @@ class RealExecutionRunner(QObject):
         self._emit_log(f"scope={config.scope}")
         self._emit_log(f"allow_save={config.allow_save}")
         self._emit_log(f"upload_images={len(config.upload_images)}")
+        self._emit_log(f"makro_target_id={makro_target_id or '<legacy-unique-tab>'}")
         self._emit_log("send_to_qc=False (repository policy lock)")
         self._emit_log("$ " + command)
         self._emit_log(f"cwd={self.project_root}")
@@ -204,6 +209,13 @@ class RealExecutionRunner(QObject):
         evidence_images = resolver_evidence_images(outputs)
         product_url = str(manifest.get("primary_product_url") or "").strip()
 
+        workflow_manifest_path = run_dir / "run-manifest.json"
+        workflow_manifest: dict[str, Any] = {}
+        if workflow_manifest_path.is_file():
+            workflow_manifest = json.loads(workflow_manifest_path.read_text(encoding="utf-8"))
+        makro_target_id = str(workflow_manifest.get("makro_target_id") or "").strip()
+        ownership_mode = str(workflow_manifest.get("ownership_mode") or "").strip()
+
         required = {
             "live_schema": live_schema,
             "decision_packet": decision_packet,
@@ -214,6 +226,11 @@ class RealExecutionRunner(QObject):
             missing.append("evidence_images=<missing>")
         if not product_url:
             missing.append("primary_product_url=<missing>")
+        if ownership_mode in {"fresh_dedicated_tab", "resume_exact_page"} and not makro_target_id:
+            missing.append("makro_target_id=<missing for owned workflow>")
+        workflow_product_url = str(workflow_manifest.get("product_url") or "").strip()
+        if workflow_product_url and product_url and workflow_product_url != product_url:
+            missing.append("workflow/resolver product_url mismatch")
         if missing:
             raise RuntimeError("真实执行 strict-rebind 输入缺失：" + " | ".join(missing))
 
@@ -221,6 +238,8 @@ class RealExecutionRunner(QObject):
             **required,
             "product_url": product_url,
             "evidence_images": evidence_images,
+            "makro_target_id": makro_target_id,
+            "ownership_mode": ownership_mode,
         }
 
     def _read_output(self) -> None:
