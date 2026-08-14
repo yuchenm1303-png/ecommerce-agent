@@ -31,12 +31,19 @@ class RequiredInputSupport(QObject):
 
     A value typed by the user remains an optional override and wins over the
     deterministic fallback. Placeholder text itself is never copied as input.
+
+    Qt editors are presentation-only. QTableWidget owns and may destroy cell
+    widgets whenever the table is rebuilt, so authoritative manual values and
+    required-field bindings live in plain Python state and never depend on a
+    QLineEdit remaining alive.
     """
 
     def __init__(self, window: Any) -> None:
         super().__init__(window)
         self.window = window
+        # Ephemeral view registry only. Never use these widgets as business state.
         self.inputs: dict[str, QLineEdit] = {}
+        self.values: dict[str, str] = {}
         self.labels: dict[str, str] = {}
         self.fields: dict[str, dict[str, Any]] = {}
         self._original_start = window._start_real_execution
@@ -71,19 +78,30 @@ class RequiredInputSupport(QObject):
         return None
 
     def _on_result(self, result: RunResult) -> None:
-        previous = {identifier: editor.text() for identifier, editor in self.inputs.items()}
+        # Preserve user-entered values from the Python model, never from old
+        # QLineEdit wrappers: QTableWidget may already have deleted those C++
+        # objects while rebuilding the result table.
+        previous_values = dict(self.values)
         self.inputs = {}
+        self.values = {}
         self.labels = {}
         self.fields = {}
 
         required = self._required_blocked(result)
         for missing in required:
             identifier = missing["field_id"]
+            field = missing["field"]
+
+            # Required fallback is business state and must exist even if the
+            # corresponding table row is temporarily not rendered/filtered.
+            self.values[identifier] = previous_values.get(identifier, "")
+            self.labels[identifier] = missing["label"]
+            self.fields[identifier] = field
+
             row = self._table_row_for_field_id(identifier)
             if row is None:
                 continue
 
-            field = missing["field"]
             fallback = required_fallback_override(field)
             fallback_values = [
                 str(value).strip()
@@ -97,8 +115,8 @@ class RequiredInputSupport(QObject):
 
             editor = QLineEdit()
             editor.setPlaceholderText(f"必填 · 留空将自动填 {fallback_text}")
-            if previous.get(identifier):
-                editor.setText(previous[identifier])
+            if self.values[identifier]:
+                editor.setText(self.values[identifier])
             options = missing.get("options") or []
             tooltip = missing.get("reason") or "正常 Resolver 未能确定该必填字段。"
             tooltip += (
@@ -108,11 +126,11 @@ class RequiredInputSupport(QObject):
             if options:
                 tooltip += "\n\nMakro 可选值：\n" + " | ".join(options)
             editor.setToolTip(tooltip)
-            editor.textChanged.connect(lambda _text, fid=identifier: self._input_changed(fid))
+            editor.textChanged.connect(
+                lambda text, fid=identifier: self._input_changed(fid, text)
+            )
             self.window.field_table.setCellWidget(row, 2, editor)
             self.inputs[identifier] = editor
-            self.labels[identifier] = missing["label"]
-            self.fields[identifier] = field
 
         if required:
             self.window.fields_hint.setText(
@@ -124,8 +142,19 @@ class RequiredInputSupport(QObject):
             )
         self._sync_button()
 
-    def _input_changed(self, _field_id: str) -> None:
+    def _input_changed(self, field_id: str, text: str) -> None:
+        # A stale editor can emit during a table rebuild. Ignore it once its
+        # field no longer belongs to the current result model.
+        if field_id not in self.fields:
+            return
+        self.values[field_id] = str(text or "")
         self._sync_button()
+
+    def _manual_count(self) -> int:
+        return sum(
+            bool(self.values.get(identifier, "").strip())
+            for identifier in self.fields
+        )
 
     def _sync_button(self) -> None:
         result = getattr(self.window, "current_result", None)
@@ -139,10 +168,10 @@ class RequiredInputSupport(QObject):
             return
 
         scope = self.window.real_scope_combo.currentData()
-        if scope == FULL_STEP3 and self.inputs:
-            self.window.real_start_button.setEnabled(result.ready > 0 or bool(self.inputs))
-            manual = sum(bool(editor.text().strip()) for editor in self.inputs.values())
-            automatic = len(self.inputs) - manual
+        if scope == FULL_STEP3 and self.fields:
+            self.window.real_start_button.setEnabled(result.ready > 0 or bool(self.fields))
+            manual = self._manual_count()
+            automatic = len(self.fields) - manual
             self.window.real_start_button.setToolTip(
                 f"可直接开始；{manual} 个使用手动值，{automatic} 个留空必填项将自动使用固定兜底值。"
             )
@@ -154,12 +183,9 @@ class RequiredInputSupport(QObject):
 
     def _merged_overrides(self) -> list[dict[str, Any]]:
         overrides: list[dict[str, Any]] = []
-        for identifier, editor in self.inputs.items():
-            value = editor.text().strip()
-            field = self.fields.get(identifier)
+        for identifier, field in self.fields.items():
+            value = self.values.get(identifier, "").strip()
             if value:
-                if field is None:
-                    raise RuntimeError(f"必填字段绑定信息已失效：{identifier}")
                 overrides.append(
                     {
                         **required_override_binding(field),
@@ -167,8 +193,7 @@ class RequiredInputSupport(QObject):
                         "source_type": "user",
                     }
                 )
-                continue
-            if field is not None:
+            else:
                 overrides.append(required_fallback_override(field))
         return overrides
 
@@ -201,7 +226,7 @@ class RequiredInputSupport(QObject):
         if result is None or not result.plan_summary:
             QMessageBox.warning(self.window, "无法开始真实填写", "请先完成 Step 3 Resolver + Fill Plan。")
             return
-        if result.ready <= 0 and not self.inputs:
+        if result.ready <= 0 and not self.fields:
             QMessageBox.warning(self.window, "没有可填写字段", "当前 Fill Plan 没有 READY 或待兜底的必填字段，真实填写保持锁定。")
             return
 
@@ -209,9 +234,9 @@ class RequiredInputSupport(QObject):
         try:
             if scope == FULL_STEP3:
                 path = self._write_overrides()
-                if self.inputs:
-                    manual = sum(bool(editor.text().strip()) for editor in self.inputs.values())
-                    automatic = len(self.inputs) - manual
+                if self.fields:
+                    manual = self._manual_count()
+                    automatic = len(self.fields) - manual
                     self.window.fields_hint.setText(
                         f"必填预检完成 · 手动 {manual} · 固定兜底 {automatic}"
                     )
