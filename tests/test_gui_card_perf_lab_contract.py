@@ -48,29 +48,26 @@ def test_lab_covers_single_and_multi_card_hot_paths() -> None:
     assert "PATH = (0, 1, 2, 3, 4, 5, 4, 3, 2, 1)" in lab
     assert "CROSSOVER_DWELL_MS = 70" in lab
     assert "--compare-demo" in lab
-    assert "多卡" in doc
-    assert "--scenario both" in doc
+    assert "--scenario crossover" in doc
+    assert "baseline_frozen,frozen_target_rect" in doc
 
 
-def test_perf_lab_records_tail_latency_and_analyzer_rejects_noise_wins() -> None:
-    lab = LAB_PATH.read_text(encoding="utf-8")
+def test_analyzer_never_mixes_cadence_with_renderer_selection() -> None:
+    analyzer = ANALYZER_PATH.read_text(encoding="utf-8")
+    assert 'CADENCE_ONLY = {"baseline_60hz", "baseline_72hz", "baseline_90hz"}' in analyzer
+    assert "excluded from renderer decision" in analyzer
+    assert "hz_mismatch" in analyzer
+    assert "abs(candidate[\"target_hz\"] - base[\"target_hz\"])" in analyzer
+
+
+def test_analyzer_prioritizes_crossover_and_guards_start_gap() -> None:
     analyzer = ANALYZER_PATH.read_text(encoding="utf-8")
     doc = DOC_PATH.read_text(encoding="utf-8")
-    for token in (
-        "frame_p95_ms",
-        "frame_p99_ms",
-        "long_1_5x_rate",
-        "transition_start_gap_p95_ms",
-        "transition_prepare_p95_ms",
-        "tick_work_p95_ms",
-        "cpu_core_percent",
-        "eligible_default",
-        "scenario",
-    ):
-        assert token in lab
+    assert "CROSSOVER_WEIGHT = 0.80" in analyzer
+    assert "SINGLE_WEIGHT = 0.20" in analyzer
+    assert "MAX_START_GAP_REGRESSION_PERCENT = 15.0" in analyzer
     assert "MIN_REPLACEMENT_SCORE_IMPROVEMENT_PERCENT = 2.0" in analyzer
     assert "KEEP BASELINE" in analyzer
-    assert "--min-replacement-improvement" in analyzer
-    assert "--parity" in analyzer
-    assert "FINAL CANDIDATE" in analyzer
-    assert "同屏" in doc
+    assert "FINAL BENCHMARK CANDIDATE" in analyzer
+    assert "large crossover" in doc.lower()
+    assert "huge crossover" in doc.lower()
