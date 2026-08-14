@@ -10,30 +10,22 @@ import app.makro.brand_selection as brand_selection
 class FakeProvider:
     name = "fake"
 
-    def __init__(self, response=None):
-        self.response = response if response is not None else {"selected_brand": ""}
-        self.requests = []
-
     def extract_json(self, request_payload):
-        self.requests.append(request_payload)
-        return self.response
+        raise AssertionError("Step 2 brand confirmation must not call AI")
 
 
 class FakeInput:
     def __init__(self) -> None:
         self.values: list[str] = []
-        self.presses: list[str] = []
 
     def fill(self, value: str) -> None:
         self.values.append(value)
-
-    def press(self, key: str) -> None:
-        self.presses.append(key)
 
 
 class FakePage:
     def __init__(self) -> None:
         self.phase = "brand"
+        self.ready_brand = ""
         self.waits: list[int] = []
 
     def wait_for_timeout(self, milliseconds: int) -> None:
@@ -41,25 +33,28 @@ class FakePage:
 
 
 def _hints(*, brand="Qigreesol", status="explicit"):
-    return SimpleNamespace(
-        brand=brand,
-        brand_status=status,
-        product_summary="solar charge controller",
-        product_identity={"product_type_en": "solar charge controller", "brand": brand},
-    )
+    return SimpleNamespace(brand=brand, brand_status=status)
 
 
-def _install_browser_mechanics(monkeypatch, page, brand_input):
+def _install_common(monkeypatch, page, brand_input):
     monkeypatch.setattr(brand_selection, "is_brand_step", lambda current: current.phase == "brand")
     monkeypatch.setattr(brand_selection, "is_product_info_step", lambda current: current.phase == "product")
     monkeypatch.setattr(brand_selection, "_brand_input", lambda _page: brand_input)
     monkeypatch.setattr(brand_selection, "reconcile_portal_interruptions", lambda _page: 0)
-    monkeypatch.setattr(brand_selection, "begin_search_query", lambda _input: None)
-    monkeypatch.setattr(brand_selection, "_advance_brand_confirmation", lambda _page, _selected: None)
+    monkeypatch.setattr(
+        brand_selection,
+        "is_brand_ready_to_create_listing",
+        lambda current, selected: current.ready_brand.casefold() == selected.casefold(),
+    )
+    monkeypatch.setattr(
+        brand_selection,
+        "is_brand_selected_confirmation",
+        lambda _current, _selected: False,
+    )
     monkeypatch.setattr(
         brand_selection,
         "_current_target_values",
-        lambda _page: ("solar_charge_controller", "QIGREESOL"),
+        lambda current: ("solar_charge_controller", "QIGREESOL" if current.phase == "product" else ""),
     )
     monkeypatch.setattr(
         brand_selection,
@@ -68,65 +63,75 @@ def _install_browser_mechanics(monkeypatch, page, brand_input):
     )
 
 
-def test_step2_selects_only_query_owned_live_brand(monkeypatch):
+def test_explicit_brand_uses_check_brand_confirmation_card(monkeypatch):
     page = FakePage()
     brand_input = FakeInput()
-    provider = FakeProvider()
-    _install_browser_mechanics(monkeypatch, page, brand_input)
+    _install_common(monkeypatch, page, brand_input)
 
-    rows = iter([[], ["Qigreesol", "Qigreesol Pro"]])
-    monkeypatch.setattr(
-        brand_selection,
-        "read_search_rows",
-        lambda _input: next(rows, ["Qigreesol", "Qigreesol Pro"]),
-    )
-    monkeypatch.setattr(brand_selection, "_click_check_brand", lambda _page: None)
-    monkeypatch.setattr(
-        brand_selection,
-        "click_search_row",
-        lambda _input, selected: selected == "Qigreesol",
-    )
+    def check_brand(_page):
+        page.ready_brand = "Qigreesol"
 
-    selected = brand_selection.select_brand(page, provider, _hints(), wait_ms=0)
+    def advance(_page, selected):
+        assert selected == "Qigreesol"
+        assert page.ready_brand == "Qigreesol"
+        page.phase = "product"
+
+    monkeypatch.setattr(brand_selection, "_click_check_brand", check_brand)
+    monkeypatch.setattr(brand_selection, "_advance_brand_confirmation", advance)
+
+    selected = brand_selection.select_brand(page, FakeProvider(), _hints(), wait_ms=0)
+
     assert selected == "QIGREESOL"
-    assert "Qigreesol" in brand_input.values
-    assert provider.requests == []
+    assert brand_input.values == ["", "Qigreesol"]
 
 
-def test_unknown_supplier_brand_never_queries_or_chooses(monkeypatch):
+def test_brand_confirmation_must_match_queried_brand(monkeypatch):
     page = FakePage()
     brand_input = FakeInput()
-    provider = FakeProvider({"selected_brand": "Samsung"})
-    _install_browser_mechanics(monkeypatch, page, brand_input)
+    _install_common(monkeypatch, page, brand_input)
+
+    def check_brand(_page):
+        page.ready_brand = "DifferentBrand"
+
+    monkeypatch.setattr(brand_selection, "_click_check_brand", check_brand)
+    monkeypatch.setattr(
+        brand_selection,
+        "_advance_brand_confirmation",
+        lambda *_args: pytest.fail("mismatched confirmation card must never be clicked"),
+    )
+
+    with pytest.raises(RuntimeError, match="did not confirm"):
+        brand_selection.select_brand(page, FakeProvider(), _hints(), wait_ms=0)
+
+
+def test_unknown_supplier_brand_never_queries_portal(monkeypatch):
+    page = FakePage()
+    brand_input = FakeInput()
+    _install_common(monkeypatch, page, brand_input)
     monkeypatch.setattr(brand_selection, "_brand_search_terms", lambda _hints: ())
+    monkeypatch.setattr(
+        brand_selection,
+        "_click_check_brand",
+        lambda _page: pytest.fail("unknown brand must not be queried"),
+    )
 
     with pytest.raises(RuntimeError, match="did not establish a brand"):
         brand_selection.select_brand(
             page,
-            provider,
+            FakeProvider(),
             _hints(brand="", status="unknown"),
             wait_ms=0,
         )
-    assert provider.requests == []
 
 
-def test_ai_brand_choice_must_be_exactly_one_live_candidate():
-    provider = FakeProvider({"selected_brand": "InventedBrand"})
-    hints = _hints(brand="Different", status="explicit")
-    with pytest.raises(ValueError, match="not one unique live Makro candidate"):
-        brand_selection.choose_live_brand_candidate(
-            provider,
-            hints,
-            "",
-            ["Samsung", "Generic"],
-        )
-
-
-def test_brand_production_path_has_no_pagewide_candidate_scan() -> None:
+def test_brand_production_path_is_not_autocomplete_based() -> None:
     import inspect
 
     source = inspect.getsource(brand_selection.select_brand)
-    assert "begin_search_query(brand_input)" in source
-    assert "read_search_rows(brand_input)" in source
-    assert "_visible_text_candidates" not in source
-    assert "_click_exact_visible_text" not in source
+    module_source = inspect.getsource(brand_selection)
+    assert "_click_check_brand(page)" in source
+    assert "_wait_for_brand_check_outcome" in source
+    assert "_advance_brand_confirmation(page, term)" in source
+    assert "read_search_rows" not in module_source
+    assert "click_search_row" not in module_source
+    assert "begin_search_query" not in module_source
