@@ -16,16 +16,17 @@ from typing import Any, Callable
 
 from playwright.sync_api import sync_playwright
 
+from app.browser_page_owner import page_target_id
 from app.browser_session import EdgeHarness, is_cdp_ready
 from app.makro.domain import MakroDomainAdapter
-from app.makro.listing import parse_makro_listing_url
+from app.makro.listing import MAKRO_HOME_URL, parse_makro_listing_url
 from app.makro.listing_creation import (
     MAKRO_NEW_LISTING_URL,
     infer_listing_bootstrap,
     is_brand_step,
     is_product_info_step,
 )
-from app.makro.step1_entry import prepare_single_step1_page
+from app.makro.step1_entry import prepare_owned_step1_page, prepare_single_step1_page
 from app.makro.step3_transition import (
     dismiss_joyride_overlay,
     select_brand_to_product_info,
@@ -102,14 +103,33 @@ def _listing_page(
     return candidates[0]
 
 
+def _create_fresh_owned_page(harness: EdgeHarness) -> tuple[Any, str]:
+    """Create one dedicated Makro tab owned by this fresh full run.
+
+    A fresh supplier URL must never inherit whatever Step 2/3 draft happened to
+    be open in the long-lived Edge. The new tab starts at the authenticated Makro
+    home route, receives a Chromium target id immediately, and every later
+    subprocess is required to bind back to that exact target.
+    """
+
+    if harness.context is None:
+        raise RuntimeError("Makro Edge context is unavailable")
+    page = harness.context.new_page()
+    page.set_default_timeout(15_000)
+    page.goto(MAKRO_HOME_URL, wait_until="commit", timeout=20_000)
+    page.wait_for_timeout(250)
+    target_id = page_target_id(page)
+    harness.page = page
+    return page, target_id
+
+
 def _resume_current_page(harness: EdgeHarness, expected_url: str):
     """Return only the exact unique Step 2/3 page from the prior failed run.
 
     A fresh full run never calls this helper. The GUI supplies ``expected_url``
     only for an immediate retry of the same supplier URL after the preceding full
-    run failed in Step 2 or Step 3. Exact URL + unique listing-tab ownership keeps
-    the retry from adopting an unrelated draft. If the browser was restarted or
-    the page moved, retry fails closed instead of guessing.
+    run failed in Step 2 or Step 3. Exact URL uniqueness is the resume proof; any
+    unrelated listing tabs may coexist and are never adopted.
     """
 
     if harness.context is None:
@@ -118,7 +138,6 @@ def _resume_current_page(harness: EdgeHarness, expected_url: str):
     if not wanted:
         raise RuntimeError("resume-current requires the prior failed page URL")
 
-    listing_pages: list[Any] = []
     exact: list[Any] = []
     for page in harness.context.pages:
         url = str(getattr(page, "url", "") or "").strip()
@@ -126,19 +145,13 @@ def _resume_current_page(harness: EdgeHarness, expected_url: str):
             parse_makro_listing_url(url)
         except (ValueError, AttributeError):
             continue
-        listing_pages.append(page)
         if url == wanted:
             exact.append(page)
 
-    if len(listing_pages) != 1:
-        raise RuntimeError(
-            "Immediate retry requires exactly one Add Listing tab from the failed run; "
-            f"found {len(listing_pages)}. Refusing to guess a draft."
-        )
     if len(exact) != 1:
         raise RuntimeError(
-            "The exact Step 2/3 page from the failed run is no longer present. "
-            "Browser/page ownership changed, so automatic resume was refused."
+            "The exact Step 2/3 page from the failed run is no longer uniquely present. "
+            f"matching_tabs={len(exact)}. Browser/page ownership changed, so automatic resume was refused."
         )
 
     page = exact[0]
@@ -340,6 +353,7 @@ def _plan_command(
     vertical: str,
     resolver_manifest: dict[str, Any],
     output_root: Path,
+    makro_target_id: str = "",
 ) -> list[str]:
     outputs = resolver_manifest.get("outputs") or {}
     decision_packet = str(outputs.get("final_decisions") or "").strip()
@@ -381,6 +395,8 @@ def _plan_command(
         "--output-dir",
         str(output_root),
     ]
+    if str(makro_target_id or "").strip():
+        command.extend(["--makro-target-id", str(makro_target_id).strip()])
     for image in evidence_images:
         command.extend(["--image", image])
     return command
@@ -457,6 +473,7 @@ def _prepare_step3(
             vertical=vertical,
             resolver_manifest=hot_manifest,
             output_root=plan_root,
+            makro_target_id=str(manifest.get("makro_target_id") or ""),
         ),
         "STEP 3 CURRENT READ-ONLY FILL PLAN",
     )
@@ -503,6 +520,8 @@ def main() -> int:
         "vertical": "",
         "brand": "",
         "resume_current_url": str(args.resume_current_url or ""),
+        "makro_target_id": "",
+        "ownership_mode": "",
         "writes_performed": 0,
         "save_clicked": False,
         "send_to_qc_clicked": False,
@@ -574,11 +593,23 @@ def main() -> int:
                 if args.resume_current_url:
                     page = _resume_current_page(harness, args.resume_current_url)
                     manifest["resumed_from_page_url"] = page.url
+                    manifest["makro_target_id"] = page_target_id(page)
+                    manifest["ownership_mode"] = "resume_exact_page"
                     _write_manifest(manifest_path, manifest)
                     prepare_step1 = lambda: page
                     allow_initial_later_stage = True
                 else:
-                    prepare_step1 = lambda: prepare_single_step1_page(harness)
+                    page, owned_target_id = _create_fresh_owned_page(harness)
+                    manifest["makro_target_id"] = owned_target_id
+                    manifest["ownership_mode"] = "fresh_dedicated_tab"
+                    manifest["owned_page_start_url"] = str(page.url or "")
+                    _write_manifest(manifest_path, manifest)
+
+                    def prepare_step1():
+                        assert page is not None
+                        prepare_owned_step1_page(page)
+                        return page
+
                     allow_initial_later_stage = False
 
                 page, _vertical, _brand = _advance_listing_to_step3(
