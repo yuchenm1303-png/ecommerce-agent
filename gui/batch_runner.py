@@ -10,6 +10,7 @@ from typing import Any
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
+from app.listing_images import listing_images_from_resolver_outputs
 from app.required_overrides import write_required_fallback_overrides
 from .batch_model import BatchJob, BatchRun, create_batch_run, save_batch_run
 from .readonly_runner import RunnerConfig
@@ -311,12 +312,8 @@ class BatchController(QObject):
         for image in evidence:
             args.extend(["--image", str(image)])
         if self._execution_images:
-            product_images = [
-                Path(str(value))
-                for value in outputs.get("primary_source_product_images") or []
-                if str(value).strip() and Path(str(value)).is_file()
-            ]
-            for image in product_images[:5]:
+            listing_images = listing_images_from_resolver_outputs(outputs)
+            for image in listing_images[:5]:
                 args.extend(["--upload-image", str(image)])
         return args
 
