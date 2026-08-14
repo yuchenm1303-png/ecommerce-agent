@@ -374,9 +374,9 @@ def _plan_command(
     ]
     evidence_images = product_images or ([screenshot] if screenshot else [])
     product_url = str(resolver_manifest.get("primary_product_url") or args.product_url).strip()
-    if not decision_packet or not snapshot or not evidence_images:
+    if not decision_packet or not snapshot:
         raise RuntimeError(
-            "Current Resolver manifest is missing final decisions / source snapshot / evidence images"
+            "Current Resolver manifest is missing final decisions / canonical source snapshot"
         )
 
     command = [
