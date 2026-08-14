@@ -11,6 +11,7 @@ STYLE = (ROOT / "gui" / "nekro_style.py").read_text(encoding="utf-8")
 def test_native_renderer_imports_static_tokens_not_legacy_renderer() -> None:
     assert "from .nekro_style import NEKRO_STYLE" in VISUAL
     assert "from .visual_style import" not in VISUAL
+    assert not (ROOT / "gui" / "visual_style.py").exists()
     assert "window.setStyleSheet(window.styleSheet() + \"\\n\" + NEKRO_STYLE)" in VISUAL
 
 
