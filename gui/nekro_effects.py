@@ -5,12 +5,11 @@ import math
 import random
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QRect, Qt, QTimer
-from PySide6.QtGui import QColor, QCursor, QPainter, QPixmap, QRegion
-from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, Qt, QTimer
+from PySide6.QtGui import QColor, QPainter, QPixmap, QRegion
+from PySide6.QtWidgets import QMainWindow, QWidget
 
 
-# One and only dynamic presentation surface.
 _FRAME_MS = 16
 _FOLLOW_FACTOR = 0.35
 _CURSOR_RADIUS = 9.0
@@ -89,7 +88,7 @@ class SakuraParticle:
 
 
 class NekroEffects(QWidget):
-    """Single transparent layer for sakura and the follower circle."""
+    """Dirty-region sakura/cursor layer driven by the shared presentation clock."""
 
     def __init__(self, window: QMainWindow, *, sakura_count: int = _SAKURA_COUNT) -> None:
         central = window.centralWidget()
@@ -121,18 +120,9 @@ class NekroEffects(QWidget):
         self.cursor_current: QPointF | None = None
         self.cursor_visible = False
         self.cursor_pressed = False
+        self._next_frame_s = 0.0
 
-        # Window lifecycle events are sufficient here. Pointer coordinates are
-        # sampled in the existing animation frame, avoiding another global
-        # QApplication event filter and thousands of Python MouseMove callbacks.
         window.installEventFilter(self)
-
-        self.timer = QTimer(self)
-        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self.timer.setInterval(_FRAME_MS)
-        self.timer.timeout.connect(self._frame)
-        self.timer.start()
-
         window.destroyed.connect(self._cleanup)
         QTimer.singleShot(0, self.sync_geometry)
 
@@ -144,17 +134,17 @@ class NekroEffects(QWidget):
         self.raise_()
         self.show()
 
-    def _point_in_central(self, global_point: QPointF) -> QPointF | None:
+    def _point_in_central(self, global_point: QPoint) -> QPointF | None:
         central = self.window.centralWidget()
         if central is None or not self.window.isVisible():
             return None
-        local = central.mapFromGlobal(global_point.toPoint())
+        local = central.mapFromGlobal(global_point)
         if not central.rect().contains(local):
             return None
         return QPointF(local)
 
-    def _sample_pointer(self) -> None:
-        local = self._point_in_central(QPointF(QCursor.pos()))
+    def _sample_pointer(self, global_pos: QPoint, *, left_down: bool) -> None:
+        local = self._point_in_central(global_pos)
         if local is None:
             self.cursor_visible = False
             self.cursor_pressed = False
@@ -163,19 +153,19 @@ class NekroEffects(QWidget):
         if self.cursor_current is None:
             self.cursor_current = QPointF(local)
         self.cursor_visible = True
-        self.cursor_pressed = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
+        self.cursor_pressed = bool(left_down)
 
-    def _frame(self) -> None:
+    def presentation_tick(self, global_pos: QPoint, *, left_down: bool, now_s: float) -> None:
         if not self.isVisible() or self.window.isMinimized():
-            if self.timer.isActive():
-                self.timer.stop()
             return
+        if now_s < self._next_frame_s:
+            return
+        self._next_frame_s = now_s + (_FRAME_MS / 1000.0)
+        self._sample_pointer(global_pos, left_down=left_down)
 
-        self._sample_pointer()
         width = max(1, self.width())
         height = max(1, self.height())
         dirty = QRegion()
-
         for particle in self.particles:
             dirty = dirty.united(_petal_rect(particle.x, particle.y, particle.s))
             particle.update(width, height)
@@ -197,7 +187,6 @@ class NekroEffects(QWidget):
             dirty = dirty.united(_cursor_rect(old_cursor))
         if self.cursor_visible and self.cursor_current is not None:
             dirty = dirty.united(_cursor_rect(self.cursor_current))
-
         if not dirty.isEmpty():
             self.update(dirty)
 
@@ -222,31 +211,19 @@ class NekroEffects(QWidget):
             alpha = 128 if self.cursor_pressed else 64
             painter.setBrush(QColor(255, 255, 255, alpha))
             painter.drawEllipse(self.cursor_current, radius, radius)
-
         painter.end()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if watched is not self.window:
             return False
-
         event_type = event.type()
         if event_type in (QEvent.Type.Resize, QEvent.Type.Show):
             QTimer.singleShot(0, self.sync_geometry)
-            if not self.timer.isActive() and not self.window.isMinimized():
-                self.timer.start()
-        elif event_type == QEvent.Type.Hide:
-            self.timer.stop()
-        elif event_type == QEvent.Type.WindowStateChange:
-            if self.window.isMinimized():
-                self.timer.stop()
-            elif not self.timer.isActive():
-                self.timer.start()
         elif event_type == QEvent.Type.Leave:
             self.cursor_visible = False
         return False
 
     def _cleanup(self) -> None:
-        self.timer.stop()
         try:
             self.window.removeEventFilter(self)
         except RuntimeError:
@@ -261,3 +238,6 @@ def install_nekro_effects(
     effects = NekroEffects(window, sakura_count=sakura_count)
     window._nekro_effects = effects  # type: ignore[attr-defined]
     return effects
+
+
+__all__ = ["NekroEffects", "install_nekro_effects"]
