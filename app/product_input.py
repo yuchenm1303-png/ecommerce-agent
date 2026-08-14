@@ -39,24 +39,42 @@ def validate_product_input(
     url = str(product_url or "").strip()
     files = [str(value).strip() for value in product_files if str(value).strip()]
     manifest = str(product_pack_manifest or "").strip()
-    selected = int(bool(url)) + int(bool(files)) + int(bool(manifest))
-    if selected != 1:
-        raise ValueError("商品输入必须且只能选择一种：供应商 URL、客户资料文件、或已解析资料包。")
+
     if manifest:
+        if files:
+            raise ValueError("已解析资料包不能再同时传入原始 product files。")
+        payload = load_product_pack_manifest(manifest)
+        reference = str(payload.get("product_reference_url") or "").strip()
+        # Internal workflow helpers may carry the stable synthetic reference URL
+        # beside the manifest. It is identity metadata, not a second evidence input.
+        if url and url != reference:
+            raise ValueError(
+                "product-pack manifest 与 product_url 身份不一致："
+                f"manifest={reference!r}, product_url={url!r}"
+            )
         return "customer_product_pack"
+
     if files:
+        if url:
+            raise ValueError("供应商 URL 与客户资料文件不能同时作为 primary product input。")
         return "customer_product_pack"
+    if not url:
+        raise ValueError("商品输入不能为空：请选择供应商 URL 或客户资料文件。")
     return "supplier_url"
 
 
 def _from_pack_capture(captured: ProductPackCapture) -> AcquiredProductInput:
+    # The individual file/page snapshots stay persisted in product-pack.json for
+    # audit and future UI inspection. Resolver/planner/executor all bind to one
+    # canonical bootstrap snapshot plus the exact image set, so source-manifest
+    # digests remain identical across every safety boundary.
     return AcquiredProductInput(
         mode="customer_product_pack",
         product_reference_url=captured.product_reference_url,
         snapshot_path=captured.bootstrap_snapshot_path,
         snapshot=captured.bootstrap_snapshot,
-        supplier_snapshot_paths=(),
-        customer_snapshot_paths=captured.customer_snapshot_paths,
+        supplier_snapshot_paths=(captured.bootstrap_snapshot_path,),
+        customer_snapshot_paths=(),
         evidence_image_paths=captured.evidence_image_paths,
         listing_image_paths=captured.listing_image_paths,
         pack_manifest_path=captured.manifest_path,
@@ -73,8 +91,8 @@ def _from_pack_manifest(path: str | Path) -> AcquiredProductInput:
         product_reference_url=str(payload["product_reference_url"]),
         snapshot_path=bootstrap_path,
         snapshot=source_snapshot_from_json(bootstrap_path),
-        supplier_snapshot_paths=(),
-        customer_snapshot_paths=tuple(Path(str(value)) for value in payload.get("customer_snapshots") or []),
+        supplier_snapshot_paths=(bootstrap_path,),
+        customer_snapshot_paths=(),
         evidence_image_paths=tuple(Path(str(value)) for value in payload.get("evidence_images") or []),
         listing_image_paths=tuple(Path(str(value)) for value in payload.get("listing_images") or []),
         pack_manifest_path=manifest_path,
@@ -120,8 +138,8 @@ def acquire_product_input(
     """Acquire one normalized product input without applying product semantics.
 
     Supplier URLs retain the existing browser capture contract. Customer files are
-    persisted and parsed once into a Product Pack; a downstream subprocess can
-    receive ``product_pack_manifest`` to reuse exactly those bytes/snapshots.
+    persisted and parsed once into a Product Pack; downstream subprocesses reuse
+    its canonical bootstrap snapshot and exact images without re-reading originals.
     """
 
     mode = validate_product_input(
