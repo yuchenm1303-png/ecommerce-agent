@@ -1,9 +1,9 @@
-"""Grounded supplier-product identity extraction for listing bootstrap.
+"""Grounded product identity extraction for listing bootstrap.
 
-This module deliberately separates "what is being sold" from marketplace
-navigation. It consumes only product-focused supplier evidence plus a small
-bounded set of already-downloaded product images. Generic page body text is not
-part of the normal identity input.
+Supplier pages remain restricted to product-focused structured evidence so generic
+page chrome can never become product identity. Customer Product Packs are already
+mechanically curated at intake, so their normalized document text is an explicit
+product evidence source as well.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ class JSONTaskProvider(Protocol):
 
 
 class ProductIdentityError(ValueError):
-    """Supplier evidence did not establish one grounded physical product."""
+    """Grounded evidence did not establish one physical product."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -93,7 +93,7 @@ def build_product_identity_sources(
     *,
     image_paths: Iterable[str | Path] = (),
 ) -> list[dict[str, Any]]:
-    """Build a bounded evidence packet without generic visible page-body text."""
+    """Build bounded identity evidence from the normalized primary input."""
 
     sources: list[dict[str, Any]] = []
 
@@ -111,12 +111,27 @@ def build_product_identity_sources(
             }
         )
 
-    add_text(
-        "identity:page-title",
-        "supplier_product_heading",
-        snapshot.final_url or snapshot.requested_url,
-        snapshot.title,
+    is_customer_pack = (
+        str(snapshot.meta.get("input_mode") or "").strip().casefold()
+        == "customer_product_pack"
     )
+    if is_customer_pack:
+        # Unlike a supplier page, this text is generated only from files the
+        # customer explicitly selected as this product's evidence. It therefore
+        # has no site navigation/chrome contamination and is safe for identity.
+        add_text(
+            "identity:customer-pack-text",
+            "customer_product_document",
+            snapshot.final_url or snapshot.requested_url,
+            snapshot.visible_text[:12000],
+        )
+    else:
+        add_text(
+            "identity:page-title",
+            "supplier_product_heading",
+            snapshot.final_url or snapshot.requested_url,
+            snapshot.title,
+        )
 
     preferred_meta = (
         "og:title",
@@ -129,7 +144,7 @@ def build_product_identity_sources(
         if value:
             add_text(
                 f"identity:meta:{key}",
-                "supplier_product_metadata",
+                "customer_product_metadata" if is_customer_pack else "supplier_product_metadata",
                 f"meta:{key}",
                 value[:1800],
             )
@@ -160,7 +175,12 @@ def build_product_identity_sources(
             continue
         content = f"{key}: {value}"[:1000]
         source_id = f"identity:attribute:{row.table_index}:{row.row_index}"
-        add_text(source_id, "supplier_product_attribute", source_id, content)
+        add_text(
+            source_id,
+            "customer_product_attribute" if is_customer_pack else "supplier_product_attribute",
+            source_id,
+            content,
+        )
         table_chars += len(content)
         table_count += 1
 
@@ -199,7 +219,7 @@ def build_product_identity_sources(
         sources.append(
             {
                 "source_id": f"identity:image:{image_count}",
-                "source_type": "supplier_product_image",
+                "source_type": "customer_product_image" if is_customer_pack else "supplier_product_image",
                 "kind": "image",
                 "image_path": str(path),
             }
@@ -218,10 +238,10 @@ def build_product_identity_request(
     return {
         "task": "infer_grounded_supplier_product_identity",
         "system_instruction": (
-            "Identify the physical item actually being offered for sale from product-focused supplier "
-            "evidence. The supplier website/platform itself is never the product unless the evidence "
-            "explicitly offers a service rather than a physical item. Evidence may be in any language. "
-            "Return canonical English product identity. JSON only."
+            "Identify the physical item actually being offered for sale from product-focused evidence. "
+            "A supplier website/platform itself is never the product unless the evidence explicitly offers "
+            "a service rather than a physical item. Evidence may be in any language. Return canonical "
+            "English product identity. JSON only."
         ),
         "prompt_instruction": (
             "Use only grounded_sources. Ignore site navigation, marketplace branding, seller-platform "
@@ -295,7 +315,7 @@ def _parse_product_identity(raw: Any, *, allowed_refs: set[str]) -> ProductIdent
     product_type = _clean(raw.get("product_type_en"))
     if entity_kind != "physical_product":
         raise ProductIdentityError(
-            f"supplier evidence did not establish one physical product (entity_kind={entity_kind or 'unknown'})"
+            f"product evidence did not establish one physical product (entity_kind={entity_kind or 'unknown'})"
         )
     if (
         len(product_type) < 2
