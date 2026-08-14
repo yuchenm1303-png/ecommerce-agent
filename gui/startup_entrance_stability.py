@@ -15,7 +15,12 @@ _NATIVE_SETTLE_FRAMES = 2
 
 
 class StartupEntranceStabilityGate(QObject):
-    """Keep startup snapshot geometry and the live QWidget/Quick handoff identical."""
+    """Keep startup snapshot geometry and the live QWidget/Quick handoff identical.
+
+    The startup overlay is the sole animated owner until handoff. Runtime card /
+    cursor/parallax presentation is held by the shared PresentationClock and is
+    resumed only after the final covered native geometry frame is committed.
+    """
 
     def __init__(self, window: QMainWindow, entrance: Any) -> None:
         super().__init__(window)
@@ -30,6 +35,11 @@ class StartupEntranceStabilityGate(QObject):
         self._stable_samples = 0
         self._start_requested = False
         self._handoff_started = False
+
+        clock = getattr(window, "_presentation_clock", None)
+        suspend = getattr(clock, "suspend", None)
+        if callable(suspend):
+            suspend("startup")
 
         if self.overlay is not None:
             try:
@@ -130,23 +140,20 @@ class StartupEntranceStabilityGate(QObject):
             if callable(start):
                 start()
             return
-
         QTimer.singleShot(_LAYOUT_POLL_MS, self._probe_layout)
 
     def _flush_native_background(self) -> None:
-        """Publish final Quick card geometry/mask while the startup overlay hides it."""
+        """Publish final Quick card geometry while the startup overlay covers it."""
 
         background = self.background
         if background is None:
             return
-
         geometry_timer = getattr(background, "_geometry_timer", None)
         if geometry_timer is not None:
             try:
                 geometry_timer.stop()
             except RuntimeError:
                 pass
-
         flush = getattr(background, "_flush_geometry", None)
         if callable(flush):
             try:
@@ -165,30 +172,6 @@ class StartupEntranceStabilityGate(QObject):
                 pass
 
     def _prime_static_runtime(self) -> None:
-        """Prepare the exact live QWidget and Quick geometry under the final overlay frame."""
-
-        # Compatibility with older local-glass builds. Current production glass is
-        # owned by NativeQuickBackground, flushed synchronously below.
-        local_glass = getattr(self.window, "_scroll_local_glass", None)
-        layer = getattr(local_glass, "_layer", None)
-        if isinstance(layer, QWidget):
-            try:
-                layer.show()
-                resize = getattr(local_glass, "resize_to_viewport", None)
-                if callable(resize):
-                    resize()
-                sync = getattr(local_glass, "sync_card_geometry", None)
-                if callable(sync):
-                    sync()
-                layer.update()
-            except RuntimeError:
-                pass
-
-        try:
-            self.entrance._hidden_local_glass = None  # noqa: SLF001
-        except (AttributeError, RuntimeError):
-            pass
-
         glass = getattr(self.visual, "_glass", None)
         if isinstance(glass, dict):
             for frame in glass:
@@ -206,7 +189,6 @@ class StartupEntranceStabilityGate(QObject):
                 central.update()
             except RuntimeError:
                 pass
-
         self._flush_native_background()
 
     def _stage_finish(self) -> None:
@@ -222,9 +204,6 @@ class StartupEntranceStabilityGate(QObject):
         QTimer.singleShot(_HANDOFF_FRAME_MS, self._settle_live_runtime)
 
     def _settle_live_runtime(self) -> None:
-        # A second native flush catches any geometry/layout request produced by the
-        # first covered QWidget paint. Keep the overlay visible until Quick has had
-        # another frame to consume the final mask texture.
         self._flush_native_background()
         QTimer.singleShot(
             _HANDOFF_FRAME_MS * max(1, _NATIVE_SETTLE_FRAMES - 1),
@@ -232,9 +211,6 @@ class StartupEntranceStabilityGate(QObject):
         )
 
     def _commit_overlay_handoff(self) -> None:
-        # One final cheap geometry flush is intentional here: it should be a no-op
-        # when the covered settle frames were stable, and prevents a queued 24 ms
-        # mask update from becoming the first visible post-entrance frame.
         self._flush_native_background()
 
         overlay = self.overlay
@@ -252,9 +228,11 @@ class StartupEntranceStabilityGate(QObject):
             except RuntimeError:
                 pass
 
+        # Preserve the established staged handoff: decorative overlay first,
+        # card interactivity second, shared runtime presentation last.
         QTimer.singleShot(_HANDOFF_FRAME_MS, self._resume_effects)
         QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_card_fx)
-        QTimer.singleShot(_HANDOFF_FRAME_MS * 3, self._resume_pointer)
+        QTimer.singleShot(_HANDOFF_FRAME_MS * 3, self._resume_presentation)
 
     def _resume_effects(self) -> None:
         effects = getattr(self.entrance, "_hidden_effects", None)
@@ -280,27 +258,11 @@ class StartupEntranceStabilityGate(QObject):
             except RuntimeError:
                 pass
 
-    def _resume_pointer(self) -> None:
-        pointer_timer = getattr(self.background, "_pointer_timer", None)
-        if bool(getattr(self.entrance, "_pointer_was_active", False)) and pointer_timer is not None:
-            try:
-                if not pointer_timer.isActive():
-                    pointer_timer.start()
-            except RuntimeError:
-                pass
-        if self.background is not None:
-            try:
-                self.background._last_pointer_norm = None  # noqa: SLF001
-            except (AttributeError, RuntimeError):
-                pass
-
-        hotpath = getattr(self.window, "_background_pointer_hotpath", None)
-        if hotpath is not None:
-            try:
-                hotpath._last_global = None  # noqa: SLF001
-                hotpath._last_geometry = None  # noqa: SLF001
-            except (AttributeError, RuntimeError):
-                pass
+    def _resume_presentation(self) -> None:
+        clock = getattr(self.window, "_presentation_clock", None)
+        resume = getattr(clock, "resume", None)
+        if callable(resume):
+            resume("startup")
 
 
 def install_startup_entrance_stability(
