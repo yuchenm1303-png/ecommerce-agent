@@ -16,6 +16,7 @@ from gui.app_updater import (
     ApplicationUpdater as _BaseApplicationUpdater,
     _sha256_file,
     _update_marker_path,
+    _version_key,
     _write_update_marker,
 )
 
@@ -454,9 +455,9 @@ class ApplicationUpdater(_BaseApplicationUpdater):
 
     def _prompt_for_update(self, manifest: dict[str, Any]) -> None:
         latest = str(manifest["version"])
-        current_key = self._version_key_for_prompt(self.current_version)
+        current_key = _version_key(self.current_version) or (0, 0, 0)
         min_supported = str(manifest.get("min_supported_version") or "").strip()
-        minimum_key = self._version_key_for_prompt(min_supported)
+        minimum_key = _version_key(min_supported)
         required = bool(manifest.get("required", False)) or (
             minimum_key is not None and current_key < minimum_key
         )
@@ -475,7 +476,8 @@ class ApplicationUpdater(_BaseApplicationUpdater):
             "2. 下载更新包\n"
             "3. 校验文件完整性\n"
             "4. 启动安装并自动重启\n\n"
-            "整个过程中不会自动提交商品，也不会触碰当前 Makro 数据。"
+            "更新不会自动提交商品，也不会触发 Send to QC。\n"
+            "安装阶段会关闭 Listing Studio，请先结束正在执行的上架任务。"
         )
         if delivery == "portal":
             detail = f"{detail}\n\n更新包会使用当前已授权账号进行安全下载。"
@@ -512,16 +514,6 @@ class ApplicationUpdater(_BaseApplicationUpdater):
             QApplication.quit()
         elif box.clickedButton() is fallback_button:
             return
-
-    @staticmethod
-    def _version_key_for_prompt(value: str) -> tuple[int, int, int] | None:
-        parts = str(value or "").strip().lstrip("v").split(".")
-        if len(parts) < 3:
-            return None
-        try:
-            return int(parts[0]), int(parts[1]), int(parts[2].split("-")[0])
-        except (TypeError, ValueError):
-            return None
 
     def _portal_failure(self, message: str, *, required: bool) -> None:
         self._last_prompted_version = None
