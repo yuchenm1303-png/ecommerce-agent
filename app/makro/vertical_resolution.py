@@ -28,6 +28,13 @@ _VALID_SELECTION_RELATIONS = {
     _BROADER_VALID_CLASS,
     _NO_VALID_CLASS,
 }
+_TOKEN_STOPWORDS = {
+    "a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with",
+}
+_GENERIC_CLASS_NOUNS = {
+    "appliance", "apparatus", "device", "equipment", "item", "machine",
+    "product", "system", "tool", "unit",
+}
 
 
 def _clean(value: object) -> str:
@@ -240,6 +247,77 @@ def merge_vertical_search_observations(
     return merged[: max(1, int(max_candidates))]
 
 
+def _stem_category_token(token: str) -> str:
+    value = str(token or "").casefold().strip()
+    if len(value) > 4 and value.endswith("ies"):
+        value = value[:-3] + "y"
+    elif len(value) > 4 and value.endswith("sses"):
+        value = value[:-2]
+    elif len(value) > 4 and value.endswith(("ches", "shes", "xes", "zes")):
+        value = value[:-2]
+    elif len(value) > 3 and value.endswith("s") and not value.endswith("ss"):
+        value = value[:-1]
+    if len(value) > 5 and value.endswith("ing"):
+        value = value[:-3]
+    elif len(value) > 4 and value.endswith("ed"):
+        value = value[:-2]
+    if len(value) > 4 and value.endswith("er"):
+        value = value[:-2]
+    return value
+
+
+def _meaningful_category_tokens(value: object) -> set[str]:
+    output: set[str] = set()
+    for raw in re.findall(r"[a-z0-9]+", _clean(value).casefold()):
+        if raw in _TOKEN_STOPWORDS:
+            continue
+        token = _stem_category_token(raw)
+        if not token or token in _GENERIC_CLASS_NOUNS or len(token) < 2:
+            continue
+        output.add(token)
+    return output
+
+
+def _product_semantic_tokens(hints: ListingBootstrapHints) -> set[str]:
+    identity = _identity(hints)
+    evidence = [
+        _canonical_product_type(hints),
+        hints.product_summary,
+        identity.get("product_type_en", ""),
+        identity.get("product_summary", ""),
+    ]
+    output: set[str] = set()
+    for value in evidence:
+        output.update(_meaningful_category_tokens(value))
+    return output
+
+
+def _token_is_supported(token: str, evidence_tokens: set[str]) -> bool:
+    if token in evidence_tokens:
+        return True
+    if len(token) < 4:
+        return False
+    return any(
+        len(existing) >= 4 and (token in existing or existing in token)
+        for existing in evidence_tokens
+    )
+
+
+def unsupported_candidate_constraints(
+    hints: ListingBootstrapHints,
+    candidate_label: str,
+) -> tuple[str, ...]:
+    """Return leaf-category qualifiers that are not grounded in Product Identity."""
+
+    parts = [part.strip() for part in str(candidate_label or "").split("/") if part.strip()]
+    leaf = parts[-1] if parts else str(candidate_label or "").strip()
+    candidate_tokens = _meaningful_category_tokens(leaf)
+    evidence_tokens = _product_semantic_tokens(hints)
+    return tuple(
+        sorted(token for token in candidate_tokens if not _token_is_supported(token, evidence_tokens))
+    )
+
+
 def build_vertical_pool_choice_request(
     hints: ListingBootstrapHints,
     search_terms: tuple[str, ...],
@@ -269,8 +347,10 @@ def build_vertical_pool_choice_request(
             "The search query that retrieved a row is only a retrieval hint, not evidence that the row is correct.",
             "Judge the full breadcrumb and especially its leaf against the physical product identity.",
             "First prefer a candidate representing the same physical product type; use selection_relation=same_product_type.",
-            "If no same-product candidate exists, a broader_valid_class is allowed only when it is a genuine semantic superclass that can contain this product without changing its defining mechanism, form, role or use case.",
-            "A more specific category with a different defining mechanism, form, role or use case is an adjacent sibling, not a broader class, even when it shares the same head noun.",
+            "If no same-product candidate exists, broader_valid_class is allowed only for a genuine semantic superclass that contains the product.",
+            "A broader class may REMOVE qualifiers from the product identity, but it must never ADD a new defining capability, mechanism, form, audience or use-case that the product evidence does not support.",
+            "A more specific category with a different defining qualifier is an adjacent sibling, not a broader class, even when it shares the same head noun.",
+            "For example, a generic Sealer may contain a handheld heat bag sealer, while Vacuum Bag Sealer adds a vacuum capability and is not broader unless vacuum is grounded in the product evidence.",
             "Reject candidates that merely share modifiers, power terms, model-like tokens or incidental words with the product.",
             "Do not choose chargers, batteries, spare parts, accessories or other adjacent products unless the product itself is one.",
             "Prefer the most specific valid candidate: same product type before broader valid class.",
@@ -303,32 +383,24 @@ def choose_vertical_candidate_pool(
     raw = provider.extract_json(build_vertical_pool_choice_request(hints, search_terms, candidates))
     if not isinstance(raw, dict):
         raise ValueError("aggregated Vertical chooser response must be a JSON object")
-
     selected = _clean(raw.get("selected_vertical"))
     relation = _clean(raw.get("selection_relation")).casefold()
-    # Compatibility for local/unit providers written against the previous
-    # response shape. Production uses strict_json_schema and must return the
-    # explicit relation above.
     if not relation:
         relation = _SAME_PRODUCT_TYPE if selected else _NO_VALID_CLASS
     if relation not in _VALID_SELECTION_RELATIONS:
         raise ValueError(f"invalid Makro Vertical selection_relation={relation!r}")
-
     if not selected:
         if relation != _NO_VALID_CLASS:
             raise ValueError("empty Makro Vertical selection requires selection_relation='none'")
         return ""
     if relation not in {_SAME_PRODUCT_TYPE, _BROADER_VALID_CLASS}:
-        raise ValueError(
-            "non-empty Makro Vertical selection requires same_product_type or broader_valid_class"
-        )
-
+        raise ValueError("non-empty Makro Vertical selection requires same_product_type or broader_valid_class")
     wanted = normalize_label(selected)
     matches = [item.label for item in candidates if normalize_label(item.label) == wanted]
     if len(matches) != 1:
-        raise ValueError(
-            f"AI returned a Vertical that is not one unique aggregated live candidate: {selected!r}"
-        )
+        raise ValueError(f"AI returned a Vertical that is not one unique aggregated live candidate: {selected!r}")
+    if unsupported_candidate_constraints(hints, matches[0]):
+        return ""
     return matches[0]
 
 
@@ -351,4 +423,5 @@ __all__ = [
     "matched_queries_for_candidate",
     "merge_vertical_search_observations",
     "plan_vertical_search_terms",
+    "unsupported_candidate_constraints",
 ]
