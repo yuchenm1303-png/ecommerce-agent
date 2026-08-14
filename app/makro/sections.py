@@ -63,6 +63,40 @@ _FIND_SECTIONS_SCRIPT = (
     + "\n}"
 )
 
+_RESET_SECTION_SCAN_ORIGIN_SCRIPT = r"""
+({sectionPath}) => {
+  const doc = document.scrollingElement || document.documentElement;
+  doc.scrollTop = 0;
+  doc.scrollLeft = 0;
+  const section = document.querySelector(sectionPath);
+  if (!section) return false;
+  section.scrollIntoView({block: 'start', inline: 'nearest'});
+  const reset = (el) => {
+    try {
+      if (el.scrollHeight > el.clientHeight + 2) el.scrollTop = 0;
+      if (el.scrollWidth > el.clientWidth + 2) el.scrollLeft = 0;
+    } catch (_) {}
+  };
+  reset(section);
+  section.querySelectorAll('*').forEach(reset);
+  return true;
+}
+"""
+
+_RESET_ONE_SCROLL_CONTAINER_SCRIPT = r"""
+({path}) => {
+  const el = document.querySelector(path);
+  if (!el) return false;
+  if (el.scrollHeight > el.clientHeight + 2) el.scrollTop = 0;
+  if (el.scrollWidth > el.clientWidth + 2) el.scrollLeft = 0;
+  return true;
+}
+"""
+
+_SCAN_STABLE_SAMPLES = 2
+_SCAN_MAX_PASSES = 4
+
+
 def find_sections(page: Page) -> list[dict[str, Any]]:
     """List all listing section cards with title and expanded state."""
     return page.evaluate(_FIND_SECTIONS_SCRIPT)
@@ -85,19 +119,67 @@ def _await_section_cards(
     return sections
 
 
-def scan_section_fields(
+def _scan_option_tokens(values: Any) -> tuple[tuple[str, str], ...]:
+    tokens: list[tuple[str, str]] = []
+    for value in values or []:
+        if isinstance(value, dict):
+            tokens.append(
+                (
+                    str(value.get("text") or "").strip(),
+                    str(value.get("value") or "").strip(),
+                )
+            )
+        else:
+            tokens.append((str(value or "").strip(), ""))
+    return tuple(sorted(tokens))
+
+
+def _section_scan_signature(controls: list[dict[str, Any]]) -> tuple[tuple[Any, ...], ...]:
+    """Return the semantic contract observed in one complete canonical pass."""
+
+    fields = build_semantic_fields(controls)
+    return tuple(
+        sorted(
+            (
+                str(field.get("attribute_key") or "").strip(),
+                str(field.get("label") or "").strip(),
+                str(field.get("section_heading") or "").strip(),
+                bool(field.get("required")),
+                bool(field.get("multi_value")),
+                _scan_option_tokens(field.get("options")),
+                _scan_option_tokens(field.get("qualifier_options")),
+            )
+            for field in fields
+        )
+    )
+
+
+def _reset_section_scan_origin(page: Page, section_path: str, *, wait_ms: int) -> None:
+    """Put the page and nested scrollers at a deterministic start position."""
+
+    if not page.evaluate(
+        _RESET_SECTION_SCAN_ORIGIN_SCRIPT,
+        {"sectionPath": section_path},
+    ):
+        raise RuntimeError("Makro section scan lost its target DOM node before canonical reset.")
+    page.wait_for_timeout(max(80, min(int(wait_ms), 350)))
+
+
+def _scan_section_once(
     page: Page,
     section_path: str,
     *,
-    include_values: bool = False,
-    wait_ms: int = 350,
-    max_scroll_steps: int = 200,
+    include_values: bool,
+    wait_ms: int,
+    max_scroll_steps: int,
 ) -> list[dict[str, Any]]:
-    """Scroll the window plus the section's own containers and scan its fields."""
+    """Perform one top-to-bottom pass from a canonical scroll origin."""
 
+    _reset_section_scan_origin(page, section_path, wait_ms=wait_ms)
     scans: list[list[dict[str, Any]]] = [
         capture_controls(page, include_values=include_values)
     ]
+
     for _ in range(max_scroll_steps):
         state = scroll_window(page)
         if not state.get("moved"):
@@ -106,9 +188,19 @@ def scan_section_fields(
         scans.append(capture_controls(page, include_values=include_values))
 
     for container in find_scroll_containers(page):
-        container_path = container.get("path", "")
+        container_path = str(container.get("path") or "")
         if not container_path.startswith(section_path + " > "):
             continue
+        try:
+            page.locator(container_path).scroll_into_view_if_needed(timeout=2_000)
+        except Exception:
+            pass
+        if page.evaluate(
+            _RESET_ONE_SCROLL_CONTAINER_SCRIPT,
+            {"path": container_path},
+        ):
+            page.wait_for_timeout(max(60, min(int(wait_ms), 250)))
+            scans.append(capture_controls(page, include_values=include_values))
         for _ in range(max_scroll_steps):
             state = scroll_container(page, container_path)
             if not state.get("moved"):
@@ -119,6 +211,53 @@ def scan_section_fields(
     merged = merge_scans(scans)
     prefix = section_path + " > "
     return [item for item in merged if item.get("path", "").startswith(prefix)]
+
+
+def scan_section_fields(
+    page: Page,
+    section_path: str,
+    *,
+    include_values: bool = False,
+    wait_ms: int = 350,
+    max_scroll_steps: int = 200,
+) -> list[dict[str, Any]]:
+    """Return a deterministic section schema after consecutive stable full passes.
+
+    Makro mounts some attribute groups asynchronously and can leave the page at
+    an arbitrary scroll offset after earlier scans. A single pass can therefore
+    miss a suffix of one card and falsely look like schema drift. Every pass now
+    starts from the same page/section/container origin and the result is accepted
+    only after two consecutive complete passes expose the same semantic contract.
+    """
+
+    previous_signature: tuple[tuple[Any, ...], ...] | None = None
+    stable_samples = 0
+    observed_counts: list[int] = []
+    latest: list[dict[str, Any]] = []
+
+    for _ in range(_SCAN_MAX_PASSES):
+        latest = _scan_section_once(
+            page,
+            section_path,
+            include_values=include_values,
+            wait_ms=wait_ms,
+            max_scroll_steps=max_scroll_steps,
+        )
+        signature = _section_scan_signature(latest)
+        observed_counts.append(len(signature))
+        if previous_signature is not None and signature == previous_signature:
+            stable_samples += 1
+            if stable_samples >= _SCAN_STABLE_SAMPLES - 1:
+                return latest
+        else:
+            stable_samples = 0
+        previous_signature = signature
+        page.wait_for_timeout(max(120, min(int(wait_ms), 400)))
+
+    raise RuntimeError(
+        "Makro section live fields did not stabilize across canonical scans; "
+        f"semantic_counts={observed_counts}. Refusing to emit a partial schema."
+    )
 
 
 def scan_sections(
@@ -140,6 +279,7 @@ def scan_sections(
         "sections_found": len(sections),
         "sections_expanded_by_scan": 0,
         "sections_cancelled": 0,
+        "scan_contract": "canonical-origin + consecutive-stable-pass",
     }
     section_results: list[dict[str, Any]] = []
     flat_scans: list[list[dict[str, Any]]] = []
@@ -207,12 +347,11 @@ def scan_sections(
 def _wait_for_section_fields(
     page: Page, section_title: str, *, wait_ms: int, timeout_s: float
 ) -> dict[str, Any] | None:
-    """Return the current section node once its actual fields have rendered.
+    """Return the current section node once its first actual fields have rendered.
 
-    Makro exposes the Cancel/Save actions before its asynchronous attribute
-    form has finished rendering.  Treating Cancel as readiness races the form
-    load and can produce an empty live schema immediately after Step 2. React
-    may also replace the card while expanding it, so every poll resolves the
+    This is only the initial-render gate. Completeness is established later by
+    :func:`scan_section_fields`, which requires consecutive stable full scans.
+    React may replace the card while expanding it, so every poll resolves the
     card again by its stable title rather than retaining a structural DOM path.
     """
     deadline = time.monotonic() + timeout_s
