@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 GUI_WORKFLOW = (ROOT / "makro_gui_workflow.py").read_text(encoding="utf-8")
 BATCH_JOB = (ROOT / "makro_batch_job.py").read_text(encoding="utf-8")
 TRANSITION_SOURCE = (ROOT / "app" / "makro" / "step3_transition.py").read_text(encoding="utf-8")
+INTERRUPTION_SOURCE = (ROOT / "app" / "makro" / "portal_interruptions.py").read_text(encoding="utf-8")
 
 
 class FakeContext:
@@ -135,13 +136,14 @@ def test_multiple_new_step3_pages_fail_closed(monkeypatch):
         )
 
 
-def test_joyride_handling_never_force_clicks_business_controls() -> None:
-    assert "joyride-overlay" in TRANSITION_SOURCE
-    assert 'page.keyboard.press("Escape")' in TRANSITION_SOURCE
-    assert 'data-action="skip"' in TRANSITION_SOURCE
-    assert 'data-action="close"' in TRANSITION_SOURCE
-    assert "force=True" not in TRANSITION_SOURCE
-    assert "business buttons were not force-clicked" in TRANSITION_SOURCE
+def test_portal_interruption_handling_never_force_clicks_business_controls() -> None:
+    assert "joyride-overlay" in INTERRUPTION_SOURCE
+    assert 'page.keyboard.press("Escape")' in INTERRUPTION_SOURCE
+    assert 'data-action="skip"' in INTERRUPTION_SOURCE
+    assert 'data-action="close"' in INTERRUPTION_SOURCE
+    assert "force=True" not in INTERRUPTION_SOURCE
+    assert "business controls were not force-clicked" in INTERRUPTION_SOURCE
+    assert "reconcile_portal_interruptions" in TRANSITION_SOURCE
 
 
 def test_formal_single_and_batch_use_exact_recovered_step3_page() -> None:

@@ -27,108 +27,25 @@ from .listing_creation import (
     select_brand,
 )
 from .portal_adapter import MakroPortalAdapter
+from .portal_interruptions import reconcile_portal_interruptions
 
 
 _CREATE_LISTING_TIMEOUT_ERROR = (
     "Makro Step 2 clicked Create New Listing, but Step 3 did not appear"
 )
-_JOYRIDE_SELECTOR = (
-    ".joyride-overlay, .react-joyride__overlay, [class*='joyride-overlay']"
-)
 _RECOVERY_TIMEOUT_S = 30.0
 _RECOVERY_POLL_MS = 250
 
 
-def _first_visible(locator: Any):
-    try:
-        count = locator.count()
-    except Exception:
-        return None
-    for index in range(count):
-        item = locator.nth(index)
-        try:
-            if item.is_visible():
-                return item
-        except Exception:
-            continue
-    return None
-
-
-def _joyride_root(page: Page):
-    try:
-        return _first_visible(page.locator(_JOYRIDE_SELECTOR))
-    except Exception:
-        return None
-
-
 def dismiss_joyride_overlay(page: Page) -> bool:
-    """Dismiss Makro's optional onboarding tour without forcing business clicks.
+    """Backward-compatible entry point for the unified portal interruption gate.
 
-    The tour is presentation-only but its overlay intercepts pointer events. We
-    first use Escape, then only exact tutorial close/skip controls inside the
-    overlay. We never use ``force=True`` and never remove portal DOM nodes.
+    Existing Single/Batch orchestration calls this function before Step 1/2
+    business actions. The implementation now reconciles the whole bounded stack
+    of safe presentation-only interruptions rather than one Joyride DOM shape.
     """
 
-    root = _joyride_root(page)
-    if root is None:
-        return False
-
-    try:
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(220)
-    except Exception:
-        pass
-    if _joyride_root(page) is None:
-        return True
-
-    safe_selectors = (
-        'button[data-action="skip"]',
-        '[role="button"][data-action="skip"]',
-        'button[data-action="close"]',
-        '[role="button"][data-action="close"]',
-        'button[aria-label="Close"]',
-        '[role="button"][aria-label="Close"]',
-    )
-    for selector in safe_selectors:
-        root = _joyride_root(page)
-        if root is None:
-            return True
-        try:
-            button = _first_visible(root.locator(selector))
-        except Exception:
-            button = None
-        if button is None:
-            continue
-        try:
-            button.click(timeout=2000)
-            page.wait_for_timeout(220)
-        except Exception:
-            continue
-        if _joyride_root(page) is None:
-            return True
-
-    for label in ("Skip", "Close", "Done", "Got it", "跳过", "关闭", "完成", "知道了"):
-        root = _joyride_root(page)
-        if root is None:
-            return True
-        try:
-            button = _first_visible(root.get_by_role("button", name=label, exact=True))
-        except Exception:
-            button = None
-        if button is None:
-            continue
-        try:
-            button.click(timeout=2000)
-            page.wait_for_timeout(220)
-        except Exception:
-            continue
-        if _joyride_root(page) is None:
-            return True
-
-    raise RuntimeError(
-        "Makro onboarding tutorial overlay is blocking listing controls. "
-        "Please close the visible tutorial once and retry; business buttons were not force-clicked."
-    )
+    return reconcile_portal_interruptions(page) > 0
 
 
 def _is_makro_page(page: Any) -> bool:
