@@ -1,7 +1,13 @@
 import pytest
 
 import app.business_fields as business_fields
-from app.business_fields import generate_listing_sku, generated_business_bundle
+from app.business_fields import (
+    BUSINESS_ATTRIBUTE_ALIASES,
+    MAKRO_ACCOUNT_FIXED_DEFAULTS,
+    generate_listing_sku,
+    generated_business_bundle,
+    is_business_question,
+)
 
 
 URL = "https://detail.1688.com/offer/850845635717.html?spm=tracking"
@@ -42,3 +48,49 @@ def test_generated_sku_is_explicit_business_rule_not_product_evidence():
 def test_generated_business_bundle_rejects_invalid_explicit_sku():
     with pytest.raises(ValueError, match="12 位纯数字"):
         generated_business_bundle(URL, sku="not-a-sku")
+
+
+def test_account_fixed_defaults_are_single_config_source_for_all_listings():
+    bundle = generated_business_bundle(URL, sku="812345678901")
+    expected = {
+        "minimum_order_quantity": "1",
+        "max_order_quantity_allowed": "99",
+        "service_profile": "FBS",
+        "shipping_days": "14",
+        "forbid_shipping": "National",
+        "country_of_origin": "China",
+        "manufacturer_details": "LILI",
+        "packer_details": "LILI",
+        "importer_details": "LILI",
+    }
+
+    assert {key: value for key, value, _source in MAKRO_ACCOUNT_FIXED_DEFAULTS} == expected
+    for attribute_key, expected_value in expected.items():
+        items = bundle.candidates((attribute_key, *BUSINESS_ATTRIBUTE_ALIASES[attribute_key]))
+        assert len(items) == 1
+        assert items[0].value == expected_value
+        assert items[0].source_type == "config"
+        assert items[0].source_reference.startswith("account-default:")
+        assert items[0].confidence == 1.0
+
+
+def test_account_fixed_labels_are_business_fields_and_skip_product_reasoning():
+    labels = (
+        "Minimum Order Quantity (MinOQ)",
+        "Maximum Order Quantity (MaxOQ)",
+        "Fulfilment by",
+        "Pick Pack SLA",
+        "Selling region preference",
+        "Country Of Origin",
+        "Manufacturer Details",
+        "Packer Details",
+        "Importer Details",
+    )
+    assert all(is_business_question(label) for label in labels)
+
+
+def test_price_and_listing_status_are_not_silently_fixed_by_account_defaults():
+    bundle = generated_business_bundle(URL, sku="812345678901")
+    assert bundle.candidates(("mrp", "Base Price")) == []
+    assert bundle.candidates(("flipkart_selling_price", "Your selling price")) == []
+    assert bundle.candidates(("listing_status", "Listing Status")) == []
