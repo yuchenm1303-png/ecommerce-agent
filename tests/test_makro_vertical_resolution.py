@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import pytest
 
+import app.makro.vertical_resolution as vertical_resolution
 import app.makro.vertical_selection as vertical_selection
 from app.makro.listing_creation import ListingBootstrapHints
 from app.makro.vertical_resolution import (
     build_vertical_pool_choice_request,
+    build_vertical_search_plan_request,
     choose_vertical_candidate_pool,
     merge_vertical_search_observations,
     plan_vertical_search_terms,
@@ -62,6 +64,22 @@ def test_search_planner_replaces_raw_identity_phrase_with_clean_retrieval_intent
     request = provider.requests[0]
     assert request["context"]["product_type_en"] == "rechargeable bag sealer"
     assert "power source" in " ".join(request["rules"]).casefold()
+
+
+def test_search_plan_schema_allows_one_reliable_query_instead_of_forced_synonyms() -> None:
+    request = build_vertical_search_plan_request(_bag_sealer_hints())
+    schema = request["json_contract"]["properties"]["queries"]
+    assert schema["minItems"] == 1
+    assert schema["maxItems"] == 5
+
+
+def test_search_query_guard_rejects_platform_pollution_without_blocking_real_product_names() -> None:
+    assert vertical_resolution._usable_query("Makro bag sealer") is False
+    assert vertical_resolution._usable_query("seller category") is False
+    assert vertical_resolution._usable_query("vertical") is False
+    assert vertical_resolution._usable_query("category") is False
+    assert vertical_resolution._usable_query("vertical blinds") is True
+    assert vertical_resolution._usable_query("category 6 cable") is True
 
 
 def test_search_planner_falls_back_to_grounded_product_type_if_planner_fails() -> None:

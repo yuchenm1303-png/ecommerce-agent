@@ -18,7 +18,8 @@ from .listing_creation import JSONTaskProvider, ListingBootstrapHints, normalize
 _MAX_SEARCH_TERMS = 5
 _MAX_LIVE_CANDIDATES = 40
 _QUERY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 '&/()+.,-]*$")
-_DISALLOWED_QUERY_WORDS = {"makro", "marketplace", "listing", "seller", "vertical", "category"}
+_FORBIDDEN_PLATFORM_WORDS = {"makro", "marketplace", "seller", "listing"}
+_GENERIC_ONLY_QUERY_WORDS = {"vertical", "category", "product"}
 
 
 def _clean(value: object) -> str:
@@ -37,7 +38,9 @@ def _usable_query(value: object) -> bool:
     if not key or not re.search(r"[a-z]", key):
         return False
     words = set(key.split())
-    return not bool(words & _DISALLOWED_QUERY_WORDS)
+    if words & _FORBIDDEN_PLATFORM_WORDS:
+        return False
+    return not bool(words and words <= _GENERIC_ONLY_QUERY_WORDS)
 
 
 def _identity(hints: ListingBootstrapHints) -> dict[str, Any]:
@@ -88,12 +91,12 @@ def build_vertical_search_plan_request(hints: ListingBootstrapHints) -> dict[str
             "product_identity": identity,
         },
         "rules": [
-            "Return 3 to 5 concise English product-type noun phrases when possible.",
+            "Return up to 5 concise English product-type noun phrases; aim for 3 to 5 only when they are genuinely useful.",
             "Keep the physical product itself central in every query.",
             "Prefer the core product class, a common synonym, and a useful head-noun variant.",
             "Drop model numbers, brand, colour, size, power source, rechargeable/battery wording and marketing adjectives unless they define a genuinely different product class.",
             "Do not output Makro Vertical names unless they independently arise as ordinary product wording; these strings are only search queries.",
-            "Do not output marketplace, seller, listing, vertical, category, or platform terminology.",
+            "Do not use marketplace/platform terminology as retrieval metadata. Words such as vertical or category are allowed only when they are genuinely part of the physical product name.",
             "Do not broaden into accessories, spare parts or adjacent products unless the supplied product itself is one.",
         ],
         "json_contract": {
@@ -102,7 +105,7 @@ def build_vertical_search_plan_request(hints: ListingBootstrapHints) -> dict[str
             "properties": {
                 "queries": {
                     "type": "array",
-                    "minItems": 3,
+                    "minItems": 1,
                     "maxItems": 5,
                     "items": {"type": "string", "minLength": 2},
                 }
