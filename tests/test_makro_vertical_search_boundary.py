@@ -15,6 +15,14 @@ class FakeProvider:
         return self.response
 
 
+class FakePage:
+    def __init__(self) -> None:
+        self.waits: list[int] = []
+
+    def wait_for_timeout(self, value: int) -> None:
+        self.waits.append(value)
+
+
 def test_search_delta_rejects_preexisting_broad_taxonomy_nodes() -> None:
     before = [
         "Health & Beauty",
@@ -121,12 +129,35 @@ def test_duplicate_exact_leaf_does_not_guess_between_live_paths(monkeypatch) -> 
     assert seen == {"term": "solar charge controller", "live": candidates}
 
 
-def test_search_fallback_uses_scoped_live_rows_and_leaf_verification() -> None:
+def test_search_surface_waits_for_async_rows(monkeypatch) -> None:
+    page = FakePage()
+    responses = iter([[], [], ["Solar Charge Controller"]])
+
+    monkeypatch.setattr(
+        vertical_selection,
+        "_scoped_vertical_search_candidates",
+        lambda _search: next(responses),
+    )
+
+    assert vertical_selection._wait_for_scoped_vertical_search_candidates(
+        page,
+        object(),
+        timeout_ms=1000,
+        poll_ms=200,
+    ) == ["Solar Charge Controller"]
+    assert page.waits == [200, 200]
+
+
+def test_search_fallback_preserves_surface_provenance_and_scoped_click() -> None:
     source = inspect.getsource(vertical_selection._select_via_search_with_context)
 
-    assert 'search.press("Enter")' in source
-    assert "_scoped_vertical_search_candidates(search)" in source
-    assert "_search_result_delta(" in source
-    assert "baseline_columns = taxonomy.columns()" in source
-    assert "_choose_vertical_search_candidate(" in source
-    assert "verification_label=_search_result_leaf(selected)" in source
+    assert "_wait_for_scoped_vertical_search_candidates(" in source
+    assert "if scoped:" in source
+    assert "candidates = scoped" in source
+    assert "click_search_row(search, selected)" in source
+    assert "observed search rows:" in source
+
+    scoped_branch = source.index("if scoped:")
+    delta_call = source.index("_search_result_delta(", scoped_branch)
+    else_branch = source.index("else:", scoped_branch)
+    assert else_branch < delta_call
