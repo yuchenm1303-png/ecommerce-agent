@@ -13,6 +13,12 @@ from urllib.parse import urlsplit
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
 from .browser_session import cdp_endpoint, is_cdp_ready, launch_detached_edge
+from .browser_visual_hud import (
+    arm_browser_visual_hud,
+    browser_visual_hud_status,
+    finish_browser_visual_hud,
+    set_browser_visual_hud_capture_safe,
+)
 from .source_snapshot import (
     SourceAccessBlocked,
     SourceCaptureError,
@@ -163,6 +169,12 @@ def _connect_source_edge(playwright, *, profile_dir: Path, port: int, start_url:
     context = contexts[0]
     pages = list(context.pages)
     page = pages[-1] if pages else context.new_page()
+    arm_browser_visual_hud(
+        page,
+        title="正在读取商品页面",
+        thought="Listing Studio 正在连接供应商商品页并准备采集页面证据。",
+        phase=0,
+    )
     return browser, context, page, launched_now
 
 
@@ -183,10 +195,14 @@ def _wait_for_navigation_recovery(page, *, settle_ms: int) -> None:
     try:
         page.wait_for_load_state("domcontentloaded", timeout=15_000)
     except PlaywrightError:
-        # A second client-side transition may already be in flight. The short
-        # settle delay below gives the new main-frame context time to attach.
         pass
     page.wait_for_timeout(max(250, min(1_500, int(settle_ms) or 250)))
+    browser_visual_hud_status(
+        page,
+        "正在跟随商品页跳转",
+        "供应商页面发生正常跳转，正在重新绑定当前页面并继续采集。",
+        phase=1,
+    )
 
 
 def _evaluate_with_navigation_retry(
@@ -210,11 +226,24 @@ def _evaluate_with_navigation_retry(
 
 
 def _load_lazy_page(page, *, initial_wait_ms: int, scroll_wait_ms: int, max_scroll_steps: int) -> None:
+    browser_visual_hud_status(
+        page,
+        "正在展开商品页面",
+        "正在滚动页面，加载懒加载商品文字、规格和图片。",
+        phase=2,
+    )
     if initial_wait_ms:
         page.wait_for_timeout(initial_wait_ms)
     stable_rounds = 0
     previous_height = 0
-    for _ in range(max_scroll_steps):
+    for step_index in range(max_scroll_steps):
+        if step_index and step_index % 12 == 0:
+            browser_visual_hud_status(
+                page,
+                "正在扫描商品页面",
+                f"已继续滚动加载页面内容 · pass {step_index + 1}",
+                phase=2,
+            )
         state = _evaluate_with_navigation_retry(
             page,
             """() => ({
@@ -249,6 +278,12 @@ def _load_lazy_page(page, *, initial_wait_ms: int, scroll_wait_ms: int, max_scro
     )
     if scroll_wait_ms:
         page.wait_for_timeout(scroll_wait_ms)
+    browser_visual_hud_status(
+        page,
+        "商品页面已展开",
+        "可见页面内容已经完成滚动加载，准备提取结构化商品信息。",
+        phase=2,
+    )
 
 
 def _capture_snapshot_with_navigation_retry(
@@ -360,8 +395,6 @@ def _download_page_images(context, image_urls: list[str], output_dir: Path, *, m
             path.write_bytes(body)
             saved.append(path)
         except Exception:
-            # Individual CDN assets are supplemental. The source snapshot plus
-            # another visual artifact remains valid evidence when one image fails.
             continue
         finally:
             if response is not None:
@@ -489,71 +522,134 @@ def capture_product_source(
             start_url=source_url,
         )
         page.set_default_timeout(15_000)
-        if use_current_page:
-            if page.url in {"", "about:blank"}:
-                raise RuntimeError("--source-use-current-page 时 source Edge 没有已打开网页。")
-        else:
-            page.goto(source_url, wait_until="domcontentloaded", timeout=45_000)
+        try:
+            if use_current_page:
+                if page.url in {"", "about:blank"}:
+                    raise RuntimeError("--source-use-current-page 时 source Edge 没有已打开网页。")
+            else:
+                browser_visual_hud_status(
+                    page,
+                    "正在打开商品链接",
+                    "正在导航到供应商商品页；页面加载后 HUD 会自动续接。",
+                    phase=0,
+                )
+                page.goto(source_url, wait_until="domcontentloaded", timeout=45_000)
 
-        _load_lazy_page(
-            page,
-            initial_wait_ms=int(initial_wait_ms),
-            scroll_wait_ms=int(scroll_wait_ms),
-            max_scroll_steps=int(max_scroll_steps),
-        )
-        snapshot = _capture_snapshot_with_navigation_retry(
-            page,
-            requested_url=source_url,
-            max_visible_text_chars=int(max_visible_text_chars),
-            settle_ms=int(scroll_wait_ms),
-        )
-        detail_documents, detail_images = _discover_detail_images(context, snapshot)
-        combined_images: list[str] = []
-        seen_images: set[str] = set()
-        # Detail-document images are the dense specification/evidence set. Keep
-        # them first so the semantic stage can avoid resending duplicate gallery
-        # thumbnails and the giant rendered-page screenshot.
-        for image_url in [*detail_images, *snapshot.image_urls]:
-            if image_url and image_url not in seen_images:
-                seen_images.add(image_url)
-                combined_images.append(image_url)
-        snapshot.image_urls = combined_images
-        if detail_documents:
-            snapshot.meta["detail_document_urls"] = json.dumps(
-                detail_documents,
-                ensure_ascii=False,
-                separators=(",", ":"),
+            browser_visual_hud_status(
+                page,
+                "商品页面已打开",
+                "正在读取当前页面并准备加载完整商品内容。",
+                phase=1,
             )
-            snapshot.meta["detail_image_count"] = str(len(detail_images))
-
-        product_image_dir = target_dir / "product-images"
-        if product_image_dir.exists():
-            shutil.rmtree(product_image_dir)
-        product_images = _download_page_images(
-            context,
-            snapshot.image_urls,
-            product_image_dir,
-        )
-
-        screenshot_path = target_dir / "source-page.png"
-        if screenshot_path.exists():
-            screenshot_path.unlink()
-        screenshot_ok, screenshot_note = _screenshot_with_navigation_retry(
-            page,
-            screenshot_path,
-            settle_ms=int(scroll_wait_ms),
-        )
-        if screenshot_note:
-            snapshot.warnings.append(screenshot_note)
-        snapshot.meta["screenshot_available"] = "true" if screenshot_ok else "false"
-        snapshot.meta["product_images_downloaded"] = str(len(product_images))
-        snapshot_path = write_source_snapshot(snapshot, target_dir / "source-snapshot.json")
-
-        if not screenshot_ok and not product_images:
-            raise SourceCaptureError(
-                "商品页面结构化资料已采集，但没有获得可用视觉证据：商品原图下载为空，且浏览器整页/当前窗口截图均失败。"
-                + (f" screenshot={screenshot_note}" if screenshot_note else "")
+            _load_lazy_page(
+                page,
+                initial_wait_ms=int(initial_wait_ms),
+                scroll_wait_ms=int(scroll_wait_ms),
+                max_scroll_steps=int(max_scroll_steps),
             )
+
+            browser_visual_hud_status(
+                page,
+                "正在提取商品信息",
+                "正在读取页面文字、表格、JSON-LD 与嵌入式商品数据。",
+                phase=2,
+            )
+            snapshot = _capture_snapshot_with_navigation_retry(
+                page,
+                requested_url=source_url,
+                max_visible_text_chars=int(max_visible_text_chars),
+                settle_ms=int(scroll_wait_ms),
+            )
+
+            browser_visual_hud_status(
+                page,
+                "正在检索详情资源",
+                "正在根据商品页已经公开的详情文档继续整理规格图片与证据链接。",
+                phase=2,
+            )
+            detail_documents, detail_images = _discover_detail_images(context, snapshot)
+            combined_images: list[str] = []
+            seen_images: set[str] = set()
+            for image_url in [*detail_images, *snapshot.image_urls]:
+                if image_url and image_url not in seen_images:
+                    seen_images.add(image_url)
+                    combined_images.append(image_url)
+            snapshot.image_urls = combined_images
+            if detail_documents:
+                snapshot.meta["detail_document_urls"] = json.dumps(
+                    detail_documents,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                snapshot.meta["detail_image_count"] = str(len(detail_images))
+
+            browser_visual_hud_status(
+                page,
+                "正在整理商品图片",
+                f"发现 {len(snapshot.image_urls)} 个页面图片候选，正在保存可用商品图。",
+                phase=3,
+            )
+            product_image_dir = target_dir / "product-images"
+            if product_image_dir.exists():
+                shutil.rmtree(product_image_dir)
+            product_images = _download_page_images(
+                context,
+                snapshot.image_urls,
+                product_image_dir,
+            )
+
+            browser_visual_hud_status(
+                page,
+                "正在生成页面证据",
+                "即将截取供应商页面证据；HUD 会在截图瞬间自动隐藏。",
+                phase=3,
+            )
+            screenshot_path = target_dir / "source-page.png"
+            if screenshot_path.exists():
+                screenshot_path.unlink()
+            set_browser_visual_hud_capture_safe(page, True)
+            try:
+                screenshot_ok, screenshot_note = _screenshot_with_navigation_retry(
+                    page,
+                    screenshot_path,
+                    settle_ms=int(scroll_wait_ms),
+                )
+            finally:
+                set_browser_visual_hud_capture_safe(page, False)
+
+            if screenshot_note:
+                snapshot.warnings.append(screenshot_note)
+            snapshot.meta["screenshot_available"] = "true" if screenshot_ok else "false"
+            snapshot.meta["product_images_downloaded"] = str(len(product_images))
+            snapshot_path = write_source_snapshot(snapshot, target_dir / "source-snapshot.json")
+
+            if not screenshot_ok and not product_images:
+                raise SourceCaptureError(
+                    "商品页面结构化资料已采集，但没有获得可用视觉证据：商品原图下载为空，且浏览器整页/当前窗口截图均失败。"
+                    + (f" screenshot={screenshot_note}" if screenshot_note else "")
+                )
+
+            finish_browser_visual_hud(
+                page,
+                success=True,
+                title="商品页信息提取完成",
+                thought=(
+                    f"已完成商品页面采集 · 商品图 {len(product_images)} 张 · "
+                    "结构化证据已写入本次任务。"
+                ),
+                hold_ms=420,
+                destroy=True,
+            )
+        except Exception:
+            finish_browser_visual_hud(
+                page,
+                success=False,
+                title="商品页采集未完成",
+                thought="浏览器采集已停止，Listing Studio 会保留当前页面和错误现场。",
+                hold_ms=260,
+                destroy=True,
+            )
+            raise
 
     _refresh_capture_cache(source_url, target_dir, cache_root)
     return CapturedProductSource(
