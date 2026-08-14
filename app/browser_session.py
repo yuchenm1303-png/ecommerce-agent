@@ -17,6 +17,7 @@ from .browser_visual_hud import arm_browser_visual_hud
 
 DEFAULT_CDP_PORT = 9222
 DEFAULT_START_URL = "https://seller.makro.co.za/"
+_MAKRO_HUD_HOST = "seller.makro.co.za"
 
 
 @dataclass
@@ -173,8 +174,8 @@ class EdgeHarness:
     - deterministic page selection (prefer an open listing, then any Makro
       tab, then the most recently created tab);
     - health check and reconnect helpers for long-running sessions;
-    - keep the existing Visual Agent HUD attached to whichever Makro page the
-      automation is actively using, including new tabs and navigations.
+    - keep the existing Visual Agent HUD attached to Makro automation pages,
+      including new tabs and later navigations.
 
     The harness never reads or logs cookies, tokens, sessionStorage or
     Authorization data. The HUD is display-only and never changes page
@@ -204,34 +205,20 @@ class EdgeHarness:
         self._watched_context_ids: set[int] = set()
         self._connect()
 
-    @staticmethod
-    def _is_makro_page(page: Page) -> bool:
-        try:
-            return "seller.makro.co.za" in str(page.url or "")
-        except Exception:
-            return False
+    def _watch_visual_page(self, page: Page) -> None:
+        """Arm one domain-scoped HUD lifecycle; the facade owns navigation."""
 
-    def _show_visual_hud(self, page: Page) -> None:
-        if page.is_closed() or not self._is_makro_page(page):
+        if page.is_closed():
             return
+        key = id(page)
+        self._watched_page_ids.add(key)
         arm_browser_visual_hud(
             page,
             title="Makro 浏览器自动化运行中",
             thought="Listing Studio 正在读取、检索或操作当前 Makro 页面。",
             phase=1,
+            host_suffix=_MAKRO_HUD_HOST,
         )
-
-    def _watch_visual_page(self, page: Page) -> None:
-        key = id(page)
-        if key in self._watched_page_ids:
-            self._show_visual_hud(page)
-            return
-        self._watched_page_ids.add(key)
-        try:
-            page.on("domcontentloaded", lambda: self._show_visual_hud(page))
-        except Exception:
-            pass
-        self._show_visual_hud(page)
 
     def _watch_visual_context(self, context: BrowserContext) -> None:
         key = id(context)
