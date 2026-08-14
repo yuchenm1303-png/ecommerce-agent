@@ -48,13 +48,23 @@ def test_gui_runner_uses_current_provider_defaults_and_one_workflow_process() ->
     assert "DASHSCOPE_API_KEY" not in RUNNER
 
 
-def test_gui_exposes_independent_stage_tests_and_full_flow() -> None:
-    assert 'QPushButton("① Step 1 · Vertical")' in WINDOW
-    assert 'QPushButton("② Step 2 · Brand")' in WINDOW
-    assert 'QPushButton("③ Step 3 · Resolve")' in WINDOW
-    assert 'self.start_button.setText("④ 完整流程准备")' in WINDOW
+def test_gui_full_run_is_always_a_fresh_owned_task() -> None:
+    assert "_immediate_resume_url" not in RUNNER
+    assert '"--resume-current-url"' not in RUNNER
+    assert "task_start=FRESH" in RUNNER
+    assert "always creates a dedicated Makro tab" in RUNNER
+    assert "_create_fresh_owned_page(harness)" in WORKFLOW
+    assert 'manifest["ownership_mode"] = "fresh_dedicated_tab"' in WORKFLOW
+
+
+def test_gui_labels_new_task_separately_from_stage_diagnostics() -> None:
+    assert 'QPushButton("诊断① · Step 1")' in WINDOW
+    assert 'QPushButton("诊断② · Step 2")' in WINDOW
+    assert 'QPushButton("诊断③ · Step 3")' in WINDOW
+    assert 'self.start_button.setText("新建任务 · 从 0 完整准备")' in WINDOW
     assert 'self.runner.start(config, mode=mode)' in WINDOW
     assert 'self._start_mode("full")' in WINDOW
+    assert "fresh dedicated Makro tab" in WINDOW
     assert "self.vertical_input.clear()" in WINDOW
     assert "self.vertical_input.setReadOnly(True)" in WINDOW
 
