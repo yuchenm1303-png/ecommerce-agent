@@ -49,8 +49,12 @@ def test_product_pack_persists_text_table_and_images(tmp_path: Path) -> None:
 
     bootstrap = source_snapshot_from_json(result.bootstrap_snapshot_path)
     assert "M8" in bootstrap.visible_text
-    assert any(row.key == "Brand" and row.value == "Acme" for row in bootstrap.table_rows)
-    assert any(row.key == "Width" and row.value == "130 mm" for row in bootstrap.table_rows)
+    # Intake remains mechanical: the raw two-column rows are preserved for the
+    # Resolver instead of Python deciding that a particular table is Makro data.
+    assert "Brand | Acme" in bootstrap.visible_text
+    assert "Width | 130 mm" in bootstrap.visible_text
+    assert any(row.key == "Field" and row.value == "Brand" for row in bootstrap.table_rows)
+    assert any(row.key == "Value" and row.value == "130 mm" for row in bootstrap.table_rows)
 
     manifest = load_product_pack_manifest(result.manifest_path)
     assert manifest["input_mode"] == "customer_product_pack"
