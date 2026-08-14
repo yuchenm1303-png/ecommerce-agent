@@ -11,11 +11,13 @@ from makro_execute_listing import main as execute_main
 from makro_gui_workflow import main as workflow_main
 from makro_one_link import main as one_link_main
 from makro_plan_listing import main as plan_listing_main
+from makro_product_pack_workflow import main as product_pack_workflow_main
 from makro_resolve_ai import main as resolve_ai_main
 
 
 _HELPERS: dict[str, tuple[str, Callable[[], int]]] = {
     "workflow": ("makro_gui_workflow.py", workflow_main),
+    "product-pack-workflow": ("makro_product_pack_workflow.py", product_pack_workflow_main),
     "execute": ("makro_execute_listing.py", execute_main),
     "batch-source": ("makro_batch_source.py", batch_source_main),
     "batch-job": ("makro_batch_job.py", batch_job_main),
