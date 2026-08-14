@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QProgressD
 
 from gui.app_updater import (
     ApplicationUpdater as _BaseApplicationUpdater,
-    _launch_installer_waiter,
+    _handoff_installer,
     _sha256_file,
     _update_marker_path,
     _version_key,
@@ -729,10 +729,11 @@ class ApplicationUpdater(_BaseApplicationUpdater):
         # Same modal-dialog trap as the base updater: an open modal progress
         # dialog keeps the process alive, so Inno Setup's RestartManager cannot
         # close us and the silent install is rolled back. Close the dialog
-        # first, then launch the installer from a detached waiter that runs only
-        # after this process (and the workflow worker) has fully exited.
+        # first, then hand the verified installer to the standalone updater,
+        # which runs only after this process (and the workflow worker) has
+        # fully exited.
         self._close_progress()
-        started = _launch_installer_waiter(path, arguments)
+        started = _handoff_installer(path, arguments, str(manifest["installer_sha256"]))
         if not started:
             try:
                 _update_marker_path().unlink(missing_ok=True)

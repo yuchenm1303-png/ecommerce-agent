@@ -15,7 +15,6 @@ from PySide6.QtCore import (
     QFile,
     QIODevice,
     QObject,
-    QProcess,
     Qt,
     QTimer,
     QUrl,
@@ -33,6 +32,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QWidget,
 )
+
+from app.updater_core import UpdaterJob
 
 
 _REPOSITORY = "yuchenm1303-png/ecommerce-agent"
@@ -120,6 +121,109 @@ def _launch_installer_waiter(installer: Path, arguments: list[str]) -> bool:
         return True
     except OSError:
         return False
+
+
+def _updater_stable_dir() -> Path:
+    base = Path(os.getenv("LOCALAPPDATA") or tempfile.gettempdir()) / "ListingStudio"
+    return base / "updater"
+
+
+def _updater_stable_exe() -> Path:
+    return _updater_stable_dir() / "updater.exe"
+
+
+def _bundled_updater_exe() -> Path | None:
+    """Locate the updater.exe shipped inside the packaged app, if any."""
+
+    candidates: list[Path] = []
+    if bool(getattr(sys, "frozen", False)):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "updater" / "updater.exe")
+        parent = Path(sys.executable).resolve().parent
+        candidates.append(parent / "updater" / "updater.exe")
+        candidates.append(parent / "_internal" / "updater" / "updater.exe")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def ensure_updater_installed() -> Path | None:
+    """Refresh the standalone updater in its stable, non-install location.
+
+    The updater lives outside the install directory so every app update can
+    overwrite the app while the updater keeps working. Returns the stable path
+    when available, else ``None`` (the caller falls back to the in-app waiter).
+    """
+
+    bundled = _bundled_updater_exe()
+    if bundled is None:
+        return None
+    target = _updater_stable_exe()
+    try:
+        if not target.is_file() or target.stat().st_size != bundled.stat().st_size:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+            tmp.write_bytes(bundled.read_bytes())
+            tmp.replace(target)
+        return target if target.is_file() else None
+    except OSError:
+        return None
+
+
+def _launch_standalone_updater(
+    installer: Path,
+    arguments: list[str],
+    installer_sha256: str,
+) -> bool:
+    """Write a job and launch the standalone updater.exe with it."""
+
+    updater = ensure_updater_installed()
+    if updater is None:
+        return False
+    stable = _updater_stable_dir()
+    job = UpdaterJob(
+        installer=str(Path(installer).resolve()),
+        arguments=arguments,
+        installer_sha256=installer_sha256,
+        app_pid=os.getpid(),
+        app_image_name=Path(sys.executable).stem,
+        log_path=str(stable / "updater.jsonl"),
+        result_path=str(stable / "last-result.json"),
+    )
+    try:
+        job_path = stable / "pending-update.json"
+        job.save(job_path)
+        subprocess.Popen(
+            [str(updater), "--job", str(job_path)],
+            creationflags=(
+                subprocess.CREATE_NO_WINDOW
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except OSError:
+        return False
+
+
+def _handoff_installer(
+    installer: Path,
+    arguments: list[str],
+    installer_sha256: str,
+) -> bool:
+    """Hand the verified installer to the standalone updater.exe.
+
+    Falls back to the in-app detached waiter for source/dev mode or when the
+    bundled updater is unavailable.
+    """
+
+    if _launch_standalone_updater(installer, arguments, installer_sha256):
+        return True
+    return _launch_installer_waiter(installer, arguments)
 
 
 def _version_key(value: str) -> tuple[int, int, int] | None:
@@ -799,10 +903,11 @@ class ApplicationUpdater(QObject):
         # is open Qt runs a nested event loop, so QApplication.quit() cannot
         # terminate the process. The app would stay alive holding its {app}
         # files open and Inno Setup's RestartManager would silently abort the
-        # silent install (rolling back the update). Launch the installer from a
-        # detached waiter that runs only after this process has exited.
+        # silent install (rolling back the update). Hand the verified installer
+        # to the standalone updater, which waits for this process to exit before
+        # installing (the in-app waiter is the source/dev fallback).
         self._close_progress()
-        started = _launch_installer_waiter(path, arguments)
+        started = _handoff_installer(path, arguments, str(manifest["installer_sha256"]))
         if not started:
             try:
                 _update_marker_path().unlink(missing_ok=True)
