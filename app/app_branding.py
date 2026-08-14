@@ -18,6 +18,12 @@ def application_icon_bytes() -> bytes:
     return raw
 
 
+# Raster sizes the packaged ICO carries; the runtime QIcon mirrors them so
+# Windows picks a well-matched glyph per context (taskbar 32, titlebar 16,
+# Alt-Tab 32, DPI-scaled large taskbars) instead of downscaling one 64px source.
+RUNTIME_ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
+
+
 def apply_qt_application_icon(app) -> None:  # noqa: ANN001
     """Apply the approved app artwork to every top-level Qt window/taskbar entry."""
 
@@ -36,8 +42,19 @@ def apply_qt_application_icon(app) -> None:  # noqa: ANN001
     )
     x = max(0, (scaled.width() - pixmap.width()) // 2)
     y = max(0, (scaled.height() - pixmap.height()) // 2)
-    pixmap = scaled.copy(x, y, pixmap.width(), pixmap.height())
-    app.setWindowIcon(QIcon(pixmap))
+    artwork = scaled.copy(x, y, pixmap.width(), pixmap.height())
+
+    icon = QIcon()
+    for size in RUNTIME_ICON_SIZES:
+        icon.addPixmap(
+            artwork.scaled(
+                size,
+                size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+    app.setWindowIcon(icon)
 
     if sys.platform == "win32":
         try:
