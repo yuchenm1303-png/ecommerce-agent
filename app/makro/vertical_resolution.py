@@ -113,28 +113,10 @@ def build_vertical_search_plan_request(hints: ListingBootstrapHints) -> dict[str
     }
 
 
-def plan_vertical_search_terms(
-    provider: JSONTaskProvider,
-    hints: ListingBootstrapHints,
-) -> tuple[str, ...]:
-    """Return AI-planned retrieval intents with grounded Product Identity fallback.
-
-    Planning is an optimization boundary rather than marketplace truth. If the
-    planner transport/provider fails, the canonical Product Identity seed still
-    remains usable and Step 1 can continue fail-closed against live Makro rows.
-    """
-
-    raw_queries: list[object] = []
-    try:
-        raw = provider.extract_json(build_vertical_search_plan_request(hints))
-        if isinstance(raw, dict):
-            raw_queries = list(raw.get("queries") or [])
-    except Exception:
-        raw_queries = []
-
+def _normalize_search_terms(values: Iterable[object]) -> tuple[str, ...]:
     output: list[str] = []
     seen: set[str] = set()
-    for raw in [*raw_queries, *_fallback_search_terms(hints)]:
+    for raw in values:
         value = _clean(raw)
         key = _query_key(value)
         if not _usable_query(value) or not key or key in seen:
@@ -143,8 +125,35 @@ def plan_vertical_search_terms(
         output.append(value)
         if len(output) >= _MAX_SEARCH_TERMS:
             break
-    if output:
-        return tuple(output)
+    return tuple(output)
+
+
+def plan_vertical_search_terms(
+    provider: JSONTaskProvider,
+    hints: ListingBootstrapHints,
+) -> tuple[str, ...]:
+    """Return semantic retrieval intents; use Product Identity only as fallback.
+
+    A successful planner replaces the raw Product Identity phrase for retrieval.
+    This prevents incidental attributes in ``product_type_en`` (for example a
+    power-source modifier) from being reintroduced after AI already produced
+    cleaner product-class queries. The grounded identity seed is used only when
+    planning fails or yields no safe query at all.
+    """
+
+    try:
+        raw = provider.extract_json(build_vertical_search_plan_request(hints))
+    except Exception:
+        raw = None
+
+    if isinstance(raw, dict):
+        planned = _normalize_search_terms(raw.get("queries") or [])
+        if planned:
+            return planned
+
+    fallback = _normalize_search_terms(_fallback_search_terms(hints))
+    if fallback:
+        return fallback
     raise ValueError("Product Identity produced no safe Makro Vertical retrieval intent")
 
 

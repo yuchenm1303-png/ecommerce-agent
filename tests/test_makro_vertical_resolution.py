@@ -46,7 +46,7 @@ def _bag_sealer_hints() -> ListingBootstrapHints:
     )
 
 
-def test_search_planner_separates_product_identity_from_retrieval_intents() -> None:
+def test_search_planner_replaces_raw_identity_phrase_with_clean_retrieval_intents() -> None:
     provider = FakeProvider(
         {
             "plan_makro_vertical_search_intents": {
@@ -57,8 +57,8 @@ def test_search_planner_separates_product_identity_from_retrieval_intents() -> N
 
     terms = plan_vertical_search_terms(provider, _bag_sealer_hints())
 
-    assert terms[:3] == ("bag sealer", "heat sealer", "sealing machine")
-    assert "rechargeable bag sealer" in terms
+    assert terms == ("bag sealer", "heat sealer", "sealing machine")
+    assert "rechargeable bag sealer" not in terms
     request = provider.requests[0]
     assert request["context"]["product_type_en"] == "rechargeable bag sealer"
     assert "power source" in " ".join(request["rules"]).casefold()
@@ -67,6 +67,20 @@ def test_search_planner_separates_product_identity_from_retrieval_intents() -> N
 def test_search_planner_falls_back_to_grounded_product_type_if_planner_fails() -> None:
     provider = FakeProvider(
         {"plan_makro_vertical_search_intents": RuntimeError("temporary provider failure")}
+    )
+
+    assert plan_vertical_search_terms(provider, _bag_sealer_hints()) == (
+        "rechargeable bag sealer",
+    )
+
+
+def test_search_planner_falls_back_when_response_contains_no_safe_queries() -> None:
+    provider = FakeProvider(
+        {
+            "plan_makro_vertical_search_intents": {
+                "queries": ["Makro vertical", "seller category", ""]
+            }
+        }
     )
 
     assert plan_vertical_search_terms(provider, _bag_sealer_hints()) == (
