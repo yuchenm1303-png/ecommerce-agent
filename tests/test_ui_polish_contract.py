@@ -9,7 +9,8 @@ RUNNER = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
 def test_standard_gui_installs_polish_after_native_visual_layer() -> None:
-    assert "from gui.console_window import MainWindow" in RUNNER
+    assert "from gui.product_input_window import ProductInputWorkflowMainWindow" in RUNNER
+    assert "MainWindow = ProductInputWorkflowMainWindow" in RUNNER
     assert "visual = install_native_visual_style(window)" in RUNNER
     assert "install_ui_polish(window)" in RUNNER
     assert RUNNER.index("visual = install_native_visual_style(window)") < RUNNER.index(
