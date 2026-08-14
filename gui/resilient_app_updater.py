@@ -88,6 +88,14 @@ def _http_status(reply: QNetworkReply) -> int | None:
         return None
 
 
+def _enum_code(value: Any) -> int | None:
+    raw = getattr(value, "value", value)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _reply_diagnostic(stage: str, reply: QNetworkReply, *, attempt: int, source: str = "") -> dict[str, Any]:
     error = reply.error()
     return {
@@ -97,7 +105,7 @@ def _reply_diagnostic(stage: str, reply: QNetworkReply, *, attempt: int, source:
         "attempt": attempt,
         "url": _safe_url(reply.url()),
         "http_status": _http_status(reply),
-        "qt_error": int(error),
+        "qt_error": _enum_code(error),
         "qt_error_name": getattr(error, "name", str(error)),
         "error": str(reply.errorString() or "").strip(),
     }
