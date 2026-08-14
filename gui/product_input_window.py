@@ -134,7 +134,6 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
         self.url_input.clear()
         self.url_input.setPlaceholderText(self._pack_summary(paths))
         self.current_page_check.setChecked(False)
-        self.current_page_check.setEnabled(False)
         self.product_pack_button.setText(f"资料包 · {len(paths)}")
         self.product_pack_button.setToolTip("\n".join(str(path) for path in paths))
         self.product_pack_clear_button.setVisible(True)
@@ -143,7 +142,6 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
     def _clear_product_files(self, _checked: bool = False) -> None:
         self._selected_product_files = ()
         self.url_input.setPlaceholderText("https://detail.1688.com/offer/...")
-        self.current_page_check.setEnabled(True)
         self.product_pack_button.setText("上传资料…")
         self.product_pack_button.setToolTip(
             "一次选择同一商品的 PDF / Word / Excel / CSV / TXT / 图片 / ZIP。"
@@ -157,10 +155,14 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
 
     def _sync_product_input_controls(self) -> None:
         pack_mode = bool(self._selected_product_files)
+        busy = self.runner.is_running
+        self.current_page_check.setEnabled(not pack_mode and not busy)
+        if pack_mode:
+            self.current_page_check.setChecked(False)
         for name in ("step1_button", "step2_button", "step3_button"):
             button = getattr(self, name, None)
             if isinstance(button, QPushButton):
-                button.setEnabled(not pack_mode and not self.runner.is_running)
+                button.setEnabled(not pack_mode and not busy)
                 if pack_mode:
                     button.setToolTip(
                         "客户资料包使用完整新建任务；阶段诊断仍用于 URL / 当前 Makro 页面。"
@@ -168,7 +170,7 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
         if pack_mode:
             self.start_button.setText("新建任务 · 使用资料包")
         else:
-            self.start_button.setText("新建任务 · 从 0 完整准备")
+            self.start_button.setText("启动单链接任务")
 
     def _clear_staged_listing_images(self) -> None:
         self._selected_upload_images = []
