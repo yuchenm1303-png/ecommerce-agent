@@ -8,6 +8,7 @@ from openpyxl import Workbook
 from PIL import Image
 
 from app.product_pack import capture_product_pack, load_product_pack_manifest
+from app.semantic_grounding import TEXT_KIND, build_grounding_catalog
 from app.source_snapshot import source_snapshot_from_json
 
 
@@ -59,6 +60,42 @@ def test_product_pack_persists_text_table_and_images(tmp_path: Path) -> None:
     manifest = load_product_pack_manifest(result.manifest_path)
     assert manifest["input_mode"] == "customer_product_pack"
     assert len(manifest["evidence_images"]) == 1
+
+
+def test_product_pack_bootstrap_expands_to_exact_customer_file_sources(tmp_path: Path) -> None:
+    notes = tmp_path / "notes.txt"
+    notes.write_text("Model: M8\nCapacity: 500 ml", encoding="utf-8")
+    specs = tmp_path / "spec.csv"
+    specs.write_text("Field,Value\nMaterial,ABS\nWeight,420 g\n", encoding="utf-8")
+
+    result = capture_product_pack([notes, specs], output_dir=tmp_path / "captured")
+
+    catalog = build_grounding_catalog(
+        supplier_snapshots=(str(result.bootstrap_snapshot_path),),
+    )
+    text_sources = [source for source in catalog.sources if source.kind == TEXT_KIND]
+
+    assert text_sources
+    assert all(source.source_type == "customer_file" for source in text_sources)
+    assert all(source.source_id.startswith("customer-file:") for source in text_sources)
+    assert all(not source.source_id.startswith("supplier:") for source in text_sources)
+    assert all("product-pack://local" not in source.origin for source in text_sources)
+
+    exact_origins = {
+        snapshot.final_url or snapshot.requested_url
+        for snapshot in (
+            source_snapshot_from_json(path) for path in result.customer_snapshot_paths
+        )
+    }
+    assert exact_origins
+    assert all(any(source.origin.startswith(origin) for origin in exact_origins) for source in text_sources)
+
+    # Resolver, planner and real executor rebuild the catalog independently. The
+    # Product Pack expansion must therefore be deterministic across safety gates.
+    rebuilt = build_grounding_catalog(
+        supplier_snapshots=(str(result.bootstrap_snapshot_path),),
+    )
+    assert catalog.as_manifest() == rebuilt.as_manifest()
 
 
 def test_zip_accepts_supported_files_and_ignores_executables(tmp_path: Path) -> None:
