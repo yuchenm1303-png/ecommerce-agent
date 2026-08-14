@@ -22,9 +22,13 @@ class FakeProvider:
 class FakeInput:
     def __init__(self) -> None:
         self.values: list[str] = []
+        self.presses: list[str] = []
 
     def fill(self, value: str) -> None:
         self.values.append(value)
+
+    def press(self, key: str) -> None:
+        self.presses.append(key)
 
 
 class FakePage:
@@ -40,30 +44,22 @@ def _hints(*, brand="Qigreesol", status="explicit"):
     return SimpleNamespace(
         brand=brand,
         brand_status=status,
-        product_summary="table lamp",
-        product_identity={"product_type_en": "table lamp", "brand": brand},
+        product_summary="solar charge controller",
+        product_identity={"product_type_en": "solar charge controller", "brand": brand},
     )
 
 
 def _install_browser_mechanics(monkeypatch, page, brand_input):
     monkeypatch.setattr(brand_selection, "is_brand_step", lambda current: current.phase == "brand")
-    monkeypatch.setattr(
-        brand_selection,
-        "is_product_info_step",
-        lambda current: current.phase == "product",
-    )
+    monkeypatch.setattr(brand_selection, "is_product_info_step", lambda current: current.phase == "product")
     monkeypatch.setattr(brand_selection, "_brand_input", lambda _page: brand_input)
     monkeypatch.setattr(brand_selection, "reconcile_portal_interruptions", lambda _page: 0)
-    monkeypatch.setattr(
-        brand_selection,
-        "_click_exact_visible_text",
-        lambda current, _selected: setattr(current, "phase", "product") or True,
-    )
+    monkeypatch.setattr(brand_selection, "begin_search_query", lambda _input: None)
     monkeypatch.setattr(brand_selection, "_advance_brand_confirmation", lambda _page, _selected: None)
     monkeypatch.setattr(
         brand_selection,
         "_current_target_values",
-        lambda _page: ("table_lamp", "QIGREESOL"),
+        lambda _page: ("solar_charge_controller", "QIGREESOL"),
     )
     monkeypatch.setattr(
         brand_selection,
@@ -72,62 +68,37 @@ def _install_browser_mechanics(monkeypatch, page, brand_input):
     )
 
 
-def test_step2_consumes_current_live_brand_before_typing_supplier_brand(monkeypatch):
+def test_step2_selects_only_query_owned_live_brand(monkeypatch):
     page = FakePage()
     brand_input = FakeInput()
     provider = FakeProvider()
     _install_browser_mechanics(monkeypatch, page, brand_input)
+
+    rows = iter([[], ["Qigreesol", "Qigreesol Pro"]])
     monkeypatch.setattr(
         brand_selection,
-        "_live_brand_candidates",
-        lambda _page: ["QIGREESOL", "Samsung"],
+        "read_search_rows",
+        lambda _input: next(rows, ["Qigreesol", "Qigreesol Pro"]),
     )
-    check_calls = []
-    monkeypatch.setattr(brand_selection, "_click_check_brand", lambda _page: check_calls.append(True))
+    monkeypatch.setattr(brand_selection, "_click_check_brand", lambda _page: None)
+    monkeypatch.setattr(
+        brand_selection,
+        "click_search_row",
+        lambda _input, selected: selected == "Qigreesol",
+    )
 
     selected = brand_selection.select_brand(page, provider, _hints(), wait_ms=0)
-
     assert selected == "QIGREESOL"
-    assert brand_input.values == [""]
-    assert check_calls == []
+    assert "Qigreesol" in brand_input.values
     assert provider.requests == []
 
 
-def test_step2_uses_supplier_brand_only_as_bounded_discovery_fallback(monkeypatch):
-    page = FakePage()
-    brand_input = FakeInput()
-    provider = FakeProvider({"selected_brand": ""})
-    _install_browser_mechanics(monkeypatch, page, brand_input)
-
-    def live_candidates(_page):
-        if brand_input.values and brand_input.values[-1] == "Qigreesol":
-            return ["Qigreesol", "Qigreesol Pro"]
-        return ["Samsung", "Generic"]
-
-    monkeypatch.setattr(brand_selection, "_live_brand_candidates", live_candidates)
-    check_calls = []
-    monkeypatch.setattr(brand_selection, "_click_check_brand", lambda _page: check_calls.append(True))
-
-    selected = brand_selection.select_brand(page, provider, _hints(), wait_ms=0)
-
-    assert selected == "QIGREESOL"
-    assert brand_input.values == ["", "", "Qigreesol"]
-    assert len(check_calls) == 1
-    assert provider.requests[0]["context"]["discovery_query"] == ""
-
-
-def test_unknown_supplier_brand_never_chooses_unrelated_live_brand(monkeypatch):
+def test_unknown_supplier_brand_never_queries_or_chooses(monkeypatch):
     page = FakePage()
     brand_input = FakeInput()
     provider = FakeProvider({"selected_brand": "Samsung"})
     _install_browser_mechanics(monkeypatch, page, brand_input)
-    monkeypatch.setattr(
-        brand_selection,
-        "_live_brand_candidates",
-        lambda _page: ["Samsung", "Generic"],
-    )
-    check_calls = []
-    monkeypatch.setattr(brand_selection, "_click_check_brand", lambda _page: check_calls.append(True))
+    monkeypatch.setattr(brand_selection, "_brand_search_terms", lambda _hints: ())
 
     with pytest.raises(RuntimeError, match="did not establish a brand"):
         brand_selection.select_brand(
@@ -136,15 +107,12 @@ def test_unknown_supplier_brand_never_chooses_unrelated_live_brand(monkeypatch):
             _hints(brand="", status="unknown"),
             wait_ms=0,
         )
-
-    assert check_calls == []
     assert provider.requests == []
 
 
 def test_ai_brand_choice_must_be_exactly_one_live_candidate():
     provider = FakeProvider({"selected_brand": "InventedBrand"})
     hints = _hints(brand="Different", status="explicit")
-
     with pytest.raises(ValueError, match="not one unique live Makro candidate"):
         brand_selection.choose_live_brand_candidate(
             provider,
@@ -152,3 +120,13 @@ def test_ai_brand_choice_must_be_exactly_one_live_candidate():
             "",
             ["Samsung", "Generic"],
         )
+
+
+def test_brand_production_path_has_no_pagewide_candidate_scan() -> None:
+    import inspect
+
+    source = inspect.getsource(brand_selection.select_brand)
+    assert "begin_search_query(brand_input)" in source
+    assert "read_search_rows(brand_input)" in source
+    assert "_visible_text_candidates" not in source
+    assert "_click_exact_visible_text" not in source

@@ -1,18 +1,17 @@
-"""Portal-first Makro Step 2 brand selection.
+"""Makro Step 2 brand selection.
 
-Supplier evidence describes the product's brand identity; Makro decides which
-brands are actually selectable.  The production workflow therefore consumes
-live Makro candidates first and only uses bounded search queries when the Step 2
-UI does not materialize a suitable candidate set on entry.
+Supplier evidence establishes brand identity; Makro establishes what is
+selectable. Brand discovery and selection therefore use the same query-owned
+surface contract as Step 1 Vertical Search. Page-wide text is never treated as
+a brand candidate.
 
-AI is never allowed to invent a marketplace brand: every selected value must be
-copied from the currently rendered Makro candidate set and is verified again by
-the existing Step 2 transition mechanics.
+The supplier brand may be used as a bounded discovery query, but the selected
+value must always be an exact live Makro result and is verified again by the
+existing Step 2 transition mechanics.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Any, Protocol
 
 from playwright.sync_api import Page
@@ -22,15 +21,14 @@ from .listing_creation import (
     _brand_input,
     _brand_search_terms,
     _click_check_brand,
-    _click_exact_visible_text,
     _current_target_values,
     _verify_selected_value,
-    _visible_text_candidates,
     is_brand_step,
     is_product_info_step,
     normalize_label,
 )
 from .portal_interruptions import reconcile_portal_interruptions
+from .search_surface import begin_search_query, click_search_row, read_search_rows
 
 
 class JSONTaskProvider(Protocol):
@@ -47,123 +45,6 @@ class BrandHints(Protocol):
     product_identity: dict[str, Any] | None
 
 
-_BRAND_CANDIDATE_EXCLUDED = {
-    normalize_label(value)
-    for value in (
-        "brand",
-        "select brand",
-        "check brand",
-        "brand check",
-        "enter brand name",
-        "selected brand",
-        "brand details",
-        "confirm brand",
-        "use brand",
-        "create new listing",
-        "create listing",
-        "search",
-        "no results",
-        "no result",
-        "选择品牌",
-        "检查品牌",
-        "输入品牌名称",
-        "已选择品牌",
-        "品牌详情",
-        "确认品牌",
-        "使用品牌",
-        "创建新商品",
-        "搜索",
-        "暂无结果",
-        "无结果",
-        "or",
-        "或",
-    )
-}
-
-
-def _structured_brand_candidate_texts(page: Page, *, limit: int = 160) -> list[str]:
-    """Read visible result/option/card text without interpreting brand semantics.
-
-    Makro has used several result shapes over time (rows, list items, option-like
-    divs and brand/result cards).  This extractor is deliberately mechanical: it
-    only returns visible rendered labels/attributes from those structures.  The
-    semantic decision remains in ``choose_live_brand_candidate``.
-    """
-
-    try:
-        raw = page.evaluate(
-            r"""(limit) => {
-              const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-              const visible = (el) => {
-                const s = getComputedStyle(el), r = el.getBoundingClientRect();
-                return s.display !== 'none' && s.visibility !== 'hidden'
-                  && Number(s.opacity || 1) !== 0 && r.width > 2 && r.height > 2;
-              };
-              const out = [];
-              const seen = new Set();
-              const push = (value) => {
-                const text = clean(value);
-                if (!text || text.length < 2 || text.length > 90) return;
-                const key = text.toLocaleLowerCase();
-                if (seen.has(key)) return;
-                seen.add(key);
-                out.push(text);
-              };
-              const selector = [
-                '[role="option"]', '[role="listitem"]', '[role="row"]',
-                'li', 'tr', '[data-brand]', '[data-value]',
-                '[class*="brand" i]', '[class*="result" i]',
-                '[class*="option" i]', '[class*="suggest" i]'
-              ].join(',');
-              for (const el of document.querySelectorAll(selector)) {
-                if (out.length >= limit || !visible(el)) continue;
-                if (el.matches('input,textarea,select') || el.querySelector('input[type="password"]')) continue;
-                for (const attr of ['data-brand', 'data-value', 'aria-label', 'title']) {
-                  const value = el.getAttribute && el.getAttribute(attr);
-                  if (value) push(value);
-                }
-                const rendered = String(el.innerText || el.textContent || '');
-                for (const line of rendered.split(/\n+/)) push(line);
-                if (el.children && el.children.length) {
-                  for (const child of el.children) {
-                    if (visible(child)) push(child.innerText || child.textContent || '');
-                  }
-                }
-              }
-              return out.slice(0, limit);
-            }""",
-            int(limit),
-        )
-    except Exception:
-        return []
-    return [
-        re.sub(r"\s+", " ", str(item or "")).strip()
-        for item in raw or []
-        if str(item or "").strip()
-    ]
-
-
-def _live_brand_candidates(page: Page, *, limit: int = 160) -> list[str]:
-    """Return a deduplicated snapshot of brands/results currently exposed by Makro."""
-
-    raw = [
-        *_structured_brand_candidate_texts(page, limit=limit),
-        *_visible_text_candidates(page, limit=limit),
-    ]
-    output: list[str] = []
-    seen: set[str] = set()
-    for item in raw:
-        value = re.sub(r"\s+", " ", str(item or "")).strip()
-        key = normalize_label(value)
-        if not key or key in _BRAND_CANDIDATE_EXCLUDED or key in seen:
-            continue
-        seen.add(key)
-        output.append(value)
-        if len(output) >= limit:
-            break
-    return output
-
-
 def _build_live_brand_choice_request(
     hints: BrandHints,
     discovery_query: str,
@@ -173,15 +54,14 @@ def _build_live_brand_choice_request(
     return {
         "task": "choose_exact_live_makro_brand",
         "system_instruction": (
-            "Choose a brand only from exact live Makro candidates. Supplier evidence describes the "
-            "product identity; Makro candidates define what is selectable. JSON only."
+            "Choose a brand only from exact live Makro candidates. Supplier evidence "
+            "describes product identity; Makro candidates define what is selectable. JSON only."
         ),
         "prompt_instruction": (
-            "Compare context.supplier_brand_status / supplier_brand / product_identity with "
-            "context.live_candidates. Return one exact candidate only when it represents the same "
-            "brand identity, or the correct no-brand/generic sentinel for an explicitly unbranded "
-            "product. The discovery query is only how the portal exposed these candidates; it is not "
-            "permission to invent or prefer a value."
+            "Compare supplier brand evidence with live_candidates. Return one exact candidate "
+            "only when it represents the same brand identity, or the correct no-brand/generic "
+            "sentinel for an explicitly unbranded product. discovery_query is only how the "
+            "portal exposed the candidates."
         ),
         "context": {
             "supplier_brand_status": str(hints.brand_status or "").strip(),
@@ -193,11 +73,11 @@ def _build_live_brand_choice_request(
         },
         "rules": [
             "selected_brand must be copied exactly from live_candidates or be empty.",
-            "For explicit supplier brand, choose only the same brand identity; harmless case, punctuation, localization, transliteration or registered display styling may differ.",
-            "For explicitly unbranded supplier status, choose only a candidate that clearly denotes no-brand, unbranded or generic status.",
+            "For explicit supplier brand, choose only the same brand identity.",
+            "For explicitly unbranded status, choose only a clear no-brand/unbranded/generic sentinel.",
             "For unknown supplier brand status, return an empty string.",
-            "Never substitute a different commercial brand and never choose a recent/favorite brand merely because it is visible.",
-            "If the live candidates do not safely represent the supplier brand status, return an empty string.",
+            "Never substitute a different commercial brand.",
+            "If live candidates do not safely represent supplier evidence, return an empty string.",
         ],
         "json_contract": {
             "type": "object",
@@ -230,19 +110,13 @@ def choose_live_brand_candidate(
         if len(exact) == 1:
             return exact[0]
 
-    raw = provider.extract_json(
-        _build_live_brand_choice_request(hints, discovery_query, candidates)
-    )
+    raw = provider.extract_json(_build_live_brand_choice_request(hints, discovery_query, candidates))
     if not isinstance(raw, dict):
         raise ValueError("live brand chooser response must be a JSON object")
     selected = str(raw.get("selected_brand") or "").strip()
     if not selected:
         return ""
-    matches = [
-        item
-        for item in candidates
-        if normalize_label(item) == normalize_label(selected)
-    ]
+    matches = [item for item in candidates if normalize_label(item) == normalize_label(selected)]
     if len(matches) != 1:
         raise ValueError(
             f"AI returned a brand that is not one unique live Makro candidate: {selected!r}"
@@ -250,31 +124,14 @@ def choose_live_brand_candidate(
     return matches[0]
 
 
-def _select_from_current_live_candidates(
-    page: Page,
-    provider: JSONTaskProvider,
-    hints: BrandHints,
-    *,
-    discovery_query: str,
-) -> tuple[str, list[str]]:
-    candidates = _live_brand_candidates(page)
-    selected = choose_live_brand_candidate(
-        provider,
-        hints,
-        discovery_query,
-        candidates,
-    )
-    if not selected:
-        return "", candidates
+def _live_brand_candidates(page: Page, *, limit: int = 160) -> list[str]:
+    """Compatibility helper: read only the active input-owned result surface."""
 
-    reconcile_portal_interruptions(page)
-    if not _click_exact_visible_text(page, selected):
-        raise RuntimeError(
-            f"Makro Step 2 could not click selected live brand: {selected!r}"
-        )
-    _advance_brand_confirmation(page, selected)
-    _, actual_brand = _current_target_values(page)
-    return _verify_selected_value("Step 2 URL", selected, actual_brand), candidates
+    try:
+        rows = read_search_rows(_brand_input(page))
+    except Exception:
+        return []
+    return rows[: max(0, int(limit))]
 
 
 def _verify_direct_transition_brand(
@@ -288,19 +145,72 @@ def _verify_direct_transition_brand(
         raise RuntimeError(
             "Makro Step 2 advanced without exposing a verifiable brand in the listing URL"
         )
-    selected = choose_live_brand_candidate(
-        provider,
-        hints,
-        discovery_query,
-        [actual_brand],
-    )
+    selected = choose_live_brand_candidate(provider, hints, discovery_query, [actual_brand])
     if not selected:
         raise RuntimeError(
-            "Makro Step 2 advanced to a brand that is not compatible with supplier evidence: "
+            "Makro Step 2 advanced to a brand incompatible with supplier evidence: "
             f"actual_brand={actual_brand!r}, supplier_brand={str(hints.brand or '').strip()!r}, "
             f"brand_status={str(hints.brand_status or '').strip()!r}"
         )
     return actual_brand
+
+
+def _wait_for_brand_query_outcome(
+    page: Page,
+    brand_input,
+    *,
+    timeout_ms: int,
+    poll_ms: int = 200,
+) -> tuple[str, list[str]]:
+    attempts = max(1, max(0, int(timeout_ms)) // max(50, int(poll_ms)))
+    for _ in range(attempts):
+        if is_product_info_step(page):
+            return "product_info", []
+        rows = read_search_rows(brand_input)
+        if rows:
+            return "rows", rows
+        page.wait_for_timeout(max(50, int(poll_ms)))
+    if is_product_info_step(page):
+        return "product_info", []
+    rows = read_search_rows(brand_input)
+    return ("rows", rows) if rows else ("none", [])
+
+
+def _select_query_owned_brand(
+    page: Page,
+    provider: JSONTaskProvider,
+    hints: BrandHints,
+    brand_input,
+    *,
+    discovery_query: str,
+    candidates: list[str],
+) -> str:
+    selected = choose_live_brand_candidate(provider, hints, discovery_query, candidates)
+    if not selected:
+        return ""
+
+    reconcile_portal_interruptions(page)
+    if not click_search_row(brand_input, selected):
+        raise RuntimeError(
+            "Makro Step 2 found an exact query-owned brand but could not click it: "
+            f"{selected!r}"
+        )
+    _advance_brand_confirmation(page, selected)
+    _, actual_brand = _current_target_values(page)
+    return _verify_selected_value("Step 2 URL", selected, actual_brand)
+
+
+def _close_brand_search(page: Page, brand_input, *, wait_ms: int) -> None:
+    try:
+        brand_input.fill("")
+    except Exception:
+        return
+    try:
+        brand_input.press("Escape")
+    except Exception:
+        pass
+    if wait_ms > 0:
+        page.wait_for_timeout(min(max(wait_ms // 3, 80), 250))
 
 
 def select_brand(
@@ -310,51 +220,54 @@ def select_brand(
     *,
     wait_ms: int = 900,
 ) -> str:
-    """Select Step 2 brand with a portal-first, live-candidate-only contract.
-
-    1. Inspect candidates already exposed by the current Makro Step 2 page.
-    2. If none safely match, use the supplier brand only as a bounded discovery
-       query (or Makro's known no-brand sentinel queries).
-    3. AI may choose only an exact candidate returned by the live portal.
-
-    This keeps supplier semantics and marketplace availability separate while
-    preserving the existing deterministic click/confirmation/URL verification.
-    """
+    """Select one verified Makro brand from query-owned live results only."""
 
     if not is_brand_step(page):
         raise RuntimeError("Makro is not on Step 2 / Select Brand")
 
-    reconcile_portal_interruptions(page)
-    brand_input = _brand_input(page)
-    brand_input.fill("")
-    page.wait_for_timeout(max(0, int(wait_ms)))
-
-    selected, last_candidates = _select_from_current_live_candidates(
-        page,
-        provider,
-        hints,
-        discovery_query="",
-    )
-    if selected:
-        return selected
-
+    status = str(hints.brand_status or "").strip().casefold()
     terms = _brand_search_terms(hints)
-    if not terms:
+    if status == "unknown" or not terms:
         raise RuntimeError(
             "Supplier evidence did not establish a brand or explicit unbranded status; "
-            "refusing to choose a Makro brand from unrelated live candidates"
+            "refusing to choose a Makro brand"
         )
 
+    reconcile_portal_interruptions(page)
+    brand_input = _brand_input(page)
+
+    _close_brand_search(page, brand_input, wait_ms=wait_ms)
+    begin_search_query(brand_input)
+    current_rows = read_search_rows(brand_input)
+    if current_rows:
+        selected = _select_query_owned_brand(
+            page,
+            provider,
+            hints,
+            brand_input,
+            discovery_query="",
+            candidates=current_rows,
+        )
+        if selected:
+            return selected
+
     attempted: list[str] = []
+    observed: list[str] = []
     for term in terms:
         attempted.append(term)
         reconcile_portal_interruptions(page)
-        brand_input.fill("")
+        _close_brand_search(page, brand_input, wait_ms=wait_ms)
+
+        begin_search_query(brand_input)
         brand_input.fill(term)
         _click_check_brand(page)
-        page.wait_for_timeout(max(0, int(wait_ms)))
 
-        if is_product_info_step(page):
+        outcome, rows = _wait_for_brand_query_outcome(
+            page,
+            brand_input,
+            timeout_ms=max(3600, wait_ms * 5),
+        )
+        if outcome == "product_info":
             _, actual_brand = _current_target_values(page)
             return _verify_direct_transition_brand(
                 provider,
@@ -363,25 +276,28 @@ def select_brand(
                 actual_brand=actual_brand,
             )
 
-        selected, last_candidates = _select_from_current_live_candidates(
+        for row in rows:
+            if row not in observed:
+                observed.append(row)
+        if not rows:
+            continue
+
+        selected = _select_query_owned_brand(
             page,
             provider,
             hints,
+            brand_input,
             discovery_query=term,
+            candidates=rows,
         )
         if selected:
             return selected
 
-    sample = last_candidates[:12]
     raise RuntimeError(
-        "Makro Step 2 could not match supplier brand evidence to a verified live Makro brand. "
-        f"brand_status={str(hints.brand_status or '').strip()!r}, "
-        f"supplier_brand={str(hints.brand or '').strip()!r}, "
-        f"queries={attempted!r}, live_candidates_sample={sample!r}"
+        "Makro Step 2 could not match supplier brand evidence to a verified query-owned Makro brand. "
+        f"brand_status={status!r}, supplier_brand={str(hints.brand or '').strip()!r}, "
+        f"queries={attempted!r}, observed_query_rows={observed[:12]!r}"
     )
 
 
-__all__ = [
-    "choose_live_brand_candidate",
-    "select_brand",
-]
+__all__ = ["choose_live_brand_candidate", "select_brand"]

@@ -1,25 +1,52 @@
-"""Hit-tested search-result surface reader for Makro portal comboboxes.
+"""Query-owned Makro search/result surface mechanics.
 
-The portal can render autocomplete rows through framework portals with unstable
-class names and without ARIA roles. This module anchors result ownership to the
-live input geometry and browser hit-testing instead of CSS implementation
-details. It only reads/clicks rows that are actually visible and topmost around
-the search control.
+A search result belongs to the query that caused it, not merely to a rectangle
+below an input. The portal keeps stale taxonomy/brand content mounted while
+autocomplete/results are painted over it, so geometry-only scans can read the
+wrong layer.
+
+This module snapshots the visible DOM immediately before a query. Afterwards it
+accepts only elements that are new or whose rendered text changed, plus explicit
+ARIA-owned popup rows. Reads and clicks use the same ownership rule.
 """
 
 from __future__ import annotations
 
+from typing import Any
 
-_READ_ROWS_JS = r"""(input) => {
+
+_BEGIN_QUERY_JS = r"""
+(input) => {
+  const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+  const visible = (el) => {
+    if (!el || !(el instanceof Element)) return false;
+    const s = getComputedStyle(el), r = el.getBoundingClientRect();
+    return s.display !== 'none' && s.visibility !== 'hidden'
+      && Number(s.opacity || 1) !== 0 && r.width > 2 && r.height > 2;
+  };
+  if (!window.__makroQuerySurfaceState) {
+    window.__makroQuerySurfaceState = new WeakMap();
+  }
+  const baseline = new Map();
+  for (const el of document.querySelectorAll('body *')) {
+    if (!visible(el)) continue;
+    const text = clean(el.innerText || el.textContent || '');
+    baseline.set(el, text.slice(0, 500));
+  }
+  window.__makroQuerySurfaceState.set(input, {baseline});
+  return baseline.size;
+}
+"""
+
+
+_READ_ROWS_JS = r"""
+(input) => {
   const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
   const label = (el) => {
-    const raw = String(el.innerText || el.textContent || '');
+    const raw = String(el && (el.innerText || el.textContent) || '').trim();
+    if (!raw) return '';
     const lines = raw.split(/\n+/).map(clean).filter(Boolean);
-    const unique = [];
-    for (const line of lines) {
-      if (!unique.length || unique[unique.length - 1] !== line) unique.push(line);
-    }
-    if (unique.length >= 2 && unique.length <= 6) return unique.join(' / ');
+    if (lines.length > 1 && !raw.includes('/')) return lines.join(' / ');
     return clean(raw);
   };
   const visible = (el) => {
@@ -29,189 +56,214 @@ _READ_ROWS_JS = r"""(input) => {
       && Number(s.opacity || 1) !== 0 && s.pointerEvents !== 'none'
       && r.width > 2 && r.height > 2;
   };
+  const stateMap = window.__makroQuerySurfaceState;
+  const state = stateMap && stateMap.get(input);
+  if (!state || !state.baseline) return [];
+  const baseline = state.baseline;
+  const ir = input.getBoundingClientRect();
 
-  const inputRect = input.getBoundingClientRect();
-  const inBand = (el) => {
-    const r = el.getBoundingClientRect();
-    const overlap = Math.min(r.right, inputRect.right + 48)
-      - Math.max(r.left, inputRect.left - 48);
-    return overlap > 24
-      && r.bottom >= inputRect.bottom - 8
-      && r.top <= inputRect.bottom + 680;
+  const overlapX = (r) => Math.max(0, Math.min(r.right, ir.right) - Math.max(r.left, ir.left));
+  const nearInput = (r) => {
+    if (r.bottom < ir.bottom - 12 || r.top > ir.bottom + 760) return false;
+    return overlapX(r) >= Math.min(ir.width * 0.20, Math.max(30, r.width * 0.35));
   };
-  const topmost = (el) => {
-    const r = el.getBoundingClientRect();
-    const left = Math.max(r.left, inputRect.left);
-    const right = Math.min(r.right, inputRect.right);
-    const x = right > left ? (left + right) / 2 : r.left + Math.min(r.width / 2, 20);
-    const y = Math.min(Math.max(r.top + Math.min(r.height / 2, 18), 0), innerHeight - 1);
-    const stack = document.elementsFromPoint(
-      Math.min(Math.max(x, 0), innerWidth - 1),
-      y
-    );
-    const hit = stack.find((node) => {
-      if (!(node instanceof Element)) return false;
-      const s = getComputedStyle(node);
-      return s.pointerEvents !== 'none'
-        && s.display !== 'none'
-        && s.visibility !== 'hidden';
-    });
-    return !!hit && (el.contains(hit) || hit.contains(el));
+  const topmost = (el, r) => {
+    const x = Math.max(1, Math.min(innerWidth - 2, Math.max(r.left + 3, Math.min(r.right - 3, ir.left + Math.min(ir.width * .18, 80)))));
+    const y = Math.max(1, Math.min(innerHeight - 2, r.top + Math.min(Math.max(r.height / 2, 3), r.height - 2)));
+    const hit = document.elementFromPoint(x, y);
+    return !!hit && (hit === el || el.contains(hit));
   };
-  const actionable = (el) => {
-    const role = String(el.getAttribute('role') || '').toLowerCase();
-    const tag = String(el.tagName || '').toLowerCase();
-    const s = getComputedStyle(el);
-    return tag === 'button' || tag === 'a'
-      || role === 'option' || role === 'menuitem' || role === 'button'
-      || !!el.onclick || s.cursor === 'pointer'
-      || (el.hasAttribute('tabindex') && Number(el.getAttribute('tabindex')) >= 0);
+  const changed = (el) => {
+    const current = clean(el.innerText || el.textContent || '').slice(0, 500);
+    return !baseline.has(el) || baseline.get(el) !== current;
+  };
+  const semantic = (el) => {
+    const role = String(el.getAttribute && el.getAttribute('role') || '').toLowerCase();
+    const cls = String(el.className || '').toLowerCase();
+    return ['option','menuitem','listitem','row'].includes(role)
+      || ['LI','TR','OPTION'].includes(el.tagName)
+      || !!el.getAttribute?.('data-brand')
+      || !!el.getAttribute?.('data-value')
+      || /autocomplete|suggest|result|option|brand/.test(cls);
+  };
+  const explicitOwned = (el) => {
+    for (const attr of ['aria-controls', 'aria-owns']) {
+      const id = input.getAttribute(attr);
+      const root = id && document.getElementById(id);
+      if (root && root.contains(el)) return true;
+    }
+    return !!el.closest?.('[role="listbox"]');
+  };
+  const rowAncestor = (start) => {
+    let el = start;
+    for (let depth = 0; el && el !== document.body && depth < 8; depth++, el = el.parentElement) {
+      if (el === input || el.contains(input) || !visible(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (!nearInput(r)) continue;
+      const text = label(el);
+      if (!text || text.length < 2 || text.length > 320) continue;
+
+      const owned = explicitOwned(el);
+      const wide = r.width >= Math.min(ir.width * .55, 360)
+        && overlapX(r) >= Math.min(ir.width * .55, r.width * .70)
+        && r.height >= 14 && r.height <= 110;
+      if ((owned || semantic(el) || wide) && topmost(el, r)) return el;
+    }
+    return null;
   };
 
-  const roots = [];
-  const addRoot = (el) => {
-    if (el && !roots.includes(el) && visible(el) && inBand(el)) roots.push(el);
-  };
-  for (const attr of ['aria-controls', 'aria-owns']) {
-    const id = input.getAttribute(attr);
-    if (id) addRoot(document.getElementById(id));
+  const candidates = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (!visible(el) || el === input || el.contains(input)) continue;
+    if (!changed(el) && !explicitOwned(el)) continue;
+    const r = el.getBoundingClientRect();
+    if (!nearInput(r) && !semantic(el)) continue;
+    const row = rowAncestor(el);
+    if (row) candidates.push(row);
   }
-  for (const el of document.querySelectorAll(
-    '[role="listbox"], [class*="autocomplete" i], [class*="suggest" i], [class*="search-result" i]'
-  )) addRoot(el);
+
+  const rows = [];
+  const seenElements = new Set();
+  for (const row of candidates) {
+    if (seenElements.has(row)) continue;
+    seenElements.add(row);
+    const r = row.getBoundingClientRect();
+    rows.push({el: row, text: label(row), top: r.top, left: r.left});
+  }
+  rows.sort((a,b) => a.top - b.top || a.left - b.left);
 
   const out = [], seen = new Set();
-  const addRow = (el) => {
-    if (!visible(el) || !inBand(el) || !topmost(el)) return;
-    const r = el.getBoundingClientRect();
-    if (r.height > 150 || r.width < 70) return;
-    const text = label(el);
-    if (!text || text.length < 2 || text.length > 320) return;
-
-    for (const child of el.children || []) {
-      if (visible(child) && inBand(child) && label(child) === text) return;
-    }
-
+  for (const item of rows) {
+    const text = item.text;
     const key = text.toLocaleLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    out.push(text);
-  };
-
-  const rowSelector = [
-    '[role="option"]', '[role="menuitem"]', 'li', 'a', 'button',
-    '[tabindex]', '[class*="option" i]', '[class*="result" i]',
-    '[class*="suggest" i]'
-  ].join(',');
-  for (const root of roots) {
-    for (const el of root.querySelectorAll(rowSelector)) addRow(el);
-  }
-
-  if (!out.length) {
-    for (const el of document.querySelectorAll('body *')) {
-      if (!visible(el) || !inBand(el) || !topmost(el)) continue;
-      const r = el.getBoundingClientRect();
-      const rowLike = r.height >= 18 && r.height <= 120
-        && r.width >= Math.min(120, Math.max(70, inputRect.width * 0.30));
-      if (!rowLike) continue;
-      if (!actionable(el) && r.width < inputRect.width * 0.55) continue;
-      addRow(el);
-    }
-  }
-
-  return out;
-}"""
-
-
-_CLICK_ROW_JS = r"""(input, wanted) => {
-  const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-  const label = (el) => {
-    const raw = String(el.innerText || el.textContent || '');
-    const lines = raw.split(/\n+/).map(clean).filter(Boolean);
-    const unique = [];
-    for (const line of lines) {
-      if (!unique.length || unique[unique.length - 1] !== line) unique.push(line);
-    }
-    if (unique.length >= 2 && unique.length <= 6) return unique.join(' / ');
-    return clean(raw);
-  };
-  const visible = (el) => {
-    if (!el || !(el instanceof Element)) return false;
-    const s = getComputedStyle(el), r = el.getBoundingClientRect();
-    return s.display !== 'none' && s.visibility !== 'hidden'
-      && Number(s.opacity || 1) !== 0 && s.pointerEvents !== 'none'
-      && r.width > 2 && r.height > 2;
-  };
-
-  const inputRect = input.getBoundingClientRect();
-  const inBand = (el) => {
-    const r = el.getBoundingClientRect();
-    const overlap = Math.min(r.right, inputRect.right + 48)
-      - Math.max(r.left, inputRect.left - 48);
-    return overlap > 24
-      && r.bottom >= inputRect.bottom - 8
-      && r.top <= inputRect.bottom + 680;
-  };
-  const topmost = (el) => {
-    const r = el.getBoundingClientRect();
-    const left = Math.max(r.left, inputRect.left);
-    const right = Math.min(r.right, inputRect.right);
-    const x = right > left ? (left + right) / 2 : r.left + Math.min(r.width / 2, 20);
-    const y = Math.min(Math.max(r.top + Math.min(r.height / 2, 18), 0), innerHeight - 1);
-    const stack = document.elementsFromPoint(
-      Math.min(Math.max(x, 0), innerWidth - 1),
-      y
-    );
-    const hit = stack.find((node) => {
-      if (!(node instanceof Element)) return false;
-      const s = getComputedStyle(node);
-      return s.pointerEvents !== 'none'
-        && s.display !== 'none'
-        && s.visibility !== 'hidden';
-    });
-    return !!hit && (el.contains(hit) || hit.contains(el));
-  };
-  const actionable = (el) => {
-    const role = String(el.getAttribute('role') || '').toLowerCase();
-    const tag = String(el.tagName || '').toLowerCase();
-    const s = getComputedStyle(el);
-    return tag === 'button' || tag === 'a'
-      || role === 'option' || role === 'menuitem' || role === 'button'
-      || !!el.onclick || s.cursor === 'pointer'
-      || (el.hasAttribute('tabindex') && Number(el.getAttribute('tabindex')) >= 0);
-  };
-
-  const matches = [];
-  for (const el of document.querySelectorAll('body *')) {
-    if (!visible(el) || !inBand(el) || !topmost(el) || label(el) !== wanted) continue;
-    const r = el.getBoundingClientRect();
-    if (r.height > 150 || r.width < 70) continue;
-    let sameChild = false;
-    for (const child of el.children || []) {
-      if (visible(child) && inBand(child) && label(child) === wanted) {
-        sameChild = true;
+    if (!text || seen.has(key)) continue;
+    let duplicateChild = false;
+    for (const child of item.el.querySelectorAll('*')) {
+      if (child === item.el || !visible(child)) continue;
+      if (label(child) === text && rowAncestor(child) === child) {
+        duplicateChild = true;
         break;
       }
     }
-    if (!sameChild) matches.push(el);
+    if (duplicateChild) continue;
+    seen.add(key);
+    out.push(text);
+    if (out.length >= 80) break;
+  }
+  return out;
+}
+"""
+
+
+_CLICK_ROW_JS = r"""
+(input, wanted) => {
+  const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+  const normalize = (v) => clean(v).toLocaleLowerCase();
+  const wantedKey = normalize(wanted);
+  if (!wantedKey) return false;
+
+  const stateMap = window.__makroQuerySurfaceState;
+  const state = stateMap && stateMap.get(input);
+  if (!state || !state.baseline) return false;
+  const baseline = state.baseline;
+  const ir = input.getBoundingClientRect();
+
+  const visible = (el) => {
+    if (!el || !(el instanceof Element)) return false;
+    const s = getComputedStyle(el), r = el.getBoundingClientRect();
+    return s.display !== 'none' && s.visibility !== 'hidden'
+      && Number(s.opacity || 1) !== 0 && s.pointerEvents !== 'none'
+      && r.width > 2 && r.height > 2;
+  };
+  const label = (el) => {
+    const raw = String(el && (el.innerText || el.textContent) || '').trim();
+    const lines = raw.split(/\n+/).map(clean).filter(Boolean);
+    return lines.length > 1 && !raw.includes('/') ? lines.join(' / ') : clean(raw);
+  };
+  const overlapX = (r) => Math.max(0, Math.min(r.right, ir.right) - Math.max(r.left, ir.left));
+  const nearInput = (r) => r.bottom >= ir.bottom - 12 && r.top <= ir.bottom + 760
+    && overlapX(r) >= Math.min(ir.width * .20, Math.max(30, r.width * .35));
+  const topmost = (el, r) => {
+    const x = Math.max(1, Math.min(innerWidth - 2, Math.max(r.left + 3, Math.min(r.right - 3, ir.left + Math.min(ir.width * .18, 80)))));
+    const y = Math.max(1, Math.min(innerHeight - 2, r.top + Math.min(Math.max(r.height / 2, 3), r.height - 2)));
+    const hit = document.elementFromPoint(x, y);
+    return !!hit && (hit === el || el.contains(hit));
+  };
+  const changed = (el) => {
+    const current = clean(el.innerText || el.textContent || '').slice(0, 500);
+    return !baseline.has(el) || baseline.get(el) !== current;
+  };
+  const explicitOwned = (el) => {
+    for (const attr of ['aria-controls', 'aria-owns']) {
+      const id = input.getAttribute(attr);
+      const root = id && document.getElementById(id);
+      if (root && root.contains(el)) return true;
+    }
+    return !!el.closest?.('[role="listbox"]');
+  };
+  const semantic = (el) => {
+    const role = String(el.getAttribute && el.getAttribute('role') || '').toLowerCase();
+    const cls = String(el.className || '').toLowerCase();
+    return ['option','menuitem','listitem','row'].includes(role)
+      || ['LI','TR','OPTION'].includes(el.tagName)
+      || !!el.getAttribute?.('data-brand')
+      || !!el.getAttribute?.('data-value')
+      || /autocomplete|suggest|result|option|brand/.test(cls);
+  };
+  const rowAncestor = (start) => {
+    let el = start;
+    for (let depth = 0; el && el !== document.body && depth < 8; depth++, el = el.parentElement) {
+      if (el === input || el.contains(input) || !visible(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (!nearInput(r)) continue;
+      const text = label(el);
+      if (!text || text.length < 2 || text.length > 320) continue;
+      const wide = r.width >= Math.min(ir.width * .55, 360)
+        && overlapX(r) >= Math.min(ir.width * .55, r.width * .70)
+        && r.height >= 14 && r.height <= 110;
+      if ((explicitOwned(el) || semantic(el) || wide) && topmost(el, r)) return el;
+    }
+    return null;
+  };
+
+  const matches = [];
+  const seen = new Set();
+  for (const el of document.querySelectorAll('body *')) {
+    if (!visible(el) || el === input || el.contains(input)) continue;
+    if (!changed(el) && !explicitOwned(el)) continue;
+    const row = rowAncestor(el);
+    if (!row || seen.has(row) || normalize(label(row)) !== wantedKey) continue;
+    seen.add(row);
+    matches.push(row);
   }
   if (matches.length !== 1) return false;
 
   let target = matches[0];
-  for (let i = 0; i < 6 && target; i++, target = target.parentElement) {
-    if (!visible(target) || !inBand(target)) break;
-    if (actionable(target)) {
+  for (let depth = 0; target && depth < 5; depth++, target = target.parentElement) {
+    if (!target || target === document.body || target.contains(input)) break;
+    const role = String(target.getAttribute?.('role') || '').toLowerCase();
+    const style = getComputedStyle(target);
+    if (target.tagName === 'A' || target.tagName === 'BUTTON'
+        || ['option','menuitem','button','listitem','row'].includes(role)
+        || typeof target.onclick === 'function' || style.cursor === 'pointer') {
       target.click();
       return true;
     }
   }
   matches[0].click();
   return true;
-}"""
+}
+"""
 
 
-def read_search_rows(search) -> list[str]:
-    """Return exact visible row labels belonging to the search surface."""
+def begin_search_query(search: Any) -> None:
+    """Capture the visible pre-query DOM for one search input."""
+
+    search.evaluate(_BEGIN_QUERY_JS)
+
+
+def read_search_rows(search: Any) -> list[str]:
+    """Return only rows owned by the query begun for ``search``."""
 
     try:
         raw = search.evaluate(_READ_ROWS_JS)
@@ -220,7 +272,7 @@ def read_search_rows(search) -> list[str]:
     output: list[str] = []
     seen: set[str] = set()
     for item in raw or []:
-        value = str(item or "").strip()
+        value = " ".join(str(item or "").split()).strip()
         key = value.casefold()
         if not value or key in seen:
             continue
@@ -229,16 +281,38 @@ def read_search_rows(search) -> list[str]:
     return output
 
 
-def click_search_row(search, label: str) -> bool:
-    """Click one exact, topmost row from the same search surface."""
+def wait_for_search_rows(
+    page: Any,
+    search: Any,
+    *,
+    timeout_ms: int = 4000,
+    poll_ms: int = 200,
+) -> list[str]:
+    """Boundedly wait for query-owned rows; never fall back to page-wide text."""
 
-    wanted = str(label or "").strip()
-    if not wanted:
-        return False
+    timeout = max(0, int(timeout_ms))
+    poll = max(50, int(poll_ms))
+    attempts = max(1, timeout // poll)
+    for _ in range(attempts):
+        rows = read_search_rows(search)
+        if rows:
+            return rows
+        page.wait_for_timeout(poll)
+    return read_search_rows(search)
+
+
+def click_search_row(search: Any, label: str) -> bool:
+    """Click exactly one row still owned by the active query."""
+
     try:
-        return bool(search.evaluate(_CLICK_ROW_JS, wanted))
+        return bool(search.evaluate(_CLICK_ROW_JS, str(label or "").strip()))
     except Exception:
         return False
 
 
-__all__ = ["click_search_row", "read_search_rows"]
+__all__ = [
+    "begin_search_query",
+    "click_search_row",
+    "read_search_rows",
+    "wait_for_search_rows",
+]
