@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 
 from app.product_pack import SUPPORTED_PRODUCT_PACK_SUFFIXES
 
+from .product_pack_review import ProductPackReviewDialog
 from .readonly_runner import RunnerConfig
 from .result_loader import RunResult
 from .workflow_console_window import WorkflowMainWindow
@@ -34,13 +35,14 @@ _PRODUCT_PACK_FILTER = (
 class ProductInputWorkflowMainWindow(WorkflowMainWindow):
     """Formal Single workspace with URL and customer Product Pack as peer inputs.
 
-    This class owns only input selection. Both paths immediately converge on the
-    existing ReadOnlyRunner / Step 1+2 / Resolver / Fill Plan / real-execution
-    chain; no second listing implementation is introduced in the GUI.
+    This class owns only input selection and Product Pack review presentation.
+    Both sources immediately converge on the existing ReadOnlyRunner / Step 1+2 /
+    Resolver / Fill Plan / real-execution chain; no second listing engine exists.
     """
 
     def __init__(self, project_root: Path) -> None:
         self._selected_product_files: tuple[Path, ...] = ()
+        self._product_pack_review_result: RunResult | None = None
         super().__init__(project_root)
 
     def _build_input_card(self):
@@ -50,8 +52,8 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
             return card
 
         # WorkflowMainWindow preserves the base Product Source row at index 1.
-        # Add the alternate input on that same line so the compact hero card does
-        # not gain another vertical row and steal space from the live console.
+        # Keep alternate input + review on that same line so the compact hero card
+        # does not gain another vertical row and steal space from the live console.
         source_row = layout.itemAt(1).layout() if layout.count() > 1 else None
         if isinstance(source_row, QHBoxLayout):
             self.product_pack_button = QPushButton("上传资料…")
@@ -67,10 +69,20 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
             self.product_pack_clear_button.setVisible(False)
             self.product_pack_clear_button.clicked.connect(self._clear_product_files)
 
+            self.product_pack_review_button = QPushButton("解析结果")
+            self.product_pack_review_button.setObjectName("quietButton")
+            self.product_pack_review_button.setVisible(False)
+            self.product_pack_review_button.setToolTip(
+                "查看每个字段的 Product Pack 证据来源、解析警告与冲突 alternatives；"
+                "required 冲突可明确确认一个值。"
+            )
+            self.product_pack_review_button.clicked.connect(self._open_product_pack_review)
+
             start_index = source_row.indexOf(self.start_button)
             insert_at = start_index if start_index >= 0 else source_row.count()
             source_row.insertWidget(insert_at, self.product_pack_button)
             source_row.insertWidget(insert_at + 1, self.product_pack_clear_button)
+            source_row.insertWidget(insert_at + 2, self.product_pack_review_button)
 
         self.url_input.textEdited.connect(self._on_url_edited)
 
@@ -131,22 +143,27 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
             return
 
         self._selected_product_files = paths
+        self._product_pack_review_result = None
         self.url_input.clear()
         self.url_input.setPlaceholderText(self._pack_summary(paths))
         self.current_page_check.setChecked(False)
         self.product_pack_button.setText(f"资料包 · {len(paths)}")
         self.product_pack_button.setToolTip("\n".join(str(path) for path in paths))
         self.product_pack_clear_button.setVisible(True)
+        self.product_pack_review_button.setVisible(False)
         self._sync_product_input_controls()
 
     def _clear_product_files(self, _checked: bool = False) -> None:
         self._selected_product_files = ()
+        self._product_pack_review_result = None
         self.url_input.setPlaceholderText("https://detail.1688.com/offer/...")
         self.product_pack_button.setText("上传资料…")
         self.product_pack_button.setToolTip(
             "一次选择同一商品的 PDF / Word / Excel / CSV / TXT / 图片 / ZIP。"
         )
         self.product_pack_clear_button.setVisible(False)
+        if hasattr(self, "product_pack_review_button"):
+            self.product_pack_review_button.setVisible(False)
         self._sync_product_input_controls()
 
     def _on_url_edited(self, text: str) -> None:
@@ -181,10 +198,13 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
             self.real_upload_check.setChecked(False)
 
     def _reset_result_views(self) -> None:
-        # Never let Listing Photos selected for a previous product leak into a
-        # newly prepared product. Product-pack candidates are re-seeded from the
-        # exact completed run below and still require explicit upload opt-in.
+        # Never let Listing Photos / conflict confirmations selected for a previous
+        # product leak into a newly prepared product. The new run seeds its own
+        # exact evidence and required-field state.
         self._clear_staged_listing_images()
+        self._product_pack_review_result = None
+        if hasattr(self, "product_pack_review_button"):
+            self.product_pack_review_button.setVisible(False)
         super()._reset_result_views()
 
     def _start_mode(self, mode: str) -> None:
@@ -256,8 +276,43 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
             output.append(path)
         return tuple(output)
 
+    def _is_pack_result(self, result: RunResult) -> bool:
+        workflow_path = result.run_dir / "run-manifest.json"
+        if not workflow_path.is_file():
+            return False
+        try:
+            workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return str(workflow.get("input_mode") or "") == "customer_product_pack"
+
+    def _open_product_pack_review(self, _checked: bool = False) -> None:
+        result = self._product_pack_review_result
+        if result is None:
+            QMessageBox.information(self, "暂无解析结果", "请先完成当前客户资料包的 Resolver + Fill Plan。")
+            return
+        try:
+            dialog = ProductPackReviewDialog(result, self)
+            dialog.exec()
+        except Exception as exc:
+            QMessageBox.warning(self, "无法打开资料解析结果", str(exc))
+            return
+        if dialog.confirmed_count:
+            self.fields_hint.setText(
+                f"资料包冲突确认完成 · 当前任务已明确确认 {dialog.confirmed_count} 个 required 字段"
+            )
+            self.real_policy_hint.setText(
+                "已确认的冲突值会作为当前任务的显式用户 override；真正写入前仍由 canonical executor "
+                "重新绑定 live field 并校验 option / unit。Save / 图片继续显式授权，QC 永久锁定。"
+            )
+
     def _unlock_real_execution(self, result: RunResult) -> None:
         super()._unlock_real_execution(result)
+        if self._is_pack_result(result):
+            self._product_pack_review_result = result
+            self.product_pack_review_button.setVisible(True)
+            self.product_pack_review_button.setEnabled(True)
+
         images = self._pack_listing_images(result)
         if not images:
             return
@@ -271,8 +326,8 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
         if result.ready > 0:
             self.real_policy_hint.setText(
                 f"read-only acceptance 已通过：READY={result.ready}。资料包中有 {len(images)} 张"
-                "可用 Listing Photos 已预选；勾选“上传图片”后才会真正上传。"
-                "Save / 图片仍是显式授权，QC 继续锁定。"
+                "可用 Listing Photos 已预选；可点“解析结果”核对字段来源 / required 冲突。"
+                "勾选“上传图片”后才会真正上传；Save / 图片仍是显式授权，QC 继续锁定。"
             )
 
     def _set_running(self, running: bool) -> None:
@@ -280,6 +335,9 @@ class ProductInputWorkflowMainWindow(WorkflowMainWindow):
         if hasattr(self, "product_pack_button"):
             self.product_pack_button.setEnabled(not running)
             self.product_pack_clear_button.setEnabled(not running)
+            self.product_pack_review_button.setEnabled(
+                not running and self._product_pack_review_result is not None
+            )
         if not running:
             self._sync_product_input_controls()
 
