@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from .native_background import NativeQuickBackground
-from .visual_style import NEKRO_STYLE
+from .nekro_style import NEKRO_STYLE
 
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
@@ -22,23 +22,12 @@ _NORMAL_SCALE_EPSILON = 1e-5
 
 
 class _CardScaleEffect(QGraphicsEffect):
-    """Scale one QWidget card subtree with live/current and frozen/outgoing modes.
+    """Transform one complete QWidget card composite without touching its layout.
 
-    Quick owns the glass shell itself. This effect owns the QWidget content painted
-    above that shell. The currently hovered/pressed card stays LIVE: every actual
-    redraw asks Qt for a fresh logical sourcePixmap(), preserving child hover,
-    press, focus, selection and cursor feedback while the complete card content
-    still scales as one composite.
-
-    A card that has just LOST interaction ownership may switch to FROZEN mode for
-    its short return-to-rest animation. Its first outgoing draw captures one final
-    composite and later scale ticks reuse that same pixmap. Returning to live
-    ownership, exact scale 1.0, modal reset or cleanup releases the frozen image.
-
-    Scale publication is also pixel-budgeted here, at the actual renderer boundary:
-    a full live QWidget subtree is not re-rasterized until the card edge would move
-    by at least ~0.18 px. This keeps the hot path local instead of wrapping
-    set_scale() at runtime.
+    At rest the native widget subtree remains live. During a short scale tween the
+    card controller asks this effect to freeze one current sourcePixmap; subsequent
+    scale steps reuse that same composite and only perform a cheap pixmap transform.
+    Exact rest, modal reset and cleanup release the frozen image immediately.
     """
 
     def __init__(self, parent: QObject) -> None:
@@ -167,7 +156,7 @@ class _CardScaleEffect(QGraphicsEffect):
 
 
 class NativeGlassProxy(QObject):
-    """Synchronize one reference-web interaction across Quick glass and QWidget content."""
+    """Publish one card interaction to Quick glass and its QWidget composite."""
 
     def __init__(self, frame: QFrame, background: NativeQuickBackground) -> None:
         super().__init__(frame)
@@ -199,7 +188,6 @@ class NativeGlassProxy(QObject):
             return
         self._surface_scale = scale
         self._overlay_alpha = overlay_alpha
-
         self.background.set_card_presentation(
             self.frame,
             scale=scale,
@@ -225,7 +213,7 @@ class NativeGlassProxy(QObject):
 
 
 class NativeVisualStyleController(QObject):
-    """Native Quick background/base glass with QWidget interaction feedback."""
+    """The single formal QWidget/Quick visual bridge."""
 
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
@@ -244,7 +232,6 @@ class NativeVisualStyleController(QObject):
             self.central.installEventFilter(self)
 
         window.setStyleSheet(window.styleSheet() + "\n" + NEKRO_STYLE)
-
         self.background = NativeQuickBackground(window)
         for frame in window.findChildren(QFrame):
             if frame.objectName() in _GLASS_NAMES:
@@ -259,7 +246,7 @@ class NativeVisualStyleController(QObject):
         return self._glass.get(frame)
 
     def refresh_glass_frames(self) -> int:
-        """Register glass cards created after the native Quick scene started."""
+        """Register cards created after the Quick scene was constructed."""
 
         new_frames = [
             frame
@@ -280,21 +267,7 @@ class NativeVisualStyleController(QObject):
                 frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
                 model.cards.append(frame)
                 model._rows[frame] = row
-                model._states.append(
-                    {
-                        "cardX": 0.0,
-                        "cardY": 0.0,
-                        "cardW": 0.0,
-                        "cardH": 0.0,
-                        "clipX": 0.0,
-                        "clipY": 0.0,
-                        "clipW": 0.0,
-                        "clipH": 0.0,
-                        "cardAlpha": _NORMAL_GLASS_ALPHA,
-                        "cardScale": 1.0,
-                        "cardVisible": False,
-                    }
-                )
+                model._states.append(model.default_state())
                 self._glass[frame] = NativeGlassProxy(frame, self.background)
         finally:
             model.endInsertRows()
@@ -369,3 +342,6 @@ def install_native_visual_style(window: QMainWindow) -> NativeVisualStyleControl
     controller = NativeVisualStyleController(window)
     window._visual_style = controller  # type: ignore[attr-defined]
     return controller
+
+
+__all__ = ["NativeGlassProxy", "NativeVisualStyleController", "install_native_visual_style"]
