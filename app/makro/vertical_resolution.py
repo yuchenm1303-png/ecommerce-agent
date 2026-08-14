@@ -20,6 +20,14 @@ _MAX_LIVE_CANDIDATES = 40
 _QUERY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 '&/()+.,-]*$")
 _FORBIDDEN_PLATFORM_WORDS = {"makro", "marketplace", "seller", "listing"}
 _GENERIC_ONLY_QUERY_WORDS = {"vertical", "category", "product"}
+_SAME_PRODUCT_TYPE = "same_product_type"
+_BROADER_VALID_CLASS = "broader_valid_class"
+_NO_VALID_CLASS = "none"
+_VALID_SELECTION_RELATIONS = {
+    _SAME_PRODUCT_TYPE,
+    _BROADER_VALID_CLASS,
+    _NO_VALID_CLASS,
+}
 
 
 def _clean(value: object) -> str:
@@ -245,9 +253,10 @@ def build_vertical_pool_choice_request(
             "search queries. The candidate set is authoritative; search-query wording is not. JSON only."
         ),
         "prompt_instruction": (
-            "Select the candidate whose full breadcrumb/leaf actually represents the physical product "
-            "in context.product_identity. Use all live candidates together instead of deciding from one "
-            "query in isolation."
+            "Classify the semantic relationship between the physical product and the best live Makro "
+            "candidate. Prefer the same product type. When Makro has no equally specific candidate, "
+            "a genuine broader class that includes the product is valid. Never substitute a different "
+            "specific sibling product merely because wording overlaps."
         ),
         "context": {
             "product_summary": hints.product_summary,
@@ -259,18 +268,25 @@ def build_vertical_pool_choice_request(
             "selected_vertical must be copied exactly from an allowed live candidate label or be empty.",
             "The search query that retrieved a row is only a retrieval hint, not evidence that the row is correct.",
             "Judge the full breadcrumb and especially its leaf against the physical product identity.",
-            "Reject a candidate that merely shares a modifier, power term, model-like token or other incidental word with the product.",
-            "Do not choose chargers, batteries, spare parts, accessories or adjacent products unless the product itself is one.",
-            "Prefer the most specific candidate that describes the same physical product type.",
-            "If none clearly describes the same product type, return an empty string so taxonomy fallback can run.",
+            "First prefer a candidate representing the same physical product type; use selection_relation=same_product_type.",
+            "If no same-product candidate exists, a broader_valid_class is allowed only when it is a genuine semantic superclass that can contain this product without changing its defining mechanism, form, role or use case.",
+            "A more specific category with a different defining mechanism, form, role or use case is an adjacent sibling, not a broader class, even when it shares the same head noun.",
+            "Reject candidates that merely share modifiers, power terms, model-like tokens or incidental words with the product.",
+            "Do not choose chargers, batteries, spare parts, accessories or other adjacent products unless the product itself is one.",
+            "Prefer the most specific valid candidate: same product type before broader valid class.",
+            "If neither a same-product candidate nor a valid broader class exists, return selected_vertical='' and selection_relation=none so taxonomy fallback can run.",
         ],
         "json_contract": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
                 "selected_vertical": {"type": "string", "enum": ["", *allowed]},
+                "selection_relation": {
+                    "type": "string",
+                    "enum": [_SAME_PRODUCT_TYPE, _BROADER_VALID_CLASS, _NO_VALID_CLASS],
+                },
             },
-            "required": ["selected_vertical"],
+            "required": ["selected_vertical", "selection_relation"],
         },
         "strict_json_schema": True,
     }
@@ -287,9 +303,26 @@ def choose_vertical_candidate_pool(
     raw = provider.extract_json(build_vertical_pool_choice_request(hints, search_terms, candidates))
     if not isinstance(raw, dict):
         raise ValueError("aggregated Vertical chooser response must be a JSON object")
+
     selected = _clean(raw.get("selected_vertical"))
+    relation = _clean(raw.get("selection_relation")).casefold()
+    # Compatibility for local/unit providers written against the previous
+    # response shape. Production uses strict_json_schema and must return the
+    # explicit relation above.
+    if not relation:
+        relation = _SAME_PRODUCT_TYPE if selected else _NO_VALID_CLASS
+    if relation not in _VALID_SELECTION_RELATIONS:
+        raise ValueError(f"invalid Makro Vertical selection_relation={relation!r}")
+
     if not selected:
+        if relation != _NO_VALID_CLASS:
+            raise ValueError("empty Makro Vertical selection requires selection_relation='none'")
         return ""
+    if relation not in {_SAME_PRODUCT_TYPE, _BROADER_VALID_CLASS}:
+        raise ValueError(
+            "non-empty Makro Vertical selection requires same_product_type or broader_valid_class"
+        )
+
     wanted = normalize_label(selected)
     matches = [item.label for item in candidates if normalize_label(item.label) == wanted]
     if len(matches) != 1:
