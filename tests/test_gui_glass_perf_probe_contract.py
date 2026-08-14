@@ -13,30 +13,30 @@ def test_glass_probe_is_development_only_and_compiles() -> None:
     assert "gui_glass_perf_probe" not in RUN
 
 
-def test_glass_probe_is_focused_on_multieffect_and_parallax() -> None:
+def test_glass_probe_compares_only_multieffect_at_fixed_cadence() -> None:
     for token in (
-        'MODES = ("production_glass", "glass_overlay_only", "static_background")',
+        'MODES = ("production_glass", "no_multieffect")',
         "ShaderEffectSource",
         "live: false",
         "MultiEffect",
-        "FrameAnimation",
-        "layer.enabled: root.glassEnabled",
-        "root.parallaxEnabled && root.animationRunning",
+        "framePulse",
+        "root.requestUpdate()",
         "frameSwapped.connect",
+        "swap_per_tick",
     ):
         assert token in PROBE
+    assert "static_background" not in PROBE
+    assert "glass_overlay_only" not in PROBE
 
 
-def test_glass_probe_reports_quick_tail_latency_and_root_cause() -> None:
+def test_glass_probe_rejects_cadence_mismatch_before_cost_decision() -> None:
     for token in (
-        "swap_p95_ms",
-        "swap_p99_ms",
-        "swap_long_1_5x_rate",
-        "multieffect-dominant",
-        "parallax-source-motion-dominant",
-        "combined-glass-parallax-cost",
-        "glass-stack-not-dominant",
-        "GLASS PERFORMANCE PROBE SUMMARY",
+        "cadence-mismatch-retry",
+        "multieffect-material",
+        "multieffect-minor",
+        "keep-production-glass",
+        "MIN_MATERIAL_GAIN_PERCENT = 10.0",
+        "FIXED-CADENCE GLASS PROBE SUMMARY",
         "VERDICT:",
     ):
         assert token in PROBE

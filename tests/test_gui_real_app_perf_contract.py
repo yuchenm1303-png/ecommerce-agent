@@ -44,3 +44,17 @@ def test_real_app_ab_changes_only_effect_lifecycle_inside_tool_process() -> None
     assert "run_local_gui.main()" in source
     assert "setEnabled(active)" not in VISUAL
     assert "updateBoundingRect()" not in VISUAL
+
+
+def test_real_app_profiler_owns_foreground_and_clean_shutdown() -> None:
+    source = TOOL.read_text(encoding="utf-8")
+    for token in (
+        "ctypes.windll.user32",
+        "SetWindowPos",
+        "SetForegroundWindow",
+        "self._set_foreground(topmost=True)",
+        "self._set_foreground(topmost=False)",
+        "app.closeAllWindows()",
+        "app.exit(0)",
+    ):
+        assert token in source

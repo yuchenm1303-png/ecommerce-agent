@@ -18,6 +18,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# Match the formal Listing Studio render-loop policy before Qt is imported.
+os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
+
 from PySide6 import __version__ as PYSIDE_VERSION
 from PySide6.QtCore import QEventLoop, QObject, Qt, QTimer, QUrl, Signal, qVersion
 from PySide6.QtGui import QImage
@@ -28,10 +31,12 @@ from PySide6.QtWidgets import QApplication
 from gui.native_background import _blur_wallpaper, _decode_wallpaper
 
 
-MODES = ("production_glass", "glass_overlay_only", "static_background")
+MODES = ("production_glass", "no_multieffect")
 PATH = (0, 1, 2, 3, 4, 5, 4, 3, 2, 1)
 CROSSOVER_DWELL_MS = 70
 TRANSITION_MS = 300
+MIN_MATERIAL_GAIN_PERCENT = 10.0
+MIN_MINOR_GAIN_PERCENT = 5.0
 
 _QML = r'''import QtQuick
 import QtQuick.Window
@@ -45,7 +50,6 @@ Window {
     property url sharpUrl
     property url blurUrl
     property bool glassEnabled: true
-    property bool parallaxEnabled: true
     property real pointerX: 0.0
     property real pointerY: 0.0
     property real offsetX: 0.0
@@ -55,6 +59,7 @@ Window {
     property int previousIndex: 0
     property real motionProgress: 1.0
     property int geometryRevision: 0
+    property int framePulse: 0
 
     readonly property real maxX: width * 0.027
     readonly property real maxY: height * 0.027
@@ -161,8 +166,20 @@ Window {
         }
     }
 
+    // A microscopic pulse makes both variants dirty at exactly the same Python
+    // cadence. This prevents frameSwapped gaps caused by Qt Quick's legitimate
+    // on-demand rendering from being misclassified as slow frames.
+    Rectangle {
+        width: 1
+        height: 1
+        x: 0
+        y: 0
+        color: "white"
+        opacity: root.framePulse % 2 === 0 ? 0.001 : 0.002
+    }
+
     FrameAnimation {
-        running: root.parallaxEnabled && root.animationRunning
+        running: root.animationRunning
         onTriggered: {
             var dt = Math.max(0.0, Math.min(frameTime, 0.05))
             var gain = 1.0 - Math.pow(0.88, dt * 60.0)
@@ -190,6 +207,7 @@ class ProbeResult:
     tick_p95_ms: float
     tick_p99_ms: float
     samples_swap: int
+    swap_per_tick: float
     swap_p95_ms: float
     swap_p99_ms: float
     swap_max_ms: float
@@ -284,6 +302,7 @@ class GlassRun(QObject):
         self.previous = PATH[0]
         self.transition_started = time.perf_counter()
         self.next_cross = time.perf_counter()
+        self.tick_index = 0
         self.last_tick: float | None = None
         self.last_swap: float | None = None
         self.tick_intervals: list[float] = []
@@ -329,7 +348,10 @@ class GlassRun(QObject):
             self.measured += 1
 
     def _publish(self, now: float) -> None:
-        progress = min(1.0, max(0.0, (now - self.transition_started) / (TRANSITION_MS / 1000.0)))
+        progress = min(
+            1.0,
+            max(0.0, (now - self.transition_started) / (TRANSITION_MS / 1000.0)),
+        )
         px, py = self.POINTERS[self.active]
         wobble = 0.035 * math.sin(now * 8.0)
         self.root.setProperty("activeIndex", self.active)
@@ -337,11 +359,16 @@ class GlassRun(QObject):
         self.root.setProperty("motionProgress", progress)
         self.root.setProperty("pointerX", max(-1.0, min(1.0, px + wobble)))
         self.root.setProperty("pointerY", max(-1.0, min(1.0, py - wobble)))
-        if self.mode != "static_background":
-            self.root.setProperty("animationRunning", True)
+        self.root.setProperty("animationRunning", True)
+        self.root.setProperty("framePulse", self.tick_index)
+        # Explicitly request a scene-graph update in both variants. The pulse above
+        # also dirties a visible node, so requestUpdate is not dependent on a
+        # property implementation detail.
+        self.root.requestUpdate()
 
     def _tick(self) -> None:
         now = time.perf_counter()
+        self.tick_index += 1
         if self.phase == "measure" and self.last_tick is not None:
             self.tick_intervals.append((now - self.last_tick) * 1000.0)
         self.last_tick = now
@@ -359,6 +386,7 @@ class GlassRun(QObject):
         cpu = max(0.0, time.process_time() - self.cpu_started)
         budget = 1000.0 / self.target_hz
         long_count = sum(value > budget * 1.5 for value in self.swap_intervals)
+        tick_count = max(1, len(self.tick_intervals))
         result = ProbeResult(
             mode=self.mode,
             round_index=self.round_index,
@@ -368,6 +396,7 @@ class GlassRun(QObject):
             tick_p95_ms=_percentile(self.tick_intervals, 0.95),
             tick_p99_ms=_percentile(self.tick_intervals, 0.99),
             samples_swap=len(self.swap_intervals),
+            swap_per_tick=len(self.swap_intervals) / tick_count,
             swap_p95_ms=_percentile(self.swap_intervals, 0.95),
             swap_p99_ms=_percentile(self.swap_intervals, 0.99),
             swap_max_ms=max(self.swap_intervals, default=0.0),
@@ -378,13 +407,11 @@ class GlassRun(QObject):
         self.finished.emit(result)
 
 
-def _mode_flags(mode: str) -> tuple[bool, bool]:
+def _glass_enabled(mode: str) -> bool:
     if mode == "production_glass":
-        return True, True
-    if mode == "glass_overlay_only":
-        return False, True
-    if mode == "static_background":
-        return True, False
+        return True
+    if mode == "no_multieffect":
+        return False
     raise ValueError(mode)
 
 
@@ -410,12 +437,10 @@ def _run_one(
     width = min(1600, max(1180, screen.availableGeometry().width() if screen else 1440))
     height = min(1000, max(760, screen.availableGeometry().height() if screen else 900))
     root.resize(width, height)
-    root.setTitle(f"Glass Performance Probe · {mode}")
+    root.setTitle(f"Glass Fixed-Cadence Probe · {mode}")
     root.setProperty("sharpUrl", QUrl.fromLocalFile(str(sharp_path)))
     root.setProperty("blurUrl", QUrl.fromLocalFile(str(blur_path)))
-    glass_enabled, parallax_enabled = _mode_flags(mode)
-    root.setProperty("glassEnabled", glass_enabled)
-    root.setProperty("parallaxEnabled", parallax_enabled)
+    root.setProperty("glassEnabled", _glass_enabled(mode))
     root.setPersistentGraphics(True)
     root.setPersistentSceneGraph(True)
     root.show()
@@ -469,6 +494,7 @@ def _summary(results: list[ProbeResult]) -> dict[str, dict[str, float]]:
             "tick_p99_ms": _median(rows, "tick_p99_ms"),
             "cpu_core_percent": _median(rows, "cpu_core_percent"),
             "samples_swap": _median(rows, "samples_swap"),
+            "swap_per_tick": _median(rows, "swap_per_tick"),
         }
     return output
 
@@ -479,43 +505,33 @@ def _gain(base: float, candidate: float) -> float:
 
 def _verdict(summary: dict[str, dict[str, float]]) -> dict[str, object]:
     base = summary.get("production_glass")
-    overlay = summary.get("glass_overlay_only")
-    static = summary.get("static_background")
-    if not base or not overlay or not static:
+    candidate = summary.get("no_multieffect")
+    if not base or not candidate:
         return {"classification": "insufficient-data"}
 
-    base_p99 = max(1e-6, base["swap_p99_ms"])
-    overlay_gain = _gain(base_p99, overlay["swap_p99_ms"])
-    static_gain = _gain(base_p99, static["swap_p99_ms"])
-    base_p95 = max(1e-6, base["swap_p95_ms"])
-    overlay_p95_gain = _gain(base_p95, overlay["swap_p95_ms"])
-    static_p95_gain = _gain(base_p95, static["swap_p95_ms"])
+    p95_gain = _gain(base["swap_p95_ms"], candidate["swap_p95_ms"])
+    p99_gain = _gain(base["swap_p99_ms"], candidate["swap_p99_ms"])
+    weighted_gain = p95_gain * 0.35 + p99_gain * 0.65
+    coverage_delta = candidate["swap_per_tick"] - base["swap_per_tick"]
 
-    overlay_signal = (overlay_gain + overlay_p95_gain) * 0.5
-    static_signal = (static_gain + static_p95_gain) * 0.5
-
-    if overlay_signal < 10.0 and static_signal < 10.0:
-        classification = "glass-stack-not-dominant"
-    elif overlay_signal >= 15.0 and static_signal < 10.0:
-        classification = "multieffect-dominant"
-    elif static_signal >= 15.0 and overlay_signal < 10.0:
-        classification = "parallax-source-motion-dominant"
-    elif overlay_signal >= 10.0 and static_signal >= 10.0:
-        if overlay_signal > static_signal * 1.35:
-            classification = "multieffect-dominant"
-        elif static_signal > overlay_signal * 1.35:
-            classification = "parallax-source-motion-dominant"
-        else:
-            classification = "combined-glass-parallax-cost"
+    if abs(coverage_delta) > 0.08:
+        classification = "cadence-mismatch-retry"
+    elif weighted_gain >= MIN_MATERIAL_GAIN_PERCENT:
+        classification = "multieffect-material"
+    elif weighted_gain >= MIN_MINOR_GAIN_PERCENT:
+        classification = "multieffect-minor"
     else:
-        classification = "mixed-quick-compositor-cost"
+        classification = "keep-production-glass"
 
     return {
         "classification": classification,
-        "overlay_only_p99_gain_percent": overlay_gain,
-        "static_background_p99_gain_percent": static_gain,
-        "overlay_only_p95_gain_percent": overlay_p95_gain,
-        "static_background_p95_gain_percent": static_p95_gain,
+        "p95_gain_percent": p95_gain,
+        "p99_gain_percent": p99_gain,
+        "weighted_gain_percent": weighted_gain,
+        "production_swap_per_tick": base["swap_per_tick"],
+        "no_multieffect_swap_per_tick": candidate["swap_per_tick"],
+        "swap_per_tick_delta": coverage_delta,
+        "material_threshold_percent": MIN_MATERIAL_GAIN_PERCENT,
     }
 
 
@@ -537,8 +553,8 @@ def _system_info(app: QApplication) -> dict[str, object]:
 def _write_outputs(output_dir: Path, payload: dict[str, object]) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    json_path = output_dir / f"gui-glass-perf-probe-{stamp}.json"
-    csv_path = output_dir / f"gui-glass-perf-probe-{stamp}.csv"
+    json_path = output_dir / f"gui-glass-fixed-probe-{stamp}.json"
+    csv_path = output_dir / f"gui-glass-fixed-probe-{stamp}.csv"
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     rows = payload["runs"]
     assert isinstance(rows, list)
@@ -551,8 +567,10 @@ def _write_outputs(output_dir: Path, payload: dict[str, object]) -> tuple[Path, 
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Focused Qt Quick glass/parallax performance probe")
-    parser.add_argument("--rounds", type=int, default=5)
+    parser = argparse.ArgumentParser(
+        description="Fixed-cadence Qt Quick MultiEffect cost probe"
+    )
+    parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--warmup-cycles", type=int, default=2)
     parser.add_argument("--cycles", type=int, default=8)
     parser.add_argument("--modes", default="all", help="all or comma-separated mode names")
@@ -561,16 +579,20 @@ def main() -> int:
 
     app = QApplication.instance() or QApplication(sys.argv)
     target_hz = max(60.0, min(90.0, _display_hz(app)))
-    modes = list(MODES) if args.modes.lower() == "all" else [part.strip() for part in args.modes.split(",") if part.strip()]
+    modes = (
+        list(MODES)
+        if args.modes.lower() == "all"
+        else [part.strip() for part in args.modes.split(",") if part.strip()]
+    )
     unknown = [mode for mode in modes if mode not in MODES]
     if unknown:
         raise SystemExit(f"unknown modes: {', '.join(unknown)}")
 
     results: list[ProbeResult] = []
-    with tempfile.TemporaryDirectory(prefix="ecommerce-agent-glass-probe-") as temp_name:
+    with tempfile.TemporaryDirectory(prefix="ecommerce-agent-glass-fixed-") as temp_name:
         temp_dir = Path(temp_name)
         sharp_path, blur_path = _prepare_assets(temp_dir)
-        qml_path = temp_dir / "glass_probe.qml"
+        qml_path = temp_dir / "glass_fixed_probe.qml"
         qml_path.write_text(_QML, encoding="utf-8")
 
         for round_index in range(1, max(1, args.rounds) + 1):
@@ -590,18 +612,18 @@ def main() -> int:
                 )
                 results.append(result)
                 print(
-                    f"[{round_index:02d}] {mode:<20} "
+                    f"[{round_index:02d}] {mode:<18} "
                     f"swap-p95={result.swap_p95_ms:6.2f} "
                     f"swap-p99={result.swap_p99_ms:6.2f} "
+                    f"coverage={result.swap_per_tick:5.2f} "
                     f"long={result.swap_long_1_5x_rate*100:5.1f}% "
-                    f"cpu={result.cpu_core_percent:5.1f}% "
-                    f"swaps={result.samples_swap}"
+                    f"cpu={result.cpu_core_percent:5.1f}%"
                 )
 
     summary = _summary(results)
     verdict = _verdict(summary)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "system": _system_info(app),
         "config": {
             "rounds": max(1, args.rounds),
@@ -610,6 +632,7 @@ def main() -> int:
             "target_hz": target_hz,
             "crossover_dwell_ms": CROSSOVER_DWELL_MS,
             "transition_ms": TRANSITION_MS,
+            "forced_cadence": True,
             "modes": modes,
         },
         "summary": summary,
@@ -618,16 +641,17 @@ def main() -> int:
     }
     json_path, csv_path = _write_outputs(Path(args.output_dir), payload)
 
-    print("\nGLASS PERFORMANCE PROBE SUMMARY")
-    print("mode                  swap-p95  swap-p99  long%   CPU%")
-    print("-" * 62)
+    print("\nFIXED-CADENCE GLASS PROBE SUMMARY")
+    print("mode                swap-p95  swap-p99  coverage  long%   CPU%")
+    print("-" * 70)
     for mode in MODES:
         row = summary.get(mode)
         if row is None:
             continue
         print(
-            f"{mode:<21} {row['swap_p95_ms']:8.2f} {row['swap_p99_ms']:9.2f} "
-            f"{row['swap_long_1_5x_rate']*100:6.1f} {row['cpu_core_percent']:6.1f}"
+            f"{mode:<19} {row['swap_p95_ms']:8.2f} {row['swap_p99_ms']:9.2f} "
+            f"{row['swap_per_tick']:9.2f} {row['swap_long_1_5x_rate']*100:6.1f} "
+            f"{row['cpu_core_percent']:6.1f}"
         )
     print(f"\nVERDICT: {verdict.get('classification')}")
     print(json.dumps(verdict, ensure_ascii=False, indent=2))

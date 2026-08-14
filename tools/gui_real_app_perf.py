@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import statistics
 import subprocess
@@ -237,6 +238,7 @@ class RealGuiProfiler(QObject):
         self._points: list[QPoint] = []
         self._path: list[int] = []
         self._path_index = 0
+        self._foreground_hwnd: int | None = None
         self._sweep_timer = QTimer(self)
         self._sweep_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._sweep_timer.setInterval(self.sweep_ms)
@@ -288,6 +290,49 @@ class RealGuiProfiler(QObject):
                 break
         return points
 
+    def _quick_window(self):  # noqa: ANN202
+        return getattr(getattr(self.visual, "background", None), "quick_window", None)
+
+    def _set_foreground(self, *, topmost: bool) -> None:
+        """Keep the real app visible during deterministic cursor sweeps on Windows."""
+
+        quick = self._quick_window()
+        try:
+            if quick is not None:
+                quick.show()
+                quick.raise_()
+                quick.requestActivate()
+            self.window.show()
+            self.window.raise_()
+            self.window.activateWindow()
+        except RuntimeError:
+            pass
+
+        if sys.platform != "win32":
+            return
+        try:
+            target = quick if quick is not None else self.window
+            hwnd = int(target.winId())
+            self._foreground_hwnd = hwnd
+            user32 = ctypes.windll.user32
+            hwnd_topmost = -1
+            hwnd_notopmost = -2
+            flags = 0x0001 | 0x0002 | 0x0040  # NOSIZE | NOMOVE | SHOWWINDOW
+            user32.SetWindowPos(
+                hwnd,
+                hwnd_topmost if topmost else hwnd_notopmost,
+                0,
+                0,
+                0,
+                0,
+                flags,
+            )
+            if topmost:
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            pass
+
     def _try_start(self) -> None:
         try:
             if not self.window.isVisible() or self.window.isMinimized():
@@ -299,6 +344,7 @@ class RealGuiProfiler(QObject):
 
     def _start(self) -> None:
         global _MEASURING
+        self._set_foreground(topmost=True)
         cards = self._visible_cards()
         self._points = self._dedupe_points(cards)
         self.paint_probe = _PaintProbe(self.window, cards, self.paint_stats)
@@ -364,6 +410,26 @@ class RealGuiProfiler(QObject):
         except (OSError, subprocess.SubprocessError):
             return "unknown"
 
+    def _shutdown_app(self) -> None:
+        self._set_foreground(topmost=False)
+        quick = self._quick_window()
+        try:
+            self.window.close()
+        except RuntimeError:
+            pass
+        if quick is not None:
+            try:
+                quick.close()
+            except RuntimeError:
+                pass
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.closeAllWindows()
+            except RuntimeError:
+                pass
+            QTimer.singleShot(0, lambda: app.exit(0))
+
     def _finish(self) -> None:
         global _MEASURING
         _MEASURING = False
@@ -401,7 +467,7 @@ class RealGuiProfiler(QObject):
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         path = self.output_dir / f"real-gui-perf-{self.variant}-{stamp}.json"
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "summary": asdict(summary),
             "samples": {
@@ -426,9 +492,9 @@ class RealGuiProfiler(QObject):
         print(f"CPU core             {summary.cpu_core_percent:.1f}%")
         print(f"JSON                  {path}")
 
-        app = QApplication.instance()
-        if app is not None:
-            app.quit()
+        # Close the real GUI after the JSON is safely persisted. This makes each
+        # variant a normal exit-0 process instead of requiring an external kill.
+        QTimer.singleShot(0, self._shutdown_app)
 
 
 def _compare(paths: list[Path]) -> int:
@@ -452,21 +518,36 @@ def _compare(paths: list[Path]) -> int:
         ("window_paint_ratio_p95", "window paint p95"),
         ("cpu_core_percent", "CPU core"),
     ):
-        print(f"{label:<20} {float(old[key]):8.2f} -> {float(new[key]):8.2f}  ({improvement(key):+6.1f}%)")
+        print(
+            f"{label:<20} {float(old[key]):8.2f} -> {float(new[key]):8.2f}  "
+            f"({improvement(key):+6.1f}%)"
+        )
     print(f"legacy toggles/bounds  {old['enable_toggles']} / {old['bounding_updates']}")
     print(f"current toggles/bounds {new['enable_toggles']} / {new['bounding_updates']}")
     return 0
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Measure the real Listing Studio GUI with deterministic card sweeps")
+    parser = argparse.ArgumentParser(
+        description="Measure the real Listing Studio GUI with deterministic card sweeps"
+    )
     parser.add_argument("--variant", choices=VARIANTS, default="current")
-    parser.add_argument("--settle", type=float, default=5.0, help="seconds after real GUI construction before measuring")
+    parser.add_argument(
+        "--settle",
+        type=float,
+        default=5.0,
+        help="seconds after real GUI construction before measuring",
+    )
     parser.add_argument("--duration", type=float, default=18.0)
     parser.add_argument("--sweep-ms", type=int, default=70)
     parser.add_argument("--output-dir", type=Path, default=Path("perf_results"))
     parser.add_argument("--manual", action="store_true", help="do not move the cursor automatically")
-    parser.add_argument("--compare", nargs=2, type=Path, metavar=("LEGACY_JSON", "CURRENT_JSON"))
+    parser.add_argument(
+        "--compare",
+        nargs=2,
+        type=Path,
+        metavar=("LEGACY_JSON", "CURRENT_JSON"),
+    )
     args = parser.parse_args()
     if args.compare:
         return _compare(args.compare)
@@ -514,7 +595,10 @@ def main() -> int:
 
     rc = run_local_gui.main()
     if "profiler" not in profiler_holder:
-        print("[real-gui-perf] profiler never attached; application access may have exited before GUI construction")
+        print(
+            "[real-gui-perf] profiler never attached; application access may have "
+            "exited before GUI construction"
+        )
     return rc
 
 
