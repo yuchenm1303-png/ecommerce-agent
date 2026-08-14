@@ -192,6 +192,22 @@ def select_listing_images(image_paths: Iterable[str | Path]) -> ListingImageSele
     )
 
 
+def listing_images_from_resolver_outputs(outputs: dict[str, Any]) -> tuple[Path, ...]:
+    """Return the canonical auto-upload image set for new and legacy Resolver runs.
+
+    New manifests publish ``primary_source_listing_images`` explicitly. Legacy
+    manifests only have raw evidence images, so the same quality gate is applied
+    at consumption time. An explicit empty curated list remains empty and never
+    falls back to raw evidence or a page screenshot.
+    """
+
+    if "primary_source_listing_images" in outputs:
+        values = outputs.get("primary_source_listing_images") or []
+    else:
+        values = outputs.get("primary_source_product_images") or []
+    return select_listing_images(values).selected
+
+
 def write_listing_image_selection(
     selection: ListingImageSelection,
     path: str | Path,
@@ -212,6 +228,7 @@ __all__ = [
     "MIN_LISTING_IMAGE_SHORT_EDGE",
     "ListingImageAssessment",
     "ListingImageSelection",
+    "listing_images_from_resolver_outputs",
     "select_listing_images",
     "write_listing_image_selection",
 ]
