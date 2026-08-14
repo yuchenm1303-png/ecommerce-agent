@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -18,6 +19,110 @@ class ProviderConfigurationError(ValueError):
 
 SUPPORTED_PROVIDERS = ("openai", "openai-compatible")
 SUPPORTED_STRUCTURED_MODES = ("auto", "prompt_only", "json_object")
+_VERTICAL_PLAN_TASK = "plan_makro_vertical_search_intents"
+_VERTICAL_CHOICE_TASK = "choose_exact_makro_vertical_from_aggregated_live_search"
+
+
+def _vertical_diag(event: str, payload: dict[str, Any]) -> None:
+    """Emit one compact machine-readable Step 1 diagnostic line.
+
+    Only Makro Vertical semantic tasks use this channel. Provider credentials and
+    transport configuration are never included, so GUI logs can be shared for
+    category diagnosis without exposing API keys.
+    """
+
+    body = {"event": str(event or "unknown"), **payload}
+    print(
+        "MAKRO_VERTICAL_DIAG "
+        + json.dumps(body, ensure_ascii=False, separators=(",", ":"), default=str),
+        flush=True,
+    )
+
+
+class _VerticalDiagnosticProvider:
+    """Transparent provider proxy that traces only Makro Vertical AI decisions."""
+
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
+
+    @property
+    def name(self) -> str:
+        return str(getattr(self._delegate, "name", "semantic-provider"))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
+        task = str(request_payload.get("task") or "").strip()
+        context = request_payload.get("context") or {}
+
+        if task == _VERTICAL_PLAN_TASK:
+            _vertical_diag(
+                "identity",
+                {
+                    "product_type_en": context.get("product_type_en", ""),
+                    "product_summary": context.get("product_summary", ""),
+                    "product_identity": context.get("product_identity") or {},
+                },
+            )
+        elif task == _VERTICAL_CHOICE_TASK:
+            ladder = context.get("search_queries_specific_to_broad") or context.get("search_queries") or []
+            candidates = context.get("live_candidates") or []
+            _vertical_diag(
+                "candidate_pool",
+                {
+                    "search_ladder": ladder,
+                    "candidate_count": len(candidates),
+                    "candidates": candidates,
+                },
+            )
+
+        try:
+            result = self._delegate.extract_json(request_payload)
+        except Exception as exc:
+            if task in {_VERTICAL_PLAN_TASK, _VERTICAL_CHOICE_TASK}:
+                _vertical_diag(
+                    "provider_error",
+                    {"task": task, "error": f"{type(exc).__name__}: {exc}"},
+                )
+            raise
+
+        if task == _VERTICAL_PLAN_TASK:
+            _vertical_diag(
+                "search_plan",
+                {
+                    "specific_queries": result.get("specific_queries") or result.get("queries") or [],
+                    "broader_queries": result.get("broader_queries") or [],
+                    "head_noun_query": result.get("head_noun_query") or "",
+                },
+            )
+        elif task == _VERTICAL_CHOICE_TASK:
+            selected = str(result.get("selected_vertical") or "").strip()
+            candidates = context.get("live_candidates") or []
+            evidence: dict[str, Any] = {}
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                if str(candidate.get("label") or "").strip().casefold() == selected.casefold():
+                    evidence = dict(candidate)
+                    break
+            _vertical_diag(
+                "decision",
+                {
+                    "selected_vertical": selected,
+                    "selection_relation": result.get("selection_relation") or "",
+                    "selected_candidate_evidence": evidence,
+                    "replay_queries": evidence.get("matched_queries") or [],
+                },
+            )
+
+        return result
+
+
+def _with_vertical_diagnostics(provider: Any) -> Any:
+    if isinstance(provider, _VerticalDiagnosticProvider):
+        return provider
+    return _VerticalDiagnosticProvider(provider)
 
 
 def _validated_base_url(value: str) -> str:
@@ -219,7 +324,7 @@ def build_semantic_provider(
     api_key = resolve_api_key(normalized, environ=environ)
 
     if normalized.provider == "openai-compatible":
-        return OpenAICompatibleSemanticProvider(
+        provider = OpenAICompatibleSemanticProvider(
             model=normalized.model,
             api_key=api_key,
             base_url=normalized.base_url,
@@ -231,6 +336,7 @@ def build_semantic_provider(
             request_timeout_seconds=normalized.request_timeout_seconds,
             enable_thinking=normalized.enable_thinking,
         )
+        return _with_vertical_diagnostics(provider)
 
     if client is None:
         try:
@@ -244,10 +350,11 @@ def build_semantic_provider(
             timeout=normalized.request_timeout_seconds,
             max_retries=0,
         )
-    return OpenAISemanticProvider(
+    provider = OpenAISemanticProvider(
         model=normalized.model,
         client=client,
         image_detail=normalized.image_detail,
         max_output_tokens=normalized.max_output_tokens,
         request_timeout_seconds=normalized.request_timeout_seconds,
     )
+    return _with_vertical_diagnostics(provider)
