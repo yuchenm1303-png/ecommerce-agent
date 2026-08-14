@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from types import MethodType
 
-from PySide6.QtCore import QEvent, QObject, QTimer
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer
 from PySide6.QtWidgets import (
+    QBoxLayout,
     QFrame,
+    QLayout,
     QMainWindow,
     QPushButton,
     QSizePolicy,
     QSplitter,
     QTabWidget,
     QToolButton,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -19,8 +22,11 @@ _SUMMARY_MIN = 292
 _SUMMARY_MAX = 336
 _SUMMARY_TARGET = 310
 _WORKSPACE_MIN = 220
-_CONSOLE_TABS_MIN = 132
-_CONSOLE_TABS_MAX = 176
+_CONSOLE_TABS_MIN = 146
+_CONSOLE_TABS_MAX = 190
+_PHASE_UNIT_MIN_WIDTH = 132
+_PHASE_UNIT_MIN_HEIGHT = 38
+_PHASE_UNIT_MAX_HEIGHT = 42
 _SIDE_MIN = 360
 _SIDE_MAX = 480
 _SIDE_RATIO = 0.29
@@ -31,8 +37,9 @@ class ConsoleSummaryMode(QObject):
     """Single-owner geometry controller for the fixed Single workspace.
 
     The mature presentation layer still owns typography/style, but its historical
-    responsive splitter sizing sleeps while Single is active. Runtime geometry
-    only wakes for a real top-level resize/show or when the user returns to Single.
+    responsive splitter sizing sleeps while Single is active. This controller also
+    owns the compact indicator composition: phase state belongs in the title row,
+    leaving the card's vertical budget to live console/timeline content.
     """
 
     def __init__(self, window: QMainWindow) -> None:
@@ -47,6 +54,7 @@ class ConsoleSummaryMode(QObject):
         self._mature_timer: QTimer | None = None
         self._mature_original_schedule = None
         self._mature_original_apply = None
+        self._layout_compacted = False
 
         if not isinstance(self.root, QWidget):
             raise RuntimeError("console summary mode requires a central widget")
@@ -75,9 +83,7 @@ class ConsoleSummaryMode(QObject):
         self.toggle.setText("展开详情")
         self.toggle.clicked.connect(self._open_detail)
 
-        for unit in getattr(self.console, "phase_units", {}).values():
-            if isinstance(unit, QWidget):
-                unit.show()
+        self._compact_indicator_layout()
 
         tabs = getattr(self.console, "tabs", None)
         if isinstance(tabs, QTabWidget):
@@ -85,6 +91,12 @@ class ConsoleSummaryMode(QObject):
             tabs.setMinimumHeight(_CONSOLE_TABS_MIN)
             tabs.setMaximumHeight(_CONSOLE_TABS_MAX)
             tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            for index in range(tabs.count()):
+                page = tabs.widget(index)
+                page_layout = page.layout() if isinstance(page, QWidget) else None
+                if isinstance(page_layout, QBoxLayout):
+                    page_layout.setContentsMargins(5, 4, 5, 5)
+                    page_layout.setSpacing(4)
 
         # This is the performance boundary: only one controller may own the fixed
         # Single splitters. The older maturity controller remains available for
@@ -104,6 +116,99 @@ class ConsoleSummaryMode(QObject):
 
         QTimer.singleShot(0, self._bind_mode_stack)
         QTimer.singleShot(0, self.apply)
+
+    @staticmethod
+    def _find_layout_containing(layout: QLayout, widget: QWidget) -> QLayout | None:
+        for index in range(layout.count()):
+            item = layout.itemAt(index)
+            if item.widget() is widget:
+                return layout
+            child = item.layout()
+            if isinstance(child, QLayout):
+                found = ConsoleSummaryMode._find_layout_containing(child, widget)
+                if found is not None:
+                    return found
+        return None
+
+    @staticmethod
+    def _detach_child_layout(parent: QLayout, child: QLayout) -> bool:
+        for index in range(parent.count()):
+            item = parent.itemAt(index)
+            nested = item.layout()
+            if nested is child:
+                parent.takeAt(index)
+                return True
+            if isinstance(nested, QLayout) and ConsoleSummaryMode._detach_child_layout(
+                nested, child
+            ):
+                return True
+        return False
+
+    def _compact_indicator_layout(self) -> None:
+        if self._layout_compacted:
+            return
+
+        root_layout = self.console.layout()
+        if not isinstance(root_layout, QVBoxLayout) or root_layout.count() == 0:
+            raise RuntimeError("acceptance console requires a vertical root layout")
+
+        header = root_layout.itemAt(0).layout()
+        if not isinstance(header, QBoxLayout):
+            raise RuntimeError("acceptance console requires a horizontal header layout")
+
+        units = [
+            unit
+            for unit in getattr(self.console, "phase_units", {}).values()
+            if isinstance(unit, QWidget)
+        ]
+        if not units:
+            raise RuntimeError("acceptance console phase units are missing")
+
+        source_layout = self._find_layout_containing(root_layout, units[0])
+        if source_layout is None or source_layout is header:
+            raise RuntimeError("acceptance console phase strip is not independently owned")
+
+        # The old header spacer separated title from metrics because phases lived on
+        # their own row. Replace that dead gap with the four compact stage cards.
+        if header.count() > 1 and header.itemAt(1).spacerItem() is not None:
+            header.takeAt(1)
+
+        title_layout = header.itemAt(0).layout()
+        if isinstance(title_layout, QBoxLayout):
+            title_layout.setSpacing(0)
+
+        header.setSpacing(7)
+        insert_at = 1
+        for unit in units:
+            source_layout.removeWidget(unit)
+            unit_layout = unit.layout()
+            if isinstance(unit_layout, QBoxLayout):
+                unit_layout.setContentsMargins(9, 4, 9, 5)
+                unit_layout.setSpacing(0)
+
+            detail = getattr(unit, "detail", None)
+            if isinstance(detail, QWidget):
+                detail.hide()
+
+            unit.setMinimumWidth(_PHASE_UNIT_MIN_WIDTH)
+            unit.setMinimumHeight(_PHASE_UNIT_MIN_HEIGHT)
+            unit.setMaximumHeight(_PHASE_UNIT_MAX_HEIGHT)
+            unit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            unit.show()
+            header.insertWidget(
+                insert_at,
+                unit,
+                1,
+                Qt.AlignmentFlag.AlignVCenter,
+            )
+            insert_at += 1
+
+        # Remove the now-empty phase row entirely. This is the vertical-space win:
+        # header + status + progress + tabs are the only remaining summary bands.
+        self._detach_child_layout(root_layout, source_layout)
+        root_layout.setContentsMargins(13, 8, 13, 10)
+        root_layout.setSpacing(6)
+        self._layout_compacted = True
 
     def _bind_mode_stack(self) -> None:
         stack = getattr(self.window, "mode_stack", None)
@@ -216,9 +321,8 @@ class ConsoleSummaryMode(QObject):
 
     def _apply_body_height(self) -> bool:
         available = max(1, self.body.height() - self.body.handleWidth())
-        # The workflow indicator carries phase cards plus live Console/Timeline
-        # content, so it receives roughly half of the body while the field/runtime
-        # pair remains a compact preview with its own internal scroll areas.
+        # The compact indicator no longer spends a full row on phase cards, so the
+        # same outer height now yields materially more live log/timeline content.
         proportional = round(available * 0.52)
         target = min(
             _SUMMARY_MAX,
@@ -246,6 +350,7 @@ class ConsoleSummaryMode(QObject):
         if not self._single_active():
             return
 
+        self._compact_indicator_layout()
         signature = self._geometry_signature()
         if signature == self._last_geometry_signature:
             return
