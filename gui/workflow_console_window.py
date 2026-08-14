@@ -44,9 +44,11 @@ class WorkflowMainWindow(ConsoleMainWindow):
         layout = card.layout()
         assert isinstance(layout, QVBoxLayout)
 
-        self.start_button.setText("④ 完整流程准备")
+        self.start_button.setText("新建任务 · 从 0 完整准备")
         self.start_button.setToolTip(
-            "从供应商 URL 自动完成 Step 1 → Step 2 → 当前 Resolver cold/hot → read-only Fill Plan；Step 3 不写入。"
+            "把当前供应商 URL 作为一个全新的 Listing Job：始终新建专属 Makro 标签页，"
+            "从首页 → Step 1 → Step 2 → Resolver cold/hot → read-only Fill Plan；"
+            "绝不自动接管或恢复旧商品草稿，Step 3 准备阶段不写入。"
         )
 
         # Vertical is output from the current Step 1 selection, not a normal GUI
@@ -60,12 +62,12 @@ class WorkflowMainWindow(ConsoleMainWindow):
             text = label.text()
             if "只输入一个 1688 / supplier 商品 URL" in text:
                 label.setText(
-                    "只输入一个 1688 / supplier 商品 URL。Step 1/2 使用当前 one-link 自动选择；"
-                    "Step 3 准备阶段保持 0 Write / 0 Save / 0 QC。"
+                    "只输入一个 1688 / supplier 商品 URL。每次“新建任务”都会创建独立 Makro tab，"
+                    "从 0 完成 Step 1/2；Step 3 准备阶段保持 0 Write / 0 Save / 0 QC。"
                 )
             elif "只有完成 read-only 四阶段后才解锁" in text:
                 label.setText(
-                    "完成 Step 3 当前 Resolver + Fill Plan 后才解锁真实填写；"
+                    "完成本任务 Step 3 Resolver + Fill Plan 后才解锁真实填写；"
                     "正式入口默认 Full Step 3，Save / 图片分别授权，Send to QC 永久锁定。"
                 )
 
@@ -94,9 +96,12 @@ class WorkflowMainWindow(ConsoleMainWindow):
 
         stage_row = QHBoxLayout()
         stage_row.setSpacing(8)
-        self.step1_button = QPushButton("① Step 1 · Vertical")
-        self.step2_button = QPushButton("② Step 2 · Brand")
-        self.step3_button = QPushButton("③ Step 3 · Resolve")
+        self.step1_button = QPushButton("诊断① · Step 1")
+        self.step2_button = QPushButton("诊断② · Step 2")
+        self.step3_button = QPushButton("诊断③ · Step 3")
+        self.step1_button.setToolTip("阶段诊断：测试 Step 1 / Vertical，不代表创建完整的新商品任务。")
+        self.step2_button.setToolTip("阶段诊断：只对当前唯一 Step 2 页面测试 Brand 流程。")
+        self.step3_button.setToolTip("阶段诊断：只对当前唯一 Step 3 页面测试 Resolver / Fill Plan。")
         for button in (self.step1_button, self.step2_button, self.step3_button):
             button.setObjectName("quietButton")
             stage_row.addWidget(button)
@@ -249,10 +254,11 @@ class WorkflowMainWindow(ConsoleMainWindow):
                 number = {"scan": "01", "cold": "02", "hot": "03", "plan": "04"}[key]
                 self.console.timeline.setItem(row, 0, self._table_item(f"{number} · {title}"))
 
-        self.console.progress_detail.setText("idle · choose Step 1 / Step 2 / Step 3 / full")
+        self.console.progress_detail.setText("idle · 新建完整任务 / 阶段诊断")
         self.console.diagnostics_view.setPlainText(
-            "Current workflow: supplier evidence → Step 1 Vertical → Step 2 Brand → "
-            "current Resolver cold/hot → read-only Fill Plan."
+            "New task contract: supplier URL → fresh dedicated Makro tab → Step 1 Vertical → "
+            "Step 2 Brand → Resolver cold/hot → read-only Fill Plan. "
+            "The three numbered buttons are stage diagnostics and may inspect an existing stage page."
         )
 
     @staticmethod
