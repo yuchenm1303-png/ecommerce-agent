@@ -12,6 +12,7 @@ change browser business behavior.
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlsplit
 
 from app.makro.visual_execution_hud import (
     HUD_API_KEY,
@@ -75,6 +76,19 @@ def _evaluate(page: Any, script: str, payload: Any = None) -> Any:
         return None
 
 
+def _page_matches_host(page: Any, host_suffix: str | None) -> bool:
+    """Keep a browser HUD scoped to the automation domain that owns it."""
+
+    if not host_suffix:
+        return True
+    try:
+        hostname = str(urlsplit(str(page.url or "")).hostname or "").casefold()
+    except Exception:
+        return False
+    wanted = str(host_suffix).strip().lstrip(".").casefold()
+    return bool(wanted and (hostname == wanted or hostname.endswith("." + wanted)))
+
+
 def _install_current(page: Any, *, title: str, thought: str, phase: int) -> bool:
     try:
         installed = bool(install_visual_execution_hud(page))
@@ -98,29 +112,65 @@ def arm_browser_visual_hud(
     title: str = "浏览器自动化运行中",
     thought: str = "Listing Studio 正在读取当前页面并准备下一步操作。",
     phase: int = 1,
+    host_suffix: str | None = None,
 ) -> bool:
-    """Install now and automatically reinstall after this page navigates."""
+    """Keep one HUD lifecycle attached to a Playwright page across navigation.
+
+    ``host_suffix`` scopes reinjection to the browser domain owned by this
+    automation.  This lets the long-lived Makro profile contain unrelated tabs
+    without painting Listing Studio visuals over them.  The page receives only
+    one DOMContentLoaded listener; repeated calls merely refresh the current HUD.
+    """
 
     marker = "_listing_studio_browser_hud_armed"
+    normalized_phase = max(0, min(4, int(phase)))
+    status_payload = [HUD_API_KEY, str(title), str(thought), normalized_phase]
     try:
         already_armed = bool(getattr(page, marker, False))
     except Exception:
         already_armed = False
 
-    installed = _install_current(page, title=title, thought=thought, phase=phase)
+    allowed_now = _page_matches_host(page, host_suffix)
     if already_armed:
-        return installed
+        if not allowed_now:
+            return False
+        # Avoid tearing down/recreating the iframe every time a harness helper
+        # reacquires the same page.  Reinstall only when navigation removed it.
+        if _evaluate(page, _STATUS_SCRIPT, status_payload):
+            _evaluate(page, _ENHANCE_INTERACTION_SCRIPT, HUD_API_KEY)
+            return True
+        return _install_current(
+            page,
+            title=title,
+            thought=thought,
+            phase=normalized_phase,
+        )
 
     try:
         setattr(page, marker, True)
 
         def _after_navigation() -> None:
-            _install_current(page, title=title, thought=thought, phase=phase)
+            if not _page_matches_host(page, host_suffix):
+                return
+            _install_current(
+                page,
+                title=title,
+                thought=thought,
+                phase=normalized_phase,
+            )
 
         page.on("domcontentloaded", _after_navigation)
     except Exception as exc:
         print(f"GUI_BROWSER_HUD\tARM_ERROR\t{type(exc).__name__}: {exc}", flush=True)
-    return installed
+
+    if not allowed_now:
+        return False
+    return _install_current(
+        page,
+        title=title,
+        thought=thought,
+        phase=normalized_phase,
+    )
 
 
 def browser_visual_hud_status(
