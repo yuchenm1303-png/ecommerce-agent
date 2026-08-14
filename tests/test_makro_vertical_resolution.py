@@ -31,46 +31,110 @@ class FakeProvider:
 
 
 def _bag_sealer_hints() -> ListingBootstrapHints:
+    summary = "Rechargeable handheld heat sealer for closing plastic food bags."
     return ListingBootstrapHints(
         vertical_search_terms=("rechargeable bag sealer",),
         brand="",
         brand_status="unknown",
-        product_summary="Rechargeable handheld heat sealer for closing plastic food bags.",
+        product_summary=summary,
         product_identity={
             "entity_kind": "physical_product",
             "product_type_en": "rechargeable bag sealer",
             "brand": "",
             "brand_status": "unknown",
-            "product_summary": "Rechargeable handheld heat sealer for closing plastic food bags.",
+            "product_summary": summary,
             "confidence": 0.95,
             "evidence_refs": ["identity:page-title"],
         },
     )
 
 
-def test_search_planner_replaces_raw_identity_phrase_with_clean_retrieval_intents() -> None:
+def test_search_plan_contract_has_specific_broader_and_head_noun_roles() -> None:
+    request = build_vertical_search_plan_request(_bag_sealer_hints())
+    properties = request["json_contract"]["properties"]
+
+    assert set(properties) == {
+        "specific_queries",
+        "broader_queries",
+        "head_noun_query",
+    }
+    assert properties["specific_queries"]["maxItems"] == 2
+    assert properties["broader_queries"]["maxItems"] == 2
+    assert request["json_contract"]["required"] == [
+        "specific_queries",
+        "broader_queries",
+        "head_noun_query",
+    ]
+    rules = " ".join(request["rules"]).casefold()
+    assert "specific -> broader -> head noun" in rules
+
+
+def test_search_planner_builds_specific_to_broad_ladder_and_keeps_head_last() -> None:
     provider = FakeProvider(
         {
             "plan_makro_vertical_search_intents": {
-                "queries": ["bag sealer", "heat sealer", "sealing machine"]
+                "specific_queries": ["bag sealer", "heat sealer"],
+                "broader_queries": ["bag sealer"],
+                "head_noun_query": "sealer",
             }
         }
     )
 
     terms = plan_vertical_search_terms(provider, _bag_sealer_hints())
 
-    assert terms == ("bag sealer", "heat sealer", "sealing machine")
+    assert terms == ("bag sealer", "heat sealer", "sealer")
+    assert terms[-1] == "sealer"
     assert "rechargeable bag sealer" not in terms
     request = provider.requests[0]
     assert request["context"]["product_type_en"] == "rechargeable bag sealer"
-    assert "power source" in " ".join(request["rules"]).casefold()
 
 
-def test_search_plan_schema_allows_one_reliable_query_instead_of_forced_synonyms() -> None:
-    request = build_vertical_search_plan_request(_bag_sealer_hints())
-    schema = request["json_contract"]["properties"]["queries"]
-    assert schema["minItems"] == 1
-    assert schema["maxItems"] == 5
+def test_search_planner_deduplicates_head_and_reappends_it_as_last_query() -> None:
+    provider = FakeProvider(
+        {
+            "plan_makro_vertical_search_intents": {
+                "specific_queries": ["sealer", "heat sealer"],
+                "broader_queries": ["bag sealer"],
+                "head_noun_query": "sealer",
+            }
+        }
+    )
+
+    assert plan_vertical_search_terms(provider, _bag_sealer_hints()) == (
+        "heat sealer",
+        "bag sealer",
+        "sealer",
+    )
+
+
+def test_search_planner_fallback_also_broadens_to_head_noun() -> None:
+    provider = FakeProvider(
+        {"plan_makro_vertical_search_intents": RuntimeError("temporary provider failure")}
+    )
+
+    assert plan_vertical_search_terms(provider, _bag_sealer_hints()) == (
+        "rechargeable bag sealer",
+        "bag sealer",
+        "sealer",
+    )
+
+
+def test_invalid_planner_head_falls_back_instead_of_searching_generic_machine() -> None:
+    provider = FakeProvider(
+        {
+            "plan_makro_vertical_search_intents": {
+                "specific_queries": ["bag sealer"],
+                "broader_queries": [],
+                "head_noun_query": "machine",
+            }
+        }
+    )
+
+    assert plan_vertical_search_terms(provider, _bag_sealer_hints()) == (
+        "rechargeable bag sealer",
+        "bag sealer",
+        "sealer",
+    )
 
 
 def test_search_query_guard_rejects_platform_pollution_without_blocking_real_product_names() -> None:
@@ -80,30 +144,6 @@ def test_search_query_guard_rejects_platform_pollution_without_blocking_real_pro
     assert vertical_resolution._usable_query("category") is False
     assert vertical_resolution._usable_query("vertical blinds") is True
     assert vertical_resolution._usable_query("category 6 cable") is True
-
-
-def test_search_planner_falls_back_to_grounded_product_type_if_planner_fails() -> None:
-    provider = FakeProvider(
-        {"plan_makro_vertical_search_intents": RuntimeError("temporary provider failure")}
-    )
-
-    assert plan_vertical_search_terms(provider, _bag_sealer_hints()) == (
-        "rechargeable bag sealer",
-    )
-
-
-def test_search_planner_falls_back_when_response_contains_no_safe_queries() -> None:
-    provider = FakeProvider(
-        {
-            "plan_makro_vertical_search_intents": {
-                "queries": ["Makro vertical", "seller category", ""]
-            }
-        }
-    )
-
-    assert plan_vertical_search_terms(provider, _bag_sealer_hints()) == (
-        "rechargeable bag sealer",
-    )
 
 
 def test_live_candidates_are_aggregated_across_queries_before_selection() -> None:
@@ -117,36 +157,33 @@ def test_live_candidates_are_aggregated_across_queries_before_selection() -> Non
                 ],
             ),
             (
-                "heat sealer",
+                "sealer",
                 [
                     "Home Appliances / Kitchen Appliances / Bag Sealers",
-                    "Automotive Spares / Spare Parts / Turbocharger",
+                    "Home Improvement / Hardware & Electricals / Sealer",
                 ],
             ),
         ]
     )
 
     assert candidates[0].label == "Home Appliances / Kitchen Appliances / Bag Sealers"
-    assert candidates[0].matched_queries == ("bag sealer", "heat sealer")
+    assert candidates[0].matched_queries == ("bag sealer", "sealer")
     assert candidates[0].hit_count == 2
     assert candidates[0].best_rank == 1
-    assert {item.label for item in candidates[1:]} == {
-        "Sports & Fitness / Accessories / Pellets Recharge",
-        "Automotive Spares / Spare Parts / Turbocharger",
-    }
 
 
 def test_aggregated_chooser_can_only_return_one_exact_live_candidate() -> None:
     candidates = merge_vertical_search_observations(
         [
             ("bag sealer", ["Home / Kitchen / Bag Sealers", "Battery / Battery Chargers"]),
-            ("heat sealer", ["Home / Kitchen / Bag Sealers"]),
+            ("sealer", ["Home / Kitchen / Bag Sealers"]),
         ]
     )
     provider = FakeProvider(
         {
             "choose_exact_makro_vertical_from_aggregated_live_search": {
-                "selected_vertical": "Home / Kitchen / Bag Sealers"
+                "selected_vertical": "Home / Kitchen / Bag Sealers",
+                "selection_relation": "same_product_type",
             }
         }
     )
@@ -154,16 +191,14 @@ def test_aggregated_chooser_can_only_return_one_exact_live_candidate() -> None:
     selected = choose_vertical_candidate_pool(
         provider,
         _bag_sealer_hints(),
-        ("bag sealer", "heat sealer"),
+        ("bag sealer", "sealer"),
         candidates,
     )
 
     assert selected == "Home / Kitchen / Bag Sealers"
     request = provider.requests[0]
     assert request["context"]["product_identity"]["product_type_en"] == "rechargeable bag sealer"
-    good = request["context"]["live_candidates"][0]
-    assert good["matched_queries"] == ["bag sealer", "heat sealer"]
-    assert good["query_hit_count"] == 2
+    assert request["context"]["search_queries_specific_to_broad"] == ["bag sealer", "sealer"]
     assert request["json_contract"]["properties"]["selected_vertical"]["enum"] == [
         "",
         "Home / Kitchen / Bag Sealers",
@@ -178,7 +213,8 @@ def test_aggregated_chooser_rejects_invented_vertical() -> None:
     provider = FakeProvider(
         {
             "choose_exact_makro_vertical_from_aggregated_live_search": {
-                "selected_vertical": "Invented / Heat Sealing Machine"
+                "selected_vertical": "Invented / Heat Sealing Machine",
+                "selection_relation": "same_product_type",
             }
         }
     )
@@ -192,19 +228,18 @@ def test_aggregated_chooser_rejects_invented_vertical() -> None:
         )
 
 
-def test_pool_prompt_treats_search_queries_as_retrieval_hints_not_truth() -> None:
+def test_pool_prompt_knows_broad_queries_trade_precision_for_recall() -> None:
     candidates = merge_vertical_search_observations(
-        [("rechargeable bag sealer", ["Battery / Battery Chargers"])]
+        [("sealer", ["Home Improvement / Hardware & Electricals / Sealer"])]
     )
     request = build_vertical_pool_choice_request(
         _bag_sealer_hints(),
-        ("rechargeable bag sealer",),
+        ("bag sealer", "sealer"),
         candidates,
     )
     rules = " ".join(request["rules"]).casefold()
-    assert "retrieval hint" in rules
-    assert "power term" in rules
-    assert "chargers" in rules
+    assert "precision for recall" in rules
+    assert "must never add" in rules
 
 
 class FakeSearch:
@@ -226,16 +261,16 @@ class FakePage:
         return None
 
 
-def test_live_search_collects_every_query_then_replays_selected_query_before_click(monkeypatch) -> None:
+def test_live_search_runs_entire_ladder_then_replays_selected_query_before_click(monkeypatch) -> None:
     page = FakePage()
     search = FakeSearch()
     rows_by_query = {
-        "bag sealer": [
-            "Home / Kitchen / Bag Sealers",
-            "Sports / Accessories / Pellets Recharge",
+        "bag sealer": ["Home / Kitchen / Vacuum Bag Sealer"],
+        "heat sealer": [],
+        "sealer": [
+            "Home Improvement / Hardware & Electricals / Sealer",
+            "Home / Kitchen / Vacuum Bag Sealer",
         ],
-        "heat sealer": ["Home / Kitchen / Bag Sealers"],
-        "sealing machine": ["Industrial / Packaging / Sealing Machines"],
     }
     clicked: list[tuple[str, str]] = []
 
@@ -244,7 +279,7 @@ def test_live_search_collects_every_query_then_replays_selected_query_before_cli
     monkeypatch.setattr(
         vertical_selection,
         "plan_vertical_search_terms",
-        lambda _provider, _hints: ("bag sealer", "heat sealer", "sealing machine"),
+        lambda _provider, _hints: ("bag sealer", "heat sealer", "sealer"),
     )
     monkeypatch.setattr(
         vertical_selection,
@@ -254,7 +289,7 @@ def test_live_search_collects_every_query_then_replays_selected_query_before_cli
     monkeypatch.setattr(
         vertical_selection,
         "choose_vertical_candidate_pool",
-        lambda _provider, _hints, _terms, _pool: "Home / Kitchen / Bag Sealers",
+        lambda _provider, _hints, _terms, _pool: "Home Improvement / Hardware & Electricals / Sealer",
     )
     monkeypatch.setattr(vertical_selection, "_current_target_values", lambda _page: ("", ""))
     monkeypatch.setattr(
@@ -265,7 +300,7 @@ def test_live_search_collects_every_query_then_replays_selected_query_before_cli
     monkeypatch.setattr(
         vertical_selection,
         "_complete_exact_live_vertical",
-        lambda _page, _selected, **_kwargs: "bag_sealer",
+        lambda _page, _selected, **_kwargs: "sealer",
     )
 
     selected, observed, planned = vertical_selection._try_select_via_search(
@@ -275,13 +310,13 @@ def test_live_search_collects_every_query_then_replays_selected_query_before_cli
         wait_ms=0,
     )
 
-    assert planned == ("bag sealer", "heat sealer", "sealing machine")
+    assert planned == ("bag sealer", "heat sealer", "sealer")
     assert search.nonempty_fills == [
         "bag sealer",
         "heat sealer",
-        "sealing machine",
-        "bag sealer",
+        "sealer",
+        "sealer",
     ]
-    assert clicked == [("bag sealer", "Home / Kitchen / Bag Sealers")]
-    assert selected == "bag_sealer"
-    assert "Sports / Accessories / Pellets Recharge" in observed
+    assert clicked == [("sealer", "Home Improvement / Hardware & Electricals / Sealer")]
+    assert selected == "sealer"
+    assert "Home / Kitchen / Vacuum Bag Sealer" in observed

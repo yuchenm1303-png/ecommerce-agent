@@ -1,9 +1,9 @@
 """Semantic resolution for Makro Step 1 live Vertical search.
 
-Product Identity answers what the supplier is selling. This module turns that
-identity into several retrieval intents, merges the query-owned Vertical rows
-Makro actually returned, and lets AI choose only from that exact live pool.
-Search terms are retrieval hints, never marketplace truth.
+Product Identity answers what the supplier is selling. This module converts that
+identity into a bounded search ladder, merges the query-owned live Makro rows, and
+lets AI choose only from that exact live pool. Search terms are retrieval hints,
+never marketplace truth.
 """
 
 from __future__ import annotations
@@ -58,6 +58,15 @@ def _usable_query(value: object) -> bool:
     return not bool(words and words <= _GENERIC_ONLY_QUERY_WORDS)
 
 
+def _usable_head_query(value: object) -> bool:
+    if not _usable_query(value):
+        return False
+    words = _query_key(value).split()
+    if not 1 <= len(words) <= 2:
+        return False
+    return not (len(words) == 1 and words[0] in _GENERIC_CLASS_NOUNS)
+
+
 def _identity(hints: ListingBootstrapHints) -> dict[str, Any]:
     return dict(hints.product_identity or {})
 
@@ -70,68 +79,11 @@ def _canonical_product_type(hints: ListingBootstrapHints) -> str:
     return _clean(hints.vertical_search_terms[0] if hints.vertical_search_terms else "")
 
 
-def _fallback_search_terms(hints: ListingBootstrapHints) -> tuple[str, ...]:
-    output: list[str] = []
-    seen: set[str] = set()
-    for raw in (*hints.vertical_search_terms, _canonical_product_type(hints)):
-        value = _clean(raw)
-        key = _query_key(value)
-        if not _usable_query(value) or not key or key in seen:
-            continue
-        seen.add(key)
-        output.append(value)
-        if len(output) >= _MAX_SEARCH_TERMS:
-            break
-    return tuple(output)
-
-
-def build_vertical_search_plan_request(hints: ListingBootstrapHints) -> dict[str, Any]:
-    product_type = _canonical_product_type(hints)
-    identity = _identity(hints)
-    return {
-        "task": "plan_makro_vertical_search_intents",
-        "system_instruction": (
-            "Plan a small set of English marketplace search queries for finding the category of one "
-            "known physical product. Queries are retrieval intents only: never claim or invent an "
-            "actual Makro Vertical. JSON only."
-        ),
-        "prompt_instruction": (
-            "Create complementary short noun-phrase searches for the physical product in "
-            "context.product_identity. Focus on the stable product class and common product-type "
-            "wording. Do not let incidental attributes dominate retrieval."
-        ),
-        "context": {
-            "product_type_en": product_type,
-            "product_summary": hints.product_summary,
-            "product_identity": identity,
-        },
-        "rules": [
-            "Return up to 5 concise English product-type noun phrases; aim for 3 to 5 only when they are genuinely useful.",
-            "Keep the physical product itself central in every query.",
-            "Prefer the core product class, a common synonym, and a useful head-noun variant.",
-            "Drop model numbers, brand, colour, size, power source, rechargeable/battery wording and marketing adjectives unless they define a genuinely different product class.",
-            "Do not output Makro Vertical names unless they independently arise as ordinary product wording; these strings are only search queries.",
-            "Do not use marketplace/platform terminology as retrieval metadata. Words such as vertical or category are allowed only when they are genuinely part of the physical product name.",
-            "Do not broaden into accessories, spare parts or adjacent products unless the supplied product itself is one.",
-        ],
-        "json_contract": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "queries": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 5,
-                    "items": {"type": "string", "minLength": 2},
-                }
-            },
-            "required": ["queries"],
-        },
-        "strict_json_schema": True,
-    }
-
-
-def _normalize_search_terms(values: Iterable[object]) -> tuple[str, ...]:
+def _normalize_search_terms(
+    values: Iterable[object],
+    *,
+    limit: int = _MAX_SEARCH_TERMS,
+) -> tuple[str, ...]:
     output: list[str] = []
     seen: set[str] = set()
     for raw in values:
@@ -141,22 +93,130 @@ def _normalize_search_terms(values: Iterable[object]) -> tuple[str, ...]:
             continue
         seen.add(key)
         output.append(value)
-        if len(output) >= _MAX_SEARCH_TERMS:
+        if len(output) >= max(1, int(limit)):
             break
     return tuple(output)
+
+
+def _append_unique_query(output: list[str], seen: set[str], raw: object) -> None:
+    value = _clean(raw)
+    key = _query_key(value)
+    if not _usable_query(value) or not key or key in seen:
+        return
+    seen.add(key)
+    output.append(value)
+
+
+def _fallback_search_ladder(hints: ListingBootstrapHints) -> tuple[str, ...]:
+    """Build a safe specific-to-broad ladder when the semantic planner fails."""
+
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw in hints.vertical_search_terms:
+        _append_unique_query(output, seen, raw)
+        if len(output) >= _MAX_SEARCH_TERMS:
+            return tuple(output)
+
+    product_type = _canonical_product_type(hints)
+    _append_unique_query(output, seen, product_type)
+
+    words = re.findall(r"[A-Za-z0-9]+", product_type)
+    if len(words) >= 3:
+        _append_unique_query(output, seen, " ".join(words[-2:]))
+    if words:
+        head = words[-1]
+        if _usable_head_query(head):
+            _append_unique_query(output, seen, head)
+
+    return tuple(output[:_MAX_SEARCH_TERMS])
+
+
+def build_vertical_search_plan_request(hints: ListingBootstrapHints) -> dict[str, Any]:
+    product_type = _canonical_product_type(hints)
+    identity = _identity(hints)
+    return {
+        "task": "plan_makro_vertical_search_intents",
+        "system_instruction": (
+            "Plan a bounded English search ladder for finding one physical product's marketplace "
+            "category. Search strings are retrieval intents only; never claim or invent an actual "
+            "Makro Vertical. JSON only."
+        ),
+        "prompt_instruction": (
+            "Create a specific-to-broad retrieval ladder from context.product_identity. The goal is "
+            "high recall without letting incidental attributes dominate search."
+        ),
+        "context": {
+            "product_type_en": product_type,
+            "product_summary": hints.product_summary,
+            "product_identity": identity,
+        },
+        "rules": [
+            "specific_queries: return 1 or 2 concise product-type phrases that closely name the physical product.",
+            "broader_queries: return 0 to 2 progressively broader product-family phrases by removing qualifiers, not by switching to adjacent products.",
+            "head_noun_query: return the shortest useful common class noun or two-word head phrase that a human would type for broad marketplace recall.",
+            "The final ladder must behave like specific -> broader -> head noun; for a handheld heat bag sealer, useful examples are bag sealer, heat sealer, then sealer.",
+            "Drop model numbers, brand, colour, size, power source, rechargeable/battery wording and marketing adjectives unless they define a genuinely different product class.",
+            "Do not use Makro, marketplace, seller, listing, vertical or category as retrieval metadata.",
+            "Do not broaden into accessories, spare parts or sibling products unless the supplied product itself is one.",
+            "The head noun may be broad because downstream selection is constrained to live Makro rows and independently verifies product semantics.",
+        ],
+        "json_contract": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "specific_queries": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 2,
+                    "items": {"type": "string", "minLength": 2},
+                },
+                "broader_queries": {
+                    "type": "array",
+                    "minItems": 0,
+                    "maxItems": 2,
+                    "items": {"type": "string", "minLength": 2},
+                },
+                "head_noun_query": {
+                    "type": "string",
+                    "minLength": 2,
+                },
+            },
+            "required": ["specific_queries", "broader_queries", "head_noun_query"],
+        },
+        "strict_json_schema": True,
+    }
+
+
+def _planned_search_ladder(raw: dict[str, Any]) -> tuple[str, ...]:
+    specific = _normalize_search_terms(raw.get("specific_queries") or (), limit=2)
+    broader = _normalize_search_terms(raw.get("broader_queries") or (), limit=2)
+    head = _clean(raw.get("head_noun_query"))
+    if not specific or not _usable_head_query(head):
+        return ()
+
+    output: list[str] = []
+    seen: set[str] = set()
+    for term in (*specific, *broader):
+        if len(output) >= _MAX_SEARCH_TERMS - 1:
+            break
+        _append_unique_query(output, seen, term)
+
+    head_key = _query_key(head)
+    if head_key in seen:
+        output = [term for term in output if _query_key(term) != head_key]
+    _append_unique_query(output, seen - {head_key}, head)
+    return tuple(output[:_MAX_SEARCH_TERMS])
 
 
 def plan_vertical_search_terms(
     provider: JSONTaskProvider,
     hints: ListingBootstrapHints,
 ) -> tuple[str, ...]:
-    """Return semantic retrieval intents; use Product Identity only as fallback.
+    """Return a bounded specific-to-broad search ladder.
 
-    A successful planner replaces the raw Product Identity phrase for retrieval.
-    This prevents incidental attributes in ``product_type_en`` (for example a
-    power-source modifier) from being reintroduced after AI already produced
-    cleaner product-class queries. The grounded identity seed is used only when
-    planning fails or yields no safe query at all.
+    A successful planner owns retrieval wording and always reserves the last slot
+    for a broad head query. Product Identity-derived fallback is used only when the
+    planner fails or returns an invalid ladder.
     """
 
     try:
@@ -165,11 +225,11 @@ def plan_vertical_search_terms(
         raw = None
 
     if isinstance(raw, dict):
-        planned = _normalize_search_terms(raw.get("queries") or [])
+        planned = _planned_search_ladder(raw)
         if planned:
             return planned
 
-    fallback = _normalize_search_terms(_fallback_search_terms(hints))
+    fallback = _fallback_search_ladder(hints)
     if fallback:
         return fallback
     raise ValueError("Product Identity produced no safe Makro Vertical retrieval intent")
@@ -339,12 +399,12 @@ def build_vertical_pool_choice_request(
         "context": {
             "product_summary": hints.product_summary,
             "product_identity": _identity(hints),
-            "search_queries": list(search_terms),
+            "search_queries_specific_to_broad": list(search_terms),
             "live_candidates": [item.as_dict() for item in candidates],
         },
         "rules": [
             "selected_vertical must be copied exactly from an allowed live candidate label or be empty.",
-            "The search query that retrieved a row is only a retrieval hint, not evidence that the row is correct.",
+            "Search queries are retrieval hints only; the later broader/head queries intentionally trade precision for recall.",
             "Judge the full breadcrumb and especially its leaf against the physical product identity.",
             "First prefer a candidate representing the same physical product type; use selection_relation=same_product_type.",
             "If no same-product candidate exists, broader_valid_class is allowed only for a genuine semantic superclass that contains the product.",
@@ -383,22 +443,29 @@ def choose_vertical_candidate_pool(
     raw = provider.extract_json(build_vertical_pool_choice_request(hints, search_terms, candidates))
     if not isinstance(raw, dict):
         raise ValueError("aggregated Vertical chooser response must be a JSON object")
+
     selected = _clean(raw.get("selected_vertical"))
     relation = _clean(raw.get("selection_relation")).casefold()
     if not relation:
         relation = _SAME_PRODUCT_TYPE if selected else _NO_VALID_CLASS
     if relation not in _VALID_SELECTION_RELATIONS:
         raise ValueError(f"invalid Makro Vertical selection_relation={relation!r}")
+
     if not selected:
         if relation != _NO_VALID_CLASS:
             raise ValueError("empty Makro Vertical selection requires selection_relation='none'")
         return ""
     if relation not in {_SAME_PRODUCT_TYPE, _BROADER_VALID_CLASS}:
-        raise ValueError("non-empty Makro Vertical selection requires same_product_type or broader_valid_class")
+        raise ValueError(
+            "non-empty Makro Vertical selection requires same_product_type or broader_valid_class"
+        )
+
     wanted = normalize_label(selected)
     matches = [item.label for item in candidates if normalize_label(item.label) == wanted]
     if len(matches) != 1:
-        raise ValueError(f"AI returned a Vertical that is not one unique aggregated live candidate: {selected!r}")
+        raise ValueError(
+            f"AI returned a Vertical that is not one unique aggregated live candidate: {selected!r}"
+        )
     if unsupported_candidate_constraints(hints, matches[0]):
         return ""
     return matches[0]
