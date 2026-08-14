@@ -7,7 +7,6 @@ ROOT = Path(__file__).resolve().parents[1]
 CLOCK = (ROOT / "gui" / "presentation_clock.py").read_text(encoding="utf-8")
 NATIVE = (ROOT / "gui" / "native_background.py").read_text(encoding="utf-8")
 VISUAL = (ROOT / "gui" / "native_visual_style.py").read_text(encoding="utf-8")
-GPU = (ROOT / "gui" / "card_gpu_snapshot.py").read_text(encoding="utf-8")
 CARD = (ROOT / "gui" / "nekro_card_fx.py").read_text(encoding="utf-8")
 EFFECTS = (ROOT / "gui" / "nekro_effects.py").read_text(encoding="utf-8")
 DATA = (ROOT / "gui" / "ui_data_optimizations.py").read_text(encoding="utf-8")
@@ -67,7 +66,7 @@ def test_background_has_no_python_pointer_timer_and_retains_gpu_scene_graph() ->
     assert "_GEOMETRY_SYNC_MS = 16" in NATIVE
 
 
-def test_card_motion_keeps_reference_semantics_but_removes_cpu_scale_chain() -> None:
+def test_card_motion_uses_shared_clock_and_one_frozen_composite_per_tween() -> None:
     assert "_NORMAL_SCALE = 1.00" in CARD
     assert "_HOVER_SCALE = 1.02" in CARD
     assert "_TRANSITION_MS = 300" in CARD
@@ -82,29 +81,17 @@ def test_card_motion_keeps_reference_semantics_but_removes_cpu_scale_chain() -> 
     )[0]
     assert "self._set_content_frozen(state, False)" in recapture
     assert "self._set_content_frozen(state, True)" in recapture
+    advance = CARD.split("def _advance_state", 1)[1].split("def _advance_motions", 1)[0]
+    assert "if not state.moving:" in advance
+    assert "self._set_content_frozen(state, False)" in advance
 
-    assert "CardGpuSnapshotPool" in VISUAL
-    assert "self.card_snapshots = CardGpuSnapshotPool(window)" in VISUAL
-    assert "self.snapshots.capture(self.frame, scale=self._surface_scale)" in VISUAL
-    assert "self.snapshots.set_scale(self.frame, scale)" in VISUAL
-    assert "_CardScaleEffect" not in VISUAL
-    assert "sourcePixmap(" not in VISUAL
-    assert "SmoothPixmapTransform" not in VISUAL
-
-
-def test_gpu_snapshot_surface_is_small_input_transparent_and_sourcepixmap_free() -> None:
-    assert "QOpenGLWidget" in GPU
-    assert "class _CardSnapshotWidget(QOpenGLWidget)" in GPU
-    assert "WA_TransparentForMouseEvents" in GPU
-    assert "frame.grab()" in GPU
-    assert "painter.drawPixmap(dest, state.pixmap" in GPU
-    assert "class _CardPaintGate(QGraphicsEffect)" in GPU
-    assert "sourcePixmap(" not in GPU
-    assert "painter.scale(" not in GPU
-    assert "frame.setGraphicsEffect(gate)" in GPU
-    assert "frame.setGraphicsEffect(None)" in GPU
-    assert "_POOL_SIZE = 2" in GPU
-    assert "_MAX_SCALE = 1.04" in GPU
+    assert "self.sourcePixmap(" in VISUAL
+    assert "self._frozen_center: QPointF | None = None" in VISUAL
+    assert "return self._frozen_source, self._frozen_offset, self._frozen_center" in VISUAL
+    draw = VISUAL.split("def draw(self, painter: QPainter)", 1)[1].split(
+        "class NativeGlassProxy", 1
+    )[0]
+    assert "sourceBoundingRect" not in draw
 
 
 def test_decorative_effects_reuse_clock_and_keep_dirty_region_budget() -> None:
@@ -159,7 +146,6 @@ def test_presentation_sources_compile_without_importing_qt() -> None:
         "gui/presentation_clock.py",
         "gui/native_background.py",
         "gui/native_visual_style.py",
-        "gui/card_gpu_snapshot.py",
         "gui/nekro_card_fx.py",
         "gui/nekro_effects.py",
         "gui/ui_data_optimizations.py",

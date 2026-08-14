@@ -1,38 +1,177 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QModelIndex, QObject, QRectF, Qt, QTimer
+from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QCursor, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QApplication,
     QFrame,
+    QGraphicsEffect,
     QMainWindow,
 )
 
-from .card_gpu_snapshot import CardGpuSnapshotPool
 from .native_background import NativeQuickBackground
 from .nekro_style import NEKRO_STYLE
 
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
 _NORMAL_GLASS_ALPHA = 64.0
+_EFFECT_BOUND_SCALE = 1.04
+_CONTENT_EDGE_STEP_PX = 0.18
+_NORMAL_SCALE_EPSILON = 1e-5
+
+
+class _CardScaleEffect(QGraphicsEffect):
+    """Transform one complete QWidget card composite without touching its layout.
+
+    At rest the native widget subtree remains live. During a short scale tween the
+    card controller asks this effect to freeze one current sourcePixmap; subsequent
+    scale steps reuse that same composite and only perform a cheap pixmap transform.
+    Exact rest, modal reset and cleanup release the frozen image immediately.
+    """
+
+    def __init__(self, parent: QObject) -> None:
+        super().__init__(parent)
+        self._scale = 1.0
+        self._frozen = False
+        self._freeze_requested = False
+        self._frozen_source: QPixmap | None = None
+        self._frozen_offset = QPoint()
+        self._frozen_center: QPointF | None = None
+        self.setEnabled(False)
+
+    @property
+    def scale(self) -> float:
+        return self._scale
+
+    @property
+    def frozen(self) -> bool:
+        return self._frozen
+
+    def _clear_frozen_source(self) -> None:
+        self._frozen_source = None
+        self._frozen_offset = QPoint()
+        self._frozen_center = None
+
+    def _content_span(self) -> float:
+        frame = self.parent()
+        try:
+            return max(1.0, float(frame.width()), float(frame.height()))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return 1.0
+
+    def set_frozen(self, frozen: bool) -> None:
+        frozen = bool(frozen)
+        if frozen == self._frozen:
+            return
+        self._frozen = frozen
+        self._freeze_requested = frozen
+        self._clear_frozen_source()
+        if self.isEnabled():
+            self.update()
+
+    def set_scale(self, scale: float) -> None:
+        requested = max(0.96, min(_EFFECT_BOUND_SCALE, float(scale)))
+        exact_rest = abs(requested - 1.0) <= _NORMAL_SCALE_EPSILON
+        if exact_rest:
+            requested = 1.0
+        else:
+            edge_delta_px = self._content_span() * abs(requested - self._scale) * 0.5
+            if edge_delta_px < _CONTENT_EDGE_STEP_PX:
+                return
+
+        if abs(requested - self._scale) <= _NORMAL_SCALE_EPSILON:
+            if exact_rest and self._frozen:
+                self._frozen = False
+                self._freeze_requested = False
+                self._clear_frozen_source()
+            return
+
+        self._scale = requested
+        active = abs(requested - 1.0) > 1e-4
+        if self.isEnabled() != active:
+            self.setEnabled(active)
+            self.updateBoundingRect()
+        if not active:
+            self._frozen = False
+            self._freeze_requested = False
+            self._clear_frozen_source()
+        self.update()
+
+    def boundingRectFor(self, source_rect: QRectF) -> QRectF:  # noqa: N802
+        if not self.isEnabled():
+            return QRectF(source_rect)
+        center = source_rect.center()
+        half_w = source_rect.width() * _EFFECT_BOUND_SCALE * 0.5
+        half_h = source_rect.height() * _EFFECT_BOUND_SCALE * 0.5
+        return QRectF(
+            center.x() - half_w,
+            center.y() - half_h,
+            half_w * 2.0,
+            half_h * 2.0,
+        )
+
+    def _current_composite(self) -> tuple[QPixmap | None, QPoint, QPointF | None]:
+        if (
+            self._frozen
+            and not self._freeze_requested
+            and self._frozen_source is not None
+            and not self._frozen_source.isNull()
+            and self._frozen_center is not None
+        ):
+            return self._frozen_source, self._frozen_offset, self._frozen_center
+
+        offset = QPoint()
+        pixmap = self.sourcePixmap(
+            Qt.CoordinateSystem.LogicalCoordinates,
+            offset,
+            QGraphicsEffect.PixmapPadMode.NoPad,
+        )
+        if pixmap.isNull():
+            return None, QPoint(), None
+
+        # sourceBoundingRect() can walk the effect source. During a frozen tween
+        # the source geometry cannot change, so resolve its transform origin once
+        # with the captured composite instead of asking Qt for it on every frame.
+        center = self.sourceBoundingRect(Qt.CoordinateSystem.LogicalCoordinates).center()
+        if self._frozen:
+            self._frozen_source = pixmap
+            self._frozen_offset = QPoint(offset)
+            self._frozen_center = QPointF(center)
+            self._freeze_requested = False
+        return pixmap, offset, center
+
+    def draw(self, painter: QPainter) -> None:  # type: ignore[override]
+        scale = self._scale
+        if abs(scale - 1.0) <= 1e-4:
+            self.drawSource(painter)
+            return
+
+        pixmap, offset, center = self._current_composite()
+        if pixmap is None or center is None:
+            self.drawSource(painter)
+            return
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.translate(center)
+        painter.scale(scale, scale)
+        painter.translate(-center)
+        painter.drawPixmap(offset, pixmap)
+        painter.restore()
 
 
 class NativeGlassProxy(QObject):
-    """Publish one card interaction to Quick glass and the GPU snapshot surface."""
+    """Publish one card interaction to Quick glass and its QWidget composite."""
 
-    def __init__(
-        self,
-        frame: QFrame,
-        background: NativeQuickBackground,
-        snapshots: CardGpuSnapshotPool,
-    ) -> None:
+    def __init__(self, frame: QFrame, background: NativeQuickBackground) -> None:
         super().__init__(frame)
         self.frame = frame
         self.background = background
-        self.snapshots = snapshots
         self._surface_scale = 1.0
         self._overlay_alpha = _NORMAL_GLASS_ALPHA
+        self._scale_effect = _CardScaleEffect(frame)
+        frame.setGraphicsEffect(self._scale_effect)
 
     @property
     def surface_scale(self) -> float:
@@ -43,10 +182,7 @@ class NativeGlassProxy(QObject):
         return self._overlay_alpha
 
     def set_content_frozen(self, frozen: bool) -> None:
-        if frozen:
-            self.snapshots.capture(self.frame, scale=self._surface_scale)
-        else:
-            self.snapshots.release(self.frame)
+        self._scale_effect.set_frozen(frozen)
 
     def set_interaction(self, *, scale: float, overlay_alpha: float) -> None:
         scale = max(0.96, min(1.04, float(scale)))
@@ -63,19 +199,21 @@ class NativeGlassProxy(QObject):
             scale=scale,
             alpha=overlay_alpha,
         )
-        self.snapshots.set_scale(self.frame, scale)
+        self._scale_effect.set_scale(scale)
 
     def sync_geometry(self) -> None:
         self.background.schedule_mask_update()
 
     def cleanup(self) -> None:
         try:
-            self.snapshots.release(self.frame)
             self.background.set_card_presentation(
                 self.frame,
                 scale=1.0,
                 alpha=_NORMAL_GLASS_ALPHA,
             )
+            self._scale_effect.set_frozen(False)
+            self._scale_effect.set_scale(1.0)
+            self.frame.setGraphicsEffect(None)
         except RuntimeError:
             pass
 
@@ -101,15 +239,10 @@ class NativeVisualStyleController(QObject):
 
         window.setStyleSheet(window.styleSheet() + "\n" + NEKRO_STYLE)
         self.background = NativeQuickBackground(window)
-        self.card_snapshots = CardGpuSnapshotPool(window)
         for frame in window.findChildren(QFrame):
             if frame.objectName() in _GLASS_NAMES:
                 frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-                self._glass[frame] = NativeGlassProxy(
-                    frame,
-                    self.background,
-                    self.card_snapshots,
-                )
+                self._glass[frame] = NativeGlassProxy(frame, self.background)
 
         self._install_cursor()
         window.destroyed.connect(self._cleanup)
@@ -141,11 +274,7 @@ class NativeVisualStyleController(QObject):
                 model.cards.append(frame)
                 model._rows[frame] = row
                 model._states.append(model.default_state())
-                self._glass[frame] = NativeGlassProxy(
-                    frame,
-                    self.background,
-                    self.card_snapshots,
-                )
+                self._glass[frame] = NativeGlassProxy(frame, self.background)
         finally:
             model.endInsertRows()
 
@@ -209,7 +338,6 @@ class NativeVisualStyleController(QObject):
                 surface.cleanup()
             except RuntimeError:
                 pass
-        self.card_snapshots.cleanup()
         self.background.shutdown()
         if self._cursor_installed:
             QApplication.restoreOverrideCursor()
