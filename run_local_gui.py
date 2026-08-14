@@ -39,8 +39,6 @@ def main() -> int:
     from gui.browser_session_manager import install_managed_makro_browser
     from gui.card_details_fast import install_card_details
     from gui.console_summary_mode import install_console_summary_mode
-    from gui.console_window import MainWindow
-    from gui.workflow_console_window import WorkflowMainWindow
     from gui.frozen_process_router import install_frozen_process_router
     from gui.listing_offer_hardening import install_listing_offer_hardening
     from gui.listing_offer_support import install_listing_offer_support
@@ -53,6 +51,7 @@ def main() -> int:
     from gui.page_scroll_layout import install_page_scroll_layout
     from gui.preparation_progress import install_detailed_preparation_progress
     from gui.product_copy import install_product_copy
+    from gui.product_input_window import ProductInputWorkflowMainWindow
     from gui.premium_copy import install_premium_copy
     from gui.required_input_support import install_required_input_support
     from gui.restore_snapshot import install_restore_snapshot
@@ -68,7 +67,7 @@ def main() -> int:
     from gui.workspace_transition_tuning import apply_workspace_transition_tuning
     from gui.smooth_scroll import SmoothWheelFilter
 
-    MainWindow = WorkflowMainWindow
+    MainWindow = ProductInputWorkflowMainWindow
 
     app = QApplication(sys.argv)
     app.setApplicationName("ecommerce-agent Listing Studio")
