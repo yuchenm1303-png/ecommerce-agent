@@ -173,3 +173,21 @@ def test_gui_manual_value_is_optional_and_empty_value_can_get_fallback():
     assert 'editor.setPlaceholderText(f"必填 · 留空将自动填 {fallback_text}")' in GUI_SOURCE
     assert 'if value:' in inspect.getsource(__import__("gui.required_input_support", fromlist=["RequiredInputSupport"]).RequiredInputSupport._merged_overrides)
     assert "required_fallback_override(field)" in GUI_SOURCE
+
+
+def test_gui_required_business_state_never_reads_qlineedit_lifetime():
+    support = __import__(
+        "gui.required_input_support",
+        fromlist=["RequiredInputSupport"],
+    ).RequiredInputSupport
+    merged = inspect.getsource(support._merged_overrides)
+    sync = inspect.getsource(support._sync_button)
+    request = inspect.getsource(support.request_start)
+
+    assert "self.values" in GUI_SOURCE
+    assert "for identifier, field in self.fields.items()" in merged
+    assert ".text()" not in merged
+    assert "editor.text()" not in sync
+    assert "editor.text()" not in request
+    assert "self._manual_count()" in sync
+    assert "self._manual_count()" in request
