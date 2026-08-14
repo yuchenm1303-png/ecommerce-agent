@@ -56,9 +56,14 @@ Type: files; Name: "{app}\icons\EcommerceAgent-*.ico"
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#IconFile}"; DestDir: "{app}\icons"; DestName: "{#InstalledIconName}"; Flags: ignoreversion
 
+; Both shortcuts must carry the same AppUserModelID as the process
+; (SetCurrentProcessExplicitAppUserModelID("EcommerceAgent.ListingStudio") in
+; app/app_branding.py). Windows resolves the taskbar/pinned button's icon by
+; matching that AUMID against registered shortcuts; without a match it falls
+; back to a generic icon instead of the installed one.
 [Icons]
-Name: "{autoprograms}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icons\{#InstalledIconName}"; IconIndex: 0
-Name: "{autodesktop}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icons\{#InstalledIconName}"; IconIndex: 0; Check: ShouldCreateDesktopShortcut
+Name: "{autoprograms}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icons\{#InstalledIconName}"; IconIndex: 0; AppUserModelID: "EcommerceAgent.ListingStudio"
+Name: "{autodesktop}\EcommerceAgent Listing Studio"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icons\{#InstalledIconName}"; IconIndex: 0; Check: ShouldCreateDesktopShortcut; AppUserModelID: "EcommerceAgent.ListingStudio"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 EcommerceAgent Listing Studio"; Flags: nowait postinstall skipifsilent
