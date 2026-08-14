@@ -2,7 +2,8 @@
 
 This module owns only portal lifecycle mechanics. Product semantics remain in
 ``listing_creation`` and Step 3 field execution remains in the domain/executor
-layers.
+layers. Brand selection itself is portal-first and consumes exact live Makro
+candidates through ``brand_selection``.
 
 Makro may take longer than the old 15 second post-create wait to settle, and a
 portal transition may replace the Playwright Page target. The formal workflows
@@ -19,12 +20,12 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page
 
+from .brand_selection import select_brand
 from .listing import MAKRO_HOST, parse_makro_listing_url
 from .listing_creation import (
     JSONTaskProvider,
     ListingBootstrapHints,
     is_product_info_step,
-    select_brand,
 )
 from .portal_adapter import MakroPortalAdapter
 from .portal_interruptions import reconcile_portal_interruptions
@@ -120,9 +121,10 @@ def select_brand_to_product_info(
 ) -> tuple[str, Page]:
     """Select Step 2 brand and return the exact Page that owns Step 3.
 
-    ``select_brand`` keeps its existing strict browser semantics. This wrapper
-    only recovers the known post-Create-New-Listing timeout race and page-target
-    handoff. It never adopts Step 3 tabs that existed before this transition.
+    ``select_brand`` uses the production portal-first live-candidate contract.
+    This wrapper only recovers the known post-Create-New-Listing timeout race and
+    page-target handoff. It never adopts Step 3 tabs that existed before this
+    transition.
     """
 
     context = page.context
