@@ -35,6 +35,10 @@ def test_mouse_input_is_event_driven_coalesced_and_visual_clock_is_adaptive() ->
     assert "def _deliver_input" in CLOCK
     assert "def _frame_tick" in CLOCK
     assert "def _card_motion_interval_ms" in CLOCK
+    assert "self.card_fx.motion_active" in CLOCK
+    assert "self.card_fx.motion_interval_ms" in CLOCK
+    assert "_moving_frames" not in CLOCK
+    assert "_motion_interval_s" not in CLOCK
     assert "self.timer.setInterval(target)" in CLOCK
 
     for consumer in (
@@ -80,7 +84,7 @@ def test_background_has_no_python_pointer_timer_and_retains_gpu_scene_graph() ->
     assert "_GEOMETRY_SYNC_MS = 16" in NATIVE
 
 
-def test_card_motion_uses_shared_clock_and_one_frozen_composite_per_tween() -> None:
+def test_card_motion_reuses_one_frozen_composite_across_reversals() -> None:
     assert "_NORMAL_SCALE = 1.00" in CARD
     assert "_HOVER_SCALE = 1.02" in CARD
     assert "_TRANSITION_MS = 300" in CARD
@@ -89,12 +93,21 @@ def test_card_motion_uses_shared_clock_and_one_frozen_composite_per_tween() -> N
     assert "def presentation_tick" in CARD
     assert "self._motion_timer" not in CARD
     assert "self._pointer_timer" not in CARD
-    assert "def _recapture_for_motion" in CARD
+    assert "def motion_active" in CARD
+    assert "def motion_interval_ms" in CARD
+
     recapture = CARD.split("def _recapture_for_motion", 1)[1].split(
         "def _retire_stale_motions", 1
     )[0]
-    assert "self._set_content_frozen(state, False)" in recapture
     assert "self._set_content_frozen(state, True)" in recapture
+    assert "self._set_content_frozen(state, False)" not in recapture
+
+    animate = CARD.split("def _animate_to", 1)[1].split("def _normal", 1)[0]
+    assert "scale_motion = (" in animate
+    assert "if scale_motion:" in animate
+    assert "self._recapture_for_motion(state)" in animate
+    assert "self._set_content_frozen(state, False)" in animate
+
     advance = CARD.split("def _advance_state", 1)[1].split("def _advance_motions", 1)[0]
     assert "if not state.moving:" in advance
     assert "self._set_content_frozen(state, False)" in advance
