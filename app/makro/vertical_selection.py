@@ -45,6 +45,7 @@ from .listing_creation import (
     is_vertical_step,
     normalize_label,
 )
+from .search_surface import click_search_row, read_search_rows
 from .taxonomy_navigation import navigate_live_taxonomy
 from .taxonomy_resilient import ResilientMakroTaxonomyBrowser
 
@@ -163,91 +164,27 @@ def _search_result_leaf(label: str) -> str:
 
 
 def _scoped_vertical_search_candidates(search) -> list[str]:
-    """Read visible candidates owned by the live search popup near its input.
+    """Compatibility wrapper for the canonical hit-tested search surface reader."""
 
-    Makro currently renders search results as full breadcrumbs such as
-    ``Home / Alternate Energy / Solar Charge Controller``. Generic page-wide
-    text scanning can miss those rows when they are nested, and can also see the
-    stale Browse taxonomy underneath the popup. This reader is presentation-only:
-    it uses the actual search input's geometry/ARIA relationship and returns the
-    exact rendered row text without interpreting product meaning.
-    """
+    return read_search_rows(search)
 
-    try:
-        raw = search.evaluate(
-            r"""(input) => {
-              const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-              const visible = (el) => {
-                if (!el || !(el instanceof Element)) return false;
-                const s = getComputedStyle(el), r = el.getBoundingClientRect();
-                return s.display !== 'none' && s.visibility !== 'hidden'
-                  && Number(s.opacity || 1) !== 0 && r.width > 2 && r.height > 2;
-              };
-              const inputRect = input.getBoundingClientRect();
-              const roots = [];
-              const addRoot = (el) => {
-                if (el && !roots.includes(el) && visible(el)) roots.push(el);
-              };
-              for (const attr of ['aria-controls', 'aria-owns']) {
-                const id = input.getAttribute(attr);
-                if (id) addRoot(document.getElementById(id));
-              }
-              for (const el of document.querySelectorAll('[role="listbox"], [class*="autocomplete" i], [class*="suggest" i], [class*="search-result" i], [class*="searchResult" i]')) {
-                const r = el.getBoundingClientRect();
-                const horizontal = r.right >= inputRect.left - 24 && r.left <= inputRect.right + 24;
-                const vertical = r.bottom >= inputRect.bottom - 8 && r.top <= inputRect.bottom + 620;
-                if (horizontal && vertical) addRoot(el);
-              }
 
-              const selectors = [
-                '[role="option"]', 'li', 'a', 'button', '[role="menuitem"]',
-                '[tabindex]', '[class*="option" i]', '[class*="result" i]',
-                '[class*="suggest" i]'
-              ].join(',');
-              const nodes = [];
-              if (roots.length) {
-                for (const root of roots) nodes.push(...root.querySelectorAll(selectors));
-              } else {
-                nodes.push(...document.querySelectorAll(selectors));
-              }
+def _wait_for_scoped_vertical_search_candidates(
+    page: Page,
+    search,
+    *,
+    timeout_ms: int,
+    poll_ms: int = 200,
+) -> list[str]:
+    """Wait for async Makro autocomplete state instead of assuming a fixed delay."""
 
-              const out = [], seen = new Set();
-              for (const el of nodes) {
-                if (!visible(el)) continue;
-                const r = el.getBoundingClientRect();
-                const horizontal = r.right >= inputRect.left - 24 && r.left <= inputRect.right + 24;
-                const vertical = r.top >= inputRect.bottom - 8 && r.top <= inputRect.bottom + 620;
-                if (!horizontal || !vertical) continue;
-                const text = clean(el.innerText || el.textContent || '');
-                if (!text || text.length < 2 || text.length > 260) continue;
-
-                const role = String(el.getAttribute('role') || '').toLowerCase();
-                const cls = String(el.className || '').toLowerCase();
-                const inListbox = !!el.closest('[role="listbox"]');
-                const semantic = role === 'option' || role === 'menuitem' || inListbox
-                  || /option|result|suggest|autocomplete/.test(cls) || text.includes('/');
-                if (!semantic) continue;
-
-                let duplicateChild = false;
-                for (const child of el.children || []) {
-                  if (clean(child.innerText || child.textContent || '') === text) {
-                    duplicateChild = true;
-                    break;
-                  }
-                }
-                if (duplicateChild) continue;
-
-                const key = text.toLocaleLowerCase();
-                if (seen.has(key)) continue;
-                seen.add(key);
-                out.push(text);
-              }
-              return out;
-            }"""
-        )
-    except Exception:
-        return []
-    return [str(item or "").strip() for item in raw or [] if str(item or "").strip()]
+    attempts = max(1, int(timeout_ms) // max(1, int(poll_ms)))
+    for _ in range(attempts):
+        candidates = _scoped_vertical_search_candidates(search)
+        if candidates:
+            return candidates
+        page.wait_for_timeout(poll_ms)
+    return _scoped_vertical_search_candidates(search)
 
 
 def _choose_vertical_search_candidate(
@@ -485,57 +422,85 @@ def _select_via_search_with_context(
     wait_ms: int,
     reason: str,
 ) -> str:
-    """Resolve a Vertical through Makro's live search without page-wide false candidates."""
+    """Resolve a Vertical through Makro's live search with explicit surface ownership."""
 
     search = _vertical_search_input(page)
     taxonomy = ResilientMakroTaxonomyBrowser(page)
     attempted: list[str] = []
+    observed: list[str] = []
     for term in hints.vertical_search_terms:
         attempted.append(term)
 
         search.fill("")
-        page.wait_for_timeout(wait_ms)
+        page.wait_for_timeout(min(max(wait_ms // 2, 120), 400))
         before = _visible_text_candidates(page)
         baseline_columns = taxonomy.columns()
 
         search.fill(term)
-        page.wait_for_timeout(wait_ms)
 
         selected = ""
+        selected_from_surface = False
         for submit in (False, True):
             if submit:
                 try:
                     search.press("Enter")
                 except Exception:
                     pass
-                page.wait_for_timeout(wait_ms)
 
-            live_text = [
-                *_scoped_vertical_search_candidates(search),
-                *_visible_text_candidates(page),
-            ]
-            candidates = _search_result_delta(
-                before,
-                live_text,
-                baseline_columns,
+            scoped = _wait_for_scoped_vertical_search_candidates(
+                page,
+                search,
+                timeout_ms=max(2400, wait_ms * 4),
             )
+            for item in scoped:
+                if item not in observed:
+                    observed.append(item)
+
+            if scoped:
+                # Search-surface provenance is stronger than page history. Do not
+                # run these rows through the stale-taxonomy delta filter: an exact
+                # result may legitimately have the same label as a node exposed by
+                # a failed partial taxonomy attempt.
+                candidates = scoped
+                from_surface = True
+            else:
+                candidates = _search_result_delta(
+                    before,
+                    _visible_text_candidates(page),
+                    baseline_columns,
+                )
+                from_surface = False
+                for item in candidates:
+                    if item not in observed:
+                        observed.append(item)
+
             if not candidates:
                 continue
-            selected = _choose_vertical_search_candidate(
+            candidate = _choose_vertical_search_candidate(
                 provider,
                 hints,
                 term,
                 candidates,
             )
-            if selected:
+            if candidate:
+                selected = candidate
+                selected_from_surface = from_surface
                 break
 
         if not selected:
             continue
 
         previous_canonical, _ = _current_target_values(page)
-        if not _click_exact_visible_text(page, selected):
-            raise RuntimeError(f"Makro Step 1 could not click selected live vertical: {selected!r}")
+        clicked = (
+            click_search_row(search, selected)
+            if selected_from_surface
+            else _click_exact_visible_text(page, selected)
+        )
+        if not clicked:
+            source = "search surface" if selected_from_surface else "page fallback"
+            raise RuntimeError(
+                f"Makro Step 1 could not click selected live vertical from {source}: {selected!r}"
+            )
         return _complete_exact_live_vertical(
             page,
             selected,
@@ -543,9 +508,11 @@ def _select_via_search_with_context(
             verification_label=_search_result_leaf(selected),
         )
 
+    observed_text = " | ".join(observed[:12]) if observed else "<none>"
     raise RuntimeError(
         f"Makro Step 1 {reason}; bounded exact-live Vertical Search found no verified result from: "
         + " | ".join(attempted)
+        + f"; observed search rows: {observed_text}"
     )
 
 
