@@ -1,9 +1,10 @@
-"""Semantic safety for Makro taxonomy fallback.
+"""Semantic policy for Makro taxonomy fallback.
 
-Taxonomy navigation may traverse broad parent branches, but every selected node
-must be a real marketplace-taxonomy relation to the product. Physical containment
-("the product can fit inside it") or incidental usage is never category ancestry.
-The final leaf receives a second independent semantic gate before Step 2.
+Makro's live taxonomy is sometimes sparse or commercially coarse. Navigation
+therefore prefers genuine taxonomy ancestry but may traverse the most plausible
+retail branch when no exact ancestry exists. The final leaf is accepted when it
+is the same product type, a genuine broader class, or the closest reasonable
+best-fit live class selected by AI from the real Makro taxonomy.
 """
 
 from __future__ import annotations
@@ -15,11 +16,14 @@ from .listing_creation import JSONTaskProvider, ListingBootstrapHints, normalize
 
 
 _ANCESTOR_BRANCH = "ancestor_branch"
+_BEST_AVAILABLE_BRANCH = "best_available_branch"
 _SAME_PRODUCT_TYPE = "same_product_type"
 _BROADER_VALID_CLASS = "broader_valid_class"
+_BEST_AVAILABLE_FIT = "best_available_fit"
 _NO_VALID_CLASS = "none"
 _PATH_RELATIONS = {
     _ANCESTOR_BRANCH,
+    _BEST_AVAILABLE_BRANCH,
     _SAME_PRODUCT_TYPE,
     _BROADER_VALID_CLASS,
     _NO_VALID_CLASS,
@@ -27,6 +31,7 @@ _PATH_RELATIONS = {
 _LEAF_RELATIONS = {
     _SAME_PRODUCT_TYPE,
     _BROADER_VALID_CLASS,
+    _BEST_AVAILABLE_FIT,
     _NO_VALID_CLASS,
 }
 
@@ -53,16 +58,24 @@ def build_taxonomy_path_choice_request(
     current_path: list[str],
     candidates: list[str],
 ) -> dict[str, Any]:
-    allowed = list(dict.fromkeys(str(item or "").strip() for item in candidates if str(item or "").strip()))
+    allowed = list(
+        dict.fromkeys(
+            str(item or "").strip()
+            for item in candidates
+            if str(item or "").strip()
+        )
+    )
     return {
         "task": "choose_safe_makro_taxonomy_node",
         "system_instruction": (
-            "Choose at most one exact live Makro taxonomy node for a physical product. "
-            "The relationship is marketplace category ancestry, never physical containment or incidental use. JSON only."
+            "Choose at most one exact live Makro taxonomy node for a physical product. Makro taxonomy "
+            "may be sparse: prefer a genuine ancestor branch, but when none exists choose the most "
+            "plausible retail branch that can lead to the closest usable live category. JSON only."
         ),
         "prompt_instruction": (
-            "Evaluate context.current_path + each live node as a marketplace taxonomy breadcrumb. "
-            "Choose a node only when that branch genuinely categorizes the product or leads toward its product class."
+            "Evaluate context.current_path + each live node as a marketplace breadcrumb. Prefer strict "
+            "taxonomy ancestry; otherwise choose the branch a marketplace operator would most reasonably "
+            "explore for a best-fit listing category."
         ),
         "context": {
             "product_summary": hints.product_summary,
@@ -72,15 +85,15 @@ def build_taxonomy_path_choice_request(
         },
         "rules": [
             "selected_node must be copied exactly from live_nodes or be empty.",
-            "selection_relation describes the selected node's taxonomy relation to the product: ancestor_branch, same_product_type, broader_valid_class, or none.",
-            "ancestor_branch is allowed only for a genuine marketplace department/product-family branch under which this product would normally be sold.",
-            "Physical containment is irrelevant: a product fitting inside a container, case, box, bag, cabinet, vehicle, room, or holder does not make that object a taxonomy ancestor.",
-            "Incidental compatibility or usage is irrelevant: accessories, consumables, spare parts, adjacent tools and sibling products are not ancestor branches.",
-            "same_product_type means the node describes the same physical product class.",
-            "broader_valid_class means the node is a genuine semantic superclass of the physical product without adding a different defining purpose, mechanism or form.",
-            "Judge the complete breadcrumb, not an isolated word. A generic-looking leaf under an incompatible department must be rejected.",
-            "Prefer the branch matching the product's defining purpose and normal retail context, not a branch sharing a vague noun.",
-            "If no live node is a genuine ancestor/same/broader class, return selected_node='' and selection_relation='none'.",
+            "Use ancestor_branch for a genuine marketplace department/product-family ancestor.",
+            "Use same_product_type when the node already names the same physical product class.",
+            "Use broader_valid_class when the node is a genuine semantic superclass.",
+            "When no strict ancestor exists, use best_available_branch for the live branch most likely to contain the closest commercially reasonable leaf.",
+            "For best_available_branch, judge retail context, buyer expectation and defining function; do not choose a branch merely because one vague word overlaps.",
+            "Physical containment alone is not evidence: a product fitting inside a container, case, bag, vehicle or room does not make that object a good category branch.",
+            "Accessories, consumables and spare parts should not be preferred when a branch representing the sold product itself is materially closer.",
+            "Judge the complete breadcrumb, not an isolated word.",
+            "Return none only when no current live branch is even a reasonable route to a usable best-fit category.",
         ],
         "json_contract": {
             "type": "object",
@@ -91,6 +104,7 @@ def build_taxonomy_path_choice_request(
                     "type": "string",
                     "enum": [
                         _ANCESTOR_BRANCH,
+                        _BEST_AVAILABLE_BRANCH,
                         _SAME_PRODUCT_TYPE,
                         _BROADER_VALID_CLASS,
                         _NO_VALID_CLASS,
@@ -139,7 +153,9 @@ def choose_taxonomy_path_candidate(
     wanted = normalize_label(selected)
     matches = [item for item in candidates if normalize_label(item) == wanted]
     if len(matches) != 1:
-        raise ValueError(f"AI returned a taxonomy node that is not one unique live candidate: {selected!r}")
+        raise ValueError(
+            f"AI returned a taxonomy node that is not one unique live candidate: {selected!r}"
+        )
     selected = matches[0]
     _diag(
         "taxonomy_path_decision",
@@ -162,12 +178,12 @@ def build_taxonomy_leaf_validation_request(
     return {
         "task": "validate_makro_taxonomy_leaf",
         "system_instruction": (
-            "Validate one already reached Makro taxonomy leaf against the grounded physical product identity. "
-            "This is a fail-closed safety gate before Step 2. JSON only."
+            "Evaluate one already reached real Makro taxonomy leaf against the grounded physical product. "
+            "Makro taxonomy may not contain an exact class, so a closest practical live best-fit is allowed. JSON only."
         ),
         "prompt_instruction": (
-            "Classify whether the full taxonomy breadcrumb is the same product type or a genuine broader valid class. "
-            "Reject sibling products, physical containers, accessories and any class that adds unsupported defining constraints."
+            "Classify the full breadcrumb as same product type, genuine broader class, closest available "
+            "best-fit, or unusable. Do not require perfect taxonomy alignment when Makro does not offer it."
         ),
         "context": {
             "product_summary": hints.product_summary,
@@ -176,12 +192,14 @@ def build_taxonomy_leaf_validation_request(
             "leaf": leaf,
         },
         "rules": [
-            "selection_relation must be same_product_type, broader_valid_class, or none.",
-            "A valid broader class must semantically contain the product as a merchandise class, not merely physically contain, store, carry or be used with it.",
-            "Reject a concrete sibling or adjacent product even when it shares one word or appears under a nearby department.",
-            "Reject a leaf that introduces a defining mechanism, purpose, form, audience or product type not grounded by product_identity.",
-            "unsupported_defining_constraints must list every such unsupported defining constraint; it must be empty for an accepted leaf.",
-            "If the breadcrumb is not clearly valid, use selection_relation='none'.",
+            "Use same_product_type for the same physical product class.",
+            "Use broader_valid_class for a genuine merchandise superclass.",
+            "Use best_available_fit when the leaf is not a strict superclass but is the most commercially reasonable live Makro category available for this product.",
+            "A best_available_fit may differ in form, use-case or specificity when Makro has no exact class; describe those tradeoffs in unsupported_defining_constraints and reason instead of automatically rejecting it.",
+            "Prefer shared defining function, normal retail context and buyer expectation over literal word overlap.",
+            "Do not use best_available_fit for a plainly unrelated class when a meaningfully closer live category exists.",
+            "unsupported_defining_constraints is diagnostic: list meaningful mismatches so logs show the compromise.",
+            "Use none only when this leaf would severely misrepresent the sold product even as a marketplace fallback.",
         ],
         "json_contract": {
             "type": "object",
@@ -189,7 +207,12 @@ def build_taxonomy_leaf_validation_request(
             "properties": {
                 "selection_relation": {
                     "type": "string",
-                    "enum": [_SAME_PRODUCT_TYPE, _BROADER_VALID_CLASS, _NO_VALID_CLASS],
+                    "enum": [
+                        _SAME_PRODUCT_TYPE,
+                        _BROADER_VALID_CLASS,
+                        _BEST_AVAILABLE_FIT,
+                        _NO_VALID_CLASS,
+                    ],
                 },
                 "unsupported_defining_constraints": {
                     "type": "array",
@@ -223,7 +246,14 @@ def validate_taxonomy_leaf_candidate(
         for item in (raw.get("unsupported_defining_constraints") or [])
         if str(item or "").strip()
     ]
-    accepted = relation in {_SAME_PRODUCT_TYPE, _BROADER_VALID_CLASS} and not unsupported
+
+    if relation == _BEST_AVAILABLE_FIT:
+        accepted = True
+    elif relation in {_SAME_PRODUCT_TYPE, _BROADER_VALID_CLASS}:
+        accepted = not unsupported
+    else:
+        accepted = False
+
     _diag(
         "taxonomy_leaf_validation",
         {

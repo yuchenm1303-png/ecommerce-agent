@@ -37,7 +37,7 @@ def _bag_sealer_hints() -> ListingBootstrapHints:
     )
 
 
-def test_category_constraint_guard_allows_broader_or_grounded_leafs() -> None:
+def test_category_constraint_analysis_still_describes_grounded_leafs() -> None:
     hints = _bag_sealer_hints()
     assert unsupported_candidate_constraints(hints, "Home / Kitchen / Sealer") == ()
     assert unsupported_candidate_constraints(hints, "Home / Kitchen / Bag Sealers") == ()
@@ -45,7 +45,7 @@ def test_category_constraint_guard_allows_broader_or_grounded_leafs() -> None:
     assert unsupported_candidate_constraints(hints, "Industrial / Packaging / Sealing Machines") == ()
 
 
-def test_category_constraint_guard_rejects_unsupported_specific_capability() -> None:
+def test_category_constraint_analysis_reports_mismatch_for_diagnostics() -> None:
     hints = _bag_sealer_hints()
     assert unsupported_candidate_constraints(
         hints,
@@ -53,7 +53,22 @@ def test_category_constraint_guard_rejects_unsupported_specific_capability() -> 
     ) == ("vacuum",)
 
 
-def test_ai_cannot_force_vacuum_sibling_even_if_it_calls_it_same_product_type() -> None:
+def test_constraint_analysis_no_longer_vetoes_ai_best_available_live_choice() -> None:
+    hints = _bag_sealer_hints()
+    label = "Home & Kitchen Accessories / Kitchen Tools / Vacuum Bag Sealer"
+    candidates = merge_vertical_search_observations([("bag sealer", [label])])
+    provider = FakeProvider(
+        {"selected_vertical": label, "selection_relation": "best_available_fit"}
+    )
+    assert choose_vertical_candidate_pool(
+        provider,
+        hints,
+        ("bag sealer",),
+        candidates,
+    ) == label
+
+
+def test_ai_selected_real_live_candidate_is_not_silently_overridden_by_lexical_guard() -> None:
     hints = _bag_sealer_hints()
     label = "Home & Kitchen Accessories / Kitchen Tools / Vacuum Bag Sealer"
     candidates = merge_vertical_search_observations([("bag sealer", [label])])
@@ -65,7 +80,7 @@ def test_ai_cannot_force_vacuum_sibling_even_if_it_calls_it_same_product_type() 
         hints,
         ("bag sealer",),
         candidates,
-    ) == ""
+    ) == label
 
 
 def test_valid_broader_class_remains_selectable() -> None:

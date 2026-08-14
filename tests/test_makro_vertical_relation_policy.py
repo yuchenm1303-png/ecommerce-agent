@@ -48,7 +48,7 @@ def _candidates():
     )
 
 
-def test_pool_contract_allows_same_or_genuine_broader_class_but_not_sibling_substitution() -> None:
+def test_pool_contract_allows_practical_best_available_fit() -> None:
     request = build_vertical_pool_choice_request(
         _hints(),
         ("heat sealer",),
@@ -59,12 +59,13 @@ def test_pool_contract_allows_same_or_genuine_broader_class_but_not_sibling_subs
     assert schema["properties"]["selection_relation"]["enum"] == [
         "same_product_type",
         "broader_valid_class",
+        "best_available_fit",
         "none",
     ]
     rules = " ".join(request["rules"]).casefold()
-    assert "genuine semantic superclass" in rules
-    assert "adjacent sibling" in rules
-    assert "same product type before broader valid class" in rules
+    assert "best_available_fit" in rules
+    assert "closest practical" in rules or "closest reasonable" in rules
+    assert "same_product_type -> broader_valid_class -> best_available_fit -> none" in rules
 
 
 def test_explicit_broader_valid_class_can_be_selected_from_exact_live_pool() -> None:
@@ -80,6 +81,22 @@ def test_explicit_broader_valid_class_can_be_selected_from_exact_live_pool() -> 
         _candidates(),
     )
     assert selected == "Home Improvement / Hardware & Electricals / Sealer"
+
+
+def test_best_available_fit_can_use_imperfect_real_live_category() -> None:
+    label = "Home & Kitchen Accessories / Kitchen Tools / Vacuum Bag Sealer"
+    selected = choose_vertical_candidate_pool(
+        FakeProvider(
+            {
+                "selected_vertical": label,
+                "selection_relation": "best_available_fit",
+            }
+        ),
+        _hints(),
+        ("heat sealer",),
+        _candidates(),
+    )
+    assert selected == label
 
 
 def test_none_relation_cannot_authorize_nonempty_candidate() -> None:
@@ -103,7 +120,7 @@ def test_empty_selection_must_be_relation_none() -> None:
             FakeProvider(
                 {
                     "selected_vertical": "",
-                    "selection_relation": "broader_valid_class",
+                    "selection_relation": "best_available_fit",
                 }
             ),
             _hints(),

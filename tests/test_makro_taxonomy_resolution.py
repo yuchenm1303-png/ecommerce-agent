@@ -42,7 +42,7 @@ def _hints() -> ListingBootstrapHints:
     )
 
 
-def test_taxonomy_path_contract_distinguishes_category_ancestry_from_physical_containment() -> None:
+def test_taxonomy_path_contract_can_explore_best_available_branch() -> None:
     request = build_taxonomy_path_choice_request(
         _hints(),
         ["Home Improvement"],
@@ -51,13 +51,14 @@ def test_taxonomy_path_contract_distinguishes_category_ancestry_from_physical_co
     relation = request["json_contract"]["properties"]["selection_relation"]
     assert relation["enum"] == [
         "ancestor_branch",
+        "best_available_branch",
         "same_product_type",
         "broader_valid_class",
         "none",
     ]
     rules = " ".join(request["rules"]).casefold()
-    assert "physical containment is irrelevant" in rules
-    assert "incidental compatibility or usage is irrelevant" in rules
+    assert "best_available_branch" in rules
+    assert "physical containment alone" in rules
 
 
 def test_taxonomy_path_rejects_nonempty_node_with_none_relation() -> None:
@@ -78,7 +79,24 @@ def test_taxonomy_path_rejects_nonempty_node_with_none_relation() -> None:
         )
 
 
-def test_taxonomy_path_can_fail_closed_without_clicking_any_node() -> None:
+def test_taxonomy_path_can_choose_practical_best_available_branch() -> None:
+    provider = FakeProvider(
+        {
+            "choose_safe_makro_taxonomy_node": {
+                "selected_node": "Gardening Tools",
+                "selection_relation": "best_available_branch",
+            }
+        }
+    )
+    assert choose_taxonomy_path_candidate(
+        provider,
+        _hints(),
+        ["Home Improvement"],
+        ["Gardening Tools", "Storage Containers"],
+    ) == "Gardening Tools"
+
+
+def test_taxonomy_path_can_still_return_none_when_every_branch_is_unusable() -> None:
     provider = FakeProvider(
         {
             "choose_safe_makro_taxonomy_node": {
@@ -95,7 +113,7 @@ def test_taxonomy_path_can_fail_closed_without_clicking_any_node() -> None:
     ) == ""
 
 
-def test_leaf_contract_is_a_second_independent_gate() -> None:
+def test_leaf_contract_allows_explicit_best_available_fit() -> None:
     request = build_taxonomy_leaf_validation_request(
         _hints(),
         ["Home Improvement", "Gardening Tools", "Watering Controllers"],
@@ -104,18 +122,19 @@ def test_leaf_contract_is_a_second_independent_gate() -> None:
     assert request["json_contract"]["properties"]["selection_relation"]["enum"] == [
         "same_product_type",
         "broader_valid_class",
+        "best_available_fit",
         "none",
     ]
     assert "unsupported_defining_constraints" in request["json_contract"]["required"]
 
 
-def test_leaf_rejects_unsupported_defining_constraints_even_when_relation_claims_broader() -> None:
+def test_leaf_strict_broader_relation_still_rejects_claimed_unsupported_constraints() -> None:
     provider = FakeProvider(
         {
             "validate_makro_taxonomy_leaf": {
                 "selection_relation": "broader_valid_class",
-                "unsupported_defining_constraints": ["unrelated defining purpose"],
-                "reason": "The leaf changes what the product is.",
+                "unsupported_defining_constraints": ["different defining purpose"],
+                "reason": "This is not truly a strict superclass.",
             }
         }
     )
@@ -126,7 +145,24 @@ def test_leaf_rejects_unsupported_defining_constraints_even_when_relation_claims
     ) is False
 
 
-def test_leaf_accepts_same_or_genuine_broader_class_only_without_unsupported_constraints() -> None:
+def test_leaf_best_available_fit_accepts_documented_taxonomy_tradeoff() -> None:
+    provider = FakeProvider(
+        {
+            "validate_makro_taxonomy_leaf": {
+                "selection_relation": "best_available_fit",
+                "unsupported_defining_constraints": ["category is broader/coarser than product"],
+                "reason": "Makro has no exact watering-timer leaf; this is the closest usable live category.",
+            }
+        }
+    )
+    assert validate_taxonomy_leaf_candidate(
+        provider,
+        _hints(),
+        ["Home Improvement", "Gardening Tools", "Irrigation Equipment"],
+    ) is True
+
+
+def test_leaf_accepts_same_or_genuine_broader_without_tradeoffs() -> None:
     provider = FakeProvider(
         {
             "validate_makro_taxonomy_leaf": {
