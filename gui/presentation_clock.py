@@ -238,13 +238,13 @@ class PresentationClock(QObject):
 
     def _card_motion_interval_ms(self) -> int:
         try:
-            moving = bool(getattr(self.card_fx, "_moving_frames", ()))
-            interval_s = float(getattr(self.card_fx, "_motion_interval_s", 0.016))
-        except (RuntimeError, TypeError, ValueError):
+            moving = bool(self.card_fx.motion_active)
+            interval_ms = int(self.card_fx.motion_interval_ms)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
             return _IDLE_FRAME_MS
         if not moving:
             return _IDLE_FRAME_MS
-        return max(4, min(_IDLE_FRAME_MS, int(round(interval_s * 1000.0))))
+        return max(4, min(_IDLE_FRAME_MS, interval_ms))
 
     def _sync_frame_interval(self) -> None:
         target = self._card_motion_interval_ms()
