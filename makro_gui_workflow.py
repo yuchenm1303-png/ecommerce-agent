@@ -210,6 +210,14 @@ def _record_listing_checkpoint(
     if brand:
         manifest["brand"] = str(brand).strip()
     manifest["page_url"] = str(getattr(page, "url", "") or "")
+    if str(manifest.get("ownership_mode") or "") in {
+        "fresh_dedicated_tab",
+        "resume_exact_page",
+    }:
+        # Step 2 -> Step 3 may replace the Chromium page target. Refresh the
+        # ownership token at every verified checkpoint so planner/executor bind
+        # the page that actually owns the current stage, never the stale origin.
+        manifest["makro_target_id"] = page_target_id(page)
     manifest["status"] = status
     _write_manifest(manifest_path, manifest)
 
