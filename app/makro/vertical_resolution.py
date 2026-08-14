@@ -16,7 +16,7 @@ from .listing_creation import JSONTaskProvider, ListingBootstrapHints, normalize
 
 
 _MAX_SEARCH_TERMS = 5
-_MAX_LIVE_CANDIDATES = 40
+_MAX_LIVE_CANDIDATES = 120
 _QUERY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 '&/()+.,-]*$")
 _FORBIDDEN_PLATFORM_WORDS = {"makro", "marketplace", "seller", "listing"}
 _GENERIC_ONLY_QUERY_WORDS = {"vertical", "category", "product"}
