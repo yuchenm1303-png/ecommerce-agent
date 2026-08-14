@@ -38,6 +38,11 @@ from app.business_fields import generate_listing_sku
 from app.best_effort_inference import run_best_effort_inference
 from app.compact_evidence import build_compact_evidence, write_compact_evidence
 from app.image_evidence import run_image_evidence, write_image_observations
+from app.listing_images import (
+    LISTING_IMAGE_POLICY_VERSION,
+    select_listing_images,
+    write_listing_image_selection,
+)
 from app.live_schema import load_live_schema
 from app.providers.dashscope_web_search import DashScopeWebSearchProvider
 from app.providers.registry import (
@@ -298,6 +303,15 @@ def main() -> int:
         return 2
 
     product_images = [str(path) for path in getattr(captured, "product_image_paths", ())]
+    listing_image_selection = select_listing_images(product_images)
+    listing_images = [str(path) for path in listing_image_selection.selected]
+    listing_image_selection_path = write_listing_image_selection(
+        listing_image_selection,
+        output_dir / "listing-image-selection.json",
+    )
+
+    # Resolver evidence remains the complete mechanically captured image set.
+    # Listing Photos are a separate derived surface and never mutate provenance.
     image_paths = [*(product_images or [str(captured.screenshot_path)]), *extra_images]
     supplier_snapshots.insert(0, str(captured.snapshot_path))
     product_url = captured.snapshot.final_url or product_url
@@ -316,6 +330,10 @@ def main() -> int:
         "product_image_urls": len(getattr(captured.snapshot, "image_urls", [])),
         "product_images_downloaded": len(product_images),
         "product_images": [str(Path(path).resolve()) for path in product_images],
+        "listing_image_policy_version": LISTING_IMAGE_POLICY_VERSION,
+        "listing_images_selected": len(listing_images),
+        "listing_images_rejected": listing_image_selection.rejected_count,
+        "listing_images": [str(Path(path).resolve()) for path in listing_images],
         "semantic_images_used": len(image_paths),
         "source_cache_hit": bool(getattr(captured, "cache_hit", False)),
         "source_edge": "new" if captured.launched_now else "reused",
@@ -326,6 +344,12 @@ def main() -> int:
         f"visible_text_chars={capture_info['visible_text_chars']} "
         f"embedded_data_items={capture_info['embedded_data_items']} "
         f"product_images={capture_info['product_images_downloaded']}",
+        flush=True,
+    )
+    print(
+        f"listing_images=SELECTED {len(listing_images)}/{len(product_images)} "
+        f"rejected={listing_image_selection.rejected_count} "
+        f"policy=v{LISTING_IMAGE_POLICY_VERSION}",
         flush=True,
     )
 
@@ -611,6 +635,8 @@ def main() -> int:
                     "primary_source_snapshot": str(captured.snapshot_path.resolve()),
                     "primary_source_screenshot": str(captured.screenshot_path.resolve()),
                     "primary_source_product_images": [str(Path(path).resolve()) for path in product_images],
+                    "primary_source_listing_images": [str(Path(path).resolve()) for path in listing_images],
+                    "primary_source_listing_image_selection": str(listing_image_selection_path.resolve()),
                     "compact_evidence": str(compact_evidence_path.resolve()),
                     "image_observations": str(image_observations_path.resolve()),
                 },
