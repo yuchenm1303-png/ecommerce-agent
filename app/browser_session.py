@@ -9,9 +9,10 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright
+
+from .browser_visual_hud import arm_browser_visual_hud
 
 
 DEFAULT_CDP_PORT = 9222
@@ -156,11 +157,8 @@ def select_listing_page(context: BrowserContext) -> Page:
     return pages[-1]
 
 
-
-
 # Backward-compatible alias used by earlier tests/scripts.
 _choose_page = select_listing_page
-
 
 
 class EdgeHarness:
@@ -174,10 +172,13 @@ class EdgeHarness:
       design; the Edge is launched detached and outlives every script);
     - deterministic page selection (prefer an open listing, then any Makro
       tab, then the most recently created tab);
-    - health check and reconnect helpers for long-running sessions.
+    - health check and reconnect helpers for long-running sessions;
+    - keep the existing Visual Agent HUD attached to whichever Makro page the
+      automation is actively using, including new tabs and navigations.
 
     The harness never reads or logs cookies, tokens, sessionStorage or
-    Authorization data.
+    Authorization data. The HUD is display-only and never changes page
+    selection, click/fill decisions or browser safety rules.
     """
 
     def __init__(
@@ -199,7 +200,50 @@ class EdgeHarness:
         self.browser: Browser | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
+        self._watched_page_ids: set[int] = set()
+        self._watched_context_ids: set[int] = set()
         self._connect()
+
+    @staticmethod
+    def _is_makro_page(page: Page) -> bool:
+        try:
+            return "seller.makro.co.za" in str(page.url or "")
+        except Exception:
+            return False
+
+    def _show_visual_hud(self, page: Page) -> None:
+        if page.is_closed() or not self._is_makro_page(page):
+            return
+        arm_browser_visual_hud(
+            page,
+            title="Makro 浏览器自动化运行中",
+            thought="Listing Studio 正在读取、检索或操作当前 Makro 页面。",
+            phase=1,
+        )
+
+    def _watch_visual_page(self, page: Page) -> None:
+        key = id(page)
+        if key in self._watched_page_ids:
+            self._show_visual_hud(page)
+            return
+        self._watched_page_ids.add(key)
+        try:
+            page.on("domcontentloaded", lambda: self._show_visual_hud(page))
+        except Exception:
+            pass
+        self._show_visual_hud(page)
+
+    def _watch_visual_context(self, context: BrowserContext) -> None:
+        key = id(context)
+        if key in self._watched_context_ids:
+            return
+        self._watched_context_ids.add(key)
+        try:
+            context.on("page", self._watch_visual_page)
+        except Exception:
+            pass
+        for page in list(context.pages):
+            self._watch_visual_page(page)
 
     def _connect(self) -> None:
         browser = self.playwright.chromium.connect_over_cdp(cdp_endpoint(self.cdp_port))
@@ -208,7 +252,9 @@ class EdgeHarness:
             raise RuntimeError("已连接 Edge，但没有可用 browser context。")
         self.browser = browser
         self.context = contexts[0]
+        self._watch_visual_context(self.context)
         self.page = select_listing_page(self.context)
+        self._watch_visual_page(self.page)
 
     def health_check(self) -> bool:
         """True when the long-lived Edge still exposes its CDP endpoint."""
@@ -219,6 +265,7 @@ class EdgeHarness:
         if self.context is None:
             raise RuntimeError("Edge harness 尚未连接 context。")
         self.page = select_listing_page(self.context)
+        self._watch_visual_page(self.page)
         return self.page
 
     def ensure_page(self) -> Page:
@@ -228,6 +275,7 @@ class EdgeHarness:
         if self.page is None or self.page.is_closed():
             self._connect()
         assert self.page is not None
+        self._watch_visual_page(self.page)
         return self.page
 
     def detach(self) -> None:
