@@ -444,16 +444,59 @@ def _sources_from_snapshot(
     return sources
 
 
+def _product_pack_customer_snapshots(snapshot_path: str | Path) -> tuple[Path, ...] | None:
+    """Expand a Product Pack bootstrap snapshot back to its exact file snapshots.
+
+    The bootstrap snapshot exists only to identify the product before Makro Step 1.
+    Field resolution, planning and execution must cite the original normalized
+    document/page/sheet snapshots instead of that merged bootstrap text. Returning
+    ``None`` means this is an ordinary supplier snapshot; an empty tuple is a valid
+    image-only Product Pack.
+    """
+
+    path = Path(snapshot_path)
+    if not path.is_file():
+        return None
+    try:
+        snapshot = source_snapshot_from_json(path)
+    except Exception:
+        return None
+    if str(snapshot.meta.get("input_mode") or "").strip().casefold() != "customer_product_pack":
+        return None
+
+    manifest_path = path.parent / "product-pack.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Product Pack bootstrap 缺少同目录 product-pack.json：{manifest_path}"
+        )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    values = payload.get("customer_snapshots") or []
+    if not isinstance(values, list):
+        raise ValueError("Product Pack customer_snapshots 必须是数组。")
+    snapshots = tuple(Path(str(value)).resolve() for value in values if str(value).strip())
+    missing = [str(value) for value in snapshots if not value.is_file()]
+    if missing:
+        raise FileNotFoundError("Product Pack customer snapshot 缺失：" + " | ".join(missing[:5]))
+    return snapshots
+
+
 def build_grounding_catalog(
     *,
     image_paths: Iterable[str] = (),
     supplier_snapshots: Iterable[str] = (),
+    customer_snapshots: Iterable[str] = (),
     official_snapshots: Iterable[str] = (),
     supplemental_text: str = "",
     max_text_chars: int = 3000,
     overlap_chars: int = 250,
 ) -> GroundingCatalog:
-    """Create the exact raw source universe visible to the field-filling AI."""
+    """Create the exact raw source universe visible to the field-filling AI.
+
+    Customer Product Pack bootstrap snapshots are automatically expanded to their
+    exact normalized file/page/sheet snapshots. This keeps Resolver, read-only
+    planner and real executor on one provenance contract without caller-specific
+    branching or a second listing engine.
+    """
 
     sources: list[GroundedSource] = []
 
@@ -473,13 +516,45 @@ def build_grounding_catalog(
             )
         )
 
-    for index, path in enumerate(supplier_snapshots, start=1):
+    supplier_index = 0
+    customer_index = 0
+    for path in supplier_snapshots:
+        expanded = _product_pack_customer_snapshots(path)
+        if expanded is not None:
+            for customer_path in expanded:
+                customer_index += 1
+                sources.extend(
+                    _sources_from_snapshot(
+                        customer_path,
+                        prefix="customer-file",
+                        source_type="customer_file",
+                        ordinal=customer_index,
+                        max_chars=max_text_chars,
+                        overlap_chars=overlap_chars,
+                    )
+                )
+            continue
+
+        supplier_index += 1
         sources.extend(
             _sources_from_snapshot(
                 path,
                 prefix="supplier",
                 source_type="supplier_web",
-                ordinal=index,
+                ordinal=supplier_index,
+                max_chars=max_text_chars,
+                overlap_chars=overlap_chars,
+            )
+        )
+
+    for path in customer_snapshots:
+        customer_index += 1
+        sources.extend(
+            _sources_from_snapshot(
+                path,
+                prefix="customer-file",
+                source_type="customer_file",
+                ordinal=customer_index,
                 max_chars=max_text_chars,
                 overlap_chars=overlap_chars,
             )
