@@ -9,8 +9,6 @@ from PySide6.QtWidgets import QFrame, QLabel, QMainWindow, QWidget
 from .card_details_fast import FastCardDetailController
 
 
-# Match the reference webpage's visible timing. Complex QWidget content never
-# animates live; one transition surface owns presentation during motion.
 _OPEN_MS = 500
 _CLOSE_MS = 300
 
@@ -21,8 +19,6 @@ _STATE_CLOSING = "closing"
 
 
 def _css_ease() -> QEasingCurve:
-    """CSS `ease`: cubic-bezier(.25, .1, .25, 1)."""
-
     curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
     curve.addCubicBezierSegment(
         QPointF(0.25, 0.10),
@@ -33,8 +29,6 @@ def _css_ease() -> QEasingCurve:
 
 
 def _css_ease_in_out() -> QEasingCurve:
-    """CSS `ease-in-out`: cubic-bezier(.42, 0, .58, 1)."""
-
     curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
     curve.addCubicBezierSegment(
         QPointF(0.42, 0.00),
@@ -77,16 +71,7 @@ def _fit_frame(source: QPixmap, widget: QWidget) -> QPixmap:
 
 
 class _ModalTransitionSurface(QWidget):
-    """The only animated visual owner for modal transitions.
-
-    Opening is an opaque cached A/B cross-fade because the real modal must be
-    prepared invisibly under an exact entry frame.
-
-    Closing is deliberately different: the *real live workspace* is restored
-    underneath first, then one captured current-modal frame fades from opacity
-    1 to 0. There is no synthetic workspace A frame and therefore no compositor
-    handoff from a QPainter approximation to native Quick + layered QWidget.
-    """
+    """The only animated visual owner for modal transitions."""
 
     clicked = Signal()
 
@@ -132,8 +117,6 @@ class _ModalTransitionSurface(QWidget):
         self.update()
 
     def set_live_underlay_fade(self, top: QPixmap, progress: float) -> None:
-        """Fade one captured foreground over the actual live widgets beneath."""
-
         self._live_underlay = True
         self._sync_opaque_attribute()
         self._base = QPixmap()
@@ -166,9 +149,6 @@ class _ModalTransitionSurface(QWidget):
         ):
             painter.drawPixmap(0, 0, frame)
             return
-
-        # Resize during a transition is rare and is snapped by the controller;
-        # this remains only as a correctness fallback for the staging frame.
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.drawPixmap(self.rect(), frame, frame.rect())
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
@@ -176,11 +156,8 @@ class _ModalTransitionSurface(QWidget):
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         if self._capture_suppressed:
             return
-
         painter = QPainter(self)
         if self._live_underlay:
-            # Do not erase or synthesize a base frame. This child is non-opaque,
-            # so the already-painted real workspace below remains authoritative.
             if self._progress > 0.0 and not self._top.isNull():
                 painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
                 painter.setOpacity(self._progress)
@@ -193,7 +170,6 @@ class _ModalTransitionSurface(QWidget):
             self._draw_fitted(painter, self._top)
             painter.end()
             return
-
         if not self._base.isNull():
             self._draw_fitted(painter, self._base)
         else:
@@ -213,7 +189,12 @@ class _ModalTransitionSurface(QWidget):
 
 
 class StaticModalInteractionController(QObject):
-    """One transition surface plus one real interactive modal."""
+    """One transition surface plus one real interactive modal.
+
+    Runtime presentation is frozen with one named hold on PresentationClock.
+    Card state and the truthful progress widget keep their own explicit lifecycle;
+    there are no background/effects/pointer timer compatibility branches.
+    """
 
     def __init__(self, window: QMainWindow, details: FastCardDetailController) -> None:
         super().__init__(window)
@@ -232,18 +213,13 @@ class StaticModalInteractionController(QObject):
         self._fallback_active = False
         self._underlay_suspended = False
         self._modal_closed_for_motion = False
-
-        self._pointer_timer_was_active = False
-        self._effects_timer_was_active = False
         self._activity_timer_was_active = False
-        self._quick_animation_was_running = False
 
         self._motion_started_s = 0.0
         self._motion_duration_s = 0.001
         self._motion_from = 0.0
         self._motion_to = 0.0
         self._motion_easing = _css_ease()
-
         self._entry_workspace_frame = QPixmap()
 
         self._original_show_prepared_modal = self.details._show_prepared_modal  # noqa: SLF001
@@ -295,7 +271,6 @@ class StaticModalInteractionController(QObject):
         except (RuntimeError, TypeError):
             pass
         self.details.close_button.clicked.connect(self.request_close)
-
         try:
             self.details.scrim.clicked.disconnect(self._original_close)
         except (RuntimeError, TypeError):
@@ -315,19 +290,10 @@ class StaticModalInteractionController(QObject):
             except RuntimeError:
                 pass
 
-        effects = getattr(self.window, "_nekro_effects", None)
-        effects_timer = getattr(effects, "timer", None)
-        try:
-            self._effects_timer_was_active = bool(
-                effects_timer is not None and effects_timer.isActive()
-            )
-        except RuntimeError:
-            self._effects_timer_was_active = False
-        if self._effects_timer_was_active:
-            try:
-                effects_timer.stop()
-            except RuntimeError:
-                pass
+        clock = getattr(self.window, "_presentation_clock", None)
+        suspend_clock = getattr(clock, "suspend", None)
+        if callable(suspend_clock):
+            suspend_clock("modal")
 
         activity = getattr(self.window, "_activity_presence_controller", None)
         activity_widget = getattr(activity, "widget", None)
@@ -344,28 +310,6 @@ class StaticModalInteractionController(QObject):
             except RuntimeError:
                 pass
 
-        pointer_timer = getattr(self.background, "_pointer_timer", None)
-        try:
-            self._pointer_timer_was_active = bool(
-                pointer_timer is not None and pointer_timer.isActive()
-            )
-        except RuntimeError:
-            self._pointer_timer_was_active = False
-        if self._pointer_timer_was_active:
-            try:
-                pointer_timer.stop()
-            except RuntimeError:
-                pass
-
-        quick = getattr(self.background, "quick_window", None)
-        self._quick_animation_was_running = False
-        if quick is not None:
-            try:
-                self._quick_animation_was_running = bool(quick.property("animationRunning"))
-                quick.setProperty("animationRunning", False)
-            except RuntimeError:
-                self._quick_animation_was_running = False
-
     def _resume_underlay(self) -> None:
         if not self._underlay_suspended:
             return
@@ -379,29 +323,10 @@ class StaticModalInteractionController(QObject):
             except RuntimeError:
                 pass
 
-        if self.background is not None:
-            try:
-                self.background._last_pointer_norm = None  # noqa: SLF001
-            except (AttributeError, RuntimeError):
-                pass
-
-        pointer_timer = getattr(self.background, "_pointer_timer", None)
-        if self._pointer_timer_was_active and pointer_timer is not None:
-            try:
-                pointer_timer.start()
-            except RuntimeError:
-                pass
-        self._pointer_timer_was_active = False
-
-        effects = getattr(self.window, "_nekro_effects", None)
-        effects_timer = getattr(effects, "timer", None)
-        if self._effects_timer_was_active and effects_timer is not None:
-            try:
-                if not effects_timer.isActive():
-                    effects_timer.start()
-            except RuntimeError:
-                pass
-        self._effects_timer_was_active = False
+        clock = getattr(self.window, "_presentation_clock", None)
+        resume_clock = getattr(clock, "resume", None)
+        if callable(resume_clock):
+            resume_clock("modal")
 
         activity = getattr(self.window, "_activity_presence_controller", None)
         activity_widget = getattr(activity, "widget", None)
@@ -415,19 +340,11 @@ class StaticModalInteractionController(QObject):
                 pass
         self._activity_timer_was_active = False
 
-        quick = getattr(self.background, "quick_window", None)
-        if self._quick_animation_was_running and quick is not None:
-            try:
-                quick.setProperty("animationRunning", True)
-            except RuntimeError:
-                pass
-        self._quick_animation_was_running = False
-
         if self.background is not None:
-            schedule_mask = getattr(self.background, "schedule_mask_update", None)
-            if callable(schedule_mask):
+            schedule_geometry = getattr(self.background, "schedule_mask_update", None)
+            if callable(schedule_geometry):
                 try:
-                    schedule_mask()
+                    schedule_geometry()
                 except RuntimeError:
                     pass
 
@@ -446,7 +363,6 @@ class StaticModalInteractionController(QObject):
         self.details.scroll.verticalScrollBar().setValue(0)
         self.details.ghost.hide()
         self._sync_modal_geometry()
-
         self.details.backdrop.show()
         self.details.backdrop.raise_()
         self.details.scrim.show()
@@ -508,7 +424,6 @@ class StaticModalInteractionController(QObject):
         eased = float(self._motion_easing.valueForProgress(linear))
         value = self._motion_from + (self._motion_to - self._motion_from) * eased
         self._set_progress(value)
-
         if linear >= 1.0:
             self._motion_timer.stop()
             self._set_progress(self._motion_to)
@@ -517,17 +432,14 @@ class StaticModalInteractionController(QObject):
     def _prepare_open_transition(self, *, ratio: tuple[float, float]) -> None:
         self.details._modal_ratio = ratio  # noqa: SLF001
         self._sync_modal_geometry()
-
         entry = self.details._capture_source()  # noqa: SLF001
         if entry.isNull():
             raise RuntimeError("failed to capture modal entry frame")
         self._entry_workspace_frame = _fit_frame(entry, self.root)
-
         blurred = self.details._blur_pixmap(entry)  # noqa: SLF001
         if blurred.isNull():
             raise RuntimeError("failed to prepare modal blur")
 
-        # Hold the exact current screen while the one real modal is prepared.
         self._transition.set_hold_frame(self._entry_workspace_frame)
         self._transition.show()
         self._transition.raise_()
@@ -537,7 +449,6 @@ class StaticModalInteractionController(QObject):
         final_modal = self._render_root_without_transition()
         if final_modal.isNull():
             raise RuntimeError("failed to capture final live modal frame")
-
         self._transition.set_transition_frames(
             self._entry_workspace_frame,
             final_modal,
@@ -551,7 +462,6 @@ class StaticModalInteractionController(QObject):
     def _show_with_animation(self, *, ratio: tuple[float, float]) -> None:
         if self._state != _STATE_IDLE or not self.details.drawer.isHidden():
             return
-
         self._suspend_underlay()
         self._fallback_active = False
         self._state = _STATE_OPENING
@@ -577,15 +487,11 @@ class StaticModalInteractionController(QObject):
         self.details.close_button.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _prepare_close_transition(self) -> None:
-        # This works both from steady OPEN and an interrupted OPENING: capture the
-        # exact visual currently on screen, including the transition surface when
-        # necessary. It becomes the only foreground frame used on close.
         current_modal = self.details._capture_source()  # noqa: SLF001
         if current_modal.isNull():
             raise RuntimeError("failed to capture current modal frame")
         current_modal = _fit_frame(current_modal, self.root)
 
-        # Keep that exact image fully opaque while swapping what is underneath.
         self._sync_modal_geometry()
         self._transition.set_hold_frame(current_modal)
         self._transition.show()
@@ -596,12 +502,8 @@ class StaticModalInteractionController(QObject):
             self._original_close()
         self._modal_closed_for_motion = True
 
-        # Restore the *real* native Quick + layered QWidget workspace while it is
-        # still completely hidden by current_modal. From the first visible fade
-        # frame onward there is no synthetic workspace and no later renderer swap.
         self._resume_underlay()
         self.root.update()
-
         self._transition.set_live_underlay_fade(current_modal, 1.0)
         self._transition.raise_()
         self._progress = 1.0
@@ -634,7 +536,6 @@ class StaticModalInteractionController(QObject):
     def _finish_close(self) -> None:
         if self._state != _STATE_CLOSING:
             return
-
         self._progress = 0.0
         self._transition.set_progress(0.0)
         if not self._modal_closed_for_motion:
@@ -642,9 +543,6 @@ class StaticModalInteractionController(QObject):
                 self._original_close()
             except RuntimeError:
                 pass
-
-        # At p=0 the user is already seeing the real live workspace underneath.
-        # Hiding this now-transparent child cannot change brightness/compositing.
         self._transition.hide()
         self._transition.clear_frames()
         self._entry_workspace_frame = QPixmap()
@@ -762,7 +660,6 @@ class StaticModalInteractionController(QObject):
             except RuntimeError:
                 pass
         self._passive_labels.clear()
-
         try:
             self._transition.deleteLater()
         except RuntimeError:
