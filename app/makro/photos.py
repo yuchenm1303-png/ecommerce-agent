@@ -75,17 +75,15 @@ def _meaningful_image_source(source: Any) -> bool:
 
 
 def _slot_is_empty(slot: dict[str, Any]) -> bool:
-    """Classify a Makro thumbnail by state, not by the orange plus alone.
+    """Return whether Makro exposes this thumbnail as an uploadable empty slot.
 
-    Makro can temporarily leave the plus icon mounted while replacing the slot
-    preview. A check mark or a real image source therefore wins over the stale
-    empty-state icon. This prevents the same logical slot from being selected
-    twice after a successful upload.
+    The orange plus is the portal's actual interaction contract for an empty
+    Product Photos role. Empty role cards may still contain decorative ``img``
+    elements, so image ``src`` values must never override a visible plus. A
+    visible completion check is stronger and marks the role as filled.
     """
 
     if bool(slot.get("has_check")):
-        return False
-    if any(_meaningful_image_source(value) for value in slot.get("image_sources") or []):
         return False
     return bool(slot.get("has_plus"))
 
@@ -391,30 +389,18 @@ def _wait_for_target_slot_completion(
     uploading_timeout_ms: int = 60_000,
     accepted_stability_ms: int = 750,
 ) -> dict[str, Any]:
-    """Wait for one submitted image using the same acceptance contract everywhere.
+    """Wait until the exact submitted Makro role stops being uploadable.
 
-    Uploading is a processing hint, not the completion predicate. A slot is
-    accepted when the exact role is consumed, a new preview appears, the empty
-    slot count drops, or the completion counter grows. Once one such signal is
-    stable briefly, a stale Uploading label can no longer hold the workflow for
-    a full minute.
+    The target role's visible plus is both the empty-state and next-action
+    contract. Other page-wide signals (preview src, counters, Uploading labels)
+    are diagnostics only here: advancing to the next image before this exact role
+    is consumed can submit twice into the same card.
     """
 
-    before_images = int(before_state.get("visible_image_count") or 0)
-    before_sources = {
-        str(value).strip()
-        for value in before_state.get("visible_image_sources") or []
-        if str(value).strip()
-    }
-    raw_completion = before_state.get("completion_count")
-    before_completion = int(raw_completion) if raw_completion is not None else None
-    before_add_tiles = int(before_state.get("add_image_tile_count") or 0)
-
+    _ = before_state, accepted_stability_ms
     started = time.monotonic()
     soft_deadline = started + soft_timeout_ms / 1000.0
     uploading_deadline: float | None = None
-    accepted_since: float | None = None
-    accepted_signal = ""
     uploading_seen = False
     latest: dict[str, Any] = {}
 
@@ -422,33 +408,13 @@ def _wait_for_target_slot_completion(
         section = find_section(page, PRODUCT_PHOTOS_SECTION)
         live_path = str((section or {}).get("path") or section_path)
         latest = _photo_state(page, live_path)
+        empty_slots = {str(value) for value in latest.get("empty_slot_ids") or []}
+        if slot_id not in empty_slots:
+            latest["uploading_seen"] = uploading_seen or bool(latest.get("uploading"))
+            latest["acceptance_signal"] = "target_slot_consumed"
+            return latest
+
         now = time.monotonic()
-
-        signal = _acceptance_signal(
-            latest,
-            before_images=before_images,
-            before_sources=before_sources,
-            before_completion=before_completion,
-            before_add_tiles=before_add_tiles,
-            target_slot_id=slot_id,
-        )
-        if signal:
-            if signal != accepted_signal:
-                accepted_signal = signal
-                accepted_since = now
-            elif accepted_since is None:
-                accepted_since = now
-            if accepted_since is not None and (
-                not bool(latest.get("uploading"))
-                or (now - accepted_since) * 1000.0 >= accepted_stability_ms
-            ):
-                latest["uploading_seen"] = uploading_seen or bool(latest.get("uploading"))
-                latest["acceptance_signal"] = accepted_signal
-                return latest
-        else:
-            accepted_signal = ""
-            accepted_since = None
-
         if bool(latest.get("uploading")):
             uploading_seen = True
             if uploading_deadline is None:
@@ -457,12 +423,12 @@ def _wait_for_target_slot_completion(
         if uploading_deadline is not None:
             if now >= uploading_deadline:
                 raise RuntimeError(
-                    f"#{slot_id} 已进入 Uploading，但 {uploading_timeout_ms}ms 内没有任何可稳定确认的接受信号；"
+                    f"#{slot_id} 已进入 Uploading，但 {uploading_timeout_ms}ms 内目标图片槽仍显示可上传 +；"
                     + _state_diagnostic(latest, slot_id)
                 )
         elif now >= soft_deadline:
             raise RuntimeError(
-                f"#{slot_id} 文件已提交，但 {soft_timeout_ms}ms 内既未进入 Uploading 也没有接受信号；"
+                f"#{slot_id} 文件已提交，但 {soft_timeout_ms}ms 内目标图片槽仍显示可上传 +；"
                 + _state_diagnostic(latest, slot_id)
             )
         page.wait_for_timeout(100)
