@@ -51,7 +51,13 @@ _PHASE_LINE = re.compile(
 
 
 class ReadOnlyRunner(QObject):
-    """GUI bridge to the current staged one-link acceptance workflow."""
+    """GUI bridge to the current staged one-link acceptance workflow.
+
+    ``full`` is the product-facing new-listing entrypoint. Every GUI invocation
+    starts a fresh ownership context and therefore never injects an implicit
+    ``--resume-current-url`` from a previous failure. Backend resume remains an
+    explicit CLI capability for diagnostics/recovery tooling only.
+    """
 
     log = Signal(str)
     phase_changed = Signal(str)
@@ -80,36 +86,6 @@ class ReadOnlyRunner(QObject):
     def is_running(self) -> bool:
         return self.process is not None and self.process.state() != QProcess.NotRunning
 
-    def _immediate_resume_url(self, config: RunnerConfig, mode: str) -> str:
-        """Return the exact failed Step 2/3 URL only for a same-product retry.
-
-        This is intentionally session-local. A successful run, a different URL,
-        a different mode, or a missing/changed prior page disables automatic
-        resume. ``makro_gui_workflow.py`` still verifies that this exact URL is
-        the one unique Add Listing tab before adopting it.
-        """
-
-        if mode != "full" or self.mode != "full" or self.config is None or self.run_dir is None:
-            return ""
-        if self.config.product_url.strip() != config.product_url.strip():
-            return ""
-        manifest_path = self.run_dir / "run-manifest.json"
-        if not manifest_path.is_file():
-            return ""
-        try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            return ""
-        if str(payload.get("status") or "").casefold() != "failed":
-            return ""
-        if str(payload.get("failed_phase") or "").casefold() not in {"step2", "step3"}:
-            return ""
-        failed_url = str(payload.get("failed_page_url") or "").strip()
-        parsed = urlparse(failed_url)
-        if parsed.scheme not in {"http", "https"} or parsed.hostname != "seller.makro.co.za":
-            return ""
-        return failed_url
-
     def start(self, config: RunnerConfig, *, mode: str = "full") -> None:
         if self.is_running:
             raise RuntimeError("Makro workflow 已在运行。")
@@ -117,7 +93,6 @@ class ReadOnlyRunner(QObject):
             raise ValueError(f"未知 workflow mode={mode!r}")
         self._validate_config(config)
         self._assert_makro_cdp_available(config.makro_cdp_port)
-        resume_current_url = self._immediate_resume_url(config, mode)
 
         self.config = config
         self.mode = mode
@@ -169,8 +144,6 @@ class ReadOnlyRunner(QObject):
         ]
         if config.source_use_current_page:
             args.append("--source-use-current-page")
-        if resume_current_url:
-            args.extend(["--resume-current-url", resume_current_url])
 
         self.running_changed.emit(True)
         self.progress_changed.emit(0, f"{mode} · preparing")
@@ -178,13 +151,15 @@ class ReadOnlyRunner(QObject):
         self._emit_log(f"mode={mode}")
         self._emit_log(f"run_dir={self.run_dir}")
         self._emit_log(f"product_url={config.product_url}")
-        if resume_current_url:
+        if mode == "full":
             self._emit_log(
-                "resume_current=YES · exact same-product failed Step 2/3 page will be verified before reuse"
+                "task_start=FRESH · GUI full run always creates a dedicated Makro tab; "
+                "previous failed/old listing tabs are never auto-resumed"
             )
-            self._emit_log(f"resume_page_url={resume_current_url}")
         else:
-            self._emit_log("resume_current=NO · fresh/normal staged preparation")
+            self._emit_log(
+                f"diagnostic_mode={mode.upper()} · stage-only probe; this is not a new full listing task"
+            )
         self._emit_log(
             "Backend: current one-link Step 1/2 + current Resolver cold/hot + current read-only Fill Plan."
         )
