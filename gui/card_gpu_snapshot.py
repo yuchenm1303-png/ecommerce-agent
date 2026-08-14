@@ -212,12 +212,30 @@ class CardGpuSnapshotPool(QObject):
         if isinstance(effects, QWidget):
             effects.raise_()
 
+    def _free_slot(self) -> _CardSnapshotWidget | None:
+        slot = next((candidate for candidate in self._slots if candidate.state is None), None)
+        if slot is not None:
+            return slot
+        # The card controller settles back to two motions after each state change,
+        # but a rapid A -> B -> C hover can request C synchronously before it has
+        # retired A. Reuse the oldest slot instead of allocating a third FBO.
+        oldest = next(iter(self._active), None)
+        if oldest is None:
+            return None
+        self.release(oldest)
+        return next((candidate for candidate in self._slots if candidate.state is None), None)
+
     def capture(self, frame: QFrame, *, scale: float) -> bool:
         self.release(frame)
         if not frame.isVisibleTo(self.window) or frame.width() <= 0 or frame.height() <= 0:
             return False
+        try:
+            if frame.graphicsEffect() is not None:
+                return False
+        except RuntimeError:
+            return False
 
-        slot = next((candidate for candidate in self._slots if candidate.state is None), None)
+        slot = self._free_slot()
         if slot is None:
             return False
 
@@ -261,12 +279,18 @@ class CardGpuSnapshotPool(QObject):
             return
         state = slot.state
         if state is not None:
+            detached = False
             try:
                 if frame.graphicsEffect() is state.gate:
                     frame.setGraphicsEffect(None)
+                    detached = True
             except RuntimeError:
                 pass
-            state.gate.deleteLater()
+            if not detached:
+                try:
+                    state.gate.deleteLater()
+                except RuntimeError:
+                    pass
         slot.detach()
         try:
             frame.update()
