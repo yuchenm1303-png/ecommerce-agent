@@ -35,13 +35,16 @@ def test_one_shared_clock_owns_all_high_frequency_python_input_sampling() -> Non
         assert "QApplication.mouseButtons()" not in source
 
 
-def test_glass_mask_is_explicit_gpu_texture_not_cpu_full_window_surface() -> None:
+def test_glass_mask_texture_refreshes_only_when_geometry_changes() -> None:
     assert "id: glassMaskScene" in NATIVE
     assert "ShaderEffectSource {{" in NATIVE
     assert "id: glassMaskTexture" in NATIVE
     assert "sourceItem: glassMaskScene" in NATIVE
     assert "hideSource: true" in NATIVE
-    assert "live: true" in NATIVE
+    assert "live: false" in NATIVE
+    assert "property int geometryRevision: 0" in NATIVE
+    assert "onGeometryRevisionChanged: glassMaskTexture.scheduleUpdate()" in NATIVE
+    assert 'quick.setProperty("geometryRevision", self._geometry_revision)' in NATIVE
     assert "maskSource: glassMaskTexture" in NATIVE
     assert "model: glassCardModel" in NATIVE
     assert "clip: true" in NATIVE
@@ -83,7 +86,12 @@ def test_card_motion_uses_shared_clock_and_one_frozen_composite_per_tween() -> N
     assert "self._set_content_frozen(state, False)" in advance
 
     assert "self.sourcePixmap(" in VISUAL
-    assert "return self._frozen_source, self._frozen_offset" in VISUAL
+    assert "self._frozen_center: QPointF | None = None" in VISUAL
+    assert "return self._frozen_source, self._frozen_offset, self._frozen_center" in VISUAL
+    draw = VISUAL.split("def draw(self, painter: QPainter)", 1)[1].split(
+        "class NativeGlassProxy", 1
+    )[0]
+    assert "sourceBoundingRect" not in draw
 
 
 def test_decorative_effects_reuse_clock_and_keep_dirty_region_budget() -> None:
