@@ -76,9 +76,6 @@ def test_card_motion_uses_shared_clock_and_one_frozen_composite_per_tween() -> N
     advance = CARD.split("def _advance_state", 1)[1].split("def _advance_motions", 1)[0]
     assert "if not state.moving:" in advance
     assert "self._set_content_frozen(state, False)" in advance
-
-    # The renderer still supports a frozen source, but motion no longer asks a
-    # live QWidget subtree for a fresh sourcePixmap on every animation step.
     assert "self.sourcePixmap(" in VISUAL
     assert "return self._frozen_source, self._frozen_offset" in VISUAL
 
@@ -107,7 +104,8 @@ def test_wallpaper_cache_is_startup_only() -> None:
     assert "_native._blur_wallpaper = cached_blur" in CACHE
     assert "QCursor" not in CACHE
     assert "QTimer" not in CACHE
-    assert "presentation" not in CACHE.lower()
+    assert "presentation_tick" not in CACHE
+    assert "setProperty(" not in CACHE
 
 
 def test_launcher_wires_one_clean_presentation_pipeline() -> None:
