@@ -91,6 +91,10 @@ def test_portal_fallback_is_explained_before_opening_browser() -> None:
     assert "QDesktopServices.openUrl" in block
 
 
-def test_installer_handoff_remains_visible_long_enough_to_read() -> None:
-    assert "_INSTALLER_HANDOFF_MS = 1_200" in TRANSPORT
-    assert "QTimer.singleShot(_INSTALLER_HANDOFF_MS, QApplication.quit)" in TRANSPORT
+def test_installer_handoff_waits_for_app_exit_and_closes_modal_progress() -> None:
+    block = TRANSPORT.split("def _verify_and_install", 1)[1]
+    assert "self._close_progress()" in block
+    assert "_launch_installer_waiter(path, arguments)" in block
+    assert "QTimer.singleShot(120, QApplication.quit)" in block
+    assert "QProcess.startDetached" not in block
+    assert "_INSTALLER_HANDOFF_MS" not in TRANSPORT

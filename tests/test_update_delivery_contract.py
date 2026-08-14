@@ -62,7 +62,7 @@ def test_download_is_stream_hash_verified_before_install() -> None:
     assert "hashlib.sha256()" in UPDATER
     assert "stream.read(1024 * 1024)" in UPDATER
     assert "installer_sha256" in UPDATER
-    assert "QProcess.startDetached" in UPDATER
+    assert "_launch_installer_waiter" in UPDATER
     for flag in (
         '"/SILENT"',
         '"/SUPPRESSMSGBOXES"',
@@ -71,6 +71,25 @@ def test_download_is_stream_hash_verified_before_install() -> None:
         '"/NORESTARTAPPLICATIONS"',
     ):
         assert flag in UPDATER
+
+
+def test_installer_handoff_waits_for_app_exit_before_launching() -> None:
+    assert "_launch_installer_waiter" in UPDATER
+    assert "_installer_waiter_script" in UPDATER
+    assert "Get-Process -Id" in UPDATER
+    assert "EcommerceAgentWorker" in UPDATER
+    assert "Start-Process -FilePath" in UPDATER
+    assert "CREATE_NO_WINDOW" in UPDATER
+    # Argument values are single-quote-escaped so embedded quotes parse in PS.
+    assert "arg.replace(chr(39), chr(39) * 2)" in UPDATER
+
+
+def test_update_closes_modal_progress_before_handing_off_installer() -> None:
+    block = UPDATER.split("def _verify_and_install", 1)[1]
+    assert "self._close_progress()" in block
+    assert "_launch_installer_waiter(path, arguments)" in block
+    assert "QTimer.singleShot(120, QApplication.quit)" in block
+    assert "QProcess.startDetached" not in block
 
 
 def test_silent_update_explicitly_relaunches_and_confirms_new_version() -> None:
