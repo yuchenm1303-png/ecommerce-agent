@@ -9,6 +9,7 @@ from typing import Any
 
 
 TASK_CONTROL_FILENAME = "task-control.json"
+TASK_COMMAND_FILENAME = "task-command.json"
 RUNNING = "RUNNING"
 PAUSE_REQUESTED = "PAUSE_REQUESTED"
 PAUSED = "PAUSED"
@@ -22,6 +23,10 @@ def _now() -> str:
 
 def control_path(root: str | Path) -> Path:
     return Path(root).resolve() / TASK_CONTROL_FILENAME
+
+
+def command_path(root: str | Path) -> Path:
+    return Path(root).resolve() / TASK_COMMAND_FILENAME
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -52,8 +57,10 @@ def initialize_task_control(
     product_url: str = "",
     reset: bool = False,
 ) -> dict[str, Any]:
-    path = control_path(root)
-    existing = {} if reset else _read(path)
+    state_path = control_path(root)
+    existing = {} if reset else _read(state_path)
+    if reset:
+        _write(command_path(root), {"version": 1, "command": RUNNING, "created_at": _now()})
     if existing:
         changed = False
         for key, value in {
@@ -64,13 +71,12 @@ def initialize_task_control(
             if value and not existing.get(key):
                 existing[key] = value
                 changed = True
-        return _write(path, existing) if changed else existing
-    return _write(
-        path,
+        return _write(state_path, existing) if changed else existing
+    payload = _write(
+        state_path,
         {
             "version": 1,
             "state": RUNNING,
-            "pause_requested": False,
             "task_id": task_id,
             "workflow": workflow,
             "product_url": product_url,
@@ -79,10 +85,28 @@ def initialize_task_control(
             "created_at": _now(),
         },
     )
+    if not command_path(root).is_file():
+        _write(command_path(root), {"version": 1, "command": RUNNING, "created_at": _now()})
+    return payload
 
 
 def task_control_state(root: str | Path) -> dict[str, Any]:
-    return _read(control_path(root))
+    state = _read(control_path(root))
+    command = _read(command_path(root))
+    if not state:
+        return {}
+    effective = dict(state)
+    current_state = str(state.get("state") or RUNNING).upper()
+    current_command = str(command.get("command") or RUNNING).upper()
+    if current_command == "PAUSE" and current_state != PAUSED:
+        effective["state"] = PAUSE_REQUESTED
+    elif current_command == "RESUME" and current_state == PAUSED:
+        effective["state"] = RESUMING
+    elif current_command == "STOP":
+        effective["state"] = STOPPED
+    if command.get("resume_kind"):
+        effective["resume_kind"] = command.get("resume_kind")
+    return effective
 
 
 def request_pause(
@@ -91,41 +115,35 @@ def request_pause(
     reason: str = "user",
     resume_kind: str = "",
 ) -> dict[str, Any]:
-    path = control_path(root)
-    payload = _read(path) or initialize_task_control(root)
-    if payload.get("state") == PAUSED:
-        return payload
-    payload.update(
-        {
-            "state": PAUSE_REQUESTED,
-            "pause_requested": True,
-            "pause_reason": str(reason or "user"),
-            "pause_requested_at": _now(),
-        }
-    )
+    initialize_task_control(root)
+    payload: dict[str, Any] = {
+        "version": 1,
+        "command": "PAUSE",
+        "reason": str(reason or "user"),
+        "requested_at": _now(),
+    }
     if resume_kind:
         payload["resume_kind"] = str(resume_kind)
-    return _write(path, payload)
+    _write(command_path(root), payload)
+    return task_control_state(root)
 
 
 def request_resume(root: str | Path) -> dict[str, Any]:
-    path = control_path(root)
-    payload = _read(path) or initialize_task_control(root)
-    payload.update(
-        {
-            "state": RESUMING,
-            "pause_requested": False,
-            "resume_requested_at": _now(),
-        }
+    initialize_task_control(root)
+    _write(
+        command_path(root),
+        {"version": 1, "command": "RESUME", "requested_at": _now()},
     )
-    return _write(path, payload)
+    return task_control_state(root)
 
 
 def request_stop(root: str | Path) -> dict[str, Any]:
-    path = control_path(root)
-    payload = _read(path) or initialize_task_control(root)
-    payload.update({"state": STOPPED, "pause_requested": False, "stopped_at": _now()})
-    return _write(path, payload)
+    initialize_task_control(root)
+    _write(
+        command_path(root),
+        {"version": 1, "command": "STOP", "requested_at": _now()},
+    )
+    return task_control_state(root)
 
 
 def record_checkpoint(
@@ -153,47 +171,51 @@ def safe_pause_point(
     context: dict[str, Any] | None = None,
     poll_seconds: float = 0.20,
 ) -> bool:
-    """Cooperatively pause only after an atomic workflow unit has completed.
+    """Cooperatively pause after an atomic workflow unit has completed.
 
-    The worker process stays alive and the browser remains untouched. The GUI
-    changes only ``task-control.json``. When resume is requested, the caller
-    continues from its normal state machine, which must re-read live browser
-    state before taking the next action.
+    The worker owns ``task-control.json`` and the GUI owns ``task-command.json``.
+    Keeping command and state writes separate avoids cross-process lost updates.
+    The browser is never frozen; after RESUME the caller continues through its
+    normal live-state reconciliation before taking the next browser action.
     """
 
-    path = control_path(root)
-    if not path.is_file():
+    state_path = control_path(root)
+    if not state_path.is_file():
         return False
 
-    payload = record_checkpoint(root, checkpoint, context=context)
-    state = str(payload.get("state") or RUNNING).upper()
-    if state not in {PAUSE_REQUESTED, PAUSED}:
+    state = record_checkpoint(root, checkpoint, context=context)
+    command = _read(command_path(root))
+    action = str(command.get("command") or RUNNING).upper()
+    if action == "STOP":
+        raise RuntimeError("Task was stopped at safe checkpoint")
+    if action != "PAUSE" and str(state.get("state") or RUNNING).upper() != PAUSED:
         return False
 
-    payload.update(
+    state.update(
         {
             "state": PAUSED,
-            "pause_requested": True,
-            "paused_at": payload.get("paused_at") or _now(),
+            "paused_at": state.get("paused_at") or _now(),
         }
     )
-    _write(path, payload)
+    if command.get("resume_kind"):
+        state["resume_kind"] = command.get("resume_kind")
+    _write(state_path, state)
     print(f"GUI_TASK_STATE PAUSED checkpoint={checkpoint}", flush=True)
 
     while True:
-        current = _read(path)
-        state = str(current.get("state") or RUNNING).upper()
-        if state == STOPPED:
+        command = _read(command_path(root))
+        action = str(command.get("command") or RUNNING).upper()
+        if action == "STOP":
             raise RuntimeError("Task was stopped while paused")
-        if state in {RESUMING, RUNNING} and not bool(current.get("pause_requested")):
+        if action in {"RESUME", RUNNING}:
+            current = _read(state_path) or state
             current.update(
                 {
                     "state": RUNNING,
-                    "pause_requested": False,
                     "resumed_at": _now(),
                 }
             )
-            _write(path, current)
+            _write(state_path, current)
             print(f"GUI_TASK_STATE RUNNING checkpoint={checkpoint}", flush=True)
             return True
         time.sleep(max(0.05, float(poll_seconds)))
@@ -205,7 +227,9 @@ __all__ = [
     "RESUMING",
     "RUNNING",
     "STOPPED",
+    "TASK_COMMAND_FILENAME",
     "TASK_CONTROL_FILENAME",
+    "command_path",
     "control_path",
     "initialize_task_control",
     "record_checkpoint",
