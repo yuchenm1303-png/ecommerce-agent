@@ -14,6 +14,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.listing_images import listing_images_from_resolver_outputs
+
 from .batch_workspace import BatchWorkspace
 from .console_window import MainWindow as ConsoleMainWindow
 from .readonly_runner import RunnerConfig
@@ -80,17 +82,17 @@ class WorkflowMainWindow(ConsoleMainWindow):
 
         self.real_upload_check.setText("上传本次商品图")
         self.real_upload_check.setToolTip(
-            "勾选后默认使用当前 Resolver 已抓取的真实商品图片；不会把 source-page 截图当 listing 图片。"
+            "勾选后默认使用当前 Resolver 通过 Listing Image 质量门的商品图片；不会把 source-page 截图当 listing 图片。"
         )
         self.real_pick_images_button.setText("手动覆盖图片…")
         self.real_pick_images_button.setToolTip(
-            "可选。只有需要替换自动商品图时才手动选择；不选择时使用当前 Resolver 商品图。"
+            "可选。只有需要替换自动商品图时才手动选择；不选择时使用当前 Resolver 的合格 Listing Images。"
         )
         self.real_image_count.setText("AUTO · waiting")
         self.real_start_button.setText("一键填写全部 READY")
         self.real_policy_hint.setText(
             "正式入口默认 Full Step 3：填写全部 READY。Save 与图片仍需每件商品显式授权；"
-            "勾选图片后自动复用当前 Resolver 商品图，无需重新选文件；Send to QC 永久锁定。"
+            "勾选图片后自动复用当前 Resolver 的合格商品图，无需重新选文件；Send to QC 永久锁定。"
         )
         self._sync_execution_mode_copy()
 
@@ -279,19 +281,7 @@ class WorkflowMainWindow(ConsoleMainWindow):
         except Exception:
             return ()
         outputs = manifest.get("outputs") or {}
-        images: list[Path] = []
-        seen: set[str] = set()
-        for raw in outputs.get("primary_source_product_images") or []:
-            value = str(raw or "").strip()
-            if not value:
-                continue
-            path = Path(value).resolve()
-            key = str(path).casefold()
-            if key in seen or not path.is_file():
-                continue
-            seen.add(key)
-            images.append(path)
-        return tuple(images)
+        return listing_images_from_resolver_outputs(outputs)
 
     def _start_run(self) -> None:
         self._start_mode("full")
@@ -369,12 +359,12 @@ class WorkflowMainWindow(ConsoleMainWindow):
             auto_count = min(len(images), _AUTO_PRODUCT_PHOTO_LIMIT)
             self.real_image_count.setText(f"AUTO {auto_count}/{len(images)}")
             self.real_image_count.setToolTip(
-                "自动候选来自本次 Resolver primary_source_product_images：\n"
+                "自动候选来自本次 Resolver primary_source_listing_images：\n"
                 + "\n".join(str(path) for path in images[:_AUTO_PRODUCT_PHOTO_LIMIT])
             )
         else:
             self.real_image_count.setText("AUTO 0")
-            self.real_image_count.setToolTip("本次 Resolver 没有可用于 Product Photos 的商品图片。")
+            self.real_image_count.setToolTip("本次 Resolver 没有通过 Listing Image 质量门的商品图片。")
 
         if not result.plan_summary or result.ready <= 0:
             self.real_start_button.setEnabled(False)
@@ -385,7 +375,7 @@ class WorkflowMainWindow(ConsoleMainWindow):
         self.real_start_button.setEnabled(True)
         self.real_policy_hint.setText(
             f"当前 Step 3 Fill Plan 已通过：READY={result.ready}。默认 Full Step 3 会填写全部 READY；"
-            f"本次可自动使用 {min(len(images), _AUTO_PRODUCT_PHOTO_LIMIT)} 张商品图。"
+            f"本次可自动使用 {min(len(images), _AUTO_PRODUCT_PHOTO_LIMIT)} 张合格商品图。"
             "Save / 图片仍需显式授权，Send to QC 继续锁定。"
         )
 
@@ -396,15 +386,15 @@ class WorkflowMainWindow(ConsoleMainWindow):
         if self.current_result is not None and self.current_result.vertical:
             self.vertical_input.setText(self.current_result.vertical)
 
-        # If image upload is explicitly authorized and no manual override was
-        # chosen, bind Product Photos to this exact run's captured product images.
+        # Automatic Product Photos are always derived from the canonical listing
+        # image gate. Raw resolver evidence remains available only for strict rebind.
         if self.real_upload_check.isChecked() and not self._selected_upload_images:
             images = self._current_resolver_product_images()
             if not images:
                 QMessageBox.warning(
                     self,
-                    "没有商品图片",
-                    "本次 Resolver 没有 primary_source_product_images；不会拿网页截图冒充商品图。",
+                    "没有合格商品图片",
+                    "本次 Resolver 没有通过 Listing Image 质量门的图片；不会拿原始证据图或网页截图冒充 Listing Photos。",
                 )
                 return
             selected = list(images[:_AUTO_PRODUCT_PHOTO_LIMIT])
