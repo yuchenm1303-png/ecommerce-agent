@@ -11,16 +11,18 @@ MOBILE_PORT = (ROOT / "app" / "makro" / "visual_execution_hud.py").read_text(enc
 PHOTOS = (ROOT / "app" / "makro" / "photos.py").read_text(encoding="utf-8")
 
 
-def test_shared_browser_hud_reuses_existing_visual_agent_renderer() -> None:
-    assert "from app.makro.visual_execution_hud import" in HUD
+def test_shared_browser_hud_reuses_existing_visual_agent_renderer_lazily() -> None:
+    assert "from app.makro import visual_execution_hud" in HUD
+    assert "renderer import is deliberately lazy" in HUD
     assert "install_visual_execution_hud" in HUD
     assert "HUD_API_KEY" in HUD
+    assert "from app.makro.visual_execution_hud import" not in HUD
     assert "mouseCursorShape" in MOBILE_PORT
     assert "edge-aurora" in MOBILE_PORT
     assert "pointer-events:none" in MOBILE_PORT
 
 
-def test_hud_recognizes_upload_and_search_custom_surfaces() -> None:
+def test_hud_recognizes_and_explicitly_targets_photo_upload_surfaces() -> None:
     for token in (
         '[id^="thumbnail_"]',
         '[data-testid*="upload" i]',
@@ -30,6 +32,13 @@ def test_hud_recognizes_upload_and_search_custom_surfaces() -> None:
         '[class*="search" i]',
     ):
         assert token in HUD
+    assert "from ..browser_visual_hud import browser_visual_hud_status, browser_visual_hud_target" in PHOTOS
+    assert '"准备上传图片"' in PHOTOS
+    assert '"正在打开图片选择"' in PHOTOS
+    assert '"正在提交商品图片"' in PHOTOS
+    assert '"商品图片已接受"' in PHOTOS
+    assert "browser_visual_hud_target(\n            slot," in PHOTOS
+    assert "browser_visual_hud_target(\n                upload_button," in PHOTOS
     assert "slot.click(timeout=1_500, force=True)" in PHOTOS
     assert "upload_button.click(timeout=1_500, force=True)" in PHOTOS
     assert "set_input_files" in PHOTOS
