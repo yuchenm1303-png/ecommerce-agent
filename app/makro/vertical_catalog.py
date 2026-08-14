@@ -10,18 +10,23 @@ from typing import Any, Callable
 
 from playwright.sync_api import Page
 
+from .catalog_taxonomy import (
+    CatalogTaxonomyBrowser,
+    assert_catalog_probe_route,
+    is_fresh_catalog_step1_url,
+)
 from .listing import parse_makro_listing_url
 from .listing_creation import (
     MAKRO_NEW_LISTING_URL,
     _vertical_confirmation_content,
     is_brand_step,
-    is_product_info_step,
 )
-from .taxonomy_resilient import ResilientMakroTaxonomyBrowser
-from .vertical_selection import is_vertical_interaction_ready
 
 
-CATALOG_SCHEMA_VERSION = 1
+# v1 used the page-global resilient taxonomy reader and could ingest Makro's
+# Dashboard sidebar as taxonomy. v2 checkpoints are created only from the
+# Step-1 Browse Verticals scoped reader and must never resume v1 state.
+CATALOG_SCHEMA_VERSION = 2
 CHECKPOINT_NAME = "vertical-catalog-checkpoint.json"
 CATALOG_NAME = "makro-vertical-catalog.json"
 LEAVES_CSV_NAME = "makro-vertical-leaves.csv"
@@ -47,6 +52,7 @@ def new_catalog_state(*, source_url: str = MAKRO_NEW_LISTING_URL) -> dict[str, A
     now = _utc_now()
     return {
         "schema_version": CATALOG_SCHEMA_VERSION,
+        "surface_contract": "step1_browse_verticals_scoped_v2",
         "source_url": str(source_url),
         "started_at": now,
         "updated_at": now,
@@ -72,7 +78,7 @@ def _resolved_path_keys(state: dict[str, Any]) -> set[str]:
 
 
 def prepare_resume_state(state: dict[str, Any]) -> dict[str, Any]:
-    """Requeue unresolved paths from an interrupted or failed harvest."""
+    """Requeue unresolved paths without replaying already resolved nodes."""
 
     resolved = _resolved_path_keys(state)
     pending: list[list[str]] = []
@@ -86,8 +92,8 @@ def prepare_resume_state(state: dict[str, Any]) -> dict[str, Any]:
         seen.add(key)
         pending.append(path)
 
-    for path in state.get("pending") or []:
-        add(path)
+    for raw in state.get("pending") or []:
+        add(raw)
     for item in state.get("failed") or []:
         add(item.get("path"))
 
@@ -103,11 +109,16 @@ def load_checkpoint(path: str | Path) -> dict[str, Any]:
     payload = json.loads(target.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("Makro vertical catalog checkpoint must be a JSON object")
-    if int(payload.get("schema_version") or 0) != CATALOG_SCHEMA_VERSION:
+    version = int(payload.get("schema_version") or 0)
+    if version != CATALOG_SCHEMA_VERSION:
         raise ValueError(
-            "unsupported Makro vertical catalog checkpoint schema_version="
-            f"{payload.get('schema_version')!r}"
+            "obsolete Makro vertical catalog checkpoint schema_version="
+            f"{version}; current={CATALOG_SCHEMA_VERSION}. "
+            "The old checkpoint was produced before Browse Verticals DOM scoping; "
+            "rerun once with --no-resume."
         )
+    if str(payload.get("surface_contract") or "") != "step1_browse_verticals_scoped_v2":
+        raise ValueError("Makro vertical catalog checkpoint has no trusted scoped-surface contract")
     return prepare_resume_state(payload)
 
 
@@ -153,6 +164,7 @@ def _insert_tree_node(
 def build_catalog_payload(state: dict[str, Any]) -> dict[str, Any]:
     tree: list[dict[str, Any]] = []
     leaves: list[dict[str, Any]] = []
+
     for raw in state.get("leaves") or []:
         path = [_clean_label(item) for item in (raw.get("path") or []) if _clean_label(item)]
         canonical = _clean_label(raw.get("canonical_vertical"))
@@ -166,7 +178,6 @@ def build_catalog_payload(state: dict[str, Any]) -> dict[str, Any]:
         leaves.append(item)
         _insert_tree_node(tree, path, item)
 
-    # Keep already discovered branch-only structure visible in partial catalogs.
     for raw in state.get("branches") or []:
         path = [_clean_label(item) for item in (raw.get("path") or []) if _clean_label(item)]
         if path:
@@ -179,12 +190,12 @@ def build_catalog_payload(state: dict[str, Any]) -> dict[str, Any]:
 
     pending_count = len(state.get("pending") or [])
     failed_count = len(state.get("failed") or [])
-    complete = pending_count == 0 and failed_count == 0
     return {
         "schema_version": CATALOG_SCHEMA_VERSION,
+        "surface_contract": "step1_browse_verticals_scoped_v2",
         "generated_at": _utc_now(),
         "source_url": str(state.get("source_url") or MAKRO_NEW_LISTING_URL),
-        "complete": complete,
+        "complete": pending_count == 0 and failed_count == 0,
         "stats": {
             "root_count": len(state.get("roots") or []),
             "branch_count": len(state.get("branches") or []),
@@ -200,6 +211,8 @@ def build_catalog_payload(state: dict[str, Any]) -> dict[str, Any]:
         "canonical_index": canonical_index,
         "safety": {
             "dedicated_probe_tab": True,
+            "taxonomy_surface": "Browse Verticals only",
+            "sidebar_navigation_eligible": False,
             "brand_selected": False,
             "listing_created": False,
             "step3_writes": 0,
@@ -274,32 +287,38 @@ def _wait_until(
     return bool(predicate())
 
 
-def reset_probe_to_step1(page: Page, *, timeout_s: float = 30.0) -> None:
+def reset_probe_to_step1(
+    page: Page,
+    *,
+    timeout_s: float = 30.0,
+    max_items_per_level: int = 200,
+) -> None:
+    """Return the dedicated tab to a verified fresh Step-1 Browse Verticals surface."""
+
     page.goto(
         MAKRO_NEW_LISTING_URL,
         wait_until="domcontentloaded",
         timeout=int(max(5.0, timeout_s) * 1000),
     )
 
+    browser = CatalogTaxonomyBrowser(page)
+
     def ready() -> bool:
-        try:
-            return bool(
-                is_vertical_interaction_ready(page)
-                and not is_brand_step(page)
-                and not is_product_info_step(page)
-            )
-        except Exception:
+        if not is_fresh_catalog_step1_url(str(getattr(page, "url", "") or "")):
             return False
+        return browser.ready(max_items_per_level=max_items_per_level)
 
     if not _wait_until(page, ready, timeout_s=timeout_s, poll_ms=250):
+        detail = browser.last_diagnostic or "fresh Step-1 Browse Verticals surface was not verified"
         raise RuntimeError(
-            "dedicated Makro catalog probe tab did not reach an operable Step 1 taxonomy state"
+            "dedicated Makro catalog probe tab did not reach the owned Browse Verticals surface: "
+            f"{detail}; url={getattr(page, 'url', '')!r}"
         )
 
 
 def _wait_for_click_outcome(
     page: Page,
-    browser: ResilientMakroTaxonomyBrowser,
+    browser: CatalogTaxonomyBrowser,
     *,
     level: int,
     previous_child: tuple[str, ...],
@@ -308,17 +327,21 @@ def _wait_for_click_outcome(
 ) -> tuple[str, list[str], str]:
     deadline = time.monotonic() + max(1.0, float(timeout_s))
     while time.monotonic() < deadline:
+        # Critical fail-closed boundary: an Orders/Dashboard navigation caused by
+        # a bad DOM match is detected immediately before any further DOM scan.
+        assert_catalog_probe_route(page, allow_vertical=True)
+
         canonical = _canonical_vertical(page)
         if canonical and _leaf_state(page):
             return "leaf", [], canonical
 
         columns = browser.columns(max_items_per_level=max_items_per_level)
         child = list(columns[level + 1]) if level + 1 < len(columns) else []
-        signature = _column_signature(child)
-        if child and signature != previous_child:
+        if child and _column_signature(child) != previous_child:
             return "branch", child, ""
         page.wait_for_timeout(180)
 
+    assert_catalog_probe_route(page, allow_vertical=True)
     canonical = _canonical_vertical(page)
     if canonical:
         return "leaf", [], canonical
@@ -343,8 +366,12 @@ def inspect_taxonomy_path(
     if not wanted_path:
         raise ValueError("taxonomy path cannot be empty")
 
-    reset_probe_to_step1(page, timeout_s=step1_timeout_s)
-    browser = ResilientMakroTaxonomyBrowser(page)
+    reset_probe_to_step1(
+        page,
+        timeout_s=step1_timeout_s,
+        max_items_per_level=max_items_per_level,
+    )
+    browser = CatalogTaxonomyBrowser(page)
 
     for level, wanted in enumerate(wanted_path):
         columns = browser.columns(max_items_per_level=max_items_per_level)
@@ -359,9 +386,10 @@ def inspect_taxonomy_path(
         ]
         if len(matches) != 1:
             raise RuntimeError(
-                "Makro taxonomy path node is not one unique live candidate: "
+                "Makro taxonomy path node is not one unique live Browse Verticals candidate: "
                 f"level={level}, wanted={wanted!r}, matches={matches!r}"
             )
+
         selected = matches[0]
         before_child = (
             _column_signature(columns[level + 1])
@@ -373,8 +401,10 @@ def inspect_taxonomy_path(
             selected,
             max_items_per_level=max_items_per_level,
         ):
+            reason = browser.last_diagnostic or "unknown scoped-click failure"
             raise RuntimeError(
-                f"Makro taxonomy probe could not click exact live node level={level}: {selected!r}"
+                "Makro taxonomy probe could not click exact node inside Browse Verticals: "
+                f"level={level}, selected={selected!r}, reason={reason}"
             )
 
         kind, children, canonical = _wait_for_click_outcome(
@@ -386,6 +416,7 @@ def inspect_taxonomy_path(
             max_items_per_level=max_items_per_level,
         )
         final = level == len(wanted_path) - 1
+
         if kind == "leaf":
             if not final:
                 raise RuntimeError(
@@ -420,9 +451,36 @@ def inspect_taxonomy_path(
                 "children": clean_children,
             }
 
-    raise RuntimeError(
-        f"Makro taxonomy path inspection ended without a result: {wanted_path!r}"
+    raise RuntimeError(f"Makro taxonomy path inspection ended without a result: {wanted_path!r}")
+
+
+def _discover_live_roots(
+    page: Page,
+    *,
+    step1_timeout_s: float,
+    max_items_per_level: int,
+) -> list[str]:
+    reset_probe_to_step1(
+        page,
+        timeout_s=step1_timeout_s,
+        max_items_per_level=max_items_per_level,
     )
+    browser = CatalogTaxonomyBrowser(page)
+    columns = browser.columns(max_items_per_level=max_items_per_level)
+    if not columns or not columns[0]:
+        detail = browser.last_diagnostic or "no root column"
+        raise RuntimeError(f"Makro Browse Verticals exposed no live root taxonomy nodes: {detail}")
+
+    roots: list[str] = []
+    seen: set[str] = set()
+    for raw in columns[0]:
+        value = _clean_label(raw)
+        key = value.casefold()
+        if not value or key in seen:
+            continue
+        seen.add(key)
+        roots.append(value)
+    return roots
 
 
 def harvest_vertical_catalog(
@@ -437,13 +495,7 @@ def harvest_vertical_catalog(
     max_items_per_level: int = 200,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Harvest the whole live taxonomy in a disposable, resumable probe tab.
-
-    A leaf click may temporarily advance only the dedicated probe tab to the
-    brand-selection boundary so the canonical Vertical can be read from the URL.
-    The harvester never selects a brand, creates a listing, writes Step 3, saves,
-    or clicks Send to QC.
-    """
+    """Harvest Makro taxonomy from a disposable, resumable Step-1 probe tab only."""
 
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -451,23 +503,28 @@ def harvest_vertical_catalog(
 
     if resume and checkpoint.exists():
         state = load_checkpoint(checkpoint)
+        # A v2 resume is accepted only while the current live root surface still
+        # matches the root set captured by that checkpoint. This prevents stale
+        # or cross-surface state from being replayed after Makro UI changes.
+        live_roots = _discover_live_roots(
+            page,
+            step1_timeout_s=step1_timeout_s,
+            max_items_per_level=max_items_per_level,
+        )
+        expected = {_clean_label(item).casefold() for item in state.get("roots") or []}
+        actual = {_clean_label(item).casefold() for item in live_roots}
+        if not expected or expected != actual:
+            raise RuntimeError(
+                "Makro live Browse Verticals roots no longer match this checkpoint; "
+                "refusing stale resume. Run once with --no-resume to create a fresh catalog."
+            )
     else:
         state = new_catalog_state()
-        reset_probe_to_step1(page, timeout_s=step1_timeout_s)
-        columns = ResilientMakroTaxonomyBrowser(page).columns(
-            max_items_per_level=max_items_per_level
+        roots = _discover_live_roots(
+            page,
+            step1_timeout_s=step1_timeout_s,
+            max_items_per_level=max_items_per_level,
         )
-        if not columns or not columns[0]:
-            raise RuntimeError("Makro Step 1 exposed no live root taxonomy nodes")
-        roots: list[str] = []
-        seen_roots: set[str] = set()
-        for raw in columns[0]:
-            value = _clean_label(raw)
-            key = value.casefold()
-            if not value or key in seen_roots:
-                continue
-            seen_roots.add(key)
-            roots.append(value)
         state["roots"] = roots
         state["pending"] = [[item] for item in roots]
         save_checkpoint(state, checkpoint)
@@ -480,9 +537,7 @@ def harvest_vertical_catalog(
     }
     processed_this_run = 0
 
-    while state["pending"] and (
-        max_paths <= 0 or processed_this_run < max_paths
-    ):
+    while state["pending"] and (max_paths <= 0 or processed_this_run < max_paths):
         path = list(state["pending"].pop(0))
         key = path_key(path)
         queued.discard(key)
@@ -515,11 +570,7 @@ def harvest_vertical_catalog(
 
         if result is None:
             state["failed"].append(
-                {
-                    "path": path,
-                    "attempts": attempts,
-                    "error": last_error,
-                }
+                {"path": path, "attempts": attempts, "error": last_error}
             )
             status = "failed"
         elif result["kind"] == "leaf":
@@ -572,6 +623,7 @@ def harvest_vertical_catalog(
 
 __all__ = [
     "CATALOG_NAME",
+    "CATALOG_SCHEMA_VERSION",
     "CHECKPOINT_NAME",
     "LEAVES_CSV_NAME",
     "build_catalog_payload",
