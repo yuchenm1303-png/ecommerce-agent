@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import Any
 
-from PySide6.QtCore import QEasingCurve, QObject, QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QCursor
-from PySide6.QtWidgets import QApplication, QFrame, QMainWindow, QWidget
-
-from .visual_style import GlassBackdrop, VisualStyleController
+from PySide6.QtCore import QEasingCurve, QObject, QPoint, QPointF, QRectF, Qt
+from PySide6.QtWidgets import QFrame, QMainWindow, QWidget
 
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
@@ -26,16 +24,12 @@ _REFERENCE_EDGE_GROWTH_PX = (
 )
 _MIN_NEIGHBOR_GAP_PX = 1.0
 _WINDOW_EDGE_GAP_PX = 1.0
-
-_POINTER_SAMPLE_MS = 8
 _HOVER_NONE_GRACE_SAMPLES = 1
 _MAX_MOTION_HZ = 90.0
 _MAX_CONCURRENT_MOTIONS = 2
 
 
 def _css_ease() -> QEasingCurve:
-    """CSS default `ease`: cubic-bezier(.25, .1, .25, 1)."""
-
     curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
     curve.addCubicBezierSegment(
         QPointF(0.25, 0.10),
@@ -48,7 +42,7 @@ def _css_ease() -> QEasingCurve:
 @dataclass(slots=True)
 class _CardState:
     frame: QFrame
-    surface: GlassBackdrop
+    surface: Any
     current_scale: float = _NORMAL_SCALE
     current_alpha: float = _NORMAL_ALPHA
     from_scale: float = _NORMAL_SCALE
@@ -72,17 +66,16 @@ class _CardState:
 
 
 class NekroCardInteractionController(QObject):
-    """Reference-site card motion with a bounded QWidget raster budget.
+    """Card interaction with one shared input clock and bounded raster work.
 
-    The current hovered/pressed card remains live so its complete QWidget subtree
-    can scale together while child hover/press/focus feedback stays current. The
-    immediately previous card may finish its 300 ms return using one frozen
-    composite, and anything older is retired immediately. This gives browser-like
-    continuity without allowing rapid A -> B -> C traversal to accumulate several
-    expensive live QWidget effects.
+    Quick renders the glass shell every presentation step. QWidget card content is
+    captured once when an interaction transition starts and that frozen composite
+    is transformed throughout the 300 ms motion. At the endpoint the real content
+    is thawed again, so inputs remain fully live while steady but the expensive
+    QWidget subtree is not re-rasterized dozens of times during one scale tween.
     """
 
-    def __init__(self, window: QMainWindow, visual: VisualStyleController) -> None:
+    def __init__(self, window: QMainWindow, visual: Any) -> None:
         super().__init__(window)
         self.window = window
         self.visual = visual
@@ -94,27 +87,17 @@ class NekroCardInteractionController(QObject):
         self.hovered: QFrame | None = None
         self.pressed: QFrame | None = None
         self._suspended = False
-        self._left_down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
+        self._left_down = False
         self._ease = _css_ease()
+        self._motion_interval_s = self._frame_interval_ms() / 1000.0
+        self._next_motion_s = 0.0
 
         for frame in window.findChildren(QFrame):
             if frame.objectName() not in _GLASS_NAMES:
                 continue
             surface = visual.surface_for(frame)
-            if surface is None:
-                continue
-            self.states[frame] = _CardState(frame=frame, surface=surface)
-
-        self._motion_timer = QTimer(self)
-        self._motion_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._motion_timer.setInterval(self._frame_interval_ms())
-        self._motion_timer.timeout.connect(self._advance_motions)
-
-        self._pointer_timer = QTimer(self)
-        self._pointer_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._pointer_timer.setInterval(_POINTER_SAMPLE_MS)
-        self._pointer_timer.timeout.connect(self._sample_pointer)
-        self._pointer_timer.start()
+            if surface is not None:
+                self.states[frame] = _CardState(frame=frame, surface=surface)
 
         window.destroyed.connect(self._cleanup)
 
@@ -141,6 +124,12 @@ class NekroCardInteractionController(QObject):
                 setter(bool(frozen))
             except RuntimeError:
                 pass
+
+    def _recapture_for_motion(self, state: _CardState) -> None:
+        # Switching False -> True clears the previous frozen source so the next
+        # effect draw captures the latest hover/press/focus pixels exactly once.
+        self._set_content_frozen(state, False)
+        self._set_content_frozen(state, True)
 
     def _retire_stale_motions(self) -> None:
         while len(self._moving_frames) > _MAX_CONCURRENT_MOTIONS:
@@ -172,7 +161,7 @@ class NekroCardInteractionController(QObject):
 
     def _geometry_cache_key(self) -> tuple[int, int, int, int]:
         background = getattr(self.visual, "background", None)
-        revision = int(getattr(background, "_mask_revision", -1))
+        revision = int(getattr(background, "_geometry_revision", -1))
         return (
             revision,
             int(self.window.width()),
@@ -190,50 +179,49 @@ class NekroCardInteractionController(QObject):
         if rect is None or rect.isEmpty():
             return 0.0
 
-        window_w = max(0.0, float(self.window.width()))
-        window_h = max(0.0, float(self.window.height()))
         edge_cap = min(
             max(0.0, rect.left() - _WINDOW_EDGE_GAP_PX),
             max(0.0, rect.top() - _WINDOW_EDGE_GAP_PX),
-            max(0.0, window_w - rect.right() - _WINDOW_EDGE_GAP_PX),
-            max(0.0, window_h - rect.bottom() - _WINDOW_EDGE_GAP_PX),
+            max(0.0, float(self.window.width()) - rect.right() - _WINDOW_EDGE_GAP_PX),
+            max(0.0, float(self.window.height()) - rect.bottom() - _WINDOW_EDGE_GAP_PX),
         )
         allowed = min(max(0.0, desired_growth), edge_cap)
         if allowed <= 0.0:
             return 0.0
 
         for other, other_rect in rects.items():
-            if other is frame:
+            if other is frame or frame.isAncestorOf(other) or other.isAncestorOf(frame):
                 continue
-            if frame.isAncestorOf(other) or other.isAncestorOf(frame):
-                continue
-
             horizontal_overlap = min(rect.right(), other_rect.right()) - max(
                 rect.left(), other_rect.left()
             )
             vertical_overlap = min(rect.bottom(), other_rect.bottom()) - max(
                 rect.top(), other_rect.top()
             )
-
             if horizontal_overlap > 0.0:
                 if other_rect.top() >= rect.bottom():
-                    gap = other_rect.top() - rect.bottom()
-                    allowed = min(allowed, max(0.0, gap - _MIN_NEIGHBOR_GAP_PX))
+                    allowed = min(
+                        allowed,
+                        max(0.0, other_rect.top() - rect.bottom() - _MIN_NEIGHBOR_GAP_PX),
+                    )
                 elif rect.top() >= other_rect.bottom():
-                    gap = rect.top() - other_rect.bottom()
-                    allowed = min(allowed, max(0.0, gap - _MIN_NEIGHBOR_GAP_PX))
-
+                    allowed = min(
+                        allowed,
+                        max(0.0, rect.top() - other_rect.bottom() - _MIN_NEIGHBOR_GAP_PX),
+                    )
             if vertical_overlap > 0.0:
                 if other_rect.left() >= rect.right():
-                    gap = other_rect.left() - rect.right()
-                    allowed = min(allowed, max(0.0, gap - _MIN_NEIGHBOR_GAP_PX))
+                    allowed = min(
+                        allowed,
+                        max(0.0, other_rect.left() - rect.right() - _MIN_NEIGHBOR_GAP_PX),
+                    )
                 elif rect.left() >= other_rect.right():
-                    gap = rect.left() - other_rect.right()
-                    allowed = min(allowed, max(0.0, gap - _MIN_NEIGHBOR_GAP_PX))
-
+                    allowed = min(
+                        allowed,
+                        max(0.0, rect.left() - other_rect.right() - _MIN_NEIGHBOR_GAP_PX),
+                    )
             if allowed <= 0.0:
                 return 0.0
-
         return allowed
 
     def _rebuild_hover_scale_cache(self) -> None:
@@ -253,9 +241,10 @@ class NekroCardInteractionController(QObject):
                 span * (_HOVER_SCALE - _NORMAL_SCALE) * 0.5,
             )
             growth = self._available_edge_growth(frame, reference_growth, rects)
-            normalized = _NORMAL_SCALE + (2.0 * growth / span)
-            cache[frame] = max(_NORMAL_SCALE, min(_HOVER_SCALE, normalized))
-
+            cache[frame] = max(
+                _NORMAL_SCALE,
+                min(_HOVER_SCALE, _NORMAL_SCALE + (2.0 * growth / span)),
+            )
         self._hover_scale_cache = cache
         self._hover_scale_cache_key = self._geometry_cache_key()
 
@@ -275,7 +264,7 @@ class NekroCardInteractionController(QObject):
             current = current.parentWidget()
         return None
 
-    def _card_at_global(self, global_pos) -> QFrame | None:  # noqa: ANN001
+    def _card_at_global(self, global_pos: QPoint) -> QFrame | None:
         try:
             local = self.window.mapFromGlobal(global_pos)
         except RuntimeError:
@@ -287,9 +276,9 @@ class NekroCardInteractionController(QObject):
         card = self._nearest_card(widget)
         if card is not None and card.isVisibleTo(self.window) and card.isEnabled():
             return card
-
         if widget is not None:
             return None
+
         best: QFrame | None = None
         best_depth = -1
         for frame in self.states:
@@ -313,7 +302,7 @@ class NekroCardInteractionController(QObject):
                 best_depth = depth
         return best
 
-    def _hover_still_owns_global(self, frame: QFrame, global_pos) -> bool:  # noqa: ANN001
+    def _hover_still_owns_global(self, frame: QFrame, global_pos: QPoint) -> bool:
         if not frame.isVisibleTo(self.window) or not frame.isEnabled():
             return False
         try:
@@ -322,7 +311,6 @@ class NekroCardInteractionController(QObject):
             return False
         if not frame.rect().contains(local):
             return False
-
         nested = self._nearest_card(frame.childAt(local))
         return nested is None or nested is frame
 
@@ -343,13 +331,13 @@ class NekroCardInteractionController(QObject):
             scale=state.current_scale,
             overlay_alpha=state.current_alpha,
         )
+        if not state.moving:
+            self._set_content_frozen(state, False)
         return state.moving
 
-    def _advance_motions(self) -> None:
+    def _advance_motions(self, now_s: float) -> None:
         if self._suspended:
-            self._motion_timer.stop()
             return
-        now_s = time.perf_counter()
         for frame in tuple(self._moving_frames):
             state = self.states.get(frame)
             if state is None:
@@ -360,9 +348,8 @@ class NekroCardInteractionController(QObject):
                     self._moving_frames.discard(frame)
             except RuntimeError:
                 state.moving = False
+                self._set_content_frozen(state, False)
                 self._moving_frames.discard(frame)
-        if not self._moving_frames:
-            self._motion_timer.stop()
 
     def _animate_to(self, frame: QFrame | None, *, scale: float, alpha: float) -> None:
         if self._suspended or frame is None:
@@ -372,8 +359,8 @@ class NekroCardInteractionController(QObject):
             return
 
         now_s = time.perf_counter()
-        if not self._advance_state(state, now_s):
-            self._moving_frames.discard(frame)
+        if state.moving:
+            self._advance_state(state, now_s)
         scale = float(scale)
         alpha = float(alpha)
         if (
@@ -381,12 +368,12 @@ class NekroCardInteractionController(QObject):
             and abs(alpha - state.target_alpha) <= 0.05
         ):
             return
-
         if (
             abs(scale - state.current_scale) <= 1e-5
             and abs(alpha - state.current_alpha) <= 0.05
         ):
             state.snap(scale, alpha)
+            self._set_content_frozen(state, False)
             self._moving_frames.discard(frame)
             return
 
@@ -396,32 +383,23 @@ class NekroCardInteractionController(QObject):
         state.target_alpha = alpha
         state.started_s = now_s
         state.moving = True
+        self._recapture_for_motion(state)
         self._moving_frames.add(frame)
         self._retire_stale_motions()
-        if not self._motion_timer.isActive():
-            self._motion_timer.setInterval(self._frame_interval_ms())
-            self._motion_timer.start()
+        self._next_motion_s = min(self._next_motion_s or now_s, now_s)
 
     def _normal(self, frame: QFrame | None) -> None:
-        if frame is not None:
-            state = self.states.get(frame)
-            if frame is not self.hovered and frame is not self.pressed:
-                self._set_content_frozen(state, True)
         self._animate_to(frame, scale=_NORMAL_SCALE, alpha=_NORMAL_ALPHA)
 
     def _hover(self, frame: QFrame | None) -> None:
-        if frame is None:
-            return
-        self._set_content_frozen(self.states.get(frame), False)
-        self._animate_to(
-            frame,
-            scale=self._hover_scale_for(frame),
-            alpha=_HOVER_ALPHA,
-        )
+        if frame is not None:
+            self._animate_to(
+                frame,
+                scale=self._hover_scale_for(frame),
+                alpha=_HOVER_ALPHA,
+            )
 
     def _active(self, frame: QFrame | None) -> None:
-        if frame is not None:
-            self._set_content_frozen(self.states.get(frame), False)
         self._animate_to(frame, scale=_ACTIVE_SCALE, alpha=_ACTIVE_ALPHA)
 
     def _set_hover(self, frame: QFrame | None) -> None:
@@ -447,7 +425,6 @@ class NekroCardInteractionController(QObject):
             if previous is not None:
                 self._normal(previous)
             return
-
         previous_hover = self.hovered
         self.hovered = frame
         self.pressed = frame
@@ -455,15 +432,14 @@ class NekroCardInteractionController(QObject):
             self._normal(previous_hover)
         self._active(frame)
 
-    def _end_press(self) -> None:
+    def _end_press(self, global_pos: QPoint) -> None:
         if self._suspended:
             return
         self._none_samples = 0
         previous = self.pressed
         self.pressed = None
-        current = self._card_at_global(QCursor.pos())
+        current = self._card_at_global(global_pos)
         self.hovered = current
-
         if previous is not None:
             if previous is current:
                 self._hover(previous)
@@ -472,21 +448,16 @@ class NekroCardInteractionController(QObject):
         if current is not None and current is not previous:
             self._hover(current)
 
-    def _sample_pointer(self) -> None:
+    def _sample_input(self, global_pos: QPoint, *, left_down: bool) -> None:
         if self._suspended or not self.window.isVisible() or self.window.isMinimized():
             return
-
-        left_down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
-
         if left_down and self._left_down and self.pressed is not None:
             return
-
         if not left_down and self._left_down:
             self._left_down = False
-            self._end_press()
+            self._end_press(global_pos)
             return
 
-        global_pos = QCursor.pos()
         if (
             not left_down
             and self.hovered is not None
@@ -497,12 +468,10 @@ class NekroCardInteractionController(QObject):
             return
 
         current = self._card_at_global(global_pos)
-
         if left_down and not self._left_down:
             self._left_down = True
             self._begin_press(current)
             return
-
         if left_down:
             if self.pressed is None:
                 self._begin_press(current)
@@ -515,15 +484,28 @@ class NekroCardInteractionController(QObject):
             self._none_samples = 0
         else:
             self._none_samples = 0
-
         self._set_hover(current)
+
+    def presentation_tick(
+        self,
+        global_pos: QPoint,
+        *,
+        left_down: bool,
+        now_s: float,
+        input_changed: bool,
+    ) -> None:
+        if self._suspended:
+            return
+        if input_changed:
+            self._sample_input(global_pos, left_down=left_down)
+        if self._moving_frames and now_s >= self._next_motion_s:
+            self._advance_motions(now_s)
+            self._next_motion_s = now_s + self._motion_interval_s
 
     def suspend_for_modal(self) -> None:
         if self._suspended:
             return
         self._suspended = True
-        self._pointer_timer.stop()
-        self._motion_timer.stop()
         self._moving_frames.clear()
         self._none_samples = 0
         self._left_down = False
@@ -544,10 +526,10 @@ class NekroCardInteractionController(QObject):
         self._hover_scale_cache.clear()
         self._hover_scale_cache_key = None
         self._none_samples = 0
-        self._left_down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
+        self._left_down = False
         self.hovered = None
         self.pressed = None
-
+        self._next_motion_s = 0.0
         for state in self.states.values():
             try:
                 self._set_content_frozen(state, False)
@@ -555,24 +537,10 @@ class NekroCardInteractionController(QObject):
             except RuntimeError:
                 state.moving = False
 
-        current = self._card_at_global(QCursor.pos())
-        self.hovered = current
-        if current is not None:
-            if self._left_down:
-                self.pressed = current
-                self._active(current)
-            else:
-                self._hover(current)
-        self._pointer_timer.start()
-
     def _cleanup(self) -> None:
-        self._pointer_timer.stop()
-        self._motion_timer.stop()
         self._moving_frames.clear()
         self._hover_scale_cache.clear()
         self._hover_scale_cache_key = None
-        self._none_samples = 0
-        self._suspended = False
         for state in tuple(self.states.values()):
             try:
                 self._set_content_frozen(state, False)
@@ -584,10 +552,10 @@ class NekroCardInteractionController(QObject):
         self.pressed = None
 
 
-def install_nekro_card_fx(
-    window: QMainWindow,
-    visual: VisualStyleController,
-) -> NekroCardInteractionController:
+def install_nekro_card_fx(window: QMainWindow, visual: Any) -> NekroCardInteractionController:
     controller = NekroCardInteractionController(window, visual)
     window._nekro_card_fx = controller  # type: ignore[attr-defined]
     return controller
+
+
+__all__ = ["NekroCardInteractionController", "install_nekro_card_fx"]
