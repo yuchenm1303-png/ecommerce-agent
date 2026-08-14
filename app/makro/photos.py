@@ -10,6 +10,7 @@ from typing import Any, Iterable
 from PIL import Image, ImageOps, UnidentifiedImageError
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
+from ..browser_visual_hud import browser_visual_hud_status, browser_visual_hud_target
 from .sections import find_section, open_section_for_edit
 
 PRODUCT_PHOTOS_SECTION = "Product Photos"
@@ -512,6 +513,13 @@ class _DynamicPhotoFileTarget:
         if not slot.is_visible():
             raise RuntimeError(f"Product Photos 图片槽 #{self.slot_id} 当前不可见。")
 
+        browser_visual_hud_target(
+            slot,
+            "准备上传图片",
+            f"正在定位 Product Photos 图片槽 {self.slot_id}，下一步会打开真实上传控件。",
+            phase=2,
+        )
+
         with tempfile.TemporaryDirectory(prefix="makro-photo-") as temp_dir:
             upload_path, upload_meta = _normalize_for_makro_upload(source, Path(temp_dir))
             self.upload_meta = upload_meta
@@ -526,10 +534,23 @@ class _DynamicPhotoFileTarget:
                     f"点击 #{self.slot_id} 图片框后 2000ms 内没有出现可见 Upload Photo 按钮。"
                 )
 
+            browser_visual_hud_target(
+                upload_button,
+                "正在打开图片选择",
+                f"已进入 {self.slot_id} 上传面板，准备点击真实 Upload Photo 按钮。",
+                phase=3,
+            )
+
             shared = _raw_file_input(self.page, current_path)
             try:
                 with self.page.expect_file_chooser(timeout=1_500) as chooser_info:
                     upload_button.click(timeout=1_500, force=True)
+                browser_visual_hud_status(
+                    self.page,
+                    "正在提交商品图片",
+                    f"正在把 {source.name} 提交到 {self.slot_id}，等待 Makro 接收。",
+                    phase=3,
+                )
                 chooser_info.value.set_files(str(upload_path))
             except PlaywrightTimeoutError:
                 if shared is None:
@@ -545,6 +566,12 @@ class _DynamicPhotoFileTarget:
                         f"#{self.slot_id} 已点击 Upload Photo，但没有 file chooser，"
                         "也找不到共享 input[type=file]。"
                     )
+                browser_visual_hud_status(
+                    self.page,
+                    "正在提交商品图片",
+                    f"正在通过页面文件输入把 {source.name} 提交到 {self.slot_id}。",
+                    phase=3,
+                )
                 shared.set_input_files(str(upload_path))
 
             print(
@@ -561,6 +588,12 @@ class _DynamicPhotoFileTarget:
             )
 
         self._selected = True
+        browser_visual_hud_status(
+            self.page,
+            "商品图片已接受",
+            f"Makro 已确认 {self.slot_id} 接受 {source.name}，准备处理下一张图片。",
+            phase=4,
+        )
         print(
             f"GUI_EXEC_PHOTO\tACCEPTED\t{self.slot_id}\t{source.name}\t"
             f"{self.last_acceptance.get('acceptance_signal') or 'unknown'}",
@@ -631,6 +664,13 @@ def upload_product_photos(
 
     if not resolved_paths:
         return PhotoUploadResult(status="skipped", detail="没有传入 --upload-image。")
+
+    browser_visual_hud_status(
+        page,
+        "正在上传商品图片",
+        f"Product Photos 将依次处理 {len(resolved_paths)} 张已授权图片。",
+        phase=1,
+    )
 
     section = find_section(page, PRODUCT_PHOTOS_SECTION)
     if section is None:
