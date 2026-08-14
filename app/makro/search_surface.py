@@ -7,7 +7,9 @@ wrong layer.
 
 This module snapshots the visible DOM immediately before a query. Afterwards it
 accepts only elements that are new or whose rendered text changed, plus explicit
-ARIA-owned popup rows. Reads and clicks use the same ownership rule.
+ARIA-owned popup rows. Reads and clicks use the same ownership rule. Scrollable
+result surfaces are harvested to exhaustion before semantic selection, and exact
+rows can be sought again across the same surface before clicking.
 """
 
 from __future__ import annotations
@@ -156,8 +158,127 @@ _READ_ROWS_JS = r"""
 """
 
 
+_MOVE_SEARCH_SURFACE_JS = r"""
+(input, reset) => {
+  const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+  const visible = (el) => {
+    if (!el || !(el instanceof Element)) return false;
+    const s = getComputedStyle(el), r = el.getBoundingClientRect();
+    return s.display !== 'none' && s.visibility !== 'hidden'
+      && Number(s.opacity || 1) !== 0 && r.width > 2 && r.height > 2;
+  };
+  const stateMap = window.__makroQuerySurfaceState;
+  const state = stateMap && stateMap.get(input);
+  if (!state || !state.baseline) {
+    return {found:false,moved:false,at_end:true,reason:'missing_query_state'};
+  }
+  const baseline = state.baseline;
+  const ir = input.getBoundingClientRect();
+  const overlapX = (r) => Math.max(0, Math.min(r.right, ir.right) - Math.max(r.left, ir.left));
+  const nearInput = (r) => r.bottom >= ir.bottom - 12 && r.top <= ir.bottom + 760
+    && overlapX(r) >= Math.min(ir.width * .20, Math.max(30, r.width * .35));
+  const label = (el) => clean(el && (el.innerText || el.textContent) || '');
+  const changed = (el) => {
+    const current = label(el).slice(0, 500);
+    return !baseline.has(el) || baseline.get(el) !== current;
+  };
+  const explicitOwned = (el) => {
+    for (const attr of ['aria-controls', 'aria-owns']) {
+      const id = input.getAttribute(attr);
+      const root = id && document.getElementById(id);
+      if (root && root.contains(el)) return true;
+    }
+    return !!el.closest?.('[role="listbox"]');
+  };
+  const semantic = (el) => {
+    const role = String(el.getAttribute && el.getAttribute('role') || '').toLowerCase();
+    const cls = String(el.className || '').toLowerCase();
+    return ['option','menuitem','listitem','row'].includes(role)
+      || ['LI','TR','OPTION'].includes(el.tagName)
+      || !!el.getAttribute?.('data-brand')
+      || !!el.getAttribute?.('data-value')
+      || /autocomplete|suggest|result|option|brand/.test(cls);
+  };
+  const scrollable = (el) => {
+    if (!visible(el)) return false;
+    const s = getComputedStyle(el);
+    return el.scrollHeight > el.clientHeight + 8
+      && (['auto','scroll'].includes(s.overflowY) || el.scrollHeight > el.clientHeight + 20);
+  };
+
+  const ownedRows = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (!visible(el) || el === input || el.contains(input)) continue;
+    if (!changed(el) && !explicitOwned(el)) continue;
+    const r = el.getBoundingClientRect();
+    if (!nearInput(r)) continue;
+    if (!semantic(el) && !explicitOwned(el)) continue;
+    const text = label(el);
+    if (!text || text.length < 2 || text.length > 320) continue;
+    ownedRows.push(el);
+  }
+
+  const scored = new Map();
+  const add = (el, score) => {
+    if (!el || !scrollable(el)) return;
+    scored.set(el, Math.max(scored.get(el) || 0, score));
+  };
+  for (const attr of ['aria-controls', 'aria-owns']) {
+    const id = input.getAttribute(attr);
+    add(id && document.getElementById(id), 100000);
+  }
+  for (const row of ownedRows) {
+    add(row.closest?.('[role="listbox"]'), 90000);
+    let parent = row.parentElement;
+    for (let depth = 0; parent && parent !== document.body && depth < 10; depth++, parent = parent.parentElement) {
+      if (scrollable(parent)) {
+        add(parent, 50000 - depth * 100 + ownedRows.filter((x) => parent.contains(x)).length * 1000);
+        break;
+      }
+    }
+  }
+  if (!scored.size) {
+    for (const el of document.querySelectorAll('body *')) {
+      if (!scrollable(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (!nearInput(r) || r.width < Math.min(ir.width * .45, 260)) continue;
+      const contained = ownedRows.filter((row) => el.contains(row)).length;
+      if (contained) add(el, 10000 + contained * 1000);
+    }
+  }
+  const ranked = [...scored.entries()].sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1];
+    const ar = a[0].getBoundingClientRect(), br = b[0].getBoundingClientRect();
+    return ar.width * ar.height - br.width * br.height;
+  });
+  if (!ranked.length) {
+    return {found:false,moved:false,at_end:true,reason:'no_query_scroll_surface'};
+  }
+
+  const surface = ranked[0][0];
+  const before = Number(surface.scrollTop || 0);
+  const maxScroll = Math.max(0, Number(surface.scrollHeight || 0) - Number(surface.clientHeight || 0));
+  const desired = reset
+    ? 0
+    : Math.min(maxScroll, before + Math.max(80, Number(surface.clientHeight || 0) * 0.78));
+  surface.scrollTop = desired;
+  surface.dispatchEvent(new Event('scroll', {bubbles:true}));
+  const after = Number(surface.scrollTop || 0);
+  return {
+    found:true,
+    moved:Math.abs(after - before) > 1,
+    at_end:maxScroll <= 1 || after >= maxScroll - 2,
+    scroll_top:after,
+    max_scroll:maxScroll,
+    scroll_height:Number(surface.scrollHeight || 0),
+    client_height:Number(surface.clientHeight || 0),
+  };
+}
+"""
+
+
 _CLICK_ROW_JS = r"""
-(input, wanted) => {
+async (input, wanted) => {
   const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
   const normalize = (v) => clean(v).toLocaleLowerCase();
   const wantedKey = normalize(wanted);
@@ -168,6 +289,7 @@ _CLICK_ROW_JS = r"""
   if (!state || !state.baseline) return {clicked:false, reason:'missing_query_state'};
   const baseline = state.baseline;
   const ir = input.getBoundingClientRect();
+  const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   const visible = (el) => {
     if (!el || !(el instanceof Element)) return false;
@@ -234,48 +356,113 @@ _CLICK_ROW_JS = r"""
     }
     return null;
   };
-
-  const matches = [];
-  const seen = new Set();
-  for (const el of document.querySelectorAll('body *')) {
-    if (!visible(el) || el === input || el.contains(input)) continue;
-    if (!changed(el) && !explicitOwned(el)) continue;
-    const row = rowAncestor(el);
-    if (!row || seen.has(row) || normalize(label(row)) !== wantedKey) continue;
-    seen.add(row);
-    matches.push(row);
-  }
-  if (matches.length !== 1) {
-    return {clicked:false, reason:'non_unique_exact_row', match_count:matches.length};
-  }
-
-  // The exact query-owned row is the semantic boundary. We may use an actionable
-  // wrapper only while that wrapper renders exactly the same row label. Never
-  // climb into a larger result/list/container whose text no longer equals the
-  // selected candidate: that can dispatch the wrong Vertical.
-  let target = matches[0];
-  for (let depth = 0; target && target !== document.body && depth < 5; depth++, target = target.parentElement) {
-    if (target === input || target.contains(input) || !visible(target)) break;
-    const targetText = label(target);
-    if (normalize(targetText) !== wantedKey) break;
-    if (!actionable(target)) continue;
-    const role = String(target.getAttribute?.('role') || '').toLowerCase();
-    const result = {
-      clicked:true,
-      strategy: depth === 0 ? 'exact_row' : 'same_label_wrapper',
-      depth,
-      row_label: label(matches[0]),
-      target_label: targetText,
-      target_tag: String(target.tagName || '').toLowerCase(),
-      target_role: role,
-      data_value: clean(target.getAttribute?.('data-value') || ''),
-      data_vertical: clean(target.getAttribute?.('data-vertical') || ''),
-      href: clean(target.getAttribute?.('href') || ''),
+  const scrollable = (el) => {
+    if (!visible(el)) return false;
+    const s = getComputedStyle(el);
+    return el.scrollHeight > el.clientHeight + 8
+      && (['auto','scroll'].includes(s.overflowY) || el.scrollHeight > el.clientHeight + 20);
+  };
+  const exactRows = () => {
+    const matches = [], seen = new Set();
+    for (const el of document.querySelectorAll('body *')) {
+      if (!visible(el) || el === input || el.contains(input)) continue;
+      if (!changed(el) && !explicitOwned(el)) continue;
+      const row = rowAncestor(el);
+      if (!row || seen.has(row) || normalize(label(row)) !== wantedKey) continue;
+      seen.add(row);
+      matches.push(row);
+    }
+    return matches;
+  };
+  const visibleOwnedRows = () => {
+    const rows = [];
+    for (const el of document.querySelectorAll('body *')) {
+      if (!visible(el) || el === input || el.contains(input)) continue;
+      if (!changed(el) && !explicitOwned(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (!nearInput(r) || (!semantic(el) && !explicitOwned(el))) continue;
+      rows.push(el);
+    }
+    return rows;
+  };
+  const findScroller = () => {
+    const rows = visibleOwnedRows();
+    const scored = new Map();
+    const add = (el, score) => {
+      if (!el || !scrollable(el)) return;
+      scored.set(el, Math.max(scored.get(el) || 0, score));
     };
-    target.click();
-    return result;
+    for (const attr of ['aria-controls', 'aria-owns']) {
+      const id = input.getAttribute(attr);
+      add(id && document.getElementById(id), 100000);
+    }
+    for (const row of rows) {
+      add(row.closest?.('[role="listbox"]'), 90000);
+      let parent = row.parentElement;
+      for (let depth = 0; parent && parent !== document.body && depth < 10; depth++, parent = parent.parentElement) {
+        if (scrollable(parent)) {
+          add(parent, 50000 - depth * 100 + rows.filter((x) => parent.contains(x)).length * 1000);
+          break;
+        }
+      }
+    }
+    const ranked = [...scored.entries()].sort((a, b) => b[1] - a[1]);
+    return ranked.length ? ranked[0][0] : null;
+  };
+  const tryClick = (seekStep) => {
+    const matches = exactRows();
+    if (matches.length !== 1) {
+      return {clicked:false, reason:'non_unique_exact_row', match_count:matches.length, seek_step:seekStep};
+    }
+    let target = matches[0];
+    for (let depth = 0; target && target !== document.body && depth < 5; depth++, target = target.parentElement) {
+      if (target === input || target.contains(input) || !visible(target)) break;
+      const targetText = label(target);
+      if (normalize(targetText) !== wantedKey) break;
+      if (!actionable(target)) continue;
+      const role = String(target.getAttribute?.('role') || '').toLowerCase();
+      const result = {
+        clicked:true,
+        strategy: depth === 0 ? 'exact_row' : 'same_label_wrapper',
+        depth,
+        seek_step:seekStep,
+        row_label: label(matches[0]),
+        target_label: targetText,
+        target_tag: String(target.tagName || '').toLowerCase(),
+        target_role: role,
+        data_value: clean(target.getAttribute?.('data-value') || ''),
+        data_vertical: clean(target.getAttribute?.('data-vertical') || ''),
+        href: clean(target.getAttribute?.('href') || ''),
+      };
+      target.click();
+      return result;
+    }
+    return {clicked:false, reason:'no_exact_action_target', row_label:label(matches[0]), seek_step:seekStep};
+  };
+
+  let surface = findScroller();
+  if (surface) {
+    surface.scrollTop = 0;
+    surface.dispatchEvent(new Event('scroll', {bubbles:true}));
+    await pause(80);
   }
-  return {clicked:false, reason:'no_exact_action_target', row_label:label(matches[0])};
+  let last = {clicked:false, reason:'exact_row_not_found'};
+  for (let step = 0; step < 64; step++) {
+    last = tryClick(step);
+    if (last.clicked) return last;
+    surface = findScroller() || surface;
+    if (!surface || !scrollable(surface)) return last;
+    const maxScroll = Math.max(0, surface.scrollHeight - surface.clientHeight);
+    const before = Number(surface.scrollTop || 0);
+    if (maxScroll <= 1 || before >= maxScroll - 2) {
+      return {...last, reason:'exact_row_not_found_after_full_scroll', reached_end:true};
+    }
+    const next = Math.min(maxScroll, before + Math.max(80, surface.clientHeight * 0.78));
+    surface.scrollTop = next;
+    surface.dispatchEvent(new Event('scroll', {bubbles:true}));
+    await pause(90);
+  }
+  return {...last, reason:'exact_row_seek_budget_exhausted'};
 }
 """
 
@@ -287,7 +474,7 @@ def begin_search_query(search: Any) -> None:
 
 
 def read_search_rows(search: Any) -> list[str]:
-    """Return only rows owned by the query begun for ``search``."""
+    """Return only currently visible rows owned by the active query."""
 
     try:
         raw = search.evaluate(_READ_ROWS_JS)
@@ -305,6 +492,74 @@ def read_search_rows(search: Any) -> list[str]:
     return output
 
 
+def _move_search_surface(search: Any, *, reset: bool = False) -> dict[str, Any]:
+    try:
+        raw = search.evaluate(_MOVE_SEARCH_SURFACE_JS, bool(reset))
+    except Exception:
+        return {"found": False, "moved": False, "at_end": True, "reason": "evaluate_failed"}
+    return dict(raw) if isinstance(raw, dict) else {
+        "found": False,
+        "moved": False,
+        "at_end": True,
+        "reason": "invalid_scroll_state",
+    }
+
+
+def _append_unique_rows(output: list[str], seen: set[str], rows: list[str]) -> int:
+    added = 0
+    for raw in rows:
+        value = " ".join(str(raw or "").split()).strip()
+        key = value.casefold()
+        if not value or key in seen:
+            continue
+        seen.add(key)
+        output.append(value)
+        added += 1
+    return added
+
+
+def harvest_search_rows(
+    page: Any,
+    search: Any,
+    *,
+    poll_ms: int = 160,
+    max_scroll_steps: int = 64,
+    max_stagnant_rounds: int = 3,
+) -> list[str]:
+    """Harvest every query-owned row exposed by a scrollable result surface.
+
+    The dropdown is reset to its top before harvesting and restored there before
+    returning. Each scroll page contributes exact query-owned rows only. Virtual
+    lists are supported because rows are accumulated while the surface moves.
+    """
+
+    poll = max(50, int(poll_ms))
+    output: list[str] = []
+    seen: set[str] = set()
+    _move_search_surface(search, reset=True)
+    page.wait_for_timeout(poll)
+    _append_unique_rows(output, seen, read_search_rows(search))
+
+    stagnant = 0
+    for _ in range(max(1, int(max_scroll_steps))):
+        state = _move_search_surface(search, reset=False)
+        if not state.get("found"):
+            break
+        if state.get("moved"):
+            page.wait_for_timeout(poll)
+            added = _append_unique_rows(output, seen, read_search_rows(search))
+            stagnant = 0 if added else stagnant + 1
+        else:
+            stagnant += 1
+        if state.get("at_end") or stagnant >= max(1, int(max_stagnant_rounds)):
+            break
+
+    _move_search_surface(search, reset=True)
+    page.wait_for_timeout(poll)
+    _append_unique_rows(output, seen, read_search_rows(search))
+    return output
+
+
 def wait_for_search_rows(
     page: Any,
     search: Any,
@@ -312,7 +567,7 @@ def wait_for_search_rows(
     timeout_ms: int = 4000,
     poll_ms: int = 200,
 ) -> list[str]:
-    """Boundedly wait for query-owned rows; never fall back to page-wide text."""
+    """Wait for a query surface, then return its complete scroll-harvested rows."""
 
     timeout = max(0, int(timeout_ms))
     poll = max(50, int(poll_ms))
@@ -320,13 +575,16 @@ def wait_for_search_rows(
     for _ in range(attempts):
         rows = read_search_rows(search)
         if rows:
-            return rows
+            return harvest_search_rows(page, search, poll_ms=min(poll, 180))
         page.wait_for_timeout(poll)
-    return read_search_rows(search)
+    rows = read_search_rows(search)
+    if not rows:
+        return []
+    return harvest_search_rows(page, search, poll_ms=min(poll, 180))
 
 
 def click_search_row(search: Any, label: str) -> bool:
-    """Click one exact query-owned row without escaping its semantic boundary."""
+    """Seek and click one exact query-owned row across the full result surface."""
 
     try:
         raw = search.evaluate(_CLICK_ROW_JS, str(label or "").strip())
@@ -350,6 +608,7 @@ def click_search_row(search: Any, label: str) -> bool:
 __all__ = [
     "begin_search_query",
     "click_search_row",
+    "harvest_search_rows",
     "read_search_rows",
     "wait_for_search_rows",
 ]
