@@ -7,13 +7,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QFile, QIODevice, QProcess, Qt, QTimer, QUrl, QUrlQuery
+from PySide6.QtCore import QFile, QIODevice, Qt, QTimer, QUrl, QUrlQuery
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtNetwork import QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QProgressDialog
 
 from gui.app_updater import (
     ApplicationUpdater as _BaseApplicationUpdater,
+    _launch_installer_waiter,
     _sha256_file,
     _update_marker_path,
     _version_key,
@@ -28,7 +29,6 @@ _NETWORK_TIMEOUT_MS = 20_000
 _RETRY_DELAY_MS = 650
 _MAX_RELEASE_ATTEMPTS = 2
 _MAX_MANIFEST_ATTEMPTS = 2
-_INSTALLER_HANDOFF_MS = 1_200
 _DIAGNOSTIC_LOG = "updater-network.jsonl"
 
 _RETRIABLE_ERRORS = {
@@ -714,7 +714,7 @@ class ApplicationUpdater(_BaseApplicationUpdater):
         version = str(manifest["version"]).strip().lstrip("v")
         self._set_progress_phase(
             "步骤 4/4 · 校验通过，正在启动安装程序…\n"
-            "接下来会显示安装进度，完成后 Listing Studio 将自动重新打开。",
+            "安装完成后会自动重新打开。",
             cancellable=False,
         )
         _write_update_marker(version)
@@ -726,27 +726,26 @@ class ApplicationUpdater(_BaseApplicationUpdater):
             "/CLOSEAPPLICATIONS",
             "/NORESTARTAPPLICATIONS",
         ]
-        started = QProcess.startDetached(str(path), arguments)
-        ok = bool(started[0]) if isinstance(started, tuple) else bool(started)
-        if not ok:
+        # Same modal-dialog trap as the base updater: an open modal progress
+        # dialog keeps the process alive, so Inno Setup's RestartManager cannot
+        # close us and the silent install is rolled back. Close the dialog
+        # first, then launch the installer from a detached waiter that runs only
+        # after this process (and the workflow worker) has fully exited.
+        self._close_progress()
+        started = _launch_installer_waiter(path, arguments)
+        if not started:
             try:
                 _update_marker_path().unlink(missing_ok=True)
             except OSError:
                 pass
             self._last_prompted_version = None
-            self._close_progress()
             self._show_update_message(
                 QMessageBox.Icon.Critical,
                 "无法启动更新安装程序。",
             )
             return
 
-        self._set_progress_phase(
-            "步骤 4/4 · 安装程序已启动。\n"
-            "Listing Studio 即将关闭；安装完成后会自动重新打开。",
-            cancellable=False,
-        )
-        QTimer.singleShot(_INSTALLER_HANDOFF_MS, QApplication.quit)
+        QTimer.singleShot(120, QApplication.quit)
 
 
 def install_application_updater(

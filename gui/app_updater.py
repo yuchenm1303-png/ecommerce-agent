@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -50,6 +51,75 @@ _AUTO_CHECK_INTERVAL_MS = 60 * 60 * 1000
 _NETWORK_TIMEOUT_MS = 10_000
 _UPDATE_MARKER_NAME = "update-complete.json"
 # Stable-channel validation remains equivalent to: manifest.get("channel") != "stable".
+
+_INSTALLER_WAIT_APP_DEADLINE_S = 30
+_INSTALLER_WAIT_WORKER_DEADLINE_S = 15
+_INSTALLER_WAIT_SETTLE_MS = 1_500
+_INSTALLER_WAIT_WORKER = "EcommerceAgentWorker"
+
+
+def _installer_waiter_script(pid: int, installer: Path, arguments: list[str]) -> str:
+    """PowerShell command that runs the installer only after this app is gone.
+
+    The running app holds its own ``{app}`` image open, so Inno Setup's
+    RestartManager cannot close it while we are alive and, with
+    ``/SUPPRESSMSGBOXES``, silently aborts the upgrade. Launching the installer
+    only once our PID (and the workflow worker) has fully exited removes that
+    failure mode. If the app never exits within the deadline the helper exits
+    without installing, so a broken close path cannot loop on silent rollbacks.
+    """
+
+    quoted = ", ".join(f"'{arg.replace(chr(39), chr(39) * 2)}'" for arg in arguments)
+    install = str(installer).replace("'", "''")
+    return (
+        "$deadline=(Get-Date).AddSeconds(%d);"
+        "$app=Get-Process -Id %d -ErrorAction SilentlyContinue;"
+        "while($app -and ((Get-Date) -lt $deadline)){"
+        "Start-Sleep -Milliseconds 250;"
+        "$app=Get-Process -Id %d -ErrorAction SilentlyContinue};"
+        "if($app){exit};"
+        "$wdead=(Get-Date).AddSeconds(%d);"
+        "while((Get-Process %s -ErrorAction SilentlyContinue)"
+        " -and ((Get-Date) -lt $wdead)){Start-Sleep -Milliseconds 250};"
+        "Start-Sleep -Milliseconds %d;"
+        "Start-Process -FilePath '%s' -ArgumentList @(%s)"
+        % (
+            _INSTALLER_WAIT_APP_DEADLINE_S,
+            pid,
+            pid,
+            _INSTALLER_WAIT_WORKER_DEADLINE_S,
+            _INSTALLER_WAIT_WORKER,
+            _INSTALLER_WAIT_SETTLE_MS,
+            install,
+            quoted,
+        )
+    )
+
+
+def _launch_installer_waiter(installer: Path, arguments: list[str]) -> bool:
+    """Detach a hidden helper that runs the installer after this process exits."""
+
+    try:
+        subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                _installer_waiter_script(os.getpid(), installer, arguments),
+            ],
+            creationflags=(
+                subprocess.CREATE_NO_WINDOW
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except OSError:
+        return False
 
 
 def _version_key(value: str) -> tuple[int, int, int] | None:
@@ -713,7 +783,7 @@ class ApplicationUpdater(QObject):
 
         version = str(manifest["version"]).strip().lstrip("v")
         self._set_progress_phase(
-            "校验通过，正在启动安装程序…\n接下来会显示安装进度，完成后 Listing Studio 将自动重新打开。",
+            "校验通过，正在启动安装程序…\n更新完成后会自动重新打开。",
             cancellable=False,
         )
         _write_update_marker(version)
@@ -725,9 +795,15 @@ class ApplicationUpdater(QObject):
             "/CLOSEAPPLICATIONS",
             "/NORESTARTAPPLICATIONS",
         ]
-        started = QProcess.startDetached(str(path), arguments)
-        ok = bool(started[0]) if isinstance(started, tuple) else bool(started)
-        if not ok:
+        # Close the modal progress dialog before quitting: while a modal dialog
+        # is open Qt runs a nested event loop, so QApplication.quit() cannot
+        # terminate the process. The app would stay alive holding its {app}
+        # files open and Inno Setup's RestartManager would silently abort the
+        # silent install (rolling back the update). Launch the installer from a
+        # detached waiter that runs only after this process has exited.
+        self._close_progress()
+        started = _launch_installer_waiter(path, arguments)
+        if not started:
             try:
                 _update_marker_path().unlink(missing_ok=True)
             except OSError:
@@ -736,11 +812,7 @@ class ApplicationUpdater(QObject):
             QMessageBox.critical(self.window, "Listing Studio 更新", "无法启动更新安装程序。")
             return
 
-        self._set_progress_phase(
-            "安装程序已启动。Listing Studio 即将关闭；更新完成后会自动重新打开。",
-            cancellable=False,
-        )
-        QTimer.singleShot(450, QApplication.quit)
+        QTimer.singleShot(120, QApplication.quit)
 
 
 def install_application_updater(
