@@ -34,11 +34,12 @@ PRODUCT_PHOTOS = "Product Photos"
 
 
 def resolver_evidence_images(outputs: dict[str, Any]) -> list[Path]:
-    """Return the exact image universe used by the Resolver.
+    """Return the exact image universe used by the Resolver, which may be empty.
 
     Product images are authoritative when capture downloaded them. The page
     screenshot is only the Resolver's fallback when no product image exists;
-    combining both changes the strict source-manifest digest.
+    combining both changes the strict source-manifest digest. Customer document
+    packs may legitimately be text/table-only, so no synthetic image is invented.
     """
 
     product_images = [
@@ -163,6 +164,7 @@ class RealExecutionRunner(QObject):
         self._emit_log("===== REAL MAKRO EXECUTION =====")
         self._emit_log(f"scope={config.scope}")
         self._emit_log(f"allow_save={config.allow_save}")
+        self._emit_log(f"evidence_images={len(prepared['evidence_images'])}")
         self._emit_log(f"upload_images={len(config.upload_images)}")
         self._emit_log(f"makro_target_id={makro_target_id or '<legacy-unique-tab>'}")
         self._emit_log("send_to_qc=False (repository policy lock)")
@@ -222,8 +224,6 @@ class RealExecutionRunner(QObject):
             "snapshot": snapshot,
         }
         missing = [f"{name}={path}" for name, path in required.items() if not path.is_file()]
-        if not evidence_images:
-            missing.append("evidence_images=<missing>")
         if not product_url:
             missing.append("primary_product_url=<missing>")
         if ownership_mode in {"fresh_dedicated_tab", "resume_exact_page"} and not makro_target_id:
