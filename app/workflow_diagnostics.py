@@ -9,6 +9,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from .task_control import safe_pause_point
+
 
 _SECRET_FRAGMENTS = (
     "api_key",
@@ -24,6 +26,7 @@ _SECRET_FRAGMENTS = (
 _MAX_STRING_CHARS = 12_000
 _MAX_COLLECTION_ITEMS = 100
 _MAX_DEPTH = 5
+_SAFE_PAUSE_EVENT_STAGES = {"source", "step1", "step2", "step3", "subprocess"}
 
 
 class WorkflowDiagnostics:
@@ -142,6 +145,37 @@ def _emit_safely(action) -> dict[str, Any] | None:
         return None
 
 
+def _pause_checkpoint(stage: str, details: dict[str, Any]) -> str:
+    if stage != "subprocess":
+        return stage
+    label = str(details.get("label") or "subprocess").strip()
+    return "subprocess:" + "_".join(label.casefold().split())[:120]
+
+
+def _pause_after_safe_event(stage: str, event: str, details: dict[str, Any]) -> None:
+    if str(event or "").upper() != "COMPLETE" or stage not in _SAFE_PAUSE_EVENT_STAGES:
+        return
+    current = _current
+    if current is None:
+        return
+    try:
+        safe_pause_point(
+            current.run_dir,
+            _pause_checkpoint(stage, details),
+            context={
+                "workflow": current.workflow,
+                "stage": stage,
+                **_sanitize_mapping(details),
+            },
+        )
+    except RuntimeError as exc:
+        if "stopped while paused" in str(exc).casefold():
+            raise
+        print(f"TASK_CONTROL_FALLBACK error={type(exc).__name__}: {exc}", flush=True)
+    except Exception as exc:
+        print(f"TASK_CONTROL_FALLBACK error={type(exc).__name__}: {exc}", flush=True)
+
+
 def _install_excepthook() -> None:
     global _excepthook_installed
     if _excepthook_installed:
@@ -191,7 +225,11 @@ def diag_event(stage: str, event: str, **details: Any) -> dict[str, Any] | None:
     current = _current
     if current is None:
         return None
-    return _emit_safely(lambda: current.emit(stage, event, **details))
+    normalized_stage = str(stage or "unknown").strip() or "unknown"
+    normalized_event = str(event or "INFO").strip().upper() or "INFO"
+    body = _emit_safely(lambda: current.emit(normalized_stage, normalized_event, **details))
+    _pause_after_safe_event(normalized_stage, normalized_event, details)
+    return body
 
 
 def diag_exception(stage: str, exc: BaseException, **details: Any) -> dict[str, Any] | None:
