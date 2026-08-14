@@ -26,7 +26,7 @@ def main() -> int:
 
     from gui.activity_presence import install_activity_presence
     from gui.app_access import ensure_application_access, install_application_access
-    from gui.app_updater import install_application_updater
+    from gui.resilient_app_updater import install_application_updater
     from gui.batch_card_responsive import install_batch_card_responsive
     from gui.batch_job_controls import install_batch_job_controls
     from gui.batch_sku_spec_ui import install_batch_sku_spec_ui
