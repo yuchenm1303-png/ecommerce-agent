@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QRectF, Qt, QTimer
+from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QCursor, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
@@ -37,6 +37,7 @@ class _CardScaleEffect(QGraphicsEffect):
         self._freeze_requested = False
         self._frozen_source: QPixmap | None = None
         self._frozen_offset = QPoint()
+        self._frozen_center: QPointF | None = None
         self.setEnabled(False)
 
     @property
@@ -50,6 +51,7 @@ class _CardScaleEffect(QGraphicsEffect):
     def _clear_frozen_source(self) -> None:
         self._frozen_source = None
         self._frozen_offset = QPoint()
+        self._frozen_center = None
 
     def _content_span(self) -> float:
         frame = self.parent()
@@ -109,14 +111,15 @@ class _CardScaleEffect(QGraphicsEffect):
             half_h * 2.0,
         )
 
-    def _current_composite(self) -> tuple[QPixmap | None, QPoint]:
+    def _current_composite(self) -> tuple[QPixmap | None, QPoint, QPointF | None]:
         if (
             self._frozen
             and not self._freeze_requested
             and self._frozen_source is not None
             and not self._frozen_source.isNull()
+            and self._frozen_center is not None
         ):
-            return self._frozen_source, self._frozen_offset
+            return self._frozen_source, self._frozen_offset, self._frozen_center
 
         offset = QPoint()
         pixmap = self.sourcePixmap(
@@ -125,13 +128,18 @@ class _CardScaleEffect(QGraphicsEffect):
             QGraphicsEffect.PixmapPadMode.NoPad,
         )
         if pixmap.isNull():
-            return None, QPoint()
+            return None, QPoint(), None
 
+        # sourceBoundingRect() can walk the effect source. During a frozen tween
+        # the source geometry cannot change, so resolve its transform origin once
+        # with the captured composite instead of asking Qt for it on every frame.
+        center = self.sourceBoundingRect(Qt.CoordinateSystem.LogicalCoordinates).center()
         if self._frozen:
             self._frozen_source = pixmap
             self._frozen_offset = QPoint(offset)
+            self._frozen_center = QPointF(center)
             self._freeze_requested = False
-        return pixmap, offset
+        return pixmap, offset, center
 
     def draw(self, painter: QPainter) -> None:  # type: ignore[override]
         scale = self._scale
@@ -139,13 +147,11 @@ class _CardScaleEffect(QGraphicsEffect):
             self.drawSource(painter)
             return
 
-        pixmap, offset = self._current_composite()
-        if pixmap is None:
+        pixmap, offset, center = self._current_composite()
+        if pixmap is None or center is None:
             self.drawSource(painter)
             return
 
-        source_rect = self.sourceBoundingRect(Qt.CoordinateSystem.LogicalCoordinates)
-        center = source_rect.center()
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.translate(center)
