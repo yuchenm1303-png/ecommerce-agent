@@ -18,12 +18,13 @@ _ORIGINAL_QML = bg._qml_source
 
 
 def _regional_qml_source() -> str:
-    """Replace the full-window mask/effect pass with card-sized glass layers.
+    """Replace the full-window mask/effect pass with stable card-sized glass layers.
 
     The wallpaper asset, pre-blur, parallax coordinates, card geometry, radius,
-    alpha and QWidget foreground remain identical. Only the compositor surface
-    area changes: each visible card owns a small texture/effect instead of one
-    window-sized MultiEffect + mask texture.
+    alpha and QWidget foreground remain identical. Each visible card gets an
+    explicit source item, mask item and MultiEffect. The effect is no longer a
+    layer.effect owned by the same item it renders, so source/mask lifetime is
+    independent from delegate clipping and visibility changes.
     """
 
     source = _ORIGINAL_QML()
@@ -53,30 +54,45 @@ def _regional_qml_source() -> str:
                 y: cardY - clipY
                 width: cardW
                 height: cardH
-                clip: true
-                layer.enabled: true
-                layer.smooth: true
-                layer.effect: MultiEffect {{
-                    maskEnabled: true
-                    maskSource: Rectangle {{
-                        width: regionalGlass.width
-                        height: regionalGlass.height
-                        radius: {bg._GLASS_RADIUS:.1f}
-                        color: "white"
-                        layer.enabled: true
+                visible: width > 0 && height > 0
+
+                Item {{
+                    id: regionalSource
+                    anchors.fill: parent
+                    clip: true
+                    visible: false
+                    layer.enabled: true
+                    layer.smooth: true
+
+                    Image {{
+                        width: root.width * {bg._OVERSCAN}
+                        height: root.height * {bg._OVERSCAN}
+                        x: root.imageX - cardX
+                        y: root.imageY - cardY
+                        source: root.blurUrl
+                        fillMode: Image.PreserveAspectCrop
+                        smooth: true
+                        cache: true
                     }}
-                    autoPaddingEnabled: false
                 }}
 
-                Image {{
-                    width: root.width * {bg._OVERSCAN}
-                    height: root.height * {bg._OVERSCAN}
-                    x: root.imageX - cardX
-                    y: root.imageY - cardY
-                    source: root.blurUrl
-                    fillMode: Image.PreserveAspectCrop
-                    smooth: true
-                    cache: true
+                Rectangle {{
+                    id: regionalMask
+                    anchors.fill: parent
+                    radius: {bg._GLASS_RADIUS:.1f}
+                    color: "white"
+                    visible: false
+                    layer.enabled: true
+                    layer.smooth: true
+                }}
+
+                MultiEffect {{
+                    id: regionalEffect
+                    anchors.fill: parent
+                    source: regionalSource
+                    maskEnabled: true
+                    maskSource: regionalMask
+                    autoPaddingEnabled: false
                 }}
             }}
         }}
@@ -85,8 +101,18 @@ def _regional_qml_source() -> str:
     candidate = source[:start] + regional + source[end:]
     if "id: glassMaskScene" in candidate or "ShaderEffectSource" in candidate:
         raise RuntimeError("regional candidate still contains the full-window mask path")
-    if "id: regionalGlass" not in candidate or "layer.effect: MultiEffect" not in candidate:
-        raise RuntimeError("regional candidate compositor was not installed")
+    for required in (
+        "id: regionalGlass",
+        "id: regionalSource",
+        "id: regionalMask",
+        "id: regionalEffect",
+        "source: regionalSource",
+        "maskSource: regionalMask",
+    ):
+        if required not in candidate:
+            raise RuntimeError(f"regional candidate missing stable compositor token: {required}")
+    if "layer.effect: MultiEffect" in candidate:
+        raise RuntimeError("regional candidate still uses the unstable layer.effect lifecycle")
     return candidate
 
 
@@ -108,6 +134,8 @@ def _run_variant(args: argparse.Namespace) -> int:
 
     if args.variant == "regional":
         bg._qml_source = _regional_qml_source
+
+    print(f"[real-glass] VARIANT={args.variant} · visual blur must remain present on every visible card")
 
     from tools import gui_real_app_perf as real_perf
 
@@ -133,6 +161,7 @@ def _run_variant(args: argparse.Namespace) -> int:
     payload = json.loads(raw_path.read_text(encoding="utf-8"))
     label = f"glass-{args.variant}"
     payload["glass_variant"] = args.variant
+    payload["visual_gate_required"] = True
     payload["summary"]["variant"] = label
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     final_path = output_dir / f"real-gui-glass-{args.variant}-{stamp}.json"
@@ -153,6 +182,7 @@ def _run_variant(args: argparse.Namespace) -> int:
         f"{float(summary['quick_swap_p99_ms']):.2f} ms"
     )
     print(f"CPU core             {float(summary['cpu_core_percent']):.2f}%")
+    print("VISUAL GATE           REQUIRED · every visible glass card must retain blur")
     print(f"JSON                 {final_path}")
     return int(rc)
 
@@ -187,13 +217,15 @@ def _compare(paths: list[Path]) -> int:
 
     weighted = gains["quick_swap_p95_ms"] * 0.4 + gains["quick_swap_p99_ms"] * 0.6
     if weighted >= 8.0 and gains["presentation_tick_p99_ms"] > -8.0:
-        verdict = "REGIONAL CANDIDATE"
+        verdict = "REGIONAL PERF CANDIDATE"
     elif weighted <= 2.0:
         verdict = "KEEP FULL-WINDOW"
     else:
         verdict = "INCONCLUSIVE"
     print(f"weighted Quick gain   {weighted:+.1f}%")
     print(f"VERDICT: {verdict}")
+    if verdict == "REGIONAL PERF CANDIDATE":
+        print("VISUAL GATE: REQUIRED · do not promote unless every visible card keeps blur for the full run")
     return 0
 
 

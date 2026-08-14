@@ -15,13 +15,18 @@ def test_real_glass_ab_is_development_only_and_compiles() -> None:
     assert "regionalGlass" not in NATIVE
 
 
-def test_regional_candidate_keeps_visual_inputs_and_removes_full_window_mask_path() -> None:
+def test_regional_candidate_uses_explicit_stable_source_and_mask_lifetimes() -> None:
     for token in (
         'VARIANTS = ("full-window", "regional")',
         "_ORIGINAL_QML = bg._qml_source",
         "bg._qml_source = _regional_qml_source",
         "id: regionalGlass",
-        "layer.effect: MultiEffect",
+        "id: regionalSource",
+        "id: regionalMask",
+        "id: regionalEffect",
+        "source: regionalSource",
+        "maskSource: regionalMask",
+        "layer.enabled: true",
         "maskEnabled: true",
         "radius: {bg._GLASS_RADIUS:.1f}",
         "width: root.width * {bg._OVERSCAN}",
@@ -32,19 +37,23 @@ def test_regional_candidate_keeps_visual_inputs_and_removes_full_window_mask_pat
         "cache: true",
     ):
         assert token in TOOL
+    assert "layer.effect: MultiEffect" not in TOOL.split("def _regional_qml_source", 1)[1].split("def _latest_new_json", 1)[0]
     assert '"id: glassMaskScene" in candidate' in TOOL
     assert '"ShaderEffectSource" in candidate' in TOOL
 
 
-def test_real_glass_ab_reuses_real_app_profiler_and_has_explicit_gate() -> None:
+def test_real_glass_ab_reuses_real_app_profiler_and_requires_visual_gate() -> None:
     for token in (
         "from tools import gui_real_app_perf as real_perf",
         '"--variant",\n        "current"',
         "real_perf.main()",
         "REAL GUI GLASS A/B · regional vs full-window",
         "weighted = gains[\"quick_swap_p95_ms\"] * 0.4",
-        'verdict = "REGIONAL CANDIDATE"',
+        'verdict = "REGIONAL PERF CANDIDATE"',
         'verdict = "KEEP FULL-WINDOW"',
         'verdict = "INCONCLUSIVE"',
+        'payload["visual_gate_required"] = True',
+        "VISUAL GATE: REQUIRED",
+        "every visible card keeps blur",
     ):
         assert token in TOOL
