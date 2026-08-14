@@ -22,6 +22,21 @@ def test_formal_gui_uses_product_input_window() -> None:
         assert suffix in WINDOW
 
 
+def test_product_pack_entry_reuses_shared_detail_panel_and_manages_multiple_files() -> None:
+    assert "self.product_pack_button.clicked.connect(self._open_product_pack_panel)" in WINDOW
+    assert "controller.open_custom(" in WINDOW
+    assert 'title="上传商品资料"' in WINDOW
+    assert "QFileDialog.getOpenFileNames(" in WINDOW
+    assert "QFileDialog.getExistingDirectory(" in WINDOW
+    assert "self._selected_product_files + validated" in WINDOW
+    assert 'add_files = QPushButton("添加文件")' in WINDOW
+    assert 'add_folder = QPushButton("添加文件夹")' in WINDOW
+    assert 'remove = QPushButton("移除选中")' in WINDOW
+    assert 'clear = QPushButton("清空全部")' in WINDOW
+    assert "QTableWidget(0, 4)" in WINDOW
+    assert 'table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)' in WINDOW
+
+
 def test_runner_routes_product_files_to_pack_workflow() -> None:
     assert "product_files: tuple[str, ...] = ()" in RUNNER
     assert 'script = "makro_product_pack_workflow.py" if is_pack else "makro_gui_workflow.py"' in RUNNER
