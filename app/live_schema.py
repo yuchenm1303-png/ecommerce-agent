@@ -9,6 +9,7 @@ from typing import Any, Iterable
 from .source_bundle import normalize_key
 
 SCHEMA_VERSION = 1
+_INDEXED_VALUE_CONTROL_RE = re.compile(r"_\d+_value$")
 
 
 def _stable_section(value: object) -> str:
@@ -121,13 +122,36 @@ def _field_context(field: dict[str, Any]) -> str:
     return " | ".join(parts)
 
 
+def _field_multi_value(field: dict[str, Any]) -> bool:
+    """Normalize Makro's repeatable-input contract before AI planning.
+
+    Makro initially renders some ``+`` attributes with exactly one visible slot.
+    Those slots still use the indexed ``<attribute>_0_value`` naming contract and
+    the executor can create additional rows on demand. Treating only two already
+    rendered indices as multi-value made Sales Package/Keywords collapse into one
+    string before execution. Indexed value naming is a DOM contract, not a field
+    label heuristic, so it applies generically to every repeatable attribute.
+    """
+
+    if bool(field.get("multi_value")):
+        return True
+    for control in field.get("controls") or []:
+        if not isinstance(control, dict):
+            continue
+        if bool(control.get("repeatable") or control.get("has_add_value_control")):
+            return True
+        if _INDEXED_VALUE_CONTROL_RE.search(str(control.get("name") or "")):
+            return True
+    return False
+
+
 def _schema_field(field: dict[str, Any]) -> dict[str, Any]:
     return {
         "attribute_key": str(field.get("attribute_key") or ""),
         "label": str(field.get("label") or ""),
         "section_heading": str(field.get("section_heading") or ""),
         "required": bool(field.get("required")),
-        "multi_value": bool(field.get("multi_value")),
+        "multi_value": _field_multi_value(field),
         "options": list(_field_options(field)),
         "qualifier_options": list(_qualifier_options(field)),
         "help_text": str(field.get("help_text") or ""),
@@ -182,7 +206,7 @@ def schema_field_signature(field: dict[str, Any]) -> tuple[object, ...]:
         normalize_key(field.get("label")),
         _stable_section(field.get("section_heading")),
         bool(field.get("required")),
-        bool(field.get("multi_value")),
+        _field_multi_value(field),
         tuple(sorted(normalize_key(item) for item in _field_options(field))),
         tuple(sorted(normalize_key(item) for item in _qualifier_options(field))),
     )
