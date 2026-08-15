@@ -74,7 +74,7 @@ def test_compact_evidence_keeps_later_customer_document_chunks() -> None:
     assert "Supplier duplicate storefront tail" not in compact.web_text
 
 
-def test_compact_evidence_preserves_image_ocr_and_fact_context() -> None:
+def test_compact_evidence_preserves_image_ocr_without_reinflating_model_notes() -> None:
     observation = ImageObservation(
         image_id="image:001:abc",
         origin="package.jpg",
@@ -95,8 +95,8 @@ def test_compact_evidence_preserves_image_ocr_and_fact_context() -> None:
 
     assert "visible_text=BOX CONTENTS 1 x HARDWIRE KIT 1 x USER MANUAL" in compact.image_facts
     assert "included items(packaging)=1 x Hardwire Kit; 1 x User Manual" in compact.image_facts
-    assert "evidence=The package graphic explicitly labels both delivered items" in compact.image_facts
-    assert "notes=Both labels point to objects shown inside the package contents panel" in compact.image_facts
+    assert "The package graphic explicitly labels both delivered items" not in compact.image_facts
+    assert "Both labels point to objects shown inside the package contents panel" not in compact.image_facts
     assert compact.image_fact_count == 1
 
 
