@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
@@ -22,7 +21,7 @@ from .business_fields import (
     BUSINESS_ATTRIBUTE_ALIASES,
     is_business_question,
 )
-from .hard_field_validators import validate_resolved_answer
+from .hard_field_validators import is_numeric_semantic_field, validate_resolved_answer
 from .resolution_types import (
     CONFLICT as RESOLVER_CONFLICT,
     MISSING as RESOLVER_MISSING,
@@ -139,23 +138,49 @@ def _exact_option(value: str, options: list[str]) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def _unit_context_texts(live_field: dict[str, Any]) -> list[str]:
+    """Return only field-local wording suitable for deterministic unit matching.
+
+    The broad context captured around a Makro attribute can include sibling
+    attributes and their units. Using that entire block as unit identity caused a
+    Length field to see a neighbouring mass unit. Prefer direct field/control
+    metadata and accept compact control context only when it is genuinely local.
+    """
+
+    output: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: object, *, compact_only: bool = False) -> None:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not text or (compact_only and len(text) > 80):
+            return
+        key = text.casefold()
+        if key not in seen:
+            seen.add(key)
+            output.append(text)
+
+    add(live_field.get("help_text"))
+    add(live_field.get("context_text"), compact_only=True)
+    for control in live_field.get("controls") or []:
+        if not isinstance(control, dict):
+            continue
+        for key in ("help_text", "placeholder", "aria_label"):
+            add(control.get(key))
+        add(control.get("context_text"), compact_only=True)
+    return output
+
+
 def _fixed_qualifier_rendered(live_field: dict[str, Any], qualifier: str) -> bool:
-    """Return True only when the exact unit token is visibly fixed in the live field context."""
+    """Return True only when the exact unit token is visibly local to this field."""
 
     token = qualifier.strip()
     if not token:
         return False
-    texts = [
-        str(live_field.get("context_text") or ""),
-        str(live_field.get("help_text") or ""),
-        *[
-            str(control.get("context_text") or "")
-            for control in live_field.get("controls") or []
-            if isinstance(control, dict)
-        ],
-    ]
-    pattern = re.compile(rf"(?<![0-9A-Za-z_]){re.escape(token)}(?![0-9A-Za-z_])", re.IGNORECASE)
-    return any(pattern.search(text) for text in texts if text)
+    pattern = re.compile(
+        rf"(?<![0-9A-Za-z_]){re.escape(token)}(?![0-9A-Za-z_])",
+        re.IGNORECASE,
+    )
+    return any(pattern.search(text) for text in _unit_context_texts(live_field))
 
 
 _UNIT_SCALE: dict[str, tuple[str, Decimal]] = {
@@ -192,6 +217,30 @@ def _convert_unit_values(values: list[str], source: str, target: str) -> list[st
     return output
 
 
+def _inline_qualifier_values(values: list[str], qualifier: str) -> list[str]:
+    """Losslessly serialize value+unit into one free-text Makro control.
+
+    When Makro exposes no separate qualifier selector and the primary control is
+    ordinary text, keeping the unit in a detached ``qualifier`` is an artificial
+    representation mismatch. Fold it into the value instead; numeric controls
+    never use this path.
+    """
+
+    rendered_qualifier = re.sub(r"[_\s]+", " ", qualifier.strip()).strip()
+    if not rendered_qualifier:
+        return values
+    suffix_key = re.sub(r"[^0-9a-z]+", "", rendered_qualifier.casefold())
+    output: list[str] = []
+    for raw in values:
+        value = str(raw).strip()
+        value_key = re.sub(r"[^0-9a-z]+", "", value.casefold())
+        if suffix_key and value_key.endswith(suffix_key):
+            output.append(value)
+        else:
+            output.append(f"{value} {rendered_qualifier}".strip())
+    return output
+
+
 def _hard_guard_values(
     live_field: dict[str, Any],
     decision: FieldDecision,
@@ -216,7 +265,13 @@ def _hard_guard_values(
     qualifiers = field_qualifier_options(live_field)
     if qualifier:
         if not qualifiers:
-            if _fixed_qualifier_rendered(live_field, qualifier):
+            # Free-text Makro controls can faithfully carry the approved unit in
+            # the same box. Do this before any fixed-unit inference so nearby UI
+            # wording cannot spuriously turn a valid text answer into a conflict.
+            if not options and not is_numeric_semantic_field(live_field):
+                values = _inline_qualifier_values(values, qualifier)
+                qualifier = ""
+            elif _fixed_qualifier_rendered(live_field, qualifier):
                 qualifier = ""
             else:
                 source_unit = qualifier.casefold()
