@@ -66,6 +66,7 @@ def main() -> int:
     from gui.ui_data_optimizations import install_ui_data_optimizations
     from gui.ui_maturity import install_mature_ui
     from gui.ui_polish import install_ui_polish
+    from gui.update_runtime import install_update_runtime
     from gui.wallpaper_cache import install_preblur_cache
     from gui.workspace_transition import install_workspace_transition
     from gui.workspace_transition_tuning import apply_workspace_transition_tuning
@@ -192,6 +193,7 @@ def main() -> int:
     entrance.raise_overlay()
     entrance_stability.start()
 
+    install_update_runtime(app, window)
     install_application_updater(window, access_controller=access_controller)
     return app.exec()
 

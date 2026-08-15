@@ -35,13 +35,16 @@ DEFAULT_INSTALLER_ARGS = [
     "/CLOSEAPPLICATIONS",
     "/NORESTARTAPPLICATIONS",
 ]
-DEFAULT_APP_DEADLINE_S = 30
+DEFAULT_APP_DEADLINE_S = 8
+DEFAULT_FORCE_CLOSE_DEADLINE_S = 5
 DEFAULT_WORKER_DEADLINE_S = 15
 DEFAULT_SETTLE_MS = 1_500
 DEFAULT_WORKER_NAMES = ("EcommerceAgentWorker",)
+_OWNED_APP_IMAGES = frozenset({"ecommerceagent.exe"})
 
 RESULT_OK = "installed"
 RESULT_APP_DID_NOT_EXIT = "app_did_not_exit"
+RESULT_WORKER_DID_NOT_EXIT = "worker_did_not_exit"
 RESULT_VERIFY_FAILED = "checksum_failed"
 RESULT_INSTALL_FAILED = "install_failed"
 RESULT_LAUNCH_FAILED = "launch_failed"
@@ -130,10 +133,17 @@ def _pid_image_name(pid: int) -> str:
     for line in (probe.stdout or "").splitlines():
         if f'"{pid}"' in line:
             try:
-                return line.split('","')[0].strip('"').lower()
+                return line.split('\",\"')[0].strip('"').lower()
             except (IndexError, ValueError):
                 return ""
     return ""
+
+
+def _normalized_image_name(image_name: str) -> str:
+    value = str(image_name or "").strip().lower()
+    if value and not value.endswith(".exe"):
+        value += ".exe"
+    return value
 
 
 def _pid_matches(pid: int, image_name: str) -> bool:
@@ -144,12 +154,91 @@ def _pid_matches(pid: int, image_name: str) -> bool:
     app. When an image name is known, require it to match as well.
     """
 
-    if not image_name:
+    expected = _normalized_image_name(image_name)
+    if not expected:
         return _pid_running(pid)
-    expected = image_name.lower()
-    if not expected.endswith(".exe"):
-        expected += ".exe"
     return _pid_image_name(pid) == expected
+
+
+def _may_force_close_owned_app(image_name: str) -> bool:
+    """Force-close is intentionally restricted to this product's GUI image."""
+
+    return _normalized_image_name(image_name) in _OWNED_APP_IMAGES
+
+
+def _terminate_owned_app_tree(pid: int, image_name: str) -> bool:
+    """Force-close the still-matching EcommerceAgent PID and its child tree."""
+
+    if not _may_force_close_owned_app(image_name):
+        return False
+    if not _pid_matches(pid, image_name):
+        return True
+    try:
+        probe = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0 or not _pid_matches(pid, image_name)
+
+
+def _wait_until_app_gone(pid: int, image_name: str, deadline_s: int) -> bool:
+    deadline = time.monotonic() + max(0.0, float(deadline_s))
+    while time.monotonic() < deadline and _pid_matches(pid, image_name):
+        time.sleep(0.25)
+    return not _pid_matches(pid, image_name)
+
+
+def _wait_until_workers_gone(worker_names: Sequence[str], deadline_s: int) -> bool:
+    names = tuple(name for name in worker_names if str(name).strip())
+    if not names:
+        return True
+    deadline = time.monotonic() + max(0.0, float(deadline_s))
+    while time.monotonic() < deadline:
+        if not any(_name_running(name) for name in names):
+            return True
+        time.sleep(0.25)
+    return not any(_name_running(name) for name in names)
+
+
+def _shutdown_gate(
+    *,
+    app_pid: int,
+    app_image_name: str,
+    app_deadline_s: int,
+    worker_names: Sequence[str],
+    worker_deadline_s: int,
+    settle_ms: int,
+    allow_owned_app_force_close: bool,
+    log_path: str | Path | None = None,
+) -> str | None:
+    """Return ``None`` only when every install-owning process is gone."""
+
+    if not _wait_until_app_gone(app_pid, app_image_name, app_deadline_s):
+        if not allow_owned_app_force_close or not _may_force_close_owned_app(app_image_name):
+            return RESULT_APP_DID_NOT_EXIT
+        _log(
+            log_path,
+            f"app still alive after {app_deadline_s}s; forcing owned process-tree shutdown",
+        )
+        if not _terminate_owned_app_tree(app_pid, app_image_name):
+            return RESULT_APP_DID_NOT_EXIT
+        if not _wait_until_app_gone(
+            app_pid,
+            app_image_name,
+            DEFAULT_FORCE_CLOSE_DEADLINE_S,
+        ):
+            return RESULT_APP_DID_NOT_EXIT
+
+    if not _wait_until_workers_gone(worker_names, worker_deadline_s):
+        return RESULT_WORKER_DID_NOT_EXIT
+
+    time.sleep(max(0.0, settle_ms) / 1000.0)
+    return None
 
 
 def wait_for_app_exit(
@@ -161,31 +250,20 @@ def wait_for_app_exit(
     worker_deadline_s: int = DEFAULT_WORKER_DEADLINE_S,
     settle_ms: int = DEFAULT_SETTLE_MS,
 ) -> bool:
-    """Wait for the owning app process (and its workflow workers) to exit.
+    """Graceful-only compatibility check for the app and workflow workers."""
 
-    Returns True only when the app actually exited within the deadline. False
-    means the app stayed alive, in which case no installer should run — the
-    upgrade would hit Inno Setup's silent RestartManager abort again and roll
-    back. ``app_image_name`` guards against PID reuse: the wait only counts a
-    PID as "still our app" while its image name matches. After the app exits,
-    workers get a bounded grace window and a short settle allows file handles
-    to release before the installer starts.
-    """
-
-    deadline = time.monotonic() + float(app_deadline_s)
-    while time.monotonic() < deadline and _pid_matches(app_pid, app_image_name):
-        time.sleep(0.25)
-    if _pid_matches(app_pid, app_image_name):
-        return False
-
-    worker_deadline = time.monotonic() + float(worker_deadline_s)
-    while time.monotonic() < worker_deadline:
-        if not any(_name_running(name) for name in worker_names):
-            break
-        time.sleep(0.25)
-
-    time.sleep(max(0.0, settle_ms) / 1000.0)
-    return True
+    return (
+        _shutdown_gate(
+            app_pid=app_pid,
+            app_image_name=app_image_name,
+            app_deadline_s=app_deadline_s,
+            worker_names=worker_names,
+            worker_deadline_s=worker_deadline_s,
+            settle_ms=settle_ms,
+            allow_owned_app_force_close=False,
+        )
+        is None
+    )
 
 
 def _write_result(result_path: str | Path | None, status: str, detail: str) -> None:
@@ -265,17 +343,28 @@ def run_job(job: UpdaterJob) -> int:
             _write_result(job.result_path, RESULT_VERIFY_FAILED, "installer checksum mismatch")
             return 3
 
-    if not wait_for_app_exit(
+    gate_failure = _shutdown_gate(
         app_pid=job.app_pid,
         app_image_name=job.app_image_name,
         app_deadline_s=job.app_deadline_s,
         worker_names=job.worker_names,
         worker_deadline_s=job.worker_deadline_s,
         settle_ms=job.settle_ms,
-    ):
-        _log(job.log_path, "app did not exit within deadline; not installing")
+        allow_owned_app_force_close=True,
+        log_path=job.log_path,
+    )
+    if gate_failure == RESULT_APP_DID_NOT_EXIT:
+        _log(job.log_path, "app did not exit after graceful/forced shutdown; not installing")
         _write_result(job.result_path, RESULT_APP_DID_NOT_EXIT, "app process stayed alive")
         return 4
+    if gate_failure == RESULT_WORKER_DID_NOT_EXIT:
+        _log(job.log_path, "workflow worker did not exit within deadline; not installing")
+        _write_result(
+            job.result_path,
+            RESULT_WORKER_DID_NOT_EXIT,
+            "workflow worker process stayed alive",
+        )
+        return 6
 
     arguments = list(job.arguments) or list(DEFAULT_INSTALLER_ARGS)
     _log(job.log_path, f"running installer: {str(installer)} {' '.join(arguments)}")
@@ -308,12 +397,14 @@ def run_job(job: UpdaterJob) -> int:
 __all__ = [
     "DEFAULT_INSTALLER_ARGS",
     "DEFAULT_APP_DEADLINE_S",
+    "DEFAULT_FORCE_CLOSE_DEADLINE_S",
     "DEFAULT_WORKER_DEADLINE_S",
     "DEFAULT_SETTLE_MS",
     "DEFAULT_WORKER_NAMES",
     "JOB_VERSION",
     "RESULT_OK",
     "RESULT_APP_DID_NOT_EXIT",
+    "RESULT_WORKER_DID_NOT_EXIT",
     "RESULT_VERIFY_FAILED",
     "RESULT_INSTALL_FAILED",
     "RESULT_LAUNCH_FAILED",
