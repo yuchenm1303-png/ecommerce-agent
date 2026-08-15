@@ -3,14 +3,11 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
-import pytest
-
 from app.fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem
 from app.required_overrides import (
     FALLBACK_NUMERIC_VALUE,
     FALLBACK_SOURCE_REFERENCE,
     FALLBACK_TEXT_VALUE,
-    RequiredOverrideError,
     apply_required_overrides,
     required_fallback_override,
 )
@@ -75,30 +72,36 @@ def test_ordinary_free_text_required_gap_uses_na_without_ai():
     assert fallback["source_type"] == "fallback"
 
 
-def test_model_name_missing_value_is_protected_from_generic_fallback():
-    with pytest.raises(RequiredOverrideError, match="Model Name"):
-        required_fallback_override(
-            _field(attribute_key="model_name", label="Model Name")
+def test_model_name_gets_final_fallback_only_after_resolver_misses():
+    fallback = required_fallback_override(
+        _field(attribute_key="model_name", label="Model Name")
+    )
+
+    assert fallback["values"] == [FALLBACK_TEXT_VALUE]
+    assert fallback["source_type"] == "fallback"
+
+
+def test_vehicle_model_name_gets_final_fallback_only_after_resolver_misses():
+    fallback = required_fallback_override(
+        _field(attribute_key="vehicle_model_name", label="Vehicle Model Name")
+    )
+
+    assert fallback["values"] == [FALLBACK_TEXT_VALUE]
+    assert fallback["source_type"] == "fallback"
+
+
+def test_title_contributor_can_use_first_live_option_as_last_resort():
+    fallback = required_fallback_override(
+        _field(
+            attribute_key="type",
+            label="Type",
+            options=["Select One", "Room", "Car"],
+            context_text="Attributes that can make up title",
         )
+    )
 
-
-def test_vehicle_model_name_missing_value_is_protected_from_generic_fallback():
-    with pytest.raises(RequiredOverrideError, match="Vehicle Model Name"):
-        required_fallback_override(
-            _field(attribute_key="vehicle_model_name", label="Vehicle Model Name")
-        )
-
-
-def test_title_contributor_missing_value_is_protected_from_random_option_fallback():
-    with pytest.raises(RequiredOverrideError, match="Type"):
-        required_fallback_override(
-            _field(
-                attribute_key="type",
-                label="Type",
-                options=["Select One", "Room", "Car"],
-                context_text="Attributes that can make up title",
-            )
-        )
+    assert fallback["values"] == ["Room"]
+    assert fallback["source_type"] == "fallback"
 
 
 def test_numeric_or_unit_required_gap_uses_one():
@@ -147,21 +150,23 @@ def test_deterministic_fallback_is_promoted_to_ready_through_existing_hard_guard
     assert item.resolution.eligible_for_autofill is True
 
 
-def test_stale_model_name_fallback_is_rejected_before_promotion():
+def test_persisted_model_name_fallback_is_recomputed_and_promoted():
     live = _field(attribute_key="model_name", label="Model Name")
     item = _blocked_item(live)
     plan = LiveFillPlan([item])
-    stale = {
+    persisted = {
         "field_id": __import__("app.ai_decisions", fromlist=["field_id"]).field_id(live),
-        "values": ["N/A"],
+        "values": ["stale placeholder"],
         "source_type": "fallback",
     }
 
-    with pytest.raises(RequiredOverrideError, match="Model Name"):
-        apply_required_overrides(plan, [live], [stale])
+    result = apply_required_overrides(plan, [live], [persisted])
 
-    assert item.action == BLOCKED
-    assert item.resolution.answer_values == []
+    assert result["applied"] == 1
+    assert result["fallback_recomputed_live"] == 1
+    assert item.action == READY
+    assert item.resolution.answer_values == [FALLBACK_TEXT_VALUE]
+    assert item.resolution.source_type == "fallback"
 
 
 def test_gui_required_preflight_has_no_second_ai_process_or_cli():
@@ -170,7 +175,7 @@ def test_gui_required_preflight_has_no_second_ai_process_or_cli():
     assert "required-ai" not in GUI_SOURCE
     assert "AI 补齐必填项" not in GUI_SOURCE
     assert "required_fallback_override" in GUI_SOURCE
-    assert "不会再调用 AI" in GUI_SOURCE
+    assert "无需再次运行 AI" in GUI_SOURCE
     assert "ai_calls=0" in GUI_SOURCE
 
 
