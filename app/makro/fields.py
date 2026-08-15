@@ -32,7 +32,7 @@ const pathOf = (el) => {
       let sibling = node.previousElementSibling;
       while (sibling) {
         if (sibling.tagName === node.tagName) index += 1;
-        sibling = sibling.previousElementSibling;
+        sibling = node.previousElementSibling;
       }
       parts.unshift(`${tag}:nth-of-type(${index})`);
     }
@@ -176,6 +176,21 @@ _SCAN_BODY = r"""
     }
     if (el.closest("[data-required], [class*='required' i], [class*='mandatory' i]")) return "container-class";
     return "";
+  };
+
+  const hasAddValueControl = (el) => {
+    const wrapper = el.closest('[class*="EditAttributeItemWrapper"]');
+    if (!wrapper) return false;
+    return [...wrapper.querySelectorAll('button, a')].some((node) => {
+      const text = clean(node.innerText || node.textContent);
+      const aria = clean(node.getAttribute('aria-label')).toLowerCase();
+      const title = clean(node.getAttribute('title')).toLowerCase();
+      if (!(text === '+' || aria === 'add' || aria.includes('add value') || title.includes('add value'))) {
+        return false;
+      }
+      if (node.disabled || node.getAttribute('aria-disabled') === 'true') return false;
+      return isVisible(node);
+    });
   };
 
   const findOptionScope = (el) => {
@@ -353,6 +368,7 @@ _SCAN_BODY = r"""
       section_heading: section.section_heading,
       section_container: section.section_container,
       subsection_heading: section.subsection_heading,
+      has_add_value_control: hasAddValueControl(el),
       has_dropdown_options: options.length > 0,
       options,
       selector_candidates: candidateSelectors(el),
@@ -503,6 +519,7 @@ _RICHNESS_KEYS = (
     "placeholder",
     "aria_label",
     "data_testid",
+    "has_add_value_control",
 )
 
 def _richness(item: dict[str, Any]) -> int:
@@ -520,8 +537,15 @@ def merge_scans(scans: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
             if not path:
                 continue
             current = best.get(path)
-            if current is None or _richness(item) > _richness(current):
+            if current is None:
                 best[path] = item
+                continue
+            has_add_value_control = bool(
+                current.get("has_add_value_control") or item.get("has_add_value_control")
+            )
+            selected = item if _richness(item) > _richness(current) else current
+            selected["has_add_value_control"] = has_add_value_control
+            best[path] = selected
     controls = sorted(best.values(), key=lambda item: item.get("path", ""))
     for ordinal, item in enumerate(controls):
         item["ordinal"] = ordinal
@@ -694,6 +718,9 @@ def _merge_semantic_field(key: str, controls: list[dict[str, Any]]) -> dict[str,
         for control in controls
         if (match := _VALUE_IDX_RE.search(control.get("name") or ""))
     }
+    has_add_value_control = any(
+        bool(control.get("has_add_value_control")) for control in controls
+    )
     return {
         "attribute_key": key,
         "label": label,
@@ -705,7 +732,8 @@ def _merge_semantic_field(key: str, controls: list[dict[str, Any]]) -> dict[str,
         "field_kind": main_kind,
         "accepted_control_kinds": sorted({kind for kind in kinds if kind}),
         "options": options,
-        "multi_value": len(value_indices) > 1,
+        "has_add_value_control": has_add_value_control,
+        "multi_value": len(value_indices) > 1 or has_add_value_control,
         "controls": controls,
     }
 
@@ -738,4 +766,3 @@ def build_semantic_fields(controls: list[dict[str, Any]]) -> list[dict[str, Any]
         )
     )
     return fields
-
