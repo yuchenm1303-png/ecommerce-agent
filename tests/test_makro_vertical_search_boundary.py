@@ -28,6 +28,7 @@ class FakePage:
 class FakeSearch:
     def __init__(self) -> None:
         self.events: list[tuple[str, str]] = []
+        self.generation = 0
 
     def fill(self, value: str) -> None:
         self.events.append(("fill", value))
@@ -35,8 +36,12 @@ class FakeSearch:
     def press(self, key: str) -> None:
         self.events.append(("press", key))
 
-    def evaluate(self, expression: str) -> None:
+    def evaluate(self, expression: str, *_args):
         self.events.append(("evaluate", expression))
+        if expression == "el => el.blur()":
+            return None
+        self.generation += 1
+        return {"generation": self.generation}
 
 
 def test_search_delta_rejects_preexisting_broad_taxonomy_nodes() -> None:
@@ -96,58 +101,106 @@ def test_duplicate_exact_leaf_does_not_guess_between_live_paths(monkeypatch) -> 
     assert seen == {"term": "solar charge controller", "live": candidates}
 
 
-def test_vertical_search_uses_query_owned_surface_only() -> None:
+def test_vertical_search_uses_generation_owned_surface_only() -> None:
     source = inspect.getsource(vertical_selection._try_select_via_search)
+    run_source = inspect.getsource(vertical_selection._run_vertical_search_query)
     assert "_run_vertical_search_query(" in source
-    assert "_wait_for_scoped_vertical_search_candidates(" in inspect.getsource(
-        vertical_selection._run_vertical_search_query
-    )
-    assert "click_search_row(search, live_selected)" in source
+    assert "begin_search_query(search)" in run_source
+    assert "generation <= 0" in run_source
+    assert "_wait_for_scoped_vertical_search_candidates(" in run_source
     assert "_search_result_delta(" not in source
     assert "_visible_text_candidates" not in source
 
 
-def test_each_query_proves_previous_owned_surface_is_quiescent_before_baseline(monkeypatch) -> None:
+def test_query_reset_never_requires_old_dom_to_disappear() -> None:
     page = FakePage()
     search = FakeSearch()
-    states = iter([
-        ["Old Query / Result"],
-        [],
-        [],
-    ])
-    monkeypatch.setattr(
-        vertical_selection,
-        "_scoped_vertical_search_candidates",
-        lambda _search: list(next(states)),
-    )
 
-    assert vertical_selection._close_vertical_search(search, page, wait_ms=800) is True
+    assert vertical_selection._close_vertical_search(search, page, wait_ms=800) is None
     assert search.events[:3] == [
         ("fill", ""),
         ("press", "Escape"),
         ("evaluate", "el => el.blur()"),
     ]
-    assert len(page.waits) >= 2
+    assert page.waits
+    source = inspect.getsource(vertical_selection._close_vertical_search)
+    assert "query_quiescence" not in source
+    assert "remaining_rows" not in source
+    assert "DOM disappearance is never used" in source
 
 
-def test_contaminated_query_surface_is_never_used_as_next_baseline(monkeypatch) -> None:
+def test_each_discovery_query_starts_fresh_generation_after_reset(monkeypatch) -> None:
     page = FakePage()
     search = FakeSearch()
-    began = {"value": False}
-    monkeypatch.setattr(vertical_selection, "_close_vertical_search", lambda *_args, **_kwargs: False)
+    order: list[str] = []
 
-    def begin(_search) -> None:
-        began["value"] = True
+    monkeypatch.setattr(
+        vertical_selection,
+        "_close_vertical_search",
+        lambda *_args, **_kwargs: order.append("reset"),
+    )
+    monkeypatch.setattr(
+        vertical_selection,
+        "begin_search_query",
+        lambda _search: order.append("generation") or 7,
+    )
+    monkeypatch.setattr(
+        vertical_selection,
+        "_wait_for_scoped_vertical_search_candidates",
+        lambda *_args, **_kwargs: ["Home Improvement Tools / Bathroom Fittings & Sanitary / Shower Head"],
+    )
 
-    monkeypatch.setattr(vertical_selection, "begin_search_query", begin)
-    with pytest.raises(RuntimeError, match="contaminated baseline"):
+    rows = vertical_selection._run_vertical_search_query(
+        page,
+        search,
+        "rain showerhead",
+        wait_ms=800,
+    )
+    assert order == ["reset", "generation"]
+    assert search.events[0] == ("fill", "rain showerhead")
+    assert rows == ["Home Improvement Tools / Bathroom Fittings & Sanitary / Shower Head"]
+
+
+def test_generation_creation_failure_stops_before_query_write(monkeypatch) -> None:
+    page = FakePage()
+    search = FakeSearch()
+    monkeypatch.setattr(vertical_selection, "_close_vertical_search", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(vertical_selection, "begin_search_query", lambda _search: 0)
+
+    with pytest.raises(RuntimeError, match="ownership generation"):
         vertical_selection._run_vertical_search_query(
             page,
             search,
             "rain showerhead",
             wait_ms=800,
         )
-    assert began["value"] is False
+    assert ("fill", "rain showerhead") not in search.events
+
+
+def test_grounded_replay_can_bind_stable_exact_row_without_fresh_mutation(monkeypatch) -> None:
+    selected = "Home Improvement Tools / Bathroom Fittings & Sanitary / Shower Head"
+    page = FakePage()
+    search = FakeSearch()
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(vertical_selection, "_run_vertical_search_query", lambda *_args, **_kwargs: [])
+
+    def click(_search, label, *, allow_stable_exact=False):
+        seen["label"] = label
+        seen["allow_stable_exact"] = allow_stable_exact
+        return True
+
+    monkeypatch.setattr(vertical_selection, "click_search_row", click)
+    clicked, rows = vertical_selection._replay_grounded_vertical_candidate(
+        page,
+        search,
+        term="rain showerhead",
+        selected=selected,
+        wait_ms=800,
+    )
+    assert clicked is True
+    assert rows == []
+    assert seen == {"label": selected, "allow_stable_exact": True}
 
 
 def test_grounded_live_candidate_replay_failure_refuses_taxonomy_fallback(monkeypatch) -> None:
@@ -179,7 +232,8 @@ def test_grounded_live_candidate_replay_failure_refuses_taxonomy_fallback(monkey
         "choose_vertical_candidate_pool",
         lambda *_args, **_kwargs: selected,
     )
-    monkeypatch.setattr(vertical_selection, "_close_vertical_search", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(vertical_selection, "click_search_row", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(vertical_selection, "_close_vertical_search", lambda *_args, **_kwargs: None)
 
     with pytest.raises(RuntimeError, match="refusing taxonomy fallback"):
         vertical_selection._try_select_via_search(
@@ -189,7 +243,7 @@ def test_grounded_live_candidate_replay_failure_refuses_taxonomy_fallback(monkey
             wait_ms=800,
         )
 
-    # Two discovery queries followed only by the original query that grounded
+    # Two discovery generations followed only by the original query that grounded
     # the selected candidate. No unrelated taxonomy mechanism is entered here.
     assert calls == ["rain showerhead", "showerhead", "rain showerhead"]
 
