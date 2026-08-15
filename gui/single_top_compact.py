@@ -6,8 +6,8 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QBoxLayout, QFrame, QVBoxLayout, QWidget
 
 
-_TOP_CARD_MIN = 238
-_TOP_CARD_MAX = 248
+_TOP_CARD_MIN = 272
+_TOP_CARD_MAX = 282
 _CONTROL_HEIGHT = 30
 _SINGLE_PAGE_SPACING = 6
 _INTENT_DETAIL_EXTRA = 112
@@ -89,6 +89,8 @@ def _apply(window: Any) -> None:
     url_row = _row_for(layout, url_input if isinstance(url_input, QWidget) else None)
     offer_input = getattr(window, "listing_intent_input", None)
     offer_row = _row_for(layout, offer_input if isinstance(offer_input, QWidget) else None)
+    ai_guidance_input = getattr(window, "ai_guidance_input", None)
+    guidance_row = _row_for(layout, ai_guidance_input if isinstance(ai_guidance_input, QWidget) else None)
     stage_button = getattr(window, "step1_button", None)
     stage_row = _row_for(layout, stage_button if isinstance(stage_button, QWidget) else None)
     source_port = getattr(window, "source_port", None)
@@ -99,6 +101,7 @@ def _apply(window: Any) -> None:
     for row, spacing in (
         (url_row, 10),
         (offer_row, 9),
+        (guidance_row, 8),
         (stage_row, 10),
         (source_row, 10),
         (settings_row, 10),
@@ -113,6 +116,8 @@ def _apply(window: Any) -> None:
         "stop_button",
         "listing_intent_input",
         "listing_intent_detail_button",
+        "ai_guidance_input",
+        "model_name_keywords_input",
         "step1_button",
         "step2_button",
         "step3_button",
