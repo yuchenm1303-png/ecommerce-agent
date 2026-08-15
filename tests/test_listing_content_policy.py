@@ -104,7 +104,7 @@ def test_content_policy_keeps_high_value_copy_rules_and_safe_exceptions() -> Non
     assert any("medical-style" in rule for rule in GLOBAL_CONTENT_RULES)
 
 
-def test_vehicle_model_name_is_exact_compatibility_not_product_model_alias() -> None:
+def test_vehicle_model_name_keeps_exact_ai_policy_but_does_not_block_final_fallback() -> None:
     vehicle_model = field_content_policy(
         _field("vehicle_model_name", "Vehicle Model Name", required=True)
     )
@@ -118,10 +118,10 @@ def test_vehicle_model_name_is_exact_compatibility_not_product_model_alias() -> 
     assert "Never output N/A" in vehicle_model["instruction"]
     assert allow_required_fallback(
         _field("vehicle_model_name", "Vehicle Model Name", required=True)
-    ) is False
+    ) is True
 
 
-def test_exact_identity_compliance_and_package_fields_keep_ai_strict_and_protect_required_fallback() -> None:
+def test_exact_identity_compliance_and_package_fields_keep_ai_strict_without_execution_lock() -> None:
     fields = [
         _field("ean", "EAN"),
         _field("certifications", "Certifications"),
@@ -130,7 +130,7 @@ def test_exact_identity_compliance_and_package_fields_keep_ai_strict_and_protect
     for target in fields:
         assert requires_exact_web_identity(target) is True
         assert allow_best_effort_inference(target) is False
-        assert allow_required_fallback(target) is False
+        assert allow_required_fallback(target) is True
         assert field_content_policy(target)["evidence_mode"] == "exact_product_only"
 
 
@@ -146,7 +146,7 @@ def test_listing_intent_turns_sales_package_into_offer_aware_synthesis(monkeypat
     assert package_policy["generation_mode"] == "grounded_synthesis"
     assert package_policy["best_effort"] == "listing_intent_allowed"
     assert allow_best_effort_inference(sales_package) is True
-    assert allow_required_fallback(sales_package) is False
+    assert allow_required_fallback(sales_package) is True
     assert colour_policy["policy_id"] == "listing_intent_scope"
     assert colour_policy["listing_intent"] == "黑色净化器 + 2瓶香薰精油"
 
@@ -179,14 +179,14 @@ def test_listing_intent_allows_sales_package_in_final_policy_stage(monkeypatch) 
     assert "ean" not in targets
 
 
-def test_title_contributing_field_keeps_copy_policy_and_protects_required_fallback() -> None:
+def test_title_contributing_field_keeps_copy_policy_without_execution_lock() -> None:
     target = _field("type", "Type", required=True)
     target["context_text"] = "Attributes that can make up title"
     policy = field_content_policy(target)
 
     assert policy["policy_id"] == "title_contributor"
     assert policy["required_fallback"] == "manual_only"
-    assert allow_required_fallback(target) is False
+    assert allow_required_fallback(target) is True
     assert "Never use N/A" in policy["instruction"]
 
 
