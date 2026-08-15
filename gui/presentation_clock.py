@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer
@@ -9,20 +10,29 @@ from PySide6.QtWidgets import QApplication, QMainWindow
 
 
 _PRESENTATION_TICK_MS = 8
+_WIDGET_STARVATION_MS = 40
+
+
+@dataclass(slots=True)
+class _WidgetSample:
+    global_pos: QPoint
+    left_down: bool
+    input_changed: bool
+    button_edge: bool
 
 
 class PresentationClock(QObject):
-    """One cursor read and one presentation heartbeat for the whole runtime UI.
+    """One input clock with explicit Quick -> QWidget presentation ordering.
 
-    Background parallax, card hit-testing/motion and the lightweight particle /
-    cursor overlay used to own separate precise timers and separate QCursor reads.
-    That multiplied main-thread wakeups and coordinate work while the user moved
-    the mouse. This clock is the only high-frequency Python presentation source.
+    The Quick background owns the GPU scene and consumes the sampled pointer first.
+    QWidget card/effect work is queued and released immediately after the next
+    QQuickWindow.frameSwapped signal.  That prevents the two native presentation
+    surfaces from being invalidated in the same GUI event-loop turn while retaining
+    one cursor read, one button read and the existing per-consumer cadence budgets.
 
-    Consumers remain responsible for their own visual cadence: the background only
-    publishes pointer targets when input changes, card motion caps itself to the
-    display refresh rate, and decorative effects keep their established 60 Hz
-    budget. Business runners and QWidget input handling are completely separate.
+    When Quick is idle there is nothing to contend with, so the QWidget lane flushes
+    immediately.  A short starvation watchdog is only a safety net for occluded or
+    stalled Quick presentation and never changes the normal animation cadence.
     """
 
     def __init__(
@@ -43,10 +53,27 @@ class PresentationClock(QObject):
         self._last_global: tuple[int, int] | None = None
         self._last_left_down: bool | None = None
 
+        self._widget_samples: list[_WidgetSample] = []
+        self._widget_flush_posted = False
+        self._quick_window = getattr(background, "quick_window", None)
+
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.setInterval(_PRESENTATION_TICK_MS)
         self.timer.timeout.connect(self._tick)
+
+        self._widget_watchdog = QTimer(self)
+        self._widget_watchdog.setSingleShot(True)
+        self._widget_watchdog.setTimerType(Qt.TimerType.PreciseTimer)
+        self._widget_watchdog.setInterval(_WIDGET_STARVATION_MS)
+        self._widget_watchdog.timeout.connect(self._flush_widget_lane)
+
+        quick = self._quick_window
+        if quick is not None:
+            try:
+                quick.frameSwapped.connect(self._on_quick_frame_swapped)
+            except (AttributeError, RuntimeError, TypeError):
+                self._quick_window = None
 
         window.installEventFilter(self)
         window.destroyed.connect(self.cleanup)
@@ -78,19 +105,27 @@ class PresentationClock(QObject):
                 self.timer.start()
         else:
             self.timer.stop()
+            self._clear_widget_lane()
 
     def _reset_input_identity(self) -> None:
         self._last_global = None
         self._last_left_down = None
+        self._clear_widget_lane()
         try:
             self.background.reset_pointer_identity()
         except (AttributeError, RuntimeError):
             pass
 
+    def _clear_widget_lane(self) -> None:
+        self._widget_samples.clear()
+        self._widget_flush_posted = False
+        self._widget_watchdog.stop()
+
     def suspend(self, reason: str) -> None:
         token = str(reason or "presentation").strip() or "presentation"
         self._holds.add(token)
         self.timer.stop()
+        self._clear_widget_lane()
         try:
             self.background.pause_pointer_animation()
         except (AttributeError, RuntimeError):
@@ -101,6 +136,97 @@ class PresentationClock(QObject):
         self._holds.discard(token)
         self._reset_input_identity()
         self._sync_window_state()
+
+    def _queue_widget_sample(
+        self,
+        global_pos: QPoint,
+        *,
+        left_down: bool,
+        input_changed: bool,
+        button_edge: bool,
+    ) -> None:
+        sample = _WidgetSample(
+            global_pos=QPoint(global_pos),
+            left_down=bool(left_down),
+            input_changed=bool(input_changed),
+            button_edge=bool(button_edge),
+        )
+        if not self._widget_samples:
+            self._widget_samples.append(sample)
+            return
+
+        if button_edge or self._widget_samples[-1].button_edge:
+            self._widget_samples.append(sample)
+            return
+
+        sample.input_changed = bool(
+            sample.input_changed or self._widget_samples[-1].input_changed
+        )
+        self._widget_samples[-1] = sample
+
+    def _quick_lane_active(self) -> bool:
+        quick = self._quick_window
+        if quick is None:
+            return False
+        try:
+            return bool(
+                quick.isVisible()
+                and quick.isExposed()
+                and not (quick.windowState() & Qt.WindowState.WindowMinimized)
+                and quick.property("animationRunning")
+            )
+        except (AttributeError, RuntimeError, TypeError):
+            return False
+
+    def _schedule_widget_lane(self) -> None:
+        if not self._widget_samples:
+            return
+        if self._quick_lane_active():
+            if not self._widget_watchdog.isActive():
+                self._widget_watchdog.start()
+            return
+        self._flush_widget_lane()
+
+    def _on_quick_frame_swapped(self) -> None:
+        if not self._widget_samples or self._widget_flush_posted:
+            return
+        self._widget_flush_posted = True
+        QTimer.singleShot(0, self._flush_widget_lane_after_swap)
+
+    def _flush_widget_lane_after_swap(self) -> None:
+        self._widget_flush_posted = False
+        self._flush_widget_lane()
+
+    def _flush_widget_lane(self) -> None:
+        if not self._widget_samples:
+            self._widget_watchdog.stop()
+            return
+
+        samples = self._widget_samples
+        self._widget_samples = []
+        self._widget_watchdog.stop()
+        now_s = time.perf_counter()
+
+        for sample in samples:
+            try:
+                self.card_fx.presentation_tick(
+                    sample.global_pos,
+                    left_down=sample.left_down,
+                    now_s=now_s,
+                    input_changed=sample.input_changed,
+                )
+            except RuntimeError:
+                pass
+
+        latest = samples[-1]
+        try:
+            self.effects.presentation_tick(
+                latest.global_pos,
+                left_down=latest.left_down,
+                now_s=now_s,
+            )
+        except RuntimeError:
+            pass
 
     def _tick(self) -> None:
         if not self._can_run():
@@ -114,34 +240,28 @@ class PresentationClock(QObject):
         except RuntimeError:
             return
 
-        input_changed = point != self._last_global or left_down != self._last_left_down
+        previous_left = self._last_left_down
+        input_changed = point != self._last_global or left_down != previous_left
+        button_edge = previous_left is not None and left_down != previous_left
         self._last_global = point
         self._last_left_down = left_down
-        now_s = time.perf_counter()
 
-        # These calls intentionally receive the same QPoint/button sample. No
-        # consumer is allowed to perform another high-frequency QCursor read.
+        # Quick owns the first presentation lane. It receives the newest pointer
+        # target immediately and may start/continue its scene-graph animation.
         try:
             self.background.presentation_tick(global_pos, input_changed=input_changed)
         except RuntimeError:
             pass
-        try:
-            self.card_fx.presentation_tick(
-                global_pos,
-                left_down=left_down,
-                now_s=now_s,
-                input_changed=input_changed,
-            )
-        except RuntimeError:
-            pass
-        try:
-            self.effects.presentation_tick(
-                global_pos,
-                left_down=left_down,
-                now_s=now_s,
-            )
-        except RuntimeError:
-            pass
+
+        # QWidget work uses the same sampled input, but it is committed only after
+        # Quick presents its frame (or immediately when Quick has no active frame).
+        self._queue_widget_sample(
+            global_pos,
+            left_down=left_down,
+            input_changed=input_changed,
+            button_edge=button_edge,
+        )
+        self._schedule_widget_lane()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if watched is not self.window:
@@ -156,7 +276,15 @@ class PresentationClock(QObject):
 
     def cleanup(self) -> None:
         self.timer.stop()
+        self._clear_widget_lane()
         self._holds.clear()
+        quick = self._quick_window
+        self._quick_window = None
+        if quick is not None:
+            try:
+                quick.frameSwapped.disconnect(self._on_quick_frame_swapped)
+            except (AttributeError, RuntimeError, TypeError):
+                pass
         try:
             self.window.removeEventFilter(self)
         except RuntimeError:
