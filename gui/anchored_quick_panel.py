@@ -181,9 +181,9 @@ class AnchoredQuickPanel(QWidget):
             return
 
         self._visible_session = True
-        self.setWindowOpacity(1.0)
 
         if not animate:
+            self.setWindowOpacity(1.0)
             self._snap_to_rect(self._final_rect)
             self._top_radius.snap(self._panel_top_radius)
             self._bottom_radius.snap(self._panel_bottom_radius)
@@ -194,9 +194,9 @@ class AnchoredQuickPanel(QWidget):
             self.activateWindow()
             return
 
-        start = self._anchor_rect
+        start = QRect(self._anchor_rect)
         if self.isVisible() and self.width() > 1 and self.height() > 1:
-            start = self.geometry()
+            start = QRect(self.geometry())
         else:
             self._snap_to_rect(start)
             capsule_radius = max(1.0, min(start.width(), start.height()) * 0.5)
@@ -204,12 +204,38 @@ class AnchoredQuickPanel(QWidget):
             self._bottom_radius.snap(capsule_radius)
 
         self._content.setVisible(False)
-        self._phase = "panel-press"
-        self._transition_started_at = monotonic()
-        self._last_frame_at = self._transition_started_at
+
+        # A native Qt.Popup can be re-realized/repositioned by Qt/Windows during
+        # show().  Prime that native surface fully transparent, then restore the
+        # exact trigger geometry on the next event-loop turn before exposing any
+        # pixels.  The user therefore sees the spring morph itself, never the
+        # platform's transient first-frame placement.
+        self.setWindowOpacity(0.0)
         self.show()
         self.raise_()
         self.activateWindow()
+        QTimer.singleShot(
+            0,
+            lambda current=token, origin=QRect(start): self._start_open_transition(
+                current,
+                origin,
+            ),
+        )
+
+    def _start_open_transition(self, token: int, start: QRect) -> None:
+        if token != self._transition_token or not self.isVisible():
+            return
+
+        self._snap_to_rect(start)
+        capsule_radius = max(1.0, min(start.width(), start.height()) * 0.5)
+        self._top_radius.snap(capsule_radius)
+        self._bottom_radius.snap(capsule_radius)
+
+        self._phase = "panel-press"
+        self._transition_started_at = monotonic()
+        self._last_frame_at = self._transition_started_at
+        self.update()
+        self.setWindowOpacity(1.0)
 
         # Original panel-press: very small down/compact anticipation before the
         # spring expansion begins.
@@ -220,9 +246,9 @@ class AnchoredQuickPanel(QWidget):
             edge_offset=6.0,
         )
         self._retarget_rect(press)
-        capsule_radius = max(1.0, min(press.width(), press.height()) * 0.5)
-        self._top_radius.retarget(capsule_radius)
-        self._bottom_radius.retarget(capsule_radius)
+        press_radius = max(1.0, min(press.width(), press.height()) * 0.5)
+        self._top_radius.retarget(press_radius)
+        self._bottom_radius.retarget(press_radius)
         self._frame_timer.start()
 
         QTimer.singleShot(
@@ -349,7 +375,11 @@ class AnchoredQuickPanel(QWidget):
                 else AnchoredQuickPanelPlacement.Above
             )
         self._placement = placement
-        selected_space = available_above if placement is AnchoredQuickPanelPlacement.Above else available_below
+        selected_space = (
+            available_above
+            if placement is AnchoredQuickPanelPlacement.Above
+            else available_below
+        )
         height = min(self._desired_size.height(), max(1, selected_space))
 
         desired_x = anchor_rect.center().x() - width // 2
@@ -436,7 +466,9 @@ class AnchoredQuickPanel(QWidget):
                 self._bottom_radius,
             )
         )
-        if self._phase == "closing" and (settled or elapsed_ms >= self._MAX_TRANSITION_MS):
+        if self._phase == "closing" and (
+            settled or elapsed_ms >= self._MAX_TRANSITION_MS
+        ):
             self._frame_timer.stop()
             self.hide()
             return
@@ -452,7 +484,12 @@ class AnchoredQuickPanel(QWidget):
             self.update()
 
     def _shape_path(self) -> QPainterPath:
-        rect = QRectF(0.8, 0.8, max(1.0, self.width() - 1.6), max(1.0, self.height() - 1.6))
+        rect = QRectF(
+            0.8,
+            0.8,
+            max(1.0, self.width() - 1.6),
+            max(1.0, self.height() - 1.6),
+        )
         max_radius = max(1.0, min(rect.width(), rect.height()) * 0.5)
         top = min(max_radius, max(1.0, self._top_radius.value))
         bottom = min(max_radius, max(1.0, self._bottom_radius.value))
@@ -462,7 +499,12 @@ class AnchoredQuickPanel(QWidget):
         path.lineTo(rect.right() - top, rect.top())
         path.quadTo(rect.right(), rect.top(), rect.right(), rect.top() + top)
         path.lineTo(rect.right(), rect.bottom() - bottom)
-        path.quadTo(rect.right(), rect.bottom(), rect.right() - bottom, rect.bottom())
+        path.quadTo(
+            rect.right(),
+            rect.bottom(),
+            rect.right() - bottom,
+            rect.bottom(),
+        )
         path.lineTo(rect.left() + bottom, rect.bottom())
         path.quadTo(rect.left(), rect.bottom(), rect.left(), rect.bottom() - bottom)
         path.lineTo(rect.left(), rect.top() + top)
@@ -477,7 +519,12 @@ class AnchoredQuickPanel(QWidget):
 
         # Source quick-panel surface without backdrop-filter: same deep-blue
         # direction and translucent glass values, but no live background sampling.
-        gradient = QLinearGradient(0.0, 0.0, float(self.width()), float(self.height()))
+        gradient = QLinearGradient(
+            0.0,
+            0.0,
+            float(self.width()),
+            float(self.height()),
+        )
         gradient.setColorAt(0.0, QColor(21, 45, 78, 245))
         gradient.setColorAt(1.0, QColor(8, 22, 48, 245))
         painter.fillPath(path, gradient)
