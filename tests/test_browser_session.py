@@ -66,7 +66,13 @@ class FakeContext:
 
 class FakePlaywright:
     def __init__(self, browser):
-        self.chromium = SimpleNamespace(connect_over_cdp=lambda endpoint: browser)
+        self.attach_calls: list[tuple[str, int | None]] = []
+
+        def connect_over_cdp(endpoint, *, timeout=None):
+            self.attach_calls.append((endpoint, timeout))
+            return browser
+
+        self.chromium = SimpleNamespace(connect_over_cdp=connect_over_cdp)
 
 
 def _fake_page(url="https://seller.makro.co.za/"):
@@ -91,6 +97,14 @@ def test_harness_launches_detached_edge_when_cdp_absent(monkeypatch, tmp_path: P
     browser = FakeBrowser(FakeContext([_fake_page(), listing]))
     playwright = FakePlaywright(browser)
 
+    # launch_detached_edge is a fake, so make CDP become ready once launch has
+    # been requested; the harness must then attach rather than start again.
+    monkeypatch.setattr(
+        bs,
+        "is_cdp_ready",
+        lambda port=9222, **kw: bool(launched),
+    )
+
     harness = bs.EdgeHarness(
         playwright, profile_dir=tmp_path / "makro-edge", port=9333,
         start_url="https://seller.makro.co.za/",
@@ -112,13 +126,49 @@ def test_harness_attaches_without_launch_when_cdp_ready(monkeypatch, tmp_path: P
     )
     page = _fake_page()
     browser = FakeBrowser(FakeContext([page]))
+    playwright = FakePlaywright(browser)
     harness = bs.EdgeHarness(
-        FakePlaywright(browser), profile_dir=tmp_path / "p", port=9222
+        playwright, profile_dir=tmp_path / "p", port=19222
     )
 
     assert harness.launched_now is False
     assert calls == []
     assert harness.page is page
+    assert playwright.attach_calls == [
+        ("http://127.0.0.1:19222", bs._CDP_ATTACH_TIMEOUT_MS)
+    ]
+    assert bs._CDP_ATTACH_TIMEOUT_MS < 180_000
+
+
+def test_harness_retries_transient_cdp_attach_without_restarting_edge(monkeypatch, tmp_path: Path):
+    import app.browser_session as bs
+
+    browser = FakeBrowser(FakeContext([_fake_page()]))
+    attach_calls: list[int | None] = []
+    launch_calls: list[object] = []
+
+    def connect_over_cdp(_endpoint, *, timeout=None):
+        attach_calls.append(timeout)
+        if len(attach_calls) == 1:
+            raise RuntimeError("simulated CDP attach stall after websocket connect")
+        return browser
+
+    playwright = SimpleNamespace(
+        chromium=SimpleNamespace(connect_over_cdp=connect_over_cdp)
+    )
+    monkeypatch.setattr(bs, "is_cdp_ready", lambda port=9222, **kw: True)
+    monkeypatch.setattr(bs, "launch_detached_edge", lambda **kw: launch_calls.append(kw))
+    monkeypatch.setattr(bs.time, "sleep", lambda _seconds: None)
+
+    harness = bs.EdgeHarness(
+        playwright,
+        profile_dir=tmp_path / "p",
+        port=19223,
+    )
+
+    assert harness.page is browser.contexts[0].pages[0]
+    assert attach_calls == [bs._CDP_ATTACH_TIMEOUT_MS, bs._CDP_ATTACH_TIMEOUT_MS]
+    assert launch_calls == []
 
 
 def test_harness_detach_never_closes_external_browser(monkeypatch, tmp_path: Path):
@@ -126,7 +176,7 @@ def test_harness_detach_never_closes_external_browser(monkeypatch, tmp_path: Pat
 
     monkeypatch.setattr(bs, "is_cdp_ready", lambda port=9222, **kw: True)
     browser = FakeBrowser(FakeContext([_fake_page()]))
-    harness = bs.EdgeHarness(FakePlaywright(browser), profile_dir=tmp_path / "p", port=9222)
+    harness = bs.EdgeHarness(FakePlaywright(browser), profile_dir=tmp_path / "p", port=19224)
 
     harness.detach()
 
@@ -146,7 +196,7 @@ def test_harness_ensure_page_reconnects_when_current_page_closed(monkeypatch, tm
     )
     old_page.is_closed = lambda: True
     browser = FakeBrowser(FakeContext([new_page]))
-    harness = bs.EdgeHarness(FakePlaywright(browser), profile_dir=tmp_path / "p", port=9222)
+    harness = bs.EdgeHarness(FakePlaywright(browser), profile_dir=tmp_path / "p", port=19225)
     harness.page = old_page
 
     page = harness.ensure_page()
@@ -157,15 +207,16 @@ def test_harness_ensure_page_reconnects_when_current_page_closed(monkeypatch, tm
 def test_harness_health_check_reflects_cdp(monkeypatch, tmp_path: Path):
     import app.browser_session as bs
 
-    monkeypatch.setattr(bs, "is_cdp_ready", lambda port=9222, **kw: True)
+    state = {"ready": True}
+    monkeypatch.setattr(bs, "is_cdp_ready", lambda port=9222, **kw: state["ready"])
     harness = bs.EdgeHarness(
         FakePlaywright(FakeBrowser(FakeContext([_fake_page()]))),
         profile_dir=tmp_path / "p",
-        port=9222,
+        port=19226,
     )
     assert harness.health_check() is True
 
-    monkeypatch.setattr(bs, "is_cdp_ready", lambda port=9222, **kw: False)
+    state["ready"] = False
     assert harness.health_check() is False
 
 
