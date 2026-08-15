@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -100,7 +99,7 @@ def test_success_requires_installed_version_then_writes_marker_and_relaunches(
     Path(job.version_file).write_text(job.target_version, encoding="utf-8")
     monkeypatch.setattr(core, "_shutdown_gate", lambda _job: None)
     launched: list[str] = []
-    monkeypatch.setattr(core, "_launch_app", lambda path: launched.append(path) is None or True)
+    monkeypatch.setattr(core, "_launch_app", lambda path: launched.append(path) is None)
 
     class _Proc:
         returncode = 0
@@ -122,6 +121,10 @@ def test_nonzero_installer_exit_recovers_without_claiming_success(
     job = _job(tmp_path)
     monkeypatch.setattr(core, "_shutdown_gate", lambda _job: None)
     monkeypatch.setattr(core, "_launch_app", lambda _path: True)
+    # Keep installer-process mocking isolated from the recovery path's tasklist
+    # probes. The recovery state itself is what this test wants to exercise.
+    monkeypatch.setattr(core, "_pid_matches", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(core, "_other_app_pids", lambda *_args, **_kwargs: ())
 
     class _Proc:
         returncode = 7
