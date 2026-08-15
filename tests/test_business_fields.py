@@ -2,8 +2,11 @@ import pytest
 
 import app.business_fields as business_fields
 from app.business_fields import (
+    ACCOUNT_DEFAULT_PROFILE,
     BUSINESS_ATTRIBUTE_ALIASES,
+    FIXED_PRICE_MOQ_ACCOUNT_DEFAULTS,
     MAKRO_ACCOUNT_FIXED_DEFAULTS,
+    ORIGINAL_ACCOUNT_FIXED_DEFAULTS,
     generate_listing_sku,
     generated_business_bundle,
     is_business_question,
@@ -50,11 +53,10 @@ def test_generated_business_bundle_rejects_invalid_explicit_sku():
         generated_business_bundle(URL, sku="not-a-sku")
 
 
-def test_account_fixed_defaults_are_single_config_source_for_all_listings():
-    bundle = generated_business_bundle(URL, sku="812345678901")
-    expected = {
-        "flipkart_selling_price": "6000",
-        "minimum_order_quantity": "5000",
+def test_original_account_defaults_are_preserved_for_one_line_revert():
+    original = {key: value for key, value, _source in ORIGINAL_ACCOUNT_FIXED_DEFAULTS}
+    assert original == {
+        "minimum_order_quantity": "1",
         "max_order_quantity_allowed": "99",
         "service_profile": "FBS",
         "shipping_days": "14",
@@ -64,8 +66,29 @@ def test_account_fixed_defaults_are_single_config_source_for_all_listings():
         "packer_details": "LILI",
         "importer_details": "LILI",
     }
+    assert "mrp" not in original
+    assert "flipkart_selling_price" not in original
 
+
+def test_current_profile_uses_relation_safe_fixed_price_and_moq_defaults():
+    assert ACCOUNT_DEFAULT_PROFILE == "fixed_price_moq"
+    assert MAKRO_ACCOUNT_FIXED_DEFAULTS is FIXED_PRICE_MOQ_ACCOUNT_DEFAULTS
+    expected = {
+        "mrp": "6000",
+        "flipkart_selling_price": "6000",
+        "minimum_order_quantity": "5000",
+        "max_order_quantity_allowed": "5000",
+        "service_profile": "FBS",
+        "shipping_days": "14",
+        "forbid_shipping": "National",
+        "country_of_origin": "China",
+        "manufacturer_details": "LILI",
+        "packer_details": "LILI",
+        "importer_details": "LILI",
+    }
     assert {key: value for key, value, _source in MAKRO_ACCOUNT_FIXED_DEFAULTS} == expected
+
+    bundle = generated_business_bundle(URL, sku="812345678901")
     for attribute_key, expected_value in expected.items():
         items = bundle.candidates((attribute_key, *BUSINESS_ATTRIBUTE_ALIASES[attribute_key]))
         assert len(items) == 1
@@ -77,6 +100,7 @@ def test_account_fixed_defaults_are_single_config_source_for_all_listings():
 
 def test_account_fixed_labels_are_business_fields_and_skip_product_reasoning():
     labels = (
+        "Base Price",
         "Your selling price",
         "Minimum Order Quantity (MinOQ)",
         "Maximum Order Quantity (MaxOQ)",
@@ -91,11 +115,6 @@ def test_account_fixed_labels_are_business_fields_and_skip_product_reasoning():
     assert all(is_business_question(label) for label in labels)
 
 
-def test_selling_price_is_fixed_while_base_price_and_listing_status_remain_unset():
+def test_listing_status_remains_unset():
     bundle = generated_business_bundle(URL, sku="812345678901")
-    assert bundle.candidates(("mrp", "Base Price")) == []
-    selling = bundle.candidates(("flipkart_selling_price", "Your selling price"))
-    assert len(selling) == 1
-    assert selling[0].value == "6000"
-    assert selling[0].source_type == "config"
     assert bundle.candidates(("listing_status", "Listing Status")) == []
