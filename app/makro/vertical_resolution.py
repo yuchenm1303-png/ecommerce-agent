@@ -17,6 +17,11 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .listing_creation import JSONTaskProvider, ListingBootstrapHints, normalize_label
+from .requested_vertical import (
+    current_requested_vertical,
+    requested_vertical_matches_label,
+    requested_vertical_query,
+)
 
 
 _MAX_SEARCH_TERMS = 5
@@ -197,6 +202,15 @@ def _planned_search_ladder(raw: dict[str, Any]) -> tuple[str, ...]:
 
 
 def plan_vertical_search_terms(provider: JSONTaskProvider, hints: ListingBootstrapHints) -> tuple[str, ...]:
+    requested = current_requested_vertical()
+    if requested:
+        query = requested_vertical_query(requested)
+        if not _usable_query(query):
+            raise ValueError(
+                f"手动指定类目无法转换成可用的 Makro Vertical 搜索词：{requested!r}"
+            )
+        return (query,)
+
     try:
         raw = provider.extract_json(build_vertical_search_plan_request(hints))
     except Exception:
@@ -385,6 +399,29 @@ def choose_vertical_candidate_pool(
     search_terms: tuple[str, ...],
     candidates: list[VerticalCandidateEvidence],
 ) -> str:
+    requested = current_requested_vertical()
+    if requested:
+        if not candidates:
+            raise ValueError(
+                f"手动指定类目 {requested!r} 没有在 Makro 当前 live Vertical 搜索中返回任何候选。"
+            )
+        matches = [
+            item.label
+            for item in candidates
+            if requested_vertical_matches_label(requested, item.label)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            available = " | ".join(item.label for item in candidates[:20])
+            raise ValueError(
+                f"手动指定类目 {requested!r} 未匹配到唯一 Makro live Vertical；"
+                f"当前候选={available or '<none>'}"
+            )
+        raise ValueError(
+            f"手动指定类目 {requested!r} 同时匹配到多个 Makro live Vertical：{matches!r}"
+        )
+
     if not candidates:
         return ""
     raw = provider.extract_json(build_vertical_pool_choice_request(hints, search_terms, candidates))
