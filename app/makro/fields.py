@@ -12,6 +12,8 @@ from typing import Any
 
 from playwright.sync_api import Page
 
+from .locators import ADD_VALUE_CONTROL_JS
+
 _JS_HELPERS = r"""
 const clean = (value) => (value == null ? "" : String(value)).replace(/\s+/g, " ").trim();
 const cssEscape = (value) => {
@@ -178,20 +180,7 @@ _SCAN_BODY = r"""
     return "";
   };
 
-  const hasAddValueControl = (el) => {
-    const wrapper = el.closest('[class*="EditAttributeItemWrapper"]');
-    if (!wrapper) return false;
-    return [...wrapper.querySelectorAll('button, a')].some((node) => {
-      const text = clean(node.innerText || node.textContent);
-      const aria = clean(node.getAttribute('aria-label')).toLowerCase();
-      const title = clean(node.getAttribute('title')).toLowerCase();
-      if (!(text === '+' || aria === 'add' || aria.includes('add value') || title.includes('add value'))) {
-        return false;
-      }
-      if (node.disabled || node.getAttribute('aria-disabled') === 'true') return false;
-      return isVisible(node);
-    });
-  };
+  const hasAddValueControl = (el) => Boolean(findMakroAddValueControl(el).node);
 
   const findOptionScope = (el) => {
     const role = el.getAttribute("role");
@@ -386,7 +375,7 @@ _SCAN_BODY = r"""
   return items;
 """
 
-_SCAN_SCRIPT = "(includeValues) => {\n" + _JS_HELPERS + _SCAN_BODY + "\n}"
+_SCAN_SCRIPT = "(includeValues) => {\n" + _JS_HELPERS + ADD_VALUE_CONTROL_JS + _SCAN_BODY + "\n}"
 
 _FIND_SCROLL_CONTAINERS_SCRIPT = (
     "() => {\n"
@@ -522,10 +511,12 @@ _RICHNESS_KEYS = (
     "has_add_value_control",
 )
 
+
 def _richness(item: dict[str, Any]) -> int:
     score = sum(1 for key in _RICHNESS_KEYS if item.get(key))
     score += min(len(item.get("options") or []), 50)
     return score
+
 
 def merge_scans(scans: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
     """Merge repeated scans, keeping the richest entry per stable DOM path."""
@@ -551,6 +542,7 @@ def merge_scans(scans: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
         item["ordinal"] = ordinal
     return controls
 
+
 def capture_controls(page: Page, include_values: bool = False) -> list[dict[str, Any]]:
     """Scan the whole DOM and return metadata for every recognised control.
 
@@ -560,17 +552,22 @@ def capture_controls(page: Page, include_values: bool = False) -> list[dict[str,
 
     return page.evaluate(_SCAN_SCRIPT, include_values)
 
+
 def find_scroll_containers(page: Page) -> list[dict[str, Any]]:
     return page.evaluate(_FIND_SCROLL_CONTAINERS_SCRIPT)
+
 
 def scroll_window(page: Page) -> dict[str, Any]:
     return page.evaluate(_SCROLL_WINDOW_SCRIPT)
 
+
 def scroll_container(page: Page, path: str) -> dict[str, Any]:
     return page.evaluate(_SCROLL_CONTAINER_SCRIPT, {"path": path})
 
+
 def scroll_to_end(page: Page, path: str) -> dict[str, Any]:
     return page.evaluate(_SCROLL_TO_END_SCRIPT, {"path": path})
+
 
 def capture_dropdown_options(
     page: Page,
@@ -602,6 +599,7 @@ def capture_dropdown_options(
         page.keyboard.press("Escape")
         page.wait_for_timeout(120)
     return controls, opened
+
 
 def scroll_and_capture(
     page: Page,
@@ -655,9 +653,11 @@ def scroll_and_capture(
 
     return controls, stats
 
+
 _INDEXED_NAME_RE = re.compile(r"_\d+_(?:value|qualifier|display|unit|name)?$")
 
 _VALUE_IDX_RE = re.compile(r"_(\d+)_value$")
+
 
 def derive_attribute_key(control: dict[str, Any]) -> str:
     """Stable Makro attribute key: id first, then indexed-name stripping.
@@ -680,11 +680,13 @@ def derive_attribute_key(control: dict[str, Any]) -> str:
         return key
     return control.get("path") or "unknown"
 
+
 def _first_nonempty(values) -> str:
     for value in values:
         if value:
             return value
     return ""
+
 
 def _merge_semantic_field(key: str, controls: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate all DOM controls of one Makro attribute into one semantic field."""
@@ -736,6 +738,7 @@ def _merge_semantic_field(key: str, controls: list[dict[str, Any]]) -> dict[str,
         "multi_value": len(value_indices) > 1 or has_add_value_control,
         "controls": controls,
     }
+
 
 def build_semantic_fields(controls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Group DOM controls into semantic Makro attributes.
