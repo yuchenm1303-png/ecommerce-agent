@@ -8,7 +8,15 @@ from .source_bundle import normalize_key
 
 
 LISTING_INTENT_ENV = "ECOMMERCE_LISTING_INTENT"
-_BASE_CONTENT_POLICY_VERSION = 3
+LISTING_AI_GUIDANCE_ENV = "ECOMMERCE_LISTING_AI_GUIDANCE"
+MODEL_NAME_KEYWORDS_ENV = "ECOMMERCE_MODEL_NAME_KEYWORDS"
+_BASE_CONTENT_POLICY_VERSION = 4
+
+
+def _env_text(name: str, *, limit: int) -> str:
+    raw = str(os.getenv(name, "") or "")
+    compact = " ".join(raw.split()).strip()
+    return compact[: max(1, int(limit))]
 
 
 def current_listing_intent() -> str:
@@ -20,17 +28,39 @@ def current_listing_intent() -> str:
     value so concurrent jobs cannot leak scope into one another.
     """
 
-    raw = str(os.getenv(LISTING_INTENT_ENV, "") or "")
-    compact = " ".join(raw.split()).strip()
-    return compact[:600]
+    return _env_text(LISTING_INTENT_ENV, limit=600)
+
+
+def current_listing_ai_guidance() -> str:
+    """Return optional user guidance for AI wording/emphasis in this run.
+
+    Guidance is deliberately soft. It may help choose emphasis among supported
+    interpretations, but it never becomes evidence and can never override source
+    facts, conflicts, exact identifiers, brand/compliance data or live Makro
+    constraints.
+    """
+
+    return _env_text(LISTING_AI_GUIDANCE_ENV, limit=1000)
+
+
+def current_model_name_keywords() -> str:
+    """Return optional candidate search terms for Model Name synthesis only."""
+
+    return _env_text(MODEL_NAME_KEYWORDS_ENV, limit=500)
 
 
 def _policy_version() -> str:
-    # Product-fact caching includes CONTENT_POLICY_VERSION. Including a short
-    # intent digest prevents two runs for the same supplier URL but different
-    # selected variants/bundles from sharing semantic answers.
-    intent = current_listing_intent()
-    digest = hashlib.sha256(intent.encode("utf-8")).hexdigest()[:12] if intent else "none"
+    # Product-fact caching includes CONTENT_POLICY_VERSION. Include all per-run
+    # seller guidance so the same supplier URL cannot reuse answers generated for
+    # a different sold offer, AI emphasis or Model Name keyword brief.
+    payload = "\n".join(
+        (
+            current_listing_intent(),
+            current_listing_ai_guidance(),
+            current_model_name_keywords(),
+        )
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12] if payload else "none"
     return f"{_BASE_CONTENT_POLICY_VERSION}:{digest}"
 
 
@@ -60,7 +90,18 @@ _INTENT_RULES: tuple[str, ...] = (
         "It is authoritative for what this listing is intended to sell, but it must not create unrelated product specifications or override a real contradiction."
     ),
 ) if _intent else ()
-GLOBAL_CONTENT_RULES: tuple[str, ...] = _GLOBAL_BASE_RULES + _INTENT_RULES
+
+_ai_guidance = current_listing_ai_guidance()
+_AI_GUIDANCE_RULES: tuple[str, ...] = (
+    (
+        "Optional seller AI guidance for this run: "
+        + repr(_ai_guidance)
+        + ". Treat it only as a soft instruction for emphasis, wording and selection among interpretations already supported by grounded evidence. "
+        "It is not product evidence and must never create or override specifications, package contents, identifiers, brand, compliance facts, live options, qualifiers or seller/business locks."
+    ),
+) if _ai_guidance else ()
+
+GLOBAL_CONTENT_RULES: tuple[str, ...] = _GLOBAL_BASE_RULES + _INTENT_RULES + _AI_GUIDANCE_RULES
 
 
 def _names(field: dict[str, Any]) -> set[str]:
@@ -92,6 +133,17 @@ def _with_intent(policy: dict[str, Any]) -> dict[str, Any]:
     return {**policy, "listing_intent": intent}
 
 
+def _with_ai_guidance(policy: dict[str, Any]) -> dict[str, Any]:
+    guidance = current_listing_ai_guidance()
+    if not guidance:
+        return policy
+    return {**policy, "ai_guidance": guidance}
+
+
+def _with_user_context(policy: dict[str, Any]) -> dict[str, Any]:
+    return _with_ai_guidance(_with_intent(policy))
+
+
 def _sales_package_value_shape(field: dict[str, Any]) -> dict[str, str]:
     if bool(field.get("multi_value")):
         return {
@@ -120,26 +172,37 @@ def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
     """Return seller content policy for one live field, without product reasoning."""
 
     if _matches(field, "Model Name", "model_name"):
-        return _with_intent(
-            {
-                "policy_id": "model_name",
-                "generation_mode": "grounded_synthesis",
-                "required_fallback": "manual_only",
-                "instruction": (
-                    "Write one concise English ecommerce title attribute for South African buyer search behaviour "
-                    "using the selected listing intent when present plus grounded product type, core functions, "
-                    "important supported specifications and supported use-case terms. Omit brand names from this "
-                    "generated title. Never output N/A, None or a numeric placeholder for Model Name. Avoid "
-                    "repetition, keyword stuffing and unsupported claims."
-                ),
-            }
-        )
+        model_keywords = current_model_name_keywords()
+        keyword_instruction = ""
+        if model_keywords:
+            keyword_instruction = (
+                " The seller supplied these candidate Model Name search terms: "
+                + repr(model_keywords)
+                + ". Use only terms that are genuinely relevant to this exact product and supported by the grounded evidence. "
+                "Blend useful terms naturally into the title, omit irrelevant or unsupported terms, do not add brands, and never keyword-stuff."
+            )
+        policy: dict[str, Any] = {
+            "policy_id": "model_name",
+            "generation_mode": "grounded_synthesis",
+            "required_fallback": "manual_only",
+            "instruction": (
+                "Write one concise English ecommerce title attribute for South African buyer search behaviour "
+                "using the selected listing intent when present plus grounded product type, core functions, "
+                "important supported specifications and supported use-case terms. Omit brand names from this "
+                "generated title. Never output N/A, None or a numeric placeholder for Model Name. Avoid "
+                "repetition, keyword stuffing and unsupported claims."
+                + keyword_instruction
+            ),
+        }
+        if model_keywords:
+            policy["model_name_candidate_keywords"] = model_keywords
+        return _with_user_context(policy)
 
     if _matches(field, "Sales Package", "sales_package"):
         intent = current_listing_intent()
         shape = _sales_package_value_shape(field)
         if intent:
-            return _with_intent(
+            return _with_user_context(
                 {
                     "policy_id": "sales_package",
                     "generation_mode": "grounded_synthesis",
@@ -157,23 +220,25 @@ def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
                     ),
                 }
             )
-        return {
-            "policy_id": "sales_package",
-            "generation_mode": "grounded_only",
-            "evidence_mode": "exact_product_only",
-            "best_effort": "disabled",
-            "required_fallback": "manual_only",
-            **shape,
-            "instruction": (
-                "List only items explicitly supported as included in the sold package. Never infer standard "
-                "accessories or quantities from product category convention. If exact package contents are not "
-                "verified, keep this field MISSING. Never use N/A as Sales Package. "
-                + shape["shape_instruction"]
-            ),
-        }
+        return _with_ai_guidance(
+            {
+                "policy_id": "sales_package",
+                "generation_mode": "grounded_only",
+                "evidence_mode": "exact_product_only",
+                "best_effort": "disabled",
+                "required_fallback": "manual_only",
+                **shape,
+                "instruction": (
+                    "List only items explicitly supported as included in the sold package. Never infer standard "
+                    "accessories or quantities from product category convention. If exact package contents are not "
+                    "verified, keep this field MISSING. Never use N/A as Sales Package. "
+                    + shape["shape_instruction"]
+                ),
+            }
+        )
 
     if _matches(field, "Description", "description"):
-        return _with_intent(
+        return _with_user_context(
             {
                 "policy_id": "description",
                 "generation_mode": "grounded_synthesis",
@@ -215,7 +280,7 @@ def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
         }
 
     if _matches(field, "Keywords", "Search Keywords", "keywords", "search_keywords"):
-        return _with_intent(
+        return _with_user_context(
             {
                 "policy_id": "keywords",
                 "generation_mode": "grounded_synthesis",
@@ -231,7 +296,7 @@ def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
         )
 
     if _matches(field, "Other Features", "Other Feature", "other_features", "other_feature"):
-        return _with_intent(
+        return _with_user_context(
             {
                 "policy_id": "other_features",
                 "generation_mode": "grounded_synthesis",
@@ -244,7 +309,7 @@ def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
         )
 
     if _matches(field, "Other Traits", "Other Trait", "other_traits", "other_trait"):
-        return _with_intent(
+        return _with_user_context(
             {
                 "policy_id": "other_traits",
                 "generation_mode": "grounded_synthesis",
@@ -257,7 +322,7 @@ def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
         )
 
     if _title_contributor(field):
-        return _with_intent(
+        return _with_user_context(
             {
                 "policy_id": "title_contributor",
                 "generation_mode": "grounded_context_only",
@@ -272,7 +337,7 @@ def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
 
     section = normalize_key(field.get("section_heading"))
     if section == normalize_key("Additional Description"):
-        return _with_intent(
+        return _with_user_context(
             {
                 "policy_id": "optional_additional_grounded",
                 "generation_mode": "grounded_context_only",
@@ -285,17 +350,17 @@ def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
         )
 
     intent = current_listing_intent()
-    if intent:
-        return {
-            "policy_id": "listing_intent_scope",
+    guidance = current_listing_ai_guidance()
+    if intent or guidance:
+        policy: dict[str, Any] = {
+            "policy_id": "user_listing_context",
             "generation_mode": "grounded_context_only",
-            "listing_intent": intent,
             "instruction": (
-                "Use the explicit seller-selected listing intent only to disambiguate this field among variants, "
-                "colours, packs, quantities or bundles that are supported by the supplier evidence. Do not infer "
-                "unmentioned specifications from the intent."
+                "Use user-provided listing context only inside the boundaries of grounded supplier evidence and the live Makro field contract. "
+                "Do not infer unmentioned specifications, identifiers, brands, compliance facts or package contents from guidance alone."
             ),
         }
+        return _with_user_context(policy)
 
     return {}
 
@@ -327,10 +392,14 @@ def requires_exact_web_identity(field: dict[str, Any]) -> bool:
 __all__ = [
     "CONTENT_POLICY_VERSION",
     "GLOBAL_CONTENT_RULES",
+    "LISTING_AI_GUIDANCE_ENV",
     "LISTING_INTENT_ENV",
+    "MODEL_NAME_KEYWORDS_ENV",
     "allow_best_effort_inference",
     "allow_required_fallback",
+    "current_listing_ai_guidance",
     "current_listing_intent",
+    "current_model_name_keywords",
     "field_content_policy",
     "requires_exact_web_identity",
 ]
