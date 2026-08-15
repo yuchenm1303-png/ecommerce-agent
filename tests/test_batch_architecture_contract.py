@@ -9,6 +9,7 @@ SOURCE = (ROOT / "makro_batch_source.py").read_text(encoding="utf-8")
 JOB = (ROOT / "makro_batch_job.py").read_text(encoding="utf-8")
 WORKFLOW = (ROOT / "makro_gui_workflow.py").read_text(encoding="utf-8")
 EXECUTOR = (ROOT / "makro_execute_listing.py").read_text(encoding="utf-8")
+MODEL = (ROOT / "gui" / "batch_model.py").read_text(encoding="utf-8")
 RUNNER = (ROOT / "gui" / "batch_runner.py").read_text(encoding="utf-8")
 WORKSPACE = (ROOT / "gui" / "batch_workspace.py").read_text(encoding="utf-8")
 CONTROLS = (ROOT / "gui" / "batch_job_controls.py").read_text(encoding="utf-8")
@@ -53,6 +54,17 @@ def test_ready_job_can_execute_while_other_batch_jobs_keep_preparing() -> None:
     assert "self.controller._start_execute_job" in CONTROLS
     assert 'self.controller._mode in {"idle", "execute"}' not in CONTROLS
     assert "READY · 可单独填写 · 其他任务继续" in CONTROLS
+
+
+def test_batch_worker_limit_is_shared_and_supports_sixteen() -> None:
+    assert "BATCH_WORKER_MIN = 1" in MODEL
+    assert "BATCH_WORKER_DEFAULT = 6" in MODEL
+    assert "BATCH_WORKER_MAX = 16" in MODEL
+    assert "normalize_batch_concurrency(execute_concurrency)" in RUNNER
+    assert "self.worker_count.setRange(BATCH_WORKER_MIN, BATCH_WORKER_MAX)" in WORKSPACE
+    assert "self.worker_count.setValue(BATCH_WORKER_DEFAULT)" in WORKSPACE
+    assert "self.worker_count.setRange(1, 3)" not in WORKSPACE
+    assert "min(4, int(execute_concurrency))" not in RUNNER
 
 
 def test_batch_and_single_share_page_progress_reconciliation() -> None:
