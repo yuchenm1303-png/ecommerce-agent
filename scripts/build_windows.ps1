@@ -1,5 +1,6 @@
 param(
-    [string]$Version = ""
+    [string]$Version = "",
+    [switch]$RunUpdateE2E
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,6 +13,11 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
 if ($Version -notmatch '^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') {
     throw "Invalid package version: $Version"
 }
+
+# The full frozen old-app -> updater -> Inno -> relaunch test is deliberately a
+# Stable-release gate, not a tax on every development package build.  Local
+# callers can opt in explicitly with -RunUpdateE2E.
+$ShouldRunUpdateE2E = [bool]$RunUpdateE2E -or ($env:GITHUB_WORKFLOW -eq "Publish Update")
 
 $DistRoot = Join-Path $Root "dist"
 $AppDir = Join-Path $DistRoot "EcommerceAgent"
@@ -148,13 +154,18 @@ if (-not (Test-Path $SetupExe)) {
     throw "Installer output missing: $SetupExe"
 }
 
-Write-Host "[post-build] Running real frozen updater end-to-end handoff"
-& (Join-Path $Root "scripts\test_windows_update_e2e.ps1") `
-    -Version $Version `
-    -AppDir $AppDir `
-    -SetupExe $SetupExe
-if ($LASTEXITCODE -ne 0) {
-    throw "Frozen updater end-to-end smoke test failed with exit code $LASTEXITCODE"
+if ($ShouldRunUpdateE2E) {
+    Write-Host "[release-gate] Running real frozen updater end-to-end handoff"
+    & (Join-Path $Root "scripts\test_windows_update_e2e.ps1") `
+        -Version $Version `
+        -AppDir $AppDir `
+        -SetupExe $SetupExe
+    if ($LASTEXITCODE -ne 0) {
+        throw "Frozen updater end-to-end smoke test failed with exit code $LASTEXITCODE"
+    }
+}
+else {
+    Write-Host "[release-gate] Skipping heavy updater E2E for normal development build"
 }
 
 Write-Host ""
