@@ -11,6 +11,7 @@ WORKFLOW = (ROOT / "makro_gui_workflow.py").read_text(encoding="utf-8")
 EXECUTOR = (ROOT / "makro_execute_listing.py").read_text(encoding="utf-8")
 RUNNER = (ROOT / "gui" / "batch_runner.py").read_text(encoding="utf-8")
 WORKSPACE = (ROOT / "gui" / "batch_workspace.py").read_text(encoding="utf-8")
+CONTROLS = (ROOT / "gui" / "batch_job_controls.py").read_text(encoding="utf-8")
 WINDOW = (ROOT / "gui" / "workflow_console_window.py").read_text(encoding="utf-8")
 
 
@@ -42,6 +43,16 @@ def test_batch_reuses_canonical_business_pipeline_and_executor() -> None:
     assert '"--all-step3"' in RUNNER
     assert '"--allow-section-save"' in RUNNER
     assert '"--upload-image"' in RUNNER
+
+
+def test_ready_job_can_execute_while_other_batch_jobs_keep_preparing() -> None:
+    assert "def _pump_prepare_lane(" in CONTROLS
+    assert "def _pump_execute_lane(" in CONTROLS
+    assert "self._pump_prepare_lane()" in CONTROLS
+    assert "self._pump_execute_lane()" in CONTROLS
+    assert "self.controller._start_execute_job" in CONTROLS
+    assert 'self.controller._mode in {"idle", "execute"}' not in CONTROLS
+    assert "READY · 可单独填写 · 其他任务继续" in CONTROLS
 
 
 def test_batch_and_single_share_page_progress_reconciliation() -> None:
