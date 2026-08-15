@@ -4,8 +4,9 @@ One production decision boundary owns Step 1: Makro must supply every selectable
 Vertical. Product Identity supplies semantics, AI plans several retrieval intents,
 Makro returns query-owned live rows, and AI chooses once from the aggregated live
 pool. The chosen row is then replayed through the query that produced it and must
-still verify to a canonical Makro Vertical. Browse taxonomy remains the bounded
-fallback when live search cannot produce a verified candidate.
+still verify to a canonical Makro Vertical. Browse taxonomy is available only when
+live search produced no semantic candidate at all; a broken binding for an already
+selected live candidate fails closed instead of silently switching mechanisms.
 
 The workflow never invents a Makro Vertical and never clicks Send to QC.
 """
@@ -317,17 +318,56 @@ def _complete_exact_live_vertical(
     return canonical_after
 
 
-def _close_vertical_search(search, page: Page, *, wait_ms: int) -> None:
+def _close_vertical_search(search, page: Page, *, wait_ms: int) -> bool:
+    """End one query transaction and prove its owned result surface is quiescent.
+
+    Makro can keep autocomplete DOM nodes mounted after a query. Capturing the
+    next pre-query baseline while those rows are still visibly painted poisons
+    ownership: a later replay may reuse the exact same DOM node/text and look
+    unchanged. We therefore clear, Escape and blur the search, then require two
+    consecutive empty query-owned reads before a new baseline may be captured.
+    """
+
     try:
         search.fill("")
     except Exception:
-        return
+        return False
     try:
         search.press("Escape")
     except Exception:
         pass
-    if wait_ms > 0:
-        page.wait_for_timeout(min(max(wait_ms // 3, 80), 250))
+    try:
+        search.evaluate("el => el.blur()")
+    except Exception:
+        pass
+
+    poll_ms = min(max(int(wait_ms) // 4, 80), 200)
+    max_polls = max(6, min(18, int(max(wait_ms, 800) / max(poll_ms, 1)) + 4))
+    empty_rounds = 0
+    last_rows: list[str] = []
+    for _ in range(max_polls):
+        last_rows = _scoped_vertical_search_candidates(search)
+        if not last_rows:
+            empty_rounds += 1
+            if empty_rounds >= 2:
+                _vertical_diag(
+                    "query_quiescence",
+                    {"verified": True, "remaining_rows": 0},
+                )
+                return True
+        else:
+            empty_rounds = 0
+        page.wait_for_timeout(poll_ms)
+
+    _vertical_diag(
+        "query_quiescence",
+        {
+            "verified": False,
+            "remaining_rows": len(last_rows),
+            "sample": last_rows[:8],
+        },
+    )
+    return False
 
 
 def _run_vertical_search_query(
@@ -339,7 +379,11 @@ def _run_vertical_search_query(
 ) -> list[str]:
     """Run one isolated query and return only rows owned by that query."""
 
-    _close_vertical_search(search, page, wait_ms=wait_ms)
+    if not _close_vertical_search(search, page, wait_ms=wait_ms):
+        raise RuntimeError(
+            "Makro Step 1 previous query-owned Vertical Search surface did not become quiescent; "
+            f"refusing to capture a contaminated baseline before query={term!r}"
+        )
     begin_search_query(search)
     search.fill(term)
     rows = _wait_for_scoped_vertical_search_candidates(
@@ -392,18 +436,37 @@ def _try_select_via_search(
         return "", observed, planned_terms
 
     replay_terms = matched_queries_for_candidate(pool, selected)
+    replay_attempts: list[dict[str, object]] = []
     for term in replay_terms:
         rows = _run_vertical_search_query(page, search, term, wait_ms=wait_ms)
         matches = [row for row in rows if normalize_label(row) == normalize_label(selected)]
+        attempt: dict[str, object] = {
+            "selected_vertical": selected,
+            "query": term,
+            "row_count": len(rows),
+            "exact_match_count": len(matches),
+            "sample": rows[:8],
+        }
+        _vertical_diag("selected_replay", attempt)
+        replay_attempts.append(attempt)
         if len(matches) != 1:
             continue
+
         live_selected = matches[0]
         previous_canonical, _ = _current_target_values(page)
-        if not click_search_row(search, live_selected):
-            raise RuntimeError(
-                "Makro Step 1 re-found the globally selected query-owned Vertical but could not bind an exact click target: "
-                f"{live_selected!r}; query={term!r}"
+        clicked = click_search_row(search, live_selected)
+        replay_attempts[-1]["click_bound"] = bool(clicked)
+        if not clicked:
+            _vertical_diag(
+                "selected_replay_click_failed",
+                {
+                    "selected_vertical": selected,
+                    "query": term,
+                    "action": "try_next_grounded_query",
+                },
             )
+            continue
+
         return (
             _complete_exact_live_vertical(
                 page,
@@ -416,7 +479,20 @@ def _try_select_via_search(
         )
 
     _close_vertical_search(search, page, wait_ms=wait_ms)
-    return "", observed, planned_terms
+    _vertical_diag(
+        "selected_replay_exhausted",
+        {
+            "selected_vertical": selected,
+            "replay_queries": list(replay_terms),
+            "attempts": replay_attempts,
+            "action": "fail_closed_no_taxonomy_fallback",
+        },
+    )
+    raise RuntimeError(
+        "Makro Step 1 selected a grounded query-owned live Vertical but could not rebind that exact candidate "
+        "through any query that originally produced it; refusing taxonomy fallback because the failure is "
+        f"binding/transport, not semantic absence: selected={selected!r}; replay_queries={list(replay_terms)!r}"
+    )
 
 
 def _select_via_search_with_context(
@@ -606,6 +682,8 @@ def select_vertical(
     if search_selected:
         return search_selected
 
+    # Taxonomy is a semantic fallback only. _try_select_via_search raises when
+    # a grounded live candidate existed but its exact replay/binding failed.
     taxonomy = ResilientMakroTaxonomyBrowser(page)
     taxonomy_selected = _select_via_taxonomy(page, provider, hints, taxonomy, wait_ms=wait_ms)
     if taxonomy_selected:
