@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
 from app.product_pack import SUPPORTED_PRODUCT_PACK_SUFFIXES
+from .async_run_journal import AsyncRunJournal
 from .result_loader import load_run_result
 
 
@@ -59,6 +60,11 @@ class ReadOnlyRunner(QObject):
     starts a fresh ownership context and therefore never injects an implicit
     ``--resume-current-url`` from a previous failure. Backend resume remains an
     explicit CLI capability for diagnostics/recovery tooling only.
+
+    Child-process output stays on the Qt event loop only long enough to decode
+    protocol markers and publish lightweight signals. Complete run logs are
+    journaled on a dedicated writer thread so stdout bursts cannot turn into
+    synchronous filesystem stalls on the GUI presentation lane.
     """
 
     log = Signal(str)
@@ -83,6 +89,7 @@ class ReadOnlyRunner(QObject):
         self._stdout_tail = ""
         self._phase_started: dict[str, tuple[float, str]] = {}
         self._completed_active: set[str] = set()
+        self._journal: AsyncRunJournal | None = None
 
     @property
     def is_running(self) -> bool:
@@ -107,6 +114,7 @@ class ReadOnlyRunner(QObject):
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         self.run_dir = self.project_root / "logs" / "gui-runs" / f"workflow-{mode}-{stamp}"
         self.run_dir.mkdir(parents=True, exist_ok=False)
+        self._start_journal(self.run_dir / "gui-workflow.log")
         source_cache = self.run_dir / "_cache" / "source"
         semantic_cache = self.run_dir / "_cache" / "semantic"
         source_cache.mkdir(parents=True, exist_ok=True)
@@ -345,6 +353,7 @@ class ReadOnlyRunner(QObject):
     ) -> None:
         self._read_output()
         self._flush_tail()
+        self._close_journal()
         self.process = None
         if self._stopping:
             self.running_changed.emit(False)
@@ -391,11 +400,22 @@ class ReadOnlyRunner(QObject):
             return
         if error == QProcess.FailedToStart:
             self.process = None
+            self._close_journal()
             self.running_changed.emit(False)
             self.failed.emit("GUI workflow Python 子进程启动失败。")
 
+    def _start_journal(self, path: Path) -> None:
+        self._close_journal()
+        self._journal = AsyncRunJournal(path)
+
+    def _close_journal(self) -> None:
+        journal = self._journal
+        self._journal = None
+        if journal is not None:
+            journal.close()
+
     def _emit_log(self, line: str) -> None:
         self.log.emit(line)
-        if self.run_dir is not None:
-            with (self.run_dir / "gui-workflow.log").open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+        journal = self._journal
+        if journal is not None:
+            journal.append(line)

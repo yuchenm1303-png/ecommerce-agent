@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
 
 from app.listing_images import listing_images_from_resolver_outputs
 from app.required_overrides import write_required_fallback_overrides
@@ -42,6 +42,9 @@ _PHASE_UI = {
     "plan": ("RESOLVING", 76, "解析字段"),
 }
 
+_BATCH_LOG_PREVIEW_MS = 140
+_BATCH_STATE_PUBLISH_MS = 180
+
 
 class BatchController(QObject):
     """Persistent batch scheduler around the canonical single-product engine.
@@ -50,6 +53,11 @@ class BatchController(QObject):
     supplier bytes are cached, up to ``prepare_concurrency`` independent Makro
     owned-tab jobs may run in parallel. Real execution uses the same owned tab
     token and has a separate bounded concurrency.
+
+    Child-process stdout remains fully owned by each job's workflow/executor
+    artifacts. The control-tower surface receives a rate-limited latest-line
+    preview per job, while batch.json and the full card model are published on a
+    coalesced state cadence. This keeps 8/16-worker bursts off the GUI paint lane.
     """
 
     jobs_changed = Signal(object)
@@ -72,6 +80,18 @@ class BatchController(QObject):
         self._buffers: dict[QProcess, str] = {}
         self._stopping = False
         self._execution_images = False
+        self._pending_log_preview: dict[str, str] = {}
+        self._state_dirty = False
+
+        self._log_preview_timer = QTimer(self)
+        self._log_preview_timer.setSingleShot(True)
+        self._log_preview_timer.setInterval(_BATCH_LOG_PREVIEW_MS)
+        self._log_preview_timer.timeout.connect(self._flush_log_preview)
+
+        self._state_publish_timer = QTimer(self)
+        self._state_publish_timer.setSingleShot(True)
+        self._state_publish_timer.setInterval(_BATCH_STATE_PUBLISH_MS)
+        self._state_publish_timer.timeout.connect(self._flush_persist_emit)
 
     @property
     def is_running(self) -> bool:
@@ -101,7 +121,7 @@ class BatchController(QObject):
         self._source_queue = [job.job_id for job in self.batch.jobs]
         self._prepare_queue = []
         self._execute_queue = []
-        self._persist_emit()
+        self._persist_emit(immediate=True)
         self.running_changed.emit(True)
         self.state_changed.emit("批量准备中")
         self._pump_prepare()
@@ -135,7 +155,7 @@ class BatchController(QObject):
         self._execute_queue = [job.job_id for job in ready]
         self.running_changed.emit(True)
         self.state_changed.emit("批量真实填写中")
-        self._persist_emit()
+        self._persist_emit(immediate=True)
         self._pump_execute()
 
     def stop(self) -> None:
@@ -153,7 +173,7 @@ class BatchController(QObject):
                 job.touch()
         if self.batch is not None:
             self.batch.status = "STOPPED"
-        self._persist_emit()
+        self._persist_emit(immediate=True)
 
     def _jobs(self) -> list[BatchJob]:
         return self.batch.jobs if self.batch is not None else []
@@ -182,7 +202,7 @@ class BatchController(QObject):
         if not self._source_queue and not self._prepare_queue and not self._processes:
             self.batch.status = "PREPARED"
             self._mode = "idle"
-            self._persist_emit()
+            self._persist_emit(immediate=True)
             self.running_changed.emit(False)
             self.state_changed.emit("批量准备完成")
 
@@ -253,7 +273,7 @@ class BatchController(QObject):
         if not self._execute_queue and not self._processes:
             self.batch.status = "COMPLETE"
             self._mode = "idle"
-            self._persist_emit()
+            self._persist_emit(immediate=True)
             self.running_changed.emit(False)
             self.state_changed.emit("Batch 执行完成")
 
@@ -279,7 +299,7 @@ class BatchController(QObject):
 
         fallback_summary = write_required_fallback_overrides(fill_plan, live_schema)
         if int(fallback_summary.get("count") or 0) > 0:
-            self.log.emit(
+            self._emit_log_now(
                 f"[{job.job_id}] [required-fallback] "
                 f"overrides={fallback_summary.get('path') or 'none'} "
                 f"automatic={fallback_summary.get('count')} ai_calls=0"
@@ -334,7 +354,7 @@ class BatchController(QObject):
             lambda exit_code, exit_status, p=process: self._finished(p, int(exit_code))
         )
         command = subprocess.list2cmdline([sys.executable, *args])
-        self.log.emit(f"[{job_id} · {stage}] $ {command}")
+        self._emit_log_now(f"[{job_id} · {stage}] $ {command}")
         process.start(sys.executable, args)
 
     def _read_output(self, process: QProcess) -> None:
@@ -352,7 +372,7 @@ class BatchController(QObject):
 
     def _observe_line(self, process: QProcess, line: str) -> None:
         job_id, stage = self._processes.get(process, ("?", "?"))
-        self.log.emit(f"[{job_id}] {line}")
+        self._queue_log_preview(job_id, f"[{job_id}] {line}")
         if job_id == "?":
             return
         job = self._job(job_id)
@@ -521,13 +541,42 @@ class BatchController(QObject):
     def _finish_if_stopped(self) -> None:
         if self._processes:
             return
+        self._flush_persist_emit()
+        self._flush_log_preview()
         self._mode = "idle"
         self.running_changed.emit(False)
         self.state_changed.emit("Batch 已停止")
 
-    def _persist_emit(self) -> None:
+    def _emit_log_now(self, text: str) -> None:
+        self.log.emit(text)
+
+    def _queue_log_preview(self, job_id: str, text: str) -> None:
+        self._pending_log_preview[str(job_id)] = text
+        if not self._log_preview_timer.isActive():
+            self._log_preview_timer.start()
+
+    def _flush_log_preview(self) -> None:
+        if not self._pending_log_preview:
+            return
+        pending = list(self._pending_log_preview.values())
+        self._pending_log_preview.clear()
+        for text in pending:
+            self.log.emit(text)
+
+    def _persist_emit(self, *, immediate: bool = False) -> None:
         if self.batch is None:
             return
+        self._state_dirty = True
+        if immediate:
+            self._flush_persist_emit()
+        elif not self._state_publish_timer.isActive():
+            self._state_publish_timer.start()
+
+    def _flush_persist_emit(self) -> None:
+        if not self._state_dirty or self.batch is None:
+            return
+        self._state_publish_timer.stop()
+        self._state_dirty = False
         save_batch_run(self.batch)
         self.jobs_changed.emit(list(self.batch.jobs))
         self.summary_changed.emit(self.batch.summary())

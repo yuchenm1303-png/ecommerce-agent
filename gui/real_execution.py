@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import json
 import subprocess
 import sys
@@ -26,11 +27,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .async_run_journal import AsyncRunJournal
 from .result_loader import latest_live_schema, latest_resolver_manifest
 
 
 FULL_STEP3 = "__full_step3__"
 PRODUCT_PHOTOS = "Product Photos"
+_LIVE_LOG_FLUSH_MS = 120
+_LIVE_LOG_BATCH_LINES = 80
+_LIVE_LOG_PENDING_LINES = 1600
+_LIVE_LOG_VISIBLE_BLOCKS = 1800
 
 
 def resolver_evidence_images(outputs: dict[str, Any]) -> list[Path]:
@@ -64,7 +70,13 @@ class RealExecutionConfig:
 
 
 class RealExecutionRunner(QObject):
-    """Thin GUI bridge to the canonical Makro production executor."""
+    """Thin GUI bridge to the canonical Makro production executor.
+
+    Browser work remains isolated in the canonical child process.  The GUI side
+    only decodes stdout and protocol milestones; complete telemetry is journaled
+    on a dedicated writer thread so output bursts do not perform filesystem I/O
+    on Qt's presentation loop.
+    """
 
     log = Signal(str)
     progress_changed = Signal(int, str)
@@ -82,6 +94,7 @@ class RealExecutionRunner(QObject):
         self._stdout_tail = ""
         self._started_at = 0.0
         self._section_milestones: set[str] = set()
+        self._journal: AsyncRunJournal | None = None
 
     @property
     def is_running(self) -> bool:
@@ -96,6 +109,7 @@ class RealExecutionRunner(QObject):
         self.config = config
         self.output_root = config.read_only_run_dir.resolve() / "05-real-execution"
         self.output_root.mkdir(parents=True, exist_ok=True)
+        self._start_journal(self.output_root / "real-execution-gui.log")
         self._stdout_tail = ""
         self._section_milestones.clear()
         self._started_at = time.monotonic()
@@ -297,6 +311,7 @@ class RealExecutionRunner(QObject):
     def _process_finished(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
         self._read_output()
         self._flush_tail()
+        self._close_journal()
         self.process = None
         elapsed = max(0.0, time.monotonic() - self._started_at)
 
@@ -324,6 +339,7 @@ class RealExecutionRunner(QObject):
     def _process_error(self, error: QProcess.ProcessError) -> None:
         if error == QProcess.FailedToStart:
             self.process = None
+            self._close_journal()
             self.running_changed.emit(False)
             self.failed.emit("真实执行 Python 子进程启动失败。")
 
@@ -335,20 +351,36 @@ class RealExecutionRunner(QObject):
             raise RuntimeError(f"未找到执行报告：{self.output_root}")
         return max(reports, key=lambda path: path.stat().st_mtime_ns)
 
+    def _start_journal(self, path: Path) -> None:
+        self._close_journal()
+        self._journal = AsyncRunJournal(path)
+
+    def _close_journal(self) -> None:
+        journal = self._journal
+        self._journal = None
+        if journal is not None:
+            journal.close()
+
     def _emit_log(self, line: str) -> None:
         self.log.emit(line)
-        if self.output_root is not None:
-            with (self.output_root / "real-execution-gui.log").open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+        journal = self._journal
+        if journal is not None:
+            journal.append(line)
 
 
 class RealExecutionConsole(QWidget):
-    """Detailed console tab for live browser execution and report inspection."""
+    """Detailed console tab for live browser execution and report inspection.
+
+    The visible QTextDocument is a telemetry viewport, not the durable log store.
+    It therefore has a fixed repaint budget while the complete stream continues
+    to the runner's AsyncRunJournal.
+    """
 
     def __init__(self, runner: RealExecutionRunner, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.runner = runner
-        self._pending_logs: list[str] = []
+        self._pending_logs: deque[str] = deque(maxlen=_LIVE_LOG_PENDING_LINES)
+        self._dropped_live_lines = 0
         self._field_rows: list[tuple[str, dict[str, Any], str]] = []
 
         layout = QVBoxLayout(self)
@@ -374,12 +406,13 @@ class RealExecutionConsole(QWidget):
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.addTab(self._build_fields_tab(), "执行结果")
-        self.tabs.addTab(self._build_live_tab(), "运行日志")
+        self.live_tab = self._build_live_tab()
+        self.tabs.addTab(self.live_tab, "运行日志")
         self.tabs.addTab(self._build_report_tab(), "原始报告")
         layout.addWidget(self.tabs, 1)
 
         self.flush_timer = QTimer(self)
-        self.flush_timer.setInterval(70)
+        self.flush_timer.setInterval(_LIVE_LOG_FLUSH_MS)
         self.flush_timer.timeout.connect(self._flush_logs)
 
         runner.log.connect(self._queue_log)
@@ -406,7 +439,7 @@ class RealExecutionConsole(QWidget):
         self.log_view.setProperty("detailTitle", "真实网页执行日志")
         self.log_view.setReadOnly(True)
         self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.log_view.document().setMaximumBlockCount(12000)
+        self.log_view.document().setMaximumBlockCount(_LIVE_LOG_VISIBLE_BLOCKS)
         layout.addWidget(self.command_view)
         layout.addWidget(self.log_view, 1)
         return host
@@ -469,18 +502,42 @@ class RealExecutionConsole(QWidget):
         return host
 
     def _queue_log(self, line: str) -> None:
+        if len(self._pending_logs) >= self._pending_logs.maxlen:
+            self._dropped_live_lines += 1
         self._pending_logs.append(line)
         if not self.flush_timer.isActive():
             self.flush_timer.start()
 
-    def _flush_logs(self) -> None:
+    def _flush_logs(self, *, force: bool = False, drain: bool = False) -> None:
         if not self._pending_logs:
             self.flush_timer.stop()
             return
-        self.log_view.appendPlainText("\n".join(self._pending_logs))
-        self._pending_logs.clear()
-        bar = self.log_view.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        if not force and self.tabs.currentWidget() is not self.live_tab:
+            return
+
+        count = len(self._pending_logs) if drain else min(
+            _LIVE_LOG_BATCH_LINES,
+            len(self._pending_logs),
+        )
+        batch = [self._pending_logs.popleft() for _ in range(count)]
+        if self._dropped_live_lines:
+            batch.insert(
+                0,
+                f"[GUI viewport] {self._dropped_live_lines} older live lines omitted; full log is persisted.",
+            )
+            self._dropped_live_lines = 0
+
+        self.log_view.setUpdatesEnabled(False)
+        try:
+            self.log_view.appendPlainText("\n".join(batch))
+            if force or self.tabs.currentWidget() is self.live_tab:
+                bar = self.log_view.verticalScrollBar()
+                bar.setValue(bar.maximum())
+        finally:
+            self.log_view.setUpdatesEnabled(True)
+
+        if not self._pending_logs:
+            self.flush_timer.stop()
 
     def _on_progress(self, percent: int, text: str) -> None:
         value = max(0, min(100, int(percent)))
@@ -500,6 +557,8 @@ class RealExecutionConsole(QWidget):
 
     def _on_running(self, running: bool) -> None:
         if running:
+            self._pending_logs.clear()
+            self._dropped_live_lines = 0
             self.log_view.clear()
             self.report_view.clear()
             self.field_table.setRowCount(0)
@@ -507,15 +566,15 @@ class RealExecutionConsole(QWidget):
             self.summary_label.setText("真实网页执行中…")
             self.tabs.setCurrentIndex(1)
         else:
-            self._flush_logs()
+            self._flush_logs(force=True, drain=True)
 
     def _on_completed(self, report: dict[str, Any]) -> None:
-        self._flush_logs()
+        self._flush_logs(force=True, drain=True)
         self._populate_report(report)
         self.state_label.setText("COMPLETED · real browser execution report loaded")
 
     def _on_failed(self, message: str) -> None:
-        self._flush_logs()
+        self._flush_logs(force=True, drain=True)
         self.state_label.setText("FAILED · " + message)
         self.state_label.setStyleSheet("color: #f18da0;")
 
