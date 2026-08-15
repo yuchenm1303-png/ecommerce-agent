@@ -3,11 +3,14 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
+import pytest
+
 from app.fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem
 from app.required_overrides import (
     FALLBACK_NUMERIC_VALUE,
     FALLBACK_SOURCE_REFERENCE,
     FALLBACK_TEXT_VALUE,
+    RequiredOverrideError,
     apply_required_overrides,
     required_fallback_override,
 )
@@ -72,27 +75,30 @@ def test_ordinary_free_text_required_gap_uses_na_without_ai():
     assert fallback["source_type"] == "fallback"
 
 
-def test_model_name_missing_value_keeps_legacy_required_fallback():
-    fallback = required_fallback_override(
-        _field(attribute_key="model_name", label="Model Name")
-    )
-
-    assert fallback["values"] == [FALLBACK_TEXT_VALUE]
-    assert fallback["source_type"] == "fallback"
-
-
-def test_title_contributor_missing_value_keeps_legacy_live_option_fallback():
-    fallback = required_fallback_override(
-        _field(
-            attribute_key="type",
-            label="Type",
-            options=["Select One", "Room", "Car"],
-            context_text="Attributes that can make up title",
+def test_model_name_missing_value_is_protected_from_generic_fallback():
+    with pytest.raises(RequiredOverrideError, match="Model Name"):
+        required_fallback_override(
+            _field(attribute_key="model_name", label="Model Name")
         )
-    )
 
-    assert fallback["values"] == ["Room"]
-    assert fallback["source_type"] == "fallback"
+
+def test_vehicle_model_name_missing_value_is_protected_from_generic_fallback():
+    with pytest.raises(RequiredOverrideError, match="Vehicle Model Name"):
+        required_fallback_override(
+            _field(attribute_key="vehicle_model_name", label="Vehicle Model Name")
+        )
+
+
+def test_title_contributor_missing_value_is_protected_from_random_option_fallback():
+    with pytest.raises(RequiredOverrideError, match="Type"):
+        required_fallback_override(
+            _field(
+                attribute_key="type",
+                label="Type",
+                options=["Select One", "Room", "Car"],
+                context_text="Attributes that can make up title",
+            )
+        )
 
 
 def test_numeric_or_unit_required_gap_uses_one():
@@ -141,7 +147,7 @@ def test_deterministic_fallback_is_promoted_to_ready_through_existing_hard_guard
     assert item.resolution.eligible_for_autofill is True
 
 
-def test_model_name_fallback_is_recomputed_and_promoted_through_existing_guard():
+def test_stale_model_name_fallback_is_rejected_before_promotion():
     live = _field(attribute_key="model_name", label="Model Name")
     item = _blocked_item(live)
     plan = LiveFillPlan([item])
@@ -151,12 +157,11 @@ def test_model_name_fallback_is_recomputed_and_promoted_through_existing_guard()
         "source_type": "fallback",
     }
 
-    result = apply_required_overrides(plan, [live], [stale])
+    with pytest.raises(RequiredOverrideError, match="Model Name"):
+        apply_required_overrides(plan, [live], [stale])
 
-    assert result["applied"] == 1
-    assert item.action == READY
-    assert item.resolution.answer_values == [FALLBACK_TEXT_VALUE]
-    assert item.resolution.source_type == "fallback"
+    assert item.action == BLOCKED
+    assert item.resolution.answer_values == []
 
 
 def test_gui_required_preflight_has_no_second_ai_process_or_cli():
