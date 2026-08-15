@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 
 from app.app_branding import apply_qt_application_icon
-from app.runtime_paths import is_frozen, is_installed_distribution, runtime_root
+from app.runtime_paths import runtime_root
+from app.runtime_paths import is_frozen, is_installed_distribution
 
 os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
 _UPDATE_E2E_MARKER_ENV = "ECOMMERCE_AGENT_UPDATE_E2E_MARKER"
@@ -16,7 +17,7 @@ def _complete_update_e2e_probe() -> bool:
     """Let release CI prove the newly installed real GUI executable boots.
 
     This mode is reachable only through an explicit environment variable used by
-    the Windows release gate.  It runs after Qt has initialized, records the
+    the Windows release gate. It runs after Qt has initialized, records the
     actual installed EcommerceAgent.exe/version, then exits before account UI.
     """
 
