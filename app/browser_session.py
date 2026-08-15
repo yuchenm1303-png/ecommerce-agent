@@ -4,11 +4,14 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright
 
@@ -18,6 +21,11 @@ from .browser_visual_hud import arm_browser_visual_hud
 DEFAULT_CDP_PORT = 9222
 DEFAULT_START_URL = "https://seller.makro.co.za/"
 _MAKRO_HUD_HOST = "seller.makro.co.za"
+_CDP_ATTACH_ATTEMPTS = 3
+_CDP_ATTACH_TIMEOUT_MS = 25_000
+_CDP_ATTACH_LOCK_TIMEOUT_S = 90.0
+_CDP_ATTACH_RETRY_DELAY_S = 0.75
+_CDP_ATTACH_LOCK_POLL_S = 0.10
 
 
 @dataclass
@@ -142,6 +150,139 @@ def launch_detached_edge(
     )
 
 
+def _cdp_attach_lock_path(port: int) -> Path:
+    root = Path(tempfile.gettempdir()) / "ecommerce-agent-cdp"
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"attach-{int(port)}.lock"
+
+
+def _try_lock_handle(handle: object) -> bool:
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            handle.seek(0)  # type: ignore[attr-defined]
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+            return True
+        except OSError:
+            return False
+
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+        return True
+    except OSError:
+        return False
+
+
+def _unlock_handle(handle: object) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            handle.seek(0)  # type: ignore[attr-defined]
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+        except OSError:
+            pass
+        return
+
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+    except OSError:
+        pass
+
+
+@contextmanager
+def cdp_attach_guard(
+    port: int = DEFAULT_CDP_PORT,
+    *,
+    timeout_s: float = _CDP_ATTACH_LOCK_TIMEOUT_S,
+) -> Iterator[None]:
+    """Serialize Playwright CDP handshakes across all local worker processes.
+
+    Batch jobs intentionally share one long-lived Edge. Multiple simultaneous
+    ``connect_over_cdp`` handshakes can leave Playwright connected at WebSocket
+    level but stalled while Chromium initializes the session. The lock covers
+    only the attach transaction, never normal page work, so different owned tabs
+    remain independent after their sessions are established.
+    """
+
+    lock_path = _cdp_attach_lock_path(port)
+    deadline = time.monotonic() + max(1.0, float(timeout_s))
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        acquired = False
+        while time.monotonic() < deadline:
+            if _try_lock_handle(handle):
+                acquired = True
+                break
+            time.sleep(_CDP_ATTACH_LOCK_POLL_S)
+        if not acquired:
+            raise RuntimeError(
+                f"等待 Makro Edge CDP {int(port)} attach 锁超时；"
+                "已有其他任务正在建立浏览器控制连接。"
+            )
+        try:
+            yield
+        finally:
+            _unlock_handle(handle)
+
+
+def _format_attach_error(exc: BaseException) -> str:
+    text = " ".join(str(exc).split())
+    if len(text) > 260:
+        text = text[:257] + "..."
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def _connect_browser_resilient(playwright: Playwright, port: int) -> Browser:
+    endpoint = cdp_endpoint(port)
+    failures: list[str] = []
+
+    with cdp_attach_guard(port):
+        for attempt in range(1, _CDP_ATTACH_ATTEMPTS + 1):
+            if not is_cdp_ready(port, timeout_s=1.0):
+                failures.append(f"attempt {attempt}: CDP endpoint not ready")
+            else:
+                try:
+                    browser = playwright.chromium.connect_over_cdp(
+                        endpoint,
+                        timeout=_CDP_ATTACH_TIMEOUT_MS,
+                    )
+                    if not list(browser.contexts):
+                        raise RuntimeError("已连接 Edge，但没有可用 browser context。")
+                    if attempt > 1:
+                        print(
+                            f"CDP_ATTACH RECOVERED port={int(port)} attempt={attempt}",
+                            flush=True,
+                        )
+                    return browser
+                except Exception as exc:
+                    failures.append(f"attempt {attempt}: {_format_attach_error(exc)}")
+
+            if attempt < _CDP_ATTACH_ATTEMPTS:
+                print(
+                    f"CDP_ATTACH RETRY port={int(port)} attempt={attempt}/{_CDP_ATTACH_ATTEMPTS}",
+                    flush=True,
+                )
+                time.sleep(_CDP_ATTACH_RETRY_DELAY_S)
+
+    detail = " | ".join(failures[-_CDP_ATTACH_ATTEMPTS:])
+    ready = is_cdp_ready(port, timeout_s=1.0)
+    raise RuntimeError(
+        f"长期 Makro Edge CDP {endpoint} "
+        + ("仍可达，但 Playwright attach 连续失败。" if ready else "当前不可达。")
+        + " 不会自动关闭或重启 Edge。"
+        + (f" diagnostics={detail}" if detail else "")
+    )
+
+
 def select_listing_page(context: BrowserContext) -> Page:
     pages = list(context.pages)
     if not pages:
@@ -233,7 +374,7 @@ class EdgeHarness:
             self._watch_visual_page(page)
 
     def _connect(self) -> None:
-        browser = self.playwright.chromium.connect_over_cdp(cdp_endpoint(self.cdp_port))
+        browser = _connect_browser_resilient(self.playwright, self.cdp_port)
         contexts = list(browser.contexts)
         if not contexts:
             raise RuntimeError("已连接 Edge，但没有可用 browser context。")
