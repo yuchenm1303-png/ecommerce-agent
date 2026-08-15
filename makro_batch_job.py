@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from app.browser_page_owner import page_target_id
@@ -36,6 +37,8 @@ from makro_one_link import _provider_config
 from makro_product_pack_workflow import _prepare_step3_pack
 
 _BATCH_TARGET_ENV = "MAKRO_BATCH_TARGET_ID"
+_STEP1_TRANSIENT_ATTEMPTS = 3
+_STEP1_TRANSIENT_BACKOFF_MS = 750
 
 
 def _args():
@@ -47,6 +50,48 @@ def _args():
         help="Customer supplemental product file for this Batch job. Repeat as needed.",
     )
     return parser.parse_args()
+
+
+def _prepare_owned_step1_with_recovery(page):
+    """Retry only transient Playwright navigation timeouts on the owned tab.
+
+    ``prepare_owned_step1_page`` is already state-driven and idempotent: every
+    invocation inspects the current Makro page before deciding the next action.
+    A ``page.goto`` timeout therefore must not make the job fail immediately;
+    Makro may already have reached Dashboard/Listings while Playwright was still
+    waiting for DOMContentLoaded. Re-entering the state machine lets it continue
+    from the page that actually exists. Unknown Step 2/3 ownership remains
+    handled by the shared workflow state machine and is never navigated backward.
+    """
+
+    for attempt in range(1, _STEP1_TRANSIENT_ATTEMPTS + 1):
+        try:
+            prepare_owned_step1_page(page)
+            return page
+        except PlaywrightTimeoutError:
+            stage = _listing_stage(page)
+            if stage in {"step2", "step3"}:
+                return page
+            if attempt >= _STEP1_TRANSIENT_ATTEMPTS:
+                raise
+            print(
+                "MAKRO_STEP1 RETRY "
+                f"reason=navigation_timeout attempt={attempt}/{_STEP1_TRANSIENT_ATTEMPTS} "
+                f"stage={stage} url={str(getattr(page, 'url', '') or '')}",
+                flush=True,
+            )
+            try:
+                page.wait_for_timeout(_STEP1_TRANSIENT_BACKOFF_MS)
+            except Exception:
+                pass
+        except RuntimeError:
+            # The owned tab may legitimately advance while the pre-Step1 helper
+            # is waiting. Once this exact invocation moved the tab, the shared
+            # state machine can reconcile Step 2/3 safely.
+            if _listing_stage(page) not in {"step2", "step3"}:
+                raise
+            return page
+    return page
 
 
 def main() -> int:
@@ -152,15 +197,7 @@ def main() -> int:
             _write_manifest(manifest_path, manifest)
 
             def prepare_owned_current_page():
-                try:
-                    prepare_owned_step1_page(page)
-                except RuntimeError:
-                    # The owned tab may legitimately advance while the pre-Step1
-                    # helper is waiting. Once this exact invocation moved the tab,
-                    # the shared state machine can reconcile Step 2/3 safely.
-                    if _listing_stage(page) not in {"step2", "step3"}:
-                        raise
-                return page
+                return _prepare_owned_step1_with_recovery(page)
 
             page, _vertical, _brand = _advance_listing_to_step3(
                 page=page,
