@@ -8,9 +8,15 @@ PUBLISH = (ROOT / ".github" / "workflows" / "publish-update.yml").read_text(enco
 WINDOWS = (ROOT / ".github" / "workflows" / "windows-package.yml").read_text(encoding="utf-8")
 TEST_BUILD = (ROOT / ".github" / "workflows" / "publish-test-build.yml").read_text(encoding="utf-8")
 UPDATER = (ROOT / "gui" / "app_updater.py").read_text(encoding="utf-8")
+UPDATE_RUNTIME = (ROOT / "gui" / "update_runtime.py").read_text(encoding="utf-8")
+RUNTIME_PATHS = (ROOT / "app" / "runtime_paths.py").read_text(encoding="utf-8")
 CORE = (ROOT / "app" / "updater_core.py").read_text(encoding="utf-8")
 ENTRY = (ROOT / "scripts" / "updater_main.py").read_text(encoding="utf-8")
+GUI_ENTRY = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 INSTALLER = (ROOT / "packaging" / "installer.iss").read_text(encoding="utf-8")
+BUILD = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
+E2E = (ROOT / "scripts" / "test_windows_update_e2e.ps1").read_text(encoding="utf-8")
+E2E_PARENT = (ROOT / "tests" / "windows_updater_e2e_parent.py").read_text(encoding="utf-8")
 
 UPDATER_TESTS = (
     "tests/test_windows_packaging_contract.py",
@@ -51,12 +57,15 @@ def test_every_packaging_workflow_runs_full_update_contract_suite() -> None:
 
 def test_windows_package_triggers_on_every_update_runtime_source() -> None:
     for path in (
+        "app/runtime_paths.py",
         "app/updater_core.py",
         "gui/app_updater.py",
         "gui/resilient_app_updater.py",
         "gui/update_runtime.py",
         "scripts/updater_main.py",
         "scripts/build_windows.ps1",
+        "scripts/test_windows_update_e2e.ps1",
+        "tests/windows_updater_e2e_parent.py",
         "tests/test_updater_core_contract.py",
         "tests/test_update_chain_contract.py",
     ):
@@ -88,3 +97,34 @@ def test_updater_self_check_exercises_embedded_core() -> None:
 def test_inno_replaces_immutable_pyinstaller_directories_cleanly() -> None:
     assert 'Type: filesandordirs; Name: "{app}\\_internal"' in INSTALLER
     assert 'Type: filesandordirs; Name: "{app}\\updater"' in INSTALLER
+
+
+def test_portable_build_cannot_enter_installed_self_update_path() -> None:
+    assert 'Subkey: "Software\\EcommerceAgent"' in INSTALLER
+    assert 'ValueName: "InstallDir"' in INSTALLER
+    assert "def is_installed_distribution()" in RUNTIME_PATHS
+    assert "is_installed_distribution()" in GUI_ENTRY
+    assert "if not is_frozen() or is_installed_distribution():" in GUI_ENTRY
+
+
+def test_independent_updater_bootloader_is_reset_before_handoff() -> None:
+    assert 'PYINSTALLER_RESET_ENVIRONMENT' in UPDATE_RUNTIME
+    assert 'env=_fresh_pyinstaller_child_environment()' in UPDATE_RUNTIME
+    assert 'os.environ[_PYINSTALLER_RESET_ENV] = "1"' in UPDATE_RUNTIME
+    assert 'PYINSTALLER_RESET_ENVIRONMENT' in ENTRY
+
+
+def test_stable_e2e_relaunches_real_installed_gui() -> None:
+    assert "ECOMMERCE_AGENT_UPDATE_E2E_MARKER" in GUI_ENTRY
+    assert 'app_executable = install_dir / "EcommerceAgent.exe"' in E2E_PARENT
+    assert '"app_executable": str(app_executable)' in E2E_PARENT
+    assert 'real-gui-relaunch.json' in E2E_PARENT
+    assert 'real-gui-relaunch.json' in E2E
+    assert 'real installed GUI' in E2E
+    assert 'RelaunchProbe' not in E2E
+
+
+def test_heavy_e2e_is_release_gate_not_normal_build_tax() -> None:
+    assert "[switch]$RunUpdateE2E" in BUILD
+    assert '$ShouldRunUpdateE2E = [bool]$RunUpdateE2E -or ($env:GITHUB_WORKFLOW -eq "Publish Update")' in BUILD
+    assert "Skipping heavy updater E2E for normal development build" in BUILD

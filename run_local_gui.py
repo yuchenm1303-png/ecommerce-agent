@@ -1,13 +1,58 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
 
 from app.app_branding import apply_qt_application_icon
-from app.runtime_paths import runtime_root
+from app.runtime_paths import is_frozen, is_installed_distribution, runtime_root
 
 os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
+_UPDATE_E2E_MARKER_ENV = "ECOMMERCE_AGENT_UPDATE_E2E_MARKER"
+
+
+def _complete_update_e2e_probe() -> bool:
+    """Let release CI prove the newly installed real GUI executable boots.
+
+    This mode is reachable only through an explicit environment variable used by
+    the Windows release gate.  It runs after Qt has initialized, records the
+    actual installed EcommerceAgent.exe/version, then exits before account UI.
+    """
+
+    marker_text = str(os.getenv(_UPDATE_E2E_MARKER_ENV, "") or "").strip()
+    if not marker_text:
+        return False
+    if not is_frozen():
+        raise RuntimeError("update E2E probe requires a frozen application")
+
+    executable = Path(sys.executable).resolve()
+    version_file = executable.parent / "_internal" / "packaging" / "VERSION"
+    version = version_file.read_text(encoding="utf-8").strip().lstrip("v")
+    marker = Path(marker_text).expanduser().resolve()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temp = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
+    try:
+        temp.write_text(
+            json.dumps(
+                {
+                    "started": True,
+                    "frozen": True,
+                    "executable": str(executable),
+                    "version": version,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(temp, marker)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return True
 
 
 def main() -> int:
@@ -78,6 +123,9 @@ def main() -> int:
     app.setApplicationName("ecommerce-agent Listing Studio")
     app.setOrganizationName("ecommerce-agent")
     apply_qt_application_icon(app)
+
+    if _complete_update_e2e_probe():
+        return 0
 
     access_session = ensure_application_access(app)
     if access_session is None:
@@ -195,8 +243,12 @@ def main() -> int:
     entrance.raise_overlay()
     entrance_stability.start()
 
-    install_update_runtime(app, window)
-    install_application_updater(window, access_controller=access_controller)
+    # Source builds retain the updater controls for development. Frozen portable
+    # archives deliberately do not self-update because Inno installs to a
+    # separate managed tree; only the Inno-owned distribution may auto-update.
+    if not is_frozen() or is_installed_distribution():
+        install_update_runtime(app, window)
+        install_application_updater(window, access_controller=access_controller)
     return app.exec()
 
 

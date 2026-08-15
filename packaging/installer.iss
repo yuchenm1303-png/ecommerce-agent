@@ -49,6 +49,11 @@ UsePreviousAppDir=yes
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式:"; Flags: unchecked
 
+; This registry identity distinguishes the Inno-managed installation from the
+; byte-identical portable archive. Only the matching installed tree self-updates.
+[Registry]
+Root: HKCU; Subkey: "Software\EcommerceAgent"; ValueType: string; ValueName: "InstallDir"; ValueData: "{app}"; Flags: uninsdeletevalue uninsdeletekeyifempty
+
 ; Mutable state lives outside {app}. Replacing PyInstaller's immutable payload
 ; directories as units prevents removed modules/DLLs from surviving upgrades.
 [InstallDelete]

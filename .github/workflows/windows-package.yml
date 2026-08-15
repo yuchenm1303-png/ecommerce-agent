@@ -35,7 +35,6 @@ on:
       - "tests/test_updater_onefile_contract.py"
       - "tests/test_update_chain_contract.py"
       - "tests/windows_updater_e2e_parent.py"
-      - "tests/windows_updater_e2e_relaunch.py"
       - ".github/workflows/windows-package.yml"
 
 jobs:

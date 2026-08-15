@@ -17,6 +17,7 @@ _COPY_CHUNK = 1024 * 1024
 _TERMINATE_GRACE_S = 1.5
 _KILL_GRACE_S = 1.0
 _CREATE_NO_WINDOW = 0x08000000
+_PYINSTALLER_RESET_ENV = "PYINSTALLER_RESET_ENVIRONMENT"
 
 
 def update_state_dir() -> Path:
@@ -86,6 +87,14 @@ def _bundled_updater_exe() -> Path | None:
     return None
 
 
+def _fresh_pyinstaller_child_environment() -> dict[str, str]:
+    """Return an environment that forces an independent PyInstaller bootloader."""
+
+    env = os.environ.copy()
+    env[_PYINSTALLER_RESET_ENV] = "1"
+    return env
+
+
 def refresh_standalone_updater() -> Path | None:
     """Copy the packaged updater outside the install tree using SHA-256 identity."""
 
@@ -142,6 +151,7 @@ def verify_standalone_updater(path: Path) -> bool:
             creationflags=(
                 getattr(subprocess, "CREATE_NO_WINDOW", _CREATE_NO_WINDOW)
             ),
+            env=_fresh_pyinstaller_child_environment(),
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -152,6 +162,11 @@ def prepare_standalone_updater() -> Path | None:
     updater = refresh_standalone_updater()
     if updater is None or not verify_standalone_updater(updater):
         return None
+
+    # app_updater launches this executable immediately after preparation.  Arm
+    # the child bootloader reset before that direct Popen so the updater never
+    # reuses the GUI's _PYI runtime state. The GUI exits after successful ACK.
+    os.environ[_PYINSTALLER_RESET_ENV] = "1"
     return updater
 
 

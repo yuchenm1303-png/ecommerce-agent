@@ -1,8 +1,9 @@
 """Frozen parent used by the Windows updater end-to-end packaging smoke test.
 
 This executable intentionally runs as ``EcommerceAgent.exe`` from a disposable
-old install tree.  It launches the real packaged updater, waits for the updater
-ACK, then exits exactly like the production GUI does after handoff.
+old install tree. It launches the real packaged updater, waits for the updater
+ACK, then exits exactly like the production GUI does after handoff. The updater
+must relaunch the real newly installed EcommerceAgent.exe, not a synthetic probe.
 """
 
 from __future__ import annotations
@@ -45,7 +46,6 @@ def main() -> int:
     parser.add_argument("--installer", required=True)
     parser.add_argument("--target-version", required=True)
     parser.add_argument("--install-dir", required=True)
-    parser.add_argument("--relaunch-probe", required=True)
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--setup-log", required=True)
     args = parser.parse_args()
@@ -53,12 +53,12 @@ def main() -> int:
     updater = Path(args.updater).resolve()
     installer = Path(args.installer).resolve()
     install_dir = Path(args.install_dir).resolve()
-    relaunch_probe = Path(args.relaunch_probe).resolve()
     state_dir = Path(args.state_dir).resolve()
     setup_log = Path(args.setup_log).resolve()
+    app_executable = install_dir / "EcommerceAgent.exe"
     version_file = install_dir / "_internal" / "packaging" / "VERSION"
 
-    for required in (updater, installer, relaunch_probe, version_file):
+    for required in (updater, installer, app_executable, version_file):
         if not required.is_file():
             return 11
 
@@ -68,8 +68,16 @@ def main() -> int:
     result_path = state_dir / "last-result.json"
     marker_path = state_dir / "update-complete.json"
     updater_log = state_dir / "updater.jsonl"
-    relaunch_marker = state_dir / "relaunch-probe.json"
-    for path in (ack_path, job_path, result_path, marker_path, updater_log, relaunch_marker, setup_log):
+    relaunch_marker = state_dir / "real-gui-relaunch.json"
+    for path in (
+        ack_path,
+        job_path,
+        result_path,
+        marker_path,
+        updater_log,
+        relaunch_marker,
+        setup_log,
+    ):
         try:
             path.unlink(missing_ok=True)
         except OSError:
@@ -81,7 +89,7 @@ def main() -> int:
         "target_version": str(args.target_version).strip().lstrip("v"),
         "app_pid": os.getpid(),
         "app_image_name": Path(sys.executable).stem,
-        "app_executable": str(relaunch_probe),
+        "app_executable": str(app_executable),
         "version_file": str(version_file),
         "installer_sha256": _sha256(installer),
         "arguments": [
@@ -105,7 +113,8 @@ def main() -> int:
     _write_json(job_path, job)
 
     env = os.environ.copy()
-    env["ECOMMERCE_AGENT_E2E_RELAUNCH_MARKER"] = str(relaunch_marker)
+    env["ECOMMERCE_AGENT_UPDATE_E2E_MARKER"] = str(relaunch_marker)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     try:
         proc = subprocess.Popen(
             [str(updater), "--job", str(job_path)],
@@ -129,7 +138,8 @@ def main() -> int:
                 isinstance(ack, dict)
                 and ack.get("status") == "accepted"
                 and int(ack.get("job_version") or 0) == JOB_VERSION
-                and str(ack.get("target_version") or "") == str(args.target_version).strip().lstrip("v")
+                and str(ack.get("target_version") or "")
+                == str(args.target_version).strip().lstrip("v")
             ):
                 return 0
         if proc.poll() is not None:
