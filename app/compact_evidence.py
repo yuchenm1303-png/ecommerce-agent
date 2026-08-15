@@ -17,8 +17,6 @@ _SUPPLIER_VISIBLE_TEXT_LIMIT = 1600
 _CUSTOMER_VISIBLE_TEXT_BUDGET = 120_000
 _CUSTOMER_VISIBLE_TEXT_MAX_PER_CHUNK = 3000
 _IMAGE_VISIBLE_TEXT_LIMIT = 1600
-_IMAGE_FACT_EVIDENCE_LIMIT = 700
-_IMAGE_NOTES_LIMIT = 700
 _DIMENSION_COLUMNS = {
     "length": ("length", "长"),
     "breadth": ("breadth", "width", "宽"),
@@ -276,17 +274,11 @@ def build_compact_evidence(
             value = _one_line(fact.value)
             qualifier = _one_line(fact.qualifier)
             rendered_value = f"{value} {qualifier}".strip()
-            evidence = _excerpt(fact.evidence_text, _IMAGE_FACT_EVIDENCE_LIMIT)
-            suffix = f"; evidence={evidence}" if evidence else ""
             image_lines.append(
                 f"[{alias}] "
-                f"{_one_line(fact.name)}({_one_line(fact.scope)})={rendered_value}{suffix}"
+                f"{_one_line(fact.name)}({_one_line(fact.scope)})={rendered_value}"
             )
             image_fact_count += 1
-
-        notes = _excerpt(observation.notes, _IMAGE_NOTES_LIMIT)
-        if notes:
-            image_lines.append(f"[{alias}] notes={notes}")
 
     web_text = "\n".join(line for line in text_lines if line.strip())
     image_facts = "\n".join(line for line in image_lines if line.strip())
