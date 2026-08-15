@@ -2,13 +2,85 @@
 
 Every real write is scoped to its owning section card. Besides locating the
 captured control itself, this module owns the generic ``+`` action attached to a
-Makro attribute wrapper so multi-value expansion is shared by the real executor
-rather than living only in synthetic coverage code.
+Makro attribute wrapper so multi-value discovery and real execution use exactly
+the same DOM contract.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+
+# Self-contained browser-side helper shared with the field scanner. Makro's add
+# control is not guaranteed to be a literal <button>; React variants may render
+# an icon/span/div inside an actionable ancestor. Detection stays scoped to the
+# current EditAttributeItemWrapper and fails closed unless exactly one enabled,
+# visible add-value action can be identified.
+ADD_VALUE_CONTROL_JS = r"""
+const findMakroAddValueControl = (el) => {
+  const wrapper = el && el.closest
+    ? el.closest('[class*="EditAttributeItemWrapper"]')
+    : null;
+  if (!wrapper) return { node: null, count: 0, reason: 'no-wrapper' };
+
+  const cleanAddText = (value) => String(value == null ? '' : value)
+    .replace(/\s+/g, ' ')
+    .trim();
+  const visibleAddNode = (node) => {
+    if (!node || !node.getBoundingClientRect) return false;
+    if (node.closest && node.closest('[hidden], [aria-hidden="true"]')) return false;
+    const style = getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const disabledAddNode = (node) => Boolean(
+    node.disabled
+    || node.hasAttribute('disabled')
+    || node.getAttribute('aria-disabled') === 'true'
+  );
+  const signalText = (node) => [
+    node.getAttribute('aria-label'),
+    node.getAttribute('title'),
+    node.getAttribute('data-testid'),
+    node.getAttribute('data-action'),
+    node.getAttribute('data-icon'),
+    typeof node.className === 'string' ? node.className : '',
+  ].map(cleanAddText).join(' ').toLowerCase();
+  const isAddMarker = (node) => {
+    const text = cleanAddText(node.innerText || node.textContent);
+    const signal = signalText(node);
+    if (/(^|[\s_-])(remove|delete|minus|subtract)([\s_-]|$)/i.test(signal)) return false;
+    if (text === '+' || text === '＋') return true;
+    return /(^|[\s_-])add([\s_-]*(value|another|more|item))?([\s_-]|$)/i.test(signal)
+      || /(^|[\s_-])plus([\s_-]|$)/i.test(signal);
+  };
+
+  const actions = [];
+  const seen = new Set();
+  for (const marker of wrapper.querySelectorAll('*')) {
+    if (!isAddMarker(marker) || !visibleAddNode(marker)) continue;
+    let action = marker.closest('button, a, [role="button"], [onclick], [tabindex]:not([tabindex="-1"])');
+    if (!action || !wrapper.contains(action)) {
+      action = getComputedStyle(marker).cursor === 'pointer' ? marker : null;
+    }
+    if (!action || !wrapper.contains(action) || !visibleAddNode(action) || disabledAddNode(action)) continue;
+    if (!seen.has(action)) {
+      seen.add(action);
+      actions.push(action);
+    }
+  }
+
+  if (actions.length !== 1) {
+    return {
+      node: null,
+      count: actions.length,
+      reason: actions.length ? 'ambiguous-add-actions' : 'no-visible-add',
+    };
+  }
+  return { node: actions[0], count: 1, reason: '' };
+};
+"""
 
 
 def _css_attr(value: str) -> str:
@@ -46,12 +118,7 @@ def click_add_value_for_control(
     section_path: str,
     control: dict[str, Any],
 ) -> dict[str, Any]:
-    """Click the visible ``+`` belonging to exactly one captured attribute.
-
-    The action never searches the whole page for a plus sign. It first resolves
-    the captured value control uniquely inside ``section_path``, then restricts
-    the button search to that control's ``EditAttributeItemWrapper``.
-    """
+    """Click the unique visible add-value action for one captured attribute."""
 
     selector = scoped_selector_for_control(section_path, control)
     matches = page.locator(selector)
@@ -71,24 +138,14 @@ def click_add_value_for_control(
         }
     locator.scroll_into_view_if_needed()
     return locator.evaluate(
-        """el => {
-          const wrapper = el.closest('[class*="EditAttributeItemWrapper"]');
-          if (!wrapper) return {available:false, clicked:false, reason:'no-wrapper'};
-          const candidates = [...wrapper.querySelectorAll('button, a')].filter((node) => {
-            const text = String(node.innerText || node.textContent || '').trim();
-            const aria = String(node.getAttribute('aria-label') || '').trim().toLowerCase();
-            const title = String(node.getAttribute('title') || '').trim().toLowerCase();
-            return text === '+' || aria === 'add' || aria.includes('add value') || title.includes('add value');
-          });
-          const button = candidates.find((node) => {
-            const style = getComputedStyle(node);
-            const rect = node.getBoundingClientRect();
-            return !node.disabled && node.getAttribute('aria-disabled') !== 'true'
-              && style.display !== 'none' && style.visibility !== 'hidden'
-              && rect.width > 0 && rect.height > 0;
-          });
-          if (!button) return {available:false, clicked:false, reason:'no-visible-add'};
-          button.click();
-          return {available:true, clicked:true, reason:''};
+        "el => {\n"
+        + ADD_VALUE_CONTROL_JS
+        + r"""
+          const found = findMakroAddValueControl(el);
+          if (!found.node) {
+            return {available:false, clicked:false, reason:found.reason, count:found.count};
+          }
+          found.node.click();
+          return {available:true, clicked:true, reason:'', count:1};
         }"""
     )
