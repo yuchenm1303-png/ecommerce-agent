@@ -33,14 +33,18 @@ class FieldTableTransfer(QObject):
         self.copy_button = QPushButton("复制字段表")
         self.copy_button.setObjectName("quietButton")
         self.copy_button.setToolTip("复制完整字段表（含表头）为 TSV，可直接粘贴到 Excel / 表格软件。")
+        self.copy_button.setFixedSize(92, 26)
+        self.copy_button.setStyleSheet("QPushButton { min-height: 26px; max-height: 26px; padding: 0 8px; }")
         self.copy_button.clicked.connect(self.copy_all)
 
         self.export_button = QPushButton("导出 CSV")
         self.export_button.setObjectName("quietButton")
         self.export_button.setToolTip("把完整字段表导出为 Excel 兼容的 UTF-8 CSV。")
+        self.export_button.setFixedSize(80, 26)
+        self.export_button.setStyleSheet("QPushButton { min-height: 26px; max-height: 26px; padding: 0 8px; }")
         self.export_button.clicked.connect(self.export_csv)
 
-        self._install_action_row()
+        self._install_header_actions()
         self.table.installEventFilter(self)
         model = self.table.model()
         model.rowsInserted.connect(self._sync_actions)
@@ -48,27 +52,46 @@ class FieldTableTransfer(QObject):
         model.modelReset.connect(self._sync_actions)
         self._sync_actions()
 
-    def _install_action_row(self) -> None:
+    def _install_header_actions(self) -> None:
+        """Mount transfer controls inside the existing field-card header row.
+
+        ui_polish compacts FIELD REVIEW into one horizontal header before this
+        controller is installed. Reusing that row keeps the table as the only
+        vertically expanding body instead of spending another line on utilities.
+        """
+
         parent = self.table.parentWidget()
         layout = parent.layout() if parent is not None else None
         if layout is None:
             raise RuntimeError("Field table parent has no layout")
 
+        table_index = layout.indexOf(self.table)
+        header_row = None
+        if table_index >= 0:
+            for index in range(table_index):
+                candidate = layout.itemAt(index).layout()
+                if isinstance(candidate, QHBoxLayout):
+                    header_row = candidate
+                    break
+
         actions = QWidget(parent)
         actions.setObjectName("fieldTableTransferActions")
         actions.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        actions.setFixedHeight(26)
         row = QHBoxLayout(actions)
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(7)
-        row.addStretch(1)
+        row.setSpacing(6)
         row.addWidget(self.copy_button)
         row.addWidget(self.export_button)
 
-        table_index = layout.indexOf(self.table)
-        if table_index < 0:
-            layout.addWidget(actions)
+        if header_row is not None:
+            header_row.addWidget(actions, 0, Qt.AlignmentFlag.AlignTop)
+        elif table_index >= 0:
+            # Source/debug builds may omit ui_polish. Keep the controls usable,
+            # but keep the fallback row at the compact toolbar height.
+            layout.insertWidget(table_index, actions, 0, Qt.AlignmentFlag.AlignRight)
         else:
-            layout.insertWidget(table_index, actions)
+            layout.addWidget(actions, 0, Qt.AlignmentFlag.AlignRight)
         self.action_host = actions
 
     @staticmethod
