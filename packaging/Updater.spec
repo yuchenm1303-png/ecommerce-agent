@@ -1,9 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 #
-# Builds the standalone updater.exe as a single windowed executable with no Qt
-# or Playwright dependency, so it stays tiny and can never be broken by the app
-# it is meant to replace. build_windows.ps1 runs this first and copies the
-# result into the onedir at updater/updater.exe.
+# Builds the standalone updater.exe as a true single-file windowed executable
+# with its Python runtime embedded. build_windows.ps1 verifies the executable
+# before copying it into the packaged app at updater/updater.exe.
 
 from pathlib import Path
 
@@ -28,6 +27,8 @@ updater_pyz = PYZ(updater_a.pure)
 updater_exe = EXE(
     updater_pyz,
     updater_a.scripts,
+    updater_a.binaries,
+    updater_a.datas,
     [("X utf8", None, "OPTION")],
     [],
     exclude_binaries=False,
