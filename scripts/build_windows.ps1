@@ -84,6 +84,11 @@ $UpdaterExe = Join-Path $DistRoot "updater.exe"
 if (-not (Test-Path $UpdaterExe)) {
     throw "Updater build output missing: $UpdaterExe"
 }
+Write-Host "  Verifying standalone updater runtime"
+& $UpdaterExe --self-check
+if ($LASTEXITCODE -ne 0) {
+    throw "Standalone updater self-check failed with exit code $LASTEXITCODE"
+}
 New-Item -ItemType Directory -Force -Path (Join-Path $AppDir "updater") | Out-Null
 Copy-Item $UpdaterExe (Join-Path $AppDir "updater\updater.exe") -Force
 Write-Host "  Standalone updater: $(Join-Path $AppDir "updater\updater.exe")"
