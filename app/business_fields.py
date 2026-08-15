@@ -16,7 +16,8 @@ WARRANTY_SERVICE_TYPE_POLICY = (
 # operational policy, not product facts: they must bypass AI/Web resolution and be
 # injected through the shared business bundle used by both Single and Batch flows.
 MAKRO_ACCOUNT_FIXED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
-    ("minimum_order_quantity", "1", "account-default:min-order-quantity"),
+    ("flipkart_selling_price", "6000", "account-default:selling-price"),
+    ("minimum_order_quantity", "5000", "account-default:min-order-quantity"),
     ("max_order_quantity_allowed", "99", "account-default:max-order-quantity"),
     ("service_profile", "FBS", "account-default:fulfilment-by"),
     ("shipping_days", "14", "account-default:pick-pack-sla"),
