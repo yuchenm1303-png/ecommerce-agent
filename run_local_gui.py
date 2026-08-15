@@ -28,6 +28,7 @@ def main() -> int:
     from gui.app_access import ensure_application_access, install_application_access
     from gui.resilient_app_updater import install_application_updater
     from gui.batch_card_responsive import install_batch_card_responsive
+    from gui.batch_product_files import install_batch_product_files
     from gui.cooperative_pause import (
         install_cooperative_batch_job_controls,
         install_cooperative_pause,
@@ -127,6 +128,7 @@ def main() -> int:
     install_required_input_support(window)
     install_listing_offer_support(window)
     install_batch_sku_spec_ui(window)
+    install_batch_product_files(window)
     install_listing_offer_hardening(window)
     install_single_top_compact(window)
     install_cooperative_pause(window)

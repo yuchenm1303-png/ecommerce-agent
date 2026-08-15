@@ -2,8 +2,9 @@
 
 This is orchestration only. It reuses the canonical source snapshot, Product
 Identity, live Makro taxonomy/brand selection, Step 3 schema scan, Resolver and
-Fill Plan. The only batch-specific behavior is deterministic page ownership:
-each job creates one new Makro tab and records its Chromium target id.
+Fill Plan. Each Batch job may also carry its own customer supplemental files;
+they remain evidence for that exact supplier URL rather than becoming a second
+product input.
 
 No Step 3 writes, Save, image upload, or Send to QC happen here.
 """
@@ -20,8 +21,9 @@ from app.browser_page_owner import page_target_id
 from app.browser_session import EdgeHarness, is_cdp_ready
 from app.makro.listing_creation import MAKRO_NEW_LISTING_URL, infer_listing_bootstrap
 from app.makro.step1_entry import prepare_owned_step1_page
+from app.product_input import acquire_product_input, product_input_manifest_payload
 from app.providers.registry import ProviderConfigurationError, build_semantic_provider
-from app.source_capture import SourceAccessBlocked, capture_product_source
+from app.source_capture import SourceAccessBlocked
 from makro_gui_workflow import (
     _advance_listing_to_step3,
     _listing_stage,
@@ -31,12 +33,24 @@ from makro_gui_workflow import (
     build_parser,
 )
 from makro_one_link import _provider_config
+from makro_product_pack_workflow import _prepare_step3_pack
 
 _BATCH_TARGET_ENV = "MAKRO_BATCH_TARGET_ID"
 
 
+def _args():
+    parser = build_parser()
+    parser.add_argument(
+        "--product-file",
+        action="append",
+        default=[],
+        help="Customer supplemental product file for this Batch job. Repeat as needed.",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
-    args = build_parser().parse_args()
+    args = _args()
     if args.mode != "full":
         raise SystemExit("makro_batch_job.py only accepts --mode full")
     if args.allow_section_save or args.upload_source_photos or args.upload_image:
@@ -58,9 +72,11 @@ def main() -> int:
     manifest_path = run_dir / "run-manifest.json"
     manifest: dict[str, object] = {
         "mode": "full",
+        "input_mode": "supplier_url",
         "batch_owned_tab": True,
         "status": "started",
         "product_url": args.product_url,
+        "supplemental_product_files": len(args.product_file),
         "vertical": "",
         "brand": "",
         "makro_target_id": "",
@@ -78,39 +94,46 @@ def main() -> int:
 
     try:
         _phase("source", "START")
-        captured = capture_product_source(
-            args.product_url,
+        acquired = acquire_product_input(
             output_dir=run_dir / "bootstrap-source",
-            profile_dir=args.source_profile_dir,
-            cdp_port=args.source_cdp_port,
-            initial_wait_ms=args.source_wait_ms,
-            scroll_wait_ms=args.source_scroll_wait_ms,
-            max_scroll_steps=args.source_max_scroll_steps,
-            max_visible_text_chars=args.source_max_visible_text_chars,
-            use_current_page=False,
-            cache_dir=args.source_cache_dir,
-            cache_ttl_seconds=args.source_cache_ttl_seconds,
-            force_refresh=False,
+            product_url=args.product_url,
+            product_files=args.product_file,
+            source_profile_dir=args.source_profile_dir,
+            source_cdp_port=args.source_cdp_port,
+            source_wait_ms=args.source_wait_ms,
+            source_scroll_wait_ms=args.source_scroll_wait_ms,
+            source_max_scroll_steps=args.source_max_scroll_steps,
+            source_max_visible_text_chars=args.source_max_visible_text_chars,
+            source_use_current_page=False,
+            source_cache_dir=args.source_cache_dir,
+            source_cache_ttl_seconds=args.source_cache_ttl_seconds,
+            refresh_source=False,
         )
-        if not captured.cache_hit:
+        if not acquired.source_cache_hit:
             raise RuntimeError(
                 "Batch source cache miss. Refusing parallel Source Edge navigation; prefetch this job first."
             )
         hints = infer_listing_bootstrap(
             provider,
-            captured.snapshot,
-            image_paths=captured.product_image_paths,
+            acquired.snapshot,
+            image_paths=acquired.evidence_image_paths,
         )
+        manifest["product_input"] = product_input_manifest_payload(acquired)
         manifest["bootstrap_source"] = {
-            "snapshot": str(captured.snapshot_path.resolve()),
-            "screenshot": str(captured.screenshot_path.resolve()),
-            "product_images": [str(path.resolve()) for path in captured.product_image_paths],
+            "snapshot": str(acquired.snapshot_path.resolve()),
+            "screenshot": str(acquired.screenshot_path.resolve()) if acquired.screenshot_path else "",
+            "product_images": [str(path.resolve()) for path in acquired.evidence_image_paths],
+            "listing_images": [str(path.resolve()) for path in acquired.listing_image_paths],
             "cache_hit": True,
+            "customer_supplement": acquired.pack_manifest_path is not None,
         }
         manifest["listing_hints"] = hints.as_dict()
         manifest["status"] = "source_complete"
         _write_manifest(manifest_path, manifest)
-        _phase("source", "COMPLETE", "supplier evidence ready")
+        detail = "supplier evidence ready"
+        if args.product_file:
+            detail += f" + {len(args.product_file)} supplemental file(s)"
+        _phase("source", "COMPLETE", detail)
 
         with sync_playwright() as playwright:
             harness = EdgeHarness(
@@ -166,7 +189,16 @@ def main() -> int:
             previous_target = os.environ.get(_BATCH_TARGET_ENV)
             os.environ[_BATCH_TARGET_ENV] = owned_target_id
             try:
-                _prepare_step3(args, run_dir=run_dir, page=page, manifest=manifest)
+                if acquired.pack_manifest_path is not None:
+                    _prepare_step3_pack(
+                        args,
+                        run_dir=run_dir,
+                        page=page,
+                        manifest=manifest,
+                        pack_manifest=acquired.pack_manifest_path,
+                    )
+                else:
+                    _prepare_step3(args, run_dir=run_dir, page=page, manifest=manifest)
             finally:
                 if previous_target is None:
                     os.environ.pop(_BATCH_TARGET_ENV, None)
