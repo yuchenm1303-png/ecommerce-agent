@@ -63,6 +63,140 @@ def test_required_depth_fallback_passes_the_same_production_hard_guard():
     assert qualifier == "cm"
 
 
+def test_free_text_field_folds_detached_qualifier_into_value():
+    field = {
+        "attribute_key": "ideal_room_size",
+        "label": "Ideal Room Size",
+        "section_heading": "Additional Description",
+        "required": False,
+        "multi_value": False,
+        "options": [],
+        "qualifier_options": [],
+        "controls": [
+            {
+                "id": "ideal_room_size",
+                "name": "ideal_room_size",
+                "field_kind": "input",
+                "type": "text",
+                "options": [],
+            }
+        ],
+    }
+    decision = FieldDecision(
+        field_id="unused",
+        status=AI_READY,
+        values=["1000"],
+        qualifier="square_feet",
+    )
+
+    values, qualifier, error = _hard_guard_values(field, decision)
+
+    assert error is None
+    assert values == ["1000 square feet"]
+    assert qualifier == ""
+
+
+def test_free_text_field_does_not_duplicate_unit_already_in_value():
+    field = {
+        "attribute_key": "water_tank_capacity",
+        "label": "Water Tank Capacity",
+        "section_heading": "Additional Description",
+        "required": False,
+        "multi_value": False,
+        "options": [],
+        "qualifier_options": [],
+        "controls": [
+            {
+                "id": "water_tank_capacity",
+                "name": "water_tank_capacity",
+                "field_kind": "input",
+                "type": "text",
+                "options": [],
+            }
+        ],
+    }
+    decision = FieldDecision(
+        field_id="unused",
+        status=AI_READY,
+        values=["95 fl oz"],
+        qualifier="fl oz",
+    )
+
+    values, qualifier, error = _hard_guard_values(field, decision)
+
+    assert error is None
+    assert values == ["95 fl oz"]
+    assert qualifier == ""
+
+
+def test_numeric_field_without_unit_contract_still_fails_closed():
+    field = {
+        "attribute_key": "capacity",
+        "label": "Capacity",
+        "section_heading": "Additional Description",
+        "required": False,
+        "multi_value": False,
+        "options": [],
+        "qualifier_options": [],
+        "controls": [
+            {
+                "id": "capacity",
+                "name": "capacity",
+                "field_kind": "input",
+                "type": "number",
+                "options": [],
+                "context_text": "",
+            }
+        ],
+    }
+    decision = FieldDecision(
+        field_id="unused",
+        status=AI_READY,
+        values=["95"],
+        qualifier="fl oz",
+    )
+
+    values, qualifier, error = _hard_guard_values(field, decision)
+
+    assert values == ["95"]
+    assert qualifier == "fl oz"
+    assert error is not None
+
+
+def test_numeric_field_accepts_exact_local_fixed_unit():
+    field = {
+        "attribute_key": "length",
+        "label": "Length",
+        "section_heading": "Additional Description",
+        "required": False,
+        "multi_value": False,
+        "options": [],
+        "qualifier_options": [],
+        "controls": [
+            {
+                "id": "length",
+                "name": "length",
+                "field_kind": "input",
+                "type": "number",
+                "options": [],
+                "context_text": "Length cm",
+            }
+        ],
+    }
+    decision = FieldDecision(
+        field_id="unused",
+        status=AI_READY,
+        values=["17"],
+        qualifier="cm",
+    )
+
+    values, qualifier, error = _hard_guard_values(field, decision)
+
+    assert error is None
+    assert values == ["17"]
+    assert qualifier == ""
+
+
 def test_real_value_select_options_are_still_preserved():
     field = {
         "attribute_key": "colour",
