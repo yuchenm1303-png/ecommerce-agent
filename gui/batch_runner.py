@@ -12,7 +12,14 @@ from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
 from app.listing_images import listing_images_from_resolver_outputs
 from app.required_overrides import write_required_fallback_overrides
-from .batch_model import BatchJob, BatchRun, create_batch_run, save_batch_run
+from .batch_model import (
+    BATCH_WORKER_DEFAULT,
+    BatchJob,
+    BatchRun,
+    create_batch_run,
+    normalize_batch_concurrency,
+    save_batch_run,
+)
 from .readonly_runner import RunnerConfig
 from .real_execution import resolver_evidence_images
 from .result_loader import (
@@ -75,7 +82,7 @@ class BatchController(QObject):
         urls: list[str],
         config: RunnerConfig,
         *,
-        prepare_concurrency: int = 2,
+        prepare_concurrency: int = BATCH_WORKER_DEFAULT,
     ) -> BatchRun:
         if self.is_running:
             raise RuntimeError("Batch 已在运行。")
@@ -105,7 +112,7 @@ class BatchController(QObject):
         *,
         allow_save: bool,
         upload_images: bool,
-        execute_concurrency: int = 2,
+        execute_concurrency: int = BATCH_WORKER_DEFAULT,
     ) -> None:
         if self.batch is None:
             raise RuntimeError("没有已准备的 Batch。")
@@ -117,7 +124,7 @@ class BatchController(QObject):
         if not ready:
             raise ValueError("当前 Batch 没有 READY 商品。")
 
-        self.batch.execute_concurrency = max(1, min(4, int(execute_concurrency)))
+        self.batch.execute_concurrency = normalize_batch_concurrency(execute_concurrency)
         self.batch.save_authorized = True
         self.batch.images_authorized = bool(upload_images)
         self.batch.send_to_qc = False
@@ -270,11 +277,6 @@ class BatchController(QObject):
         if live_schema is None or fill_plan is None or resolver_manifest_path is None:
             raise RuntimeError(f"{job.job_id} 缺少 live schema / fill plan / resolver manifest")
 
-        # Batch must use the exact same required-field completion policy as Single.
-        # Persist deterministic fallback instructions beside this job's planned
-        # live schema before starting the canonical executor. The executor then
-        # rebinds/recomputes them against the current owned tab and keeps its
-        # existing pre-write hard guards. No AI call happens here.
         fallback_summary = write_required_fallback_overrides(fill_plan, live_schema)
         if int(fallback_summary.get("count") or 0) > 0:
             self.log.emit(
