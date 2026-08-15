@@ -53,7 +53,8 @@ def test_generated_business_bundle_rejects_invalid_explicit_sku():
 def test_account_fixed_defaults_are_single_config_source_for_all_listings():
     bundle = generated_business_bundle(URL, sku="812345678901")
     expected = {
-        "minimum_order_quantity": "1",
+        "flipkart_selling_price": "6000",
+        "minimum_order_quantity": "5000",
         "max_order_quantity_allowed": "99",
         "service_profile": "FBS",
         "shipping_days": "14",
@@ -76,6 +77,7 @@ def test_account_fixed_defaults_are_single_config_source_for_all_listings():
 
 def test_account_fixed_labels_are_business_fields_and_skip_product_reasoning():
     labels = (
+        "Your selling price",
         "Minimum Order Quantity (MinOQ)",
         "Maximum Order Quantity (MaxOQ)",
         "Fulfilment by",
@@ -89,8 +91,11 @@ def test_account_fixed_labels_are_business_fields_and_skip_product_reasoning():
     assert all(is_business_question(label) for label in labels)
 
 
-def test_price_and_listing_status_are_not_silently_fixed_by_account_defaults():
+def test_selling_price_is_fixed_while_base_price_and_listing_status_remain_unset():
     bundle = generated_business_bundle(URL, sku="812345678901")
     assert bundle.candidates(("mrp", "Base Price")) == []
-    assert bundle.candidates(("flipkart_selling_price", "Your selling price")) == []
+    selling = bundle.candidates(("flipkart_selling_price", "Your selling price"))
+    assert len(selling) == 1
+    assert selling[0].value == "6000"
+    assert selling[0].source_type == "config"
     assert bundle.candidates(("listing_status", "Listing Status")) == []
