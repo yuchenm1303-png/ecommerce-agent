@@ -5,16 +5,30 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BATCH_FILES_UI = (ROOT / "gui" / "batch_product_files.py").read_text(encoding="utf-8")
+ANCHORED_PANEL = (ROOT / "gui" / "anchored_quick_panel.py").read_text(encoding="utf-8")
 BATCH_JOB = (ROOT / "makro_batch_job.py").read_text(encoding="utf-8")
 ENTRY = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
 def test_batch_rows_expose_per_product_supplemental_files() -> None:
     assert 'QPushButton("资料 0"' in BATCH_FILES_UI
+    assert "BatchProductFilesDetail" in BATCH_FILES_UI
+    assert "AnchoredQuickPanel" in BATCH_FILES_UI
+    assert "AnchoredQuickPanelPlacement.Above" in BATCH_FILES_UI
+    assert "_toggle_panel" in BATCH_FILES_UI
     assert "getOpenFileNames" in BATCH_FILES_UI
     assert "product_files" in BATCH_FILES_UI
     assert "_files_by_url" in BATCH_FILES_UI
     assert "url.casefold()" in BATCH_FILES_UI
+
+
+def test_batch_material_detail_uses_reusable_anchored_popup_shell() -> None:
+    assert "class AnchoredQuickPanel(QWidget)" in ANCHORED_PANEL
+    assert "Qt.WindowType.Popup" in ANCHORED_PANEL
+    assert "def show_anchored" in ANCHORED_PANEL
+    assert "def _resolve_geometry" in ANCHORED_PANEL
+    assert "_tail_fraction" in ANCHORED_PANEL
+    assert "screenAt(anchor_rect.center())" in ANCHORED_PANEL
 
 
 def test_batch_prepare_forwards_files_only_to_the_owned_job() -> None:
