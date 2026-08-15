@@ -32,7 +32,7 @@ const pathOf = (el) => {
       let sibling = node.previousElementSibling;
       while (sibling) {
         if (sibling.tagName === node.tagName) index += 1;
-        sibling = node.previousElementSibling;
+        sibling = sibling.previousElementSibling;
       }
       parts.unshift(`${tag}:nth-of-type(${index})`);
     }
