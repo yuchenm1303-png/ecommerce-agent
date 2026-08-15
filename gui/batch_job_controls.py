@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import QObject
+from PySide6.QtCore import QObject, QTimer
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -44,10 +44,10 @@ class _JobControls:
 class BatchJobControlManager(QObject):
     """Per-job execution and safe scheduler pause controls for Batch cards.
 
-    The controller remains the sole owner of source/prepare/execute subprocesses.
-    This layer only chooses which existing job id enters those canonical queues.
-    Active subprocesses are never force-suspended: a pause requested mid-stage is
-    applied at the next safe stage boundary so Makro is not left half-written.
+    Preparation and execution are independent lanes. A READY job may enter the
+    canonical real executor immediately while other owned jobs continue Source /
+    prepare work. The controller remains the only subprocess owner; this layer
+    only schedules job ids into its existing queues and start methods.
     """
 
     def __init__(self, workspace: QWidget) -> None:
@@ -58,6 +58,7 @@ class BatchJobControlManager(QObject):
         self._paused: dict[str, _PauseState] = {}
         self._pause_requested: dict[str, str] = {}
         self._syncing = False
+        self._repump_scheduled = False
 
         self.controller.jobs_changed.connect(self._on_jobs_changed)
         self.controller.running_changed.connect(lambda _running: self._refresh_controls())
@@ -86,6 +87,17 @@ class BatchJobControlManager(QObject):
             self._syncing = False
         if changed:
             self.controller._persist_emit()
+        self._schedule_repump()
+
+    def _schedule_repump(self) -> None:
+        if self._repump_scheduled:
+            return
+        self._repump_scheduled = True
+        QTimer.singleShot(0, self._run_scheduled_repump)
+
+    def _run_scheduled_repump(self) -> None:
+        self._repump_scheduled = False
+        self._repump()
 
     def _ensure_controls(self, card: QWidget, job_id: str) -> None:
         if job_id in self._controls:
@@ -145,17 +157,7 @@ class BatchJobControlManager(QObject):
             )
             return
         if self.controller.config is None:
-            QMessageBox.warning(self.workspace, "缺少 Batch 配置", "请先完成该 Batch 的准备阶段。")
-            return
-        if self.controller._mode == "prepare":
-            QMessageBox.information(
-                self.workspace,
-                "准备仍在运行",
-                "为避免准备阶段和真实写入争抢 Makro 页面，请等待当前批量准备结束后再单独填写。",
-            )
-            return
-        if self.controller._mode not in {"idle", "execute"}:
-            QMessageBox.information(self.workspace, "任务忙碌", "当前 Batch 状态暂不接受新的真实填写任务。")
+            QMessageBox.warning(self.workspace, "缺少 Batch 配置", "请先完成该商品的准备阶段。")
             return
         if self._is_active(job_id) or job_id in self.controller._execute_queue:
             return
@@ -164,6 +166,7 @@ class BatchJobControlManager(QObject):
             self.workspace,
             f"确认单独真实填写 · {job_id}",
             "将只执行这一件商品的 Full Step 3。\n\n"
+            "其他商品会继续准备或填写。\n"
             "Save + reopen: ON\n"
             "Product Photos: ON\n"
             "Send to QC: LOCKED / FALSE\n\n"
@@ -180,16 +183,29 @@ class BatchJobControlManager(QObject):
         batch.save_authorized = True
         batch.images_authorized = True
         batch.send_to_qc = False
-        batch.status = "EXECUTING"
         self.controller._execution_images = True
         self.controller._stopping = False
+
+        # Keep an active prepare owner-mode intact. The execution lane is pumped
+        # independently below, so other products continue their own preparation.
         if self.controller._mode == "idle":
             self.controller._mode = "execute"
+            batch.status = "EXECUTING"
             self.controller.running_changed.emit(True)
-        self.controller._execute_queue.append(job_id)
-        self.controller.state_changed.emit(f"{job_id} · 单独真实填写")
+
+        self._append_unique(self.controller._execute_queue, job_id)
+        self.controller.state_changed.emit(f"{job_id} · 单独真实填写 · 其他任务继续")
         self.controller._persist_emit()
-        self.controller._pump_execute()
+        try:
+            self._repump()
+        except Exception as exc:
+            self._remove_job(self.controller._execute_queue, job_id)
+            job.status = "FAILED"
+            job.stage_detail = "真实填写无法启动"
+            job.error = str(exc)
+            job.touch()
+            self.controller._persist_emit()
+            QMessageBox.critical(self.workspace, "真实填写无法启动", str(exc))
 
     def toggle_pause(self, job_id: str) -> None:
         job = self._job(job_id)
@@ -244,23 +260,12 @@ class BatchJobControlManager(QObject):
                 return True
             return False
         if stage == "execute":
-            # Real execution is a persistence transaction. Do not interrupt it
-            # between a write and its Save/reopen verification. Once it finishes,
-            # the result is authoritative and there is nothing left to resume.
             return False
         return False
 
     def _resume(self, job: Any) -> None:
         state = self._paused.pop(str(job.job_id), None)
         if state is None:
-            return
-        if self.controller._mode == "execute" and state.resume_kind in {"source", "prepare"}:
-            self._paused[str(job.job_id)] = state
-            QMessageBox.information(
-                self.workspace,
-                "真实填写正在运行",
-                "请等待当前真实填写结束，再继续这个准备任务。",
-            )
             return
 
         if state.resume_kind == "source":
@@ -310,10 +315,37 @@ class BatchJobControlManager(QObject):
             self.controller.state_changed.emit("Batch · 继续真实填写")
 
     def _repump(self) -> None:
+        self._pump_prepare_lane()
+        self._pump_execute_lane()
+
+        # Let the original owner-mode perform only lifecycle settlement. Queue
+        # starts above are already bounded independently by their own limits.
         if self.controller._mode == "prepare":
             self.controller._pump_prepare()
         elif self.controller._mode == "execute":
             self.controller._pump_execute()
+
+    def _pump_prepare_lane(self) -> None:
+        batch = self.controller.batch
+        if batch is None or self.controller.config is None:
+            return
+        source_active = any(stage == "source" for _, stage in self.controller._processes.values())
+        if self.controller._source_queue and not source_active:
+            self.controller._start_source(self.controller._source_queue.pop(0))
+
+        active_prepare = sum(stage == "prepare" for _, stage in self.controller._processes.values())
+        while self.controller._prepare_queue and active_prepare < batch.prepare_concurrency:
+            self.controller._start_prepare_job(self.controller._prepare_queue.pop(0))
+            active_prepare += 1
+
+    def _pump_execute_lane(self) -> None:
+        batch = self.controller.batch
+        if batch is None or self.controller.config is None:
+            return
+        active_execute = sum(stage == "execute" for _, stage in self.controller._processes.values())
+        while self.controller._execute_queue and active_execute < batch.execute_concurrency:
+            self.controller._start_execute_job(self.controller._execute_queue.pop(0))
+            active_execute += 1
 
     def _mark_paused(self, job: Any, resume_kind: str, detail: str) -> None:
         self._paused[str(job.job_id)] = _PauseState(resume_kind, detail)
@@ -344,7 +376,6 @@ class BatchJobControlManager(QObject):
                 and not pending
                 and not active
                 and not queued_execute
-                and self.controller._mode in {"idle", "execute"}
             )
             if paused:
                 controls.hint.setText("已暂停 · 不参与批量调度")
@@ -360,7 +391,7 @@ class BatchJobControlManager(QObject):
             elif pending:
                 controls.hint.setText("安全暂停已请求 · 当前阶段完成后停住")
             elif job.status == "READY":
-                controls.hint.setText("READY · 可单独 Full Step 3")
+                controls.hint.setText("READY · 可单独填写 · 其他任务继续")
             elif active:
                 controls.hint.setText("任务运行中")
             else:
@@ -413,4 +444,4 @@ def install_batch_job_controls(workspace: QWidget) -> BatchJobControlManager:
     return manager
 
 
-__all__ = ["BatchJobControlManager", "install_batch_job_controls"]
+__all__ = ["BatchJobControlManager", "_PauseState", "install_batch_job_controls"]
