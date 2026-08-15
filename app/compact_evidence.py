@@ -11,9 +11,14 @@ from .image_evidence import ImageObservation
 from .semantic_grounding import GroundingCatalog, TEXT_KIND
 
 
-COMPACT_EVIDENCE_VERSION = 4
+COMPACT_EVIDENCE_VERSION = 5
 _ROW_PREFIX = "Structured page row; preserve key/value meaning exactly: "
-_VISIBLE_TEXT_LIMIT = 1600
+_SUPPLIER_VISIBLE_TEXT_LIMIT = 1600
+_CUSTOMER_VISIBLE_TEXT_BUDGET = 120_000
+_CUSTOMER_VISIBLE_TEXT_MAX_PER_CHUNK = 3000
+_IMAGE_VISIBLE_TEXT_LIMIT = 1600
+_IMAGE_FACT_EVIDENCE_LIMIT = 700
+_IMAGE_NOTES_LIMIT = 700
 _DIMENSION_COLUMNS = {
     "length": ("length", "长"),
     "breadth": ("breadth", "width", "宽"),
@@ -25,6 +30,22 @@ _DIMENSION_COLUMNS = {
 
 def _one_line(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _excerpt(value: object, limit: int) -> str:
+    """Return a deterministic head+tail excerpt so late details are not erased."""
+
+    text = _one_line(value)
+    maximum = max(1, int(limit))
+    if len(text) <= maximum:
+        return text
+    if maximum < 12:
+        return text[:maximum]
+    separator = " … "
+    available = maximum - len(separator)
+    head = max(1, (available * 2) // 3)
+    tail = max(1, available - head)
+    return text[:head].rstrip() + separator + text[-tail:].lstrip()
 
 
 def _structured_row(content: str) -> tuple[str, str] | None:
@@ -41,7 +62,12 @@ def _structured_row(content: str) -> tuple[str, str] | None:
     return (key, value) if key and value else None
 
 
-def _compact_text(source_id: str, content: str, *, visible_text: bool = False) -> str:
+def _compact_text(
+    source_id: str,
+    content: str,
+    *,
+    visible_limit: int | None = None,
+) -> str:
     value = content.strip()
     row = _structured_row(value)
     if row is not None:
@@ -54,9 +80,8 @@ def _compact_text(source_id: str, content: str, *, visible_text: bool = False) -
         if value.startswith(prefix):
             value = value[len(prefix) :]
             break
-    if visible_text:
-        value = value[:_VISIBLE_TEXT_LIMIT]
-    return f"[{source_id}] {_one_line(value)}"
+    rendered = _excerpt(value, visible_limit) if visible_limit is not None else _one_line(value)
+    return f"[{source_id}] {rendered}"
 
 
 def _row_is_redundant(row: tuple[str, str], atomic_rows: set[tuple[str, str]]) -> bool:
@@ -113,6 +138,32 @@ def _scoped_dimension_rows(
     return overrides, consumed_headers
 
 
+def _is_visible_text_source(source: Any) -> bool:
+    return str(source.origin or "").endswith("#evidence=visible-text")
+
+
+def _customer_visible_quota(text_sources: list[Any]) -> int:
+    """Share a bounded prompt budget fairly across every customer text chunk.
+
+    Customer files are deliberate seller evidence, so unlike supplier storefront
+    chrome we never keep only the first customer chunk. When the pack is large,
+    every chunk receives the same bounded head+tail excerpt rather than silently
+    dropping later PDF pages, Word sections or TXT files.
+    """
+
+    count = sum(
+        1
+        for source in text_sources
+        if source.source_type == "customer_file" and _is_visible_text_source(source)
+    )
+    if not count:
+        return 0
+    return min(
+        _CUSTOMER_VISIBLE_TEXT_MAX_PER_CHUNK,
+        max(1, _CUSTOMER_VISIBLE_TEXT_BUDGET // count),
+    )
+
+
 @dataclass(slots=True, frozen=True)
 class CompactEvidence:
     web_text: str
@@ -133,7 +184,7 @@ class CompactEvidence:
             sources.append(
                 {
                     "source_id": "compact:web",
-                    "source_type": "compact_supplier_evidence",
+                    "source_type": "compact_grounded_text_evidence",
                     "kind": "text",
                     "origin": "local compact evidence",
                     "content": self.web_text,
@@ -177,43 +228,68 @@ def build_compact_evidence(
     }
     atomic_rows = {row for row in parsed_rows.values() if "|" not in row[1]}
     dimension_overrides, dimension_headers = _scoped_dimension_rows(text_sources, parsed_rows)
+    customer_visible_quota = _customer_visible_quota(text_sources)
+
     text_lines: list[str] = []
     citation_aliases: dict[str, str] = {}
-    visible_text_kept = False
+    compacted_non_customer_visible: set[str] = set()
     for source in text_sources:
         row = parsed_rows.get(source.source_id)
         if source.source_id in dimension_headers:
             continue
         if row is not None and _row_is_redundant(row, atomic_rows):
             continue
-        visible_text = source.origin.endswith("#evidence=visible-text")
-        if visible_text and visible_text_kept:
-            continue
+
+        visible_text = _is_visible_text_source(source)
+        visible_limit: int | None = None
+        if visible_text:
+            if source.source_type == "customer_file":
+                visible_limit = customer_visible_quota or _CUSTOMER_VISIBLE_TEXT_MAX_PER_CHUNK
+            else:
+                logical_id = source.logical_source_id
+                if logical_id in compacted_non_customer_visible:
+                    continue
+                compacted_non_customer_visible.add(logical_id)
+                visible_limit = _SUPPLIER_VISIBLE_TEXT_LIMIT
+
         alias = f"s{len(text_lines) + 1}"
         if source.source_id in dimension_overrides:
             line = f"[{alias}] {dimension_overrides[source.source_id]}"
         else:
-            line = _compact_text(alias, source.content, visible_text=visible_text)
+            line = _compact_text(alias, source.content, visible_limit=visible_limit)
         if line.strip():
             text_lines.append(line)
             citation_aliases[alias] = source.source_id
-        if visible_text:
-            visible_text_kept = True
+
     observations = list(image_observations)
-    fact_lines: list[str] = []
+    image_lines: list[str] = []
+    image_fact_count = 0
     for image_index, observation in enumerate(observations, start=1):
         alias = f"i{image_index}"
         citation_aliases[alias] = observation.image_id
+
+        visible_text = _excerpt(observation.visible_text, _IMAGE_VISIBLE_TEXT_LIMIT)
+        if visible_text:
+            image_lines.append(f"[{alias}] visible_text={visible_text}")
+
         for fact in observation.facts:
             value = _one_line(fact.value)
             qualifier = _one_line(fact.qualifier)
             rendered_value = f"{value} {qualifier}".strip()
-            fact_lines.append(
+            evidence = _excerpt(fact.evidence_text, _IMAGE_FACT_EVIDENCE_LIMIT)
+            suffix = f"; evidence={evidence}" if evidence else ""
+            image_lines.append(
                 f"[{alias}] "
-                f"{_one_line(fact.name)}({_one_line(fact.scope)})={rendered_value}"
+                f"{_one_line(fact.name)}({_one_line(fact.scope)})={rendered_value}{suffix}"
             )
+            image_fact_count += 1
+
+        notes = _excerpt(observation.notes, _IMAGE_NOTES_LIMIT)
+        if notes:
+            image_lines.append(f"[{alias}] notes={notes}")
+
     web_text = "\n".join(line for line in text_lines if line.strip())
-    image_facts = "\n".join(fact_lines)
+    image_facts = "\n".join(line for line in image_lines if line.strip())
     raw = json.dumps(
         {
             "version": COMPACT_EVIDENCE_VERSION,
@@ -229,7 +305,7 @@ def build_compact_evidence(
         image_facts=image_facts,
         text_source_count=len(text_lines),
         image_count=len(observations),
-        image_fact_count=len(fact_lines),
+        image_fact_count=image_fact_count,
         citation_aliases=citation_aliases,
         sha256=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
     )
