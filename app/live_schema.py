@@ -9,7 +9,6 @@ from typing import Any, Iterable
 from .source_bundle import normalize_key
 
 SCHEMA_VERSION = 1
-_INDEXED_VALUE_CONTROL_RE = re.compile(r"_\d+_value$")
 
 
 def _stable_section(value: object) -> str:
@@ -123,26 +122,21 @@ def _field_context(field: dict[str, Any]) -> str:
 
 
 def _field_multi_value(field: dict[str, Any]) -> bool:
-    """Normalize Makro's repeatable-input contract before AI planning.
+    """Return repeatability only when the live Makro contract proves it.
 
-    Makro initially renders some ``+`` attributes with exactly one visible slot.
-    Those slots still use the indexed ``<attribute>_0_value`` naming contract and
-    the executor can create additional rows on demand. Treating only two already
-    rendered indices as multi-value made Sales Package/Keywords collapse into one
-    string before execution. Indexed value naming is a DOM contract, not a field
-    label heuristic, so it applies generically to every repeatable attribute.
+    Makro also uses indexed names such as ``<attribute>_0_value`` for ordinary
+    single-value attributes, so that name shape alone is not proof of a repeatable
+    field. The DOM scanner marks a real visible add-value control, while fields
+    with multiple already-rendered value slots arrive with ``multi_value=True``.
     """
 
-    if bool(field.get("multi_value")):
+    if bool(field.get("multi_value") or field.get("has_add_value_control")):
         return True
-    for control in field.get("controls") or []:
-        if not isinstance(control, dict):
-            continue
-        if bool(control.get("repeatable") or control.get("has_add_value_control")):
-            return True
-        if _INDEXED_VALUE_CONTROL_RE.search(str(control.get("name") or "")):
-            return True
-    return False
+    return any(
+        isinstance(control, dict)
+        and bool(control.get("repeatable") or control.get("has_add_value_control"))
+        for control in field.get("controls") or []
+    )
 
 
 def _schema_field(field: dict[str, Any]) -> dict[str, Any]:
