@@ -70,11 +70,11 @@ def test_original_account_defaults_are_preserved_for_one_line_revert():
     assert "flipkart_selling_price" not in original
 
 
-def test_current_profile_fixes_only_min_and_max_order_quantity():
+def test_current_profile_uses_valid_minimum_and_customer_maximum():
     assert ACCOUNT_DEFAULT_PROFILE == "fixed_order_quantity"
     assert MAKRO_ACCOUNT_FIXED_DEFAULTS is FIXED_ORDER_QUANTITY_ACCOUNT_DEFAULTS
     expected = {
-        "minimum_order_quantity": "5000",
+        "minimum_order_quantity": "1",
         "max_order_quantity_allowed": "6000",
         "service_profile": "FBS",
         "shipping_days": "14",
