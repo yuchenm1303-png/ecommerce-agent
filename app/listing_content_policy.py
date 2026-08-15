@@ -10,7 +10,7 @@ from .source_bundle import normalize_key
 LISTING_INTENT_ENV = "ECOMMERCE_LISTING_INTENT"
 LISTING_AI_GUIDANCE_ENV = "ECOMMERCE_LISTING_AI_GUIDANCE"
 MODEL_NAME_KEYWORDS_ENV = "ECOMMERCE_MODEL_NAME_KEYWORDS"
-_BASE_CONTENT_POLICY_VERSION = 4
+_BASE_CONTENT_POLICY_VERSION = 5
 
 
 def _env_text(name: str, *, limit: int) -> str:
@@ -170,6 +170,23 @@ def _sales_package_value_shape(field: dict[str, Any]) -> dict[str, str]:
 
 def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
     """Return seller content policy for one live field, without product reasoning."""
+
+    if _matches(field, "Vehicle Model Name", "vehicle_model_name"):
+        return _with_user_context(
+            {
+                "policy_id": "vehicle_model_name",
+                "generation_mode": "grounded_only",
+                "evidence_mode": "exact_product_only",
+                "best_effort": "disabled",
+                "required_fallback": "manual_only",
+                "instruction": (
+                    "Fill Vehicle Model Name only from exact selected-offer supplier evidence or exact-product Web evidence. "
+                    "This field describes compatible vehicle model information; do not copy the product Model Number, product Model Name or Brand into it. "
+                    "Use 'Universal' only when exact evidence explicitly establishes universal vehicle compatibility. "
+                    "Never output N/A, None or a guessed vehicle model. If compatibility is not verified, keep MISSING."
+                ),
+            }
+        )
 
     if _matches(field, "Model Name", "model_name"):
         model_keywords = current_model_name_keywords()
@@ -371,17 +388,16 @@ def allow_best_effort_inference(field: dict[str, Any]) -> bool:
 
 
 def allow_required_fallback(field: dict[str, Any]) -> bool:
-    """Keep unresolved required fields on the established deterministic fallback path.
+    """Allow deterministic fallback only for ordinary required fields.
 
-    Content policy still controls what AI may infer and how seller-facing copy is
-    generated. It must not turn a missing required value into a GUI execution lock.
-    If AI/evidence cannot resolve a required field and the user supplies no manual
-    value, the existing required-overrides path remains responsible for completing
-    the form with its live-schema-bound deterministic fallback.
+    Customer-critical fields explicitly marked ``required_fallback=manual_only``
+    must keep their evidence/content contract all the way to execution. They may
+    be resolved by the normal AI/evidence pipeline or by an explicit user value,
+    but they must never silently become N/A, 1 or an arbitrary live option.
     """
 
-    del field
-    return True
+    policy = field_content_policy(field)
+    return policy.get("required_fallback") != "manual_only"
 
 
 def requires_exact_web_identity(field: dict[str, Any]) -> bool:
