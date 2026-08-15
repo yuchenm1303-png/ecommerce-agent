@@ -23,7 +23,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .batch_model import BatchJob, normalize_batch_urls
+from .batch_model import (
+    BATCH_WORKER_DEFAULT,
+    BATCH_WORKER_MAX,
+    BATCH_WORKER_MIN,
+    BatchJob,
+    normalize_batch_urls,
+)
 from .batch_runner import BatchController
 from .readonly_runner import RunnerConfig
 
@@ -211,9 +217,7 @@ class BatchJobCard(QFrame):
         self.open_dir_button.clicked.connect(self._open_dir)
         self.modal_button = QPushButton("详情窗口")
         self.modal_button.setObjectName("quietButton")
-        self.modal_button.clicked.connect(
-            lambda: self._details_callback(self.job_id)
-        )
+        self.modal_button.clicked.connect(lambda: self._details_callback(self.job_id))
         self.toggle_button = QPushButton("展开详情 / 日志")
         self.toggle_button.setObjectName("quietButton")
         self.toggle_button.clicked.connect(self._toggle_details)
@@ -230,7 +234,6 @@ class BatchJobCard(QFrame):
         self.details_layout = QVBoxLayout(self.details_box)
         self.details_layout.setContentsMargins(11, 9, 11, 10)
         self.details_layout.setSpacing(7)
-
         self.details_meta = QLabel()
         self.details_meta.setTextFormat(Qt.PlainText)
         self.details_meta.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -246,7 +249,6 @@ class BatchJobCard(QFrame):
         self._job = job
         progress = max(0, min(100, int(job.progress)))
         product = job.product_name or _product_label(job.product_url)
-
         self.job_label.setText(f"{job.job_id} · OWNED PRODUCT TASK")
         self.product_label.setText(product)
         self.product_label.setToolTip(job.product_name or job.product_url)
@@ -256,7 +258,6 @@ class BatchJobCard(QFrame):
         self.progress_bar.setValue(progress)
         self._render_status(job.status)
         self._render_phase(progress)
-
         self.meta_label.setText(
             f"Vertical  {job.vertical or '—'}    ·    "
             f"Brand  {job.brand or '—'}    ·    "
@@ -293,10 +294,7 @@ class BatchJobCard(QFrame):
 
     def _render_status(self, status: str) -> None:
         label = _STAGE_LABELS.get(status, status)
-        foreground, background = _STATUS_PALETTE.get(
-            status,
-            ("#ccecff", "rgba(69, 151, 201, 0.22)"),
-        )
+        foreground, background = _STATUS_PALETTE.get(status, ("#ccecff", "rgba(69, 151, 201, 0.22)"))
         self.status_chip.setText(label)
         self.status_chip.setStyleSheet(
             f"color: {foreground}; background: {background};"
@@ -320,9 +318,7 @@ class BatchJobCard(QFrame):
             else:
                 color = "rgba(255,255,255,0.38)"
                 marker = "○"
-            pieces.append(
-                f'<span style="color:{color}; font-weight:650;">{marker} {label}</span>'
-            )
+            pieces.append(f'<span style="color:{color}; font-weight:650;">{marker} {label}</span>')
         self.phase_label.setText("&nbsp;&nbsp;&nbsp;".join(pieces))
 
     def _update_details_meta(self) -> None:
@@ -360,9 +356,7 @@ class BatchJobCard(QFrame):
         if self._expanded:
             self._ensure_log_view()
         self.details_box.setVisible(self._expanded)
-        self.toggle_button.setText(
-            "收起详情 / 日志" if self._expanded else "展开详情 / 日志"
-        )
+        self.toggle_button.setText("收起详情 / 日志" if self._expanded else "展开详情 / 日志")
 
     def _open_url(self) -> None:
         if self._job is not None and self._job.product_url:
@@ -376,13 +370,7 @@ class BatchJobCard(QFrame):
 class BatchWorkspace(QWidget):
     """Multi-product control tower with one persistent surface per supplier URL."""
 
-    def __init__(
-        self,
-        project_root: Path,
-        *,
-        busy_guard: Callable[[], bool] | None = None,
-        parent: QWidget | None = None,
-    ) -> None:
+    def __init__(self, project_root: Path, *, busy_guard: Callable[[], bool] | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.project_root = project_root.resolve()
         self.busy_guard = busy_guard or (lambda: False)
@@ -428,8 +416,8 @@ class BatchWorkspace(QWidget):
         title_box.addWidget(eyebrow)
         title_box.addWidget(title)
         hint = QLabel(
-            "每行一个 1688 / supplier URL。Source 串行预取；每个商品独立 owned Makro Tab，"
-            "准备和真实填写按 Worker 上限并行。"
+            f"每行一个 1688 / supplier URL。Source 串行预取；每个商品独立 owned Makro Tab，"
+            f"Makro 准备和填写最高支持 {BATCH_WORKER_MAX} Workers 并行。"
         )
         hint.setObjectName("cardHint")
         hint.setWordWrap(True)
@@ -459,10 +447,14 @@ class BatchWorkspace(QWidget):
         self.source_port.setPrefix("Source CDP  ")
         self.source_port.setMaximumWidth(175)
         self.worker_count = QSpinBox()
-        self.worker_count.setRange(1, 3)
-        self.worker_count.setValue(2)
+        self.worker_count.setRange(BATCH_WORKER_MIN, BATCH_WORKER_MAX)
+        self.worker_count.setValue(BATCH_WORKER_DEFAULT)
         self.worker_count.setPrefix("Makro Workers  ")
         self.worker_count.setMaximumWidth(190)
+        self.worker_count.setToolTip(
+            f"Makro 准备/填写并行数：{BATCH_WORKER_MIN}-{BATCH_WORKER_MAX}。"
+            "默认 6；并行越高，对浏览器、内存和接口并发要求越高。Source 采集始终串行。"
+        )
         row.addWidget(self.makro_port)
         row.addWidget(self.source_port)
         row.addWidget(self.worker_count)
@@ -483,14 +475,7 @@ class BatchWorkspace(QWidget):
         row = QHBoxLayout()
         row.setSpacing(10)
         self.summary_labels: dict[str, QLabel] = {}
-        for key, title in (
-            ("total", "TOTAL"),
-            ("processing", "PROCESSING"),
-            ("ready", "READY"),
-            ("done", "DONE"),
-            ("review", "REVIEW"),
-            ("failed", "FAILED"),
-        ):
+        for key, title in (("total", "TOTAL"), ("processing", "PROCESSING"), ("ready", "READY"), ("done", "DONE"), ("review", "REVIEW"), ("failed", "FAILED")):
             card = QFrame()
             card.setObjectName("statusCard")
             box = QVBoxLayout(card)
@@ -511,7 +496,6 @@ class BatchWorkspace(QWidget):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(15, 13, 15, 14)
         layout.setSpacing(9)
-
         header_row = QHBoxLayout()
         title_box = QVBoxLayout()
         title_box.setSpacing(0)
@@ -531,42 +515,25 @@ class BatchWorkspace(QWidget):
         header_row.addSpacing(12)
         header_row.addWidget(self.state_label, 0, Qt.AlignTop)
         layout.addLayout(header_row)
-
         self.job_scroll = QScrollArea()
         self.job_scroll.setObjectName("batchJobScroll")
         self.job_scroll.setWidgetResizable(True)
         self.job_scroll.setFrameShape(QFrame.NoFrame)
         self.job_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.job_scroll.setStyleSheet(
-            """
-            QScrollArea#batchJobScroll {
-                background: transparent;
-                border: none;
-            }
-            QScrollArea#batchJobScroll > QWidget > QWidget {
-                background: transparent;
-            }
-            """
-        )
-
+        self.job_scroll.setStyleSheet("QScrollArea#batchJobScroll { background: transparent; border: none; } QScrollArea#batchJobScroll > QWidget > QWidget { background: transparent; }")
         self.jobs_host = QWidget()
         self.jobs_host.setObjectName("batchJobsHost")
         self.jobs_host.setStyleSheet("QWidget#batchJobsHost { background: transparent; }")
         self.jobs_layout = QVBoxLayout(self.jobs_host)
         self.jobs_layout.setContentsMargins(2, 2, 2, 2)
         self.jobs_layout.setSpacing(10)
-
-        self.empty_state = QLabel(
-            "尚未创建商品任务\n"
-            "批量准备后，每个链接会生成独立任务卡、owned tab 状态、实时进度和独立日志。"
-        )
+        self.empty_state = QLabel("尚未创建商品任务\n批量准备后，每个链接会生成独立任务卡、owned tab 状态、实时进度和独立日志。")
         self.empty_state.setObjectName("cardHint")
         self.empty_state.setAlignment(Qt.AlignCenter)
         self.empty_state.setWordWrap(True)
         self.empty_state.setMinimumHeight(220)
         self.jobs_layout.addWidget(self.empty_state)
         self.jobs_layout.addStretch(1)
-
         self.job_scroll.setWidget(self.jobs_host)
         layout.addWidget(self.job_scroll, 1)
         return card
@@ -577,7 +544,6 @@ class BatchWorkspace(QWidget):
         layout = QHBoxLayout(card)
         layout.setContentsMargins(16, 11, 16, 11)
         layout.setSpacing(10)
-
         self.save_check = QCheckBox("允许 Save + reopen")
         self.images_check = QCheckBox("上传本次商品图")
         self.qc_check = QCheckBox("Send to QC · LOCKED")
@@ -587,7 +553,6 @@ class BatchWorkspace(QWidget):
         layout.addWidget(self.images_check)
         layout.addWidget(self.qc_check)
         layout.addStretch(1)
-
         self.open_batch_button = QPushButton("打开 Batch 目录")
         self.open_batch_button.setObjectName("quietButton")
         self.open_batch_button.setEnabled(False)
@@ -619,11 +584,7 @@ class BatchWorkspace(QWidget):
             )
             self.save_check.setChecked(False)
             self.images_check.setChecked(False)
-            self.controller.start_prepare(
-                urls,
-                config,
-                prepare_concurrency=int(self.worker_count.value()),
-            )
+            self.controller.start_prepare(urls, config, prepare_concurrency=int(self.worker_count.value()))
             self.open_batch_button.setEnabled(True)
         except Exception as exc:
             QMessageBox.critical(self, "批量准备无法启动", str(exc))
@@ -640,11 +601,7 @@ class BatchWorkspace(QWidget):
             QMessageBox.information(self, "没有 READY 商品", "当前 Batch 没有可执行的 READY Job。")
             return
         if not self.save_check.isChecked():
-            QMessageBox.warning(
-                self,
-                "需要 Save 授权",
-                "批量 Full Step 3 会持久化草稿。请显式勾选“允许 Save + reopen”。",
-            )
+            QMessageBox.warning(self, "需要 Save 授权", "批量 Full Step 3 会持久化草稿。请显式勾选“允许 Save + reopen”。")
             return
         answer = QMessageBox.question(
             self,
@@ -675,36 +632,27 @@ class BatchWorkspace(QWidget):
         if batch_id != self._batch_id:
             self._batch_id = batch_id
             self._clear_job_cards()
-
         seen: set[str] = set()
         for job in jobs:
             seen.add(job.job_id)
             card = self._job_cards.get(job.job_id)
             if card is None:
-                card = BatchJobCard(
-                    job.job_id,
-                    details_callback=self._open_job_detail,
-                    parent=self.jobs_host,
-                )
+                card = BatchJobCard(job.job_id, details_callback=self._open_job_detail, parent=self.jobs_host)
                 self._job_cards[job.job_id] = card
                 self.jobs_layout.insertWidget(self.jobs_layout.count() - 1, card)
                 pending = self._pending_logs.pop(job.job_id, deque())
                 for line in pending:
                     card.append_log(line)
             card.update_job(job)
-
         for job_id in list(self._job_cards):
             if job_id in seen:
                 continue
             card = self._job_cards.pop(job_id)
             card.setParent(None)
             card.deleteLater()
-
         self.empty_state.setVisible(not jobs)
         self.job_count_label.setText(f"{len(jobs)} JOBS")
-        self.execute_button.setEnabled(
-            not self.controller.is_running and any(job.status == "READY" for job in jobs)
-        )
+        self.execute_button.setEnabled(not self.controller.is_running and any(job.status == "READY" for job in jobs))
 
     def _append_controller_log(self, text: str) -> None:
         match = _JOB_LOG_LINE.match(str(text or "").strip())
@@ -715,10 +663,7 @@ class BatchWorkspace(QWidget):
         if card is not None:
             card.append_log(line)
             return
-        pending = self._pending_logs.setdefault(
-            job_id,
-            deque(maxlen=_MAX_JOB_LOG_LINES),
-        )
+        pending = self._pending_logs.setdefault(job_id, deque(maxlen=_MAX_JOB_LOG_LINES))
         pending.append(line)
 
     def _clear_job_cards(self) -> None:
@@ -782,11 +727,7 @@ class BatchWorkspace(QWidget):
             return
         if self._open_job_in_shared_modal(job):
             return
-        QMessageBox.information(
-            self,
-            f"{job.job_id} · Batch Job",
-            self._job_detail_text(job),
-        )
+        QMessageBox.information(self, f"{job.job_id} · Batch Job", self._job_detail_text(job))
 
     def _open_job_in_shared_modal(self, job: BatchJob) -> bool:
         details = getattr(self.window(), "_card_details", None)
@@ -794,7 +735,6 @@ class BatchWorkspace(QWidget):
         body_layout = getattr(details, "body_layout", None)
         if not callable(open_custom) or not isinstance(body_layout, QVBoxLayout):
             return False
-
         card = self._job_cards.get(job.job_id)
         live_log = card.log_text() if card is not None else ""
 
@@ -806,7 +746,6 @@ class BatchWorkspace(QWidget):
             )
             summary.setObjectName("modalMetaLabel")
             body_layout.addWidget(summary)
-
             detail = QPlainTextEdit()
             detail.setObjectName("cardDetailTextView")
             detail.setReadOnly(True)
@@ -816,13 +755,10 @@ class BatchWorkspace(QWidget):
             detail.setPlainText(text)
             detail.setMinimumHeight(420)
             body_layout.addWidget(detail, 1)
-
             row = QHBoxLayout()
             open_url = QPushButton("打开商品链接")
             open_url.setObjectName("quietButton")
-            open_url.clicked.connect(
-                lambda: QDesktopServices.openUrl(QUrl(job.product_url))
-            )
+            open_url.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(job.product_url)))
             row.addWidget(open_url)
             row.addStretch(1)
             open_dir = QPushButton("打开 Job 目录")
