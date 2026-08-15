@@ -15,10 +15,13 @@ WARRANTY_SERVICE_TYPE_POLICY = (
 # Account-level seller defaults confirmed for this Makro account. These values are
 # operational policy, not product facts: they must bypass AI/Web resolution and be
 # injected through the shared business bundle used by both Single and Batch flows.
+# Paired relation fields are kept internally consistent so the shared hard guards
+# do not reject the account defaults before browser execution.
 MAKRO_ACCOUNT_FIXED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
+    ("mrp", "6000", "account-default:base-price"),
     ("flipkart_selling_price", "6000", "account-default:selling-price"),
     ("minimum_order_quantity", "5000", "account-default:min-order-quantity"),
-    ("max_order_quantity_allowed", "99", "account-default:max-order-quantity"),
+    ("max_order_quantity_allowed", "5000", "account-default:max-order-quantity"),
     ("service_profile", "FBS", "account-default:fulfilment-by"),
     ("shipping_days", "14", "account-default:pick-pack-sla"),
     ("forbid_shipping", "National", "account-default:selling-region"),
