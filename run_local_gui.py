@@ -57,6 +57,7 @@ def main() -> int:
     from gui.required_input_support import install_required_input_support
     from gui.restore_snapshot import install_restore_snapshot
     from gui.runtime_assistant import install_runtime_assistant
+    from gui.single_ai_guidance import install_single_ai_guidance
     from gui.single_top_compact import install_single_top_compact
     from gui.smooth_scroll import SmoothWheelFilter
     from gui.startup_entrance import install_startup_entrance
@@ -127,6 +128,7 @@ def main() -> int:
     install_managed_makro_browser(window)
     install_required_input_support(window)
     install_listing_offer_support(window)
+    install_single_ai_guidance(window)
     install_batch_sku_spec_ui(window)
     install_batch_product_files(window)
     install_listing_offer_hardening(window)
