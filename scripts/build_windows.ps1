@@ -148,6 +148,15 @@ if (-not (Test-Path $SetupExe)) {
     throw "Installer output missing: $SetupExe"
 }
 
+Write-Host "[post-build] Running real frozen updater end-to-end handoff"
+& (Join-Path $Root "scripts\test_windows_update_e2e.ps1") `
+    -Version $Version `
+    -AppDir $AppDir `
+    -SetupExe $SetupExe
+if ($LASTEXITCODE -ne 0) {
+    throw "Frozen updater end-to-end smoke test failed with exit code $LASTEXITCODE"
+}
+
 Write-Host ""
 Write-Host "Windows package ready:"
 Write-Host "  Installer: $SetupExe"
