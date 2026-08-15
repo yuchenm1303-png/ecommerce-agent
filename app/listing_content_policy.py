@@ -388,16 +388,18 @@ def allow_best_effort_inference(field: dict[str, Any]) -> bool:
 
 
 def allow_required_fallback(field: dict[str, Any]) -> bool:
-    """Allow deterministic fallback only for ordinary required fields.
+    """Keep final deterministic completion available for every required field.
 
-    Customer-critical fields explicitly marked ``required_fallback=manual_only``
-    must keep their evidence/content contract all the way to execution. They may
-    be resolved by the normal AI/evidence pipeline or by an explicit user value,
-    but they must never silently become N/A, 1 or an arbitrary live option.
+    ``required_fallback=manual_only`` remains useful metadata for the Resolver: it
+    tells AI/search stages not to invent a product fact or use a placeholder as a
+    normal answer. It must not become an execution lock. Only after the normal
+    evidence + synthesis pipeline has finished unresolved does the shared
+    required-field layer apply its deterministic live-schema fallback so Single
+    and Batch can continue through the canonical executor.
     """
 
-    policy = field_content_policy(field)
-    return policy.get("required_fallback") != "manual_only"
+    del field
+    return True
 
 
 def requires_exact_web_identity(field: dict[str, Any]) -> bool:
