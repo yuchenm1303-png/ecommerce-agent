@@ -154,6 +154,9 @@ if (-not (Test-Path $SetupExe)) {
     throw "Installer output missing: $SetupExe"
 }
 
+$ReleaseSetupHash = (Get-FileHash $SetupExe -Algorithm SHA256).Hash
+$ReleaseSetupSize = (Get-Item $SetupExe).Length
+
 if ($ShouldRunUpdateE2E) {
     Write-Host "[release-gate] Running real frozen updater end-to-end handoff"
     & (Join-Path $Root "scripts\test_windows_update_e2e.ps1") `
@@ -162,6 +165,17 @@ if ($ShouldRunUpdateE2E) {
         -SetupExe $SetupExe
     if ($LASTEXITCODE -ne 0) {
         throw "Frozen updater end-to-end smoke test failed with exit code $LASTEXITCODE"
+    }
+
+    # The release artifact is immutable. The E2E owns and may delete only its
+    # probe copy, never the installer that later smoke/manifest/release steps use.
+    if (-not (Test-Path $SetupExe)) {
+        throw "Release installer disappeared during updater E2E: $SetupExe"
+    }
+    $ReleaseSetupHashAfterE2E = (Get-FileHash $SetupExe -Algorithm SHA256).Hash
+    $ReleaseSetupSizeAfterE2E = (Get-Item $SetupExe).Length
+    if ($ReleaseSetupHashAfterE2E -ne $ReleaseSetupHash -or $ReleaseSetupSizeAfterE2E -ne $ReleaseSetupSize) {
+        throw "Release installer changed during updater E2E: $SetupExe"
     }
 }
 else {

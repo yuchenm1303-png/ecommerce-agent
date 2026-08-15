@@ -18,10 +18,25 @@ $ParentDist = Join-Path $ProbeRoot "parent-dist"
 $ParentWork = Join-Path $ProbeRoot "parent-work"
 $OldInstall = Join-Path $ProbeRoot "old-install"
 $StateDir = Join-Path $ProbeRoot "state"
+$PayloadDir = Join-Path $ProbeRoot "payload"
 $SetupLog = Join-Path $ProbeRoot "inno-update.log"
 
 if (Test-Path $ProbeRoot) { Remove-Item $ProbeRoot -Recurse -Force }
-New-Item -ItemType Directory -Force -Path $ProbeRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $ProbeRoot, $PayloadDir | Out-Null
+
+# The updater owns its installer payload and deletes it after a successful handoff.
+# Never give it the caller's release artifact; clone that immutable input into the
+# probe workspace and let the E2E consume only the clone.
+$ProbeSetupExe = Join-Path $PayloadDir (Split-Path $SetupExe -Leaf)
+$SourceSetupHash = (Get-FileHash $SetupExe -Algorithm SHA256).Hash
+Copy-Item $SetupExe $ProbeSetupExe -Force
+if (-not (Test-Path $ProbeSetupExe)) {
+    throw "Updater E2E payload copy missing: $ProbeSetupExe"
+}
+$ProbeSetupHash = (Get-FileHash $ProbeSetupExe -Algorithm SHA256).Hash
+if ($ProbeSetupHash -ne $SourceSetupHash) {
+    throw "Updater E2E payload copy hash mismatch"
+}
 
 Write-Host "  [E2E 1/4] Building frozen old-app handoff probe"
 & python -m PyInstaller `
@@ -50,7 +65,7 @@ New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 Write-Host "  [E2E 2/4] Frozen EcommerceAgent.exe hands off to packaged updater.exe"
 $ParentArgs = @(
     "--updater", $UpdaterExe,
-    "--installer", $SetupExe,
+    "--installer", $ProbeSetupExe,
     "--target-version", $Version,
     "--install-dir", $OldInstall,
     "--state-dir", $StateDir,
