@@ -9,6 +9,15 @@ from typing import Any
 from urllib.parse import urlparse
 
 
+BATCH_WORKER_MIN = 1
+BATCH_WORKER_DEFAULT = 6
+BATCH_WORKER_MAX = 16
+
+
+def normalize_batch_concurrency(value: int) -> int:
+    return max(BATCH_WORKER_MIN, min(BATCH_WORKER_MAX, int(value)))
+
+
 BATCH_JOB_STATES = (
     "QUEUED",
     "CAPTURING",
@@ -67,13 +76,17 @@ class BatchRun:
     root_dir: str
     jobs: list[BatchJob]
     status: str = "IDLE"
-    prepare_concurrency: int = 2
-    execute_concurrency: int = 2
+    prepare_concurrency: int = BATCH_WORKER_DEFAULT
+    execute_concurrency: int = BATCH_WORKER_DEFAULT
     save_authorized: bool = False
     images_authorized: bool = False
     send_to_qc: bool = False
     created_at: str = field(default_factory=lambda: _now())
     updated_at: str = field(default_factory=lambda: _now())
+
+    def __post_init__(self) -> None:
+        self.prepare_concurrency = normalize_batch_concurrency(self.prepare_concurrency)
+        self.execute_concurrency = normalize_batch_concurrency(self.execute_concurrency)
 
     def touch(self) -> None:
         self.updated_at = _now()
@@ -142,8 +155,8 @@ def create_batch_run(
     project_root: Path,
     urls: list[str],
     *,
-    prepare_concurrency: int = 2,
-    execute_concurrency: int = 2,
+    prepare_concurrency: int = BATCH_WORKER_DEFAULT,
+    execute_concurrency: int = BATCH_WORKER_DEFAULT,
 ) -> BatchRun:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     batch_id = f"batch-{stamp}"
@@ -166,8 +179,8 @@ def create_batch_run(
         root_dir=str(root.resolve()),
         jobs=jobs,
         status="QUEUED",
-        prepare_concurrency=max(1, min(4, int(prepare_concurrency))),
-        execute_concurrency=max(1, min(4, int(execute_concurrency))),
+        prepare_concurrency=normalize_batch_concurrency(prepare_concurrency),
+        execute_concurrency=normalize_batch_concurrency(execute_concurrency),
     )
     save_batch_run(batch)
     return batch
@@ -196,10 +209,14 @@ def load_batch_run(path: str | Path) -> BatchRun:
 
 __all__ = [
     "BATCH_JOB_STATES",
+    "BATCH_WORKER_DEFAULT",
+    "BATCH_WORKER_MAX",
+    "BATCH_WORKER_MIN",
     "BatchJob",
     "BatchRun",
     "create_batch_run",
     "load_batch_run",
+    "normalize_batch_concurrency",
     "normalize_batch_urls",
     "save_batch_run",
 ]
