@@ -1,15 +1,17 @@
 """Query-owned Makro search/result surface mechanics.
 
-A search result belongs to the query that caused it, not merely to a rectangle
-below an input. The portal keeps stale taxonomy/brand content mounted while
-autocomplete/results are painted over it, so geometry-only scans can read the
-wrong layer.
+A search result belongs to the query generation that caused it, not merely to a
+rectangle below an input. Makro may keep autocomplete/taxonomy DOM mounted while
+reusing the same nodes across several searches, so waiting for the old DOM to
+vanish is neither necessary nor reliable.
 
-This module snapshots the visible DOM immediately before a query. Afterwards it
-accepts only elements that are new or whose rendered text changed, plus explicit
-ARIA-owned popup rows. Reads and clicks use the same ownership rule. Scrollable
-result surfaces are harvested to exhaustion before semantic selection, and exact
-rows can be sought again across the same surface before clicking.
+Each call to :func:`begin_search_query` starts a new generation. It snapshots the
+currently visible DOM and observes mutations produced after that boundary.
+Discovery reads accept only rows that are new, changed, or touched by the current
+generation. Exact replay is deliberately separate: once a candidate has already
+been grounded by a prior discovery generation, the caller may allow one stable
+exact row to be rebound and clicked, after which the normal canonical-Vertical
+verification remains authoritative.
 """
 
 from __future__ import annotations
@@ -27,17 +29,54 @@ _BEGIN_QUERY_JS = r"""
     return s.display !== 'none' && s.visibility !== 'hidden'
       && Number(s.opacity || 1) !== 0 && r.width > 2 && r.height > 2;
   };
+  const mark = (set, node) => {
+    let el = node instanceof Element ? node : node && node.parentElement;
+    for (let depth = 0; el && el !== document.body && depth < 10; depth++, el = el.parentElement) {
+      set.add(el);
+    }
+  };
+
   if (!window.__makroQuerySurfaceState) {
     window.__makroQuerySurfaceState = new WeakMap();
   }
+  const stateMap = window.__makroQuerySurfaceState;
+  const previous = stateMap.get(input);
+  if (previous && previous.observer) {
+    try { previous.observer.disconnect(); } catch (_) {}
+  }
+
+  const generation = Number(previous && previous.generation || 0) + 1;
   const baseline = new Map();
   for (const el of document.querySelectorAll('body *')) {
     if (!visible(el)) continue;
     const text = clean(el.innerText || el.textContent || '');
     baseline.set(el, text.slice(0, 500));
   }
-  window.__makroQuerySurfaceState.set(input, {baseline});
-  return baseline.size;
+
+  const touched = new WeakSet();
+  const observer = new MutationObserver((records) => {
+    for (const record of records) {
+      mark(touched, record.target);
+      for (const node of record.addedNodes || []) mark(touched, node);
+      for (const node of record.removedNodes || []) mark(touched, node);
+    }
+  });
+  const root = document.body || document.documentElement;
+  if (root) {
+    observer.observe(root, {
+      subtree: true,
+      childList: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: [
+        'class', 'style', 'aria-hidden', 'aria-selected', 'aria-expanded',
+        'data-value', 'data-vertical', 'data-brand'
+      ],
+    });
+  }
+
+  stateMap.set(input, {generation, baseline, touched, observer});
+  return {generation, baseline_size: baseline.size};
 }
 """
 
@@ -63,6 +102,7 @@ _READ_ROWS_JS = r"""
   const state = stateMap && stateMap.get(input);
   if (!state || !state.baseline) return [];
   const baseline = state.baseline;
+  const touched = state.touched;
   const ir = input.getBoundingClientRect();
 
   const overlapX = (r) => Math.max(0, Math.min(r.right, ir.right) - Math.max(r.left, ir.left));
@@ -80,6 +120,7 @@ _READ_ROWS_JS = r"""
     const current = clean(el.innerText || el.textContent || '').slice(0, 500);
     return !baseline.has(el) || baseline.get(el) !== current;
   };
+  const fresh = (el) => changed(el) || !!(touched && touched.has(el));
   const semantic = (el) => {
     const role = String(el.getAttribute && el.getAttribute('role') || '').toLowerCase();
     const cls = String(el.className || '').toLowerCase();
@@ -118,7 +159,9 @@ _READ_ROWS_JS = r"""
   const candidates = [];
   for (const el of document.querySelectorAll('body *')) {
     if (!visible(el) || el === input || el.contains(input)) continue;
-    if (!changed(el) && !explicitOwned(el)) continue;
+    // Explicit ownership says where a row lives; it does not prove that the row
+    // belongs to this generation. Freshness is always required for discovery.
+    if (!fresh(el)) continue;
     const r = el.getBoundingClientRect();
     if (!nearInput(r) && !semantic(el)) continue;
     const row = rowAncestor(el);
@@ -173,6 +216,7 @@ _MOVE_SEARCH_SURFACE_JS = r"""
     return {found:false,moved:false,at_end:true,reason:'missing_query_state'};
   }
   const baseline = state.baseline;
+  const touched = state.touched;
   const ir = input.getBoundingClientRect();
   const overlapX = (r) => Math.max(0, Math.min(r.right, ir.right) - Math.max(r.left, ir.left));
   const nearInput = (r) => r.bottom >= ir.bottom - 12 && r.top <= ir.bottom + 760
@@ -182,6 +226,7 @@ _MOVE_SEARCH_SURFACE_JS = r"""
     const current = label(el).slice(0, 500);
     return !baseline.has(el) || baseline.get(el) !== current;
   };
+  const fresh = (el) => changed(el) || !!(touched && touched.has(el));
   const explicitOwned = (el) => {
     for (const attr of ['aria-controls', 'aria-owns']) {
       const id = input.getAttribute(attr);
@@ -209,7 +254,7 @@ _MOVE_SEARCH_SURFACE_JS = r"""
   const ownedRows = [];
   for (const el of document.querySelectorAll('body *')) {
     if (!visible(el) || el === input || el.contains(input)) continue;
-    if (!changed(el) && !explicitOwned(el)) continue;
+    if (!fresh(el)) continue;
     const r = el.getBoundingClientRect();
     if (!nearInput(r)) continue;
     if (!semantic(el) && !explicitOwned(el)) continue;
@@ -278,9 +323,11 @@ _MOVE_SEARCH_SURFACE_JS = r"""
 
 
 _CLICK_ROW_JS = r"""
-async (input, wanted) => {
+async (input, request) => {
   const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
   const normalize = (v) => clean(v).toLocaleLowerCase();
+  const wanted = typeof request === 'string' ? request : request && request.wanted;
+  const allowStableExact = !!(request && typeof request === 'object' && request.allow_stable_exact);
   const wantedKey = normalize(wanted);
   if (!wantedKey) return {clicked:false, reason:'empty_wanted'};
 
@@ -288,6 +335,8 @@ async (input, wanted) => {
   const state = stateMap && stateMap.get(input);
   if (!state || !state.baseline) return {clicked:false, reason:'missing_query_state'};
   const baseline = state.baseline;
+  const touched = state.touched;
+  const generation = Number(state.generation || 0);
   const ir = input.getBoundingClientRect();
   const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -316,6 +365,8 @@ async (input, wanted) => {
     const current = clean(el.innerText || el.textContent || '').slice(0, 500);
     return !baseline.has(el) || baseline.get(el) !== current;
   };
+  const fresh = (el) => changed(el) || !!(touched && touched.has(el));
+  const eligible = (el) => fresh(el) || allowStableExact;
   const explicitOwned = (el) => {
     for (const attr of ['aria-controls', 'aria-owns']) {
       const id = input.getAttribute(attr);
@@ -366,9 +417,12 @@ async (input, wanted) => {
     const matches = [], seen = new Set();
     for (const el of document.querySelectorAll('body *')) {
       if (!visible(el) || el === input || el.contains(input)) continue;
-      if (!changed(el) && !explicitOwned(el)) continue;
+      if (!eligible(el)) continue;
       const row = rowAncestor(el);
       if (!row || seen.has(row) || normalize(label(row)) !== wantedKey) continue;
+      // Stable replay is only allowed for the already-grounded exact label; the
+      // geometry/topmost/row constraints above still prevent page-wide clicks.
+      if (!fresh(row) && !allowStableExact) continue;
       seen.add(row);
       matches.push(row);
     }
@@ -378,7 +432,7 @@ async (input, wanted) => {
     const rows = [];
     for (const el of document.querySelectorAll('body *')) {
       if (!visible(el) || el === input || el.contains(input)) continue;
-      if (!changed(el) && !explicitOwned(el)) continue;
+      if (!eligible(el)) continue;
       const r = el.getBoundingClientRect();
       if (!nearInput(r) || (!semantic(el) && !explicitOwned(el))) continue;
       rows.push(el);
@@ -412,7 +466,14 @@ async (input, wanted) => {
   const tryClick = (seekStep) => {
     const matches = exactRows();
     if (matches.length !== 1) {
-      return {clicked:false, reason:'non_unique_exact_row', match_count:matches.length, seek_step:seekStep};
+      return {
+        clicked:false,
+        reason:'non_unique_exact_row',
+        match_count:matches.length,
+        seek_step:seekStep,
+        generation,
+        allow_stable_exact:allowStableExact,
+      };
     }
     let target = matches[0];
     for (let depth = 0; target && target !== document.body && depth < 5; depth++, target = target.parentElement) {
@@ -426,6 +487,8 @@ async (input, wanted) => {
         strategy: depth === 0 ? 'exact_row' : 'same_label_wrapper',
         depth,
         seek_step:seekStep,
+        generation,
+        allow_stable_exact:allowStableExact,
         row_label: label(matches[0]),
         target_label: targetText,
         target_tag: String(target.tagName || '').toLowerCase(),
@@ -437,7 +500,14 @@ async (input, wanted) => {
       target.click();
       return result;
     }
-    return {clicked:false, reason:'no_exact_action_target', row_label:label(matches[0]), seek_step:seekStep};
+    return {
+      clicked:false,
+      reason:'no_exact_action_target',
+      row_label:label(matches[0]),
+      seek_step:seekStep,
+      generation,
+      allow_stable_exact:allowStableExact,
+    };
   };
 
   let surface = findScroller();
@@ -446,7 +516,7 @@ async (input, wanted) => {
     surface.dispatchEvent(new Event('scroll', {bubbles:true}));
     await pause(80);
   }
-  let last = {clicked:false, reason:'exact_row_not_found'};
+  let last = {clicked:false, reason:'exact_row_not_found', generation, allow_stable_exact:allowStableExact};
   for (let step = 0; step < 64; step++) {
     last = tryClick(step);
     if (last.clicked) return last;
@@ -467,14 +537,23 @@ async (input, wanted) => {
 """
 
 
-def begin_search_query(search: Any) -> None:
-    """Capture the visible pre-query DOM for one search input."""
+def begin_search_query(search: Any) -> int:
+    """Start a new DOM-ownership generation for one search input."""
 
-    search.evaluate(_BEGIN_QUERY_JS)
+    try:
+        raw = search.evaluate(_BEGIN_QUERY_JS)
+    except Exception:
+        return 0
+    if isinstance(raw, dict):
+        try:
+            return int(raw.get("generation") or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
 
 
 def read_search_rows(search: Any) -> list[str]:
-    """Return only currently visible rows owned by the active query."""
+    """Return visible rows proven fresh in the active query generation."""
 
     try:
         raw = search.evaluate(_READ_ROWS_JS)
@@ -526,11 +605,11 @@ def harvest_search_rows(
     max_scroll_steps: int = 64,
     max_stagnant_rounds: int = 3,
 ) -> list[str]:
-    """Harvest every query-owned row exposed by a scrollable result surface.
+    """Harvest every row proven fresh in the active query generation.
 
     The dropdown is reset to its top before harvesting and restored there before
-    returning. Each scroll page contributes exact query-owned rows only. Virtual
-    lists are supported because rows are accumulated while the surface moves.
+    returning. Virtual lists are supported because newly mounted/reused rows are
+    marked by the generation observer as the result surface moves.
     """
 
     poll = max(50, int(poll_ms))
@@ -567,7 +646,7 @@ def wait_for_search_rows(
     timeout_ms: int = 4000,
     poll_ms: int = 200,
 ) -> list[str]:
-    """Wait for a query surface, then return its complete scroll-harvested rows."""
+    """Wait for fresh rows, then return the generation's complete harvested set."""
 
     timeout = max(0, int(timeout_ms))
     poll = max(50, int(poll_ms))
@@ -583,17 +662,34 @@ def wait_for_search_rows(
     return harvest_search_rows(page, search, poll_ms=min(poll, 180))
 
 
-def click_search_row(search: Any, label: str) -> bool:
-    """Seek and click one exact query-owned row across the full result surface."""
+def click_search_row(
+    search: Any,
+    label: str,
+    *,
+    allow_stable_exact: bool = False,
+) -> bool:
+    """Seek and click one exact row across the active result surface.
 
+    ``allow_stable_exact`` is reserved for replay of a candidate that was already
+    grounded by a previous discovery generation. It never broadens the requested
+    label and the caller must independently verify the resulting canonical state.
+    """
+
+    requested = str(label or "").strip()
     try:
-        raw = search.evaluate(_CLICK_ROW_JS, str(label or "").strip())
+        raw = search.evaluate(
+            _CLICK_ROW_JS,
+            {
+                "wanted": requested,
+                "allow_stable_exact": bool(allow_stable_exact),
+            },
+        )
     except Exception:
         return False
     if isinstance(raw, dict):
         payload = {
             "event": "click_binding",
-            "requested_label": str(label or "").strip(),
+            "requested_label": requested,
             **raw,
         }
         print(
