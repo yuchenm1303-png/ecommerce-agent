@@ -4,7 +4,7 @@ import app.business_fields as business_fields
 from app.business_fields import (
     ACCOUNT_DEFAULT_PROFILE,
     BUSINESS_ATTRIBUTE_ALIASES,
-    FIXED_PRICE_MOQ_ACCOUNT_DEFAULTS,
+    FIXED_ORDER_QUANTITY_ACCOUNT_DEFAULTS,
     MAKRO_ACCOUNT_FIXED_DEFAULTS,
     ORIGINAL_ACCOUNT_FIXED_DEFAULTS,
     generate_listing_sku,
@@ -70,14 +70,12 @@ def test_original_account_defaults_are_preserved_for_one_line_revert():
     assert "flipkart_selling_price" not in original
 
 
-def test_current_profile_uses_relation_safe_fixed_price_and_moq_defaults():
-    assert ACCOUNT_DEFAULT_PROFILE == "fixed_price_moq"
-    assert MAKRO_ACCOUNT_FIXED_DEFAULTS is FIXED_PRICE_MOQ_ACCOUNT_DEFAULTS
+def test_current_profile_fixes_only_min_and_max_order_quantity():
+    assert ACCOUNT_DEFAULT_PROFILE == "fixed_order_quantity"
+    assert MAKRO_ACCOUNT_FIXED_DEFAULTS is FIXED_ORDER_QUANTITY_ACCOUNT_DEFAULTS
     expected = {
-        "mrp": "6000",
-        "flipkart_selling_price": "6000",
         "minimum_order_quantity": "5000",
-        "max_order_quantity_allowed": "5000",
+        "max_order_quantity_allowed": "6000",
         "service_profile": "FBS",
         "shipping_days": "14",
         "forbid_shipping": "National",
@@ -87,6 +85,8 @@ def test_current_profile_uses_relation_safe_fixed_price_and_moq_defaults():
         "importer_details": "LILI",
     }
     assert {key: value for key, value, _source in MAKRO_ACCOUNT_FIXED_DEFAULTS} == expected
+    assert "mrp" not in expected
+    assert "flipkart_selling_price" not in expected
 
     bundle = generated_business_bundle(URL, sku="812345678901")
     for attribute_key, expected_value in expected.items():
@@ -96,6 +96,11 @@ def test_current_profile_uses_relation_safe_fixed_price_and_moq_defaults():
         assert items[0].source_type == "config"
         assert items[0].source_reference.startswith("account-default:")
         assert items[0].confidence == 1.0
+
+    assert bundle.candidates(("mrp", *BUSINESS_ATTRIBUTE_ALIASES["mrp"])) == []
+    assert bundle.candidates(
+        ("flipkart_selling_price", *BUSINESS_ATTRIBUTE_ALIASES["flipkart_selling_price"])
+    ) == []
 
 
 def test_account_fixed_labels_are_business_fields_and_skip_product_reasoning():
