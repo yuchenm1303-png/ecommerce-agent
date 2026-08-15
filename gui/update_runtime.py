@@ -1,31 +1,56 @@
-"""Update-runtime bootstrap and deterministic GUI shutdown.
-
-The updater executable is copied to a stable directory outside the app install
-tree before any update check can run. The copy is content-addressed with
-SHA-256 and replaced atomically, so an updater binary can never remain stale
-just because a new build happens to have the same byte length.
-
-The same bootstrap owns shutdown of QProcess children. When Qt begins quitting,
-all GUI-owned workflow workers are first asked to terminate, then killed only if
-needed. The external updater remains the final safety net for non-Qt/background
-threads that can otherwise keep the Python process alive after app.exec()
-returns.
-"""
+"""Updater bootstrap paths and deterministic GUI-owned process shutdown."""
 
 from __future__ import annotations
 
 import hashlib
 import os
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QProcess
 from PySide6.QtWidgets import QApplication, QMainWindow
 
 _COPY_CHUNK = 1024 * 1024
-_TERMINATE_WAIT_MS = 1_500
-_KILL_WAIT_MS = 1_000
+_TERMINATE_GRACE_S = 1.5
+_KILL_GRACE_S = 1.0
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def update_state_dir() -> Path:
+    base = Path(os.getenv("LOCALAPPDATA") or tempfile.gettempdir()) / "ListingStudio"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def stable_updater_dir() -> Path:
+    path = update_state_dir() / "updater"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def stable_updater_exe() -> Path:
+    return stable_updater_dir() / "updater.exe"
+
+
+def update_download_dir() -> Path:
+    path = update_state_dir() / "updates"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def update_marker_path() -> Path:
+    return update_state_dir() / "update-complete.json"
+
+
+def updater_result_path() -> Path:
+    return stable_updater_dir() / "last-result.json"
+
+
+def updater_log_path() -> Path:
+    return stable_updater_dir() / "updater.jsonl"
 
 
 def _sha256_file(path: Path) -> str:
@@ -40,11 +65,6 @@ def _sha256_file(path: Path) -> str:
     except OSError:
         return ""
     return digest.hexdigest()
-
-
-def _stable_updater_exe() -> Path:
-    base = Path(os.getenv("LOCALAPPDATA") or tempfile.gettempdir()) / "ListingStudio"
-    return base / "updater" / "updater.exe"
 
 
 def _bundled_updater_exe() -> Path | None:
@@ -67,7 +87,7 @@ def _bundled_updater_exe() -> Path | None:
 
 
 def refresh_standalone_updater() -> Path | None:
-    """Install the bundled updater by content hash into its stable location."""
+    """Copy the packaged updater outside the install tree using SHA-256 identity."""
 
     bundled = _bundled_updater_exe()
     if bundled is None:
@@ -77,14 +97,13 @@ def refresh_standalone_updater() -> Path | None:
     if not expected:
         return None
 
-    target = _stable_updater_exe()
+    target = stable_updater_exe()
     if target.is_file() and _sha256_file(target) == expected:
         return target
 
-    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    temp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with bundled.open("rb") as source, tmp.open("wb") as destination:
+        with bundled.open("rb") as source, temp.open("wb") as destination:
             while True:
                 block = source.read(_COPY_CHUNK)
                 if not block:
@@ -93,28 +112,95 @@ def refresh_standalone_updater() -> Path | None:
             destination.flush()
             os.fsync(destination.fileno())
 
-        if _sha256_file(tmp) != expected:
+        if _sha256_file(temp) != expected:
             return None
-
-        os.replace(tmp, target)
-        return target if _sha256_file(target) == expected else None
+        os.replace(temp, target)
+        if _sha256_file(target) != expected:
+            return None
+        return target
     except OSError:
         return None
     finally:
         try:
-            tmp.unlink(missing_ok=True)
+            temp.unlink(missing_ok=True)
         except OSError:
             pass
 
 
-def _shutdown_owned_qprocesses(window: QMainWindow) -> None:
-    """Stop only child processes owned by this GUI instance."""
+def verify_standalone_updater(path: Path) -> bool:
+    """Run the real updater binary and import its embedded core before handoff."""
 
-    processes = [
-        process
-        for process in window.findChildren(QProcess)
-        if process.state() != QProcess.ProcessState.NotRunning
-    ]
+    if not path.is_file():
+        return False
+    try:
+        probe = subprocess.run(
+            [str(path), "--self-check"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            creationflags=(
+                getattr(subprocess, "CREATE_NO_WINDOW", _CREATE_NO_WINDOW)
+            ),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
+def prepare_standalone_updater() -> Path | None:
+    updater = refresh_standalone_updater()
+    if updater is None or not verify_standalone_updater(updater):
+        return None
+    return updater
+
+
+def owned_qprocess_pids(window: QMainWindow) -> tuple[int, ...]:
+    pids: list[int] = []
+    for process in window.findChildren(QProcess):
+        try:
+            if process.state() == QProcess.ProcessState.NotRunning:
+                continue
+            pid = int(process.processId())
+        except (RuntimeError, TypeError, ValueError):
+            continue
+        if pid > 0:
+            pids.append(pid)
+    return tuple(sorted(set(pids)))
+
+
+def _live_owned_qprocesses(window: QMainWindow) -> list[QProcess]:
+    result: list[QProcess] = []
+    for process in window.findChildren(QProcess):
+        try:
+            if process.state() != QProcess.ProcessState.NotRunning:
+                result.append(process)
+        except RuntimeError:
+            continue
+    return result
+
+
+def _wait_processes(processes: list[QProcess], deadline_s: float) -> list[QProcess]:
+    deadline = time.monotonic() + max(0.0, deadline_s)
+    remaining = list(processes)
+    while remaining and time.monotonic() < deadline:
+        next_remaining: list[QProcess] = []
+        for process in remaining:
+            try:
+                if process.state() != QProcess.ProcessState.NotRunning:
+                    process.waitForFinished(50)
+                if process.state() != QProcess.ProcessState.NotRunning:
+                    next_remaining.append(process)
+            except RuntimeError:
+                continue
+        remaining = next_remaining
+    return remaining
+
+
+def shutdown_owned_qprocesses(window: QMainWindow) -> None:
+    """Stop only QProcess children belonging to this GUI instance."""
+
+    processes = _live_owned_qprocesses(window)
     if not processes:
         return
 
@@ -124,53 +210,44 @@ def _shutdown_owned_qprocesses(window: QMainWindow) -> None:
         except RuntimeError:
             pass
 
-    for process in processes:
-        try:
-            if process.state() != QProcess.ProcessState.NotRunning:
-                process.waitForFinished(_TERMINATE_WAIT_MS)
-        except RuntimeError:
-            pass
-
-    remaining = []
-    for process in processes:
-        try:
-            if process.state() != QProcess.ProcessState.NotRunning:
-                remaining.append(process)
-        except RuntimeError:
-            pass
-
+    remaining = _wait_processes(processes, _TERMINATE_GRACE_S)
     for process in remaining:
         try:
             process.kill()
         except RuntimeError:
             pass
-
-    for process in remaining:
-        try:
-            if process.state() != QProcess.ProcessState.NotRunning:
-                process.waitForFinished(_KILL_WAIT_MS)
-        except RuntimeError:
-            pass
+    _wait_processes(remaining, _KILL_GRACE_S)
 
 
 def install_update_runtime(app: QApplication, window: QMainWindow) -> Path | None:
-    """Install updater bootstrap before checks and register deterministic teardown."""
+    """Refresh updater early and register one deterministic process teardown hook."""
 
-    stable_updater = refresh_standalone_updater()
-
+    stable = refresh_standalone_updater()
     if not bool(getattr(window, "_update_runtime_shutdown_installed", False)):
+
         def _shutdown() -> None:
-            _shutdown_owned_qprocesses(window)
+            shutdown_owned_qprocesses(window)
 
         app.aboutToQuit.connect(_shutdown)
         window._update_runtime_shutdown = _shutdown  # type: ignore[attr-defined]
         window._update_runtime_shutdown_installed = True  # type: ignore[attr-defined]
 
-    window._stable_updater_path = stable_updater  # type: ignore[attr-defined]
-    return stable_updater
+    window._stable_updater_path = stable  # type: ignore[attr-defined]
+    return stable
 
 
 __all__ = [
     "install_update_runtime",
+    "owned_qprocess_pids",
+    "prepare_standalone_updater",
     "refresh_standalone_updater",
+    "shutdown_owned_qprocesses",
+    "stable_updater_dir",
+    "stable_updater_exe",
+    "update_download_dir",
+    "update_marker_path",
+    "update_state_dir",
+    "updater_log_path",
+    "updater_result_path",
+    "verify_standalone_updater",
 ]

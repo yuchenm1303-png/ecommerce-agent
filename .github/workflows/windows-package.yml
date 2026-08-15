@@ -11,13 +11,17 @@ on:
       - "app/runtime_paths.py"
       - "app/app_branding.py"
       - "app/app_icon_data.py"
+      - "app/updater_core.py"
       - "gui/__init__.py"
       - "gui/app_access.py"
       - "gui/app_updater.py"
+      - "gui/resilient_app_updater.py"
+      - "gui/update_runtime.py"
       - "gui/frozen_process_router.py"
       - "run_packaged_worker.py"
       - "run_local_gui.py"
       - "packaging/**"
+      - "scripts/updater_main.py"
       - "scripts/build_windows.ps1"
       - "scripts/generate_app_icon.py"
       - "requirements.txt"
@@ -25,12 +29,16 @@ on:
       - "requirements-build.txt"
       - "tests/test_windows_packaging_contract.py"
       - "tests/test_update_delivery_contract.py"
+      - "tests/test_updater_core_contract.py"
+      - "tests/test_resilient_app_updater_contract.py"
+      - "tests/test_updater_onefile_contract.py"
+      - "tests/test_update_chain_contract.py"
       - ".github/workflows/windows-package.yml"
 
 jobs:
   build-windows:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
 
     steps:
       - name: Checkout
@@ -48,9 +56,16 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-gui.txt -r requirements-build.txt
 
-      - name: Packaging contracts
+      - name: Full update-chain contracts
         shell: pwsh
-        run: python -m pytest -q tests/test_windows_packaging_contract.py tests/test_update_delivery_contract.py
+        run: |
+          python -m pytest -q `
+            tests/test_windows_packaging_contract.py `
+            tests/test_update_delivery_contract.py `
+            tests/test_updater_core_contract.py `
+            tests/test_resilient_app_updater_contract.py `
+            tests/test_updater_onefile_contract.py `
+            tests/test_update_chain_contract.py
 
       - name: Install Inno Setup
         shell: pwsh
@@ -67,57 +82,34 @@ jobs:
           if (-not $setup) { throw "Installer artifact not found" }
 
           $installDir = Join-Path $env:RUNNER_TEMP "EcommerceAgentInstalled"
-          if (Test-Path $installDir) {
-            Remove-Item $installDir -Recurse -Force
-          }
-
+          if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
           $setupLog = Join-Path $env:RUNNER_TEMP "ecommerce-agent-setup.log"
-          if (Test-Path $setupLog) {
-            Remove-Item $setupLog -Force
-          }
+          if (Test-Path $setupLog) { Remove-Item $setupLog -Force }
 
-          $arguments = @(
-            "/VERYSILENT",
-            "/SUPPRESSMSGBOXES",
-            "/NORESTART",
-            "/DIR=$installDir",
-            "/LOG=$setupLog"
-          )
-          $install = Start-Process -FilePath $setup.FullName -ArgumentList $arguments -Wait -PassThru
-          Write-Host "Installer exit code: $($install.ExitCode)"
+          $install = Start-Process -FilePath $setup.FullName -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir", "/LOG=$setupLog"
+          ) -Wait -PassThru
           if ($install.ExitCode -ne 0) {
-            if (Test-Path $setupLog) {
-              Write-Host "---- Inno Setup log (tail) ----"
-              Get-Content $setupLog -Tail 120
-            }
+            if (Test-Path $setupLog) { Get-Content $setupLog -Tail 120 }
             throw "Silent install failed with exit code $($install.ExitCode)"
           }
 
-          if (-not (Test-Path $installDir)) {
-            if (Test-Path $setupLog) {
-              Write-Host "---- Inno Setup log (tail) ----"
-              Get-Content $setupLog -Tail 120
-            }
-            throw "Installer reported success but install directory is missing: $installDir"
-          }
-
-          Write-Host "Top-level installed files:"
-          Get-ChildItem $installDir | Format-Table Name, Length, Mode
-
+          $gui = Join-Path $installDir "EcommerceAgent.exe"
           $worker = Join-Path $installDir "EcommerceAgentWorker.exe"
+          $updater = Join-Path $installDir "updater\updater.exe"
           $internal = Join-Path $installDir "_internal"
           $versionFile = Join-Path $internal "packaging\VERSION"
-          if (-not (Test-Path $worker)) { throw "Installed worker missing: $worker" }
-          if (-not (Test-Path $internal)) { throw "Installed _internal directory missing: $internal" }
-          if (-not (Test-Path $versionFile)) { throw "Installed version metadata missing: $versionFile" }
+          foreach ($required in @($gui, $worker, $updater, $internal, $versionFile)) {
+            if (-not (Test-Path $required)) { throw "Installed package component missing: $required" }
+          }
+          if (Test-Path (Join-Path $installDir "updater\_internal")) {
+            throw "Standalone updater unexpectedly depends on an installed _internal directory"
+          }
 
           & $worker --self-test
           if ($LASTEXITCODE -ne 0) {
             throw "Installed worker self-test failed with exit code $LASTEXITCODE"
           }
-
-          $updater = Join-Path $installDir "updater\updater.exe"
-          if (-not (Test-Path $updater)) { throw "Installed updater missing: $updater" }
           & $updater --self-check
           if ($LASTEXITCODE -ne 0) {
             throw "Installed updater self-check failed with exit code $LASTEXITCODE"

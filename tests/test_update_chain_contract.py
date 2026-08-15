@@ -1,0 +1,90 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PUBLISH = (ROOT / ".github" / "workflows" / "publish-update.yml").read_text(encoding="utf-8")
+WINDOWS = (ROOT / ".github" / "workflows" / "windows-package.yml").read_text(encoding="utf-8")
+TEST_BUILD = (ROOT / ".github" / "workflows" / "publish-test-build.yml").read_text(encoding="utf-8")
+UPDATER = (ROOT / "gui" / "app_updater.py").read_text(encoding="utf-8")
+CORE = (ROOT / "app" / "updater_core.py").read_text(encoding="utf-8")
+ENTRY = (ROOT / "scripts" / "updater_main.py").read_text(encoding="utf-8")
+INSTALLER = (ROOT / "packaging" / "installer.iss").read_text(encoding="utf-8")
+
+UPDATER_TESTS = (
+    "tests/test_windows_packaging_contract.py",
+    "tests/test_update_delivery_contract.py",
+    "tests/test_updater_core_contract.py",
+    "tests/test_resilient_app_updater_contract.py",
+    "tests/test_updater_onefile_contract.py",
+    "tests/test_update_chain_contract.py",
+)
+
+
+def test_publish_workflow_guards_stable_version_order_and_policy() -> None:
+    assert "concurrency:" in PUBLISH
+    assert "Latest published Stable version" in PUBLISH
+    assert "must be newer than current Stable" in PUBLISH
+    assert "Minimum supported version cannot exceed release version" in PUBLISH
+    assert "Release version must be strict x.y.z" in PUBLISH
+    assert "Minimum supported version must be strict x.y.z" in PUBLISH
+
+
+def test_publish_manifest_contains_full_binding_metadata() -> None:
+    for token in (
+        'delivery = "portal"',
+        'portal_url = "https://smirel.com/download/"',
+        "installer_sha256 = $sha",
+        "installer_size = $setupSize",
+        'source_commit = "${{ steps.source.outputs.sha }}"',
+        'channel = "stable"',
+    ):
+        assert token in PUBLISH
+
+
+def test_every_packaging_workflow_runs_full_update_contract_suite() -> None:
+    for workflow in (PUBLISH, WINDOWS, TEST_BUILD):
+        for test_path in UPDATER_TESTS:
+            assert test_path in workflow
+
+
+def test_windows_package_triggers_on_every_update_runtime_source() -> None:
+    for path in (
+        "app/updater_core.py",
+        "gui/app_updater.py",
+        "gui/resilient_app_updater.py",
+        "gui/update_runtime.py",
+        "scripts/updater_main.py",
+        "scripts/build_windows.ps1",
+        "tests/test_updater_core_contract.py",
+        "tests/test_update_chain_contract.py",
+    ):
+        assert f'- "{path}"' in WINDOWS
+    assert '- "packaging/**"' in WINDOWS
+
+
+def test_test_build_smokes_installed_updater_runtime() -> None:
+    assert 'updater\\updater.exe' in TEST_BUILD
+    assert "& $updater --self-check" in TEST_BUILD
+    assert "Installed updater self-check failed" in TEST_BUILD
+
+
+def test_chain_has_two_sided_handoff_and_post_install_version_gate() -> None:
+    assert "JOB_VERSION = 2" in CORE
+    assert '"status": "accepted"' in CORE
+    assert "_HANDOFF_ACK_TIMEOUT_S" in UPDATER
+    assert 'ack.get("status") == "accepted"' in UPDATER
+    assert "installed version mismatch" in CORE
+    assert "_launch_app(job.app_executable)" in CORE
+    assert "_consume_previous_update_result" in UPDATER
+
+
+def test_updater_self_check_exercises_embedded_core() -> None:
+    assert "from app.updater_core import JOB_VERSION, UpdaterJob, run_job" in ENTRY
+    assert "JOB_VERSION < 2" in ENTRY
+
+
+def test_inno_replaces_immutable_pyinstaller_directories_cleanly() -> None:
+    assert 'Type: filesandordirs; Name: "{app}\\_internal"' in INSTALLER
+    assert 'Type: filesandordirs; Name: "{app}\\updater"' in INSTALLER

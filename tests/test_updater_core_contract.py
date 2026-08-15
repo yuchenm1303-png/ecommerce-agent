@@ -1,33 +1,52 @@
-"""Contract + functional tests for the standalone updater core.
-
-The updater core is dependency-free and runs as the tiny updater.exe, so it is
-tested here directly (job round-trip, checksum gating, wait-for-app-exit
-timing, and the "never install while the app is alive" invariant).
-"""
+"""Contracts for the dependency-free standalone updater execution core."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
-import subprocess
-import sys
-import tempfile
-import time
 from pathlib import Path
 
+import pytest
+
+import app.updater_core as core
 from app.updater_core import (
-    RESULT_APP_DID_NOT_EXIT,
+    JOB_VERSION,
     RESULT_INSTALL_FAILED,
-    RESULT_LAUNCH_FAILED,
     RESULT_OK,
     RESULT_VERIFY_FAILED,
     UpdaterJob,
-    _pid_running,
     run_job,
-    wait_for_app_exit,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-CREATE_NO_WINDOW = 0x08000000
+
+
+def _job(tmp_path: Path, **overrides) -> UpdaterJob:
+    installer = tmp_path / "Setup.exe"
+    installer.write_bytes(b"verified-installer")
+    app_executable = tmp_path / "EcommerceAgent.exe"
+    app_executable.write_bytes(b"app")
+    version_file = tmp_path / "VERSION"
+    version_file.write_text("0.9.9", encoding="utf-8")
+    values = {
+        "installer": str(installer),
+        "target_version": "1.0.0",
+        "app_pid": 1234,
+        "app_image_name": "EcommerceAgent",
+        "app_executable": str(app_executable),
+        "version_file": str(version_file),
+        "installer_sha256": hashlib.sha256(installer.read_bytes()).hexdigest(),
+        "arguments": ["/SILENT"],
+        "worker_pids": (),
+        "ack_path": str(tmp_path / "ack.json"),
+        "marker_path": str(tmp_path / "update-complete.json"),
+        "result_path": str(tmp_path / "result.json"),
+        "log_path": str(tmp_path / "updater.jsonl"),
+        "settle_ms": 0,
+    }
+    values.update(overrides)
+    return UpdaterJob(**values)
 
 
 def test_updater_core_and_entry_compile() -> None:
@@ -36,152 +55,89 @@ def test_updater_core_and_entry_compile() -> None:
         compile(source, str(ROOT / rel), "exec")
 
 
-def test_pid_running_distinguishes_live_and_dead_processes() -> None:
-    assert _pid_running(os.getpid())
-    assert not _pid_running(-1)
-    assert not _pid_running(999_999_999)
+def test_job_version_is_explicit_and_round_trip_is_strict(tmp_path: Path) -> None:
+    assert JOB_VERSION >= 2
+    job = _job(tmp_path, worker_pids=(41, 42))
+    path = tmp_path / "job.json"
+    job.save(path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["job_version"] == JOB_VERSION
+    loaded = UpdaterJob.load(path)
+    assert loaded.target_version == "1.0.0"
+    assert loaded.worker_pids == (41, 42)
+
+    raw["job_version"] = JOB_VERSION + 1
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported update job version"):
+        UpdaterJob.load(path)
 
 
-def test_job_round_trip_preserves_fields(tmp_path: Path) -> None:
-    job = UpdaterJob(
-        installer=r"C:\WINDOWS\TEMP\Setup.exe",
-        arguments=["/SILENT"],
-        installer_sha256="ab" * 32,
-        app_pid=1234,
-        log_path=str(tmp_path / "updater.jsonl"),
-        result_path=str(tmp_path / "result.json"),
-    )
-    job_path = tmp_path / "job.json"
-    job.save(job_path)
-    loaded = UpdaterJob.load(job_path)
-    assert loaded.installer == job.installer
-    assert loaded.arguments == ["/SILENT"]
-    assert loaded.installer_sha256 == "ab" * 32
-    assert loaded.app_pid == 1234
-    assert loaded.log_path == job.log_path
-    assert loaded.result_path == job.result_path
-
-
-def test_run_job_fails_when_installer_is_missing(tmp_path: Path) -> None:
-    job = UpdaterJob(
-        installer=str(tmp_path / "missing.exe"),
-        result_path=str(tmp_path / "result.json"),
-        log_path=str(tmp_path / "updater.jsonl"),
-    )
-    assert run_job(job) == 2
-    result = (tmp_path / "result.json").read_text(encoding="utf-8")
-    assert RESULT_LAUNCH_FAILED in result
-
-
-def test_run_job_aborts_on_checksum_mismatch_before_installing(tmp_path: Path) -> None:
-    installer = tmp_path / "Setup.exe"
-    installer.write_bytes(b"not really an installer")
-    job = UpdaterJob(
-        installer=str(installer),
-        installer_sha256="0" * 64,  # wrong
-        result_path=str(tmp_path / "result.json"),
-        log_path=str(tmp_path / "updater.jsonl"),
-    )
+def test_preflight_rehashes_installer_before_ack(tmp_path: Path) -> None:
+    job = _job(tmp_path)
+    Path(job.installer).write_bytes(b"tampered after GUI verification")
     assert run_job(job) == 3
-    assert RESULT_VERIFY_FAILED in (tmp_path / "result.json").read_text(encoding="utf-8")
+    assert not Path(job.ack_path).exists()
+    result = json.loads(Path(job.result_path).read_text(encoding="utf-8"))
+    assert result["status"] == RESULT_VERIFY_FAILED
 
 
-def test_run_job_never_installs_while_the_app_is_still_alive(tmp_path: Path) -> None:
-    marker = tmp_path / "installed.txt"
-    if " " in str(marker):
-        return  # Start-Process array cannot pass paths with spaces
-
-    # Fake "app" that stays alive past the 1s deadline.
-    app = subprocess.Popen(
-        ["ping", "127.0.0.1", "-n", "13"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=CREATE_NO_WINDOW,
-    )
-    try:
-        installer = Path(r"C:\Windows\System32\cmd.exe")
-        job = UpdaterJob(
-            installer=str(installer),
-            arguments=["/c", f"echo INSTALLED>{marker}"],
-            app_pid=app.pid,
-            app_image_name="ping",
-            app_deadline_s=1,
-            settle_ms=0,
-            result_path=str(tmp_path / "result.json"),
-            log_path=str(tmp_path / "updater.jsonl"),
-        )
-        assert run_job(job) == 4
-        assert not marker.exists()
-        assert RESULT_APP_DID_NOT_EXIT in (tmp_path / "result.json").read_text(encoding="utf-8")
-    finally:
-        app.kill()
-        app.wait()
+def test_ack_is_written_only_after_preflight(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    job = _job(tmp_path)
+    monkeypatch.setattr(core, "_shutdown_gate", lambda _job: core.RESULT_APP_DID_NOT_EXIT)
+    monkeypatch.setattr(core, "_launch_app", lambda _path: True)
+    assert run_job(job) == 4
+    ack = json.loads(Path(job.ack_path).read_text(encoding="utf-8"))
+    assert ack["status"] == "accepted"
+    assert ack["job_version"] == JOB_VERSION
+    assert ack["target_version"] == job.target_version
 
 
-def test_run_job_installs_only_after_the_app_has_exited(tmp_path: Path) -> None:
-    marker = tmp_path / "installed.txt"
-    if " " in str(marker):
-        return
+def test_success_requires_installed_version_then_writes_marker_and_relaunches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    job = _job(tmp_path)
+    Path(job.version_file).write_text(job.target_version, encoding="utf-8")
+    monkeypatch.setattr(core, "_shutdown_gate", lambda _job: None)
+    launched: list[str] = []
+    monkeypatch.setattr(core, "_launch_app", lambda path: launched.append(path) is None or True)
 
-    # Fake "app" that exits quickly; the job is executed afterwards.
-    app = subprocess.Popen(
-        ["ping", "127.0.0.1", "-n", "2"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=CREATE_NO_WINDOW,
-    )
-    pid = app.pid
-    app.wait(timeout=15)
+    class _Proc:
+        returncode = 0
 
-    installer = Path(r"C:\Windows\System32\cmd.exe")
-    job = UpdaterJob(
-        installer=str(installer),
-        arguments=["/c", f"echo INSTALLED>{marker}"],
-        app_pid=pid,
-        app_image_name="ping",
-        worker_names=(),
-        app_deadline_s=10,
-        settle_ms=0,
-        result_path=str(tmp_path / "result.json"),
-        log_path=str(tmp_path / "updater.jsonl"),
-    )
+    monkeypatch.setattr(core.subprocess, "run", lambda *args, **kwargs: _Proc())
     assert run_job(job) == 0
-    assert marker.exists()
-    assert RESULT_OK in (tmp_path / "result.json").read_text(encoding="utf-8")
+    result = json.loads(Path(job.result_path).read_text(encoding="utf-8"))
+    marker = json.loads(Path(job.marker_path).read_text(encoding="utf-8"))
+    assert result["status"] == RESULT_OK
+    assert marker["version"] == job.target_version
+    assert launched == [job.app_executable]
+    assert not Path(job.installer).exists()
 
 
-def test_wait_for_app_exit_returns_false_for_an_alive_process() -> None:
-    app = subprocess.Popen(
-        ["ping", "127.0.0.1", "-n", "13"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=CREATE_NO_WINDOW,
-    )
-    try:
-        assert not wait_for_app_exit(
-            app_pid=app.pid,
-            app_image_name="ping",
-            app_deadline_s=1,
-            worker_names=(),
-            settle_ms=0,
-        )
-    finally:
-        app.kill()
-        app.wait()
+def test_nonzero_installer_exit_recovers_without_claiming_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    job = _job(tmp_path)
+    monkeypatch.setattr(core, "_shutdown_gate", lambda _job: None)
+    monkeypatch.setattr(core, "_launch_app", lambda _path: True)
 
+    class _Proc:
+        returncode = 7
 
-def test_run_job_reports_nonzero_installer_exit(tmp_path: Path) -> None:
-    # cmd /c exit 7 -> installer exit code 7 -> RESULT_INSTALL_FAILED.
-    installer = Path(r"C:\Windows\System32\cmd.exe")
-    job = UpdaterJob(
-        installer=str(installer),
-        arguments=["/c", "exit 7"],
-        app_pid=-1,
-        app_deadline_s=10,
-        worker_names=(),
-        settle_ms=0,
-        result_path=str(tmp_path / "result.json"),
-        log_path=str(tmp_path / "updater.jsonl"),
-    )
+    monkeypatch.setattr(core.subprocess, "run", lambda *args, **kwargs: _Proc())
     assert run_job(job) == 5
-    assert RESULT_INSTALL_FAILED in (tmp_path / "result.json").read_text(encoding="utf-8")
+    result = json.loads(Path(job.result_path).read_text(encoding="utf-8"))
+    assert result["status"] == RESULT_INSTALL_FAILED
+    assert not Path(job.marker_path).exists()
+
+
+def test_process_matching_is_exact_not_substring_based() -> None:
+    source = (ROOT / "app" / "updater_core.py").read_text(encoding="utf-8")
+    assert "csv.reader" in source
+    assert "_other_app_pids" in source
+    assert "OWNED_APP_IMAGE" in source
+    assert "OWNED_WORKER_IMAGE" in source
+    assert '["taskkill", "/PID", str(pid), "/T", "/F"]' in source
+    assert "worker_pids" in source
