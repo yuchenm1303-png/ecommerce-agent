@@ -6,7 +6,6 @@ from types import MethodType
 from typing import Any
 
 from PySide6.QtCore import QObject, Qt
-from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QMenu, QMessageBox, QPushButton
 
 from app.product_pack import SUPPORTED_PRODUCT_PACK_SUFFIXES
@@ -108,7 +107,7 @@ class BatchProductFilesUi(QObject):
         button = QPushButton("资料 0", row)
         button.setObjectName("batchProductFilesButton")
         button.setFixedSize(68, 28)
-        button.setToolTip("给这一条商品链接添加补充资料；可多选 PDF / Word / 表格 / 图片 / ZIP。")
+        button.setToolTip("点击直接添加这一条商品的补充资料；可多选 PDF / Word / 表格 / 图片 / ZIP。右键可清空。")
         button.setStyleSheet(
             "QPushButton#batchProductFilesButton {"
             "  min-height:28px; max-height:28px; padding:0 8px;"
@@ -125,15 +124,26 @@ class BatchProductFilesUi(QObject):
             "}"
         )
 
+        # Primary interaction is a plain QPushButton click. Do not use setMenu():
+        # menu-backed buttons are unreliable under the current QWidget/Quick
+        # compositor and can consume the click without ever opening QFileDialog.
+        button.clicked.connect(
+            lambda _checked=False, current=row: self._pick_files(current)
+        )
+
+        # Clearing is secondary and therefore lives on an explicit right-click
+        # context menu. Uploading never depends on this popup path.
         menu = QMenu(button)
-        add_action = QAction("添加补充资料…", menu)
-        add_action.setToolTip("一次可选择多个文件，后续还可以继续追加。")
-        add_action.triggered.connect(lambda _checked=False, current=row: self._pick_files(current))
-        clear_action = QAction("清空这条资料", menu)
-        clear_action.triggered.connect(lambda _checked=False, current=row: self._clear_files(current))
-        menu.addAction(add_action)
-        menu.addAction(clear_action)
-        button.setMenu(menu)
+        clear_action = menu.addAction("清空这条资料")
+        clear_action.triggered.connect(
+            lambda _checked=False, current=row: self._clear_files(current)
+        )
+        button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        button.customContextMenuRequested.connect(
+            lambda pos, current_button=button, current_menu=menu: current_menu.exec(
+                current_button.mapToGlobal(pos)
+            )
+        )
 
         index = layout.indexOf(remove)
         layout.insertWidget(index if index >= 0 else layout.count(), button, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -199,10 +209,10 @@ class BatchProductFilesUi(QObject):
             button.setToolTip(
                 "\n".join(str(path) for path in files)
                 if files
-                else "给这一条商品链接添加补充资料；可多选 PDF / Word / 表格 / 图片 / ZIP。"
+                else "点击直接添加这一条商品的补充资料；可多选 PDF / Word / 表格 / 图片 / ZIP。右键可清空。"
             )
         clear_action = getattr(row, "product_files_clear_action", None)
-        if isinstance(clear_action, QAction):
+        if clear_action is not None:
             clear_action.setEnabled(bool(files))
 
     def _sync_row_enabled(self, row: Any) -> None:
