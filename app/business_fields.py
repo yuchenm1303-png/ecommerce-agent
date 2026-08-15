@@ -12,12 +12,24 @@ WARRANTY_SERVICE_TYPE_POLICY = (
     "Any damage caused by daily wear, accidental impact, improper assembly or wrong usage will not be supported."
 )
 
-# Account-level seller defaults confirmed for this Makro account. These values are
-# operational policy, not product facts: they must bypass AI/Web resolution and be
-# injected through the shared business bundle used by both Single and Batch flows.
-# Paired relation fields are kept internally consistent so the shared hard guards
-# do not reject the account defaults before browser execution.
-MAKRO_ACCOUNT_FIXED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
+# Keep the original production defaults intact so the temporary fixed-price/MOQ
+# policy can be reverted by changing one profile selector instead of restoring code.
+ORIGINAL_ACCOUNT_FIXED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
+    ("minimum_order_quantity", "1", "account-default:min-order-quantity"),
+    ("max_order_quantity_allowed", "99", "account-default:max-order-quantity"),
+    ("service_profile", "FBS", "account-default:fulfilment-by"),
+    ("shipping_days", "14", "account-default:pick-pack-sla"),
+    ("forbid_shipping", "National", "account-default:selling-region"),
+    ("country_of_origin", "China", "account-default:country-of-origin"),
+    ("manufacturer_details", "LILI", "account-default:manufacturer-details"),
+    ("packer_details", "LILI", "account-default:packer-details"),
+    ("importer_details", "LILI", "account-default:importer-details"),
+)
+
+# Temporary account policy requested for the current listing run. Base Price and
+# MaxOQ are paired with the requested Selling Price / MinOQ so the existing hard
+# relation guards and Makro Save validation do not reject the configured values.
+FIXED_PRICE_MOQ_ACCOUNT_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("mrp", "6000", "account-default:base-price"),
     ("flipkart_selling_price", "6000", "account-default:selling-price"),
     ("minimum_order_quantity", "5000", "account-default:min-order-quantity"),
@@ -30,6 +42,13 @@ MAKRO_ACCOUNT_FIXED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("packer_details", "LILI", "account-default:packer-details"),
     ("importer_details", "LILI", "account-default:importer-details"),
 )
+
+ACCOUNT_DEFAULT_PROFILE = "fixed_price_moq"
+_ACCOUNT_DEFAULT_PROFILES: dict[str, tuple[tuple[str, str, str], ...]] = {
+    "original": ORIGINAL_ACCOUNT_FIXED_DEFAULTS,
+    "fixed_price_moq": FIXED_PRICE_MOQ_ACCOUNT_DEFAULTS,
+}
+MAKRO_ACCOUNT_FIXED_DEFAULTS = _ACCOUNT_DEFAULT_PROFILES[ACCOUNT_DEFAULT_PROFILE]
 
 BUSINESS_ATTRIBUTE_ALIASES: dict[str, tuple[str, ...]] = {
     "sku_id": ("sku", "sku id", "sku_id", "商品sku", "商品编码"),
