@@ -3,10 +3,17 @@
 One production decision boundary owns Step 1: Makro must supply every selectable
 Vertical. Product Identity supplies semantics, AI plans several retrieval intents,
 Makro returns query-owned live rows, and AI chooses once from the aggregated live
-pool. The chosen row is then replayed through the query that produced it and must
-still verify to a canonical Makro Vertical. Browse taxonomy is available only when
-live search produced no semantic candidate at all; a broken binding for an already
-selected live candidate fails closed instead of silently switching mechanisms.
+pool. The chosen row is then replayed through a query that originally produced it
+and must still verify to a canonical Makro Vertical. Browse taxonomy is available
+only when live search produced no semantic candidate at all; a broken binding for
+an already selected live candidate fails closed instead of silently switching
+mechanisms.
+
+Search isolation is generation-based. Makro is allowed to keep old autocomplete
+DOM mounted indefinitely; every query establishes a fresh DOM ownership generation
+and discovery accepts only rows changed/touched in that generation. Replaying an
+already-grounded candidate may bind one stable exact row, but the resulting
+canonical Vertical is still independently verified before Step 2 is accepted.
 
 The workflow never invents a Makro Vertical and never clicks Send to QC.
 """
@@ -318,20 +325,19 @@ def _complete_exact_live_vertical(
     return canonical_after
 
 
-def _close_vertical_search(search, page: Page, *, wait_ms: int) -> bool:
-    """End one query transaction and prove its owned result surface is quiescent.
+def _close_vertical_search(search, page: Page, *, wait_ms: int) -> None:
+    """End the visible query interaction without requiring Makro to destroy DOM.
 
-    Makro can keep autocomplete DOM nodes mounted after a query. Capturing the
-    next pre-query baseline while those rows are still visibly painted poisons
-    ownership: a later replay may reuse the exact same DOM node/text and look
-    unchanged. We therefore clear, Escape and blur the search, then require two
-    consecutive empty query-owned reads before a new baseline may be captured.
+    Persistent autocomplete nodes are a normal portal implementation detail. The
+    next call to ``begin_search_query`` snapshots whatever remains and starts a new
+    ownership generation, so DOM disappearance is never used as a correctness
+    condition.
     """
 
     try:
         search.fill("")
-    except Exception:
-        return False
+    except Exception as exc:
+        raise RuntimeError("Makro Step 1 Vertical Search input could not be cleared between query generations") from exc
     try:
         search.press("Escape")
     except Exception:
@@ -340,34 +346,8 @@ def _close_vertical_search(search, page: Page, *, wait_ms: int) -> bool:
         search.evaluate("el => el.blur()")
     except Exception:
         pass
-
-    poll_ms = min(max(int(wait_ms) // 4, 80), 200)
-    max_polls = max(6, min(18, int(max(wait_ms, 800) / max(poll_ms, 1)) + 4))
-    empty_rounds = 0
-    last_rows: list[str] = []
-    for _ in range(max_polls):
-        last_rows = _scoped_vertical_search_candidates(search)
-        if not last_rows:
-            empty_rounds += 1
-            if empty_rounds >= 2:
-                _vertical_diag(
-                    "query_quiescence",
-                    {"verified": True, "remaining_rows": 0},
-                )
-                return True
-        else:
-            empty_rounds = 0
-        page.wait_for_timeout(poll_ms)
-
-    _vertical_diag(
-        "query_quiescence",
-        {
-            "verified": False,
-            "remaining_rows": len(last_rows),
-            "sample": last_rows[:8],
-        },
-    )
-    return False
+    if wait_ms > 0:
+        page.wait_for_timeout(min(max(int(wait_ms) // 5, 80), 180))
 
 
 def _run_vertical_search_query(
@@ -377,31 +357,76 @@ def _run_vertical_search_query(
     *,
     wait_ms: int,
 ) -> list[str]:
-    """Run one isolated query and return only rows owned by that query."""
+    """Run one isolated discovery generation and return only generation-owned rows."""
 
-    if not _close_vertical_search(search, page, wait_ms=wait_ms):
+    _close_vertical_search(search, page, wait_ms=wait_ms)
+    generation = begin_search_query(search)
+    if generation <= 0:
         raise RuntimeError(
-            "Makro Step 1 previous query-owned Vertical Search surface did not become quiescent; "
-            f"refusing to capture a contaminated baseline before query={term!r}"
+            "Makro Step 1 could not establish a fresh Vertical Search ownership generation "
+            f"before query={term!r}"
         )
-    begin_search_query(search)
+
     search.fill(term)
     rows = _wait_for_scoped_vertical_search_candidates(
         page,
         search,
         timeout_ms=max(3200, wait_ms * 5),
     )
-    if rows:
-        return rows
+    if not rows:
+        try:
+            search.press("Enter")
+        except Exception:
+            pass
+        rows = _wait_for_scoped_vertical_search_candidates(
+            page,
+            search,
+            timeout_ms=max(2200, wait_ms * 3),
+        )
+
+    _vertical_diag(
+        "query_generation",
+        {
+            "generation": generation,
+            "query": term,
+            "fresh_row_count": len(rows),
+            "sample": rows[:8],
+        },
+    )
+    return rows
+
+
+def _replay_grounded_vertical_candidate(
+    page: Page,
+    search,
+    *,
+    term: str,
+    selected: str,
+    wait_ms: int,
+) -> tuple[bool, list[str]]:
+    """Replay one already-grounded candidate without requiring a DOM repaint.
+
+    Discovery remains generation-fresh. Replay is different: the exact candidate
+    was already observed from this query earlier, so a portal that keeps the same
+    result row mounted may legitimately expose no fresh mutation. We therefore
+    allow stable binding for this exact label only, then rely on canonical Step 1
+    verification to prove the click committed the intended Vertical.
+    """
+
+    rows = _run_vertical_search_query(page, search, term, wait_ms=wait_ms)
+    clicked = click_search_row(search, selected, allow_stable_exact=True)
+    if clicked:
+        return True, rows
+
+    # One bounded submit/rebind retry covers portals that do not refresh the
+    # autocomplete surface until Enter is dispatched. This does not change the
+    # candidate or broaden the query.
     try:
         search.press("Enter")
     except Exception:
-        pass
-    return _wait_for_scoped_vertical_search_candidates(
-        page,
-        search,
-        timeout_ms=max(2200, wait_ms * 3),
-    )
+        return False, rows
+    page.wait_for_timeout(min(max(int(wait_ms) // 2, 180), 450))
+    return click_search_row(search, selected, allow_stable_exact=True), rows
 
 
 def _try_select_via_search(
@@ -411,7 +436,7 @@ def _try_select_via_search(
     *,
     wait_ms: int,
 ) -> tuple[str, list[str], tuple[str, ...]]:
-    """Resolve from several Makro searches before mutating Browse taxonomy."""
+    """Resolve from several Makro search generations before mutating Browse taxonomy."""
 
     search = _vertical_search_input(page)
     planned_terms = plan_vertical_search_terms(provider, hints)
@@ -438,41 +463,35 @@ def _try_select_via_search(
     replay_terms = matched_queries_for_candidate(pool, selected)
     replay_attempts: list[dict[str, object]] = []
     for term in replay_terms:
-        rows = _run_vertical_search_query(page, search, term, wait_ms=wait_ms)
+        clicked, rows = _replay_grounded_vertical_candidate(
+            page,
+            search,
+            term=term,
+            selected=selected,
+            wait_ms=wait_ms,
+        )
         matches = [row for row in rows if normalize_label(row) == normalize_label(selected)]
         attempt: dict[str, object] = {
             "selected_vertical": selected,
             "query": term,
-            "row_count": len(rows),
-            "exact_match_count": len(matches),
+            "fresh_row_count": len(rows),
+            "fresh_exact_match_count": len(matches),
+            "stable_exact_replay_allowed": True,
+            "click_bound": bool(clicked),
             "sample": rows[:8],
         }
         _vertical_diag("selected_replay", attempt)
         replay_attempts.append(attempt)
-        if len(matches) != 1:
-            continue
-
-        live_selected = matches[0]
-        previous_canonical, _ = _current_target_values(page)
-        clicked = click_search_row(search, live_selected)
-        replay_attempts[-1]["click_bound"] = bool(clicked)
         if not clicked:
-            _vertical_diag(
-                "selected_replay_click_failed",
-                {
-                    "selected_vertical": selected,
-                    "query": term,
-                    "action": "try_next_grounded_query",
-                },
-            )
             continue
 
+        previous_canonical, _ = _current_target_values(page)
         return (
             _complete_exact_live_vertical(
                 page,
-                live_selected,
+                selected,
                 previous_canonical=previous_canonical,
-                verification_label=_search_result_leaf(live_selected),
+                verification_label=_search_result_leaf(selected),
             ),
             observed,
             planned_terms,
