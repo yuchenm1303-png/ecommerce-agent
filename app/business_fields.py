@@ -26,10 +26,11 @@ ORIGINAL_ACCOUNT_FIXED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("importer_details", "LILI", "account-default:importer-details"),
 )
 
-# Temporary seller policy for order-quantity limits only. Price fields stay out
-# of this profile and continue through their normal price-resolution path.
+# Temporary seller policy for order-quantity limits only. MinOQ must stay on a
+# value accepted by Makro's live selector; MaxOQ remains the customer-requested
+# account value. Price fields stay on their normal resolution path.
 FIXED_ORDER_QUANTITY_ACCOUNT_DEFAULTS: tuple[tuple[str, str, str], ...] = (
-    ("minimum_order_quantity", "5000", "account-default:min-order-quantity"),
+    ("minimum_order_quantity", "1", "account-default:min-order-quantity"),
     ("max_order_quantity_allowed", "6000", "account-default:max-order-quantity"),
     ("service_profile", "FBS", "account-default:fulfilment-by"),
     ("shipping_days", "14", "account-default:pick-pack-sla"),
