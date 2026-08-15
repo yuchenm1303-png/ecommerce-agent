@@ -39,6 +39,7 @@ def main() -> int:
     from gui.browser_session_manager import install_managed_makro_browser
     from gui.card_details_fast import install_card_details
     from gui.console_summary_mode import install_console_summary_mode
+    from gui.field_table_transfer import install_field_table_transfer
     from gui.frozen_process_router import install_frozen_process_router
     from gui.listing_offer_hardening import install_listing_offer_hardening
     from gui.listing_offer_support import install_listing_offer_support
@@ -118,6 +119,7 @@ def main() -> int:
     install_page_scroll_layout(window, visual)
     install_console_summary_mode(window)
     install_static_modal_interaction(window, details)
+    install_field_table_transfer(window)
 
     window.install_mode_workspace()
     install_batch_url_editor(window.batch_workspace)
