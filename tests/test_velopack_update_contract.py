@@ -83,8 +83,10 @@ def test_real_e2e_is_old_velopack_to_new_velopack_and_real_qt_gui() -> None:
     assert "$OldAppDir" in E2E
     assert "Set-Content -Path $OldEmbeddedVersion -Value $OldVersion" in E2E
     assert "Get-SingleVelopackArtifact" in E2E
+    assert "Resolve-E2EFullPackage" in E2E
     assert '-Filter "$PackId*-Setup.exe"' in E2E
     assert 'Join-Path $FeedDir "$PackId-Setup.exe"' not in E2E
+    assert '"$PackId-$Version-full.nupkg"' not in E2E
     assert "--silent" in E2E
     assert "--installto" in E2E
     assert "--velopack-e2e-source" in E2E
@@ -94,24 +96,27 @@ def test_real_e2e_is_old_velopack_to_new_velopack_and_real_qt_gui() -> None:
     assert "Velopack E2E passed" in E2E
 
 
-def test_stable_publish_verifies_exact_local_and_remote_assets_without_guessing_native_names() -> None:
+def test_stable_publish_derives_all_native_update_assets_from_feed_or_output() -> None:
     assert 'Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Setup.exe"' in PUBLISH
     assert 'Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Portable.zip"' in PUBLISH
-    assert '"native_setup=$($nativeSetup[0].Name)"' in PUBLISH
-    assert '"native_portable=$($nativePortable[0].Name)"' in PUBLISH
-    assert "$env:native_setup" in PUBLISH
-    assert "$env:native_portable" in PUBLISH
+    assert '$targetFull = [string]$target[0].FileName' in PUBLISH
+    assert '"target_full=$targetFull"' in PUBLISH
+    assert "$env:target_full" in PUBLISH
+    assert '"Smirel.ListingStudio-$env:UPDATE_VERSION-full.nupkg"' not in PUBLISH
     assert '"Smirel.ListingStudio-Setup.exe"' not in PUBLISH
     assert '"Smirel.ListingStudio-Portable.zip"' not in PUBLISH
 
 
-def test_release_publication_is_transactional_and_test_releases_are_bounded() -> None:
+def test_release_publication_is_transactional_and_checks_portal_installer_digest() -> None:
     assert "Stage Velopack Stable release as draft" in PUBLISH
     assert "--publish false" in PUBLISH
     assert "Verify complete draft before publication" in PUBLISH
+    assert "friendly_setup_sha" in PUBLISH
+    assert "friendly_setup_size" in PUBLISH
+    assert '"sha256:$env:friendly_setup_sha"' in PUBLISH
     assert "gh release edit $tag --draft=false --latest" in PUBLISH
     assert "Stage prerelease Velopack assets as draft" in TEST_PUBLISH
-    assert "--pre true" in TEST_PUBLISH
+    assert "$env:target_full" in TEST_PUBLISH
     assert "gh release edit $tag --draft=false --prerelease" in TEST_PUBLISH
     assert "Prune old test prereleases" in TEST_PUBLISH
     assert "Select-Object -Skip 3" in TEST_PUBLISH
