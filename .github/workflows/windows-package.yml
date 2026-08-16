@@ -8,11 +8,14 @@ on:
     tags:
       - "v*"
     paths:
+      - "app/app_branding.py"
       - "app/runtime_paths.py"
       - "app/velopack_runtime.py"
       - "app/update_browser_gate.py"
       - "app/browser_session.py"
       - "gui/app_updater.py"
+      - "gui/update_panel.py"
+      - "gui/native_window_shell.py"
       - "gui/browser_session_manager.py"
       - "gui/resilient_app_updater.py"
       - "gui/update_runtime.py"
@@ -36,7 +39,7 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
-    timeout-minutes: 50
+    timeout-minutes: 55
 
     steps:
       - name: Checkout
@@ -69,15 +72,15 @@ jobs:
             tests/test_app_update_ui_contract.py `
             tests/test_updater_browser_shutdown_contract.py
 
-      - name: Build Velopack installer and portable package
+      - name: Build branded Velopack installers and portable package
         shell: pwsh
         run: .\scripts\build_windows.ps1
 
-      - name: Silent Velopack installer smoke test
+      - name: Silent Velopack Setup smoke test
         shell: pwsh
         run: |
           $setups = @(Get-ChildItem artifacts\EcommerceAgent-Setup-*.exe -File)
-          if ($setups.Count -ne 1) { throw "Expected exactly one friendly Velopack installer artifact, found $($setups.Count)" }
+          if ($setups.Count -ne 1) { throw "Expected exactly one friendly Velopack Setup artifact, found $($setups.Count)" }
           $setup = $setups[0]
           $expectedVersion = (Get-Content packaging\VERSION -Raw).Trim()
           $installDir = Join-Path $env:RUNNER_TEMP "ListingStudioVelopackInstalled"
@@ -85,7 +88,7 @@ jobs:
           $install = Start-Process -FilePath $setup.FullName -ArgumentList @(
             "--silent", "--installto", $installDir
           ) -Wait -PassThru
-          if ($install.ExitCode -ne 0) { throw "Velopack install failed: $($install.ExitCode)" }
+          if ($install.ExitCode -ne 0) { throw "Velopack Setup install failed: $($install.ExitCode)" }
 
           $stub = Join-Path $installDir "EcommerceAgent.exe"
           $update = Join-Path $installDir "Update.exe"
@@ -102,12 +105,40 @@ jobs:
           & $worker --self-test
           if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
 
+      - name: Silent branded MSI install and uninstall smoke test
+        shell: pwsh
+        run: |
+          $msis = @(Get-ChildItem artifacts\EcommerceAgent-Setup-*.msi -File)
+          if ($msis.Count -ne 1) { throw "Expected exactly one branded MSI artifact, found $($msis.Count)" }
+          $msi = $msis[0].FullName
+          $installDir = Join-Path $env:RUNNER_TEMP "ListingStudioMsiInstalled"
+          if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
+
+          $installArgs = @(
+            "/i", "`"$msi`"", "/qn", "/norestart", "VELOPACK_INSTALLDIR=`"$installDir`""
+          )
+          $install = Start-Process -FilePath "msiexec.exe" -ArgumentList $installArgs -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Velopack MSI install failed: $($install.ExitCode)" }
+          foreach ($required in @(
+            (Join-Path $installDir "EcommerceAgent.exe"),
+            (Join-Path $installDir "Update.exe"),
+            (Join-Path $installDir "current\EcommerceAgent.exe")
+          )) {
+            if (-not (Test-Path $required)) { throw "MSI installed component missing: $required" }
+          }
+
+          $uninstall = Start-Process -FilePath "msiexec.exe" -ArgumentList @(
+            "/x", "`"$msi`"", "/qn", "/norestart"
+          ) -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Velopack MSI uninstall failed: $($uninstall.ExitCode)" }
+
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: EcommerceAgent-Windows-${{ github.sha }}
           path: |
             artifacts/EcommerceAgent-Setup-*.exe
+            artifacts/EcommerceAgent-Setup-*.msi
             artifacts/EcommerceAgent-*-portable.zip
             artifacts/velopack/*
           if-no-files-found: error
