@@ -13,6 +13,7 @@ BRANDING = (ROOT / "app" / "app_branding.py").read_text(encoding="utf-8")
 ICON_DATA = (ROOT / "app" / "app_icon_data.py").read_text(encoding="utf-8")
 ICON_GENERATOR = (ROOT / "scripts" / "generate_app_icon.py").read_text(encoding="utf-8")
 MSI_SMOKE = (ROOT / "scripts" / "test_velopack_msi.ps1").read_text(encoding="utf-8")
+E2E = (ROOT / "scripts" / "test_velopack_update_e2e.ps1").read_text(encoding="utf-8")
 ROUTER = (ROOT / "gui" / "frozen_process_router.py").read_text(encoding="utf-8")
 NATIVE_SHELL = (ROOT / "gui" / "native_window_shell.py").read_text(encoding="utf-8")
 UPDATE_PANEL = (ROOT / "gui" / "update_panel.py").read_text(encoding="utf-8")
@@ -107,6 +108,26 @@ def test_velopack_pack_uses_canonical_branding_and_msi() -> None:
     assert '"--msiBanner", $MsiBannerFile' in BUILD
     assert '"--msiLogo", $MsiLogoFile' in BUILD
     assert 'EcommerceAgent-Setup-$Version.msi' in BUILD
+
+
+def test_heavy_msi_and_e2e_work_are_parallel_and_e2e_omits_unused_outputs() -> None:
+    assert "Start-VpkProcess" in BUILD
+    assert "Starting branded MSI/WiX build in parallel" in BUILD
+    assert "while MSI builds" in BUILD
+    assert '"--noPortable", "true"' in BUILD
+    assert '"--noPortable", "true"' in E2E
+    assert '"--noInst", "true"' in E2E
+    assert "update assets only (no setup/portable)" in E2E
+    assert "--clean" not in BUILD
+    assert "$WorkDir" not in BUILD[BUILD.index("foreach ($Path in @(") : BUILD.index("New-Item -ItemType Directory")]
+
+
+def test_windows_ci_uses_fast_pushes_and_full_msi_manual_or_tag_gate() -> None:
+    assert "BUILD_FULL_MSI" in WINDOWS
+    assert ".\\scripts\\build_windows.ps1 -SkipMsi" in WINDOWS
+    assert "github.event_name == 'workflow_dispatch'" in WINDOWS
+    assert "startsWith(github.ref, 'refs/tags/v')" in WINDOWS
+    assert "python -m pip install --upgrade pip" not in WINDOWS
 
 
 def test_windows_ci_uses_one_isolated_pinned_velopack_msi_smoke() -> None:
