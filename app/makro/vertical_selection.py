@@ -258,6 +258,39 @@ def _wait_for_canonical_vertical(page: Page, *, timeout_s: float = 10.0) -> str:
     return str(actual or "").strip()
 
 
+def _vertical_confirmation_ready(page: Page, selected: str = "") -> bool:
+    """Recognize both Makro Step 1 confirmation variants without version flags.
+
+    Legacy builds either transition directly to Step 2 or expose the older
+    confirmation content/URL shape. The newer intermittent build keeps the same
+    Step 1 route while rendering the selected Vertical details in place and only
+    exposes an enabled ``Select Brand`` action. That structural state is sufficient
+    only while the page is still Step 1; when a selected label is supplied it must
+    also remain visible, preventing an unrelated action from being accepted.
+    """
+
+    try:
+        if is_brand_step(page):
+            return True
+    except Exception:
+        pass
+    try:
+        if _vertical_confirmation_content(page):
+            return True
+    except Exception:
+        pass
+    try:
+        if not is_vertical_step(page):
+            return False
+        if _vertical_select_brand_button(page) is None:
+            return False
+    except Exception:
+        return False
+
+    selected_value = str(selected or "").strip()
+    return not selected_value or _selected_label_visible(page, selected_value)
+
+
 def _complete_exact_live_vertical(
     page: Page,
     selected: str,
@@ -267,13 +300,13 @@ def _complete_exact_live_vertical(
 ) -> str:
     verify_as = str(verification_label or selected).strip()
     transitioned = _wait_for(
-        lambda current: is_brand_step(current) or _vertical_confirmation_content(current),
+        lambda current: _vertical_confirmation_ready(current, verify_as),
         page,
         timeout_s=15.0,
     )
     if not transitioned:
         raise RuntimeError(
-            f"Makro Step 1 selected live vertical {selected!r}, but neither Step 2 nor the vertical confirmation appeared"
+            f"Makro Step 1 selected live vertical {selected!r}, but no verified Step 1 confirmation or Step 2 appeared"
         )
 
     selected_visible = _selected_label_visible(page, verify_as)
@@ -599,7 +632,7 @@ def _resume_partial_taxonomy(
             columns_fn=shifted_columns,
             click_fn=shifted_click,
             choose_fn=choose_node,
-            leaf_ready_fn=lambda: is_brand_step(page) or _vertical_confirmation_content(page),
+            leaf_ready_fn=lambda: _vertical_confirmation_ready(page),
             complete_leaf_fn=complete_leaf,
             wait_ms=wait_ms,
             max_depth=max(1, 7 - start_level),
@@ -631,7 +664,7 @@ def _select_via_taxonomy(
         columns_fn=taxonomy.columns,
         click_fn=taxonomy.click_node,
         choose_fn=choose_node,
-        leaf_ready_fn=lambda: is_brand_step(page) or _vertical_confirmation_content(page),
+        leaf_ready_fn=lambda: _vertical_confirmation_ready(page),
         complete_leaf_fn=complete_leaf,
         wait_ms=wait_ms,
         max_depth=7,
