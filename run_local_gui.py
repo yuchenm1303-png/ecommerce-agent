@@ -113,6 +113,7 @@ def main() -> int:
     from gui.ui_maturity import install_mature_ui
     from gui.ui_polish import install_ui_polish
     from gui.update_runtime import install_update_runtime
+    from gui.usage_telemetry import install_usage_telemetry
     from gui.wallpaper_cache import install_preblur_cache
     from gui.workspace_transition import install_workspace_transition
     from gui.workspace_transition_tuning import apply_workspace_transition_tuning
@@ -170,6 +171,7 @@ def main() -> int:
     install_field_table_transfer(window)
 
     window.install_mode_workspace()
+    install_usage_telemetry(window, access_controller)
     install_batch_url_editor(window.batch_workspace)
     install_batch_workspace_density(window.batch_workspace)
     install_batch_card_responsive(window.batch_workspace)
