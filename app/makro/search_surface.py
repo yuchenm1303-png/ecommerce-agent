@@ -609,7 +609,9 @@ def harvest_search_rows(
 
     The dropdown is reset to its top before harvesting and restored there before
     returning. Virtual lists are supported because newly mounted/reused rows are
-    marked by the generation observer as the result surface moves.
+    marked by the generation observer as the result surface moves. End-of-list is
+    confirmed across two quiet polls so a slower concurrent Batch tab cannot make
+    a partially rendered result set look complete.
     """
 
     poll = max(50, int(poll_ms))
@@ -620,17 +622,33 @@ def harvest_search_rows(
     _append_unique_rows(output, seen, read_search_rows(search))
 
     stagnant = 0
+    end_confirmations = 0
     for _ in range(max(1, int(max_scroll_steps))):
         state = _move_search_surface(search, reset=False)
-        if not state.get("found"):
-            break
-        if state.get("moved"):
+        found = bool(state.get("found"))
+        moved = bool(state.get("moved"))
+        at_end = bool(state.get("at_end"))
+
+        if moved or at_end or not found:
             page.wait_for_timeout(poll)
-            added = _append_unique_rows(output, seen, read_search_rows(search))
-            stagnant = 0 if added else stagnant + 1
-        else:
-            stagnant += 1
-        if state.get("at_end") or stagnant >= max(1, int(max_stagnant_rounds)):
+        added = _append_unique_rows(output, seen, read_search_rows(search))
+        stagnant = 0 if added else stagnant + 1
+
+        if not found:
+            # A short result list may not expose a scrollable surface at all.
+            # Require more than one quiet observation before treating it as done.
+            if stagnant >= 2:
+                break
+            continue
+
+        if at_end:
+            end_confirmations = 0 if added else end_confirmations + 1
+            if end_confirmations >= 2:
+                break
+            continue
+
+        end_confirmations = 0
+        if stagnant >= max(1, int(max_stagnant_rounds)):
             break
 
     _move_search_surface(search, reset=True)
