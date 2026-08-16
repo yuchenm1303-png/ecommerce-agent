@@ -14,6 +14,7 @@ from typing import Any, Iterable
 from playwright.sync_api import Page
 
 from ..makro_dryrun import FillVerification, fill_resolved_field, verify_resolved_field
+from .field_engine import fill_control as fill_live_control
 from .fields import build_semantic_fields, scroll_and_capture
 from .listing import (
     MakroListingTarget,
@@ -50,6 +51,14 @@ def _value_controls(field: dict[str, Any]) -> list[dict[str, Any]]:
         for control in field.get("controls") or []
         if control.get("field_kind") != "option"
         and not str(control.get("name") or "").endswith("_qualifier")
+    ]
+
+
+def _qualifier_controls(field: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        control
+        for control in field.get("controls") or []
+        if str(control.get("name") or "").endswith("_qualifier")
     ]
 
 
@@ -276,25 +285,74 @@ class MakroDomainAdapter:
         )
         return constrained
 
+    def _seed_repeatable_slot(
+        self,
+        semantic_field: dict[str, Any],
+        answer: Any,
+        slot_index: int,
+        section_path: str,
+    ) -> None:
+        """Commit the approved value needed to enable Makro's disabled ``+``.
+
+        Makro's repeatable control contract disables AddRemoveValueIcon while the
+        current slot is empty. Slot materialisation is therefore inherently
+        progressive: write the final approved value for the current last slot,
+        let React enable ``+``, then request the next slot. The normal Generic
+        Field Engine subsequently rewrites and verifies the complete answer, so
+        this helper never invents or transforms product semantics.
+        """
+
+        values = list(getattr(answer, "answer_values", []) or [])
+        controls = _value_controls(semantic_field)
+        if slot_index < 0 or slot_index >= len(values) or slot_index >= len(controls):
+            raise RuntimeError("multi-value slot seed index 与当前 live field 不一致。")
+        fill_live_control(
+            self.page,
+            controls[slot_index],
+            str(values[slot_index]),
+            section_path=section_path,
+        )
+
+        qualifier = str(getattr(answer, "qualifier", "") or "").strip()
+        if qualifier:
+            qualifier_controls = _qualifier_controls(semantic_field)
+            target: dict[str, Any] | None = None
+            if len(qualifier_controls) == 1:
+                target = qualifier_controls[0]
+            elif slot_index < len(qualifier_controls):
+                target = qualifier_controls[slot_index]
+            if target is not None:
+                fill_live_control(
+                    self.page,
+                    target,
+                    qualifier,
+                    section_path=section_path,
+                )
+
     def _ensure_answer_value_slots(
         self,
         semantic_field: dict[str, Any],
         answer: Any,
         section_path: str | None,
     ) -> dict[str, Any]:
-        """Expand the live ``+`` control until every answer value has one slot.
+        """Materialise one live value slot per approved answer value.
 
-        Expansion is attempted only when the answer actually contains more
-        values than currently rendered controls and a section path is known. No
-        synthetic value is written here; the field is re-discovered after every
-        click so React-created indexed controls become first-class live controls.
+        Some Makro repeatable attributes render exactly one empty slot plus a
+        disabled ``+``. The scanner still treats that visible add control as
+        repeatable capability. At execution time, if ``+`` is disabled, seed the
+        current last slot with its final approved value, wait for React to enable
+        the same control, then add the next slot. Every newly-created indexed
+        control is re-scanned before the next step.
         """
 
-        needed = len(list(getattr(answer, "answer_values", []) or []))
+        values = list(getattr(answer, "answer_values", []) or [])
+        needed = len(values)
         current = semantic_field
         if needed <= len(_value_controls(current)) or needed <= 1:
             return current
         if not section_path:
+            return current
+        if not bool(current.get("has_add_value_control") or current.get("multi_value")):
             return current
 
         while len(_value_controls(current)) < needed:
@@ -302,13 +360,34 @@ class MakroDomainAdapter:
             if not value_controls:
                 return current
             before = len(value_controls)
+            anchor = value_controls[-1]
             click = click_add_value_for_control(
                 self.page,
                 section_path,
-                value_controls[0],
+                anchor,
             )
+
+            if (
+                not click.get("clicked")
+                and click.get("available")
+                and click.get("reason") == "add-disabled"
+            ):
+                self._seed_repeatable_slot(
+                    current,
+                    answer,
+                    before - 1,
+                    section_path,
+                )
+                self.page.wait_for_timeout(180)
+                click = click_add_value_for_control(
+                    self.page,
+                    section_path,
+                    anchor,
+                )
+
             if not click.get("clicked"):
                 return current
+
             self.page.wait_for_timeout(300)
             refreshed = self._refresh_field(current, section_path)
             after = len(_value_controls(refreshed))
