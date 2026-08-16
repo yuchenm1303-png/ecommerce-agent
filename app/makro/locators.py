@@ -14,14 +14,17 @@ from typing import Any
 # Self-contained browser-side helper shared with the field scanner. Makro's add
 # control is not guaranteed to be a literal <button>; React variants may render
 # an icon/span/div inside an actionable ancestor. Detection stays scoped to the
-# current EditAttributeItemWrapper and fails closed unless exactly one enabled,
-# visible add-value action can be identified.
+# current EditAttributeItemWrapper and fails closed unless exactly one visible
+# add-value action can be identified. Disabled state is intentionally *not* part
+# of capability detection: Makro renders repeatable fields with a disabled ``+``
+# while the current value slot is empty, then enables the same button after the
+# slot has a valid value. Execution checks enabledness separately before click.
 ADD_VALUE_CONTROL_JS = r"""
 const findMakroAddValueControl = (el) => {
   const wrapper = el && el.closest
     ? el.closest('[class*="EditAttributeItemWrapper"]')
     : null;
-  if (!wrapper) return { node: null, count: 0, reason: 'no-wrapper' };
+  if (!wrapper) return { node: null, count: 0, reason: 'no-wrapper', disabled: false };
 
   const cleanAddText = (value) => String(value == null ? '' : value)
     .replace(/\s+/g, ' ')
@@ -64,7 +67,7 @@ const findMakroAddValueControl = (el) => {
     if (!action || !wrapper.contains(action)) {
       action = getComputedStyle(marker).cursor === 'pointer' ? marker : null;
     }
-    if (!action || !wrapper.contains(action) || !visibleAddNode(action) || disabledAddNode(action)) continue;
+    if (!action || !wrapper.contains(action) || !visibleAddNode(action)) continue;
     if (!seen.has(action)) {
       seen.add(action);
       actions.push(action);
@@ -76,9 +79,11 @@ const findMakroAddValueControl = (el) => {
       node: null,
       count: actions.length,
       reason: actions.length ? 'ambiguous-add-actions' : 'no-visible-add',
+      disabled: false,
     };
   }
-  return { node: actions[0], count: 1, reason: '' };
+  const node = actions[0];
+  return { node, count: 1, reason: '', disabled: disabledAddNode(node) };
 };
 """
 
@@ -118,7 +123,13 @@ def click_add_value_for_control(
     section_path: str,
     control: dict[str, Any],
 ) -> dict[str, Any]:
-    """Click the unique visible add-value action for one captured attribute."""
+    """Click the unique visible add-value action for one captured attribute.
+
+    ``available`` means the current field is structurally repeatable. A disabled
+    add button therefore reports ``available=True`` but ``clicked=False`` so the
+    caller can seed the current slot first instead of misclassifying the field as
+    single-value.
+    """
 
     selector = scoped_selector_for_control(section_path, control)
     matches = page.locator(selector)
@@ -144,6 +155,9 @@ def click_add_value_for_control(
           const found = findMakroAddValueControl(el);
           if (!found.node) {
             return {available:false, clicked:false, reason:found.reason, count:found.count};
+          }
+          if (found.disabled) {
+            return {available:true, clicked:false, reason:'add-disabled', count:1};
           }
           found.node.click();
           return {available:true, clicked:true, reason:'', count:1};
