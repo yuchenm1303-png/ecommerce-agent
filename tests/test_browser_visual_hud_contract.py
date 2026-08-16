@@ -22,6 +22,17 @@ def test_shared_browser_hud_reuses_existing_visual_agent_renderer_lazily() -> No
     assert "pointer-events:none" in MOBILE_PORT
 
 
+def test_hud_bubble_keeps_chinese_at_native_css_pixels() -> None:
+    assert "--info-bubble-scale" not in MOBILE_PORT
+    assert "scale(var(--info-bubble-scale))" not in MOBILE_PORT
+    assert "--info-bubble-width:292px" in MOBILE_PORT
+    assert '"Microsoft YaHei UI"' in MOBILE_PORT
+    assert "transform:translate(var(--bubble-x),var(--bubble-y))" in MOBILE_PORT
+    assert "const rect=nodes.bubble.getBoundingClientRect();" in MOBILE_PORT
+    assert "Math.round(Math.max(12" in MOBILE_PORT
+    assert "backdrop-filter" not in MOBILE_PORT
+
+
 def test_hud_recognizes_and_explicitly_targets_photo_upload_surfaces() -> None:
     for token in (
         '[id^="thumbnail_"]',
