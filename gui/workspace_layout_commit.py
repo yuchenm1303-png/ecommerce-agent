@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
-
-from PySide6.QtCore import QObject, QEvent, Qt
+from PySide6.QtCore import QObject, Qt
 from PySide6.QtWidgets import QLayout, QMainWindow, QStackedWidget, QWidget
 
 from .page_scroll_layout import refresh_single_source_layout
@@ -34,7 +32,8 @@ def _activate_layout_tree(widget: QWidget) -> bool:
     try:
         children = widget.findChildren(
             QWidget,
-            options=Qt.FindChildOption.FindDirectChildrenOnly,
+            "",
+            Qt.FindChildOption.FindDirectChildrenOnly,
         )
     except (RuntimeError, TypeError):
         return changed
@@ -107,8 +106,9 @@ class WorkspaceLayoutCommitter(QObject):
                 if not changed:
                     break
 
-            page.updateGeometry()
-            self.stack.updateGeometry()
+            # Intentionally do not call updateGeometry() here. That API notifies
+            # the parent layout and can queue fresh LayoutRequest work after this
+            # barrier, recreating the exact one-frame reflow this class prevents.
         finally:
             self._committing = False
 
