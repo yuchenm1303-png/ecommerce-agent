@@ -122,6 +122,13 @@ def test_heavy_msi_and_e2e_work_are_parallel_and_e2e_omits_unused_outputs() -> N
     assert "$WorkDir" not in BUILD[BUILD.index("foreach ($Path in @(") : BUILD.index("New-Item -ItemType Directory")]
 
 
+def test_parallel_msi_is_registered_for_velopack_upload() -> None:
+    assert "Merge-VelopackMsiAsset" in BUILD
+    assert '"assets.$Channel.json"' in BUILD
+    assert "Parallel MSI manifest must contain exactly one" in BUILD
+    assert "Registered parallel MSI in canonical Velopack upload manifest" in BUILD
+
+
 def test_windows_ci_uses_path_sensitive_fast_pushes_and_full_installer_gate() -> None:
     assert "Decide full installer gate" in WINDOWS
     assert "steps.installer_gate.outputs.full_msi" in WINDOWS
@@ -144,12 +151,14 @@ def test_windows_ci_uses_one_isolated_pinned_velopack_msi_smoke() -> None:
     assert WINDOWS.index("Silent branded MSI install and uninstall smoke test") < WINDOWS.index(
         "Silent Velopack Setup smoke test"
     )
-    assert 'VELOPACK_INSTALLDIR=`"$installDir`"' in MSI_SMOKE
-    assert "supported public install" in MSI_SMOKE
+    assert '"VELOPACK_INSTALLDIR=$installDir"' in MSI_SMOKE
+    assert "ProcessStartInfo" in MSI_SMOKE
+    assert '$msiRootStubName = "$PackTitle.exe"' in MSI_SMOKE
+    assert 'Join-Path $actualInstallDir "current\\EcommerceAgent.exe"' in MSI_SMOKE
     assert 'Uninstall\\MSI:$PackId' in MSI_SMOKE
     assert 'Uninstall\\$PackId' in MSI_SMOKE
-    assert '"/i' in MSI_SMOKE
-    assert '"/x' in MSI_SMOKE
+    assert '"/i", $msi' in MSI_SMOKE
+    assert '"/x", $msi' in MSI_SMOKE
     assert 'current\\EcommerceAgentWorker.exe' in MSI_SMOKE
     assert 'current\\_internal\\packaging\\VERSION' in MSI_SMOKE
     assert "InstallLocation mismatch" in MSI_SMOKE
