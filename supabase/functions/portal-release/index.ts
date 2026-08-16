@@ -68,18 +68,6 @@ function createAdminClient() {
   });
 }
 
-function resolveInstallerAsset(release: any, version: string) {
-  const candidates = [
-    `EcommerceAgent-Setup-${version}.msi`,
-    `EcommerceAgent-Setup-${version}.exe`,
-  ];
-  for (const installerName of candidates) {
-    const asset = release.assets.find((item: any) => item?.name === installerName);
-    if (asset?.browser_download_url) return { installerName, asset };
-  }
-  throw new Error("invalid_installer_asset");
-}
-
 async function resolveStableRelease() {
   const headers = {
     "Accept": "application/vnd.github+json",
@@ -100,7 +88,8 @@ async function resolveStableRelease() {
     throw new Error("invalid_stable_tag");
   }
 
-  const { installerName, asset: installerAsset } = resolveInstallerAsset(release, version);
+  const installerName = `EcommerceAgent-Setup-${version}.exe`;
+  const installerAsset = release.assets.find((asset: any) => asset?.name === installerName);
   const installerSize = Number(installerAsset?.size || 0);
   const digest = String(installerAsset?.digest || "").trim().toLowerCase();
   const digestMatch = digest.match(SHA256_DIGEST_RE);
@@ -233,7 +222,6 @@ Deno.serve(async (req: Request) => {
       publishedAt: stable.publishedAt,
       required: stable.required,
       minSupportedVersion: stable.minSupportedVersion,
-      fileName: stable.installerName,
       fileSize: stable.fileSize,
       fileSizeBytes: stable.installerSize,
       installerSha256: stable.installerSha256,

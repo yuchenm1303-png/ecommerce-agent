@@ -12,11 +12,7 @@ RUNTIME_HOOK = (ROOT / "packaging" / "velopack_runtime_hook.py").read_text(encod
 BRANDING = (ROOT / "app" / "app_branding.py").read_text(encoding="utf-8")
 ICON_DATA = (ROOT / "app" / "app_icon_data.py").read_text(encoding="utf-8")
 ICON_GENERATOR = (ROOT / "scripts" / "generate_app_icon.py").read_text(encoding="utf-8")
-MSI_SMOKE = (ROOT / "scripts" / "test_velopack_msi.ps1").read_text(encoding="utf-8")
-E2E = (ROOT / "scripts" / "test_velopack_update_e2e.ps1").read_text(encoding="utf-8")
 ROUTER = (ROOT / "gui" / "frozen_process_router.py").read_text(encoding="utf-8")
-NATIVE_SHELL = (ROOT / "gui" / "native_window_shell.py").read_text(encoding="utf-8")
-UPDATE_PANEL = (ROOT / "gui" / "update_panel.py").read_text(encoding="utf-8")
 WORKER = (ROOT / "run_packaged_worker.py").read_text(encoding="utf-8")
 RUN = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 SPEC = (ROOT / "packaging" / "EcommerceAgent.spec").read_text(encoding="utf-8")
@@ -29,33 +25,18 @@ def test_packaging_python_sources_compile() -> None:
         (ROOT / "app" / "runtime_paths.py", RUNTIME),
         (ROOT / "app" / "velopack_runtime.py", VELOPACK_RUNTIME),
         (ROOT / "packaging" / "velopack_runtime_hook.py", RUNTIME_HOOK),
-        (ROOT / "gui" / "update_panel.py", UPDATE_PANEL),
-        (ROOT / "gui" / "native_window_shell.py", NATIVE_SHELL),
         (ROOT / "run_local_gui.py", RUN),
     ):
         compile(source, str(path), "exec")
 
 
-def test_approved_application_icon_is_preserved_everywhere() -> None:
+def test_approved_application_icon_is_preserved() -> None:
     raw = application_icon_bytes()
     assert raw.startswith(b"\x89PNG\r\n\x1a\n")
     assert len(raw) > 5_000
     assert "APP_ICON_PNG_BASE64" in ICON_DATA
     assert "hashlib.sha256(raw).hexdigest()" in BRANDING
-    assert 'APP_USER_MODEL_ID = "Smirel.ListingStudio"' in BRANDING
     assert "apply_qt_application_icon(app)" in RUN
-    assert "owner.setIcon(app_icon)" in NATIVE_SHELL
-    assert "overlay.setWindowIcon(app_icon)" in NATIVE_SHELL
-
-
-def test_branding_generator_builds_setup_and_msi_artwork() -> None:
-    assert "build_installer_splash" in ICON_GENERATOR
-    assert "build_msi_banner" in ICON_GENERATOR
-    assert "build_msi_logo" in ICON_GENERATOR
-    assert '(493, 58)' in ICON_GENERATOR
-    assert '(493, 312)' in ICON_GENERATOR
-    assert 'format="BMP"' in ICON_GENERATOR
-    assert 'format="PNG"' in ICON_GENERATOR
 
 
 def test_frozen_runtime_keeps_mutable_state_outside_versioned_current_dir() -> None:
@@ -97,86 +78,21 @@ def test_velopack_toolchain_is_pinned_and_build_replaces_inno() -> None:
     assert "Compress-Archive" not in BUILD
 
 
-def test_velopack_pack_uses_canonical_branding_and_msi() -> None:
-    assert '"--icon", $IconFile' in BUILD
-    assert '"--splashImage", $SplashFile' in BUILD
-    assert '"--splashProgressColor", "#5DA7FF"' in BUILD
-    assert '"--aumid", $PackId' in BUILD
-    assert '"--shortcuts", "Desktop,StartMenuRoot"' in BUILD
-    assert '"--msi", "true"' in BUILD
-    assert '"--instLocation", "PerUser"' in BUILD
-    assert '"--msiBanner", $MsiBannerFile' in BUILD
-    assert '"--msiLogo", $MsiLogoFile' in BUILD
-    assert 'EcommerceAgent-Setup-$Version.msi' in BUILD
-
-
-def test_heavy_msi_and_e2e_work_are_parallel_and_e2e_uses_legal_minimal_outputs() -> None:
-    assert "Start-VpkProcess" in BUILD
-    assert "Starting branded MSI/WiX build in parallel" in BUILD
-    assert "while MSI builds" in BUILD
-    assert '"--noPortable", "true"' in BUILD
-    assert '"--noPortable", "true"' in E2E
-    assert '"--noInst"' not in E2E
-    assert "mutually exclusive" in E2E
-    assert "target Setup ignored" in E2E
-    assert "--clean" not in BUILD
-    assert "$WorkDir" not in BUILD[BUILD.index("foreach ($Path in @(") : BUILD.index("New-Item -ItemType Directory")]
-
-
-def test_parallel_msi_is_registered_for_velopack_upload() -> None:
-    assert "Merge-VelopackMsiAsset" in BUILD
-    assert '"assets.$Channel.json"' in BUILD
-    assert "Parallel MSI manifest must contain exactly one" in BUILD
-    assert "Registered parallel MSI in canonical Velopack upload manifest" in BUILD
-
-
-def test_windows_ci_uses_path_sensitive_fast_pushes_and_full_installer_gate() -> None:
-    assert "Decide full installer gate" in WINDOWS
-    assert "steps.installer_gate.outputs.full_msi" in WINDOWS
-    assert ".\\scripts\\build_windows.ps1 -SkipMsi" in WINDOWS
-    assert '$env:GITHUB_EVENT_NAME -eq "workflow_dispatch"' in WINDOWS
-    assert '$env:GITHUB_REF -like "refs/tags/v*"' in WINDOWS
-    assert '"scripts/build_windows.ps1"' in WINDOWS
-    assert '"scripts/test_velopack_msi.ps1"' in WINDOWS
-    assert '"tests/test_windows_packaging_contract.py"' in WINDOWS
-    assert '"packaging/"' in WINDOWS
-    assert "python -m pip install --upgrade pip" not in WINDOWS
-
-
-def test_windows_ci_uses_one_isolated_pinned_velopack_msi_smoke() -> None:
+def test_windows_ci_smokes_canonical_velopack_layout() -> None:
     assert "actions/setup-dotnet@v4" in WINDOWS
     assert "dotnet tool restore" in WINDOWS
     assert '"--silent", "--installto", $installDir' in WINDOWS
     assert 'Join-Path $installDir "Update.exe"' in WINDOWS
     assert 'Join-Path $installDir "current\\EcommerceAgent.exe"' in WINDOWS
-    assert 'scripts\\test_velopack_msi.ps1' in WINDOWS
-    assert WINDOWS.index("Silent branded MSI install and uninstall smoke test") < WINDOWS.index(
-        "Silent Velopack Setup smoke test"
-    )
-    assert '"VELOPACK_INSTALLDIR=$installDir"' in MSI_SMOKE
-    assert "ProcessStartInfo" in MSI_SMOKE
-    assert '$msiRootStubName = "$PackTitle.exe"' in MSI_SMOKE
-    assert 'Join-Path $actualInstallDir "current\\EcommerceAgent.exe"' in MSI_SMOKE
-    assert 'Uninstall\\MSI:$PackId' in MSI_SMOKE
-    assert 'Uninstall\\$PackId' in MSI_SMOKE
-    assert '"/i", $msi' in MSI_SMOKE
-    assert '"/x", $msi' in MSI_SMOKE
-    assert 'current\\EcommerceAgentWorker.exe' in MSI_SMOKE
-    assert 'current\\_internal\\packaging\\VERSION' in MSI_SMOKE
-    assert "InstallLocation mismatch" in MSI_SMOKE
-    assert "uninstall registration remained" in MSI_SMOKE
-    assert "MSI uninstall left installed component" in MSI_SMOKE
     assert "Inno Setup" not in WINDOWS
 
 
 def test_build_discovers_native_assets_and_never_guesses_velopack_package_names() -> None:
     assert 'EcommerceAgent-Setup-$Version.exe' in BUILD
-    assert 'EcommerceAgent-Setup-$Version.msi' in BUILD
     assert 'EcommerceAgent-$Version-portable.zip' in BUILD
     assert "Get-SingleVelopackArtifact" in BUILD
     assert "Resolve-VelopackFullPackage" in BUILD
     assert '-Filter "$PackId*-Setup.exe"' in BUILD
-    assert '-Filter "$PackId*.msi"' in BUILD
     assert '-Filter "$PackId*-Portable.zip"' in BUILD
     assert 'releases.$Channel.json' in BUILD
     assert '[string]$Target[0].FileName' in BUILD

@@ -74,37 +74,23 @@ if (-not (Test-Path $OldEmbeddedVersion)) {
 }
 Set-Content -Path $OldEmbeddedVersion -Value $OldVersion -Encoding ascii -NoNewline
 
-function Invoke-E2EPack {
-    param(
-        [Parameter(Mandatory = $true)][string]$PackVersion,
-        [Parameter(Mandatory = $true)][string]$PackDirectory
-    )
-
-    # Velopack 1.2.0 requires at least one distribution surface. --noPortable and
-    # --noInst are mutually exclusive, so E2E keeps the cheap Setup bundle and
-    # disables only Portable. The target Setup is ignored; the update path still
-    # consumes only the Full/Delta/feed assets.
-    $args = @(
-        "pack",
-        "--outputDir", $FeedDir,
-        "--channel", $Channel,
-        "--runtime", "win-x64",
-        "--packId", $PackId,
-        "--packVersion", $PackVersion,
-        "--packDir", $PackDirectory,
-        "--packAuthors", "Smirel",
-        "--packTitle", "Listing Studio E2E",
-        "--icon", $IconFile,
-        "--mainExe", "EcommerceAgent.exe",
-        "--noPortable", "true"
-    )
-
-    & dotnet tool run vpk -- @args
+function Invoke-E2EPack([string]$PackVersion, [string]$PackDirectory) {
+    & dotnet tool run vpk -- pack `
+        --outputDir $FeedDir `
+        --channel $Channel `
+        --runtime win-x64 `
+        --packId $PackId `
+        --packVersion $PackVersion `
+        --packDir $PackDirectory `
+        --packAuthors Smirel `
+        --packTitle "Listing Studio E2E" `
+        --icon $IconFile `
+        --mainExe EcommerceAgent.exe
     if ($LASTEXITCODE -ne 0) { throw "Velopack E2E pack failed for $PackVersion" }
 }
 
-Write-Host "  [E2E 1/4] Pack and install old Velopack version $OldVersion (portable disabled)"
-Invoke-E2EPack -PackVersion $OldVersion -PackDirectory $OldAppDir
+Write-Host "  [E2E 1/4] Pack and install old Velopack version $OldVersion"
+Invoke-E2EPack $OldVersion $OldAppDir
 $Setup = Get-SingleVelopackArtifact -Directory $FeedDir -Filter "$PackId*-Setup.exe" -Label "old setup"
 $Install = Start-Process -FilePath $Setup.FullName -ArgumentList @("--silent", "--installto", $InstallDir) -Wait -PassThru
 if ($Install.ExitCode -ne 0) { throw "Velopack E2E old install failed: $($Install.ExitCode)" }
@@ -121,8 +107,8 @@ if ($InstalledOldVersion -ne $OldVersion) {
     throw "Velopack E2E old install VERSION mismatch: expected=$OldVersion actual=$InstalledOldVersion"
 }
 
-Write-Host "  [E2E 2/4] Add target v$Version to the same feed (portable disabled; target Setup ignored)"
-Invoke-E2EPack -PackVersion $Version -PackDirectory $AppDir
+Write-Host "  [E2E 2/4] Add target v$Version to the same local Velopack feed"
+Invoke-E2EPack $Version $AppDir
 $Index = Join-Path $FeedDir "releases.$Channel.json"
 if (-not (Test-Path $Index)) { throw "Velopack E2E release index missing: $Index" }
 $TargetPackage = Resolve-E2EFullPackage `

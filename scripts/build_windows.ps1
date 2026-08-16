@@ -2,8 +2,7 @@ param(
     [string]$Version = "",
     [string]$Channel = "win-x64-stable",
     [string]$ReleaseNotesPath = "",
-    [switch]$RunUpdateE2E,
-    [switch]$SkipMsi
+    [switch]$RunUpdateE2E
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,63 +57,6 @@ function Resolve-VelopackFullPackage {
     return $Package
 }
 
-function Start-VpkProcess {
-    param(
-        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
-        [Parameter(Mandatory = $true)][string[]]$VpkArgs
-    )
-
-    $psi = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName = (Get-Command dotnet -ErrorAction Stop).Source
-    $psi.WorkingDirectory = $WorkingDirectory
-    $psi.UseShellExecute = $false
-    foreach ($arg in @("tool", "run", "vpk", "--") + $VpkArgs) {
-        [void]$psi.ArgumentList.Add([string]$arg)
-    }
-    $process = [System.Diagnostics.Process]::new()
-    $process.StartInfo = $psi
-    if (-not $process.Start()) { throw "Failed to start background Velopack process" }
-    return $process
-}
-
-function Merge-VelopackMsiAsset {
-    param(
-        [Parameter(Mandatory = $true)][string]$CoreOutputDir,
-        [Parameter(Mandatory = $true)][string]$MsiOutputDir,
-        [Parameter(Mandatory = $true)][string]$Channel,
-        [Parameter(Mandatory = $true)][string]$MsiFileName
-    )
-
-    # vpk upload does not scan arbitrary files in outputDir; it reads
-    # assets.<channel>.json. The MSI is built by an isolated parallel vpk pack,
-    # so copy its own native asset record into the canonical build manifest.
-    $coreManifest = Join-Path $CoreOutputDir "assets.$Channel.json"
-    $msiManifest = Join-Path $MsiOutputDir "assets.$Channel.json"
-    foreach ($required in @($coreManifest, $msiManifest)) {
-        if (-not (Test-Path $required -PathType Leaf)) {
-            throw "Velopack build asset manifest missing: $required"
-        }
-    }
-
-    $coreAssets = @(Get-Content $coreManifest -Raw -Encoding UTF8 | ConvertFrom-Json)
-    $msiAssets = @(Get-Content $msiManifest -Raw -Encoding UTF8 | ConvertFrom-Json)
-    $msiRecord = @($msiAssets | Where-Object {
-        [string]$_.RelativeFileName -eq $MsiFileName
-    })
-    if ($msiRecord.Count -ne 1) {
-        throw "Parallel MSI manifest must contain exactly one '$MsiFileName' record; found $($msiRecord.Count)"
-    }
-    $existingMsi = @($coreAssets | Where-Object {
-        [string]::Equals([IO.Path]::GetExtension([string]$_.RelativeFileName), ".msi", [StringComparison]::OrdinalIgnoreCase)
-    })
-    if ($existingMsi.Count -ne 0) {
-        throw "Canonical Velopack asset manifest unexpectedly already contains MSI records"
-    }
-
-    @($coreAssets + $msiRecord[0]) | ConvertTo-Json -Depth 8 | Set-Content $coreManifest -Encoding utf8
-    Write-Host "  Registered parallel MSI in canonical Velopack upload manifest: $MsiFileName"
-}
-
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = (Get-Content (Join-Path $Root "packaging\VERSION") -Raw).Trim()
@@ -130,61 +72,31 @@ $PackId = "Smirel.ListingStudio"
 $PackTitle = "Listing Studio"
 $PackAuthors = "Smirel"
 $ShouldRunUpdateE2E = [bool]$RunUpdateE2E -or ($env:GITHUB_WORKFLOW -eq "Publish Update")
-$ShouldBuildMsi = -not [bool]$SkipMsi
 
 $DistRoot = Join-Path $Root "dist"
 $AppDir = Join-Path $DistRoot "EcommerceAgent"
 $WorkDir = Join-Path $Root "build\pyinstaller"
 $ArtifactDir = Join-Path $Root "artifacts"
 $VelopackDir = Join-Path $ArtifactDir "velopack"
-$MsiBuildRoot = Join-Path $Root "build\velopack-msi"
-$MsiAppDir = Join-Path $MsiBuildRoot "app"
-$MsiOutputDir = Join-Path $MsiBuildRoot "out"
 $SetupAlias = Join-Path $ArtifactDir "EcommerceAgent-Setup-$Version.exe"
-$MsiAlias = Join-Path $ArtifactDir "EcommerceAgent-Setup-$Version.msi"
 $PortableAlias = Join-Path $ArtifactDir "EcommerceAgent-$Version-portable.zip"
 $IconFile = Join-Path $Root "packaging\app_icon.ico"
-$SplashFile = Join-Path $Root "packaging\installer_splash.png"
-$MsiBannerFile = Join-Path $Root "packaging\msi_banner.bmp"
-$MsiLogoFile = Join-Path $Root "packaging\msi_logo.bmp"
 
-# Keep PyInstaller's work directory so repeated local builds can reuse its analysis.
-# Release outputs themselves are always rebuilt from a clean dist/feed.
-foreach ($Path in @(
-    $AppDir,
-    $VelopackDir,
-    $MsiBuildRoot,
-    $SetupAlias,
-    $MsiAlias,
-    $PortableAlias,
-    $IconFile,
-    $SplashFile,
-    $MsiBannerFile,
-    $MsiLogoFile
-)) {
+foreach ($Path in @($AppDir, $WorkDir, $VelopackDir, $SetupAlias, $PortableAlias, $IconFile)) {
     if (Test-Path $Path) { Remove-Item $Path -Recurse -Force }
 }
 New-Item -ItemType Directory -Force -Path $DistRoot, $WorkDir, $ArtifactDir, $VelopackDir | Out-Null
 
-Write-Host "[1/5] Ensuring pinned Velopack CLI"
+Write-Host "[1/5] Restoring pinned Velopack CLI"
+& dotnet tool restore
+if ($LASTEXITCODE -ne 0) { throw "dotnet tool restore failed: $LASTEXITCODE" }
 & dotnet tool run vpk -- --help *> $null
-if ($LASTEXITCODE -ne 0) {
-    & dotnet tool restore
-    if ($LASTEXITCODE -ne 0) { throw "dotnet tool restore failed: $LASTEXITCODE" }
-    & dotnet tool run vpk -- --help *> $null
-    if ($LASTEXITCODE -ne 0) { throw "Pinned Velopack CLI failed to start: $LASTEXITCODE" }
-}
+if ($LASTEXITCODE -ne 0) { throw "Pinned Velopack CLI failed to start: $LASTEXITCODE" }
 
-Write-Host "[2/5] Generating canonical Windows branding"
-& python (Join-Path $Root "scripts\generate_app_icon.py") `
-    --output $IconFile `
-    --splash $SplashFile `
-    --msi-banner $MsiBannerFile `
-    --msi-logo $MsiLogoFile `
-    --version $Version
-if ($LASTEXITCODE -ne 0) { throw "Windows branding generation failed" }
-foreach ($Required in @($IconFile, $SplashFile, $MsiBannerFile, $MsiLogoFile)) {
-    if (-not (Test-Path $Required -PathType Leaf)) { throw "Windows branding output missing: $Required" }
+Write-Host "[2/5] Generating application icon"
+& python (Join-Path $Root "scripts\generate_app_icon.py") --output $IconFile
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $IconFile)) {
+    throw "Application icon generation failed"
 }
 
 Write-Host "[3/5] Building PyInstaller onedir application v$Version"
@@ -193,6 +105,7 @@ $env:ECOMMERCE_AGENT_BUILD_VERSION = $Version
 try {
     & python -m PyInstaller `
         --noconfirm `
+        --clean `
         --distpath $DistRoot `
         --workpath $WorkDir `
         (Join-Path $Root "packaging\EcommerceAgent.spec")
@@ -240,7 +153,9 @@ if (-not [string]::IsNullOrWhiteSpace($AzureTrustedSignFile) -and -not [string]:
     throw "Configure only one Velopack signing mode: VPK_AZURE_TRUSTED_SIGN_FILE or VPK_SIGN_PARAMS"
 }
 if (-not [string]::IsNullOrWhiteSpace($AzureTrustedSignFile)) {
-    if (-not (Test-Path $AzureTrustedSignFile)) { throw "Velopack Azure signing metadata file not found: $AzureTrustedSignFile" }
+    if (-not (Test-Path $AzureTrustedSignFile)) {
+        throw "Velopack Azure signing metadata file not found: $AzureTrustedSignFile"
+    }
     Write-Host "Velopack code signing enabled via Azure Artifact Signing metadata"
 }
 elseif (-not [string]::IsNullOrWhiteSpace($SignParams)) {
@@ -250,97 +165,29 @@ else {
     Write-Warning "Velopack package is unsigned. This is acceptable for development/E2E only; configure VPK_AZURE_TRUSTED_SIGN_FILE or VPK_SIGN_PARAMS before production distribution."
 }
 
-$CommonPackArgs = @(
+$PackArgs = @(
+    "pack",
+    "--outputDir", $VelopackDir,
     "--channel", $Channel,
     "--runtime", "win-x64",
     "--packId", $PackId,
     "--packVersion", $Version,
+    "--packDir", $AppDir,
     "--packAuthors", $PackAuthors,
     "--packTitle", $PackTitle,
     "--icon", $IconFile,
-    "--aumid", $PackId,
-    "--shortcuts", "Desktop,StartMenuRoot",
-    "--instLocation", "PerUser",
     "--mainExe", "EcommerceAgent.exe"
 )
 if (-not [string]::IsNullOrWhiteSpace($ReleaseNotesPath)) {
     $resolvedNotes = (Resolve-Path $ReleaseNotesPath).Path
-    $CommonPackArgs += @("--releaseNotes", $resolvedNotes)
+    $PackArgs += @("--releaseNotes", $resolvedNotes)
 }
-if (-not [string]::IsNullOrWhiteSpace($AzureTrustedSignFile)) {
-    $CommonPackArgs += @("--azureTrustedSignFile", (Resolve-Path $AzureTrustedSignFile).Path)
-}
-elseif (-not [string]::IsNullOrWhiteSpace($SignParams)) {
-    $CommonPackArgs += @("--signParams", $SignParams)
-}
+& dotnet tool run vpk -- @PackArgs
+if ($LASTEXITCODE -ne 0) { throw "Velopack pack failed: $LASTEXITCODE" }
 
-# MSI/WiX cabinet generation is by far the slowest packaging phase. Build it in
-# an isolated app copy so it can run concurrently with the normal feed and E2E
-# without racing code-signing or mutating the production package tree.
-$MsiProcess = $null
-if ($ShouldBuildMsi) {
-    New-Item -ItemType Directory -Force -Path $MsiBuildRoot, $MsiOutputDir | Out-Null
-    Copy-Item -Path $AppDir -Destination $MsiAppDir -Recurse -Force
-    $MsiPackArgs = @(
-        "pack",
-        "--outputDir", $MsiOutputDir,
-        "--packDir", $MsiAppDir,
-        "--splashImage", $SplashFile,
-        "--splashProgressColor", "#5DA7FF",
-        "--msi", "true",
-        "--msiBanner", $MsiBannerFile,
-        "--msiLogo", $MsiLogoFile,
-        "--noPortable", "true"
-    ) + $CommonPackArgs
-    Write-Host "  Starting branded MSI/WiX build in parallel"
-    $MsiProcess = Start-VpkProcess -WorkingDirectory $Root -VpkArgs $MsiPackArgs
-}
-else {
-    Write-Host "  Fast mode: MSI/WiX build skipped"
-}
-
-$PackArgs = @(
-    "pack",
-    "--outputDir", $VelopackDir,
-    "--packDir", $AppDir,
-    "--splashImage", $SplashFile,
-    "--splashProgressColor", "#5DA7FF"
-) + $CommonPackArgs
-
-$coreFailure = $null
-try {
-    & dotnet tool run vpk -- @PackArgs
-    if ($LASTEXITCODE -ne 0) { throw "Velopack pack failed: $LASTEXITCODE" }
-
-    if ($ShouldRunUpdateE2E) {
-        Write-Host "[release-gate] Running real Velopack old -> new update E2E while MSI builds"
-        & (Join-Path $Root "scripts\test_velopack_update_e2e.ps1") `
-            -Version $Version `
-            -AppDir $AppDir `
-            -Channel $Channel
-        if ($LASTEXITCODE -ne 0) { throw "Velopack end-to-end update test failed: $LASTEXITCODE" }
-    }
-    else {
-        Write-Host "[release-gate] Heavy Velopack E2E skipped for normal development build"
-    }
-}
-catch {
-    $coreFailure = $_
-}
-
-if ($null -ne $MsiProcess) {
-    if ($null -ne $coreFailure -and -not $MsiProcess.HasExited) {
-        $MsiProcess.Kill($true)
-    }
-    else {
-        $MsiProcess.WaitForExit()
-        if ($MsiProcess.ExitCode -ne 0 -and $null -eq $coreFailure) {
-            $coreFailure = [System.Exception]::new("Parallel Velopack MSI pack failed: $($MsiProcess.ExitCode)")
-        }
-    }
-}
-if ($null -ne $coreFailure) { throw $coreFailure }
-
+# Native artifact names are a Velopack implementation detail and may include
+# channel/runtime qualifiers. Setup/portable are discovered from the clean output
+# directory; the update package itself is resolved only through the release feed.
 $NativeSetup = Get-SingleVelopackArtifact -Directory $VelopackDir -Filter "$PackId*-Setup.exe" -Label "setup bundle"
 $NativePortable = Get-SingleVelopackArtifact -Directory $VelopackDir -Filter "$PackId*-Portable.zip" -Label "portable bundle"
 $ReleaseIndex = Join-Path $VelopackDir "releases.$Channel.json"
@@ -353,29 +200,26 @@ $FullPackage = Resolve-VelopackFullPackage `
 Copy-Item $NativeSetup.FullName $SetupAlias -Force
 Copy-Item $NativePortable.FullName $PortableAlias -Force
 
-$NativeMsi = $null
-if ($ShouldBuildMsi) {
-    $BuiltMsi = Get-SingleVelopackArtifact -Directory $MsiOutputDir -Filter "$PackId*.msi" -Label "MSI bundle"
-    $NativeMsiPath = Join-Path $VelopackDir $BuiltMsi.Name
-    Copy-Item $BuiltMsi.FullName $NativeMsiPath -Force
-    Copy-Item $BuiltMsi.FullName $MsiAlias -Force
-    Merge-VelopackMsiAsset `
-        -CoreOutputDir $VelopackDir `
-        -MsiOutputDir $MsiOutputDir `
-        -Channel $Channel `
-        -MsiFileName $BuiltMsi.Name
-    $NativeMsi = Get-Item $NativeMsiPath
+if ($ShouldRunUpdateE2E) {
+    Write-Host "[release-gate] Running real Velopack old -> new update E2E"
+    & (Join-Path $Root "scripts\test_velopack_update_e2e.ps1") `
+        -Version $Version `
+        -AppDir $AppDir `
+        -Channel $Channel
+    if ($LASTEXITCODE -ne 0) {
+        throw "Velopack end-to-end update test failed: $LASTEXITCODE"
+    }
+}
+else {
+    Write-Host "[release-gate] Heavy Velopack E2E skipped for normal development build"
 }
 
 Write-Host ""
 Write-Host "Windows package ready:"
 Write-Host "  Velopack feed : $VelopackDir"
 Write-Host "  Native setup  : $($NativeSetup.Name)"
-if ($null -ne $NativeMsi) { Write-Host "  Native MSI    : $($NativeMsi.Name)" }
-else { Write-Host "  Native MSI    : <skipped>" }
 Write-Host "  Native portable: $($NativePortable.Name)"
 Write-Host "  Full package  : $($FullPackage.Name)"
-Write-Host "  Installer EXE : $SetupAlias"
-if ($ShouldBuildMsi) { Write-Host "  Installer MSI : $MsiAlias" }
+Write-Host "  Installer     : $SetupAlias"
 Write-Host "  Portable      : $PortableAlias"
 Write-Host "  App dir       : $AppDir"

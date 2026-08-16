@@ -8,15 +8,11 @@ on:
     tags:
       - "v*"
     paths:
-      - "app/app_branding.py"
-      - "app/app_icon_data.py"
       - "app/runtime_paths.py"
       - "app/velopack_runtime.py"
       - "app/update_browser_gate.py"
       - "app/browser_session.py"
       - "gui/app_updater.py"
-      - "gui/update_panel.py"
-      - "gui/native_window_shell.py"
       - "gui/browser_session_manager.py"
       - "gui/resilient_app_updater.py"
       - "gui/update_runtime.py"
@@ -26,7 +22,6 @@ on:
       - "packaging/**"
       - "scripts/build_windows.ps1"
       - "scripts/test_velopack_update_e2e.ps1"
-      - "scripts/test_velopack_msi.ps1"
       - "scripts/generate_app_icon.py"
       - ".config/dotnet-tools.json"
       - "requirements.txt"
@@ -41,52 +36,11 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
-    timeout-minutes: 55
+    timeout-minutes: 50
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-
-      - name: Decide full installer gate
-        id: installer_gate
-        shell: pwsh
-        run: |
-          $full = $env:GITHUB_EVENT_NAME -eq "workflow_dispatch" -or $env:GITHUB_REF -like "refs/tags/v*"
-          if (-not $full -and $env:GITHUB_EVENT_NAME -eq "push") {
-            $before = "${{ github.event.before }}"
-            if (-not [string]::IsNullOrWhiteSpace($before) -and $before -notmatch '^0+$') {
-              $changed = @(git diff --name-only $before $env:GITHUB_SHA)
-            }
-            else {
-              $changed = @(git show --pretty="" --name-only $env:GITHUB_SHA)
-            }
-            $installerSensitive = @(
-              "app/app_branding.py",
-              "app/app_icon_data.py",
-              "packaging/",
-              "scripts/build_windows.ps1",
-              "scripts/test_velopack_msi.ps1",
-              "scripts/generate_app_icon.py",
-              ".config/dotnet-tools.json",
-              "requirements-build.txt",
-              "tests/test_windows_packaging_contract.py",
-              ".github/workflows/windows-package.yml"
-            )
-            foreach ($path in $changed) {
-              foreach ($prefix in $installerSensitive) {
-                if ($path -eq $prefix -or $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
-                  $full = $true
-                  break
-                }
-              }
-              if ($full) { break }
-            }
-          }
-          $value = $full.ToString().ToLowerInvariant()
-          "full_msi=$value" >> $env:GITHUB_OUTPUT
-          Write-Host "Full MSI/WiX gate: $value"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -102,7 +56,8 @@ jobs:
       - name: Install build dependencies
         shell: pwsh
         run: |
-          python -m pip install --disable-pip-version-check -r requirements.txt -r requirements-gui.txt -r requirements-build.txt
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-gui.txt -r requirements-build.txt
           dotnet tool restore
 
       - name: Velopack packaging contracts
@@ -114,31 +69,15 @@ jobs:
             tests/test_app_update_ui_contract.py `
             tests/test_updater_browser_shutdown_contract.py
 
-      - name: Build branded Velopack package
+      - name: Build Velopack installer and portable package
         shell: pwsh
-        run: |
-          if ("${{ steps.installer_gate.outputs.full_msi }}" -eq "true") {
-            .\scripts\build_windows.ps1
-          }
-          else {
-            .\scripts\build_windows.ps1 -SkipMsi
-          }
+        run: .\scripts\build_windows.ps1
 
-      - name: Silent branded MSI install and uninstall smoke test
-        if: ${{ steps.installer_gate.outputs.full_msi == 'true' }}
-        shell: pwsh
-        run: |
-          $expectedVersion = (Get-Content packaging\VERSION -Raw).Trim()
-          .\scripts\test_velopack_msi.ps1 `
-            -MsiPath "artifacts\EcommerceAgent-Setup-$expectedVersion.msi" `
-            -ExpectedVersion $expectedVersion `
-            -InstallDir (Join-Path $env:RUNNER_TEMP "ListingStudioMsiInstalled")
-
-      - name: Silent Velopack Setup smoke test
+      - name: Silent Velopack installer smoke test
         shell: pwsh
         run: |
           $setups = @(Get-ChildItem artifacts\EcommerceAgent-Setup-*.exe -File)
-          if ($setups.Count -ne 1) { throw "Expected exactly one friendly Velopack Setup artifact, found $($setups.Count)" }
+          if ($setups.Count -ne 1) { throw "Expected exactly one friendly Velopack installer artifact, found $($setups.Count)" }
           $setup = $setups[0]
           $expectedVersion = (Get-Content packaging\VERSION -Raw).Trim()
           $installDir = Join-Path $env:RUNNER_TEMP "ListingStudioVelopackInstalled"
@@ -146,7 +85,7 @@ jobs:
           $install = Start-Process -FilePath $setup.FullName -ArgumentList @(
             "--silent", "--installto", $installDir
           ) -Wait -PassThru
-          if ($install.ExitCode -ne 0) { throw "Velopack Setup install failed: $($install.ExitCode)" }
+          if ($install.ExitCode -ne 0) { throw "Velopack install failed: $($install.ExitCode)" }
 
           $stub = Join-Path $installDir "EcommerceAgent.exe"
           $update = Join-Path $installDir "Update.exe"
@@ -169,7 +108,6 @@ jobs:
           name: EcommerceAgent-Windows-${{ github.sha }}
           path: |
             artifacts/EcommerceAgent-Setup-*.exe
-            artifacts/EcommerceAgent-Setup-*.msi
             artifacts/EcommerceAgent-*-portable.zip
             artifacts/velopack/*
           if-no-files-found: error
