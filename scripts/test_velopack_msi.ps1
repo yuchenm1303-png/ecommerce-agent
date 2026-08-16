@@ -10,7 +10,7 @@ Set-StrictMode -Version Latest
 
 function Normalize-ComparablePath {
     param([Parameter(Mandatory = $true)][string]$Path)
-    return [IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
+    return [IO.Path]::GetFullPath($Path).TrimEnd([char[]]"\/")
 }
 
 function Write-MsiLogTail {
