@@ -30,6 +30,7 @@ on:
       - "tests/test_windows_packaging_contract.py"
       - "tests/test_velopack_update_contract.py"
       - "tests/test_app_update_ui_contract.py"
+      - "tests/test_updater_browser_shutdown_contract.py"
       - ".github/workflows/windows-package.yml"
 
 jobs:
@@ -69,14 +70,16 @@ jobs:
             tests/test_updater_browser_shutdown_contract.py
 
       - name: Build Velopack installer and portable package
-        shell: powershell
+        shell: pwsh
         run: .\scripts\build_windows.ps1
 
       - name: Silent Velopack installer smoke test
         shell: pwsh
         run: |
-          $setup = Get-ChildItem artifacts\EcommerceAgent-Setup-*.exe | Select-Object -First 1
-          if (-not $setup) { throw "Velopack installer artifact not found" }
+          $setups = @(Get-ChildItem artifacts\EcommerceAgent-Setup-*.exe -File)
+          if ($setups.Count -ne 1) { throw "Expected exactly one friendly Velopack installer artifact, found $($setups.Count)" }
+          $setup = $setups[0]
+          $expectedVersion = (Get-Content packaging\VERSION -Raw).Trim()
           $installDir = Join-Path $env:RUNNER_TEMP "ListingStudioVelopackInstalled"
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
           $install = Start-Process -FilePath $setup.FullName -ArgumentList @(
@@ -91,6 +94,10 @@ jobs:
           $versionFile = Join-Path $installDir "current\_internal\packaging\VERSION"
           foreach ($required in @($stub, $update, $gui, $worker, $versionFile)) {
             if (-not (Test-Path $required)) { throw "Velopack installed component missing: $required" }
+          }
+          $installedVersion = (Get-Content $versionFile -Raw).Trim()
+          if ($installedVersion -ne $expectedVersion) {
+            throw "Installed VERSION mismatch: expected=$expectedVersion actual=$installedVersion"
           }
           & $worker --self-test
           if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
