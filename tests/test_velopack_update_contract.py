@@ -101,3 +101,15 @@ def test_stable_publish_verifies_exact_local_and_remote_assets_without_guessing_
     assert "$env:native_portable" in PUBLISH
     assert '"Smirel.ListingStudio-Setup.exe"' not in PUBLISH
     assert '"Smirel.ListingStudio-Portable.zip"' not in PUBLISH
+
+
+def test_release_publication_is_transactional_and_test_releases_are_bounded() -> None:
+    assert "Stage Velopack Stable release as draft" in PUBLISH
+    assert "--publish false" in PUBLISH
+    assert "Verify complete draft before publication" in PUBLISH
+    assert "gh release edit $tag --draft=false --latest" in PUBLISH
+    assert "Stage prerelease Velopack assets as draft" in TEST_PUBLISH
+    assert "--pre true" in TEST_PUBLISH
+    assert "gh release edit $tag --draft=false --prerelease" in TEST_PUBLISH
+    assert "Prune old test prereleases" in TEST_PUBLISH
+    assert "Select-Object -Skip 3" in TEST_PUBLISH
