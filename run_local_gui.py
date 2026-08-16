@@ -74,11 +74,9 @@ def main() -> int:
     from gui.app_access import ensure_application_access, install_application_access
     from gui.resilient_app_updater import install_application_updater
     from gui.batch_card_responsive import install_batch_card_responsive
+    from gui.batch_individual_controls import install_batch_individual_controls
     from gui.batch_product_files import install_batch_product_files
-    from gui.cooperative_pause import (
-        install_cooperative_batch_job_controls,
-        install_cooperative_pause,
-    )
+    from gui.cooperative_pause import install_cooperative_pause
     from gui.batch_sku_spec_ui import install_batch_sku_spec_ui
     from gui.batch_url_editor import install_batch_url_editor
     from gui.batch_workspace_density import install_batch_workspace_density
@@ -174,7 +172,6 @@ def main() -> int:
     window.install_mode_workspace()
     install_batch_url_editor(window.batch_workspace)
     install_batch_workspace_density(window.batch_workspace)
-    install_cooperative_batch_job_controls(window.batch_workspace)
     install_batch_card_responsive(window.batch_workspace)
     install_workspace_mode_switch(window)
     install_frozen_process_router(window)
@@ -186,6 +183,7 @@ def main() -> int:
     install_batch_product_files(window)
     install_listing_offer_hardening(window)
     install_listing_photo_ownership(window)
+    install_batch_individual_controls(window.batch_workspace)
     install_single_top_compact(window)
     install_cooperative_pause(window)
     install_activity_presence(window)
