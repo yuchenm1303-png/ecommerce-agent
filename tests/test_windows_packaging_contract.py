@@ -122,11 +122,15 @@ def test_heavy_msi_and_e2e_work_are_parallel_and_e2e_omits_unused_outputs() -> N
     assert "$WorkDir" not in BUILD[BUILD.index("foreach ($Path in @(") : BUILD.index("New-Item -ItemType Directory")]
 
 
-def test_windows_ci_uses_fast_pushes_and_full_msi_manual_or_tag_gate() -> None:
-    assert "BUILD_FULL_MSI" in WINDOWS
+def test_windows_ci_uses_path_sensitive_fast_pushes_and_full_installer_gate() -> None:
+    assert "Decide full installer gate" in WINDOWS
+    assert "steps.installer_gate.outputs.full_msi" in WINDOWS
     assert ".\\scripts\\build_windows.ps1 -SkipMsi" in WINDOWS
-    assert "github.event_name == 'workflow_dispatch'" in WINDOWS
-    assert "startsWith(github.ref, 'refs/tags/v')" in WINDOWS
+    assert '$env:GITHUB_EVENT_NAME -eq "workflow_dispatch"' in WINDOWS
+    assert '$env:GITHUB_REF -like "refs/tags/v*"' in WINDOWS
+    assert '"scripts/build_windows.ps1"' in WINDOWS
+    assert '"scripts/test_velopack_msi.ps1"' in WINDOWS
+    assert '"packaging/"' in WINDOWS
     assert "python -m pip install --upgrade pip" not in WINDOWS
 
 
