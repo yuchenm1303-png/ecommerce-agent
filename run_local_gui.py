@@ -89,6 +89,7 @@ def main() -> int:
     from gui.frozen_process_router import install_frozen_process_router
     from gui.listing_offer_hardening import install_listing_offer_hardening
     from gui.listing_offer_support import install_listing_offer_support
+    from gui.listing_photo_ownership import install_listing_photo_ownership
     from gui.log_presenter import install_buffered_logs
     from gui.mode_toggle import install_workspace_mode_switch
     from gui.native_visual_style import install_native_visual_style
@@ -184,6 +185,7 @@ def main() -> int:
     install_batch_sku_spec_ui(window)
     install_batch_product_files(window)
     install_listing_offer_hardening(window)
+    install_listing_photo_ownership(window)
     install_single_top_compact(window)
     install_cooperative_pause(window)
     install_activity_presence(window)
