@@ -77,6 +77,44 @@ function Start-VpkProcess {
     return $process
 }
 
+function Merge-VelopackMsiAsset {
+    param(
+        [Parameter(Mandatory = $true)][string]$CoreOutputDir,
+        [Parameter(Mandatory = $true)][string]$MsiOutputDir,
+        [Parameter(Mandatory = $true)][string]$Channel,
+        [Parameter(Mandatory = $true)][string]$MsiFileName
+    )
+
+    # vpk upload does not scan arbitrary files in outputDir; it reads
+    # assets.<channel>.json. The MSI is built by an isolated parallel vpk pack,
+    # so copy its own native asset record into the canonical build manifest.
+    $coreManifest = Join-Path $CoreOutputDir "assets.$Channel.json"
+    $msiManifest = Join-Path $MsiOutputDir "assets.$Channel.json"
+    foreach ($required in @($coreManifest, $msiManifest)) {
+        if (-not (Test-Path $required -PathType Leaf)) {
+            throw "Velopack build asset manifest missing: $required"
+        }
+    }
+
+    $coreAssets = @(Get-Content $coreManifest -Raw -Encoding UTF8 | ConvertFrom-Json)
+    $msiAssets = @(Get-Content $msiManifest -Raw -Encoding UTF8 | ConvertFrom-Json)
+    $msiRecord = @($msiAssets | Where-Object {
+        [string]$_.RelativeFileName -eq $MsiFileName
+    })
+    if ($msiRecord.Count -ne 1) {
+        throw "Parallel MSI manifest must contain exactly one '$MsiFileName' record; found $($msiRecord.Count)"
+    }
+    $existingMsi = @($coreAssets | Where-Object {
+        [string]::Equals([IO.Path]::GetExtension([string]$_.RelativeFileName), ".msi", [StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($existingMsi.Count -ne 0) {
+        throw "Canonical Velopack asset manifest unexpectedly already contains MSI records"
+    }
+
+    @($coreAssets + $msiRecord[0]) | ConvertTo-Json -Depth 8 | Set-Content $coreManifest -Encoding utf8
+    Write-Host "  Registered parallel MSI in canonical Velopack upload manifest: $MsiFileName"
+}
+
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = (Get-Content (Join-Path $Root "packaging\VERSION") -Raw).Trim()
@@ -321,6 +359,11 @@ if ($ShouldBuildMsi) {
     $NativeMsiPath = Join-Path $VelopackDir $BuiltMsi.Name
     Copy-Item $BuiltMsi.FullName $NativeMsiPath -Force
     Copy-Item $BuiltMsi.FullName $MsiAlias -Force
+    Merge-VelopackMsiAsset `
+        -CoreOutputDir $VelopackDir `
+        -MsiOutputDir $MsiOutputDir `
+        -Channel $Channel `
+        -MsiFileName $BuiltMsi.Name
     $NativeMsi = Get-Item $NativeMsiPath
 }
 
