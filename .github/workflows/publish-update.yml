@@ -274,18 +274,30 @@ jobs:
         run: |
           $tag = "v$env:UPDATE_VERSION"
           $raw = gh release view $tag --json isDraft,tagName 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            $global:LASTEXITCODE = 0
-            Write-Host "No release exists for cleanup: $tag"
-            exit 0
-          }
-          $release = $raw | ConvertFrom-Json
-          if ($release.isDraft) {
-            gh release delete $tag --yes --cleanup-tag
-            if ($LASTEXITCODE -ne 0) { throw "Failed to cleanup draft $tag" }
+          if ($LASTEXITCODE -eq 0) {
+            $release = $raw | ConvertFrom-Json
+            if ($release.isDraft) {
+              gh release delete $tag --yes
+              if ($LASTEXITCODE -ne 0) { throw "Failed to delete draft release $tag" }
+            }
+            else {
+              Write-Warning "Release $tag is already public; automatic cleanup intentionally refused"
+              exit 0
+            }
           }
           else {
-            Write-Warning "Release $tag is already public; automatic cleanup intentionally refused"
+            $global:LASTEXITCODE = 0
+            Write-Host "No draft release exists for cleanup: $tag"
+          }
+
+          $remoteTag = (& git ls-remote --tags origin "refs/tags/$tag" 2>$null | Out-String).Trim()
+          $global:LASTEXITCODE = 0
+          if (-not [string]::IsNullOrWhiteSpace($remoteTag)) {
+            git push origin ":refs/tags/$tag"
+            if ($LASTEXITCODE -ne 0) { throw "Failed to delete orphan tag $tag" }
+          }
+          else {
+            Write-Host "No orphan tag exists for cleanup: $tag"
           }
 
       - name: Upload published files to workflow run
