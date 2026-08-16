@@ -90,18 +90,34 @@ jobs:
         run: |
           $version = "${{ steps.build.outputs.version }}"
           $dir = "artifacts\velopack"
+          $feedPath = Join-Path $dir "releases.$env:VELOPACK_CHANNEL.json"
+          if (-not (Test-Path $feedPath)) { throw "Velopack prerelease feed missing: $feedPath" }
+          $feed = Get-Content $feedPath -Raw -Encoding UTF8 | ConvertFrom-Json
+          $target = @($feed.Assets | Where-Object {
+            [string]$_.PackageId -eq "Smirel.ListingStudio" -and
+            [string]$_.Version -eq $version -and
+            [string]$_.Type -eq "Full"
+          })
+          if ($target.Count -ne 1) { throw "Velopack prerelease feed does not contain exactly one target Full release" }
+          $targetFull = [string]$target[0].FileName
+          if ([string]::IsNullOrWhiteSpace($targetFull) -or [IO.Path]::GetFileName($targetFull) -ne $targetFull) {
+            throw "Unsafe prerelease target package filename: $targetFull"
+          }
+          $targetPath = Join-Path $dir $targetFull
+          if (-not (Test-Path $targetPath -PathType Leaf)) { throw "Prerelease target package missing: $targetPath" }
+          if ([int64]$target[0].Size -ne [int64](Get-Item $targetPath).Length) { throw "Prerelease target package size mismatch" }
+
           $nativeSetup = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Setup.exe")
           $nativePortable = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Portable.zip")
           if ($nativeSetup.Count -ne 1) { throw "Expected exactly one native test Setup, found $($nativeSetup.Count)" }
           if ($nativePortable.Count -ne 1) { throw "Expected exactly one native test Portable, found $($nativePortable.Count)" }
           foreach ($required in @(
-            "artifacts\velopack\Smirel.ListingStudio-$version-full.nupkg",
-            "artifacts\velopack\releases.$env:VELOPACK_CHANNEL.json",
             "artifacts\EcommerceAgent-Setup-$version.exe",
             "artifacts\EcommerceAgent-$version-portable.zip"
           )) {
-            if (-not (Test-Path $required)) { throw "Prerelease asset missing before publish: $required" }
+            if (-not (Test-Path $required)) { throw "Prerelease friendly asset missing before publish: $required" }
           }
+          "target_full=$targetFull" >> $env:GITHUB_ENV
           "native_setup=$($nativeSetup[0].Name)" >> $env:GITHUB_ENV
           "native_portable=$($nativePortable[0].Name)" >> $env:GITHUB_ENV
 
@@ -116,9 +132,10 @@ jobs:
             "--silent", "--installto", $installDir
           ) -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Velopack install failed: $($process.ExitCode)" }
+          $stub = Join-Path $installDir "EcommerceAgent.exe"
           $worker = Join-Path $installDir "current\EcommerceAgentWorker.exe"
           $versionFile = Join-Path $installDir "current\_internal\packaging\VERSION"
-          foreach ($required in @($worker, $versionFile, (Join-Path $installDir "Update.exe"))) {
+          foreach ($required in @($stub, $worker, $versionFile, (Join-Path $installDir "Update.exe"))) {
             if (-not (Test-Path $required)) { throw "Installed component missing: $required" }
           }
           & $worker --self-test
@@ -149,19 +166,19 @@ jobs:
       - name: Verify complete prerelease draft
         shell: pwsh
         run: |
-          $version = "${{ steps.build.outputs.version }}"
           $tag = "${{ steps.build.outputs.tag }}"
           $draft = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($draft.tagName -ne $tag) { throw "Test draft tag mismatch" }
           if (-not $draft.isDraft) { throw "Test release became public before verification" }
           if (-not $draft.isPrerelease) { throw "Test draft is not marked prerelease" }
           $names = @($draft.assets | ForEach-Object { $_.name })
           foreach ($expected in @(
-            "Smirel.ListingStudio-$version-full.nupkg",
+            $env:target_full,
             "releases.$env:VELOPACK_CHANNEL.json",
             $env:native_setup,
             $env:native_portable,
-            "EcommerceAgent-Setup-$version.exe",
-            "EcommerceAgent-$version-portable.zip"
+            "EcommerceAgent-Setup-${{ steps.build.outputs.version }}.exe",
+            "EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip"
           )) {
             if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
               throw "Draft prerelease asset missing: $expected"
@@ -178,19 +195,19 @@ jobs:
       - name: Verify published prerelease contract
         shell: pwsh
         run: |
-          $version = "${{ steps.build.outputs.version }}"
           $tag = "${{ steps.build.outputs.tag }}"
           $release = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($release.tagName -ne $tag) { throw "Published test tag mismatch" }
           if ($release.isDraft) { throw "Test release is still a draft" }
           if (-not $release.isPrerelease) { throw "Test release was not published as prerelease" }
           $names = @($release.assets | ForEach-Object { $_.name })
           foreach ($expected in @(
-            "Smirel.ListingStudio-$version-full.nupkg",
+            $env:target_full,
             "releases.$env:VELOPACK_CHANNEL.json",
             $env:native_setup,
             $env:native_portable,
-            "EcommerceAgent-Setup-$version.exe",
-            "EcommerceAgent-$version-portable.zip"
+            "EcommerceAgent-Setup-${{ steps.build.outputs.version }}.exe",
+            "EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip"
           )) {
             if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
               throw "Published prerelease asset missing: $expected"
