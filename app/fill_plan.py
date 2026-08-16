@@ -170,17 +170,60 @@ def _unit_context_texts(live_field: dict[str, Any]) -> list[str]:
     return output
 
 
-def _fixed_qualifier_rendered(live_field: dict[str, Any], qualifier: str) -> bool:
-    """Return True only when the exact unit token is visibly local to this field."""
+def _qualifier_render_aliases(qualifier: str) -> tuple[tuple[str, bool], ...]:
+    """Return conservative visual aliases for one already-approved unit token.
 
-    token = qualifier.strip()
+    Parenthetical one-letter annotations are a common display distinction rather
+    than a separate Makro qualifier control: ``dB(A)`` may be rendered as ``dB``
+    or ``dBA`` beside a numeric input. Only that narrow shape is normalized. The
+    boolean marks the bare-base alias so it can explicitly reject a different
+    parenthetical annotation such as ``dB(C)``.
+    """
+
+    token = re.sub(r"\s+", " ", qualifier.strip())
     if not token:
-        return False
-    pattern = re.compile(
-        rf"(?<![0-9A-Za-z_]){re.escape(token)}(?![0-9A-Za-z_])",
-        re.IGNORECASE,
+        return ()
+    aliases: list[tuple[str, bool]] = [(token, False)]
+    match = re.fullmatch(
+        r"(?P<base>[A-Za-z][A-Za-z0-9%°/._-]*?)\s*\(\s*(?P<annotation>[A-Za-z])\s*\)",
+        token,
     )
-    return any(pattern.search(text) for text in _unit_context_texts(live_field))
+    if match:
+        base = match.group("base").strip()
+        annotation = match.group("annotation").strip()
+        aliases.append((f"{base}{annotation}", False))
+        aliases.append((base, True))
+
+    output: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+    for alias, bare_base in aliases:
+        key = alias.casefold()
+        if key and key not in seen:
+            seen.add(key)
+            output.append((alias, bare_base))
+    return tuple(output)
+
+
+def _fixed_qualifier_rendered(live_field: dict[str, Any], qualifier: str) -> bool:
+    """Return True only when a deterministic unit alias is visibly field-local."""
+
+    aliases = _qualifier_render_aliases(qualifier)
+    if not aliases:
+        return False
+    texts = _unit_context_texts(live_field)
+    for alias, bare_base in aliases:
+        tail_guard = r"(?![0-9A-Za-z_])"
+        if bare_base:
+            # dB(A) may map to a bare `dB` display, but must never silently accept
+            # another explicit weighting such as dB(C).
+            tail_guard = r"(?![0-9A-Za-z_]|\s*\()"
+        pattern = re.compile(
+            rf"(?<![0-9A-Za-z_]){re.escape(alias)}{tail_guard}",
+            re.IGNORECASE,
+        )
+        if any(pattern.search(text) for text in texts):
+            return True
+    return False
 
 
 _UNIT_SCALE: dict[str, tuple[str, Decimal]] = {
