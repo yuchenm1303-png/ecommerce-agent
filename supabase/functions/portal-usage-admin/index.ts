@@ -53,7 +53,7 @@ Deno.serve(async (req: Request) => {
     if (accessError) return json(req, { error: "access_check_failed" }, 503);
     if (!access?.enabled || !access?.is_admin) return json(req, { error: "not_authorized" }, 403);
 
-    const { data, error } = await admin.rpc("get_listing_usage_admin_snapshot");
+    const { data, error } = await admin.rpc("get_listing_usage_admin_snapshot", { p_caller: user.id });
     if (error) return json(req, { error: "usage_snapshot_failed" }, 503);
     return json(req, data ?? {});
   } catch {
