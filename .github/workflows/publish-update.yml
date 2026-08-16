@@ -131,25 +131,41 @@ jobs:
         shell: pwsh
         run: |
           $dir = "artifacts\velopack"
+          $feedPath = Join-Path $dir "releases.$env:VELOPACK_CHANNEL.json"
+          if (-not (Test-Path $feedPath)) { throw "Velopack feed missing: $feedPath" }
+          $feed = Get-Content $feedPath -Raw -Encoding UTF8 | ConvertFrom-Json
+          $target = @($feed.Assets | Where-Object {
+            [string]$_.PackageId -eq "Smirel.ListingStudio" -and
+            [string]$_.Version -eq $env:UPDATE_VERSION -and
+            [string]$_.Type -eq "Full"
+          })
+          if ($target.Count -ne 1) { throw "Velopack feed does not contain exactly one target Full release" }
+          $targetFull = [string]$target[0].FileName
+          if ([string]::IsNullOrWhiteSpace($targetFull) -or [IO.Path]::GetFileName($targetFull) -ne $targetFull) {
+            throw "Unsafe target package filename in Velopack feed: $targetFull"
+          }
+          $targetPath = Join-Path $dir $targetFull
+          if (-not (Test-Path $targetPath -PathType Leaf)) { throw "Feed target package missing: $targetPath" }
+          if ([int64]$target[0].Size -ne [int64](Get-Item $targetPath).Length) {
+            throw "Feed target package size mismatch: $targetFull"
+          }
+
           $nativeSetup = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Setup.exe")
           $nativePortable = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Portable.zip")
           if ($nativeSetup.Count -ne 1) { throw "Expected exactly one native Velopack Setup, found $($nativeSetup.Count)" }
           if ($nativePortable.Count -ne 1) { throw "Expected exactly one native Velopack Portable, found $($nativePortable.Count)" }
-          foreach ($required in @(
-            "artifacts\velopack\Smirel.ListingStudio-$env:UPDATE_VERSION-full.nupkg",
-            "artifacts\velopack\releases.$env:VELOPACK_CHANNEL.json",
-            "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe",
-            "artifacts\EcommerceAgent-$env:UPDATE_VERSION-portable.zip"
-          )) {
-            if (-not (Test-Path $required)) { throw "Release asset missing before publish: $required" }
-          }
-          $feed = Get-Content "artifacts\velopack\releases.$env:VELOPACK_CHANNEL.json" -Raw -Encoding UTF8 | ConvertFrom-Json
-          $target = @($feed.Assets | Where-Object {
-            $_.PackageId -eq "Smirel.ListingStudio" -and $_.Version -eq $env:UPDATE_VERSION -and $_.Type -eq "Full"
-          })
-          if ($target.Count -ne 1) { throw "Velopack feed does not contain exactly one target Full release" }
+
+          $friendlySetup = Get-Item "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe"
+          $friendlyPortable = Get-Item "artifacts\EcommerceAgent-$env:UPDATE_VERSION-portable.zip"
+          $friendlySha = (Get-FileHash $friendlySetup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          "target_full=$targetFull" >> $env:GITHUB_ENV
           "native_setup=$($nativeSetup[0].Name)" >> $env:GITHUB_ENV
           "native_portable=$($nativePortable[0].Name)" >> $env:GITHUB_ENV
+          "friendly_setup_sha=$friendlySha" >> $env:GITHUB_ENV
+          "friendly_setup_size=$($friendlySetup.Length)" >> $env:GITHUB_ENV
+          Write-Host "Velopack target Full asset: $targetFull"
+          Write-Host "Friendly installer SHA256: $friendlySha"
 
       - name: Silent Velopack installer smoke test
         shell: pwsh
@@ -162,10 +178,11 @@ jobs:
             "--silent", "--installto", $installDir
           ) -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Velopack install failed: $($process.ExitCode)" }
+          $stub = Join-Path $installDir "EcommerceAgent.exe"
           $versionFile = Join-Path $installDir "current\_internal\packaging\VERSION"
           $worker = Join-Path $installDir "current\EcommerceAgentWorker.exe"
           $update = Join-Path $installDir "Update.exe"
-          foreach ($required in @($versionFile, $worker, $update)) {
+          foreach ($required in @($stub, $versionFile, $worker, $update)) {
             if (-not (Test-Path $required)) { throw "Installed component missing: $required" }
           }
           if ((Get-Content $versionFile -Raw).Trim() -ne $env:UPDATE_VERSION) {
@@ -199,13 +216,13 @@ jobs:
         shell: pwsh
         run: |
           $tag = "v$env:UPDATE_VERSION"
-          $draft = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          $draft = gh release view $tag --json databaseId,tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
           if ($draft.tagName -ne $tag) { throw "Draft tag mismatch" }
           if (-not $draft.isDraft) { throw "Velopack release became public before verification" }
           if ($draft.isPrerelease) { throw "Stable draft unexpectedly marked prerelease" }
           $names = @($draft.assets | ForEach-Object { $_.name })
           foreach ($expected in @(
-            "Smirel.ListingStudio-$env:UPDATE_VERSION-full.nupkg",
+            $env:target_full,
             "releases.$env:VELOPACK_CHANNEL.json",
             $env:native_setup,
             $env:native_portable,
@@ -216,6 +233,12 @@ jobs:
               throw "Draft release asset missing: $expected"
             }
           }
+
+          $apiRelease = gh api "repos/$env:GITHUB_REPOSITORY/releases/$($draft.databaseId)" | ConvertFrom-Json
+          $friendly = @($apiRelease.assets | Where-Object { $_.name -eq "EcommerceAgent-Setup-$env:UPDATE_VERSION.exe" })
+          if ($friendly.Count -ne 1) { throw "Draft friendly installer asset is not unique" }
+          if ([int64]$friendly[0].size -ne [int64]$env:friendly_setup_size) { throw "Draft friendly installer size mismatch" }
+          if ([string]$friendly[0].digest -ne "sha256:$env:friendly_setup_sha") { throw "Draft friendly installer SHA256 mismatch" }
 
       - name: Publish verified Stable release
         shell: pwsh
@@ -234,7 +257,7 @@ jobs:
           if ($release.isPrerelease) { throw "Stable release unexpectedly marked prerelease" }
           $names = @($release.assets | ForEach-Object { $_.name })
           foreach ($expected in @(
-            "Smirel.ListingStudio-$env:UPDATE_VERSION-full.nupkg",
+            $env:target_full,
             "releases.$env:VELOPACK_CHANNEL.json",
             $env:native_setup,
             $env:native_portable,
