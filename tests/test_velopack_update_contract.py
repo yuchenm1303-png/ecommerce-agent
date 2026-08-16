@@ -11,6 +11,7 @@ BROWSER_MANAGER = (ROOT / "gui" / "browser_session_manager.py").read_text(encodi
 UPDATE_RUNTIME = (ROOT / "gui" / "update_runtime.py").read_text(encoding="utf-8")
 BUILD = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
 E2E = (ROOT / "scripts" / "test_velopack_update_e2e.ps1").read_text(encoding="utf-8")
+RELEASE_TAG = (ROOT / "scripts" / "prepare_release_tag.ps1").read_text(encoding="utf-8")
 PUBLISH = (ROOT / ".github" / "workflows" / "publish-update.yml").read_text(encoding="utf-8")
 TEST_PUBLISH = (ROOT / ".github" / "workflows" / "publish-test-build.yml").read_text(encoding="utf-8")
 PORTAL_DOWNLOAD = (ROOT / "supabase" / "functions" / "portal-download" / "index.ts").read_text(encoding="utf-8")
@@ -66,17 +67,23 @@ def test_resilient_module_is_only_a_compatibility_import() -> None:
     assert "class ApplicationUpdater" not in SHIM
 
 
-def test_release_build_and_publish_are_native_velopack() -> None:
+def test_release_build_is_native_velopack_but_github_publication_is_explicit() -> None:
     assert "test_velopack_update_e2e.ps1" in BUILD
     assert "Updater.spec" not in BUILD
     assert "installer.iss" not in BUILD
     assert '"--msi", "true"' in BUILD
-    assert "dotnet tool run vpk -- upload github" in PUBLISH
     assert "artifacts\\velopack" in PUBLISH
     assert "releases.$env:VELOPACK_CHANNEL.json" in PUBLISH
     assert "update.json" not in PUBLISH
     assert "Inno" not in PUBLISH
-    assert "dotnet tool run vpk -- upload github" in TEST_PUBLISH
+    assert "dotnet tool run vpk -- upload github" not in PUBLISH
+    assert "dotnet tool run vpk -- upload github" not in TEST_PUBLISH
+    assert "gh release create" in PUBLISH
+    assert "gh release upload" in PUBLISH
+    assert "gh release create" in TEST_PUBLISH
+    assert "gh release upload" in TEST_PUBLISH
+    assert "--targetCommitish" not in PUBLISH
+    assert "--targetCommitish" not in TEST_PUBLISH
 
 
 def test_real_e2e_is_old_velopack_to_new_velopack_and_real_qt_gui() -> None:
@@ -97,53 +104,77 @@ def test_real_e2e_is_old_velopack_to_new_velopack_and_real_qt_gui() -> None:
     assert "Velopack E2E passed" in E2E
 
 
-def test_stable_publish_derives_all_native_update_assets_from_feed_or_output() -> None:
+def test_stable_publish_derives_native_update_assets_from_feed_or_output() -> None:
     assert 'Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Setup.exe"' in PUBLISH
     assert 'Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*.msi"' in PUBLISH
     assert 'Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Portable.zip"' in PUBLISH
     assert '$targetFull = [string]$target[0].FileName' in PUBLISH
     assert '"target_full=$targetFull"' in PUBLISH
-    assert "$env:target_full" in PUBLISH
     assert '"Smirel.ListingStudio-$env:UPDATE_VERSION-full.nupkg"' not in PUBLISH
     assert '"Smirel.ListingStudio-Setup.exe"' not in PUBLISH
     assert '"Smirel.ListingStudio-Portable.zip"' not in PUBLISH
 
 
-def test_release_identity_conflicts_fail_before_expensive_builds() -> None:
+def test_release_snapshot_keeps_workflows_on_default_branch_and_app_on_source() -> None:
+    assert 'Invoke-Git @("read-tree", "--reset", "-u", $sourceResolved)' in RELEASE_TAG
+    assert 'git rm -r -q --ignore-unmatch -- ".github/workflows"' in RELEASE_TAG
+    assert 'Invoke-Git @("checkout", $DefaultRef, "--", ".github/workflows")' in RELEASE_TAG
+    assert 'Set-Content "packaging\\VERSION" $Version' in RELEASE_TAG
+    assert 'git diff --name-only $DefaultRef $snapshotSha -- ".github/workflows"' in RELEASE_TAG
+    assert "Release snapshot unexpectedly changes workflow files" in RELEASE_TAG
+    assert "Release snapshot differs from source outside workflow/version metadata" in RELEASE_TAG
+    assert 'Invoke-Git @("tag", "-a", $Tag' in RELEASE_TAG
+    assert 'Invoke-Git @("push", "origin", "refs/tags/$Tag")' in RELEASE_TAG
+    assert '"snapshot_sha=$snapshotSha"' in RELEASE_TAG
+
+
+def test_release_identity_and_github_permissions_fail_before_expensive_builds() -> None:
     assert "Preflight Stable release identity" in PUBLISH
     assert '$releaseName = "$env:UPDATE_TITLE v$env:UPDATE_VERSION"' in PUBLISH
+    assert "git ls-remote --tags origin" in PUBLISH
     assert 'gh release list --limit 1000 --json name,tagName,isDraft,isPrerelease' in PUBLISH
     assert '"RELEASE_NAME=$releaseName"' in PUBLISH
-    assert '--releaseName "$env:RELEASE_NAME"' in PUBLISH
-    assert "Draft release name mismatch" in PUBLISH
-    assert "Published release name mismatch" in PUBLISH
-    assert PUBLISH.index("Preflight Stable release identity") < PUBLISH.index("Set up Python")
+    assert "Prepare workflow-safe release tag" in PUBLISH
+    assert "Create empty Stable draft before build" in PUBLISH
+    assert "prepare_release_tag.ps1" in PUBLISH
+    assert "gh release create $tag" in PUBLISH
+    assert "--verify-tag" in PUBLISH
+    assert "GitHub draft creation preflight passed before heavy build" in PUBLISH
+    assert PUBLISH.index("Create empty Stable draft before build") < PUBLISH.index("Set up Python")
+    assert PUBLISH.index("Create empty Stable draft before build") < PUBLISH.index("Build and run real Velopack update E2E")
 
-    assert "Resolve and preflight test build identity" in TEST_PUBLISH
+    assert "Resolve and preflight test release identity" in TEST_PUBLISH
     assert '#${{ github.run_number }}' in TEST_PUBLISH
-    assert '"release_name=$releaseName"' in TEST_PUBLISH
-    assert '--releaseName "${{ steps.build.outputs.release_name }}"' in TEST_PUBLISH
-    assert "Test draft release name mismatch" in TEST_PUBLISH
-    assert "Published test release name mismatch" in TEST_PUBLISH
-    assert TEST_PUBLISH.index("Resolve and preflight test build identity") < TEST_PUBLISH.index("Set up Python")
+    assert "Prepare workflow-safe test tag" in TEST_PUBLISH
+    assert "Create empty prerelease draft before build" in TEST_PUBLISH
+    assert "prepare_release_tag.ps1" in TEST_PUBLISH
+    assert "gh release create $tag" in TEST_PUBLISH
+    assert "--verify-tag" in TEST_PUBLISH
+    assert "--prerelease" in TEST_PUBLISH
+    assert TEST_PUBLISH.index("Create empty prerelease draft before build") < TEST_PUBLISH.index("Set up Python")
+    assert TEST_PUBLISH.index("Create empty prerelease draft before build") < TEST_PUBLISH.index("Build branded test package")
 
 
-def test_release_publication_is_transactional_and_checks_branded_msi_digest() -> None:
-    assert "Stage Velopack Stable release as draft" in PUBLISH
-    assert "--publish false" in PUBLISH
+def test_release_publication_is_transactional_and_checks_branded_digests() -> None:
+    assert "Create empty Stable draft before build" in PUBLISH
+    assert "Upload verified assets to existing Stable draft" in PUBLISH
     assert "Verify complete draft before publication" in PUBLISH
     assert "friendly_msi_sha" in PUBLISH
     assert "friendly_msi_size" in PUBLISH
+    assert "friendly_setup_sha" in PUBLISH
+    assert "friendly_setup_size" in PUBLISH
     assert '"sha256:$env:friendly_msi_sha"' in PUBLISH
-    assert "EcommerceAgent-Setup-$env:UPDATE_VERSION.msi" in PUBLISH
+    assert '"sha256:$env:friendly_setup_sha"' in PUBLISH
     assert "gh release edit $tag --draft=false --latest" in PUBLISH
-    assert "Cleanup failed Stable draft" in PUBLISH
+    assert "Cleanup failed Stable draft and tag" in PUBLISH
     assert "gh release delete $tag --yes --cleanup-tag" in PUBLISH
-    assert "Stage prerelease Velopack assets as draft" in TEST_PUBLISH
+    assert 'git push origin ":refs/tags/$tag"' in PUBLISH
+
+    assert "Create empty prerelease draft before build" in TEST_PUBLISH
+    assert "Upload verified assets to existing prerelease draft" in TEST_PUBLISH
     assert "EcommerceAgent-Setup-${{ steps.build.outputs.version }}.msi" in TEST_PUBLISH
-    assert "$env:target_full" in TEST_PUBLISH
     assert "gh release edit $tag --draft=false --prerelease" in TEST_PUBLISH
-    assert "Cleanup failed prerelease draft" in TEST_PUBLISH
+    assert "Cleanup failed prerelease draft and tag" in TEST_PUBLISH
     assert "Prune old test prereleases" in TEST_PUBLISH
     assert "Select-Object -Skip 3" in TEST_PUBLISH
 
