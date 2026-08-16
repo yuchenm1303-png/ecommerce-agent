@@ -1,33 +1,55 @@
 param(
     [Parameter(Mandatory = $true)][string]$Version,
-    [Parameter(Mandatory = $true)][string]$AppDir
+    [Parameter(Mandatory = $true)][string]$AppDir,
+    [string]$Channel = "win-x64-stable"
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+function Get-SingleVelopackArtifact {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$Filter,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $Items = @(Get-ChildItem -Path $Directory -File -Filter $Filter -ErrorAction Stop)
+    if ($Items.Count -ne 1) {
+        $Names = if ($Items.Count -eq 0) { "<none>" } else { ($Items.Name -join ", ") }
+        throw "Expected exactly one Velopack E2E $Label matching '$Filter', found $($Items.Count): $Names"
+    }
+    return $Items[0]
+}
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $AppDir = (Resolve-Path $AppDir).Path
 $ProbeRoot = Join-Path $Root "build\velopack-e2e"
 $FeedDir = Join-Path $ProbeRoot "feed"
 $InstallDir = Join-Path $ProbeRoot "install"
+$OldAppDir = Join-Path $ProbeRoot "old-app"
 $Marker = Join-Path $ProbeRoot "real-gui-relaunch.json"
 $IconFile = Join-Path $Root "packaging\app_icon.ico"
 $PackId = "Smirel.ListingStudio.E2E"
-$Channel = "win-e2e"
 $OldVersion = "0.0.1"
 
 if (Test-Path $ProbeRoot) { Remove-Item $ProbeRoot -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $ProbeRoot, $FeedDir | Out-Null
+Copy-Item -Path $AppDir -Destination $OldAppDir -Recurse -Force
+$OldEmbeddedVersion = Join-Path $OldAppDir "_internal\packaging\VERSION"
+if (-not (Test-Path $OldEmbeddedVersion)) {
+    throw "Velopack E2E old app VERSION file missing: $OldEmbeddedVersion"
+}
+Set-Content -Path $OldEmbeddedVersion -Value $OldVersion -Encoding ascii -NoNewline
 
-function Invoke-E2EPack([string]$PackVersion) {
+function Invoke-E2EPack([string]$PackVersion, [string]$PackDirectory) {
     & dotnet tool run vpk -- pack `
         --outputDir $FeedDir `
         --channel $Channel `
         --runtime win-x64 `
         --packId $PackId `
         --packVersion $PackVersion `
-        --packDir $AppDir `
+        --packDir $PackDirectory `
         --packAuthors Smirel `
         --packTitle "Listing Studio E2E" `
         --icon $IconFile `
@@ -36,25 +58,39 @@ function Invoke-E2EPack([string]$PackVersion) {
 }
 
 Write-Host "  [E2E 1/4] Pack and install old Velopack version $OldVersion"
-Invoke-E2EPack $OldVersion
-$Setup = Join-Path $FeedDir "$PackId-Setup.exe"
-if (-not (Test-Path $Setup)) { throw "Velopack E2E old Setup missing: $Setup" }
-$Install = Start-Process -FilePath $Setup -ArgumentList @("--silent", "--installto", $InstallDir) -Wait -PassThru
+Invoke-E2EPack $OldVersion $OldAppDir
+$Setup = Get-SingleVelopackArtifact -Directory $FeedDir -Filter "$PackId*-Setup.exe" -Label "old setup"
+$Install = Start-Process -FilePath $Setup.FullName -ArgumentList @("--silent", "--installto", $InstallDir) -Wait -PassThru
 if ($Install.ExitCode -ne 0) { throw "Velopack E2E old install failed: $($Install.ExitCode)" }
 
 $RootGui = Join-Path $InstallDir "EcommerceAgent.exe"
 $UpdateExe = Join-Path $InstallDir "Update.exe"
 $CurrentGui = Join-Path $InstallDir "current\EcommerceAgent.exe"
-foreach ($Required in @($RootGui, $UpdateExe, $CurrentGui)) {
+$InstalledVersionFile = Join-Path $InstallDir "current\_internal\packaging\VERSION"
+foreach ($Required in @($RootGui, $UpdateExe, $CurrentGui, $InstalledVersionFile)) {
     if (-not (Test-Path $Required)) { throw "Velopack E2E installed component missing: $Required" }
+}
+$InstalledOldVersion = (Get-Content $InstalledVersionFile -Raw).Trim()
+if ($InstalledOldVersion -ne $OldVersion) {
+    throw "Velopack E2E old install VERSION mismatch: expected=$OldVersion actual=$InstalledOldVersion"
 }
 
 Write-Host "  [E2E 2/4] Add target v$Version to the same local Velopack feed"
-Invoke-E2EPack $Version
+Invoke-E2EPack $Version $AppDir
 $Index = Join-Path $FeedDir "releases.$Channel.json"
-$TargetPackage = Join-Path $FeedDir "$PackId-$Version-full.nupkg"
-foreach ($Required in @($Index, $TargetPackage)) {
-    if (-not (Test-Path $Required)) { throw "Velopack E2E target feed missing: $Required" }
+if (-not (Test-Path $Index)) { throw "Velopack E2E release index missing: $Index" }
+$TargetPackage = Get-SingleVelopackArtifact -Directory $FeedDir -Filter "$PackId-$Version-full.nupkg" -Label "target full package"
+$Feed = Get-Content $Index -Raw -Encoding UTF8 | ConvertFrom-Json
+$TargetAssets = @($Feed.Assets | Where-Object {
+    [string]$_.PackageId -eq $PackId -and
+    [string]$_.Version -eq $Version -and
+    [string]$_.Type -eq "Full"
+})
+if ($TargetAssets.Count -ne 1) {
+    throw "Velopack E2E feed must contain exactly one Full target v$Version; found $($TargetAssets.Count)"
+}
+if ([string]$TargetAssets[0].FileName -ne $TargetPackage.Name) {
+    throw "Velopack E2E feed/package mismatch: feed=$($TargetAssets[0].FileName) file=$($TargetPackage.Name)"
 }
 
 Write-Host "  [E2E 3/4] Launch installed old app and let Velopack update + restart it"
