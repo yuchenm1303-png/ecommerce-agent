@@ -4,6 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 UPDATER = (ROOT / "gui" / "app_updater.py").read_text(encoding="utf-8")
+PANEL = (ROOT / "gui" / "update_panel.py").read_text(encoding="utf-8")
 
 
 def test_update_ui_exposes_current_version_and_manual_check() -> None:
@@ -31,13 +32,19 @@ def test_periodic_check_does_not_repeat_the_same_update_prompt() -> None:
     assert 'if not manual and latest == self._last_prompted_version' in UPDATER
 
 
-def test_updater_ui_stays_foreground_and_shows_download_progress() -> None:
-    assert "WindowStaysOnTopHint" in UPDATER
-    assert "QProgressDialog" in UPDATER
+def test_updater_uses_premium_foreground_panels_and_download_progress() -> None:
+    assert "UpdateOfferDialog" in UPDATER
+    assert "UpdateProgressDialog" in UPDATER
+    assert "UpdateMessageDialog" in UPDATER
+    assert "QProgressDialog" not in UPDATER
     assert "_download_progress" in UPDATER
-    assert '"立即更新"' in UPDATER
-    assert "Velopack" in UPDATER
+    assert "WindowStaysOnTopHint" in PANEL
+    assert 'setObjectName("updatePanelCard")' in PANEL
+    assert 'QPushButton("立即更新"' in PANEL
+    assert 'setObjectName("updateProgress")' in PANEL
+    assert "Velopack" in PANEL
 
 
-def test_updater_source_compiles() -> None:
+def test_updater_presentation_sources_compile() -> None:
     compile(UPDATER, str(ROOT / "gui" / "app_updater.py"), "exec")
+    compile(PANEL, str(ROOT / "gui" / "update_panel.py"), "exec")
