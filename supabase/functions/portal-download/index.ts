@@ -81,6 +81,20 @@ async function getAuthorizedUser(req: Request) {
   return { user, status: 200 } as const;
 }
 
+function resolveInstallerAsset(release: any, version: string) {
+  // Velopack MSI is the branded user-facing installer. The EXE fallback keeps
+  // the current Inno-era Stable downloadable during the one-time migration.
+  const candidates = [
+    `EcommerceAgent-Setup-${version}.msi`,
+    `EcommerceAgent-Setup-${version}.exe`,
+  ];
+  for (const installerName of candidates) {
+    const asset = release.assets.find((item: any) => item?.name === installerName);
+    if (asset?.browser_download_url) return { installerName, asset };
+  }
+  throw new Error("stable_installer_missing");
+}
+
 async function resolveCurrentStable(requestedVersion: string) {
   const githubHeaders = {
     "Accept": "application/vnd.github+json",
@@ -101,12 +115,7 @@ async function resolveCurrentStable(requestedVersion: string) {
     return { error: "version_not_current", status: 409 } as const;
   }
 
-  const installerName = `EcommerceAgent-Setup-${requestedVersion}.exe`;
-  const installerAsset = release.assets.find((asset: any) => asset?.name === installerName);
-  if (!installerAsset?.browser_download_url) {
-    throw new Error("stable_installer_missing");
-  }
-
+  const { installerName, asset: installerAsset } = resolveInstallerAsset(release, requestedVersion);
   const expectedInstallerUrl = `https://github.com/${REPOSITORY}/releases/download/v${requestedVersion}/${installerName}`;
   if (String(installerAsset.browser_download_url) !== expectedInstallerUrl) {
     throw new Error("installer_url_mismatch");
@@ -121,6 +130,7 @@ async function resolveCurrentStable(requestedVersion: string) {
 
   return {
     version: requestedVersion,
+    fileName: installerName,
     url: expectedInstallerUrl,
     sha256: digestMatch[1].toLowerCase(),
     size: installerSize,
@@ -163,6 +173,7 @@ Deno.serve(async (req: Request) => {
     }
     return json(req, {
       url: stable.url,
+      fileName: stable.fileName,
       version: `v${stable.version}`,
       sha256: stable.sha256,
       size: stable.size,
