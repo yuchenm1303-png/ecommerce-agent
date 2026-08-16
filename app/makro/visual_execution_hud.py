@@ -1,17 +1,10 @@
 """Visual execution HUD for the real Makro browser tab.
 
 The visual language is ported from the existing mobile visual-agent HUD in
-``yuchenm1303-png/yuchen1303.github.io`` (``dev-update-1``):
-
-- ``ai-ledger-android/app/src/main/assets/visual_agent_hud_runtime.html``
-- ``visual_agent_hud_base.css``
-- ``visual_agent_hud_cursor.css``
-- ``visual_agent_hud_layout.css``
-
-This module intentionally does not replace or steer Playwright.  It injects a
-pointer-events-none iframe into the exact owned Makro page and observes the real
-DOM events produced by the existing executor.  The business executor remains
-the only authority that decides what to click/fill/save.
+``yuchenm1303-png/yuchen1303.github.io`` (``dev-update-1``), but the desktop
+browser renderer keeps text at native CSS pixel size.  The HUD never steers
+Playwright; it only mirrors the real DOM operations performed by the existing
+executor.
 """
 
 from __future__ import annotations
@@ -21,10 +14,9 @@ from typing import Any
 HUD_FRAME_ID = "listing-studio-visual-agent-hud"
 HUD_API_KEY = "__listingStudioVisualHud"
 
-# Direct desktop/browser port of the existing mobile HUD.  The cursor path,
-# gradient stops, aura, bubble, five-stage timeline and edge Aurora parameters
-# intentionally stay aligned with that source instead of creating a second
-# Listing Studio visual language.
+# Desktop HUD: the bubble keeps the mobile visual language without scaling the
+# whole text surface.  Native-size glyphs avoid Chromium/Windows re-rasterizing
+# 12-13px Chinese text down to ~8px, which previously looked like mojibake.
 _HUD_SRCDOC = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -39,14 +31,14 @@ _HUD_SRCDOC = r"""<!doctype html>
   --lab-rotation:-2.5deg;--lab-offset-x:-.5px;--lab-offset-y:-.5px;
   --lab-aura-size:72px;--lab-aura-blur:8px;--lab-aura-opacity:.54;
   --hotspot-x:10px;--hotspot-y:10.5px;
-  --info-bubble-width:420px;--info-bubble-scale:.65;
+  --info-bubble-width:292px;
   --edge-inset:0px;--edge-radius:0px;--edge-halo-width:0px;
   --edge-halo-blur:0px;--edge-halo-opacity:.58;--edge-cast-depth:29.2px;
   --edge-cast-blur:0px;--edge-cast-opacity:.8;--edge-flow-speed:7.5s;
   --edge-breath-speed:1.5s;--edge-breath-strength:.55;
 }
 *{box-sizing:border-box}
-html,body{margin:0;width:100%;height:100%;min-height:0;background:transparent;color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;overflow:hidden;pointer-events:none}
+html,body{margin:0;width:100%;height:100%;min-height:0;background:transparent;color:var(--text);font-family:"Segoe UI","Microsoft YaHei UI","Microsoft YaHei","PingFang SC",Arial,sans-serif;overflow:hidden;pointer-events:none;text-rendering:optimizeLegibility;-webkit-font-smoothing:antialiased}
 .app{position:relative;width:100%;height:100%;overflow:hidden;background:transparent}
 .hud{position:absolute;inset:0;z-index:20;pointer-events:none;overflow:hidden;opacity:1;visibility:visible;transition:opacity .22s ease,visibility .22s ease}
 .app.hud-hidden .hud{opacity:0;visibility:hidden}
@@ -69,15 +61,16 @@ html,body{margin:0;width:100%;height:100%;min-height:0;background:transparent;co
 .cursor-wrap.clicking .click-wave{animation:clickWave .6s ease-out}
 @keyframes cursorPress{0%{transform:scale(1)}45%{transform:scale(.94)}100%{transform:scale(1)}}
 @keyframes clickWave{0%{opacity:1;transform:translate(-50%,-50%) scale(.35)}100%{opacity:0;transform:translate(-50%,-50%) scale(3.8)}}
-.info-bubble{position:absolute;left:0;top:0;width:min(var(--info-bubble-width),calc(100vw - 24px));min-height:112px;padding:14px 15px 13px;border-radius:16px;background:rgba(8,17,27,.88);border:1px solid rgba(102,217,255,.20);backdrop-filter:blur(18px);box-shadow:0 16px 45px rgba(0,0,0,.40),0 0 26px rgba(102,217,255,.07);transform:translate3d(var(--bubble-x),var(--bubble-y),0) scale(var(--info-bubble-scale));transform-origin:left top;transition:transform var(--cursor-move-speed) cubic-bezier(.18,.78,.18,1),opacity .2s ease,filter .2s ease,box-shadow .24s ease;will-change:transform,opacity,filter;contain:layout style;pointer-events:none}
-.bubble-title{font-size:13px;font-weight:750;margin-bottom:7px;min-height:17px}
-.bubble-line{display:flex;justify-content:space-between;gap:12px;font-size:12px;color:var(--muted);line-height:1.7}
-.bubble-line b{color:#e7f8ff;font-weight:600}
-.bubble-thought{margin-top:9px;padding-top:9px;border-top:1px solid rgba(255,255,255,.07);min-height:29px;font-size:12px;color:#c3d7e4;line-height:1.65}
-.bottom-timeline{position:absolute;left:50%;bottom:92px;transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:9px 13px;border-radius:999px;background:rgba(8,17,27,.78);border:1px solid rgba(255,255,255,.08);backdrop-filter:blur(16px);pointer-events:none}
+.info-bubble{position:absolute;left:0;top:0;width:min(var(--info-bubble-width),calc(100vw - 24px));min-height:112px;padding:14px 15px 13px;border-radius:16px;background:rgba(8,17,27,.92);border:1px solid rgba(102,217,255,.20);box-shadow:0 16px 45px rgba(0,0,0,.40),0 0 26px rgba(102,217,255,.07);transform:translate(var(--bubble-x),var(--bubble-y));transition:transform var(--cursor-move-speed) cubic-bezier(.18,.78,.18,1),opacity .2s ease;contain:layout style;pointer-events:none}
+.bubble-title{font-size:13px;font-weight:750;line-height:1.35;margin-bottom:7px;min-height:18px;letter-spacing:0}
+.bubble-line{display:flex;justify-content:space-between;align-items:baseline;gap:12px;font-size:12px;color:var(--muted);line-height:1.7}
+.bubble-line span,.bubble-line b,.bubble-title,.bubble-thought{transform:none!important;filter:none!important}
+.bubble-line b{color:#e7f8ff;font-weight:600;text-align:right;overflow-wrap:anywhere}
+.bubble-thought{margin-top:9px;padding-top:9px;border-top:1px solid rgba(255,255,255,.07);min-height:29px;font-size:12px;color:#c3d7e4;line-height:1.65;overflow-wrap:anywhere}
+.bottom-timeline{position:absolute;left:50%;bottom:92px;transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:9px 13px;border-radius:999px;background:rgba(8,17,27,.86);border:1px solid rgba(255,255,255,.08);pointer-events:none}
 .phase{display:flex;align-items:center;gap:8px;color:#7f91a2;font-size:12px;white-space:nowrap}.phase::after{content:"";width:18px;height:1px;background:rgba(255,255,255,.13)}.phase:last-child::after{display:none}.phase.active{color:#dff8ff}.phase.done{color:var(--success)}.phase i{width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 10px currentColor}
-@media(max-width:720px){:root{--info-bubble-scale:.58}.bottom-timeline{bottom:34px;gap:4px;padding:7px 9px}.phase{gap:4px;font-size:9.5px}.phase::after{width:8px}.phase i{width:4.5px;height:4.5px}}
-@media(max-width:500px){.bottom-timeline{display:none}:root{--info-bubble-scale:.52;--info-bubble-width:360px}}
+@media(max-width:720px){:root{--info-bubble-width:260px}.bottom-timeline{bottom:34px;gap:4px;padding:7px 9px}.phase{gap:4px;font-size:11px}.phase::after{width:8px}.phase i{width:4.5px;height:4.5px}}
+@media(max-width:500px){:root{--info-bubble-width:232px}.bottom-timeline{display:none}.bubble-title{font-size:12.5px}.bubble-line,.bubble-thought{font-size:11.5px}}
 @media(prefers-reduced-motion:reduce){.edge-aurora-layer,.cursor-aura,.cursor-icon{animation:none}.cursor-wrap,.info-bubble{transition-duration:0ms}}
 </style>
 </head>
@@ -148,7 +141,7 @@ _INSTALL_SCRIPT = r"""
     nodes(){
       const d=this.doc();
       if(!d) return null;
-      return {
+      const nodes={
         d,
         root:d.documentElement,
         app:d.getElementById('app'),
@@ -161,6 +154,8 @@ _INSTALL_SCRIPT = r"""
         thought:d.getElementById('thought'),
         phases:Array.from(d.querySelectorAll('.phase'))
       };
+      if(!nodes.root || !nodes.app || !nodes.bubble || !nodes.title || !nodes.confidence || !nodes.coords || !nodes.source || !nodes.thought) return null;
+      return nodes;
     },
     interactive(node){
       if(!(node instanceof Element)) return null;
@@ -200,16 +195,15 @@ _INSTALL_SCRIPT = r"""
     },
     placeBubble(nodes,x,y){
       const vw=Math.max(1,window.innerWidth), vh=Math.max(1,window.innerHeight);
-      const scale=vw <= 500 ? .52 : (vw <= 720 ? .58 : .65);
-      const rawW=Math.min(420,Math.max(220,vw-24));
-      const w=rawW*scale;
-      const h=Math.min(150,Math.max(92,(nodes.bubble && nodes.bubble.offsetHeight || 132)*scale));
+      const rect=nodes.bubble.getBoundingClientRect();
+      const w=Math.max(1,Math.ceil(rect.width || nodes.bubble.offsetWidth || 292));
+      const h=Math.max(1,Math.ceil(rect.height || nodes.bubble.offsetHeight || 132));
       const gap=28;
       let bx=x+gap, by=y+14;
       if(bx+w > vw-12) bx=x-gap-w;
       if(by+h > vh-12) by=y-gap-h;
-      bx=Math.max(12,Math.min(Math.max(12,vw-w-12),bx));
-      by=Math.max(12,Math.min(Math.max(12,vh-h-12),by));
+      bx=Math.round(Math.max(12,Math.min(Math.max(12,vw-w-12),bx)));
+      by=Math.round(Math.max(12,Math.min(Math.max(12,vh-h-12),by)));
       nodes.root.style.setProperty('--bubble-x',`${bx}px`);
       nodes.root.style.setProperty('--bubble-y',`${by}px`);
     },
@@ -228,10 +222,10 @@ _INSTALL_SCRIPT = r"""
       nodes.title.textContent=`${verb}「${this.label(target)}」`;
       nodes.confidence.textContent='LIVE DOM';
       nodes.source.textContent='Playwright + Live DOM';
-      nodes.thought.textContent=detail;
+      nodes.thought.textContent=String(detail || '');
       this.placeBubble(nodes,x,y);
       this.setPhase(phase);
-      nodes.app && nodes.app.classList.remove('hud-hidden');
+      nodes.app.classList.remove('hud-hidden');
     },
     pulse(){
       const nodes=this.nodes();
@@ -243,14 +237,15 @@ _INSTALL_SCRIPT = r"""
     },
     status(title,thought,phase=1){
       const nodes=this.nodes();
-      if(!nodes) return;
+      if(!nodes) return false;
       nodes.title.textContent=String(title || '正在执行真实填写');
       nodes.thought.textContent=String(thought || '等待真实页面操作。');
       nodes.confidence.textContent='LIVE DOM';
       nodes.source.textContent='Listing Studio';
       this.setPhase(Math.max(0,Math.min(4,Number(phase)||0)));
-      nodes.app && nodes.app.classList.remove('hud-hidden');
+      nodes.app.classList.remove('hud-hidden');
       this.lastActionAt=Date.now();
+      return true;
     },
     captureSafe(active){
       frame.style.opacity=active?'0':'1';
@@ -333,7 +328,7 @@ def _safe_evaluate(page: Any, script: str, payload: Any = None) -> Any:
 
 
 def install_visual_execution_hud(page: Any) -> bool:
-    """Install the ported mobile HUD into the current owned Makro viewport."""
+    """Install the desktop-safe Visual Agent HUD into the owned viewport."""
 
     installed = bool(
         _safe_evaluate(
