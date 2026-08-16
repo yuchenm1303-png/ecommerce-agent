@@ -57,11 +57,14 @@ jobs:
           "sha=$sha" >> $env:GITHUB_OUTPUT
           Write-Host "Publishing source $env:SOURCE_REF at $sha"
 
-      - name: Validate monotonic Stable version
+      - name: Validate Stable release identity
         shell: pwsh
         run: |
           if ($env:UPDATE_VERSION -notmatch '^\d+\.\d+\.\d+$') {
             throw "Release version must be strict x.y.z: $env:UPDATE_VERSION"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:UPDATE_TITLE)) {
+            throw "Release title must not be empty"
           }
           $releaseVersion = [version]$env:UPDATE_VERSION
           $latestRaw = & gh api "repos/$env:GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>$null
@@ -76,20 +79,39 @@ jobs:
           }
           $global:LASTEXITCODE = 0
           $tag = "v$env:UPDATE_VERSION"
+          $remoteTag = (& git ls-remote --tags origin "refs/tags/$tag" 2>$null | Out-String).Trim()
+          $global:LASTEXITCODE = 0
+          if (-not [string]::IsNullOrWhiteSpace($remoteTag)) { throw "Tag already exists: $tag" }
           gh release view $tag *> $null
           $exists = ($LASTEXITCODE -eq 0)
           $global:LASTEXITCODE = 0
           if ($exists) { throw "Release already exists: $tag" }
 
-      - name: Stamp package version and release notes
+      - name: Prepare release metadata
         shell: pwsh
         run: |
           Set-Content "packaging\VERSION" $env:UPDATE_VERSION -Encoding ascii -NoNewline
           New-Item -ItemType Directory -Force artifacts | Out-Null
           @(
-            "# $env:UPDATE_TITLE", "", $env:UPDATE_NOTES, "",
-            "Source commit: ${{ steps.source.outputs.sha }}"
+            "# $env:UPDATE_TITLE v$env:UPDATE_VERSION", "", $env:UPDATE_NOTES, "",
+            "Application source commit: ${{ steps.source.outputs.sha }}"
           ) | Set-Content "artifacts\release-notes.md" -Encoding utf8
+
+      - name: Create Stable draft before build
+        shell: pwsh
+        run: |
+          $tag = "v$env:UPDATE_VERSION"
+          $releaseName = "$env:UPDATE_TITLE v$env:UPDATE_VERSION"
+          gh release create $tag `
+            --target "${{ github.sha }}" `
+            --draft `
+            --title "$releaseName" `
+            --notes-file "artifacts\release-notes.md"
+          if ($LASTEXITCODE -ne 0) { throw "GitHub Stable draft creation failed: $LASTEXITCODE" }
+          $draft = gh release view $tag --json tagName,name,isDraft,isPrerelease | ConvertFrom-Json
+          if ($draft.tagName -ne $tag -or $draft.name -ne $releaseName -or -not $draft.isDraft -or $draft.isPrerelease) {
+            throw "Stable draft identity mismatch"
+          }
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -149,23 +171,18 @@ jobs:
           if ([int64]$target[0].Size -ne [int64](Get-Item $targetPath).Length) {
             throw "Feed target package size mismatch: $targetFull"
           }
-
           $nativeSetup = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Setup.exe")
           $nativePortable = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Portable.zip")
           if ($nativeSetup.Count -ne 1) { throw "Expected exactly one native Velopack Setup, found $($nativeSetup.Count)" }
           if ($nativePortable.Count -ne 1) { throw "Expected exactly one native Velopack Portable, found $($nativePortable.Count)" }
-
           $friendlySetup = Get-Item "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe"
           $friendlyPortable = Get-Item "artifacts\EcommerceAgent-$env:UPDATE_VERSION-portable.zip"
           $friendlySha = (Get-FileHash $friendlySetup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-
           "target_full=$targetFull" >> $env:GITHUB_ENV
           "native_setup=$($nativeSetup[0].Name)" >> $env:GITHUB_ENV
           "native_portable=$($nativePortable[0].Name)" >> $env:GITHUB_ENV
           "friendly_setup_sha=$friendlySha" >> $env:GITHUB_ENV
           "friendly_setup_size=$($friendlySetup.Length)" >> $env:GITHUB_ENV
-          Write-Host "Velopack target Full asset: $targetFull"
-          Write-Host "Friendly installer SHA256: $friendlySha"
 
       - name: Silent Velopack installer smoke test
         shell: pwsh
@@ -174,9 +191,7 @@ jobs:
           if (-not (Test-Path $setup)) { throw "Setup missing: $setup" }
           $installDir = Join-Path $env:RUNNER_TEMP "ListingStudioStableSmoke"
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
-          $process = Start-Process -FilePath $setup -ArgumentList @(
-            "--silent", "--installto", $installDir
-          ) -Wait -PassThru
+          $process = Start-Process -FilePath $setup -ArgumentList @("--silent", "--installto", $installDir) -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Velopack install failed: $($process.ExitCode)" }
           $stub = Join-Path $installDir "EcommerceAgent.exe"
           $versionFile = Join-Path $installDir "current\_internal\packaging\VERSION"
@@ -185,28 +200,19 @@ jobs:
           foreach ($required in @($stub, $versionFile, $worker, $update)) {
             if (-not (Test-Path $required)) { throw "Installed component missing: $required" }
           }
-          if ((Get-Content $versionFile -Raw).Trim() -ne $env:UPDATE_VERSION) {
-            throw "Installed VERSION mismatch"
-          }
+          if ((Get-Content $versionFile -Raw).Trim() -ne $env:UPDATE_VERSION) { throw "Installed VERSION mismatch" }
           & $worker --self-test
           if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
 
-      - name: Stage Velopack Stable release as draft
+      - name: Upload Stable release assets
         shell: pwsh
-        env:
-          VPK_TOKEN: ${{ github.token }}
         run: |
-          dotnet tool run vpk -- upload github `
-            --outputDir "artifacts\velopack" `
-            --channel $env:VELOPACK_CHANNEL `
-            --repoUrl "https://github.com/$env:GITHUB_REPOSITORY" `
-            --publish false `
-            --releaseName "$env:UPDATE_TITLE" `
-            --tag "v$env:UPDATE_VERSION" `
-            --targetCommitish "${{ steps.source.outputs.sha }}"
-          if ($LASTEXITCODE -ne 0) { throw "Velopack GitHub draft upload failed: $LASTEXITCODE" }
-
-          gh release upload "v$env:UPDATE_VERSION" `
+          $tag = "v$env:UPDATE_VERSION"
+          $native = @(Get-ChildItem "artifacts\velopack" -File | ForEach-Object { $_.FullName })
+          if ($native.Count -eq 0) { throw "No Velopack assets available for upload" }
+          & gh release upload $tag @native --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Velopack asset upload failed: $LASTEXITCODE" }
+          & gh release upload $tag `
             "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe" `
             "artifacts\EcommerceAgent-$env:UPDATE_VERSION-portable.zip" `
             --clobber
@@ -216,24 +222,19 @@ jobs:
         shell: pwsh
         run: |
           $tag = "v$env:UPDATE_VERSION"
-          $draft = gh release view $tag --json databaseId,tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
-          if ($draft.tagName -ne $tag) { throw "Draft tag mismatch" }
-          if (-not $draft.isDraft) { throw "Velopack release became public before verification" }
+          $releaseName = "$env:UPDATE_TITLE v$env:UPDATE_VERSION"
+          $draft = gh release view $tag --json databaseId,tagName,name,isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($draft.tagName -ne $tag -or $draft.name -ne $releaseName) { throw "Draft release identity mismatch" }
+          if (-not $draft.isDraft) { throw "Release became public before verification" }
           if ($draft.isPrerelease) { throw "Stable draft unexpectedly marked prerelease" }
           $names = @($draft.assets | ForEach-Object { $_.name })
-          foreach ($expected in @(
-            $env:target_full,
-            "releases.$env:VELOPACK_CHANNEL.json",
-            $env:native_setup,
-            $env:native_portable,
+          $localVelopack = @(Get-ChildItem "artifacts\velopack" -File | ForEach-Object { $_.Name })
+          foreach ($expected in @($localVelopack) + @(
             "EcommerceAgent-Setup-$env:UPDATE_VERSION.exe",
             "EcommerceAgent-$env:UPDATE_VERSION-portable.zip"
           )) {
-            if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
-              throw "Draft release asset missing: $expected"
-            }
+            if ($expected -notin $names) { throw "Draft release asset missing: $expected" }
           }
-
           $apiRelease = gh api "repos/$env:GITHUB_REPOSITORY/releases/$($draft.databaseId)" | ConvertFrom-Json
           $friendly = @($apiRelease.assets | Where-Object { $_.name -eq "EcommerceAgent-Setup-$env:UPDATE_VERSION.exe" })
           if ($friendly.Count -ne 1) { throw "Draft friendly installer asset is not unique" }
@@ -247,14 +248,14 @@ jobs:
           gh release edit $tag --draft=false --latest
           if ($LASTEXITCODE -ne 0) { throw "Failed to publish verified Stable draft: $LASTEXITCODE" }
 
-      - name: Verify published Velopack contract
+      - name: Verify published Stable contract
         shell: pwsh
         run: |
           $tag = "v$env:UPDATE_VERSION"
-          $release = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
-          if ($release.tagName -ne $tag) { throw "Published tag mismatch" }
-          if ($release.isDraft) { throw "Stable release is still a draft" }
-          if ($release.isPrerelease) { throw "Stable release unexpectedly marked prerelease" }
+          $releaseName = "$env:UPDATE_TITLE v$env:UPDATE_VERSION"
+          $release = gh release view $tag --json tagName,name,isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($release.tagName -ne $tag -or $release.name -ne $releaseName) { throw "Published release identity mismatch" }
+          if ($release.isDraft -or $release.isPrerelease) { throw "Stable release publication flags are invalid" }
           $names = @($release.assets | ForEach-Object { $_.name })
           foreach ($expected in @(
             $env:target_full,
@@ -264,9 +265,7 @@ jobs:
             "EcommerceAgent-Setup-$env:UPDATE_VERSION.exe",
             "EcommerceAgent-$env:UPDATE_VERSION-portable.zip"
           )) {
-            if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
-              throw "Published asset missing: $expected"
-            }
+            if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) { throw "Published asset missing: $expected" }
           }
 
       - name: Cleanup failed Stable draft
@@ -282,7 +281,6 @@ jobs:
           }
           $release = $raw | ConvertFrom-Json
           if ($release.isDraft) {
-            Write-Host "Removing failed draft $tag so the same version can be retried cleanly"
             gh release delete $tag --yes --cleanup-tag
             if ($LASTEXITCODE -ne 0) { throw "Failed to cleanup draft $tag" }
           }
