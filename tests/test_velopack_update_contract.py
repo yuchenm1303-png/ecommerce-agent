@@ -109,6 +109,25 @@ def test_stable_publish_derives_all_native_update_assets_from_feed_or_output() -
     assert '"Smirel.ListingStudio-Portable.zip"' not in PUBLISH
 
 
+def test_release_identity_conflicts_fail_before_expensive_builds() -> None:
+    assert "Preflight Stable release identity" in PUBLISH
+    assert '$releaseName = "$env:UPDATE_TITLE v$env:UPDATE_VERSION"' in PUBLISH
+    assert 'gh release list --limit 1000 --json name,tagName,isDraft,isPrerelease' in PUBLISH
+    assert '"RELEASE_NAME=$releaseName"' in PUBLISH
+    assert '--releaseName "$env:RELEASE_NAME"' in PUBLISH
+    assert "Draft release name mismatch" in PUBLISH
+    assert "Published release name mismatch" in PUBLISH
+    assert PUBLISH.index("Preflight Stable release identity") < PUBLISH.index("Set up Python")
+
+    assert "Resolve and preflight test build identity" in TEST_PUBLISH
+    assert '#${{ github.run_number }}' in TEST_PUBLISH
+    assert '"release_name=$releaseName"' in TEST_PUBLISH
+    assert '--releaseName "${{ steps.build.outputs.release_name }}"' in TEST_PUBLISH
+    assert "Test draft release name mismatch" in TEST_PUBLISH
+    assert "Published test release name mismatch" in TEST_PUBLISH
+    assert TEST_PUBLISH.index("Resolve and preflight test build identity") < TEST_PUBLISH.index("Set up Python")
+
+
 def test_release_publication_is_transactional_and_checks_branded_msi_digest() -> None:
     assert "Stage Velopack Stable release as draft" in PUBLISH
     assert "--publish false" in PUBLISH
