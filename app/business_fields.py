@@ -26,9 +26,9 @@ ORIGINAL_ACCOUNT_FIXED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("importer_details", "LILI", "account-default:importer-details"),
 )
 
-# Temporary seller policy for order-quantity limits only. MinOQ must stay on a
-# value accepted by Makro's live selector; MaxOQ remains the customer-requested
-# account value. Price fields stay on their normal resolution path.
+# Keep the previous temporary order-quantity profile intact. It remains
+# available as a one-line rollback target and preserves the former behavior,
+# including the normal resolver path for both price fields.
 FIXED_ORDER_QUANTITY_ACCOUNT_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("minimum_order_quantity", "1", "account-default:min-order-quantity"),
     ("max_order_quantity_allowed", "6000", "account-default:max-order-quantity"),
@@ -41,10 +41,28 @@ FIXED_ORDER_QUANTITY_ACCOUNT_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("importer_details", "LILI", "account-default:importer-details"),
 )
 
-ACCOUNT_DEFAULT_PROFILE = "fixed_order_quantity"
+# Current seller policy. These are account-operated commercial values, not
+# product facts, so they bypass AI/product inference while the older resolver
+# paths and prior account profiles remain intact for rollback or future policy.
+FIXED_COMMERCIAL_ACCOUNT_DEFAULTS: tuple[tuple[str, str, str], ...] = (
+    ("mrp", "6000", "account-default:base-price"),
+    ("flipkart_selling_price", "5000", "account-default:selling-price"),
+    ("minimum_order_quantity", "1", "account-default:min-order-quantity"),
+    ("max_order_quantity_allowed", "99", "account-default:max-order-quantity"),
+    ("service_profile", "FBS", "account-default:fulfilment-by"),
+    ("shipping_days", "1", "account-default:pick-pack-sla"),
+    ("forbid_shipping", "National", "account-default:selling-region"),
+    ("country_of_origin", "China", "account-default:country-of-origin"),
+    ("manufacturer_details", "LILI", "account-default:manufacturer-details"),
+    ("packer_details", "LILI", "account-default:packer-details"),
+    ("importer_details", "LILI", "account-default:importer-details"),
+)
+
+ACCOUNT_DEFAULT_PROFILE = "fixed_commercial"
 _ACCOUNT_DEFAULT_PROFILES: dict[str, tuple[tuple[str, str, str], ...]] = {
     "original": ORIGINAL_ACCOUNT_FIXED_DEFAULTS,
     "fixed_order_quantity": FIXED_ORDER_QUANTITY_ACCOUNT_DEFAULTS,
+    "fixed_commercial": FIXED_COMMERCIAL_ACCOUNT_DEFAULTS,
 }
 MAKRO_ACCOUNT_FIXED_DEFAULTS = _ACCOUNT_DEFAULT_PROFILES[ACCOUNT_DEFAULT_PROFILE]
 
