@@ -227,7 +227,30 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Failed to prune old test prerelease $($old.tagName)" }
           }
 
+      - name: Cleanup failed prerelease draft
+        if: ${{ failure() }}
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.build.outputs.tag }}"
+          if ([string]::IsNullOrWhiteSpace($tag)) { exit 0 }
+          $raw = gh release view $tag --json isDraft,tagName 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            $global:LASTEXITCODE = 0
+            Write-Host "No test release exists for cleanup: $tag"
+            exit 0
+          }
+          $release = $raw | ConvertFrom-Json
+          if ($release.isDraft) {
+            Write-Host "Removing failed test draft $tag"
+            gh release delete $tag --yes --cleanup-tag
+            if ($LASTEXITCODE -ne 0) { throw "Failed to cleanup test draft $tag" }
+          }
+          else {
+            Write-Warning "Test release $tag is already public; automatic cleanup intentionally refused"
+          }
+
       - name: Upload test build files to workflow run
+        if: ${{ success() }}
         uses: actions/upload-artifact@v4
         with:
           name: EcommerceAgent-Test-${{ steps.build.outputs.tag }}
