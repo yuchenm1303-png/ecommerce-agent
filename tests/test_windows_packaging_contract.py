@@ -13,6 +13,8 @@ BRANDING = (ROOT / "app" / "app_branding.py").read_text(encoding="utf-8")
 ICON_DATA = (ROOT / "app" / "app_icon_data.py").read_text(encoding="utf-8")
 ICON_GENERATOR = (ROOT / "scripts" / "generate_app_icon.py").read_text(encoding="utf-8")
 ROUTER = (ROOT / "gui" / "frozen_process_router.py").read_text(encoding="utf-8")
+NATIVE_SHELL = (ROOT / "gui" / "native_window_shell.py").read_text(encoding="utf-8")
+UPDATE_PANEL = (ROOT / "gui" / "update_panel.py").read_text(encoding="utf-8")
 WORKER = (ROOT / "run_packaged_worker.py").read_text(encoding="utf-8")
 RUN = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 SPEC = (ROOT / "packaging" / "EcommerceAgent.spec").read_text(encoding="utf-8")
@@ -25,18 +27,33 @@ def test_packaging_python_sources_compile() -> None:
         (ROOT / "app" / "runtime_paths.py", RUNTIME),
         (ROOT / "app" / "velopack_runtime.py", VELOPACK_RUNTIME),
         (ROOT / "packaging" / "velopack_runtime_hook.py", RUNTIME_HOOK),
+        (ROOT / "gui" / "update_panel.py", UPDATE_PANEL),
+        (ROOT / "gui" / "native_window_shell.py", NATIVE_SHELL),
         (ROOT / "run_local_gui.py", RUN),
     ):
         compile(source, str(path), "exec")
 
 
-def test_approved_application_icon_is_preserved() -> None:
+def test_approved_application_icon_is_preserved_everywhere() -> None:
     raw = application_icon_bytes()
     assert raw.startswith(b"\x89PNG\r\n\x1a\n")
     assert len(raw) > 5_000
     assert "APP_ICON_PNG_BASE64" in ICON_DATA
     assert "hashlib.sha256(raw).hexdigest()" in BRANDING
+    assert 'APP_USER_MODEL_ID = "Smirel.ListingStudio"' in BRANDING
     assert "apply_qt_application_icon(app)" in RUN
+    assert "owner.setIcon(app_icon)" in NATIVE_SHELL
+    assert "overlay.setWindowIcon(app_icon)" in NATIVE_SHELL
+
+
+def test_branding_generator_builds_setup_and_msi_artwork() -> None:
+    assert "build_installer_splash" in ICON_GENERATOR
+    assert "build_msi_banner" in ICON_GENERATOR
+    assert "build_msi_logo" in ICON_GENERATOR
+    assert '(493, 58)' in ICON_GENERATOR
+    assert '(493, 312)' in ICON_GENERATOR
+    assert 'format="BMP"' in ICON_GENERATOR
+    assert 'format="PNG"' in ICON_GENERATOR
 
 
 def test_frozen_runtime_keeps_mutable_state_outside_versioned_current_dir() -> None:
@@ -78,21 +95,40 @@ def test_velopack_toolchain_is_pinned_and_build_replaces_inno() -> None:
     assert "Compress-Archive" not in BUILD
 
 
-def test_windows_ci_smokes_canonical_velopack_layout() -> None:
+def test_velopack_pack_uses_canonical_branding_and_msi() -> None:
+    assert '"--icon", $IconFile' in BUILD
+    assert '"--splashImage", $SplashFile' in BUILD
+    assert '"--splashProgressColor", "#5DA7FF"' in BUILD
+    assert '"--aumid", $PackId' in BUILD
+    assert '"--shortcuts", "Desktop,StartMenuRoot"' in BUILD
+    assert '"--msi", "true"' in BUILD
+    assert '"--instLocation", "PerUser"' in BUILD
+    assert '"--msiBanner", $MsiBannerFile' in BUILD
+    assert '"--msiLogo", $MsiLogoFile' in BUILD
+    assert 'EcommerceAgent-Setup-$Version.msi' in BUILD
+
+
+def test_windows_ci_smokes_canonical_velopack_layout_and_msi_uninstall() -> None:
     assert "actions/setup-dotnet@v4" in WINDOWS
     assert "dotnet tool restore" in WINDOWS
     assert '"--silent", "--installto", $installDir' in WINDOWS
     assert 'Join-Path $installDir "Update.exe"' in WINDOWS
     assert 'Join-Path $installDir "current\\EcommerceAgent.exe"' in WINDOWS
+    assert "EcommerceAgent-Setup-*.msi" in WINDOWS
+    assert '"/i"' in WINDOWS
+    assert '"/x"' in WINDOWS
+    assert "VELOPACK_INSTALLDIR" in WINDOWS
     assert "Inno Setup" not in WINDOWS
 
 
 def test_build_discovers_native_assets_and_never_guesses_velopack_package_names() -> None:
     assert 'EcommerceAgent-Setup-$Version.exe' in BUILD
+    assert 'EcommerceAgent-Setup-$Version.msi' in BUILD
     assert 'EcommerceAgent-$Version-portable.zip' in BUILD
     assert "Get-SingleVelopackArtifact" in BUILD
     assert "Resolve-VelopackFullPackage" in BUILD
     assert '-Filter "$PackId*-Setup.exe"' in BUILD
+    assert '-Filter "$PackId*.msi"' in BUILD
     assert '-Filter "$PackId*-Portable.zip"' in BUILD
     assert 'releases.$Channel.json' in BUILD
     assert '[string]$Target[0].FileName' in BUILD
