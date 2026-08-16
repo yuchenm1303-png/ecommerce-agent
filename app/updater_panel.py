@@ -40,6 +40,17 @@ class NativeUpdatePanel:
                 self._monitor_thread = threading.Thread(target=self._monitor_log, daemon=True)
                 self._monitor_thread.start()
 
+    def _log_event(self, message: str) -> None:
+        path = self.log_path
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{time.time():.3f}\t{message}\n")
+        except OSError:
+            pass
+
     def set_phase(self, title: str, detail: str = "") -> None:
         if not self._hwnd:
             return
@@ -134,6 +145,7 @@ class NativeUpdatePanel:
             user32.ShowWindow(hwnd, 5)
             user32.UpdateWindow(hwnd)
             user32.SetForegroundWindow(hwnd)
+            self._log_event("native update panel shown")
             self._ready.set()
 
             class POINT(ctypes.Structure):
@@ -147,7 +159,9 @@ class NativeUpdatePanel:
                     user32.DispatchMessageW(ctypes.byref(msg))
                 time.sleep(0.02)
             user32.DestroyWindow(hwnd)
-        except Exception:
+            self._log_event("native update panel closed")
+        except Exception as exc:
+            self._log_event(f"native update panel failed: {exc!r}")
             self._ready.set()
         finally:
             self._hwnd = self._phase = self._detail = 0
