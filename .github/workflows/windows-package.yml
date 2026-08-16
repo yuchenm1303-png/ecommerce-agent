@@ -9,15 +9,9 @@ on:
       - "v*"
     paths:
       - "app/runtime_paths.py"
-      - "app/app_branding.py"
-      - "app/app_icon_data.py"
-      - "app/browser_session.py"
-      - "app/updater_core.py"
+      - "app/velopack_runtime.py"
       - "app/update_browser_gate.py"
-      - "app/updater_panel.py"
-      - "app/windows_restart_manager.py"
-      - "gui/__init__.py"
-      - "gui/app_access.py"
+      - "app/browser_session.py"
       - "gui/app_updater.py"
       - "gui/browser_session_manager.py"
       - "gui/resilient_app_updater.py"
@@ -26,24 +20,16 @@ on:
       - "run_packaged_worker.py"
       - "run_local_gui.py"
       - "packaging/**"
-      - "scripts/updater_main.py"
-      - "scripts/updater_main_v2.py"
       - "scripts/build_windows.ps1"
-      - "scripts/test_windows_update_e2e.ps1"
+      - "scripts/test_velopack_update_e2e.ps1"
       - "scripts/generate_app_icon.py"
+      - ".config/dotnet-tools.json"
       - "requirements.txt"
       - "requirements-gui.txt"
       - "requirements-build.txt"
       - "tests/test_windows_packaging_contract.py"
-      - "tests/test_update_delivery_contract.py"
-      - "tests/test_updater_core_contract.py"
-      - "tests/test_updater_browser_shutdown_contract.py"
-      - "tests/test_update_panel_contract.py"
-      - "tests/test_resilient_app_updater_contract.py"
-      - "tests/test_updater_onefile_contract.py"
-      - "tests/test_update_chain_contract.py"
-      - "tests/windows_updater_e2e_parent.py"
-      - "tests/windows_updater_fake_edge.py"
+      - "tests/test_velopack_update_contract.py"
+      - "tests/test_app_update_ui_contract.py"
       - ".github/workflows/windows-package.yml"
 
 jobs:
@@ -61,77 +47,61 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install Python dependencies
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Install build dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-gui.txt -r requirements-build.txt
+          dotnet tool restore
 
-      - name: Full update-chain contracts
+      - name: Velopack packaging contracts
         shell: pwsh
         run: |
           python -m pytest -q `
             tests/test_windows_packaging_contract.py `
-            tests/test_update_delivery_contract.py `
-            tests/test_updater_core_contract.py `
-            tests/test_updater_browser_shutdown_contract.py `
-            tests/test_update_panel_contract.py `
-            tests/test_resilient_app_updater_contract.py `
-            tests/test_updater_onefile_contract.py `
-            tests/test_update_chain_contract.py
+            tests/test_velopack_update_contract.py `
+            tests/test_app_update_ui_contract.py `
+            tests/test_updater_browser_shutdown_contract.py
 
-      - name: Install Inno Setup
-        shell: pwsh
-        run: choco install innosetup --no-progress -y
-
-      - name: Build installer and portable package
+      - name: Build Velopack installer and portable package
         shell: powershell
         run: .\scripts\build_windows.ps1
 
-      - name: Silent installer smoke test
+      - name: Silent Velopack installer smoke test
         shell: pwsh
         run: |
           $setup = Get-ChildItem artifacts\EcommerceAgent-Setup-*.exe | Select-Object -First 1
-          if (-not $setup) { throw "Installer artifact not found" }
-
-          $installDir = Join-Path $env:RUNNER_TEMP "EcommerceAgentInstalled"
+          if (-not $setup) { throw "Velopack installer artifact not found" }
+          $installDir = Join-Path $env:RUNNER_TEMP "ListingStudioVelopackInstalled"
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
-          $setupLog = Join-Path $env:RUNNER_TEMP "ecommerce-agent-setup.log"
-          if (Test-Path $setupLog) { Remove-Item $setupLog -Force }
-
           $install = Start-Process -FilePath $setup.FullName -ArgumentList @(
-            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir", "/LOG=$setupLog"
+            "--silent", "--installto", $installDir
           ) -Wait -PassThru
-          if ($install.ExitCode -ne 0) {
-            if (Test-Path $setupLog) { Get-Content $setupLog -Tail 120 }
-            throw "Silent install failed with exit code $($install.ExitCode)"
-          }
+          if ($install.ExitCode -ne 0) { throw "Velopack install failed: $($install.ExitCode)" }
 
-          $gui = Join-Path $installDir "EcommerceAgent.exe"
-          $worker = Join-Path $installDir "EcommerceAgentWorker.exe"
-          $updater = Join-Path $installDir "updater\updater.exe"
-          $internal = Join-Path $installDir "_internal"
-          $versionFile = Join-Path $internal "packaging\VERSION"
-          foreach ($required in @($gui, $worker, $updater, $internal, $versionFile)) {
-            if (-not (Test-Path $required)) { throw "Installed package component missing: $required" }
+          $stub = Join-Path $installDir "EcommerceAgent.exe"
+          $update = Join-Path $installDir "Update.exe"
+          $gui = Join-Path $installDir "current\EcommerceAgent.exe"
+          $worker = Join-Path $installDir "current\EcommerceAgentWorker.exe"
+          $versionFile = Join-Path $installDir "current\_internal\packaging\VERSION"
+          foreach ($required in @($stub, $update, $gui, $worker, $versionFile)) {
+            if (-not (Test-Path $required)) { throw "Velopack installed component missing: $required" }
           }
-          if (Test-Path (Join-Path $installDir "updater\_internal")) {
-            throw "Standalone updater unexpectedly depends on an installed _internal directory"
-          }
-
           & $worker --self-test
-          if ($LASTEXITCODE -ne 0) {
-            throw "Installed worker self-test failed with exit code $LASTEXITCODE"
-          }
-          & $updater --self-check
-          if ($LASTEXITCODE -ne 0) {
-            throw "Installed updater self-check failed with exit code $LASTEXITCODE"
-          }
+          if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: EcommerceAgent-Windows-${{ github.sha }}
-          path: artifacts/*
+          path: |
+            artifacts/EcommerceAgent-Setup-*.exe
+            artifacts/EcommerceAgent-*-portable.zip
+            artifacts/velopack/*
           if-no-files-found: error
           retention-days: 14

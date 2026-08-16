@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 UPDATER = (ROOT / "gui" / "app_updater.py").read_text(encoding="utf-8")
 
@@ -30,6 +29,14 @@ def test_periodic_check_does_not_repeat_the_same_update_prompt() -> None:
     assert 'latest == self._last_prompted_version' in UPDATER
     assert 'manual = self._manual_check' in UPDATER
     assert 'if not manual and latest == self._last_prompted_version' in UPDATER
+
+
+def test_updater_ui_stays_foreground_and_shows_download_progress() -> None:
+    assert "WindowStaysOnTopHint" in UPDATER
+    assert "QProgressDialog" in UPDATER
+    assert "_download_progress" in UPDATER
+    assert '"立即更新"' in UPDATER
+    assert "Velopack" in UPDATER
 
 
 def test_updater_source_compiles() -> None:

@@ -10,10 +10,13 @@ ROOT = Path(SPECPATH).resolve().parent
 APP_ICON = ROOT / "packaging" / "app_icon.ico"
 APP_ACCESS_SOURCE = ROOT / "gui" / "app_access.py"
 APP_ACCESS_MODULE = "gui.app_access"
+VELOPACK_RUNTIME_HOOK = ROOT / "packaging" / "velopack_runtime_hook.py"
 if not APP_ICON.is_file():
     raise RuntimeError(f"Application icon was not generated: {APP_ICON}")
 if not APP_ACCESS_SOURCE.is_file():
     raise RuntimeError(f"Application access source missing: {APP_ACCESS_SOURCE}")
+if not VELOPACK_RUNTIME_HOOK.is_file():
+    raise RuntimeError(f"Velopack runtime hook missing: {VELOPACK_RUNTIME_HOOK}")
 
 BUILD_VERSION = os.environ.get("ECOMMERCE_AGENT_BUILD_VERSION", "").strip()
 if not BUILD_VERSION:
@@ -23,34 +26,30 @@ BUILD_METADATA.mkdir(parents=True, exist_ok=True)
 (BUILD_METADATA / "VERSION").write_text(BUILD_VERSION + "\n", encoding="utf-8")
 
 playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all("playwright")
+velopack_datas, velopack_binaries, velopack_hiddenimports = collect_all("velopack")
 
 gui_datas = [
     (str(ROOT / "gui" / "assets"), "gui/assets"),
-    # Ship account/access as transparent source. PyInstaller still analyzes the
-    # module normally below so every current and future dependency is collected;
-    # only the module bytecode itself is removed from PYZ after analysis.
     (str(APP_ACCESS_SOURCE), "gui"),
     (str(ROOT / "THIRD_PARTY_NOTICES.md"), "."),
     (str(BUILD_METADATA / "VERSION"), "packaging"),
+    *velopack_datas,
 ]
 
 gui_a = Analysis(
     [str(ROOT / "run_local_gui.py")],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=velopack_binaries,
     datas=gui_datas,
-    hiddenimports=[],
+    hiddenimports=velopack_hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(VELOPACK_RUNTIME_HOOK)],
     excludes=["pytest"],
     noarchive=False,
     optimize=0,
 )
 
-# Keep dependency discovery intact while preventing gui.app_access from being
-# embedded as compiled PYZ bytecode. This avoids maintaining a brittle manual
-# hidden-import list and guarantees newly added app_access imports are analyzed.
 app_access_pure = [entry for entry in gui_a.pure if entry[0] == APP_ACCESS_MODULE]
 if len(app_access_pure) != 1:
     raise RuntimeError(
@@ -67,7 +66,7 @@ worker_a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["PySide6", "pytest"],
+    excludes=["PySide6", "pytest", "velopack"],
     noarchive=False,
     optimize=0,
 )

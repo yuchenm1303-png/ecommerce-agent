@@ -6,8 +6,6 @@ from pathlib import Path
 
 _DATA_ENV = "ECOMMERCE_AGENT_DATA_DIR"
 _APP_DATA_DIRNAME = "EcommerceAgent"
-_INSTALL_REGISTRY_KEY = r"Software\EcommerceAgent"
-_INSTALL_REGISTRY_VALUE = "InstallDir"
 
 
 def is_frozen() -> bool:
@@ -19,60 +17,32 @@ def source_project_root() -> Path:
 
 
 def installed_application_dir() -> Path | None:
-    """Return the Inno-owned install directory for the current Windows user."""
+    """Return the Velopack installation root for the current process."""
 
     if os.name != "nt" or not is_frozen():
         return None
     try:
-        import winreg
+        from app.velopack_runtime import velopack_root
 
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            _INSTALL_REGISTRY_KEY,
-            0,
-            winreg.KEY_READ,
-        ) as key:
-            value, _ = winreg.QueryValueEx(key, _INSTALL_REGISTRY_VALUE)
-    except (ImportError, OSError):
-        return None
-
-    text = os.path.expandvars(str(value or "").strip())
-    if not text:
-        return None
-    try:
-        return Path(text).expanduser().resolve()
-    except OSError:
+        return velopack_root()
+    except Exception:
         return None
 
 
 def is_installed_distribution() -> bool:
-    """True only when this frozen executable is running from the Inno install tree.
+    """True only for the Velopack-managed installed application.
 
-    The portable archive contains the same frozen binaries, so ``sys.frozen`` is
-    not sufficient to decide whether self-update is safe.  Inno records its
-    exact install directory in HKCU and portable copies have no matching record.
+    A raw PyInstaller directory and the Velopack portable archive are not treated
+    as installed self-updating distributions. This keeps update ownership inside
+    Velopack instead of reconstructing install identity from our own registry
+    marker or directory convention.
     """
 
-    install_dir = installed_application_dir()
-    if install_dir is None:
-        return False
-    try:
-        current_dir = Path(sys.executable).resolve().parent
-    except OSError:
-        return False
-    return os.path.normcase(os.path.abspath(str(current_dir))) == os.path.normcase(
-        os.path.abspath(str(install_dir))
-    )
+    return installed_application_dir() is not None
 
 
 def runtime_root() -> Path:
-    """Return the writable application root.
-
-    Source/development runs keep the historical repository-local layout.
-    Frozen Windows builds move mutable state out of the install directory into
-    LOCALAPPDATA so upgrades can replace program files without touching login
-    profiles, run history, caches, or batch state.
-    """
+    """Return the writable application-data root outside the versioned app tree."""
 
     override = str(os.getenv(_DATA_ENV, "") or "").strip()
     if override:
