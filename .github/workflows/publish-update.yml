@@ -127,6 +127,30 @@ jobs:
             -ReleaseNotesPath "artifacts\release-notes.md" `
             -RunUpdateE2E
 
+      - name: Validate local Velopack release assets
+        shell: pwsh
+        run: |
+          $dir = "artifacts\velopack"
+          $nativeSetup = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Setup.exe")
+          $nativePortable = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Portable.zip")
+          if ($nativeSetup.Count -ne 1) { throw "Expected exactly one native Velopack Setup, found $($nativeSetup.Count)" }
+          if ($nativePortable.Count -ne 1) { throw "Expected exactly one native Velopack Portable, found $($nativePortable.Count)" }
+          foreach ($required in @(
+            "artifacts\velopack\Smirel.ListingStudio-$env:UPDATE_VERSION-full.nupkg",
+            "artifacts\velopack\releases.$env:VELOPACK_CHANNEL.json",
+            "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe",
+            "artifacts\EcommerceAgent-$env:UPDATE_VERSION-portable.zip"
+          )) {
+            if (-not (Test-Path $required)) { throw "Release asset missing before publish: $required" }
+          }
+          $feed = Get-Content "artifacts\velopack\releases.$env:VELOPACK_CHANNEL.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+          $target = @($feed.Assets | Where-Object {
+            $_.PackageId -eq "Smirel.ListingStudio" -and $_.Version -eq $env:UPDATE_VERSION -and $_.Type -eq "Full"
+          })
+          if ($target.Count -ne 1) { throw "Velopack feed does not contain exactly one target Full release" }
+          "native_setup=$($nativeSetup[0].Name)" >> $env:GITHUB_ENV
+          "native_portable=$($nativePortable[0].Name)" >> $env:GITHUB_ENV
+
       - name: Silent Velopack installer smoke test
         shell: pwsh
         run: |
@@ -169,21 +193,26 @@ jobs:
             "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe" `
             "artifacts\EcommerceAgent-$env:UPDATE_VERSION-portable.zip" `
             --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Friendly release asset upload failed: $LASTEXITCODE" }
 
       - name: Verify published Velopack contract
         shell: pwsh
         run: |
           $tag = "v$env:UPDATE_VERSION"
           $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
+          if ($release.tag_name -ne $tag) { throw "Published tag mismatch" }
           $names = @($release.assets | ForEach-Object { $_.name })
           foreach ($expected in @(
             "Smirel.ListingStudio-$env:UPDATE_VERSION-full.nupkg",
             "releases.$env:VELOPACK_CHANNEL.json",
-            "Smirel.ListingStudio-Setup.exe",
+            $env:native_setup,
+            $env:native_portable,
             "EcommerceAgent-Setup-$env:UPDATE_VERSION.exe",
             "EcommerceAgent-$env:UPDATE_VERSION-portable.zip"
           )) {
-            if ($expected -notin $names) { throw "Published asset missing: $expected" }
+            if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
+              throw "Published asset missing: $expected"
+            }
           }
 
       - name: Upload published files to workflow run
