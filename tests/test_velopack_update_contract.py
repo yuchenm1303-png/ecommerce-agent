@@ -13,6 +13,8 @@ BUILD = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
 E2E = (ROOT / "scripts" / "test_velopack_update_e2e.ps1").read_text(encoding="utf-8")
 PUBLISH = (ROOT / ".github" / "workflows" / "publish-update.yml").read_text(encoding="utf-8")
 TEST_PUBLISH = (ROOT / ".github" / "workflows" / "publish-test-build.yml").read_text(encoding="utf-8")
+PORTAL_DOWNLOAD = (ROOT / "supabase" / "functions" / "portal-download" / "index.ts").read_text(encoding="utf-8")
+PORTAL_RELEASE = (ROOT / "supabase" / "functions" / "portal-release" / "index.ts").read_text(encoding="utf-8")
 
 
 def test_runtime_uses_official_velopack_manager_and_github_source() -> None:
@@ -113,3 +115,20 @@ def test_release_publication_is_transactional_and_test_releases_are_bounded() ->
     assert "gh release edit $tag --draft=false --prerelease" in TEST_PUBLISH
     assert "Prune old test prereleases" in TEST_PUBLISH
     assert "Select-Object -Skip 3" in TEST_PUBLISH
+
+
+def test_portal_download_no_longer_depends_on_legacy_update_manifest() -> None:
+    assert 'const MANIFEST_ASSET = "update.json"' not in PORTAL_DOWNLOAD
+    assert "SHA256_DIGEST_RE" in PORTAL_DOWNLOAD
+    assert "installerAsset?.digest" in PORTAL_DOWNLOAD
+    assert 'const installerName = `EcommerceAgent-Setup-${requestedVersion}.exe`' in PORTAL_DOWNLOAD
+    assert 'source: "github_release_stable"' in PORTAL_DOWNLOAD
+
+
+def test_public_release_metadata_accepts_velopack_release_and_only_uses_legacy_manifest_optionally() -> None:
+    assert 'const LEGACY_MANIFEST_ASSET = "update.json"' in PORTAL_RELEASE
+    assert "legacyManifestAsset?.browser_download_url" in PORTAL_RELEASE
+    assert "invalid_stable_tag" in PORTAL_RELEASE
+    assert "installerAsset?.digest" in PORTAL_RELEASE
+    assert 'const installerName = `EcommerceAgent-Setup-${version}.exe`' in PORTAL_RELEASE
+    assert "stable_manifest_missing" not in PORTAL_RELEASE
