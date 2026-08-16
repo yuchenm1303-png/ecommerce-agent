@@ -58,7 +58,7 @@ def _complete_update_e2e_probe() -> bool:
 
 def main() -> int:
     try:
-        from PySide6.QtCore import Qt
+        from PySide6.QtCore import QTimer, Qt
         from PySide6.QtQuick import QQuickWindow
         from PySide6.QtWidgets import QApplication, QAbstractScrollArea, QLabel, QSizePolicy
     except ImportError:
@@ -248,8 +248,18 @@ def main() -> int:
     # archives deliberately do not self-update because Inno installs to a
     # separate managed tree; only the Inno-owned distribution may auto-update.
     if not is_frozen() or is_installed_distribution():
-        install_update_runtime(app, window)
+        # Header/version controls are cheap and belong in the first frame. The
+        # updater binary hash/copy warmup is pure maintenance work and must not
+        # sit on the launch critical path before the Qt event loop can paint.
         install_application_updater(window, access_controller=access_controller)
+
+        def _warm_update_runtime_after_launch() -> None:
+            try:
+                install_update_runtime(app, window)
+            except RuntimeError:
+                return
+
+        QTimer.singleShot(2500, _warm_update_runtime_after_launch)
     return app.exec()
 
 
