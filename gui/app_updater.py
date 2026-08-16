@@ -13,7 +13,7 @@ import threading
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtWidgets import QApplication, QBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QWidget
+from PySide6.QtWidgets import QBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QWidget
 
 from app.update_browser_gate import DEFAULT_CDP_PORT, close_managed_browser
 from app.velopack_runtime import (
@@ -307,6 +307,17 @@ class ApplicationUpdater(QObject):
             except Exception:
                 pass
 
+    def _fail_update(self, error: str) -> None:
+        self._updating = False
+        self._resume_browser_manager()
+        self._last_prompted_version = None
+        self._close_progress()
+        self._show_message(
+            QMessageBox.Icon.Critical,
+            "更新未完成，Listing Studio 已保持当前版本运行。",
+            informative=error,
+        )
+
     def _begin_update(self, target_version: str) -> None:
         if self._updating:
             return
@@ -350,6 +361,8 @@ class ApplicationUpdater(QObject):
                     self._download_progress.emit(percent)
 
                 manager.download_updates(info, _progress)
+                if manager.get_update_pending_restart() is None:
+                    raise RuntimeError("Velopack 下载完成但没有生成可应用的更新包。")
 
                 if browser_manager is not None and hasattr(browser_manager, "wait_for_update_quiesce"):
                     ready, reason = browser_manager.wait_for_update_quiesce(20.0)
@@ -360,12 +373,6 @@ class ApplicationUpdater(QObject):
                 if not closed.ok:
                     raise RuntimeError(closed.detail or "无法安全关闭 Makro Browser。")
 
-                manager.wait_exit_then_apply_updates(
-                    info,
-                    silent=False,
-                    restart=True,
-                    restart_args=None,
-                )
                 self._update_finished.emit({"ok": True, "version": target_version})
             except Exception as exc:
                 self._update_finished.emit(
@@ -384,27 +391,35 @@ class ApplicationUpdater(QObject):
         except RuntimeError:
             pass
 
+    def _apply_downloaded_update(self) -> None:
+        if not self._updating:
+            return
+        try:
+            manager = create_update_manager()
+            pending = manager.get_update_pending_restart()
+            if pending is None:
+                raise RuntimeError("Velopack 未找到已经下载完成的待应用更新。")
+            manager.apply_updates_and_restart(pending)
+            raise RuntimeError("Velopack 更新器返回了控制权，程序未按预期退出并重启。")
+        except Exception as exc:
+            self._fail_update(f"{type(exc).__name__}: {exc}")
+
     def _on_update_finished(self, payload_obj: object) -> None:
         payload = dict(payload_obj) if isinstance(payload_obj, dict) else {}
         if not payload.get("ok"):
-            self._updating = False
-            self._resume_browser_manager()
-            self._last_prompted_version = None
-            self._close_progress()
-            self._show_message(
-                QMessageBox.Icon.Critical,
-                "更新准备未完成，Listing Studio 保持当前版本运行。",
-                informative=str(payload.get("error") or "Velopack update failed"),
-            )
+            self._fail_update(str(payload.get("error") or "Velopack update failed"))
             return
 
-        self._set_progress_text("下载与校验完成。正在交给 Velopack 切换版本并重新打开 Listing Studio…")
+        self._set_progress_text("下载与校验完成。正在关闭当前版本并自动启动新版本…")
         if self._progress is not None:
             try:
                 self._progress.set_progress(100)
             except RuntimeError:
                 pass
-        QTimer.singleShot(180, QApplication.quit)
+        # Give the branded surface one final paint, then use Velopack's explicit
+        # process-exit/apply/restart primitive. Do not rely on QApplication.quit():
+        # Python background services can keep the process alive after the Qt loop ends.
+        QTimer.singleShot(120, self._apply_downloaded_update)
 
 
 def install_application_updater(
