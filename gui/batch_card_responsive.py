@@ -152,6 +152,15 @@ class BatchCardResponsiveController(QObject):
             card.setMaximumWidth(content_width)
             self._elide_url(card)
 
+    def commit_now(self) -> None:
+        """Synchronously bind Batch cards to the current viewport geometry."""
+
+        self._refresh_pending = False
+        try:
+            self._sync_width()
+        except RuntimeError:
+            return
+
     def schedule_refresh(self) -> None:
         if self._refresh_pending:
             return
@@ -159,11 +168,7 @@ class BatchCardResponsiveController(QObject):
         QTimer.singleShot(0, self._refresh)
 
     def _refresh(self) -> None:
-        self._refresh_pending = False
-        try:
-            self._sync_width()
-        except RuntimeError:
-            return
+        self.commit_now()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if watched in {self.viewport, self.jobs_host} and event.type() in {
