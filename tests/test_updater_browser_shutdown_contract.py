@@ -61,8 +61,8 @@ def test_velopack_update_quiesces_business_browser_before_framework_handoff() ->
     assert "wait_for_update_quiesce" in updater
     assert "resume_after_update_failure" in updater
     assert "close_managed_browser" in updater
-    assert "wait_exit_then_apply_updates" in updater
-    assert updater.index("close_managed_browser") < updater.rindex("wait_exit_then_apply_updates")
+    assert "apply_updates_and_restart" in updater
+    assert updater.index("close_managed_browser") < updater.rindex("apply_updates_and_restart")
     assert "self._update_quiesced = True" in manager
     assert "self._poll_timer.stop()" in manager
 
