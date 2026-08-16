@@ -149,3 +149,4 @@ if ($ActualExe -ne $ExpectedExe) {
 }
 
 Write-Host "  Updater E2E passed: stubborn frozen old app -> surviving updater -> Inno -> v$InstalledVersion -> real installed GUI"
+exit 0
