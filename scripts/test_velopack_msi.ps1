@@ -44,10 +44,11 @@ Remove-Item $logPath -Force -ErrorAction SilentlyContinue
 $installed = $false
 $failure = $null
 try {
-    # Velopack 1.2.0's own MSI tests use INSTALLFOLDER for silent installs.
-    # Use one raw argument string so PowerShell cannot re-tokenize the quoted MSI
-    # property value before it reaches msiexec.
-    $installArgs = "/i `"$msi`" /qn /norestart INSTALLFOLDER=`"$installDir`" /L*v `"$logPath`""
+    # Velopack 1.2.0 defines VELOPACK_INSTALLDIR as the supported public install
+    # directory override and maps it to the internal INSTALLFOLDER property before
+    # CostFinalize. Setting INSTALLFOLDER directly is not the supported CLI contract
+    # and can be replaced by the package's own default-folder logic.
+    $installArgs = "/i `"$msi`" /qn /norestart VELOPACK_INSTALLDIR=`"$installDir`" /L*v `"$logPath`""
     $install = Start-Process -FilePath "msiexec.exe" -ArgumentList $installArgs -Wait -PassThru
     if ($install.ExitCode -ne 0) {
         throw "Velopack MSI install failed: $($install.ExitCode)"
