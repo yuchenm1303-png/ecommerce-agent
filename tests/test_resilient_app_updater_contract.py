@@ -8,6 +8,7 @@ CANONICAL_PATH = ROOT / "gui" / "app_updater.py"
 CANONICAL = CANONICAL_PATH.read_text(encoding="utf-8")
 PRESENTATION_PATH = ROOT / "gui" / "resilient_app_updater.py"
 PRESENTATION = PRESENTATION_PATH.read_text(encoding="utf-8")
+BROWSER_MANAGER = (ROOT / "gui" / "browser_session_manager.py").read_text(encoding="utf-8")
 RUN = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
@@ -33,8 +34,12 @@ def test_presentation_keeps_expensive_pre_handoff_work_off_qt_thread() -> None:
 def test_presentation_owns_managed_browser_gate_not_arbitrary_edge_shutdown() -> None:
     assert "close_managed_browser" in PRESENTATION
     assert "DEFAULT_CDP_PORT" in PRESENTATION
-    assert "poll_timer.stop()" in PRESENTATION
-    assert "poll_timer.start()" in PRESENTATION
+    assert "begin_update_quiesce" in PRESENTATION
+    assert "wait_for_update_quiesce" in PRESENTATION
+    assert "resume_after_update_failure" in PRESENTATION
+    assert "self._poll_timer.stop()" in BROWSER_MANAGER
+    assert "self._poll_timer.start()" in BROWSER_MANAGER
+    assert "_update_quiesced" in BROWSER_MANAGER
     assert "不会关闭其他普通 Edge 窗口" in PRESENTATION
     assert "taskkill" not in PRESENTATION.lower()
 
