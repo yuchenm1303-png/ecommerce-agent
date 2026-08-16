@@ -303,6 +303,30 @@ def _session_from_auth(
     )
 
 
+def _session_from_stored(
+    stored: dict[str, Any],
+    *,
+    refresh_token: str,
+    device_id: str,
+    device_name: str,
+    offline_grace: bool,
+) -> ApplicationAccessSession:
+    return ApplicationAccessSession(
+        enforced=True,
+        email=str(stored.get("email") or ""),
+        user_id=str(stored.get("user_id") or ""),
+        refresh_token=refresh_token,
+        device_id=device_id,
+        device_name=device_name,
+        validated_at=float(stored.get("validated_at") or 0.0),
+        grace_until=float(stored.get("grace_until") or 0.0),
+        offline_grace=offline_grace,
+        max_devices=max(1, int(stored.get("max_devices") or 2)),
+        active_devices=max(0, int(stored.get("active_devices") or 0)),
+        display_name=str(stored.get("display_name") or ""),
+    )
+
+
 def _restore_session() -> ApplicationAccessSession | None:
     stored = _load_state()
     refresh_token = str(stored.get("refresh_token") or "")
@@ -314,6 +338,24 @@ def _restore_session() -> ApplicationAccessSession | None:
     if stored_device_id and stored_device_id != device_id:
         _clear_state()
         return None
+
+    now = time.time()
+    try:
+        validated_at = float(stored.get("validated_at") or 0.0)
+    except (TypeError, ValueError):
+        validated_at = 0.0
+    validation_age_ms = (now - validated_at) * 1000.0
+    if validated_at > 0.0 and 0.0 <= validation_age_ms < _REVALIDATE_INTERVAL_MS:
+        try:
+            return _session_from_stored(
+                stored,
+                refresh_token=refresh_token,
+                device_id=device_id,
+                device_name=device_name,
+                offline_grace=False,
+            )
+        except (TypeError, ValueError):
+            pass
 
     try:
         auth = _auth_refresh(refresh_token)
@@ -337,22 +379,18 @@ def _restore_session() -> ApplicationAccessSession | None:
         _save_state(session)
         return session
     except AccessNetworkError:
-        grace_until = float(stored.get("grace_until") or 0.0)
-        if grace_until > time.time():
-            return ApplicationAccessSession(
-                enforced=True,
-                email=str(stored.get("email") or ""),
-                user_id=str(stored.get("user_id") or ""),
+        try:
+            session = _session_from_stored(
+                stored,
                 refresh_token=refresh_token,
                 device_id=device_id,
                 device_name=device_name,
-                validated_at=float(stored.get("validated_at") or 0.0),
-                grace_until=grace_until,
                 offline_grace=True,
-                max_devices=max(1, int(stored.get("max_devices") or 2)),
-                active_devices=max(0, int(stored.get("active_devices") or 0)),
-                display_name=str(stored.get("display_name") or ""),
             )
+        except (TypeError, ValueError):
+            return None
+        if session.grace_until > time.time():
+            return session
         return None
     except AccessError:
         _clear_state()
@@ -517,9 +555,12 @@ class ApplicationAccessController(QObject):
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self.revalidate)
         if session.enforced:
-            self._schedule(
-                _OFFLINE_RETRY_INTERVAL_MS if session.offline_grace else _REVALIDATE_INTERVAL_MS
-            )
+            if session.offline_grace:
+                delay_ms = _OFFLINE_RETRY_INTERVAL_MS
+            else:
+                age_ms = max(0, int((time.time() - float(session.validated_at or 0.0)) * 1000.0))
+                delay_ms = max(60_000, _REVALIDATE_INTERVAL_MS - age_ms)
+            self._schedule(delay_ms)
 
     @property
     def download_function_url(self) -> str:
