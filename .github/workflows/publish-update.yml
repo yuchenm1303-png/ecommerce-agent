@@ -33,7 +33,7 @@ concurrency:
 jobs:
   publish-stable-update:
     runs-on: windows-latest
-    timeout-minutes: 70
+    timeout-minutes: 75
     env:
       SOURCE_REF: ${{ inputs.source_ref }}
       UPDATE_VERSION: ${{ inputs.version }}
@@ -127,7 +127,7 @@ jobs:
             -ReleaseNotesPath "artifacts\release-notes.md" `
             -RunUpdateE2E
 
-      - name: Validate local Velopack release assets
+      - name: Validate local branded Velopack release assets
         shell: pwsh
         run: |
           $dir = "artifacts\velopack"
@@ -151,23 +151,30 @@ jobs:
           }
 
           $nativeSetup = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Setup.exe")
+          $nativeMsi = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*.msi")
           $nativePortable = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Portable.zip")
           if ($nativeSetup.Count -ne 1) { throw "Expected exactly one native Velopack Setup, found $($nativeSetup.Count)" }
+          if ($nativeMsi.Count -ne 1) { throw "Expected exactly one native Velopack MSI, found $($nativeMsi.Count)" }
           if ($nativePortable.Count -ne 1) { throw "Expected exactly one native Velopack Portable, found $($nativePortable.Count)" }
 
           $friendlySetup = Get-Item "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe"
+          $friendlyMsi = Get-Item "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.msi"
           $friendlyPortable = Get-Item "artifacts\EcommerceAgent-$env:UPDATE_VERSION-portable.zip"
-          $friendlySha = (Get-FileHash $friendlySetup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $friendlySetupSha = (Get-FileHash $friendlySetup.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $friendlyMsiSha = (Get-FileHash $friendlyMsi.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 
           "target_full=$targetFull" >> $env:GITHUB_ENV
           "native_setup=$($nativeSetup[0].Name)" >> $env:GITHUB_ENV
+          "native_msi=$($nativeMsi[0].Name)" >> $env:GITHUB_ENV
           "native_portable=$($nativePortable[0].Name)" >> $env:GITHUB_ENV
-          "friendly_setup_sha=$friendlySha" >> $env:GITHUB_ENV
+          "friendly_setup_sha=$friendlySetupSha" >> $env:GITHUB_ENV
           "friendly_setup_size=$($friendlySetup.Length)" >> $env:GITHUB_ENV
+          "friendly_msi_sha=$friendlyMsiSha" >> $env:GITHUB_ENV
+          "friendly_msi_size=$($friendlyMsi.Length)" >> $env:GITHUB_ENV
           Write-Host "Velopack target Full asset: $targetFull"
-          Write-Host "Friendly installer SHA256: $friendlySha"
+          Write-Host "Friendly MSI SHA256: $friendlyMsiSha"
 
-      - name: Silent Velopack installer smoke test
+      - name: Silent Velopack Setup smoke test
         shell: pwsh
         run: |
           $setup = "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe"
@@ -191,6 +198,28 @@ jobs:
           & $worker --self-test
           if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
 
+      - name: Silent branded MSI install and uninstall smoke test
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.msi").Path
+          $installDir = Join-Path $env:RUNNER_TEMP "ListingStudioStableMsiSmoke"
+          if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
+          $install = Start-Process -FilePath "msiexec.exe" -ArgumentList @(
+            "/i", "`"$msi`"", "/qn", "/norestart", "VELOPACK_INSTALLDIR=`"$installDir`""
+          ) -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Velopack MSI install failed: $($install.ExitCode)" }
+          foreach ($required in @(
+            (Join-Path $installDir "EcommerceAgent.exe"),
+            (Join-Path $installDir "Update.exe"),
+            (Join-Path $installDir "current\EcommerceAgent.exe")
+          )) {
+            if (-not (Test-Path $required)) { throw "MSI installed component missing: $required" }
+          }
+          $uninstall = Start-Process -FilePath "msiexec.exe" -ArgumentList @(
+            "/x", "`"$msi`"", "/qn", "/norestart"
+          ) -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Velopack MSI uninstall failed: $($uninstall.ExitCode)" }
+
       - name: Stage Velopack Stable release as draft
         shell: pwsh
         env:
@@ -208,6 +237,7 @@ jobs:
 
           gh release upload "v$env:UPDATE_VERSION" `
             "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe" `
+            "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.msi" `
             "artifacts\EcommerceAgent-$env:UPDATE_VERSION-portable.zip" `
             --clobber
           if ($LASTEXITCODE -ne 0) { throw "Friendly release asset upload failed: $LASTEXITCODE" }
@@ -225,8 +255,10 @@ jobs:
             $env:target_full,
             "releases.$env:VELOPACK_CHANNEL.json",
             $env:native_setup,
+            $env:native_msi,
             $env:native_portable,
             "EcommerceAgent-Setup-$env:UPDATE_VERSION.exe",
+            "EcommerceAgent-Setup-$env:UPDATE_VERSION.msi",
             "EcommerceAgent-$env:UPDATE_VERSION-portable.zip"
           )) {
             if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
@@ -235,10 +267,10 @@ jobs:
           }
 
           $apiRelease = gh api "repos/$env:GITHUB_REPOSITORY/releases/$($draft.databaseId)" | ConvertFrom-Json
-          $friendly = @($apiRelease.assets | Where-Object { $_.name -eq "EcommerceAgent-Setup-$env:UPDATE_VERSION.exe" })
-          if ($friendly.Count -ne 1) { throw "Draft friendly installer asset is not unique" }
-          if ([int64]$friendly[0].size -ne [int64]$env:friendly_setup_size) { throw "Draft friendly installer size mismatch" }
-          if ([string]$friendly[0].digest -ne "sha256:$env:friendly_setup_sha") { throw "Draft friendly installer SHA256 mismatch" }
+          $friendlyMsi = @($apiRelease.assets | Where-Object { $_.name -eq "EcommerceAgent-Setup-$env:UPDATE_VERSION.msi" })
+          if ($friendlyMsi.Count -ne 1) { throw "Draft branded MSI asset is not unique" }
+          if ([int64]$friendlyMsi[0].size -ne [int64]$env:friendly_msi_size) { throw "Draft branded MSI size mismatch" }
+          if ([string]$friendlyMsi[0].digest -ne "sha256:$env:friendly_msi_sha") { throw "Draft branded MSI SHA256 mismatch" }
 
       - name: Publish verified Stable release
         shell: pwsh
@@ -260,8 +292,10 @@ jobs:
             $env:target_full,
             "releases.$env:VELOPACK_CHANNEL.json",
             $env:native_setup,
+            $env:native_msi,
             $env:native_portable,
             "EcommerceAgent-Setup-$env:UPDATE_VERSION.exe",
+            "EcommerceAgent-Setup-$env:UPDATE_VERSION.msi",
             "EcommerceAgent-$env:UPDATE_VERSION-portable.zip"
           )) {
             if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
@@ -297,6 +331,7 @@ jobs:
           name: EcommerceAgent-Stable-${{ inputs.version }}
           path: |
             artifacts/EcommerceAgent-Setup-${{ inputs.version }}.exe
+            artifacts/EcommerceAgent-Setup-${{ inputs.version }}.msi
             artifacts/EcommerceAgent-${{ inputs.version }}-portable.zip
             artifacts/velopack/*
           if-no-files-found: error
