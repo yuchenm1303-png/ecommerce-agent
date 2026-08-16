@@ -321,10 +321,23 @@ class WorkflowMainWindow(ConsoleMainWindow):
             button.setEnabled(not running and not workflow_running)
 
     def _reset_result_views(self) -> None:
+        previous_url = ""
+        if self.current_result is not None:
+            previous_url = str(self.current_result.product_url or "").strip()
+        current_url = self.url_input.text().strip()
+        preserve_manual = bool(
+            self._selected_upload_images
+            and previous_url
+            and current_url
+            and previous_url.casefold() == current_url.casefold()
+        )
+        manual_images = list(self._selected_upload_images) if preserve_manual else []
+
         super()._reset_result_views()
-        # Permissions are per product/run. Never carry Save/image authorization
-        # or manually selected photos across products.
-        self._selected_upload_images = []
+        # Save/image authorization is per run. Manual Product Photos are different:
+        # preserve an explicit user selection only across a re-prepare of the exact
+        # same supplier URL; changing products clears it so photos never leak.
+        self._selected_upload_images = manual_images
         if hasattr(self, "real_save_check"):
             self.real_save_check.setChecked(False)
         if hasattr(self, "real_upload_check"):
@@ -334,8 +347,12 @@ class WorkflowMainWindow(ConsoleMainWindow):
             if full_index >= 0:
                 self.real_scope_combo.setCurrentIndex(full_index)
         if hasattr(self, "real_image_count"):
-            self.real_image_count.setText("AUTO · waiting")
-            self.real_image_count.setToolTip("")
+            if manual_images:
+                self.real_image_count.setText(f"MANUAL {len(manual_images)}")
+                self.real_image_count.setToolTip("\n".join(str(path) for path in manual_images))
+            else:
+                self.real_image_count.setText("AUTO · waiting")
+                self.real_image_count.setToolTip("")
         self._sync_execution_mode_copy()
 
     def _apply_result(self, result: RunResult) -> None:
@@ -355,7 +372,14 @@ class WorkflowMainWindow(ConsoleMainWindow):
 
     def _unlock_real_execution(self, result: RunResult) -> None:
         images = self._current_resolver_product_images()
-        if images:
+        manual_images = tuple(self._selected_upload_images)
+        if manual_images:
+            self.real_image_count.setText(f"MANUAL {len(manual_images)}")
+            self.real_image_count.setToolTip(
+                "手动 Product Photos 优先于 Resolver 自动图片：\n"
+                + "\n".join(str(path) for path in manual_images)
+            )
+        elif images:
             auto_count = min(len(images), _AUTO_PRODUCT_PHOTO_LIMIT)
             self.real_image_count.setText(f"AUTO {auto_count}/{len(images)}")
             self.real_image_count.setToolTip(
@@ -373,10 +397,15 @@ class WorkflowMainWindow(ConsoleMainWindow):
             )
             return
         self.real_start_button.setEnabled(True)
+        photo_copy = (
+            f"本次使用 {len(manual_images)} 张手动 Product Photos。"
+            if manual_images
+            else f"本次可自动使用 {min(len(images), _AUTO_PRODUCT_PHOTO_LIMIT)} 张合格商品图。"
+        )
         self.real_policy_hint.setText(
             f"当前 Step 3 Fill Plan 已通过：READY={result.ready}。默认 Full Step 3 会填写全部 READY；"
-            f"本次可自动使用 {min(len(images), _AUTO_PRODUCT_PHOTO_LIMIT)} 张合格商品图。"
-            "Save / 图片仍需显式授权，Send to QC 继续锁定。"
+            + photo_copy
+            + "Save / 图片仍需显式授权，Send to QC 继续锁定。"
         )
 
     def _start_real_execution(self) -> None:
@@ -386,9 +415,13 @@ class WorkflowMainWindow(ConsoleMainWindow):
         if self.current_result is not None and self.current_result.vertical:
             self.vertical_input.setText(self.current_result.vertical)
 
-        # Automatic Product Photos are always derived from the canonical listing
-        # image gate. Raw resolver evidence remains available only for strict rebind.
-        if self.real_upload_check.isChecked() and not self._selected_upload_images:
+        # Manual photos remain the persistent user-owned state. Resolver fallback
+        # photos are injected only for the synchronous hand-off to the executor and
+        # are immediately removed again, so a later manual pick can never inherit
+        # or be crowded out by stale automatic images from an earlier execution.
+        manual_images = list(self._selected_upload_images)
+        temporary_auto = False
+        if self.real_upload_check.isChecked() and not manual_images:
             images = self._current_resolver_product_images()
             if not images:
                 QMessageBox.warning(
@@ -399,7 +432,12 @@ class WorkflowMainWindow(ConsoleMainWindow):
                 return
             selected = list(images[:_AUTO_PRODUCT_PHOTO_LIMIT])
             self._selected_upload_images = selected
+            temporary_auto = True
             self.real_image_count.setText(f"AUTO {len(selected)}/{len(images)}")
             self.real_image_count.setToolTip("\n".join(str(path) for path in selected))
 
-        super()._start_real_execution()
+        try:
+            super()._start_real_execution()
+        finally:
+            if temporary_auto:
+                self._selected_upload_images = manual_images
