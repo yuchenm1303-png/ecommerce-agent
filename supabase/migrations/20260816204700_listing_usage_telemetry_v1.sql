@@ -59,20 +59,38 @@ grant all on table public.listing_usage_sessions to service_role;
 grant all on table public.listing_usage_events to service_role;
 grant usage, select on sequence public.listing_usage_events_id_seq to service_role;
 
-create or replace function public.get_listing_usage_admin_snapshot()
+drop policy if exists "listing usage sessions deny direct client access" on public.listing_usage_sessions;
+create policy "listing usage sessions deny direct client access"
+on public.listing_usage_sessions
+for all
+to public
+using (false)
+with check (false);
+
+drop policy if exists "listing usage events deny direct client access" on public.listing_usage_events;
+create policy "listing usage events deny direct client access"
+on public.listing_usage_events
+for all
+to public
+using (false)
+with check (false);
+
+drop function if exists public.get_listing_usage_admin_snapshot();
+drop function if exists public.get_listing_usage_admin_snapshot(uuid);
+
+create function public.get_listing_usage_admin_snapshot(p_caller uuid)
 returns jsonb
 language plpgsql
 security definer
 set search_path = public, auth
 as $$
 declare
-  caller uuid := auth.uid();
   payload jsonb;
 begin
-  if caller is null or not exists (
+  if p_caller is null or not exists (
     select 1
     from public.download_portal_users
-    where user_id = caller and is_admin = true
+    where user_id = p_caller and is_admin = true and enabled = true
   ) then
     raise exception 'not_authorized' using errcode = '42501';
   end if;
@@ -198,5 +216,5 @@ begin
 end;
 $$;
 
-revoke all on function public.get_listing_usage_admin_snapshot() from public, anon;
-grant execute on function public.get_listing_usage_admin_snapshot() to authenticated;
+revoke all on function public.get_listing_usage_admin_snapshot(uuid) from public, anon, authenticated;
+grant execute on function public.get_listing_usage_admin_snapshot(uuid) to service_role;
