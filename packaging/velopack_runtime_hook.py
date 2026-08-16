@@ -42,11 +42,9 @@ if _source and _target and _marker:
                 f"Velopack E2E target mismatch: expected={_target} actual={_actual}"
             )
         _manager.download_updates(_info)
-        _manager.wait_exit_then_apply_updates(
-            _info,
-            silent=True,
-            restart=True,
-            restart_args=sys.argv[1:],
-        )
-        raise SystemExit(0)
+        _pending = _manager.get_update_pending_restart()
+        if _pending is None:
+            raise RuntimeError("Velopack E2E downloaded update but no pending asset was prepared")
+        _manager.apply_updates_and_restart_with_args(_pending, sys.argv[1:])
+        raise RuntimeError("Velopack E2E apply/restart unexpectedly returned")
     os.environ[_GUI_MARKER_ENV] = _marker
