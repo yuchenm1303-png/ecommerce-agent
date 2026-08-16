@@ -70,6 +70,7 @@ def test_release_build_and_publish_are_native_velopack() -> None:
     assert "test_velopack_update_e2e.ps1" in BUILD
     assert "Updater.spec" not in BUILD
     assert "installer.iss" not in BUILD
+    assert '"--msi", "true"' in BUILD
     assert "dotnet tool run vpk -- upload github" in PUBLISH
     assert "artifacts\\velopack" in PUBLISH
     assert "releases.$env:VELOPACK_CHANNEL.json" in PUBLISH
@@ -98,6 +99,7 @@ def test_real_e2e_is_old_velopack_to_new_velopack_and_real_qt_gui() -> None:
 
 def test_stable_publish_derives_all_native_update_assets_from_feed_or_output() -> None:
     assert 'Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Setup.exe"' in PUBLISH
+    assert 'Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*.msi"' in PUBLISH
     assert 'Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Portable.zip"' in PUBLISH
     assert '$targetFull = [string]$target[0].FileName' in PUBLISH
     assert '"target_full=$targetFull"' in PUBLISH
@@ -107,17 +109,19 @@ def test_stable_publish_derives_all_native_update_assets_from_feed_or_output() -
     assert '"Smirel.ListingStudio-Portable.zip"' not in PUBLISH
 
 
-def test_release_publication_is_transactional_and_checks_portal_installer_digest() -> None:
+def test_release_publication_is_transactional_and_checks_branded_msi_digest() -> None:
     assert "Stage Velopack Stable release as draft" in PUBLISH
     assert "--publish false" in PUBLISH
     assert "Verify complete draft before publication" in PUBLISH
-    assert "friendly_setup_sha" in PUBLISH
-    assert "friendly_setup_size" in PUBLISH
-    assert '"sha256:$env:friendly_setup_sha"' in PUBLISH
+    assert "friendly_msi_sha" in PUBLISH
+    assert "friendly_msi_size" in PUBLISH
+    assert '"sha256:$env:friendly_msi_sha"' in PUBLISH
+    assert "EcommerceAgent-Setup-$env:UPDATE_VERSION.msi" in PUBLISH
     assert "gh release edit $tag --draft=false --latest" in PUBLISH
     assert "Cleanup failed Stable draft" in PUBLISH
     assert "gh release delete $tag --yes --cleanup-tag" in PUBLISH
     assert "Stage prerelease Velopack assets as draft" in TEST_PUBLISH
+    assert "EcommerceAgent-Setup-${{ steps.build.outputs.version }}.msi" in TEST_PUBLISH
     assert "$env:target_full" in TEST_PUBLISH
     assert "gh release edit $tag --draft=false --prerelease" in TEST_PUBLISH
     assert "Cleanup failed prerelease draft" in TEST_PUBLISH
@@ -125,18 +129,22 @@ def test_release_publication_is_transactional_and_checks_portal_installer_digest
     assert "Select-Object -Skip 3" in TEST_PUBLISH
 
 
-def test_portal_download_no_longer_depends_on_legacy_update_manifest() -> None:
+def test_portal_download_prefers_branded_msi_and_keeps_exe_migration_fallback() -> None:
     assert 'const MANIFEST_ASSET = "update.json"' not in PORTAL_DOWNLOAD
     assert "SHA256_DIGEST_RE" in PORTAL_DOWNLOAD
+    assert "resolveInstallerAsset" in PORTAL_DOWNLOAD
+    assert '`EcommerceAgent-Setup-${version}.msi`' in PORTAL_DOWNLOAD
+    assert '`EcommerceAgent-Setup-${version}.exe`' in PORTAL_DOWNLOAD
     assert "installerAsset?.digest" in PORTAL_DOWNLOAD
-    assert 'const installerName = `EcommerceAgent-Setup-${requestedVersion}.exe`' in PORTAL_DOWNLOAD
     assert 'source: "github_release_stable"' in PORTAL_DOWNLOAD
 
 
-def test_public_release_metadata_accepts_velopack_release_and_only_uses_legacy_manifest_optionally() -> None:
+def test_public_release_metadata_prefers_msi_and_uses_legacy_manifest_only_optionally() -> None:
     assert 'const LEGACY_MANIFEST_ASSET = "update.json"' in PORTAL_RELEASE
     assert "legacyManifestAsset?.browser_download_url" in PORTAL_RELEASE
     assert "invalid_stable_tag" in PORTAL_RELEASE
+    assert "resolveInstallerAsset" in PORTAL_RELEASE
+    assert '`EcommerceAgent-Setup-${version}.msi`' in PORTAL_RELEASE
+    assert '`EcommerceAgent-Setup-${version}.exe`' in PORTAL_RELEASE
     assert "installerAsset?.digest" in PORTAL_RELEASE
-    assert 'const installerName = `EcommerceAgent-Setup-${version}.exe`' in PORTAL_RELEASE
     assert "stable_manifest_missing" not in PORTAL_RELEASE
