@@ -12,6 +12,8 @@ on:
       - "app/app_branding.py"
       - "app/app_icon_data.py"
       - "app/updater_core.py"
+      - "app/update_browser_gate.py"
+      - "app/updater_panel.py"
       - "gui/__init__.py"
       - "gui/app_access.py"
       - "gui/app_updater.py"
@@ -22,6 +24,7 @@ on:
       - "run_local_gui.py"
       - "packaging/**"
       - "scripts/updater_main.py"
+      - "scripts/updater_main_v2.py"
       - "scripts/build_windows.ps1"
       - "scripts/test_windows_update_e2e.ps1"
       - "scripts/generate_app_icon.py"
@@ -31,10 +34,13 @@ on:
       - "tests/test_windows_packaging_contract.py"
       - "tests/test_update_delivery_contract.py"
       - "tests/test_updater_core_contract.py"
+      - "tests/test_updater_browser_shutdown_contract.py"
+      - "tests/test_update_panel_contract.py"
       - "tests/test_resilient_app_updater_contract.py"
       - "tests/test_updater_onefile_contract.py"
       - "tests/test_update_chain_contract.py"
       - "tests/windows_updater_e2e_parent.py"
+      - "tests/windows_updater_fake_edge.py"
       - ".github/workflows/windows-package.yml"
 
 jobs:
@@ -65,6 +71,8 @@ jobs:
             tests/test_windows_packaging_contract.py `
             tests/test_update_delivery_contract.py `
             tests/test_updater_core_contract.py `
+            tests/test_updater_browser_shutdown_contract.py `
+            tests/test_update_panel_contract.py `
             tests/test_resilient_app_updater_contract.py `
             tests/test_updater_onefile_contract.py `
             tests/test_update_chain_contract.py
