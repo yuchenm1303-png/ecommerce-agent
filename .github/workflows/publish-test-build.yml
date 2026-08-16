@@ -125,6 +125,15 @@ jobs:
           "native_msi=$($nativeMsi[0].Name)" >> $env:GITHUB_ENV
           "native_portable=$($nativePortable[0].Name)" >> $env:GITHUB_ENV
 
+      - name: Silent branded MSI install and uninstall smoke test
+        shell: pwsh
+        run: |
+          $version = "${{ steps.build.outputs.version }}"
+          .\scripts\test_velopack_msi.ps1 `
+            -MsiPath "artifacts\EcommerceAgent-Setup-$version.msi" `
+            -ExpectedVersion $version `
+            -InstallDir (Join-Path $env:RUNNER_TEMP "ListingStudioTestMsiSmoke")
+
       - name: Silent Velopack Setup smoke test
         shell: pwsh
         run: |
@@ -252,7 +261,7 @@ jobs:
           if ($release.isDraft) {
             Write-Host "Removing failed test draft $tag"
             gh release delete $tag --yes --cleanup-tag
-            if ($LASTEXITCODE -ne 0) { throw "Failed to cleanup test draft $tag" }
+            if ($LASTEXITCODE -ne 0) { throw "Failed to cleanup test prerelease $($release.tagName)" }
           }
           else {
             Write-Warning "Test release $tag is already public; automatic cleanup intentionally refused"
