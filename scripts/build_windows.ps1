@@ -23,6 +23,40 @@ function Get-SingleVelopackArtifact {
     return $Items[0]
 }
 
+function Resolve-VelopackFullPackage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$ReleaseIndex,
+        [Parameter(Mandatory = $true)][string]$PackageId,
+        [Parameter(Mandatory = $true)][string]$PackageVersion
+    )
+
+    if (-not (Test-Path $ReleaseIndex)) { throw "Velopack release index missing: $ReleaseIndex" }
+    $Feed = Get-Content $ReleaseIndex -Raw -Encoding UTF8 | ConvertFrom-Json
+    $Target = @($Feed.Assets | Where-Object {
+        [string]$_.PackageId -eq $PackageId -and
+        [string]$_.Version -eq $PackageVersion -and
+        [string]$_.Type -eq "Full"
+    })
+    if ($Target.Count -ne 1) {
+        throw "Velopack release index must contain exactly one Full asset for $PackageId v$PackageVersion; found $($Target.Count)"
+    }
+
+    $FileName = [string]$Target[0].FileName
+    if ([string]::IsNullOrWhiteSpace($FileName) -or [IO.Path]::GetFileName($FileName) -ne $FileName) {
+        throw "Unsafe Velopack package filename in release index: '$FileName'"
+    }
+    $PackagePath = Join-Path $Directory $FileName
+    if (-not (Test-Path $PackagePath -PathType Leaf)) {
+        throw "Velopack release index points to missing package: $PackagePath"
+    }
+    $Package = Get-Item $PackagePath
+    if ([int64]$Target[0].Size -ne [int64]$Package.Length) {
+        throw "Velopack release index/package size mismatch for $FileName"
+    }
+    return $Package
+}
+
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = (Get-Content (Join-Path $Root "packaging\VERSION") -Raw).Trim()
@@ -151,30 +185,17 @@ if (-not [string]::IsNullOrWhiteSpace($ReleaseNotesPath)) {
 & dotnet tool run vpk -- @PackArgs
 if ($LASTEXITCODE -ne 0) { throw "Velopack pack failed: $LASTEXITCODE" }
 
-# Velopack may channel-qualify native installer/portable filenames. Never derive
-# those names ourselves; resolve the actual assets produced by this pack run.
+# Native artifact names are a Velopack implementation detail and may include
+# channel/runtime qualifiers. Setup/portable are discovered from the clean output
+# directory; the update package itself is resolved only through the release feed.
 $NativeSetup = Get-SingleVelopackArtifact -Directory $VelopackDir -Filter "$PackId*-Setup.exe" -Label "setup bundle"
 $NativePortable = Get-SingleVelopackArtifact -Directory $VelopackDir -Filter "$PackId*-Portable.zip" -Label "portable bundle"
-$FullPackage = Get-SingleVelopackArtifact -Directory $VelopackDir -Filter "$PackId-$Version-full.nupkg" -Label "full package"
 $ReleaseIndex = Join-Path $VelopackDir "releases.$Channel.json"
-if (-not (Test-Path $ReleaseIndex)) { throw "Velopack release index missing: $ReleaseIndex" }
-
-$Feed = Get-Content $ReleaseIndex -Raw -Encoding UTF8 | ConvertFrom-Json
-$FeedAssets = @($Feed.Assets)
-$TargetFull = @($FeedAssets | Where-Object {
-    [string]$_.PackageId -eq $PackId -and
-    [string]$_.Version -eq $Version -and
-    [string]$_.Type -eq "Full"
-})
-if ($TargetFull.Count -ne 1) {
-    throw "Velopack release index must contain exactly one Full asset for $PackId v$Version; found $($TargetFull.Count)"
-}
-if ([string]$TargetFull[0].FileName -ne $FullPackage.Name) {
-    throw "Velopack release index/package mismatch: feed=$($TargetFull[0].FileName) file=$($FullPackage.Name)"
-}
-if ([int64]$TargetFull[0].Size -ne [int64]$FullPackage.Length) {
-    throw "Velopack release index/package size mismatch for $($FullPackage.Name)"
-}
+$FullPackage = Resolve-VelopackFullPackage `
+    -Directory $VelopackDir `
+    -ReleaseIndex $ReleaseIndex `
+    -PackageId $PackId `
+    -PackageVersion $Version
 
 Copy-Item $NativeSetup.FullName $SetupAlias -Force
 Copy-Item $NativePortable.FullName $PortableAlias -Force
@@ -198,6 +219,7 @@ Write-Host "Windows package ready:"
 Write-Host "  Velopack feed : $VelopackDir"
 Write-Host "  Native setup  : $($NativeSetup.Name)"
 Write-Host "  Native portable: $($NativePortable.Name)"
+Write-Host "  Full package  : $($FullPackage.Name)"
 Write-Host "  Installer     : $SetupAlias"
 Write-Host "  Portable      : $PortableAlias"
 Write-Host "  App dir       : $AppDir"
