@@ -71,6 +71,7 @@ jobs:
               "scripts/generate_app_icon.py",
               ".config/dotnet-tools.json",
               "requirements-build.txt",
+              "tests/test_windows_packaging_contract.py",
               ".github/workflows/windows-package.yml"
             )
             foreach ($path in $changed) {
