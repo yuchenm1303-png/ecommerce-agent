@@ -9,6 +9,7 @@ on:
       - "v*"
     paths:
       - "app/app_branding.py"
+      - "app/app_icon_data.py"
       - "app/runtime_paths.py"
       - "app/velopack_runtime.py"
       - "app/update_browser_gate.py"
@@ -41,14 +42,50 @@ jobs:
   build-windows:
     runs-on: windows-latest
     timeout-minutes: 55
-    env:
-      # Normal branch pushes prove the actual PyInstaller + Setup/feed path but do
-      # not spend ~3 minutes compiling the WiX MSI. Manual/tag builds remain full.
-      BUILD_FULL_MSI: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Decide full installer gate
+        id: installer_gate
+        shell: pwsh
+        run: |
+          $full = $env:GITHUB_EVENT_NAME -eq "workflow_dispatch" -or $env:GITHUB_REF -like "refs/tags/v*"
+          if (-not $full -and $env:GITHUB_EVENT_NAME -eq "push") {
+            $before = "${{ github.event.before }}"
+            if (-not [string]::IsNullOrWhiteSpace($before) -and $before -notmatch '^0+$') {
+              $changed = @(git diff --name-only $before $env:GITHUB_SHA)
+            }
+            else {
+              $changed = @(git show --pretty="" --name-only $env:GITHUB_SHA)
+            }
+            $installerSensitive = @(
+              "app/app_branding.py",
+              "app/app_icon_data.py",
+              "packaging/",
+              "scripts/build_windows.ps1",
+              "scripts/test_velopack_msi.ps1",
+              "scripts/generate_app_icon.py",
+              ".config/dotnet-tools.json",
+              "requirements-build.txt",
+              ".github/workflows/windows-package.yml"
+            )
+            foreach ($path in $changed) {
+              foreach ($prefix in $installerSensitive) {
+                if ($path -eq $prefix -or $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+                  $full = $true
+                  break
+                }
+              }
+              if ($full) { break }
+            }
+          }
+          $value = $full.ToString().ToLowerInvariant()
+          "full_msi=$value" >> $env:GITHUB_OUTPUT
+          Write-Host "Full MSI/WiX gate: $value"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -79,7 +116,7 @@ jobs:
       - name: Build branded Velopack package
         shell: pwsh
         run: |
-          if ($env:BUILD_FULL_MSI -eq "true") {
+          if ("${{ steps.installer_gate.outputs.full_msi }}" -eq "true") {
             .\scripts\build_windows.ps1
           }
           else {
@@ -87,7 +124,7 @@ jobs:
           }
 
       - name: Silent branded MSI install and uninstall smoke test
-        if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ steps.installer_gate.outputs.full_msi == 'true' }}
         shell: pwsh
         run: |
           $expectedVersion = (Get-Content packaging\VERSION -Raw).Trim()
