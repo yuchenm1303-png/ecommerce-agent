@@ -41,6 +41,10 @@ jobs:
   build-windows:
     runs-on: windows-latest
     timeout-minutes: 55
+    env:
+      # Normal branch pushes prove the actual PyInstaller + Setup/feed path but do
+      # not spend ~3 minutes compiling the WiX MSI. Manual/tag builds remain full.
+      BUILD_FULL_MSI: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
 
     steps:
       - name: Checkout
@@ -60,8 +64,7 @@ jobs:
       - name: Install build dependencies
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r requirements-gui.txt -r requirements-build.txt
+          python -m pip install --disable-pip-version-check -r requirements.txt -r requirements-gui.txt -r requirements-build.txt
           dotnet tool restore
 
       - name: Velopack packaging contracts
@@ -73,11 +76,18 @@ jobs:
             tests/test_app_update_ui_contract.py `
             tests/test_updater_browser_shutdown_contract.py
 
-      - name: Build branded Velopack installers and portable package
+      - name: Build branded Velopack package
         shell: pwsh
-        run: .\scripts\build_windows.ps1
+        run: |
+          if ($env:BUILD_FULL_MSI -eq "true") {
+            .\scripts\build_windows.ps1
+          }
+          else {
+            .\scripts\build_windows.ps1 -SkipMsi
+          }
 
       - name: Silent branded MSI install and uninstall smoke test
+        if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
         shell: pwsh
         run: |
           $expectedVersion = (Get-Content packaging\VERSION -Raw).Trim()
