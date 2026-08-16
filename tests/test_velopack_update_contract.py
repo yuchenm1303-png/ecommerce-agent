@@ -78,6 +78,11 @@ def test_release_build_and_publish_are_native_velopack() -> None:
 
 def test_real_e2e_is_old_velopack_to_new_velopack_and_real_qt_gui() -> None:
     assert '$OldVersion = "0.0.1"' in E2E
+    assert "$OldAppDir" in E2E
+    assert "Set-Content -Path $OldEmbeddedVersion -Value $OldVersion" in E2E
+    assert "Get-SingleVelopackArtifact" in E2E
+    assert '-Filter "$PackId*-Setup.exe"' in E2E
+    assert 'Join-Path $FeedDir "$PackId-Setup.exe"' not in E2E
     assert "--silent" in E2E
     assert "--installto" in E2E
     assert "--velopack-e2e-source" in E2E
@@ -85,3 +90,14 @@ def test_real_e2e_is_old_velopack_to_new_velopack_and_real_qt_gui() -> None:
     assert "real-gui-relaunch.json" in E2E
     assert 'current\\EcommerceAgent.exe' in E2E
     assert "Velopack E2E passed" in E2E
+
+
+def test_stable_publish_verifies_exact_local_and_remote_assets_without_guessing_native_names() -> None:
+    assert 'Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Setup.exe"' in PUBLISH
+    assert 'Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Portable.zip"' in PUBLISH
+    assert '"native_setup=$($nativeSetup[0].Name)"' in PUBLISH
+    assert '"native_portable=$($nativePortable[0].Name)"' in PUBLISH
+    assert "$env:native_setup" in PUBLISH
+    assert "$env:native_portable" in PUBLISH
+    assert '"Smirel.ListingStudio-Setup.exe"' not in PUBLISH
+    assert '"Smirel.ListingStudio-Portable.zip"' not in PUBLISH
