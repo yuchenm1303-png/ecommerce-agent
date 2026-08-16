@@ -87,9 +87,20 @@ def test_windows_ci_smokes_canonical_velopack_layout() -> None:
     assert "Inno Setup" not in WINDOWS
 
 
-def test_build_keeps_website_friendly_aliases_but_feed_is_native_velopack() -> None:
+def test_build_discovers_channel_qualified_native_assets_instead_of_guessing_names() -> None:
     assert 'EcommerceAgent-Setup-$Version.exe' in BUILD
     assert 'EcommerceAgent-$Version-portable.zip' in BUILD
-    assert '$PackId-Setup.exe' in BUILD
-    assert '$PackId-Portable.zip' in BUILD
+    assert "Get-SingleVelopackArtifact" in BUILD
+    assert '-Filter "$PackId*-Setup.exe"' in BUILD
+    assert '-Filter "$PackId*-Portable.zip"' in BUILD
     assert 'releases.$Channel.json' in BUILD
+    assert 'Join-Path $VelopackDir "$PackId-Setup.exe"' not in BUILD
+    assert 'Join-Path $VelopackDir "$PackId-Portable.zip"' not in BUILD
+
+
+def test_build_validates_feed_binding_and_has_production_signing_hooks() -> None:
+    assert "$Feed.Assets" in BUILD
+    assert '"Full"' in BUILD
+    assert "release index/package mismatch" in BUILD
+    assert "VPK_AZURE_TRUSTED_SIGN_FILE" in BUILD
+    assert "VPK_SIGN_PARAMS" in BUILD
