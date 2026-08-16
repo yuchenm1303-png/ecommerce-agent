@@ -72,7 +72,8 @@ jobs:
           python -m pytest -q `
             tests/test_windows_packaging_contract.py `
             tests/test_velopack_update_contract.py `
-            tests/test_app_update_ui_contract.py
+            tests/test_app_update_ui_contract.py `
+            tests/test_updater_browser_shutdown_contract.py
 
       - name: Build test package
         shell: pwsh
@@ -83,6 +84,26 @@ jobs:
             -Version "${{ steps.build.outputs.version }}" `
             -Channel $env:VELOPACK_CHANNEL `
             -ReleaseNotesPath "artifacts\test-notes.md"
+
+      - name: Validate local prerelease assets
+        shell: pwsh
+        run: |
+          $version = "${{ steps.build.outputs.version }}"
+          $dir = "artifacts\velopack"
+          $nativeSetup = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Setup.exe")
+          $nativePortable = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Portable.zip")
+          if ($nativeSetup.Count -ne 1) { throw "Expected exactly one native test Setup, found $($nativeSetup.Count)" }
+          if ($nativePortable.Count -ne 1) { throw "Expected exactly one native test Portable, found $($nativePortable.Count)" }
+          foreach ($required in @(
+            "artifacts\velopack\Smirel.ListingStudio-$version-full.nupkg",
+            "artifacts\velopack\releases.$env:VELOPACK_CHANNEL.json",
+            "artifacts\EcommerceAgent-Setup-$version.exe",
+            "artifacts\EcommerceAgent-$version-portable.zip"
+          )) {
+            if (-not (Test-Path $required)) { throw "Prerelease asset missing before publish: $required" }
+          }
+          "native_setup=$($nativeSetup[0].Name)" >> $env:GITHUB_ENV
+          "native_portable=$($nativePortable[0].Name)" >> $env:GITHUB_ENV
 
       - name: Silent Velopack installer smoke test
         shell: pwsh
@@ -123,6 +144,28 @@ jobs:
             "artifacts\EcommerceAgent-Setup-${{ steps.build.outputs.version }}.exe" `
             "artifacts\EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip" `
             --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Friendly prerelease asset upload failed: $LASTEXITCODE" }
+
+      - name: Verify published prerelease contract
+        shell: pwsh
+        run: |
+          $version = "${{ steps.build.outputs.version }}"
+          $tag = "${{ steps.build.outputs.tag }}"
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
+          if (-not $release.prerelease) { throw "Test release was not published as prerelease" }
+          $names = @($release.assets | ForEach-Object { $_.name })
+          foreach ($expected in @(
+            "Smirel.ListingStudio-$version-full.nupkg",
+            "releases.$env:VELOPACK_CHANNEL.json",
+            $env:native_setup,
+            $env:native_portable,
+            "EcommerceAgent-Setup-$version.exe",
+            "EcommerceAgent-$version-portable.zip"
+          )) {
+            if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
+              throw "Published prerelease asset missing: $expected"
+            }
+          }
 
       - name: Upload test build files to workflow run
         uses: actions/upload-artifact@v4
