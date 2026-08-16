@@ -25,6 +25,7 @@ on:
       - "packaging/**"
       - "scripts/build_windows.ps1"
       - "scripts/test_velopack_update_e2e.ps1"
+      - "scripts/test_velopack_msi.ps1"
       - "scripts/generate_app_icon.py"
       - ".config/dotnet-tools.json"
       - "requirements.txt"
@@ -76,6 +77,15 @@ jobs:
         shell: pwsh
         run: .\scripts\build_windows.ps1
 
+      - name: Silent branded MSI install and uninstall smoke test
+        shell: pwsh
+        run: |
+          $expectedVersion = (Get-Content packaging\VERSION -Raw).Trim()
+          .\scripts\test_velopack_msi.ps1 `
+            -MsiPath "artifacts\EcommerceAgent-Setup-$expectedVersion.msi" `
+            -ExpectedVersion $expectedVersion `
+            -InstallDir (Join-Path $env:RUNNER_TEMP "ListingStudioMsiInstalled")
+
       - name: Silent Velopack Setup smoke test
         shell: pwsh
         run: |
@@ -104,33 +114,6 @@ jobs:
           }
           & $worker --self-test
           if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
-
-      - name: Silent branded MSI install and uninstall smoke test
-        shell: pwsh
-        run: |
-          $msis = @(Get-ChildItem artifacts\EcommerceAgent-Setup-*.msi -File)
-          if ($msis.Count -ne 1) { throw "Expected exactly one branded MSI artifact, found $($msis.Count)" }
-          $msi = $msis[0].FullName
-          $installDir = Join-Path $env:RUNNER_TEMP "ListingStudioMsiInstalled"
-          if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
-
-          $installArgs = @(
-            "/i", "`"$msi`"", "/qn", "/norestart", "VELOPACK_INSTALLDIR=`"$installDir`""
-          )
-          $install = Start-Process -FilePath "msiexec.exe" -ArgumentList $installArgs -Wait -PassThru
-          if ($install.ExitCode -ne 0) { throw "Velopack MSI install failed: $($install.ExitCode)" }
-          foreach ($required in @(
-            (Join-Path $installDir "EcommerceAgent.exe"),
-            (Join-Path $installDir "Update.exe"),
-            (Join-Path $installDir "current\EcommerceAgent.exe")
-          )) {
-            if (-not (Test-Path $required)) { throw "MSI installed component missing: $required" }
-          }
-
-          $uninstall = Start-Process -FilePath "msiexec.exe" -ArgumentList @(
-            "/x", "`"$msi`"", "/qn", "/norestart"
-          ) -Wait -PassThru
-          if ($uninstall.ExitCode -ne 0) { throw "Velopack MSI uninstall failed: $($uninstall.ExitCode)" }
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
