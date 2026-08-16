@@ -174,7 +174,7 @@ jobs:
           & $worker --self-test
           if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
 
-      - name: Publish Velopack Stable feed to GitHub Releases
+      - name: Stage Velopack Stable release as draft
         shell: pwsh
         env:
           VPK_TOKEN: ${{ github.token }}
@@ -183,11 +183,11 @@ jobs:
             --outputDir "artifacts\velopack" `
             --channel $env:VELOPACK_CHANNEL `
             --repoUrl "https://github.com/$env:GITHUB_REPOSITORY" `
-            --publish true `
+            --publish false `
             --releaseName "$env:UPDATE_TITLE" `
             --tag "v$env:UPDATE_VERSION" `
             --targetCommitish "${{ steps.source.outputs.sha }}"
-          if ($LASTEXITCODE -ne 0) { throw "Velopack GitHub upload failed: $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "Velopack GitHub draft upload failed: $LASTEXITCODE" }
 
           gh release upload "v$env:UPDATE_VERSION" `
             "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe" `
@@ -195,12 +195,43 @@ jobs:
             --clobber
           if ($LASTEXITCODE -ne 0) { throw "Friendly release asset upload failed: $LASTEXITCODE" }
 
+      - name: Verify complete draft before publication
+        shell: pwsh
+        run: |
+          $tag = "v$env:UPDATE_VERSION"
+          $draft = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($draft.tagName -ne $tag) { throw "Draft tag mismatch" }
+          if (-not $draft.isDraft) { throw "Velopack release became public before verification" }
+          if ($draft.isPrerelease) { throw "Stable draft unexpectedly marked prerelease" }
+          $names = @($draft.assets | ForEach-Object { $_.name })
+          foreach ($expected in @(
+            "Smirel.ListingStudio-$env:UPDATE_VERSION-full.nupkg",
+            "releases.$env:VELOPACK_CHANNEL.json",
+            $env:native_setup,
+            $env:native_portable,
+            "EcommerceAgent-Setup-$env:UPDATE_VERSION.exe",
+            "EcommerceAgent-$env:UPDATE_VERSION-portable.zip"
+          )) {
+            if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
+              throw "Draft release asset missing: $expected"
+            }
+          }
+
+      - name: Publish verified Stable release
+        shell: pwsh
+        run: |
+          $tag = "v$env:UPDATE_VERSION"
+          gh release edit $tag --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw "Failed to publish verified Stable draft: $LASTEXITCODE" }
+
       - name: Verify published Velopack contract
         shell: pwsh
         run: |
           $tag = "v$env:UPDATE_VERSION"
-          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
-          if ($release.tag_name -ne $tag) { throw "Published tag mismatch" }
+          $release = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($release.tagName -ne $tag) { throw "Published tag mismatch" }
+          if ($release.isDraft) { throw "Stable release is still a draft" }
+          if ($release.isPrerelease) { throw "Stable release unexpectedly marked prerelease" }
           $names = @($release.assets | ForEach-Object { $_.name })
           foreach ($expected in @(
             "Smirel.ListingStudio-$env:UPDATE_VERSION-full.nupkg",
