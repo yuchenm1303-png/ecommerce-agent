@@ -8,6 +8,21 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+function Get-SingleVelopackArtifact {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$Filter,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $Items = @(Get-ChildItem -Path $Directory -File -Filter $Filter -ErrorAction Stop)
+    if ($Items.Count -ne 1) {
+        $Names = if ($Items.Count -eq 0) { "<none>" } else { ($Items.Name -join ", ") }
+        throw "Expected exactly one Velopack $Label matching '$Filter' in '$Directory', found $($Items.Count): $Names"
+    }
+    return $Items[0]
+}
+
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = (Get-Content (Join-Path $Root "packaging\VERSION") -Raw).Trim()
@@ -98,6 +113,24 @@ if ($GuiProbeExitCode -ne 0) { throw "Packaged GUI import probe failed: $GuiProb
 if ($LASTEXITCODE -ne 0) { throw "Packaged worker self-test failed: $LASTEXITCODE" }
 
 Write-Host "[5/5] Packing standard Velopack release"
+$AzureTrustedSignFile = [string]$env:VPK_AZURE_TRUSTED_SIGN_FILE
+$SignParams = [string]$env:VPK_SIGN_PARAMS
+if (-not [string]::IsNullOrWhiteSpace($AzureTrustedSignFile) -and -not [string]::IsNullOrWhiteSpace($SignParams)) {
+    throw "Configure only one Velopack signing mode: VPK_AZURE_TRUSTED_SIGN_FILE or VPK_SIGN_PARAMS"
+}
+if (-not [string]::IsNullOrWhiteSpace($AzureTrustedSignFile)) {
+    if (-not (Test-Path $AzureTrustedSignFile)) {
+        throw "Velopack Azure signing metadata file not found: $AzureTrustedSignFile"
+    }
+    Write-Host "Velopack code signing enabled via Azure Artifact Signing metadata"
+}
+elseif (-not [string]::IsNullOrWhiteSpace($SignParams)) {
+    Write-Host "Velopack code signing enabled via signtool parameters"
+}
+else {
+    Write-Warning "Velopack package is unsigned. This is acceptable for development/E2E only; configure VPK_AZURE_TRUSTED_SIGN_FILE or VPK_SIGN_PARAMS before production distribution."
+}
+
 $PackArgs = @(
     "pack",
     "--outputDir", $VelopackDir,
@@ -118,23 +151,40 @@ if (-not [string]::IsNullOrWhiteSpace($ReleaseNotesPath)) {
 & dotnet tool run vpk -- @PackArgs
 if ($LASTEXITCODE -ne 0) { throw "Velopack pack failed: $LASTEXITCODE" }
 
-$NativeSetup = Join-Path $VelopackDir "$PackId-Setup.exe"
-$NativePortable = Join-Path $VelopackDir "$PackId-Portable.zip"
+# Velopack may channel-qualify native installer/portable filenames. Never derive
+# those names ourselves; resolve the actual assets produced by this pack run.
+$NativeSetup = Get-SingleVelopackArtifact -Directory $VelopackDir -Filter "$PackId*-Setup.exe" -Label "setup bundle"
+$NativePortable = Get-SingleVelopackArtifact -Directory $VelopackDir -Filter "$PackId*-Portable.zip" -Label "portable bundle"
+$FullPackage = Get-SingleVelopackArtifact -Directory $VelopackDir -Filter "$PackId-$Version-full.nupkg" -Label "full package"
 $ReleaseIndex = Join-Path $VelopackDir "releases.$Channel.json"
-$FullPackage = Get-ChildItem $VelopackDir -Filter "$PackId-$Version-full.nupkg" | Select-Object -First 1
-foreach ($Required in @($NativeSetup, $NativePortable, $ReleaseIndex)) {
-    if (-not (Test-Path $Required)) { throw "Velopack output missing: $Required" }
-}
-if (-not $FullPackage) { throw "Velopack full package missing for v$Version" }
+if (-not (Test-Path $ReleaseIndex)) { throw "Velopack release index missing: $ReleaseIndex" }
 
-Copy-Item $NativeSetup $SetupAlias -Force
-Copy-Item $NativePortable $PortableAlias -Force
+$Feed = Get-Content $ReleaseIndex -Raw -Encoding UTF8 | ConvertFrom-Json
+$FeedAssets = @($Feed.Assets)
+$TargetFull = @($FeedAssets | Where-Object {
+    [string]$_.PackageId -eq $PackId -and
+    [string]$_.Version -eq $Version -and
+    [string]$_.Type -eq "Full"
+})
+if ($TargetFull.Count -ne 1) {
+    throw "Velopack release index must contain exactly one Full asset for $PackId v$Version; found $($TargetFull.Count)"
+}
+if ([string]$TargetFull[0].FileName -ne $FullPackage.Name) {
+    throw "Velopack release index/package mismatch: feed=$($TargetFull[0].FileName) file=$($FullPackage.Name)"
+}
+if ([int64]$TargetFull[0].Size -ne [int64]$FullPackage.Length) {
+    throw "Velopack release index/package size mismatch for $($FullPackage.Name)"
+}
+
+Copy-Item $NativeSetup.FullName $SetupAlias -Force
+Copy-Item $NativePortable.FullName $PortableAlias -Force
 
 if ($ShouldRunUpdateE2E) {
     Write-Host "[release-gate] Running real Velopack old -> new update E2E"
     & (Join-Path $Root "scripts\test_velopack_update_e2e.ps1") `
         -Version $Version `
-        -AppDir $AppDir
+        -AppDir $AppDir `
+        -Channel $Channel
     if ($LASTEXITCODE -ne 0) {
         throw "Velopack end-to-end update test failed: $LASTEXITCODE"
     }
@@ -146,6 +196,8 @@ else {
 Write-Host ""
 Write-Host "Windows package ready:"
 Write-Host "  Velopack feed : $VelopackDir"
+Write-Host "  Native setup  : $($NativeSetup.Name)"
+Write-Host "  Native portable: $($NativePortable.Name)"
 Write-Host "  Installer     : $SetupAlias"
 Write-Host "  Portable      : $PortableAlias"
 Write-Host "  App dir       : $AppDir"
