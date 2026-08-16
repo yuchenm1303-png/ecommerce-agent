@@ -48,6 +48,17 @@ class StartupEntranceStabilityGate(QObject):
                 pass
             self.overlay.finished.connect(self._stage_finish)
 
+    def _commit_workspace_layout(self) -> None:
+        """Commit the current mode's QWidget tree before geometry is sampled."""
+
+        coordinator = getattr(self.window, "_workspace_layout_commit", None)
+        commit = getattr(coordinator, "commit_current", None)
+        if callable(commit):
+            try:
+                commit()
+            except RuntimeError:
+                pass
+
     def start(self) -> None:
         if self._start_requested:
             return
@@ -56,6 +67,10 @@ class StartupEntranceStabilityGate(QObject):
         raise_overlay = getattr(self.entrance, "raise_overlay", None)
         if callable(raise_overlay):
             raise_overlay()
+        # install_mode_workspace reparents the fully built Single widgets before
+        # the top-level shell is shown. Commit that new hierarchy immediately;
+        # otherwise three identical samples can describe a stable-but-stale tree.
+        self._commit_workspace_layout()
         QTimer.singleShot(0, self._probe_layout)
 
     def _geometry_signature(self) -> tuple[Any, ...]:
@@ -124,6 +139,9 @@ class StartupEntranceStabilityGate(QObject):
         if bool(getattr(self.entrance, "_started", False)):
             return
 
+        # Stability means "same geometry after an explicit layout commit", not
+        # merely "the deferred Qt layout has not run yet".
+        self._commit_workspace_layout()
         signature = self._geometry_signature()
         if signature == self._last_signature:
             self._stable_samples += 1
@@ -172,6 +190,10 @@ class StartupEntranceStabilityGate(QObject):
                 pass
 
     def _prime_static_runtime(self) -> None:
+        # The QWidget geometry is authoritative. Native glass is flushed only
+        # after that geometry has reached its fixed point, never the other way
+        # around.
+        self._commit_workspace_layout()
         glass = getattr(self.visual, "_glass", None)
         if isinstance(glass, dict):
             for frame in glass:
@@ -204,6 +226,7 @@ class StartupEntranceStabilityGate(QObject):
         QTimer.singleShot(_HANDOFF_FRAME_MS, self._settle_live_runtime)
 
     def _settle_live_runtime(self) -> None:
+        self._commit_workspace_layout()
         self._flush_native_background()
         QTimer.singleShot(
             _HANDOFF_FRAME_MS * max(1, _NATIVE_SETTLE_FRAMES - 1),
@@ -211,6 +234,9 @@ class StartupEntranceStabilityGate(QObject):
         )
 
     def _commit_overlay_handoff(self) -> None:
+        # Last covered commit: the live QWidget tree and the native glass model
+        # must describe the same geometry before the overlay relinquishes pixels.
+        self._commit_workspace_layout()
         self._flush_native_background()
 
         overlay = self.overlay
