@@ -3,8 +3,8 @@
 This executable intentionally runs as ``EcommerceAgent.exe`` from a disposable
 old install tree. It launches the real packaged updater and can deliberately
 remain alive after ACK so the release gate exercises the production force-close
-path. The updater must survive that close, run Inno, and relaunch the real newly
-installed EcommerceAgent.exe.
+path. The updater must survive that close, stop the owned managed-browser CDP
+process, run Inno, and relaunch the real newly installed EcommerceAgent.exe.
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+from app.update_browser_gate import close_managed_browser
 
 JOB_VERSION = 2
 CREATE_NO_WINDOW = 0x08000000
@@ -51,6 +53,7 @@ def main() -> int:
     parser.add_argument("--setup-log", required=True)
     parser.add_argument("--app-deadline-s", type=int, default=15)
     parser.add_argument("--linger-after-ack-s", type=float, default=0.0)
+    parser.add_argument("--browser-cdp-port", type=int, default=19222)
     args = parser.parse_args()
 
     updater = Path(args.updater).resolve()
@@ -114,6 +117,14 @@ def main() -> int:
         "result_path": str(result_path),
     }
     _write_json(job_path, job)
+
+    browser = close_managed_browser(
+        port=int(args.browser_cdp_port),
+        deadline_s=5.0,
+        log_path=updater_log,
+    )
+    if not browser.ok:
+        return 15
 
     env = os.environ.copy()
     env["ECOMMERCE_AGENT_UPDATE_E2E_MARKER"] = str(relaunch_marker)

@@ -1,15 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 #
 # Builds the standalone updater.exe as a true single-file windowed executable
-# with its Python runtime embedded. build_windows.ps1 verifies the executable
-# before copying it into the packaged app at updater/updater.exe.
+# with its Python runtime embedded. The v2 entry keeps one native topmost update
+# panel alive after the Qt application exits, while reusing the proven updater
+# core and diagnostics from scripts/updater_main.py.
 
 from pathlib import Path
 
 ROOT = Path(SPECPATH).resolve().parent
 
 updater_a = Analysis(
-    [str(ROOT / "scripts" / "updater_main.py")],
+    [str(ROOT / "scripts" / "updater_main_v2.py")],
     pathex=[str(ROOT)],
     binaries=[],
     datas=[],
