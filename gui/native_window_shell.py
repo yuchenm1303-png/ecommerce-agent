@@ -160,6 +160,12 @@ class NativeWindowShell(QObject):
         self._focus_pending = False
         self._last_focus_widget: QWidget | None = None
 
+        app = QApplication.instance()
+        app_icon = app.windowIcon() if app is not None else overlay.windowIcon()
+        if not app_icon.isNull():
+            overlay.setWindowIcon(app_icon)
+            owner.setIcon(app_icon)
+
         owner.setTitle(overlay.windowTitle())
         owner.setFlags(
             Qt.WindowType.Window
@@ -191,7 +197,6 @@ class NativeWindowShell(QObject):
         for widget in self._keyboard_focus_watch:
             widget.installEventFilter(self)
 
-        app = QApplication.instance()
         if app is not None:
             app.focusChanged.connect(self._on_focus_changed)
 
