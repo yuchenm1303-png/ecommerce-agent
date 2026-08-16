@@ -25,8 +25,9 @@ class NativeUpdatePanel:
     def __init__(self, target_version: str, log_path: str | Path | None = None) -> None:
         self.target_version = str(target_version or "").strip().lstrip("v")
         self.log_path = Path(log_path) if log_path else None
-        self._ready = threading.Event()
+        self._initialized = threading.Event()
         self._stop = threading.Event()
+        self._created = not (sys.platform == "win32" and bool(getattr(sys, "frozen", False)))
         self._hwnd = 0
         self._phase = 0
         self._detail = 0
@@ -35,10 +36,14 @@ class NativeUpdatePanel:
         if sys.platform == "win32" and bool(getattr(sys, "frozen", False)):
             self._ui_thread = threading.Thread(target=self._run_ui, daemon=True)
             self._ui_thread.start()
-            self._ready.wait(3.0)
-            if self.log_path:
+            self._initialized.wait(3.0)
+            if self._created and self.log_path:
                 self._monitor_thread = threading.Thread(target=self._monitor_log, daemon=True)
                 self._monitor_thread.start()
+
+    @property
+    def ready(self) -> bool:
+        return bool(self._created)
 
     def _log_event(self, message: str) -> None:
         path = self.log_path
@@ -83,7 +88,9 @@ class NativeUpdatePanel:
                         text = stream.read()
                         offset = stream.tell()
                     for line in text.splitlines():
-                        if "running installer:" in line:
+                        if "install tree lock audit start" in line:
+                            self.set_phase("步骤 4/6 · 正在确认更新文件已释放", "正在检查是否还有其他程序占用 Listing Studio 文件。")
+                        elif "running installer:" in line:
                             self.set_phase("步骤 5/6 · 正在安装新版本", "安装过程会在后台静默完成，请勿关闭电脑。")
                         elif "installer exit code 0" in line:
                             self.set_phase("步骤 5/6 · 正在验证安装结果", "新版本文件已经写入，正在进行最终完整性确认。")
@@ -117,7 +124,7 @@ class NativeUpdatePanel:
                 ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ]
 
-            width, height = 620, 210
+            width, height = 620, 190
             x = max(0, (user32.GetSystemMetrics(0) - width) // 2)
             y = max(0, (user32.GetSystemMetrics(1) - height) // 2)
             hwnd = user32.CreateWindowExW(
@@ -129,12 +136,13 @@ class NativeUpdatePanel:
                 None, None, None, None,
             )
             if not hwnd:
-                self._ready.set()
+                self._log_event("native update panel unavailable: CreateWindowExW returned 0")
+                self._initialized.set()
                 return
-            phase = user32.CreateWindowExW(0, "STATIC", "步骤 4/6 · 正在接管更新任务", self._WS_CHILD | self._WS_VISIBLE, 34, 32, 540, 28, hwnd, None, None, None)
-            detail = user32.CreateWindowExW(0, "STATIC", f"目标版本：v{self.target_version or '?'}", self._WS_CHILD | self._WS_VISIBLE, 34, 72, 540, 30, hwnd, None, None, None)
-            bar = user32.CreateWindowExW(0, "msctls_progress32", "", self._WS_CHILD | self._WS_VISIBLE | self._PBS_MARQUEE, 34, 118, 540, 12, hwnd, None, None, None)
-            footer = user32.CreateWindowExW(0, "STATIC", "请保持电脑开机。安装完成后程序会自动重新打开。", self._WS_CHILD | self._WS_VISIBLE, 34, 148, 540, 24, hwnd, None, None, None)
+            phase = user32.CreateWindowExW(0, "STATIC", "步骤 4/6 · 正在接管更新任务", self._WS_CHILD | self._WS_VISIBLE, 34, 30, 540, 28, hwnd, None, None, None)
+            detail = user32.CreateWindowExW(0, "STATIC", f"目标版本：v{self.target_version or '?'}", self._WS_CHILD | self._WS_VISIBLE, 34, 68, 540, 30, hwnd, None, None, None)
+            bar = user32.CreateWindowExW(0, "msctls_progress32", "", self._WS_CHILD | self._WS_VISIBLE | self._PBS_MARQUEE, 34, 112, 540, 12, hwnd, None, None, None)
+            footer = user32.CreateWindowExW(0, "STATIC", "请保持电脑开机。安装完成后程序会自动重新打开。", self._WS_CHILD | self._WS_VISIBLE, 34, 140, 540, 24, hwnd, None, None, None)
             font = gdi32.GetStockObject(self._DEFAULT_GUI_FONT)
             for control in (phase, detail, footer):
                 if control:
@@ -142,11 +150,13 @@ class NativeUpdatePanel:
             if bar:
                 user32.SendMessageW(bar, self._PBM_SETMARQUEE, 1, 25)
             self._hwnd, self._phase, self._detail = int(hwnd), int(phase), int(detail)
+            self._created = True
             user32.ShowWindow(hwnd, 5)
             user32.UpdateWindow(hwnd)
             user32.SetForegroundWindow(hwnd)
-            self._log_event("native update panel shown")
-            self._ready.set()
+            self._log_event(f"native update panel shown hwnd={int(hwnd)}")
+            self._log_event(f"native update panel ready hwnd={int(hwnd)}")
+            self._initialized.set()
 
             class POINT(ctypes.Structure):
                 _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
@@ -161,8 +171,8 @@ class NativeUpdatePanel:
             user32.DestroyWindow(hwnd)
             self._log_event("native update panel closed")
         except Exception as exc:
-            self._log_event(f"native update panel failed: {exc!r}")
-            self._ready.set()
+            self._log_event(f"native update panel unavailable: {exc!r}")
+            self._initialized.set()
         finally:
             self._hwnd = self._phase = self._detail = 0
 

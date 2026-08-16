@@ -20,26 +20,9 @@ from app.browser_session import (
 
 
 class ManagedMakroBrowser(QObject):
-    """Own the formal GUI's single long-lived Makro browser session.
-
-    The browser is still a detached Edge process with a localhost CDP endpoint,
-    but the GUI now treats that as an implementation detail:
-
-    - one dedicated ``browser_profiles/makro-edge`` profile is reused;
-    - the browser starts automatically when absent;
-    - Single and Batch share that one browser/login session;
-    - Batch continues to isolate jobs by owned tabs/target ids, not browsers;
-    - a browser restart invalidates prepared Step-3/tab ownership and therefore
-      refuses a stale real-execution attempt instead of guessing another tab.
-
-    The manager never reads cookies/tokens and never closes the external Edge.
-    Authentication remains inside Edge's dedicated profile. If Makro expires the
-    login, the normal Makro page stays open for the user to authenticate and the
-    GUI surfaces LOGIN REQUIRED instead of turning that into a CDP problem.
-    """
+    """Own the formal GUI's one long-lived Makro browser session."""
 
     status_changed = Signal(str, str)
-
     _POLL_MS = 1500
 
     def __init__(self, window: Any, *, port: int = DEFAULT_CDP_PORT) -> None:
@@ -57,6 +40,7 @@ class ManagedMakroBrowser(QObject):
         self._generation = 0
         self._single_prepared_generation: int | None = None
         self._batch_prepare_generation: int | None = None
+        self._update_quiesced = False
 
         self._original_single_start: Callable[..., Any] = window.runner.start
         self._original_real_start: Callable[..., Any] = window.execution_runner.start
@@ -69,8 +53,6 @@ class ManagedMakroBrowser(QObject):
         self._install_status_labels()
         self.status_changed.connect(self._apply_status)
 
-        # Wrap only the formal GUI entry points. Core CLI/browser helpers remain
-        # unchanged and available for developer/external-CDP diagnostics.
         window.runner.start = self._start_single
         window.execution_runner.start = self._start_real
         window.runner.completed.connect(self._single_prepared)
@@ -95,13 +77,15 @@ class ManagedMakroBrowser(QObject):
         self._poll_timer.setInterval(self._POLL_MS)
         self._poll_timer.timeout.connect(self._poll)
         self._poll_timer.start()
-
-        # Do not block the first GUI paint while Edge starts.
         QTimer.singleShot(250, self.ensure_async)
 
     @property
     def generation(self) -> int:
         return self._generation
+
+    @property
+    def update_quiesced(self) -> bool:
+        return self._update_quiesced
 
     def _install_status_labels(self) -> None:
         makro_port = getattr(self.window, "makro_port", None)
@@ -147,6 +131,7 @@ class ManagedMakroBrowser(QObject):
             "LOGIN": "#f4cb7a",
             "OFFLINE": "#f18da0",
             "ERROR": "#f18da0",
+            "UPDATING": "#8fc5ff",
         }.get(state, "rgba(255,255,255,180)")
         text = f"Makro Browser · {state} · {detail}"
         if self._single_label is not None:
@@ -157,12 +142,6 @@ class ManagedMakroBrowser(QObject):
             self._batch_label.setStyleSheet(f"color: {color};")
 
     def _cdp_instance_token(self) -> str:
-        """Return Chromium browser-instance UUID from /json/version.
-
-        ``webSocketDebuggerUrl`` changes whenever Edge is restarted. Tracking it
-        lets us distinguish a healthy reconnect from a stale Step-3/tab token.
-        """
-
         try:
             with urllib.request.urlopen(
                 f"{cdp_endpoint(self.port)}/json/version", timeout=0.45
@@ -186,12 +165,7 @@ class ManagedMakroBrowser(QObject):
         return any(
             marker in text
             for marker in (
-                "登录",
-                "login",
-                "authentication",
-                "authenticated",
-                "sign in",
-                "signin",
+                "登录", "login", "authentication", "authenticated", "sign in", "signin"
             )
         )
 
@@ -208,13 +182,57 @@ class ManagedMakroBrowser(QObject):
         batch_workspace = getattr(self.window, "batch_workspace", None)
         return bool(batch_workspace is not None and batch_workspace.is_running)
 
+    def is_busy(self) -> bool:
+        return self._is_busy()
+
+    def begin_update_quiesce(self) -> tuple[bool, str]:
+        """Atomically stop new browser/task work before updater preflight."""
+
+        if self._update_quiesced:
+            return True, ""
+        if self._is_busy():
+            return False, "当前仍有商品准备、真实填写或批量任务正在运行。请等待任务结束后再更新。"
+        self._update_quiesced = True
+        try:
+            self._poll_timer.stop()
+        except RuntimeError:
+            pass
+        self._emit_status("UPDATING", "更新准备中 · 已暂停浏览器自动恢复和新任务启动")
+        return True, ""
+
+    def wait_for_update_quiesce(self, timeout_s: float = 20.0) -> tuple[bool, str]:
+        """Wait off the Qt thread for any already-started Edge launch to settle."""
+
+        thread = self._launch_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, float(timeout_s)))
+        if thread is not None and thread.is_alive():
+            return False, "Makro Browser 后台启动线程仍在运行，无法安全进入安装阶段。"
+        if not self._update_quiesced:
+            return False, "更新冻结状态意外解除。"
+        return True, ""
+
+    def resume_after_update_failure(self) -> None:
+        """Restore normal browser lifecycle when handoff/preflight is cancelled."""
+
+        if not self._update_quiesced:
+            return
+        self._update_quiesced = False
+        try:
+            if not self._poll_timer.isActive():
+                self._poll_timer.start()
+        except RuntimeError:
+            pass
+        self._emit_status("STARTING", "更新未进入安装 · 正在恢复 Makro Browser")
+        self.ensure_async()
+
+    def _assert_task_start_allowed(self) -> None:
+        if self._update_quiesced:
+            raise RuntimeError("Listing Studio 正在准备更新，暂时不能启动新的上架任务。")
+
     def ensure_ready(self, reason: str = "task") -> bool:
-        """Synchronously ensure the one managed Makro Edge exists.
-
-        Returns True only when this call had to launch Edge. It never launches a
-        second browser when the managed CDP endpoint is already healthy.
-        """
-
+        if self._update_quiesced:
+            raise RuntimeError("Makro Browser 已进入更新冻结状态，不能在安装前重新启动。")
         token = self._cdp_instance_token()
         if token:
             self._observe_instance(token)
@@ -223,6 +241,8 @@ class ManagedMakroBrowser(QObject):
 
         self._emit_status("STARTING", f"{reason} · 正在恢复 Makro Browser")
         with self._launch_lock:
+            if self._update_quiesced:
+                raise RuntimeError("Makro Browser 已进入更新冻结状态，已取消后台恢复。")
             token = self._cdp_instance_token()
             if token:
                 self._observe_instance(token)
@@ -241,12 +261,16 @@ class ManagedMakroBrowser(QObject):
                 self._emit_status("READY", "Makro Browser 已自动启动 · 专用登录 Profile 已载入")
                 return True
             except Exception as exc:
+                if self._update_quiesced:
+                    raise RuntimeError("更新准备期间已取消 Makro Browser 自动恢复。") from exc
                 self._emit_status("ERROR", f"Makro Browser 启动失败：{exc}")
                 raise RuntimeError(
                     "无法自动启动 Makro Browser。请确认 Microsoft Edge 已安装且内部浏览器端口未被其他程序占用。"
                 ) from exc
 
     def ensure_async(self) -> None:
+        if self._update_quiesced:
+            return
         if self._launch_thread is not None and self._launch_thread.is_alive():
             return
         if self._cdp_instance_token():
@@ -257,8 +281,6 @@ class ManagedMakroBrowser(QObject):
             try:
                 self.ensure_ready("GUI startup")
             except Exception:
-                # Status is already surfaced by ensure_ready; task start will
-                # raise the same actionable error if the user tries to proceed.
                 pass
 
         self._launch_thread = threading.Thread(
@@ -269,6 +291,8 @@ class ManagedMakroBrowser(QObject):
         self._launch_thread.start()
 
     def _poll(self) -> None:
+        if self._update_quiesced:
+            return
         token = self._cdp_instance_token()
         if token:
             previous_generation = self._generation
@@ -294,6 +318,7 @@ class ManagedMakroBrowser(QObject):
         self.ensure_async()
 
     def _start_single(self, config: Any, *, mode: str = "full") -> Any:
+        self._assert_task_start_allowed()
         self._single_prepared_generation = None
         self.ensure_ready("Single preparation")
         return self._original_single_start(config, mode=mode)
@@ -304,6 +329,7 @@ class ManagedMakroBrowser(QObject):
         self._emit_status("READY", "Makro Browser 已连接 · 当前商品准备完成")
 
     def _start_real(self, config: Any) -> Any:
+        self._assert_task_start_allowed()
         self.ensure_ready("Real execution")
         if (
             self._single_prepared_generation is not None
@@ -323,6 +349,7 @@ class ManagedMakroBrowser(QObject):
         prepare_concurrency: int = 2,
     ) -> Any:
         assert self._original_batch_prepare is not None
+        self._assert_task_start_allowed()
         self.ensure_ready("Batch preparation")
         self._batch_prepare_generation = self._generation
         return self._original_batch_prepare(
@@ -339,6 +366,7 @@ class ManagedMakroBrowser(QObject):
         execute_concurrency: int = 2,
     ) -> Any:
         assert self._original_batch_execute is not None
+        self._assert_task_start_allowed()
         self.ensure_ready("Batch execution")
         if (
             self._batch_prepare_generation is not None

@@ -1,11 +1,9 @@
 """Formal Listing Studio updater presentation over the canonical update state machine.
 
 Transport, release validation, download and handoff stay in ``gui.app_updater``.
-This module owns only the user-facing progress surface and moves the expensive
-installer SHA-256 verification and managed-browser shutdown off the Qt GUI thread
-so the update panel never appears frozen before standalone updater handoff.
+This module owns the user-facing progress surface, update quiesce gate and the
+expensive pre-handoff work that must stay off the Qt GUI thread.
 """
-
 from __future__ import annotations
 
 import threading
@@ -25,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 import gui.app_updater as canonical
-from app.update_browser_gate import DEFAULT_CDP_PORT, close_managed_browser
+from app.update_browser_gate import BrowserCloseResult, DEFAULT_CDP_PORT, close_managed_browser
 
 
 def _six_step_label(text: str) -> str:
@@ -51,8 +49,6 @@ def _six_step_label(text: str) -> str:
 
 
 class _UpdateProgressPanel(QDialog):
-    """One stable always-on-top panel for download/verify/handoff phases."""
-
     canceled = Signal()
 
     def __init__(self, parent: QMainWindow) -> None:
@@ -67,12 +63,10 @@ class _UpdateProgressPanel(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(34, 28, 34, 24)
         layout.setSpacing(18)
-
         self._label = QLabel("正在准备更新…", self)
         self._label.setWordWrap(True)
         self._label.setStyleSheet("font-size: 14px; font-weight: 600;")
         layout.addWidget(self._label)
-
         self._bar = QProgressBar(self)
         self._bar.setTextVisible(False)
         self._bar.setFixedHeight(8)
@@ -128,8 +122,6 @@ class _UpdateProgressPanel(QDialog):
 
 
 class ApplicationUpdater(canonical.ApplicationUpdater):
-    """Canonical updater with a responsive six-stage progress presentation."""
-
     _checksum_ready = Signal(str, str, object)
     _browser_close_ready = Signal(str, object, object)
 
@@ -139,6 +131,33 @@ class ApplicationUpdater(canonical.ApplicationUpdater):
         self._browser_thread: threading.Thread | None = None
         self._checksum_ready.connect(self._finish_verified_install)
         self._browser_close_ready.connect(self._finish_browser_close)
+
+    def _show_completed_update(self) -> None:
+        """Standalone updater already showed completion; relaunch stays quiet."""
+
+        return
+
+    def _show_previous_update_result(self, payload: dict[str, Any]) -> None:
+        if str(payload.get("kind") or "") == "success":
+            return
+        super()._show_previous_update_result(payload)
+
+    def _prompt_for_update(self, manifest: dict[str, Any]) -> None:
+        manager = getattr(self.window, "_managed_makro_browser", None)
+        if manager is not None and hasattr(manager, "is_busy"):
+            try:
+                busy = bool(manager.is_busy())
+            except Exception:
+                busy = True
+            if busy:
+                self._last_prompted_version = None
+                self._show_update_message(
+                    canonical.QMessageBox.Icon.Information,
+                    "当前有上架任务正在运行，暂不开始更新。",
+                    informative="请等待当前 Single / Real Execution / Batch 任务结束后再次检查更新。",
+                )
+                return
+        super()._prompt_for_update(manifest)
 
     def _ensure_progress(self, label: str, *, cancellable: bool) -> _UpdateProgressPanel:
         progress = self._progress
@@ -158,8 +177,6 @@ class ApplicationUpdater(canonical.ApplicationUpdater):
         return progress
 
     def _verify_and_install(self, path: Path, manifest: dict[str, Any]) -> None:
-        """Hash the large installer off-thread, then resume canonical handoff on Qt."""
-
         if self._verify_thread is not None and self._verify_thread.is_alive():
             return
         self._set_progress_phase(
@@ -179,6 +196,14 @@ class ApplicationUpdater(canonical.ApplicationUpdater):
             daemon=True,
         )
         self._verify_thread.start()
+
+    def _resume_browser_manager(self) -> None:
+        manager = getattr(self.window, "_managed_makro_browser", None)
+        if manager is not None and hasattr(manager, "resume_after_update_failure"):
+            try:
+                manager.resume_after_update_failure()
+            except Exception:
+                pass
 
     def _finish_verified_install(
         self,
@@ -202,8 +227,25 @@ class ApplicationUpdater(canonical.ApplicationUpdater):
             )
             return
 
+        manager = getattr(self.window, "_managed_makro_browser", None)
+        if manager is not None and hasattr(manager, "begin_update_quiesce"):
+            try:
+                ready, reason = manager.begin_update_quiesce()
+            except Exception as exc:
+                ready, reason = False, f"无法冻结浏览器任务状态：{exc}"
+            if not ready:
+                self._last_prompted_version = None
+                self._close_progress()
+                self._show_update_message(
+                    canonical.QMessageBox.Icon.Information,
+                    "当前状态不适合进入更新。",
+                    informative=str(reason or "请等待当前任务结束后重试。"),
+                )
+                return
+
         version = str(manifest.get("version") or "").strip().lstrip("v")
         if not version or not canonical._write_update_marker(version):
+            self._resume_browser_manager()
             self._last_prompted_version = None
             self._close_progress()
             self._show_update_message(
@@ -214,22 +256,26 @@ class ApplicationUpdater(canonical.ApplicationUpdater):
             return
 
         self._set_progress_phase(
-            "步骤 4/6 · 校验通过，正在关闭 Makro Browser…",
+            "步骤 4/6 · 校验通过，正在冻结任务并关闭 Makro Browser…",
             cancellable=False,
         )
-        manager = getattr(self.window, "_managed_makro_browser", None)
-        poll_timer = getattr(manager, "_poll_timer", None)
-        if poll_timer is not None:
-            try:
-                poll_timer.stop()
-            except RuntimeError:
-                pass
-
         if self._browser_thread is not None and self._browser_thread.is_alive():
             return
         manifest_copy = dict(manifest)
 
         def _browser_worker() -> None:
+            if manager is not None and hasattr(manager, "wait_for_update_quiesce"):
+                try:
+                    quiesced, reason = manager.wait_for_update_quiesce(20.0)
+                except Exception as exc:
+                    quiesced, reason = False, f"等待浏览器冻结失败：{exc}"
+                if not quiesced:
+                    self._browser_close_ready.emit(
+                        str(path),
+                        manifest_copy,
+                        BrowserCloseResult(False, str(reason or "浏览器冻结失败")),
+                    )
+                    return
             result = close_managed_browser(
                 port=DEFAULT_CDP_PORT,
                 log_path=canonical.updater_log_path(),
@@ -252,35 +298,26 @@ class ApplicationUpdater(canonical.ApplicationUpdater):
         self._browser_thread = None
         manifest = dict(manifest_obj) if isinstance(manifest_obj, dict) else {}
         path = Path(path_text)
-        manager = getattr(self.window, "_managed_makro_browser", None)
-        poll_timer = getattr(manager, "_poll_timer", None)
 
         if not bool(getattr(browser_result, "ok", False)):
             try:
                 canonical.update_marker_path().unlink(missing_ok=True)
             except OSError:
                 pass
-            if poll_timer is not None:
-                try:
-                    poll_timer.start()
-                except RuntimeError:
-                    pass
+            self._resume_browser_manager()
             self._last_prompted_version = None
             self._close_progress()
             detail = str(getattr(browser_result, "detail", "") or "无法确认 Makro Browser 已安全关闭")
             self._show_update_message(
                 canonical.QMessageBox.Icon.Critical,
                 "无法安全关闭 Makro Browser，已取消安装。",
-                informative=(
-                    detail
-                    + "\n\nListing Studio 保持打开；不会关闭其他普通 Edge 窗口。"
-                ),
+                informative=detail + "\n\nListing Studio 保持打开；不会关闭其他普通 Edge 窗口。",
             )
             return
 
         self._set_progress_phase(
-            "步骤 4/6 · 浏览器已关闭，正在交接更新执行器…\n"
-            "执行器接管后，本面板会连续显示关闭程序、安装和重启状态。",
+            "步骤 4/6 · 浏览器和任务已冻结，正在交接更新执行器…\n"
+            "执行器接管后，本面板会连续显示关闭程序、文件锁检查、安装和重启状态。",
             cancellable=False,
         )
         arguments = [
@@ -292,16 +329,7 @@ class ApplicationUpdater(canonical.ApplicationUpdater):
         ]
         started, detail = self._handoff_installer(path, manifest, arguments)
         if not started:
-            if poll_timer is not None:
-                try:
-                    poll_timer.start()
-                except RuntimeError:
-                    pass
-            if manager is not None and hasattr(manager, "ensure_async"):
-                try:
-                    manager.ensure_async()
-                except Exception:
-                    pass
+            self._resume_browser_manager()
             try:
                 canonical.update_marker_path().unlink(missing_ok=True)
             except OSError:

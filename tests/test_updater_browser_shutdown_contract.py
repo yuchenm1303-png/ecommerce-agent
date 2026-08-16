@@ -62,10 +62,36 @@ def test_browser_gate_fails_closed_for_unexpected_port_owner(monkeypatch: pytest
     assert commands == []
 
 
-def test_gui_update_flow_stops_browser_poll_before_handoff() -> None:
-    source = Path("gui/resilient_app_updater.py").read_text(encoding="utf-8")
-    stop = source.index("poll_timer.stop()")
-    close = source.index("close_managed_browser(")
-    handoff = source.index("self._handoff_installer(")
-    assert stop < close < handoff
-    assert "不会关闭其他普通 Edge 窗口" in source
+def test_gui_update_flow_quiesces_browser_lifecycle_before_handoff() -> None:
+    presentation = Path("gui/resilient_app_updater.py").read_text(encoding="utf-8")
+    manager = Path("gui/browser_session_manager.py").read_text(encoding="utf-8")
+    assert "begin_update_quiesce" in presentation
+    assert "wait_for_update_quiesce" in presentation
+    assert "resume_after_update_failure" in presentation
+    assert "self._update_quiesced = True" in manager
+    assert "if self._update_quiesced:" in manager
+    assert "self._poll_timer.stop()" in manager
+    assert "thread.join" in manager
+    close = presentation.index("close_managed_browser(")
+    handoff = presentation.index("self._handoff_installer(")
+    assert close < handoff
+    assert "不会关闭其他普通 Edge 窗口" in presentation
+
+
+def test_managed_edge_is_spawned_with_clean_external_runtime() -> None:
+    source = Path("app/browser_session.py").read_text(encoding="utf-8")
+    assert "fresh_external_child_environment" in source
+    assert 'key.startswith("_PYI_")' in source
+    assert 'env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"' in source
+    assert "SetDllDirectoryW(None)" in source
+    assert "env=env" in source
+    assert "_spawn_external(command" in source
+
+
+def test_updater_blocks_new_tasks_while_update_is_quiesced() -> None:
+    manager = Path("gui/browser_session_manager.py").read_text(encoding="utf-8")
+    presentation = Path("gui/resilient_app_updater.py").read_text(encoding="utf-8")
+    assert "def is_busy" in manager
+    assert "_assert_task_start_allowed" in manager
+    assert "当前有上架任务正在运行，暂不开始更新" in presentation
+    assert "manager.is_busy()" in presentation

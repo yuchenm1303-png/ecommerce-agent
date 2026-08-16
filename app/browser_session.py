@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -26,6 +29,7 @@ _CDP_ATTACH_TIMEOUT_MS = 25_000
 _CDP_ATTACH_LOCK_TIMEOUT_S = 90.0
 _CDP_ATTACH_RETRY_DELAY_S = 0.75
 _CDP_ATTACH_LOCK_POLL_S = 0.10
+_EXTERNAL_SPAWN_LOCK = threading.Lock()
 
 
 @dataclass
@@ -61,6 +65,64 @@ def is_cdp_ready(port: int = DEFAULT_CDP_PORT, *, timeout_s: float = 0.4) -> boo
         return bool(payload.get("webSocketDebuggerUrl"))
     except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
         return False
+
+
+def _path_is_inside(candidate: str, root: str) -> bool:
+    if not candidate or not root:
+        return False
+    try:
+        candidate_abs = os.path.normcase(os.path.abspath(candidate))
+        root_abs = os.path.normcase(os.path.abspath(root))
+        return os.path.commonpath([candidate_abs, root_abs]) == root_abs
+    except (OSError, ValueError):
+        return False
+
+
+def fresh_external_child_environment() -> dict[str, str]:
+    """Return an environment that does not leak PyInstaller runtime state."""
+
+    env = os.environ.copy()
+    for key in tuple(env):
+        if key.startswith("_PYI_"):
+            env.pop(key, None)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    bundle_root = str(getattr(sys, "_MEIPASS", "") or "")
+    if bundle_root:
+        entries = [entry for entry in env.get("PATH", "").split(os.pathsep) if entry]
+        env["PATH"] = os.pathsep.join(
+            entry for entry in entries if not _path_is_inside(entry, bundle_root)
+        )
+    return env
+
+
+def _spawn_external(command: list[str], *, creationflags: int) -> subprocess.Popen[bytes]:
+    """Spawn a real external program without inheriting frozen DLL search state."""
+
+    env = fresh_external_child_environment()
+    bundle_root = str(getattr(sys, "_MEIPASS", "") or "")
+    with _EXTERNAL_SPAWN_LOCK:
+        reset_dll_directory = os.name == "nt" and bool(bundle_root)
+        if reset_dll_directory:
+            try:
+                ctypes.windll.kernel32.SetDllDirectoryW(None)
+            except (AttributeError, OSError):
+                reset_dll_directory = False
+        try:
+            return subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                creationflags=creationflags,
+                env=env,
+            )
+        finally:
+            if reset_dll_directory:
+                try:
+                    ctypes.windll.kernel32.SetDllDirectoryW(bundle_root)
+                except (AttributeError, OSError):
+                    pass
 
 
 def _edge_candidates() -> list[Path]:
@@ -106,13 +168,8 @@ def launch_detached_edge(
     port: int = DEFAULT_CDP_PORT,
     start_url: str = DEFAULT_START_URL,
     startup_timeout_s: float = 15.0,
-) -> None:
-    """Launch the dedicated Edge independently so later scripts can reconnect.
-
-    The process intentionally outlives the Python caller. Authentication remains
-    inside the dedicated Chromium profile; no cookie/token/session value is read
-    or persisted by this helper.
-    """
+) -> int:
+    """Launch the dedicated Edge independently with a clean external runtime."""
 
     profile_dir = profile_dir.resolve()
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -131,19 +188,11 @@ def launch_detached_edge(
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         )
 
-    subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-        creationflags=creationflags,
-    )
-
+    proc = _spawn_external(command, creationflags=creationflags)
     deadline = time.monotonic() + startup_timeout_s
     while time.monotonic() < deadline:
         if is_cdp_ready(port):
-            return
+            return int(proc.pid)
         time.sleep(0.2)
     raise RuntimeError(
         f"Edge 已尝试启动，但本地 CDP 端口 {port} 未就绪。请确认该端口未被其他程序占用。"
@@ -201,14 +250,7 @@ def cdp_attach_guard(
     *,
     timeout_s: float = _CDP_ATTACH_LOCK_TIMEOUT_S,
 ) -> Iterator[None]:
-    """Serialize Playwright CDP handshakes across all local worker processes.
-
-    Batch jobs intentionally share one long-lived Edge. Multiple simultaneous
-    ``connect_over_cdp`` handshakes can leave Playwright connected at WebSocket
-    level but stalled while Chromium initializes the session. The lock covers
-    only the attach transaction, never normal page work, so different owned tabs
-    remain independent after their sessions are established.
-    """
+    """Serialize Playwright CDP handshakes across all local worker processes."""
 
     lock_path = _cdp_attach_lock_path(port)
     deadline = time.monotonic() + max(1.0, float(timeout_s))
@@ -287,9 +329,6 @@ def select_listing_page(context: BrowserContext) -> Page:
     pages = list(context.pages)
     if not pages:
         return context.new_page()
-
-    # Prefer an already-open Makro listing, then any Makro seller tab, then the
-    # most recently created tab. We never navigate away from a valid current tab.
     for page in reversed(pages):
         if "seller.makro.co.za" in (page.url or "") and "addListings/single" in (page.url or ""):
             return page
@@ -299,29 +338,11 @@ def select_listing_page(context: BrowserContext) -> Page:
     return pages[-1]
 
 
-# Backward-compatible alias used by earlier tests/scripts.
 _choose_page = select_listing_page
 
 
 class EdgeHarness:
-    """Browser-Harness-style session abstraction for the long-lived Makro Edge.
-
-    Responsibilities:
-
-    - attach to the one long-lived Edge over localhost CDP (launching it only
-      when no CDP endpoint exists yet);
-    - never own/close the external Edge process (``detach`` is a no-op by
-      design; the Edge is launched detached and outlives every script);
-    - deterministic page selection (prefer an open listing, then any Makro
-      tab, then the most recently created tab);
-    - health check and reconnect helpers for long-running sessions;
-    - keep the existing Visual Agent HUD attached to Makro automation pages,
-      including new tabs and later navigations.
-
-    The harness never reads or logs cookies, tokens, sessionStorage or
-    Authorization data. The HUD is display-only and never changes page
-    selection, click/fill decisions or browser safety rules.
-    """
+    """Browser-Harness-style session abstraction for the long-lived Makro Edge."""
 
     def __init__(
         self,
@@ -347,8 +368,6 @@ class EdgeHarness:
         self._connect()
 
     def _watch_visual_page(self, page: Page) -> None:
-        """Arm one domain-scoped HUD lifecycle; the facade owns navigation."""
-
         if page.is_closed():
             return
         key = id(page)
@@ -385,11 +404,9 @@ class EdgeHarness:
         self._watch_visual_page(self.page)
 
     def health_check(self) -> bool:
-        """True when the long-lived Edge still exposes its CDP endpoint."""
         return is_cdp_ready(self.cdp_port)
 
     def select_page(self) -> Page:
-        """Deterministically re-select the best page in the current context."""
         if self.context is None:
             raise RuntimeError("Edge harness 尚未连接 context。")
         self.page = select_listing_page(self.context)
@@ -397,7 +414,6 @@ class EdgeHarness:
         return self.page
 
     def ensure_page(self) -> Page:
-        """Return the current page, re-attaching when it was closed/detached."""
         if not self.health_check():
             raise RuntimeError("长期 Makro Edge 的 CDP 端点不可达，无法继续。")
         if self.page is None or self.page.is_closed():
@@ -407,12 +423,6 @@ class EdgeHarness:
         return self.page
 
     def detach(self) -> None:
-        """Drop our connection without closing the external Edge process.
-
-        The Edge is launched independently (launch_detached_edge) and is
-        intentionally never closed by scripts; leaving the Playwright
-        connection is enough for later runs to re-attach over CDP.
-        """
         self.page = None
         self.context = None
         self.browser = None
@@ -425,13 +435,6 @@ def connect_single_edge(
     port: int = DEFAULT_CDP_PORT,
     start_url: str = DEFAULT_START_URL,
 ) -> SingleEdgeSession:
-    """Backward-compatible wrapper around :class:`EdgeHarness`.
-
-    Returns a :class:`SingleEdgeSession` exposing the same fields as before.
-    Callers must simply let their Playwright connection end; the harness never
-    closes the external Edge.
-    """
-
     harness = EdgeHarness(
         playwright,
         profile_dir=profile_dir,

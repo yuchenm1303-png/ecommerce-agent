@@ -1,14 +1,10 @@
 """Dependency-free execution core for the standalone Windows updater.
 
-The GUI verifies the release and writes an :class:`UpdaterJob`.  The tiny
-``updater.exe`` performs a second checksum verification, acknowledges the job
-before the GUI exits, owns the shutdown/install boundary, verifies the installed
-version, and finally relaunches Listing Studio itself.
-
-Keeping this module free of Qt/third-party dependencies is intentional: the
-updater must remain runnable while the application install tree is replaced.
+The GUI verifies the release and writes an :class:`UpdaterJob`. The standalone
+updater performs a second checksum verification, acknowledges the job before the
+GUI exits, owns the shutdown/install boundary, audits install-tree file locks,
+verifies the installed version, and finally relaunches Listing Studio itself.
 """
-
 from __future__ import annotations
 
 import csv
@@ -23,6 +19,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
+
+from app.windows_restart_manager import audit_install_tree_locks
 
 JOB_VERSION = 2
 
@@ -51,6 +49,8 @@ RESULT_VERSION_MISMATCH = "installed_version_mismatch"
 RESULT_MARKER_FAILED = "completion_marker_failed"
 RESULT_RELAUNCH_FAILED = "relaunch_failed"
 RESULT_LAUNCH_FAILED = "launch_failed"
+RESULT_FILE_LOCKED = "file_lock_blocked"
+RESULT_LOCK_AUDIT_FAILED = "file_lock_audit_failed"
 
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.-]+)?$")
@@ -201,13 +201,7 @@ def _wait_pid_gone(pid: int, image_name: str, deadline_s: float) -> bool:
 
 
 def _force_kill_pid(pid: int, image_name: str, *, allowed_image: str) -> bool:
-    """Force-close exactly one owned process and never its child process tree.
-
-    The standalone updater is launched by the GUI, so it is a descendant of the
-    GUI process. Using ``taskkill /T`` against the GUI would therefore kill the
-    updater that is supposed to continue the installation. Child workflow
-    workers are tracked separately and have their own shutdown gate below.
-    """
+    """Force-close exactly one owned process and never its child process tree."""
 
     expected = _normalized_image_name(image_name)
     if expected != _normalized_image_name(allowed_image):
@@ -447,6 +441,29 @@ def _shutdown_gate(job: UpdaterJob) -> str | None:
     return None
 
 
+def _install_tree_lock_gate(job: UpdaterJob) -> tuple[str, str] | None:
+    if os.name != "nt":
+        return None
+    install_root = Path(job.app_executable).resolve().parent
+    _log(job.log_path, f"install tree lock audit start root={install_root}")
+    result = audit_install_tree_locks(install_root, ignore_pids=(os.getpid(),))
+    if not result.ok:
+        detail = result.error or "Restart Manager could not audit install tree"
+        _log(job.log_path, f"install tree lock audit failed: {detail}")
+        return RESULT_LOCK_AUDIT_FAILED, detail
+    if result.blockers:
+        blockers = ", ".join(
+            f"{item.app_name} (PID {item.pid})" for item in result.blockers[:8]
+        )
+        if len(result.blockers) > 8:
+            blockers += f", +{len(result.blockers) - 8} more"
+        detail = f"update files are still in use by: {blockers}"
+        _log(job.log_path, f"install tree lock audit blocked: {detail}")
+        return RESULT_FILE_LOCKED, detail
+    _log(job.log_path, "install tree lock audit clean")
+    return None
+
+
 def wait_for_app_exit(
     *,
     app_pid: int,
@@ -456,8 +473,6 @@ def wait_for_app_exit(
     worker_deadline_s: int = DEFAULT_WORKER_DEADLINE_S,
     settle_ms: int = DEFAULT_SETTLE_MS,
 ) -> bool:
-    """Graceful-only compatibility helper used by focused tests."""
-
     if not _wait_pid_gone(app_pid, app_image_name, app_deadline_s):
         return False
     if not _wait_owned_workers(worker_pids, worker_deadline_s):
@@ -485,6 +500,8 @@ def _recover_after_failure(job: UpdaterJob, status: str, detail: str) -> int:
         RESULT_WORKER_DID_NOT_EXIT: 6,
         RESULT_OTHER_APP_RUNNING: 7,
         RESULT_VERSION_MISMATCH: 8,
+        RESULT_FILE_LOCKED: 11,
+        RESULT_LOCK_AUDIT_FAILED: 12,
     }.get(status, 2)
 
 
@@ -516,10 +533,11 @@ def run_job(job: UpdaterJob) -> int:
         }.get(gate_failure, "shutdown gate failed")
         return _recover_after_failure(job, gate_failure, detail)
 
-    # The installer keeps a legacy marker-based auto-relaunch path for older
-    # clients. New updater jobs deliberately remove the marker while Inno runs
-    # so only this updater owns relaunch; the marker is recreated after version
-    # verification succeeds.
+    lock_failure = _install_tree_lock_gate(job)
+    if lock_failure is not None:
+        status, detail = lock_failure
+        return _recover_after_failure(job, status, detail)
+
     if not _clear_marker(job.marker_path):
         return _recover_after_failure(
             job,
@@ -608,8 +626,10 @@ __all__ = [
     "OWNED_APP_IMAGE",
     "OWNED_WORKER_IMAGE",
     "RESULT_APP_DID_NOT_EXIT",
+    "RESULT_FILE_LOCKED",
     "RESULT_INSTALL_FAILED",
     "RESULT_LAUNCH_FAILED",
+    "RESULT_LOCK_AUDIT_FAILED",
     "RESULT_MARKER_FAILED",
     "RESULT_OK",
     "RESULT_OTHER_APP_RUNNING",

@@ -11,7 +11,10 @@ UPDATER = (ROOT / "gui" / "app_updater.py").read_text(encoding="utf-8")
 PRESENTATION = (ROOT / "gui" / "resilient_app_updater.py").read_text(encoding="utf-8")
 UPDATE_RUNTIME = (ROOT / "gui" / "update_runtime.py").read_text(encoding="utf-8")
 RUNTIME_PATHS = (ROOT / "app" / "runtime_paths.py").read_text(encoding="utf-8")
+BROWSER_SESSION = (ROOT / "app" / "browser_session.py").read_text(encoding="utf-8")
+BROWSER_MANAGER = (ROOT / "gui" / "browser_session_manager.py").read_text(encoding="utf-8")
 BROWSER_GATE = (ROOT / "app" / "update_browser_gate.py").read_text(encoding="utf-8")
+LOCK_AUDIT = (ROOT / "app" / "windows_restart_manager.py").read_text(encoding="utf-8")
 UPDATER_PANEL = (ROOT / "app" / "updater_panel.py").read_text(encoding="utf-8")
 CORE = (ROOT / "app" / "updater_core.py").read_text(encoding="utf-8")
 ENTRY = (ROOT / "scripts" / "updater_main.py").read_text(encoding="utf-8")
@@ -65,10 +68,13 @@ def test_every_packaging_workflow_runs_full_update_contract_suite() -> None:
 def test_windows_package_triggers_on_every_update_runtime_source() -> None:
     for path in (
         "app/runtime_paths.py",
+        "app/browser_session.py",
         "app/updater_core.py",
         "app/update_browser_gate.py",
         "app/updater_panel.py",
+        "app/windows_restart_manager.py",
         "gui/app_updater.py",
+        "gui/browser_session_manager.py",
         "gui/resilient_app_updater.py",
         "gui/update_runtime.py",
         "scripts/updater_main.py",
@@ -107,6 +113,7 @@ def test_updater_self_check_exercises_embedded_core_and_v2_panel_entry() -> None
     assert "JOB_VERSION < 2" in ENTRY
     assert "legacy._self_check()" in ENTRY_V2
     assert "NativeUpdatePanel" in ENTRY_V2
+    assert "if not panel.ready" in ENTRY_V2
     assert "updater_main_v2.py" in UPDATER_SPEC
 
 
@@ -115,9 +122,30 @@ def test_update_preflight_owns_managed_browser_without_killing_normal_edge() -> 
     assert 'OWNED_BROWSER_IMAGE = "msedge.exe"' in BROWSER_GATE
     assert '["taskkill", "/PID", str(pid), "/T", "/F"]' in BROWSER_GATE
     assert "unexpected process" in BROWSER_GATE
-    assert "poll_timer.stop()" in PRESENTATION
+    assert "begin_update_quiesce" in PRESENTATION
+    assert "wait_for_update_quiesce" in PRESENTATION
+    assert "_update_quiesced" in BROWSER_MANAGER
     assert "close_managed_browser" in PRESENTATION
     assert "不会关闭其他普通 Edge 窗口" in PRESENTATION
+
+
+def test_external_edge_spawn_is_isolated_from_pyinstaller_runtime() -> None:
+    assert "fresh_external_child_environment" in BROWSER_SESSION
+    assert 'key.startswith("_PYI_")' in BROWSER_SESSION
+    assert 'PYINSTALLER_RESET_ENVIRONMENT' in BROWSER_SESSION
+    assert "SetDllDirectoryW(None)" in BROWSER_SESSION
+    assert "env=env" in BROWSER_SESSION
+
+
+def test_restart_manager_lock_audit_runs_before_inno() -> None:
+    assert "audit_install_tree_locks" in CORE
+    assert "install tree lock audit start" in CORE
+    assert 'RESULT_FILE_LOCKED = "file_lock_blocked"' in CORE
+    assert 'RESULT_LOCK_AUDIT_FAILED = "file_lock_audit_failed"' in CORE
+    assert "RmStartSession" in LOCK_AUDIT
+    assert "RmRegisterResources" in LOCK_AUDIT
+    assert "RmGetList" in LOCK_AUDIT
+    assert CORE.index("_install_tree_lock_gate(job)") < CORE.index("running installer:")
 
 
 def test_update_progress_is_continuous_and_inno_hidden() -> None:
@@ -129,6 +157,7 @@ def test_update_progress_is_continuous_and_inno_hidden() -> None:
     assert "步骤 5/6" in UPDATER_PANEL
     assert "步骤 6/6" in UPDATER_PANEL
     assert "WindowStaysOnTopHint" in PRESENTATION
+    assert "native update panel ready" in UPDATER_PANEL
 
 
 def test_inno_replaces_immutable_pyinstaller_directories_cleanly() -> None:
@@ -151,7 +180,7 @@ def test_independent_updater_bootloader_is_reset_before_handoff() -> None:
     assert 'PYINSTALLER_RESET_ENVIRONMENT' in ENTRY
 
 
-def test_stable_e2e_relaunches_real_installed_gui_and_exercises_browser_gate() -> None:
+def test_stable_e2e_relaunches_real_installed_gui_and_exercises_preflight() -> None:
     assert "ECOMMERCE_AGENT_UPDATE_E2E_MARKER" in GUI_ENTRY
     assert 'app_executable = install_dir / "EcommerceAgent.exe"' in E2E_PARENT
     assert '"app_executable": str(app_executable)' in E2E_PARENT
@@ -159,7 +188,8 @@ def test_stable_e2e_relaunches_real_installed_gui_and_exercises_browser_gate() -
     assert 'real-gui-relaunch.json' in E2E_PARENT
     assert 'real-gui-relaunch.json' in E2E
     assert 'windows_updater_fake_edge.py' in E2E
-    assert 'managed Edge closed' in E2E
+    assert 'native update panel ready' in E2E
+    assert 'install tree lock audit clean' in E2E
     assert 'hidden Inno' in E2E
     assert 'real installed GUI' in E2E
     assert 'RelaunchProbe' not in E2E
