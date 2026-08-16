@@ -255,15 +255,28 @@ class MainWindow(BaseMainWindow):
         self.real_scope_combo.setEnabled(not real_running)
 
     def _pick_upload_images(self) -> None:
+        initial_dir = ""
+        if self._selected_upload_images:
+            initial_dir = str(self._selected_upload_images[-1].parent)
+
         files, _selected_filter = QFileDialog.getOpenFileNames(
             self,
-            "选择要上传到 Product Photos 的图片",
-            "",
+            "添加要上传到 Product Photos 的图片",
+            initial_dir,
             "Images (*.jpg *.jpeg *.png *.webp);;All files (*.*)",
         )
         if not files:
             return
-        self._selected_upload_images = [Path(value).resolve() for value in files]
+
+        existing = {str(path).casefold() for path in self._selected_upload_images}
+        for value in files:
+            path = Path(value).resolve()
+            key = str(path).casefold()
+            if key in existing:
+                continue
+            self._selected_upload_images.append(path)
+            existing.add(key)
+
         self.real_image_count.setText(f"{len(self._selected_upload_images)} files")
         self.real_image_count.setToolTip("\n".join(str(path) for path in self._selected_upload_images))
 
