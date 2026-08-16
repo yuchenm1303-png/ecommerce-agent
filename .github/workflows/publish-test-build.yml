@@ -19,7 +19,7 @@ permissions:
 jobs:
   publish-test-build:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 65
     env:
       SOURCE_REF: ${{ inputs.source_ref }}
       PACKAGE_VERSION: ${{ inputs.package_version }}
@@ -75,7 +75,7 @@ jobs:
             tests/test_app_update_ui_contract.py `
             tests/test_updater_browser_shutdown_contract.py
 
-      - name: Build test package
+      - name: Build branded test package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifacts | Out-Null
@@ -108,20 +108,24 @@ jobs:
           if ([int64]$target[0].Size -ne [int64](Get-Item $targetPath).Length) { throw "Prerelease target package size mismatch" }
 
           $nativeSetup = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Setup.exe")
+          $nativeMsi = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*.msi")
           $nativePortable = @(Get-ChildItem $dir -File -Filter "Smirel.ListingStudio*-Portable.zip")
           if ($nativeSetup.Count -ne 1) { throw "Expected exactly one native test Setup, found $($nativeSetup.Count)" }
+          if ($nativeMsi.Count -ne 1) { throw "Expected exactly one native test MSI, found $($nativeMsi.Count)" }
           if ($nativePortable.Count -ne 1) { throw "Expected exactly one native test Portable, found $($nativePortable.Count)" }
           foreach ($required in @(
             "artifacts\EcommerceAgent-Setup-$version.exe",
+            "artifacts\EcommerceAgent-Setup-$version.msi",
             "artifacts\EcommerceAgent-$version-portable.zip"
           )) {
             if (-not (Test-Path $required)) { throw "Prerelease friendly asset missing before publish: $required" }
           }
           "target_full=$targetFull" >> $env:GITHUB_ENV
           "native_setup=$($nativeSetup[0].Name)" >> $env:GITHUB_ENV
+          "native_msi=$($nativeMsi[0].Name)" >> $env:GITHUB_ENV
           "native_portable=$($nativePortable[0].Name)" >> $env:GITHUB_ENV
 
-      - name: Silent Velopack installer smoke test
+      - name: Silent Velopack Setup smoke test
         shell: pwsh
         run: |
           $version = "${{ steps.build.outputs.version }}"
@@ -159,6 +163,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Velopack prerelease draft upload failed: $LASTEXITCODE" }
           gh release upload "${{ steps.build.outputs.tag }}" `
             "artifacts\EcommerceAgent-Setup-${{ steps.build.outputs.version }}.exe" `
+            "artifacts\EcommerceAgent-Setup-${{ steps.build.outputs.version }}.msi" `
             "artifacts\EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip" `
             --clobber
           if ($LASTEXITCODE -ne 0) { throw "Friendly prerelease asset upload failed: $LASTEXITCODE" }
@@ -176,8 +181,10 @@ jobs:
             $env:target_full,
             "releases.$env:VELOPACK_CHANNEL.json",
             $env:native_setup,
+            $env:native_msi,
             $env:native_portable,
             "EcommerceAgent-Setup-${{ steps.build.outputs.version }}.exe",
+            "EcommerceAgent-Setup-${{ steps.build.outputs.version }}.msi",
             "EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip"
           )) {
             if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
@@ -205,8 +212,10 @@ jobs:
             $env:target_full,
             "releases.$env:VELOPACK_CHANNEL.json",
             $env:native_setup,
+            $env:native_msi,
             $env:native_portable,
             "EcommerceAgent-Setup-${{ steps.build.outputs.version }}.exe",
+            "EcommerceAgent-Setup-${{ steps.build.outputs.version }}.msi",
             "EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip"
           )) {
             if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
@@ -256,6 +265,7 @@ jobs:
           name: EcommerceAgent-Test-${{ steps.build.outputs.tag }}
           path: |
             artifacts/EcommerceAgent-Setup-${{ steps.build.outputs.version }}.exe
+            artifacts/EcommerceAgent-Setup-${{ steps.build.outputs.version }}.msi
             artifacts/EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip
             artifacts/velopack/*
           if-no-files-found: error
