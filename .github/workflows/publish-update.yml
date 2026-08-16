@@ -216,7 +216,7 @@ jobs:
             --channel $env:VELOPACK_CHANNEL `
             --repoUrl "https://github.com/$env:GITHUB_REPOSITORY" `
             --publish false `
-            --releaseName "$env:UPDATE_TITLE" `
+            --releaseName "$env:UPDATE_TITLE v$env:UPDATE_VERSION" `
             --tag "v$env:UPDATE_VERSION" `
             --targetCommitish "${{ steps.source.outputs.sha }}"
           if ($LASTEXITCODE -ne 0) { throw "Velopack GitHub draft upload failed: $LASTEXITCODE" }
