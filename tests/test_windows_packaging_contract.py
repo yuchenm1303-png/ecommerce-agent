@@ -87,20 +87,24 @@ def test_windows_ci_smokes_canonical_velopack_layout() -> None:
     assert "Inno Setup" not in WINDOWS
 
 
-def test_build_discovers_channel_qualified_native_assets_instead_of_guessing_names() -> None:
+def test_build_discovers_native_assets_and_never_guesses_velopack_package_names() -> None:
     assert 'EcommerceAgent-Setup-$Version.exe' in BUILD
     assert 'EcommerceAgent-$Version-portable.zip' in BUILD
     assert "Get-SingleVelopackArtifact" in BUILD
+    assert "Resolve-VelopackFullPackage" in BUILD
     assert '-Filter "$PackId*-Setup.exe"' in BUILD
     assert '-Filter "$PackId*-Portable.zip"' in BUILD
     assert 'releases.$Channel.json' in BUILD
+    assert '[string]$Target[0].FileName' in BUILD
+    assert '[IO.Path]::GetFileName($FileName) -ne $FileName' in BUILD
     assert 'Join-Path $VelopackDir "$PackId-Setup.exe"' not in BUILD
     assert 'Join-Path $VelopackDir "$PackId-Portable.zip"' not in BUILD
+    assert '"$PackId-$Version-full.nupkg"' not in BUILD
 
 
 def test_build_validates_feed_binding_and_has_production_signing_hooks() -> None:
     assert "$Feed.Assets" in BUILD
     assert '"Full"' in BUILD
-    assert "release index/package mismatch" in BUILD
+    assert "release index/package size mismatch" in BUILD
     assert "VPK_AZURE_TRUSTED_SIGN_FILE" in BUILD
     assert "VPK_SIGN_PARAMS" in BUILD
