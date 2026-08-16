@@ -22,6 +22,38 @@ function Get-SingleVelopackArtifact {
     return $Items[0]
 }
 
+function Resolve-E2EFullPackage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$ReleaseIndex,
+        [Parameter(Mandatory = $true)][string]$PackageId,
+        [Parameter(Mandatory = $true)][string]$PackageVersion
+    )
+
+    $Feed = Get-Content $ReleaseIndex -Raw -Encoding UTF8 | ConvertFrom-Json
+    $Target = @($Feed.Assets | Where-Object {
+        [string]$_.PackageId -eq $PackageId -and
+        [string]$_.Version -eq $PackageVersion -and
+        [string]$_.Type -eq "Full"
+    })
+    if ($Target.Count -ne 1) {
+        throw "Velopack E2E feed must contain exactly one Full target v$PackageVersion; found $($Target.Count)"
+    }
+    $FileName = [string]$Target[0].FileName
+    if ([string]::IsNullOrWhiteSpace($FileName) -or [IO.Path]::GetFileName($FileName) -ne $FileName) {
+        throw "Unsafe Velopack E2E package filename: '$FileName'"
+    }
+    $PackagePath = Join-Path $Directory $FileName
+    if (-not (Test-Path $PackagePath -PathType Leaf)) {
+        throw "Velopack E2E feed points to missing package: $PackagePath"
+    }
+    $Package = Get-Item $PackagePath
+    if ([int64]$Target[0].Size -ne [int64]$Package.Length) {
+        throw "Velopack E2E feed/package size mismatch for $FileName"
+    }
+    return $Package
+}
+
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $AppDir = (Resolve-Path $AppDir).Path
 $ProbeRoot = Join-Path $Root "build\velopack-e2e"
@@ -79,19 +111,11 @@ Write-Host "  [E2E 2/4] Add target v$Version to the same local Velopack feed"
 Invoke-E2EPack $Version $AppDir
 $Index = Join-Path $FeedDir "releases.$Channel.json"
 if (-not (Test-Path $Index)) { throw "Velopack E2E release index missing: $Index" }
-$TargetPackage = Get-SingleVelopackArtifact -Directory $FeedDir -Filter "$PackId-$Version-full.nupkg" -Label "target full package"
-$Feed = Get-Content $Index -Raw -Encoding UTF8 | ConvertFrom-Json
-$TargetAssets = @($Feed.Assets | Where-Object {
-    [string]$_.PackageId -eq $PackId -and
-    [string]$_.Version -eq $Version -and
-    [string]$_.Type -eq "Full"
-})
-if ($TargetAssets.Count -ne 1) {
-    throw "Velopack E2E feed must contain exactly one Full target v$Version; found $($TargetAssets.Count)"
-}
-if ([string]$TargetAssets[0].FileName -ne $TargetPackage.Name) {
-    throw "Velopack E2E feed/package mismatch: feed=$($TargetAssets[0].FileName) file=$($TargetPackage.Name)"
-}
+$TargetPackage = Resolve-E2EFullPackage `
+    -Directory $FeedDir `
+    -ReleaseIndex $Index `
+    -PackageId $PackId `
+    -PackageVersion $Version
 
 Write-Host "  [E2E 3/4] Launch installed old app and let Velopack update + restart it"
 $Process = Start-Process -FilePath $RootGui -ArgumentList @(
@@ -128,5 +152,5 @@ if ($Embedded -ne $Version) {
     throw "Updated embedded VERSION mismatch: expected=$Version actual=$Embedded"
 }
 
-Write-Host "  Velopack E2E passed: v$OldVersion -> Update.exe -> v$Version -> real installed GUI"
+Write-Host "  Velopack E2E passed: v$OldVersion -> $($TargetPackage.Name) -> Update.exe -> v$Version -> real installed GUI"
 exit 0
