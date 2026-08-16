@@ -45,11 +45,64 @@ def _column_signature(column: list[str] | None) -> tuple[str, ...]:
     return tuple(_key(item) for item in (column or []) if _key(item))
 
 
-def _child_column(columns: list[list[str]], level: int) -> list[str]:
-    index = int(level) + 1
+def _column_at(columns: list[list[str]], level: int) -> list[str]:
+    index = int(level)
     if index < 0 or index >= len(columns):
         return []
     return list(columns[index] or [])
+
+
+def _child_column(columns: list[list[str]], level: int) -> list[str]:
+    return _column_at(columns, int(level) + 1)
+
+
+def _required_stable_polls(max_polls: int) -> int:
+    """Use a short quiet window without making small test/recovery budgets impossible."""
+
+    return min(3, max(1, int(max_polls)))
+
+
+def _wait_for_stable_column(
+    page: Any,
+    *,
+    level: int,
+    columns_fn: ColumnsFn,
+    poll_ms: int,
+    max_polls: int,
+) -> list[str]:
+    """Return one live taxonomy level only after its exact contents settle.
+
+    Makro paints taxonomy columns incrementally. A newly visible singleton can be
+    a legitimate final column, but it can also be merely the first row of a larger
+    column. Requiring the same non-empty signature across a bounded quiet window
+    preserves real singleton leaves while preventing semantic decisions on a
+    partially rendered list.
+    """
+
+    required = _required_stable_polls(max_polls)
+    candidate_signature: tuple[str, ...] = ()
+    candidate_values: list[str] = []
+    confirmations = 0
+
+    for _ in range(max(1, int(max_polls))):
+        values = _column_at(columns_fn(), level)
+        signature = _column_signature(values)
+        if signature:
+            if signature == candidate_signature:
+                confirmations += 1
+            else:
+                candidate_signature = signature
+                candidate_values = values
+                confirmations = 1
+            if confirmations >= required:
+                return list(candidate_values)
+        else:
+            candidate_signature = ()
+            candidate_values = []
+            confirmations = 0
+        page.wait_for_timeout(max(1, int(poll_ms)))
+
+    return []
 
 
 def _wait_for_branch_outcome(
@@ -62,28 +115,40 @@ def _wait_for_branch_outcome(
     poll_ms: int,
     max_polls: int,
 ) -> str:
-    """Wait for either a verified leaf or a genuinely changed next column.
+    """Wait for either a verified leaf or a stable, genuinely changed child.
 
     Comparing the next-column signature matters during backtracking: a stale child
     column from the previously selected sibling must not be mistaken for the new
-    sibling's children while the Makro SPA is still repainting.
+    sibling's children while the Makro SPA is still repainting. A changed child is
+    also provisional until its exact contents remain unchanged for a short quiet
+    window, because Makro may render one row before the rest of the column.
     """
+
+    required = _required_stable_polls(max_polls)
+    candidate_signature: tuple[str, ...] = ()
+    confirmations = 0
 
     for _ in range(max(1, int(max_polls))):
         if leaf_ready_fn():
             return "leaf"
-        columns = columns_fn()
-        child = _column_signature(_child_column(columns, level))
+
+        child = _column_signature(_child_column(columns_fn(), level))
         if child and child != previous_child:
-            return "child"
+            if child == candidate_signature:
+                confirmations += 1
+            else:
+                candidate_signature = child
+                confirmations = 1
+            if confirmations >= required:
+                return "child"
+        else:
+            candidate_signature = ()
+            confirmations = 0
+
         page.wait_for_timeout(max(1, int(poll_ms)))
 
     if leaf_ready_fn():
         return "leaf"
-    columns = columns_fn()
-    child = _column_signature(_child_column(columns, level))
-    if child and child != previous_child:
-        return "child"
     return "dead"
 
 
@@ -131,13 +196,19 @@ def navigate_live_taxonomy(
         tried = budget.tried_by_path.setdefault(path_key, set())
 
         while not budget.exhausted:
-            columns = columns_fn()
-            if level >= len(columns) or not columns[level]:
+            live_values = _wait_for_stable_column(
+                page,
+                level=level,
+                columns_fn=columns_fn,
+                poll_ms=poll_ms,
+                max_polls=transition_polls,
+            )
+            if not live_values:
                 return ""
 
             candidates = [
                 item
-                for item in columns[level]
+                for item in live_values
                 if _key(item) and _key(item) not in tried
             ]
             if not candidates:
@@ -145,8 +216,8 @@ def navigate_live_taxonomy(
 
             selected = str(choose_fn(list(path), candidates) or "").strip()
             if not selected:
-                # The AI is explicitly allowed to reject every live node at this
-                # level. The parent will then try its next sibling.
+                # The semantic layer may reject every stable live node at this
+                # level. Do not reinterpret that as a transport error.
                 return ""
 
             selected_key = _key(selected)
