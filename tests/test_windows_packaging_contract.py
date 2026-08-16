@@ -119,8 +119,8 @@ def test_windows_ci_uses_one_isolated_pinned_velopack_msi_smoke() -> None:
     assert WINDOWS.index("Silent branded MSI install and uninstall smoke test") < WINDOWS.index(
         "Silent Velopack Setup smoke test"
     )
-    assert 'INSTALLFOLDER=`"$installDir`"' in MSI_SMOKE
-    assert "VELOPACK_INSTALLDIR" not in MSI_SMOKE
+    assert 'VELOPACK_INSTALLDIR=`"$installDir`"' in MSI_SMOKE
+    assert "supported public install" in MSI_SMOKE
     assert 'Uninstall\\MSI:$PackId' in MSI_SMOKE
     assert 'Uninstall\\$PackId' in MSI_SMOKE
     assert '"/i' in MSI_SMOKE
