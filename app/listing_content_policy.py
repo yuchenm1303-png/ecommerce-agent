@@ -10,7 +10,17 @@ from .source_bundle import normalize_key
 LISTING_INTENT_ENV = "ECOMMERCE_LISTING_INTENT"
 LISTING_AI_GUIDANCE_ENV = "ECOMMERCE_LISTING_AI_GUIDANCE"
 MODEL_NAME_KEYWORDS_ENV = "ECOMMERCE_MODEL_NAME_KEYWORDS"
-_BASE_CONTENT_POLICY_VERSION = 5
+_BASE_CONTENT_POLICY_VERSION = 6
+
+_MODEL_NAME_PROMPT = (
+    "请按以下要求，基于我提供的 1688 链接和我的销售规格/套装-SKU规格的提示内容，生成一个用于亚马逊南非站的英文产品标题：\n"
+    "标题结构：按『核心关键词 + 主要特性（材质/功能/设计）+ 规格/数量 + 适用场景』顺序组合，简洁有力，无冗余词。\n"
+    "套装信息：当销售规格/套装-SKU规格包含套装或组合时，必须将套装内有证据支持的产品组合、数量、配套关系清晰融入标题；没有套装信息时不得自行虚构。\n"
+    "绝对规避：不得出现任何品牌词、商标名；严禁使用涉及治疗、医疗、健康功效的敏感词（如 cure, treatment, therapeutic, medical, healing, remedy, prevent 等），仅描述物理属性、功能、用途或场景。\n"
+    "南非用户偏好：用当地常用英语表述，在真实证据支持的前提下突出实用性、耐用性、性价比，并考虑当地季节/使用习惯（如适用），不得为了营销效果虚构属性或功效。\n"
+    "最终目标：提升搜索曝光率，精准匹配买家需求，促进点击与转化。\n"
+    "Model Name 字段值中仅输出最终英文标题，不附加解释、分析过程、前缀、标签或备注。"
+)
 
 
 def _env_text(name: str, *, limit: int) -> str:
@@ -193,23 +203,15 @@ def field_content_policy(field: dict[str, Any]) -> dict[str, Any]:
         keyword_instruction = ""
         if model_keywords:
             keyword_instruction = (
-                " The seller supplied these candidate Model Name search terms: "
+                "\n补充候选搜索词："
                 + repr(model_keywords)
-                + ". Use only terms that are genuinely relevant to this exact product and supported by the grounded evidence. "
-                "Blend useful terms naturally into the title, omit irrelevant or unsupported terms, do not add brands, and never keyword-stuff."
+                + "。只使用与当前真实商品及销售规格直接相关、且有证据支持的词；自然融入标题，忽略无关或无证据词，不得堆砌关键词。"
             )
         policy: dict[str, Any] = {
             "policy_id": "model_name",
             "generation_mode": "grounded_synthesis",
             "required_fallback": "manual_only",
-            "instruction": (
-                "Write one concise English ecommerce title attribute for South African buyer search behaviour "
-                "using the selected listing intent when present plus grounded product type, core functions, "
-                "important supported specifications and supported use-case terms. Omit brand names from this "
-                "generated title. Never output N/A, None or a numeric placeholder for Model Name. Avoid "
-                "repetition, keyword stuffing and unsupported claims."
-                + keyword_instruction
-            ),
+            "instruction": _MODEL_NAME_PROMPT + keyword_instruction,
         }
         if model_keywords:
             policy["model_name_candidate_keywords"] = model_keywords
