@@ -33,7 +33,7 @@ jobs:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 0
 
-      - name: Resolve test build identity
+      - name: Resolve and preflight test build identity
         id: build
         shell: pwsh
         run: |
@@ -41,12 +41,29 @@ jobs:
           $short = $sha.Substring(0, 8)
           $version = $env:PACKAGE_VERSION.Trim()
           if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid package version: $version" }
+
           $tag = "test-$version-$short-${{ github.run_number }}"
+          $releaseName = "Listing Studio Test $version ($short) #${{ github.run_number }}"
+
+          gh release view $tag *> $null
+          $tagExists = ($LASTEXITCODE -eq 0)
+          $global:LASTEXITCODE = 0
+          if ($tagExists) { throw "Test release already exists: $tag" }
+
+          $releases = gh release list --limit 1000 --json name,tagName,isDraft,isPrerelease | ConvertFrom-Json
+          $nameConflicts = @($releases | Where-Object { [string]$_.name -eq $releaseName })
+          if ($nameConflicts.Count -gt 0) {
+            $conflictTags = ($nameConflicts | ForEach-Object { [string]$_.tagName }) -join ", "
+            throw "Test release name already exists: '$releaseName' ($conflictTags)"
+          }
+
           "sha=$sha" >> $env:GITHUB_OUTPUT
           "short=$short" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
+          "release_name=$releaseName" >> $env:GITHUB_OUTPUT
           Set-Content "packaging\VERSION" $version -Encoding ascii -NoNewline
+          Write-Host "Test release preflight passed: tag=$tag name='$releaseName'"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -166,7 +183,7 @@ jobs:
             --repoUrl "https://github.com/$env:GITHUB_REPOSITORY" `
             --publish false `
             --pre true `
-            --releaseName "Listing Studio Test ${{ steps.build.outputs.version }} (${{ steps.build.outputs.short }})" `
+            --releaseName "${{ steps.build.outputs.release_name }}" `
             --tag "${{ steps.build.outputs.tag }}" `
             --targetCommitish "${{ steps.build.outputs.sha }}"
           if ($LASTEXITCODE -ne 0) { throw "Velopack prerelease draft upload failed: $LASTEXITCODE" }
@@ -181,8 +198,9 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ steps.build.outputs.tag }}"
-          $draft = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          $draft = gh release view $tag --json tagName,name,isDraft,isPrerelease,assets | ConvertFrom-Json
           if ($draft.tagName -ne $tag) { throw "Test draft tag mismatch" }
+          if ($draft.name -ne "${{ steps.build.outputs.release_name }}") { throw "Test draft release name mismatch" }
           if (-not $draft.isDraft) { throw "Test release became public before verification" }
           if (-not $draft.isPrerelease) { throw "Test draft is not marked prerelease" }
           $names = @($draft.assets | ForEach-Object { $_.name })
@@ -212,8 +230,9 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ steps.build.outputs.tag }}"
-          $release = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          $release = gh release view $tag --json tagName,name,isDraft,isPrerelease,assets | ConvertFrom-Json
           if ($release.tagName -ne $tag) { throw "Published test tag mismatch" }
+          if ($release.name -ne "${{ steps.build.outputs.release_name }}") { throw "Published test release name mismatch" }
           if ($release.isDraft) { throw "Test release is still a draft" }
           if (-not $release.isPrerelease) { throw "Test release was not published as prerelease" }
           $names = @($release.assets | ForEach-Object { $_.name })
