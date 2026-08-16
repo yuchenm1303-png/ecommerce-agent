@@ -125,7 +125,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
           if ((Get-Content $versionFile -Raw).Trim() -ne $version) { throw "Embedded VERSION mismatch" }
 
-      - name: Publish prerelease Velopack assets
+      - name: Stage prerelease Velopack assets as draft
         shell: pwsh
         env:
           VPK_TOKEN: ${{ github.token }}
@@ -134,25 +134,55 @@ jobs:
             --outputDir "artifacts\velopack" `
             --channel $env:VELOPACK_CHANNEL `
             --repoUrl "https://github.com/$env:GITHUB_REPOSITORY" `
-            --publish true `
+            --publish false `
             --pre true `
             --releaseName "Listing Studio Test ${{ steps.build.outputs.version }} (${{ steps.build.outputs.short }})" `
             --tag "${{ steps.build.outputs.tag }}" `
             --targetCommitish "${{ steps.build.outputs.sha }}"
-          if ($LASTEXITCODE -ne 0) { throw "Velopack prerelease upload failed: $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "Velopack prerelease draft upload failed: $LASTEXITCODE" }
           gh release upload "${{ steps.build.outputs.tag }}" `
             "artifacts\EcommerceAgent-Setup-${{ steps.build.outputs.version }}.exe" `
             "artifacts\EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip" `
             --clobber
           if ($LASTEXITCODE -ne 0) { throw "Friendly prerelease asset upload failed: $LASTEXITCODE" }
 
+      - name: Verify complete prerelease draft
+        shell: pwsh
+        run: |
+          $version = "${{ steps.build.outputs.version }}"
+          $tag = "${{ steps.build.outputs.tag }}"
+          $draft = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          if (-not $draft.isDraft) { throw "Test release became public before verification" }
+          if (-not $draft.isPrerelease) { throw "Test draft is not marked prerelease" }
+          $names = @($draft.assets | ForEach-Object { $_.name })
+          foreach ($expected in @(
+            "Smirel.ListingStudio-$version-full.nupkg",
+            "releases.$env:VELOPACK_CHANNEL.json",
+            $env:native_setup,
+            $env:native_portable,
+            "EcommerceAgent-Setup-$version.exe",
+            "EcommerceAgent-$version-portable.zip"
+          )) {
+            if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
+              throw "Draft prerelease asset missing: $expected"
+            }
+          }
+
+      - name: Publish verified prerelease
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.build.outputs.tag }}"
+          gh release edit $tag --draft=false --prerelease
+          if ($LASTEXITCODE -ne 0) { throw "Failed to publish verified prerelease: $LASTEXITCODE" }
+
       - name: Verify published prerelease contract
         shell: pwsh
         run: |
           $version = "${{ steps.build.outputs.version }}"
           $tag = "${{ steps.build.outputs.tag }}"
-          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
-          if (-not $release.prerelease) { throw "Test release was not published as prerelease" }
+          $release = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($release.isDraft) { throw "Test release is still a draft" }
+          if (-not $release.isPrerelease) { throw "Test release was not published as prerelease" }
           $names = @($release.assets | ForEach-Object { $_.name })
           foreach ($expected in @(
             "Smirel.ListingStudio-$version-full.nupkg",
@@ -165,6 +195,19 @@ jobs:
             if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
               throw "Published prerelease asset missing: $expected"
             }
+          }
+
+      - name: Prune old test prereleases
+        shell: pwsh
+        run: |
+          $all = gh release list --limit 100 --json tagName,isPrerelease,isDraft,createdAt | ConvertFrom-Json
+          $tests = @($all | Where-Object {
+            $_.isPrerelease -and -not $_.isDraft -and [string]$_.tagName -like "test-*"
+          } | Sort-Object { [datetime]$_.createdAt } -Descending)
+          foreach ($old in @($tests | Select-Object -Skip 3)) {
+            Write-Host "Pruning old test prerelease $($old.tagName)"
+            gh release delete $old.tagName --yes --cleanup-tag
+            if ($LASTEXITCODE -ne 0) { throw "Failed to prune old test prerelease $($old.tagName)" }
           }
 
       - name: Upload test build files to workflow run
