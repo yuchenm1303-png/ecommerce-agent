@@ -269,7 +269,29 @@ jobs:
             }
           }
 
+      - name: Cleanup failed Stable draft
+        if: ${{ failure() }}
+        shell: pwsh
+        run: |
+          $tag = "v$env:UPDATE_VERSION"
+          $raw = gh release view $tag --json isDraft,tagName 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            $global:LASTEXITCODE = 0
+            Write-Host "No release exists for cleanup: $tag"
+            exit 0
+          }
+          $release = $raw | ConvertFrom-Json
+          if ($release.isDraft) {
+            Write-Host "Removing failed draft $tag so the same version can be retried cleanly"
+            gh release delete $tag --yes --cleanup-tag
+            if ($LASTEXITCODE -ne 0) { throw "Failed to cleanup draft $tag" }
+          }
+          else {
+            Write-Warning "Release $tag is already public; automatic cleanup intentionally refused"
+          }
+
       - name: Upload published files to workflow run
+        if: ${{ success() }}
         uses: actions/upload-artifact@v4
         with:
           name: EcommerceAgent-Stable-${{ inputs.version }}
