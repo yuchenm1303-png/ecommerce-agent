@@ -38,6 +38,7 @@ _AUTH_PASSWORD_URL = f"{_SUPABASE_URL}/auth/v1/token?grant_type=password"
 _AUTH_REFRESH_URL = f"{_SUPABASE_URL}/auth/v1/token?grant_type=refresh_token"
 _LICENSE_URL = f"{_SUPABASE_URL}/functions/v1/portal-license"
 _DOWNLOAD_URL = f"{_SUPABASE_URL}/functions/v1/portal-download"
+_TELEMETRY_URL = f"{_SUPABASE_URL}/functions/v1/portal-telemetry"
 _FINGERPRINT_VERSION = 1
 _HTTP_TIMEOUT_SECONDS = 12
 _REVALIDATE_INTERVAL_MS = 6 * 60 * 60 * 1000
@@ -64,6 +65,7 @@ class ApplicationAccessSession:
     refresh_token: str = ""
     device_id: str = ""
     device_name: str = ""
+    telemetry_token: str = ""
     validated_at: float = 0.0
     grace_until: float = 0.0
     offline_grace: bool = False
@@ -160,6 +162,7 @@ def _save_state(session: ApplicationAccessSession) -> None:
         "refresh_token": session.refresh_token,
         "device_id": session.device_id,
         "device_name": session.device_name,
+        "telemetry_token": session.telemetry_token,
         "validated_at": session.validated_at,
         "grace_until": session.grace_until,
         "max_devices": session.max_devices,
@@ -294,6 +297,7 @@ def _session_from_auth(
         refresh_token=str(auth.get("refresh_token") or ""),
         device_id=device_id,
         device_name=device_name,
+        telemetry_token=str(license_payload.get("telemetry_token") or ""),
         validated_at=now,
         grace_until=now + grace_hours * 3600,
         offline_grace=False,
@@ -318,6 +322,7 @@ def _session_from_stored(
         refresh_token=refresh_token,
         device_id=device_id,
         device_name=device_name,
+        telemetry_token=str(stored.get("telemetry_token") or ""),
         validated_at=float(stored.get("validated_at") or 0.0),
         grace_until=float(stored.get("grace_until") or 0.0),
         offline_grace=offline_grace,
@@ -345,7 +350,12 @@ def _restore_session() -> ApplicationAccessSession | None:
     except (TypeError, ValueError):
         validated_at = 0.0
     validation_age_ms = (now - validated_at) * 1000.0
-    if validated_at > 0.0 and 0.0 <= validation_age_ms < _REVALIDATE_INTERVAL_MS:
+    telemetry_token = str(stored.get("telemetry_token") or "")
+    if (
+        telemetry_token
+        and validated_at > 0.0
+        and 0.0 <= validation_age_ms < _REVALIDATE_INTERVAL_MS
+    ):
         try:
             return _session_from_stored(
                 stored,
@@ -565,6 +575,14 @@ class ApplicationAccessController(QObject):
     @property
     def download_function_url(self) -> str:
         return _DOWNLOAD_URL
+
+    @property
+    def telemetry_function_url(self) -> str:
+        return _TELEMETRY_URL
+
+    @property
+    def installed_version(self) -> str:
+        return _installed_version()
 
     @property
     def publishable_key(self) -> str:
