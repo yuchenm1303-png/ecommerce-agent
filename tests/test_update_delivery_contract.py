@@ -6,6 +6,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 UPDATER_PATH = ROOT / "gui" / "app_updater.py"
 UPDATER = UPDATER_PATH.read_text(encoding="utf-8")
+PRESENTATION_PATH = ROOT / "gui" / "resilient_app_updater.py"
+PRESENTATION = PRESENTATION_PATH.read_text(encoding="utf-8")
 RUNTIME = (ROOT / "gui" / "update_runtime.py").read_text(encoding="utf-8")
 CORE = (ROOT / "app" / "updater_core.py").read_text(encoding="utf-8")
 ACCESS = (ROOT / "gui" / "app_access.py").read_text(encoding="utf-8")
@@ -17,19 +19,25 @@ PUBLISH = (ROOT / ".github" / "workflows" / "publish-update.yml").read_text(enco
 def test_update_sources_compile() -> None:
     for path in (
         UPDATER_PATH,
+        PRESENTATION_PATH,
         ROOT / "gui" / "update_runtime.py",
-        ROOT / "gui" / "resilient_app_updater.py",
         ROOT / "app" / "updater_core.py",
+        ROOT / "app" / "update_browser_gate.py",
+        ROOT / "app" / "updater_panel.py",
         ROOT / "scripts" / "updater_main.py",
+        ROOT / "scripts" / "updater_main_v2.py",
     ):
         compile(path.read_text(encoding="utf-8"), str(path), "exec")
     compile(ACCESS, str(ROOT / "gui" / "app_access.py"), "exec")
 
 
-def test_formal_app_uses_one_canonical_stable_updater() -> None:
-    shim = (ROOT / "gui" / "resilient_app_updater.py").read_text(encoding="utf-8")
-    assert "from gui.app_updater import ApplicationUpdater, install_application_updater" in shim
-    assert "class ApplicationUpdater" not in shim
+def test_formal_app_uses_one_canonical_stable_transport_with_one_presentation_layer() -> None:
+    assert "import gui.app_updater as canonical" in PRESENTATION
+    assert "class ApplicationUpdater(canonical.ApplicationUpdater)" in PRESENTATION
+    assert "QNetworkAccessManager" not in PRESENTATION
+    assert "QNetworkRequest" not in PRESENTATION
+    assert "_LATEST_RELEASE_API" not in PRESENTATION
+    assert "_download_portal_update" not in PRESENTATION
     assert "from gui.resilient_app_updater import install_application_updater" in RUN
     assert "install_update_runtime(app, window)" in RUN
     assert RUN.index("install_update_runtime(app, window)") < RUN.index(
@@ -67,6 +75,7 @@ def test_download_is_durable_size_and_hash_verified() -> None:
     assert "hashlib.sha256()" in UPDATER
     assert "stream.read(1024 * 1024)" in UPDATER
     assert "更新文件 SHA-256 校验失败" in UPDATER
+    assert "listing-studio-update-sha256" in PRESENTATION
 
 
 def test_formal_handoff_has_no_powershell_fallback_and_requires_runtime_self_check() -> None:
@@ -84,8 +93,8 @@ def test_gui_quits_only_after_updater_acknowledges_verified_job() -> None:
     assert 'int(ack.get("job_version") or 0) == JOB_VERSION' in UPDATER
     assert "if proc.poll() is not None" in UPDATER
     assert "Catch an immediate post-ACK crash" in UPDATER
-    verify_block = UPDATER.split("def _verify_and_install", 1)[1]
-    assert "if not _write_update_marker(version):" in verify_block
+    verify_block = PRESENTATION.split("def _finish_verified_install", 1)[1]
+    assert "canonical._write_update_marker(version)" in verify_block
     assert "started, detail = self._handoff_installer" in verify_block
     assert "QTimer.singleShot(120, QApplication.quit)" in verify_block
 
@@ -114,16 +123,16 @@ def test_update_ui_remains_continuous_and_visible() -> None:
         "发现新版本",
         "立即更新",
         "稍后",
-        "步骤 1/4",
-        "步骤 2/4",
-        "步骤 3/4",
-        "步骤 4/4",
-        "更新已完成",
+        "步骤 1/6",
+        "步骤 2/6",
+        "步骤 3/6",
+        "步骤 4/6",
     ):
-        assert text in UPDATER
-    assert "QProgressDialog" in UPDATER
-    assert "WindowStaysOnTopHint" in UPDATER
-    assert "Qt.WindowModality.ApplicationModal" in UPDATER
+        assert text in PRESENTATION or text in UPDATER
+    assert "class _UpdateProgressPanel(QDialog)" in PRESENTATION
+    assert "WindowStaysOnTopHint" in PRESENTATION
+    assert "Qt.WindowModality.ApplicationModal" in PRESENTATION
+    assert '"/VERYSILENT"' in PRESENTATION
 
 
 def test_publish_contract_is_manual_stable_only() -> None:
