@@ -7,6 +7,9 @@ import sys
 from app.app_icon_data import APP_ICON_PNG_BASE64, APP_ICON_SHA256
 
 
+APP_DISPLAY_NAME = "Listing Studio"
+APP_ORGANIZATION = "Smirel"
+APP_USER_MODEL_ID = "Smirel.ListingStudio"
 ICON_VISUAL_SCALE = 1.12
 
 
@@ -25,7 +28,7 @@ RUNTIME_ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
 
 
 def apply_qt_application_icon(app) -> None:  # noqa: ANN001
-    """Apply the approved app artwork to every top-level Qt window/taskbar entry."""
+    """Apply one canonical Windows identity and icon to the whole Qt process."""
 
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QIcon, QPixmap
@@ -54,6 +57,9 @@ def apply_qt_application_icon(app) -> None:  # noqa: ANN001
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
+
+    app.setApplicationName(APP_DISPLAY_NAME)
+    app.setOrganizationName(APP_ORGANIZATION)
     app.setWindowIcon(icon)
 
     if sys.platform == "win32":
@@ -61,10 +67,16 @@ def apply_qt_application_icon(app) -> None:  # noqa: ANN001
             import ctypes
 
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(  # type: ignore[attr-defined]
-                "EcommerceAgent.ListingStudio"
+                APP_USER_MODEL_ID
             )
         except Exception:
             pass
 
 
-__all__ = ["application_icon_bytes", "apply_qt_application_icon"]
+__all__ = [
+    "APP_DISPLAY_NAME",
+    "APP_ORGANIZATION",
+    "APP_USER_MODEL_ID",
+    "application_icon_bytes",
+    "apply_qt_application_icon",
+]
