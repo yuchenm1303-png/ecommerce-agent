@@ -8,11 +8,81 @@ from typing import Any
 
 _INDEXED_NAME_RE = re.compile(r"_\d+_(?:value|display|name)?$")
 _SECTION_COUNT_RE = re.compile(r"\s*\(\s*\d+\s*/\s*\d+\s*\)\s*$")
+_READABLE_ATTRIBUTE_KEY_RE = re.compile(r"^[a-z]+(?:[_-][a-z]+)*$")
 _RADIO_KINDS = {"radio", "custom_radio"}
 
 
 def _section_identity(value: object) -> str:
     return _SECTION_COUNT_RE.sub("", str(value or "").strip()).casefold()
+
+
+def _label_identity(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _humanize_attribute_key(value: object) -> str:
+    """Return a safe human label only for transparent semantic attribute keys.
+
+    DOM ids containing digits/camel-case/internal hashes are intentionally rejected;
+    they are not trustworthy presentation labels. Simple runtime keys such as
+    ``length``, ``breadth``, ``height`` and ``weight`` are stable enough to repair
+    a duplicated rendered label without category-specific knowledge.
+    """
+
+    raw = str(value or "").strip()
+    if not raw or raw != raw.casefold() or not _READABLE_ATTRIBUTE_KEY_RE.fullmatch(raw):
+        return ""
+    words = [word for word in re.split(r"[_-]+", raw) if word]
+    return " ".join(word.capitalize() for word in words)
+
+
+def _disambiguate_duplicate_labels(fields: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Repair duplicate rendered labels only when stable attribute keys prove identity.
+
+    Makro can render several distinct controls inside a shared attribute wrapper.
+    The scanner may then expose the first visual label for every child control even
+    though the DOM ids/names still carry distinct semantic keys. When a duplicate
+    label occurs inside the same section/subsection, use those transparent keys as
+    the canonical labels only if *every* member has a readable, unique key. Opaque
+    keys fail closed and leave the rendered wording untouched.
+    """
+
+    grouped: dict[tuple[str, str, str], list[int]] = defaultdict(list)
+    for index, field in enumerate(fields):
+        label_key = _label_identity(field.get("label"))
+        if not label_key:
+            continue
+        grouped[
+            (
+                _section_identity(field.get("section_heading")),
+                _label_identity(field.get("subsection_heading")),
+                label_key,
+            )
+        ].append(index)
+
+    output = list(fields)
+    for indices in grouped.values():
+        if len(indices) < 2:
+            continue
+        canonical = [
+            _humanize_attribute_key(fields[index].get("attribute_key"))
+            for index in indices
+        ]
+        canonical_keys = {_label_identity(label) for label in canonical if label}
+        if any(not label for label in canonical) or len(canonical_keys) != len(indices):
+            continue
+
+        rendered = str(fields[indices[0]].get("label") or "").strip()
+        if all(_label_identity(label) == _label_identity(rendered) for label in canonical):
+            continue
+
+        for index, label in zip(indices, canonical):
+            repaired = copy.copy(fields[index])
+            repaired["rendered_label"] = str(fields[index].get("label") or "")
+            repaired["label"] = label
+            repaired["label_disambiguated_from_attribute_key"] = True
+            output[index] = repaired
+    return output
 
 
 def _radio_group_name(field: dict[str, Any]) -> str:
@@ -45,13 +115,12 @@ def _radio_option(control: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def coalesce_radio_semantic_fields(fields: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Merge native/custom radios that HTML already declares as one named group.
+    """Return the canonical Makro semantic-field list after structural normalization.
 
-    No label/category heuristics are used. A merge is allowed only when at least
-    two radio-only semantic fields share the same non-empty ``name`` inside the
-    same section/subsection. This repairs the scanner's normal id-first field
-    identity for the one HTML control family where distinct ids intentionally
-    belong to one semantic value.
+    Native/custom radios are merged only when HTML declares the same non-empty
+    group name inside one section/subsection. After that structural merge, any
+    duplicated rendered labels are disambiguated only from transparent, unique DOM
+    attribute keys. No product/category field list or value inference is used.
     """
 
     grouped: dict[tuple[str, str, str], list[tuple[int, dict[str, Any]]]] = defaultdict(list)
@@ -120,7 +189,7 @@ def coalesce_radio_semantic_fields(fields: list[dict[str, Any]]) -> list[dict[st
             output.append(replacements[index])
         elif index not in consumed:
             output.append(field)
-    return output
+    return _disambiguate_duplicate_labels(output)
 
 
 __all__ = ["coalesce_radio_semantic_fields"]
