@@ -110,14 +110,15 @@ def test_velopack_pack_uses_canonical_branding_and_msi() -> None:
     assert 'EcommerceAgent-Setup-$Version.msi' in BUILD
 
 
-def test_heavy_msi_and_e2e_work_are_parallel_and_e2e_omits_unused_outputs() -> None:
+def test_heavy_msi_and_e2e_work_are_parallel_and_e2e_uses_legal_minimal_outputs() -> None:
     assert "Start-VpkProcess" in BUILD
     assert "Starting branded MSI/WiX build in parallel" in BUILD
     assert "while MSI builds" in BUILD
     assert '"--noPortable", "true"' in BUILD
     assert '"--noPortable", "true"' in E2E
-    assert '"--noInst", "true"' in E2E
-    assert "update assets only (no setup/portable)" in E2E
+    assert '"--noInst"' not in E2E
+    assert "mutually exclusive" in E2E
+    assert "target Setup ignored" in E2E
     assert "--clean" not in BUILD
     assert "$WorkDir" not in BUILD[BUILD.index("foreach ($Path in @(") : BUILD.index("New-Item -ItemType Directory")]
 
@@ -137,6 +138,7 @@ def test_windows_ci_uses_path_sensitive_fast_pushes_and_full_installer_gate() ->
     assert '$env:GITHUB_REF -like "refs/tags/v*"' in WINDOWS
     assert '"scripts/build_windows.ps1"' in WINDOWS
     assert '"scripts/test_velopack_msi.ps1"' in WINDOWS
+    assert '"tests/test_windows_packaging_contract.py"' in WINDOWS
     assert '"packaging/"' in WINDOWS
     assert "python -m pip install --upgrade pip" not in WINDOWS
 
