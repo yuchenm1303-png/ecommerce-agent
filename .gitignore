@@ -49,3 +49,5 @@ test-results/
 /dist/
 /artifacts/
 /packaging/app_icon.ico
+# PyInstaller auto-generates a root spec when packaging the E2E parent probe
+/EcommerceAgent.spec

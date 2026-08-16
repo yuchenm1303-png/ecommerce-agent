@@ -90,7 +90,7 @@ if (-not (Test-Path $ResultPath)) {
     throw "Updater E2E timed out waiting for result"
 }
 
-$Result = Get-Content $ResultPath -Raw | ConvertFrom-Json
+$Result = Get-Content $ResultPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ([string]$Result.status -ne "installed") {
     if (Test-Path $UpdaterLog) { Write-Host "---- updater log ----"; Get-Content $UpdaterLog -Tail 160 }
     if (Test-Path $SetupLog) { Write-Host "---- Inno log ----"; Get-Content $SetupLog -Tail 160 }
@@ -119,7 +119,7 @@ if (-not (Test-Path $RelaunchMarker)) {
     throw "Updater E2E installed successfully but real EcommerceAgent.exe never reached Qt/Python startup"
 }
 
-$Relaunch = Get-Content $RelaunchMarker -Raw | ConvertFrom-Json
+$Relaunch = Get-Content $RelaunchMarker -Raw -Encoding UTF8 | ConvertFrom-Json
 if (-not [bool]$Relaunch.started -or -not [bool]$Relaunch.frozen) {
     throw "Updater E2E real GUI did not run as a frozen application"
 }
