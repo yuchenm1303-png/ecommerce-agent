@@ -79,10 +79,25 @@ $WorkDir = Join-Path $Root "build\pyinstaller"
 $ArtifactDir = Join-Path $Root "artifacts"
 $VelopackDir = Join-Path $ArtifactDir "velopack"
 $SetupAlias = Join-Path $ArtifactDir "EcommerceAgent-Setup-$Version.exe"
+$MsiAlias = Join-Path $ArtifactDir "EcommerceAgent-Setup-$Version.msi"
 $PortableAlias = Join-Path $ArtifactDir "EcommerceAgent-$Version-portable.zip"
 $IconFile = Join-Path $Root "packaging\app_icon.ico"
+$SplashFile = Join-Path $Root "packaging\installer_splash.png"
+$MsiBannerFile = Join-Path $Root "packaging\msi_banner.bmp"
+$MsiLogoFile = Join-Path $Root "packaging\msi_logo.bmp"
 
-foreach ($Path in @($AppDir, $WorkDir, $VelopackDir, $SetupAlias, $PortableAlias, $IconFile)) {
+foreach ($Path in @(
+    $AppDir,
+    $WorkDir,
+    $VelopackDir,
+    $SetupAlias,
+    $MsiAlias,
+    $PortableAlias,
+    $IconFile,
+    $SplashFile,
+    $MsiBannerFile,
+    $MsiLogoFile
+)) {
     if (Test-Path $Path) { Remove-Item $Path -Recurse -Force }
 }
 New-Item -ItemType Directory -Force -Path $DistRoot, $WorkDir, $ArtifactDir, $VelopackDir | Out-Null
@@ -93,10 +108,16 @@ if ($LASTEXITCODE -ne 0) { throw "dotnet tool restore failed: $LASTEXITCODE" }
 & dotnet tool run vpk -- --help *> $null
 if ($LASTEXITCODE -ne 0) { throw "Pinned Velopack CLI failed to start: $LASTEXITCODE" }
 
-Write-Host "[2/5] Generating application icon"
-& python (Join-Path $Root "scripts\generate_app_icon.py") --output $IconFile
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path $IconFile)) {
-    throw "Application icon generation failed"
+Write-Host "[2/5] Generating canonical Windows branding"
+& python (Join-Path $Root "scripts\generate_app_icon.py") `
+    --output $IconFile `
+    --splash $SplashFile `
+    --msi-banner $MsiBannerFile `
+    --msi-logo $MsiLogoFile `
+    --version $Version
+if ($LASTEXITCODE -ne 0) { throw "Windows branding generation failed" }
+foreach ($Required in @($IconFile, $SplashFile, $MsiBannerFile, $MsiLogoFile)) {
+    if (-not (Test-Path $Required -PathType Leaf)) { throw "Windows branding output missing: $Required" }
 }
 
 Write-Host "[3/5] Building PyInstaller onedir application v$Version"
@@ -146,7 +167,7 @@ if ($GuiProbeExitCode -ne 0) { throw "Packaged GUI import probe failed: $GuiProb
 & $WorkerExe --self-test
 if ($LASTEXITCODE -ne 0) { throw "Packaged worker self-test failed: $LASTEXITCODE" }
 
-Write-Host "[5/5] Packing standard Velopack release"
+Write-Host "[5/5] Packing branded standard Velopack release"
 $AzureTrustedSignFile = [string]$env:VPK_AZURE_TRUSTED_SIGN_FILE
 $SignParams = [string]$env:VPK_SIGN_PARAMS
 if (-not [string]::IsNullOrWhiteSpace($AzureTrustedSignFile) -and -not [string]::IsNullOrWhiteSpace($SignParams)) {
@@ -176,19 +197,34 @@ $PackArgs = @(
     "--packAuthors", $PackAuthors,
     "--packTitle", $PackTitle,
     "--icon", $IconFile,
+    "--splashImage", $SplashFile,
+    "--splashProgressColor", "#5DA7FF",
+    "--aumid", $PackId,
+    "--shortcuts", "Desktop,StartMenuRoot",
+    "--msi", "true",
+    "--instLocation", "PerUser",
+    "--msiBanner", $MsiBannerFile,
+    "--msiLogo", $MsiLogoFile,
     "--mainExe", "EcommerceAgent.exe"
 )
 if (-not [string]::IsNullOrWhiteSpace($ReleaseNotesPath)) {
     $resolvedNotes = (Resolve-Path $ReleaseNotesPath).Path
     $PackArgs += @("--releaseNotes", $resolvedNotes)
 }
+if (-not [string]::IsNullOrWhiteSpace($AzureTrustedSignFile)) {
+    $PackArgs += @("--azureTrustedSignFile", (Resolve-Path $AzureTrustedSignFile).Path)
+}
+elseif (-not [string]::IsNullOrWhiteSpace($SignParams)) {
+    $PackArgs += @("--signParams", $SignParams)
+}
 & dotnet tool run vpk -- @PackArgs
 if ($LASTEXITCODE -ne 0) { throw "Velopack pack failed: $LASTEXITCODE" }
 
 # Native artifact names are a Velopack implementation detail and may include
-# channel/runtime qualifiers. Setup/portable are discovered from the clean output
-# directory; the update package itself is resolved only through the release feed.
+# channel/runtime qualifiers. Setup/portable/MSI are discovered from the clean
+# output directory; the update package itself is resolved only through the feed.
 $NativeSetup = Get-SingleVelopackArtifact -Directory $VelopackDir -Filter "$PackId*-Setup.exe" -Label "setup bundle"
+$NativeMsi = Get-SingleVelopackArtifact -Directory $VelopackDir -Filter "$PackId*.msi" -Label "MSI bundle"
 $NativePortable = Get-SingleVelopackArtifact -Directory $VelopackDir -Filter "$PackId*-Portable.zip" -Label "portable bundle"
 $ReleaseIndex = Join-Path $VelopackDir "releases.$Channel.json"
 $FullPackage = Resolve-VelopackFullPackage `
@@ -198,6 +234,7 @@ $FullPackage = Resolve-VelopackFullPackage `
     -PackageVersion $Version
 
 Copy-Item $NativeSetup.FullName $SetupAlias -Force
+Copy-Item $NativeMsi.FullName $MsiAlias -Force
 Copy-Item $NativePortable.FullName $PortableAlias -Force
 
 if ($ShouldRunUpdateE2E) {
@@ -218,8 +255,10 @@ Write-Host ""
 Write-Host "Windows package ready:"
 Write-Host "  Velopack feed : $VelopackDir"
 Write-Host "  Native setup  : $($NativeSetup.Name)"
+Write-Host "  Native MSI    : $($NativeMsi.Name)"
 Write-Host "  Native portable: $($NativePortable.Name)"
 Write-Host "  Full package  : $($FullPackage.Name)"
-Write-Host "  Installer     : $SetupAlias"
+Write-Host "  Installer EXE : $SetupAlias"
+Write-Host "  Installer MSI : $MsiAlias"
 Write-Host "  Portable      : $PortableAlias"
 Write-Host "  App dir       : $AppDir"
