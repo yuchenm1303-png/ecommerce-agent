@@ -288,6 +288,25 @@ def merge_vertical_search_observations(
     return merged[: max(1, int(max_candidates))]
 
 
+def _exact_product_type_candidate(
+    hints: ListingBootstrapHints,
+    candidates: list[VerticalCandidateEvidence],
+) -> str:
+    """Return one uniquely exact live leaf for the canonical physical product type.
+
+    Exact Makro truth should not be demoted by a probabilistic best-fit decision.
+    This is deliberately narrow: only the live leaf itself may exactly equal the
+    canonical Product Identity type after punctuation/case normalization. Broader,
+    sibling and synonym decisions still go through the semantic chooser.
+    """
+
+    product_key = _query_key(_canonical_product_type(hints))
+    if not product_key:
+        return ""
+    matches = [item.label for item in candidates if _query_key(item.leaf_label) == product_key]
+    return matches[0] if len(matches) == 1 else ""
+
+
 def _stem_category_token(token: str) -> str:
     value = str(token or "").casefold().strip()
     if len(value) > 4 and value.endswith("ies"):
@@ -424,6 +443,9 @@ def choose_vertical_candidate_pool(
 
     if not candidates:
         return ""
+    exact_product_type = _exact_product_type_candidate(hints, candidates)
+    if exact_product_type:
+        return exact_product_type
     raw = provider.extract_json(build_vertical_pool_choice_request(hints, search_terms, candidates))
     if not isinstance(raw, dict):
         raise ValueError("aggregated Vertical chooser response must be a JSON object")
