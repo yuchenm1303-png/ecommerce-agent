@@ -12,6 +12,7 @@ RUNTIME_HOOK = (ROOT / "packaging" / "velopack_runtime_hook.py").read_text(encod
 BRANDING = (ROOT / "app" / "app_branding.py").read_text(encoding="utf-8")
 ICON_DATA = (ROOT / "app" / "app_icon_data.py").read_text(encoding="utf-8")
 ICON_GENERATOR = (ROOT / "scripts" / "generate_app_icon.py").read_text(encoding="utf-8")
+MSI_SMOKE = (ROOT / "scripts" / "test_velopack_msi.ps1").read_text(encoding="utf-8")
 ROUTER = (ROOT / "gui" / "frozen_process_router.py").read_text(encoding="utf-8")
 NATIVE_SHELL = (ROOT / "gui" / "native_window_shell.py").read_text(encoding="utf-8")
 UPDATE_PANEL = (ROOT / "gui" / "update_panel.py").read_text(encoding="utf-8")
@@ -108,16 +109,27 @@ def test_velopack_pack_uses_canonical_branding_and_msi() -> None:
     assert 'EcommerceAgent-Setup-$Version.msi' in BUILD
 
 
-def test_windows_ci_smokes_canonical_velopack_layout_and_msi_uninstall() -> None:
+def test_windows_ci_uses_one_isolated_pinned_velopack_msi_smoke() -> None:
     assert "actions/setup-dotnet@v4" in WINDOWS
     assert "dotnet tool restore" in WINDOWS
     assert '"--silent", "--installto", $installDir' in WINDOWS
     assert 'Join-Path $installDir "Update.exe"' in WINDOWS
     assert 'Join-Path $installDir "current\\EcommerceAgent.exe"' in WINDOWS
-    assert "EcommerceAgent-Setup-*.msi" in WINDOWS
-    assert '"/i"' in WINDOWS
-    assert '"/x"' in WINDOWS
-    assert "VELOPACK_INSTALLDIR" in WINDOWS
+    assert 'scripts\\test_velopack_msi.ps1' in WINDOWS
+    assert WINDOWS.index("Silent branded MSI install and uninstall smoke test") < WINDOWS.index(
+        "Silent Velopack Setup smoke test"
+    )
+    assert 'INSTALLFOLDER=`"$installDir`"' in MSI_SMOKE
+    assert "VELOPACK_INSTALLDIR" not in MSI_SMOKE
+    assert 'Uninstall\\MSI:$PackId' in MSI_SMOKE
+    assert 'Uninstall\\$PackId' in MSI_SMOKE
+    assert '"/i' in MSI_SMOKE
+    assert '"/x' in MSI_SMOKE
+    assert 'current\\EcommerceAgentWorker.exe' in MSI_SMOKE
+    assert 'current\\_internal\\packaging\\VERSION' in MSI_SMOKE
+    assert "InstallLocation mismatch" in MSI_SMOKE
+    assert "uninstall registration remained" in MSI_SMOKE
+    assert "MSI uninstall left installed component" in MSI_SMOKE
     assert "Inno Setup" not in WINDOWS
 
 
