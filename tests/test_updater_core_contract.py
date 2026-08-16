@@ -136,11 +136,52 @@ def test_nonzero_installer_exit_recovers_without_claiming_success(
     assert not Path(job.marker_path).exists()
 
 
+def test_force_close_main_app_never_uses_tree_kill(monkeypatch: pytest.MonkeyPatch) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setattr(core, "_pid_matches", lambda *_args, **_kwargs: True)
+
+    class _Proc:
+        returncode = 0
+
+    def _run(command, **_kwargs):
+        commands.append(list(command))
+        return _Proc()
+
+    monkeypatch.setattr(core.subprocess, "run", _run)
+    assert core._force_kill_pid(1234, "EcommerceAgent", allowed_image=core.OWNED_APP_IMAGE)
+    assert commands == [["taskkill", "/PID", "1234", "/F"]]
+
+
+def test_shutdown_gate_uses_pid_only_force_close_for_stubborn_gui(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    job = _job(tmp_path, app_deadline_s=0, settle_ms=0)
+    waits = iter((False, True))
+    monkeypatch.setattr(core, "_wait_pid_gone", lambda *_args, **_kwargs: next(waits))
+    forced: list[tuple[int, str, str]] = []
+
+    def _force(pid: int, image_name: str, *, allowed_image: str) -> bool:
+        forced.append((pid, image_name, allowed_image))
+        return True
+
+    monkeypatch.setattr(core, "_force_kill_pid", _force)
+    monkeypatch.setattr(core, "_other_app_pids", lambda *_args, **_kwargs: ())
+    monkeypatch.setattr(core, "_wait_owned_workers", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(core.time, "sleep", lambda *_args, **_kwargs: None)
+
+    assert core._shutdown_gate(job) is None
+    assert forced == [(job.app_pid, job.app_image_name, core.OWNED_APP_IMAGE)]
+    log_text = Path(job.log_path).read_text(encoding="utf-8")
+    assert "forcing owned application PID" in log_text
+
+
 def test_process_matching_is_exact_not_substring_based() -> None:
     source = (ROOT / "app" / "updater_core.py").read_text(encoding="utf-8")
     assert "csv.reader" in source
     assert "_other_app_pids" in source
     assert "OWNED_APP_IMAGE" in source
     assert "OWNED_WORKER_IMAGE" in source
+    assert '["taskkill", "/PID", str(pid), "/F"]' in source
     assert '["taskkill", "/PID", str(pid), "/T", "/F"]' in source
     assert "worker_pids" in source

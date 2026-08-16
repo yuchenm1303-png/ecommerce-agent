@@ -200,7 +200,36 @@ def _wait_pid_gone(pid: int, image_name: str, deadline_s: float) -> bool:
     return not _pid_matches(pid, image_name)
 
 
+def _force_kill_pid(pid: int, image_name: str, *, allowed_image: str) -> bool:
+    """Force-close exactly one owned process and never its child process tree.
+
+    The standalone updater is launched by the GUI, so it is a descendant of the
+    GUI process. Using ``taskkill /T`` against the GUI would therefore kill the
+    updater that is supposed to continue the installation. Child workflow
+    workers are tracked separately and have their own shutdown gate below.
+    """
+
+    expected = _normalized_image_name(image_name)
+    if expected != _normalized_image_name(allowed_image):
+        return False
+    if not _pid_matches(pid, expected):
+        return True
+    try:
+        probe = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0 or not _pid_matches(pid, expected)
+
+
 def _force_kill_pid_tree(pid: int, image_name: str, *, allowed_image: str) -> bool:
+    """Force-close an owned worker and any children spawned by that worker."""
+
     expected = _normalized_image_name(image_name)
     if expected != _normalized_image_name(allowed_image):
         return False
@@ -390,9 +419,9 @@ def _shutdown_gate(job: UpdaterJob) -> str | None:
     if not _wait_pid_gone(job.app_pid, job.app_image_name, job.app_deadline_s):
         _log(
             job.log_path,
-            f"app still alive after {job.app_deadline_s}s; forcing owned process tree",
+            f"app still alive after {job.app_deadline_s}s; forcing owned application PID {job.app_pid}",
         )
-        if not _force_kill_pid_tree(
+        if not _force_kill_pid(
             job.app_pid,
             job.app_image_name,
             allowed_image=OWNED_APP_IMAGE,
@@ -488,7 +517,7 @@ def run_job(job: UpdaterJob) -> int:
         return _recover_after_failure(job, gate_failure, detail)
 
     # The installer keeps a legacy marker-based auto-relaunch path for older
-    # clients.  New updater jobs deliberately remove the marker while Inno runs
+    # clients. New updater jobs deliberately remove the marker while Inno runs
     # so only this updater owns relaunch; the marker is recreated after version
     # verification succeeds.
     if not _clear_marker(job.marker_path):

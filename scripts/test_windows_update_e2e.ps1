@@ -62,22 +62,32 @@ New-Item -ItemType Directory -Force -Path (Split-Path $OldVersionFile -Parent) |
 "0.0.1" | Set-Content $OldVersionFile -Encoding ascii
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 
-Write-Host "  [E2E 2/4] Frozen EcommerceAgent.exe hands off to packaged updater.exe"
+Write-Host "  [E2E 2/4] Frozen EcommerceAgent.exe hands off, stays alive, and is force-closed without killing updater.exe"
 $ParentArgs = @(
     "--updater", $UpdaterExe,
     "--installer", $ProbeSetupExe,
     "--target-version", $Version,
     "--install-dir", $OldInstall,
     "--state-dir", $StateDir,
-    "--setup-log", $SetupLog
+    "--setup-log", $SetupLog,
+    "--app-deadline-s", "2",
+    "--linger-after-ack-s", "5"
 )
 & $ParentExe @ParentArgs
 $ParentExit = $LASTEXITCODE
-if ($ParentExit -ne 0) {
-    throw "Frozen updater E2E parent failed before handoff completed: $ParentExit"
+$AckPath = Join-Path $StateDir "handoff.json"
+if (-not (Test-Path $AckPath)) {
+    throw "Frozen updater E2E parent never received updater ACK; exit=$ParentExit"
+}
+$Ack = Get-Content $AckPath -Raw -Encoding UTF8 | ConvertFrom-Json
+if ([string]$Ack.status -ne "accepted" -or [string]$Ack.target_version -ne $Version) {
+    throw "Frozen updater E2E handoff ACK invalid; exit=$ParentExit"
+}
+if ($ParentExit -eq 0) {
+    throw "Frozen updater E2E parent exited normally; force-close survival path was not exercised"
 }
 
-Write-Host "  [E2E 3/4] Waiting for real Inno upgrade + installed VERSION verification"
+Write-Host "  [E2E 3/4] Waiting for updater survival + real Inno upgrade + installed VERSION verification"
 $ResultPath = Join-Path $StateDir "last-result.json"
 $UpdaterLog = Join-Path $StateDir "updater.jsonl"
 $Deadline = (Get-Date).AddMinutes(5)
@@ -95,6 +105,12 @@ if ([string]$Result.status -ne "installed") {
     if (Test-Path $UpdaterLog) { Write-Host "---- updater log ----"; Get-Content $UpdaterLog -Tail 160 }
     if (Test-Path $SetupLog) { Write-Host "---- Inno log ----"; Get-Content $SetupLog -Tail 160 }
     throw "Updater E2E failed: status=$($Result.status) detail=$($Result.detail)"
+}
+if (-not (Select-String -Path $UpdaterLog -Pattern "forcing owned application PID" -Quiet)) {
+    throw "Updater E2E did not exercise the stubborn-GUI force-close path"
+}
+if (-not (Select-String -Path $UpdaterLog -Pattern "running installer:" -Quiet)) {
+    throw "Updater died after force-closing the GUI instead of reaching the installer"
 }
 
 $InstalledVersionFile = Join-Path $OldInstall "_internal\packaging\VERSION"
@@ -132,4 +148,4 @@ if ($ActualExe -ne $ExpectedExe) {
     throw "Updater E2E relaunched wrong executable: expected=$ExpectedExe actual=$ActualExe"
 }
 
-Write-Host "  Updater E2E passed: frozen old app -> updater -> Inno -> v$InstalledVersion -> real installed GUI"
+Write-Host "  Updater E2E passed: stubborn frozen old app -> surviving updater -> Inno -> v$InstalledVersion -> real installed GUI"

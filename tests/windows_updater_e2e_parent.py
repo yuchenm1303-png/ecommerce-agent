@@ -1,9 +1,10 @@
 """Frozen parent used by the Windows updater end-to-end packaging smoke test.
 
 This executable intentionally runs as ``EcommerceAgent.exe`` from a disposable
-old install tree. It launches the real packaged updater, waits for the updater
-ACK, then exits exactly like the production GUI does after handoff. The updater
-must relaunch the real newly installed EcommerceAgent.exe, not a synthetic probe.
+old install tree. It launches the real packaged updater and can deliberately
+remain alive after ACK so the release gate exercises the production force-close
+path. The updater must survive that close, run Inno, and relaunch the real newly
+installed EcommerceAgent.exe.
 """
 
 from __future__ import annotations
@@ -48,6 +49,8 @@ def main() -> int:
     parser.add_argument("--install-dir", required=True)
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--setup-log", required=True)
+    parser.add_argument("--app-deadline-s", type=int, default=15)
+    parser.add_argument("--linger-after-ack-s", type=float, default=0.0)
     args = parser.parse_args()
 
     updater = Path(args.updater).resolve()
@@ -102,7 +105,7 @@ def main() -> int:
             f"/LOG={setup_log}",
         ],
         "worker_pids": [],
-        "app_deadline_s": 15,
+        "app_deadline_s": max(0, int(args.app_deadline_s)),
         "worker_deadline_s": 5,
         "settle_ms": 250,
         "ack_path": str(ack_path),
@@ -141,6 +144,8 @@ def main() -> int:
                 and str(ack.get("target_version") or "")
                 == str(args.target_version).strip().lstrip("v")
             ):
+                if args.linger_after_ack_s > 0:
+                    time.sleep(float(args.linger_after_ack_s))
                 return 0
         if proc.poll() is not None:
             return 13
