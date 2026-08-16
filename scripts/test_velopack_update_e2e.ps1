@@ -77,10 +77,13 @@ Set-Content -Path $OldEmbeddedVersion -Value $OldVersion -Encoding ascii -NoNewl
 function Invoke-E2EPack {
     param(
         [Parameter(Mandatory = $true)][string]$PackVersion,
-        [Parameter(Mandatory = $true)][string]$PackDirectory,
-        [switch]$NeedInstaller
+        [Parameter(Mandatory = $true)][string]$PackDirectory
     )
 
+    # Velopack 1.2.0 requires at least one distribution surface. --noPortable and
+    # --noInst are mutually exclusive, so E2E keeps the cheap Setup bundle and
+    # disables only Portable. The target Setup is ignored; the update path still
+    # consumes only the Full/Delta/feed assets.
     $args = @(
         "pack",
         "--outputDir", $FeedDir,
@@ -95,18 +98,13 @@ function Invoke-E2EPack {
         "--mainExe", "EcommerceAgent.exe",
         "--noPortable", "true"
     )
-    if (-not $NeedInstaller) {
-        # The target only needs Full/Delta/feed assets. Rebuilding another Setup.exe
-        # adds no coverage to the update path and costs tens of seconds per release.
-        $args += @("--noInst", "true")
-    }
 
     & dotnet tool run vpk -- @args
     if ($LASTEXITCODE -ne 0) { throw "Velopack E2E pack failed for $PackVersion" }
 }
 
-Write-Host "  [E2E 1/4] Pack and install old Velopack version $OldVersion (no portable)"
-Invoke-E2EPack -PackVersion $OldVersion -PackDirectory $OldAppDir -NeedInstaller
+Write-Host "  [E2E 1/4] Pack and install old Velopack version $OldVersion (portable disabled)"
+Invoke-E2EPack -PackVersion $OldVersion -PackDirectory $OldAppDir
 $Setup = Get-SingleVelopackArtifact -Directory $FeedDir -Filter "$PackId*-Setup.exe" -Label "old setup"
 $Install = Start-Process -FilePath $Setup.FullName -ArgumentList @("--silent", "--installto", $InstallDir) -Wait -PassThru
 if ($Install.ExitCode -ne 0) { throw "Velopack E2E old install failed: $($Install.ExitCode)" }
@@ -123,7 +121,7 @@ if ($InstalledOldVersion -ne $OldVersion) {
     throw "Velopack E2E old install VERSION mismatch: expected=$OldVersion actual=$InstalledOldVersion"
 }
 
-Write-Host "  [E2E 2/4] Add target v$Version as update assets only (no setup/portable)"
+Write-Host "  [E2E 2/4] Add target v$Version to the same feed (portable disabled; target Setup ignored)"
 Invoke-E2EPack -PackVersion $Version -PackDirectory $AppDir
 $Index = Join-Path $FeedDir "releases.$Channel.json"
 if (-not (Test-Path $Index)) { throw "Velopack E2E release index missing: $Index" }
