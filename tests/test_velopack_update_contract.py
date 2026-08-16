@@ -28,7 +28,9 @@ def test_runtime_uses_official_velopack_manager_and_github_source() -> None:
 
 def test_velopack_app_runs_before_normal_pyinstaller_entrypoint() -> None:
     assert "velopack.App().run()" in RUNTIME_HOOK
-    assert "wait_exit_then_apply_updates" in RUNTIME_HOOK
+    assert "get_update_pending_restart()" in RUNTIME_HOOK
+    assert "apply_updates_and_restart_with_args" in RUNTIME_HOOK
+    assert "wait_exit_then_apply_updates" not in RUNTIME_HOOK
     assert "ECOMMERCE_AGENT_UPDATE_E2E_MARKER" in RUNTIME_HOOK
 
 
@@ -36,7 +38,10 @@ def test_application_update_flow_delegates_transport_install_and_restart_to_velo
     assert "create_update_manager()" in UPDATER
     assert "manager.check_for_updates()" in UPDATER
     assert "manager.download_updates(info" in UPDATER
-    assert "manager.wait_exit_then_apply_updates(" in UPDATER
+    assert "manager.get_update_pending_restart()" in UPDATER
+    assert "manager.apply_updates_and_restart(pending)" in UPDATER
+    assert "wait_exit_then_apply_updates" not in UPDATER
+    assert "QApplication.quit" not in UPDATER
     assert "installer_sha256" not in UPDATER
     assert "UpdaterJob" not in UPDATER
     assert "prepare_standalone_updater" not in UPDATER
