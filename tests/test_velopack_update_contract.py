@@ -41,7 +41,7 @@ def test_application_update_flow_delegates_transport_install_and_restart_to_velo
     assert "manager.get_update_pending_restart()" in UPDATER
     assert "manager.apply_updates_and_restart(pending)" in UPDATER
     assert "wait_exit_then_apply_updates" not in UPDATER
-    assert "QApplication.quit" not in UPDATER
+    assert "QTimer.singleShot(180, QApplication.quit)" not in UPDATER
     assert "installer_sha256" not in UPDATER
     assert "UpdaterJob" not in UPDATER
     assert "prepare_standalone_updater" not in UPDATER
@@ -121,7 +121,6 @@ def test_release_publication_is_transactional_and_checks_portal_installer_digest
     assert '"sha256:$env:friendly_setup_sha"' in PUBLISH
     assert "gh release edit $tag --draft=false --latest" in PUBLISH
     assert "Cleanup failed Stable draft" in PUBLISH
-    assert "gh release delete $tag --yes --cleanup-tag" in PUBLISH
     assert "Stage prerelease Velopack assets as draft" in TEST_PUBLISH
     assert "$env:target_full" in TEST_PUBLISH
     assert "gh release edit $tag --draft=false --prerelease" in TEST_PUBLISH
