@@ -1,9 +1,9 @@
-"""Velopack-backed Stable update UI for Listing Studio.
+"""Velopack-backed Stable update presentation for Listing Studio.
 
-Listing Studio owns only product-specific policy: when to offer an update, whether
-listing work is idle, and closing its dedicated Makro browser. Velopack owns
-release discovery, package download, process handoff, replacement, rollback and
-restart. No application file is replaced by this module directly.
+Listing Studio owns only product policy and presentation: when to offer an update,
+whether listing work is idle, closing its dedicated Makro browser, and showing the
+branded progress surface. Velopack owns release discovery, package download,
+process handoff, replacement, rollback and restart.
 """
 from __future__ import annotations
 
@@ -13,16 +13,7 @@ import threading
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtWidgets import (
-    QApplication,
-    QBoxLayout,
-    QLabel,
-    QMainWindow,
-    QMessageBox,
-    QProgressDialog,
-    QPushButton,
-    QWidget,
-)
+from PySide6.QtWidgets import QApplication, QBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QWidget
 
 from app.update_browser_gate import DEFAULT_CDP_PORT, close_managed_browser
 from app.velopack_runtime import (
@@ -31,6 +22,7 @@ from app.velopack_runtime import (
     is_velopack_managed,
     update_summary,
 )
+from gui.update_panel import UpdateMessageDialog, UpdateOfferDialog, UpdateProgressDialog
 
 _CHECK_DELAY_MS = 1800
 _AUTO_CHECK_INTERVAL_MS = 60 * 60 * 1000
@@ -48,7 +40,7 @@ def _format_size(size: int) -> str:
 
 
 class ApplicationUpdater(QObject):
-    """Thin Qt presentation over Velopack's standard update lifecycle."""
+    """Thin branded Qt presentation over Velopack's standard lifecycle."""
 
     _check_finished = Signal(object)
     _download_progress = Signal(int)
@@ -63,7 +55,7 @@ class ApplicationUpdater(QObject):
         self._checking = False
         self._updating = False
         self._last_prompted_version: str | None = None
-        self._progress: QProgressDialog | None = None
+        self._progress: UpdateProgressDialog | None = None
         self._check_button: QPushButton | None = None
         self._version_label: QLabel | None = None
         self._threads: set[threading.Thread] = set()
@@ -110,25 +102,20 @@ class ApplicationUpdater(QObject):
 
     def _show_message(
         self,
-        icon: QMessageBox.Icon,
+        _icon: QMessageBox.Icon,
         text: str,
         *,
         informative: str = "",
         details: str = "",
     ) -> int:
-        box = QMessageBox(self.window)
-        box.setWindowTitle("Listing Studio 更新")
-        box.setIcon(icon)
-        box.setText(text)
-        if informative:
-            box.setInformativeText(informative)
-        if details:
-            box.setDetailedText(details)
-        box.setStandardButtons(QMessageBox.StandardButton.Ok)
-        box.setWindowModality(Qt.WindowModality.ApplicationModal)
-        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        QTimer.singleShot(0, lambda: self._bring_to_front(box))
-        return box.exec()
+        dialog = UpdateMessageDialog(
+            self.window,
+            title=text,
+            message=informative,
+            details=details,
+        )
+        QTimer.singleShot(0, lambda: self._bring_to_front(dialog))
+        return dialog.exec()
 
     def _install_header_controls(self) -> None:
         root = self.window.centralWidget()
@@ -192,7 +179,7 @@ class ApplicationUpdater(QObject):
         if not self.enabled():
             message = "当前不是 Velopack 管理的正式安装版。"
             if bool(getattr(sys, "frozen", False)):
-                message += "\n\n旧 Inno/便携版只需从官网下载并安装一次新的 Listing Studio Setup；之后更新全部由 Velopack 接管。"
+                message += "\n\n旧安装版或便携版只需从官网下载并安装一次新的 Listing Studio；之后更新全部由 Velopack 接管。"
             else:
                 message += "\n\n源码开发模式不连接正式更新通道。"
             self._show_message(
@@ -243,6 +230,7 @@ class ApplicationUpdater(QObject):
                 self._show_message(
                     QMessageBox.Icon.Information,
                     f"当前已是最新版本 v{self.current_version}。",
+                    informative="Stable 通道没有比当前版本更新的发布。",
                 )
             return
 
@@ -275,43 +263,19 @@ class ApplicationUpdater(QObject):
         latest = str(summary.get("version") or "").strip().lstrip("v")
         notes = str(summary.get("notes") or "").strip()
         size = _format_size(int(summary.get("size") or 0))
-        box = QMessageBox(self.window)
-        box.setWindowTitle("Listing Studio 更新")
-        box.setIcon(QMessageBox.Icon.Information)
-        box.setText(f"发现新版本 v{latest}")
-        detail = f"当前版本：v{self.current_version}"
-        if size:
-            detail += f"\n更新包：{size}"
-        if notes:
-            detail += f"\n\n{notes[:1800]}"
-        box.setInformativeText(detail)
-        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        box.setButtonText(QMessageBox.StandardButton.Yes, "立即更新")
-        box.setButtonText(QMessageBox.StandardButton.No, "稍后")
-        box.setDefaultButton(QMessageBox.StandardButton.Yes)
-        box.setWindowModality(Qt.WindowModality.ApplicationModal)
-        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        QTimer.singleShot(0, lambda: self._bring_to_front(box))
-        if box.exec() == QMessageBox.StandardButton.Yes:
+        dialog = UpdateOfferDialog(
+            self.window,
+            current_version=self.current_version,
+            target_version=latest,
+            package_size=size,
+            notes=notes,
+        )
+        QTimer.singleShot(0, lambda: self._bring_to_front(dialog))
+        if dialog.exec() == UpdateOfferDialog.DialogCode.Accepted:
             self._begin_update(latest)
 
     def _open_progress(self, target_version: str) -> None:
-        progress = QProgressDialog(
-            f"正在下载 v{target_version}…",
-            "",
-            0,
-            100,
-            self.window,
-        )
-        progress.setWindowTitle("Listing Studio 更新")
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-        progress.setMinimumDuration(0)
-        progress.setMinimumWidth(520)
-        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-        progress.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        progress.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
-        progress.setValue(0)
+        progress = UpdateProgressDialog(self.window, target_version=target_version)
         progress.show()
         self._progress = progress
         self._bring_to_front(progress)
@@ -320,7 +284,7 @@ class ApplicationUpdater(QObject):
         if self._progress is None:
             return
         try:
-            self._progress.setLabelText(text)
+            self._progress.set_stage(text)
             self._bring_to_front(self._progress)
         except RuntimeError:
             pass
@@ -330,7 +294,7 @@ class ApplicationUpdater(QObject):
         self._progress = None
         if progress is not None:
             try:
-                progress.close()
+                progress.done(UpdateProgressDialog.DialogCode.Accepted)
                 progress.deleteLater()
             except RuntimeError:
                 pass
@@ -414,8 +378,9 @@ class ApplicationUpdater(QObject):
         if self._progress is None:
             return
         try:
-            self._progress.setValue(max(0, min(100, int(value))))
-            self._progress.setLabelText(f"正在下载更新… {int(value)}%")
+            percent = max(0, min(100, int(value)))
+            self._progress.set_progress(percent)
+            self._progress.set_stage(f"正在下载并校验更新包… {percent}%")
         except RuntimeError:
             pass
 
@@ -433,13 +398,13 @@ class ApplicationUpdater(QObject):
             )
             return
 
-        self._set_progress_text("下载完成，已交给 Velopack。正在关闭 Listing Studio 并安装新版本…")
+        self._set_progress_text("下载与校验完成。正在交给 Velopack 切换版本并重新打开 Listing Studio…")
         if self._progress is not None:
             try:
-                self._progress.setValue(100)
+                self._progress.set_progress(100)
             except RuntimeError:
                 pass
-        QTimer.singleShot(120, QApplication.quit)
+        QTimer.singleShot(180, QApplication.quit)
 
 
 def install_application_updater(
