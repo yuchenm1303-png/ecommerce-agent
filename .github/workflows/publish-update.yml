@@ -57,13 +57,20 @@ jobs:
           "sha=$sha" >> $env:GITHUB_OUTPUT
           Write-Host "Publishing source $env:SOURCE_REF at $sha"
 
-      - name: Validate monotonic Stable version
+      - name: Preflight Stable release identity
         shell: pwsh
         run: |
           if ($env:UPDATE_VERSION -notmatch '^\d+\.\d+\.\d+$') {
             throw "Release version must be strict x.y.z: $env:UPDATE_VERSION"
           }
+          if ([string]::IsNullOrWhiteSpace($env:UPDATE_TITLE)) {
+            throw "Release title must not be empty"
+          }
+
           $releaseVersion = [version]$env:UPDATE_VERSION
+          $tag = "v$env:UPDATE_VERSION"
+          $releaseName = "$env:UPDATE_TITLE v$env:UPDATE_VERSION"
+
           $latestRaw = & gh api "repos/$env:GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>$null
           if ($LASTEXITCODE -eq 0) {
             $latestTag = ($latestRaw | Out-String).Trim()
@@ -75,11 +82,21 @@ jobs:
             }
           }
           $global:LASTEXITCODE = 0
-          $tag = "v$env:UPDATE_VERSION"
+
           gh release view $tag *> $null
-          $exists = ($LASTEXITCODE -eq 0)
+          $tagExists = ($LASTEXITCODE -eq 0)
           $global:LASTEXITCODE = 0
-          if ($exists) { throw "Release already exists: $tag" }
+          if ($tagExists) { throw "Release already exists: $tag" }
+
+          $releases = gh release list --limit 1000 --json name,tagName,isDraft,isPrerelease | ConvertFrom-Json
+          $nameConflicts = @($releases | Where-Object { [string]$_.name -eq $releaseName })
+          if ($nameConflicts.Count -gt 0) {
+            $conflictTags = ($nameConflicts | ForEach-Object { [string]$_.tagName }) -join ", "
+            throw "Release name already exists: '$releaseName' ($conflictTags)"
+          }
+
+          "RELEASE_NAME=$releaseName" >> $env:GITHUB_ENV
+          Write-Host "Stable release preflight passed: tag=$tag name='$releaseName'"
 
       - name: Stamp package version and release notes
         shell: pwsh
@@ -87,7 +104,7 @@ jobs:
           Set-Content "packaging\VERSION" $env:UPDATE_VERSION -Encoding ascii -NoNewline
           New-Item -ItemType Directory -Force artifacts | Out-Null
           @(
-            "# $env:UPDATE_TITLE", "", $env:UPDATE_NOTES, "",
+            "# $env:RELEASE_NAME", "", $env:UPDATE_NOTES, "",
             "Source commit: ${{ steps.source.outputs.sha }}"
           ) | Set-Content "artifacts\release-notes.md" -Encoding utf8
 
@@ -216,7 +233,7 @@ jobs:
             --channel $env:VELOPACK_CHANNEL `
             --repoUrl "https://github.com/$env:GITHUB_REPOSITORY" `
             --publish false `
-            --releaseName "$env:UPDATE_TITLE v$env:UPDATE_VERSION" `
+            --releaseName "$env:RELEASE_NAME" `
             --tag "v$env:UPDATE_VERSION" `
             --targetCommitish "${{ steps.source.outputs.sha }}"
           if ($LASTEXITCODE -ne 0) { throw "Velopack GitHub draft upload failed: $LASTEXITCODE" }
@@ -232,8 +249,9 @@ jobs:
         shell: pwsh
         run: |
           $tag = "v$env:UPDATE_VERSION"
-          $draft = gh release view $tag --json databaseId,tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          $draft = gh release view $tag --json databaseId,tagName,name,isDraft,isPrerelease,assets | ConvertFrom-Json
           if ($draft.tagName -ne $tag) { throw "Draft tag mismatch" }
+          if ($draft.name -ne $env:RELEASE_NAME) { throw "Draft release name mismatch" }
           if (-not $draft.isDraft) { throw "Velopack release became public before verification" }
           if ($draft.isPrerelease) { throw "Stable draft unexpectedly marked prerelease" }
           $names = @($draft.assets | ForEach-Object { $_.name })
@@ -269,8 +287,9 @@ jobs:
         shell: pwsh
         run: |
           $tag = "v$env:UPDATE_VERSION"
-          $release = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          $release = gh release view $tag --json tagName,name,isDraft,isPrerelease,assets | ConvertFrom-Json
           if ($release.tagName -ne $tag) { throw "Published tag mismatch" }
+          if ($release.name -ne $env:RELEASE_NAME) { throw "Published release name mismatch" }
           if ($release.isDraft) { throw "Stable release is still a draft" }
           if ($release.isPrerelease) { throw "Stable release unexpectedly marked prerelease" }
           $names = @($release.assets | ForEach-Object { $_.name })
