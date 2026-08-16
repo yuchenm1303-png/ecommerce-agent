@@ -115,9 +115,12 @@ def test_release_publication_is_transactional_and_checks_portal_installer_digest
     assert "friendly_setup_size" in PUBLISH
     assert '"sha256:$env:friendly_setup_sha"' in PUBLISH
     assert "gh release edit $tag --draft=false --latest" in PUBLISH
+    assert "Cleanup failed Stable draft" in PUBLISH
+    assert "gh release delete $tag --yes --cleanup-tag" in PUBLISH
     assert "Stage prerelease Velopack assets as draft" in TEST_PUBLISH
     assert "$env:target_full" in TEST_PUBLISH
     assert "gh release edit $tag --draft=false --prerelease" in TEST_PUBLISH
+    assert "Cleanup failed prerelease draft" in TEST_PUBLISH
     assert "Prune old test prereleases" in TEST_PUBLISH
     assert "Select-Object -Skip 3" in TEST_PUBLISH
 
