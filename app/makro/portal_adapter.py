@@ -312,10 +312,6 @@ class MakroPortalAdapter:
         if self._has_password():
             return ListingStage.UNKNOWN
 
-        # A collapsed Step 3 page is structurally complete even before its
-        # sections expose input controls, and the SPA URL can lag or use a
-        # transient shape immediately after Create New Listing. Recognize the
-        # live Step 3 shell before requiring route parsing or control density.
         if self._product_info_structure_visible():
             return ListingStage.PRODUCT_INFO
 
@@ -328,21 +324,14 @@ class MakroPortalAdapter:
         vertical = str(target.vertical or "").strip()
         brand = str(target.brand or "").strip()
 
-        # Expanded Step 3 forms remain a structural fallback when labels are
-        # localized beyond the known shell markers.
         if (target.request_id or target.vid or (vertical and brand)) and controls >= 5:
             return ListingStage.PRODUCT_INFO
 
         fallback = self._text_stage_fallback()
 
-        # No chosen vertical + an editable search control is unambiguously Step 1.
         if not vertical and inputs:
             return ListingStage.VERTICAL
 
-        # A chosen vertical does not automatically mean Step 2: Makro keeps the
-        # Step 1 vertical search/browser visible while showing the leaf
-        # confirmation + Select Brand action. Prefer the actual input semantics
-        # and page structure before treating this as the brand-search step.
         if vertical and not brand and inputs:
             blobs = [_attribute_blob(item) for item in inputs]
             if any(_contains_any(blob, _VERTICAL_TOKENS) for blob in blobs):
@@ -439,8 +428,69 @@ class MakroPortalAdapter:
                 continue
         return []
 
+    def _exact_text_action_candidates(self, tokens: tuple[str, ...]) -> list[Any]:
+        """Resolve exact visible action text to its real clickable DOM owner.
+
+        Some Makro builds style primary actions as ordinary ``div``/``span``
+        nodes rather than semantic ``button`` elements. We therefore bind the
+        exact localized action label first and then walk only that node's own
+        ancestor chain for a genuine clickable owner. Unrelated global buttons
+        (tour close buttons, floating HUD controls, etc.) are never candidates.
+        """
+
+        output: list[Any] = []
+        seen: set[str] = set()
+        for token in tokens:
+            pattern = re.compile(r"^\s*" + re.escape(str(token)) + r"\s*$", re.IGNORECASE)
+            try:
+                text_nodes = _visible_items(self.page.get_by_text(pattern, exact=True))
+            except Exception:
+                text_nodes = []
+            for node in text_nodes:
+                current = node
+                chosen = None
+                for _ in range(6):
+                    try:
+                        actionable = bool(
+                            current.evaluate(
+                                r"""el => {
+                                  const tag = String(el.tagName || '').toUpperCase();
+                                  const role = String(el.getAttribute && el.getAttribute('role') || '').toLowerCase();
+                                  const style = getComputedStyle(el);
+                                  const disabled = !!el.disabled || el.getAttribute?.('aria-disabled') === 'true';
+                                  return !disabled && (
+                                    tag === 'BUTTON' || tag === 'A' || role === 'button' ||
+                                    typeof el.onclick === 'function' || style.cursor === 'pointer'
+                                  );
+                                }"""
+                            )
+                        )
+                    except Exception:
+                        actionable = False
+                    if actionable:
+                        chosen = current
+                        break
+                    try:
+                        parent = current.locator("xpath=..")
+                        if parent.count() != 1:
+                            break
+                        current = parent
+                    except Exception:
+                        break
+                if chosen is None:
+                    continue
+                try:
+                    key = str(chosen.evaluate("el => el.outerHTML"))
+                except Exception:
+                    key = str(id(chosen))
+                if key in seen:
+                    continue
+                seen.add(key)
+                output.append(chosen)
+        return output
+
     def find_action_button(self, action: str, *, related_input=None):
-        """Find one semantic action conservatively; never guess among many buttons."""
+        """Find one semantic action conservatively; never guess an unrelated control."""
 
         tokens = _ACTION_TOKENS.get(action)
         if tokens is None:
@@ -465,31 +515,16 @@ class MakroPortalAdapter:
             if len(winners) == 1:
                 return winners[0]
 
+        text_actions = self._exact_text_action_candidates(tokens)
+        if len(text_actions) == 1:
+            return text_actions[0]
+        if len(text_actions) > 1:
+            return None
+
         nearby = self._nearby_buttons(related_input)
-        if len(nearby) == 1:
+        if related_input is not None and len(nearby) == 1:
             return nearby[0]
 
-        main_buttons: list[Any] = []
-        try:
-            mains = _visible_items(self.page.locator('main, [role="main"]'))
-        except Exception:
-            mains = []
-        for main in mains:
-            main_buttons.extend(self._button_candidates(main))
-        deduped: list[Any] = []
-        seen: set[str] = set()
-        for item in main_buttons:
-            try:
-                key = str(item.evaluate("(el) => el.outerHTML"))
-            except Exception:
-                key = str(id(item))
-            if key not in seen:
-                seen.add(key)
-                deduped.append(item)
-        if len(deduped) == 1:
-            return deduped[0]
-        if len(buttons) == 1:
-            return buttons[0]
         return None
 
     def visible_text_candidates(self, *, limit: int = 160) -> list[str]:
