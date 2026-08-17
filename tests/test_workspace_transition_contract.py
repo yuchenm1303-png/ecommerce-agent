@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TRANSITION = (ROOT / "gui" / "workspace_transition.py").read_text(encoding="utf-8")
+SNAPSHOT = (ROOT / "gui" / "workspace_transition_snapshot.py").read_text(encoding="utf-8")
 TOGGLE = (ROOT / "gui" / "mode_toggle.py").read_text(encoding="utf-8")
 RUNNER = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
@@ -34,12 +35,13 @@ def test_transition_surface_is_root_level_so_stack_pages_cannot_overtake_it() ->
 
 
 def test_snapshot_capture_renders_only_the_current_workspace_page() -> None:
-    assert "def _render_current_page" in TRANSITION
-    assert "page = self.stack.currentWidget()" in TRANSITION
-    assert "target_offset = page.mapTo(self.stack, QPoint(0, 0))" in TRANSITION
-    assert "page.render(" in TRANSITION
-    assert "widget_frame = self._render_current_page()" in TRANSITION
-    assert "self.stack.render(" not in TRANSITION
+    assert "class WorkspaceTransitionSnapshotRenderer" in SNAPSHOT
+    assert "def _render_current_page" in SNAPSHOT
+    assert "page = self.stack.currentWidget()" in SNAPSHOT
+    assert "target_offset = page.mapTo(self.stack, QPoint(0, 0))" in SNAPSHOT
+    assert "page.render(" in SNAPSHOT
+    assert "widget_frame = self._render_current_page()" in SNAPSHOT
+    assert "self.stack.render(" not in SNAPSHOT
 
 
 def test_two_readable_workspace_frames_are_never_cross_faded_together() -> None:
@@ -58,7 +60,7 @@ def test_root_surface_owns_opaque_pixels_and_blocks_hidden_workspace_input() -> 
     assert "CompositionMode_Source" in TRANSITION
 
 
-def test_incoming_capture_waits_for_a_presented_quick_frame() -> None:
+def test_incoming_handoff_still_waits_for_a_presented_live_quick_frame() -> None:
     assert "_QUICK_SYNC_TIMEOUT_MS = 64" in TRANSITION
     assert "quick.frameSwapped.connect(" in TRANSITION
     assert "type=Qt.ConnectionType.QueuedConnection" in TRANSITION
@@ -69,21 +71,38 @@ def test_incoming_capture_waits_for_a_presented_quick_frame() -> None:
     assert "def _capture_incoming_after_quick_sync" in TRANSITION
 
 
+def test_transition_snapshot_uses_authoritative_widget_geometry_not_quick_pixels() -> None:
+    assert "WorkspaceTransitionSnapshotRenderer" in TRANSITION
+    assert "return self._snapshot_renderer.capture_neutral()" in TRANSITION
+    assert "return self._snapshot_renderer.capture_composite()" in TRANSITION
+    assert "quick.grabWindow()" not in TRANSITION
+    assert "quick.grabWindow()" not in SNAPSHOT
+
+    # Glass and QWidget pixels are generated from the same current geometry.
+    assert "def _card_geometry" in SNAPSHOT
+    assert "frame.isVisibleTo(self.window)" in SNAPSHOT
+    assert "frame.mapToGlobal(QPoint(0, 0))" in SNAPSHOT
+    assert "ancestor.mapToGlobal(QPoint(0, 0))" in SNAPSHOT
+    assert "def _paint_glass" in SNAPSHOT
+    assert "self._paint_glass(painter, self._capture_blur())" in SNAPSHOT
+    assert "painter.drawPixmap(0, 0, widget_frame)" in SNAPSHOT
+
+
 def test_handoff_uses_clean_fuji_background_and_subtle_static_veil() -> None:
-    assert "from .native_background import _OVERSCAN" in TRANSITION
-    assert "def _capture_neutral_background" in TRANSITION
-    assert 'quick.property("imageX")' in TRANSITION
-    assert 'quick.property("imageY")' in TRANSITION
+    assert "from .native_background import _GLASS_RADIUS, _NORMAL_GLASS_ALPHA, _OVERSCAN" in SNAPSHOT
+    assert "def capture_neutral" in SNAPSHOT
+    assert 'quick.property("imageX")' in SNAPSHOT
+    assert 'quick.property("imageY")' in SNAPSHOT
     assert "_VEIL_MAX_OPACITY = 0.06" in TRANSITION
     assert "_VEIL_START_MS = 135" in TRANSITION
     assert "_VEIL_PEAK_MS = 170" in TRANSITION
     assert "_VEIL_END_MS = 220" in TRANSITION
     assert "QGraphicsBlurEffect" not in TRANSITION
+    assert "QGraphicsBlurEffect" not in SNAPSHOT
 
 
 def test_workspace_transition_animates_cached_frames_not_live_widget_trees() -> None:
     assert "class _WorkspaceTransitionSurface(QWidget)" in TRANSITION
-    assert "quick.grabWindow()" in TRANSITION
     assert "def _capture_composite" in TRANSITION
     assert "self.stack.setGraphicsEffect" not in TRANSITION
     assert "QPropertyAnimation" not in TRANSITION
@@ -96,6 +115,7 @@ def test_animated_mode_switch_never_forces_page_relayout() -> None:
     assert "self._set_mode(index)" in request
     assert "page_layout.activate()" not in request
     assert "current_page.layout()" not in request
+    assert "invalidate()" not in request
     assert 'request = getattr(transition, "request_mode", None)' in TOGGLE
     assert "request(target)" in TOGGLE
 
@@ -142,5 +162,6 @@ def test_formal_runner_installs_transition_after_interaction_controllers_exist()
     assert RUNNER.index("install_workspace_transition(window, visual)") < RUNNER.index("shell.show()")
 
 
-def test_workspace_transition_source_compiles_without_importing_pyside() -> None:
+def test_workspace_transition_sources_compile_without_importing_pyside() -> None:
     compile(TRANSITION, str(ROOT / "gui" / "workspace_transition.py"), "exec")
+    compile(SNAPSHOT, str(ROOT / "gui" / "workspace_transition_snapshot.py"), "exec")
