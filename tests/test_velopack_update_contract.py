@@ -129,18 +129,21 @@ def test_release_publication_is_transactional_and_checks_portal_installer_digest
     assert "Select-Object -Skip 3" in TEST_PUBLISH
 
 
-def test_portal_download_no_longer_depends_on_legacy_update_manifest() -> None:
+def test_portal_download_resolves_authorized_stable_version_without_legacy_manifest() -> None:
     assert 'const MANIFEST_ASSET = "update.json"' not in PORTAL_DOWNLOAD
     assert "SHA256_DIGEST_RE" in PORTAL_DOWNLOAD
     assert "installerAsset?.digest" in PORTAL_DOWNLOAD
     assert 'const installerName = `EcommerceAgent-Setup-${requestedVersion}.exe`' in PORTAL_DOWNLOAD
-    assert 'source: "github_release_stable"' in PORTAL_DOWNLOAD
+    assert 'source: "github_release_stable_version"' in PORTAL_DOWNLOAD
+    assert 'error: "version_not_found"' in PORTAL_DOWNLOAD
 
 
 def test_public_release_metadata_accepts_velopack_release_and_only_uses_legacy_manifest_optionally() -> None:
     assert 'const LEGACY_MANIFEST_ASSET = "update.json"' in PORTAL_RELEASE
     assert "legacyManifestAsset?.browser_download_url" in PORTAL_RELEASE
-    assert "invalid_stable_tag" in PORTAL_RELEASE
+    assert 'String(release.tag_name || "") !== `v${version}`' in PORTAL_RELEASE
+    assert 'throw new Error("invalid_latest_release")' in PORTAL_RELEASE
     assert "installerAsset?.digest" in PORTAL_RELEASE
     assert 'const installerName = `EcommerceAgent-Setup-${version}.exe`' in PORTAL_RELEASE
+    assert "RELEASE_HISTORY_API" in PORTAL_RELEASE
     assert "stable_manifest_missing" not in PORTAL_RELEASE
