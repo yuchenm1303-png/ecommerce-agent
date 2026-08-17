@@ -17,10 +17,13 @@ PORTAL_DOWNLOAD = (ROOT / "supabase" / "functions" / "portal-download" / "index.
 PORTAL_RELEASE = (ROOT / "supabase" / "functions" / "portal-release" / "index.ts").read_text(encoding="utf-8")
 
 
-def test_runtime_uses_official_velopack_manager_and_github_source() -> None:
+def test_runtime_uses_official_velopack_manager_and_bounded_release_discovery() -> None:
     assert "import velopack" in RUNTIME
     assert "velopack.GithubSource" in RUNTIME
     assert "velopack.UpdateManager" in RUNTIME
+    assert "PORTAL_RELEASE_URL" in RUNTIME
+    assert "resolve_stable_update_source" in RUNTIME
+    assert "_UPDATE_DISCOVERY_TIMEOUT_SECONDS = 8" in RUNTIME
     assert "get_current_version()" in RUNTIME
     assert "Update.exe" in RUNTIME
     assert 'current.name.casefold() != "current"' in RUNTIME
@@ -35,12 +38,13 @@ def test_velopack_app_runs_before_normal_pyinstaller_entrypoint() -> None:
 
 
 def test_application_update_flow_delegates_transport_install_and_restart_to_velopack() -> None:
-    assert "create_update_manager()" in UPDATER
-    assert "manager.check_for_updates()" in UPDATER
+    assert "create_update_manager(source_url)" in UPDATER
+    assert UPDATER.count("manager.check_for_updates()") == 1
     assert "manager.download_updates(info" in UPDATER
     assert "manager.get_update_pending_restart()" in UPDATER
     assert "manager.apply_updates_and_restart(pending)" in UPDATER
     assert "wait_exit_then_apply_updates" not in UPDATER
+    assert "已从 Stable 通道撤回" not in UPDATER
     assert "QTimer.singleShot(180, QApplication.quit)" not in UPDATER
     assert "installer_sha256" not in UPDATER
     assert "UpdaterJob" not in UPDATER
