@@ -7,6 +7,7 @@ const SESSION_TABLE = "listing_usage_sessions";
 const EVENT_TABLE = "listing_usage_events";
 const DIAGNOSTIC_TABLE = "listing_diagnostic_reports";
 const AUDIT_TABLE = "listing_task_audits";
+const SYSTEM_SAMPLE_TABLE = "listing_system_samples";
 const DEVICE_RE = /^[0-9a-f]{32,128}$/i;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN_RE = /^[A-Za-z0-9_-]{32,256}$/;
@@ -16,6 +17,7 @@ const AUDIT_KINDS = new Set(["single", "batch"]);
 const AUDIT_STATUSES = new Set(["running", "completed", "failed", "cancelled", "review", "ready"]);
 const MAX_DIAGNOSTIC_BYTES = 80_000;
 const MAX_AUDIT_BYTES = 260_000;
+const MAX_SYSTEM_SAMPLE_BYTES = 32_000;
 const SECRET_KEY_RE = /(^|_)(api[_-]?key|token|secret|password|authorization|cookie|refresh[_-]?token|access[_-]?token)($|_)/i;
 
 function headers(): Record<string, string> {
@@ -90,7 +92,7 @@ Deno.serve(async (req: Request) => {
   const eventType = String(body.event_type || "").trim();
   const outcome = String(body.outcome || "").trim();
 
-  if (!["session_start", "heartbeat", "event", "session_end", "diagnostic", "task_audit"].includes(action)) {
+  if (!["session_start", "heartbeat", "event", "session_end", "diagnostic", "task_audit", "system_sample"].includes(action)) {
     return json({ error: "invalid_action" }, 400);
   }
   if (!UUID_RE.test(userId)) return json({ error: "invalid_identity" }, 400);
@@ -202,6 +204,28 @@ Deno.serve(async (req: Request) => {
       created_at: nowIso,
     });
     if (error) return json({ error: "event_write_failed" }, 503);
+  }
+
+  if (action === "system_sample") {
+    const rawSample = body.sample;
+    if (!rawSample || typeof rawSample !== "object" || Array.isArray(rawSample)) {
+      return json({ error: "invalid_system_sample" }, 400);
+    }
+    const sample = redactSecrets(rawSample) as Record<string, unknown>;
+    const encoded = JSON.stringify(sample);
+    if (new TextEncoder().encode(encoded).byteLength > MAX_SYSTEM_SAMPLE_BYTES) {
+      return json({ error: "system_sample_too_large" }, 413);
+    }
+    const { error } = await admin.from(SYSTEM_SAMPLE_TABLE).insert({
+      user_id: userId,
+      session_id: sessionId,
+      device_id: deviceId,
+      app_version: appVersion,
+      sample,
+      occurred_at: nowIso,
+      created_at: nowIso,
+    });
+    if (error) return json({ error: "system_sample_write_failed" }, 503);
   }
 
   if (action === "task_audit") {
