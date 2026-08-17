@@ -2,26 +2,27 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QPoint, QRectF, Qt
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPixmap, QRegion
-from PySide6.QtWidgets import QFrame, QStackedWidget, QWidget
+from PySide6.QtCore import QPoint, QRect, QRectF, Qt
+from PySide6.QtGui import QColor, QPainter, QPixmap, QRegion
+from PySide6.QtWidgets import QStackedWidget, QWidget
 
-from .native_background import _GLASS_RADIUS, _NORMAL_GLASS_ALPHA, _OVERSCAN
+from .native_background import _OVERSCAN
 
 
 class WorkspaceTransitionSnapshotRenderer:
-    """Build one coherent workspace frame from one authoritative geometry source.
+    """Freeze the already-presented UI instead of rebuilding a second UI.
 
-    The live application renders its wallpaper/glass in a threaded QQuickWindow
-    while all labels, controls and tables remain QWidget content.  Grabbing those
-    two renderers independently during a QStackedWidget mode change can combine
-    a new QWidget page with the previous Quick glass mask for one frame.
+    The live application has two real renderers: the QQuickWindow owns wallpaper
+    and glass, while the embedded QWidget tree owns labels, controls and tables.
+    Transition frames must sample those exact renderers. Reconstructing glass from
+    QWidget geometry creates a visually different "transition UI" and can expose
+    a one-frame shape/layout jump before the fade even begins.
 
-    Transition frames therefore never sample Quick pixels.  They reconstruct the
-    same sharp wallpaper + preblurred glass directly from the current QWidget
-    card geometry, then render the current page on top.  The transition timing and
-    live Quick presentation are untouched; only the cached transition snapshot is
-    made atomic.
+    ``prime_live_frame`` is called directly from the mode-switch click path before
+    any transition preparation can change presentation state. The transition then
+    consumes that exact frozen outgoing frame. Incoming capture happens only after
+    the new Quick frame has been presented, so both sides of the animation use the
+    same production renderers as the live application.
     """
 
     def __init__(self, window: QWidget, visual: Any, stack: QStackedWidget) -> None:
@@ -30,11 +31,12 @@ class WorkspaceTransitionSnapshotRenderer:
         self.stack = stack
         self.root = window.centralWidget() if hasattr(window, "centralWidget") else None
         self.background = getattr(visual, "background", None)
-        self._sharp = self._load_pixmap("_sharp_path")
-        self._blur = self._load_pixmap("_blur_path")
+        self._wallpaper = self._load_wallpaper()
+        self._primed_neutral = QPixmap()
+        self._primed_composite = QPixmap()
 
-    def _load_pixmap(self, attribute: str) -> QPixmap:
-        path = getattr(self.background, attribute, None)
+    def _load_wallpaper(self) -> QPixmap:
+        path = getattr(self.background, "_sharp_path", None)
         if path is None:
             return QPixmap()
         try:
@@ -42,97 +44,68 @@ class WorkspaceTransitionSnapshotRenderer:
         except RuntimeError:
             return QPixmap()
 
-    def _empty_stack_frame(self) -> QPixmap:
-        dpr = max(1.0, float(self.stack.devicePixelRatioF()))
+    @staticmethod
+    def _empty_frame(widget: QWidget) -> QPixmap:
+        dpr = max(1.0, float(widget.devicePixelRatioF()))
         frame = QPixmap(
-            max(1, int(round(self.stack.width() * dpr))),
-            max(1, int(round(self.stack.height() * dpr))),
+            max(1, int(round(widget.width() * dpr))),
+            max(1, int(round(widget.height() * dpr))),
         )
         frame.setDevicePixelRatio(dpr)
         frame.fill(Qt.GlobalColor.transparent)
         return frame
 
-    def _background_for_stack(self, source: QPixmap) -> QPixmap:
+    @staticmethod
+    def _fit_frame(source: QPixmap, widget: QWidget) -> QPixmap:
+        if source.isNull() or widget.width() <= 0 or widget.height() <= 0:
+            return QPixmap(source)
+
+        dpr = max(1.0, float(widget.devicePixelRatioF()))
+        target_width = max(1, int(round(widget.width() * dpr)))
+        target_height = max(1, int(round(widget.height() * dpr)))
+        same_pixels = source.width() == target_width and source.height() == target_height
+        same_dpr = abs(float(source.devicePixelRatio()) - dpr) <= 1e-3
+        if same_pixels and same_dpr:
+            return QPixmap(source)
+
+        fitted = source.scaled(
+            target_width,
+            target_height,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        fitted.setDevicePixelRatio(dpr)
+        return fitted
+
+    def _capture_quick_for_stack(self) -> QPixmap:
         root = self.root
-        if (
-            root is None
-            or source.isNull()
-            or root.width() <= 0
-            or root.height() <= 0
-            or self.stack.width() <= 0
-            or self.stack.height() <= 0
-        ):
+        quick = getattr(self.background, "quick_window", None)
+        if root is None or quick is None:
+            return QPixmap()
+        try:
+            image = quick.grabWindow()
+        except RuntimeError:
+            return QPixmap()
+        if image.isNull():
             return QPixmap()
 
-        dpr = max(1.0, float(root.devicePixelRatioF()))
-        root_frame = QPixmap(
-            max(1, int(round(root.width() * dpr))),
-            max(1, int(round(root.height() * dpr))),
+        # NativeWindowShell keeps the embedded QWidget child exactly fitted to the
+        # Quick owner client, so both renderers share the same logical root space.
+        full = self._fit_frame(QPixmap.fromImage(image), root)
+        if full.isNull():
+            return QPixmap()
+
+        top_left = self.stack.mapTo(root, QPoint(0, 0))
+        dpr = max(1.0, float(full.devicePixelRatio()))
+        pixel_rect = QRect(
+            int(round(top_left.x() * dpr)),
+            int(round(top_left.y() * dpr)),
+            max(1, int(round(self.stack.width() * dpr))),
+            max(1, int(round(self.stack.height() * dpr))),
         )
-        root_frame.setDevicePixelRatio(dpr)
-        root_frame.fill(QColor(23, 38, 58))
-
-        quick = getattr(self.background, "quick_window", None)
-        root_w = float(root.width())
-        root_h = float(root.height())
-        if quick is not None:
-            try:
-                if quick.width() > 0 and quick.height() > 0:
-                    root_w = float(quick.width())
-                    root_h = float(quick.height())
-            except RuntimeError:
-                pass
-
-        item_w = root_w * float(_OVERSCAN)
-        item_h = root_h * float(_OVERSCAN)
-        item_x = (root_w - item_w) * 0.5
-        item_y = (root_h - item_h) * 0.5
-        if quick is not None:
-            try:
-                item_x = float(quick.property("imageX"))
-                item_y = float(quick.property("imageY"))
-            except (RuntimeError, TypeError, ValueError):
-                pass
-
-        source_w = max(1.0, float(source.width()))
-        source_h = max(1.0, float(source.height()))
-        scale = max(item_w / source_w, item_h / source_h)
-        visible_source_w = item_w / max(scale, 1e-9)
-        visible_source_h = item_h / max(scale, 1e-9)
-        source_rect = QRectF(
-            (source_w - visible_source_w) * 0.5,
-            (source_h - visible_source_h) * 0.5,
-            visible_source_w,
-            visible_source_h,
-        )
-        target_rect = QRectF(item_x, item_y, item_w, item_h)
-
-        painter = QPainter(root_frame)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.drawPixmap(target_rect, source, source_rect)
-        painter.end()
-
-        stack_top_left = self.stack.mapTo(root, QPoint(0, 0))
-        pixel_rect = QRectF(
-            float(stack_top_left.x()) * dpr,
-            float(stack_top_left.y()) * dpr,
-            float(self.stack.width()) * dpr,
-            float(self.stack.height()) * dpr,
-        ).toAlignedRect()
-        cropped = root_frame.copy(pixel_rect)
+        cropped = full.copy(pixel_rect)
         cropped.setDevicePixelRatio(dpr)
-        return cropped
-
-    def capture_neutral(self) -> QPixmap:
-        frame = self._background_for_stack(self._sharp)
-        if not frame.isNull():
-            return frame
-        fallback = self._empty_stack_frame()
-        fallback.fill(QColor(23, 38, 58))
-        return fallback
-
-    def _capture_blur(self) -> QPixmap:
-        return self._background_for_stack(self._blur)
+        return self._fit_frame(cropped, self.stack)
 
     def _render_current_page(self) -> QPixmap:
         page = self.stack.currentWidget()
@@ -145,7 +118,7 @@ class WorkspaceTransitionSnapshotRenderer:
         ):
             return QPixmap()
 
-        frame = self._empty_stack_frame()
+        frame = self._empty_frame(self.stack)
         target_offset = page.mapTo(self.stack, QPoint(0, 0))
         page.render(
             frame,
@@ -155,132 +128,107 @@ class WorkspaceTransitionSnapshotRenderer:
         )
         return frame
 
-    @staticmethod
-    def _scaled_rect(rect: QRectF, scale: float) -> QRectF:
-        if abs(scale - 1.0) <= 1e-6:
-            return QRectF(rect)
-        center = rect.center()
-        width = rect.width() * scale
-        height = rect.height() * scale
-        return QRectF(
-            center.x() - width * 0.5,
-            center.y() - height * 0.5,
-            width,
-            height,
-        )
-
-    def _card_geometry(self, frame: QFrame) -> tuple[QRectF, QRectF] | None:
-        try:
-            if (
-                not frame.isVisibleTo(self.window)
-                or frame.width() <= 0
-                or frame.height() <= 0
-            ):
-                return None
-
-            stack_global = self.stack.mapToGlobal(QPoint(0, 0))
-            frame_global = frame.mapToGlobal(QPoint(0, 0))
-            card_rect = QRectF(
-                float(frame_global.x() - stack_global.x()),
-                float(frame_global.y() - stack_global.y()),
-                float(frame.width()),
-                float(frame.height()),
-            )
-            clip_rect = QRectF(
-                0.0,
-                0.0,
-                float(self.stack.width()),
-                float(self.stack.height()),
-            )
-
-            ancestor = frame.parentWidget()
-            while ancestor is not None:
-                if not ancestor.isVisibleTo(self.window):
-                    return None
-                ancestor_global = ancestor.mapToGlobal(QPoint(0, 0))
-                ancestor_rect = QRectF(
-                    float(ancestor_global.x() - stack_global.x()),
-                    float(ancestor_global.y() - stack_global.y()),
-                    float(ancestor.width()),
-                    float(ancestor.height()),
-                )
-                clip_rect = clip_rect.intersected(ancestor_rect)
-                if clip_rect.isEmpty() or ancestor is self.stack:
-                    break
-                ancestor = ancestor.parentWidget()
-
-            if card_rect.intersected(clip_rect).isEmpty():
-                return None
-            return card_rect, clip_rect
-        except RuntimeError:
-            return None
-
-    def _paint_glass(self, painter: QPainter, blur: QPixmap) -> None:
-        glass = getattr(self.visual, "_glass", None)
-        if not isinstance(glass, dict):
-            return
-
-        for frame, proxy in glass.items():
-            if not isinstance(frame, QFrame):
-                continue
-            geometry = self._card_geometry(frame)
-            if geometry is None:
-                continue
-            card_rect, clip_rect = geometry
-
-            try:
-                scale = float(getattr(proxy, "surface_scale", 1.0))
-            except (RuntimeError, TypeError, ValueError):
-                scale = 1.0
-            scale = max(0.96, min(1.04, scale))
-            target = self._scaled_rect(card_rect, scale)
-
-            try:
-                alpha = float(getattr(proxy, "overlay_alpha", _NORMAL_GLASS_ALPHA))
-            except (RuntimeError, TypeError, ValueError):
-                alpha = _NORMAL_GLASS_ALPHA
-            alpha = max(_NORMAL_GLASS_ALPHA, min(255.0, alpha))
-
-            painter.save()
-            painter.setClipRect(clip_rect)
-            path = QPainterPath()
-            path.addRoundedRect(
-                target,
-                float(_GLASS_RADIUS) * scale,
-                float(_GLASS_RADIUS) * scale,
-            )
-            painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
-            if not blur.isNull():
-                # Draw the complete stack-aligned blurred wallpaper through the
-                # authoritative card clip.  No source-rect math and no Quick
-                # texture-mask frame can drift from the QWidget geometry.
-                painter.drawPixmap(0, 0, blur)
-            painter.fillRect(
-                target,
-                QColor(0, 0, 0, int(round(alpha))),
-            )
-            painter.restore()
-
-    def capture_composite(self) -> QPixmap:
-        neutral = self.capture_neutral()
+    def _capture_composite_live(self) -> QPixmap:
+        quick_frame = self._capture_quick_for_stack()
         widget_frame = self._render_current_page()
-        if neutral.isNull() and widget_frame.isNull():
-            return QPixmap()
+        if quick_frame.isNull():
+            return self._fit_frame(widget_frame, self.stack)
+        if widget_frame.isNull():
+            return self._fit_frame(quick_frame, self.stack)
 
-        result = self._empty_stack_frame()
+        result = self._empty_frame(self.stack)
         painter = QPainter(result)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-        if neutral.isNull():
-            painter.fillRect(QRectF(self.stack.rect()), QColor(23, 38, 58))
-        else:
-            painter.drawPixmap(0, 0, neutral)
-
+        painter.drawPixmap(0, 0, self._fit_frame(quick_frame, self.stack))
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-        self._paint_glass(painter, self._capture_blur())
-        if not widget_frame.isNull():
-            painter.drawPixmap(0, 0, widget_frame)
+        painter.drawPixmap(0, 0, self._fit_frame(widget_frame, self.stack))
         painter.end()
         return result
+
+    def _capture_neutral_live_position(self) -> QPixmap:
+        root = self.root
+        quick = getattr(self.background, "quick_window", None)
+        wallpaper = self._wallpaper
+        if (
+            root is None
+            or quick is None
+            or wallpaper.isNull()
+            or quick.width() <= 0
+            or quick.height() <= 0
+            or root.width() <= 0
+            or root.height() <= 0
+        ):
+            return self._capture_quick_for_stack()
+
+        # Neutral is intentionally only the Fuji wallpaper. It is not a second
+        # card renderer; it simply preserves the original fade-through backdrop.
+        root_frame = self._empty_frame(root)
+        root_frame.fill(QColor(23, 38, 58))
+        painter = QPainter(root_frame)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        root_w = float(quick.width())
+        root_h = float(quick.height())
+        item_w = root_w * float(_OVERSCAN)
+        item_h = root_h * float(_OVERSCAN)
+        try:
+            item_x = float(quick.property("imageX"))
+            item_y = float(quick.property("imageY"))
+        except (RuntimeError, TypeError, ValueError):
+            item_x = (root_w - item_w) * 0.5
+            item_y = (root_h - item_h) * 0.5
+
+        source_w = max(1.0, float(wallpaper.width()))
+        source_h = max(1.0, float(wallpaper.height()))
+        scale = max(item_w / source_w, item_h / source_h)
+        visible_source_w = item_w / max(scale, 1e-9)
+        visible_source_h = item_h / max(scale, 1e-9)
+        source_rect = QRectF(
+            (source_w - visible_source_w) * 0.5,
+            (source_h - visible_source_h) * 0.5,
+            visible_source_w,
+            visible_source_h,
+        )
+        painter.drawPixmap(QRectF(item_x, item_y, item_w, item_h), wallpaper, source_rect)
+        painter.end()
+
+        top_left = self.stack.mapTo(root, QPoint(0, 0))
+        dpr = max(1.0, float(root_frame.devicePixelRatio()))
+        pixel_rect = QRect(
+            int(round(top_left.x() * dpr)),
+            int(round(top_left.y() * dpr)),
+            max(1, int(round(self.stack.width() * dpr))),
+            max(1, int(round(self.stack.height() * dpr))),
+        )
+        cropped = root_frame.copy(pixel_rect)
+        cropped.setDevicePixelRatio(dpr)
+        return self._fit_frame(cropped, self.stack)
+
+    def prime_live_frame(self) -> bool:
+        """Freeze exactly what is on screen before transition preparation starts."""
+
+        composite = self._capture_composite_live()
+        if composite.isNull():
+            self._primed_composite = QPixmap()
+            self._primed_neutral = QPixmap()
+            return False
+        self._primed_composite = composite
+        neutral = self._capture_neutral_live_position()
+        self._primed_neutral = neutral if not neutral.isNull() else QPixmap(composite)
+        return True
+
+    def capture_neutral(self) -> QPixmap:
+        if not self._primed_neutral.isNull():
+            return QPixmap(self._primed_neutral)
+        return self._capture_neutral_live_position()
+
+    def capture_composite(self) -> QPixmap:
+        if not self._primed_composite.isNull():
+            result = QPixmap(self._primed_composite)
+            self._primed_composite = QPixmap()
+            self._primed_neutral = QPixmap()
+            return result
+        return self._capture_composite_live()
 
 
 __all__ = ["WorkspaceTransitionSnapshotRenderer"]
