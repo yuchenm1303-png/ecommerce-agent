@@ -2,7 +2,6 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
 const REPOSITORY = "yuchenm1303-png/ecommerce-agent";
-const RELEASE_API = `https://api.github.com/repos/${REPOSITORY}/releases/latest`;
 const ACCESS_TABLE = "download_portal_users";
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const SHA256_DIGEST_RE = /^sha256:([0-9a-f]{64})$/i;
@@ -81,34 +80,37 @@ async function getAuthorizedUser(req: Request) {
   return { user, status: 200 } as const;
 }
 
-async function resolveCurrentStable(requestedVersion: string) {
+async function resolveStableVersion(requestedVersion: string) {
+  const releaseApi = `https://api.github.com/repos/${REPOSITORY}/releases/tags/v${requestedVersion}`;
   const githubHeaders = {
     "Accept": "application/vnd.github+json",
     "User-Agent": "Listing-Studio-Authorized-Download",
     "X-GitHub-Api-Version": "2022-11-28",
   };
-  const releaseResponse = await fetch(RELEASE_API, {
+  const releaseResponse = await fetch(releaseApi, {
     headers: githubHeaders,
     cache: "no-store",
   });
+  if (releaseResponse.status === 404) {
+    return { error: "version_not_found", status: 404 } as const;
+  }
   if (!releaseResponse.ok) throw new Error(`release_api_${releaseResponse.status}`);
 
   const release = await releaseResponse.json();
-  if (!release || release.draft || release.prerelease || !Array.isArray(release.assets)) {
-    throw new Error("invalid_latest_release");
-  }
-  if (String(release.tag_name || "") !== `v${requestedVersion}`) {
-    return { error: "version_not_current", status: 409 } as const;
+  if (
+    !release ||
+    release.draft ||
+    release.prerelease ||
+    !Array.isArray(release.assets) ||
+    String(release.tag_name || "") !== `v${requestedVersion}`
+  ) {
+    return { error: "version_not_stable", status: 409 } as const;
   }
 
   const installerName = `EcommerceAgent-Setup-${requestedVersion}.exe`;
   const installerAsset = release.assets.find((asset: any) => asset?.name === installerName);
-  if (!installerAsset?.browser_download_url) {
-    throw new Error("stable_installer_missing");
-  }
-
   const expectedInstallerUrl = `https://github.com/${REPOSITORY}/releases/download/v${requestedVersion}/${installerName}`;
-  if (String(installerAsset.browser_download_url) !== expectedInstallerUrl) {
+  if (String(installerAsset?.browser_download_url || "") !== expectedInstallerUrl) {
     throw new Error("installer_url_mismatch");
   }
 
@@ -124,6 +126,7 @@ async function resolveCurrentStable(requestedVersion: string) {
     url: expectedInstallerUrl,
     sha256: digestMatch[1].toLowerCase(),
     size: installerSize,
+    publishedAt: String(release.published_at || release.created_at || ""),
   } as const;
 }
 
@@ -157,7 +160,7 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const stable = await resolveCurrentStable(version);
+    const stable = await resolveStableVersion(version);
     if ("error" in stable) {
       return json(req, { error: stable.error }, stable.status);
     }
@@ -166,10 +169,11 @@ Deno.serve(async (req: Request) => {
       version: `v${stable.version}`,
       sha256: stable.sha256,
       size: stable.size,
-      source: "github_release_stable",
+      publishedAt: stable.publishedAt,
+      source: "github_release_stable_version",
     });
   } catch (error) {
-    console.error("authorized stable download resolution failed", error);
+    console.error("authorized stable version download resolution failed", error);
     return json(req, { error: "stable_release_unavailable" }, 503);
   }
 });
