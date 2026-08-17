@@ -39,6 +39,18 @@ def test_approved_application_icon_is_preserved() -> None:
     assert "apply_qt_application_icon(app)" in RUN
 
 
+def test_windows_icon_pipeline_emits_and_validates_full_shell_size_pyramid() -> None:
+    for edge in (16, 24, 32, 48, 64, 128, 256):
+        assert f"({edge}, {edge})" in ICON_GENERATOR
+    assert "ICON_MASTER_SIZE = max" in ICON_GENERATOR
+    assert "_icon_master(source).save(output, format=\"ICO\", sizes=ICON_SIZES)" in ICON_GENERATOR
+    assert "generated.info.get(\"sizes\")" in ICON_GENERATOR
+    assert "generated_sizes != expected_sizes" in ICON_GENERATOR
+    assert "_validate_icon(output)" in ICON_GENERATOR
+    assert "icon=str(APP_ICON)" in SPEC
+    assert '"--icon", $IconFile' in BUILD
+
+
 def test_frozen_runtime_keeps_mutable_state_outside_versioned_current_dir() -> None:
     assert 'os.getenv("LOCALAPPDATA"' in RUNTIME
     assert '"ECOMMERCE_AGENT_DATA_DIR"' in RUNTIME
