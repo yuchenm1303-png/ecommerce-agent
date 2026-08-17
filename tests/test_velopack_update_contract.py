@@ -54,6 +54,8 @@ def test_business_idle_and_browser_quiesce_remain_application_policy() -> None:
     assert "begin_update_quiesce" in UPDATER
     assert "wait_for_update_quiesce" in UPDATER
     assert "close_managed_browser" in UPDATER
+    assert "shutdown_owned_qprocesses" in UPDATER
+    assert UPDATER.rindex("shutdown_owned_qprocesses") < UPDATER.rindex("apply_updates_and_restart")
     assert "_update_quiesced" in BROWSER_MANAGER
     assert "_poll_timer.stop()" in BROWSER_MANAGER
     assert "resume_after_update_failure" in BROWSER_MANAGER
@@ -98,6 +100,8 @@ def test_real_e2e_is_old_velopack_to_new_velopack_and_real_qt_gui() -> None:
     assert "--velopack-e2e-target" in E2E
     assert "real-gui-relaunch.json" in E2E
     assert 'current\\EcommerceAgent.exe' in E2E
+    assert 'ArgumentList @("--silent", "uninstall")' in E2E
+    assert "Velopack E2E uninstall left installation root behind" in E2E
     assert "Velopack E2E passed" in E2E
 
 
