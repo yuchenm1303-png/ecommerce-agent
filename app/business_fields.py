@@ -50,7 +50,7 @@ FIXED_COMMERCIAL_ACCOUNT_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("minimum_order_quantity", "1", "account-default:min-order-quantity"),
     ("max_order_quantity_allowed", "99", "account-default:max-order-quantity"),
     ("service_profile", "FBS", "account-default:fulfilment-by"),
-    ("shipping_days", "1", "account-default:pick-pack-sla"),
+    ("shipping_days", "11", "account-default:pick-pack-sla"),
     ("forbid_shipping", "National", "account-default:selling-region"),
     ("country_of_origin", "China", "account-default:country-of-origin"),
     ("manufacturer_details", "LILI", "account-default:manufacturer-details"),
