@@ -60,7 +60,7 @@ def test_crash_diagnostics_capture_previous_abnormal_exit_and_offer_one_click_re
     assert 'QPushButton("发送诊断报告"' in CRASH_UI
     assert '"action": "diagnostic"' in CRASH_UI
     assert "acknowledge_pending_report" in CRASH_UI
-    assert '"diagnostic"].includes(action)' in TELEMETRY
+    assert '["session_start", "heartbeat", "event", "session_end", "diagnostic", "task_audit", "system_sample"].includes(action)' in TELEMETRY
     assert 'const DIAGNOSTIC_TABLE = "listing_diagnostic_reports"' in TELEMETRY
     assert "MAX_DIAGNOSTIC_BYTES" in TELEMETRY
     assert "report_code" in TELEMETRY
