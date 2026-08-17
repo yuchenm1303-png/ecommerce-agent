@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtWidgets import QLabel, QScrollArea, QSizePolicy, QWidget
 
 
 class BatchCardResponsiveController(QObject):
     """Keep owned Batch job cards constrained to the visible scroll viewport.
 
-    Long supplier URLs and live log lines are presentation data, not layout
-    constraints.  They must never force ``jobs_host`` wider than the viewport
-    while the horizontal scrollbar is intentionally disabled.
+    Width ownership is synchronous.  In particular, showing a previously hidden
+    Batch workspace must not expose the QScrollArea's provisional child width and
+    correct it one event-loop turn later; that delayed correction was visible as a
+    one-frame reflow during Single/Batch transitions.
     """
 
     def __init__(self, workspace: QWidget) -> None:
@@ -19,7 +20,6 @@ class BatchCardResponsiveController(QObject):
         self.jobs_host = getattr(workspace, "jobs_host", None)
         self.jobs_layout = getattr(workspace, "jobs_layout", None)
         self.viewport = self.scroll.viewport() if isinstance(self.scroll, QScrollArea) else None
-        self._refresh_pending = False
 
         if self.viewport is None or not isinstance(self.jobs_host, QWidget):
             return
@@ -36,9 +36,11 @@ class BatchCardResponsiveController(QObject):
         controller = getattr(workspace, "controller", None)
         jobs_changed = getattr(controller, "jobs_changed", None)
         if jobs_changed is not None and hasattr(jobs_changed, "connect"):
-            jobs_changed.connect(lambda _jobs: self.schedule_refresh())
+            # BatchWorkspace._apply_jobs is connected before this controller is
+            # installed, so the card tree already exists when this slot runs.
+            jobs_changed.connect(lambda _jobs: self.commit_now())
 
-        self.schedule_refresh()
+        self.commit_now()
 
     @staticmethod
     def _soft_horizontal(widget: QWidget | None) -> None:
@@ -110,8 +112,6 @@ class BatchCardResponsiveController(QObject):
         if not isinstance(label, QLabel) or not url:
             return
 
-        # QLabel has no native elide mode.  Recompute a middle-elided preview
-        # from the authoritative job URL whenever the viewport/card width changes.
         available = int(label.width())
         if available <= 40:
             available = max(80, int(card.width()) - 36)
@@ -129,9 +129,8 @@ class BatchCardResponsiveController(QObject):
         viewport_width = max(1, int(self.viewport.width()))
 
         # QScrollArea(widgetResizable=True) normally performs this resize itself,
-        # but a child's enormous minimumSizeHint can override it.  Cap the host to
-        # the real viewport width, then let the vertical layout distribute that
-        # width among the cards.
+        # but a child's enormous minimumSizeHint can override it.  Bind the host
+        # to the real viewport synchronously, before any visible frame is sampled.
         self.jobs_host.setMaximumWidth(viewport_width)
         if self.jobs_host.width() != viewport_width:
             self.jobs_host.resize(viewport_width, self.jobs_host.height())
@@ -155,28 +154,25 @@ class BatchCardResponsiveController(QObject):
     def commit_now(self) -> None:
         """Synchronously bind Batch cards to the current viewport geometry."""
 
-        self._refresh_pending = False
         try:
             self._sync_width()
         except RuntimeError:
             return
 
     def schedule_refresh(self) -> None:
-        if self._refresh_pending:
-            return
-        self._refresh_pending = True
-        QTimer.singleShot(0, self._refresh)
+        """Compatibility alias: width refreshes are intentionally never deferred."""
 
-    def _refresh(self) -> None:
         self.commit_now()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if watched in {self.viewport, self.jobs_host} and event.type() in {
             QEvent.Type.Resize,
             QEvent.Type.Show,
-            QEvent.Type.LayoutRequest,
         }:
-            self.schedule_refresh()
+            # Show is especially important: a hidden QScrollArea can report a
+            # provisional child width. Correct it in the same event, not with a
+            # zero-delay timer after the transition has already captured pixels.
+            self.commit_now()
         return False
 
 
