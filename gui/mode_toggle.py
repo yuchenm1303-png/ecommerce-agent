@@ -5,7 +5,6 @@ from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import QAbstractButton, QHBoxLayout, QMainWindow, QVBoxLayout, QWidget
 
 from .settings_modal_surface import install_ai_settings_modal
-from .workspace_layout_commit import install_workspace_layout_commit
 
 
 _CORE_WIDTH = 40.0
@@ -119,12 +118,6 @@ def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
     if mode_stack is None or single_button is None or batch_button is None or not callable(set_mode):
         raise RuntimeError("workspace mode switch requires installed Single/Batch workspace")
 
-    # Install the geometry barrier before any interactive mode changes. Its
-    # currentChanged slot runs synchronously inside setCurrentIndex(), so the
-    # transition controller can never snapshot a newly selected but unlaid-out
-    # workspace.
-    install_workspace_layout_commit(window)
-
     legacy_card = single_button.parentWidget()
     if legacy_card is not None:
         legacy_card.setObjectName("")
@@ -144,13 +137,12 @@ def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
     toggle.set_checked_immediate(int(mode_stack.currentIndex()) == 1)
 
     def request_mode(checked: bool) -> None:
-        target = 1 if checked else 0
-        transition = getattr(window, "_workspace_transition_controller", None)
-        request = getattr(transition, "request_mode", None)
-        if callable(request):
-            request(target)
-        else:
-            set_mode(target)
+        # Single and Batch are persistent siblings in the same QStackedWidget.
+        # Switching modes must therefore only select the already-laid-out page.
+        # Do not run a snapshot transition or recursively invalidate/activate the
+        # page tree here: both mechanisms can expose transient card geometry and
+        # make the native glass layer appear to "reflow" during a simple switch.
+        set_mode(1 if checked else 0)
 
     toggle.clicked.connect(request_mode)
 
