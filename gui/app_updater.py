@@ -45,6 +45,7 @@ class ApplicationUpdater(QObject):
 
     _check_finished = Signal(object)
     _download_progress = Signal(int)
+    _update_stage = Signal(str, bool)
     _update_finished = Signal(object)
 
     def __init__(self, window: QMainWindow, *, access_controller: Any | None = None) -> None:
@@ -63,6 +64,7 @@ class ApplicationUpdater(QObject):
 
         self._check_finished.connect(self._on_check_finished)
         self._download_progress.connect(self._on_download_progress)
+        self._update_stage.connect(self._on_update_stage)
         self._update_finished.connect(self._on_update_finished)
 
         self._auto_timer = QTimer(self)
@@ -290,6 +292,21 @@ class ApplicationUpdater(QObject):
         except RuntimeError:
             pass
 
+    def _set_progress_processing(self, text: str) -> None:
+        if self._progress is None:
+            return
+        try:
+            self._progress.set_processing(text)
+            self._bring_to_front(self._progress)
+        except RuntimeError:
+            pass
+
+    def _on_update_stage(self, text: str, processing: bool) -> None:
+        if processing:
+            self._set_progress_processing(text)
+        else:
+            self._set_progress_text(text)
+
     def _close_progress(self) -> None:
         progress = self._progress
         self._progress = None
@@ -365,15 +382,21 @@ class ApplicationUpdater(QObject):
                 if manager.get_update_pending_restart() is None:
                     raise RuntimeError("Velopack 下载完成但没有生成可应用的更新包。")
 
+                self._update_stage.emit("下载完成。正在确认后台任务已经安全停止…", True)
                 if browser_manager is not None and hasattr(browser_manager, "wait_for_update_quiesce"):
                     ready, reason = browser_manager.wait_for_update_quiesce(20.0)
                     if not ready:
                         raise RuntimeError(str(reason or "Makro Browser 更新冻结没有完成。"))
 
-                closed = close_managed_browser(port=DEFAULT_CDP_PORT)
+                self._update_stage.emit("正在关闭 Makro Browser，释放更新文件…", True)
+                closed = close_managed_browser(
+                    port=DEFAULT_CDP_PORT,
+                    progress=lambda text: self._update_stage.emit(str(text), True),
+                )
                 if not closed.ok:
                     raise RuntimeError(closed.detail or "无法安全关闭 Makro Browser。")
 
+                self._update_stage.emit("后台任务已经停止。正在准备切换到新版本…", True)
                 self._update_finished.emit({"ok": True, "version": target_version})
             except Exception as exc:
                 self._update_finished.emit(
@@ -388,7 +411,10 @@ class ApplicationUpdater(QObject):
         try:
             percent = max(0, min(100, int(value)))
             self._progress.set_progress(percent)
-            self._progress.set_stage(f"正在下载并校验更新包… {percent}%")
+            if percent >= 100:
+                self._progress.set_stage("下载完成。正在完成安全校验…")
+            else:
+                self._progress.set_stage(f"正在下载并校验更新包… {percent}%")
         except RuntimeError:
             pass
 
@@ -400,8 +426,9 @@ class ApplicationUpdater(QObject):
             pending = manager.get_update_pending_restart()
             if pending is None:
                 raise RuntimeError("Velopack 未找到已经下载完成的待应用更新。")
-            self._set_progress_text("正在关闭后台组件并准备切换到新版本…")
+            self._set_progress_processing("正在关闭后台组件并准备切换到新版本…")
             shutdown_owned_qprocesses(self.window)
+            self._set_progress_processing("正在应用新版本，Listing Studio 即将重新启动…")
             manager.apply_updates_and_restart(pending)
             raise RuntimeError("Velopack 更新器返回了控制权，程序未按预期退出并重启。")
         except Exception as exc:
@@ -413,16 +440,7 @@ class ApplicationUpdater(QObject):
             self._fail_update(str(payload.get("error") or "Velopack update failed"))
             return
 
-        self._set_progress_text("下载与校验完成。正在关闭当前版本并自动启动新版本…")
-        if self._progress is not None:
-            try:
-                self._progress.set_progress(100)
-            except RuntimeError:
-                pass
-        # Give the branded surface one final paint, then use Velopack's explicit
-        # process-exit/apply/restart primitive. All app-owned QProcess children are
-        # stopped immediately before the handoff so no worker can keep files or
-        # runtime state alive across the version switch.
+        self._set_progress_processing("准备完成。正在关闭当前版本并自动启动新版本…")
         QTimer.singleShot(120, self._apply_downloaded_update)
 
 
