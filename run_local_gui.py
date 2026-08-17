@@ -119,6 +119,7 @@ def main() -> int:
     from gui.startup_entrance import install_startup_entrance
     from gui.startup_entrance_stability import install_startup_entrance_stability
     from gui.static_modal_interaction import install_static_modal_interaction
+    from gui.system_health_telemetry import install_system_health_telemetry
     from gui.ui_data_optimizations import install_ui_data_optimizations
     from gui.ui_maturity import install_mature_ui
     from gui.ui_polish import install_ui_polish
@@ -190,6 +191,7 @@ def main() -> int:
 
     window.install_mode_workspace()
     install_usage_telemetry(window, access_controller)
+    install_system_health_telemetry(window, access_controller)
     install_batch_url_editor(window.batch_workspace)
     install_batch_workspace_density(window.batch_workspace)
     install_batch_card_responsive(window.batch_workspace)
