@@ -119,10 +119,10 @@ def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
     if mode_stack is None or single_button is None or batch_button is None or not callable(set_mode):
         raise RuntimeError("workspace mode switch requires installed Single/Batch workspace")
 
-    # Keep both persistent pages laid out at the same stack geometry. Preparing
-    # the hidden target happens before currentIndex changes, never as a visible
-    # post-show correction.
-    layout_keeper = install_workspace_layout_commit(window)
+    # The committer keeps both persistent pages ready on startup/resize. A click
+    # itself performs zero layout work; any last target preparation is owned by
+    # WorkspaceTransitionController and runs only after the neutral cover is opaque.
+    install_workspace_layout_commit(window)
 
     # This header control is hidden in Batch mode. Retain its layout slot while
     # hidden so _set_workspace_mode() cannot resize the vertical workspace merely
@@ -158,25 +158,6 @@ def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
 
         transition = getattr(window, "_workspace_transition_controller", None)
         request = getattr(transition, "request_mode", None)
-
-        # Freeze the exact currently-presented pixels before *any* transition
-        # preparation. The animation surface can therefore replace the live page
-        # pixel-for-pixel instead of flashing a separately reconstructed card UI.
-        snapshot_renderer = getattr(transition, "_snapshot_renderer", None)
-        prime_live = getattr(snapshot_renderer, "prime_live_frame", None)
-        if callable(prime_live):
-            try:
-                prime_live()
-            except RuntimeError:
-                pass
-
-        prepare_page = getattr(layout_keeper, "prepare_page", None)
-        if callable(prepare_page):
-            try:
-                prepare_page(target)
-            except RuntimeError:
-                pass
-
         if callable(request):
             request(target)
         else:
