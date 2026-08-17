@@ -90,12 +90,14 @@ def test_velopack_toolchain_is_pinned_and_build_replaces_inno() -> None:
     assert "Compress-Archive" not in BUILD
 
 
-def test_windows_ci_smokes_canonical_velopack_layout() -> None:
+def test_windows_ci_smokes_canonical_velopack_layout_and_uninstall() -> None:
     assert "actions/setup-dotnet@v4" in WINDOWS
     assert "dotnet tool restore" in WINDOWS
     assert '"--silent", "--installto", $installDir' in WINDOWS
     assert 'Join-Path $installDir "Update.exe"' in WINDOWS
     assert 'Join-Path $installDir "current\\EcommerceAgent.exe"' in WINDOWS
+    assert 'ArgumentList @("--silent", "uninstall")' in WINDOWS
+    assert "Velopack uninstall left installation root behind" in WINDOWS
     assert "Inno Setup" not in WINDOWS
 
 
