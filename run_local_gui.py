@@ -115,8 +115,6 @@ def main() -> int:
     from gui.update_runtime import install_update_runtime
     from gui.usage_telemetry import install_usage_telemetry
     from gui.wallpaper_cache import install_preblur_cache
-    from gui.workspace_transition import install_workspace_transition
-    from gui.workspace_transition_tuning import apply_workspace_transition_tuning
 
     MainWindow = ProductInputWorkflowMainWindow
 
@@ -219,9 +217,6 @@ def main() -> int:
         card_fx=card_fx,
         effects=effects,
     )
-
-    apply_workspace_transition_tuning()
-    install_workspace_transition(window, visual)
 
     product_copy = install_product_copy(window)
     legacy_headings = {
