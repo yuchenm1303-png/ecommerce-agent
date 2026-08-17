@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QByteArray, QObject, QTimer, QUrl
@@ -12,14 +15,171 @@ from .app_access import ApplicationAccessController
 
 
 _HEARTBEAT_MS = 60_000
+_AUDIT_FLUSH_MS = 1_200
+_MAX_TEXT = 12_000
+_MAX_LIST = 180
+_SECRET_KEY_RE = re.compile(
+    r"(^|_)(api[_-]?key|token|secret|password|authorization|cookie|refresh[_-]?token|access[_-]?token)($|_)",
+    re.IGNORECASE,
+)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _text(value: object, limit: int = _MAX_TEXT) -> str:
+    return str(value or "").strip()[: max(1, int(limit))]
+
+
+def _safe_value(value: Any, *, depth: int = 0) -> Any:
+    if depth > 8:
+        return "[TRUNCATED]"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, Path):
+        return value.name
+    if isinstance(value, str):
+        return value[:_MAX_TEXT]
+    if isinstance(value, (list, tuple, set)):
+        return [_safe_value(item, depth=depth + 1) for item in list(value)[:_MAX_LIST]]
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        for key, item in list(value.items())[:_MAX_LIST]:
+            name = _text(key, 160)
+            output[name] = "[REDACTED]" if _SECRET_KEY_RE.search(name) else _safe_value(item, depth=depth + 1)
+        return output
+    if hasattr(value, "__dict__"):
+        return _safe_value(vars(value), depth=depth + 1)
+    return _text(value)
+
+
+def _widget_text(widget: Any) -> str:
+    getter = getattr(widget, "text", None)
+    if not callable(getter):
+        return ""
+    try:
+        return _text(getter())
+    except Exception:
+        return ""
+
+
+def _file_metadata(values: Any) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for raw in list(values or ())[:100]:
+        try:
+            path = Path(raw).expanduser().resolve()
+        except Exception:
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        output.append(
+            {
+                "name": path.name,
+                "extension": path.suffix.casefold(),
+                "size_bytes": int(size),
+            }
+        )
+    return output
+
+
+def _phase_stats(stats: Any) -> dict[str, Any]:
+    return {
+        "batch_count": int(getattr(stats, "batch_count", 0) or 0),
+        "model_calls": int(getattr(stats, "model_calls", 0) or 0),
+        "cache_hits": int(getattr(stats, "cache_hits", 0) or 0),
+        "failed_batches": int(getattr(stats, "failed_batches", 0) or 0),
+        "source_cache_hit": bool(getattr(stats, "source_cache_hit", False)),
+        "web_batch_count": int(getattr(stats, "web_batch_count", 0) or 0),
+        "web_model_calls": int(getattr(stats, "web_model_calls", 0) or 0),
+        "web_cache_hits": int(getattr(stats, "web_cache_hits", 0) or 0),
+        "web_failed_batches": int(getattr(stats, "web_failed_batches", 0) or 0),
+        "elapsed_seconds": float(getattr(stats, "elapsed_seconds", 0.0) or 0.0),
+    }
+
+
+def _run_result_payload(result: Any) -> dict[str, Any]:
+    if result is None or not hasattr(result, "run_dir"):
+        return {}
+
+    fields: list[dict[str, Any]] = []
+    for field in list(getattr(result, "fields", ()) or ())[:160]:
+        fields.append(
+            {
+                "field_id": _text(getattr(field, "field_id", ""), 240),
+                "field_name": _text(getattr(field, "field_name", ""), 500),
+                "ai_result": _text(getattr(field, "ai_result", ""), 8_000),
+                "ai_status": _text(getattr(field, "ai_status", ""), 80),
+                "final_status": _text(getattr(field, "final_status", ""), 80),
+                "blocked_reason": _text(getattr(field, "blocked_reason", ""), 4_000),
+                "source": _text(getattr(field, "source", ""), 8_000),
+            }
+        )
+
+    web_candidates: list[dict[str, Any]] = []
+    for item in list(getattr(result, "web_candidates", ()) or ())[:80]:
+        web_candidates.append(
+            {
+                "url": _text(getattr(item, "url", ""), 4_096),
+                "title": _text(getattr(item, "title", ""), 1_000),
+                "match": _text(getattr(item, "match", ""), 80),
+                "reason": _text(getattr(item, "reason", ""), 2_000),
+                "identity_evidence": _safe_value(getattr(item, "identity_evidence", []) or []),
+            }
+        )
+
+    safety = getattr(result, "safety", None)
+    payload = {
+        "workflow_mode": _text(getattr(result, "workflow_mode", ""), 80),
+        "workflow_status": _text(getattr(result, "workflow_status", ""), 120),
+        "product_url": _text(getattr(result, "product_url", ""), 4_096),
+        "vertical": _text(getattr(result, "vertical", ""), 500),
+        "brand": _text(getattr(result, "brand", ""), 500),
+        "ready": int(getattr(result, "ready", 0) or 0),
+        "missing": int(getattr(result, "missing", 0) or 0),
+        "conflict": int(getattr(result, "conflict", 0) or 0),
+        "blocked": int(getattr(result, "blocked", 0) or 0),
+        "live_field_count": int(getattr(result, "live_field_count", 0) or 0),
+        "cold": _phase_stats(getattr(result, "cold", None)),
+        "hot": _phase_stats(getattr(result, "hot", None)),
+        "plan_summary": _safe_value(getattr(result, "plan_summary", {}) or {}),
+        "safety": {
+            "writes_performed": int(getattr(safety, "writes_performed", 0) or 0),
+            "save_clicked": bool(getattr(safety, "save_clicked", False)),
+            "send_to_qc_clicked": bool(getattr(safety, "send_to_qc_clicked", False)),
+        },
+        "fields": fields,
+        "web_candidates": web_candidates,
+        "executor_report": _safe_value(getattr(result, "executor_report", {}) or {}),
+        "run_id": Path(getattr(result, "run_dir")).name,
+    }
+    return _safe_value(payload)
+
+
+def _first_result(args: tuple[Any, ...]) -> Any | None:
+    for value in args:
+        if hasattr(value, "run_dir") and hasattr(value, "fields"):
+            return value
+    return None
+
+
+def _error_text(args: tuple[Any, ...]) -> str:
+    for value in args:
+        if isinstance(value, BaseException):
+            return _text(value, 12_000)
+        if isinstance(value, str) and value.strip():
+            return _text(value, 12_000)
+    return "任务失败"
 
 
 class UsageTelemetryController(QObject):
-    """Best-effort, privacy-minimal usage telemetry for licensed installs.
+    """Licensed-install telemetry plus owner-visible business task audit.
 
-    The client reports only session liveness, app version and coarse workflow
-    lifecycle counters. Supplier URLs, product content, AI prompts/results,
-    Makro fields and customer files never leave through this channel.
+    The audit intentionally captures customer-entered listing inputs and resolved
+    outputs so the owner console can inspect real usage. Authentication secrets,
+    API keys, cookies and raw uploaded file binaries are never included.
     """
 
     def __init__(self, window: QWidget, access: ApplicationAccessController) -> None:
@@ -35,6 +195,17 @@ class UsageTelemetryController(QObject):
         self._prepare_active = False
         self._execute_active = False
         self._batch_event_type = ""
+        self._single_audit_id = ""
+        self._single_started_at = ""
+        self._single_input: dict[str, Any] = {}
+        self._single_result: dict[str, Any] = {}
+        self._batch_audit_id = ""
+        self._batch_started_at = ""
+        self._batch_input: dict[str, Any] = {}
+        self._batch_flush = QTimer(self)
+        self._batch_flush.setSingleShot(True)
+        self._batch_flush.setInterval(_AUDIT_FLUSH_MS)
+        self._batch_flush.timeout.connect(self._flush_batch_audit)
 
         if not self._enabled():
             return
@@ -65,31 +236,172 @@ class UsageTelemetryController(QObject):
             "app_version": self.access.installed_version,
         }
 
-    def _post(self, action: str, *, event_type: str = "", outcome: str = "") -> None:
+    def _post(
+        self,
+        action: str,
+        *,
+        event_type: str = "",
+        outcome: str = "",
+        audit: dict[str, Any] | None = None,
+    ) -> None:
         if not self._enabled():
             return
-        payload = self._base_payload(action)
+        payload: dict[str, Any] = self._base_payload(action)
         if action == "event":
             payload["event_type"] = event_type
             payload["outcome"] = outcome
+        elif action == "task_audit" and audit is not None:
+            payload["audit"] = _safe_value(audit)
 
         request = QNetworkRequest(QUrl(self.access.telemetry_function_url))
         request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
         reply = self.network.post(
             request,
-            QByteArray(json.dumps(payload, separators=(",", ":")).encode("utf-8")),
+            QByteArray(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")),
         )
         reply.finished.connect(reply.deleteLater)
 
     def _event(self, event_type: str, outcome: str) -> None:
         self._post("event", event_type=event_type, outcome=outcome)
 
+    def _task_audit(
+        self,
+        audit_id: str,
+        *,
+        task_kind: str,
+        phase: str,
+        status: str,
+        product_url: str = "",
+        input_data: dict[str, Any] | None = None,
+        result_data: dict[str, Any] | None = None,
+        error_text: str = "",
+        started_at: str = "",
+        completed_at: str = "",
+    ) -> None:
+        if not audit_id:
+            return
+        self._post(
+            "task_audit",
+            audit={
+                "id": audit_id,
+                "task_kind": task_kind,
+                "phase": phase,
+                "status": status,
+                "product_url": _text(product_url, 4_096),
+                "input_data": input_data or {},
+                "result_data": result_data or {},
+                "error_text": _text(error_text, 12_000),
+                "started_at": started_at,
+                "completed_at": completed_at,
+            },
+        )
+
     def _heartbeat(self) -> None:
         self._post("heartbeat")
 
     def _session_end(self) -> None:
         self.heartbeat.stop()
+        self._batch_flush.stop()
         self._post("session_end")
+
+    def _single_input_snapshot(self) -> dict[str, Any]:
+        window = self.window
+        vertical = getattr(window, "vertical_input", None)
+        vertical_origin = ""
+        try:
+            vertical_origin = _text(vertical.property("listingVerticalOrigin"), 80) if vertical is not None else ""
+        except Exception:
+            vertical_origin = ""
+
+        scope = getattr(window, "real_scope_combo", None)
+        scope_value = ""
+        current_data = getattr(scope, "currentData", None)
+        if callable(current_data):
+            try:
+                scope_value = _text(current_data(), 160)
+            except Exception:
+                pass
+
+        config = getattr(getattr(window, "runner", None), "config", None)
+        model_config = {}
+        for name in ("provider", "base_url", "model", "fact_model", "web_search_model", "structured_mode"):
+            value = getattr(config, name, None) if config is not None else None
+            if value not in (None, ""):
+                model_config[name] = _safe_value(value)
+
+        return {
+            "supplier_url": _widget_text(getattr(window, "url_input", None)),
+            "listing_intent": _widget_text(getattr(window, "listing_intent_input", None)),
+            "ai_guidance": _widget_text(getattr(window, "ai_guidance_input", None)),
+            "model_name_keywords": _widget_text(getattr(window, "model_name_keywords_input", None)),
+            "requested_vertical": _widget_text(vertical),
+            "requested_vertical_origin": vertical_origin,
+            "execution_scope": scope_value,
+            "customer_files": _file_metadata(getattr(window, "_selected_product_files", ()) or ()),
+            "model_config": model_config,
+        }
+
+    def _batch_input_snapshot(self) -> dict[str, Any]:
+        workspace = getattr(self.window, "batch_workspace", None)
+        editor = getattr(workspace, "_batch_url_editor", None)
+        rows = list(getattr(editor, "rows", ()) or ())
+        items: list[dict[str, Any]] = []
+        for index, row in enumerate(rows[:120], start=1):
+            try:
+                enabled = bool(row.is_enabled())
+            except Exception:
+                enabled = True
+            url_getter = getattr(row, "url", None)
+            try:
+                url = _text(url_getter() if callable(url_getter) else "", 4_096)
+            except Exception:
+                url = ""
+            if not url and not enabled:
+                continue
+            items.append(
+                {
+                    "row": index,
+                    "enabled": enabled,
+                    "supplier_url": url,
+                    "listing_intent": _widget_text(getattr(row, "offer_input", None)),
+                    "customer_files": _file_metadata(getattr(row, "product_files", ()) or ()),
+                }
+            )
+        return {"items": items, "item_count": len(items)}
+
+    def _batch_result_snapshot(self) -> dict[str, Any]:
+        workspace = getattr(self.window, "batch_workspace", None)
+        controller = getattr(workspace, "controller", None)
+        batch = getattr(controller, "batch", None)
+        jobs = list(getattr(batch, "jobs", ()) or getattr(workspace, "_jobs", ()) or ())
+        result_jobs: list[dict[str, Any]] = []
+        for job in jobs[:120]:
+            run_dir = getattr(job, "run_dir", "")
+            result_jobs.append(
+                {
+                    "job_id": _text(getattr(job, "job_id", ""), 160),
+                    "product_url": _text(getattr(job, "product_url", ""), 4_096),
+                    "status": _text(getattr(job, "status", ""), 120),
+                    "progress": int(getattr(job, "progress", 0) or 0),
+                    "vertical": _text(getattr(job, "vertical", ""), 500),
+                    "brand": _text(getattr(job, "brand", ""), 500),
+                    "ready": int(getattr(job, "ready", 0) or 0),
+                    "blocked": int(getattr(job, "blocked", 0) or 0),
+                    "required_blocked": int(getattr(job, "required_blocked", 0) or 0),
+                    "product_images": int(getattr(job, "product_images", 0) or 0),
+                    "makro_target_id": _text(getattr(job, "makro_target_id", ""), 240),
+                    "stage_detail": _text(getattr(job, "stage_detail", ""), 2_000),
+                    "error": _text(getattr(job, "error", ""), 8_000),
+                    "run_id": Path(str(run_dir)).name if str(run_dir).strip() else "",
+                    "created_at": _text(getattr(job, "created_at", ""), 120),
+                    "updated_at": _text(getattr(job, "updated_at", ""), 120),
+                }
+            )
+        return {
+            "batch_status": _text(getattr(batch, "status", ""), 120),
+            "jobs": result_jobs,
+            "job_count": len(result_jobs),
+        }
 
     def _bind_single(self) -> None:
         prepare = getattr(self.window, "runner", None)
@@ -111,36 +423,121 @@ class UsageTelemetryController(QObject):
             return
         controller.running_changed.connect(self._on_batch_running)
         controller.failed.connect(self._on_batch_failed)
+        jobs_changed = getattr(controller, "jobs_changed", None)
+        if jobs_changed is not None:
+            jobs_changed.connect(self._on_batch_jobs_changed)
 
     def _on_prepare_running(self, running: bool) -> None:
         if running and not self._prepare_active:
             self._prepare_active = True
             self._event("listing_prepare", "started")
+            self._single_audit_id = str(uuid.uuid4())
+            self._single_started_at = _utc_now()
+            self._single_input = self._single_input_snapshot()
+            self._single_result = {}
+            self._task_audit(
+                self._single_audit_id,
+                task_kind="single",
+                phase="listing_prepare",
+                status="running",
+                product_url=_text(self._single_input.get("supplier_url"), 4_096),
+                input_data=self._single_input,
+                started_at=self._single_started_at,
+            )
 
-    def _on_prepare_completed(self, *_args: Any) -> None:
+    def _on_prepare_completed(self, *args: Any) -> None:
         if self._prepare_active:
             self._prepare_active = False
             self._event("listing_prepare", "completed")
+        result = _first_result(args)
+        if result is not None:
+            self._single_result = _run_result_payload(result)
+        if self._single_audit_id:
+            self._task_audit(
+                self._single_audit_id,
+                task_kind="single",
+                phase="listing_prepare",
+                status="ready",
+                product_url=_text(self._single_input.get("supplier_url"), 4_096),
+                input_data=self._single_input,
+                result_data=self._single_result,
+                started_at=self._single_started_at,
+            )
 
-    def _on_prepare_failed(self, *_args: Any) -> None:
+    def _on_prepare_failed(self, *args: Any) -> None:
         if self._prepare_active:
             self._prepare_active = False
             self._event("listing_prepare", "failed")
+        if self._single_audit_id:
+            self._task_audit(
+                self._single_audit_id,
+                task_kind="single",
+                phase="listing_prepare",
+                status="failed",
+                product_url=_text(self._single_input.get("supplier_url"), 4_096),
+                input_data=self._single_input,
+                result_data=self._single_result,
+                error_text=_error_text(args),
+                started_at=self._single_started_at,
+                completed_at=_utc_now(),
+            )
 
     def _on_execute_running(self, running: bool) -> None:
         if running and not self._execute_active:
             self._execute_active = True
             self._event("listing_execute", "started")
+            if not self._single_audit_id:
+                self._single_audit_id = str(uuid.uuid4())
+                self._single_started_at = _utc_now()
+                self._single_input = self._single_input_snapshot()
+            self._task_audit(
+                self._single_audit_id,
+                task_kind="single",
+                phase="listing_execute",
+                status="running",
+                product_url=_text(self._single_input.get("supplier_url"), 4_096),
+                input_data=self._single_input,
+                result_data=self._single_result,
+                started_at=self._single_started_at,
+            )
 
-    def _on_execute_completed(self, *_args: Any) -> None:
+    def _on_execute_completed(self, *args: Any) -> None:
         if self._execute_active:
             self._execute_active = False
             self._event("listing_execute", "completed")
+        result = _first_result(args)
+        if result is not None:
+            self._single_result = _run_result_payload(result)
+        if self._single_audit_id:
+            self._task_audit(
+                self._single_audit_id,
+                task_kind="single",
+                phase="listing_execute",
+                status="completed",
+                product_url=_text(self._single_input.get("supplier_url"), 4_096),
+                input_data=self._single_input,
+                result_data=self._single_result,
+                started_at=self._single_started_at,
+                completed_at=_utc_now(),
+            )
 
-    def _on_execute_failed(self, *_args: Any) -> None:
+    def _on_execute_failed(self, *args: Any) -> None:
         if self._execute_active:
             self._execute_active = False
             self._event("listing_execute", "failed")
+        if self._single_audit_id:
+            self._task_audit(
+                self._single_audit_id,
+                task_kind="single",
+                phase="listing_execute",
+                status="failed",
+                product_url=_text(self._single_input.get("supplier_url"), 4_096),
+                input_data=self._single_input,
+                result_data=self._single_result,
+                error_text=_error_text(args),
+                started_at=self._single_started_at,
+                completed_at=_utc_now(),
+            )
 
     def _on_batch_running(self, running: bool) -> None:
         workspace = getattr(self.window, "batch_workspace", None)
@@ -153,18 +550,79 @@ class UsageTelemetryController(QObject):
             if not self._batch_event_type:
                 self._batch_event_type = event_type
                 self._event(event_type, "started")
+            if not self._batch_audit_id:
+                self._batch_audit_id = str(uuid.uuid4())
+                self._batch_started_at = _utc_now()
+                self._batch_input = self._batch_input_snapshot()
+            self._task_audit(
+                self._batch_audit_id,
+                task_kind="batch",
+                phase=event_type,
+                status="running",
+                input_data=self._batch_input,
+                result_data=self._batch_result_snapshot(),
+                started_at=self._batch_started_at,
+            )
             return
 
         if not self._batch_event_type:
             return
         outcome = "completed" if status in {"PREPARED", "COMPLETE"} else "failed"
         self._event(self._batch_event_type, outcome)
+        audit_status = "ready" if status == "PREPARED" else "completed" if status == "COMPLETE" else "failed"
+        if self._batch_audit_id:
+            self._task_audit(
+                self._batch_audit_id,
+                task_kind="batch",
+                phase=self._batch_event_type,
+                status=audit_status,
+                input_data=self._batch_input,
+                result_data=self._batch_result_snapshot(),
+                started_at=self._batch_started_at,
+                completed_at=_utc_now() if audit_status in {"completed", "failed"} else "",
+            )
         self._batch_event_type = ""
+        if audit_status in {"completed", "failed"}:
+            self._batch_audit_id = ""
+            self._batch_started_at = ""
+            self._batch_input = {}
 
-    def _on_batch_failed(self, *_args: Any) -> None:
+    def _on_batch_jobs_changed(self, *_args: Any) -> None:
+        if self._batch_audit_id:
+            self._batch_flush.start()
+
+    def _flush_batch_audit(self) -> None:
+        if not self._batch_audit_id:
+            return
+        self._task_audit(
+            self._batch_audit_id,
+            task_kind="batch",
+            phase=self._batch_event_type or "batch",
+            status="running",
+            input_data=self._batch_input,
+            result_data=self._batch_result_snapshot(),
+            started_at=self._batch_started_at,
+        )
+
+    def _on_batch_failed(self, *args: Any) -> None:
         if self._batch_event_type:
             self._event(self._batch_event_type, "failed")
-            self._batch_event_type = ""
+        if self._batch_audit_id:
+            self._task_audit(
+                self._batch_audit_id,
+                task_kind="batch",
+                phase=self._batch_event_type or "batch",
+                status="failed",
+                input_data=self._batch_input,
+                result_data=self._batch_result_snapshot(),
+                error_text=_error_text(args),
+                started_at=self._batch_started_at,
+                completed_at=_utc_now(),
+            )
+        self._batch_event_type = ""
+        self._batch_audit_id = ""
+        self._batch_started_at = ""
+        self._batch_input = {}
 
 
 def install_usage_telemetry(
