@@ -89,7 +89,7 @@ function Invoke-E2EPack([string]$PackVersion, [string]$PackDirectory) {
     if ($LASTEXITCODE -ne 0) { throw "Velopack E2E pack failed for $PackVersion" }
 }
 
-Write-Host "  [E2E 1/4] Pack and install old Velopack version $OldVersion"
+Write-Host "  [E2E 1/5] Pack and install old Velopack version $OldVersion"
 Invoke-E2EPack $OldVersion $OldAppDir
 $Setup = Get-SingleVelopackArtifact -Directory $FeedDir -Filter "$PackId*-Setup.exe" -Label "old setup"
 $Install = Start-Process -FilePath $Setup.FullName -ArgumentList @("--silent", "--installto", $InstallDir) -Wait -PassThru
@@ -107,7 +107,7 @@ if ($InstalledOldVersion -ne $OldVersion) {
     throw "Velopack E2E old install VERSION mismatch: expected=$OldVersion actual=$InstalledOldVersion"
 }
 
-Write-Host "  [E2E 2/4] Add target v$Version to the same local Velopack feed"
+Write-Host "  [E2E 2/5] Add target v$Version to the same local Velopack feed"
 Invoke-E2EPack $Version $AppDir
 $Index = Join-Path $FeedDir "releases.$Channel.json"
 if (-not (Test-Path $Index)) { throw "Velopack E2E release index missing: $Index" }
@@ -117,7 +117,7 @@ $TargetPackage = Resolve-E2EFullPackage `
     -PackageId $PackId `
     -PackageVersion $Version
 
-Write-Host "  [E2E 3/4] Launch installed old app and let Velopack update + restart it"
+Write-Host "  [E2E 3/5] Launch installed old app and let Velopack update + restart it"
 $Process = Start-Process -FilePath $RootGui -ArgumentList @(
     "--velopack-e2e-source", $FeedDir,
     "--velopack-e2e-target", $Version,
@@ -132,7 +132,7 @@ if (-not (Test-Path $Marker)) {
     throw "Velopack E2E timed out waiting for the real updated GUI startup marker"
 }
 
-Write-Host "  [E2E 4/4] Verify real installed GUI restarted on v$Version"
+Write-Host "  [E2E 4/5] Verify real installed GUI restarted on v$Version"
 $Result = Get-Content $Marker -Raw -Encoding UTF8 | ConvertFrom-Json
 if (-not [bool]$Result.started -or -not [bool]$Result.frozen) {
     throw "Velopack E2E updated GUI did not reach frozen Qt/Python startup"
@@ -152,5 +152,16 @@ if ($Embedded -ne $Version) {
     throw "Updated embedded VERSION mismatch: expected=$Version actual=$Embedded"
 }
 
-Write-Host "  Velopack E2E passed: v$OldVersion -> $($TargetPackage.Name) -> Update.exe -> v$Version -> real installed GUI"
+Write-Host "  [E2E 5/5] Uninstall the updated Velopack application"
+$Uninstall = Start-Process -FilePath $UpdateExe -ArgumentList @("--silent", "uninstall") -Wait -PassThru
+if ($Uninstall.ExitCode -ne 0) { throw "Velopack E2E uninstall failed: $($Uninstall.ExitCode)" }
+$UninstallDeadline = (Get-Date).AddSeconds(15)
+while ((Test-Path $InstallDir) -and (Get-Date) -lt $UninstallDeadline) {
+    Start-Sleep -Milliseconds 100
+}
+if (Test-Path $InstallDir) {
+    throw "Velopack E2E uninstall left installation root behind: $InstallDir"
+}
+
+Write-Host "  Velopack E2E passed: install v$OldVersion -> update $($TargetPackage.Name) -> restart v$Version -> uninstall"
 exit 0
