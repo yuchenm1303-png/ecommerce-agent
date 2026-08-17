@@ -165,6 +165,13 @@ def _first_result(args: tuple[Any, ...]) -> Any | None:
     return None
 
 
+def _first_mapping(args: tuple[Any, ...]) -> dict[str, Any] | None:
+    for value in args:
+        if isinstance(value, dict):
+            return value
+    return None
+
+
 def _error_text(args: tuple[Any, ...]) -> str:
     for value in args:
         if isinstance(value, BaseException):
@@ -508,6 +515,11 @@ class UsageTelemetryController(QObject):
         result = _first_result(args)
         if result is not None:
             self._single_result = _run_result_payload(result)
+        execution_report = _first_mapping(args)
+        if execution_report is not None:
+            self._single_result = dict(self._single_result)
+            self._single_result["executor_report"] = _safe_value(execution_report)
+            self._single_result["execution_elapsed_seconds"] = float(execution_report.get("_elapsed_s") or 0.0)
         if self._single_audit_id:
             self._task_audit(
                 self._single_audit_id,
