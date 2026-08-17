@@ -63,14 +63,57 @@ class _PROCESSENTRY32W(ctypes.Structure):
         ("dwSize", wintypes.DWORD),
         ("cntUsage", wintypes.DWORD),
         ("th32ProcessID", wintypes.DWORD),
-        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+        ("th32DefaultHeapID", ctypes.c_size_t),
         ("th32ModuleID", wintypes.DWORD),
         ("cntThreads", wintypes.DWORD),
         ("th32ParentProcessID", wintypes.DWORD),
-        ("pcPriClassBase", ctypes.c_long),
+        ("pcPriClassBase", wintypes.LONG),
         ("dwFlags", wintypes.DWORD),
         ("szExeFile", wintypes.WCHAR * 260),
     ]
+
+
+def _configure_winapi() -> tuple[Any, Any]:
+    if os.name != "nt":
+        return None, None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+
+    kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MEMORYSTATUSEX)]
+    kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
+    kernel32.GetSystemTimes.argtypes = [ctypes.POINTER(_FILETIME), ctypes.POINTER(_FILETIME), ctypes.POINTER(_FILETIME)]
+    kernel32.GetSystemTimes.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    psapi.GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_PROCESS_MEMORY_COUNTERS),
+        wintypes.DWORD,
+    ]
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+    return kernel32, psapi
+
+
+_KERNEL32, _PSAPI = _configure_winapi()
 
 
 def _filetime_value(value: _FILETIME) -> int:
@@ -78,11 +121,11 @@ def _filetime_value(value: _FILETIME) -> int:
 
 
 def _windows_memory() -> dict[str, Any]:
-    if os.name != "nt":
+    if _KERNEL32 is None:
         return {}
     state = _MEMORYSTATUSEX()
     state.dwLength = ctypes.sizeof(state)
-    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(state)):
+    if not _KERNEL32.GlobalMemoryStatusEx(ctypes.byref(state)):
         return {}
     total = int(state.ullTotalPhys)
     available = int(state.ullAvailPhys)
@@ -94,52 +137,44 @@ def _windows_memory() -> dict[str, Any]:
     }
 
 
-def _process_memory(handle: int | None = None) -> dict[str, int]:
-    if os.name != "nt":
+def _process_memory(handle: Any = None) -> dict[str, int]:
+    if _KERNEL32 is None or _PSAPI is None:
         return {}
-    kernel32 = ctypes.windll.kernel32
-    psapi = ctypes.windll.psapi
-    owned = False
     if handle is None:
-        handle = kernel32.GetCurrentProcess()
+        handle = _KERNEL32.GetCurrentProcess()
     counters = _PROCESS_MEMORY_COUNTERS()
     counters.cb = ctypes.sizeof(counters)
-    if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
-        if owned:
-            kernel32.CloseHandle(handle)
+    if not _PSAPI.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
         return {}
-    result = {
+    return {
         "working_set_bytes": int(counters.WorkingSetSize),
         "peak_working_set_bytes": int(counters.PeakWorkingSetSize),
         "pagefile_bytes": int(counters.PagefileUsage),
         "peak_pagefile_bytes": int(counters.PeakPagefileUsage),
         "page_faults": int(counters.PageFaultCount),
     }
-    if owned:
-        kernel32.CloseHandle(handle)
-    return result
 
 
 def _system_cpu_times() -> tuple[int, int, int] | None:
-    if os.name != "nt":
+    if _KERNEL32 is None:
         return None
     idle = _FILETIME()
     kernel = _FILETIME()
     user = _FILETIME()
-    if not ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+    if not _KERNEL32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
         return None
     return _filetime_value(idle), _filetime_value(kernel), _filetime_value(user)
 
 
 def _process_cpu_times() -> tuple[int, int] | None:
-    if os.name != "nt":
+    if _KERNEL32 is None:
         return None
     creation = _FILETIME()
     exit_time = _FILETIME()
     kernel = _FILETIME()
     user = _FILETIME()
-    handle = ctypes.windll.kernel32.GetCurrentProcess()
-    if not ctypes.windll.kernel32.GetProcessTimes(
+    handle = _KERNEL32.GetCurrentProcess()
+    if not _KERNEL32.GetProcessTimes(
         handle,
         ctypes.byref(creation),
         ctypes.byref(exit_time),
@@ -151,11 +186,10 @@ def _process_cpu_times() -> tuple[int, int] | None:
 
 
 def _edge_processes() -> dict[str, int]:
-    if os.name != "nt":
+    if _KERNEL32 is None:
         return {"count": 0, "working_set_bytes": 0}
-    kernel32 = ctypes.windll.kernel32
-    snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
-    if snapshot == _INVALID_HANDLE_VALUE:
+    snapshot = _KERNEL32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if not snapshot or snapshot == _INVALID_HANDLE_VALUE:
         return {"count": 0, "working_set_bytes": 0}
 
     entry = _PROCESSENTRY32W()
@@ -163,12 +197,12 @@ def _edge_processes() -> dict[str, int]:
     count = 0
     working_set = 0
     try:
-        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        ok = _KERNEL32.Process32FirstW(snapshot, ctypes.byref(entry))
         while ok:
             name = str(entry.szExeFile or "").casefold()
             if name in {"msedge.exe", "msedgewebview2.exe"}:
                 count += 1
-                handle = kernel32.OpenProcess(
+                handle = _KERNEL32.OpenProcess(
                     _PROCESS_QUERY_INFORMATION | _PROCESS_VM_READ,
                     False,
                     int(entry.th32ProcessID),
@@ -177,10 +211,10 @@ def _edge_processes() -> dict[str, int]:
                     try:
                         working_set += int(_process_memory(handle).get("working_set_bytes", 0))
                     finally:
-                        kernel32.CloseHandle(handle)
-            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+                        _KERNEL32.CloseHandle(handle)
+            ok = _KERNEL32.Process32NextW(snapshot, ctypes.byref(entry))
     finally:
-        kernel32.CloseHandle(snapshot)
+        _KERNEL32.CloseHandle(snapshot)
     return {"count": count, "working_set_bytes": working_set}
 
 
@@ -274,7 +308,7 @@ class SystemHealthTelemetryController(QObject):
         return {
             "single_prepare_running": _runner_active(getattr(self.window, "runner", None)),
             "single_execute_running": _runner_active(getattr(self.window, "execution_runner", None)),
-            "batch_running": bool(getattr(controller, "running", False) or _runner_active(controller)),
+            "batch_running": _runner_active(controller),
             "batch_status": str(getattr(batch, "status", "") or "")[:120],
         }
 
