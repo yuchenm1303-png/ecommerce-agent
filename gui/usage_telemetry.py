@@ -181,6 +181,65 @@ def _error_text(args: tuple[Any, ...]) -> str:
     return "任务失败"
 
 
+def _batch_jobs(batch: Any) -> list[Any]:
+    return list(getattr(batch, "jobs", ()) or ())
+
+
+def _batch_operation_job_ids(batch: Any, event_type: str) -> tuple[str, ...]:
+    jobs = _batch_jobs(batch)
+    if event_type == "batch_execute":
+        jobs = [job for job in jobs if str(getattr(job, "status", "") or "").upper() == "READY"]
+    return tuple(
+        _text(getattr(job, "job_id", ""), 160)
+        for job in jobs
+        if _text(getattr(job, "job_id", ""), 160)
+    )
+
+
+def _batch_cohort_statuses(batch: Any, job_ids: tuple[str, ...]) -> list[str]:
+    wanted = set(job_ids)
+    return [
+        str(getattr(job, "status", "") or "").upper()
+        for job in _batch_jobs(batch)
+        if _text(getattr(job, "job_id", ""), 160) in wanted
+    ]
+
+
+def _batch_terminal_semantics(
+    event_type: str,
+    batch: Any,
+    job_ids: tuple[str, ...],
+) -> tuple[str, str]:
+    """Return event outcome and audit status from the jobs that actually ran.
+
+    BatchController deliberately uses PREPARED/COMPLETE to mean that its queues
+    have drained. Those controller states do not mean every product succeeded.
+    Telemetry therefore evaluates the exact operation cohort: all jobs for
+    prepare, and only the READY jobs captured when execute started.
+    """
+
+    batch_status = str(getattr(batch, "status", "") or "").upper()
+    statuses = _batch_cohort_statuses(batch, job_ids)
+    expected_batch_status = "PREPARED" if event_type == "batch_prepare" else "COMPLETE"
+    expected_job_status = "READY" if event_type == "batch_prepare" else "DONE"
+    audit_success = "ready" if event_type == "batch_prepare" else "completed"
+
+    if batch_status == expected_batch_status and statuses and all(
+        status == expected_job_status for status in statuses
+    ):
+        if event_type == "batch_execute":
+            all_statuses = [str(getattr(job, "status", "") or "").upper() for job in _batch_jobs(batch)]
+            if any(status in {"FAILED", "REVIEW", "STOPPED"} for status in all_statuses):
+                return "completed", "review"
+        return "completed", audit_success
+
+    successful = sum(status == expected_job_status for status in statuses)
+    hard_failed = any(status in {"FAILED", "STOPPED"} for status in statuses)
+    if successful > 0:
+        return "failed", "review"
+    return "failed", "failed" if hard_failed or not statuses else "review"
+
+
 class UsageTelemetryController(QObject):
     """Licensed-install telemetry plus owner-visible business task audit.
 
@@ -202,6 +261,7 @@ class UsageTelemetryController(QObject):
         self._prepare_active = False
         self._execute_active = False
         self._batch_event_type = ""
+        self._batch_job_ids: tuple[str, ...] = ()
         self._single_audit_id = ""
         self._single_started_at = ""
         self._single_input: dict[str, Any] = {}
@@ -382,13 +442,16 @@ class UsageTelemetryController(QObject):
         batch = getattr(controller, "batch", None)
         jobs = list(getattr(batch, "jobs", ()) or getattr(workspace, "_jobs", ()) or ())
         result_jobs: list[dict[str, Any]] = []
+        status_counts: dict[str, int] = {}
         for job in jobs[:120]:
             run_dir = getattr(job, "run_dir", "")
+            job_status = _text(getattr(job, "status", ""), 120).upper()
+            status_counts[job_status] = status_counts.get(job_status, 0) + 1
             result_jobs.append(
                 {
                     "job_id": _text(getattr(job, "job_id", ""), 160),
                     "product_url": _text(getattr(job, "product_url", ""), 4_096),
-                    "status": _text(getattr(job, "status", ""), 120),
+                    "status": job_status,
                     "progress": int(getattr(job, "progress", 0) or 0),
                     "vertical": _text(getattr(job, "vertical", ""), 500),
                     "brand": _text(getattr(job, "brand", ""), 500),
@@ -408,6 +471,7 @@ class UsageTelemetryController(QObject):
             "batch_status": _text(getattr(batch, "status", ""), 120),
             "jobs": result_jobs,
             "job_count": len(result_jobs),
+            "job_status_counts": status_counts,
         }
 
     def _bind_single(self) -> None:
@@ -561,6 +625,7 @@ class UsageTelemetryController(QObject):
             event_type = "batch_execute" if status == "EXECUTING" else "batch_prepare"
             if not self._batch_event_type:
                 self._batch_event_type = event_type
+                self._batch_job_ids = _batch_operation_job_ids(batch, event_type)
                 self._event(event_type, "started")
             if not self._batch_audit_id:
                 self._batch_audit_id = str(uuid.uuid4())
@@ -579,22 +644,32 @@ class UsageTelemetryController(QObject):
 
         if not self._batch_event_type:
             return
-        outcome = "completed" if status in {"PREPARED", "COMPLETE"} else "failed"
-        self._event(self._batch_event_type, outcome)
-        audit_status = "ready" if status == "PREPARED" else "completed" if status == "COMPLETE" else "failed"
+        event_type = self._batch_event_type
+        outcome, audit_status = _batch_terminal_semantics(
+            event_type,
+            batch,
+            self._batch_job_ids,
+        )
+        self._event(event_type, outcome)
+        ready_for_execute = event_type == "batch_prepare" and any(
+            str(getattr(job, "status", "") or "").upper() == "READY"
+            for job in _batch_jobs(batch)
+        )
+        terminal_audit = event_type == "batch_execute" or not ready_for_execute
         if self._batch_audit_id:
             self._task_audit(
                 self._batch_audit_id,
                 task_kind="batch",
-                phase=self._batch_event_type,
+                phase=event_type,
                 status=audit_status,
                 input_data=self._batch_input,
                 result_data=self._batch_result_snapshot(),
                 started_at=self._batch_started_at,
-                completed_at=_utc_now() if audit_status in {"completed", "failed"} else "",
+                completed_at=_utc_now() if terminal_audit else "",
             )
         self._batch_event_type = ""
-        if audit_status in {"completed", "failed"}:
+        self._batch_job_ids = ()
+        if terminal_audit:
             self._batch_audit_id = ""
             self._batch_started_at = ""
             self._batch_input = {}
@@ -632,6 +707,7 @@ class UsageTelemetryController(QObject):
                 completed_at=_utc_now(),
             )
         self._batch_event_type = ""
+        self._batch_job_ids = ()
         self._batch_audit_id = ""
         self._batch_started_at = ""
         self._batch_input = {}
