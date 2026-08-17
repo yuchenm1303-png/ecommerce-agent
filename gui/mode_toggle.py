@@ -137,12 +137,13 @@ def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
     toggle.set_checked_immediate(int(mode_stack.currentIndex()) == 1)
 
     def request_mode(checked: bool) -> None:
-        # Single and Batch are persistent siblings in the same QStackedWidget.
-        # Switching modes must therefore only select the already-laid-out page.
-        # Do not run a snapshot transition or recursively invalidate/activate the
-        # page tree here: both mechanisms can expose transient card geometry and
-        # make the native glass layer appear to "reflow" during a simple switch.
-        set_mode(1 if checked else 0)
+        target = 1 if checked else 0
+        transition = getattr(window, "_workspace_transition_controller", None)
+        request = getattr(transition, "request_mode", None)
+        if callable(request):
+            request(target)
+        else:
+            set_mode(target)
 
     toggle.clicked.connect(request_mode)
 
