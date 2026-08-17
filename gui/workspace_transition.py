@@ -58,12 +58,10 @@ def _cubic_bezier(c1x: float, c1y: float, c2x: float, c2y: float) -> QEasingCurv
 
 
 def _exit_easing() -> QEasingCurve:
-    # CSS cubic-bezier(.4, 0, 1, 1): old content accelerates away.
     return _cubic_bezier(0.40, 0.00, 1.00, 1.00)
 
 
 def _enter_easing() -> QEasingCurve:
-    # Fast establishment, long gentle settle for the incoming workspace.
     return _cubic_bezier(0.16, 1.00, 0.30, 1.00)
 
 
@@ -114,19 +112,11 @@ def _fit_frame(source: QPixmap, widget: QWidget) -> QPixmap:
 
 
 class _WorkspaceTransitionSurface(QWidget):
-    """Root-level opaque owner for the complete modeStack image during motion.
-
-    The surface intentionally lives under the central widget, not under
-    QStackedWidget. Switching the current page can raise children inside the stack,
-    but can never raise them above this sibling overlay. That makes one object the
-    sole owner of every visible modeStack pixel until the final handoff.
-    """
+    """Root-level opaque owner for the complete modeStack image during motion."""
 
     def __init__(self, root: QWidget) -> None:
         super().__init__(root)
         self.setObjectName("workspaceTransitionSurface")
-        # Block pointer input to the hidden live workspace while the header switch
-        # remains available above/outside this geometry.
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
@@ -195,19 +185,12 @@ class _WorkspaceTransitionSurface(QWidget):
         ):
             painter.drawPixmap(0, 0, frame)
             return
-
-        # Geometry changes during an active transition normally snap immediately,
-        # so this is only a defensive fallback.
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.drawPixmap(self.rect(), frame, frame.rect())
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
 
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         painter = QPainter(self)
-
-        # CompositionMode_Source is deliberate: the neutral Fuji base writes
-        # opaque pixels into the translucent top-level backing store. Nothing from
-        # the live QStackedWidget or native Quick glass can leak through.
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         self._draw_fitted(painter, self._neutral)
 
@@ -225,7 +208,6 @@ class _WorkspaceTransitionSurface(QWidget):
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
             painter.setOpacity(self._veil_alpha)
             painter.fillRect(self.rect(), _VEIL_COLOR)
-
         painter.end()
 
 
@@ -243,8 +225,6 @@ class WorkspaceTransitionController(QObject):
         if self.root is None or not isinstance(self.stack, QStackedWidget) or not callable(self._set_mode):
             raise RuntimeError("workspace transition requires installed mode workspace")
 
-        # Root-level ownership is the key anti-overlap invariant. A current page
-        # can be raised inside QStackedWidget without ever overtaking this overlay.
         self._surface = _WorkspaceTransitionSurface(self.root)
         self._sync_surface_geometry()
         self._surface.hide()
@@ -328,9 +308,6 @@ class WorkspaceTransitionController(QObject):
 
     def _raise_transition_surface(self) -> None:
         self._surface.raise_()
-
-        # Sakura is an independent ambient layer. Keep it above the workspace
-        # transition so the background world never appears frozen.
         effects = getattr(self.window, "_nekro_effects", None)
         if isinstance(effects, QWidget):
             try:
@@ -339,8 +316,6 @@ class WorkspaceTransitionController(QObject):
                 pass
 
     def _render_current_page(self) -> QPixmap:
-        """Render exactly one QStackedWidget page into stack coordinates."""
-
         page = self.stack.currentWidget()
         if (
             page is None
@@ -389,8 +364,6 @@ class WorkspaceTransitionController(QObject):
         return _fit_frame(cropped, self.stack)
 
     def _capture_neutral_background(self) -> QPixmap:
-        """Rebuild the sharp Fuji frame at the current parallax offset, without glass."""
-
         quick = getattr(self.background, "quick_window", None)
         wallpaper = self._wallpaper
         if (
@@ -554,29 +527,17 @@ class WorkspaceTransitionController(QObject):
             if elapsed_ms < _HEADER_EXIT_START_MS:
                 effect.setOpacity(1.0)
                 return
-
             if elapsed_ms < _HEADER_EXIT_END_MS:
-                progress = _segment_progress(
-                    elapsed_ms,
-                    _HEADER_EXIT_START_MS,
-                    _HEADER_EXIT_END_MS,
-                )
+                progress = _segment_progress(elapsed_ms, _HEADER_EXIT_START_MS, _HEADER_EXIT_END_MS)
                 effect.setOpacity(1.0 - float(self._exit_easing.valueForProgress(progress)))
                 return
-
             if not self._phase_swapped:
                 badge.setText(self._phase_new_text)
                 self._phase_swapped = True
-
             if elapsed_ms < _HEADER_ENTER_START_MS:
                 effect.setOpacity(0.0)
                 return
-
-            progress = _segment_progress(
-                elapsed_ms,
-                _HEADER_ENTER_START_MS,
-                _HEADER_ENTER_END_MS,
-            )
+            progress = _segment_progress(elapsed_ms, _HEADER_ENTER_START_MS, _HEADER_ENTER_END_MS)
             effect.setOpacity(float(self._enter_easing.valueForProgress(progress)))
         except RuntimeError:
             self._phase_effect = None
@@ -665,9 +626,6 @@ class WorkspaceTransitionController(QObject):
             except RuntimeError:
                 phase_old = ""
 
-        # Real state changes underneath a root-level opaque surface. Calling
-        # setCurrentIndex can raise the new page only inside QStackedWidget; it
-        # cannot overtake the transition surface anymore.
         self._set_mode(index)
         self._raise_transition_surface()
 
@@ -679,11 +637,9 @@ class WorkspaceTransitionController(QObject):
                 phase_new = phase_old
         self._begin_phase_badge_transition(phase_old, phase_new)
 
-        current_page = self.stack.currentWidget()
-        page_layout = current_page.layout() if current_page is not None else None
-        if page_layout is not None:
-            page_layout.activate()
-
+        # Single and Batch are persistent pages. Their geometry is established at
+        # startup and must not be reactivated during a mode transition. A forced
+        # QLayout.activate() here was the source of the visible one-frame reflow.
         schedule_mask = getattr(self.background, "schedule_mask_update", None)
         if callable(schedule_mask):
             schedule_mask()
@@ -719,9 +675,6 @@ class WorkspaceTransitionController(QObject):
             self._capture_incoming_after_quick_sync()
             return
 
-        # Do not grab immediately after quick.update(). With the threaded render
-        # loop that can sample the previous glass mask and combine it with the new
-        # QWidget page. Wait for the next queued/presented Quick frame instead.
         self._awaiting_quick_frame = True
         try:
             quick.update()
@@ -747,7 +700,6 @@ class WorkspaceTransitionController(QObject):
             return
         self._awaiting_quick_frame = False
         self._quick_sync_timeout.stop()
-
         if (
             self.window.isMinimized()
             or not self.window.isVisible()
@@ -765,10 +717,7 @@ class WorkspaceTransitionController(QObject):
         self._surface.set_incoming(incoming)
         self._raise_transition_surface()
         self._surface.repaint()
-        self._incoming_enter_start_ms = max(
-            float(_ENTER_START_MS),
-            self._elapsed_ms(),
-        )
+        self._incoming_enter_start_ms = max(float(_ENTER_START_MS), self._elapsed_ms())
 
     def _mix_for_elapsed(self, elapsed_ms: float) -> tuple[float, float, float]:
         if elapsed_ms <= _HOLD_MS:
@@ -798,10 +747,8 @@ class WorkspaceTransitionController(QObject):
             fall = _segment_progress(elapsed_ms, _VEIL_PEAK_MS, _VEIL_END_MS)
             veil_alpha = _VEIL_MAX_OPACITY * (1.0 - _smoothstep(fall))
 
-        # Hard contract: two readable workspace snapshots never coexist.
         if outgoing_alpha > 1e-4:
             incoming_alpha = 0.0
-
         return outgoing_alpha, incoming_alpha, veil_alpha
 
     def _advance(self) -> None:
@@ -814,15 +761,11 @@ class WorkspaceTransitionController(QObject):
         )
         self._update_phase_badge(elapsed_ms)
 
-        finish_ms = max(
-            float(_TOTAL_MS),
-            self._incoming_enter_start_ms + float(_ENTER_DURATION_MS),
-        )
+        finish_ms = max(float(_TOTAL_MS), self._incoming_enter_start_ms + float(_ENTER_DURATION_MS))
         if elapsed_ms >= finish_ms and not self._incoming.isNull():
             self._finish_transition()
 
     def _refresh_phase_copy_for_current_mode(self) -> None:
-        # Recompute once so any status signal that landed during motion wins.
         try:
             self._set_mode(int(self.stack.currentIndex()))
         except RuntimeError:
@@ -835,9 +778,6 @@ class WorkspaceTransitionController(QObject):
         if not self._active:
             return
 
-        # Paint the exact incoming endpoint once, then hand ownership to the live
-        # page in the same GUI turn. The Quick frame used for this pixmap was
-        # captured only after frameSwapped, eliminating old-mask/new-page flashes.
         self._surface.set_mix(
             outgoing_alpha=0.0,
             incoming_alpha=1.0,
@@ -882,7 +822,6 @@ class WorkspaceTransitionController(QObject):
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
-
         if watched is self.stack:
             if event_type in {QEvent.Type.Move, QEvent.Type.Resize, QEvent.Type.Show}:
                 if self._active and event_type in {QEvent.Type.Move, QEvent.Type.Resize}:
@@ -891,7 +830,6 @@ class WorkspaceTransitionController(QObject):
                     self._sync_surface_geometry()
             elif event_type == QEvent.Type.Hide and self._active:
                 self._finish_immediate()
-
         elif watched is self.root:
             if event_type == QEvent.Type.Resize:
                 if self._active:
@@ -900,14 +838,12 @@ class WorkspaceTransitionController(QObject):
                     self._sync_surface_geometry()
             elif event_type == QEvent.Type.Hide and self._active:
                 self._finish_immediate()
-
         return False
 
     def cleanup(self) -> None:
         self._timer.stop()
         self._quick_sync_timeout.stop()
         self._awaiting_quick_frame = False
-
         try:
             self.stack.removeEventFilter(self)
         except RuntimeError:
