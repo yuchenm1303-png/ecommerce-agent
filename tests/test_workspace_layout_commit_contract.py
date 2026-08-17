@@ -10,27 +10,32 @@ BATCH = (ROOT / "gui" / "batch_card_responsive.py").read_text(encoding="utf-8")
 STARTUP = (ROOT / "gui" / "startup_entrance_stability.py").read_text(encoding="utf-8")
 
 
-def test_mode_change_commits_layout_synchronously_before_transition_can_capture() -> None:
+def test_mode_switch_never_forces_workspace_relayout() -> None:
     assert "class WorkspaceLayoutCommitter(QObject)" in COMMIT
-    assert "self.stack.currentChanged.connect(self.commit_current)" in COMMIT
+    assert "self.stack.currentChanged.connect(self.commit_current)" not in COMMIT
+    assert "install_workspace_layout_commit(window)" not in TOGGLE
+    assert 'request = getattr(transition, "request_mode", None)' in TOGGLE
+    assert "request(target)" in TOGGLE
+
+
+def test_layout_primer_is_owned_exclusively_by_startup_overlay() -> None:
+    assert "from .workspace_layout_commit import install_workspace_layout_commit" in STARTUP
+    assert "self._workspace_layout_commit = install_workspace_layout_commit(window)" in STARTUP
     assert "stack_layout.invalidate()" in COMMIT
     assert "stack_layout.activate()" in COMMIT
     assert "_activate_layout_tree(page)" in COMMIT
     assert "processEvents" not in COMMIT
     assert "sleep(" not in COMMIT
-    assert "install_workspace_layout_commit(window)" in TOGGLE
 
 
-def test_layout_barrier_handles_single_reflow_and_batch_viewport_ownership() -> None:
+def test_startup_layout_primer_keeps_single_and_batch_specific_rules() -> None:
     assert "refresh_single_source_layout(self.window)" in COMMIT
     assert 'getattr(responsive, "commit_now", None)' in COMMIT
     assert "def commit_now(self)" in BATCH
     assert "self._sync_width()" in BATCH
-    assert "def _refresh(self)" in BATCH
-    assert "self.commit_now()" in BATCH
 
 
-def test_startup_never_samples_or_reveals_uncommitted_widget_geometry() -> None:
+def test_startup_never_reveals_uncommitted_widget_geometry() -> None:
     assert "def _commit_workspace_layout(self)" in STARTUP
     probe = STARTUP.split("def _probe_layout", 1)[1].split("def _flush_native_background", 1)[0]
     assert "self._commit_workspace_layout()" in probe
