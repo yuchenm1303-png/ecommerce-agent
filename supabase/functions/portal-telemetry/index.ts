@@ -6,12 +6,17 @@ const DEVICE_TABLE = "download_portal_devices";
 const SESSION_TABLE = "listing_usage_sessions";
 const EVENT_TABLE = "listing_usage_events";
 const DIAGNOSTIC_TABLE = "listing_diagnostic_reports";
+const AUDIT_TABLE = "listing_task_audits";
 const DEVICE_RE = /^[0-9a-f]{32,128}$/i;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN_RE = /^[A-Za-z0-9_-]{32,256}$/;
 const EVENTS = new Set(["listing_prepare", "listing_execute", "batch_prepare", "batch_execute"]);
 const OUTCOMES = new Set(["started", "completed", "failed"]);
+const AUDIT_KINDS = new Set(["single", "batch"]);
+const AUDIT_STATUSES = new Set(["running", "completed", "failed", "cancelled", "review", "ready"]);
 const MAX_DIAGNOSTIC_BYTES = 80_000;
+const MAX_AUDIT_BYTES = 260_000;
+const SECRET_KEY_RE = /(^|_)(api[_-]?key|token|secret|password|authorization|cookie|refresh[_-]?token|access[_-]?token)($|_)/i;
 
 function headers(): Record<string, string> {
   return {
@@ -47,6 +52,28 @@ function diagnosticCode(): string {
   return `LS-${stamp}-${random}`;
 }
 
+function redactSecrets(value: unknown, depth = 0): unknown {
+  if (depth > 10) return "[TRUNCATED]";
+  if (Array.isArray(value)) return value.slice(0, 500).map((item) => redactSecrets(item, depth + 1));
+  if (!value || typeof value !== "object") {
+    if (typeof value === "string") return value.slice(0, 32_000);
+    return value;
+  }
+  const source = value as Record<string, unknown>;
+  const output: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(source).slice(0, 500)) {
+    output[key.slice(0, 160)] = SECRET_KEY_RE.test(key) ? "[REDACTED]" : redactSecrets(item, depth + 1);
+  }
+  return output;
+}
+
+function safeIso(value: unknown, fallback: string | null): string | null {
+  const text = String(value || "").trim();
+  if (!text) return fallback;
+  const timestamp = Date.parse(text);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : fallback;
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: headers() });
   if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
@@ -63,7 +90,7 @@ Deno.serve(async (req: Request) => {
   const eventType = String(body.event_type || "").trim();
   const outcome = String(body.outcome || "").trim();
 
-  if (!["session_start", "heartbeat", "event", "session_end", "diagnostic"].includes(action)) {
+  if (!["session_start", "heartbeat", "event", "session_end", "diagnostic", "task_audit"].includes(action)) {
     return json({ error: "invalid_action" }, 400);
   }
   if (!UUID_RE.test(userId)) return json({ error: "invalid_identity" }, 400);
@@ -175,6 +202,69 @@ Deno.serve(async (req: Request) => {
       created_at: nowIso,
     });
     if (error) return json({ error: "event_write_failed" }, 503);
+  }
+
+  if (action === "task_audit") {
+    const rawAudit = body.audit;
+    if (!rawAudit || typeof rawAudit !== "object" || Array.isArray(rawAudit)) {
+      return json({ error: "invalid_task_audit" }, 400);
+    }
+    const audit = redactSecrets(rawAudit) as Record<string, unknown>;
+    const encoded = JSON.stringify(audit);
+    if (new TextEncoder().encode(encoded).byteLength > MAX_AUDIT_BYTES) {
+      return json({ error: "task_audit_too_large" }, 413);
+    }
+
+    const auditId = String(audit.id || "").trim().toLowerCase();
+    const taskKind = String(audit.task_kind || "").trim().toLowerCase();
+    const phase = String(audit.phase || "").trim().slice(0, 80);
+    const status = String(audit.status || "running").trim().toLowerCase();
+    const productUrl = String(audit.product_url || "").trim().slice(0, 4096);
+    const errorText = String(audit.error_text || "").trim().slice(0, 12_000);
+    const inputData = audit.input_data && typeof audit.input_data === "object" && !Array.isArray(audit.input_data)
+      ? audit.input_data
+      : {};
+    const resultData = audit.result_data && typeof audit.result_data === "object" && !Array.isArray(audit.result_data)
+      ? audit.result_data
+      : {};
+    if (!UUID_RE.test(auditId) || !AUDIT_KINDS.has(taskKind) || !AUDIT_STATUSES.has(status)) {
+      return json({ error: "invalid_task_audit_contract" }, 400);
+    }
+
+    const { data: existingAudit, error: auditCheckError } = await admin
+      .from(AUDIT_TABLE)
+      .select("id, user_id, device_id, created_at")
+      .eq("id", auditId)
+      .maybeSingle();
+    if (auditCheckError) return json({ error: "task_audit_check_failed" }, 503);
+    if (existingAudit && (existingAudit.user_id !== userId || existingAudit.device_id !== deviceId)) {
+      return json({ error: "task_audit_owner_mismatch" }, 403);
+    }
+
+    const record = {
+      user_id: userId,
+      session_id: sessionId,
+      device_id: deviceId,
+      app_version: appVersion,
+      task_kind: taskKind,
+      phase,
+      status,
+      product_url: productUrl,
+      input_data: inputData,
+      result_data: resultData,
+      error_text: errorText,
+      started_at: safeIso(audit.started_at, existingAudit ? null : nowIso) || nowIso,
+      completed_at: safeIso(audit.completed_at, null),
+      updated_at: nowIso,
+    };
+
+    if (existingAudit) {
+      const { error } = await admin.from(AUDIT_TABLE).update(record).eq("id", auditId).eq("user_id", userId);
+      if (error) return json({ error: "task_audit_update_failed" }, 503);
+    } else {
+      const { error } = await admin.from(AUDIT_TABLE).insert({ id: auditId, ...record, created_at: nowIso });
+      if (error) return json({ error: "task_audit_create_failed" }, 503);
+    }
   }
 
   return json({ accepted: true, action, server_time: nowIso });
