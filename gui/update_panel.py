@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -148,13 +148,43 @@ class _UpdatePanelBase(QDialog):
         header.addLayout(heading, 1)
         self.card_layout.addLayout(header)
 
+    def _center_over_parent(self) -> None:
+        parent = self.parentWidget()
+        if parent is not None and parent.isVisible():
+            center = parent.mapToGlobal(parent.rect().center())
+        else:
+            screen = self.screen() or QGuiApplication.primaryScreen()
+            if screen is None:
+                return
+            center = screen.availableGeometry().center()
+
+        frame = self.frameGeometry()
+        width = frame.width()
+        height = frame.height()
+        x = center.x() - width // 2
+        y = center.y() - height // 2
+
+        screen = QGuiApplication.screenAt(center) or self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            min_x = available.left()
+            min_y = available.top()
+            max_x = max(min_x, available.right() - width + 1)
+            max_y = max(min_y, available.bottom() - height + 1)
+            x = min(max(x, min_x), max_x)
+            y = min(max(y, min_y), max_y)
+
+        self.move(x, y)
+
     def showEvent(self, event) -> None:  # noqa: N802, ANN001
         super().showEvent(event)
-        parent = self.parentWidget()
-        if parent is not None:
-            frame = self.frameGeometry()
-            frame.moveCenter(parent.frameGeometry().center())
-            self.move(frame.topLeft())
+        # The main QWidget is embedded under a native QQuickWindow, so its
+        # frameGeometry is not a reliable global desktop coordinate. mapToGlobal
+        # resolves the visible parent center correctly across native embedding,
+        # DPI scaling and multiple monitors. Re-center once more after Qt has
+        # finalized the frameless dialog geometry for this show cycle.
+        self._center_over_parent()
+        QTimer.singleShot(0, self._center_over_parent)
         self.raise_()
         self.activateWindow()
 
