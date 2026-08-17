@@ -226,21 +226,94 @@ jobs:
         env:
           VPK_TOKEN: ${{ github.token }}
         run: |
-          dotnet tool run vpk -- upload github `
-            --outputDir "artifacts\velopack" `
-            --channel $env:VELOPACK_CHANNEL `
-            --repoUrl "https://github.com/$env:GITHUB_REPOSITORY" `
-            --publish false `
-            --releaseName "$env:UPDATE_TITLE" `
-            --tag "v$env:UPDATE_VERSION" `
-            --targetCommitish "${{ steps.source.outputs.sha }}"
-          if ($LASTEXITCODE -ne 0) { throw "Velopack GitHub draft upload failed: $LASTEXITCODE" }
+          $tag = "v$env:UPDATE_VERSION"
+          $maxAttempts = 4
+          $vpkUploaded = $false
 
-          gh release upload "v$env:UPDATE_VERSION" `
-            "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe" `
-            "artifacts\EcommerceAgent-$env:UPDATE_VERSION-portable.zip" `
-            --clobber
-          if ($LASTEXITCODE -ne 0) { throw "Friendly release asset upload failed: $LASTEXITCODE" }
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "Velopack GitHub draft upload attempt $attempt/$maxAttempts"
+            & dotnet tool run vpk -- upload github `
+              --outputDir "artifacts\velopack" `
+              --channel $env:VELOPACK_CHANNEL `
+              --repoUrl "https://github.com/$env:GITHUB_REPOSITORY" `
+              --publish false `
+              --releaseName "$env:UPDATE_TITLE" `
+              --tag $tag `
+              --targetCommitish "${{ steps.source.outputs.sha }}"
+            $vpkExit = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            if ($vpkExit -eq 0) {
+              $vpkUploaded = $true
+              break
+            }
+
+            Write-Warning "Velopack GitHub upload attempt $attempt failed with exit code $vpkExit"
+            $draftRaw = & gh release view $tag --json isDraft,tagName,assets 2>$null
+            $draftViewExit = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            if ($draftViewExit -eq 0) {
+              $draft = $draftRaw | ConvertFrom-Json
+              if (-not $draft.isDraft) {
+                throw "Release $tag became public after a failed upload attempt; refusing automatic retry"
+              }
+              $names = @($draft.assets | ForEach-Object { $_.name })
+              $requiredVelopack = @(
+                $env:target_full,
+                "releases.$env:VELOPACK_CHANNEL.json",
+                $env:native_setup,
+                $env:native_portable
+              )
+              $missingVelopack = @($requiredVelopack | Where-Object {
+                [string]::IsNullOrWhiteSpace($_) -or $_ -notin $names
+              })
+              if ($missingVelopack.Count -eq 0) {
+                Write-Host "Draft $tag already contains the complete Velopack asset set; continuing"
+                $vpkUploaded = $true
+                break
+              }
+              if ($attempt -lt $maxAttempts) {
+                Write-Warning "Removing incomplete draft $tag before retry; missing: $($missingVelopack -join ', ')"
+                & gh release delete $tag --yes --cleanup-tag
+                if ($LASTEXITCODE -ne 0) {
+                  throw "Failed to clean incomplete draft $tag before retry"
+                }
+                $global:LASTEXITCODE = 0
+              }
+            }
+
+            if ($attempt -lt $maxAttempts) {
+              $delaySeconds = 5 * [math]::Pow(2, $attempt - 1)
+              Write-Host "Retrying GitHub release staging in $delaySeconds second(s)"
+              Start-Sleep -Seconds $delaySeconds
+            }
+          }
+
+          if (-not $vpkUploaded) {
+            throw "Velopack GitHub draft upload failed after $maxAttempts attempts"
+          }
+
+          $friendlyUploaded = $false
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "Friendly release asset upload attempt $attempt/$maxAttempts"
+            & gh release upload $tag `
+              "artifacts\EcommerceAgent-Setup-$env:UPDATE_VERSION.exe" `
+              "artifacts\EcommerceAgent-$env:UPDATE_VERSION-portable.zip" `
+              --clobber
+            $friendlyExit = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            if ($friendlyExit -eq 0) {
+              $friendlyUploaded = $true
+              break
+            }
+            if ($attempt -lt $maxAttempts) {
+              $delaySeconds = 5 * [math]::Pow(2, $attempt - 1)
+              Write-Warning "Friendly asset upload failed with exit code $friendlyExit; retrying in $delaySeconds second(s)"
+              Start-Sleep -Seconds $delaySeconds
+            }
+          }
+          if (-not $friendlyUploaded) {
+            throw "Friendly release asset upload failed after $maxAttempts attempts"
+          }
 
       - name: Verify complete draft before publication
         shell: pwsh
