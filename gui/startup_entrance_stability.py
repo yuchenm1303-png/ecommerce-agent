@@ -6,6 +6,8 @@ from typing import Any
 from PySide6.QtCore import QObject, QPoint, QTimer
 from PySide6.QtWidgets import QFrame, QMainWindow, QWidget
 
+from .workspace_layout_commit import install_workspace_layout_commit
+
 
 _LAYOUT_POLL_MS = 16
 _LAYOUT_STABLE_SAMPLES = 3
@@ -29,6 +31,10 @@ class StartupEntranceStabilityGate(QObject):
         self.visual = getattr(entrance, "visual", None)
         self.background = getattr(entrance, "background", None)
         self.overlay = getattr(entrance, "overlay", None)
+        # Layout settlement belongs to startup only. The coordinator deliberately
+        # has no currentChanged connection, so later Single/Batch switches keep
+        # their persistent page geometry and never trigger a forced reflow.
+        self._workspace_layout_commit = install_workspace_layout_commit(window)
 
         self._probe_started_s = 0.0
         self._last_signature: tuple[Any, ...] | None = None
@@ -49,10 +55,9 @@ class StartupEntranceStabilityGate(QObject):
             self.overlay.finished.connect(self._stage_finish)
 
     def _commit_workspace_layout(self) -> None:
-        """Commit the current mode's QWidget tree before geometry is sampled."""
+        """Commit the initially visible QWidget tree while startup stays covered."""
 
-        coordinator = getattr(self.window, "_workspace_layout_commit", None)
-        commit = getattr(coordinator, "commit_current", None)
+        commit = getattr(self._workspace_layout_commit, "commit_current", None)
         if callable(commit):
             try:
                 commit()
@@ -68,8 +73,8 @@ class StartupEntranceStabilityGate(QObject):
         if callable(raise_overlay):
             raise_overlay()
         # install_mode_workspace reparents the fully built Single widgets before
-        # the top-level shell is shown. Commit that new hierarchy immediately;
-        # otherwise three identical samples can describe a stable-but-stale tree.
+        # the top-level shell is shown. Commit that hierarchy only while the
+        # startup overlay owns the pixels; normal mode switching never does this.
         self._commit_workspace_layout()
         QTimer.singleShot(0, self._probe_layout)
 
@@ -139,8 +144,6 @@ class StartupEntranceStabilityGate(QObject):
         if bool(getattr(self.entrance, "_started", False)):
             return
 
-        # Stability means "same geometry after an explicit layout commit", not
-        # merely "the deferred Qt layout has not run yet".
         self._commit_workspace_layout()
         signature = self._geometry_signature()
         if signature == self._last_signature:
@@ -190,9 +193,6 @@ class StartupEntranceStabilityGate(QObject):
                 pass
 
     def _prime_static_runtime(self) -> None:
-        # The QWidget geometry is authoritative. Native glass is flushed only
-        # after that geometry has reached its fixed point, never the other way
-        # around.
         self._commit_workspace_layout()
         glass = getattr(self.visual, "_glass", None)
         if isinstance(glass, dict):
@@ -234,8 +234,6 @@ class StartupEntranceStabilityGate(QObject):
         )
 
     def _commit_overlay_handoff(self) -> None:
-        # Last covered commit: the live QWidget tree and the native glass model
-        # must describe the same geometry before the overlay relinquishes pixels.
         self._commit_workspace_layout()
         self._flush_native_background()
 
@@ -254,8 +252,6 @@ class StartupEntranceStabilityGate(QObject):
             except RuntimeError:
                 pass
 
-        # Preserve the established staged handoff: decorative overlay first,
-        # card interactivity second, shared runtime presentation last.
         QTimer.singleShot(_HANDOFF_FRAME_MS, self._resume_effects)
         QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_card_fx)
         QTimer.singleShot(_HANDOFF_FRAME_MS * 3, self._resume_presentation)
