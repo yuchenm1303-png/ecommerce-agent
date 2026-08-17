@@ -10,13 +10,12 @@ _MAX_LAYOUT_PASSES = 3
 
 
 def _activate_layout_tree(widget: QWidget) -> bool:
-    """Synchronously commit one QWidget subtree without pumping application events.
+    """Synchronously settle one QWidget subtree during startup only.
 
-    Qt normally coalesces LayoutRequest delivery. That is fine for ordinary
-    interactive resizing, but presentation snapshots must never sample the tree
-    between a QStackedWidget page switch and the deferred layout pass. Activate
-    the already-owned layouts directly instead of calling processEvents(), which
-    could re-enter business slots while a transition is in progress.
+    The operation deliberately does not pump application events. It is used while
+    the startup overlay owns the screen, never as part of Single/Batch mode
+    switching. Once both workspaces are live, their geometry is left persistent
+    and QStackedWidget only changes which page is visible.
     """
 
     changed = False
@@ -44,12 +43,13 @@ def _activate_layout_tree(widget: QWidget) -> bool:
 
 
 class WorkspaceLayoutCommitter(QObject):
-    """Single authority for final QWidget geometry before snapshots/handoffs.
+    """Startup-only geometry primer for the initially visible workspace.
 
-    Single/Batch pages are deliberately persistent siblings in ``modeStack``.
-    Hidden pages may therefore carry deferred LayoutRequest work. The visual
-    transition and startup entrance are allowed to cache pixels only after this
-    object has synchronously committed the newly current page.
+    Single and Batch are persistent sibling pages. A mode change must never
+    invalidate or reactivate their layout trees because doing so exposes a
+    transient reflow to the native glass layer. This helper therefore has no
+    ``currentChanged`` connection; the startup entrance calls it explicitly while
+    its opaque overlay still covers the live QWidget tree.
     """
 
     def __init__(self, window: QMainWindow) -> None:
@@ -59,8 +59,6 @@ class WorkspaceLayoutCommitter(QObject):
         if not isinstance(self.stack, QStackedWidget):
             raise RuntimeError("workspace layout commit requires installed modeStack")
         self._committing = False
-        self.stack.currentChanged.connect(self.commit_current)
-        self.commit_current()
 
     def _commit_batch_responsive(self) -> None:
         workspace = getattr(self.window, "batch_workspace", None)
@@ -78,37 +76,22 @@ class WorkspaceLayoutCommitter(QObject):
 
         self._committing = True
         try:
-            # The stack's private QStackedLayout owns current-page geometry.
-            # Activate it first so the page receives the final viewport rect.
             stack_layout = self.stack.layout()
             if isinstance(stack_layout, QLayout):
                 stack_layout.invalidate()
                 stack_layout.activate()
 
             if int(self.stack.currentIndex()) == 0:
-                # Optional Single rows are installed after the original fixed
-                # layout setup. Reflow them against the current, final page size.
                 refresh_single_source_layout(self.window)
             else:
-                # Batch URL/job cards have a viewport-owned width contract. Run
-                # that calculation synchronously instead of waiting for its
-                # coalesced zero-delay refresh while a snapshot is being taken.
                 self._commit_batch_responsive()
 
-            # A parent activation can change a splitter/scroll viewport which in
-            # turn changes a descendant sizeHint. A small bounded fixed-point
-            # loop gives nested layouts their final geometry in this same GUI
-            # turn, with no arbitrary sleep and no processEvents re-entry.
             for _pass in range(_MAX_LAYOUT_PASSES):
                 changed = _activate_layout_tree(page)
                 if int(self.stack.currentIndex()) == 1:
                     self._commit_batch_responsive()
                 if not changed:
                     break
-
-            # Intentionally do not call updateGeometry() here. That API notifies
-            # the parent layout and can queue fresh LayoutRequest work after this
-            # barrier, recreating the exact one-frame reflow this class prevents.
         finally:
             self._committing = False
 
