@@ -10,15 +10,14 @@ from PySide6.QtCore import (
     QPoint,
     QPointF,
     QRect,
-    QRectF,
     Qt,
     QTimer,
     Slot,
 )
-from PySide6.QtGui import QColor, QPainter, QPixmap, QRegion
+from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QMainWindow, QStackedWidget, QWidget
 
-from .native_background import _OVERSCAN
+from .workspace_transition_snapshot import WorkspaceTransitionSnapshotRenderer
 
 
 # Large top-level workspaces get more time than the tiny 300 ms switch control.
@@ -41,9 +40,9 @@ _VEIL_END_MS = 220
 _VEIL_MAX_OPACITY = 0.06
 _VEIL_COLOR = QColor(228, 241, 250)
 
-# Quick uses the threaded render loop in the formal runner. The new card geometry
-# must reach at least one presented Quick frame before the incoming composite is
-# sampled; otherwise the QWidget page can be combined with the previous glass mask.
+# Quick still owns the live runtime glass.  Incoming transition pixels no longer
+# come from Quick; this sync is retained solely so the live Quick scene has
+# presented the new mode before the cached transition hands ownership back.
 _QUICK_SYNC_TIMEOUT_MS = 64
 
 
@@ -225,6 +224,7 @@ class WorkspaceTransitionController(QObject):
         if self.root is None or not isinstance(self.stack, QStackedWidget) or not callable(self._set_mode):
             raise RuntimeError("workspace transition requires installed mode workspace")
 
+        self._snapshot_renderer = WorkspaceTransitionSnapshotRenderer(window, visual, self.stack)
         self._surface = _WorkspaceTransitionSurface(self.root)
         self._sync_surface_geometry()
         self._surface.hide()
@@ -235,7 +235,6 @@ class WorkspaceTransitionController(QObject):
         self._outgoing = QPixmap()
         self._incoming = QPixmap()
         self._neutral = QPixmap()
-        self._wallpaper = self._load_wallpaper()
         self._started_s = 0.0
         self._incoming_enter_start_ms = float(_ENTER_START_MS)
         self._pointer_timer_was_active = False
@@ -275,15 +274,6 @@ class WorkspaceTransitionController(QObject):
         self.root.installEventFilter(self)
         window.destroyed.connect(self.cleanup)
 
-    def _load_wallpaper(self) -> QPixmap:
-        path = getattr(self.background, "_sharp_path", None)
-        if path is None:
-            return QPixmap()
-        try:
-            return QPixmap(str(path))
-        except RuntimeError:
-            return QPixmap()
-
     def _frame_interval_ms(self) -> int:
         refresh_hz = 60.0
         screen = self.window.screen()
@@ -315,126 +305,11 @@ class WorkspaceTransitionController(QObject):
             except RuntimeError:
                 pass
 
-    def _render_current_page(self) -> QPixmap:
-        page = self.stack.currentWidget()
-        if (
-            page is None
-            or self.stack.width() <= 0
-            or self.stack.height() <= 0
-            or page.width() <= 0
-            or page.height() <= 0
-        ):
-            return QPixmap()
-
-        frame = _empty_frame(self.stack)
-        target_offset = page.mapTo(self.stack, QPoint(0, 0))
-        page.render(
-            frame,
-            target_offset,
-            QRegion(),
-            QWidget.RenderFlag.DrawChildren,
-        )
-        return frame
-
-    def _capture_quick_for_stack(self) -> QPixmap:
-        quick = getattr(self.background, "quick_window", None)
-        if quick is None:
-            return QPixmap()
-        try:
-            image = quick.grabWindow()
-        except RuntimeError:
-            return QPixmap()
-        if image.isNull():
-            return QPixmap()
-
-        full = _fit_frame(QPixmap.fromImage(image), self.root)
-        if full.isNull():
-            return QPixmap()
-
-        top_left = self.stack.mapTo(self.root, QPoint(0, 0))
-        dpr = max(1.0, float(full.devicePixelRatio()))
-        pixel_rect = QRect(
-            int(round(top_left.x() * dpr)),
-            int(round(top_left.y() * dpr)),
-            max(1, int(round(self.stack.width() * dpr))),
-            max(1, int(round(self.stack.height() * dpr))),
-        )
-        cropped = full.copy(pixel_rect)
-        cropped.setDevicePixelRatio(dpr)
-        return _fit_frame(cropped, self.stack)
-
     def _capture_neutral_background(self) -> QPixmap:
-        quick = getattr(self.background, "quick_window", None)
-        wallpaper = self._wallpaper
-        if (
-            quick is None
-            or wallpaper.isNull()
-            or quick.width() <= 0
-            or quick.height() <= 0
-            or self.root.width() <= 0
-            or self.root.height() <= 0
-        ):
-            return self._capture_quick_for_stack()
-
-        root_frame = _empty_frame(self.root)
-        root_frame.fill(QColor(23, 38, 58))
-        painter = QPainter(root_frame)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-
-        root_w = float(quick.width())
-        root_h = float(quick.height())
-        item_w = root_w * float(_OVERSCAN)
-        item_h = root_h * float(_OVERSCAN)
-        try:
-            item_x = float(quick.property("imageX"))
-            item_y = float(quick.property("imageY"))
-        except (TypeError, ValueError, RuntimeError):
-            item_x = (root_w - item_w) * 0.5
-            item_y = (root_h - item_h) * 0.5
-
-        source_w = max(1.0, float(wallpaper.width()))
-        source_h = max(1.0, float(wallpaper.height()))
-        scale = max(item_w / source_w, item_h / source_h)
-        visible_source_w = item_w / max(scale, 1e-9)
-        visible_source_h = item_h / max(scale, 1e-9)
-        source_rect = QRectF(
-            (source_w - visible_source_w) * 0.5,
-            (source_h - visible_source_h) * 0.5,
-            visible_source_w,
-            visible_source_h,
-        )
-        target_rect = QRectF(item_x, item_y, item_w, item_h)
-        painter.drawPixmap(target_rect, wallpaper, source_rect)
-        painter.end()
-
-        top_left = self.stack.mapTo(self.root, QPoint(0, 0))
-        dpr = max(1.0, float(root_frame.devicePixelRatio()))
-        pixel_rect = QRect(
-            int(round(top_left.x() * dpr)),
-            int(round(top_left.y() * dpr)),
-            max(1, int(round(self.stack.width() * dpr))),
-            max(1, int(round(self.stack.height() * dpr))),
-        )
-        cropped = root_frame.copy(pixel_rect)
-        cropped.setDevicePixelRatio(dpr)
-        return _fit_frame(cropped, self.stack)
+        return self._snapshot_renderer.capture_neutral()
 
     def _capture_composite(self) -> QPixmap:
-        quick_frame = self._capture_quick_for_stack()
-        widget_frame = self._render_current_page()
-        if quick_frame.isNull():
-            return _fit_frame(widget_frame, self.stack)
-        if widget_frame.isNull():
-            return _fit_frame(quick_frame, self.stack)
-
-        result = _empty_frame(self.stack)
-        painter = QPainter(result)
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-        painter.drawPixmap(0, 0, _fit_frame(quick_frame, self.stack))
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-        painter.drawPixmap(0, 0, _fit_frame(widget_frame, self.stack))
-        painter.end()
-        return result
+        return self._snapshot_renderer.capture_composite()
 
     def _suspend_presentation(self) -> None:
         card_fx = getattr(self.window, "_nekro_card_fx", None)
@@ -601,8 +476,6 @@ class WorkspaceTransitionController(QObject):
             self._set_mode(index)
             return
         if neutral.isNull():
-            neutral = self._capture_quick_for_stack()
-        if neutral.isNull():
             neutral = QPixmap(outgoing)
 
         self._target_index = index
@@ -626,6 +499,8 @@ class WorkspaceTransitionController(QObject):
             except RuntimeError:
                 phase_old = ""
 
+        # Single/Batch are persistent pages.  Switching changes visibility/state
+        # only; no QLayout activation is performed by the animation controller.
         self._set_mode(index)
         self._raise_transition_surface()
 
@@ -637,9 +512,9 @@ class WorkspaceTransitionController(QObject):
                 phase_new = phase_old
         self._begin_phase_badge_transition(phase_old, phase_new)
 
-        # Single and Batch are persistent pages. Their geometry is established at
-        # startup and must not be reactivated during a mode transition. A forced
-        # QLayout.activate() here was the source of the visible one-frame reflow.
+        # Publish the new live Quick geometry in parallel.  The cached transition
+        # itself uses the synchronous snapshot renderer above, so this update can
+        # never contaminate its pixels with an old card mask.
         schedule_mask = getattr(self.background, "schedule_mask_update", None)
         if callable(schedule_mask):
             schedule_mask()
@@ -708,6 +583,9 @@ class WorkspaceTransitionController(QObject):
             self._finish_immediate()
             return
 
+        # Atomic cached frame: wallpaper, glass and QWidget children all use the
+        # same current QWidget geometry.  Quick is synchronized only for the final
+        # live handoff; its pixels are never composited into this snapshot.
         incoming = self._capture_composite()
         if incoming.isNull():
             self._finish_immediate()
@@ -747,6 +625,7 @@ class WorkspaceTransitionController(QObject):
             fall = _segment_progress(elapsed_ms, _VEIL_PEAK_MS, _VEIL_END_MS)
             veil_alpha = _VEIL_MAX_OPACITY * (1.0 - _smoothstep(fall))
 
+        # Hard contract: two readable workspace snapshots never coexist.
         if outgoing_alpha > 1e-4:
             incoming_alpha = 0.0
         return outgoing_alpha, incoming_alpha, veil_alpha
