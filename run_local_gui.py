@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from app.app_branding import apply_qt_application_icon
+from app.crash_diagnostics import mark_clean_exit, mark_startup_stage, start_crash_diagnostics
 from app.runtime_paths import runtime_root
 from app.runtime_paths import is_frozen, is_installed_distribution
 
@@ -58,10 +59,17 @@ def _complete_update_e2e_probe() -> bool:
 
 def main() -> int:
     try:
+        pending_crash = start_crash_diagnostics()
+    except Exception:
+        pending_crash = None
+    mark_startup_stage("qt_import")
+
+    try:
         from PySide6.QtCore import QTimer, Qt
         from PySide6.QtQuick import QQuickWindow
         from PySide6.QtWidgets import QApplication, QAbstractScrollArea, QLabel, QSizePolicy
     except ImportError:
+        mark_clean_exit("missing_qt_dependency")
         print(
             "缺少开发 GUI 依赖 PySide6。\n"
             "请在 ecommerce-agent 当前 Python/venv 中执行：\n"
@@ -70,6 +78,7 @@ def main() -> int:
         )
         return 2
 
+    mark_startup_stage("gui_module_imports")
     from gui.activity_presence import install_activity_presence
     from gui.app_access import ensure_application_access, install_application_access
     from gui.resilient_app_updater import install_application_updater
@@ -83,6 +92,7 @@ def main() -> int:
     from gui.browser_session_manager import install_managed_makro_browser
     from gui.card_details_fast import install_card_details
     from gui.console_summary_mode import install_console_summary_mode
+    from gui.crash_diagnostics_ui import offer_pending_crash_report
     from gui.field_table_transfer import install_field_table_transfer
     from gui.frozen_process_router import install_frozen_process_router
     from gui.listing_offer_hardening import install_listing_offer_hardening
@@ -120,25 +130,33 @@ def main() -> int:
 
     MainWindow = ProductInputWorkflowMainWindow
 
+    mark_startup_stage("qt_application")
     app = QApplication(sys.argv)
     app.setApplicationName("ecommerce-agent Listing Studio")
     app.setOrganizationName("ecommerce-agent")
     apply_qt_application_icon(app)
+    app.aboutToQuit.connect(lambda: mark_clean_exit("qt_about_to_quit"))
 
     if _complete_update_e2e_probe():
+        mark_clean_exit("update_e2e_probe")
         return 0
 
+    mark_startup_stage("access_check")
     access_session = ensure_application_access(app)
     if access_session is None:
+        mark_clean_exit("access_cancelled")
         return 0
 
+    mark_startup_stage("renderer_setup")
     QQuickWindow.setDefaultAlphaBuffer(True)
     install_preblur_cache()
 
+    mark_startup_stage("main_window_create")
     window = MainWindow(runtime_root())
     access_controller = install_application_access(window, access_session)
     visual = install_native_visual_style(window)
 
+    mark_startup_stage("main_ui_install")
     install_ui_polish(window)
 
     side_tabs = getattr(window, "side_detail_tabs", None)
@@ -201,6 +219,7 @@ def main() -> int:
     window._smooth_wheel_filter = smooth_wheel  # type: ignore[attr-defined]
     window.destroyed.connect(smooth_wheel.cleanup)
 
+    mark_startup_stage("native_shell_create")
     quick_window = visual.background.quick_window
     if quick_window is None:
         raise RuntimeError("Native Quick renderer was not created")
@@ -237,6 +256,7 @@ def main() -> int:
     entrance = install_startup_entrance(window, visual)
     entrance_stability = install_startup_entrance_stability(window, entrance)
 
+    mark_startup_stage("window_show")
     shell.show()
     effects.raise_()
     assistant = install_runtime_assistant(window)
@@ -245,6 +265,17 @@ def main() -> int:
     assistant.raise_()
     entrance.raise_overlay()
     entrance_stability.start()
+    mark_startup_stage("running")
+
+    if pending_crash is not None and access_session.enforced:
+        QTimer.singleShot(
+            1400,
+            lambda: offer_pending_crash_report(
+                window,
+                access=access_controller,
+                report=pending_crash,
+            ),
+        )
 
     # Source builds retain the updater controls for development. Frozen portable
     # archives deliberately do not self-update because Inno installs to a
