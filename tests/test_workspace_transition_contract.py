@@ -71,25 +71,47 @@ def test_incoming_handoff_still_waits_for_a_presented_live_quick_frame() -> None
     assert "def _capture_incoming_after_quick_sync" in TRANSITION
 
 
-def test_transition_snapshot_uses_authoritative_widget_geometry_not_quick_pixels() -> None:
+def test_transition_snapshot_samples_the_real_renderers_not_a_second_card_ui() -> None:
     assert "WorkspaceTransitionSnapshotRenderer" in TRANSITION
     assert "return self._snapshot_renderer.capture_neutral()" in TRANSITION
     assert "return self._snapshot_renderer.capture_composite()" in TRANSITION
-    assert "quick.grabWindow()" not in TRANSITION
-    assert "quick.grabWindow()" not in SNAPSHOT
 
-    # Glass and QWidget pixels are generated from the same current geometry.
-    assert "def _card_geometry" in SNAPSHOT
-    assert "frame.isVisibleTo(self.window)" in SNAPSHOT
-    assert "frame.mapToGlobal(QPoint(0, 0))" in SNAPSHOT
-    assert "ancestor.mapToGlobal(QPoint(0, 0))" in SNAPSHOT
-    assert "def _paint_glass" in SNAPSHOT
-    assert "self._paint_glass(painter, self._capture_blur())" in SNAPSHOT
-    assert "painter.drawPixmap(0, 0, widget_frame)" in SNAPSHOT
+    # Quick is the one production owner of wallpaper + glass; QWidget remains the
+    # one production owner of labels/controls. Transition samples both directly.
+    assert "quick.grabWindow()" in SNAPSHOT
+    assert "QPixmap.fromImage(image)" in SNAPSHOT
+    assert "page.render(" in SNAPSHOT
+    assert "def _capture_composite_live" in SNAPSHOT
+    assert "painter.drawPixmap(0, 0, self._fit_frame(quick_frame, self.stack))" in SNAPSHOT
+    assert "painter.drawPixmap(0, 0, self._fit_frame(widget_frame, self.stack))" in SNAPSHOT
+
+    # Never recreate glass cards in a parallel transition-only renderer again.
+    assert "def _paint_glass" not in SNAPSHOT
+    assert "def _card_geometry" not in SNAPSHOT
+    assert "_capture_blur" not in SNAPSHOT
+    assert "visual._glass" not in SNAPSHOT
+    assert "QPainterPath" not in SNAPSHOT
 
 
-def test_handoff_uses_clean_fuji_background_and_subtle_static_veil() -> None:
-    assert "from .native_background import _GLASS_RADIUS, _NORMAL_GLASS_ALPHA, _OVERSCAN" in SNAPSHOT
+def test_outgoing_frame_is_frozen_before_any_transition_preparation() -> None:
+    request = TOGGLE.split("def request_mode", 1)[1].split("toggle.clicked.connect", 1)[0]
+    assert 'snapshot_renderer = getattr(transition, "_snapshot_renderer", None)' in request
+    assert 'prime_live = getattr(snapshot_renderer, "prime_live_frame", None)' in request
+    assert "prime_live()" in request
+    assert 'prepare_page = getattr(layout_keeper, "prepare_page", None)' in request
+    assert "prepare_page(target)" in request
+    assert "request(target)" in request
+    assert request.index("prime_live()") < request.index("prepare_page(target)")
+    assert request.index("prime_live()") < request.index("request(target)")
+
+    assert "def prime_live_frame" in SNAPSHOT
+    assert "self._primed_composite = composite" in SNAPSHOT
+    assert "if not self._primed_composite.isNull():" in SNAPSHOT
+    assert "result = QPixmap(self._primed_composite)" in SNAPSHOT
+
+
+def test_handoff_keeps_clean_fuji_background_and_subtle_static_veil() -> None:
+    assert "from .native_background import _OVERSCAN" in SNAPSHOT
     assert "def capture_neutral" in SNAPSHOT
     assert 'quick.property("imageX")' in SNAPSHOT
     assert 'quick.property("imageY")' in SNAPSHOT
@@ -110,7 +132,7 @@ def test_workspace_transition_animates_cached_frames_not_live_widget_trees() -> 
     assert ".resize(" not in TRANSITION
 
 
-def test_animated_mode_switch_never_forces_page_relayout() -> None:
+def test_animated_mode_switch_never_forces_visible_page_relayout() -> None:
     request = TRANSITION.split("def request_mode", 1)[1].split("def _elapsed_ms", 1)[0]
     assert "self._set_mode(index)" in request
     assert "page_layout.activate()" not in request
@@ -165,3 +187,4 @@ def test_formal_runner_installs_transition_after_interaction_controllers_exist()
 def test_workspace_transition_sources_compile_without_importing_pyside() -> None:
     compile(TRANSITION, str(ROOT / "gui" / "workspace_transition.py"), "exec")
     compile(SNAPSHOT, str(ROOT / "gui" / "workspace_transition_snapshot.py"), "exec")
+    compile(TOGGLE, str(ROOT / "gui" / "mode_toggle.py"), "exec")
