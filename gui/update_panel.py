@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont, QGuiApplication
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -178,11 +178,6 @@ class _UpdatePanelBase(QDialog):
 
     def showEvent(self, event) -> None:  # noqa: N802, ANN001
         super().showEvent(event)
-        # The main QWidget is embedded under a native QQuickWindow, so its
-        # frameGeometry is not a reliable global desktop coordinate. mapToGlobal
-        # resolves the visible parent center correctly across native embedding,
-        # DPI scaling and multiple monitors. Re-center once more after Qt has
-        # finalized the frameless dialog geometry for this show cycle.
         self._center_over_parent()
         QTimer.singleShot(0, self._center_over_parent)
         self.raise_()
@@ -262,14 +257,23 @@ class UpdateProgressDialog(_UpdatePanelBase):
         self.percent_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.card_layout.addWidget(self.percent_label)
 
-        hint = QLabel("下载、校验、版本切换和回滚由 Velopack 管理。", self.card)
+        hint = QLabel("下载、校验、后台清理、版本切换和回滚由安全更新链管理。", self.card)
         hint.setObjectName("updateMeta")
         self.card_layout.addWidget(hint)
 
     def set_progress(self, value: int) -> None:
         percent = max(0, min(100, int(value)))
+        if self.progress.minimum() != 0 or self.progress.maximum() != 100:
+            self.progress.setRange(0, 100)
         self.progress.setValue(percent)
         self.percent_label.setText(f"{percent}%")
+
+    def set_processing(self, text: str) -> None:
+        self.stage_label.setText(str(text))
+        self.progress.setRange(0, 0)
+        self.percent_label.setText("处理中…")
+        self.raise_()
+        self.activateWindow()
 
     def set_stage(self, text: str) -> None:
         self.stage_label.setText(str(text))
@@ -277,7 +281,6 @@ class UpdateProgressDialog(_UpdatePanelBase):
         self.activateWindow()
 
     def reject(self) -> None:
-        # The update panel cannot be dismissed while package handoff is active.
         return
 
 
