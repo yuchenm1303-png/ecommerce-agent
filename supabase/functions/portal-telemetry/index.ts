@@ -5,11 +5,13 @@ const ACCESS_TABLE = "download_portal_users";
 const DEVICE_TABLE = "download_portal_devices";
 const SESSION_TABLE = "listing_usage_sessions";
 const EVENT_TABLE = "listing_usage_events";
+const DIAGNOSTIC_TABLE = "listing_diagnostic_reports";
 const DEVICE_RE = /^[0-9a-f]{32,128}$/i;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN_RE = /^[A-Za-z0-9_-]{32,256}$/;
 const EVENTS = new Set(["listing_prepare", "listing_execute", "batch_prepare", "batch_execute"]);
 const OUTCOMES = new Set(["started", "completed", "failed"]);
+const MAX_DIAGNOSTIC_BYTES = 80_000;
 
 function headers(): Record<string, string> {
   return {
@@ -39,6 +41,12 @@ async function sha256Hex(value: string): Promise<string> {
   return Array.from(new Uint8Array(digest)).map((part) => part.toString(16).padStart(2, "0")).join("");
 }
 
+function diagnosticCode(): string {
+  const stamp = Date.now().toString(36).toUpperCase();
+  const random = crypto.randomUUID().replaceAll("-", "").slice(0, 8).toUpperCase();
+  return `LS-${stamp}-${random}`;
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: headers() });
   if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
@@ -55,10 +63,15 @@ Deno.serve(async (req: Request) => {
   const eventType = String(body.event_type || "").trim();
   const outcome = String(body.outcome || "").trim();
 
-  if (!["session_start", "heartbeat", "event", "session_end"].includes(action)) return json({ error: "invalid_action" }, 400);
-  if (!UUID_RE.test(userId) || !UUID_RE.test(sessionId)) return json({ error: "invalid_identity" }, 400);
+  if (!["session_start", "heartbeat", "event", "session_end", "diagnostic"].includes(action)) {
+    return json({ error: "invalid_action" }, 400);
+  }
+  if (!UUID_RE.test(userId)) return json({ error: "invalid_identity" }, 400);
+  if (action !== "diagnostic" && !UUID_RE.test(sessionId)) return json({ error: "invalid_identity" }, 400);
   if (!DEVICE_RE.test(deviceId) || !TOKEN_RE.test(token)) return json({ error: "invalid_device_auth" }, 400);
-  if (action === "event" && (!EVENTS.has(eventType) || !OUTCOMES.has(outcome))) return json({ error: "invalid_event" }, 400);
+  if (action === "event" && (!EVENTS.has(eventType) || !OUTCOMES.has(outcome))) {
+    return json({ error: "invalid_event" }, 400);
+  }
 
   const admin = adminClient();
   const nowIso = new Date().toISOString();
@@ -80,7 +93,45 @@ Deno.serve(async (req: Request) => {
     .maybeSingle();
   if (deviceError) return json({ error: "device_check_failed" }, 503);
   if (!device || !device.enabled || device.revoked_at) return json({ error: "device_not_authorized" }, 403);
-  if (!device.telemetry_token_hash || await sha256Hex(token) !== device.telemetry_token_hash) return json({ error: "invalid_telemetry_token" }, 401);
+  if (!device.telemetry_token_hash || await sha256Hex(token) !== device.telemetry_token_hash) {
+    return json({ error: "invalid_telemetry_token" }, 401);
+  }
+
+  const { error: deviceTouchError } = await admin
+    .from(DEVICE_TABLE)
+    .update({ last_seen_at: nowIso, app_version: appVersion, updated_at: nowIso })
+    .eq("user_id", userId)
+    .eq("device_id", deviceId);
+  if (deviceTouchError) return json({ error: "device_touch_failed" }, 503);
+
+  if (action === "diagnostic") {
+    const diagnostic = body.diagnostic;
+    if (!diagnostic || typeof diagnostic !== "object" || Array.isArray(diagnostic)) {
+      return json({ error: "invalid_diagnostic" }, 400);
+    }
+    const encoded = JSON.stringify(diagnostic);
+    if (new TextEncoder().encode(encoded).byteLength > MAX_DIAGNOSTIC_BYTES) {
+      return json({ error: "diagnostic_too_large" }, 413);
+    }
+    const report = diagnostic as Record<string, unknown>;
+    const crashId = String(report.crash_id || "").trim().slice(0, 160);
+    const startupStage = String(report.last_stage || "").trim().slice(0, 160);
+    if (crashId.length < 8) return json({ error: "invalid_crash_id" }, 400);
+
+    const reportCode = diagnosticCode();
+    const { error } = await admin.from(DIAGNOSTIC_TABLE).insert({
+      report_code: reportCode,
+      user_id: userId,
+      device_id: deviceId,
+      app_version: appVersion,
+      crash_id: crashId,
+      startup_stage: startupStage,
+      report,
+      created_at: nowIso,
+    });
+    if (error) return json({ error: "diagnostic_write_failed" }, 503);
+    return json({ accepted: true, action, report_code: reportCode, server_time: nowIso });
+  }
 
   const { data: existingSession, error: sessionError } = await admin
     .from(SESSION_TABLE)
@@ -111,13 +162,6 @@ Deno.serve(async (req: Request) => {
     const { error } = await admin.from(SESSION_TABLE).update(patch).eq("id", sessionId).eq("user_id", userId);
     if (error) return json({ error: "session_update_failed" }, 503);
   }
-
-  const { error: deviceTouchError } = await admin
-    .from(DEVICE_TABLE)
-    .update({ last_seen_at: nowIso, app_version: appVersion, updated_at: nowIso })
-    .eq("user_id", userId)
-    .eq("device_id", deviceId);
-  if (deviceTouchError) return json({ error: "device_touch_failed" }, 503);
 
   if (action === "event") {
     const { error } = await admin.from(EVENT_TABLE).insert({
