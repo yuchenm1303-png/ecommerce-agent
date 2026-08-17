@@ -2,133 +2,153 @@ from __future__ import annotations
 
 import hashlib
 import os
-import struct
 import sys
-from functools import wraps
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths, qVersion
 from PySide6.QtGui import QImage
 
-from . import native_background as _native
+from .native_background import (
+    NativeQuickBackground,
+    _WALLPAPER_ASSET,
+    _blur_wallpaper,
+    _decode_wallpaper,
+)
 
 
-_CACHE_MAGIC = b"ECBGRAW1"
-_CACHE_HEADER = struct.Struct("<8sIIII")
-_CACHE_VERSION = "preblur-raw-v1"
+_CACHE_VERSION = "materialized-jpeg-v1"
+_JPEG_QUALITY = 92
+_prepared_assets: tuple[Path, Path] | None = None
 
 
-def _preblur_cache_path(source: QImage, radius: float) -> Path | None:
+def _cache_root() -> Path:
+    for location in (
+        QStandardPaths.StandardLocation.CacheLocation,
+        QStandardPaths.StandardLocation.AppLocalDataLocation,
+    ):
+        value = QStandardPaths.writableLocation(location)
+        if value:
+            root = Path(value) / "background"
+            root.mkdir(parents=True, exist_ok=True)
+            return root
+    raise RuntimeError("Qt did not provide a writable wallpaper cache location")
+
+
+def _cache_identity() -> str:
     try:
-        root = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation)
-        if not root:
-            return None
-        asset_digest = hashlib.sha256(_native._WALLPAPER_ASSET.read_bytes()).hexdigest()
-        identity = "|".join(
-            (
-                _CACHE_VERSION,
-                asset_digest,
-                qVersion(),
-                sys.platform,
-                sys.byteorder,
-                f"radius={float(radius):.6f}",
-                f"size={source.width()}x{source.height()}",
-                f"dpr={source.devicePixelRatio():.6f}",
-            )
+        asset_digest = hashlib.sha256(_WALLPAPER_ASSET.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise RuntimeError(f"Wallpaper asset cannot be read: {_WALLPAPER_ASSET}") from exc
+
+    identity = "|".join(
+        (
+            _CACHE_VERSION,
+            asset_digest,
+            qVersion(),
+            sys.platform,
+            sys.byteorder,
+            f"quality={_JPEG_QUALITY}",
         )
-        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-        return Path(root) / "background" / f"fuji-preblur-{digest}.raw"
-    except (OSError, RuntimeError, TypeError, ValueError):
-        return None
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def _load_raw_preblur(path: Path, source: QImage) -> QImage | None:
+def _jpeg_file_is_ready(path: Path) -> bool:
     try:
-        data = path.read_bytes()
-        if len(data) < _CACHE_HEADER.size:
-            return None
-        magic, width, height, bytes_per_line, payload_size = _CACHE_HEADER.unpack_from(data)
-        if magic != _CACHE_MAGIC:
-            return None
-        if width != source.width() or height != source.height():
-            return None
-        if width <= 0 or height <= 0 or bytes_per_line <= 0:
-            return None
-        expected = bytes_per_line * height
-        if payload_size != expected or len(data) != _CACHE_HEADER.size + expected:
-            return None
-        payload = data[_CACHE_HEADER.size :]
-        image = QImage(
-            payload,
-            width,
-            height,
-            bytes_per_line,
-            QImage.Format.Format_ARGB32_Premultiplied,
-        ).copy()
-        if image.isNull() or image.size() != source.size():
-            return None
-        return image
-    except (OSError, RuntimeError, TypeError, ValueError, struct.error):
-        return None
+        if path.stat().st_size <= 4096:
+            return False
+        with path.open("rb") as stream:
+            if stream.read(3) != b"\xff\xd8\xff":
+                return False
+            stream.seek(-2, os.SEEK_END)
+            return stream.read(2) == b"\xff\xd9"
+    except OSError:
+        return False
 
 
-def _store_raw_preblur(path: Path, image: QImage) -> None:
-    temp_path: Path | None = None
+def _atomic_write(path: Path, data: bytes) -> None:
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        if image.isNull() or image.format() != QImage.Format.Format_ARGB32_Premultiplied:
-            return
-        width = int(image.width())
-        height = int(image.height())
-        bytes_per_line = int(image.bytesPerLine())
-        payload_size = bytes_per_line * height
-        if width <= 0 or height <= 0 or payload_size <= 0:
-            return
-        payload = bytes(memoryview(image.constBits())[:payload_size])
-        if len(payload) != payload_size:
-            return
-        header = _CACHE_HEADER.pack(
-            _CACHE_MAGIC,
-            width,
-            height,
-            bytes_per_line,
-            payload_size,
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        temp_path.write_bytes(header + payload)
-        os.replace(temp_path, path)
-        temp_path = None
-    except (OSError, RuntimeError, TypeError, ValueError, BufferError, struct.error):
-        return
+        temp.write_bytes(data)
+        os.replace(temp, path)
     finally:
-        if temp_path is not None:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
-def install_preblur_cache() -> None:
-    """Cache the one startup blur computation; no runtime presentation hooks."""
-
-    original = _native._blur_wallpaper
-    if bool(getattr(original, "_ecommerce_preblur_cached", False)):
-        return
-
-    @wraps(original)
-    def cached_blur(source: QImage, radius: float = 10.0) -> QImage:
-        cache_path = _preblur_cache_path(source, radius)
-        if cache_path is not None:
-            cached = _load_raw_preblur(cache_path, source)
-            if cached is not None:
-                return cached
-        result = original(source, radius)
-        if cache_path is not None and not result.isNull():
-            _store_raw_preblur(cache_path, result)
-        return result
-
-    cached_blur._ecommerce_preblur_cached = True  # type: ignore[attr-defined]
-    _native._blur_wallpaper = cached_blur
+def _atomic_save_jpeg(path: Path, image: QImage) -> None:
+    temp = path.with_name(f".{path.stem}.{os.getpid()}.tmp.jpg")
+    try:
+        if not image.save(str(temp), "JPG", _JPEG_QUALITY):
+            raise RuntimeError("Failed to encode the persistent blurred wallpaper")
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
-__all__ = ["install_preblur_cache"]
+def prepare_wallpaper_assets() -> tuple[Path, Path]:
+    """Materialize the exact Quick wallpaper pair once and reuse it thereafter.
+
+    The sharp file is the bundled JPEG byte-for-byte. The blurred file is produced
+    by the same Qt ``QGraphicsBlurEffect`` path and JPEG quality used by the native
+    background before this cache existed. A content/Qt/platform identity prevents a
+    stale visual asset from surviving a source image or renderer change.
+    """
+
+    global _prepared_assets
+    prepared = _prepared_assets
+    if prepared is not None and all(_jpeg_file_is_ready(path) for path in prepared):
+        return prepared
+
+    identity = _cache_identity()
+    root = _cache_root()
+    sharp_path = root / f"fuji-sharp-{identity}.jpg"
+    blur_path = root / f"fuji-blurred-{identity}.jpg"
+
+    if not _jpeg_file_is_ready(sharp_path):
+        _atomic_write(sharp_path, _decode_wallpaper())
+
+    if not _jpeg_file_is_ready(blur_path):
+        source = QImage(str(sharp_path))
+        if source.isNull():
+            source_data = _decode_wallpaper()
+            _atomic_write(sharp_path, source_data)
+            source = QImage.fromData(source_data)
+        if source.isNull():
+            raise RuntimeError("Qt could not decode the bundled wallpaper image")
+
+        blurred = _blur_wallpaper(source)
+        if blurred.isNull():
+            raise RuntimeError("Failed to create the pre-blurred wallpaper")
+        _atomic_save_jpeg(blur_path, blurred)
+
+    if not _jpeg_file_is_ready(sharp_path) or not _jpeg_file_is_ready(blur_path):
+        raise RuntimeError("Persistent wallpaper assets were not materialized correctly")
+
+    _prepared_assets = (sharp_path, blur_path)
+    return _prepared_assets
+
+
+def install_preblur_cache() -> tuple[Path, Path]:
+    """Warm the persistent wallpaper pair before the native Quick scene is built."""
+
+    return prepare_wallpaper_assets()
+
+
+class PersistentNativeQuickBackground(NativeQuickBackground):
+    """Native Quick background backed by persistent, already-prepared JPEG assets."""
+
+    def _prepare_assets(self) -> None:
+        self._sharp_path, self._blur_path = prepare_wallpaper_assets()
+
+
+__all__ = [
+    "PersistentNativeQuickBackground",
+    "install_preblur_cache",
+    "prepare_wallpaper_assets",
+]

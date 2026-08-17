@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
 )
 
-from .native_background import NativeQuickBackground
+from .wallpaper_cache import PersistentNativeQuickBackground as NativeQuickBackground
 from .nekro_style import NEKRO_STYLE
 
 
