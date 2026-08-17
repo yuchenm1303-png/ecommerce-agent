@@ -24,6 +24,7 @@ ICON_SIZES = (
     (256, 256),
 )
 ICON_VISUAL_SCALE = 1.12
+ICON_MASTER_SIZE = max(width for width, _height in ICON_SIZES)
 
 
 def _enlarge_icon_artwork(source: Image.Image) -> Image.Image:
@@ -38,10 +39,38 @@ def _enlarge_icon_artwork(source: Image.Image) -> Image.Image:
     return scaled.crop((left, top, left + width, top + height))
 
 
+def _icon_master(source: Image.Image) -> Image.Image:
+    """Return a 256px master so Pillow can actually emit every requested ICO frame."""
+
+    artwork = _enlarge_icon_artwork(source)
+    if artwork.width != artwork.height:
+        raise RuntimeError(f"Application icon source must be square, got {artwork.size}")
+    if artwork.width == ICON_MASTER_SIZE:
+        return artwork
+    return artwork.resize(
+        (ICON_MASTER_SIZE, ICON_MASTER_SIZE),
+        Image.Resampling.LANCZOS,
+    )
+
+
+def _validate_icon(output: Path) -> None:
+    with Image.open(output) as generated:
+        generated_sizes = set(generated.info.get("sizes") or ())
+    expected_sizes = set(ICON_SIZES)
+    if generated_sizes != expected_sizes:
+        missing = sorted(expected_sizes - generated_sizes)
+        unexpected = sorted(generated_sizes - expected_sizes)
+        raise RuntimeError(
+            "Generated Windows ICO frame set is invalid: "
+            f"missing={missing}, unexpected={unexpected}, actual={sorted(generated_sizes)}"
+        )
+
+
 def build_icon(output: Path) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(io.BytesIO(application_icon_bytes())) as source:
-        _enlarge_icon_artwork(source).save(output, format="ICO", sizes=ICON_SIZES)
+        _icon_master(source).save(output, format="ICO", sizes=ICON_SIZES)
+    _validate_icon(output)
     return output
 
 
