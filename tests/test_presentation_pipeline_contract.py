@@ -20,7 +20,11 @@ def test_obsolete_runtime_patch_modules_are_gone() -> None:
 
 
 def test_one_shared_clock_owns_all_high_frequency_python_input_sampling() -> None:
-    assert "_PRESENTATION_TICK_MS = 8" in CLOCK
+    assert "_ACTIVE_PRESENTATION_TICK_MS = 8" in CLOCK
+    assert "_AMBIENT_PRESENTATION_TICK_MS = 16" in CLOCK
+    assert "_INTERACTION_GRACE_MS = 360" in CLOCK
+    assert "self.timer.setInterval(_AMBIENT_PRESENTATION_TICK_MS)" in CLOCK
+    assert "self._set_tick_interval(_ACTIVE_PRESENTATION_TICK_MS)" in CLOCK
     assert CLOCK.count("QCursor.pos()") == 1
     assert CLOCK.count("QApplication.mouseButtons()") == 1
     for consumer in (

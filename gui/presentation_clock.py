@@ -9,7 +9,9 @@ from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QApplication, QMainWindow
 
 
-_PRESENTATION_TICK_MS = 8
+_ACTIVE_PRESENTATION_TICK_MS = 8
+_AMBIENT_PRESENTATION_TICK_MS = 16
+_INTERACTION_GRACE_MS = 360
 _WIDGET_STARVATION_MS = 40
 
 
@@ -22,17 +24,19 @@ class _WidgetSample:
 
 
 class PresentationClock(QObject):
-    """One input clock with explicit Quick -> QWidget presentation ordering.
+    """One adaptive input clock with explicit Quick -> QWidget ordering.
 
-    The Quick background owns the GPU scene and consumes the sampled pointer first.
-    QWidget card/effect work is queued and released immediately after the next
-    QQuickWindow.frameSwapped signal.  That prevents the two native presentation
-    surfaces from being invalidated in the same GUI event-loop turn while retaining
-    one cursor read, one button read and the existing per-consumer cadence budgets.
+    Ambient visual work already has a 16 ms frame budget, so idle presentation
+    sampling runs at that cadence instead of waking Python every 8 ms forever.
+    Any pointer/button change immediately promotes the shared clock to the original
+    8 ms interaction cadence for long enough to cover the complete 300 ms card
+    tween.  The final settle sample is retained even if the GUI thread was briefly
+    blocked, so frozen card content can never be stranded mid-transition.
 
-    When Quick is idle there is nothing to contend with, so the QWidget lane flushes
-    immediately.  A short starvation watchdog is only a safety net for occluded or
-    stalled Quick presentation and never changes the normal animation cadence.
+    Quick owns the first presentation lane. QWidget card/effect work is released
+    after the next QQuickWindow.frameSwapped signal while Quick is animating. When
+    Quick is idle, the QWidget lane flushes immediately. A short starvation timer
+    remains only as a safety net for an occluded or stalled Quick surface.
     """
 
     def __init__(
@@ -52,6 +56,8 @@ class PresentationClock(QObject):
         self._window_paused = False
         self._last_global: tuple[int, int] | None = None
         self._last_left_down: bool | None = None
+        self._active_until_s = 0.0
+        self._card_settle_pending = False
 
         self._widget_samples: list[_WidgetSample] = []
         self._widget_flush_posted = False
@@ -59,7 +65,7 @@ class PresentationClock(QObject):
 
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self.timer.setInterval(_PRESENTATION_TICK_MS)
+        self.timer.setInterval(_AMBIENT_PRESENTATION_TICK_MS)
         self.timer.timeout.connect(self._tick)
 
         self._widget_watchdog = QTimer(self)
@@ -91,6 +97,27 @@ class PresentationClock(QObject):
         except RuntimeError:
             return False
 
+    def _set_tick_interval(self, interval_ms: int) -> None:
+        interval_ms = int(interval_ms)
+        if self.timer.interval() != interval_ms:
+            self.timer.setInterval(interval_ms)
+
+    def _mark_interaction_active(self, now_s: float) -> None:
+        self._active_until_s = max(
+            self._active_until_s,
+            now_s + (_INTERACTION_GRACE_MS / 1000.0),
+        )
+        self._card_settle_pending = True
+        self._set_tick_interval(_ACTIVE_PRESENTATION_TICK_MS)
+
+    def _sync_cadence(self, now_s: float) -> None:
+        interval = (
+            _ACTIVE_PRESENTATION_TICK_MS
+            if now_s < self._active_until_s
+            else _AMBIENT_PRESENTATION_TICK_MS
+        )
+        self._set_tick_interval(interval)
+
     def _sync_window_state(self) -> None:
         try:
             self._window_paused = bool(
@@ -102,6 +129,7 @@ class PresentationClock(QObject):
         if self._can_run():
             if not self.timer.isActive():
                 self._reset_input_identity()
+                self._set_tick_interval(_AMBIENT_PRESENTATION_TICK_MS)
                 self.timer.start()
         else:
             self.timer.stop()
@@ -110,6 +138,8 @@ class PresentationClock(QObject):
     def _reset_input_identity(self) -> None:
         self._last_global = None
         self._last_left_down = None
+        self._active_until_s = 0.0
+        self._card_settle_pending = False
         self._clear_widget_lane()
         try:
             self.background.reset_pointer_identity()
@@ -125,6 +155,8 @@ class PresentationClock(QObject):
         token = str(reason or "presentation").strip() or "presentation"
         self._holds.add(token)
         self.timer.stop()
+        self._active_until_s = 0.0
+        self._card_settle_pending = False
         self._clear_widget_lane()
         try:
             self.background.pause_pointer_animation()
@@ -206,17 +238,25 @@ class PresentationClock(QObject):
         self._widget_samples = []
         self._widget_watchdog.stop()
         now_s = time.perf_counter()
+        card_active = now_s < self._active_until_s
+        card_due = card_active or self._card_settle_pending
 
-        for sample in samples:
-            try:
-                self.card_fx.presentation_tick(
-                    sample.global_pos,
-                    left_down=sample.left_down,
-                    now_s=now_s,
-                    input_changed=sample.input_changed,
-                )
-            except RuntimeError:
-                pass
+        if card_due:
+            for sample in samples:
+                try:
+                    self.card_fx.presentation_tick(
+                        sample.global_pos,
+                        left_down=sample.left_down,
+                        now_s=now_s,
+                        input_changed=sample.input_changed,
+                    )
+                except RuntimeError:
+                    pass
+
+            if not card_active:
+                # One final call after the interaction window guarantees that a
+                # delayed event loop still snaps any 300 ms tween to its endpoint.
+                self._card_settle_pending = False
 
         latest = samples[-1]
         try:
@@ -240,21 +280,28 @@ class PresentationClock(QObject):
         except RuntimeError:
             return
 
+        now_s = time.perf_counter()
         previous_left = self._last_left_down
         input_changed = point != self._last_global or left_down != previous_left
         button_edge = previous_left is not None and left_down != previous_left
         self._last_global = point
         self._last_left_down = left_down
 
-        # Quick owns the first presentation lane. It receives the newest pointer
-        # target immediately and may start/continue its scene-graph animation.
-        try:
-            self.background.presentation_tick(global_pos, input_changed=input_changed)
-        except RuntimeError:
-            pass
+        if input_changed:
+            self._mark_interaction_active(now_s)
+            # Quick only needs new pointer targets. Its FrameAnimation owns the
+            # ongoing GPU parallax tween after this handoff.
+            try:
+                self.background.presentation_tick(global_pos, input_changed=True)
+            except RuntimeError:
+                pass
+        else:
+            self._sync_cadence(now_s)
 
         # QWidget work uses the same sampled input, but it is committed only after
         # Quick presents its frame (or immediately when Quick has no active frame).
+        # Ambient effects keep their existing 16 ms visual budget while card work
+        # disappears completely once the interaction tween has settled.
         self._queue_widget_sample(
             global_pos,
             left_down=left_down,
@@ -276,6 +323,8 @@ class PresentationClock(QObject):
 
     def cleanup(self) -> None:
         self.timer.stop()
+        self._active_until_s = 0.0
+        self._card_settle_pending = False
         self._clear_widget_lane()
         self._holds.clear()
         quick = self._quick_window
