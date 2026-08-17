@@ -23,6 +23,7 @@ from app.velopack_runtime import (
     update_summary,
 )
 from gui.update_panel import UpdateMessageDialog, UpdateOfferDialog, UpdateProgressDialog
+from gui.update_runtime import shutdown_owned_qprocesses
 
 _CHECK_DELAY_MS = 1800
 _AUTO_CHECK_INTERVAL_MS = 60 * 60 * 1000
@@ -399,6 +400,8 @@ class ApplicationUpdater(QObject):
             pending = manager.get_update_pending_restart()
             if pending is None:
                 raise RuntimeError("Velopack 未找到已经下载完成的待应用更新。")
+            self._set_progress_text("正在关闭后台组件并准备切换到新版本…")
+            shutdown_owned_qprocesses(self.window)
             manager.apply_updates_and_restart(pending)
             raise RuntimeError("Velopack 更新器返回了控制权，程序未按预期退出并重启。")
         except Exception as exc:
@@ -417,8 +420,9 @@ class ApplicationUpdater(QObject):
             except RuntimeError:
                 pass
         # Give the branded surface one final paint, then use Velopack's explicit
-        # process-exit/apply/restart primitive. Do not rely on QApplication.quit():
-        # Python background services can keep the process alive after the Qt loop ends.
+        # process-exit/apply/restart primitive. All app-owned QProcess children are
+        # stopped immediately before the handoff so no worker can keep files or
+        # runtime state alive across the version switch.
         QTimer.singleShot(120, self._apply_downloaded_update)
 
 
