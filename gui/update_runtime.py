@@ -6,6 +6,8 @@ import time
 from PySide6.QtCore import QProcess
 from PySide6.QtWidgets import QApplication, QMainWindow
 
+from app.crash_diagnostics import mark_startup_stage
+
 _TERMINATE_GRACE_S = 1.5
 _KILL_GRACE_S = 1.0
 
@@ -40,6 +42,14 @@ def _wait_processes(processes: list[QProcess], deadline_s: float) -> list[QProce
 
 def shutdown_owned_qprocesses(window: QMainWindow) -> None:
     """Stop only child worker processes created by this GUI instance."""
+
+    updater = getattr(window, "_application_updater", None)
+    if bool(getattr(updater, "_updating", False)):
+        # Velopack exits the process directly after this cleanup rather than
+        # travelling through the normal Qt aboutToQuit path. Preserve a distinct
+        # marker so the next version can distinguish a successful update restart
+        # from a genuine crash during handoff.
+        mark_startup_stage("velopack_handoff")
 
     processes = _live_owned_qprocesses(window)
     for process in processes:
