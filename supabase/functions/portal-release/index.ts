@@ -2,11 +2,13 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
 const REPOSITORY = "yuchenm1303-png/ecommerce-agent";
-const RELEASE_API = `https://api.github.com/repos/${REPOSITORY}/releases/latest`;
+const LATEST_RELEASE_API = `https://api.github.com/repos/${REPOSITORY}/releases/latest`;
+const RELEASE_HISTORY_API = `https://api.github.com/repos/${REPOSITORY}/releases?per_page=20`;
 const RELEASE_BUCKET = "listing-studio-releases";
 const LEGACY_MANIFEST_ASSET = "update.json";
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const SHA256_DIGEST_RE = /^sha256:([0-9a-f]{64})$/i;
+const HISTORY_LIMIT = 12;
 const ALLOWED_ORIGINS = new Set([
   "https://smirel.com",
   "https://www.smirel.com",
@@ -32,6 +34,14 @@ function json(req: Request, body: unknown, status = 200): Response {
       "Cache-Control": status === 200 ? "public, max-age=30, s-maxage=60" : "no-store",
     },
   });
+}
+
+function githubHeaders(userAgent: string): Record<string, string> {
+  return {
+    "Accept": "application/vnd.github+json",
+    "User-Agent": userAgent,
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
 }
 
 function normalizeVersion(value: unknown): string {
@@ -68,24 +78,14 @@ function createAdminClient() {
   });
 }
 
-async function resolveStableRelease() {
-  const headers = {
-    "Accept": "application/vnd.github+json",
-    "User-Agent": "Listing-Studio-Release-Metadata",
-    "X-GitHub-Api-Version": "2022-11-28",
-  };
-
-  const releaseResponse = await fetch(RELEASE_API, { headers, cache: "no-store" });
-  if (!releaseResponse.ok) throw new Error(`release_api_${releaseResponse.status}`);
-
-  const release = await releaseResponse.json();
+function parseStableRelease(release: any) {
   if (!release || release.draft || release.prerelease || !Array.isArray(release.assets)) {
-    throw new Error("invalid_latest_release");
+    return null;
   }
 
   const version = normalizeVersion(release.tag_name);
   if (!VERSION_RE.test(version) || String(release.tag_name || "") !== `v${version}`) {
-    throw new Error("invalid_stable_tag");
+    return null;
   }
 
   const installerName = `EcommerceAgent-Setup-${version}.exe`;
@@ -93,64 +93,104 @@ async function resolveStableRelease() {
   const installerSize = Number(installerAsset?.size || 0);
   const digest = String(installerAsset?.digest || "").trim().toLowerCase();
   const digestMatch = digest.match(SHA256_DIGEST_RE);
+  const expectedUrl = `https://github.com/${REPOSITORY}/releases/download/v${version}/${installerName}`;
   if (
-    !installerAsset?.browser_download_url ||
+    String(installerAsset?.browser_download_url || "") !== expectedUrl ||
     !Number.isSafeInteger(installerSize) ||
     installerSize <= 0 ||
     !digestMatch
   ) {
-    throw new Error("invalid_installer_asset");
-  }
-
-  let title = String(release.name || `Listing Studio ${version}`).trim();
-  let notes = String(release.body || "").trim();
-  let publishedAt = String(release.published_at || "").trim();
-  let required = false;
-  let minSupportedVersion = "";
-
-  // Old Inno-era releases carried presentation metadata in update.json. Treat it
-  // as optional transition metadata only; Velopack releases intentionally do not
-  // publish it because legacy clients must not auto-cross-install the new format.
-  const legacyManifestAsset = release.assets.find((asset: any) => asset?.name === LEGACY_MANIFEST_ASSET);
-  if (legacyManifestAsset?.browser_download_url) {
-    try {
-      const manifestResponse = await fetch(String(legacyManifestAsset.browser_download_url), {
-        headers: { "User-Agent": "Listing-Studio-Release-Metadata" },
-        cache: "no-store",
-        redirect: "follow",
-      });
-      if (manifestResponse.ok) {
-        const manifest = await manifestResponse.json();
-        if (
-          manifest?.schema_version === 1 &&
-          manifest?.channel === "stable" &&
-          normalizeVersion(manifest?.version) === version
-        ) {
-          title = String(manifest?.title || title).trim();
-          notes = String(manifest?.notes || notes).trim();
-          publishedAt = String(manifest?.published_at || publishedAt).trim();
-          required = Boolean(manifest?.required);
-          minSupportedVersion = String(manifest?.min_supported_version || "").trim();
-        }
-      }
-    } catch (error) {
-      console.error("legacy release metadata ignored", error);
-    }
+    return null;
   }
 
   return {
     version,
-    title: title || `Listing Studio ${version}`,
-    notes,
-    publishedAt,
-    required,
-    minSupportedVersion,
+    title: String(release.name || `Listing Studio ${version}`).trim() || `Listing Studio ${version}`,
+    notes: String(release.body || "").trim(),
+    publishedAt: String(release.published_at || release.created_at || "").trim(),
+    required: false,
+    minSupportedVersion: "",
     installerName,
-    installerUrl: String(installerAsset.browser_download_url),
+    installerUrl: expectedUrl,
     installerSha256: digestMatch[1].toLowerCase(),
     installerSize,
     fileSize: formatBytes(installerSize),
   };
+}
+
+async function applyLegacyMetadata(stable: NonNullable<ReturnType<typeof parseStableRelease>>, release: any) {
+  const legacyManifestAsset = release.assets.find((asset: any) => asset?.name === LEGACY_MANIFEST_ASSET);
+  if (!legacyManifestAsset?.browser_download_url) return stable;
+
+  try {
+    const manifestResponse = await fetch(String(legacyManifestAsset.browser_download_url), {
+      headers: { "User-Agent": "Listing-Studio-Release-Metadata" },
+      cache: "no-store",
+      redirect: "follow",
+    });
+    if (!manifestResponse.ok) return stable;
+
+    const manifest = await manifestResponse.json();
+    if (
+      manifest?.schema_version !== 1 ||
+      manifest?.channel !== "stable" ||
+      normalizeVersion(manifest?.version) !== stable.version
+    ) {
+      return stable;
+    }
+
+    return {
+      ...stable,
+      title: String(manifest?.title || stable.title).trim() || stable.title,
+      notes: String(manifest?.notes || stable.notes).trim(),
+      publishedAt: String(manifest?.published_at || stable.publishedAt).trim(),
+      required: Boolean(manifest?.required),
+      minSupportedVersion: String(manifest?.min_supported_version || "").trim(),
+    };
+  } catch (error) {
+    console.error("legacy release metadata ignored", error);
+    return stable;
+  }
+}
+
+async function resolveStableRelease() {
+  const releaseResponse = await fetch(LATEST_RELEASE_API, {
+    headers: githubHeaders("Listing-Studio-Release-Metadata"),
+    cache: "no-store",
+  });
+  if (!releaseResponse.ok) throw new Error(`release_api_${releaseResponse.status}`);
+
+  const release = await releaseResponse.json();
+  const parsed = parseStableRelease(release);
+  if (!parsed) throw new Error("invalid_latest_release");
+  return await applyLegacyMetadata(parsed, release);
+}
+
+async function resolveStableHistory(currentVersion: string) {
+  const response = await fetch(RELEASE_HISTORY_API, {
+    headers: githubHeaders("Listing-Studio-Release-History"),
+    cache: "no-store",
+  });
+  if (!response.ok) throw new Error(`release_history_api_${response.status}`);
+
+  const releases = await response.json();
+  if (!Array.isArray(releases)) throw new Error("invalid_release_history");
+
+  return releases
+    .map(parseStableRelease)
+    .filter((item): item is NonNullable<ReturnType<typeof parseStableRelease>> => Boolean(item))
+    .filter((item) => item.version !== currentVersion)
+    .sort((a, b) => Date.parse(b.publishedAt || "") - Date.parse(a.publishedAt || ""))
+    .slice(0, HISTORY_LIMIT)
+    .map((item) => ({
+      version: `v${item.version}`,
+      title: item.title,
+      notes: item.notes,
+      publishedAt: item.publishedAt,
+      fileSize: item.fileSize,
+      fileSizeBytes: item.installerSize,
+      installerSha256: item.installerSha256,
+    }));
 }
 
 async function privateInstallerExists(
@@ -212,6 +252,10 @@ Deno.serve(async (req: Request) => {
 
   try {
     const stable = await resolveStableRelease();
+    const history = await resolveStableHistory(stable.version).catch((error) => {
+      console.error("release history resolution failed", error);
+      return [];
+    });
     EdgeRuntime.waitUntil(warmPrivateMirror(stable));
 
     return json(req, {
@@ -225,6 +269,7 @@ Deno.serve(async (req: Request) => {
       fileSize: stable.fileSize,
       fileSizeBytes: stable.installerSize,
       installerSha256: stable.installerSha256,
+      history,
     });
   } catch (error) {
     console.error("public release metadata resolution failed", error);
