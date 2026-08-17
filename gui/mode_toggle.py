@@ -5,6 +5,7 @@ from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import QAbstractButton, QHBoxLayout, QMainWindow, QVBoxLayout, QWidget
 
 from .settings_modal_surface import install_ai_settings_modal
+from .workspace_layout_commit import install_workspace_layout_commit
 
 
 _CORE_WIDTH = 40.0
@@ -118,6 +119,20 @@ def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
     if mode_stack is None or single_button is None or batch_button is None or not callable(set_mode):
         raise RuntimeError("workspace mode switch requires installed Single/Batch workspace")
 
+    # Keep both persistent pages laid out at the same stack geometry.  Preparing
+    # the hidden target happens before the transition starts, so currentIndex can
+    # change without exposing a Show-triggered child-layout catch-up frame.
+    layout_keeper = install_workspace_layout_commit(window)
+
+    # This header control is hidden in Batch mode.  Retain its layout slot while
+    # hidden so _set_workspace_mode() cannot resize the whole vertical workspace
+    # merely because the header button disappears.
+    open_run_button = getattr(window, "open_run_button", None)
+    if isinstance(open_run_button, QWidget):
+        policy = open_run_button.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        open_run_button.setSizePolicy(policy)
+
     legacy_card = single_button.parentWidget()
     if legacy_card is not None:
         legacy_card.setObjectName("")
@@ -138,6 +153,16 @@ def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
 
     def request_mode(checked: bool) -> None:
         target = 1 if checked else 0
+        if target == int(mode_stack.currentIndex()):
+            return
+
+        prepare_page = getattr(layout_keeper, "prepare_page", None)
+        if callable(prepare_page):
+            try:
+                prepare_page(target)
+            except RuntimeError:
+                pass
+
         transition = getattr(window, "_workspace_transition_controller", None)
         request = getattr(transition, "request_mode", None)
         if callable(request):
