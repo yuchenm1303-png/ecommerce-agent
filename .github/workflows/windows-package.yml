@@ -73,7 +73,7 @@ jobs:
         shell: pwsh
         run: .\scripts\build_windows.ps1
 
-      - name: Silent Velopack installer smoke test
+      - name: Silent Velopack install and uninstall smoke test
         shell: pwsh
         run: |
           $setups = @(Get-ChildItem artifacts\EcommerceAgent-Setup-*.exe -File)
@@ -101,6 +101,14 @@ jobs:
           }
           & $worker --self-test
           if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
+
+          $uninstall = Start-Process -FilePath $update -ArgumentList @("--silent", "uninstall") -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Velopack uninstall failed: $($uninstall.ExitCode)" }
+          $deadline = (Get-Date).AddSeconds(15)
+          while ((Test-Path $installDir) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 100
+          }
+          if (Test-Path $installDir) { throw "Velopack uninstall left installation root behind: $installDir" }
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
