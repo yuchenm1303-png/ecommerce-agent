@@ -166,11 +166,20 @@ def start_crash_diagnostics() -> dict[str, Any] | None:
         _active_path = root / _ACTIVE_NAME
         _pending_path = root / _PENDING_NAME
 
+        current_version = _application_version()
         pending = _read_json(_pending_path)
         previous = _read_json(_active_path)
         if pending is None and previous is not None and not bool(previous.get("clean_exit")):
-            pending = _build_pending(previous)
-            _atomic_json(_pending_path, pending)
+            previous_stage = str(previous.get("stage") or "")
+            previous_version = str(previous.get("app_version") or "")
+            completed_update_handoff = (
+                previous_stage == "velopack_handoff"
+                and bool(previous_version)
+                and previous_version != current_version
+            )
+            if not completed_update_handoff:
+                pending = _build_pending(previous)
+                _atomic_json(_pending_path, pending)
 
         crash_id = str(uuid.uuid4())
         native_path = root / f"native-{crash_id}.log"
@@ -187,7 +196,7 @@ def start_crash_diagnostics() -> dict[str, Any] | None:
             "started_at": _utc_now(),
             "updated_at": _utc_now(),
             "stage": "process_start",
-            "app_version": _application_version(),
+            "app_version": current_version,
             "frozen": is_frozen(),
             "platform": {
                 "system": platform.system(),
