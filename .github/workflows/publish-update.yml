@@ -9,8 +9,9 @@ on:
         default: "feat/local-test-gui"
         type: string
       version:
-        description: "New Stable version (strict x.y.z)"
-        required: true
+        description: "Stable version override (x.y.z) or auto"
+        required: false
+        default: "auto"
         type: string
       title:
         description: "Release title"
@@ -36,7 +37,7 @@ jobs:
     timeout-minutes: 70
     env:
       SOURCE_REF: ${{ inputs.source_ref }}
-      UPDATE_VERSION: ${{ inputs.version }}
+      REQUESTED_VERSION: ${{ inputs.version }}
       UPDATE_TITLE: ${{ inputs.title }}
       UPDATE_NOTES: ${{ inputs.release_notes }}
       GH_TOKEN: ${{ github.token }}
@@ -57,29 +58,57 @@ jobs:
           "sha=$sha" >> $env:GITHUB_OUTPUT
           Write-Host "Publishing source $env:SOURCE_REF at $sha"
 
-      - name: Validate monotonic Stable version
+      - name: Resolve next Stable version
+        id: version
         shell: pwsh
         run: |
-          if ($env:UPDATE_VERSION -notmatch '^\d+\.\d+\.\d+$') {
-            throw "Release version must be strict x.y.z: $env:UPDATE_VERSION"
-          }
-          $releaseVersion = [version]$env:UPDATE_VERSION
+          $requested = ([string]$env:REQUESTED_VERSION).Trim()
+          $latestVersion = $null
+          $latestTag = ""
+
           $latestRaw = & gh api "repos/$env:GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>$null
           if ($LASTEXITCODE -eq 0) {
             $latestTag = ($latestRaw | Out-String).Trim()
             if ($latestTag -match '^v(\d+\.\d+\.\d+)$') {
               $latestVersion = [version]$Matches[1]
-              if ($releaseVersion -le $latestVersion) {
-                throw "New Stable $releaseVersion must be newer than $latestVersion"
-              }
             }
           }
           $global:LASTEXITCODE = 0
-          $tag = "v$env:UPDATE_VERSION"
+
+          if ([string]::IsNullOrWhiteSpace($requested) -or $requested -ieq "auto") {
+            if ($null -eq $latestVersion) {
+              $releaseVersion = [version]"0.0.1"
+            }
+            else {
+              $releaseVersion = [version]::new(
+                $latestVersion.Major,
+                $latestVersion.Minor,
+                $latestVersion.Build + 1
+              )
+            }
+            Write-Host "Auto Stable version: latest=$latestTag next=$releaseVersion"
+          }
+          else {
+            if ($requested -notmatch '^\d+\.\d+\.\d+$') {
+              throw "Version override must be strict x.y.z or auto: $requested"
+            }
+            $releaseVersion = [version]$requested
+            if ($null -ne $latestVersion -and $releaseVersion -le $latestVersion) {
+              throw "Requested Stable $releaseVersion must be newer than $latestVersion"
+            }
+            Write-Host "Manual Stable version override: $releaseVersion"
+          }
+
+          $resolved = $releaseVersion.ToString()
+          $tag = "v$resolved"
           gh release view $tag *> $null
           $exists = ($LASTEXITCODE -eq 0)
           $global:LASTEXITCODE = 0
           if ($exists) { throw "Release already exists: $tag" }
+
+          "UPDATE_VERSION=$resolved" >> $env:GITHUB_ENV
+          "version=$resolved" >> $env:GITHUB_OUTPUT
+          Write-Host "Resolved Stable version: $resolved"
 
       - name: Stamp package version and release notes
         shell: pwsh
@@ -88,6 +117,7 @@ jobs:
           New-Item -ItemType Directory -Force artifacts | Out-Null
           @(
             "# $env:UPDATE_TITLE", "", $env:UPDATE_NOTES, "",
+            "Version: $env:UPDATE_VERSION",
             "Source commit: ${{ steps.source.outputs.sha }}"
           ) | Set-Content "artifacts\release-notes.md" -Encoding utf8
 
@@ -273,6 +303,10 @@ jobs:
         if: ${{ failure() }}
         shell: pwsh
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:UPDATE_VERSION)) {
+            Write-Host "No resolved Stable version exists; nothing to clean up"
+            exit 0
+          }
           $tag = "v$env:UPDATE_VERSION"
           $raw = gh release view $tag --json isDraft,tagName 2>$null
           if ($LASTEXITCODE -ne 0) {
@@ -294,10 +328,10 @@ jobs:
         if: ${{ success() }}
         uses: actions/upload-artifact@v4
         with:
-          name: EcommerceAgent-Stable-${{ inputs.version }}
+          name: EcommerceAgent-Stable-${{ steps.version.outputs.version }}
           path: |
-            artifacts/EcommerceAgent-Setup-${{ inputs.version }}.exe
-            artifacts/EcommerceAgent-${{ inputs.version }}-portable.zip
+            artifacts/EcommerceAgent-Setup-${{ steps.version.outputs.version }}.exe
+            artifacts/EcommerceAgent-${{ steps.version.outputs.version }}-portable.zip
             artifacts/velopack/*
           if-no-files-found: error
           retention-days: 30
