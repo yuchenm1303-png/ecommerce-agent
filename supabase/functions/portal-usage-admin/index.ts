@@ -2,6 +2,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const ALLOWED_ORIGINS = new Set(["https://smirel.com", "https://www.smirel.com"]);
+const TASK_AUDIT_LIMIT = 120;
 
 function corsHeaders(req: Request): Record<string, string> {
   const origin = req.headers.get("origin") || "";
@@ -53,9 +54,39 @@ Deno.serve(async (req: Request) => {
     if (accessError) return json(req, { error: "access_check_failed" }, 503);
     if (!access?.enabled || !access?.is_admin) return json(req, { error: "not_authorized" }, 403);
 
-    const { data, error } = await admin.rpc("get_listing_usage_admin_snapshot", { p_caller: user.id });
-    if (error) return json(req, { error: "usage_snapshot_failed" }, 503);
-    return json(req, data ?? {});
+    const [{ data: snapshot, error: snapshotError }, { data: taskAudits, error: auditError }] = await Promise.all([
+      admin.rpc("get_listing_usage_admin_snapshot", { p_caller: user.id }),
+      admin
+        .from("listing_task_audits")
+        .select(
+          "id,user_id,device_id,app_version,task_kind,phase,status,product_url,input_data,result_data,error_text,started_at,completed_at,updated_at,created_at"
+        )
+        .order("updated_at", { ascending: false })
+        .limit(TASK_AUDIT_LIMIT),
+    ]);
+    if (snapshotError) return json(req, { error: "usage_snapshot_failed" }, 503);
+    if (auditError) return json(req, { error: "task_audit_snapshot_failed" }, 503);
+
+    const payload = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)
+      ? { ...(snapshot as Record<string, unknown>) }
+      : {};
+    payload.task_audits = taskAudits ?? [];
+    payload.task_audit_limit = TASK_AUDIT_LIMIT;
+    payload.task_audit_scope = {
+      includes: [
+        "supplier URL",
+        "sales specification / bundle intent",
+        "AI guidance",
+        "Model Name keywords",
+        "requested Vertical",
+        "customer file metadata",
+        "resolved field outputs",
+        "task status / errors",
+        "batch job status",
+      ],
+      excludes: ["API keys", "access / refresh tokens", "passwords", "cookies", "authorization secrets", "raw customer file binaries"],
+    };
+    return json(req, payload);
   } catch {
     return json(req, { error: "server_error" }, 500);
   }
