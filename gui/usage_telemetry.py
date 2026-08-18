@@ -20,8 +20,8 @@ from .task_failure_diagnostics import (
 _HEARTBEAT_MS = 60_000
 _AUDIT_FLUSH_MS = 1_200
 _MAX_TEXT = 12_000
+_MAX_AUDIT_TEXT = 32_000
 _MAX_LIST = 180
-_BATCH_FAILURE_DIAGNOSTIC_LIMIT = 8
 
 
 def _utc_now() -> str:
@@ -32,11 +32,16 @@ def _text(value: object, limit: int = _MAX_TEXT) -> str:
     return str(value or "").strip()[: max(1, int(limit))]
 
 
-def _safe_value(value: Any, *, depth: int = 0) -> Any:
+def _safe_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    max_text: int = _MAX_TEXT,
+) -> Any:
     return sanitize_telemetry_value(
         value,
         depth=depth,
-        max_text=_MAX_TEXT,
+        max_text=max_text,
         max_list=_MAX_LIST,
     )
 
@@ -175,12 +180,38 @@ def _error_type(args: tuple[Any, ...]) -> str:
     return "TaskFailure"
 
 
-def _runner_run_dir(runner: Any) -> str:
+def _runner_workflow_dir(runner: Any) -> str:
+    config = getattr(runner, "config", None) if runner is not None else None
+    read_only_run_dir = getattr(config, "read_only_run_dir", None) if config is not None else None
+    if str(read_only_run_dir or "").strip():
+        return str(read_only_run_dir)
     for name in ("run_dir", "output_dir", "last_run_dir"):
         value = getattr(runner, name, None) if runner is not None else None
         if str(value or "").strip():
             return str(value)
     return ""
+
+
+def _runner_process_log(runner: Any) -> str:
+    output_root = getattr(runner, "output_root", None) if runner is not None else None
+    if not str(output_root or "").strip():
+        return ""
+    return str(Path(output_root) / "real-execution-gui.log")
+
+
+def _runner_artifact_roots(runner: Any) -> tuple[str, ...]:
+    output_root = getattr(runner, "output_root", None) if runner is not None else None
+    return (str(output_root),) if str(output_root or "").strip() else ()
+
+
+def _runner_mode(runner: Any) -> str:
+    config = getattr(runner, "config", None) if runner is not None else None
+    return _text(
+        getattr(config, "scope", None)
+        or getattr(runner, "mode", None)
+        or "",
+        120,
+    )
 
 
 def _failure_result(
@@ -192,20 +223,15 @@ def _failure_result(
 ) -> dict[str, Any]:
     output = dict(result_data)
     output["failure_diagnostic"] = collect_workflow_failure_diagnostic(
-        _runner_run_dir(runner),
+        _runner_workflow_dir(runner),
         fallback_error=_error_text(args),
         fallback_error_type=_error_type(args),
         fallback_stage=fallback_stage,
-        workflow_mode=_text(getattr(runner, "mode", ""), 120),
+        workflow_mode=_runner_mode(runner),
+        process_log_path=_runner_process_log(runner),
+        artifact_roots=_runner_artifact_roots(runner),
     )
-    return _safe_value(output)
-
-
-def _compact_batch_diagnostic(diagnostic: dict[str, Any]) -> dict[str, Any]:
-    compact = dict(diagnostic)
-    compact["timeline"] = list(compact.get("timeline") or [])[-24:]
-    compact["traceback"] = _text(compact.get("traceback"), 12_000)
-    return _safe_value(compact)
+    return _safe_value(output, max_text=_MAX_AUDIT_TEXT)
 
 
 def _batch_jobs(batch: Any) -> list[Any]:
@@ -237,13 +263,7 @@ def _batch_terminal_semantics(
     batch: Any,
     job_ids: tuple[str, ...],
 ) -> tuple[str, str]:
-    """Return event outcome and audit status from the jobs that actually ran.
-
-    BatchController deliberately uses PREPARED/COMPLETE to mean that its queues
-    have drained. Those controller states do not mean every product succeeded.
-    Telemetry therefore evaluates the exact operation cohort: all jobs for
-    prepare, and only the READY jobs captured when execute started.
-    """
+    """Return coarse batch outcome while product audits remain per-link."""
 
     batch_status = str(getattr(batch, "status", "") or "").upper()
     statuses = _batch_cohort_statuses(batch, job_ids)
@@ -267,12 +287,85 @@ def _batch_terminal_semantics(
     return "failed", "failed" if hard_failed or not statuses else "review"
 
 
-class UsageTelemetryController(QObject):
-    """Licensed-install telemetry plus owner-visible business task audit.
+def _batch_job_status(event_type: str, job_status: str) -> str:
+    status = str(job_status or "").upper()
+    if event_type == "batch_execute":
+        if status == "DONE":
+            return "completed"
+        if status == "REVIEW":
+            return "review"
+        if status == "FAILED":
+            return "failed"
+        if status == "STOPPED":
+            return "cancelled"
+        return "running"
+    if status == "READY":
+        return "ready"
+    if status == "REVIEW":
+        return "review"
+    if status == "FAILED":
+        return "failed"
+    if status == "STOPPED":
+        return "cancelled"
+    return "running"
 
-    The audit intentionally captures customer-entered listing inputs and resolved
-    outputs so the owner console can inspect real usage. Authentication secrets,
-    API keys, cookies and raw uploaded file binaries are never included.
+
+def _read_json_file(path: str | Path | None) -> dict[str, Any]:
+    if not str(path or "").strip():
+        return {}
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _compact_executor_report(payload: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "mode",
+        "page_url",
+        "makro_target_id",
+        "product_url",
+        "expected_vertical",
+        "plan_summary",
+        "blocked_reason_summary",
+        "section_reports",
+        "field_totals",
+        "photo_upload",
+        "completion",
+        "section_save_attempted",
+        "section_saved",
+        "send_to_qc_clicked",
+        "browser_closed",
+        "final_screenshot",
+    )
+    return _safe_value(
+        {key: payload.get(key) for key in keys if key in payload},
+        max_text=_MAX_AUDIT_TEXT,
+    )
+
+
+def _batch_process_log(job: Any, event_type: str) -> str:
+    run_dir = str(getattr(job, "run_dir", "") or "").strip()
+    if not run_dir:
+        return ""
+    diagnostic_root = Path(run_dir).parent / "diagnostics"
+    if event_type == "batch_execute":
+        return str(diagnostic_root / "execute.log")
+    candidates = [diagnostic_root / "prepare.log", diagnostic_root / "source.log"]
+    existing = [path for path in candidates if path.is_file()]
+    if not existing:
+        return str(candidates[0])
+    return str(max(existing, key=lambda path: path.stat().st_mtime_ns))
+
+
+class UsageTelemetryController(QObject):
+    """Licensed-install telemetry plus owner-visible product-level task audit.
+
+    Each supplier product gets its own audit identity. A failed Batch link therefore
+    carries its own process log, traceback and executor evidence instead of being
+    hidden inside one aggregate Batch payload. Authentication secrets, API keys,
+    cookies and raw uploaded file binaries are never included.
     """
 
     def __init__(self, window: QWidget, access: ApplicationAccessController) -> None:
@@ -287,19 +380,21 @@ class UsageTelemetryController(QObject):
 
         self._prepare_active = False
         self._execute_active = False
-        self._batch_event_type = ""
-        self._batch_job_ids: tuple[str, ...] = ()
         self._single_audit_id = ""
         self._single_started_at = ""
         self._single_input: dict[str, Any] = {}
         self._single_result: dict[str, Any] = {}
-        self._batch_audit_id = ""
-        self._batch_started_at = ""
-        self._batch_input: dict[str, Any] = {}
+
+        self._batch_id = ""
+        self._batch_event_type = ""
+        self._batch_job_ids: tuple[str, ...] = ()
+        self._batch_audit_ids: dict[str, str] = {}
+        self._batch_started_at: dict[str, str] = {}
+        self._batch_inputs: dict[str, dict[str, Any]] = {}
         self._batch_flush = QTimer(self)
         self._batch_flush.setSingleShot(True)
         self._batch_flush.setInterval(_AUDIT_FLUSH_MS)
-        self._batch_flush.timeout.connect(self._flush_batch_audit)
+        self._batch_flush.timeout.connect(self._flush_batch_audits)
 
         if not self._enabled():
             return
@@ -345,7 +440,7 @@ class UsageTelemetryController(QObject):
             payload["event_type"] = event_type
             payload["outcome"] = outcome
         elif action == "task_audit" and audit is not None:
-            payload["audit"] = _safe_value(audit)
+            payload["audit"] = _safe_value(audit, max_text=_MAX_AUDIT_TEXT)
 
         request = QNetworkRequest(QUrl(self.access.telemetry_function_url))
         request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
@@ -435,7 +530,7 @@ class UsageTelemetryController(QObject):
             "model_config": model_config,
         }
 
-    def _batch_input_snapshot(self) -> dict[str, Any]:
+    def _batch_items_snapshot(self) -> list[dict[str, Any]]:
         workspace = getattr(self.window, "batch_workspace", None)
         editor = getattr(workspace, "_batch_url_editor", None)
         rows = list(getattr(editor, "rows", ()) or ())
@@ -450,7 +545,7 @@ class UsageTelemetryController(QObject):
                 url = _text(url_getter() if callable(url_getter) else "", 4_096)
             except Exception:
                 url = ""
-            if not url and not enabled:
+            if not url:
                 continue
             items.append(
                 {
@@ -461,67 +556,164 @@ class UsageTelemetryController(QObject):
                     "customer_files": _file_metadata(getattr(row, "product_files", ()) or ()),
                 }
             )
-        return {"items": items, "item_count": len(items)}
+        return items
 
-    def _batch_result_snapshot(self, *, include_failure_diagnostics: bool = False) -> dict[str, Any]:
-        workspace = getattr(self.window, "batch_workspace", None)
-        controller = getattr(workspace, "controller", None)
-        batch = getattr(controller, "batch", None)
-        jobs = list(getattr(batch, "jobs", ()) or getattr(workspace, "_jobs", ()) or ())
-        result_jobs: list[dict[str, Any]] = []
-        status_counts: dict[str, int] = {}
-        failure_diagnostics: list[dict[str, Any]] = []
-        for job in jobs[:120]:
-            run_dir = getattr(job, "run_dir", "")
-            job_status = _text(getattr(job, "status", ""), 120).upper()
-            job_error = _text(getattr(job, "error", ""), 8_000)
-            status_counts[job_status] = status_counts.get(job_status, 0) + 1
-            job_id = _text(getattr(job, "job_id", ""), 160)
-            result_jobs.append(
-                {
-                    "job_id": job_id,
-                    "product_url": _text(getattr(job, "product_url", ""), 4_096),
-                    "status": job_status,
-                    "progress": int(getattr(job, "progress", 0) or 0),
-                    "vertical": _text(getattr(job, "vertical", ""), 500),
-                    "brand": _text(getattr(job, "brand", ""), 500),
-                    "ready": int(getattr(job, "ready", 0) or 0),
-                    "blocked": int(getattr(job, "blocked", 0) or 0),
-                    "required_blocked": int(getattr(job, "required_blocked", 0) or 0),
-                    "product_images": int(getattr(job, "product_images", 0) or 0),
-                    "makro_target_id": _text(getattr(job, "makro_target_id", ""), 240),
-                    "stage_detail": _text(getattr(job, "stage_detail", ""), 2_000),
-                    "error": job_error,
-                    "run_id": Path(str(run_dir)).name if str(run_dir).strip() else "",
-                    "created_at": _text(getattr(job, "created_at", ""), 120),
-                    "updated_at": _text(getattr(job, "updated_at", ""), 120),
-                }
-            )
-            if (
-                include_failure_diagnostics
-                and len(failure_diagnostics) < _BATCH_FAILURE_DIAGNOSTIC_LIMIT
-                and (job_status in {"FAILED", "REVIEW", "STOPPED"} or job_error)
-            ):
-                diagnostic = collect_workflow_failure_diagnostic(
-                    str(run_dir) if str(run_dir).strip() else None,
-                    fallback_error=job_error or _text(getattr(job, "stage_detail", ""), 8_000),
-                    fallback_error_type="BatchJobFailure",
-                    fallback_stage="batch_job",
-                    workflow_mode="full",
-                )
-                diagnostic = _compact_batch_diagnostic(diagnostic)
-                diagnostic["job_id"] = job_id
-                diagnostic["job_status"] = job_status
-                failure_diagnostics.append(diagnostic)
-        payload: dict[str, Any] = {
-            "batch_status": _text(getattr(batch, "status", ""), 120),
-            "jobs": result_jobs,
-            "job_count": len(result_jobs),
-            "job_status_counts": status_counts,
+    def _batch_input_for_job(
+        self,
+        batch: Any,
+        job: Any,
+        index: int,
+        items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        product_url = _text(getattr(job, "product_url", ""), 4_096)
+        item = next(
+            (candidate for candidate in items if _text(candidate.get("supplier_url"), 4_096) == product_url),
+            items[index] if index < len(items) else {},
+        )
+        jobs = _batch_jobs(batch)
+        return {
+            "audit_scope": "batch_link",
+            "batch_id": _text(getattr(batch, "batch_id", ""), 200),
+            "job_id": _text(getattr(job, "job_id", ""), 160),
+            "batch_index": index + 1,
+            "batch_size": len(jobs),
+            "supplier_url": product_url,
+            "listing_intent": _text(item.get("listing_intent"), 12_000),
+            "customer_files": _safe_value(item.get("customer_files") or []),
         }
-        if failure_diagnostics:
-            payload["failure_diagnostics"] = failure_diagnostics
-        return _safe_value(payload)
+
+    def _reset_batch_audits(self, batch_id: str) -> None:
+        self._batch_id = batch_id
+        self._batch_audit_ids = {}
+        self._batch_started_at = {}
+        self._batch_inputs = {}
+
+    def _ensure_batch_audits(self, batch: Any, job_ids: tuple[str, ...]) -> None:
+        batch_id = _text(getattr(batch, "batch_id", ""), 200)
+        if batch_id != self._batch_id:
+            self._reset_batch_audits(batch_id)
+        items = self._batch_items_snapshot()
+        wanted = set(job_ids)
+        for index, job in enumerate(_batch_jobs(batch)):
+            job_id = _text(getattr(job, "job_id", ""), 160)
+            if not job_id or job_id not in wanted:
+                continue
+            if job_id not in self._batch_audit_ids:
+                self._batch_audit_ids[job_id] = str(uuid.uuid4())
+                self._batch_started_at[job_id] = _utc_now()
+                self._batch_inputs[job_id] = self._batch_input_for_job(batch, job, index, items)
+
+    def _batch_job_result(
+        self,
+        batch: Any,
+        job: Any,
+        event_type: str,
+        *,
+        include_failure_diagnostic: bool,
+    ) -> dict[str, Any]:
+        job_id = _text(getattr(job, "job_id", ""), 160)
+        job_status = _text(getattr(job, "status", ""), 120).upper()
+        job_error = _text(getattr(job, "error", ""), 12_000)
+        batch_id = _text(getattr(batch, "batch_id", ""), 200)
+        jobs = _batch_jobs(batch)
+        index = next((i for i, candidate in enumerate(jobs) if _text(getattr(candidate, "job_id", ""), 160) == job_id), -1)
+        run_dir = _text(getattr(job, "run_dir", ""), 4_096)
+        result: dict[str, Any] = {
+            "audit_scope": "batch_link",
+            "batch_id": batch_id,
+            "job_id": job_id,
+            "batch_index": index + 1 if index >= 0 else 0,
+            "batch_size": len(jobs),
+            "job_status": job_status,
+            "product_url": _text(getattr(job, "product_url", ""), 4_096),
+            "product_name": _text(getattr(job, "product_name", ""), 1_000),
+            "progress": int(getattr(job, "progress", 0) or 0),
+            "vertical": _text(getattr(job, "vertical", ""), 500),
+            "brand": _text(getattr(job, "brand", ""), 500),
+            "ready": int(getattr(job, "ready", 0) or 0),
+            "blocked": int(getattr(job, "blocked", 0) or 0),
+            "required_blocked": int(getattr(job, "required_blocked", 0) or 0),
+            "product_images": int(getattr(job, "image_count", 0) or 0),
+            "makro_target_id": _text(getattr(job, "makro_target_id", ""), 240),
+            "stage_detail": _text(getattr(job, "stage_detail", ""), 2_000),
+            "failure_stage": _text(getattr(job, "failure_stage", ""), 500),
+            "exit_code": getattr(job, "exit_code", None),
+            "error": job_error,
+            "run_id": f"{batch_id}/{job_id}" if batch_id and job_id else job_id,
+            "created_at": _text(getattr(job, "created_at", ""), 120),
+            "updated_at": _text(getattr(job, "updated_at", ""), 120),
+        }
+
+        execution_report_path = str(getattr(job, "execution_report", "") or "").strip()
+        execution_report = _read_json_file(execution_report_path)
+        if execution_report:
+            result["executor_report"] = _compact_executor_report(execution_report)
+
+        if include_failure_diagnostic and (job_status in {"FAILED", "REVIEW", "STOPPED"} or job_error):
+            job_root = Path(run_dir).parent if run_dir else None
+            artifact_roots: tuple[str, ...] = ()
+            if job_root is not None and event_type == "batch_execute":
+                artifact_roots = (str(job_root / "real-execution"),)
+            result["failure_diagnostic"] = collect_workflow_failure_diagnostic(
+                run_dir or None,
+                fallback_error=job_error or _text(getattr(job, "stage_detail", ""), 8_000),
+                fallback_error_type="BatchJobFailure",
+                fallback_stage=(
+                    _text(getattr(job, "failure_stage", ""), 500)
+                    or _text(getattr(job, "stage_detail", ""), 500)
+                    or event_type
+                ),
+                workflow_mode="full",
+                process_log_path=_batch_process_log(job, event_type),
+                artifact_roots=artifact_roots,
+            )
+        return _safe_value(result, max_text=_MAX_AUDIT_TEXT)
+
+    def _post_batch_jobs(
+        self,
+        batch: Any,
+        event_type: str,
+        job_ids: tuple[str, ...],
+        *,
+        terminal: bool,
+        include_failure_diagnostics: bool,
+        forced_error: str = "",
+    ) -> None:
+        self._ensure_batch_audits(batch, job_ids)
+        wanted = set(job_ids)
+        now = _utc_now() if terminal else ""
+        for job in _batch_jobs(batch):
+            job_id = _text(getattr(job, "job_id", ""), 160)
+            if job_id not in wanted:
+                continue
+            job_status = _text(getattr(job, "status", ""), 120).upper()
+            status = _batch_job_status(event_type, job_status)
+            if terminal and forced_error and status == "running":
+                status = "failed"
+            include_diag = include_failure_diagnostics and (
+                status in {"failed", "review", "cancelled"}
+                or bool(_text(getattr(job, "error", ""), 12_000))
+            )
+            result_data = self._batch_job_result(
+                batch,
+                job,
+                event_type,
+                include_failure_diagnostic=include_diag,
+            )
+            error_text = _text(getattr(job, "error", ""), 12_000) or (forced_error if status == "failed" else "")
+            input_data = self._batch_inputs.get(job_id, {})
+            self._task_audit(
+                self._batch_audit_ids.get(job_id, ""),
+                task_kind="batch",
+                phase=event_type,
+                status=status,
+                product_url=_text(getattr(job, "product_url", ""), 4_096),
+                input_data=input_data,
+                result_data=result_data,
+                error_text=error_text,
+                started_at=self._batch_started_at.get(job_id, ""),
+                completed_at=now if terminal and status != "running" else "",
+            )
 
     def _bind_single(self) -> None:
         prepare = getattr(self.window, "runner", None)
@@ -682,6 +874,8 @@ class UsageTelemetryController(QObject):
         workspace = getattr(self.window, "batch_workspace", None)
         controller = getattr(workspace, "controller", None)
         batch = getattr(controller, "batch", None)
+        if batch is None:
+            return
         status = str(getattr(batch, "status", "") or "").upper()
 
         if running:
@@ -690,92 +884,86 @@ class UsageTelemetryController(QObject):
                 self._batch_event_type = event_type
                 self._batch_job_ids = _batch_operation_job_ids(batch, event_type)
                 self._event(event_type, "started")
-            if not self._batch_audit_id:
-                self._batch_audit_id = str(uuid.uuid4())
-                self._batch_started_at = _utc_now()
-                self._batch_input = self._batch_input_snapshot()
-            self._task_audit(
-                self._batch_audit_id,
-                task_kind="batch",
-                phase=event_type,
-                status="running",
-                input_data=self._batch_input,
-                result_data=self._batch_result_snapshot(),
-                started_at=self._batch_started_at,
+            self._post_batch_jobs(
+                batch,
+                event_type,
+                self._batch_job_ids,
+                terminal=False,
+                include_failure_diagnostics=False,
             )
             return
 
         if not self._batch_event_type:
             return
         event_type = self._batch_event_type
-        outcome, audit_status = _batch_terminal_semantics(
+        outcome, _audit_status = _batch_terminal_semantics(
             event_type,
             batch,
             self._batch_job_ids,
         )
         self._event(event_type, outcome)
-        ready_for_execute = event_type == "batch_prepare" and any(
-            str(getattr(job, "status", "") or "").upper() == "READY"
-            for job in _batch_jobs(batch)
+        self._post_batch_jobs(
+            batch,
+            event_type,
+            self._batch_job_ids,
+            terminal=True,
+            include_failure_diagnostics=True,
         )
-        terminal_audit = event_type == "batch_execute" or not ready_for_execute
-        if self._batch_audit_id:
-            self._task_audit(
-                self._batch_audit_id,
-                task_kind="batch",
-                phase=event_type,
-                status=audit_status,
-                input_data=self._batch_input,
-                result_data=self._batch_result_snapshot(
-                    include_failure_diagnostics=audit_status in {"failed", "review"}
-                ),
-                started_at=self._batch_started_at,
-                completed_at=_utc_now() if terminal_audit else "",
-            )
         self._batch_event_type = ""
         self._batch_job_ids = ()
-        if terminal_audit:
-            self._batch_audit_id = ""
-            self._batch_started_at = ""
-            self._batch_input = {}
+
+        if event_type == "batch_execute" or not any(
+            str(getattr(job, "status", "") or "").upper() == "READY"
+            for job in _batch_jobs(batch)
+        ):
+            self._batch_id = ""
+            self._batch_audit_ids = {}
+            self._batch_started_at = {}
+            self._batch_inputs = {}
 
     def _on_batch_jobs_changed(self, *_args: Any) -> None:
-        if self._batch_audit_id:
+        if self._batch_event_type and self._batch_job_ids:
             self._batch_flush.start()
 
-    def _flush_batch_audit(self) -> None:
-        if not self._batch_audit_id:
+    def _flush_batch_audits(self) -> None:
+        if not self._batch_event_type or not self._batch_job_ids:
             return
-        self._task_audit(
-            self._batch_audit_id,
-            task_kind="batch",
-            phase=self._batch_event_type or "batch",
-            status="running",
-            input_data=self._batch_input,
-            result_data=self._batch_result_snapshot(),
-            started_at=self._batch_started_at,
+        workspace = getattr(self.window, "batch_workspace", None)
+        controller = getattr(workspace, "controller", None)
+        batch = getattr(controller, "batch", None)
+        if batch is None:
+            return
+        self._post_batch_jobs(
+            batch,
+            self._batch_event_type,
+            self._batch_job_ids,
+            terminal=False,
+            include_failure_diagnostics=False,
         )
 
     def _on_batch_failed(self, *args: Any) -> None:
-        if self._batch_event_type:
-            self._event(self._batch_event_type, "failed")
-        if self._batch_audit_id:
-            self._task_audit(
-                self._batch_audit_id,
-                task_kind="batch",
-                phase=self._batch_event_type or "batch",
-                status="failed",
-                input_data=self._batch_input,
-                result_data=self._batch_result_snapshot(include_failure_diagnostics=True),
-                error_text=_error_text(args),
-                started_at=self._batch_started_at,
-                completed_at=_utc_now(),
-            )
+        if not self._batch_event_type:
+            return
+        workspace = getattr(self.window, "batch_workspace", None)
+        controller = getattr(workspace, "controller", None)
+        batch = getattr(controller, "batch", None)
+        if batch is None:
+            return
+        self._event(self._batch_event_type, "failed")
+        self._post_batch_jobs(
+            batch,
+            self._batch_event_type,
+            self._batch_job_ids,
+            terminal=True,
+            include_failure_diagnostics=True,
+            forced_error=_error_text(args),
+        )
         self._batch_event_type = ""
         self._batch_job_ids = ()
-        self._batch_audit_id = ""
-        self._batch_started_at = ""
-        self._batch_input = {}
+        self._batch_id = ""
+        self._batch_audit_ids = {}
+        self._batch_started_at = {}
+        self._batch_inputs = {}
 
 
 def install_usage_telemetry(
