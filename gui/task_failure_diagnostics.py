@@ -7,10 +7,12 @@ from typing import Any, Iterable
 from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 _MAX_TEXT = 12_000
-_MAX_TRACEBACK = 32_000
-_MAX_PROCESS_LOG = 64_000
-_MAX_EVENTS = 96
+_MAX_TRACEBACK = 24_000
+_MAX_PROCESS_LOG = 32_000
+_MAX_EVENTS = 48
+_MAX_STAGE_SUMMARY = 40
 _MAX_LIST = 180
+_EVENT_TEXT = 2_000
 _SECRET_KEY_RE = re.compile(
     r"(^|_)(api[_-]?key|token|secret|password|authorization|cookie|refresh[_-]?token|access[_-]?token)($|_)",
     re.IGNORECASE,
@@ -32,8 +34,6 @@ _TRACEBACK_MARKER = "Traceback (most recent call last):"
 
 
 def sanitize_telemetry_url(value: str) -> str:
-    """Redact secret-like query values without changing non-secret URL context."""
-
     raw = str(value or "")
     if not raw:
         return ""
@@ -59,8 +59,6 @@ def sanitize_telemetry_url(value: str) -> str:
 
 
 def sanitize_telemetry_text(value: str, limit: int = _MAX_TEXT) -> str:
-    """Sanitize URLs and obvious bearer credentials embedded in diagnostic text."""
-
     text = str(value or "")[: max(1, int(limit))]
     text = _URL_RE.sub(lambda match: sanitize_telemetry_url(match.group(0)), text)
     text = _INLINE_QUERY_SECRET_RE.sub(r"\1[REDACTED]", text)
@@ -74,8 +72,6 @@ def sanitize_telemetry_value(
     max_text: int = _MAX_TEXT,
     max_list: int = _MAX_LIST,
 ) -> Any:
-    """Recursively sanitize owner telemetry while preserving diagnostic structure."""
-
     if depth > 10:
         return "[TRUNCATED]"
     if value is None or isinstance(value, (bool, int, float)):
@@ -139,11 +135,11 @@ def _read_diagnostic_events(path: Path) -> list[dict[str, Any]]:
 
 
 def _read_text_tail(path: Path, limit: int = _MAX_PROCESS_LOG) -> tuple[str, bool]:
-    """Read the diagnostically useful tail without loading an unbounded log file."""
+    """Keep the newest process evidence so the actual exception is never cut off."""
 
     try:
         size = path.stat().st_size
-        read_size = min(size, max(limit * 4, 256_000))
+        read_size = min(size, max(limit * 4, 128_000))
         with path.open("rb") as handle:
             if size > read_size:
                 handle.seek(-read_size, 2)
@@ -165,7 +161,7 @@ def _extract_traceback(log_text: str) -> str:
     traceback_text = log_text[marker:]
     if len(traceback_text) <= _MAX_TRACEBACK:
         return sanitize_telemetry_text(traceback_text, _MAX_TRACEBACK)
-    keep = max(1, _MAX_TRACEBACK - len(_TRACEBACK_MARKER) - 2)
+    keep = max(1, _MAX_TRACEBACK - len(_TRACEBACK_MARKER) - 40)
     return sanitize_telemetry_text(
         _TRACEBACK_MARKER + "\n…[traceback middle truncated]…\n" + traceback_text[-keep:],
         _MAX_TRACEBACK,
@@ -186,18 +182,26 @@ def _infer_exception(log_text: str) -> tuple[str, str]:
     return "", ""
 
 
+def _compact_event(raw: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "ts",
+        "event",
+        "stage",
+        "ui_phase",
+        "elapsed_s",
+        "detail",
+        "error",
+        "error_type",
+        "mode",
+        "active_stages",
+        "context",
+    )
+    event = {key: raw.get(key) for key in keys if key in raw}
+    return sanitize_telemetry_value(event, max_text=_EVENT_TEXT, max_list=80)
+
+
 def _event_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    timeline: list[dict[str, Any]] = []
-    for raw in events[-_MAX_EVENTS:]:
-        event = dict(raw)
-        if event.get("traceback"):
-            event["traceback"] = "[see failure_diagnostic.traceback]"
-        if event.get("process_log_tail"):
-            event["process_log_tail"] = "[see failure_diagnostic.process_log_tail]"
-        timeline.append(
-            sanitize_telemetry_value(event, max_text=_MAX_TEXT, max_list=_MAX_LIST)
-        )
-    return timeline
+    return [_compact_event(raw) for raw in events[-_MAX_EVENTS:]]
 
 
 def _stage_summary(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -218,9 +222,32 @@ def _stage_summary(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "detail": str(event.get("detail") or event.get("error") or ""),
         }
     return [
-        sanitize_telemetry_value(stages[name], max_text=4_000, max_list=40)
-        for name in order[-80:]
+        sanitize_telemetry_value(stages[name], max_text=1_500, max_list=40)
+        for name in order[-_MAX_STAGE_SUMMARY:]
     ]
+
+
+def _compact_manifest(payload: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "run_id",
+        "mode",
+        "product_url",
+        "workflow_status",
+        "vertical",
+        "brand",
+        "makro_target_id",
+        "ownership_mode",
+        "error",
+        "error_type",
+        "failed_stage",
+        "started_at",
+        "completed_at",
+    )
+    return sanitize_telemetry_value(
+        {key: payload.get(key) for key in keys if key in payload},
+        max_text=4_000,
+        max_list=60,
+    )
 
 
 def _latest_execution_report(roots: Iterable[str | Path]) -> tuple[Path | None, dict[str, Any]]:
@@ -241,10 +268,35 @@ def _latest_execution_report(roots: Iterable[str | Path]) -> tuple[Path | None, 
     return latest, _read_json_object(latest)
 
 
+def _section_report_summary(raw: Any) -> dict[str, Any]:
+    payload = raw if isinstance(raw, dict) else {}
+    keys = (
+        "section",
+        "section_title",
+        "title",
+        "status",
+        "writes_attempted",
+        "validated",
+        "persisted_verified",
+        "validation_failed",
+        "persisted_validation_failed",
+        "fill_error",
+        "save_attempted",
+        "saved",
+        "error",
+    )
+    return sanitize_telemetry_value(
+        {key: payload.get(key) for key in keys if key in payload},
+        max_text=2_000,
+        max_list=40,
+    )
+
+
 def _compact_execution_report(payload: dict[str, Any]) -> dict[str, Any]:
     if not payload:
         return {}
-    keys = (
+    result: dict[str, Any] = {}
+    for key in (
         "mode",
         "page_url",
         "makro_target_id",
@@ -252,21 +304,23 @@ def _compact_execution_report(payload: dict[str, Any]) -> dict[str, Any]:
         "expected_vertical",
         "plan_summary",
         "blocked_reason_summary",
-        "section_reports",
         "field_totals",
-        "photo_upload",
         "completion",
         "section_save_attempted",
         "section_saved",
         "send_to_qc_clicked",
         "browser_closed",
         "final_screenshot",
-    )
-    return sanitize_telemetry_value(
-        {key: payload.get(key) for key in keys if key in payload},
-        max_text=_MAX_TEXT,
-        max_list=_MAX_LIST,
-    )
+    ):
+        if key in payload:
+            result[key] = payload.get(key)
+    sections = payload.get("section_reports")
+    if isinstance(sections, list):
+        result["section_reports"] = [_section_report_summary(item) for item in sections[:12]]
+    photos = payload.get("photo_upload")
+    if isinstance(photos, dict):
+        result["photo_upload"] = sanitize_telemetry_value(photos, max_text=2_000, max_list=60)
+    return sanitize_telemetry_value(result, max_text=4_000, max_list=100)
 
 
 def collect_workflow_failure_diagnostic(
@@ -279,12 +333,11 @@ def collect_workflow_failure_diagnostic(
     process_log_path: str | Path | None = None,
     artifact_roots: Iterable[str | Path] = (),
 ) -> dict[str, Any]:
-    """Build an owner-visible diagnosis that is sufficient to repair a failed task.
+    """Return bounded, secret-redacted evidence sufficient for remote repair.
 
-    Structured workflow events remain the canonical source for prepare failures.
-    Real execution failures additionally consume the exact merged child-process
-    log and any executor report that survived the failure. Secrets are redacted
-    before upload and log size is deterministically bounded per product audit.
+    The product audit is intentionally kept below the server's 260 KB contract:
+    newest process log tail, traceback, compact workflow timeline/manifest and any
+    surviving executor report. Each failed Batch product is uploaded separately.
     """
 
     path = Path(run_dir).expanduser() if str(run_dir or "").strip() else None
@@ -310,7 +363,11 @@ def collect_workflow_failure_diagnostic(
             break
 
     event_traceback = str(failed_event.get("traceback") or "")
-    traceback_text = sanitize_telemetry_text(event_traceback, _MAX_TRACEBACK) if event_traceback else _extract_traceback(process_log)
+    traceback_text = (
+        sanitize_telemetry_text(event_traceback, _MAX_TRACEBACK)
+        if event_traceback
+        else _extract_traceback(process_log)
+    )
     log_error_type, log_error_message = _infer_exception(process_log)
 
     error_message = sanitize_telemetry_text(
@@ -329,23 +386,12 @@ def collect_workflow_failure_diagnostic(
     )
     failed_stage = sanitize_telemetry_text(
         str(failed_event.get("stage") or fallback_stage or "unknown"),
-        240,
+        500,
     )
     resolved_mode = sanitize_telemetry_text(
-        str(
-            failed_event.get("mode")
-            or manifest.get("mode")
-            or workflow_mode
-            or ""
-        ),
+        str(failed_event.get("mode") or manifest.get("mode") or workflow_mode or ""),
         120,
     )
-
-    failed_event_safe = dict(failed_event)
-    if failed_event_safe.get("traceback"):
-        failed_event_safe["traceback"] = "[see failure_diagnostic.traceback]"
-    if failed_event_safe.get("process_log_tail"):
-        failed_event_safe["process_log_tail"] = "[see failure_diagnostic.process_log_tail]"
 
     sources = {
         "workflow_diagnostics": bool(events),
@@ -369,10 +415,10 @@ def collect_workflow_failure_diagnostic(
         "elapsed_seconds": float(failed_event.get("elapsed_s") or 0.0),
         "diagnostic_source_available": any(sources.values()),
         "diagnostic_sources": sources,
-        "failed_event": sanitize_telemetry_value(failed_event_safe, max_text=_MAX_TEXT, max_list=_MAX_LIST),
+        "failed_event": _compact_event(failed_event) if failed_event else {},
         "stage_summary": _stage_summary(events),
         "timeline": _event_timeline(events),
-        "manifest": sanitize_telemetry_value(manifest, max_text=_MAX_TEXT, max_list=_MAX_LIST),
+        "manifest": _compact_manifest(manifest),
         "process_log_name": process_path.name if process_path is not None else "",
         "process_log_tail": process_log,
         "process_log_truncated": process_log_truncated,
@@ -380,7 +426,7 @@ def collect_workflow_failure_diagnostic(
         "execution_report_run": report_path.parent.name if report_path is not None else "",
         "execution_report": execution_report,
     }
-    return sanitize_telemetry_value(payload, max_text=_MAX_PROCESS_LOG, max_list=_MAX_EVENTS)
+    return sanitize_telemetry_value(payload, max_text=_MAX_PROCESS_LOG, max_list=_MAX_LIST)
 
 
 __all__ = [
