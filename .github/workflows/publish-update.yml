@@ -106,9 +106,12 @@ jobs:
           $global:LASTEXITCODE = 0
           if ($exists) { throw "Release already exists: $tag" }
 
+          $releaseName = "$env:UPDATE_TITLE v$resolved"
           "UPDATE_VERSION=$resolved" >> $env:GITHUB_ENV
+          "UPDATE_RELEASE_NAME=$releaseName" >> $env:GITHUB_ENV
           "version=$resolved" >> $env:GITHUB_OUTPUT
           Write-Host "Resolved Stable version: $resolved"
+          Write-Host "Resolved unique release name: $releaseName"
 
       - name: Stamp package version and release notes
         shell: pwsh
@@ -237,7 +240,7 @@ jobs:
               --channel $env:VELOPACK_CHANNEL `
               --repoUrl "https://github.com/$env:GITHUB_REPOSITORY" `
               --publish false `
-              --releaseName "$env:UPDATE_TITLE" `
+              --releaseName "$env:UPDATE_RELEASE_NAME" `
               --tag $tag `
               --targetCommitish "${{ steps.source.outputs.sha }}"
             $vpkExit = $LASTEXITCODE
