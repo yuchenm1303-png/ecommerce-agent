@@ -23,6 +23,16 @@ _MAX_TEXT = 12_000
 _MAX_AUDIT_TEXT = 32_000
 _MAX_LIST = 180
 _BATCH_EXECUTE_ACTIVE = {"FILLING", "UPLOADING_IMAGES", "SAVING", "VERIFYING"}
+_EXECUTOR_LOCAL_ARTIFACT_KEYS = {
+    "path",
+    "live_schema",
+    "_report_path",
+    "decision_packet",
+    "required_override_file",
+    "final_screenshot",
+    "evidence_images",
+    "source_snapshots",
+}
 
 
 def _utc_now() -> str:
@@ -57,25 +67,223 @@ def _widget_text(widget: Any) -> str:
         return ""
 
 
+def _file_metadata_entry(raw: Any) -> dict[str, Any] | None:
+    try:
+        path = Path(raw).expanduser().resolve()
+    except Exception:
+        return None
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    return {
+        "name": path.name,
+        "extension": path.suffix.casefold(),
+        "size_bytes": int(size),
+    }
+
+
 def _file_metadata(values: Any) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for raw in list(values or ())[:100]:
-        try:
-            path = Path(raw).expanduser().resolve()
-        except Exception:
-            continue
-        try:
-            size = path.stat().st_size
-        except OSError:
-            size = 0
-        output.append(
-            {
-                "name": path.name,
-                "extension": path.suffix.casefold(),
-                "size_bytes": int(size),
-            }
-        )
+        item = _file_metadata_entry(raw)
+        if item is not None:
+            output.append(item)
     return output
+
+
+def _optional_int(payload: Any, key: str) -> int | None:
+    if not isinstance(payload, dict) or key not in payload:
+        return None
+    try:
+        return int(payload.get(key))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _privacy_safe_executor_value(value: Any, *, depth: int = 0) -> Any:
+    """Keep executor evidence while dropping local filesystem artifact locations."""
+
+    if depth > 10:
+        return "[TRUNCATED]"
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        for key, item in list(value.items())[:_MAX_LIST]:
+            name = str(key or "")
+            folded = name.casefold()
+            if (
+                folded in _EXECUTOR_LOCAL_ARTIFACT_KEYS
+                or folded.endswith("_path")
+                or folded.startswith("screenshot_")
+            ):
+                continue
+            output[name] = _privacy_safe_executor_value(item, depth=depth + 1)
+        return output
+    if isinstance(value, (list, tuple, set)):
+        return [
+            _privacy_safe_executor_value(item, depth=depth + 1)
+            for item in list(value)[:_MAX_LIST]
+        ]
+    return value
+
+
+def _compact_photo_upload(raw: Any) -> dict[str, Any]:
+    payload = raw if isinstance(raw, dict) else {}
+    if not payload:
+        return {}
+
+    result: dict[str, Any] = {}
+    for key in (
+        "status",
+        "detail",
+        "requested",
+        "attempted",
+        "staged",
+        "persisted",
+        "final_count",
+        "initial_count",
+        "already_persisted",
+        "capacity",
+        "save_attempted",
+        "saved",
+        "save_count",
+    ):
+        if key in payload:
+            result[key] = payload.get(key)
+
+    persistence = payload.get("persistence")
+    if isinstance(persistence, dict):
+        result["persistence"] = {
+            key: persistence.get(key)
+            for key in ("status", "detail", "final_count", "initial_count", "expected_added")
+            if key in persistence
+        }
+
+    reopened = payload.get("reopened_state")
+    if isinstance(reopened, dict):
+        result["reopened_state"] = {
+            key: reopened.get(key)
+            for key in ("capacity", "completion_count", "visible_image_count", "remaining_empty_slots")
+            if key in reopened
+        }
+
+    items: list[dict[str, Any]] = []
+    for raw_item in list(payload.get("items") or ())[:20]:
+        if not isinstance(raw_item, dict):
+            continue
+        path_value = raw_item.get("path")
+        metadata = _file_metadata_entry(path_value) if str(path_value or "").strip() else None
+        item: dict[str, Any] = {
+            key: raw_item.get(key)
+            for key in (
+                "index",
+                "status",
+                "slot_position",
+                "before_empty_slots",
+                "after_empty_slots",
+                "before_completion_count",
+            )
+            if key in raw_item
+        }
+        if metadata is not None:
+            item.update(metadata)
+        elif raw_item.get("name"):
+            item["name"] = Path(str(raw_item.get("name"))).name
+        items.append(item)
+    if items:
+        result["items"] = items
+
+    return _safe_value(result, max_text=2_000)
+
+
+def _material_usage_payload(
+    selected_files: Any,
+    executor_report: Any,
+) -> dict[str, Any]:
+    selected = [
+        _safe_value(item, max_text=1_000)
+        for item in list(selected_files or ())[:100]
+        if isinstance(item, dict)
+    ]
+    report = executor_report if isinstance(executor_report, dict) else {}
+    photo = report.get("photo_upload") if isinstance(report.get("photo_upload"), dict) else {}
+    report_items = [item for item in list(photo.get("items") or ())[:20] if isinstance(item, dict)]
+
+    requested = _optional_int(photo, "requested")
+    attempted = _optional_int(photo, "attempted")
+    staged = _optional_int(photo, "staged")
+    persisted = _optional_int(photo, "persisted")
+    final_count = _optional_int(photo, "final_count")
+    already_persisted = _optional_int(photo, "already_persisted")
+    confirmed_saved = max(persisted or 0, final_count or 0, already_persisted or 0)
+    detected = max(
+        len(selected),
+        len(report_items),
+        requested or 0,
+        attempted or 0,
+        staged or 0,
+    )
+    has_execution_evidence = bool(photo)
+
+    if confirmed_saved > 0:
+        state = "used"
+        evidence = "executor_report"
+    elif detected > 0:
+        state = "detected"
+        evidence = "executor_report" if has_execution_evidence else "gui_snapshot"
+    elif has_execution_evidence and requested == 0 and attempted == 0:
+        state = "none"
+        evidence = "executor_report"
+    else:
+        state = "unknown"
+        evidence = "none"
+
+    actual_files = [
+        {
+            key: item.get(key)
+            for key in ("name", "extension", "size_bytes", "index", "status", "slot_position")
+            if key in item
+        }
+        for item in report_items
+    ]
+    return _safe_value(
+        {
+            "schema": 1,
+            "state": state,
+            "evidence": evidence,
+            "selected_file_count": len(selected),
+            "selected_files": selected,
+            "photo_requested": requested,
+            "photo_attempted": attempted,
+            "photo_staged": staged,
+            "photo_persisted": persisted,
+            "photo_final_count": final_count,
+            "photo_confirmed_saved": confirmed_saved,
+            "actual_files": actual_files,
+        },
+        max_text=2_000,
+    )
+
+
+def _material_report(result_data: dict[str, Any]) -> dict[str, Any]:
+    report = result_data.get("executor_report")
+    if isinstance(report, dict):
+        return report
+    diagnostic = result_data.get("failure_diagnostic")
+    if isinstance(diagnostic, dict):
+        failure_report = diagnostic.get("execution_report")
+        if isinstance(failure_report, dict):
+            return failure_report
+    return {}
+
+
+def _with_material_usage(
+    result_data: dict[str, Any],
+    selected_files: Any,
+) -> dict[str, Any]:
+    output = dict(result_data)
+    output["material_usage"] = _material_usage_payload(selected_files, _material_report(output))
+    return _safe_value(output, max_text=_MAX_AUDIT_TEXT)
 
 
 def _phase_stats(stats: Any) -> dict[str, Any]:
@@ -93,7 +301,41 @@ def _phase_stats(stats: Any) -> dict[str, Any]:
     }
 
 
-def _run_result_payload(result: Any) -> dict[str, Any]:
+def _compact_executor_report(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict) or not payload:
+        return {}
+    keys = (
+        "mode",
+        "page_url",
+        "makro_target_id",
+        "product_url",
+        "expected_vertical",
+        "plan_summary",
+        "blocked_reason_summary",
+        "section_reports",
+        "field_totals",
+        "completion",
+        "section_save_attempted",
+        "section_saved",
+        "send_to_qc_clicked",
+        "browser_closed",
+    )
+    result: dict[str, Any] = {
+        key: _privacy_safe_executor_value(payload.get(key))
+        for key in keys
+        if key in payload
+    }
+    photo_upload = _compact_photo_upload(payload.get("photo_upload"))
+    if photo_upload:
+        result["photo_upload"] = photo_upload
+    return _safe_value(result, max_text=_MAX_AUDIT_TEXT)
+
+
+def _run_result_payload(
+    result: Any,
+    *,
+    selected_files: Any = (),
+) -> dict[str, Any]:
     if result is None or not hasattr(result, "run_dir"):
         return {}
 
@@ -124,6 +366,7 @@ def _run_result_payload(result: Any) -> dict[str, Any]:
         )
 
     safety = getattr(result, "safety", None)
+    executor_report = _compact_executor_report(getattr(result, "executor_report", {}) or {})
     payload = {
         "workflow_mode": _text(getattr(result, "workflow_mode", ""), 80),
         "workflow_status": _text(getattr(result, "workflow_status", ""), 120),
@@ -145,10 +388,10 @@ def _run_result_payload(result: Any) -> dict[str, Any]:
         },
         "fields": fields,
         "web_candidates": web_candidates,
-        "executor_report": _safe_value(getattr(result, "executor_report", {}) or {}),
+        "executor_report": executor_report,
         "run_id": Path(getattr(result, "run_dir")).name,
     }
-    return _safe_value(payload)
+    return _with_material_usage(payload, selected_files)
 
 
 def _first_result(args: tuple[Any, ...]) -> Any | None:
@@ -339,31 +582,6 @@ def _read_json_file(path: str | Path | None) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _compact_executor_report(payload: dict[str, Any]) -> dict[str, Any]:
-    keys = (
-        "mode",
-        "page_url",
-        "makro_target_id",
-        "product_url",
-        "expected_vertical",
-        "plan_summary",
-        "blocked_reason_summary",
-        "section_reports",
-        "field_totals",
-        "photo_upload",
-        "completion",
-        "section_save_attempted",
-        "section_saved",
-        "send_to_qc_clicked",
-        "browser_closed",
-        "final_screenshot",
-    )
-    return _safe_value(
-        {key: payload.get(key) for key in keys if key in payload},
-        max_text=_MAX_AUDIT_TEXT,
-    )
-
-
 def _batch_process_log(job: Any, event_type: str) -> str:
     run_dir = str(getattr(job, "run_dir", "") or "").strip()
     if not run_dir:
@@ -537,6 +755,7 @@ class UsageTelemetryController(QObject):
             if value not in (None, ""):
                 model_config[name] = _safe_value(value)
 
+        customer_files = _file_metadata(getattr(window, "_selected_product_files", ()) or ())
         return {
             "supplier_url": _widget_text(getattr(window, "url_input", None)),
             "listing_intent": _widget_text(getattr(window, "listing_intent_input", None)),
@@ -545,7 +764,12 @@ class UsageTelemetryController(QObject):
             "requested_vertical": _widget_text(vertical),
             "requested_vertical_origin": vertical_origin,
             "execution_scope": scope_value,
-            "customer_files": _file_metadata(getattr(window, "_selected_product_files", ()) or ()),
+            "customer_files": customer_files,
+            "customer_files_capture": {
+                "source": "gui_snapshot",
+                "count": len(customer_files),
+                "state": "captured_nonempty" if customer_files else "empty_snapshot",
+            },
             "model_config": model_config,
         }
 
@@ -566,13 +790,19 @@ class UsageTelemetryController(QObject):
                 url = ""
             if not url:
                 continue
+            customer_files = _file_metadata(getattr(row, "product_files", ()) or ())
             items.append(
                 {
                     "row": index,
                     "enabled": enabled,
                     "supplier_url": url,
                     "listing_intent": _widget_text(getattr(row, "offer_input", None)),
-                    "customer_files": _file_metadata(getattr(row, "product_files", ()) or ()),
+                    "customer_files": customer_files,
+                    "customer_files_capture": {
+                        "source": "batch_row_snapshot",
+                        "count": len(customer_files),
+                        "state": "captured_nonempty" if customer_files else "empty_snapshot",
+                    },
                 }
             )
         return items
@@ -590,6 +820,7 @@ class UsageTelemetryController(QObject):
             items[index] if index < len(items) else {},
         )
         jobs = _batch_jobs(batch)
+        customer_files = _safe_value(item.get("customer_files") or [])
         return {
             "audit_scope": "batch_link",
             "batch_id": _text(getattr(batch, "batch_id", ""), 200),
@@ -598,7 +829,15 @@ class UsageTelemetryController(QObject):
             "batch_size": len(jobs),
             "supplier_url": product_url,
             "listing_intent": _text(item.get("listing_intent"), 12_000),
-            "customer_files": _safe_value(item.get("customer_files") or []),
+            "customer_files": customer_files,
+            "customer_files_capture": _safe_value(
+                item.get("customer_files_capture")
+                or {
+                    "source": "batch_row_snapshot",
+                    "count": len(customer_files),
+                    "state": "captured_nonempty" if customer_files else "empty_snapshot",
+                }
+            ),
         }
 
     def _reset_batch_audits(self, batch_id: str) -> None:
@@ -686,7 +925,8 @@ class UsageTelemetryController(QObject):
                 process_log_path=_batch_process_log(job, event_type),
                 artifact_roots=artifact_roots,
             )
-        return _safe_value(result, max_text=_MAX_AUDIT_TEXT)
+        selected_files = self._batch_inputs.get(job_id, {}).get("customer_files", [])
+        return _with_material_usage(result, selected_files)
 
     def _post_batch_jobs(
         self,
@@ -783,7 +1023,10 @@ class UsageTelemetryController(QObject):
             self._event("listing_prepare", "completed")
         result = _first_result(args)
         if result is not None:
-            self._single_result = _run_result_payload(result)
+            self._single_result = _run_result_payload(
+                result,
+                selected_files=self._single_input.get("customer_files", []),
+            )
         if self._single_audit_id:
             self._task_audit(
                 self._single_audit_id,
@@ -808,6 +1051,10 @@ class UsageTelemetryController(QObject):
                 args=args,
                 fallback_stage="listing_prepare",
             )
+            self._single_result = _with_material_usage(
+                self._single_result,
+                self._single_input.get("customer_files", []),
+            )
             self._task_audit(
                 self._single_audit_id,
                 task_kind="single",
@@ -829,6 +1076,10 @@ class UsageTelemetryController(QObject):
                 self._single_audit_id = str(uuid.uuid4())
                 self._single_started_at = _utc_now()
                 self._single_input = self._single_input_snapshot()
+            self._single_result = _with_material_usage(
+                self._single_result,
+                self._single_input.get("customer_files", []),
+            )
             self._task_audit(
                 self._single_audit_id,
                 task_kind="single",
@@ -844,14 +1095,16 @@ class UsageTelemetryController(QObject):
         if self._execute_active:
             self._execute_active = False
             self._event("listing_execute", "completed")
+        selected_files = self._single_input.get("customer_files", [])
         result = _first_result(args)
         if result is not None:
-            self._single_result = _run_result_payload(result)
+            self._single_result = _run_result_payload(result, selected_files=selected_files)
         execution_report = _first_mapping(args)
         if execution_report is not None:
             self._single_result = dict(self._single_result)
-            self._single_result["executor_report"] = _safe_value(execution_report)
+            self._single_result["executor_report"] = _compact_executor_report(execution_report)
             self._single_result["execution_elapsed_seconds"] = float(execution_report.get("_elapsed_s") or 0.0)
+        self._single_result = _with_material_usage(self._single_result, selected_files)
         if self._single_audit_id:
             self._task_audit(
                 self._single_audit_id,
@@ -876,6 +1129,10 @@ class UsageTelemetryController(QObject):
                 runner=runner,
                 args=args,
                 fallback_stage="listing_execute",
+            )
+            self._single_result = _with_material_usage(
+                self._single_result,
+                self._single_input.get("customer_files", []),
             )
             self._task_audit(
                 self._single_audit_id,
