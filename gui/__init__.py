@@ -9,15 +9,15 @@ import sys
 _PACKAGE_IMPORT_PROBE = "ECOMMERCE_AGENT_PACKAGE_IMPORT_PROBE"
 
 
-def _install_account_controls_hook() -> None:
+def _install_application_access_extensions_hook() -> None:
     from . import app_access as _app_access
 
-    if getattr(_app_access, "_account_controls_hooked", False):
+    if getattr(_app_access, "_application_access_extensions_hooked", False):
         return
 
     original_install = _app_access.install_application_access
 
-    def install_with_account_controls(window, session):
+    def install_with_extensions(window, session):
         controller = original_install(window, session)
         try:
             from .account_controls import install_application_account_controls
@@ -25,15 +25,21 @@ def _install_account_controls_hook() -> None:
             install_application_account_controls(window, controller)
         except Exception as exc:  # Account UI must never block the core workspace.
             print(f"[account-controls] install skipped: {exc}", file=sys.stderr)
+        try:
+            from .batch_link_telemetry import install_batch_link_telemetry
+
+            install_batch_link_telemetry(window, controller)
+        except Exception as exc:  # Telemetry must never block the core workspace.
+            print(f"[batch-link-telemetry] install skipped: {exc}", file=sys.stderr)
         return controller
 
-    _app_access.install_application_access = install_with_account_controls
-    _app_access._account_controls_hooked = True
+    _app_access.install_application_access = install_with_extensions
+    _app_access._application_access_extensions_hooked = True
 
 
 _package_probe = os.environ.get(_PACKAGE_IMPORT_PROBE) == "1"
 try:
-    _install_account_controls_hook()
+    _install_application_access_extensions_hook()
 except Exception:
     if _package_probe:
         os._exit(92)
