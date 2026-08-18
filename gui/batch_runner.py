@@ -12,6 +12,7 @@ from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signa
 
 from app.listing_images import listing_images_from_resolver_outputs
 from app.required_overrides import write_required_fallback_overrides
+from .async_run_journal import AsyncRunJournal
 from .batch_model import (
     BATCH_WORKER_DEFAULT,
     BatchJob,
@@ -54,10 +55,10 @@ class BatchController(QObject):
     owned-tab jobs may run in parallel. Real execution uses the same owned tab
     token and has a separate bounded concurrency.
 
-    Child-process stdout remains fully owned by each job's workflow/executor
-    artifacts. The control-tower surface receives a rate-limited latest-line
-    preview per job, while batch.json and the full card model are published on a
-    coalesced state cadence. This keeps 8/16-worker bursts off the GUI paint lane.
+    Child-process stdout is durably journaled per job/stage while the control-tower
+    surface receives only a rate-limited preview. This keeps complete failure
+    evidence available for owner telemetry without turning console bursts into GUI
+    thread filesystem work.
     """
 
     jobs_changed = Signal(object)
@@ -78,6 +79,7 @@ class BatchController(QObject):
         self._execute_queue: list[str] = []
         self._processes: dict[QProcess, tuple[str, str]] = {}
         self._buffers: dict[QProcess, str] = {}
+        self._journals: dict[QProcess, AsyncRunJournal] = {}
         self._stopping = False
         self._execution_images = False
         self._pending_log_preview: dict[str, str] = {}
@@ -349,11 +351,26 @@ class BatchController(QObject):
         process.setProcessEnvironment(environment)
         self._processes[process] = (job_id, stage)
         self._buffers[process] = ""
+
+        job = self._job(job_id)
+        log_path = self._job_root(job) / "diagnostics" / f"{stage}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            log_path.write_text("", encoding="utf-8")
+        except OSError:
+            pass
+        journal = AsyncRunJournal(log_path)
+        self._journals[process] = journal
+
         process.readyReadStandardOutput.connect(lambda p=process: self._read_output(p))
         process.finished.connect(
             lambda exit_code, exit_status, p=process: self._finished(p, int(exit_code))
         )
+        process.errorOccurred.connect(lambda error, p=process: self._process_error(p, error))
         command = subprocess.list2cmdline([sys.executable, *args])
+        journal.append(f"stage={stage}")
+        journal.append(f"cwd={self.project_root}")
+        journal.append("$ " + command)
         self._emit_log_now(f"[{job_id} · {stage}] $ {command}")
         process.start(sys.executable, args)
 
@@ -371,6 +388,9 @@ class BatchController(QObject):
                 self._buffers[process] = part
 
     def _observe_line(self, process: QProcess, line: str) -> None:
+        journal = self._journals.get(process)
+        if journal is not None:
+            journal.append(line)
         job_id, stage = self._processes.get(process, ("?", "?"))
         self._queue_log_preview(job_id, f"[{job_id}] {line}")
         if job_id == "?":
@@ -411,11 +431,17 @@ class BatchController(QObject):
             job.touch()
             self._persist_emit()
 
+    def _close_process_journal(self, process: QProcess) -> None:
+        journal = self._journals.pop(process, None)
+        if journal is not None:
+            journal.close()
+
     def _finished(self, process: QProcess, exit_code: int) -> None:
         self._read_output(process)
         tail = self._buffers.pop(process, "")
         if tail:
             self._observe_line(process, tail)
+        self._close_process_journal(process)
         job_id, stage = self._processes.pop(process, ("", ""))
         if not job_id:
             return
@@ -507,6 +533,26 @@ class BatchController(QObject):
                 job.stage_detail = "真实填写失败"
             job.touch()
             self._persist_emit()
+            self._pump_execute()
+
+    def _process_error(self, process: QProcess, error: QProcess.ProcessError) -> None:
+        if error != QProcess.FailedToStart or process not in self._processes:
+            return
+        job_id, stage = self._processes.pop(process)
+        self._buffers.pop(process, None)
+        journal = self._journals.get(process)
+        if journal is not None:
+            journal.append("QProcess failed to start")
+        self._close_process_journal(process)
+        job = self._job(job_id)
+        job.status = "FAILED"
+        job.error = f"{stage} process failed to start"
+        job.stage_detail = "子进程启动失败"
+        job.touch()
+        self._persist_emit()
+        if stage in {"source", "prepare"}:
+            self._pump_prepare()
+        elif stage == "execute":
             self._pump_execute()
 
     def _workflow_error(self, job: BatchJob) -> str:
