@@ -55,6 +55,8 @@ class BatchJob:
     execution_report: str = ""
     image_count: int = 0
     error: str = ""
+    failure_stage: str = ""
+    exit_code: int | None = None
     created_at: str = field(default_factory=lambda: _now())
     updated_at: str = field(default_factory=lambda: _now())
 
