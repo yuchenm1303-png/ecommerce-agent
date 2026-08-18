@@ -2,6 +2,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
 const REPOSITORY = "yuchenm1303-png/ecommerce-agent";
+const UPDATE_BASE_URL = `https://github.com/${REPOSITORY}`;
 const LATEST_RELEASE_API = `https://api.github.com/repos/${REPOSITORY}/releases/latest`;
 const RELEASE_HISTORY_API = `https://api.github.com/repos/${REPOSITORY}/releases?per_page=20`;
 const RELEASE_BUCKET = "listing-studio-releases";
@@ -261,6 +262,7 @@ Deno.serve(async (req: Request) => {
     return json(req, {
       channel: "stable",
       version: `v${stable.version}`,
+      updateBaseUrl: UPDATE_BASE_URL,
       title: stable.title,
       notes: stable.notes,
       publishedAt: stable.publishedAt,
