@@ -157,6 +157,7 @@ class BatchLinkTelemetryController(QObject):
         super().__init__(window)
         self.window = window
         self.access = access
+        self.session_id = str(uuid.uuid4())
         self.network = QNetworkAccessManager(self)
         self._last_signatures: dict[str, str] = {}
         self._result_cache: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -418,7 +419,7 @@ class BatchLinkTelemetryController(QObject):
             "action": "task_audit",
             "user_id": session.user_id,
             "device_id": session.device_id,
-            "session_id": str(uuid.uuid4()),
+            "session_id": self.session_id,
             "telemetry_token": session.telemetry_token,
             "app_version": self.access.installed_version,
             "audit": _safe(audit),
