@@ -84,6 +84,10 @@ def test_release_build_and_publish_are_native_velopack() -> None:
     assert "dotnet tool run vpk -- upload github" in PUBLISH
     assert "artifacts\\velopack" in PUBLISH
     assert "releases.$env:VELOPACK_CHANNEL.json" in PUBLISH
+    assert '$releaseName = "$env:UPDATE_TITLE v$resolved"' in PUBLISH
+    assert '"UPDATE_RELEASE_NAME=$releaseName"' in PUBLISH
+    assert '--releaseName "$env:UPDATE_RELEASE_NAME"' in PUBLISH
+    assert '--releaseName "$env:UPDATE_TITLE"' not in PUBLISH
     assert "update.json" not in PUBLISH
     assert "Inno" not in PUBLISH
     assert "dotnet tool run vpk -- upload github" in TEST_PUBLISH
