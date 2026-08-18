@@ -22,6 +22,7 @@ _AUDIT_FLUSH_MS = 1_200
 _MAX_TEXT = 12_000
 _MAX_AUDIT_TEXT = 32_000
 _MAX_LIST = 180
+_BATCH_EXECUTE_ACTIVE = {"FILLING", "UPLOADING_IMAGES", "SAVING", "VERIFYING"}
 
 
 def _utc_now() -> str:
@@ -308,6 +309,24 @@ def _batch_job_status(event_type: str, job_status: str) -> str:
     if status == "STOPPED":
         return "cancelled"
     return "running"
+
+
+def _batch_job_phase(job: Any, default_event_type: str) -> str:
+    """Resolve a product's actual lane even while prepare and execute overlap."""
+
+    status = _text(getattr(job, "status", ""), 120).upper()
+    if status in _BATCH_EXECUTE_ACTIVE or status == "DONE":
+        return "batch_execute"
+
+    run_dir = str(getattr(job, "run_dir", "") or "").strip()
+    execute_log = Path(run_dir).parent / "diagnostics" / "execute.log" if run_dir else None
+    if status in {"FAILED", "REVIEW", "STOPPED"} and (
+        int(getattr(job, "progress", 0) or 0) >= 82
+        or bool(str(getattr(job, "execution_report", "") or "").strip())
+        or bool(execute_log is not None and execute_log.is_file())
+    ):
+        return "batch_execute"
+    return default_event_type
 
 
 def _read_json_file(path: str | Path | None) -> dict[str, Any]:
@@ -686,8 +705,9 @@ class UsageTelemetryController(QObject):
             job_id = _text(getattr(job, "job_id", ""), 160)
             if job_id not in wanted:
                 continue
+            job_phase = _batch_job_phase(job, event_type)
             job_status = _text(getattr(job, "status", ""), 120).upper()
-            status = _batch_job_status(event_type, job_status)
+            status = _batch_job_status(job_phase, job_status)
             if terminal and forced_error and status == "running":
                 status = "failed"
             include_diag = include_failure_diagnostics and (
@@ -697,7 +717,7 @@ class UsageTelemetryController(QObject):
             result_data = self._batch_job_result(
                 batch,
                 job,
-                event_type,
+                job_phase,
                 include_failure_diagnostic=include_diag,
             )
             error_text = _text(getattr(job, "error", ""), 12_000) or (forced_error if status == "failed" else "")
@@ -705,7 +725,7 @@ class UsageTelemetryController(QObject):
             self._task_audit(
                 self._batch_audit_ids.get(job_id, ""),
                 task_kind="batch",
-                phase=event_type,
+                phase=job_phase,
                 status=status,
                 product_url=_text(getattr(job, "product_url", ""), 4_096),
                 input_data=input_data,
