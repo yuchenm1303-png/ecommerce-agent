@@ -17,13 +17,15 @@ PORTAL_DOWNLOAD = (ROOT / "supabase" / "functions" / "portal-download" / "index.
 PORTAL_RELEASE = (ROOT / "supabase" / "functions" / "portal-release" / "index.ts").read_text(encoding="utf-8")
 
 
-def test_runtime_uses_official_velopack_manager_and_bounded_release_discovery() -> None:
+def test_runtime_uses_official_velopack_manager_as_the_single_release_authority() -> None:
     assert "import velopack" in RUNTIME
     assert "velopack.GithubSource" in RUNTIME
     assert "velopack.UpdateManager" in RUNTIME
-    assert "PORTAL_RELEASE_URL" in RUNTIME
     assert "resolve_stable_update_source" in RUNTIME
-    assert "_UPDATE_DISCOVERY_TIMEOUT_SECONDS = 8" in RUNTIME
+    assert 'return "", GITHUB_REPOSITORY_URL' in RUNTIME
+    assert "PORTAL_RELEASE_URL" not in RUNTIME
+    assert "urllib.request" not in RUNTIME
+    assert "urllib.error" not in RUNTIME
     assert "get_current_version()" in RUNTIME
     assert "Update.exe" in RUNTIME
     assert 'current.name.casefold() != "current"' in RUNTIME
