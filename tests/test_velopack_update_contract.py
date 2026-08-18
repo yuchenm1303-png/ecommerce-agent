@@ -23,6 +23,7 @@ def test_runtime_uses_official_velopack_manager_as_the_single_release_authority(
     assert "velopack.UpdateManager" in RUNTIME
     assert "resolve_stable_update_source" in RUNTIME
     assert 'return "", GITHUB_REPOSITORY_URL' in RUNTIME
+    assert "override != GITHUB_REPOSITORY_URL" in RUNTIME
     assert "PORTAL_RELEASE_URL" not in RUNTIME
     assert "urllib.request" not in RUNTIME
     assert "urllib.error" not in RUNTIME
@@ -153,6 +154,8 @@ def test_portal_download_resolves_authorized_stable_version_without_legacy_manif
 
 
 def test_public_release_metadata_accepts_velopack_release_and_only_uses_legacy_manifest_optionally() -> None:
+    assert 'const UPDATE_BASE_URL = `https://github.com/${REPOSITORY}`' in PORTAL_RELEASE
+    assert "updateBaseUrl: UPDATE_BASE_URL" in PORTAL_RELEASE
     assert 'const LEGACY_MANIFEST_ASSET = "update.json"' in PORTAL_RELEASE
     assert "legacyManifestAsset?.browser_download_url" in PORTAL_RELEASE
     assert 'String(release.tag_name || "") !== `v${version}`' in PORTAL_RELEASE
