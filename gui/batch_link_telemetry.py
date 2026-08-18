@@ -157,7 +157,6 @@ class BatchLinkTelemetryController(QObject):
         super().__init__(window)
         self.window = window
         self.access = access
-        self.session_id = str(uuid.uuid4())
         self.network = QNetworkAccessManager(self)
         self._last_signatures: dict[str, str] = {}
         self._result_cache: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -176,6 +175,10 @@ class BatchLinkTelemetryController(QObject):
     def _enabled(self) -> bool:
         session = self.access.session
         return bool(session.enforced and session.user_id and session.device_id and session.telemetry_token)
+
+    def _usage_session_id(self) -> str:
+        usage = getattr(self.window, "_usage_telemetry", None)
+        return _text(getattr(usage, "session_id", ""), 80)
 
     def _try_bind(self) -> None:
         if self._bound_controller is not None:
@@ -379,6 +382,10 @@ class BatchLinkTelemetryController(QObject):
     def _publish_all(self, force_terminal: bool = False) -> None:
         if not self._enabled():
             return
+        session_id = self._usage_session_id()
+        if not session_id:
+            self._schedule_publish()
+            return
         batch = self._batch()
         jobs = list(getattr(batch, "jobs", ()) or ()) if batch is not None else []
         if not jobs:
@@ -411,15 +418,15 @@ class BatchLinkTelemetryController(QObject):
             if not force_terminal and self._last_signatures.get(audit_id) == signature:
                 continue
             self._last_signatures[audit_id] = signature
-            self._post_audit(audit)
+            self._post_audit(audit, session_id=session_id)
 
-    def _post_audit(self, audit: dict[str, Any]) -> None:
+    def _post_audit(self, audit: dict[str, Any], *, session_id: str) -> None:
         session = self.access.session
         payload = {
             "action": "task_audit",
             "user_id": session.user_id,
             "device_id": session.device_id,
-            "session_id": self.session_id,
+            "session_id": session_id,
             "telemetry_token": session.telemetry_token,
             "app_version": self.access.installed_version,
             "audit": _safe(audit),
