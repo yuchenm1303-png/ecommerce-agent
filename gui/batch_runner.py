@@ -170,6 +170,8 @@ class BatchController(QObject):
                 process.terminate()
         for job in self._jobs():
             if job.status not in {"READY", "DONE", "REVIEW", "FAILED"}:
+                job.failure_stage = job.stage_detail or "stopped"
+                job.exit_code = None
                 job.status = "STOPPED"
                 job.stage_detail = "stopped by user"
                 job.touch()
@@ -227,6 +229,8 @@ class BatchController(QObject):
         job.stage_detail = "采集商品"
         job.progress = 8
         job.error = ""
+        job.failure_stage = ""
+        job.exit_code = None
         job.touch()
         self._persist_emit()
         self._spawn(job_id, "source", args)
@@ -261,6 +265,8 @@ class BatchController(QObject):
         job.status = "UNDERSTANDING"
         job.stage_detail = "识别商品"
         job.progress = 22
+        job.failure_stage = ""
+        job.exit_code = None
         job.touch()
         self._persist_emit()
         self._spawn(job_id, "prepare", args)
@@ -287,6 +293,8 @@ class BatchController(QObject):
         job.stage_detail = "填写全部 READY"
         job.progress = 82
         job.error = ""
+        job.failure_stage = ""
+        job.exit_code = None
         job.touch()
         self._persist_emit()
         self._spawn(job_id, "execute", args)
@@ -448,6 +456,8 @@ class BatchController(QObject):
         job = self._job(job_id)
 
         if self._stopping:
+            job.failure_stage = job.stage_detail or stage
+            job.exit_code = exit_code
             job.status = "STOPPED"
             job.stage_detail = "stopped by user"
             job.touch()
@@ -456,12 +466,15 @@ class BatchController(QObject):
             return
 
         if stage == "source":
+            job.exit_code = exit_code
             if exit_code == 0:
+                job.failure_stage = ""
                 job.status = "QUEUED"
                 job.stage_detail = "source cached"
                 job.progress = 18
                 self._prepare_queue.append(job_id)
             else:
+                job.failure_stage = job.stage_detail or "采集商品"
                 job.status = "FAILED"
                 job.error = f"Source Capture exit code={exit_code}"
                 job.stage_detail = "采集失败"
@@ -471,6 +484,7 @@ class BatchController(QObject):
             return
 
         if stage == "prepare":
+            job.exit_code = exit_code
             if exit_code == 0:
                 try:
                     result = load_run_result(Path(job.run_dir))
@@ -490,13 +504,16 @@ class BatchController(QObject):
                         job.product_name = str(identity.get("product_type_en") or identity.get("product_name") or "")
                     job.status = "READY" if job.ready > 0 else "REVIEW"
                     job.stage_detail = "准备完成" if job.ready > 0 else "没有 READY 字段"
+                    job.failure_stage = "" if job.ready > 0 else "准备验收"
                     job.progress = 100
                     job.error = ""
                 except Exception as exc:
+                    job.failure_stage = "读取准备结果"
                     job.status = "FAILED"
                     job.error = f"读取准备结果失败：{exc}"
                     job.stage_detail = "结果读取失败"
             else:
+                job.failure_stage = job.stage_detail or "prepare"
                 job.status = "FAILED"
                 job.error = self._workflow_error(job) or f"Prepare exit code={exit_code}"
                 job.stage_detail = "准备失败"
@@ -506,6 +523,7 @@ class BatchController(QObject):
             return
 
         if stage == "execute":
+            job.exit_code = exit_code
             if exit_code == 0:
                 try:
                     report = self._latest_execution_report(job)
@@ -518,16 +536,19 @@ class BatchController(QObject):
                     )
                     job.status = "DONE" if complete else "REVIEW"
                     job.stage_detail = "保存并验证完成" if complete else "已执行，需复核"
+                    job.failure_stage = "" if complete else "执行验收"
                     job.progress = 100
                     if not complete:
                         job.error = self._execution_review_reason(payload)
                     else:
                         job.error = ""
                 except Exception as exc:
+                    job.failure_stage = "执行报告读取"
                     job.status = "FAILED"
                     job.error = f"读取真实执行报告失败：{exc}"
                     job.stage_detail = "执行结果读取失败"
             else:
+                job.failure_stage = job.stage_detail or "execute"
                 job.status = "FAILED"
                 job.error = f"Real execution exit code={exit_code}"
                 job.stage_detail = "真实填写失败"
@@ -545,6 +566,8 @@ class BatchController(QObject):
             journal.append("QProcess failed to start")
         self._close_process_journal(process)
         job = self._job(job_id)
+        job.failure_stage = job.stage_detail or stage
+        job.exit_code = None
         job.status = "FAILED"
         job.error = f"{stage} process failed to start"
         job.stage_detail = "子进程启动失败"
