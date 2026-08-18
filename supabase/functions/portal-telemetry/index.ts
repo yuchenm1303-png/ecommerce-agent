@@ -19,6 +19,10 @@ const MAX_DIAGNOSTIC_BYTES = 80_000;
 const MAX_AUDIT_BYTES = 260_000;
 const MAX_SYSTEM_SAMPLE_BYTES = 32_000;
 const SECRET_KEY_RE = /(^|_)(api[_-]?key|token|secret|password|authorization|cookie|refresh[_-]?token|access[_-]?token)($|_)/i;
+const SECRET_QUERY_RE = /^(api[_-]?key|key|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|pwd|authorization|auth|signature|sig|sign|credential|session|sessionid)$/i;
+const URL_RE = /https?:\/\/[^\s"'<>]+/gi;
+const INLINE_QUERY_SECRET_RE = /([?&](?:api[_-]?key|key|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|pwd|authorization|auth|signature|sig|sign|credential|session|sessionid)=)([^&#\s"'<>]+)/gi;
+const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+\-/=]{8,}/gi;
 
 function headers(): Record<string, string> {
   return {
@@ -54,11 +58,30 @@ function diagnosticCode(): string {
   return `LS-${stamp}-${random}`;
 }
 
+function sanitizeUrl(raw: string): string {
+  try {
+    const url = new URL(raw);
+    for (const key of [...url.searchParams.keys()]) {
+      if (SECRET_QUERY_RE.test(key)) url.searchParams.set(key, "[REDACTED]");
+    }
+    return url.toString();
+  } catch {
+    return raw.replace(INLINE_QUERY_SECRET_RE, "$1[REDACTED]");
+  }
+}
+
+function sanitizeText(value: string): string {
+  return value
+    .replace(URL_RE, (raw) => sanitizeUrl(raw))
+    .replace(INLINE_QUERY_SECRET_RE, "$1[REDACTED]")
+    .replace(BEARER_RE, "Bearer [REDACTED]");
+}
+
 function redactSecrets(value: unknown, depth = 0): unknown {
   if (depth > 10) return "[TRUNCATED]";
   if (Array.isArray(value)) return value.slice(0, 500).map((item) => redactSecrets(item, depth + 1));
   if (!value || typeof value !== "object") {
-    if (typeof value === "string") return value.slice(0, 32_000);
+    if (typeof value === "string") return sanitizeText(value.slice(0, 32_000));
     return value;
   }
   const source = value as Record<string, unknown>;
@@ -134,17 +157,17 @@ Deno.serve(async (req: Request) => {
   if (deviceTouchError) return json({ error: "device_touch_failed" }, 503);
 
   if (action === "diagnostic") {
-    const diagnostic = body.diagnostic;
-    if (!diagnostic || typeof diagnostic !== "object" || Array.isArray(diagnostic)) {
+    const rawDiagnostic = body.diagnostic;
+    if (!rawDiagnostic || typeof rawDiagnostic !== "object" || Array.isArray(rawDiagnostic)) {
       return json({ error: "invalid_diagnostic" }, 400);
     }
+    const diagnostic = redactSecrets(rawDiagnostic) as Record<string, unknown>;
     const encoded = JSON.stringify(diagnostic);
     if (new TextEncoder().encode(encoded).byteLength > MAX_DIAGNOSTIC_BYTES) {
       return json({ error: "diagnostic_too_large" }, 413);
     }
-    const report = diagnostic as Record<string, unknown>;
-    const crashId = String(report.crash_id || "").trim().slice(0, 160);
-    const startupStage = String(report.last_stage || "").trim().slice(0, 160);
+    const crashId = String(diagnostic.crash_id || "").trim().slice(0, 160);
+    const startupStage = String(diagnostic.last_stage || "").trim().slice(0, 160);
     if (crashId.length < 8) return json({ error: "invalid_crash_id" }, 400);
 
     const reportCode = diagnosticCode();
@@ -155,7 +178,7 @@ Deno.serve(async (req: Request) => {
       app_version: appVersion,
       crash_id: crashId,
       startup_stage: startupStage,
-      report,
+      report: diagnostic,
       created_at: nowIso,
     });
     if (error) return json({ error: "diagnostic_write_failed" }, 503);
