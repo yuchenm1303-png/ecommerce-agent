@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,16 +11,17 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import QApplication, QWidget
 
 from .app_access import ApplicationAccessController
+from .task_failure_diagnostics import (
+    collect_workflow_failure_diagnostic,
+    sanitize_telemetry_value,
+)
 
 
 _HEARTBEAT_MS = 60_000
 _AUDIT_FLUSH_MS = 1_200
 _MAX_TEXT = 12_000
 _MAX_LIST = 180
-_SECRET_KEY_RE = re.compile(
-    r"(^|_)(api[_-]?key|token|secret|password|authorization|cookie|refresh[_-]?token|access[_-]?token)($|_)",
-    re.IGNORECASE,
-)
+_BATCH_FAILURE_DIAGNOSTIC_LIMIT = 8
 
 
 def _utc_now() -> str:
@@ -33,25 +33,12 @@ def _text(value: object, limit: int = _MAX_TEXT) -> str:
 
 
 def _safe_value(value: Any, *, depth: int = 0) -> Any:
-    if depth > 8:
-        return "[TRUNCATED]"
-    if value is None or isinstance(value, (bool, int, float)):
-        return value
-    if isinstance(value, Path):
-        return value.name
-    if isinstance(value, str):
-        return value[:_MAX_TEXT]
-    if isinstance(value, (list, tuple, set)):
-        return [_safe_value(item, depth=depth + 1) for item in list(value)[:_MAX_LIST]]
-    if isinstance(value, dict):
-        output: dict[str, Any] = {}
-        for key, item in list(value.items())[:_MAX_LIST]:
-            name = _text(key, 160)
-            output[name] = "[REDACTED]" if _SECRET_KEY_RE.search(name) else _safe_value(item, depth=depth + 1)
-        return output
-    if hasattr(value, "__dict__"):
-        return _safe_value(vars(value), depth=depth + 1)
-    return _text(value)
+    return sanitize_telemetry_value(
+        value,
+        depth=depth,
+        max_text=_MAX_TEXT,
+        max_list=_MAX_LIST,
+    )
 
 
 def _widget_text(widget: Any) -> str:
@@ -179,6 +166,46 @@ def _error_text(args: tuple[Any, ...]) -> str:
         if isinstance(value, str) and value.strip():
             return _text(value, 12_000)
     return "任务失败"
+
+
+def _error_type(args: tuple[Any, ...]) -> str:
+    for value in args:
+        if isinstance(value, BaseException):
+            return type(value).__name__[:240]
+    return "TaskFailure"
+
+
+def _runner_run_dir(runner: Any) -> str:
+    for name in ("run_dir", "output_dir", "last_run_dir"):
+        value = getattr(runner, name, None) if runner is not None else None
+        if str(value or "").strip():
+            return str(value)
+    return ""
+
+
+def _failure_result(
+    result_data: dict[str, Any],
+    *,
+    runner: Any,
+    args: tuple[Any, ...],
+    fallback_stage: str,
+) -> dict[str, Any]:
+    output = dict(result_data)
+    output["failure_diagnostic"] = collect_workflow_failure_diagnostic(
+        _runner_run_dir(runner),
+        fallback_error=_error_text(args),
+        fallback_error_type=_error_type(args),
+        fallback_stage=fallback_stage,
+        workflow_mode=_text(getattr(runner, "mode", ""), 120),
+    )
+    return _safe_value(output)
+
+
+def _compact_batch_diagnostic(diagnostic: dict[str, Any]) -> dict[str, Any]:
+    compact = dict(diagnostic)
+    compact["timeline"] = list(compact.get("timeline") or [])[-24:]
+    compact["traceback"] = _text(compact.get("traceback"), 12_000)
+    return _safe_value(compact)
 
 
 def _batch_jobs(batch: Any) -> list[Any]:
@@ -436,20 +463,23 @@ class UsageTelemetryController(QObject):
             )
         return {"items": items, "item_count": len(items)}
 
-    def _batch_result_snapshot(self) -> dict[str, Any]:
+    def _batch_result_snapshot(self, *, include_failure_diagnostics: bool = False) -> dict[str, Any]:
         workspace = getattr(self.window, "batch_workspace", None)
         controller = getattr(workspace, "controller", None)
         batch = getattr(controller, "batch", None)
         jobs = list(getattr(batch, "jobs", ()) or getattr(workspace, "_jobs", ()) or ())
         result_jobs: list[dict[str, Any]] = []
         status_counts: dict[str, int] = {}
+        failure_diagnostics: list[dict[str, Any]] = []
         for job in jobs[:120]:
             run_dir = getattr(job, "run_dir", "")
             job_status = _text(getattr(job, "status", ""), 120).upper()
+            job_error = _text(getattr(job, "error", ""), 8_000)
             status_counts[job_status] = status_counts.get(job_status, 0) + 1
+            job_id = _text(getattr(job, "job_id", ""), 160)
             result_jobs.append(
                 {
-                    "job_id": _text(getattr(job, "job_id", ""), 160),
+                    "job_id": job_id,
                     "product_url": _text(getattr(job, "product_url", ""), 4_096),
                     "status": job_status,
                     "progress": int(getattr(job, "progress", 0) or 0),
@@ -461,18 +491,37 @@ class UsageTelemetryController(QObject):
                     "product_images": int(getattr(job, "product_images", 0) or 0),
                     "makro_target_id": _text(getattr(job, "makro_target_id", ""), 240),
                     "stage_detail": _text(getattr(job, "stage_detail", ""), 2_000),
-                    "error": _text(getattr(job, "error", ""), 8_000),
+                    "error": job_error,
                     "run_id": Path(str(run_dir)).name if str(run_dir).strip() else "",
                     "created_at": _text(getattr(job, "created_at", ""), 120),
                     "updated_at": _text(getattr(job, "updated_at", ""), 120),
                 }
             )
-        return {
+            if (
+                include_failure_diagnostics
+                and len(failure_diagnostics) < _BATCH_FAILURE_DIAGNOSTIC_LIMIT
+                and (job_status in {"FAILED", "REVIEW", "STOPPED"} or job_error)
+            ):
+                diagnostic = collect_workflow_failure_diagnostic(
+                    str(run_dir) if str(run_dir).strip() else None,
+                    fallback_error=job_error or _text(getattr(job, "stage_detail", ""), 8_000),
+                    fallback_error_type="BatchJobFailure",
+                    fallback_stage="batch_job",
+                    workflow_mode="full",
+                )
+                diagnostic = _compact_batch_diagnostic(diagnostic)
+                diagnostic["job_id"] = job_id
+                diagnostic["job_status"] = job_status
+                failure_diagnostics.append(diagnostic)
+        payload: dict[str, Any] = {
             "batch_status": _text(getattr(batch, "status", ""), 120),
             "jobs": result_jobs,
             "job_count": len(result_jobs),
             "job_status_counts": status_counts,
         }
+        if failure_diagnostics:
+            payload["failure_diagnostics"] = failure_diagnostics
+        return _safe_value(payload)
 
     def _bind_single(self) -> None:
         prepare = getattr(self.window, "runner", None)
@@ -540,6 +589,13 @@ class UsageTelemetryController(QObject):
             self._prepare_active = False
             self._event("listing_prepare", "failed")
         if self._single_audit_id:
+            runner = getattr(self.window, "runner", None)
+            self._single_result = _failure_result(
+                self._single_result,
+                runner=runner,
+                args=args,
+                fallback_stage="listing_prepare",
+            )
             self._task_audit(
                 self._single_audit_id,
                 task_kind="single",
@@ -602,6 +658,13 @@ class UsageTelemetryController(QObject):
             self._execute_active = False
             self._event("listing_execute", "failed")
         if self._single_audit_id:
+            runner = getattr(self.window, "execution_runner", None)
+            self._single_result = _failure_result(
+                self._single_result,
+                runner=runner,
+                args=args,
+                fallback_stage="listing_execute",
+            )
             self._task_audit(
                 self._single_audit_id,
                 task_kind="single",
@@ -663,7 +726,9 @@ class UsageTelemetryController(QObject):
                 phase=event_type,
                 status=audit_status,
                 input_data=self._batch_input,
-                result_data=self._batch_result_snapshot(),
+                result_data=self._batch_result_snapshot(
+                    include_failure_diagnostics=audit_status in {"failed", "review"}
+                ),
                 started_at=self._batch_started_at,
                 completed_at=_utc_now() if terminal_audit else "",
             )
@@ -701,7 +766,7 @@ class UsageTelemetryController(QObject):
                 phase=self._batch_event_type or "batch",
                 status="failed",
                 input_data=self._batch_input,
-                result_data=self._batch_result_snapshot(),
+                result_data=self._batch_result_snapshot(include_failure_diagnostics=True),
                 error_text=_error_text(args),
                 started_at=self._batch_started_at,
                 completed_at=_utc_now(),
