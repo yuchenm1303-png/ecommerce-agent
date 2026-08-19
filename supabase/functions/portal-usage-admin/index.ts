@@ -3,6 +3,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const ALLOWED_ORIGINS = new Set(["https://smirel.com", "https://www.smirel.com"]);
 const TASK_AUDIT_LIMIT = 300;
+const TASK_METRIC_LIMIT = 5000;
 const DIAGNOSTIC_LIMIT = 160;
 const SYSTEM_SAMPLE_LIMIT = 3000;
 const SYSTEM_WINDOW_HOURS = 24;
@@ -236,10 +237,12 @@ Deno.serve(async (req: Request) => {
     if (accessError) return json(req, { error: "access_check_failed" }, 503);
     if (!access?.enabled || !access?.is_admin) return json(req, { error: "not_authorized" }, 403);
 
-    const systemSince = new Date(Date.now() - SYSTEM_WINDOW_HOURS * HOUR_MS).toISOString();
+    const taskSince = new Date(Date.now() - SYSTEM_WINDOW_HOURS * HOUR_MS).toISOString();
+    const systemSince = taskSince;
     const [
       { data: snapshot, error: snapshotError },
       { data: taskAudits, error: auditError },
+      { data: taskMetricAudits, error: taskMetricError },
       { data: diagnostics, error: diagnosticError },
       { data: systemSamples, error: systemError },
     ] = await Promise.all([
@@ -251,6 +254,14 @@ Deno.serve(async (req: Request) => {
         )
         .order("updated_at", { ascending: false })
         .limit(TASK_AUDIT_LIMIT),
+      admin
+        .from("listing_task_audits")
+        .select(
+          "id,user_id,device_id,task_kind,phase,status,product_url,input_data,result_data,started_at,completed_at,updated_at,created_at"
+        )
+        .gte("updated_at", taskSince)
+        .order("updated_at", { ascending: false })
+        .limit(TASK_METRIC_LIMIT),
       admin
         .from("listing_diagnostic_reports")
         .select("id,report_code,user_id,device_id,app_version,crash_id,startup_stage,report,created_at")
@@ -265,6 +276,7 @@ Deno.serve(async (req: Request) => {
     ]);
     if (snapshotError) return json(req, { error: "usage_snapshot_failed" }, 503);
     if (auditError) return json(req, { error: "task_audit_snapshot_failed" }, 503);
+    if (taskMetricError) return json(req, { error: "task_metric_snapshot_failed" }, 503);
     if (diagnosticError) return json(req, { error: "diagnostic_snapshot_failed" }, 503);
     if (systemError) return json(req, { error: "system_health_snapshot_failed" }, 503);
 
@@ -272,11 +284,15 @@ Deno.serve(async (req: Request) => {
       ? { ...(snapshot as Record<string, unknown>) }
       : {};
     const normalizedTaskAudits = normalizeTaskAudits(taskAudits ?? []);
-    payload.users = withIndependentProductActivity(payload.users, normalizedTaskAudits);
+    const normalizedMetricAudits = normalizeTaskAudits(taskMetricAudits ?? []);
+    payload.users = withIndependentProductActivity(payload.users, normalizedMetricAudits);
     payload.task_audits = normalizedTaskAudits;
     payload.task_audit_raw_count = Array.isArray(taskAudits) ? taskAudits.length : 0;
     payload.task_audit_limit = TASK_AUDIT_LIMIT;
     payload.task_metric_basis = "independent_product_audits";
+    payload.task_metric_window_hours = SYSTEM_WINDOW_HOURS;
+    payload.task_metric_raw_count = Array.isArray(taskMetricAudits) ? taskMetricAudits.length : 0;
+    payload.task_metric_limit = TASK_METRIC_LIMIT;
     payload.diagnostic_reports = diagnostics ?? [];
     payload.diagnostic_limit = DIAGNOSTIC_LIMIT;
     payload.system_samples = systemSamples ?? [];
