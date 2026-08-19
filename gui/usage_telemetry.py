@@ -566,9 +566,9 @@ def _batch_job_status(event_type: str, job_status: str) -> str:
 def _batch_job_phase(job: Any, default_event_type: str) -> str:
     """Resolve a product's real lane from product-local lifecycle evidence.
 
-    Batch prepare and execute can overlap. The controller's global event type is
-    therefore only a fallback for unknown states; it must never relabel a known
-    prepare-stage failure as execute and make telemetry read the wrong log file.
+    New Batch jobs persist their own operation phase before each lane starts. The
+    controller's global event type is only a backward-compatible fallback for old
+    saved batches and unknown states, never the source of truth for known jobs.
     """
 
     status = _text(getattr(job, "status", ""), 120).upper()
@@ -577,11 +577,14 @@ def _batch_job_phase(job: Any, default_event_type: str) -> str:
     if status in _BATCH_PREPARE_ACTIVE:
         return "batch_prepare"
 
+    recorded_phase = _text(getattr(job, "operation_phase", ""), 80)
+    if recorded_phase in {"batch_prepare", "batch_execute"}:
+        return recorded_phase
+
     run_dir = str(getattr(job, "run_dir", "") or "").strip()
     execute_log = Path(run_dir).parent / "diagnostics" / "execute.log" if run_dir else None
     has_execute_evidence = (
-        int(getattr(job, "progress", 0) or 0) >= 82
-        or bool(str(getattr(job, "execution_report", "") or "").strip())
+        bool(str(getattr(job, "execution_report", "") or "").strip())
         or bool(execute_log is not None and execute_log.is_file())
     )
     if status in {"FAILED", "REVIEW", "STOPPED"}:
@@ -900,6 +903,7 @@ class UsageTelemetryController(QObject):
             "batch_index": index + 1 if index >= 0 else 0,
             "batch_size": len(jobs),
             "job_status": job_status,
+            "operation_phase": _text(getattr(job, "operation_phase", ""), 80),
             "product_url": _text(getattr(job, "product_url", ""), 4_096),
             "product_name": _text(getattr(job, "product_name", ""), 1_000),
             "progress": int(getattr(job, "progress", 0) or 0),
