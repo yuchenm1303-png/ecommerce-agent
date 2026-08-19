@@ -22,6 +22,15 @@ _AUDIT_FLUSH_MS = 1_200
 _MAX_TEXT = 12_000
 _MAX_AUDIT_TEXT = 32_000
 _MAX_LIST = 180
+_BATCH_PREPARE_ACTIVE = {
+    "QUEUED",
+    "CAPTURING",
+    "UNDERSTANDING",
+    "SELECTING_VERTICAL",
+    "SELECTING_BRAND",
+    "RESOLVING",
+    "READY",
+}
 _BATCH_EXECUTE_ACTIVE = {"FILLING", "UPLOADING_IMAGES", "SAVING", "VERIFYING"}
 _EXECUTOR_LOCAL_ARTIFACT_KEYS = {
     "path",
@@ -555,20 +564,28 @@ def _batch_job_status(event_type: str, job_status: str) -> str:
 
 
 def _batch_job_phase(job: Any, default_event_type: str) -> str:
-    """Resolve a product's actual lane even while prepare and execute overlap."""
+    """Resolve a product's real lane from product-local lifecycle evidence.
+
+    Batch prepare and execute can overlap. The controller's global event type is
+    therefore only a fallback for unknown states; it must never relabel a known
+    prepare-stage failure as execute and make telemetry read the wrong log file.
+    """
 
     status = _text(getattr(job, "status", ""), 120).upper()
     if status in _BATCH_EXECUTE_ACTIVE or status == "DONE":
         return "batch_execute"
+    if status in _BATCH_PREPARE_ACTIVE:
+        return "batch_prepare"
 
     run_dir = str(getattr(job, "run_dir", "") or "").strip()
     execute_log = Path(run_dir).parent / "diagnostics" / "execute.log" if run_dir else None
-    if status in {"FAILED", "REVIEW", "STOPPED"} and (
+    has_execute_evidence = (
         int(getattr(job, "progress", 0) or 0) >= 82
         or bool(str(getattr(job, "execution_report", "") or "").strip())
         or bool(execute_log is not None and execute_log.is_file())
-    ):
-        return "batch_execute"
+    )
+    if status in {"FAILED", "REVIEW", "STOPPED"}:
+        return "batch_execute" if has_execute_evidence else "batch_prepare"
     return default_event_type
 
 
@@ -739,7 +756,7 @@ class UsageTelemetryController(QObject):
         except Exception:
             vertical_origin = ""
 
-        scope = getattr(window, "real_scope_combo", None)
+        scope = getattr(self.window, "real_scope_combo", None)
         scope_value = ""
         current_data = getattr(scope, "currentData", None)
         if callable(current_data):
