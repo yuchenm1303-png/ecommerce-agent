@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -149,6 +150,66 @@ def _required_override_path(live_schema: str) -> Path:
     """GUI writes explicit required-field values beside this run's live schema."""
 
     return Path(live_schema).resolve().with_name("required-overrides.json")
+
+
+def _capture_optional_screenshot(page, path: Path) -> dict[str, Any]:
+    """Capture diagnostic evidence without making the screenshot a business gate.
+
+    Step 3 acceptance is determined by field/photo persistence, not by whether
+    Chromium can rasterize a full-page PNG. Capture failures are therefore fully
+    recorded and surfaced, but never abort Save/reopen acceptance or suppress the
+    execution report.
+    """
+
+    requested_path = str(path.resolve())
+    result: dict[str, Any] = {
+        "status": "failed",
+        "requested_path": requested_path,
+        "path": "",
+        "error_type": "",
+        "error": "",
+        "traceback": "",
+        "hud_prepare_error": "",
+        "hud_restore_error": "",
+    }
+
+    try:
+        set_visual_execution_hud_capture_safe(page, True)
+    except Exception as exc:
+        result["hud_prepare_error"] = f"{type(exc).__name__}: {exc}"
+        print(
+            "GUI_EXEC_SCREENSHOT\tWARNING\thud_prepare\t"
+            f"{result['hud_prepare_error']}",
+            flush=True,
+        )
+
+    try:
+        page.screenshot(path=str(path), full_page=True)
+        result["status"] = "captured"
+        result["path"] = requested_path
+        print(f"GUI_EXEC_SCREENSHOT\tCOMPLETE\t{requested_path}", flush=True)
+    except Exception as exc:
+        result["error_type"] = type(exc).__name__
+        result["error"] = str(exc)
+        result["traceback"] = traceback.format_exc()
+        print(
+            "GUI_EXEC_SCREENSHOT\tWARNING\tcapture_failed\t"
+            f"{result['error_type']}\t{result['error']}",
+            flush=True,
+        )
+        print(result["traceback"], flush=True)
+    finally:
+        try:
+            set_visual_execution_hud_capture_safe(page, False)
+        except Exception as exc:
+            result["hud_restore_error"] = f"{type(exc).__name__}: {exc}"
+            print(
+                "GUI_EXEC_SCREENSHOT\tWARNING\thud_restore\t"
+                f"{result['hud_restore_error']}",
+                flush=True,
+            )
+
+    return result
 
 
 def _pause_and_reconcile(
@@ -451,11 +512,7 @@ def main() -> int:
             else None
         )
         final_screenshot = run_dir / "step3-final.png"
-        set_visual_execution_hud_capture_safe(page, True)
-        try:
-            page.screenshot(path=str(final_screenshot), full_page=True)
-        finally:
-            set_visual_execution_hud_capture_safe(page, False)
+        final_screenshot_capture = _capture_optional_screenshot(page, final_screenshot)
 
         if args.all_step3:
             mode = "single_url_all_step3_persisted_acceptance"
@@ -500,7 +557,8 @@ def main() -> int:
             + int(bool(photo_report and photo_report.get("saved"))),
             "send_to_qc_clicked": False,
             "browser_closed": False,
-            "final_screenshot": str(final_screenshot.resolve()),
+            "final_screenshot": final_screenshot_capture.get("path", ""),
+            "final_screenshot_capture": final_screenshot_capture,
         }
         report_path = run_dir / "report.json"
         report_path.write_text(
@@ -531,7 +589,12 @@ def main() -> int:
             print(f"autofill_safe_complete={completion['autofill_safe_complete']}")
         print("Send to QC=False。")
         print(f"报告：{report_path.resolve()}")
-        print(f"最终截图：{final_screenshot.resolve()}")
+        if final_screenshot_capture.get("status") == "captured":
+            print(f"最终截图：{final_screenshot.resolve()}")
+        else:
+            print(
+                "最终截图：未生成；截图属于辅助诊断，不影响字段/图片持久化验收。"
+            )
 
         acceptance_ok = True
         if args.all_step3 and completion is not None:
