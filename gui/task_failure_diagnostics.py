@@ -9,6 +9,7 @@ from urllib.parse import unquote_plus, urlsplit, urlunsplit
 _MAX_TEXT = 12_000
 _MAX_TRACEBACK = 24_000
 _MAX_PROCESS_LOG = 32_000
+_MAX_PER_LOG = 12_000
 _MAX_EVENTS = 48
 _MAX_STAGE_SUMMARY = 40
 _MAX_LIST = 180
@@ -31,6 +32,7 @@ _EXCEPTION_LINE_RE = re.compile(
     r"^(?P<type>[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)):\s*(?P<message>.*)$"
 )
 _TRACEBACK_MARKER = "Traceback (most recent call last):"
+_BATCH_STAGE_LOGS = ("source.log", "prepare.log", "execute.log")
 
 
 def sanitize_telemetry_url(value: str) -> str:
@@ -135,8 +137,6 @@ def _read_diagnostic_events(path: Path) -> list[dict[str, Any]]:
 
 
 def _read_text_tail(path: Path, limit: int = _MAX_PROCESS_LOG) -> tuple[str, bool]:
-    """Keep the newest process evidence so the actual exception is never cut off."""
-
     try:
         size = path.stat().st_size
         read_size = min(size, max(limit * 4, 128_000))
@@ -152,6 +152,66 @@ def _read_text_tail(path: Path, limit: int = _MAX_PROCESS_LOG) -> tuple[str, boo
     if len(text) > limit:
         text = text[-limit:]
     return sanitize_telemetry_text(text, limit), truncated
+
+
+def _discover_process_logs(
+    run_dir: Path | None,
+    explicit_path: str | Path | None,
+) -> list[Path]:
+    """Discover the real local process logs without trusting telemetry phase labels.
+
+    Batch Runner already writes source/prepare/execute stdout+stderr to the job's
+    diagnostics directory. Remote diagnostics must consume those files directly;
+    a stale or incorrect phase label must never make the real customer log disappear.
+    """
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def add(raw: str | Path | None) -> None:
+        if not str(raw or "").strip():
+            return
+        path = Path(raw).expanduser()
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        if key in seen or not path.is_file():
+            return
+        seen.add(key)
+        candidates.append(path)
+
+    add(explicit_path)
+    if run_dir is not None:
+        for root in (run_dir / "diagnostics", run_dir.parent / "diagnostics"):
+            for name in _BATCH_STAGE_LOGS:
+                add(root / name)
+
+    return sorted(candidates, key=lambda path: path.stat().st_mtime_ns)
+
+
+def _process_log_payload(paths: list[Path]) -> tuple[Path | None, str, bool, list[dict[str, Any]]]:
+    logs: list[dict[str, Any]] = []
+    primary_path: Path | None = None
+    primary_tail = ""
+    primary_truncated = False
+
+    for path in paths:
+        tail, truncated = _read_text_tail(path, _MAX_PER_LOG)
+        if not tail:
+            continue
+        logs.append(
+            {
+                "name": path.name,
+                "tail": tail,
+                "truncated": truncated,
+                "size_bytes": int(path.stat().st_size),
+            }
+        )
+        primary_path = path
+        primary_tail, primary_truncated = _read_text_tail(path, _MAX_PROCESS_LOG)
+
+    return primary_path, primary_tail, primary_truncated, logs
 
 
 def _extract_traceback(log_text: str) -> str:
@@ -196,8 +256,11 @@ def _compact_event(raw: dict[str, Any]) -> dict[str, Any]:
         "active_stages",
         "context",
     )
-    event = {key: raw.get(key) for key in keys if key in raw}
-    return sanitize_telemetry_value(event, max_text=_EVENT_TEXT, max_list=80)
+    return sanitize_telemetry_value(
+        {key: raw.get(key) for key in keys if key in raw},
+        max_text=_EVENT_TEXT,
+        max_list=80,
+    )
 
 
 def _event_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -259,9 +322,8 @@ def _latest_execution_report(roots: Iterable[str | Path]) -> tuple[Path | None, 
         if root.is_file() and root.name == "report.json":
             candidates.append(root)
             continue
-        if not root.is_dir():
-            continue
-        candidates.extend(path for path in root.glob("execute-*/report.json") if path.is_file())
+        if root.is_dir():
+            candidates.extend(path for path in root.glob("execute-*/report.json") if path.is_file())
     if not candidates:
         return None, {}
     latest = max(candidates, key=lambda path: path.stat().st_mtime_ns)
@@ -333,11 +395,11 @@ def collect_workflow_failure_diagnostic(
     process_log_path: str | Path | None = None,
     artifact_roots: Iterable[str | Path] = (),
 ) -> dict[str, Any]:
-    """Return bounded, secret-redacted evidence sufficient for remote repair.
+    """Upload the customer's real local failure log plus structured context.
 
-    The product audit is intentionally kept below the server's 260 KB contract:
-    newest process log tail, traceback, compact workflow timeline/manifest and any
-    surviving executor report. Each failed Batch product is uploaded separately.
+    The local process log is the primary repair evidence. Phase/timeline/report
+    fields are auxiliary only. Batch logs are discovered directly from disk so a
+    wrong telemetry phase can never hide the actual source/prepare/execute log.
     """
 
     path = Path(run_dir).expanduser() if str(run_dir or "").strip() else None
@@ -347,11 +409,8 @@ def collect_workflow_failure_diagnostic(
         manifest = _read_json_object(path / "run-manifest.json")
         events = _read_diagnostic_events(path / "workflow-diagnostics.jsonl")
 
-    process_path = Path(process_log_path).expanduser() if str(process_log_path or "").strip() else None
-    process_log = ""
-    process_log_truncated = False
-    if process_path is not None:
-        process_log, process_log_truncated = _read_text_tail(process_path)
+    process_paths = _discover_process_logs(path, process_log_path)
+    process_path, process_log, process_log_truncated, process_logs = _process_log_payload(process_paths)
 
     report_path, report_payload = _latest_execution_report(artifact_roots)
     execution_report = _compact_execution_report(report_payload)
@@ -363,12 +422,19 @@ def collect_workflow_failure_diagnostic(
             break
 
     event_traceback = str(failed_event.get("traceback") or "")
-    traceback_text = (
-        sanitize_telemetry_text(event_traceback, _MAX_TRACEBACK)
-        if event_traceback
-        else _extract_traceback(process_log)
-    )
-    log_error_type, log_error_message = _infer_exception(process_log)
+    traceback_text = sanitize_telemetry_text(event_traceback, _MAX_TRACEBACK) if event_traceback else ""
+    if not traceback_text:
+        for item in reversed(process_logs):
+            traceback_text = _extract_traceback(str(item.get("tail") or ""))
+            if traceback_text:
+                break
+
+    log_error_type = ""
+    log_error_message = ""
+    for item in reversed(process_logs):
+        log_error_type, log_error_message = _infer_exception(str(item.get("tail") or ""))
+        if log_error_type or log_error_message:
+            break
 
     error_message = sanitize_telemetry_text(
         str(
@@ -403,7 +469,7 @@ def collect_workflow_failure_diagnostic(
         run_id = path.name
 
     payload = {
-        "schema": 2,
+        "schema": 3,
         "run_id": run_id,
         "workflow_mode": resolved_mode,
         "failed_stage": failed_stage,
@@ -422,6 +488,8 @@ def collect_workflow_failure_diagnostic(
         "process_log_name": process_path.name if process_path is not None else "",
         "process_log_tail": process_log,
         "process_log_truncated": process_log_truncated,
+        "process_log_files": [item.get("name") for item in process_logs],
+        "process_logs": process_logs,
         "execution_report_name": report_path.name if report_path is not None else "",
         "execution_report_run": report_path.parent.name if report_path is not None else "",
         "execution_report": execution_report,
