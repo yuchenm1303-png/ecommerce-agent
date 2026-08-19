@@ -7,6 +7,7 @@ const TASK_METRIC_LIMIT = 5000;
 const DIAGNOSTIC_LIMIT = 160;
 const SYSTEM_SAMPLE_LIMIT = 3000;
 const SYSTEM_WINDOW_HOURS = 24;
+const DAILY_HEATMAP_DAYS = 365;
 const HOUR_MS = 60 * 60 * 1000;
 
 type JsonObject = Record<string, unknown>;
@@ -241,12 +242,14 @@ Deno.serve(async (req: Request) => {
     const systemSince = taskSince;
     const [
       { data: snapshot, error: snapshotError },
+      { data: dailyHeatmap, error: heatmapError },
       { data: taskAudits, error: auditError },
       { data: taskMetricAudits, error: taskMetricError },
       { data: diagnostics, error: diagnosticError },
       { data: systemSamples, error: systemError },
     ] = await Promise.all([
       admin.rpc("get_listing_usage_admin_snapshot", { p_caller: user.id }),
+      admin.rpc("get_listing_usage_daily_heatmap", { p_caller: user.id, p_days: DAILY_HEATMAP_DAYS }),
       admin
         .from("listing_task_audits")
         .select(
@@ -275,6 +278,7 @@ Deno.serve(async (req: Request) => {
         .limit(SYSTEM_SAMPLE_LIMIT),
     ]);
     if (snapshotError) return json(req, { error: "usage_snapshot_failed" }, 503);
+    if (heatmapError) return json(req, { error: "daily_heatmap_failed" }, 503);
     if (auditError) return json(req, { error: "task_audit_snapshot_failed" }, 503);
     if (taskMetricError) return json(req, { error: "task_metric_snapshot_failed" }, 503);
     if (diagnosticError) return json(req, { error: "diagnostic_snapshot_failed" }, 503);
@@ -286,6 +290,7 @@ Deno.serve(async (req: Request) => {
     const normalizedTaskAudits = normalizeTaskAudits(taskAudits ?? []);
     const normalizedMetricAudits = normalizeTaskAudits(taskMetricAudits ?? []);
     payload.users = withIndependentProductActivity(payload.users, normalizedMetricAudits);
+    payload.daily_activity = dailyHeatmap ?? { timezone: "Asia/Shanghai", window_days: DAILY_HEATMAP_DAYS, days: [] };
     payload.task_audits = normalizedTaskAudits;
     payload.task_audit_raw_count = Array.isArray(taskAudits) ? taskAudits.length : 0;
     payload.task_audit_limit = TASK_AUDIT_LIMIT;
@@ -302,6 +307,7 @@ Deno.serve(async (req: Request) => {
       includes: [
         "one independent audit per supplier product link",
         "per-product 24h success/failure chart counts",
+        "365-day daily activity heatmap",
         "supplier URL",
         "sales specification / bundle intent",
         "AI guidance",
