@@ -1,19 +1,18 @@
 """Makro Step 1 Vertical resolution.
 
 One production decision boundary owns Step 1: Makro must supply every selectable
-Vertical. Product Identity supplies semantics, AI plans several retrieval intents,
-Makro returns query-owned live rows, and AI chooses once from the aggregated live
-pool. The chosen row is then replayed through a query that originally produced it
-and must still verify to a canonical Makro Vertical. Browse taxonomy is available
-only when live search produced no semantic candidate at all; a broken binding for
-an already selected live candidate fails closed instead of silently switching
-mechanisms.
+Vertical. Product Identity supplies semantics and AI plans a bounded specific-to-
+broad retrieval ladder. Each query is then handled as one live transaction: create
+a fresh query-owned generation, harvest its current Makro rows, choose only from
+those rows, click the chosen row in that same generation, and verify the resulting
+canonical Vertical before Step 2 is accepted.
 
-Search isolation is generation-based. Makro is allowed to keep old autocomplete
-DOM mounted indefinitely; every query establishes a fresh DOM ownership generation
-and discovery accepts only rows changed/touched in that generation. Replaying an
-already-grounded candidate may bind one stable exact row, but the resulting
-canonical Vertical is still independently verified before Step 2 is accepted.
+The normal path never replays a query merely to rediscover a row that was already
+observed. If one query has no clear semantic candidate, the next broader query is
+tried. Browse taxonomy is available only when every search generation yields no
+semantic candidate at all. If a row was selected from the current generation but
+cannot be bound for the click, the workflow fails closed instead of silently
+switching mechanisms.
 
 The workflow never invents a Makro Vertical and never clicks Send to QC.
 """
@@ -39,6 +38,7 @@ from .listing_creation import (
     is_vertical_step,
     normalize_label,
 )
+from .requested_vertical import current_requested_vertical, requested_vertical_matches_label
 from .search_surface import (
     begin_search_query,
     click_search_row,
@@ -51,12 +51,7 @@ from .taxonomy_resolution import (
     choose_taxonomy_path_candidate,
     validate_taxonomy_leaf_candidate,
 )
-from .vertical_resolution import (
-    choose_vertical_candidate_pool,
-    matched_queries_for_candidate,
-    merge_vertical_search_observations,
-    plan_vertical_search_terms,
-)
+from .vertical_resolution import plan_vertical_search_terms
 
 
 _VERTICAL_INPUT_TOKENS = (
@@ -171,7 +166,26 @@ def _choose_vertical_search_candidate(
     term: str,
     candidates: list[str],
 ) -> str:
-    """Legacy one-query chooser retained for compatibility tests only."""
+    """Choose one exact row from the active query generation, or decline it."""
+
+    requested = current_requested_vertical()
+    if requested:
+        matches = [
+            candidate
+            for candidate in candidates
+            if requested_vertical_matches_label(requested, candidate)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            available = " | ".join(candidates[:20])
+            raise ValueError(
+                f"手动指定类目 {requested!r} 未匹配到唯一 Makro live Vertical；"
+                f"当前候选={available or '<none>'}"
+            )
+        raise ValueError(
+            f"手动指定类目 {requested!r} 同时匹配到多个 Makro live Vertical：{matches!r}"
+        )
 
     wanted = normalize_label(term)
     exact_leaf = [
@@ -359,13 +373,7 @@ def _complete_exact_live_vertical(
 
 
 def _close_vertical_search(search, page: Page, *, wait_ms: int) -> None:
-    """End the visible query interaction without requiring Makro to destroy DOM.
-
-    Persistent autocomplete nodes are a normal portal implementation detail. The
-    next call to ``begin_search_query`` snapshots whatever remains and starts a new
-    ownership generation, so DOM disappearance is never used as a correctness
-    condition.
-    """
+    """End one query generation without requiring Makro to destroy old DOM."""
 
     try:
         search.fill("")
@@ -429,39 +437,6 @@ def _run_vertical_search_query(
     return rows
 
 
-def _replay_grounded_vertical_candidate(
-    page: Page,
-    search,
-    *,
-    term: str,
-    selected: str,
-    wait_ms: int,
-) -> tuple[bool, list[str]]:
-    """Replay one already-grounded candidate without requiring a DOM repaint.
-
-    Discovery remains generation-fresh. Replay is different: the exact candidate
-    was already observed from this query earlier, so a portal that keeps the same
-    result row mounted may legitimately expose no fresh mutation. We therefore
-    allow stable binding for this exact label only, then rely on canonical Step 1
-    verification to prove the click committed the intended Vertical.
-    """
-
-    rows = _run_vertical_search_query(page, search, term, wait_ms=wait_ms)
-    clicked = click_search_row(search, selected, allow_stable_exact=True)
-    if clicked:
-        return True, rows
-
-    # One bounded submit/rebind retry covers portals that do not refresh the
-    # autocomplete surface until Enter is dispatched. This does not change the
-    # candidate or broaden the query.
-    try:
-        search.press("Enter")
-    except Exception:
-        return False, rows
-    page.wait_for_timeout(min(max(int(wait_ms) // 2, 180), 450))
-    return click_search_row(search, selected, allow_stable_exact=True), rows
-
-
 def _try_select_via_search(
     page: Page,
     provider: JSONTaskProvider,
@@ -469,17 +444,15 @@ def _try_select_via_search(
     *,
     wait_ms: int,
 ) -> tuple[str, list[str], tuple[str, ...]]:
-    """Resolve from several Makro search generations before mutating Browse taxonomy."""
+    """Evaluate the search ladder in order and click within the winning generation."""
 
     search = _vertical_search_input(page)
     planned_terms = plan_vertical_search_terms(provider, hints)
-    observations: list[tuple[str, list[str]]] = []
     observed: list[str] = []
     observed_keys: set[str] = set()
 
-    for term in planned_terms:
+    for query_index, term in enumerate(planned_terms, start=1):
         rows = _run_vertical_search_query(page, search, term, wait_ms=wait_ms)
-        observations.append((term, rows))
         for row in rows:
             key = normalize_label(row)
             if not key or key in observed_keys:
@@ -487,38 +460,41 @@ def _try_select_via_search(
             observed_keys.add(key)
             observed.append(row)
 
-    pool = merge_vertical_search_observations(observations)
-    selected = choose_vertical_candidate_pool(provider, hints, planned_terms, pool)
-    if not selected:
-        _close_vertical_search(search, page, wait_ms=wait_ms)
-        return "", observed, planned_terms
-
-    replay_terms = matched_queries_for_candidate(pool, selected)
-    replay_attempts: list[dict[str, object]] = []
-    for term in replay_terms:
-        clicked, rows = _replay_grounded_vertical_candidate(
-            page,
-            search,
-            term=term,
-            selected=selected,
-            wait_ms=wait_ms,
+        selected = _choose_vertical_search_candidate(provider, hints, term, rows)
+        _vertical_diag(
+            "query_decision",
+            {
+                "query_index": query_index,
+                "query_count": len(planned_terms),
+                "query": term,
+                "fresh_row_count": len(rows),
+                "selected_vertical": selected,
+                "action": "click_current_generation" if selected else "continue_search_ladder",
+                "sample": rows[:8],
+            },
         )
-        matches = [row for row in rows if normalize_label(row) == normalize_label(selected)]
-        attempt: dict[str, object] = {
-            "selected_vertical": selected,
-            "query": term,
-            "fresh_row_count": len(rows),
-            "fresh_exact_match_count": len(matches),
-            "stable_exact_replay_allowed": True,
-            "click_bound": bool(clicked),
-            "sample": rows[:8],
-        }
-        _vertical_diag("selected_replay", attempt)
-        replay_attempts.append(attempt)
-        if not clicked:
+        if not selected:
             continue
 
         previous_canonical, _ = _current_target_values(page)
+        clicked = click_search_row(search, selected, allow_stable_exact=False)
+        _vertical_diag(
+            "selected_current_generation",
+            {
+                "query_index": query_index,
+                "query": term,
+                "selected_vertical": selected,
+                "click_bound": bool(clicked),
+                "replay_performed": False,
+            },
+        )
+        if not clicked:
+            raise RuntimeError(
+                "Makro Step 1 selected a grounded query-owned live Vertical from the current search generation "
+                "but could not bind that exact current row for clicking; no replay was attempted because the "
+                f"selection must remain generation-local: selected={selected!r}; query={term!r}"
+            )
+
         return (
             _complete_exact_live_vertical(
                 page,
@@ -531,20 +507,7 @@ def _try_select_via_search(
         )
 
     _close_vertical_search(search, page, wait_ms=wait_ms)
-    _vertical_diag(
-        "selected_replay_exhausted",
-        {
-            "selected_vertical": selected,
-            "replay_queries": list(replay_terms),
-            "attempts": replay_attempts,
-            "action": "fail_closed_no_taxonomy_fallback",
-        },
-    )
-    raise RuntimeError(
-        "Makro Step 1 selected a grounded query-owned live Vertical but could not rebind that exact candidate "
-        "through any query that originally produced it; refusing taxonomy fallback because the failure is "
-        f"binding/transport, not semantic absence: selected={selected!r}; replay_queries={list(replay_terms)!r}"
-    )
+    return "", observed, planned_terms
 
 
 def _select_via_search_with_context(
@@ -566,7 +529,7 @@ def _select_via_search_with_context(
     attempted = " | ".join(attempted_terms)
     rows = " | ".join(observed[:20]) if observed else "<none>"
     raise RuntimeError(
-        f"Makro Step 1 {reason}; aggregated exact-live Vertical Search found no verified result from: "
+        f"Makro Step 1 {reason}; ordered exact-live Vertical Search found no verified result from: "
         f"{attempted}; observed query-owned rows: {rows}"
     )
 
@@ -734,8 +697,9 @@ def select_vertical(
     if search_selected:
         return search_selected
 
-    # Taxonomy is a semantic fallback only. _try_select_via_search raises when
-    # a grounded live candidate existed but its exact replay/binding failed.
+    # Taxonomy is a semantic fallback only. If a current live search generation
+    # produced and selected a candidate but its row could not be clicked,
+    # _try_select_via_search already failed closed above.
     taxonomy = ResilientMakroTaxonomyBrowser(page)
     taxonomy_selected = _select_via_taxonomy(page, provider, hints, taxonomy, wait_ms=wait_ms)
     if taxonomy_selected:
@@ -744,7 +708,7 @@ def select_vertical(
     attempted = " | ".join(attempted_terms)
     rows = " | ".join(observed[:20]) if observed else "<none>"
     raise RuntimeError(
-        "Makro Step 1 could not resolve a verified Vertical through aggregated query-owned live search "
+        "Makro Step 1 could not resolve a verified Vertical through ordered query-owned live search "
         f"or bounded live taxonomy; search_terms={attempted}; observed query-owned rows={rows}"
     )
 
