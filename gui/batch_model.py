@@ -57,7 +57,6 @@ class BatchJob:
     error: str = ""
     failure_stage: str = ""
     exit_code: int | None = None
-    operation_phase: str = ""
     created_at: str = field(default_factory=lambda: _now())
     updated_at: str = field(default_factory=lambda: _now())
 
