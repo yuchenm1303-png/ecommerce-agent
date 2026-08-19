@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNNER = (ROOT / "gui" / "batch_runner.py").read_text(encoding="utf-8")
 TELEMETRY = (ROOT / "gui" / "usage_telemetry.py").read_text(encoding="utf-8")
 MODEL = (ROOT / "gui" / "batch_model.py").read_text(encoding="utf-8")
+BATCH_JOB = (ROOT / "makro_batch_job.py").read_text(encoding="utf-8")
 
 
 def test_failure_diagnostic_keeps_newest_real_process_exception_and_redacts_secret(tmp_path: Path) -> None:
@@ -53,6 +54,7 @@ def test_failure_diagnostic_keeps_newest_real_process_exception_and_redacts_secr
         artifact_roots=(tmp_path / "real-execution",),
     )
 
+    assert diagnostic["schema"] == 3
     assert diagnostic["diagnostic_sources"]["process_log"] is True
     assert diagnostic["diagnostic_sources"]["execution_report"] is True
     assert diagnostic["failed_stage"] == "验证附加描述"
@@ -60,10 +62,42 @@ def test_failure_diagnostic_keeps_newest_real_process_exception_and_redacts_secr
     assert "locator timed out" in diagnostic["error_message"]
     assert "Traceback (most recent call last):" in diagnostic["traceback"]
     assert "TimeoutError" in diagnostic["process_log_tail"]
+    assert "execute.log" in diagnostic["process_log_files"]
     assert "super-secret" not in json.dumps(diagnostic, ensure_ascii=False)
     assert "[REDACTED]" in diagnostic["process_log_tail"]
     assert diagnostic["execution_report"]["completion"]["draft_persisted_complete"] is False
     assert len(json.dumps(diagnostic, ensure_ascii=False).encode("utf-8")) < 240_000
+
+
+def test_batch_failure_discovers_real_prepare_log_even_when_phase_points_to_missing_execute_log(tmp_path: Path) -> None:
+    workflow = tmp_path / "jobs" / "JOB-002" / "workflow"
+    workflow.mkdir(parents=True)
+    diagnostics = workflow.parent / "diagnostics"
+    diagnostics.mkdir()
+    prepare_log = diagnostics / "prepare.log"
+    prepare_log.write_text(
+        "STEP 3 CURRENT READ-ONLY FILL PLAN\n"
+        "Traceback (most recent call last):\n"
+        "  File \"makro_plan_listing.py\", line 220, in main\n"
+        "RuntimeError: live schema mismatch\n",
+        encoding="utf-8",
+    )
+
+    diagnostic = collect_workflow_failure_diagnostic(
+        workflow,
+        fallback_error="Prepare exit code=1",
+        fallback_error_type="BatchJobFailure",
+        fallback_stage="解析字段",
+        workflow_mode="full",
+        process_log_path=diagnostics / "execute.log",
+    )
+
+    assert diagnostic["diagnostic_sources"]["process_log"] is True
+    assert diagnostic["process_log_name"] == "prepare.log"
+    assert diagnostic["process_log_files"] == ["prepare.log"]
+    assert "live schema mismatch" in diagnostic["process_log_tail"]
+    assert diagnostic["error_type"] == "RuntimeError"
+    assert "makro_plan_listing.py" in diagnostic["traceback"]
 
 
 def test_batch_runner_persists_per_job_stage_logs_and_failure_location() -> None:
@@ -74,6 +108,11 @@ def test_batch_runner_persists_per_job_stage_logs_and_failure_location() -> None
     assert "job.exit_code = exit_code" in RUNNER
     assert "failure_stage: str = \"\"" in MODEL
     assert "exit_code: int | None = None" in MODEL
+
+
+def test_batch_prepare_keeps_full_python_traceback_in_the_local_log() -> None:
+    assert "import traceback" in BATCH_JOB
+    assert BATCH_JOB.count("traceback.print_exc()") >= 2
 
 
 def test_owner_telemetry_uses_independent_product_audits_with_real_failure_evidence() -> None:
