@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import traceback
 from pathlib import Path
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -85,9 +86,6 @@ def _prepare_owned_step1_with_recovery(page):
             except Exception:
                 pass
         except RuntimeError:
-            # The owned tab may legitimately advance while the pre-Step1 helper
-            # is waiting. Once this exact invocation moved the tab, the shared
-            # state machine can reconcile Step 2/3 safely.
             if _listing_stage(page) not in {"step2", "step3"}:
                 raise
             return page
@@ -210,8 +208,6 @@ def main() -> int:
                 set_current=set_current_phase,
             )
             harness.page = page
-            # Step 2 -> Step 3 may replace the Chromium target. Ownership must
-            # follow the exact recovered Step 3 page before Resolver/planner starts.
             owned_target_id = page_target_id(page)
             manifest["makro_target_id"] = owned_target_id
             manifest["page_url"] = page.url
@@ -219,10 +215,6 @@ def main() -> int:
 
             current = "step3"
             _phase("step3", "START")
-            # Each batch job is its own OS process. Propagate this job's refreshed
-            # Chromium target through the process environment so the nested
-            # read-only planner binds the exact owned tab instead of applying the
-            # Single-mode unique-tab rule to all concurrent Batch tabs.
             previous_target = os.environ.get(_BATCH_TARGET_ENV)
             os.environ[_BATCH_TARGET_ENV] = owned_target_id
             try:
@@ -258,12 +250,14 @@ def main() -> int:
         manifest["error"] = str(exc)
         _write_manifest(manifest_path, manifest)
         _phase(current, "FAILED", str(exc))
+        traceback.print_exc()
         return 2
     except Exception as exc:
         manifest["status"] = "failed"
         manifest["error"] = str(exc)
         _write_manifest(manifest_path, manifest)
         _phase(current, "FAILED", str(exc))
+        traceback.print_exc()
         print(f"BATCH JOB FAILED: {exc}", flush=True)
         print("现场保留；不会 Send to QC，也不会关闭/重启长期 Makro Edge。", flush=True)
         return 1
