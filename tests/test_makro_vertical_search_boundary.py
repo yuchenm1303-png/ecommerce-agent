@@ -110,6 +110,8 @@ def test_vertical_search_uses_generation_owned_surface_only() -> None:
     assert "_wait_for_scoped_vertical_search_candidates(" in run_source
     assert "_search_result_delta(" not in source
     assert "_visible_text_candidates" not in source
+    assert "_replay_grounded_vertical_candidate" not in source
+    assert "merge_vertical_search_observations" not in source
 
 
 def test_query_reset_never_requires_old_dom_to_disappear() -> None:
@@ -126,7 +128,6 @@ def test_query_reset_never_requires_old_dom_to_disappear() -> None:
     source = inspect.getsource(vertical_selection._close_vertical_search)
     assert "query_quiescence" not in source
     assert "remaining_rows" not in source
-    assert "DOM disappearance is never used" in source
 
 
 def test_each_discovery_query_starts_fresh_generation_after_reset(monkeypatch) -> None:
@@ -177,33 +178,107 @@ def test_generation_creation_failure_stops_before_query_write(monkeypatch) -> No
     assert ("fill", "rain showerhead") not in search.events
 
 
-def test_grounded_replay_can_bind_stable_exact_row_without_fresh_mutation(monkeypatch) -> None:
+def test_selected_candidate_clicks_in_same_generation_without_replay(monkeypatch) -> None:
     selected = "Home Improvement Tools / Bathroom Fittings & Sanitary / Shower Head"
-    page = FakePage()
     search = FakeSearch()
-    seen: dict[str, object] = {}
+    provider = FakeProvider()
+    hints = vertical_selection.ListingBootstrapHints(
+        ("rain showerhead",), "SparkPod", "explicit", "high pressure rain showerhead"
+    )
+    queries: list[str] = []
+    clicks: list[tuple[str, bool]] = []
+    completions: list[tuple[str, str, str]] = []
 
-    monkeypatch.setattr(vertical_selection, "_run_vertical_search_query", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(vertical_selection, "_vertical_search_input", lambda _page: search)
+    monkeypatch.setattr(
+        vertical_selection,
+        "plan_vertical_search_terms",
+        lambda _provider, _hints: ("rain showerhead", "showerhead"),
+    )
+
+    def run_query(_page, _search, term, *, wait_ms):
+        _ = wait_ms
+        queries.append(term)
+        return [selected]
+
+    def choose(_provider, _hints, term, rows):
+        assert term == "rain showerhead"
+        assert rows == [selected]
+        return selected
 
     def click(_search, label, *, allow_stable_exact=False):
-        seen["label"] = label
-        seen["allow_stable_exact"] = allow_stable_exact
+        clicks.append((label, allow_stable_exact))
         return True
 
+    def complete(_page, label, *, previous_canonical="", verification_label=""):
+        completions.append((label, previous_canonical, verification_label))
+        return "shower_head"
+
+    monkeypatch.setattr(vertical_selection, "_run_vertical_search_query", run_query)
+    monkeypatch.setattr(vertical_selection, "_choose_vertical_search_candidate", choose)
     monkeypatch.setattr(vertical_selection, "click_search_row", click)
-    clicked, rows = vertical_selection._replay_grounded_vertical_candidate(
-        page,
-        search,
-        term="rain showerhead",
-        selected=selected,
+    monkeypatch.setattr(vertical_selection, "_current_target_values", lambda _page: ("", ""))
+    monkeypatch.setattr(vertical_selection, "_complete_exact_live_vertical", complete)
+
+    resolved, observed, terms = vertical_selection._try_select_via_search(
+        FakePage(),
+        provider,
+        hints,
         wait_ms=800,
     )
-    assert clicked is True
-    assert rows == []
-    assert seen == {"label": selected, "allow_stable_exact": True}
+
+    assert resolved == "shower_head"
+    assert observed == [selected]
+    assert terms == ("rain showerhead", "showerhead")
+    assert queries == ["rain showerhead"]
+    assert clicks == [(selected, False)]
+    assert completions == [(selected, "", "Shower Head")]
 
 
-def test_grounded_live_candidate_replay_failure_refuses_taxonomy_fallback(monkeypatch) -> None:
+def test_search_continues_only_when_current_query_has_no_semantic_candidate(monkeypatch) -> None:
+    selected = "Home Improvement Tools / Bathroom Fittings & Sanitary / Shower Head"
+    first_rows = ["Home & Kitchen / Bathroom Accessories / Soap Dishes"]
+    search = FakeSearch()
+    provider = FakeProvider()
+    hints = vertical_selection.ListingBootstrapHints(
+        ("rain showerhead",), "SparkPod", "explicit", "high pressure rain showerhead"
+    )
+    queries: list[str] = []
+
+    monkeypatch.setattr(vertical_selection, "_vertical_search_input", lambda _page: search)
+    monkeypatch.setattr(
+        vertical_selection,
+        "plan_vertical_search_terms",
+        lambda _provider, _hints: ("rain showerhead", "showerhead"),
+    )
+
+    def run_query(_page, _search, term, *, wait_ms):
+        _ = wait_ms
+        queries.append(term)
+        return first_rows if term == "rain showerhead" else [selected]
+
+    def choose(_provider, _hints, term, rows):
+        return "" if term == "rain showerhead" else selected
+
+    monkeypatch.setattr(vertical_selection, "_run_vertical_search_query", run_query)
+    monkeypatch.setattr(vertical_selection, "_choose_vertical_search_candidate", choose)
+    monkeypatch.setattr(vertical_selection, "click_search_row", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(vertical_selection, "_current_target_values", lambda _page: ("", ""))
+    monkeypatch.setattr(vertical_selection, "_complete_exact_live_vertical", lambda *_args, **_kwargs: "shower_head")
+
+    resolved, observed, _terms = vertical_selection._try_select_via_search(
+        FakePage(),
+        provider,
+        hints,
+        wait_ms=800,
+    )
+
+    assert resolved == "shower_head"
+    assert queries == ["rain showerhead", "showerhead"]
+    assert observed == [*first_rows, selected]
+
+
+def test_current_generation_binding_failure_stops_without_replay(monkeypatch) -> None:
     selected = "Home Improvement Tools / Bathroom Fittings & Sanitary / Shower Head"
     calls: list[str] = []
     search = FakeSearch()
@@ -222,20 +297,18 @@ def test_grounded_live_candidate_replay_failure_refuses_taxonomy_fallback(monkey
     def run_query(_page, _search, term, *, wait_ms):
         _ = wait_ms
         calls.append(term)
-        if len(calls) == 1:
-            return [selected]
-        return []
+        return [selected]
 
     monkeypatch.setattr(vertical_selection, "_run_vertical_search_query", run_query)
     monkeypatch.setattr(
         vertical_selection,
-        "choose_vertical_candidate_pool",
+        "_choose_vertical_search_candidate",
         lambda *_args, **_kwargs: selected,
     )
+    monkeypatch.setattr(vertical_selection, "_current_target_values", lambda _page: ("", ""))
     monkeypatch.setattr(vertical_selection, "click_search_row", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(vertical_selection, "_close_vertical_search", lambda *_args, **_kwargs: None)
 
-    with pytest.raises(RuntimeError, match="refusing taxonomy fallback"):
+    with pytest.raises(RuntimeError, match="current search generation"):
         vertical_selection._try_select_via_search(
             FakePage(),
             provider,
@@ -243,9 +316,7 @@ def test_grounded_live_candidate_replay_failure_refuses_taxonomy_fallback(monkey
             wait_ms=800,
         )
 
-    # Two discovery generations followed only by the original query that grounded
-    # the selected candidate. No unrelated taxonomy mechanism is entered here.
-    assert calls == ["rain showerhead", "showerhead", "rain showerhead"]
+    assert calls == ["rain showerhead"]
 
 
 def test_select_vertical_searches_before_mutating_taxonomy() -> None:
