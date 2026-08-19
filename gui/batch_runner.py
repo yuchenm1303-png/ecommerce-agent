@@ -213,6 +213,7 @@ class BatchController(QObject):
     def _start_source(self, job_id: str) -> None:
         assert self.config is not None
         job = self._job(job_id)
+        job.operation_phase = "batch_prepare"
         root = self._job_root(job)
         cache = root / "_cache" / "source"
         output = root / "source-prefetch"
@@ -238,6 +239,7 @@ class BatchController(QObject):
     def _start_prepare_job(self, job_id: str) -> None:
         assert self.config is not None
         job = self._job(job_id)
+        job.operation_phase = "batch_prepare"
         root = self._job_root(job)
         source_cache = root / "_cache" / "source"
         semantic_cache = root / "_cache" / "semantic"
@@ -288,6 +290,7 @@ class BatchController(QObject):
     def _start_execute_job(self, job_id: str) -> None:
         assert self.config is not None
         job = self._job(job_id)
+        job.operation_phase = "batch_execute"
         args = self._execution_args(job)
         job.status = "FILLING"
         job.stage_detail = "填写全部 READY"
