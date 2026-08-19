@@ -19,12 +19,20 @@ def _batch(status: str, *job_states: str) -> SimpleNamespace:
     )
 
 
-def _job(status: str, *, progress: int = 0, run_dir: str = "", execution_report: str = "") -> SimpleNamespace:
+def _job(
+    status: str,
+    *,
+    progress: int = 0,
+    run_dir: str = "",
+    execution_report: str = "",
+    operation_phase: str = "",
+) -> SimpleNamespace:
     return SimpleNamespace(
         status=status,
         progress=progress,
         run_dir=run_dir,
         execution_report=execution_report,
+        operation_phase=operation_phase,
     )
 
 
@@ -65,9 +73,33 @@ def test_successful_execute_cohort_keeps_prior_prepare_failure_visible_in_audit(
 
 
 def test_prepare_failure_never_inherits_global_execute_phase() -> None:
-    failed_fill_plan = _job("FAILED", progress=76)
+    failed_fill_plan = _job(
+        "FAILED",
+        progress=76,
+        operation_phase="batch_prepare",
+    )
 
     assert _batch_job_phase(failed_fill_plan, "batch_execute") == "batch_prepare"
+
+
+def test_prepare_review_at_100_percent_stays_prepare_from_persisted_phase() -> None:
+    prepare_review = _job(
+        "REVIEW",
+        progress=100,
+        operation_phase="batch_prepare",
+    )
+
+    assert _batch_job_phase(prepare_review, "batch_execute") == "batch_prepare"
+
+
+def test_execute_initialization_failure_stays_execute_from_persisted_phase() -> None:
+    execute_failure = _job(
+        "FAILED",
+        progress=0,
+        operation_phase="batch_execute",
+    )
+
+    assert _batch_job_phase(execute_failure, "batch_prepare") == "batch_execute"
 
 
 def test_known_prepare_states_never_inherit_global_execute_phase() -> None:
@@ -75,7 +107,14 @@ def test_known_prepare_states_never_inherit_global_execute_phase() -> None:
     assert _batch_job_phase(_job("READY", progress=100), "batch_execute") == "batch_prepare"
 
 
-def test_execute_states_and_terminal_execute_evidence_stay_execute() -> None:
+def test_execute_active_and_done_states_stay_execute() -> None:
     assert _batch_job_phase(_job("FILLING", progress=82), "batch_prepare") == "batch_execute"
     assert _batch_job_phase(_job("DONE", progress=100), "batch_prepare") == "batch_execute"
-    assert _batch_job_phase(_job("FAILED", progress=94), "batch_prepare") == "batch_execute"
+
+
+def test_legacy_terminal_jobs_fall_back_to_local_execute_evidence() -> None:
+    assert _batch_job_phase(_job("FAILED", progress=94), "batch_execute") == "batch_prepare"
+    assert _batch_job_phase(
+        _job("FAILED", progress=0, execution_report="report.json"),
+        "batch_prepare",
+    ) == "batch_execute"
