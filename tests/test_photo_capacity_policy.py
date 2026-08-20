@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+from pathlib import Path
 
 from app.makro.execution import _persisted_gallery_report, _photo_upload_budget
 from makro_preview_listing import _completion_summary
@@ -31,24 +31,22 @@ def test_photo_upload_budget_falls_back_to_visible_slots_without_counter() -> No
 
 
 def test_full_gallery_is_persisted_but_request_is_explicitly_capacity_limited() -> None:
+    omitted = [Path(f"image-{index}.jpg") for index in range(5)]
     report = _persisted_gallery_report(
         requested=5,
         initial_count=5,
         capacity=5,
         available_slots=0,
-        omitted_paths=[],
-        request_status="not_requested",
-        detail="existing gallery",
+        omitted_paths=omitted,
+        request_status="skipped_no_capacity",
+        detail="existing gallery is already full",
     )
-    report["request_status"] = "skipped_no_capacity"
-    report["request_complete"] = False
-    report["capacity_limited"] = True
-    report["omitted_count"] = 5
-    report["omitted_due_capacity"] = [f"image-{index}.jpg" for index in range(5)]
 
     assert report["status"] == "persisted_verified"
     assert report["request_status"] == "skipped_no_capacity"
     assert report["request_complete"] is False
+    assert report["capacity_limited"] is True
+    assert report["omitted_count"] == 5
     assert report["listing_photo_requirement_satisfied"] is True
     assert report["persistence"]["final_count"] == 5
 
