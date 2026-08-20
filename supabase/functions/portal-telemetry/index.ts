@@ -262,28 +262,58 @@ Deno.serve(async (req: Request) => {
       return json({ error: "task_audit_too_large" }, 413);
     }
 
-    const auditId = String(audit.id || "").trim().toLowerCase();
+    let auditId = String(audit.id || "").trim().toLowerCase();
     const taskKind = String(audit.task_kind || "").trim().toLowerCase();
     const phase = String(audit.phase || "").trim().slice(0, 80);
     const status = String(audit.status || "running").trim().toLowerCase();
     const productUrl = String(audit.product_url || "").trim().slice(0, 4096);
     const errorText = String(audit.error_text || "").trim().slice(0, 12_000);
     const inputData = audit.input_data && typeof audit.input_data === "object" && !Array.isArray(audit.input_data)
-      ? audit.input_data
+      ? audit.input_data as Record<string, unknown>
       : {};
     const resultData = audit.result_data && typeof audit.result_data === "object" && !Array.isArray(audit.result_data)
-      ? audit.result_data
+      ? audit.result_data as Record<string, unknown>
       : {};
     if (!UUID_RE.test(auditId) || !AUDIT_KINDS.has(taskKind) || !AUDIT_STATUSES.has(status)) {
       return json({ error: "invalid_task_audit_contract" }, 400);
     }
 
-    const { data: existingAudit, error: auditCheckError } = await admin
-      .from(AUDIT_TABLE)
-      .select("id, user_id, device_id, created_at")
-      .eq("id", auditId)
-      .maybeSingle();
-    if (auditCheckError) return json({ error: "task_audit_check_failed" }, 503);
+    const batchId = taskKind === "batch"
+      ? String(inputData.batch_id || resultData.batch_id || "").trim().slice(0, 200)
+      : "";
+    const jobId = taskKind === "batch"
+      ? String(inputData.job_id || resultData.job_id || "").trim().slice(0, 160)
+      : "";
+
+    let existingAudit: { id: string; user_id: string; device_id: string; created_at: string } | null = null;
+
+    // Batch audit identity belongs to the logical product job, not to whichever
+    // client-side telemetry controller happened to generate a UUID first.
+    if (batchId && jobId) {
+      const { data: logicalAudit, error: logicalAuditError } = await admin
+        .from(AUDIT_TABLE)
+        .select("id, user_id, device_id, created_at")
+        .eq("user_id", userId)
+        .eq("batch_id", batchId)
+        .eq("job_id", jobId)
+        .maybeSingle();
+      if (logicalAuditError) return json({ error: "task_audit_logical_check_failed" }, 503);
+      if (logicalAudit) {
+        existingAudit = logicalAudit;
+        auditId = logicalAudit.id;
+      }
+    }
+
+    if (!existingAudit) {
+      const { data: idAudit, error: auditCheckError } = await admin
+        .from(AUDIT_TABLE)
+        .select("id, user_id, device_id, created_at")
+        .eq("id", auditId)
+        .maybeSingle();
+      if (auditCheckError) return json({ error: "task_audit_check_failed" }, 503);
+      existingAudit = idAudit;
+    }
+
     if (existingAudit && (existingAudit.user_id !== userId || existingAudit.device_id !== deviceId)) {
       return json({ error: "task_audit_owner_mismatch" }, 403);
     }
@@ -309,8 +339,32 @@ Deno.serve(async (req: Request) => {
       const { error } = await admin.from(AUDIT_TABLE).update(record).eq("id", auditId).eq("user_id", userId);
       if (error) return json({ error: "task_audit_update_failed" }, 503);
     } else {
-      const { error } = await admin.from(AUDIT_TABLE).insert({ id: auditId, ...record, created_at: nowIso });
-      if (error) return json({ error: "task_audit_create_failed" }, 503);
+      const { error: createError } = await admin.from(AUDIT_TABLE).insert({ id: auditId, ...record, created_at: nowIso });
+      if (createError) {
+        // Two legacy writers can race after both observe no row. The database
+        // logical-key constraint arbitrates that race; the loser then updates
+        // the row that won instead of creating another audit or returning 503.
+        if (createError.code !== "23505" || !batchId || !jobId) {
+          return json({ error: "task_audit_create_failed" }, 503);
+        }
+        const { data: racedAudit, error: raceLookupError } = await admin
+          .from(AUDIT_TABLE)
+          .select("id, user_id, device_id")
+          .eq("user_id", userId)
+          .eq("batch_id", batchId)
+          .eq("job_id", jobId)
+          .maybeSingle();
+        if (raceLookupError || !racedAudit) return json({ error: "task_audit_race_recovery_failed" }, 503);
+        if (racedAudit.user_id !== userId || racedAudit.device_id !== deviceId) {
+          return json({ error: "task_audit_owner_mismatch" }, 403);
+        }
+        const { error: updateError } = await admin
+          .from(AUDIT_TABLE)
+          .update(record)
+          .eq("id", racedAudit.id)
+          .eq("user_id", userId);
+        if (updateError) return json({ error: "task_audit_update_failed" }, 503);
+      }
     }
   }
 
