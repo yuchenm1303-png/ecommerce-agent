@@ -29,6 +29,7 @@ from .result_loader import (
     latest_resolver_manifest,
     load_run_result,
 )
+from .task_failure_diagnostics import execution_report_failure_summary
 
 
 _PHASE_LINE = re.compile(
@@ -527,33 +528,52 @@ class BatchController(QObject):
 
         if stage == "execute":
             job.exit_code = exit_code
+            report_payload: dict[str, Any] = {}
+            report_error = ""
+            try:
+                report = self._latest_execution_report(job)
+                report_payload = json.loads(report.read_text(encoding="utf-8"))
+                job.execution_report = str(report.resolve())
+            except Exception as exc:
+                report_error = str(exc)
+
             if exit_code == 0:
-                try:
-                    report = self._latest_execution_report(job)
-                    payload = json.loads(report.read_text(encoding="utf-8"))
-                    job.execution_report = str(report.resolve())
-                    completion = payload.get("completion") or {}
+                if report_error:
+                    job.failure_stage = "执行报告读取"
+                    job.status = "FAILED"
+                    job.error = f"读取真实执行报告失败：{report_error}"
+                    job.stage_detail = "执行结果读取失败"
+                else:
+                    completion = report_payload.get("completion") or {}
                     complete = bool(
                         isinstance(completion, dict)
                         and completion.get("draft_persisted_complete")
                     )
                     job.status = "DONE" if complete else "REVIEW"
                     job.stage_detail = "保存并验证完成" if complete else "已执行，需复核"
-                    job.failure_stage = "" if complete else "执行验收"
                     job.progress = 100
-                    if not complete:
-                        job.error = self._execution_review_reason(payload)
-                    else:
+                    if complete:
+                        job.failure_stage = ""
                         job.error = ""
-                except Exception as exc:
-                    job.failure_stage = "执行报告读取"
-                    job.status = "FAILED"
-                    job.error = f"读取真实执行报告失败：{exc}"
-                    job.stage_detail = "执行结果读取失败"
+                    else:
+                        failure = execution_report_failure_summary(report_payload)
+                        job.failure_stage = str(failure.get("stage") or "执行验收")
+                        job.error = str(
+                            failure.get("error_message")
+                            or self._execution_review_reason(report_payload)
+                        )
             else:
-                job.failure_stage = job.stage_detail or "execute"
+                failure = execution_report_failure_summary(report_payload)
+                job.failure_stage = str(
+                    failure.get("stage")
+                    or job.stage_detail
+                    or "execute"
+                )
                 job.status = "FAILED"
-                job.error = f"Real execution exit code={exit_code}"
+                job.error = str(
+                    failure.get("error_message")
+                    or f"Real execution exit code={exit_code}"
+                )
                 job.stage_detail = "真实填写失败"
             job.touch()
             self._persist_emit()
