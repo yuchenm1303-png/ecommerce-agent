@@ -33,6 +33,18 @@ _EXCEPTION_LINE_RE = re.compile(
 )
 _TRACEBACK_MARKER = "Traceback (most recent call last):"
 _BATCH_STAGE_LOGS = ("source.log", "prepare.log", "execute.log")
+_FIELD_FAILURE_STATUSES = {
+    "fill_error": "FieldFillError",
+    "validation_failed": "FieldValidationFailure",
+    "persisted_validation_failed": "FieldPersistenceFailure",
+    "skipped_live_match": "FieldBindingFailure",
+}
+_SECTION_FAILURE_STATUSES = {
+    "section_error": "SectionExecutionFailure",
+    "save_failed": "SectionSaveFailure",
+    "persisted_validation_failed": "SectionPersistenceFailure",
+}
+_PHOTO_SUCCESS_STATUSES = {"persisted_verified", "skipped"}
 
 
 def sanitize_telemetry_url(value: str) -> str:
@@ -354,6 +366,205 @@ def _section_report_summary(raw: Any) -> dict[str, Any]:
     )
 
 
+def _section_name(payload: dict[str, Any]) -> str:
+    return str(
+        payload.get("section")
+        or payload.get("section_title")
+        or payload.get("title")
+        or "执行字段"
+    ).strip()
+
+
+def _field_name(payload: dict[str, Any]) -> str:
+    return str(
+        payload.get("label")
+        or payload.get("question")
+        or payload.get("attribute_key")
+        or "unknown field"
+    ).strip()
+
+
+def _verification_detail(payload: dict[str, Any]) -> str:
+    verification = payload.get("verification")
+    if isinstance(verification, dict):
+        detail = str(verification.get("detail") or "").strip()
+        if detail:
+            return detail
+    return str(payload.get("detail") or payload.get("error") or "").strip()
+
+
+def execution_report_failure_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    """Derive the canonical failure from executor acceptance evidence.
+
+    Progress/UI phase is intentionally excluded.  A section may finish and the
+    photo phase may run successfully after an earlier field failed validation;
+    the acceptance report, not the last visible phase, owns failure attribution.
+    """
+
+    if not isinstance(payload, dict) or not payload:
+        return {}
+
+    sections = payload.get("section_reports")
+    if isinstance(sections, list):
+        for raw_section in sections:
+            if not isinstance(raw_section, dict):
+                continue
+            section = _section_name(raw_section)
+            results = raw_section.get("results")
+            if isinstance(results, list):
+                for raw_result in results:
+                    if not isinstance(raw_result, dict):
+                        continue
+                    status = str(raw_result.get("execution_status") or "").strip()
+                    error_type = _FIELD_FAILURE_STATUSES.get(status)
+                    if not error_type:
+                        continue
+                    field = _field_name(raw_result)
+                    detail = _verification_detail(raw_result)
+                    message = detail or f"字段 {field} 执行状态={status}"
+                    return sanitize_telemetry_value(
+                        {
+                            "source": "execution_report",
+                            "stage": f"{section} / {field}",
+                            "section": section,
+                            "field": field,
+                            "status": status,
+                            "error_type": error_type,
+                            "error_message": message,
+                        },
+                        max_text=4_000,
+                        max_list=40,
+                    )
+
+            persisted = raw_section.get("persisted_verifications")
+            if isinstance(persisted, list):
+                for raw_verification in persisted:
+                    if not isinstance(raw_verification, dict):
+                        continue
+                    status = str(raw_verification.get("status") or "").strip()
+                    if status in {"", "persisted_verified"}:
+                        continue
+                    field = _field_name(raw_verification)
+                    detail = str(raw_verification.get("detail") or "").strip()
+                    return sanitize_telemetry_value(
+                        {
+                            "source": "execution_report",
+                            "stage": f"{section} / {field}",
+                            "section": section,
+                            "field": field,
+                            "status": status,
+                            "error_type": "FieldPersistenceFailure",
+                            "error_message": detail or f"字段 {field} Save 后验证状态={status}",
+                        },
+                        max_text=4_000,
+                        max_list=40,
+                    )
+
+            section_status = str(raw_section.get("status") or "").strip()
+            section_error_type = _SECTION_FAILURE_STATUSES.get(section_status)
+            if section_error_type:
+                message = str(
+                    raw_section.get("save_error")
+                    or raw_section.get("detail")
+                    or raw_section.get("error")
+                    or f"section {section} 状态={section_status}"
+                ).strip()
+                return sanitize_telemetry_value(
+                    {
+                        "source": "execution_report",
+                        "stage": section,
+                        "section": section,
+                        "field": "",
+                        "status": section_status,
+                        "error_type": section_error_type,
+                        "error_message": message,
+                    },
+                    max_text=4_000,
+                    max_list=40,
+                )
+
+    photos = payload.get("photo_upload")
+    if isinstance(photos, dict):
+        requested = int(photos.get("requested") or 0)
+        status = str(photos.get("status") or "").strip()
+        if requested > 0 and status not in _PHOTO_SUCCESS_STATUSES:
+            return sanitize_telemetry_value(
+                {
+                    "source": "execution_report",
+                    "stage": "Product Photos",
+                    "section": "Product Photos",
+                    "field": "",
+                    "status": status or "incomplete",
+                    "error_type": "PhotoPersistenceFailure",
+                    "error_message": str(photos.get("detail") or f"Product Photos 状态={status or 'incomplete'}"),
+                },
+                max_text=4_000,
+                max_list=40,
+            )
+
+    completion = payload.get("completion")
+    if isinstance(completion, dict):
+        required_blocked = int(completion.get("required_blocked") or 0)
+        if required_blocked:
+            return sanitize_telemetry_value(
+                {
+                    "source": "execution_report",
+                    "stage": "执行验收 / required fields",
+                    "section": "",
+                    "field": "",
+                    "status": "required_blocked",
+                    "error_type": "RequiredFieldBlocked",
+                    "error_message": f"required_blocked={required_blocked}",
+                },
+                max_text=4_000,
+                max_list=40,
+            )
+        if not completion.get("required_field_cards_persisted", True):
+            return sanitize_telemetry_value(
+                {
+                    "source": "execution_report",
+                    "stage": "执行验收 / required fields",
+                    "section": "",
+                    "field": "",
+                    "status": "required_not_persisted",
+                    "error_type": "RequiredFieldPersistenceFailure",
+                    "error_message": "required sections not fully persisted",
+                },
+                max_text=4_000,
+                max_list=40,
+            )
+        if not completion.get("photos_persisted", True):
+            return sanitize_telemetry_value(
+                {
+                    "source": "execution_report",
+                    "stage": "Product Photos",
+                    "section": "Product Photos",
+                    "field": "",
+                    "status": "photos_not_persisted",
+                    "error_type": "PhotoPersistenceFailure",
+                    "error_message": "Product Photos not persisted",
+                },
+                max_text=4_000,
+                max_list=40,
+            )
+        if not completion.get("draft_persisted_complete", True):
+            return sanitize_telemetry_value(
+                {
+                    "source": "execution_report",
+                    "stage": "执行验收",
+                    "section": "",
+                    "field": "",
+                    "status": "acceptance_incomplete",
+                    "error_type": "ExecutionAcceptanceFailure",
+                    "error_message": "Full Step 3 persisted acceptance 未完整通过",
+                },
+                max_text=4_000,
+                max_list=40,
+            )
+
+    return {}
+
+
 def _compact_execution_report(payload: dict[str, Any]) -> dict[str, Any]:
     if not payload:
         return {}
@@ -382,6 +593,9 @@ def _compact_execution_report(payload: dict[str, Any]) -> dict[str, Any]:
     photos = payload.get("photo_upload")
     if isinstance(photos, dict):
         result["photo_upload"] = sanitize_telemetry_value(photos, max_text=2_000, max_list=60)
+    failure_summary = execution_report_failure_summary(payload)
+    if failure_summary:
+        result["failure_summary"] = failure_summary
     return sanitize_telemetry_value(result, max_text=4_000, max_list=100)
 
 
@@ -400,6 +614,8 @@ def collect_workflow_failure_diagnostic(
     The local process log is the primary repair evidence. Phase/timeline/report
     fields are auxiliary only. Batch logs are discovered directly from disk so a
     wrong telemetry phase can never hide the actual source/prepare/execute log.
+    When the executor produced its canonical acceptance report, that report owns
+    execution-failure attribution instead of the last GUI progress phase.
     """
 
     path = Path(run_dir).expanduser() if str(run_dir or "").strip() else None
@@ -413,6 +629,7 @@ def collect_workflow_failure_diagnostic(
     process_path, process_log, process_log_truncated, process_logs = _process_log_payload(process_paths)
 
     report_path, report_payload = _latest_execution_report(artifact_roots)
+    execution_failure = execution_report_failure_summary(report_payload)
     execution_report = _compact_execution_report(report_payload)
 
     failed_event: dict[str, Any] = {}
@@ -436,24 +653,33 @@ def collect_workflow_failure_diagnostic(
         if log_error_type or log_error_message:
             break
 
-    error_message = sanitize_telemetry_text(
-        str(
+    if failed_event:
+        raw_error_message = str(
             failed_event.get("error")
             or failed_event.get("detail")
             or log_error_message
             or fallback_error
             or "任务失败"
-        ),
-        _MAX_TEXT,
-    )
-    error_type = sanitize_telemetry_text(
-        str(failed_event.get("error_type") or log_error_type or fallback_error_type or "TaskFailure"),
-        240,
-    )
-    failed_stage = sanitize_telemetry_text(
-        str(failed_event.get("stage") or fallback_stage or "unknown"),
-        500,
-    )
+        )
+        raw_error_type = str(
+            failed_event.get("error_type")
+            or log_error_type
+            or fallback_error_type
+            or "TaskFailure"
+        )
+        raw_failed_stage = str(failed_event.get("stage") or fallback_stage or "unknown")
+    elif execution_failure:
+        raw_error_message = str(execution_failure.get("error_message") or fallback_error or "任务失败")
+        raw_error_type = str(execution_failure.get("error_type") or fallback_error_type or "TaskFailure")
+        raw_failed_stage = str(execution_failure.get("stage") or fallback_stage or "unknown")
+    else:
+        raw_error_message = str(log_error_message or fallback_error or "任务失败")
+        raw_error_type = str(log_error_type or fallback_error_type or "TaskFailure")
+        raw_failed_stage = str(fallback_stage or "unknown")
+
+    error_message = sanitize_telemetry_text(raw_error_message, _MAX_TEXT)
+    error_type = sanitize_telemetry_text(raw_error_type, 240)
+    failed_stage = sanitize_telemetry_text(raw_failed_stage, 500)
     resolved_mode = sanitize_telemetry_text(
         str(failed_event.get("mode") or manifest.get("mode") or workflow_mode or ""),
         120,
@@ -482,6 +708,7 @@ def collect_workflow_failure_diagnostic(
         "diagnostic_source_available": any(sources.values()),
         "diagnostic_sources": sources,
         "failed_event": _compact_event(failed_event) if failed_event else {},
+        "execution_failure": execution_failure,
         "stage_summary": _stage_summary(events),
         "timeline": _event_timeline(events),
         "manifest": _compact_manifest(manifest),
@@ -499,6 +726,7 @@ def collect_workflow_failure_diagnostic(
 
 __all__ = [
     "collect_workflow_failure_diagnostic",
+    "execution_report_failure_summary",
     "sanitize_telemetry_text",
     "sanitize_telemetry_url",
     "sanitize_telemetry_value",
