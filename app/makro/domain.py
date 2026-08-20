@@ -341,8 +341,9 @@ class MakroDomainAdapter:
         disabled ``+``. The scanner still treats that visible add control as
         repeatable capability. At execution time, if ``+`` is disabled, seed the
         current last slot with its final approved value, wait for React to enable
-        the same control, then add the next slot. Every newly-created indexed
-        control is re-scanned before the next step.
+        the same control, then add the next slot. Every mutation boundary is
+        re-scanned before the next DOM action so React-replaced controls are never
+        reused from stale semantic metadata.
         """
 
         values = list(getattr(answer, "answer_values", []) or [])
@@ -379,6 +380,16 @@ class MakroDomainAdapter:
                     section_path,
                 )
                 self.page.wait_for_timeout(180)
+
+                current = self._refresh_field(current, section_path)
+                value_controls = _value_controls(current)
+                after_seed = len(value_controls)
+                if after_seed > before:
+                    continue
+                if after_seed < before or not value_controls:
+                    return current
+
+                anchor = value_controls[-1]
                 click = click_add_value_for_control(
                     self.page,
                     section_path,
