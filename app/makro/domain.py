@@ -124,7 +124,23 @@ class MakroDomainAdapter:
     def cancel_section(self, section_title: str, *, wait_ms: int = 450) -> None:
         cancel_section(self.page, section_title, wait_ms=wait_ms)
 
-    def save_section(self, section_title: str, *, timeout_s: float = 15.0) -> None:
+    def save_section(
+        self,
+        section_title: str,
+        *,
+        timeout_s: float | None = None,
+    ) -> None:
+        """Persist one section using the canonical section lifecycle policy.
+
+        The sections layer owns the production default timeout because it also
+        owns Makro's asynchronous Save/reopen verification contract.  Callers
+        may still supply an explicit timeout for a deliberate bounded override,
+        but the adapter must not silently replace that canonical default.
+        """
+
+        if timeout_s is None:
+            save_section(self.page, section_title)
+            return
         save_section(self.page, section_title, timeout_s=timeout_s)
 
     def visible_section_errors(self, section_path: str) -> list[str]:
