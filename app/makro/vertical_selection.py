@@ -273,16 +273,16 @@ def _wait_for_canonical_vertical(page: Page, *, timeout_s: float = 10.0) -> str:
 
 
 def _vertical_confirmation_ready(page: Page, selected: str = "") -> bool:
-    """Recognize both Makro Step 1 confirmation variants without version flags.
+    """Recognize only a confirmation that belongs to the selected live Vertical.
 
-    Legacy builds either transition directly to Step 2 or expose the older
-    confirmation content/URL shape. The newer intermittent build keeps the same
-    Step 1 route while rendering the selected Vertical details in place and only
-    exposes an enabled ``Select Brand`` action. That structural state is sufficient
-    only while the page is still Step 1; when a selected label is supplied it must
-    also remain visible, preventing an unrelated action from being accepted.
+    During taxonomy backtracking Makro may leave the previous leaf confirmation on
+    screen briefly. When a selected label is supplied, every Step 1 confirmation
+    variant therefore has to show that exact label before it can be treated as the
+    new branch outcome. Step 2 remains safe because semantic rejection happens
+    before Select Brand is clicked.
     """
 
+    selected_value = str(selected or "").strip()
     try:
         if is_brand_step(page):
             return True
@@ -290,7 +290,7 @@ def _vertical_confirmation_ready(page: Page, selected: str = "") -> bool:
         pass
     try:
         if _vertical_confirmation_content(page):
-            return True
+            return not selected_value or _selected_label_visible(page, selected_value)
     except Exception:
         pass
     try:
@@ -301,7 +301,6 @@ def _vertical_confirmation_ready(page: Page, selected: str = "") -> bool:
     except Exception:
         return False
 
-    selected_value = str(selected or "").strip()
     return not selected_value or _selected_label_visible(page, selected_value)
 
 
@@ -592,7 +591,7 @@ def _resume_partial_taxonomy(
             columns_fn=shifted_columns,
             click_fn=shifted_click,
             choose_fn=choose_node,
-            leaf_ready_fn=lambda: _vertical_confirmation_ready(page),
+            leaf_ready_fn=lambda selected_node: _vertical_confirmation_ready(page, selected_node),
             complete_leaf_fn=complete_leaf,
             wait_ms=wait_ms,
             max_depth=max(1, 7 - start_level),
@@ -624,7 +623,7 @@ def _select_via_taxonomy(
         columns_fn=taxonomy.columns,
         click_fn=taxonomy.click_node,
         choose_fn=choose_node,
-        leaf_ready_fn=lambda: _vertical_confirmation_ready(page),
+        leaf_ready_fn=lambda selected_node: _vertical_confirmation_ready(page, selected_node),
         complete_leaf_fn=complete_leaf,
         wait_ms=wait_ms,
         max_depth=7,
