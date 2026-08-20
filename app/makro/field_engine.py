@@ -207,8 +207,17 @@ def _boolean_target(value: object) -> bool:
     raise ValueError(f"布尔控件无法机械解释值 {value!r}；仅接受明确 true/false/yes/no/1/0。")
 
 
-def _commit_select_like(locator: Any, *, native_select: bool) -> None:
-    if native_select:
+def _commit_value(locator: Any, *, dispatch_value_events: bool) -> None:
+    """Finish one live-control mutation using the browser event contract.
+
+    Playwright ``fill`` changes the DOM value and emits ``input``, but Makro's
+    controlled React fields do not all commit their model state on the same
+    event.  Every editable value therefore finishes with deterministic
+    input/change/blur semantics before any readback or repeatable-slot action.
+    This is mechanical DOM behaviour only; it contains no field-specific rules.
+    """
+
+    if dispatch_value_events:
         dispatch = getattr(locator, "dispatch_event", None)
         if callable(dispatch):
             dispatch("input")
@@ -268,10 +277,12 @@ def fill_control(page: Any, control: dict[str, Any], value: str, section_path: s
         if kind == "custom_slider" and str(control.get("tag") or "").casefold() != "input":
             raise ValueError("非原生 role=slider 控件缺少确定性直接赋值契约，已 fail closed。")
         locator.fill(numeric)
+        _commit_value(locator, dispatch_value_events=True)
         return selector
 
     if kind in _TEXT_KINDS:
         locator.fill(value)
+        _commit_value(locator, dispatch_value_events=True)
         return selector
 
     if kind == "select":
@@ -290,7 +301,7 @@ def fill_control(page: Any, control: dict[str, Any], value: str, section_path: s
                 locator.select_option(label=value)
             except Exception:
                 locator.select_option(value=value)
-        _commit_select_like(locator, native_select=True)
+        _commit_value(locator, dispatch_value_events=True)
         return selector
 
     if kind in _BOOLEAN_KINDS:
@@ -298,6 +309,7 @@ def fill_control(page: Any, control: dict[str, Any], value: str, section_path: s
             locator.check()
         else:
             locator.uncheck()
+        _commit_value(locator, dispatch_value_events=False)
         return selector
 
     if kind in _SELECT_KINDS:
@@ -305,7 +317,7 @@ def fill_control(page: Any, control: dict[str, Any], value: str, section_path: s
         target_text = str((matched or {}).get("text") or value).strip()
         locator.click()
         _click_unique_visible_text(page, target_text)
-        _commit_select_like(locator, native_select=False)
+        _commit_value(locator, dispatch_value_events=False)
         return selector
 
     if kind in _RADIO_KINDS:
@@ -439,9 +451,7 @@ def fill_radio_group(
         check()
     else:
         locator.click()
-    blur = getattr(locator, "blur", None)
-    if callable(blur):
-        blur()
+    _commit_value(locator, dispatch_value_events=False)
     return selector
 
 
