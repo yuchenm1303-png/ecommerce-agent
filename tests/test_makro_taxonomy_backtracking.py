@@ -27,8 +27,6 @@ class FakePage:
         if self.selected.get(0) == "Home Appliances":
             columns.append(["Small Appliances", "Home & Kitchen Appliances"])
             if self.selected.get(1) == "Small Appliances":
-                # Regression from the real Makro Air Purifier acceptance: a
-                # legitimate next taxonomy column can contain exactly one item.
                 columns.append(["Coffee Bean Grinder"])
             elif self.selected.get(1) == "Home & Kitchen Appliances":
                 columns.append(["Air Purifiers"])
@@ -77,6 +75,9 @@ class RejectedLeafPage:
         self.leaf = level == 2 and node in {"Fertilizer", "Soil Testers"}
         return True
 
+    def leaf_ready(self, selected: str) -> bool:
+        return self.leaf and self.selected.get(2) == selected
+
 
 def _choose_soil_tester_path(path: list[str], candidates: list[str]) -> str:
     if path == []:
@@ -118,12 +119,10 @@ def test_taxonomy_backtracks_from_semantically_dead_singleton_branch() -> None:
         if path == []:
             return "Home Appliances"
         if path == ["Home Appliances"]:
-            # First pass chooses Small Appliances. After that branch is rejected,
-            # the navigator must call us with only the untried sibling.
             return candidates[0]
         if path == ["Home Appliances", "Small Appliances"]:
             assert candidates == ["Coffee Bean Grinder"]
-            return ""  # Air purifier is not a coffee grinder.
+            return ""
         if path == ["Home Appliances", "Home & Kitchen Appliances"]:
             assert candidates == ["Air Purifiers"]
             return "Air Purifiers"
@@ -134,7 +133,7 @@ def test_taxonomy_backtracks_from_semantically_dead_singleton_branch() -> None:
         columns_fn=page.columns,
         click_fn=page.click,
         choose_fn=choose,
-        leaf_ready_fn=lambda: page.leaf,
+        leaf_ready_fn=lambda node: page.leaf and page.selected.get(2) == node,
         complete_leaf_fn=lambda node: node,
         wait_ms=0,
         max_node_attempts=12,
@@ -166,7 +165,7 @@ def test_taxonomy_rejected_leaf_backtracks_to_alternative_root_branch() -> None:
         columns_fn=page.columns,
         click_fn=page.click,
         choose_fn=_choose_soil_tester_path,
-        leaf_ready_fn=lambda: page.leaf,
+        leaf_ready_fn=page.leaf_ready,
         complete_leaf_fn=complete,
         wait_ms=0,
         max_node_attempts=12,
@@ -194,7 +193,7 @@ def test_taxonomy_all_rejected_leaves_exhaust_cleanly() -> None:
         columns_fn=page.columns,
         click_fn=page.click,
         choose_fn=_choose_soil_tester_path,
-        leaf_ready_fn=lambda: page.leaf,
+        leaf_ready_fn=page.leaf_ready,
         complete_leaf_fn=lambda _node: "",
         wait_ms=0,
         max_node_attempts=12,
@@ -215,7 +214,7 @@ def test_taxonomy_exhaustion_returns_empty_for_search_fallback() -> None:
         columns_fn=page.columns,
         click_fn=page.click,
         choose_fn=lambda _path, _candidates: "",
-        leaf_ready_fn=lambda: False,
+        leaf_ready_fn=lambda _node: False,
         complete_leaf_fn=lambda node: node,
         wait_ms=0,
         transition_polls=1,
@@ -234,7 +233,7 @@ def test_taxonomy_mechanical_click_failure_is_not_semantic_backtracking() -> Non
             columns_fn=page.columns,
             click_fn=lambda _level, _node: False,
             choose_fn=lambda _path, candidates: candidates[0],
-            leaf_ready_fn=lambda: False,
+            leaf_ready_fn=lambda _node: False,
             complete_leaf_fn=lambda node: node,
             wait_ms=0,
             transition_polls=1,
