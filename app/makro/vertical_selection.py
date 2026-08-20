@@ -555,13 +555,10 @@ def _taxonomy_navigation_callbacks(
                 {
                     "breadcrumb": breadcrumb,
                     "leaf": node,
-                    "action": "fail_closed_before_step2",
+                    "action": "backtrack_current_branch",
                 },
             )
-            raise RuntimeError(
-                "Makro Step 1 taxonomy fallback reached a live leaf that failed the final Product Identity semantic gate: "
-                + " / ".join(breadcrumb)
-            )
+            return ""
         return _complete_exact_live_vertical(page, node)
 
     return choose, complete
