@@ -20,15 +20,25 @@ class FakeContext:
 
 
 class FakePage:
-    def __init__(self, context: FakeContext, phase: str, *, brand: str = "Unbranded") -> None:
+    def __init__(
+        self,
+        context: FakeContext,
+        phase: str,
+        *,
+        brand: str = "Unbranded",
+        vertical: str = "cases_covers",
+        vid: str = "4331",
+        opener: FakePage | None = None,
+    ) -> None:
         self.context = context
         self.phase = phase
         self.closed = False
         self.timeout = 0
         self.wait_calls = 0
+        self.opener = opener
         self.url = (
             "https://seller.makro.co.za/index.html#dashboard/addListings/single"
-            f"?vertical=cases_covers&brand={brand}"
+            f"?vertical={vertical}&brand={brand}&vid={vid}"
         )
         context.pages.append(self)
 
@@ -85,6 +95,25 @@ def test_new_step3_target_is_handed_off(monkeypatch):
     created: list[FakePage] = []
 
     def select_brand(_page, _provider, _hints, *, wait_ms):
+        created.append(FakePage(context, "product", opener=origin))
+        raise RuntimeError(transition._CREATE_LISTING_TIMEOUT_ERROR)
+
+    monkeypatch.setattr(transition, "select_brand", select_brand)
+    brand, step3_page = transition.select_brand_to_product_info(
+        origin, object(), object(), recovery_timeout_s=0.2
+    )
+
+    assert step3_page is created[0]
+    assert brand == "Unbranded"
+
+
+def test_unlinked_unique_target_replacement_remains_supported(monkeypatch):
+    context = FakeContext()
+    origin = FakePage(context, "brand")
+    _install_basics(monkeypatch)
+    created: list[FakePage] = []
+
+    def select_brand(_page, _provider, _hints, *, wait_ms):
         created.append(FakePage(context, "product"))
         raise RuntimeError(transition._CREATE_LISTING_TIMEOUT_ERROR)
 
@@ -105,7 +134,7 @@ def test_preexisting_other_job_step3_page_is_never_adopted(monkeypatch):
     created: list[FakePage] = []
 
     def select_brand(_page, _provider, _hints, *, wait_ms):
-        created.append(FakePage(context, "product"))
+        created.append(FakePage(context, "product", opener=origin))
         raise RuntimeError(transition._CREATE_LISTING_TIMEOUT_ERROR)
 
     monkeypatch.setattr(transition, "select_brand", select_brand)
@@ -118,7 +147,81 @@ def test_preexisting_other_job_step3_page_is_never_adopted(monkeypatch):
     assert brand == "Unbranded"
 
 
-def test_multiple_new_step3_pages_fail_closed(monkeypatch):
+def test_concurrent_other_vertical_step3_never_competes_with_owned_child(monkeypatch):
+    context = FakeContext()
+    origin = FakePage(context, "brand", vertical="smart_band_tag", vid="4331")
+    _install_basics(monkeypatch)
+    owned: list[FakePage] = []
+    unrelated: list[FakePage] = []
+
+    def select_brand(_page, _provider, _hints, *, wait_ms):
+        unrelated.append(
+            FakePage(
+                context,
+                "product",
+                vertical="meat_tenderizer",
+                vid="2900",
+            )
+        )
+        owned.append(
+            FakePage(
+                context,
+                "product",
+                vertical="smart_band_tag",
+                vid="4331",
+                opener=origin,
+            )
+        )
+        raise RuntimeError(transition._CREATE_LISTING_TIMEOUT_ERROR)
+
+    monkeypatch.setattr(transition, "select_brand", select_brand)
+    brand, step3_page = transition.select_brand_to_product_info(
+        origin, object(), object(), recovery_timeout_s=0.2
+    )
+
+    assert step3_page is owned[0]
+    assert step3_page is not unrelated[0]
+    assert brand == "Unbranded"
+
+
+def test_owned_child_wins_even_if_concurrent_job_has_same_vertical_and_vid(monkeypatch):
+    context = FakeContext()
+    origin = FakePage(context, "brand", vertical="smart_band_tag", vid="4331")
+    _install_basics(monkeypatch)
+    owned: list[FakePage] = []
+    unrelated: list[FakePage] = []
+
+    def select_brand(_page, _provider, _hints, *, wait_ms):
+        unrelated.append(
+            FakePage(
+                context,
+                "product",
+                vertical="smart_band_tag",
+                vid="4331",
+            )
+        )
+        owned.append(
+            FakePage(
+                context,
+                "product",
+                vertical="smart_band_tag",
+                vid="4331",
+                opener=origin,
+            )
+        )
+        raise RuntimeError(transition._CREATE_LISTING_TIMEOUT_ERROR)
+
+    monkeypatch.setattr(transition, "select_brand", select_brand)
+    brand, step3_page = transition.select_brand_to_product_info(
+        origin, object(), object(), recovery_timeout_s=0.2
+    )
+
+    assert step3_page is owned[0]
+    assert step3_page is not unrelated[0]
+    assert brand == "Unbranded"
+
+
+def test_multiple_unlinked_matching_step3_pages_fail_closed(monkeypatch):
     context = FakeContext()
     origin = FakePage(context, "brand")
     _install_basics(monkeypatch)
@@ -130,7 +233,7 @@ def test_multiple_new_step3_pages_fail_closed(monkeypatch):
 
     monkeypatch.setattr(transition, "select_brand", select_brand)
 
-    with pytest.raises(RuntimeError, match="multiple new Step 3 pages"):
+    with pytest.raises(RuntimeError, match="multiple .* Step 3 pages"):
         transition.select_brand_to_product_info(
             origin, object(), object(), recovery_timeout_s=0.2
         )
