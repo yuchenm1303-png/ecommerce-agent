@@ -10,7 +10,8 @@ const DAILY_HEATMAP_DAYS = 365;
 
 const TTL = {
   snapshot: 10_000,
-  tasks: 20_000,
+  taskSummaries: 20_000,
+  taskDetails: 60_000,
   system: 30_000,
   diagnostics: 60_000,
   heatmap: 5 * 60_000,
@@ -154,6 +155,17 @@ function normalizeTaskAudits(rawValue: unknown): JsonObject[] {
   });
 }
 
+function taskSummary(rowValue: unknown): JsonObject {
+  const row = objectValue(rowValue);
+  return {
+    ...row,
+    source_audit_id: textValue(row.id),
+    input_data: {},
+    result_data: {},
+    summary_only: true,
+  };
+}
+
 function corsHeaders(req: Request): Record<string, string> {
   const origin = req.headers.get("origin") || "";
   return {
@@ -228,8 +240,21 @@ async function loadSnapshot(admin: ReturnType<typeof createClient>, userId: stri
     dataOrThrow(admin.rpc("get_listing_usage_admin_snapshot", { p_caller: userId }), "usage_snapshot_failed"));
 }
 
-async function loadTasks(admin: ReturnType<typeof createClient>, userId: string) {
-  return await cached(`tasks:${userId}`, TTL.tasks, async () => {
+async function loadTaskSummaries(admin: ReturnType<typeof createClient>, userId: string) {
+  return await cached(`task-summaries:${userId}`, TTL.taskSummaries, async () => {
+    const rows = await dataOrThrow(
+      admin.from("listing_task_audits")
+        .select("id,user_id,device_id,app_version,task_kind,phase,status,product_url,error_text,started_at,completed_at,updated_at,created_at")
+        .order("updated_at", { ascending: false })
+        .limit(TASK_AUDIT_LIMIT),
+      "task_summary_snapshot_failed",
+    );
+    return Array.isArray(rows) ? rows.map(taskSummary) : [];
+  });
+}
+
+async function loadTaskDetails(admin: ReturnType<typeof createClient>, userId: string) {
+  return await cached(`task-details:${userId}`, TTL.taskDetails, async () => {
     const rows = await dataOrThrow(
       admin.from("listing_task_audits")
         .select("id,user_id,device_id,app_version,task_kind,phase,status,product_url,input_data,result_data,error_text,started_at,completed_at,updated_at,created_at")
@@ -345,9 +370,10 @@ Deno.serve(async (req: Request) => {
 
     if (scope === "core") {
       try {
-        const tasks = await loadTasks(admin, user.id);
+        const tasks = await loadTaskSummaries(admin, user.id);
         payload.task_audits = tasks.value;
         payload.task_audit_limit = TASK_AUDIT_LIMIT;
+        payload.task_audit_basis = "lightweight_summary_lazy_detail";
         if (tasks.stale) partialErrors.push({ component: "task_audits", code: "stale_cache" });
       } catch {
         payload.task_audits = [];
@@ -360,7 +386,7 @@ Deno.serve(async (req: Request) => {
 
     if (scope === "ops") {
       const [tasksResult, diagnosticsResult, systemResult] = await Promise.allSettled([
-        loadTasks(admin, user.id),
+        loadTaskDetails(admin, user.id),
         loadDiagnostics(admin, user.id),
         loadSystem(admin, user.id),
       ]);
@@ -379,7 +405,7 @@ Deno.serve(async (req: Request) => {
     }
 
     const [tasksResult, diagnosticsResult, systemResult, heatmapResult] = await Promise.allSettled([
-      loadTasks(admin, user.id),
+      loadTaskDetails(admin, user.id),
       loadDiagnostics(admin, user.id),
       loadSystem(admin, user.id),
       loadHeatmap(admin, user.id),
