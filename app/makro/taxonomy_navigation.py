@@ -170,9 +170,14 @@ def navigate_live_taxonomy(
 
     ``choose_fn`` may return an empty string when none of the exact live nodes is
     semantically suitable. That rejects the current branch instead of failing the
-    whole workflow. When all bounded tree paths are exhausted this function
-    returns ``""`` so the caller can use its existing Makro search fallback.
+    whole workflow. ``complete_leaf_fn`` follows the same contract at a reached
+    leaf: a non-empty canonical Vertical accepts the leaf, while an empty string
+    means the leaf failed semantic validation and the navigator must backtrack.
+    Exceptions from either callback remain hard failures because they indicate an
+    invalid response or a mechanical/verification problem rather than an unsuitable
+    taxonomy branch.
 
+    When all bounded tree paths are exhausted this function returns ``""``.
     Mechanical click failures remain hard errors because they indicate a portal
     interruption rather than an unsuitable taxonomy branch.
     """
@@ -247,16 +252,19 @@ def navigate_live_taxonomy(
                 max_polls=transition_polls,
             )
             if outcome == "leaf":
-                return complete_leaf_fn(selected)
+                resolved = str(complete_leaf_fn(selected) or "").strip()
+                if resolved:
+                    return resolved
 
-            if outcome == "child":
+            elif outcome == "child":
                 resolved = explore(level + 1, [*path, selected])
                 if resolved:
                     return resolved
 
-            # Either the selected node exposed no usable child/leaf, or its child
-            # subtree contained no semantically valid path. Mark that branch dead
-            # and try the next exact sibling still visible at this level.
+            # Either the selected node exposed no usable child/leaf, its child
+            # subtree contained no semantically valid path, or a reached leaf was
+            # explicitly rejected by the final semantic gate. Mark that branch
+            # dead and try the next exact sibling still visible at this level.
             budget.backtracks += 1
             if budget.exhausted:
                 return ""
