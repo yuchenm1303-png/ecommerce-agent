@@ -40,9 +40,56 @@ class FakePage:
         for stale_level in list(self.selected):
             if stale_level > level:
                 del self.selected[stale_level]
-        if level == 2 and node == "Air Purifiers":
-            self.leaf = True
+        self.leaf = level == 2 and node == "Air Purifiers"
         return True
+
+
+class RejectedLeafPage:
+    """Model the soil-tester failure: first real leaf is semantically wrong."""
+
+    def __init__(self) -> None:
+        self.selected: dict[int, str] = {}
+        self.leaf = False
+        self.clicks: list[tuple[int, str]] = []
+
+    def wait_for_timeout(self, _milliseconds: int) -> None:
+        return None
+
+    def columns(self) -> list[list[str]]:
+        columns: list[list[str]] = [["Agricultural Products", "Measuring & Layout Tools"]]
+        root = self.selected.get(0)
+        if root == "Agricultural Products":
+            columns.append(["Plant Nutrition"])
+            if self.selected.get(1) == "Plant Nutrition":
+                columns.append(["Fertilizer"])
+        elif root == "Measuring & Layout Tools":
+            columns.append(["Measuring Tools"])
+            if self.selected.get(1) == "Measuring Tools":
+                columns.append(["Soil Testers"])
+        return columns
+
+    def click(self, level: int, node: str) -> bool:
+        self.clicks.append((level, node))
+        self.selected[level] = node
+        for stale_level in list(self.selected):
+            if stale_level > level:
+                del self.selected[stale_level]
+        self.leaf = level == 2 and node in {"Fertilizer", "Soil Testers"}
+        return True
+
+
+def _choose_soil_tester_path(path: list[str], candidates: list[str]) -> str:
+    if path == []:
+        return candidates[0]
+    if path == ["Agricultural Products"]:
+        return "Plant Nutrition"
+    if path == ["Agricultural Products", "Plant Nutrition"]:
+        return "Fertilizer"
+    if path == ["Measuring & Layout Tools"]:
+        return "Measuring Tools"
+    if path == ["Measuring & Layout Tools", "Measuring Tools"]:
+        return "Soil Testers"
+    raise AssertionError((path, candidates))
 
 
 class FakeSearch:
@@ -102,6 +149,62 @@ def test_taxonomy_backtracks_from_semantically_dead_singleton_branch() -> None:
         (1, "Home & Kitchen Appliances"),
         (2, "Air Purifiers"),
     ]
+
+
+def test_taxonomy_rejected_leaf_backtracks_to_alternative_root_branch() -> None:
+    page = RejectedLeafPage()
+    completed: list[str] = []
+
+    def complete(node: str) -> str:
+        if node == "Fertilizer":
+            return ""
+        completed.append(node)
+        return "soil_tester"
+
+    selected = navigate_live_taxonomy(
+        page,
+        columns_fn=page.columns,
+        click_fn=page.click,
+        choose_fn=_choose_soil_tester_path,
+        leaf_ready_fn=lambda: page.leaf,
+        complete_leaf_fn=complete,
+        wait_ms=0,
+        max_node_attempts=12,
+        max_backtracks=10,
+        transition_polls=2,
+    )
+
+    assert selected == "soil_tester"
+    assert completed == ["Soil Testers"]
+    assert page.clicks == [
+        (0, "Agricultural Products"),
+        (1, "Plant Nutrition"),
+        (2, "Fertilizer"),
+        (0, "Measuring & Layout Tools"),
+        (1, "Measuring Tools"),
+        (2, "Soil Testers"),
+    ]
+
+
+def test_taxonomy_all_rejected_leaves_exhaust_cleanly() -> None:
+    page = RejectedLeafPage()
+
+    selected = navigate_live_taxonomy(
+        page,
+        columns_fn=page.columns,
+        click_fn=page.click,
+        choose_fn=_choose_soil_tester_path,
+        leaf_ready_fn=lambda: page.leaf,
+        complete_leaf_fn=lambda _node: "",
+        wait_ms=0,
+        max_node_attempts=12,
+        max_backtracks=10,
+        transition_polls=2,
+    )
+
+    assert selected == ""
+    assert (2, "Fertilizer") in page.clicks
+    assert (2, "Soil Testers") in page.clicks
 
 
 def test_taxonomy_exhaustion_returns_empty_for_search_fallback() -> None:
