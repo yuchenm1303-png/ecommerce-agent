@@ -2,35 +2,46 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const ALLOWED_ORIGINS = new Set(["https://smirel.com", "https://www.smirel.com"]);
-const TASK_AUDIT_LIMIT = 300;
-const TASK_METRIC_LIMIT = 5000;
+
+const TASK_AUDIT_LIMIT = 200;
 const DIAGNOSTIC_LIMIT = 160;
-const SYSTEM_SAMPLE_LIMIT = 3000;
 const SYSTEM_WINDOW_HOURS = 24;
+const SYSTEM_BUCKET_MINUTES = 5;
 const DAILY_HEATMAP_DAYS = 365;
-const HOUR_MS = 60 * 60 * 1000;
 
-type JsonObject = Record<string, unknown>;
+const SNAPSHOT_TTL_MS = 10_000;
+const TASKS_TTL_MS = 15_000;
+const SYSTEM_TTL_MS = 30_000;
+const DIAGNOSTICS_TTL_MS = 30_000;
+const HEATMAP_TTL_MS = 5 * 60_000;
 
-function objectValue(value: unknown): JsonObject {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : {};
+const componentCache = new Map();
+const componentInflight = new Map();
+
+function objectValue(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
-function textValue(value: unknown): string {
+function textValue(value) {
   return String(value ?? "").trim();
 }
 
-function numberValue(value: unknown): number {
+function numberValue(value) {
   const parsed = Number(value ?? 0);
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function auditMinute(value: unknown): number {
+function errorMessage(error) {
+  if (error instanceof Error) return error.message;
+  return textValue(error) || "unknown_error";
+}
+
+function auditMinute(value) {
   const stamp = Date.parse(textValue(value));
   return Number.isFinite(stamp) ? Math.floor(stamp / 60_000) : 0;
 }
 
-function jobAuditStatus(phase: unknown, jobStatus: unknown, fallback: unknown): string {
+function jobAuditStatus(phase, jobStatus, fallback) {
   const status = textValue(jobStatus).toUpperCase();
   if (textValue(phase).toLowerCase() === "batch_execute") {
     if (status === "DONE") return "completed";
@@ -46,7 +57,7 @@ function jobAuditStatus(phase: unknown, jobStatus: unknown, fallback: unknown): 
   return textValue(fallback).toLowerCase() || "running";
 }
 
-function nativeBatchLink(audit: JsonObject): boolean {
+function nativeBatchLink(audit) {
   if (textValue(audit.task_kind) !== "batch") return false;
   const input = objectValue(audit.input_data);
   const result = objectValue(audit.result_data);
@@ -57,7 +68,7 @@ function nativeBatchLink(audit: JsonObject): boolean {
   );
 }
 
-function batchDedupeKey(audit: JsonObject): string {
+function batchDedupeKey(audit) {
   const input = objectValue(audit.input_data);
   return [
     textValue(audit.user_id),
@@ -68,25 +79,35 @@ function batchDedupeKey(audit: JsonObject): string {
   ].join("|");
 }
 
-function explodeLegacyBatchAudit(audit: JsonObject): JsonObject[] {
+function explodeLegacyBatchAudit(audit) {
   const input = objectValue(audit.input_data);
   const result = objectValue(audit.result_data);
   const items = Array.isArray(input.items) ? input.items.map(objectValue) : [];
   const jobs = Array.isArray(result.jobs) ? result.jobs.map(objectValue) : [];
-  const count = Math.max(jobs.length, items.length, numberValue(input.item_count), numberValue(result.job_count));
+  const count = Math.max(
+    jobs.length,
+    items.length,
+    numberValue(input.item_count),
+    numberValue(result.job_count),
+  );
   if (!count) return [audit];
 
   const diagnostics = Array.isArray(result.failure_diagnostics)
     ? result.failure_diagnostics.map(objectValue)
     : [];
-  const output: JsonObject[] = [];
+  const output = [];
+
   for (let index = 0; index < count; index += 1) {
     const job = jobs[index] ?? {};
     const jobUrl = textValue(job.product_url);
-    const item = items.find((candidate) => jobUrl && textValue(candidate.supplier_url) === jobUrl) ?? items[index] ?? {};
+    const item =
+      items.find((candidate) => jobUrl && textValue(candidate.supplier_url) === jobUrl) ??
+      items[index] ??
+      {};
     const jobId = textValue(job.job_id) || `JOB-${String(index + 1).padStart(3, "0")}`;
     const diagnostic = diagnostics.find((candidate) => textValue(candidate.job_id) === jobId);
     const productUrl = jobUrl || textValue(item.supplier_url);
+
     output.push({
       ...audit,
       id: `${textValue(audit.id) || "legacy-batch"}:${jobId}`,
@@ -117,13 +138,14 @@ function explodeLegacyBatchAudit(audit: JsonObject): JsonObject[] {
       error_text: textValue(job.error) || textValue(audit.error_text),
     });
   }
+
   return output;
 }
 
-function normalizeTaskAudits(rawValue: unknown): JsonObject[] {
+function normalizeTaskAudits(rawValue) {
   const raw = Array.isArray(rawValue) ? rawValue.map(objectValue) : [];
   const nativeKeys = new Set(raw.filter(nativeBatchLink).map(batchDedupeKey));
-  const normalized: JsonObject[] = [];
+  const normalized = [];
 
   for (const audit of raw) {
     if (textValue(audit.task_kind) !== "batch" || nativeBatchLink(audit)) {
@@ -139,56 +161,12 @@ function normalizeTaskAudits(rawValue: unknown): JsonObject[] {
   return normalized.sort((left, right) => {
     const leftStamp = Date.parse(textValue(left.updated_at) || textValue(left.created_at));
     const rightStamp = Date.parse(textValue(right.updated_at) || textValue(right.created_at));
-    return (Number.isFinite(rightStamp) ? rightStamp : 0) - (Number.isFinite(leftStamp) ? leftStamp : 0);
+    return (Number.isFinite(rightStamp) ? rightStamp : 0) -
+      (Number.isFinite(leftStamp) ? leftStamp : 0);
   });
 }
 
-function withIndependentProductActivity(usersValue: unknown, audits: JsonObject[]): JsonObject[] {
-  const users = Array.isArray(usersValue) ? usersValue.map(objectValue) : [];
-  const counts = new Map<string, Map<number, { completed: number; failed: number }>>();
-
-  for (const audit of audits) {
-    const status = textValue(audit.status).toLowerCase();
-    const successful = status === "completed" || status === "ready";
-    const failed = status === "failed" || status === "cancelled";
-    if (!successful && !failed) continue;
-
-    const userId = textValue(audit.user_id);
-    if (!userId) continue;
-    const stamp = Date.parse(
-      textValue(audit.completed_at) || textValue(audit.updated_at) || textValue(audit.created_at),
-    );
-    if (!Number.isFinite(stamp)) continue;
-    const hour = Math.floor(stamp / HOUR_MS);
-    const byHour = counts.get(userId) ?? new Map<number, { completed: number; failed: number }>();
-    const bucket = byHour.get(hour) ?? { completed: 0, failed: 0 };
-    if (successful) bucket.completed += 1;
-    if (failed) bucket.failed += 1;
-    byHour.set(hour, bucket);
-    counts.set(userId, byHour);
-  }
-
-  return users.map((user) => {
-    const userId = textValue(user.user_id);
-    const byHour = counts.get(userId) ?? new Map<number, { completed: number; failed: number }>();
-    const activity = Array.isArray(user.activity_24h) ? user.activity_24h.map(objectValue) : [];
-    return {
-      ...user,
-      activity_24h: activity.map((rawBucket) => {
-        const stamp = Date.parse(textValue(rawBucket.bucket_start));
-        const hour = Number.isFinite(stamp) ? Math.floor(stamp / HOUR_MS) : Number.NaN;
-        const taskCounts = Number.isFinite(hour) ? byHour.get(hour) : undefined;
-        return {
-          ...rawBucket,
-          completed: taskCounts?.completed ?? 0,
-          failed: taskCounts?.failed ?? 0,
-        };
-      }),
-    };
-  });
-}
-
-function corsHeaders(req: Request): Record<string, string> {
+function corsHeaders(req) {
   const origin = req.headers.get("origin") || "";
   return {
     "Access-Control-Allow-Origin": ALLOWED_ORIGINS.has(origin) ? origin : "https://smirel.com",
@@ -199,110 +177,229 @@ function corsHeaders(req: Request): Record<string, string> {
   };
 }
 
-function json(req: Request, body: unknown, status = 200): Response {
+function json(req, body, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { ...corsHeaders(req), "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+    headers: {
+      ...corsHeaders(req),
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
   });
 }
 
-function clients(req: Request) {
+function clients(req) {
   const url = Deno.env.get("SUPABASE_URL") || "";
   const anonKey = Deno.env.get("SUPABASE_ANON_KEY") || "";
   const serviceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
   if (!url || !anonKey || !serviceRole) throw new Error("server_config");
+
   const authHeader = req.headers.get("Authorization") || "";
   const userClient = createClient(url, anonKey, {
     global: { headers: { Authorization: authHeader } },
     auth: { persistSession: false, autoRefreshToken: false },
   });
-  const admin = createClient(url, serviceRole, { auth: { persistSession: false, autoRefreshToken: false } });
+  const admin = createClient(url, serviceRole, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
   return { userClient, admin };
 }
 
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(req) });
-  if (req.method !== "POST") return json(req, { error: "method_not_allowed" }, 405);
+async function dataOrThrow(request, code) {
+  const { data, error } = await request;
+  if (error) {
+    const message = textValue(error.message) || textValue(error.code) || "query_failed";
+    throw new Error(`${code}:${message}`);
+  }
+  return data;
+}
+
+async function cachedComponent(key, ttlMs, loader) {
+  const now = Date.now();
+  const cached = componentCache.get(key);
+  if (cached && cached.expiresAt > now) {
+    return { value: cached.value, stale: false, cacheHit: true };
+  }
+
+  const running = componentInflight.get(key);
+  if (running) return await running;
+
+  const promise = (async () => {
+    try {
+      const value = await loader();
+      componentCache.set(key, {
+        value,
+        expiresAt: Date.now() + ttlMs,
+        storedAt: Date.now(),
+      });
+      return { value, stale: false, cacheHit: false };
+    } catch (error) {
+      if (cached) {
+        return {
+          value: cached.value,
+          stale: true,
+          cacheHit: true,
+          error: errorMessage(error),
+        };
+      }
+      throw error;
+    } finally {
+      componentInflight.delete(key);
+    }
+  })();
+
+  componentInflight.set(key, promise);
+  return await promise;
+}
+
+function readSettled(result, name, fallback, partialErrors) {
+  if (result.status === "rejected") {
+    partialErrors.push({ component: name, code: "query_failed" });
+    return fallback;
+  }
+  if (result.value.stale) {
+    partialErrors.push({ component: name, code: "stale_cache" });
+  }
+  return result.value.value;
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: corsHeaders(req) });
+  }
+  if (req.method !== "POST") {
+    return json(req, { error: "method_not_allowed" }, 405);
+  }
 
   try {
     const { userClient, admin } = clients(req);
+
     const { data: userData, error: userError } = await userClient.auth.getUser();
     const user = userData?.user;
-    if (userError || !user) return json(req, { error: "invalid_auth" }, 401);
+    if (userError || !user) {
+      return json(req, { error: "invalid_auth" }, 401);
+    }
 
     const { data: access, error: accessError } = await admin
       .from("download_portal_users")
       .select("enabled, is_admin")
       .eq("user_id", user.id)
       .maybeSingle();
-    if (accessError) return json(req, { error: "access_check_failed" }, 503);
-    if (!access?.enabled || !access?.is_admin) return json(req, { error: "not_authorized" }, 403);
 
-    const taskSince = new Date(Date.now() - SYSTEM_WINDOW_HOURS * HOUR_MS).toISOString();
-    const systemSince = taskSince;
-    const [
-      { data: snapshot, error: snapshotError },
-      { data: dailyHeatmap, error: heatmapError },
-      { data: taskAudits, error: auditError },
-      { data: taskMetricAudits, error: taskMetricError },
-      { data: diagnostics, error: diagnosticError },
-      { data: systemSamples, error: systemError },
-    ] = await Promise.all([
-      admin.rpc("get_listing_usage_admin_snapshot", { p_caller: user.id }),
-      admin.rpc("get_listing_usage_daily_heatmap", { p_caller: user.id, p_days: DAILY_HEATMAP_DAYS }),
-      admin
-        .from("listing_task_audits")
-        .select(
-          "id,user_id,device_id,app_version,task_kind,phase,status,product_url,input_data,result_data,error_text,started_at,completed_at,updated_at,created_at"
-        )
-        .order("updated_at", { ascending: false })
-        .limit(TASK_AUDIT_LIMIT),
-      admin
-        .from("listing_task_audits")
-        .select(
-          "id,user_id,device_id,task_kind,phase,status,product_url,input_data,result_data,started_at,completed_at,updated_at,created_at"
-        )
-        .gte("updated_at", taskSince)
-        .order("updated_at", { ascending: false })
-        .limit(TASK_METRIC_LIMIT),
-      admin
-        .from("listing_diagnostic_reports")
-        .select("id,report_code,user_id,device_id,app_version,crash_id,startup_stage,report,created_at")
-        .order("created_at", { ascending: false })
-        .limit(DIAGNOSTIC_LIMIT),
-      admin
-        .from("listing_system_samples")
-        .select("id,user_id,session_id,device_id,app_version,sample,occurred_at")
-        .gte("occurred_at", systemSince)
-        .order("occurred_at", { ascending: false })
-        .limit(SYSTEM_SAMPLE_LIMIT),
+    if (accessError) {
+      return json(req, { error: "access_check_failed" }, 503);
+    }
+    if (!access?.enabled || !access?.is_admin) {
+      return json(req, { error: "not_authorized" }, 403);
+    }
+
+    const partialErrors = [];
+
+    let snapshotComponent;
+    try {
+      snapshotComponent = await cachedComponent(
+        `snapshot:${user.id}`,
+        SNAPSHOT_TTL_MS,
+        () => dataOrThrow(
+          admin.rpc("get_listing_usage_admin_snapshot", { p_caller: user.id }),
+          "usage_snapshot_failed",
+        ),
+      );
+    } catch {
+      return json(req, { error: "usage_snapshot_failed" }, 503);
+    }
+
+    if (snapshotComponent.stale) {
+      partialErrors.push({ component: "summary", code: "stale_cache" });
+    }
+
+    const [heatmapResult, auditsResult, diagnosticsResult, systemResult] = await Promise.allSettled([
+      cachedComponent(
+        `heatmap:${user.id}:${DAILY_HEATMAP_DAYS}`,
+        HEATMAP_TTL_MS,
+        () => dataOrThrow(
+          admin.rpc("get_listing_usage_daily_heatmap", {
+            p_caller: user.id,
+            p_days: DAILY_HEATMAP_DAYS,
+          }),
+          "daily_heatmap_failed",
+        ),
+      ),
+      cachedComponent(
+        `audits:${user.id}`,
+        TASKS_TTL_MS,
+        () => dataOrThrow(
+          admin
+            .from("listing_task_audits")
+            .select(
+              "id,user_id,device_id,app_version,task_kind,phase,status,product_url,input_data,result_data,error_text,started_at,completed_at,updated_at,created_at",
+            )
+            .order("updated_at", { ascending: false })
+            .limit(TASK_AUDIT_LIMIT),
+          "task_audit_snapshot_failed",
+        ),
+      ),
+      cachedComponent(
+        `diagnostics:${user.id}`,
+        DIAGNOSTICS_TTL_MS,
+        () => dataOrThrow(
+          admin
+            .from("listing_diagnostic_reports")
+            .select("id,report_code,user_id,device_id,app_version,crash_id,startup_stage,report,created_at")
+            .order("created_at", { ascending: false })
+            .limit(DIAGNOSTIC_LIMIT),
+          "diagnostic_snapshot_failed",
+        ),
+      ),
+      cachedComponent(
+        `system:${user.id}:${SYSTEM_WINDOW_HOURS}:${SYSTEM_BUCKET_MINUTES}`,
+        SYSTEM_TTL_MS,
+        () => dataOrThrow(
+          admin.rpc("get_listing_usage_system_samples", {
+            p_caller: user.id,
+            p_hours: SYSTEM_WINDOW_HOURS,
+            p_bucket_minutes: SYSTEM_BUCKET_MINUTES,
+          }),
+          "system_health_snapshot_failed",
+        ),
+      ),
     ]);
-    if (snapshotError) return json(req, { error: "usage_snapshot_failed" }, 503);
-    if (heatmapError) return json(req, { error: "daily_heatmap_failed" }, 503);
-    if (auditError) return json(req, { error: "task_audit_snapshot_failed" }, 503);
-    if (taskMetricError) return json(req, { error: "task_metric_snapshot_failed" }, 503);
-    if (diagnosticError) return json(req, { error: "diagnostic_snapshot_failed" }, 503);
-    if (systemError) return json(req, { error: "system_health_snapshot_failed" }, 503);
 
+    const dailyHeatmap = readSettled(
+      heatmapResult,
+      "daily_activity",
+      { timezone: "Asia/Shanghai", window_days: DAILY_HEATMAP_DAYS, days: [] },
+      partialErrors,
+    );
+    const rawTaskAudits = readSettled(auditsResult, "task_audits", [], partialErrors);
+    const diagnostics = readSettled(diagnosticsResult, "diagnostics", [], partialErrors);
+    const systemSamples = readSettled(systemResult, "system_health", [], partialErrors);
+
+    const snapshot = snapshotComponent.value;
     const payload = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)
-      ? { ...(snapshot as Record<string, unknown>) }
+      ? { ...snapshot }
       : {};
-    const normalizedTaskAudits = normalizeTaskAudits(taskAudits ?? []);
-    const normalizedMetricAudits = normalizeTaskAudits(taskMetricAudits ?? []);
-    payload.users = withIndependentProductActivity(payload.users, normalizedMetricAudits);
-    payload.daily_activity = dailyHeatmap ?? { timezone: "Asia/Shanghai", window_days: DAILY_HEATMAP_DAYS, days: [] };
+
+    const normalizedTaskAudits = normalizeTaskAudits(rawTaskAudits ?? []);
+
+    payload.query_architecture = "usage_monitor_read_model_v2";
+    payload.daily_activity = dailyHeatmap;
     payload.task_audits = normalizedTaskAudits;
-    payload.task_audit_raw_count = Array.isArray(taskAudits) ? taskAudits.length : 0;
+    payload.task_audit_raw_count = Array.isArray(rawTaskAudits) ? rawTaskAudits.length : 0;
     payload.task_audit_limit = TASK_AUDIT_LIMIT;
-    payload.task_metric_basis = "independent_product_audits";
+    payload.task_metric_basis = "database_hourly_independent_product_audits";
     payload.task_metric_window_hours = SYSTEM_WINDOW_HOURS;
-    payload.task_metric_raw_count = Array.isArray(taskMetricAudits) ? taskMetricAudits.length : 0;
-    payload.task_metric_limit = TASK_METRIC_LIMIT;
+    payload.task_metric_raw_count = 0;
+    payload.task_metric_limit = 0;
     payload.diagnostic_reports = diagnostics ?? [];
     payload.diagnostic_limit = DIAGNOSTIC_LIMIT;
     payload.system_samples = systemSamples ?? [];
-    payload.system_sample_limit = SYSTEM_SAMPLE_LIMIT;
+    payload.system_sample_limit = Math.ceil((SYSTEM_WINDOW_HOURS * 60) / SYSTEM_BUCKET_MINUTES);
+    payload.system_sample_limit_scope = "per_device";
+    payload.system_sample_basis = "latest_sample_per_time_bucket";
+    payload.system_bucket_minutes = SYSTEM_BUCKET_MINUTES;
     payload.system_window_hours = SYSTEM_WINDOW_HOURS;
+    payload.partial_errors = partialErrors;
     payload.task_audit_scope = {
       includes: [
         "one independent audit per supplier product link",
@@ -324,8 +421,16 @@ Deno.serve(async (req: Request) => {
         "CPU / memory / disk / UI loop / Edge process health",
         "telemetry request latency",
       ],
-      excludes: ["API keys", "access / refresh tokens", "passwords", "cookies", "authorization secrets", "raw customer file binaries"],
+      excludes: [
+        "API keys",
+        "access / refresh tokens",
+        "passwords",
+        "cookies",
+        "authorization secrets",
+        "raw customer file binaries",
+      ],
     };
+
     return json(req, payload);
   } catch {
     return json(req, { error: "server_error" }, 500);
