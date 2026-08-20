@@ -33,8 +33,7 @@ class ProgressiveTaxonomyPage:
         for stale_level in list(self.selected):
             if stale_level > level:
                 del self.selected[stale_level]
-        if level == 2 and node == "Tops":
-            self.leaf = True
+        self.leaf = level == 2 and node == "Tops"
         return True
 
 
@@ -58,7 +57,7 @@ def test_taxonomy_waits_for_incremental_child_column_before_semantic_choice() ->
         columns_fn=page.columns,
         click_fn=page.click,
         choose_fn=choose,
-        leaf_ready_fn=lambda: page.leaf,
+        leaf_ready_fn=lambda node: page.leaf and page.selected.get(2) == node,
         complete_leaf_fn=lambda node: node,
         wait_ms=800,
         transition_polls=12,
