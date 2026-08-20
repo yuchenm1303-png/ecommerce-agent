@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 import app.makro.vertical_selection as vertical_selection
 from app.makro.listing_creation import ListingBootstrapHints
 
@@ -24,7 +22,7 @@ def _hints() -> ListingBootstrapHints:
     )
 
 
-def test_taxonomy_callbacks_fail_closed_before_vertical_completion_when_leaf_gate_rejects(monkeypatch) -> None:
+def test_taxonomy_callbacks_reject_leaf_without_completing_vertical(monkeypatch) -> None:
     monkeypatch.setattr(
         vertical_selection,
         "choose_taxonomy_path_candidate",
@@ -48,8 +46,7 @@ def test_taxonomy_callbacks_fail_closed_before_vertical_completion_when_leaf_gat
     selected = choose(["Home Improvement"], ["Storage Containers"])
     assert selected == "Storage Containers"
 
-    with pytest.raises(RuntimeError, match="failed the final Product Identity semantic gate"):
-        complete(selected)
+    assert complete(selected) == ""
     assert completed == []
 
 
