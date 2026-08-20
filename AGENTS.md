@@ -89,7 +89,7 @@ Makro SKU ID 是 seller-controlled identifier，不是 supplier SKU、不是 lis
 
 **Fill Plan 的 READY 是最终写入许可。** 生产 executor 只保留“当前 live field 必须唯一匹配”这一写错位置防线；不得再用“当前控件看起来已有值”之类的二次判断把 READY 静默跳过。protected required 若未确认，必须在真实写入前 fail closed。
 
-`input[type=file].files > 0` 不等于图片上传成功。Product Photos 每张上传前都要重新定位当前 React card/file input；请求 N 张就必须确认 N/N 张进入编辑事务后才允许 Save，部分上传不能报告为成功。Save 后仍验证 completion count。offer intent 只允许调整候选图片顺序，不能降低 N/N transaction/persistence gate。
+`input[type=file].files > 0` 不等于图片上传成功。Product Photos 每次执行必须先读取当前 live completion/capacity，再把明确的 `--upload-image` 限定到当前真实剩余槽位。对**本次实际进入事务的图片子集**仍必须逐张确认 N/N staged，且一次 Save 后验证 completion count；上传、Save、持久化验证失败一律 fail closed。若用户明确请求的图片数量超过 live gallery 剩余容量，不允许把容量不足伪装成上传失败，也不允许删除/覆盖已有图片腾位置：只上传当前可容纳子集，剩余路径必须以 `request_status=capacity_limited` / `skipped_no_capacity`、`omitted_due_capacity` 和 warning 明确记录。只要最终 gallery 已有至少 1 张持久化图片，纯容量饱和不应把已成功持久化的 Step 3 草稿判成整单 FAILED。offer intent 只允许调整候选图片顺序，不能绕过上述事务和持久化校验。
 
 schema/source drift fail closed；真实 section Save 后保持现有 reopen persisted verification。
 
