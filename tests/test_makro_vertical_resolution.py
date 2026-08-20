@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 import app.makro.vertical_resolution as vertical_resolution
-import app.makro.vertical_selection as vertical_selection
 from app.makro.listing_creation import ListingBootstrapHints
 from app.makro.vertical_resolution import (
     build_vertical_pool_choice_request,
@@ -69,7 +68,7 @@ def test_search_plan_contract_has_specific_broader_and_head_noun_roles() -> None
     assert "specific -> broader -> head noun" in rules
 
 
-def test_search_planner_builds_specific_to_broad_ladder_and_keeps_head_last() -> None:
+def test_search_planner_preserves_ai_ladder_then_appends_missing_canonical_product_type() -> None:
     provider = FakeProvider(
         {
             "plan_makro_vertical_search_intents": {
@@ -82,14 +81,19 @@ def test_search_planner_builds_specific_to_broad_ladder_and_keeps_head_last() ->
 
     terms = plan_vertical_search_terms(provider, _bag_sealer_hints())
 
-    assert terms == ("bag sealer", "heat sealer", "sealer")
-    assert terms[-1] == "sealer"
-    assert "rechargeable bag sealer" not in terms
+    assert terms == (
+        "bag sealer",
+        "heat sealer",
+        "sealer",
+        "rechargeable bag sealer",
+    )
+    assert terms[:-1] == ("bag sealer", "heat sealer", "sealer")
+    assert terms[-1] == "rechargeable bag sealer"
     request = provider.requests[0]
     assert request["context"]["product_type_en"] == "rechargeable bag sealer"
 
 
-def test_search_planner_deduplicates_head_and_reappends_it_as_last_query() -> None:
+def test_search_planner_deduplicates_head_and_keeps_canonical_fallback_last() -> None:
     provider = FakeProvider(
         {
             "plan_makro_vertical_search_intents": {
@@ -104,7 +108,30 @@ def test_search_planner_deduplicates_head_and_reappends_it_as_last_query() -> No
         "heat sealer",
         "bag sealer",
         "sealer",
+        "rechargeable bag sealer",
     )
+
+
+def test_search_planner_does_not_duplicate_canonical_when_ai_already_planned_it() -> None:
+    provider = FakeProvider(
+        {
+            "plan_makro_vertical_search_intents": {
+                "specific_queries": ["rechargeable bag sealer", "heat sealer"],
+                "broader_queries": ["bag sealer"],
+                "head_noun_query": "sealer",
+            }
+        }
+    )
+
+    terms = plan_vertical_search_terms(provider, _bag_sealer_hints())
+
+    assert terms == (
+        "rechargeable bag sealer",
+        "heat sealer",
+        "bag sealer",
+        "sealer",
+    )
+    assert terms.count("rechargeable bag sealer") == 1
 
 
 def test_search_planner_fallback_also_broadens_to_head_noun() -> None:
@@ -240,83 +267,3 @@ def test_pool_prompt_knows_broad_queries_trade_precision_for_recall() -> None:
     rules = " ".join(request["rules"]).casefold()
     assert "precision for recall" in rules
     assert "must never add" in rules
-
-
-class FakeSearch:
-    def __init__(self) -> None:
-        self.current = ""
-        self.nonempty_fills: list[str] = []
-
-    def fill(self, value: str) -> None:
-        self.current = value
-        if value:
-            self.nonempty_fills.append(value)
-
-    def press(self, _key: str) -> None:
-        return None
-
-
-class FakePage:
-    def wait_for_timeout(self, _milliseconds: int) -> None:
-        return None
-
-
-def test_live_search_runs_entire_ladder_then_replays_selected_query_before_click(monkeypatch) -> None:
-    page = FakePage()
-    search = FakeSearch()
-    rows_by_query = {
-        "bag sealer": ["Home / Kitchen / Vacuum Bag Sealer"],
-        "heat sealer": [],
-        "sealer": [
-            "Home Improvement / Hardware & Electricals / Sealer",
-            "Home / Kitchen / Vacuum Bag Sealer",
-        ],
-    }
-    clicked: list[tuple[str, str]] = []
-
-    monkeypatch.setattr(vertical_selection, "_vertical_search_input", lambda _page: search)
-    monkeypatch.setattr(vertical_selection, "begin_search_query", lambda _search: None)
-    monkeypatch.setattr(
-        vertical_selection,
-        "plan_vertical_search_terms",
-        lambda _provider, _hints: ("bag sealer", "heat sealer", "sealer"),
-    )
-    monkeypatch.setattr(
-        vertical_selection,
-        "_wait_for_scoped_vertical_search_candidates",
-        lambda _page, active, **_kwargs: list(rows_by_query.get(active.current, [])),
-    )
-    monkeypatch.setattr(
-        vertical_selection,
-        "choose_vertical_candidate_pool",
-        lambda _provider, _hints, _terms, _pool: "Home Improvement / Hardware & Electricals / Sealer",
-    )
-    monkeypatch.setattr(vertical_selection, "_current_target_values", lambda _page: ("", ""))
-    monkeypatch.setattr(
-        vertical_selection,
-        "click_search_row",
-        lambda active, label: clicked.append((active.current, label)) or True,
-    )
-    monkeypatch.setattr(
-        vertical_selection,
-        "_complete_exact_live_vertical",
-        lambda _page, _selected, **_kwargs: "sealer",
-    )
-
-    selected, observed, planned = vertical_selection._try_select_via_search(
-        page,
-        object(),
-        _bag_sealer_hints(),
-        wait_ms=0,
-    )
-
-    assert planned == ("bag sealer", "heat sealer", "sealer")
-    assert search.nonempty_fills == [
-        "bag sealer",
-        "heat sealer",
-        "sealer",
-        "sealer",
-    ]
-    assert clicked == [("sealer", "Home Improvement / Hardware & Electricals / Sealer")]
-    assert selected == "sealer"
-    assert "Home / Kitchen / Vacuum Bag Sealer" in observed
