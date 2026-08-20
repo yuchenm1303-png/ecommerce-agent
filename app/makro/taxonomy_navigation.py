@@ -14,7 +14,7 @@ from typing import Any, Callable
 ColumnsFn = Callable[[], list[list[str]]]
 ClickFn = Callable[[int, str], bool]
 ChooseFn = Callable[[list[str], list[str]], str]
-LeafReadyFn = Callable[[], bool]
+LeafReadyFn = Callable[[str], bool]
 CompleteLeafFn = Callable[[str], str]
 
 
@@ -109,19 +109,19 @@ def _wait_for_branch_outcome(
     page: Any,
     *,
     level: int,
+    selected: str,
     previous_child: tuple[str, ...],
     columns_fn: ColumnsFn,
     leaf_ready_fn: LeafReadyFn,
     poll_ms: int,
     max_polls: int,
 ) -> str:
-    """Wait for either a verified leaf or a stable, genuinely changed child.
+    """Wait for a selected-node leaf or a stable, genuinely changed child.
 
-    Comparing the next-column signature matters during backtracking: a stale child
-    column from the previously selected sibling must not be mistaken for the new
-    sibling's children while the Makro SPA is still repainting. A changed child is
-    also provisional until its exact contents remain unchanged for a short quiet
-    window, because Makro may render one row before the rest of the column.
+    The leaf probe is selected-node aware. This prevents a rejected leaf's stale
+    confirmation state from being mistaken for the next sibling during backtracking.
+    Comparing the next-column signature separately prevents stale child columns from
+    being mistaken for the newly selected sibling's children while Makro repaints.
     """
 
     required = _required_stable_polls(max_polls)
@@ -129,7 +129,7 @@ def _wait_for_branch_outcome(
     confirmations = 0
 
     for _ in range(max(1, int(max_polls))):
-        if leaf_ready_fn():
+        if leaf_ready_fn(selected):
             return "leaf"
 
         child = _column_signature(_child_column(columns_fn(), level))
@@ -147,7 +147,7 @@ def _wait_for_branch_outcome(
 
         page.wait_for_timeout(max(1, int(poll_ms)))
 
-    if leaf_ready_fn():
+    if leaf_ready_fn(selected):
         return "leaf"
     return "dead"
 
@@ -173,13 +173,12 @@ def navigate_live_taxonomy(
     whole workflow. ``complete_leaf_fn`` follows the same contract at a reached
     leaf: a non-empty canonical Vertical accepts the leaf, while an empty string
     means the leaf failed semantic validation and the navigator must backtrack.
-    Exceptions from either callback remain hard failures because they indicate an
-    invalid response or a mechanical/verification problem rather than an unsuitable
-    taxonomy branch.
+    ``leaf_ready_fn`` receives the node that was just clicked and must only report
+    a leaf when the current confirmation belongs to that exact node.
 
+    Exceptions from callbacks remain hard failures because they indicate an invalid
+    response or a mechanical/verification problem rather than an unsuitable branch.
     When all bounded tree paths are exhausted this function returns ``""``.
-    Mechanical click failures remain hard errors because they indicate a portal
-    interruption rather than an unsuitable taxonomy branch.
     """
 
     initial = columns_fn()
@@ -221,8 +220,6 @@ def navigate_live_taxonomy(
 
             selected = str(choose_fn(list(path), candidates) or "").strip()
             if not selected:
-                # The semantic layer may reject every stable live node at this
-                # level. Do not reinterpret that as a transport error.
                 return ""
 
             selected_key = _key(selected)
@@ -245,6 +242,7 @@ def navigate_live_taxonomy(
             outcome = _wait_for_branch_outcome(
                 page,
                 level=level,
+                selected=selected,
                 previous_child=previous_child,
                 columns_fn=columns_fn,
                 leaf_ready_fn=leaf_ready_fn,
@@ -261,10 +259,6 @@ def navigate_live_taxonomy(
                 if resolved:
                     return resolved
 
-            # Either the selected node exposed no usable child/leaf, its child
-            # subtree contained no semantically valid path, or a reached leaf was
-            # explicitly rejected by the final semantic gate. Mark that branch
-            # dead and try the next exact sibling still visible at this level.
             budget.backtracks += 1
             if budget.exhausted:
                 return ""
