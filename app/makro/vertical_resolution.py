@@ -201,6 +201,21 @@ def _planned_search_ladder(raw: dict[str, Any]) -> tuple[str, ...]:
     return tuple(output[:_MAX_SEARCH_TERMS])
 
 
+def _with_canonical_product_type_fallback(
+    hints: ListingBootstrapHints,
+    terms: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Preserve the existing ladder and add one final canonical identity query when missing."""
+
+    output = list(terms)
+    seen = {_query_key(term) for term in output if _query_key(term)}
+    product_type = _canonical_product_type(hints)
+    product_key = _query_key(product_type)
+    if product_key and product_key not in seen and _usable_query(product_type):
+        output.append(product_type)
+    return tuple(output)
+
+
 def plan_vertical_search_terms(provider: JSONTaskProvider, hints: ListingBootstrapHints) -> tuple[str, ...]:
     requested = current_requested_vertical()
     if requested:
@@ -218,10 +233,10 @@ def plan_vertical_search_terms(provider: JSONTaskProvider, hints: ListingBootstr
     if isinstance(raw, dict):
         planned = _planned_search_ladder(raw)
         if planned:
-            return planned
+            return _with_canonical_product_type_fallback(hints, planned)
     fallback = _fallback_search_ladder(hints)
     if fallback:
-        return fallback
+        return _with_canonical_product_type_fallback(hints, fallback)
     raise ValueError("Product Identity produced no safe Makro Vertical retrieval intent")
 
 
