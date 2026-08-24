@@ -6,13 +6,17 @@ from pathlib import Path
 
 
 class AsyncRunJournal:
-    """Write runtime telemetry off the Qt GUI thread.
+    """Write runtime telemetry off the Qt GUI thread without losing tail lines.
 
-    QProcess stdout is delivered on the GUI event loop.  Runtime logging must not
+    QProcess stdout is delivered on the GUI event loop. Runtime logging must not
     turn every output line into a synchronous open/write/close syscall on that
-    same loop, because browser execution can emit large bursts.  This journal
-    keeps one file handle on a tiny daemon writer and drains queued lines in
-    batches.  The GUI thread only performs an in-memory Queue.put().
+    same loop, because browser execution can emit large bursts. The journal keeps
+    one file handle on a daemon writer and uses an unbounded FIFO queue.
+
+    ``close()`` is a durability barrier: after it returns every line accepted by
+    ``append()`` has either been flushed to disk or ``error`` records the writer
+    failure. Failure diagnostics are allowed to read a stage log only after this
+    barrier completes, so terminal telemetry can never race an unfinished writer.
     """
 
     _STOP = object()
@@ -39,13 +43,12 @@ class AsyncRunJournal:
             return
         self._queue.put(str(line))
 
-    def close(self, *, timeout: float = 1.5) -> None:
+    def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         self._queue.put(self._STOP)
-        if self._thread.is_alive():
-            self._thread.join(max(0.0, float(timeout)))
+        self._thread.join()
 
     def _run(self) -> None:
         pending: list[str] = []
