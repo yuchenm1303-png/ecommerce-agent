@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import json
 import os
 import re
@@ -57,9 +58,8 @@ class BatchController(QObject):
     token and has a separate bounded concurrency.
 
     Child-process stdout is durably journaled per job/stage while the control-tower
-    surface receives only a rate-limited preview. This keeps complete failure
-    evidence available for owner telemetry without turning console bursts into GUI
-    thread filesystem work.
+    surface receives a rate-limited FIFO preview. The preview is lossless: every
+    complete stdout/stderr line stays queued until it has been emitted to the GUI.
     """
 
     jobs_changed = Signal(object)
@@ -83,7 +83,7 @@ class BatchController(QObject):
         self._journals: dict[QProcess, AsyncRunJournal] = {}
         self._stopping = False
         self._execution_images = False
-        self._pending_log_preview: dict[str, str] = {}
+        self._pending_log_preview: deque[str] = deque()
         self._state_dirty = False
 
         self._log_preview_timer = QTimer(self)
@@ -643,17 +643,17 @@ class BatchController(QObject):
         self.log.emit(text)
 
     def _queue_log_preview(self, job_id: str, text: str) -> None:
-        self._pending_log_preview[str(job_id)] = text
+        del job_id
+        self._pending_log_preview.append(text)
         if not self._log_preview_timer.isActive():
             self._log_preview_timer.start()
 
     def _flush_log_preview(self) -> None:
         if not self._pending_log_preview:
             return
-        pending = list(self._pending_log_preview.values())
-        self._pending_log_preview.clear()
-        for text in pending:
-            self.log.emit(text)
+        self._log_preview_timer.stop()
+        while self._pending_log_preview:
+            self.log.emit(self._pending_log_preview.popleft())
 
     def _persist_emit(self, *, immediate: bool = False) -> None:
         if self.batch is None:
