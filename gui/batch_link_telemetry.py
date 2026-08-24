@@ -20,7 +20,7 @@ from .task_failure_diagnostics import (
 
 _FLUSH_MS = 900
 _MAX_TEXT = 12_000
-_MAX_LIST = 180
+_MAX_LIST = 500
 _TERMINAL_JOB_STATES = {"READY", "DONE", "REVIEW", "FAILED", "STOPPED"}
 
 
@@ -291,12 +291,13 @@ class BatchLinkTelemetryController(QObject):
         job_status = _text(getattr(job, "status", ""), 120).upper()
         run_dir = _text(getattr(job, "run_dir", ""), 8_000)
         execution_report_path = _text(getattr(job, "execution_report", ""), 8_000)
+        failure_required = job_status == "FAILED" or include_failure
         cache_key = "|".join(
             (
                 job_status,
                 _text(getattr(job, "updated_at", ""), 120),
                 execution_report_path,
-                "failure" if include_failure else "normal",
+                "failure" if failure_required else "normal",
             )
         )
         job_id = _text(getattr(job, "job_id", ""), 160)
@@ -322,6 +323,8 @@ class BatchLinkTelemetryController(QObject):
             "product_images": int(getattr(job, "image_count", 0) or 0),
             "makro_target_id": _text(getattr(job, "makro_target_id", ""), 240),
             "stage_detail": _text(getattr(job, "stage_detail", ""), 4_000),
+            "failure_stage": _text(getattr(job, "failure_stage", ""), 4_000),
+            "exit_code": getattr(job, "exit_code", None),
             "error": _text(getattr(job, "error", ""), 12_000),
             "run_id": Path(run_dir).name if run_dir else "",
             "created_at": _text(getattr(job, "created_at", ""), 120),
@@ -347,6 +350,8 @@ class BatchLinkTelemetryController(QObject):
                         "product_name": _text(getattr(job, "product_name", ""), 1_000),
                         "makro_target_id": _text(getattr(job, "makro_target_id", ""), 240),
                         "stage_detail": _text(getattr(job, "stage_detail", ""), 4_000),
+                        "failure_stage": _text(getattr(job, "failure_stage", ""), 4_000),
+                        "exit_code": getattr(job, "exit_code", None),
                         "error": _text(getattr(job, "error", ""), 12_000),
                         "required_blocked": int(getattr(job, "required_blocked", 0) or 0),
                         "product_images": int(getattr(job, "image_count", 0) or 0),
@@ -354,22 +359,38 @@ class BatchLinkTelemetryController(QObject):
                     }
                 )
 
-        if execution_report_path:
+        if execution_report_path and job_status != "FAILED":
             execution_report = _read_json(execution_report_path)
             if execution_report:
                 result["executor_report"] = _safe(execution_report)
                 result["execution_report_file"] = Path(execution_report_path).name
+        elif execution_report_path:
+            result["execution_report_file"] = Path(execution_report_path).name
 
-        if include_failure and (job_status in {"REVIEW", "FAILED", "STOPPED"} or result.get("error")):
+        if failure_required and (job_status in {"REVIEW", "FAILED", "STOPPED"} or result.get("error")):
+            artifact_roots: tuple[str | Path, ...] = (execution_report_path,) if execution_report_path else ()
             result["failure_diagnostic"] = collect_workflow_failure_diagnostic(
                 run_dir or None,
                 fallback_error=_text(result.get("error") or result.get("stage_detail"), 12_000),
                 fallback_error_type="BatchJobFailure",
-                fallback_stage=_text(result.get("stage_detail") or "batch_job", 240),
+                fallback_stage=_text(
+                    getattr(job, "failure_stage", "") or result.get("stage_detail") or "batch_job",
+                    500,
+                ),
                 workflow_mode="full",
+                artifact_roots=artifact_roots,
             )
 
         safe_result = _safe(result)
+        if job_status == "FAILED" and "failure_diagnostic" not in safe_result:
+            safe_result["failure_diagnostic"] = collect_workflow_failure_diagnostic(
+                run_dir or None,
+                fallback_error=_text(result.get("error") or "Batch job failed", 12_000),
+                fallback_error_type="BatchJobFailure",
+                fallback_stage=_text(getattr(job, "failure_stage", "") or "batch_job", 500),
+                workflow_mode="full",
+                artifact_roots=(execution_report_path,) if execution_report_path else (),
+            )
         self._result_cache[job_id] = (cache_key, safe_result)
         return safe_result
 
