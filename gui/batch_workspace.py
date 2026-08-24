@@ -72,7 +72,6 @@ _PHASES = (
 
 _JOB_LOG_LINE = re.compile(r"^\[(JOB-\d+)(?:\s*·[^\]]+)?\]\s?(.*)$")
 _BATCH_DETAIL_RATIO = (0.88, 0.86)
-_MAX_JOB_LOG_LINES = 180
 
 
 class BatchJobCard(QFrame):
@@ -89,7 +88,7 @@ class BatchJobCard(QFrame):
         self.job_id = job_id
         self._job: BatchJob | None = None
         self._details_callback = details_callback
-        self._logs: deque[str] = deque(maxlen=_MAX_JOB_LOG_LINES)
+        self._logs: deque[str] = deque()
         self._log_view: QPlainTextEdit | None = None
         self._expanded = False
 
@@ -346,7 +345,6 @@ class BatchJobCard(QFrame):
         viewer.setObjectName("cardDetailTextView")
         viewer.setReadOnly(True)
         viewer.setMinimumHeight(170)
-        viewer.document().setMaximumBlockCount(_MAX_JOB_LOG_LINES)
         viewer.setPlainText(self.log_text())
         self.details_layout.addWidget(viewer)
         self._log_view = viewer
@@ -663,7 +661,7 @@ class BatchWorkspace(QWidget):
         if card is not None:
             card.append_log(line)
             return
-        pending = self._pending_logs.setdefault(job_id, deque(maxlen=_MAX_JOB_LOG_LINES))
+        pending = self._pending_logs.setdefault(job_id, deque())
         pending.append(line)
 
     def _clear_job_cards(self) -> None:
