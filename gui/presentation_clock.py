@@ -6,7 +6,9 @@ from typing import Any
 
 from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer
 from PySide6.QtGui import QCursor
-from PySide6.QtWidgets import QApplication, QMainWindow
+from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QMainWindow, QVBoxLayout, QWidget
+
+from .mode_toggle import WorkspaceModeSwitch
 
 
 _ACTIVE_PRESENTATION_TICK_MS = 8
@@ -21,6 +23,19 @@ class _WidgetSample:
     left_down: bool
     input_changed: bool
     button_edge: bool
+
+
+class BackgroundDriftSwitch(WorkspaceModeSwitch):
+    """Established micro-switch visuals for the wallpaper pointer parallax."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("backgroundDriftSwitch")
+        self.setAccessibleName("背景漂移")
+        self.set_checked_immediate(False)
+
+    def _sync_tooltip(self, checked: bool) -> None:
+        self.setToolTip("背景漂移已开启 · 点击关闭" if checked else "背景漂移已关闭 · 点击开启")
 
 
 class PresentationClock(QObject):
@@ -58,6 +73,7 @@ class PresentationClock(QObject):
         self._last_left_down: bool | None = None
         self._active_until_s = 0.0
         self._card_settle_pending = False
+        self._background_drift_enabled = False
 
         self._widget_samples: list[_WidgetSample] = []
         self._widget_flush_posted = False
@@ -83,11 +99,38 @@ class PresentationClock(QObject):
 
         window.installEventFilter(self)
         window.destroyed.connect(self.cleanup)
+        self.set_background_drift_enabled(False)
         self._sync_window_state()
 
     @property
     def running(self) -> bool:
         return bool(self.timer.isActive() and not self._holds and not self._window_paused)
+
+    @property
+    def background_drift_enabled(self) -> bool:
+        return self._background_drift_enabled
+
+    def set_background_drift_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        self._background_drift_enabled = enabled
+        self._last_global = None
+        try:
+            self.background.reset_pointer_identity()
+        except (AttributeError, RuntimeError):
+            pass
+
+        if enabled:
+            return
+
+        quick = self._quick_window
+        if quick is None:
+            return
+        try:
+            quick.setProperty("pointerX", 0.0)
+            quick.setProperty("pointerY", 0.0)
+            quick.setProperty("animationRunning", True)
+        except RuntimeError:
+            pass
 
     def _can_run(self) -> bool:
         if self._holds or self._window_paused:
@@ -289,12 +332,13 @@ class PresentationClock(QObject):
 
         if input_changed:
             self._mark_interaction_active(now_s)
-            # Quick only needs new pointer targets. Its FrameAnimation owns the
-            # ongoing GPU parallax tween after this handoff.
-            try:
-                self.background.presentation_tick(global_pos, input_changed=True)
-            except RuntimeError:
-                pass
+            # Background parallax is opt-in. Card/cursor interactions keep using
+            # the same shared pointer clock regardless of this preference.
+            if self._background_drift_enabled:
+                try:
+                    self.background.presentation_tick(global_pos, input_changed=True)
+                except RuntimeError:
+                    pass
         else:
             self._sync_cadence(now_s)
 
@@ -340,6 +384,42 @@ class PresentationClock(QObject):
             pass
 
 
+def _install_background_drift_switch(
+    window: QMainWindow,
+    clock: PresentationClock,
+) -> BackgroundDriftSwitch:
+    existing = getattr(window, "_background_drift_switch", None)
+    if isinstance(existing, BackgroundDriftSwitch):
+        existing.set_checked_immediate(clock.background_drift_enabled)
+        return existing
+
+    root = window.centralWidget()
+    outer = root.layout() if root is not None else None
+    header_item = outer.itemAt(0) if isinstance(outer, QVBoxLayout) and outer.count() else None
+    header = header_item.layout() if header_item is not None else None
+    if root is None or not isinstance(header, QHBoxLayout):
+        raise RuntimeError("background drift switch expected the common application header")
+
+    label = QLabel("背景漂移", root)
+    label.setObjectName("backgroundDriftToggleLabel")
+    label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+    label.setFixedHeight(32)
+    label.setStyleSheet("color: rgba(232, 241, 252, 178);")
+
+    toggle = BackgroundDriftSwitch(root)
+    toggle.set_checked_immediate(False)
+    clock.set_background_drift_enabled(False)
+    toggle.toggled.connect(clock.set_background_drift_enabled)
+
+    header.addSpacing(10)
+    header.addWidget(label, 0, Qt.AlignmentFlag.AlignBottom)
+    header.addWidget(toggle, 0, Qt.AlignmentFlag.AlignBottom)
+
+    window._background_drift_toggle_label = label  # type: ignore[attr-defined]
+    window._background_drift_switch = toggle  # type: ignore[attr-defined]
+    return toggle
+
+
 def install_presentation_clock(
     window: QMainWindow,
     *,
@@ -349,6 +429,7 @@ def install_presentation_clock(
 ) -> PresentationClock:
     existing = getattr(window, "_presentation_clock", None)
     if isinstance(existing, PresentationClock):
+        _install_background_drift_switch(window, existing)
         return existing
     clock = PresentationClock(
         window,
@@ -357,7 +438,12 @@ def install_presentation_clock(
         effects=effects,
     )
     window._presentation_clock = clock  # type: ignore[attr-defined]
+    _install_background_drift_switch(window, clock)
     return clock
 
 
-__all__ = ["PresentationClock", "install_presentation_clock"]
+__all__ = [
+    "BackgroundDriftSwitch",
+    "PresentationClock",
+    "install_presentation_clock",
+]
