@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from app.providers.usage_telemetry import (
@@ -135,3 +136,13 @@ def test_failed_sdk_call_is_counted_as_a_physical_request(tmp_path, monkeypatch)
     assert event["error_type"] == "TimeoutError"
     assert event["stage"] == "product_identity"
     assert summarize_usage_journal(journal)["error_requests"] == 1
+
+
+def test_production_workflows_bind_one_usage_journal_per_run() -> None:
+    root = Path(__file__).resolve().parents[1]
+    diagnostics = (root / "app" / "workflow_diagnostics.py").read_text(encoding="utf-8")
+    one_link = (root / "makro_one_link.py").read_text(encoding="utf-8")
+    assert "from .providers.usage_telemetry import ensure_usage_journal" in diagnostics
+    assert "ensure_usage_journal(sink.run_dir)" in diagnostics
+    assert "from app.providers.usage_telemetry import ensure_usage_journal" in one_link
+    assert "ensure_usage_journal(run_dir)" in one_link

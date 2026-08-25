@@ -31,6 +31,7 @@ from app.makro.listing_creation import (
     run_listing_creation,
 )
 from app.providers.registry import ProviderConfigurationError, build_semantic_provider
+from app.providers.usage_telemetry import ensure_usage_journal
 from app.source_capture import SourceAccessBlocked, capture_product_source
 from app.workflow_cli import build_one_link_parser, provider_config as _provider_config
 from app.workflow_runtime import (
@@ -135,6 +136,7 @@ def main() -> int:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     run_dir = Path(args.output_dir) / f"one-link-{stamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    ensure_usage_journal(run_dir)
     manifest_path = run_dir / "run-manifest.json"
     manifest: dict[str, Any] = {
         "mode": "one_supplier_url_makro_step1_step2_step3",

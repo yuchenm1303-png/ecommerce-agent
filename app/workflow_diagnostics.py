@@ -9,6 +9,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from .providers.usage_telemetry import ensure_usage_journal
 from .task_control import safe_pause_point
 
 
@@ -200,6 +201,11 @@ def configure_diagnostics(
     sink = WorkflowDiagnostics(run_dir, workflow, **context)
     _current = sink
     _install_excepthook()
+    try:
+        ensure_usage_journal(sink.run_dir)
+    except Exception:
+        # AI usage telemetry is observational and may never break orchestration.
+        pass
     _emit_safely(lambda: sink.emit("diagnostics", "START", log_path=str(sink.path)))
     return sink
 
