@@ -35,6 +35,17 @@ def _snapshot() -> SourceSnapshot:
     )
 
 
+def _identity_response(brand_identity: str) -> dict:
+    return {
+        "entity_kind": "physical_product",
+        "product_type_en": "vacuum insulated bottle",
+        "brand_identity": brand_identity,
+        "product_summary": "750 ml stainless steel vacuum insulated bottle",
+        "confidence": 0.98,
+        "evidence_refs": ["identity:page-title", "identity:attribute:1:1"],
+    }
+
+
 def test_product_identity_sources_exclude_generic_visible_page_body():
     snapshot = _snapshot()
     sources = build_product_identity_sources(snapshot)
@@ -48,33 +59,49 @@ def test_product_identity_sources_exclude_generic_visible_page_body():
 
 def test_product_identity_request_is_physical_product_grounded_contract():
     request = build_product_identity_request(_snapshot())
+    properties = request["json_contract"]["properties"]
 
     assert request["task"] == "infer_grounded_supplier_product_identity"
+    assert request["context"]["identity_contract_version"] == 2
     assert request["grounded_sources"]
     assert "visible_text" not in str(request["context"])
-    assert "physical_product" in request["json_contract"]["properties"]["entity_kind"]["enum"]
-    assert "evidence_refs" in request["json_contract"]["required"]
+    assert "physical_product" in properties["entity_kind"]["enum"]
+    assert properties["brand_identity"]["minLength"] == 1
+    assert "brand" not in properties
+    assert "brand_status" not in properties
+    assert "brand_identity" in request["json_contract"]["required"]
+    assert request["json_contract"]["properties"]["evidence_refs"]["minItems"] == 1
 
 
-def test_listing_bootstrap_stops_after_grounded_identity_before_live_taxonomy():
-    provider = SequenceProvider(
-        [
-            {
-                "entity_kind": "physical_product",
-                "product_type_en": "vacuum insulated bottle",
-                "brand": "",
-                "brand_status": "unknown",
-                "product_summary": "750 ml stainless steel vacuum insulated bottle",
-                "confidence": 0.98,
-                "evidence_refs": ["identity:page-title", "identity:attribute:1:1"],
-            }
-        ]
-    )
+def test_listing_bootstrap_derives_unknown_brand_from_atomic_identity():
+    provider = SequenceProvider([_identity_response("__UNKNOWN__")])
 
     hints = infer_listing_bootstrap(provider, _snapshot())
 
     assert hints.vertical_search_terms == ("vacuum insulated bottle",)
+    assert hints.brand == ""
+    assert hints.brand_status == "unknown"
     assert hints.product_identity is not None
     assert hints.product_identity["entity_kind"] == "physical_product"
     assert len(provider.requests) == 1
     assert provider.requests[0]["task"] == "infer_grounded_supplier_product_identity"
+
+
+def test_listing_bootstrap_derives_explicit_brand_from_atomic_identity():
+    provider = SequenceProvider([_identity_response("Thermos")])
+
+    hints = infer_listing_bootstrap(provider, _snapshot())
+
+    assert hints.brand == "Thermos"
+    assert hints.brand_status == "explicit"
+    assert hints.product_identity["brand"] == "Thermos"
+    assert hints.product_identity["brand_status"] == "explicit"
+
+
+def test_listing_bootstrap_derives_unbranded_from_atomic_identity():
+    provider = SequenceProvider([_identity_response("__UNBRANDED__")])
+
+    hints = infer_listing_bootstrap(provider, _snapshot())
+
+    assert hints.brand == ""
+    assert hints.brand_status == "unbranded"

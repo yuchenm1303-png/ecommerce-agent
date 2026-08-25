@@ -19,6 +19,8 @@ from .source_snapshot import SourceSnapshot
 
 _ENGLISH_PHRASE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 '&/()+.,-]*$")
 _ENGLISH_LETTER = re.compile(r"[A-Za-z]")
+_BRAND_IDENTITY_UNKNOWN = "__UNKNOWN__"
+_BRAND_IDENTITY_UNBRANDED = "__UNBRANDED__"
 
 
 class JSONTaskProvider(Protocol):
@@ -116,9 +118,6 @@ def build_product_identity_sources(
         == "customer_product_pack"
     )
     if is_customer_pack:
-        # Unlike a supplier page, this text is generated only from files the
-        # customer explicitly selected as this product's evidence. It therefore
-        # has no site navigation/chrome contamination and is safe for identity.
         add_text(
             "identity:customer-pack-text",
             "customer_product_document",
@@ -192,9 +191,6 @@ def build_product_identity_sources(
         text = _clean(item)
         if not text:
             continue
-        # Source capture already limits embedded_data to product identity / SKU /
-        # specification / offer / detail-document structures. Keep this bounded
-        # and never add generic script or page-body text here.
         text = text[:1200]
         add_text(
             f"identity:embedded:{index}",
@@ -247,11 +243,12 @@ def build_product_identity_request(
             "Use only grounded_sources. Ignore site navigation, marketplace branding, seller-platform "
             "descriptions, procurement slogans and other page chrome. Determine whether the evidence "
             "establishes one physical product. For a physical product, cite the exact source_id values "
-            "that support product identity and brand status."
+            "that support product identity and brand identity."
         ),
         "context": {
             "product_url": snapshot.final_url or snapshot.requested_url,
             "allowed_evidence_refs": allowed_refs,
+            "identity_contract_version": 2,
         },
         "grounded_sources": sources,
         "rules": [
@@ -263,9 +260,8 @@ def build_product_identity_request(
             "evidence_refs may contain only exact source_id values from allowed_evidence_refs.",
             "For physical_product, evidence_refs must contain at least one source that identifies the item itself.",
             "Treat model numbers, variants and descriptive words as non-brand unless evidence explicitly identifies them as a brand.",
-            "brand_status=explicit only when evidence explicitly identifies a brand.",
-            "brand_status=unbranded only when evidence explicitly indicates neutral/no-brand/OEM/unbranded status.",
-            "Otherwise brand_status=unknown and brand must be empty.",
+            f"brand_identity is one atomic value: return the exact explicit brand name when evidence identifies one; return {_BRAND_IDENTITY_UNBRANDED} only when evidence explicitly indicates neutral/no-brand/OEM/unbranded status; otherwise return {_BRAND_IDENTITY_UNKNOWN}.",
+            "Never return explicit/unbranded/unknown as a brand name and never invent a brand.",
             "confidence is 0..1 and reflects confidence in product identity from the supplied evidence.",
         ],
         "json_contract": {
@@ -277,24 +273,20 @@ def build_product_identity_request(
                     "enum": ["physical_product", "service_or_platform", "unknown"],
                 },
                 "product_type_en": {"type": "string"},
-                "brand": {"type": "string"},
-                "brand_status": {
-                    "type": "string",
-                    "enum": ["explicit", "unbranded", "unknown"],
-                },
+                "brand_identity": {"type": "string", "minLength": 1, "maxLength": 200},
                 "product_summary": {"type": "string"},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "evidence_refs": {
                     "type": "array",
                     "items": {"type": "string", "enum": allowed_refs},
+                    "minItems": 1,
                     "maxItems": 12,
                 },
             },
             "required": [
                 "entity_kind",
                 "product_type_en",
-                "brand",
-                "brand_status",
+                "brand_identity",
                 "product_summary",
                 "confidence",
                 "evidence_refs",
@@ -302,6 +294,18 @@ def build_product_identity_request(
         },
         "strict_json_schema": True,
     }
+
+
+def _decode_brand_identity(value: Any) -> tuple[str, str]:
+    atomic = _clean(value)
+    if not atomic:
+        raise ProductIdentityError("product identity brand_identity must not be empty")
+    key = atomic.casefold()
+    if key == _BRAND_IDENTITY_UNKNOWN.casefold():
+        return "", "unknown"
+    if key == _BRAND_IDENTITY_UNBRANDED.casefold():
+        return "", "unbranded"
+    return atomic, "explicit"
 
 
 def _parse_product_identity(raw: Any, *, allowed_refs: set[str]) -> ProductIdentity:
@@ -327,14 +331,7 @@ def _parse_product_identity(raw: Any, *, allowed_refs: set[str]) -> ProductIdent
             f"physical product identity did not contain a canonical English product type: {product_type!r}"
         )
 
-    brand_status = _clean(raw.get("brand_status")).casefold()
-    if brand_status not in {"explicit", "unbranded", "unknown"}:
-        raise ProductIdentityError(f"invalid product identity brand_status={brand_status!r}")
-    brand = _clean(raw.get("brand"))
-    if brand_status == "explicit" and not brand:
-        raise ProductIdentityError("explicit product identity brand_status requires brand")
-    if brand_status != "explicit":
-        brand = ""
+    brand, brand_status = _decode_brand_identity(raw.get("brand_identity"))
 
     summary = _clean(raw.get("product_summary"))
     if not summary:
@@ -383,6 +380,8 @@ def infer_product_identity(
         for item in request.get("grounded_sources") or []
         if str(item.get("source_id") or "")
     }
+    if not allowed_refs:
+        raise ProductIdentityError("product identity has no grounded evidence sources")
     return _parse_product_identity(provider.extract_json(request), allowed_refs=allowed_refs)
 
 
