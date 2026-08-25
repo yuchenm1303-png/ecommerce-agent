@@ -276,7 +276,7 @@ def summarize_usage_journal(path: str | Path | None = None) -> dict[str, Any]:
 
     return {
         "schema_version": _SCHEMA_VERSION,
-        "journal": str(target.resolve()) if target is not None else "",
+        "journal": target.name if target is not None else "",
         **overall,
         "provider_usage_complete": overall["usage_missing_requests"] == 0,
         "by_stage": by_stage,
@@ -299,7 +299,11 @@ def load_run_usage_summary(run_dir: str | Path | None) -> dict[str, Any]:
         payload = json.loads(summary.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return {}
-    return payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        return {}
+    payload = dict(payload)
+    payload["journal"] = Path(str(payload.get("journal") or "")).name
+    return payload
 
 
 def _write_summary(path: Path) -> None:
