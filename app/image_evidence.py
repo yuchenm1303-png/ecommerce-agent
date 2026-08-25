@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
+from .providers.usage_telemetry import usage_request_context
 from .semantic_grounding import GroundedSource, IMAGE_KIND
 
 
@@ -245,8 +246,6 @@ def _is_retryable_image_batch_error(exc: BaseException) -> bool:
     """Retry only model-output/structured-response failures, never account/config errors."""
 
     if isinstance(exc, ImageEvidenceError):
-        # These errors happen after a model response arrived but its image partition
-        # or per-image JSON shape did not satisfy the deterministic contract.
         return True
 
     text = _exception_text(exc)
@@ -255,9 +254,6 @@ def _is_retryable_image_batch_error(exc: BaseException) -> bool:
     if "openai-compatible api 返回空文本" in text:
         return True
 
-    # DashScope/Qwen occasionally aborts native response_format generation when
-    # the partial model output becomes invalid JSON. The service itself labels
-    # this as retryable, despite returning HTTP 400 / invalid_parameter_error.
     return (
         "response_format" in text
         and (
@@ -280,27 +276,32 @@ def _run_batch(provider: JSONTaskProvider, index: int, images: list[GroundedSour
 
     model_calls = 0
     last_error: BaseException | None = None
-    for attempt in range(1, _IMAGE_BATCH_MAX_ATTEMPTS + 1):
-        try:
-            model_calls += 1
-            raw = provider.extract_json(request)
-            keyed = raw.get("images") if isinstance(raw, dict) else None
-            if not isinstance(keyed, dict) or set(keyed) != {source.source_id for source in images}:
-                raise ImageEvidenceError("image observation response did not contain the exact image_id partition")
-            observations = [
-                ImageObservation.from_mapping(keyed[source.source_id], source=source)
-                for source in images
-                if isinstance(keyed.get(source.source_id), dict)
-            ]
-            if len(observations) != len(images):
-                raise ImageEvidenceError("image observation response omitted an image")
-            return _BatchResult(index=index, observations=observations, model_calls=model_calls)
-        except Exception as exc:
-            last_error = exc
-            if attempt >= _IMAGE_BATCH_MAX_ATTEMPTS or not _is_retryable_image_batch_error(exc):
-                break
-            delay = _IMAGE_BATCH_BACKOFF_SECONDS[min(attempt - 1, len(_IMAGE_BATCH_BACKOFF_SECONDS) - 1)]
-            time.sleep(delay)
+    with usage_request_context(
+        task=str(request.get("task") or ""),
+        provider=str(getattr(provider, "name", "")),
+        model=str(getattr(provider, "model", "")),
+    ):
+        for attempt in range(1, _IMAGE_BATCH_MAX_ATTEMPTS + 1):
+            try:
+                model_calls += 1
+                raw = provider.extract_json(request)
+                keyed = raw.get("images") if isinstance(raw, dict) else None
+                if not isinstance(keyed, dict) or set(keyed) != {source.source_id for source in images}:
+                    raise ImageEvidenceError("image observation response did not contain the exact image_id partition")
+                observations = [
+                    ImageObservation.from_mapping(keyed[source.source_id], source=source)
+                    for source in images
+                    if isinstance(keyed.get(source.source_id), dict)
+                ]
+                if len(observations) != len(images):
+                    raise ImageEvidenceError("image observation response omitted an image")
+                return _BatchResult(index=index, observations=observations, model_calls=model_calls)
+            except Exception as exc:
+                last_error = exc
+                if attempt >= _IMAGE_BATCH_MAX_ATTEMPTS or not _is_retryable_image_batch_error(exc):
+                    break
+                delay = _IMAGE_BATCH_BACKOFF_SECONDS[min(attempt - 1, len(_IMAGE_BATCH_BACKOFF_SECONDS) - 1)]
+                time.sleep(delay)
 
     attempts = model_calls
     return _BatchResult(
