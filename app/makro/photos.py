@@ -15,6 +15,8 @@ from .sections import find_section, open_section_for_edit
 
 PRODUCT_PHOTOS_SECTION = "Product Photos"
 PHOTO_SLOT_IDS = tuple(f"thumbnail_{index}" for index in range(5))
+PHOTO_SURFACE_READY_TIMEOUT_MS = 8_000
+PHOTO_SURFACE_STABLE_SAMPLES = 2
 MAX_UPLOAD_EDGE = 4096
 JPEG_QUALITY = 92
 _PLACEHOLDER_SOURCE_TOKENS = (
@@ -255,6 +257,66 @@ def _photo_state(page: Page, section_path: str) -> dict[str, Any]:
     }
 
 
+def _surface_slot_ids(state: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            str(slot.get("id") or "")
+            for slot in state.get("slots") or []
+            if str(slot.get("id") or "")
+        )
+    )
+
+
+def _photo_surface_is_ready(state: dict[str, Any]) -> bool:
+    """A Product Photos editor is usable only after all five fixed roles exist."""
+
+    return bool(state.get("found")) and _surface_slot_ids(state) == tuple(sorted(PHOTO_SLOT_IDS))
+
+
+def _wait_for_photo_surface_ready(
+    page: Page,
+    section_path: str,
+    *,
+    timeout_ms: int = PHOTO_SURFACE_READY_TIMEOUT_MS,
+) -> tuple[str, dict[str, Any]]:
+    """Reacquire React-owned Product Photos until all five roles are stable.
+
+    Makro marks the card expanded before the gallery subtree has necessarily
+    finished rendering.  Capacity and slot ownership must therefore never be
+    derived from a partial subtree. Two consecutive complete snapshots are the
+    readiness postcondition; an incomplete surface fails closed with diagnostics.
+    """
+
+    timeout_ms = max(1, int(timeout_ms))
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    stable_samples = 0
+    latest: dict[str, Any] = {}
+    live_path = section_path
+
+    while True:
+        section = find_section(page, PRODUCT_PHOTOS_SECTION)
+        live_path = str((section or {}).get("path") or live_path)
+        latest = _photo_state(page, live_path)
+        if _photo_surface_is_ready(latest):
+            stable_samples += 1
+            if stable_samples >= PHOTO_SURFACE_STABLE_SAMPLES:
+                latest["surface_ready"] = True
+                latest["surface_stable_samples"] = stable_samples
+                latest["section_path"] = live_path
+                return live_path, latest
+        else:
+            stable_samples = 0
+
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Product Photos 已展开，但固定图片槽结构未稳定就绪；"
+                f"timeout_ms={timeout_ms}, expected_slots={list(PHOTO_SLOT_IDS)}, "
+                f"observed_slots={list(_surface_slot_ids(latest))}, "
+                f"completion={latest.get('completion_count')}/{latest.get('capacity')}."
+            )
+        page.wait_for_timeout(100)
+
+
 def inspect_product_photos(page: Page) -> dict[str, Any]:
     section = find_section(page, PRODUCT_PHOTOS_SECTION)
     if section is None:
@@ -262,7 +324,17 @@ def inspect_product_photos(page: Page) -> dict[str, Any]:
     path = str(section.get("path") or "")
     if not path:
         return {"found": False, "detail": "Product Photos section 缺少稳定 DOM path。"}
-    state = _photo_state(page, path)
+
+    if bool(section.get("has_edit")):
+        state = _photo_state(page, path)
+    else:
+        path, state = _wait_for_photo_surface_ready(
+            page,
+            path,
+            timeout_ms=PHOTO_SURFACE_READY_TIMEOUT_MS,
+        )
+        section = find_section(page, PRODUCT_PHOTOS_SECTION) or section
+
     state["section_title"] = section.get("title")
     state["section_path"] = path
     state["expanded"] = not bool(section.get("has_edit"))
@@ -650,10 +722,18 @@ def _normalize_for_makro_upload(source: Path, destination_dir: Path) -> tuple[Pa
 class _DynamicPhotoFileTarget:
     """Upload one file exactly once into one concrete Makro thumbnail role."""
 
-    def __init__(self, page: Page, section_path: str, slot_id: str) -> None:
+    def __init__(
+        self,
+        page: Page,
+        section_path: str,
+        slot_id: str,
+        *,
+        timeout_ms: int,
+    ) -> None:
         self.page = page
         self.section_path = section_path
         self.slot_id = slot_id
+        self.timeout_ms = max(1, int(timeout_ms))
         self._selected = False
         self.last_acceptance: dict[str, Any] = {}
         self.upload_meta: dict[str, Any] = {}
@@ -666,7 +746,11 @@ class _DynamicPhotoFileTarget:
     def set_input_files(self, files: str | Path) -> None:
         source = Path(files).expanduser().resolve()
         current_path = self._current_path()
-        before_state = _photo_state(self.page, current_path)
+        current_path, before_state = _wait_for_photo_surface_ready(
+            self.page,
+            current_path,
+            timeout_ms=self.timeout_ms,
+        )
         if self.slot_id not in {str(value) for value in before_state.get("empty_slot_ids") or []}:
             raise RuntimeError(f"Product Photos 目标图片槽 #{self.slot_id} 已不是空槽，拒绝重复提交。")
 
@@ -747,6 +831,8 @@ class _DynamicPhotoFileTarget:
                 current_path,
                 self.slot_id,
                 before_state=before_state,
+                soft_timeout_ms=self.timeout_ms,
+                uploading_timeout_ms=max(self.timeout_ms, 60_000),
             )
 
         self._selected = True
@@ -771,6 +857,7 @@ def _select_file_input(
     section_path: str,
     *,
     consumed_slot_ids: set[str] | None = None,
+    timeout_ms: int = 8_000,
 ):
     next_slot = _next_empty_photo_slot(
         page,
@@ -780,7 +867,12 @@ def _select_file_input(
     if next_slot is None:
         return None
     slot_id, _slot = next_slot
-    return _DynamicPhotoFileTarget(page, section_path, slot_id)
+    return _DynamicPhotoFileTarget(
+        page,
+        section_path,
+        slot_id,
+        timeout_ms=timeout_ms,
+    )
 
 
 def _wait_for_staged_signal(
@@ -823,7 +915,7 @@ def upload_product_photos(
 ) -> PhotoUploadResult:
     """Stage images transactionally into Makro's five fixed roles; never Save."""
 
-    _ = timeout_ms
+    timeout_ms = max(1, int(timeout_ms))
     resolved_paths: list[Path] = []
     seen: set[str] = set()
     for raw in image_paths:
@@ -855,7 +947,11 @@ def upload_product_photos(
     if not section_path:
         return PhotoUploadResult(status="not_found", detail="Product Photos section 缺少稳定 DOM path。")
 
-    state = _photo_state(page, section_path)
+    section_path, state = _wait_for_photo_surface_ready(
+        page,
+        section_path,
+        timeout_ms=timeout_ms,
+    )
     initial_count = state.get("completion_count")
     capacity = state.get("capacity")
     result = PhotoUploadResult(
@@ -871,17 +967,23 @@ def upload_product_photos(
     for path in resolved_paths:
         section = find_section(page, PRODUCT_PHOTOS_SECTION) or section
         section_path = str(section.get("path") or section_path)
+        section_path, _ready_state = _wait_for_photo_surface_ready(
+            page,
+            section_path,
+            timeout_ms=timeout_ms,
+        )
         target = _select_file_input(
             page,
             section_path,
             consumed_slot_ids=consumed_slots,
+            timeout_ms=timeout_ms,
         )
         if target is None:
             result.items.append(
                 {
                     "path": str(path),
                     "status": "slot_missing",
-                    "detail": "没有下一个未消费的逻辑空 #thumbnail_N 图片框。",
+                    "detail": "完整五槽结构已就绪，但没有下一个未消费的逻辑空 #thumbnail_N 图片框。",
                     "consumed_slots": sorted(consumed_slots),
                 }
             )
@@ -905,6 +1007,7 @@ def upload_product_photos(
                     "uploading_seen": bool(settled.get("uploading_seen")),
                     "consumed_slots": sorted(consumed_slots),
                     "upload_meta": target.upload_meta,
+                    "timeout_ms": timeout_ms,
                 }
             )
         except Exception as exc:
@@ -921,6 +1024,7 @@ def upload_product_photos(
                     "detail": str(exc),
                     "target_slot_after_error": _slot_diagnostic_payload(live_state, target.slot_id),
                     "consumed_slots": sorted(consumed_slots),
+                    "timeout_ms": timeout_ms,
                 }
             )
             # After a submitted file cannot be confirmed, the target role may be
