@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import makro_gui_workflow
 import makro_one_link
-from app.workflow_cli import build_one_link_parser, build_staged_workflow_parser
+from app.workflow_cli import (
+    build_one_link_parser,
+    build_staged_workflow_parser,
+    provider_config,
+)
 
 
 def _parser_contract(parser):
@@ -23,8 +27,9 @@ def _parser_contract(parser):
     return rows
 
 
-def test_shared_one_link_parser_is_behavior_equivalent_to_existing_cli() -> None:
-    assert _parser_contract(build_one_link_parser()) == _parser_contract(makro_one_link.build_parser())
+def test_one_link_cli_delegates_parser_and_provider_config_to_shared_owner() -> None:
+    assert makro_one_link.build_parser is build_one_link_parser
+    assert makro_one_link._provider_config is provider_config
 
 
 def test_shared_staged_parser_is_behavior_equivalent_to_existing_gui_cli() -> None:
