@@ -62,6 +62,16 @@ def test_one_link_compatibility_names_delegate_to_runtime_owner() -> None:
     assert 'script_path=Path(__file__).with_name("makro_execute_listing.py")' in executor_source
 
 
+def test_product_pack_imports_mechanical_helpers_from_runtime_owner() -> None:
+    source = (Path(__file__).resolve().parents[1] / "makro_product_pack_workflow.py").read_text(encoding="utf-8")
+    assert "from app.workflow_runtime import (" in source
+    assert "build_resolver_command as _resolver_command" in source
+    assert "run_command as _run" in source
+    assert "scan_and_write_live_schema as _scan_and_write_live_schema" in source
+    assert "single_run_dir as _single_run_dir" in source
+    assert "from makro_one_link import (" not in source
+
+
 def test_resolver_command_preserves_existing_cli_contract() -> None:
     command = workflow_runtime.build_resolver_command(
         _args(),

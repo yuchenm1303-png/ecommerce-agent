@@ -21,18 +21,18 @@ from app.product_input import acquire_product_input, product_input_manifest_payl
 from app.providers.registry import ProviderConfigurationError, build_semantic_provider
 from app.source_capture import SourceAccessBlocked
 from app.workflow_cli import build_one_link_parser, provider_config
+from app.workflow_runtime import (
+    build_resolver_command as _resolver_command,
+    run_command as _run,
+    scan_and_write_live_schema as _scan_and_write_live_schema,
+    single_run_dir as _single_run_dir,
+)
 from makro_gui_workflow import (
     _advance_listing_to_step3,
     _create_fresh_owned_page,
     _phase,
     _plan_command,
     _write_manifest,
-)
-from makro_one_link import (
-    _resolver_command,
-    _run,
-    _scan_and_write_live_schema,
-    _single_run_dir,
 )
 
 
