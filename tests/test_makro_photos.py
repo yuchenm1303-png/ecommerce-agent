@@ -8,6 +8,7 @@ from app.makro.photos import (
     _normalize_for_makro_upload,
     _slot_is_empty,
     _stage_accepted,
+    _target_slot_acceptance_signal,
     _wait_for_target_slot_completion,
     parse_completion_counter,
     upload_product_photos,
@@ -55,7 +56,7 @@ def test_file_input_files_alone_do_not_count_as_makro_acceptance():
     )
 
 
-def test_new_preview_source_counts_as_makro_acceptance_even_if_img_count_is_same():
+def test_new_preview_source_counts_as_page_level_makro_acceptance():
     state = {
         "file_inputs": [{"files": 1}],
         "visible_image_count": 1,
@@ -85,7 +86,7 @@ def test_counter_growth_counts_as_makro_acceptance():
     )
 
 
-def test_visible_plus_is_authoritative_uploadable_slot():
+def test_visible_plus_remains_dom_level_uploadable_state():
     assert _slot_is_empty(
         {
             "has_plus": True,
@@ -93,9 +94,8 @@ def test_visible_plus_is_authoritative_uploadable_slot():
             "image_sources": ["/static/photo-placeholder.svg"],
         }
     )
-    # Empty Makro role cards may contain decorative images whose src does not
-    # identify them as placeholders. A visible plus must still keep the role
-    # uploadable until Makro consumes that exact role.
+    # A blank Makro role may contain decorative images. DOM emptiness therefore
+    # remains plus-driven; transaction acceptance handles before/after evidence.
     assert _slot_is_empty(
         {
             "has_plus": True,
@@ -110,6 +110,80 @@ def test_visible_plus_is_authoritative_uploadable_slot():
             "image_sources": ["blob:accepted-product-photo"],
         }
     )
+
+
+def _state(
+    *,
+    plus: bool,
+    check: bool,
+    sources: list[str],
+    completion: int = 0,
+    uploading: bool = False,
+):
+    slot = {
+        "id": "thumbnail_0",
+        "has_plus": plus,
+        "has_check": check,
+        "image_sources": list(sources),
+    }
+    return {
+        "empty_slot_ids": ["thumbnail_0"] if plus and not check else [],
+        "visible_image_count": len(sources),
+        "visible_image_sources": list(sources),
+        "completion_count": completion,
+        "capacity": 5,
+        "add_image_tile_count": 1 if plus and not check else 0,
+        "uploading": uploading,
+        "slots": [slot],
+    }
+
+
+def test_preexisting_decorative_image_is_not_target_transaction_acceptance():
+    before = _state(
+        plus=True,
+        check=False,
+        sources=["/static/media/image.abc123.png"],
+    )
+    after = _state(
+        plus=True,
+        check=False,
+        sources=["/static/media/image.abc123.png"],
+    )
+
+    signal, new_sources = _target_slot_acceptance_signal(before, after, "thumbnail_0")
+
+    assert signal == ""
+    assert new_sources == set()
+
+
+def test_new_target_preview_is_acceptance_even_while_plus_is_stale():
+    before = _state(
+        plus=True,
+        check=False,
+        sources=["/static/media/image.abc123.png"],
+    )
+    after = _state(
+        plus=True,
+        check=False,
+        sources=["/static/media/image.abc123.png", "blob:new-product-photo"],
+    )
+
+    signal, new_sources = _target_slot_acceptance_signal(before, after, "thumbnail_0")
+
+    assert signal == "target_slot_new_preview"
+    assert new_sources == {"blob:new-product-photo"}
+
+
+def test_check_or_consumed_plus_is_strong_target_acceptance():
+    before = _state(plus=True, check=False, sources=[])
+
+    checked = _state(plus=True, check=True, sources=["blob:new-product-photo"])
+    signal, _ = _target_slot_acceptance_signal(before, checked, "thumbnail_0")
+    assert signal == "target_slot_check"
+
+    consumed = _state(plus=False, check=False, sources=["blob:new-product-photo"])
+    signal, _ = _target_slot_acceptance_signal(before, consumed, "thumbnail_0")
+    assert signal == "target_slot_consumed"
 
 
 def test_photo_normalization_creates_rgb_baseline_jpeg(tmp_path: Path):
@@ -135,64 +209,59 @@ class FakeWaitPage:
         self.waits.append(ms)
 
 
-def test_target_completion_waits_until_exact_role_is_consumed(monkeypatch):
+def test_target_completion_accepts_exact_slot_preview_with_stale_plus(monkeypatch):
     page = FakeWaitPage()
-    states = iter(
-        [
-            {
-                "empty_slot_ids": ["thumbnail_0"],
-                "visible_image_count": 1,
-                "visible_image_sources": ["blob:new-product-photo"],
-                "completion_count": 0,
-                "capacity": 5,
-                "add_image_tile_count": 5,
-                "uploading": False,
-                "slots": [
-                    {
-                        "id": "thumbnail_0",
-                        "has_plus": True,
-                        "has_check": False,
-                        "image_sources": ["blob:new-product-photo"],
-                    }
-                ],
-            },
-            {
-                "empty_slot_ids": [],
-                "visible_image_count": 1,
-                "visible_image_sources": ["blob:new-product-photo"],
-                "completion_count": 1,
-                "capacity": 5,
-                "add_image_tile_count": 4,
-                "uploading": False,
-                "slots": [
-                    {
-                        "id": "thumbnail_0",
-                        "has_plus": False,
-                        "has_check": True,
-                        "image_sources": ["blob:new-product-photo"],
-                    }
-                ],
-            },
-        ]
+    before = _state(
+        plus=True,
+        check=False,
+        sources=["/static/media/image.abc123.png"],
+    )
+    after = _state(
+        plus=True,
+        check=False,
+        sources=["/static/media/image.abc123.png", "blob:new-product-photo"],
+        uploading=False,
     )
     monkeypatch.setattr("app.makro.photos.find_section", lambda *_args: {"path": "#photos"})
-    monkeypatch.setattr("app.makro.photos._photo_state", lambda *_args: next(states))
+    monkeypatch.setattr("app.makro.photos._photo_state", lambda *_args: after)
 
     settled = _wait_for_target_slot_completion(
         page,
         "#photos",
         "thumbnail_0",
-        before_state={
-            "visible_image_count": 0,
-            "visible_image_sources": [],
-            "completion_count": 0,
-            "add_image_tile_count": 5,
-        },
+        before_state=before,
         accepted_stability_ms=0,
     )
 
-    assert settled["acceptance_signal"] == "target_slot_consumed"
-    assert page.waits == [100]
+    assert settled["acceptance_signal"] == "target_slot_new_preview"
+    assert settled["new_target_sources"] == ["blob:new-product-photo"]
+    assert settled["target_slot_before"]["has_plus"] is True
+    assert settled["target_slot_after"]["has_plus"] is True
+    assert page.waits == []
+
+
+def test_target_completion_still_accepts_exact_role_consumption(monkeypatch):
+    page = FakeWaitPage()
+    before = _state(plus=True, check=False, sources=[])
+    after = _state(
+        plus=False,
+        check=True,
+        sources=["blob:new-product-photo"],
+        completion=1,
+    )
+    monkeypatch.setattr("app.makro.photos.find_section", lambda *_args: {"path": "#photos"})
+    monkeypatch.setattr("app.makro.photos._photo_state", lambda *_args: after)
+
+    settled = _wait_for_target_slot_completion(
+        page,
+        "#photos",
+        "thumbnail_0",
+        before_state=before,
+        accepted_stability_ms=0,
+    )
+
+    assert settled["acceptance_signal"] == "target_slot_check"
+    assert page.waits == []
 
 
 def test_persisted_photo_count_polls_until_counter_updates(monkeypatch):
