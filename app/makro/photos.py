@@ -349,6 +349,57 @@ def _wait_for_upload_photo_button(page: Page, section_path: str, *, timeout_ms: 
     return None
 
 
+def _open_photo_slot_upload_panel(
+    page: Page,
+    section_path: str,
+    slot: Any,
+    slot_id: str,
+    *,
+    click_timeout_ms: int = 1_500,
+    panel_timeout_ms: int = 2_000,
+) -> tuple[str, Any]:
+    """Trigger one thumbnail and prove success by the resulting upload panel.
+
+    Playwright can raise TimeoutError after the physical click has already been
+    delivered while it waits for a navigation signal that is irrelevant to this
+    in-page Makro interaction. The click call is therefore not the truth source.
+    The operation succeeds only when the Product Photos Upload Photo control
+    becomes visible; if it does not, a click timeout remains a real failure.
+    """
+
+    click_timeout_detail = ""
+    try:
+        slot.click(timeout=click_timeout_ms, force=True)
+    except PlaywrightTimeoutError as exc:
+        click_timeout_detail = str(exc)
+
+    section = find_section(page, PRODUCT_PHOTOS_SECTION)
+    live_path = str((section or {}).get("path") or section_path)
+    upload_button = _wait_for_upload_photo_button(
+        page,
+        live_path,
+        timeout_ms=panel_timeout_ms,
+    )
+    if upload_button is not None:
+        if click_timeout_detail:
+            print(
+                f"GUI_EXEC_PHOTO\tSLOT_OPEN_RECOVERED\t{slot_id}\t"
+                "Playwright click timeout occurred after dispatch; Upload Photo panel is visible.",
+                flush=True,
+            )
+        return live_path, upload_button
+
+    if click_timeout_detail:
+        raise RuntimeError(
+            f"点击 #{slot_id} 图片框时 Playwright 等待超时，且随后 {panel_timeout_ms}ms 内"
+            "没有出现可见 Upload Photo 按钮；"
+            f"click_timeout={click_timeout_detail}"
+        )
+    raise RuntimeError(
+        f"点击 #{slot_id} 图片框后 {panel_timeout_ms}ms 内没有出现可见 Upload Photo 按钮。"
+    )
+
+
 def _acceptance_signal(
     state: dict[str, Any],
     *,
@@ -638,14 +689,12 @@ class _DynamicPhotoFileTarget:
             self.upload_meta = upload_meta
 
             slot.evaluate("el => el.scrollIntoView({block: 'nearest', inline: 'nearest'})")
-            slot.click(timeout=1_500, force=True)
-
-            current_path = self._current_path()
-            upload_button = _wait_for_upload_photo_button(self.page, current_path)
-            if upload_button is None:
-                raise RuntimeError(
-                    f"点击 #{self.slot_id} 图片框后 2000ms 内没有出现可见 Upload Photo 按钮。"
-                )
+            current_path, upload_button = _open_photo_slot_upload_panel(
+                self.page,
+                current_path,
+                slot,
+                self.slot_id,
+            )
 
             browser_visual_hud_target(
                 upload_button,
