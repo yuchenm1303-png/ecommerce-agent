@@ -35,6 +35,7 @@ def _image_data_uri(path_value: str) -> str:
 
 def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
     payload = {
+        "task": request_payload.get("task"),
         "product_identity": request_payload.get("product_identity") or {},
         "schema_sha256": request_payload.get("schema_sha256", ""),
         "source_manifest_sha256": request_payload.get("source_manifest_sha256", ""),
