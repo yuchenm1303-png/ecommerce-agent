@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import JSONTaskProviderError, JSONTaskResponseError, JSONTaskTransportError
+from .usage_telemetry import instrument_openai_client, usage_request_context
 
 
 class OpenAIProviderError(JSONTaskProviderError):
@@ -34,7 +35,6 @@ def _image_data_uri(path_value: str) -> str:
 
 def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
     payload = {
-        "task": request_payload.get("task"),
         "product_identity": request_payload.get("product_identity") or {},
         "schema_sha256": request_payload.get("schema_sha256", ""),
         "source_manifest_sha256": request_payload.get("source_manifest_sha256", ""),
@@ -134,8 +134,8 @@ class OpenAISemanticProvider:
                 raise OpenAIProviderError("缺少 openai Python SDK。") from exc
             client = OpenAI(timeout=float(request_timeout_seconds), max_retries=0)
 
-        self.client = client
         self.model = model.strip()
+        self.client = instrument_openai_client(client, default_model=self.model)
         self.image_detail = image_detail
         self.max_output_tokens = int(max_output_tokens)
         self.request_timeout_seconds = float(request_timeout_seconds)
@@ -145,35 +145,40 @@ class OpenAISemanticProvider:
         if not isinstance(schema, dict) or not schema:
             raise OpenAIProviderError("JSON task 缺少 json_contract。")
         try:
-            response = self.client.responses.create(
+            with usage_request_context(
+                task=str(request_payload.get("task") or ""),
+                provider=self.name,
                 model=self.model,
-                input=[
-                    {
-                        "role": "system",
-                        "content": str(
-                            request_payload.get("system_instruction")
-                            or "You execute the supplied grounded JSON task."
-                        ),
+            ):
+                response = self.client.responses.create(
+                    model=self.model,
+                    input=[
+                        {
+                            "role": "system",
+                            "content": str(
+                                request_payload.get("system_instruction")
+                                or "You execute the supplied grounded JSON task."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": _input_content(
+                                request_payload,
+                                image_detail=self.image_detail,
+                            ),
+                        },
+                    ],
+                    text={
+                        "format": {
+                            "type": "json_schema",
+                            "name": "makro_ai_field_decisions",
+                            "strict": True,
+                            "schema": schema,
+                        }
                     },
-                    {
-                        "role": "user",
-                        "content": _input_content(
-                            request_payload,
-                            image_detail=self.image_detail,
-                        ),
-                    },
-                ],
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": "makro_ai_field_decisions",
-                        "strict": True,
-                        "schema": schema,
-                    }
-                },
-                max_output_tokens=self.max_output_tokens,
-                timeout=self.request_timeout_seconds,
-            )
+                    max_output_tokens=self.max_output_tokens,
+                    timeout=self.request_timeout_seconds,
+                )
         except Exception as exc:
             raise OpenAITransportError(f"OpenAI JSON task 调用失败：{exc}") from exc
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import json
 import queue
 import threading
@@ -9,6 +10,7 @@ from typing import Any, Callable, Iterable
 
 from .errors import JSONTaskResponseError, JSONTaskTransportError
 from .transient_retry import run_with_transient_retry
+from .usage_telemetry import instrument_openai_client, usage_request_context
 
 
 _PROGRESS_INTERVAL_SECONDS = 15.0
@@ -168,6 +170,7 @@ class DashScopeWebSearchProvider:
                 timeout=self.request_timeout_seconds,
                 max_retries=0,
             )
+            client = instrument_openai_client(client, default_model=self.model)
             return client.responses.create(**kwargs)
         except Exception as exc:
             raise JSONTaskTransportError(f"DashScope Responses web search 调用失败：{exc}") from exc
@@ -206,7 +209,12 @@ class DashScopeWebSearchProvider:
                 except queue.Full:
                     pass
 
-        threading.Thread(target=worker, name="dashscope-responses-web-search", daemon=True).start()
+        copied_context = contextvars.copy_context()
+        threading.Thread(
+            target=lambda: copied_context.run(worker),
+            name="dashscope-responses-web-search",
+            daemon=True,
+        ).start()
         deadline = started + self.request_timeout_seconds
         next_progress = started + _PROGRESS_INTERVAL_SECONDS
         self._progress(
@@ -242,8 +250,9 @@ class DashScopeWebSearchProvider:
             raise JSONTaskTransportError(f"DashScope Responses web search 调用失败：{value}") from value
 
     def search_json(self, prompt: str) -> WebSearchJSONResult:
-        return run_with_transient_retry(
-            lambda: self._search_json_once(prompt),
-            progress=self._progress,
-            label="Web AI request",
-        )
+        with usage_request_context(task="web_search", provider=self.name, model=self.model):
+            return run_with_transient_retry(
+                lambda: self._search_json_once(prompt),
+                progress=self._progress,
+                label="Web AI request",
+            )

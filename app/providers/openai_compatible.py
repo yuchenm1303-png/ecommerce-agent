@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import json
 import mimetypes
 import queue
@@ -11,6 +12,7 @@ from typing import Any, Callable
 
 from .errors import JSONTaskProviderError, JSONTaskResponseError, JSONTaskTransportError
 from .transient_retry import run_with_transient_retry
+from .usage_telemetry import instrument_openai_client, usage_request_context
 
 
 class OpenAICompatibleProviderError(JSONTaskProviderError):
@@ -259,8 +261,8 @@ class OpenAICompatibleSemanticProvider:
                 max_retries=0,
             )
 
-        self.client = client
         self.model = model.strip()
+        self.client = instrument_openai_client(client, default_model=self.model)
         self.base_url = base_url.rstrip("/")
         self.image_detail = image_detail
         self.max_output_tokens = int(max_output_tokens)
@@ -299,7 +301,12 @@ class OpenAICompatibleSemanticProvider:
                 except queue.Full:
                     pass
 
-        thread = threading.Thread(target=worker, name="ai-json-request", daemon=True)
+        copied_context = contextvars.copy_context()
+        thread = threading.Thread(
+            target=lambda: copied_context.run(worker),
+            name="ai-json-request",
+            daemon=True,
+        )
         thread.start()
         deadline = started + self.request_timeout_seconds
         next_progress = started + _PROGRESS_INTERVAL_SECONDS
@@ -386,10 +393,15 @@ class OpenAICompatibleSemanticProvider:
             output_text = self._network_text(kwargs, streaming=streaming)
             return _parse_json_object(output_text)
 
-        payload = run_with_transient_retry(
-            attempt,
-            progress=self._progress,
-            label="AI JSON task",
-        )
+        with usage_request_context(
+            task=str(request_payload.get("task") or ""),
+            provider=self.name,
+            model=self.model,
+        ):
+            payload = run_with_transient_retry(
+                attempt,
+                progress=self._progress,
+                label="AI JSON task",
+            )
         payload["extractor"] = self.name
         return payload
