@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from PIL import Image
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from app.makro.photos import (
     _normalize_for_makro_upload,
+    _open_photo_slot_upload_panel,
     _slot_is_empty,
     _stage_accepted,
     _target_slot_acceptance_signal,
@@ -207,6 +210,65 @@ class FakeWaitPage:
 
     def wait_for_timeout(self, ms):
         self.waits.append(ms)
+
+
+class FakePostClickTimeoutSlot:
+    def __init__(self):
+        self.clicks = 0
+
+    def click(self, *, timeout, force):
+        assert force is True
+        assert timeout > 0
+        self.clicks += 1
+        raise PlaywrightTimeoutError(
+            "Timeout exceeded after click action done while waiting for scheduled navigations"
+        )
+
+
+def test_slot_open_uses_panel_postcondition_after_post_click_timeout(monkeypatch):
+    page = FakeWaitPage()
+    slot = FakePostClickTimeoutSlot()
+    upload_button = object()
+    monkeypatch.setattr("app.makro.photos.find_section", lambda *_args: {"path": "#live-photos"})
+    monkeypatch.setattr(
+        "app.makro.photos._wait_for_upload_photo_button",
+        lambda _page, path, *, timeout_ms: upload_button if path == "#live-photos" else None,
+    )
+
+    live_path, actual_button = _open_photo_slot_upload_panel(
+        page,
+        "#old-photos",
+        slot,
+        "thumbnail_2",
+        click_timeout_ms=1_500,
+        panel_timeout_ms=2_000,
+    )
+
+    assert live_path == "#live-photos"
+    assert actual_button is upload_button
+    assert slot.clicks == 1
+
+
+def test_slot_open_does_not_swallow_timeout_when_panel_never_opens(monkeypatch):
+    page = FakeWaitPage()
+    slot = FakePostClickTimeoutSlot()
+    monkeypatch.setattr("app.makro.photos.find_section", lambda *_args: {"path": "#live-photos"})
+    monkeypatch.setattr(
+        "app.makro.photos._wait_for_upload_photo_button",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="Playwright 等待超时"):
+        _open_photo_slot_upload_panel(
+            page,
+            "#old-photos",
+            slot,
+            "thumbnail_2",
+            click_timeout_ms=1_500,
+            panel_timeout_ms=2_000,
+        )
+
+    assert slot.clicks == 1
 
 
 def test_target_completion_accepts_exact_slot_preview_with_stale_plus(monkeypatch):
