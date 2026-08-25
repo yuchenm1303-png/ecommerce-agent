@@ -10,6 +10,8 @@ from PySide6.QtCore import QByteArray, QObject, QTimer, QUrl
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import QWidget
 
+from app.providers.usage_telemetry import load_run_usage_summary
+
 from .app_access import ApplicationAccessController
 from .result_loader import load_run_result
 from .task_failure_diagnostics import (
@@ -332,6 +334,9 @@ class BatchLinkTelemetryController(QObject):
         }
 
         if run_dir and job_status in _TERMINAL_JOB_STATES:
+            ai_usage_summary = load_run_usage_summary(run_dir)
+            if ai_usage_summary:
+                result["ai_usage_summary"] = _safe(ai_usage_summary)
             try:
                 full_result = load_run_result(Path(run_dir))
             except Exception:
@@ -356,6 +361,7 @@ class BatchLinkTelemetryController(QObject):
                         "required_blocked": int(getattr(job, "required_blocked", 0) or 0),
                         "product_images": int(getattr(job, "image_count", 0) or 0),
                         "run_id": Path(run_dir).name,
+                        "ai_usage_summary": result.get("ai_usage_summary") or {},
                     }
                 )
 
@@ -391,6 +397,8 @@ class BatchLinkTelemetryController(QObject):
                 workflow_mode="full",
                 artifact_roots=(execution_report_path,) if execution_report_path else (),
             )
+        if safe_result.get("ai_usage_summary") and isinstance(safe_result.get("failure_diagnostic"), dict):
+            safe_result["failure_diagnostic"]["ai_usage_summary"] = safe_result["ai_usage_summary"]
         self._result_cache[job_id] = (cache_key, safe_result)
         return safe_result
 
