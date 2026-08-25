@@ -26,15 +26,14 @@ from app.makro.step1_entry import prepare_owned_step1_page
 from app.product_input import acquire_product_input, product_input_manifest_payload
 from app.providers.registry import ProviderConfigurationError, build_semantic_provider
 from app.source_capture import SourceAccessBlocked
+from app.workflow_cli import build_staged_workflow_parser, provider_config
 from makro_gui_workflow import (
     _advance_listing_to_step3,
     _listing_stage,
     _phase,
     _prepare_step3,
     _write_manifest,
-    build_parser,
 )
-from makro_one_link import _provider_config
 from makro_product_pack_workflow import _prepare_step3_pack
 
 _BATCH_TARGET_ENV = "MAKRO_BATCH_TARGET_ID"
@@ -43,7 +42,7 @@ _STEP1_TRANSIENT_BACKOFF_MS = 750
 
 
 def _args():
-    parser = build_parser()
+    parser = build_staged_workflow_parser()
     parser.add_argument(
         "--product-file",
         action="append",
@@ -106,7 +105,7 @@ def main() -> int:
         )
 
     try:
-        provider = build_semantic_provider(_provider_config(args))
+        provider = build_semantic_provider(provider_config(args))
     except ProviderConfigurationError as exc:
         raise SystemExit(str(exc)) from exc
 
