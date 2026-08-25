@@ -1,8 +1,8 @@
 """Run-scoped AI usage telemetry with no prompt or credential capture.
 
-Every physical SDK request is appended as one compact JSONL event. The journal
-is intentionally transport-level: retries become separate physical attempts,
-while all attempts from one semantic task share one logical_request_id.
+Every physical SDK request is appended as one compact JSONL event. Retries are
+separate physical attempts, while repeated attempts for one semantic operation
+share a logical_request_id when an outer operation context is present.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from typing import Any, Iterator
 
 
 USAGE_JOURNAL_ENV = "ECOM_AI_USAGE_JOURNAL"
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _WRITE_LOCK = threading.Lock()
 
 
@@ -68,11 +68,11 @@ def response_usage(response: Any) -> dict[str, int]:
 
 
 def response_web_search_calls(response: Any) -> int:
-    count = 0
-    for item in _get(response, "output", []) or []:
-        if str(_get(item, "type", "") or "") == "web_search_call":
-            count += 1
-    return count
+    return sum(
+        1
+        for item in (_get(response, "output", []) or [])
+        if str(_get(item, "type", "") or "") == "web_search_call"
+    )
 
 
 def classify_task(task: str) -> str:
@@ -116,14 +116,43 @@ class UsageRequestContext:
 
 
 _CURRENT_CONTEXT: contextvars.ContextVar[UsageRequestContext | None] = contextvars.ContextVar(
-    "ai_usage_request_context",
-    default=None,
+    "ai_usage_request_context", default=None
 )
 
 
+def _same_context(current: UsageRequestContext, *, task: str, provider: str, model: str) -> bool:
+    return (
+        current.task == str(task or "")
+        and current.provider == str(provider or "")
+        and (not model or not current.model or current.model == str(model or ""))
+    )
+
+
 @contextmanager
-def usage_request_context(*, task: str, provider: str, model: str) -> Iterator[UsageRequestContext]:
-    context = UsageRequestContext(task=str(task or ""), provider=str(provider or ""), model=str(model or ""))
+def usage_request_context(
+    *,
+    task: str,
+    provider: str,
+    model: str,
+    reuse_existing: bool = True,
+) -> Iterator[UsageRequestContext]:
+    """Bind one semantic operation so all physical attempts share one id.
+
+    Provider adapters call this directly. Higher-level code with its own retry
+    loop may wrap the full loop in the same context; nested provider calls then
+    reuse it instead of manufacturing false logical requests.
+    """
+
+    current = _CURRENT_CONTEXT.get()
+    if reuse_existing and current is not None and _same_context(
+        current, task=task, provider=provider, model=model
+    ):
+        yield current
+        return
+
+    context = UsageRequestContext(
+        task=str(task or ""), provider=str(provider or ""), model=str(model or "")
+    )
     token = _CURRENT_CONTEXT.set(context)
     try:
         yield context
@@ -142,7 +171,6 @@ def ensure_usage_journal(run_dir: str | Path) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         os.environ[USAGE_JOURNAL_ENV] = str(path)
     except Exception:
-        # Telemetry must never become a production dependency.
         pass
     return path
 
@@ -159,6 +187,8 @@ def _summary_bucket() -> dict[str, int]:
         "retry_requests": 0,
         "response_requests": 0,
         "error_requests": 0,
+        "usage_reported_requests": 0,
+        "usage_missing_requests": 0,
         "input_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
@@ -173,72 +203,103 @@ def _read_events(path: Path) -> list[dict[str, Any]]:
         return []
     events: list[dict[str, Any]] = []
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(item, dict) and item.get("kind") == "ai_http_request":
-                events.append(item)
-    except Exception:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
         return []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict) and item.get("kind") == "ai_http_request":
+            events.append(item)
     return events
+
+
+def _add_event(bucket: dict[str, int], event: dict[str, Any]) -> None:
+    bucket["physical_requests"] += 1
+    bucket["response_requests" if event.get("status") == "response" else "error_requests"] += 1
+    bucket["usage_reported_requests" if event.get("usage_reported") else "usage_missing_requests"] += 1
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cached_input_tokens",
+        "reasoning_tokens",
+        "web_search_calls",
+    ):
+        bucket[key] += _int(event.get(key))
+
+
+def _finalize_bucket(bucket: dict[str, int], logical_ids: set[str]) -> None:
+    bucket["logical_requests"] = len(logical_ids)
+    bucket["retry_requests"] = max(0, bucket["physical_requests"] - bucket["logical_requests"])
 
 
 def summarize_usage_journal(path: str | Path | None = None) -> dict[str, Any]:
     target = Path(path) if path is not None else current_usage_journal()
     events = _read_events(target) if target is not None else []
     overall = _summary_bucket()
-    logical_ids: set[str] = set()
     by_stage: dict[str, dict[str, int]] = {}
     by_model: dict[str, dict[str, int]] = {}
+    by_task: dict[str, dict[str, int]] = {}
+    overall_logical: set[str] = set()
     stage_logical: dict[str, set[str]] = {}
     model_logical: dict[str, set[str]] = {}
-
-    def add(bucket: dict[str, int], event: dict[str, Any]) -> None:
-        bucket["physical_requests"] += 1
-        bucket["response_requests" if event.get("status") == "response" else "error_requests"] += 1
-        for key in (
-            "input_tokens",
-            "output_tokens",
-            "total_tokens",
-            "cached_input_tokens",
-            "reasoning_tokens",
-            "web_search_calls",
-        ):
-            bucket[key] += _int(event.get(key))
+    task_logical: dict[str, set[str]] = {}
 
     for event in events:
         logical_id = str(event.get("logical_request_id") or "")
-        if logical_id:
-            logical_ids.add(logical_id)
-        add(overall, event)
         stage = str(event.get("stage") or "semantic")
         model = str(event.get("model") or "unknown")
+        task = str(event.get("task") or "unknown")
+        _add_event(overall, event)
         by_stage.setdefault(stage, _summary_bucket())
         by_model.setdefault(model, _summary_bucket())
-        add(by_stage[stage], event)
-        add(by_model[model], event)
+        by_task.setdefault(task, _summary_bucket())
+        _add_event(by_stage[stage], event)
+        _add_event(by_model[model], event)
+        _add_event(by_task[task], event)
         if logical_id:
+            overall_logical.add(logical_id)
             stage_logical.setdefault(stage, set()).add(logical_id)
             model_logical.setdefault(model, set()).add(logical_id)
+            task_logical.setdefault(task, set()).add(logical_id)
 
-    overall["logical_requests"] = len(logical_ids)
-    overall["retry_requests"] = max(0, overall["physical_requests"] - overall["logical_requests"])
+    _finalize_bucket(overall, overall_logical)
     for name, bucket in by_stage.items():
-        bucket["logical_requests"] = len(stage_logical.get(name, set()))
-        bucket["retry_requests"] = max(0, bucket["physical_requests"] - bucket["logical_requests"])
+        _finalize_bucket(bucket, stage_logical.get(name, set()))
     for name, bucket in by_model.items():
-        bucket["logical_requests"] = len(model_logical.get(name, set()))
-        bucket["retry_requests"] = max(0, bucket["physical_requests"] - bucket["logical_requests"])
+        _finalize_bucket(bucket, model_logical.get(name, set()))
+    for name, bucket in by_task.items():
+        _finalize_bucket(bucket, task_logical.get(name, set()))
 
     return {
         "schema_version": _SCHEMA_VERSION,
         "journal": str(target.resolve()) if target is not None else "",
         **overall,
+        "provider_usage_complete": overall["usage_missing_requests"] == 0,
         "by_stage": by_stage,
         "by_model": by_model,
+        "by_task": by_task,
     }
+
+
+def load_run_usage_summary(run_dir: str | Path | None) -> dict[str, Any]:
+    """Load the freshest run usage summary for monitoring/diagnostics."""
+
+    if not str(run_dir or "").strip():
+        return {}
+    root = Path(run_dir).expanduser()
+    journal = root / "ai-usage.jsonl"
+    if journal.is_file():
+        return summarize_usage_journal(journal)
+    summary = root / "ai-usage-summary.json"
+    try:
+        payload = json.loads(summary.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _write_summary(path: Path) -> None:
@@ -266,8 +327,7 @@ def record_current_request(
     context = _CURRENT_CONTEXT.get()
     if context is None:
         context = UsageRequestContext(task="", provider="semantic-provider", model=model)
-    attempt = context.next_attempt()
-    usage = response_usage(response)
+    usage_obj = _get(response, "usage", None)
     body = {
         "schema_version": _SCHEMA_VERSION,
         "kind": "ai_http_request",
@@ -279,22 +339,27 @@ def record_current_request(
         "stage": context.stage,
         "task": context.task,
         "logical_request_id": context.logical_request_id,
-        "attempt": attempt,
+        "attempt": context.next_attempt(),
         "status": "response" if status == "response" else "error",
         "request_id": str(_get(response, "id", "") or ""),
-        **usage,
+        "usage_reported": usage_obj is not None,
+        **normalize_usage(usage_obj),
         "web_search_calls": response_web_search_calls(response),
         "elapsed_seconds": round(max(0.0, time.monotonic() - started), 3),
         "error_type": type(error).__name__ if error is not None else "",
     }
+    line = json.dumps(body, ensure_ascii=False, separators=(",", ":"), default=str)
+    try:
+        print("AI_USAGE_REQUEST " + line, flush=True)
+    except Exception:
+        pass
     try:
         with _WRITE_LOCK:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(body, ensure_ascii=False, separators=(",", ":"), default=str) + "\n")
+                handle.write(line + "\n")
             _write_summary(path)
     except Exception:
-        # Cost telemetry is observational only; logging failure cannot affect AI.
         return
 
 
@@ -361,11 +426,7 @@ class _CreateProxy:
             response = self._delegate.create(*args, **kwargs)
         except BaseException as exc:
             record_current_request(
-                api_kind=self._api_kind,
-                model=model,
-                status="error",
-                started=started,
-                error=exc,
+                api_kind=self._api_kind, model=model, status="error", started=started, error=exc
             )
             raise
         if _looks_streaming(response):
@@ -431,6 +492,7 @@ __all__ = [
     "current_usage_journal",
     "ensure_usage_journal",
     "instrument_openai_client",
+    "load_run_usage_summary",
     "normalize_usage",
     "record_current_request",
     "summarize_usage_journal",
