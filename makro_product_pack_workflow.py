@@ -16,9 +16,11 @@ from playwright.sync_api import sync_playwright
 
 from app.browser_session import EdgeHarness, is_cdp_ready
 from app.makro.domain import MakroDomainAdapter
+from app.makro.listing_creation import infer_listing_bootstrap
 from app.product_input import acquire_product_input, product_input_manifest_payload
 from app.providers.registry import ProviderConfigurationError, build_semantic_provider
 from app.source_capture import SourceAccessBlocked
+from app.workflow_cli import build_one_link_parser, provider_config
 from makro_gui_workflow import (
     _advance_listing_to_step3,
     _create_fresh_owned_page,
@@ -27,14 +29,11 @@ from makro_gui_workflow import (
     _write_manifest,
 )
 from makro_one_link import (
-    _provider_config,
     _resolver_command,
     _run,
     _scan_and_write_live_schema,
     _single_run_dir,
-    build_parser as build_one_link_parser,
 )
-from app.makro.listing_creation import infer_listing_bootstrap
 
 
 def build_parser():
@@ -164,7 +163,7 @@ def main() -> int:
         )
 
     try:
-        provider = build_semantic_provider(_provider_config(args))
+        provider = build_semantic_provider(provider_config(args))
     except ProviderConfigurationError as exc:
         raise SystemExit(str(exc)) from exc
 

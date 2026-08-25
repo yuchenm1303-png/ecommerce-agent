@@ -44,3 +44,14 @@ def test_batch_no_longer_borrows_parser_or_provider_config_from_one_link_cli() -
     assert "from app.workflow_cli import build_staged_workflow_parser, provider_config" in source
     assert "from makro_one_link import _provider_config" not in source
     assert "build_semantic_provider(provider_config(args))" in source
+
+
+def test_product_pack_uses_shared_parser_and_provider_config_owner() -> None:
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "makro_product_pack_workflow.py").read_text(encoding="utf-8")
+    assert "from app.workflow_cli import build_one_link_parser, provider_config" in source
+    assert "_provider_config" not in source
+    assert "build_parser as build_one_link_parser" not in source
+    assert "build_semantic_provider(provider_config(args))" in source
