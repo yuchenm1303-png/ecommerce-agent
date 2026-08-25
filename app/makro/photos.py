@@ -75,18 +75,51 @@ def _meaningful_image_source(source: Any) -> bool:
     return not any(token in folded for token in _PLACEHOLDER_SOURCE_TOKENS)
 
 
-def _slot_is_empty(slot: dict[str, Any]) -> bool:
-    """Return whether Makro exposes this thumbnail as an uploadable empty slot.
+def _meaningful_slot_sources(slot: dict[str, Any] | None) -> set[str]:
+    return {
+        str(value).strip()
+        for value in (slot or {}).get("image_sources") or []
+        if _meaningful_image_source(value)
+    }
 
-    The orange plus is the portal's actual interaction contract for an empty
-    Product Photos role. Empty role cards may still contain decorative ``img``
-    elements, so image ``src`` values must never override a visible plus. A
-    visible completion check is stronger and marks the role as filled.
+
+def _slot_is_empty(slot: dict[str, Any]) -> bool:
+    """Return Makro's DOM-level uploadable state for one thumbnail role.
+
+    A visible plus remains the portal's own empty-role contract because blank
+    cards may contain decorative image elements. Transactional upload acceptance
+    is intentionally decided elsewhere by comparing this exact slot before and
+    after one submitted file.
     """
 
     if bool(slot.get("has_check")):
         return False
     return bool(slot.get("has_plus"))
+
+
+def _slot_from_state(state: dict[str, Any], slot_id: str) -> dict[str, Any]:
+    return next(
+        (
+            dict(item)
+            for item in state.get("slots") or []
+            if str(item.get("id") or "") == slot_id
+        ),
+        {},
+    )
+
+
+def _slot_diagnostic_payload(state: dict[str, Any], slot_id: str) -> dict[str, Any]:
+    slot = _slot_from_state(state, slot_id)
+    return {
+        "slot_id": slot_id,
+        "has_plus": bool(slot.get("has_plus")),
+        "has_check": bool(slot.get("has_check")),
+        "image_sources": [str(value) for value in slot.get("image_sources") or []],
+        "meaningful_image_sources": sorted(_meaningful_slot_sources(slot)),
+        "completion_count": state.get("completion_count"),
+        "capacity": state.get("capacity"),
+        "uploading": bool(state.get("uploading")),
+    }
 
 
 def _photo_surface(page: Page, section_path: str):
@@ -153,9 +186,7 @@ def _slot_snapshot(page: Page, section_path: str) -> list[dict[str, Any]]:
     for raw in raw_slots or []:
         slot = dict(raw)
         slot["is_empty"] = _slot_is_empty(slot)
-        slot["has_meaningful_image"] = any(
-            _meaningful_image_source(value) for value in slot.get("image_sources") or []
-        )
+        slot["has_meaningful_image"] = bool(_meaningful_slot_sources(slot))
         slots.append(slot)
     return slots
 
@@ -257,12 +288,20 @@ def _raw_file_input(page: Page, section_path: str):
     return usable[0] if usable else None
 
 
-def _next_empty_photo_slot(page: Page, section_path: str) -> tuple[str, Any] | None:
-    """Return the first logical empty thumbnail in fixed Makro role order."""
+def _next_empty_photo_slot(
+    page: Page,
+    section_path: str,
+    *,
+    consumed_slot_ids: set[str] | None = None,
+) -> tuple[str, Any] | None:
+    """Return the first DOM-empty role not already consumed by this transaction."""
 
+    consumed = consumed_slot_ids or set()
     surface = _photo_surface(page, section_path)
     snapshots = {str(slot.get("id")): slot for slot in _slot_snapshot(page, section_path)}
     for slot_id in PHOTO_SLOT_IDS:
+        if slot_id in consumed:
+            continue
         snapshot = snapshots.get(slot_id)
         if not snapshot or not bool(snapshot.get("is_empty")):
             continue
@@ -319,6 +358,8 @@ def _acceptance_signal(
     before_add_tiles: int | None = None,
     target_slot_id: str | None = None,
 ) -> str:
+    """Backward-compatible page-level acceptance helper used by diagnostics/tests."""
+
     empty_slots = {str(value) for value in state.get("empty_slot_ids") or []}
     if target_slot_id and target_slot_id not in empty_slots:
         return "target_slot_consumed"
@@ -353,8 +394,6 @@ def _stage_accepted(
     before_add_tiles: int | None = None,
     target_slot_id: str | None = None,
 ) -> bool:
-    """Return True when Makro exposes any reliable acceptance signal."""
-
     return bool(
         _acceptance_signal(
             state,
@@ -367,16 +406,52 @@ def _stage_accepted(
     )
 
 
+def _target_slot_acceptance_signal(
+    before_state: dict[str, Any],
+    after_state: dict[str, Any],
+    slot_id: str,
+) -> tuple[str, set[str]]:
+    """Return evidence created by this exact slot transaction.
+
+    Pre-existing decorative images are harmless because only sources that appear
+    after the file submission and were absent from this same slot beforehand are
+    accepted as preview evidence.
+    """
+
+    before_slot = _slot_from_state(before_state, slot_id)
+    after_slot = _slot_from_state(after_state, slot_id)
+    before_sources = _meaningful_slot_sources(before_slot)
+    after_sources = _meaningful_slot_sources(after_slot)
+    new_sources = after_sources.difference(before_sources)
+
+    if after_slot and bool(after_slot.get("has_check")) and not bool(before_slot.get("has_check")):
+        return "target_slot_check", new_sources
+    if (
+        before_slot
+        and bool(before_slot.get("has_plus"))
+        and after_slot
+        and not bool(after_slot.get("has_plus"))
+    ):
+        return "target_slot_consumed", new_sources
+    if new_sources:
+        return "target_slot_new_preview", new_sources
+
+    before_completion_raw = before_state.get("completion_count")
+    after_completion_raw = after_state.get("completion_count")
+    if before_completion_raw is not None and after_completion_raw is not None:
+        if int(after_completion_raw) > int(before_completion_raw):
+            return "completion_counter_growth", new_sources
+
+    return "", new_sources
+
+
 def _state_diagnostic(state: dict[str, Any], slot_id: str) -> str:
-    slot = next(
-        (item for item in state.get("slots") or [] if str(item.get("id")) == slot_id),
-        {},
-    )
+    slot = _slot_from_state(state, slot_id)
     return (
         f"completion={state.get('completion_count')}/{state.get('capacity')}, "
         f"empty_slots={state.get('empty_slot_ids')}, uploading={bool(state.get('uploading'))}, "
         f"slot_plus={slot.get('has_plus')}, slot_check={slot.get('has_check')}, "
-        f"slot_images={len(slot.get('image_sources') or [])}"
+        f"slot_sources={sorted(_meaningful_slot_sources(slot))}"
     )
 
 
@@ -390,47 +465,85 @@ def _wait_for_target_slot_completion(
     uploading_timeout_ms: int = 60_000,
     accepted_stability_ms: int = 750,
 ) -> dict[str, Any]:
-    """Wait until the exact submitted Makro role stops being uploadable.
+    """Confirm one submitted file by evidence from the exact target role.
 
-    The target role's visible plus is both the empty-state and next-action
-    contract. Other page-wide signals (preview src, counters, Uploading labels)
-    are diagnostics only here: advancing to the next image before this exact role
-    is consumed can submit twice into the same card.
+    Strong Makro signals (new check, consumed plus, completion growth) complete
+    immediately. A new target-slot preview is also valid, but only when it is new
+    relative to this same slot's pre-submit snapshot, remains stable, and Makro is
+    no longer reporting Uploading. This removes both historical failure modes:
+    decorative images cannot cause false success, and a stale plus cannot cause a
+    false timeout after a real preview has arrived.
     """
 
-    _ = before_state, accepted_stability_ms
+    if not _slot_from_state(before_state, slot_id):
+        raise RuntimeError(f"Product Photos 提交前状态缺少目标图片槽 #{slot_id}。")
+
     started = time.monotonic()
     soft_deadline = started + soft_timeout_ms / 1000.0
     uploading_deadline: float | None = None
     uploading_seen = False
+    candidate_key: tuple[str, tuple[str, ...]] | None = None
+    candidate_since: float | None = None
     latest: dict[str, Any] = {}
+    latest_new_sources: set[str] = set()
 
     while True:
         section = find_section(page, PRODUCT_PHOTOS_SECTION)
         live_path = str((section or {}).get("path") or section_path)
         latest = _photo_state(page, live_path)
-        empty_slots = {str(value) for value in latest.get("empty_slot_ids") or []}
-        if slot_id not in empty_slots:
-            latest["uploading_seen"] = uploading_seen or bool(latest.get("uploading"))
-            latest["acceptance_signal"] = "target_slot_consumed"
-            return latest
-
         now = time.monotonic()
+
         if bool(latest.get("uploading")):
             uploading_seen = True
             if uploading_deadline is None:
                 uploading_deadline = now + uploading_timeout_ms / 1000.0
 
+        signal, new_sources = _target_slot_acceptance_signal(before_state, latest, slot_id)
+        latest_new_sources = set(new_sources)
+        strong_signal = signal in {
+            "target_slot_check",
+            "target_slot_consumed",
+            "completion_counter_growth",
+        }
+        if strong_signal:
+            latest["uploading_seen"] = uploading_seen or bool(latest.get("uploading"))
+            latest["acceptance_signal"] = signal
+            latest["new_target_sources"] = sorted(new_sources)
+            latest["target_slot_before"] = _slot_diagnostic_payload(before_state, slot_id)
+            latest["target_slot_after"] = _slot_diagnostic_payload(latest, slot_id)
+            return latest
+
+        if signal == "target_slot_new_preview":
+            key = (signal, tuple(sorted(new_sources)))
+            if key != candidate_key:
+                candidate_key = key
+                candidate_since = now
+            stable_ms = 0.0 if candidate_since is None else (now - candidate_since) * 1000.0
+            if not bool(latest.get("uploading")) and stable_ms >= accepted_stability_ms:
+                latest["uploading_seen"] = uploading_seen
+                latest["acceptance_signal"] = signal
+                latest["new_target_sources"] = sorted(new_sources)
+                latest["target_slot_before"] = _slot_diagnostic_payload(before_state, slot_id)
+                latest["target_slot_after"] = _slot_diagnostic_payload(latest, slot_id)
+                return latest
+        else:
+            candidate_key = None
+            candidate_since = None
+
         if uploading_deadline is not None:
             if now >= uploading_deadline:
+                before_diag = _slot_diagnostic_payload(before_state, slot_id)
+                after_diag = _slot_diagnostic_payload(latest, slot_id)
                 raise RuntimeError(
-                    f"#{slot_id} 已进入 Uploading，但 {uploading_timeout_ms}ms 内目标图片槽仍显示可上传 +；"
-                    + _state_diagnostic(latest, slot_id)
+                    f"#{slot_id} 已进入 Uploading，但 {uploading_timeout_ms}ms 内未形成稳定的目标槽接受证据；"
+                    f"before={before_diag}; after={after_diag}; new_sources={sorted(latest_new_sources)}"
                 )
         elif now >= soft_deadline:
+            before_diag = _slot_diagnostic_payload(before_state, slot_id)
+            after_diag = _slot_diagnostic_payload(latest, slot_id)
             raise RuntimeError(
-                f"#{slot_id} 文件已提交，但 {soft_timeout_ms}ms 内目标图片槽仍显示可上传 +；"
-                + _state_diagnostic(latest, slot_id)
+                f"#{slot_id} 文件已提交，但 {soft_timeout_ms}ms 内未形成稳定的目标槽接受证据；"
+                f"before={before_diag}; after={after_diag}; new_sources={sorted(latest_new_sources)}"
             )
         page.wait_for_timeout(100)
 
@@ -604,8 +717,17 @@ class _DynamicPhotoFileTarget:
         return 1 if self._selected else 0
 
 
-def _select_file_input(page: Page, section_path: str):
-    next_slot = _next_empty_photo_slot(page, section_path)
+def _select_file_input(
+    page: Page,
+    section_path: str,
+    *,
+    consumed_slot_ids: set[str] | None = None,
+):
+    next_slot = _next_empty_photo_slot(
+        page,
+        section_path,
+        consumed_slot_ids=consumed_slot_ids,
+    )
     if next_slot is None:
         return None
     slot_id, _slot = next_slot
@@ -623,6 +745,8 @@ def _wait_for_staged_signal(
     target_slot_id: str | None = None,
     timeout_ms: int,
 ) -> dict[str, Any]:
+    """Legacy page-level poll retained for callers/tests outside the upload transaction."""
+
     deadline = time.monotonic() + timeout_ms / 1000.0
     latest = _photo_state(page, section_path)
     while time.monotonic() < deadline:
@@ -648,8 +772,9 @@ def upload_product_photos(
     *,
     timeout_ms: int = 8_000,
 ) -> PhotoUploadResult:
-    """Stage images into Makro's five fixed thumbnail slots; never Save."""
+    """Stage images transactionally into Makro's five fixed roles; never Save."""
 
+    _ = timeout_ms
     resolved_paths: list[Path] = []
     seen: set[str] = set()
     for raw in image_paths:
@@ -693,87 +818,66 @@ def upload_product_photos(
         multiple=False,
     )
 
-    current_images = int(state.get("visible_image_count") or 0)
-    current_sources = {
-        str(value).strip()
-        for value in state.get("visible_image_sources") or []
-        if str(value).strip()
-    }
-    current_completion = int(state["completion_count"]) if state.get("completion_count") is not None else None
-    current_add_tiles = int(state.get("add_image_tile_count") or 0)
-
+    consumed_slots: set[str] = set()
     for path in resolved_paths:
         section = find_section(page, PRODUCT_PHOTOS_SECTION) or section
         section_path = str(section.get("path") or section_path)
-        target = _select_file_input(page, section_path)
+        target = _select_file_input(
+            page,
+            section_path,
+            consumed_slot_ids=consumed_slots,
+        )
         if target is None:
             result.items.append(
-                {"path": str(path), "status": "slot_missing", "detail": "没有下一个逻辑空的 #thumbnail_N 图片框。"}
+                {
+                    "path": str(path),
+                    "status": "slot_missing",
+                    "detail": "没有下一个未消费的逻辑空 #thumbnail_N 图片框。",
+                    "consumed_slots": sorted(consumed_slots),
+                }
             )
-            continue
+            break
 
         result.attempted += 1
-        before_images = current_images
-        before_sources = set(current_sources)
-        before_completion = current_completion
-        before_add_tiles = current_add_tiles
         try:
             target.set_input_files(str(path))
-            settled = _wait_for_staged_signal(
-                page,
-                section_path,
-                before_images=before_images,
-                before_sources=before_sources,
-                before_completion=before_completion,
-                before_add_tiles=before_add_tiles,
-                target_slot_id=target.slot_id,
-                timeout_ms=timeout_ms,
+            settled = dict(target.last_acceptance)
+            consumed_slots.add(target.slot_id)
+            result.staged += 1
+            result.items.append(
+                {
+                    "path": str(path),
+                    "status": "staged",
+                    "slot_id": target.slot_id,
+                    "acceptance_signal": settled.get("acceptance_signal"),
+                    "new_target_sources": settled.get("new_target_sources") or [],
+                    "target_slot_before": settled.get("target_slot_before") or {},
+                    "target_slot_after": settled.get("target_slot_after") or {},
+                    "uploading_seen": bool(settled.get("uploading_seen")),
+                    "consumed_slots": sorted(consumed_slots),
+                    "upload_meta": target.upload_meta,
+                }
             )
-            current_images = int(settled.get("visible_image_count") or 0)
-            current_sources = {
-                str(value).strip()
-                for value in settled.get("visible_image_sources") or []
-                if str(value).strip()
-            }
-            current_completion = int(settled["completion_count"]) if settled.get("completion_count") is not None else None
-            current_add_tiles = int(settled.get("add_image_tile_count") or 0)
-            accepted = _stage_accepted(
-                settled,
-                before_images=before_images,
-                before_sources=before_sources,
-                before_completion=before_completion,
-                before_add_tiles=before_add_tiles,
-                target_slot_id=target.slot_id,
-            )
-            if accepted:
-                result.staged += 1
-                result.items.append(
-                    {
-                        "path": str(path),
-                        "status": "staged",
-                        "slot_id": target.slot_id,
-                        "remaining_empty_slots": current_add_tiles,
-                        "acceptance_signal": target.last_acceptance.get("acceptance_signal"),
-                        "upload_meta": target.upload_meta,
-                    }
-                )
-            else:
-                result.items.append(
-                    {
-                        "path": str(path),
-                        "status": "staging_unconfirmed",
-                        "slot_id": target.slot_id,
-                        "detail": "Makro 没有确认目标 thumbnail 图片框已接受新图片。",
-                    }
-                )
         except Exception as exc:
+            live_state = _photo_state(page, section_path)
             print(
                 f"GUI_EXEC_PHOTO\tERROR\t{target.slot_id}\t{path.name}\t{exc}",
                 flush=True,
             )
             result.items.append(
-                {"path": str(path), "status": "upload_error", "slot_id": target.slot_id, "detail": str(exc)}
+                {
+                    "path": str(path),
+                    "status": "upload_error",
+                    "slot_id": target.slot_id,
+                    "detail": str(exc),
+                    "target_slot_after_error": _slot_diagnostic_payload(live_state, target.slot_id),
+                    "consumed_slots": sorted(consumed_slots),
+                }
             )
+            # After a submitted file cannot be confirmed, the target role may be
+            # consumed on Makro even if the DOM has not settled. Continuing would
+            # risk assigning the next image to the wrong role, so fail closed.
+            break
 
     section = find_section(page, PRODUCT_PHOTOS_SECTION) or section
     section_path = str(section.get("path") or section_path)
@@ -781,13 +885,16 @@ def upload_product_photos(
     result.final_count = final_state.get("completion_count")
     if result.staged == len(resolved_paths):
         result.status = "staged"
-        result.detail = f"{result.staged}/{len(resolved_paths)} 个固定 thumbnail 图片框已依次接受，等待 Save。"
+        result.detail = f"{result.staged}/{len(resolved_paths)} 个固定 thumbnail 图片槽已事务确认，等待 Save。"
     elif result.staged > 0:
         result.status = "partial_staged"
-        result.detail = f"仅 {result.staged}/{len(resolved_paths)} 个固定 thumbnail 图片框确认接受。"
+        result.detail = (
+            f"仅 {result.staged}/{len(resolved_paths)} 个固定 thumbnail 图片槽事务确认；"
+            "遇到不确定槽状态后已停止，未继续冒险上传。"
+        )
     else:
         result.status = "staging_unconfirmed"
-        result.detail = "没有任何固定 thumbnail 图片框确认接受。"
+        result.detail = "没有任何固定 thumbnail 图片槽形成可证明的本次上传接受证据。"
     return result
 
 
