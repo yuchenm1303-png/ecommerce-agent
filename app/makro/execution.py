@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Any
 
 from app.fill_plan import LiveFillPlan
 from app.makro.domain import MakroDomainAdapter
-from app.makro.photos import _photo_state, _select_file_input, _stage_accepted
 from makro_preview_listing import (
     _base_result_payload,
     _item_identity,
@@ -323,65 +321,15 @@ def fill_one_section(
     return report
 
 
-def _fresh_photo_state(adapter: MakroDomainAdapter) -> tuple[str, dict[str, Any]]:
+def _fresh_photo_state(adapter: MakroDomainAdapter) -> dict[str, Any]:
+    """Open Product Photos if needed and read state through the domain boundary."""
+
     section = adapter.find_section(PRODUCT_PHOTOS)
     if section is None:
         raise RuntimeError("当前页面找不到 Product Photos section。")
     if section.get("has_edit"):
         adapter.open_section_for_edit(section)
-        section = adapter.find_section(PRODUCT_PHOTOS) or section
-    path = str(section.get("path") or "")
-    if not path:
-        raise RuntimeError("Product Photos section 缺少稳定 DOM path。")
-    return path, _photo_state(adapter.page, path)
-
-
-def _wait_for_file_input(
-    adapter: MakroDomainAdapter,
-    *,
-    timeout_ms: int,
-) -> tuple[str, Any, dict[str, Any]] | None:
-    deadline = time.monotonic() + timeout_ms / 1000.0
-    while time.monotonic() < deadline:
-        try:
-            section_path, state = _fresh_photo_state(adapter)
-            target = _select_file_input(adapter.page, section_path)
-            if target is not None:
-                return section_path, target, state
-        except Exception:
-            pass
-        adapter.page.wait_for_timeout(200)
-    return None
-
-
-def _wait_for_photo_acceptance(
-    adapter: MakroDomainAdapter,
-    *,
-    before_images: int,
-    before_sources: set[str],
-    before_completion: int | None,
-    before_add_tiles: int | None,
-    timeout_ms: int,
-) -> dict[str, Any]:
-    """Poll until Makro visibly consumes the target image slot."""
-
-    deadline = time.monotonic() + timeout_ms / 1000.0
-    latest: dict[str, Any] = {}
-    while time.monotonic() < deadline:
-        try:
-            _section_path, latest = _fresh_photo_state(adapter)
-            if _stage_accepted(
-                latest,
-                before_images=before_images,
-                before_sources=before_sources,
-                before_completion=before_completion,
-                before_add_tiles=before_add_tiles,
-            ):
-                return latest
-        except Exception:
-            pass
-        adapter.page.wait_for_timeout(200)
-    return latest
+    return adapter.inspect_product_photos()
 
 
 def _cancel_open_photo_transaction(adapter: MakroDomainAdapter) -> None:
@@ -477,11 +425,10 @@ def run_photos(
 ) -> dict[str, Any]:
     """Persist the safe subset of explicit listing images into Product Photos.
 
-    The current live gallery owns the capacity decision. If fewer slots remain
-    than explicitly requested, only the available left-to-right subset is
-    uploaded and every omitted path is reported. Capacity saturation is not an
-    execution failure when the listing already has at least one persisted photo;
-    upload, Save, or persistence verification failures remain fatal.
+    ``app.makro.photos`` owns the complete per-image transaction, including
+    logical-slot ownership and acceptance.  This orchestrator owns only gallery
+    capacity, all-or-nothing Save policy and post-Save persistence verification.
+    There is deliberately no second page-level acceptance test here.
     """
 
     resolved: list[Path] = []
@@ -516,7 +463,7 @@ def run_photos(
     initial_section = adapter.find_section(PRODUCT_PHOTOS)
     initial_was_collapsed = bool(initial_section and initial_section.get("has_edit"))
     try:
-        _initial_path, initial_state = _fresh_photo_state(adapter)
+        initial_state = _fresh_photo_state(adapter)
     except Exception as exc:
         return {
             "status": "not_found",
@@ -704,70 +651,22 @@ def run_photos(
         "saved": False,
     }
 
-    for offset, image in enumerate(pending, start=1):
-        current = _wait_for_file_input(adapter, timeout_ms=upload_timeout_ms)
-        if current is None:
-            report["items"].append(
-                {
-                    "path": str(image),
-                    "status": "slot_missing",
-                    "slot_position": initial_count + offset,
-                    "detail": "找不到下一个带橙色 + 的未完成图片槽。",
-                }
-            )
-            report["status"] = "incomplete_upload"
-            break
-
-        _section_path, target, before = current
-        before_images = int(before.get("visible_image_count") or 0)
-        before_sources = {
-            str(value).strip()
-            for value in before.get("visible_image_sources") or []
-            if str(value).strip()
-        }
-        raw_completion = before.get("completion_count")
-        before_completion = int(raw_completion) if raw_completion is not None else None
-        before_add_tiles = int(before.get("add_image_tile_count") or 0)
-        report["attempted"] += 1
-        item_report: dict[str, Any] = {
-            "path": str(image),
-            "index": initial_count + offset,
-            "slot_position": initial_count + offset,
-            "before_completion_count": before_completion,
-            "before_empty_slots": before_add_tiles,
-        }
-        report["items"].append(item_report)
-
-        try:
-            target.set_input_files(str(image))
-            settled = _wait_for_photo_acceptance(
-                adapter,
-                before_images=before_images,
-                before_sources=before_sources,
-                before_completion=before_completion,
-                before_add_tiles=before_add_tiles,
-                timeout_ms=upload_timeout_ms,
-            )
-            accepted = bool(settled) and _stage_accepted(
-                settled,
-                before_images=before_images,
-                before_sources=before_sources,
-                before_completion=before_completion,
-                before_add_tiles=before_add_tiles,
-            )
-            if not accepted:
-                item_report["status"] = "staging_unconfirmed"
-                item_report["detail"] = "Makro 没有确认这个图片槽已被填入。"
-                report["status"] = "incomplete_upload"
-                break
-            report["staged"] += 1
-            item_report["status"] = "staged"
-            item_report["after_empty_slots"] = int(settled.get("add_image_tile_count") or 0)
-        except Exception as exc:
-            item_report["status"] = "upload_error"
-            item_report["detail"] = str(exc)
-            report["status"] = "incomplete_upload"
-            break
+    try:
+        staged_result = adapter.upload_product_photos(
+            [str(image) for image in pending],
+            timeout_ms=upload_timeout_ms,
+        )
+        staged_payload = staged_result.as_dict()
+        report["attempted"] = int(staged_payload.get("attempted") or 0)
+        report["staged"] = int(staged_payload.get("staged") or 0)
+        report["items"] = list(staged_payload.get("items") or [])
+        report["staging_status"] = str(staged_payload.get("status") or "")
+        report["staging_detail"] = str(staged_payload.get("detail") or "")
+    except Exception as exc:
+        report["status"] = "incomplete_upload"
+        report["staging_status"] = "transaction_error"
+        report["staging_error"] = str(exc)
+        report["detail"] = "Product Photos 精确槽位上传事务异常，中止本次图片 Save。"
 
     staged_shot = run_dir / "Product-Photos-staged.png"
     _capture_diagnostic_screenshot(
@@ -779,10 +678,11 @@ def run_photos(
 
     expected_new = len(pending)
     if int(report["staged"]) != expected_new:
-        report["detail"] = (
-            f"本次容量计划允许上传 {expected_new} 张，只确认 staged={report['staged']}；"
-            "真实上传事务未完成，因此没有 Save。"
-        )
+        if "detail" not in report:
+            report["detail"] = (
+                f"本次容量计划允许上传 {expected_new} 张，只确认 staged={report['staged']}；"
+                "精确槽位事务未全部完成，因此没有 Save。"
+            )
         try:
             _cancel_open_photo_transaction(adapter)
             report["cancelled_unsaved_partial"] = True
@@ -792,7 +692,7 @@ def run_photos(
 
     if not allow_save:
         report["status"] = "staged"
-        report["detail"] = f"{expected_new}/{expected_new} 个本次可用图片槽已填写，等待一次 Save。"
+        report["detail"] = f"{expected_new}/{expected_new} 个本次可用图片槽已事务确认，等待一次 Save。"
         return report
 
     report["save_attempted"] = True

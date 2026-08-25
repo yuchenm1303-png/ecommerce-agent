@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Callable
 from typing import Any
 
 from playwright.sync_api import Page
@@ -29,6 +30,7 @@ from .fields import (
     scroll_container,
     scroll_window,
 )
+from .ui_transition import trigger_transition
 
 _FIND_SECTIONS_SCRIPT = (
     "() => {\n"
@@ -244,19 +246,53 @@ def find_section(page: Page, wanted: str) -> dict[str, Any] | None:
     return None
 
 
+def _wait_for_section_state(
+    page: Page,
+    section_title: str,
+    predicate: Callable[[dict[str, Any]], bool],
+    *,
+    timeout_s: float = 5.0,
+    poll_ms: int = 150,
+) -> dict[str, Any] | None:
+    """Reacquire a React-owned card until its business postcondition is true."""
+
+    deadline = time.monotonic() + max(0.1, float(timeout_s))
+    latest: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        latest = find_section(page, section_title)
+        if latest is not None and predicate(latest):
+            return latest
+        page.wait_for_timeout(max(50, int(poll_ms)))
+    latest = find_section(page, section_title)
+    if latest is not None and predicate(latest):
+        return latest
+    return None
+
+
 def open_section_for_edit(page: Page, section: dict[str, Any]) -> None:
-    """Click only the safe EDIT button of a collapsed listing section."""
+    """Trigger EDIT and prove the exact card entered its expanded state."""
 
     if not section.get("has_edit"):
         return
+    title = str(section.get("title") or "").strip()
     path = str(section.get("path") or "")
+    if not title:
+        raise RuntimeError("section 缺少 title，无法验证 EDIT 后置状态。")
     if not path:
         raise RuntimeError("section 缺少 DOM path，无法安全打开。")
     card = page.locator(path).first
     button = card.get_by_text("EDIT", exact=True).first
     button.scroll_into_view_if_needed()
-    button.click()
-    page.wait_for_timeout(500)
+    trigger = trigger_transition(lambda: button.click())
+    expanded = _wait_for_section_state(
+        page,
+        title,
+        lambda current: not bool(current.get("has_edit")),
+        timeout_s=5.0,
+    )
+    if expanded is None:
+        suffix = f"；click timeout={trigger.timeout_detail}" if trigger.timed_out else ""
+        raise RuntimeError(f"section {title!r} EDIT 后未进入展开态{suffix}")
 
 
 def visible_section_errors(page: Page, section_path: str) -> list[str]:
@@ -289,7 +325,7 @@ def collapsed_error_badges(page: Page, section_title: str) -> list[str]:
 
 
 def cancel_section(page: Page, section_title: str, *, wait_ms: int = 450) -> None:
-    """Discard the target section's current edits and prove it collapsed."""
+    """Trigger Cancel and prove the target card returned to collapsed state."""
 
     section = find_section(page, section_title)
     if section is None:
@@ -306,25 +342,28 @@ def cancel_section(page: Page, section_title: str, *, wait_ms: int = 450) -> Non
             f"section {section_title!r} 没有唯一可见 Cancel；拒绝猜测其它按钮。"
         )
     cancel.first.scroll_into_view_if_needed()
-    cancel.first.click()
-    page.wait_for_timeout(wait_ms)
-    collapsed = find_section(page, section_title)
-    if collapsed is None or not collapsed.get("has_edit"):
-        raise RuntimeError(f"section {section_title!r} Cancel 后未恢复折叠态。")
+    trigger = trigger_transition(lambda: cancel.first.click())
+    collapsed = _wait_for_section_state(
+        page,
+        section_title,
+        lambda current: bool(current.get("has_edit")),
+        timeout_s=max(5.0, max(0, int(wait_ms)) / 1000.0),
+    )
+    if collapsed is None:
+        suffix = f"；click timeout={trigger.timeout_detail}" if trigger.timed_out else ""
+        raise RuntimeError(f"section {section_title!r} Cancel 后未恢复折叠态{suffix}")
 
 
 def save_section(page: Page, section_title: str, *, timeout_s: float = 45.0) -> None:
-    """Click one Step 3 card's Save and prove Makro accepted persistence.
+    """Trigger one Step 3 Save and prove Makro accepted persistence.
 
-    Makro persists Step 3 cards asynchronously. A card can remain expanded for
-    noticeably longer than the field-write transaction, and React can briefly
-    render a stale aggregate ``N Error`` badge while the accepted save is still
-    settling. Treat neither transient state as an immediate rejection.
+    Playwright's click completion is not the persistence truth: a browser can
+    dispatch the Save and then time out waiting for navigation/settling.  Such a
+    timeout is reconciled against the same business postcondition as a normal
+    click.  Success requires the card to collapse back to ``EDIT`` with no
+    validation badge; genuine click errors still propagate immediately.
 
-    Success requires two consecutive observations of the collapsed ``EDIT``
-    state with no validation badge. Persistent badges or an editor that never
-    collapses are reported only after the bounded hard timeout. This function
-    never clicks Send to QC.
+    This function never clicks Send to QC.
     """
 
     section = find_section(page, section_title)
@@ -341,7 +380,7 @@ def save_section(page: Page, section_title: str, *, timeout_s: float = 45.0) -> 
     if save.count() != 1 or not save.first.is_visible():
         raise RuntimeError(f"{section_title} 没有唯一可见 Save 按钮。")
     save.first.scroll_into_view_if_needed()
-    save.first.click()
+    trigger = trigger_transition(lambda: save.first.click())
 
     deadline = time.monotonic() + timeout_s
     clean_collapsed_samples = 0
@@ -355,10 +394,6 @@ def save_section(page: Page, section_title: str, *, timeout_s: float = 45.0) -> 
 
         last_badges = collapsed_error_badges(page, section_title)
         if last_badges:
-            # Do not reopen on the first transient badge. Makro/React can expose
-            # the previous validation summary for a short period after an
-            # accepted asynchronous save. Only a badge that survives the whole
-            # bounded settle window is treated as a real rejection.
             clean_collapsed_samples = 0
             continue
 
@@ -370,9 +405,6 @@ def save_section(page: Page, section_title: str, *, timeout_s: float = 45.0) -> 
     if live is not None and live.get("has_edit"):
         badges = collapsed_error_badges(page, section_title)
         if not badges:
-            # The hard deadline may land between the first and second clean
-            # sample. A final clean collapsed state is still direct evidence
-            # that Makro accepted the transaction.
             return
 
         field_errors: list[str] = []
@@ -385,20 +417,27 @@ def save_section(page: Page, section_title: str, *, timeout_s: float = 45.0) -> 
                 field_errors = visible_section_errors(page, expanded_path)
         except Exception:
             pass
-        detail = (
-            "；字段错误：" + " | ".join(field_errors)
-            if field_errors
+        detail = "；字段错误：" + " | ".join(field_errors) if field_errors else ""
+        trigger_detail = (
+            "；Save click 曾 timeout，但后置状态仍未通过验证"
+            if trigger.timed_out
             else ""
         )
         raise RuntimeError(
             f"{section_title} 保存后仍有 Makro validation error："
             + " | ".join(badges or last_badges)
             + detail
+            + trigger_detail
         )
 
     live_path = str((live or {}).get("path") or path)
     errors = visible_section_errors(page, live_path)
     detail = " | ".join(errors) if errors else "未读取到可见 validation error"
+    trigger_detail = (
+        f"；Save click timeout={trigger.timeout_detail}"
+        if trigger.timed_out
+        else ""
+    )
     raise RuntimeError(
-        f"{section_title} 点击 Save 后 {timeout_s:.0f}s 内未恢复 EDIT：{detail}"
+        f"{section_title} 点击 Save 后 {timeout_s:.0f}s 内未恢复 EDIT：{detail}{trigger_detail}"
     )

@@ -46,22 +46,43 @@ _RETRYABLE_MARKERS = (
     "status code: 504",
     "temporarily unavailable",
     "temporary failure",
+    "connection error",
     "connection reset",
     "connection aborted",
     "connection refused",
+    "server disconnected without sending a response",
+    "peer closed connection",
     "remote protocol error",
+    "remoteprotocolerror",
+    "apiconnectionerror",
 )
 
 
 def exception_text(exc: BaseException) -> str:
+    """Flatten the full exception chain including concrete exception types.
+
+    Transport libraries often expose the useful retry signal only in a nested
+    exception class (for example ``APIConnectionError`` ->
+    ``RemoteProtocolError``) while ``str(exc)`` is merely ``Connection error``.
+    Retry classification therefore uses both type names and messages and follows
+    ``__cause__`` / ``__context__`` without looping.
+    """
+
     parts: list[str] = []
     current: BaseException | None = exc
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        parts.append(str(current))
+        type_name = f"{type(current).__module__}.{type(current).__name__}"
+        parts.append(f"{type_name}: {current}")
         cause = getattr(current, "__cause__", None)
-        current = cause if isinstance(cause, BaseException) else None
+        context = getattr(current, "__context__", None)
+        if isinstance(cause, BaseException):
+            current = cause
+        elif isinstance(context, BaseException):
+            current = context
+        else:
+            current = None
     return " ".join(parts).casefold()
 
 

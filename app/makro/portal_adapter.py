@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import Page
 
 from .listing import parse_makro_listing_url
+from .ui_transition import PostconditionAction
 
 
 class ListingStage(str, Enum):
@@ -490,7 +491,14 @@ class MakroPortalAdapter:
         return output
 
     def find_action_button(self, action: str, *, related_input=None):
-        """Find one semantic action conservatively; never guess an unrelated control."""
+        """Find one semantic action and return a postcondition-owned trigger.
+
+        The caller already owns the business transition check (Step 2 appears,
+        Step 3 appears, brand confirmation appears, etc.).  The returned facade
+        therefore treats a Playwright timeout as an indeterminate trigger result
+        and lets the caller's postcondition decide success.  Non-timeout click
+        failures are never swallowed.
+        """
 
         tokens = _ACTION_TOKENS.get(action)
         if tokens is None:
@@ -513,17 +521,17 @@ class MakroPortalAdapter:
             best = max(score for score, _ in scored)
             winners = [item for score, item in scored if score == best]
             if len(winners) == 1:
-                return winners[0]
+                return PostconditionAction(winners[0])
 
         text_actions = self._exact_text_action_candidates(tokens)
         if len(text_actions) == 1:
-            return text_actions[0]
+            return PostconditionAction(text_actions[0])
         if len(text_actions) > 1:
             return None
 
         nearby = self._nearby_buttons(related_input)
         if related_input is not None and len(nearby) == 1:
-            return nearby[0]
+            return PostconditionAction(nearby[0])
 
         return None
 
