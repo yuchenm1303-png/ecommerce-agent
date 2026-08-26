@@ -14,6 +14,7 @@ from .ai_decisions import (
     MISSING,
     READY,
     AIDecisionPacket,
+    DecisionAlternative,
     FieldDecision,
     field_contract,
     field_id,
@@ -269,6 +270,76 @@ def _expand_aliases(
             _expand_aliases(value, aliases, line_index)
 
 
+def _decision_alternatives(decision: FieldDecision) -> list[DecisionAlternative]:
+    if decision.status == READY and decision.values and decision.citations:
+        return [
+            DecisionAlternative(
+                values=tuple(decision.values),
+                qualifier=decision.qualifier,
+                citations=tuple(decision.citations),
+            )
+        ]
+    if decision.status == CONFLICT:
+        return list(decision.alternatives)
+    return []
+
+
+def _merge_duplicate_decisions(existing: FieldDecision, candidate: FieldDecision) -> FieldDecision:
+    alternatives: list[DecisionAlternative] = []
+    by_value: dict[tuple[tuple[str, ...], str], int] = {}
+    for alternative in _decision_alternatives(existing) + _decision_alternatives(candidate):
+        signature = (
+            tuple(normalize_key(value) for value in alternative.values),
+            normalize_key(alternative.qualifier),
+        )
+        if not signature[0]:
+            continue
+        if signature in by_value:
+            current = alternatives[by_value[signature]]
+            citations = list(current.citations)
+            seen = {(item.source_reference, item.evidence_text) for item in citations}
+            for citation in alternative.citations:
+                key = (citation.source_reference, citation.evidence_text)
+                if key not in seen:
+                    seen.add(key)
+                    citations.append(citation)
+            alternatives[by_value[signature]] = DecisionAlternative(
+                values=current.values,
+                qualifier=current.qualifier,
+                citations=tuple(citations),
+                reason=current.reason or alternative.reason,
+            )
+            continue
+        by_value[signature] = len(alternatives)
+        alternatives.append(alternative)
+
+    confidence = max(existing.confidence, candidate.confidence)
+    if len(alternatives) == 1:
+        only = alternatives[0]
+        return FieldDecision(
+            field_id=existing.field_id,
+            status=READY,
+            values=list(only.values),
+            qualifier=only.qualifier,
+            confidence=confidence,
+            citations=list(only.citations),
+            reason="duplicate model facts collapsed to one grounded value",
+        )
+    if len(alternatives) >= 2:
+        return FieldDecision(
+            field_id=existing.field_id,
+            status=CONFLICT,
+            confidence=confidence,
+            alternatives=alternatives,
+            reason="duplicate model facts reconciled as grounded alternatives",
+        )
+    return FieldDecision(
+        field_id=existing.field_id,
+        status=MISSING,
+        reason="duplicate model facts had no executable grounded value",
+    )
+
+
 def _packet_from_response(
     raw: Any,
     fields: list[dict[str, Any]],
@@ -310,19 +381,19 @@ def _packet_from_response(
             canonical_key = next(iter(cited_keys))
             if canonical_key in packaging_targets:
                 item["field_id"] = packaging_targets[canonical_key]
-    seen: set[str] = set()
-    decisions: list[FieldDecision] = []
+
+    decisions_by_id: dict[str, FieldDecision] = {}
+    warnings: list[str] = []
     for index, item in enumerate(raw["facts"], start=1):
         if not isinstance(item, dict):
-            raise ValueError(f"facts[{index}] must be an object")
+            warnings.append(f"facts[{index}] ignored because it is not an object")
+            continue
         identifier = str(item.get("field_id") or "").strip()
         if identifier not in allowed:
-            raise ValueError(f"facts[{index}] has unknown field_id={identifier!r}")
-        if identifier in seen:
-            raise ValueError(f"duplicate fact field_id={identifier}")
-        seen.add(identifier)
-        decisions.append(
-            FieldDecision.from_mapping(
+            warnings.append(f"facts[{index}] ignored unknown field_id={identifier!r}")
+            continue
+        try:
+            candidate = FieldDecision.from_mapping(
                 {
                     "field_id": identifier,
                     "status": item.get("status"),
@@ -335,14 +406,25 @@ def _packet_from_response(
                 },
                 index=index,
             )
+        except Exception as exc:
+            warnings.append(f"facts[{index}] ignored malformed field_id={identifier}: {exc}")
+            continue
+        existing = decisions_by_id.get(identifier)
+        if existing is None:
+            decisions_by_id[identifier] = candidate
+            continue
+        decisions_by_id[identifier] = _merge_duplicate_decisions(existing, candidate)
+        warnings.append(
+            f"duplicate fact field_id={identifier} isolated and reconciled without discarding the batch"
         )
+
     packet = AIDecisionPacket(
         identity=ProductIdentity(),
         schema_sha256=schema_digest(fields),
         source_manifest_sha256=source_manifest_digest(grounding),
-        decisions=decisions,
+        decisions=list(decisions_by_id.values()),
         model_summary=str(raw.get("model_summary") or "").strip(),
-        warnings=[],
+        warnings=warnings,
         extractor=f"{provider_name}+global-product-facts",
     )
     validated = validate_ai_decision_packet(packet, fields, grounding)
