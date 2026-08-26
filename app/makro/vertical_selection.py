@@ -5,9 +5,11 @@ Vertical. Product Identity supplies semantics and AI plans a bounded retrieval
 ladder. Every query is sampled into its own fresh query-owned generation first;
 only after the bounded ladder is complete are those exact live rows merged and
 ranked as one evidence pool. If a pool candidate is selected, the resolver re-runs
-only a query that previously owned that exact row, requires the same row to appear
-uniquely in the fresh generation, then clicks and verifies the resulting canonical
-Vertical before Step 2 is accepted.
+only a query that previously owned that exact row. Fresh query-owned rows remain
+the default binding proof; when that re-run is an exact replay of the currently
+active owner query and Makro reuses the same DOM nodes, one unique stable exact row
+may be rebound explicitly. Every click is still verified against the resulting
+canonical Vertical before Step 2 is accepted.
 
 This separation prevents one noisy query from making an early decision while still
 preserving strict query ownership at the mutation boundary. Browse taxonomy is the
@@ -474,7 +476,7 @@ def _try_select_via_search(
     *,
     wait_ms: int,
 ) -> tuple[str, list[str], tuple[str, ...]]:
-    """Sample the full bounded ladder, decide globally, then fresh-rebind once."""
+    """Sample the full bounded ladder, decide globally, then owner-query rebind."""
 
     search = _vertical_search_input(page)
     planned_terms = plan_vertical_search_terms(provider, hints)
@@ -513,7 +515,7 @@ def _try_select_via_search(
             "candidate_count": len(pool),
             "selected_vertical": selected,
             "owner_queries": list(owner_queries),
-            "action": "fresh_rebind_selected_row" if selected else "fallback_to_taxonomy",
+            "action": "owner_query_rebind_selected_row" if selected else "fallback_to_taxonomy",
             "sample": [item.label for item in pool[:8]],
         },
     )
@@ -527,9 +529,19 @@ def _try_select_via_search(
         )
 
     selected_key = normalize_label(selected)
+    active_query = planned_terms[-1] if planned_terms else ""
     for rebind_index, owner_query in enumerate(owner_queries, start=1):
+        stable_exact_allowed = normalize_label(owner_query) == normalize_label(active_query)
         rows = _run_vertical_search_query(page, search, owner_query, wait_ms=wait_ms)
+        active_query = owner_query
         exact = [row for row in rows if normalize_label(row) == selected_key]
+        action = (
+            "click_fresh_generation"
+            if len(exact) == 1
+            else "click_stable_exact_replay"
+            if len(exact) == 0 and stable_exact_allowed
+            else "try_next_owner_query"
+        )
         _vertical_diag(
             "selected_row_rebind",
             {
@@ -538,16 +550,41 @@ def _try_select_via_search(
                 "query": owner_query,
                 "selected_vertical": selected,
                 "exact_match_count": len(exact),
-                "action": "click_fresh_generation" if len(exact) == 1 else "try_next_owner_query",
+                "stable_exact_allowed": stable_exact_allowed,
+                "action": action,
             },
         )
-        if len(exact) != 1:
+
+        allow_stable_exact = False
+        if len(exact) == 1:
+            rebound = exact[0]
+        elif len(exact) == 0 and stable_exact_allowed:
+            rebound = selected
+            allow_stable_exact = True
+        else:
             continue
 
-        rebound = exact[0]
         previous_canonical, _ = _current_target_values(page)
-        clicked = click_search_row(search, rebound, allow_stable_exact=False)
+        clicked = click_search_row(
+            search,
+            rebound,
+            allow_stable_exact=allow_stable_exact,
+        )
         if not clicked:
+            if allow_stable_exact:
+                _vertical_diag(
+                    "selected_row_rebind",
+                    {
+                        "rebind_index": rebind_index,
+                        "rebind_count": len(owner_queries),
+                        "query": owner_query,
+                        "selected_vertical": selected,
+                        "exact_match_count": 0,
+                        "stable_exact_allowed": True,
+                        "action": "stable_exact_unavailable",
+                    },
+                )
+                continue
             raise RuntimeError(
                 "Makro Step 1 re-observed the globally selected Vertical in a fresh query-owned generation "
                 "but could not bind that exact current row for clicking; "
@@ -566,7 +603,8 @@ def _try_select_via_search(
 
     raise RuntimeError(
         "Makro Step 1 selected a grounded Vertical from the aggregated live pool, but that exact row "
-        "could not be re-observed uniquely in any query generation that originally owned it; "
+        "could not be rebound as either one fresh exact owner-query row or one explicitly permitted "
+        "stable exact same-query replay; "
         f"selected={selected!r}; owner_queries={' | '.join(owner_queries)}"
     )
 
