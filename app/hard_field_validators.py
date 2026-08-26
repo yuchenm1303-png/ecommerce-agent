@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 from .resolution_types import RESOLVED, ResolvedAnswer
 from .source_bundle import normalize_key
+
+
+_SELECTION_KINDS = {
+    "select",
+    "dropdown",
+    "autocomplete",
+    "listbox",
+    "radio",
+    "custom_radio",
+}
 
 
 @dataclass(slots=True, frozen=True)
@@ -29,19 +40,109 @@ def is_valid_gtin(value: str) -> bool:
     return check == expected
 
 
-def _primary_control(semantic_field: dict[str, Any]) -> dict[str, Any] | None:
-    controls = [
+def _value_controls(semantic_field: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
         control
         for control in semantic_field.get("controls") or []
         if isinstance(control, dict)
+        and str(control.get("field_kind") or "").casefold() != "option"
         and not str(control.get("name") or "").endswith("_qualifier")
     ]
+
+
+def _qualifier_controls(semantic_field: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        control
+        for control in semantic_field.get("controls") or []
+        if isinstance(control, dict)
+        and str(control.get("name") or "").endswith("_qualifier")
+    ]
+
+
+def _primary_control(semantic_field: dict[str, Any]) -> dict[str, Any] | None:
+    controls = _value_controls(semantic_field)
     key = str(semantic_field.get("attribute_key") or "")
     if key:
         for control in controls:
             if str(control.get("id") or "") == key:
                 return control
     return controls[0] if controls else None
+
+
+def _norm(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _option_value(option: object) -> str:
+    if isinstance(option, dict):
+        return str(option.get("text") or option.get("value") or "").strip()
+    return str(option or "").strip()
+
+
+def _enabled_option_values(values: Iterable[object]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        if isinstance(raw, dict) and bool(raw.get("disabled")):
+            continue
+        value = _option_value(raw)
+        key = _norm(value)
+        if not value or not key or key in seen:
+            continue
+        seen.add(key)
+        output.append(value)
+    return output
+
+
+def is_closed_selection_semantic_field(semantic_field: dict[str, Any]) -> bool:
+    """Return True only when the current live value control proves a closed domain."""
+
+    controls = _value_controls(semantic_field)
+    if controls:
+        return all(
+            str(control.get("field_kind") or "").casefold() in _SELECTION_KINDS
+            for control in controls
+        )
+    # Legacy serialized fields do not carry controls; a non-empty option list is
+    # the only deterministic evidence that the value domain is closed.
+    return bool(semantic_field.get("options"))
+
+
+def executable_value_options(semantic_field: dict[str, Any]) -> list[str]:
+    """Return only values the current live value control can mechanically select.
+
+    Modern fields are control-owned: aggregate semantic options may be stale or
+    polluted by child/qualifier controls, so they are never authoritative once
+    current live controls exist. Radio groups are the one structural exception:
+    coalescing stores their option records on the semantic field while retaining
+    the individual radio controls.
+    """
+
+    controls = _value_controls(semantic_field)
+    if controls:
+        direct: list[str] = []
+        for control in controls:
+            direct.extend(_enabled_option_values(control.get("options") or []))
+        if direct:
+            return list(dict.fromkeys(direct))
+        if all(
+            str(control.get("field_kind") or "").casefold()
+            in {"radio", "custom_radio"}
+            for control in controls
+        ):
+            return _enabled_option_values(semantic_field.get("options") or [])
+        return []
+    return _enabled_option_values(semantic_field.get("options") or [])
+
+
+def executable_qualifier_options(semantic_field: dict[str, Any]) -> list[str]:
+    controls = _qualifier_controls(semantic_field)
+    if controls:
+        output: list[str] = []
+        for control in controls:
+            output.extend(_enabled_option_values(control.get("options") or []))
+        return list(dict.fromkeys(output))
+    return _enabled_option_values(semantic_field.get("qualifier_options") or [])
 
 
 def is_numeric_semantic_field(semantic_field: dict[str, Any]) -> bool:
@@ -111,6 +212,41 @@ def _length_validation(
     return FieldValidationResult(True)
 
 
+def _closed_domain_validation(
+    semantic_field: dict[str, Any],
+    answer: ResolvedAnswer,
+) -> FieldValidationResult:
+    if is_closed_selection_semantic_field(semantic_field):
+        options = executable_value_options(semantic_field)
+        if not options:
+            return FieldValidationResult(
+                False,
+                "当前 live selection 控件没有 enabled executable option；拒绝把自由文本答案标记为 READY。",
+            )
+        allowed = {_norm(value): value for value in options if _norm(value)}
+        for value in answer.answer_values:
+            if _norm(value) not in allowed:
+                return FieldValidationResult(
+                    False,
+                    f"selection 答案 {value!r} 不属于当前 enabled live options。",
+                )
+
+    qualifier_controls = _qualifier_controls(semantic_field)
+    if answer.qualifier and qualifier_controls:
+        qualifiers = executable_qualifier_options(semantic_field)
+        if not qualifiers:
+            return FieldValidationResult(
+                False,
+                "当前 qualifier 控件没有 enabled executable option。",
+            )
+        if _norm(answer.qualifier) not in {_norm(value) for value in qualifiers}:
+            return FieldValidationResult(
+                False,
+                f"qualifier {answer.qualifier!r} 不属于当前 enabled live qualifier options。",
+            )
+    return FieldValidationResult(True)
+
+
 def validate_resolved_answer(
     semantic_field: dict[str, Any],
     answer: ResolvedAnswer,
@@ -119,7 +255,9 @@ def validate_resolved_answer(
 
     Product meaning is intentionally absent here. Translation, synonyms,
     compatibility, feature interpretation and source conflict judgment belong to
-    the AI field-decision layer.
+    the AI field-decision layer. Closed-domain mechanics are live-control facts:
+    a selection answer is executable only when it belongs to the currently
+    enabled option domain.
     """
 
     if answer.status != RESOLVED:
@@ -140,7 +278,11 @@ def validate_resolved_answer(
                     f"GTIN/EAN 校验失败：{value!r} 不是有效的 GTIN-8/12/13/14。",
                 )
 
-    for validator in (_numeric_constraint_validation, _length_validation):
+    for validator in (
+        _closed_domain_validation,
+        _numeric_constraint_validation,
+        _length_validation,
+    ):
         result = validator(semantic_field, answer)
         if not result.valid:
             return result
