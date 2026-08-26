@@ -2,9 +2,10 @@
 
 Makro's live taxonomy is sometimes sparse or commercially coarse. Navigation
 therefore prefers genuine taxonomy ancestry but may traverse the most plausible
-retail branch when no exact ancestry exists. The final leaf is accepted when it
-is the same product type, a genuine broader class, or the closest reasonable
-best-fit live class selected by AI from the real Makro taxonomy.
+retail branch when no exact ancestry exists. Product Identity is only the initial
+interpretation: the exact supplier snippets cited by that identity and any customer
+listing intent remain independent evidence so taxonomy fallback cannot reinforce an
+early AI misunderstanding. The final leaf still has to be a real live Makro class.
 """
 
 from __future__ import annotations
@@ -50,6 +51,14 @@ def _diag(event: str, payload: dict[str, Any]) -> None:
 
 def _identity(hints: ListingBootstrapHints) -> dict[str, Any]:
     return dict(hints.product_identity or {})
+
+
+def _reconciliation_context(hints: ListingBootstrapHints) -> dict[str, Any]:
+    return {
+        "initial_product_identity": _identity(hints),
+        "grounded_supplier_evidence": list(hints.grounded_product_evidence),
+        "customer_listing_intent": str(hints.customer_intent or "").strip(),
+    }
 
 
 def _taxonomy_path_options(allowed: list[str]) -> tuple[list[dict[str, str]], list[str]]:
@@ -116,17 +125,18 @@ def build_taxonomy_path_choice_request(
         "task": "choose_safe_makro_taxonomy_node",
         "system_instruction": (
             "Choose at most one exact live Makro taxonomy node for a physical product. Makro taxonomy "
-            "may be sparse: prefer a genuine ancestor branch, but when none exists choose the most "
-            "plausible retail branch that can lead to the closest usable live category. JSON only."
+            "may be sparse. The initial Product Identity is an AI interpretation, not immutable truth; "
+            "reconcile it against cited raw supplier evidence and customer intent before choosing. JSON only."
         ),
         "prompt_instruction": (
             "Evaluate context.current_path + each live node as a marketplace breadcrumb. Prefer strict "
             "taxonomy ancestry; otherwise choose the branch a marketplace operator would most reasonably "
-            "explore for a best-fit listing category. Return one atomic selection_key from the schema."
+            "explore for a best-fit listing category. If independent evidence exposes an initial identity "
+            "mistake, correct the hypothesis rather than repeatedly following it. Return one atomic selection_key."
         ),
         "context": {
             "product_summary": hints.product_summary,
-            "product_identity": _identity(hints),
+            **_reconciliation_context(hints),
             "current_path": list(current_path),
             "live_nodes": allowed,
             "live_node_options": live_node_options,
@@ -134,6 +144,9 @@ def build_taxonomy_path_choice_request(
         "rules": [
             "selection_key is atomic: return exactly 'none' or '<relation>:<node_id>' from the schema enum; never invent a key.",
             "Each node_id maps to exactly one label in live_node_options, so node choice and semantic relation cannot be returned independently.",
+            "Treat initial_product_identity as a hypothesis. Grounded supplier evidence is independent factual evidence.",
+            "Customer listing intent may reveal a plausible misunderstanding but must never override supplier evidence that plainly describes a different physical item.",
+            "Separate core sold product class from incidental material, personalization, colour, size and marketing attributes.",
             "Use ancestor_branch for a genuine marketplace department/product-family ancestor.",
             "Use same_product_type when the node already names the same physical product class.",
             "Use broader_valid_class when the node is a genuine semantic superclass.",
@@ -142,7 +155,7 @@ def build_taxonomy_path_choice_request(
             "Physical containment alone is not evidence: a product fitting inside a container, case, bag, vehicle or room does not make that object a good category branch.",
             "Accessories, consumables and spare parts should not be preferred when a branch representing the sold product itself is materially closer.",
             "Judge the complete breadcrumb, not an isolated word.",
-            "Return none only when no current live branch is even a reasonable route to a usable best-fit category.",
+            "Return none only when no current live branch is even a reasonable route to a usable best-fit category after reconciling all independent evidence.",
         ],
         "json_contract": {
             "type": "object",
@@ -222,20 +235,25 @@ def build_taxonomy_leaf_validation_request(
     return {
         "task": "validate_makro_taxonomy_leaf",
         "system_instruction": (
-            "Evaluate one already reached real Makro taxonomy leaf against the grounded physical product. "
-            "Makro taxonomy may not contain an exact class, so a closest practical live best-fit is allowed. JSON only."
+            "Evaluate one already reached real Makro taxonomy leaf against the physical product using independent "
+            "evidence channels. The initial Product Identity may be over-specific or mistaken. Makro taxonomy may not "
+            "contain an exact class, so a closest practical live best-fit is allowed. JSON only."
         ),
         "prompt_instruction": (
-            "Classify the full breadcrumb as same product type, genuine broader class, closest available "
-            "best-fit, or unusable. Do not require perfect taxonomy alignment when Makro does not offer it."
+            "Classify the full breadcrumb as same product type, genuine broader class, closest available best-fit, "
+            "or unusable. Reconcile initial identity with cited raw supplier evidence and customer intent first; "
+            "do not let one early interpretation veto a better-supported real live leaf."
         ),
         "context": {
             "product_summary": hints.product_summary,
-            "product_identity": _identity(hints),
+            **_reconciliation_context(hints),
             "taxonomy_breadcrumb": path,
             "leaf": leaf,
         },
         "rules": [
+            "Treat initial_product_identity as a hypothesis. Grounded supplier evidence is independent factual evidence.",
+            "Customer listing intent can expose a plausible misunderstanding but cannot contradict clear supplier facts.",
+            "Distinguish the core product class from incidental material, personalization, colour, size and marketing attributes.",
             "Use same_product_type for the same physical product class.",
             "Use broader_valid_class for a genuine merchandise superclass.",
             "Use best_available_fit when the leaf is not a strict superclass but is the most commercially reasonable live Makro category available for this product.",
@@ -243,7 +261,7 @@ def build_taxonomy_leaf_validation_request(
             "Prefer shared defining function, normal retail context and buyer expectation over literal word overlap.",
             "Do not use best_available_fit for a plainly unrelated class when a meaningfully closer live category exists.",
             "unsupported_defining_constraints is diagnostic: list meaningful mismatches so logs show the compromise.",
-            "Use none only when this leaf would severely misrepresent the sold product even as a marketplace fallback.",
+            "Use none only when this leaf would severely misrepresent the sold product even after reconciling all independent evidence.",
         ],
         "json_contract": {
             "type": "object",
