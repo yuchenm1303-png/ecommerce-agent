@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ _FLUSH_MS = 900
 _MAX_TEXT = 12_000
 _MAX_LIST = 500
 _TERMINAL_JOB_STATES = {"READY", "DONE", "REVIEW", "FAILED", "STOPPED"}
+_JOB_ID_RE = re.compile(r"^JOB-(\d+)$", re.IGNORECASE)
 
 
 def _utc_now() -> str:
@@ -36,6 +38,17 @@ def _text(value: object, limit: int = _MAX_TEXT) -> str:
 
 def _safe(value: Any, *, depth: int = 0) -> Any:
     return sanitize_telemetry_value(value, depth=depth, max_text=_MAX_TEXT, max_list=_MAX_LIST)
+
+
+def _job_ordinal(job_id: object) -> int:
+    match = _JOB_ID_RE.fullmatch(str(job_id or "").strip())
+    if not match:
+        return 0
+    try:
+        value = int(match.group(1))
+    except ValueError:
+        return 0
+    return value if value > 0 else 0
 
 
 def _phase_stats(stats: Any) -> dict[str, Any]:
@@ -162,6 +175,8 @@ class BatchLinkTelemetryController(QObject):
         self.network = QNetworkAccessManager(self)
         self._last_signatures: dict[str, str] = {}
         self._result_cache: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._batch_positions: dict[str, dict[str, int]] = {}
+        self._batch_sizes: dict[str, int] = {}
         self._bound_controller: Any = None
         self._flush = QTimer(self)
         self._flush.setSingleShot(True)
@@ -217,6 +232,46 @@ class BatchLinkTelemetryController(QObject):
 
     def _batch(self) -> Any:
         return getattr(self._bound_controller, "batch", None)
+
+    def _stable_batch_coordinates(self, batch_id: str, jobs: list[Any]) -> tuple[dict[str, int], int]:
+        """Freeze per-link batch position independently from mutable scheduler views.
+
+        Batch controllers may temporarily expose only a subset of jobs during
+        lifecycle transitions. Re-enumerating that mutable list caused a persistent
+        JOB-003 audit to be overwritten later as 2/2. Coordinates are identity
+        metadata, not scheduler state: cache them on first observation and use the
+        generated JOB-NNN ordinal as a deterministic recovery hint.
+        """
+
+        positions = self._batch_positions.setdefault(batch_id, {})
+        used = set(positions.values())
+        observed_ordinals = [
+            _job_ordinal(getattr(job, "job_id", ""))
+            for job in jobs
+        ]
+        total = max(
+            self._batch_sizes.get(batch_id, 0),
+            len(jobs),
+            max(observed_ordinals, default=0),
+        )
+
+        for fallback_index, job in enumerate(jobs, start=1):
+            job_id = _text(getattr(job, "job_id", ""), 160)
+            if not job_id or job_id in positions:
+                continue
+            ordinal = _job_ordinal(job_id)
+            if ordinal > 0 and ordinal not in used:
+                position = ordinal
+            else:
+                position = fallback_index
+                while position in used:
+                    position += 1
+            positions[job_id] = position
+            used.add(position)
+            total = max(total, position)
+
+        self._batch_sizes[batch_id] = total
+        return dict(positions), total
 
     def _input_items(self) -> list[dict[str, Any]]:
         workspace = getattr(self.window, "batch_workspace", None)
@@ -299,6 +354,7 @@ class BatchLinkTelemetryController(QObject):
                 job_status,
                 _text(getattr(job, "updated_at", ""), 120),
                 execution_report_path,
+                f"{index}/{total}",
                 "failure" if failure_required else "normal",
             )
         )
@@ -422,8 +478,10 @@ class BatchLinkTelemetryController(QObject):
         batch_id = _text(getattr(batch, "batch_id", ""), 240)
         batch_status = _text(getattr(batch, "status", ""), 120).upper()
         items = self._input_items()
-        total = len(jobs)
-        for index, job in enumerate(jobs, start=1):
+        positions, total = self._stable_batch_coordinates(batch_id, jobs)
+        for fallback_index, job in enumerate(jobs, start=1):
+            job_id = _text(getattr(job, "job_id", ""), 160)
+            index = positions.get(job_id, fallback_index)
             job_status = _text(getattr(job, "status", ""), 120).upper()
             phase = _job_phase(batch_status, job_status)
             status, terminal = _audit_status(phase, job_status)
@@ -431,7 +489,7 @@ class BatchLinkTelemetryController(QObject):
             input_data = self._job_input(job, index, total, items, batch_id)
             result_data = self._job_result(job, index, total, batch_id, include_failure=include_failure)
             audit = {
-                "id": self._audit_id(batch_id, _text(getattr(job, "job_id", ""), 160)),
+                "id": self._audit_id(batch_id, job_id),
                 "task_kind": "batch",
                 "phase": phase,
                 "status": status,
