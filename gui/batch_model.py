@@ -42,6 +42,7 @@ BATCH_JOB_STATES = (
 class BatchJob:
     job_id: str
     product_url: str
+    listing_intent: str = ""
     status: str = "QUEUED"
     stage_detail: str = "waiting"
     progress: int = 0

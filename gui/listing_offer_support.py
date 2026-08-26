@@ -31,6 +31,7 @@ from app.required_overrides import (
     required_override_binding,
 )
 from app.source_bundle import normalize_key
+from app.supplier_url_identity import supplier_request_identity
 from .real_execution import FULL_STEP3
 from .result_loader import latest_fill_plan, latest_live_schema, latest_resolver_manifest
 
@@ -309,12 +310,12 @@ class ListingOfferSupport(QObject):
                 continue
             offer = getattr(row, "offer_input", None)
             intent = _clean_intent(offer.text() if isinstance(offer, QLineEdit) else "")
-            output[url.casefold()] = intent
+            output[supplier_request_identity(url)] = intent
         return output
 
-    def _job_intent(self, job: Any) -> str:
-        mapping = getattr(self.controller, "_listing_offer_intent_by_url", {})
-        return _clean_intent(mapping.get(str(job.product_url).casefold(), "")) if isinstance(mapping, dict) else ""
+    @staticmethod
+    def _job_intent(job: Any) -> str:
+        return _clean_intent(getattr(job, "listing_intent", ""))
 
     # --------------------------------------------------------------- Process env
     def _install_process_handoff(self) -> None:
@@ -333,10 +334,12 @@ class ListingOfferSupport(QObject):
 
         def start_prepare(_controller: Any, urls: list[str], config: Any, **kwargs: Any):
             mapping = self._batch_intent_by_url()
-            _controller._listing_offer_intent_by_url = dict(mapping)
             batch = original_start_prepare(urls, config, **kwargs)
             for job in batch.jobs:
-                _write_intent_sidecar(Path(job.run_dir).parent, mapping.get(job.product_url.casefold(), ""))
+                intent = _clean_intent(mapping.get(supplier_request_identity(job.product_url), ""))
+                job.listing_intent = intent
+                _write_intent_sidecar(Path(job.run_dir).parent, intent)
+            _controller._persist_emit(immediate=True)
             return batch
 
         self.controller.start_prepare = MethodType(start_prepare, self.controller)
