@@ -11,6 +11,7 @@ from app.makro.photos import (
     PHOTO_SLOT_IDS,
     _DynamicPhotoFileTarget,
     _next_empty_photo_slot,
+    _open_photo_slot_upload_panel,
     _photo_surface,
     _select_file_input,
     _stage_accepted,
@@ -137,17 +138,17 @@ def test_rejected_save_reopens_same_section_to_expose_field_level_error():
     assert "字段错误" in after_click
 
 
-def test_production_photo_path_fills_all_fixed_slots_then_saves_once():
+def test_production_photo_path_stages_one_transaction_then_saves_once():
     source = inspect.getsource(run_photos)
-    loop = source.index("for offset, image in enumerate(pending, start=1):")
-    save = source.index("adapter.save_section(PRODUCT_PHOTOS)", loop)
+    stage = source.index("adapter.upload_product_photos(")
+    save = source.index("adapter.save_section(PRODUCT_PHOTOS)", stage)
     verify = source.index("expected_added=expected_new", save)
 
-    assert loop < save < verify
+    assert stage < save < verify
     assert 'report["save_count"] = 1' in source
-    assert 'report["staged"] += 1' in source
+    assert 'report["staged"] = int(staged_payload.get("staged") or 0)' in source
     assert 'report["persisted"] = final_count' in source
-    assert "before_add_tiles=before_add_tiles" in source
+    assert "[str(image) for image in pending]" in source
     assert "expected_added=1" not in source
 
 
@@ -165,30 +166,30 @@ def test_product_photos_uses_real_thumbnail_ids_and_shared_input_surface():
     )
     assert '[id^="thumbnail_"]' in surface_source
     assert 'input[type="file"]' in surface_source
-    assert "i.fa-plus" in next_slot_source
     assert "PHOTO_SLOT_IDS" in next_slot_source
+    assert 'snapshot.get("is_empty")' in next_slot_source
     assert "_next_empty_photo_slot" in select_source
     assert "_DynamicPhotoFileTarget" in select_source
     assert "AddProductImage" not in next_slot_source
 
 
-def test_dynamic_photo_target_bypasses_banner_stability_then_clicks_upload_once():
-    source = inspect.getsource(_DynamicPhotoFileTarget.set_input_files)
+def test_dynamic_photo_target_opens_exact_slot_then_clicks_upload_once():
+    target_source = inspect.getsource(_DynamicPhotoFileTarget.set_input_files)
+    panel_source = inspect.getsource(_open_photo_slot_upload_panel)
 
-    slot_click = source.index("slot.click(timeout=1_500, force=True)")
-    button_lookup = source.index("_wait_for_upload_photo_button", slot_click)
-    chooser = source.index("expect_file_chooser(timeout=1_500)", button_lookup)
-    upload_click = source.index("upload_button.click(timeout=1_500, force=True)", chooser)
-    completion_wait = source.index("_wait_for_target_slot_completion", upload_click)
+    panel_open = target_source.index("_open_photo_slot_upload_panel")
+    chooser = target_source.index("expect_file_chooser(timeout=1_500)", panel_open)
+    upload_click = target_source.index("upload_button.click(timeout=1_500, force=True)", chooser)
+    completion_wait = target_source.index("_wait_for_target_slot_completion", upload_click)
 
-    assert slot_click < button_lookup < chooser < upload_click < completion_wait
-    assert 'locator(f"#{self.slot_id}")' in source
-    assert "scroll_into_view_if_needed" not in source
-    assert "role_selector.click()" not in source
-    assert "i.fa-plus" not in source
-    assert "set_files" in source
-    assert "_raw_file_input" in source
-    assert "shared.set_input_files" in source
+    assert panel_open < chooser < upload_click < completion_wait
+    assert "slot.click(timeout=click_timeout_ms, force=True)" in panel_source
+    assert "_wait_for_upload_photo_button" in panel_source
+    assert 'locator(f"#{self.slot_id}")' in target_source
+    assert "role_selector.click()" not in target_source
+    assert "set_files" in target_source
+    assert "_raw_file_input" in target_source
+    assert "shared.set_input_files" in target_source
 
 
 def test_upload_photo_button_is_exact_visible_enabled_active_role_control():
@@ -201,7 +202,7 @@ def test_upload_photo_button_is_exact_visible_enabled_active_role_control():
     assert "len(visible) > 1" in source
 
 
-def test_photo_upload_waits_on_real_uploading_state_not_page_stability():
+def test_photo_upload_waits_on_target_transaction_evidence_not_page_stability():
     target_source = inspect.getsource(_DynamicPhotoFileTarget.set_input_files)
     button_wait_source = inspect.getsource(_wait_for_upload_photo_button)
     uploading_source = inspect.getsource(_uploading_visible)
@@ -217,7 +218,8 @@ def test_photo_upload_waits_on_real_uploading_state_not_page_stability():
     assert "uploading_timeout_ms: int = 60_000" in completion_source
     assert "uploading_seen" in completion_source
     assert "wait_for_timeout(100)" in completion_source
-    assert "slot_id not in empty_slots" in completion_source
+    assert "_target_slot_acceptance_signal" in completion_source
+    assert '"target_slot_consumed"' in completion_source
 
 
 def test_photo_acceptance_can_be_proved_by_target_thumbnail_losing_plus():
