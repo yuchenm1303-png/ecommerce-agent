@@ -18,8 +18,6 @@ from app.resolution_types import MISSING, ResolutionRecord
 
 
 def _field(**updates):
-    # Rebind mechanics are tested on an ordinary required field. Protected
-    # listing/title fields intentionally cannot use deterministic fallback now.
     field = {
         "attribute_key": "required_note",
         "label": "Required Note",
@@ -69,9 +67,6 @@ def test_old_override_field_id_rebinds_when_production_schema_identity_is_unchan
     planned = _field(help_text="serialized planning help")
     current = _field(help_text="current DOM help changed")
 
-    # This is the exact production boundary from the real failure: the schema
-    # drift gate accepts the fields, while the presentation-sensitive field id
-    # can still differ.
     assert_live_schema_matches([planned], [current])
     assert schema_field_signature(planned) == schema_field_signature(current)
     assert field_id(planned) != field_id(current)
@@ -108,7 +103,7 @@ def test_new_fallback_persists_stable_schema_signature():
     assert len(fallback["schema_signature"]) == 7
 
 
-def test_stable_schema_rebind_remains_fail_closed_when_current_match_is_ambiguous():
+def test_duplicate_current_field_identity_fails_closed_before_override_rebind():
     planned = _field(help_text="serialized planning help")
     current_a = _field(help_text="current DOM help A")
     current_b = _field(help_text="current DOM help B")
@@ -120,7 +115,7 @@ def test_stable_schema_rebind_remains_fail_closed_when_current_match_is_ambiguou
         "source_type": "fallback",
     }
 
-    with pytest.raises(RequiredOverrideError, match="stable_matches=2"):
+    with pytest.raises(RequiredOverrideError, match="occurrence=2"):
         apply_required_overrides(
             plan,
             [current_a, current_b],
