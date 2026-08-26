@@ -1,16 +1,24 @@
 # Ecommerce-Agent Test Lab
 
-`tools/test_lab.py` is the default developer regression entrypoint for changes that should not spend AI quota or require a real supplier listing run.
+`tools/test_lab.py` is the default developer regression entrypoint when code should be tested without spending AI quota or requiring a real supplier listing run.
 
-## Fast start
+## Start here
 
-Run every curated offline suite:
+On Windows you can double-click:
+
+```text
+run_test_lab.bat
+```
+
+or run directly:
 
 ```bash
 python tools/test_lab.py --all
 ```
 
-Run one area repeatedly while developing:
+`--all` is deliberately comprehensive: it runs the complete repository `tests/` tree with `-m "not probe"`. New ordinary pytest tests are therefore included automatically; only tests explicitly marked `probe` are excluded as live-browser checks.
+
+For a fast development loop, run one area only:
 
 ```bash
 python tools/test_lab.py --suite vertical
@@ -18,7 +26,7 @@ python tools/test_lab.py --suite cdp --stress-rounds 25
 python tools/test_lab.py --suite resolver --suite fill_plan
 ```
 
-List suites:
+List targeted suites:
 
 ```bash
 python tools/test_lab.py --list
@@ -36,14 +44,14 @@ A Test Lab run is intentionally different from a production smoke test:
 
 - paid AI credential environment variables are removed from every pytest child process;
 - external socket connections are blocked by `app.test_lab_pytest_plugin`;
+- loopback remains available for local fixture servers, but production CDP ports `9222` and `9333` are explicitly blocked inside pytest;
 - HTTP(S) proxy variables inherited by nested child processes point to a closed loopback port;
-- loopback remains available for local process/CDP coordination tests;
-- curated suites do not execute real Amazon capture or real Makro listing writes;
-- Test Lab never clicks Save or Send to QC.
+- all tests explicitly marked `probe` are excluded from `--all` and targeted suites;
+- Test Lab itself never launches the real Amazon/Makro workflow and never clicks Save or Send to QC.
 
-If a test unexpectedly tries to escape to the network it should fail with `TEST_LAB_EXTERNAL_NETWORK_BLOCKED` instead of silently spending quota.
+If a test unexpectedly tries to escape to the network it fails with `TEST_LAB_NETWORK_BLOCKED` instead of silently spending quota.
 
-## Suite map
+## Targeted suite map
 
 - `source`: Supplier URL identity and source-cache identity.
 - `vertical`: full query-ladder sampling, global candidate ownership, current-generation binding, prior-owner rebind, exact-row safety, relation/constraint policy, and historical incident replay.
@@ -55,6 +63,8 @@ If a test unexpectedly tries to escape to the network it should fail with `TEST_
 - `fill_plan`: deterministic Fill Plan logic.
 - `batch`: Batch architecture, target ownership and Step1 transient recovery.
 - `diagnostics`: failure diagnostic and FAILED telemetry completeness.
+
+Targeted suites are for speed while modifying one subsystem. They are not the release gate. `--all` is the offline release gate because it includes every non-probe test in the repository, including tests not assigned to one of the targeted groups.
 
 ## Historical incidents become permanent regressions
 
@@ -74,7 +84,7 @@ When a new real incident reveals a root bug, minimize the state needed to reprod
 
 ## CDP stress test
 
-The `cdp` suite includes real Python subprocesses; it does not mock the OS file lock. It verifies:
+The `cdp` tests include real Python subprocesses; the OS file-lock boundary is not mocked. They verify:
 
 - unrelated processes serialize on one CDP port;
 - a synchronous child inherits the parent owner's cryptographic lease token;
@@ -88,11 +98,12 @@ Increase `--stress-rounds` when changing browser-session code. The accepted rang
 
 Offline replay can catch deterministic code bugs, regressions, race/ownership contracts and most error-handling defects. It cannot prove that today's live Makro DOM, account session, network path or marketplace behaviour has not changed.
 
-The intended release sequence is therefore:
+The intended release sequence is:
 
 1. `python tools/test_lab.py --all`
-2. targeted high-round stress for the area changed, if applicable
-3. only after those pass, one small real Makro/Amazon smoke run
+2. if browser/session code changed: `python tools/test_lab.py --suite cdp --stress-rounds 25` (or higher)
+3. fix every offline failure first
+4. only then run one small real Makro/Amazon smoke test
 
 Do not use expensive real supplier runs as the first debugging layer.
 
@@ -100,6 +111,6 @@ Do not use expensive real supplier runs as the first debugging layer.
 
 A local coding agent should run Test Lab rather than manually clicking through the whole product flow. A useful instruction is:
 
-> Run `python tools/test_lab.py --all`. Do not run real Amazon/Makro workflows or use paid AI. Fix root causes for any failing offline regression, rerun only the affected suite, then rerun all suites.
+> Run `python tools/test_lab.py --all`. Do not run real Amazon/Makro workflows or use paid AI. Fix root causes for any failing offline regression, rerun only the affected targeted suite, then rerun `--all`.
 
-Manual browser interaction should be reserved for the final live smoke check or for capturing a new marketplace state that cannot be represented by existing fixtures.
+Manual browser interaction should be reserved for the final live smoke check or for capturing a new marketplace state that existing fixtures cannot represent.

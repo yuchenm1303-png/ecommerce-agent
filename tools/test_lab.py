@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Zero-cost, no-retailer regression launcher for ecommerce-agent.
 
-This command deliberately runs only curated offline tests. It strips paid AI
-credentials, blocks external sockets inside pytest, and points HTTP(S) proxy
-variables at a closed loopback port so accidental child-process web traffic also
-fails locally. Real Makro/Amazon smoke tests are intentionally outside this tool.
+``--all`` executes the repository's complete pytest suite except tests explicitly
+marked ``probe``. Targeted suites remain available for fast stage-level loops.
+Every Test Lab pytest process strips paid AI credentials and installs the socket
+safety plugin; real Amazon/Makro smoke tests intentionally live outside this tool.
 """
 
 from __future__ import annotations
@@ -56,9 +56,7 @@ SUITES: dict[str, tuple[str, ...]] = {
         "tests/test_transient_ai_retry.py",
         "tests/test_transient_ai_transport_contract.py",
     ),
-    "fill_plan": (
-        "tests/test_fill_plan.py",
-    ),
+    "fill_plan": ("tests/test_fill_plan.py",),
     "batch": (
         "tests/test_batch_architecture_contract.py",
         "tests/test_batch_step1_timeout_recovery.py",
@@ -82,25 +80,29 @@ _SECRET_ENV_KEYS = {
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run curated ecommerce-agent regression suites with zero external network and zero paid AI credentials."
+        description="Run ecommerce-agent regressions with external network blocked and paid AI credentials stripped."
     )
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--all", action="store_true", help="Run every curated offline suite.")
-    mode.add_argument("--list", action="store_true", help="List available suites and exit.")
+    mode.add_argument(
+        "--all",
+        action="store_true",
+        help="Run all repository tests except tests explicitly marked probe (default when no --suite is given).",
+    )
+    mode.add_argument("--list", action="store_true", help="List targeted suites and exit.")
     parser.add_argument(
         "--suite",
         action="append",
         choices=tuple(SUITES),
         default=[],
-        help="Run one suite; repeat to run several. With no selection, --all is assumed.",
+        help="Run one targeted suite; repeat to run several.",
     )
     parser.add_argument(
         "--stress-rounds",
         type=int,
         default=3,
-        help="Cross-process CDP serialization rounds used by the cdp suite (default: 3).",
+        help="Cross-process CDP serialization rounds used by the cdp tests (default: 3).",
     )
-    parser.add_argument("--fail-fast", action="store_true", help="Stop after the first failing suite.")
+    parser.add_argument("--fail-fast", action="store_true", help="Stop pytest / suite dispatch after the first failure.")
     parser.add_argument("--verbose", action="store_true", help="Show normal pytest verbosity instead of -q.")
     parser.add_argument("--json-report", default="", help="Optional path for a machine-readable Test Lab summary.")
     return parser
@@ -113,8 +115,9 @@ def _safe_environment(stress_rounds: int) -> dict[str, str]:
     env["ECOMMERCE_TEST_LAB"] = "1"
     env["ECOMMERCE_TEST_LAB_NO_EXTERNAL"] = "1"
     env["ECOMMERCE_TEST_LAB_STRESS_ROUNDS"] = str(max(1, min(int(stress_rounds), 100)))
-    # Child Python processes that do not load the pytest plugin still cannot use
-    # normal HTTP(S) clients to escape: their proxy target is a closed loopback port.
+
+    # Nested Python workers that do not load the pytest socket plugin still fail
+    # normal HTTP(S) traffic locally instead of reaching a paid provider/retailer.
     dead_proxy = "http://127.0.0.1:9"
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         env[key] = dead_proxy
@@ -124,9 +127,7 @@ def _safe_environment(stress_rounds: int) -> dict[str, str]:
     return env
 
 
-def _selected_suites(args: argparse.Namespace) -> list[str]:
-    if args.all or not args.suite:
-        return list(SUITES)
+def _targeted_names(args: argparse.Namespace) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for name in args.suite:
@@ -136,14 +137,19 @@ def _selected_suites(args: argparse.Namespace) -> list[str]:
     return result
 
 
-def _suite_nodes(name: str) -> list[str]:
-    missing = [path for path in SUITES[name] if not (ROOT / path).exists()]
+def _assert_nodes_exist(nodes: tuple[str, ...]) -> None:
+    missing = [path for path in nodes if not (ROOT / path).exists()]
     if missing:
-        raise RuntimeError(f"Test Lab suite {name!r} references missing tests: {missing}")
-    return list(SUITES[name])
+        raise RuntimeError(f"Test Lab references missing test paths: {missing}")
 
 
-def _run_suite(name: str, *, env: dict[str, str], verbose: bool) -> dict[str, object]:
+def _pytest_command(
+    nodes: tuple[str, ...],
+    *,
+    verbose: bool,
+    fail_fast: bool,
+    exclude_probe: bool,
+) -> list[str]:
     command = [
         sys.executable,
         "-m",
@@ -154,20 +160,43 @@ def _run_suite(name: str, *, env: dict[str, str], verbose: bool) -> dict[str, ob
     ]
     if not verbose:
         command.append("-q")
-    command.extend(_suite_nodes(name))
+    if fail_fast:
+        command.append("-x")
+    if exclude_probe:
+        command.extend(["-m", "not probe"])
+    command.extend(nodes)
+    return command
 
-    print(f"\n===== TEST LAB · {name.upper()} =====", flush=True)
+
+def _run_pytest(
+    label: str,
+    nodes: tuple[str, ...],
+    *,
+    env: dict[str, str],
+    verbose: bool,
+    fail_fast: bool,
+    exclude_probe: bool,
+) -> dict[str, object]:
+    _assert_nodes_exist(nodes)
+    command = _pytest_command(
+        nodes,
+        verbose=verbose,
+        fail_fast=fail_fast,
+        exclude_probe=exclude_probe,
+    )
+    print(f"\n===== TEST LAB · {label.upper()} =====", flush=True)
     started = time.monotonic()
     result = subprocess.run(command, cwd=ROOT, env=env, check=False)
     elapsed = round(time.monotonic() - started, 3)
     status = "PASS" if result.returncode == 0 else "FAIL"
-    print(f"TEST_LAB_SUITE {name} {status} elapsed_s={elapsed}", flush=True)
+    print(f"TEST_LAB_SUITE {label} {status} elapsed_s={elapsed}", flush=True)
     return {
-        "suite": name,
+        "suite": label,
         "status": status,
         "returncode": int(result.returncode),
         "elapsed_seconds": elapsed,
-        "tests": list(SUITES[name]),
+        "tests": list(nodes),
+        "probe_tests_excluded": bool(exclude_probe),
     }
 
 
@@ -186,39 +215,63 @@ def main() -> int:
         raise SystemExit("--stress-rounds must be between 1 and 100")
 
     if args.list:
-        print("Available zero-cost Test Lab suites:")
+        print("Targeted zero-cost Test Lab suites:")
         for name, tests in SUITES.items():
             print(f"  {name:<12} {len(tests)} test module(s)")
-        print("\nReal Amazon/Makro smoke tests are intentionally not part of Test Lab.")
+        print("\n--all/default runs the complete tests/ tree with '-m not probe'.")
+        print("Real Amazon/Makro probe tests are intentionally excluded.")
         return 0
 
-    selected = _selected_suites(args)
     env = _safe_environment(args.stress_rounds)
     started = time.monotonic()
     results: list[dict[str, object]] = []
+    targeted = _targeted_names(args)
+    full_offline = bool(args.all or not targeted)
 
     print("===== ECOMMERCE-AGENT TEST LAB =====")
     print("mode=offline_replay external_network=BLOCKED paid_ai_credentials=STRIPPED makro_writes=0")
-    print(f"suites={','.join(selected)} cdp_stress_rounds={args.stress_rounds}")
-
-    for name in selected:
-        result = _run_suite(name, env=env, verbose=args.verbose)
-        results.append(result)
-        if result["status"] == "FAIL" and args.fail_fast:
-            break
+    if full_offline:
+        print(f"scope=ALL_NON_PROBE_TESTS cdp_stress_rounds={args.stress_rounds}")
+        results.append(
+            _run_pytest(
+                "full_offline",
+                ("tests",),
+                env=env,
+                verbose=args.verbose,
+                fail_fast=args.fail_fast,
+                exclude_probe=True,
+            )
+        )
+    else:
+        print(f"suites={','.join(targeted)} cdp_stress_rounds={args.stress_rounds}")
+        for name in targeted:
+            result = _run_pytest(
+                name,
+                SUITES[name],
+                env=env,
+                verbose=args.verbose,
+                fail_fast=args.fail_fast,
+                exclude_probe=True,
+            )
+            results.append(result)
+            if result["status"] == "FAIL" and args.fail_fast:
+                break
 
     elapsed = round(time.monotonic() - started, 3)
     failed = [item["suite"] for item in results if item["status"] != "PASS"]
+    expected_runs = 1 if full_offline else len(targeted)
     summary: dict[str, object] = {
         "schema_version": 1,
         "mode": "offline_replay",
+        "scope": "all_non_probe_tests" if full_offline else "targeted_suites",
         "external_network": "blocked",
         "paid_ai_credentials": "stripped",
+        "probe_tests_excluded": True,
         "real_amazon_requests": 0,
         "real_makro_writes": 0,
         "stress_rounds": args.stress_rounds,
         "elapsed_seconds": elapsed,
-        "status": "PASS" if not failed and len(results) == len(selected) else "FAIL",
+        "status": "PASS" if not failed and len(results) == expected_runs else "FAIL",
         "failed_suites": failed,
         "results": results,
     }
@@ -228,8 +281,9 @@ def main() -> int:
     print("\n===== TEST LAB SUMMARY =====")
     for item in results:
         print(f"{str(item['suite']).upper():<14} {item['status']}")
-    if len(results) < len(selected):
-        print(f"NOT_RUN        {len(selected) - len(results)} suite(s) (fail-fast)")
+    if not full_offline and len(results) < expected_runs:
+        print(f"NOT_RUN        {expected_runs - len(results)} suite(s) (fail-fast)")
+    print("PROBE TESTS    EXCLUDED")
     print("EXTERNAL NET   BLOCKED")
     print("PAID AI KEYS   STRIPPED")
     print("AMAZON REQUEST 0")

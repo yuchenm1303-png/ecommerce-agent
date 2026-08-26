@@ -1,10 +1,10 @@
 """Pytest safety boundary for the local zero-cost Test Lab.
 
-The plugin is loaded explicitly by ``tools/test_lab.py``.  It is intentionally
-not registered in ``pytest.ini`` so ordinary developer pytest runs keep their
-existing behaviour.  Test Lab runs may use loopback sockets (Playwright/CDP
-fakes and local subprocess tests) but any attempt to open an external socket is
-failed before bytes leave the machine.
+Loaded explicitly by ``tools/test_lab.py`` rather than globally through pytest.ini.
+External sockets are rejected before bytes leave the machine. Loopback stays
+available for local fixture servers and process tests, but the production Makro
+and Source Edge CDP ports are explicitly forbidden so an offline regression can
+never attach to the user's live browsers by accident.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from typing import Any
 _ORIGINAL_CONNECT = socket.socket.connect
 _ORIGINAL_CONNECT_EX = socket.socket.connect_ex
 _ORIGINAL_CREATE_CONNECTION = socket.create_connection
+_BLOCKED_LIVE_CDP_PORTS = {9222, 9333}
 _INSTALLED = False
 
 
@@ -35,18 +36,27 @@ def _host_is_loopback(host: object) -> bool:
         return False
 
 
+def _loopback_port_blocked(address: Any) -> bool:
+    if not isinstance(address, tuple) or len(address) < 2:
+        return False
+    try:
+        return _host_is_loopback(address[0]) and int(address[1]) in _BLOCKED_LIVE_CDP_PORTS
+    except (TypeError, ValueError):
+        return False
+
+
 def _socket_address_allowed(sock: socket.socket, address: Any) -> bool:
     if getattr(sock, "family", None) == getattr(socket, "AF_UNIX", object()):
         return True
     if isinstance(address, tuple) and address:
-        return _host_is_loopback(address[0])
+        return _host_is_loopback(address[0]) and not _loopback_port_blocked(address)
     return False
 
 
 def _blocked(address: Any) -> RuntimeError:
     return RuntimeError(
-        "TEST_LAB_EXTERNAL_NETWORK_BLOCKED: zero-cost replay attempted an "
-        f"external socket connection to {address!r}"
+        "TEST_LAB_NETWORK_BLOCKED: zero-cost replay attempted a forbidden "
+        f"socket connection to {address!r}"
     )
 
 
@@ -64,7 +74,7 @@ def _guarded_connect_ex(sock: socket.socket, address: Any) -> Any:
 
 def _guarded_create_connection(address: Any, *args: Any, **kwargs: Any) -> socket.socket:
     host = address[0] if isinstance(address, tuple) and address else ""
-    if not _host_is_loopback(host):
+    if not _host_is_loopback(host) or _loopback_port_blocked(address):
         raise _blocked(address)
     return _ORIGINAL_CREATE_CONNECTION(address, *args, **kwargs)
 
@@ -95,4 +105,7 @@ def pytest_sessionfinish(session: Any, exitstatus: int) -> None:
 
 
 def pytest_report_header(config: Any) -> str:
-    return "Test Lab safety: external sockets blocked; loopback only; paid AI credentials stripped"
+    return (
+        "Test Lab safety: external sockets blocked; live CDP 9222/9333 blocked; "
+        "paid AI credentials stripped"
+    )
