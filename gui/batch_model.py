@@ -6,7 +6,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+
+from app.supplier_url_identity import supplier_request_identity
 
 
 BATCH_WORKER_MIN = 1
@@ -141,10 +142,7 @@ def normalize_batch_urls(text: str) -> list[str]:
         value = raw.strip()
         if not value:
             continue
-        parsed = urlparse(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError(f"不是完整 http(s) 商品链接：{value}")
-        key = value.casefold()
+        key = supplier_request_identity(value)
         if key in seen:
             continue
         seen.add(key)
