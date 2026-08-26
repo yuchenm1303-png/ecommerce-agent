@@ -43,6 +43,9 @@ def test_batch_coordinates_do_not_shrink_when_scheduler_view_loses_jobs() -> Non
     assert total == 3
 
 
-def test_result_cache_identity_includes_fixed_batch_coordinates() -> None:
+def test_result_cache_identity_is_batch_scoped_and_coordinate_sensitive() -> None:
     source = inspect.getsource(BatchLinkTelemetryController._job_result)
     assert 'f"{index}/{total}"' in source
+    assert 'cache_identity = f"{batch_id}/{job_id}"' in source
+    assert "self._result_cache.get(cache_identity)" in source
+    assert "self._result_cache[cache_identity]" in source
