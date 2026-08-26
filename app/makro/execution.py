@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from app.fill_plan import LiveFillPlan
+from app.hard_field_validators import validate_resolved_answer
 from app.makro.domain import MakroDomainAdapter
 from makro_preview_listing import (
     _base_result_payload,
@@ -127,6 +128,19 @@ def _collect_save_failure_diagnostics(
     return diagnostics
 
 
+def _cancel_open_section_transaction(
+    adapter: MakroDomainAdapter,
+    section_title: str,
+) -> bool:
+    """Discard only the current unsaved section transaction when it is still open."""
+
+    live = adapter.find_section(section_title)
+    if live is None or live.get("has_edit"):
+        return False
+    adapter.cancel_section(section_title)
+    return True
+
+
 def fill_one_section(
     adapter: MakroDomainAdapter,
     plan: LiveFillPlan,
@@ -139,12 +153,15 @@ def fill_one_section(
     recheck_wait_ms: int,
     run_dir: Path,
 ) -> dict[str, Any]:
-    """Execute every READY candidate once it uniquely binds to the live field.
+    """Execute one Step 3 card as an all-or-nothing unsaved transaction.
 
-    READY is the upstream write decision. The executor does not re-decide the
-    business/AI question by inspecting whether Makro currently renders a value.
-    Existing DOM values, default units and unchecked radio values therefore can
-    never silently turn READY into skipped_existing.
+    READY is an upstream semantic decision, not permission to trust a stale DOM
+    snapshot. Makro's React form can rebuild dependent controls after any prior
+    field mutation, so every candidate is rebound to a freshly scanned live field
+    immediately before its write and revalidated against that current control
+    domain. Any bind/preflight/fill/readback failure aborts the card and Cancels
+    all unsaved mutations; Save is attempted only after every intended candidate
+    has validated in the same open section transaction.
     """
 
     candidates = _section_candidates(
@@ -175,7 +192,7 @@ def fill_one_section(
         return report
 
     try:
-        section_path, live = _open_and_index_section(
+        _open_and_index_section(
             adapter,
             section_title,
             wait_ms=scroll_wait_ms,
@@ -194,27 +211,81 @@ def fill_one_section(
         )
         base_payload = _base_result_payload(item, mode)
         identity = _item_identity(item)
+
+        live_section = adapter.find_section(section_title)
+        if live_section is None or live_section.get("has_edit"):
+            report["validation_failed"] += 1
+            report["aborted_on_field"] = item.label
+            report["results"].append(
+                {
+                    **base_payload,
+                    "execution_status": "section_transaction_lost",
+                    "detail": "字段写入前目标 section 已不存在或意外折叠；未继续执行。",
+                }
+            )
+            break
+
+        try:
+            section_path, live = _open_and_index_section(
+                adapter,
+                section_title,
+                wait_ms=scroll_wait_ms,
+                max_scroll_steps=max_scroll_steps,
+            )
+        except Exception as exc:
+            report["validation_failed"] += 1
+            report["aborted_on_field"] = item.label
+            report["results"].append(
+                {
+                    **base_payload,
+                    "execution_status": "live_refresh_failed",
+                    "detail": f"字段写入前刷新当前 React live schema 失败：{exc}",
+                }
+            )
+            break
+
         matches = live.get(identity, [])
         if len(matches) != 1:
             report["skipped_live_match"] += 1
+            report["aborted_on_field"] = item.label
             report["results"].append(
                 {
                     **base_payload,
                     "execution_status": "skipped_live_match",
-                    "detail": f"展开 section 后 live field 匹配数={len(matches)}，期望恰好 1。",
+                    "detail": (
+                        f"字段写入前重新扫描后 live field 匹配数={len(matches)}，期望恰好 1；"
+                        "当前 section 事务已中止。"
+                    ),
                 }
             )
-            continue
+            break
 
         answer = execution_answer_for_item(
             item,
             include_review_candidates=include_review_candidates,
         )
+        live_field = matches[0]
+        hard_validation = validate_resolved_answer(live_field, answer)
+        if not hard_validation.valid:
+            report["validation_failed"] += 1
+            report["aborted_on_field"] = item.label
+            report["results"].append(
+                {
+                    **base_payload,
+                    "execution_status": "preflight_rejected",
+                    "detail": (
+                        "当前 live field 与 Fill Plan 答案的机械契约不再兼容；"
+                        f"未写入：{hard_validation.detail}"
+                    ),
+                }
+            )
+            break
+
         report["writes_attempted"] += 1
         if mode == "review":
             report["review_candidates_attempted"] += 1
         verification = adapter.fill_resolved_field(
-            matches[0],
+            live_field,
             answer,
             section_path=section_path,
             recheck_wait_ms=recheck_wait_ms,
@@ -233,6 +304,38 @@ def fill_one_section(
                 "verification": verification.as_dict(),
             }
         )
+        if verification.status != "validated":
+            report["aborted_on_field"] = item.label
+            break
+
+    execution_incomplete = bool(
+        report["validation_failed"]
+        or report["fill_error"]
+        or report["skipped_live_match"]
+        or report["validated"] != len(candidates)
+    )
+    if execution_incomplete:
+        failed_shot = run_dir / f"{_safe_name(section_title)}-transaction-failed.png"
+        _capture_diagnostic_screenshot(
+            adapter,
+            failed_shot,
+            report,
+            "screenshot_transaction_failed",
+        )
+        if persist:
+            try:
+                if _cancel_open_section_transaction(adapter, section_title):
+                    report["cancelled_unsaved_after_failure"] = True
+            except Exception as cleanup_exc:
+                report["cleanup_error"] = str(cleanup_exc)
+            report["status"] = "execution_failed_unsaved"
+            report["detail"] = (
+                "section 内至少一个字段未通过当前 live DOM 契约；"
+                "已放弃本 section 的未保存事务，没有点击 Save。"
+            )
+        else:
+            report["status"] = "preview_failed"
+        return report
 
     before_save = run_dir / f"{_safe_name(section_title)}-before-save.png"
     _capture_diagnostic_screenshot(
@@ -295,15 +398,8 @@ def fill_one_section(
             report["cleanup_error"] = str(cleanup_exc)
         return report
 
-    execution_incomplete = bool(
-        report["validation_failed"]
-        or report["fill_error"]
-        or report["skipped_live_match"]
-    )
     if errors or report["persisted_validation_failed"]:
         report["status"] = "persisted_validation_failed"
-    elif execution_incomplete:
-        report["status"] = "partial_persisted"
     else:
         report["status"] = "persisted_verified"
 
