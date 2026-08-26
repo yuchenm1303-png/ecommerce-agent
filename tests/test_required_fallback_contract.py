@@ -3,11 +3,14 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
+import pytest
+
 from app.fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem
 from app.required_overrides import (
     FALLBACK_NUMERIC_VALUE,
     FALLBACK_SOURCE_REFERENCE,
     FALLBACK_TEXT_VALUE,
+    RequiredOverrideError,
     apply_required_overrides,
     required_fallback_override,
 )
@@ -128,6 +131,64 @@ def test_select_required_gap_takes_first_real_live_option_not_select_one():
     )
 
     assert fallback["values"] == ["Orange"]
+
+
+def test_live_select_required_gap_uses_only_enabled_control_options():
+    fallback = required_fallback_override(
+        _field(
+            attribute_key="trimming_range",
+            label="Trimming Range",
+            options=["0.2 - 0.4 mm", "0.5 - 1 mm"],
+            controls=[
+                {
+                    "name": "trimming_range_0_value",
+                    "field_kind": "select",
+                    "options": [
+                        {
+                            "text": "0.2 - 0.4 mm",
+                            "value": "0.2 - 0.4 mm",
+                            "disabled": True,
+                        },
+                        {
+                            "text": "0.5 - 1 mm",
+                            "value": "0.5 - 1 mm",
+                            "disabled": False,
+                        },
+                    ],
+                }
+            ],
+        )
+    )
+
+    assert fallback["values"] == ["0.5 - 1 mm"]
+
+
+def test_selection_without_executable_live_option_never_degrades_to_placeholder():
+    for kind in ("select", "dropdown"):
+        field = _field(
+            attribute_key="trimming_range",
+            label="Trimming Range",
+            options=["0.2 - 0.4 mm"],
+            controls=[
+                {
+                    "name": "trimming_range_0_value",
+                    "field_kind": kind,
+                    "options": (
+                        [
+                            {
+                                "text": "0.2 - 0.4 mm",
+                                "value": "0.2 - 0.4 mm",
+                                "disabled": True,
+                            }
+                        ]
+                        if kind == "select"
+                        else []
+                    ),
+                }
+            ],
+        )
+        with pytest.raises(RequiredOverrideError, match="selection 控件"):
+            required_fallback_override(field)
 
 
 def test_deterministic_fallback_is_promoted_to_ready_through_existing_hard_guard():
