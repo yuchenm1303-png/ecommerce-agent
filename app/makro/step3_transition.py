@@ -210,8 +210,6 @@ def _step3_matches(
         if _matches_transition_identity(candidate, expected):
             fallback_step3.append(candidate)
 
-    # Once Chromium gives us explicit lineage, never fall back to an unrelated
-    # concurrently-created page even if it happens to share the same vertical.
     if saw_direct_child_step3:
         return child_step3
     return fallback_step3
@@ -292,13 +290,16 @@ def select_brand_to_product_info(
     brand = ""
     recoverable_error: RuntimeError | None = None
     try:
-        brand = select_brand(
-            page,
-            provider,
-            hints,
-            wait_ms=wait_ms,
-            diagnostic_override=diagnostic_brand_override,
-        )
+        if str(diagnostic_brand_override or "").strip():
+            brand = select_brand(
+                page,
+                provider,
+                hints,
+                wait_ms=wait_ms,
+                diagnostic_override=diagnostic_brand_override,
+            )
+        else:
+            brand = select_brand(page, provider, hints, wait_ms=wait_ms)
         if is_product_info_step(page):
             if not _matches_transition_identity(page, expected):
                 raise RuntimeError(
