@@ -196,6 +196,7 @@ def _run_pytest(
     suite_env = dict(env)
     for key in ("TEMP", "TMP", "TMPDIR"):
         suite_env[key] = str(system_temp)
+    suite_env["ECOMMERCE_TEST_LAB_TEMP_ROOT"] = str(run_root)
     command = _pytest_command(
         nodes,
         verbose=verbose,
