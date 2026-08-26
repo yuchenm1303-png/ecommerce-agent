@@ -49,7 +49,7 @@ def _grounding():
     )
 
 
-def test_local_fill_prompt_reads_original_sources_directly_and_uses_typed_schema():
+def test_local_fill_prompt_reads_compact_grounded_text_and_uses_typed_schema():
     evidence = CompactEvidence(
         web_text="[s1] Package length 16 cm, width 11 cm, height 7 cm",
         image_facts="",
@@ -70,7 +70,7 @@ def test_local_fill_prompt_reads_original_sources_directly_and_uses_typed_schema
     assert target["label"] == "Breadth"
     assert target["qualifier_options"] == ["cm", "mm"]
     assert target["context_text"] == "Breadth cm"
-    assert request["grounded_sources"][0]["source_type"] == "compact_supplier_evidence"
+    assert request["grounded_sources"][0]["source_type"] == "compact_grounded_text_evidence"
     assert request["product_identity"] == {"source_product_url": PRODUCT_URL}
     assert request["strict_json_schema"] is True
     properties = request["json_contract"]["properties"]
