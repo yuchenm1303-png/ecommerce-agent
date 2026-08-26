@@ -116,7 +116,7 @@ def test_request_sees_all_non_business_fields_once_and_uses_compact_text_only():
     assert len(request["target_fields"]) == 2
     assert request["strict_json_schema"] is True
     assert {source["source_id"] for source in request["grounded_sources"]} == {"compact:web"}
-    assert set(request["json_contract"]["properties"]) == {"facts", "model_summary"}
+    assert set(request["json_contract"]["properties"]) == {"facts"}
 
 
 def test_global_facts_expand_aliases_preserve_conflict_and_synthesize_missing_and_business(tmp_path):
@@ -204,6 +204,56 @@ def test_large_field_set_is_mechanically_batched_and_each_batch_hot_caches(tmp_p
     assert second.cache_hits == 3
     assert second.cache_hit is True
     assert provider.calls == 3
+
+
+def test_duplicate_fact_is_reconciled_without_discarding_valid_siblings():
+    fields = [_field("package_length", "Length"), _field("recording_resolution", "Recording Resolution")]
+
+    class DuplicateProvider:
+        name = "duplicate-provider"
+
+        def extract_json(self, request):
+            by_key = {item["attribute_key"]: item["field_id"] for item in request["target_fields"]}
+            duplicate_id = by_key["package_length"]
+            return {
+                "facts": [
+                    {
+                        "field_id": duplicate_id,
+                        "status": "ready",
+                        "values": ["16"],
+                        "qualifier": "cm",
+                        "confidence": 1.0,
+                        "citations": [{"source_reference": "s1", "evidence_text": "Length 16 cm"}],
+                        "alternatives": [],
+                    },
+                    {
+                        "field_id": duplicate_id,
+                        "status": "ready",
+                        "values": ["17"],
+                        "qualifier": "cm",
+                        "confidence": 0.9,
+                        "citations": [{"source_reference": "s1", "evidence_text": "Length 17 cm"}],
+                        "alternatives": [],
+                    },
+                    {
+                        "field_id": by_key["recording_resolution"],
+                        "status": "ready",
+                        "values": ["1080p"],
+                        "qualifier": "",
+                        "confidence": 1.0,
+                        "citations": [{"source_reference": "s2", "evidence_text": "Resolution 1080p"}],
+                        "alternatives": [],
+                    },
+                ]
+            }
+
+    result = run_product_facts(DuplicateProvider(), fields, _grounding(), _compact())
+    by_id = {decision.field_id: decision for decision in result.packet.decisions}
+
+    assert result.failed_batches == 0
+    assert by_id[field_id(fields[0])].status == CONFLICT
+    assert by_id[field_id(fields[1])].status == READY
+    assert "isolated and reconciled without discarding the batch" in result.warning
 
 
 def test_unscoped_fov_and_packaging_scoped_product_dimension_are_not_ready():
