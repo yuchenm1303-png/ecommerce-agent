@@ -36,7 +36,7 @@ def test_direct_executor_cli_has_no_old_product_inputs():
     assert "--facts-json" not in options
 
 
-def test_direct_executor_requires_exact_resolver_source_files():
+def test_direct_executor_requires_canonical_resolver_source_snapshot():
     parser = makro_execute_listing.build_parser()
     args = parser.parse_args(
         [
@@ -47,7 +47,7 @@ def test_direct_executor_requires_exact_resolver_source_files():
             "--section", "Product Description",
         ]
     )
-    with pytest.raises(SystemExit, match="source-snapshot.json"):
+    with pytest.raises(SystemExit, match="canonical source snapshot"):
         makro_execute_listing._validate_args(args)
 
 
