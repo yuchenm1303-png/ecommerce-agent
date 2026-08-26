@@ -21,6 +21,11 @@ _NON_RETRYABLE_MARKERS = (
     "forbidden",
     "permission denied",
     "billing",
+    # A provider-level wall-clock deadline is the budget for the complete logical
+    # request, not one transport attempt. Retrying it would exceed the very bound
+    # the caller asked us to enforce. Lower-level socket/read timeouts remain
+    # retryable below.
+    "wall-clock deadline exceeded",
 )
 
 _RETRYABLE_MARKERS = (
