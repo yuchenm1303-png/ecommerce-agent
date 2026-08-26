@@ -42,6 +42,26 @@ def _hints() -> ListingBootstrapHints:
     )
 
 
+def _reconciliation_hints() -> ListingBootstrapHints:
+    return ListingBootstrapHints(
+        vertical_search_terms=("personalized wooden sunglasses",),
+        brand="",
+        brand_status="unknown",
+        product_summary="Polarized protective eyewear with a wooden-style frame.",
+        product_identity={
+            "entity_kind": "physical_product",
+            "product_type_en": "personalized wooden sunglasses",
+            "product_summary": "Personalized wooden polarized sunglasses.",
+            "confidence": 0.78,
+            "evidence_refs": ["identity:page-title"],
+        },
+        customer_intent="1个偏光防护镜",
+        grounded_product_evidence=(
+            "supplier_product_heading: Polarized protective eyewear with impact-resistant lenses and wooden-style frame",
+        ),
+    )
+
+
 def test_taxonomy_path_contract_is_one_atomic_selection_key() -> None:
     request = build_taxonomy_path_choice_request(
         _hints(),
@@ -72,6 +92,32 @@ def test_taxonomy_path_contract_is_one_atomic_selection_key() -> None:
     assert "atomic" in rules
     assert "best_available_branch" in rules
     assert "physical containment alone" in rules
+
+
+def test_taxonomy_reconciliation_preserves_independent_evidence_without_splitting_atomic_decision() -> None:
+    hints = _reconciliation_hints()
+    request = build_taxonomy_path_choice_request(
+        hints,
+        ["Industrial & Scientific Supplies"],
+        ["Safety Products", "Storage Containers"],
+    )
+
+    context = request["context"]
+    assert context["initial_product_identity"]["product_type_en"] == "personalized wooden sunglasses"
+    assert context["customer_listing_intent"] == "1个偏光防护镜"
+    assert "Polarized protective eyewear" in context["grounded_supplier_evidence"][0]
+    assert set(request["json_contract"]["properties"]) == {"selection_key"}
+    assert "selected_node" not in request["json_contract"]["properties"]
+    assert "selection_relation" not in request["json_contract"]["properties"]
+
+    leaf_request = build_taxonomy_leaf_validation_request(
+        hints,
+        ["Industrial & Scientific Supplies", "Safety Products", "Protective Glasses"],
+    )
+    leaf_context = leaf_request["context"]
+    assert leaf_context["initial_product_identity"] == context["initial_product_identity"]
+    assert leaf_context["grounded_supplier_evidence"] == context["grounded_supplier_evidence"]
+    assert leaf_context["customer_listing_intent"] == context["customer_listing_intent"]
 
 
 def test_taxonomy_path_rejects_legacy_split_field_response() -> None:
