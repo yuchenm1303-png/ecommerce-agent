@@ -61,6 +61,23 @@ def test_glass_mask_texture_refreshes_only_when_geometry_changes() -> None:
     assert "_geometry_revision" in NATIVE
 
 
+def test_static_wallpaper_source_is_cached_without_freezing_card_interaction() -> None:
+    assert "id: blurTexture" in NATIVE
+    assert "sourceItem: blurSource" in NATIVE
+    assert "live: root.animationRunning" in NATIVE
+    assert "onBlurUrlChanged: blurTexture.scheduleUpdate()" in NATIVE
+    assert "onWidthChanged: blurTexture.scheduleUpdate()" in NATIVE
+    assert "onHeightChanged: blurTexture.scheduleUpdate()" in NATIVE
+    assert "onAnimationRunningChanged:" in NATIVE
+    assert "blurTexture.scheduleUpdate()" in NATIVE
+    assert "source: blurTexture" in NATIVE
+    assert "scale: cardScale" in NATIVE
+    assert "color: Qt.rgba(0, 0, 0, cardAlpha / 255.0)" in NATIVE
+
+    blur_source = NATIVE.split("id: blurSource", 1)[1].split("ShaderEffectSource {{", 1)[0]
+    assert "layer.enabled: true" not in blur_source
+
+
 def test_background_has_no_python_pointer_timer_and_retains_gpu_scene_graph() -> None:
     assert "def presentation_tick" in NATIVE
     assert "def reset_pointer_identity" in NATIVE

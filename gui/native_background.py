@@ -334,8 +334,6 @@ Window {{
         anchors.fill: parent
         clip: true
         visible: false
-        layer.enabled: true
-        layer.smooth: true
 
         Image {{
             width: root.width * {_OVERSCAN}
@@ -347,6 +345,16 @@ Window {{
             smooth: true
             cache: true
         }}
+    }}
+
+    ShaderEffectSource {{
+        id: blurTexture
+        anchors.fill: parent
+        sourceItem: blurSource
+        hideSource: true
+        live: root.animationRunning
+        smooth: true
+        visible: false
     }}
 
     Item {{
@@ -386,11 +394,22 @@ Window {{
         visible: false
     }}
 
+    onBlurUrlChanged: blurTexture.scheduleUpdate()
+    onWidthChanged: blurTexture.scheduleUpdate()
+    onHeightChanged: blurTexture.scheduleUpdate()
+    onAnimationRunningChanged: {{
+        if (!animationRunning)
+            blurTexture.scheduleUpdate()
+    }}
     onGeometryRevisionChanged: glassMaskTexture.scheduleUpdate()
+    Component.onCompleted: {{
+        blurTexture.scheduleUpdate()
+        glassMaskTexture.scheduleUpdate()
+    }}
 
     MultiEffect {{
         anchors.fill: parent
-        source: blurSource
+        source: blurTexture
         maskEnabled: true
         maskSource: glassMaskTexture
         autoPaddingEnabled: false
