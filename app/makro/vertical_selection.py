@@ -18,6 +18,7 @@ The workflow never invents a Makro Vertical and never clicks Send to QC.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 from playwright.sync_api import Page
 
@@ -235,36 +236,85 @@ def _wait_for_canonical_vertical(page: Page, *, timeout_s: float = 10.0) -> str:
     return str(actual or "").strip()
 
 
-def _vertical_confirmation_ready(page: Page, selected: str = "") -> bool:
-    """Recognize only a confirmation that belongs to the selected live Vertical.
+@dataclass(frozen=True, slots=True)
+class _VerticalBrandTransitionObservation:
+    """One coherent read of the Step 1 confirmation -> Step 2 boundary.
 
-    During taxonomy backtracking Makro may leave the previous leaf confirmation on
-    screen briefly. When a selected label is supplied, every Step 1 confirmation
-    variant therefore has to show that exact label before it can be treated as the
-    new branch outcome. Step 2 remains safe because semantic rejection happens
-    before Select Brand is clicked.
+    Confirmation text alone is not executable state. A Step 1 confirmation is
+    actionable only when the same observation also proves that it belongs to the
+    selected live Vertical and yields the exact current Select Brand action. This
+    prevents a React render gap from being promoted to a successful readiness
+    check and eliminates the old check-then-requery TOCTOU boundary.
     """
 
-    selected_value = str(selected or "").strip()
-    try:
-        if is_brand_step(page):
-            return True
-    except Exception:
-        pass
-    try:
-        if _vertical_confirmation_content(page):
-            return not selected_value or _selected_label_visible(page, selected_value)
-    except Exception:
-        pass
-    try:
-        if not is_vertical_step(page):
-            return False
-        if _vertical_select_brand_button(page) is None:
-            return False
-    except Exception:
-        return False
+    brand_step: bool = False
+    confirmation_visible: bool = False
+    selected_visible: bool = False
+    canonical: str = ""
+    select_brand_action: object | None = None
 
-    return not selected_value or _selected_label_visible(page, selected_value)
+    @property
+    def actionable(self) -> bool:
+        return bool(self.brand_step or self.select_brand_action is not None)
+
+
+def _observe_vertical_brand_transition(
+    page: Page,
+    selected: str = "",
+) -> _VerticalBrandTransitionObservation:
+    selected_value = str(selected or "").strip()
+
+    try:
+        brand_step = bool(is_brand_step(page))
+    except Exception:
+        brand_step = False
+    try:
+        canonical, _ = _current_target_values(page)
+    except Exception:
+        canonical = ""
+    canonical_value = str(canonical or "").strip()
+
+    if brand_step:
+        return _VerticalBrandTransitionObservation(
+            brand_step=True,
+            canonical=canonical_value,
+        )
+
+    try:
+        confirmation_visible = bool(_vertical_confirmation_content(page))
+    except Exception:
+        confirmation_visible = False
+    if not confirmation_visible:
+        return _VerticalBrandTransitionObservation(canonical=canonical_value)
+
+    selected_visible = not selected_value or _selected_label_visible(page, selected_value)
+    if not selected_visible:
+        return _VerticalBrandTransitionObservation(
+            confirmation_visible=True,
+            canonical=canonical_value,
+        )
+
+    try:
+        action = _vertical_select_brand_button(page)
+    except Exception:
+        action = None
+    return _VerticalBrandTransitionObservation(
+        confirmation_visible=True,
+        selected_visible=True,
+        canonical=canonical_value,
+        select_brand_action=action,
+    )
+
+
+def _vertical_confirmation_ready(page: Page, selected: str = "") -> bool:
+    """Return true only for Step 2 or one atomically actionable confirmation.
+
+    Taxonomy navigation also uses this readiness boundary. Stale confirmation text,
+    the wrong leaf, or a render interval in which Select Brand is absent is now
+    pending state rather than success.
+    """
+
+    return _observe_vertical_brand_transition(page, selected).actionable
 
 
 def _complete_exact_live_vertical(
@@ -275,19 +325,27 @@ def _complete_exact_live_vertical(
     verification_label: str = "",
 ) -> str:
     verify_as = str(verification_label or selected).strip()
-    transitioned = _wait_for(
-        lambda current: _vertical_confirmation_ready(current, verify_as),
-        page,
-        timeout_s=15.0,
-    )
+    observation = _VerticalBrandTransitionObservation()
+
+    def observe(current: Page) -> bool:
+        nonlocal observation
+        observation = _observe_vertical_brand_transition(current, verify_as)
+        return observation.actionable
+
+    transitioned = _wait_for(observe, page, timeout_s=15.0)
     if not transitioned:
+        if observation.confirmation_visible:
+            raise RuntimeError(
+                "Makro Step 1 selected the expected live Vertical and rendered its confirmation, "
+                "but that confirmation never became atomically actionable with the exact Select Brand action"
+            )
         raise RuntimeError(
             f"Makro Step 1 selected live vertical {selected!r}, but no verified Step 1 confirmation or Step 2 appeared"
         )
 
-    selected_visible = _selected_label_visible(page, verify_as)
-    if is_brand_step(page):
-        canonical_after = _wait_for_canonical_vertical(page)
+    selected_visible = bool(observation.selected_visible)
+    if observation.brand_step:
+        canonical_after = observation.canonical or _wait_for_canonical_vertical(page)
         if not canonical_after:
             raise RuntimeError("Makro Step 1 reached Step 2 but no canonical vertical appeared in the listing URL")
         _verify_retry_canonical(
@@ -299,7 +357,7 @@ def _complete_exact_live_vertical(
         )
         return canonical_after
 
-    canonical_before_brand, _ = _current_target_values(page)
+    canonical_before_brand = observation.canonical
     if canonical_before_brand:
         _verify_retry_canonical(
             page,
@@ -314,12 +372,22 @@ def _complete_exact_live_vertical(
             f"or a canonical URL value: selected={selected!r}, verify_as={verify_as!r}"
         )
 
-    button = _vertical_select_brand_button(page)
+    button = observation.select_brand_action
     if button is None:
-        raise RuntimeError("Makro Step 1 vertical confirmation appeared, but the exact Select Brand button was not found")
+        raise RuntimeError("Makro Step 1 transition observation became actionable without a Select Brand action")
+
+    _vertical_diag(
+        "select_brand_transition",
+        {
+            "selected_leaf": verify_as,
+            "canonical_before_brand": canonical_before_brand,
+            "selected_visible_confirmation": selected_visible,
+            "action": "click_observed_action_then_verify_step2",
+        },
+    )
     button.click(timeout=5000)
     if not _wait_for(is_brand_step, page, timeout_s=15.0):
-        raise RuntimeError("Makro Step 1 clicked the vertical confirmation Select Brand button, but Step 2 did not appear")
+        raise RuntimeError("Makro Step 1 triggered the verified Select Brand action, but Step 2 did not appear")
 
     canonical_after = _wait_for_canonical_vertical(page)
     if not canonical_after:
