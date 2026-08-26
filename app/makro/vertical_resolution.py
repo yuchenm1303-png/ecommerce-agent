@@ -24,7 +24,7 @@ from .requested_vertical import (
 )
 
 
-_MAX_SEARCH_TERMS = 5
+_MAX_SEARCH_TERMS = 7
 _MAX_LIVE_CANDIDATES = 120
 _QUERY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 '&/()+.,-]*$")
 _FORBIDDEN_PLATFORM_WORDS = {"makro", "marketplace", "seller", "listing"}
@@ -90,6 +90,33 @@ def _canonical_product_type(hints: ListingBootstrapHints) -> str:
     return _clean(hints.vertical_search_terms[0] if hints.vertical_search_terms else "")
 
 
+def _product_type_query_words(hints: ListingBootstrapHints) -> list[str]:
+    return [
+        word
+        for word in _query_key(_canonical_product_type(hints)).split()
+        if word and word not in _TOKEN_STOPWORDS
+    ]
+
+
+def _usable_head_query_for_product(hints: ListingBootstrapHints, value: object) -> bool:
+    """Reject lossy one-word heads for an already multi-word product identity.
+
+    A bare functional/form noun such as ``cleaner``, ``sleeve`` or ``sealer`` is
+    often dramatically more ambiguous than the grounded product type that produced
+    it. When Product Identity contains at least two meaningful words, the broadest
+    query must retain at least two words so one discriminating signal survives.
+    Single-word product types (for example ``toaster``) may still use one word.
+    """
+
+    if not _usable_head_query(value):
+        return False
+    head_words = _query_key(value).split()
+    product_words = _product_type_query_words(hints)
+    if len(product_words) >= 2 and len(head_words) < 2:
+        return False
+    return True
+
+
 def _normalize_search_terms(
     values: Iterable[object],
     *,
@@ -134,7 +161,7 @@ def _fallback_search_ladder(hints: ListingBootstrapHints) -> tuple[str, ...]:
         _append_unique_query(output, seen, " ".join(words[-2:]))
     if words:
         head = words[-1]
-        if _usable_head_query(head):
+        if _usable_head_query_for_product(hints, head):
             _append_unique_query(output, seen, head)
     return tuple(output[:_MAX_SEARCH_TERMS])
 
@@ -150,7 +177,8 @@ def build_vertical_search_plan_request(hints: ListingBootstrapHints) -> dict[str
         ),
         "prompt_instruction": (
             "Create a specific-to-broad retrieval ladder from context.product_identity. The goal is "
-            "high recall without letting incidental attributes dominate search."
+            "high recall without letting incidental attributes dominate search. Include conventional "
+            "retail paraphrases so sparse marketplace vocabulary does not depend on one head noun."
         ),
         "context": {
             "product_type_en": product_type,
@@ -159,45 +187,50 @@ def build_vertical_search_plan_request(hints: ListingBootstrapHints) -> dict[str
         },
         "rules": [
             "specific_queries: return 1 or 2 concise product-type phrases that closely name the physical product.",
+            "alternate_queries: return 0 to 2 conventional retail synonyms/paraphrases for the same physical product class; preserve defining mechanism/form/function but change likely marketplace vocabulary when useful (for example cleaner -> cleaning machine only when it still means the sold device).",
             "broader_queries: return 0 to 2 progressively broader product-family phrases by removing qualifiers, not by switching to unrelated products.",
-            "head_noun_query: return the shortest useful common class noun or two-word head phrase that a human would type for broad marketplace recall.",
-            "The final ladder must behave like specific -> broader -> head noun.",
+            "head_noun_query: return the shortest useful common class phrase for broad marketplace recall.",
+            "The final ladder must behave like specific -> alternate vocabulary -> broader -> discriminative head phrase.",
+            "If the grounded product type has multiple meaningful words, do not collapse head_noun_query to one bare functional/form noun; keep at least one differentiating modifier (for example ultrasonic cleaner, knee sleeve, bag sealer rather than cleaner, sleeve, sealer).",
             "Drop model numbers, brand, colour, size, power source, rechargeable/battery wording and marketing adjectives unless they define a genuinely different product class.",
             "Do not use Makro, marketplace, seller, listing, vertical or category as retrieval metadata.",
             "Do not deliberately broaden into accessories or spare parts unless the supplied product itself is one.",
-            "The head noun may be broad because downstream selection is constrained to real live Makro rows and evaluates the complete breadcrumb.",
+            "Alternate queries must remain the same sold physical product, not an accessory, use-case object, consumable or neighboring product.",
         ],
         "json_contract": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
                 "specific_queries": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "string", "minLength": 2}},
+                "alternate_queries": {"type": "array", "minItems": 0, "maxItems": 2, "items": {"type": "string", "minLength": 2}},
                 "broader_queries": {"type": "array", "minItems": 0, "maxItems": 2, "items": {"type": "string", "minLength": 2}},
                 "head_noun_query": {"type": "string", "minLength": 2},
             },
-            "required": ["specific_queries", "broader_queries", "head_noun_query"],
+            "required": ["specific_queries", "alternate_queries", "broader_queries", "head_noun_query"],
         },
         "strict_json_schema": True,
     }
 
 
-def _planned_search_ladder(raw: dict[str, Any]) -> tuple[str, ...]:
+def _planned_search_ladder(raw: dict[str, Any], hints: ListingBootstrapHints) -> tuple[str, ...]:
     specific = _normalize_search_terms(raw.get("specific_queries") or (), limit=2)
+    alternate = _normalize_search_terms(raw.get("alternate_queries") or (), limit=2)
     broader = _normalize_search_terms(raw.get("broader_queries") or (), limit=2)
     head = _clean(raw.get("head_noun_query"))
-    if not specific or not _usable_head_query(head):
+    if not specific:
         return ()
     output: list[str] = []
     seen: set[str] = set()
-    for term in (*specific, *broader):
+    for term in (*specific, *alternate, *broader):
         if len(output) >= _MAX_SEARCH_TERMS - 1:
             break
         _append_unique_query(output, seen, term)
-    head_key = _query_key(head)
-    if head_key in seen:
-        output = [term for term in output if _query_key(term) != head_key]
-        seen = {_query_key(term) for term in output}
-    _append_unique_query(output, seen, head)
+    if _usable_head_query_for_product(hints, head):
+        head_key = _query_key(head)
+        if head_key in seen:
+            output = [term for term in output if _query_key(term) != head_key]
+            seen = {_query_key(term) for term in output}
+        _append_unique_query(output, seen, head)
     return tuple(output[:_MAX_SEARCH_TERMS])
 
 
@@ -205,15 +238,17 @@ def _with_canonical_product_type_fallback(
     hints: ListingBootstrapHints,
     terms: tuple[str, ...],
 ) -> tuple[str, ...]:
-    """Preserve the existing ladder and add one final canonical identity query when missing."""
+    """Preserve the ladder and reserve one bounded slot for canonical identity."""
 
-    output = list(terms)
-    seen = {_query_key(term) for term in output if _query_key(term)}
     product_type = _canonical_product_type(hints)
     product_key = _query_key(product_type)
+    output = list(terms)
+    seen = {_query_key(term) for term in output if _query_key(term)}
     if product_key and product_key not in seen and _usable_query(product_type):
+        if len(output) >= _MAX_SEARCH_TERMS:
+            output = output[: _MAX_SEARCH_TERMS - 1]
         output.append(product_type)
-    return tuple(output)
+    return tuple(output[:_MAX_SEARCH_TERMS])
 
 
 def plan_vertical_search_terms(provider: JSONTaskProvider, hints: ListingBootstrapHints) -> tuple[str, ...]:
@@ -231,7 +266,7 @@ def plan_vertical_search_terms(provider: JSONTaskProvider, hints: ListingBootstr
     except Exception:
         raw = None
     if isinstance(raw, dict):
-        planned = _planned_search_ladder(raw)
+        planned = _planned_search_ladder(raw, hints)
         if planned:
             return _with_canonical_product_type_fallback(hints, planned)
     fallback = _fallback_search_ladder(hints)
@@ -403,7 +438,7 @@ def build_vertical_pool_choice_request(
         },
         "rules": [
             "selected_vertical must be copied exactly from an allowed live candidate label or be empty.",
-            "Search queries are retrieval hints only; broader/head queries intentionally trade precision for recall.",
+            "Search queries are retrieval hints only; broader queries intentionally trade precision for recall, but no query wording is evidence that a returned row is correct.",
             "Judge the complete breadcrumb, retail context and leaf against the physical product identity.",
             "Use same_product_type when the candidate represents the same physical product class.",
             "Use broader_valid_class when the candidate is a genuine semantic superclass that contains the product; a strict broader class must never add a different defining capability, mechanism, form, audience or use-case.",
@@ -411,6 +446,7 @@ def build_vertical_pool_choice_request(
             "For best_available_fit, prefer shared defining function, merchandise context and buyer expectation over literal word overlap.",
             "A nearby sibling or form-specific class may be used as best_available_fit when the portal offers no better category; do not mislabel it as a broader superclass.",
             "Avoid accessory, spare-part or consumable classes when a non-accessory live option is materially closer to the sold product.",
+            "A candidate returned only because of a generic word overlap (for example cleaner -> toilet cleaner, sleeve -> cable sleeve) is not a valid best_available_fit unless the complete breadcrumb independently matches the sold product.",
             "Return none only when every live candidate is plainly unrelated and selecting any of them would severely misrepresent what is being sold.",
             "Priority is same_product_type -> broader_valid_class -> best_available_fit -> none.",
         ],
