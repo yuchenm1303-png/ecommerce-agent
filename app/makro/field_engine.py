@@ -251,6 +251,27 @@ def _matched_option(control: dict[str, Any], value: object) -> dict[str, Any] | 
     return matches[0]
 
 
+def _native_select_options(locator: Any) -> list[dict[str, Any]]:
+    """Read the actual native select domain at the final mutation boundary.
+
+    Earlier semantic scans are intentionally not trusted here: Makro's React form
+    can rebuild dependent option sets after another field changes. A native select
+    write is therefore authorized only by the options owned by the current DOM
+    node immediately before ``select_option``.
+    """
+
+    raw = locator.evaluate(
+        "el => Array.from(el.options || []).map(opt => ({"
+        "text: String(opt.textContent || '').replace(/\\s+/g, ' ').trim(),"
+        "value: String(opt.value || '').trim(),"
+        "disabled: opt.disabled === true"
+        "}))"
+    )
+    if not isinstance(raw, list):
+        raise RuntimeError("当前 native select 无法返回 live option domain；拒绝写入。")
+    return [item for item in raw if isinstance(item, dict)]
+
+
 def _click_unique_visible_text(page: Any, text: str) -> None:
     candidates = page.get_by_text(text, exact=True)
     count = candidates.count()
@@ -286,21 +307,19 @@ def fill_control(page: Any, control: dict[str, Any], value: str, section_path: s
         return selector
 
     if kind == "select":
-        matched = _matched_option(control, value)
-        if matched is not None:
-            label = str(matched.get("text") or "").strip()
-            option_value = str(matched.get("value") or "").strip()
-            if label:
-                locator.select_option(label=label)
-            elif option_value:
-                locator.select_option(value=option_value)
-            else:
-                raise ValueError(f"live option {matched!r} 没有可写 label/value。")
+        live_control = dict(control)
+        live_control["options"] = _native_select_options(locator)
+        matched = _matched_option(live_control, value)
+        if matched is None:
+            raise ValueError("当前 native select 没有 enabled live options；拒绝写入。")
+        label = str(matched.get("text") or "").strip()
+        option_value = str(matched.get("value") or "").strip()
+        if label:
+            locator.select_option(label=label)
+        elif option_value:
+            locator.select_option(value=option_value)
         else:
-            try:
-                locator.select_option(label=value)
-            except Exception:
-                locator.select_option(value=value)
+            raise ValueError(f"live option {matched!r} 没有可写 label/value。")
         _commit_value(locator, dispatch_value_events=True)
         return selector
 
