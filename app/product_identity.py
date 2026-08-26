@@ -236,25 +236,30 @@ def build_product_identity_request(
         "system_instruction": (
             "Identify the physical item actually being offered for sale from product-focused evidence. "
             "A supplier website/platform itself is never the product unless the evidence explicitly offers "
-            "a service rather than a physical item. Evidence may be in any language. Return canonical "
-            "English product identity. JSON only."
+            "a service rather than a physical item. Evidence may be in any language. Return the canonical "
+            "English core retail product class separately from descriptive attributes. JSON only."
         ),
         "prompt_instruction": (
             "Use only grounded_sources. Ignore site navigation, marketplace branding, seller-platform "
             "descriptions, procurement slogans and other page chrome. Determine whether the evidence "
-            "establishes one physical product. For a physical product, cite the exact source_id values "
+            "establishes one physical product. For a physical product, product_type_en must name the core "
+            "sold product class rather than restating material, personalization or marketing modifiers; "
+            "product_summary may retain supported distinguishing attributes. Cite the exact source_id values "
             "that support product identity and brand identity."
         ),
         "context": {
             "product_url": snapshot.final_url or snapshot.requested_url,
             "allowed_evidence_refs": allowed_refs,
-            "identity_contract_version": 2,
+            "identity_contract_version": 3,
         },
         "grounded_sources": sources,
         "rules": [
             "entity_kind must be physical_product, service_or_platform, or unknown.",
             "Use physical_product only when the evidence establishes a tangible item being sold.",
-            "For physical_product, product_type_en must be one concise ordinary English noun phrase for the item itself.",
+            "For physical_product, product_type_en must be one concise ordinary English noun phrase for the core retail class of the item itself.",
+            "Keep defining form, mechanism or function when removing it would change the product class; for example an ultrasonic cleaner is not merely a cleaner.",
+            "Do not include brand, model number, colour, size, material, finish, engraving, personalization, bundle count, promotional adjectives or style words in product_type_en unless that qualifier defines a genuinely different product class.",
+            "Treat product_type_en as a classification anchor, not as an SEO title. Put supported descriptive attributes in product_summary instead.",
             "For service_or_platform or unknown, product_type_en must be empty.",
             "product_summary must describe the offered item, not the supplier website.",
             "evidence_refs may contain only exact source_id values from allowed_evidence_refs.",
