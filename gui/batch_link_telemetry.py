@@ -359,7 +359,8 @@ class BatchLinkTelemetryController(QObject):
             )
         )
         job_id = _text(getattr(job, "job_id", ""), 160)
-        cached = self._result_cache.get(job_id)
+        cache_identity = f"{batch_id}/{job_id}"
+        cached = self._result_cache.get(cache_identity)
         if cached and cached[0] == cache_key:
             return cached[1]
 
@@ -455,7 +456,7 @@ class BatchLinkTelemetryController(QObject):
             )
         if safe_result.get("ai_usage_summary") and isinstance(safe_result.get("failure_diagnostic"), dict):
             safe_result["failure_diagnostic"]["ai_usage_summary"] = safe_result["ai_usage_summary"]
-        self._result_cache[job_id] = (cache_key, safe_result)
+        self._result_cache[cache_identity] = (cache_key, safe_result)
         return safe_result
 
     def _audit_id(self, batch_id: str, job_id: str) -> str:
