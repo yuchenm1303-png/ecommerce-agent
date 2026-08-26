@@ -8,7 +8,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
@@ -30,7 +30,7 @@ from .source_snapshot import (
 
 
 DEFAULT_SOURCE_CDP_PORT = 9333
-SOURCE_CAPTURE_CACHE_VERSION = 4
+SOURCE_CAPTURE_CACHE_VERSION = 5
 
 _DETAIL_DOCUMENT_PATTERN = re.compile(
     r"detail(?:Url|_url)[^h]{0,48}(https?://[^\\\"'<>\s]+)",
@@ -62,9 +62,25 @@ def validate_source_url(value: str) -> str:
 
 
 def _canonical_source_url(value: str) -> str:
+    """Return the exact cache identity for one supplier product URL.
+
+    Query parameters are part of product identity because many supplier sites use
+    them for SKU/variant routing. A fragment is browser-local navigation state and
+    therefore intentionally excluded. Query order is preserved: repeated/order-
+    sensitive parameters must never be silently rewritten into another request.
+    """
+
     parsed = urlsplit(validate_source_url(value))
     path = parsed.path.rstrip("/") or "/"
-    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            path,
+            parsed.query,
+            "",
+        )
+    )
 
 
 def _source_cache_key(value: str) -> str:
@@ -427,6 +443,13 @@ def _cached_capture(
     if age < 0 or age > cache_ttl_seconds:
         return None
 
+    try:
+        cached_snapshot = source_snapshot_from_json(snapshot)
+        if _canonical_source_url(cached_snapshot.requested_url) != _canonical_source_url(source_url):
+            return None
+    except Exception:
+        return None
+
     output_dir.mkdir(parents=True, exist_ok=True)
     output_snapshot = output_dir / "source-snapshot.json"
     output_screenshot = output_dir / "source-page.png"
@@ -447,7 +470,7 @@ def _cached_capture(
     return CapturedProductSource(
         snapshot_path=output_snapshot,
         screenshot_path=output_screenshot,
-        snapshot=source_snapshot_from_json(output_snapshot),
+        snapshot=cached_snapshot,
         launched_now=False,
         product_image_paths=product_images,
         cache_hit=True,
@@ -667,6 +690,7 @@ __all__ = [
     "DEFAULT_SOURCE_CDP_PORT",
     "SourceAccessBlocked",
     "SOURCE_CAPTURE_CACHE_VERSION",
+    "_canonical_source_url",
     "_detail_document_urls",
     "_detail_image_urls_from_text",
     "_source_cache_key",
