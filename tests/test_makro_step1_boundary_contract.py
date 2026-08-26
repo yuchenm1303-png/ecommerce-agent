@@ -43,7 +43,11 @@ class SelectBrandButton:
 
 
 def _brand_ready(monkeypatch, canonical: str) -> None:
-    monkeypatch.setattr(vertical_selection, "_wait_for", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        vertical_selection,
+        "_wait_for",
+        lambda predicate, current, **_kwargs: bool(predicate(current)),
+    )
     monkeypatch.setattr(vertical_selection, "is_brand_step", lambda _page: True)
     monkeypatch.setattr(vertical_selection, "_current_target_values", lambda _page: (canonical, ""))
     monkeypatch.setattr(vertical_selection, "_body_text", lambda _page: "")
@@ -62,7 +66,7 @@ def test_repeated_air_purifier_selection_accepts_display_slug_equivalence(monkey
 
 def test_repeated_unrelated_vertical_is_not_accepted(monkeypatch) -> None:
     _brand_ready(monkeypatch, "air_purifier")
-    with pytest.raises(RuntimeError, match="independently verifiable vertical state"):
+    with pytest.raises(RuntimeError, match="selected live leaf"):
         vertical_selection._complete_exact_live_vertical(
             FakePage(), "Coffee Bean Grinder", previous_canonical="air_purifier"
         )
@@ -80,6 +84,62 @@ def test_vertical_confirmation_may_precede_canonical_url_commit(monkeypatch) -> 
     selected = vertical_selection._complete_exact_live_vertical(page, "Air Purifiers", previous_canonical="")
     assert button.clicked is True
     assert selected == "air_purifier"
+
+
+def test_confirmation_text_is_pending_until_select_brand_action_exists(monkeypatch) -> None:
+    page = ConfirmationPage()
+    button = SelectBrandButton(page)
+    action_reads = {"count": 0}
+
+    def delayed_action(_current):
+        action_reads["count"] += 1
+        if action_reads["count"] == 1:
+            return None
+        return button
+
+    def bounded_wait(predicate, current, **_kwargs):
+        for _ in range(5):
+            if predicate(current):
+                return True
+        return False
+
+    monkeypatch.setattr(vertical_selection, "_wait_for", bounded_wait)
+    monkeypatch.setattr(vertical_selection, "is_brand_step", lambda current: current.brand_ready)
+    monkeypatch.setattr(vertical_selection, "_vertical_confirmation_content", lambda current: not current.brand_ready)
+    monkeypatch.setattr(vertical_selection, "_current_target_values", lambda current: (current.canonical, ""))
+    monkeypatch.setattr(
+        vertical_selection,
+        "_body_text",
+        lambda _current: "VERTICAL Air Purifiers Please select a brand to start selling in this vertical.",
+    )
+    monkeypatch.setattr(vertical_selection, "_vertical_select_brand_button", delayed_action)
+
+    selected = vertical_selection._complete_exact_live_vertical(page, "Air Purifiers", previous_canonical="")
+
+    assert action_reads["count"] >= 2
+    assert button.clicked is True
+    assert selected == "air_purifier"
+
+
+def test_confirmation_for_wrong_leaf_never_becomes_actionable(monkeypatch) -> None:
+    page = ConfirmationPage()
+    button = SelectBrandButton(page)
+    monkeypatch.setattr(vertical_selection, "is_brand_step", lambda _current: False)
+    monkeypatch.setattr(vertical_selection, "_vertical_confirmation_content", lambda _current: True)
+    monkeypatch.setattr(vertical_selection, "_current_target_values", lambda _current: ("", ""))
+    monkeypatch.setattr(
+        vertical_selection,
+        "_body_text",
+        lambda _current: "VERTICAL Coffee Grinders Please select a brand to start selling in this vertical.",
+    )
+    monkeypatch.setattr(vertical_selection, "_vertical_select_brand_button", lambda _current: button)
+
+    observation = vertical_selection._observe_vertical_brand_transition(page, "Air Purifiers")
+
+    assert observation.confirmation_visible is True
+    assert observation.selected_visible is False
+    assert observation.select_brand_action is None
+    assert observation.actionable is False
 
 
 def test_canonical_url_may_lag_step2_dom(monkeypatch) -> None:
