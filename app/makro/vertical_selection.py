@@ -1,19 +1,17 @@
 """Makro Step 1 Vertical resolution.
 
 One production decision boundary owns Step 1: Makro must supply every selectable
-Vertical. Product Identity supplies semantics and AI plans a bounded specific-to-
-broad retrieval ladder. Each query is then handled as one live transaction: create
-a fresh query-owned generation, harvest its current Makro rows, choose only from
-those rows, click the chosen row in that same generation, and verify the resulting
-canonical Vertical before Step 2 is accepted.
+Vertical. Product Identity supplies semantics and AI plans a bounded retrieval
+ladder. Every query is sampled into its own fresh query-owned generation first;
+only after the bounded ladder is complete are those exact live rows merged and
+ranked as one evidence pool. If a pool candidate is selected, the resolver re-runs
+only a query that previously owned that exact row, requires the same row to appear
+uniquely in the fresh generation, then clicks and verifies the resulting canonical
+Vertical before Step 2 is accepted.
 
-The normal path never replays a query merely to rediscover a row that was already
-observed. If one query has no clear semantic candidate, the next broader query is
-tried. Browse taxonomy is available only when every search generation yields no
-semantic candidate at all. If a row was selected from the current generation but
-cannot be bound for the click, the workflow fails closed instead of silently
-switching mechanisms.
-
+This separation prevents one noisy query from making an early decision while still
+preserving strict query ownership at the mutation boundary. Browse taxonomy is the
+semantic fallback when the complete live search pool contains no acceptable class.
 The workflow never invents a Makro Vertical and never clicks Send to QC.
 """
 
@@ -32,13 +30,11 @@ from .listing_creation import (
     _vertical_search_input,
     _vertical_select_brand_button,
     _wait_for,
-    choose_vertical_candidate,
     is_brand_step,
     is_product_info_step,
     is_vertical_step,
     normalize_label,
 )
-from .requested_vertical import current_requested_vertical, requested_vertical_matches_label
 from .search_surface import (
     begin_search_query,
     click_search_row,
@@ -51,7 +47,12 @@ from .taxonomy_resolution import (
     choose_taxonomy_path_candidate,
     validate_taxonomy_leaf_candidate,
 )
-from .vertical_resolution import plan_vertical_search_terms
+from .vertical_resolution import (
+    choose_vertical_candidate_pool,
+    matched_queries_for_candidate,
+    merge_vertical_search_observations,
+    plan_vertical_search_terms,
+)
 
 
 _VERTICAL_INPUT_TOKENS = (
@@ -158,44 +159,6 @@ def _wait_for_scoped_vertical_search_candidates(
     poll_ms: int = 200,
 ) -> list[str]:
     return wait_for_search_rows(page, search, timeout_ms=timeout_ms, poll_ms=poll_ms)
-
-
-def _choose_vertical_search_candidate(
-    provider: JSONTaskProvider,
-    hints: ListingBootstrapHints,
-    term: str,
-    candidates: list[str],
-) -> str:
-    """Choose one exact row from the active query generation, or decline it."""
-
-    requested = current_requested_vertical()
-    if requested:
-        matches = [
-            candidate
-            for candidate in candidates
-            if requested_vertical_matches_label(requested, candidate)
-        ]
-        if len(matches) == 1:
-            return matches[0]
-        if not matches:
-            available = " | ".join(candidates[:20])
-            raise ValueError(
-                f"手动指定类目 {requested!r} 未匹配到唯一 Makro live Vertical；"
-                f"当前候选={available or '<none>'}"
-            )
-        raise ValueError(
-            f"手动指定类目 {requested!r} 同时匹配到多个 Makro live Vertical：{matches!r}"
-        )
-
-    wanted = normalize_label(term)
-    exact_leaf = [
-        candidate
-        for candidate in candidates
-        if wanted and normalize_label(_search_result_leaf(candidate)) == wanted
-    ]
-    if len(exact_leaf) == 1:
-        return exact_leaf[0]
-    return choose_vertical_candidate(provider, hints, term, candidates)
 
 
 def _vertical_search_semantics_visible(page: Page) -> bool:
@@ -443,70 +406,101 @@ def _try_select_via_search(
     *,
     wait_ms: int,
 ) -> tuple[str, list[str], tuple[str, ...]]:
-    """Evaluate the search ladder in order and click within the winning generation."""
+    """Sample the full bounded ladder, decide globally, then fresh-rebind once."""
 
     search = _vertical_search_input(page)
     planned_terms = plan_vertical_search_terms(provider, hints)
+    observations: list[tuple[str, list[str]]] = []
     observed: list[str] = []
     observed_keys: set[str] = set()
 
     for query_index, term in enumerate(planned_terms, start=1):
         rows = _run_vertical_search_query(page, search, term, wait_ms=wait_ms)
+        observations.append((term, rows))
         for row in rows:
             key = normalize_label(row)
             if not key or key in observed_keys:
                 continue
             observed_keys.add(key)
             observed.append(row)
-
-        selected = _choose_vertical_search_candidate(provider, hints, term, rows)
         _vertical_diag(
-            "query_decision",
+            "query_observation",
             {
                 "query_index": query_index,
                 "query_count": len(planned_terms),
                 "query": term,
                 "fresh_row_count": len(rows),
-                "selected_vertical": selected,
-                "action": "click_current_generation" if selected else "continue_search_ladder",
+                "action": "collect_for_global_pool",
                 "sample": rows[:8],
             },
         )
-        if not selected:
-            continue
 
-        previous_canonical, _ = _current_target_values(page)
-        clicked = click_search_row(search, selected, allow_stable_exact=False)
+    pool = merge_vertical_search_observations(observations)
+    selected = choose_vertical_candidate_pool(provider, hints, planned_terms, pool)
+    owner_queries = matched_queries_for_candidate(pool, selected) if selected else ()
+    _vertical_diag(
+        "pooled_query_decision",
+        {
+            "query_count": len(planned_terms),
+            "candidate_count": len(pool),
+            "selected_vertical": selected,
+            "owner_queries": list(owner_queries),
+            "action": "fresh_rebind_selected_row" if selected else "fallback_to_taxonomy",
+            "sample": [item.label for item in pool[:8]],
+        },
+    )
+    if not selected:
+        _close_vertical_search(search, page, wait_ms=wait_ms)
+        return "", observed, planned_terms
+    if not owner_queries:
+        raise RuntimeError(
+            "Makro Step 1 pooled Vertical decision lost query ownership evidence; "
+            f"selected={selected!r}"
+        )
+
+    selected_key = normalize_label(selected)
+    for rebind_index, owner_query in enumerate(owner_queries, start=1):
+        rows = _run_vertical_search_query(page, search, owner_query, wait_ms=wait_ms)
+        exact = [row for row in rows if normalize_label(row) == selected_key]
         _vertical_diag(
-            "selected_current_generation",
+            "selected_row_rebind",
             {
-                "query_index": query_index,
-                "query": term,
+                "rebind_index": rebind_index,
+                "rebind_count": len(owner_queries),
+                "query": owner_query,
                 "selected_vertical": selected,
-                "click_bound": bool(clicked),
-                "replay_performed": False,
+                "exact_match_count": len(exact),
+                "action": "click_fresh_generation" if len(exact) == 1 else "try_next_owner_query",
             },
         )
+        if len(exact) != 1:
+            continue
+
+        rebound = exact[0]
+        previous_canonical, _ = _current_target_values(page)
+        clicked = click_search_row(search, rebound, allow_stable_exact=False)
         if not clicked:
             raise RuntimeError(
-                "Makro Step 1 selected a grounded query-owned live Vertical from the current search generation "
-                "but could not bind that exact current row for clicking; no replay was attempted because the "
-                f"selection must remain generation-local: selected={selected!r}; query={term!r}"
+                "Makro Step 1 re-observed the globally selected Vertical in a fresh query-owned generation "
+                "but could not bind that exact current row for clicking; "
+                f"selected={rebound!r}; query={owner_query!r}"
             )
-
         return (
             _complete_exact_live_vertical(
                 page,
-                selected,
+                rebound,
                 previous_canonical=previous_canonical,
-                verification_label=_search_result_leaf(selected),
+                verification_label=_search_result_leaf(rebound),
             ),
             observed,
             planned_terms,
         )
 
-    _close_vertical_search(search, page, wait_ms=wait_ms)
-    return "", observed, planned_terms
+    raise RuntimeError(
+        "Makro Step 1 selected a grounded Vertical from the aggregated live pool, but that exact row "
+        "could not be re-observed uniquely in any query generation that originally owned it; "
+        f"selected={selected!r}; owner_queries={' | '.join(owner_queries)}"
+    )
 
 
 def _select_via_search_with_context(
@@ -528,7 +522,7 @@ def _select_via_search_with_context(
     attempted = " | ".join(attempted_terms)
     rows = " | ".join(observed[:20]) if observed else "<none>"
     raise RuntimeError(
-        f"Makro Step 1 {reason}; ordered exact-live Vertical Search found no verified result from: "
+        f"Makro Step 1 {reason}; aggregated exact-live Vertical Search found no verified result from: "
         f"{attempted}; observed query-owned rows: {rows}"
     )
 
@@ -693,9 +687,6 @@ def select_vertical(
     if search_selected:
         return search_selected
 
-    # Taxonomy is a semantic fallback only. If a current live search generation
-    # produced and selected a candidate but its row could not be clicked,
-    # _try_select_via_search already failed closed above.
     taxonomy = ResilientMakroTaxonomyBrowser(page)
     taxonomy_selected = _select_via_taxonomy(page, provider, hints, taxonomy, wait_ms=wait_ms)
     if taxonomy_selected:
@@ -704,7 +695,7 @@ def select_vertical(
     attempted = " | ".join(attempted_terms)
     rows = " | ".join(observed[:20]) if observed else "<none>"
     raise RuntimeError(
-        "Makro Step 1 could not resolve a verified Vertical through ordered query-owned live search "
+        "Makro Step 1 could not resolve a verified Vertical through aggregated query-owned live search "
         f"or bounded live taxonomy; search_terms={attempted}; observed query-owned rows={rows}"
     )
 
