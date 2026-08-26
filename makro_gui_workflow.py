@@ -19,6 +19,7 @@ from playwright.sync_api import sync_playwright
 
 from app.browser_page_owner import page_target_id
 from app.browser_session import EdgeHarness, is_cdp_ready
+from app.listing_content_policy import current_listing_intent
 from app.makro.domain import MakroDomainAdapter
 from app.makro.listing import MAKRO_HOME_URL, parse_makro_listing_url
 from app.makro.listing_creation import (
@@ -264,20 +265,24 @@ def _target_values(page: Any) -> tuple[str, str]:
 
 
 def _listing_stage(page: Any | None) -> str:
-    """Return the highest verified Makro listing stage currently visible."""
+    """Return the highest verified Makro listing stage currently visible.
+
+    ``pre_step1`` is a verified negative result, not an error fallback. If DOM or
+    target inspection itself fails, propagation is mandatory so a later-stage
+    draft can never be mistaken for a fresh Step 1 surface.
+    """
 
     if page is None:
         return "pre_step1"
     try:
         if is_product_info_step(page):
             return "step3"
-    except Exception:
-        pass
-    try:
         if is_brand_step(page):
             return "step2"
-    except Exception:
-        pass
+    except Exception as exc:
+        raise RuntimeError(
+            "Makro listing stage inspection failed; refusing to assume pre-Step1 state"
+        ) from exc
     return "pre_step1"
 
 
@@ -755,10 +760,12 @@ def main() -> int:
     run_dir = Path(args.output_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / "run-manifest.json"
+    listing_intent = current_listing_intent()
     manifest: dict[str, Any] = {
         "mode": args.mode,
         "status": "started",
         "product_url": args.product_url,
+        "listing_intent": listing_intent,
         "vertical": "",
         "brand": "",
         "resume_current_url": str(args.resume_current_url or ""),
@@ -781,6 +788,7 @@ def main() -> int:
         model=args.model,
         fact_model=args.fact_model,
         web_search_model=args.web_search_model,
+        listing_intent=listing_intent,
         resume_current_url=str(args.resume_current_url or ""),
     )
 
@@ -849,6 +857,7 @@ def main() -> int:
             provider,
             captured.snapshot,
             image_paths=captured.product_image_paths,
+            listing_intent=listing_intent,
         )
         diag_event("listing_bootstrap", "COMPLETE", hints=hints.as_dict())
         manifest["bootstrap_source"] = {
