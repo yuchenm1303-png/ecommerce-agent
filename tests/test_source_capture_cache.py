@@ -10,10 +10,10 @@ from app.source_capture import (
 from app.source_snapshot import SourceSnapshot, write_source_snapshot
 
 
-def test_source_cache_key_ignores_query_tracking_noise():
+def test_source_cache_key_preserves_exact_supplier_query_identity():
     clean = "https://detail.1688.com/offer/850845635717.html"
     tracked = clean + "?spm=a2615.2177701.autotrace-offerGeneral.1&from=market"
-    assert _source_cache_key(clean) == _source_cache_key(tracked)
+    assert _source_cache_key(clean) != _source_cache_key(tracked)
 
 
 def test_source_cache_key_changes_for_different_offer():
