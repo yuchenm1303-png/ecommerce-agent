@@ -62,7 +62,7 @@ def test_product_identity_request_is_physical_product_grounded_contract():
     properties = request["json_contract"]["properties"]
 
     assert request["task"] == "infer_grounded_supplier_product_identity"
-    assert request["context"]["identity_contract_version"] == 2
+    assert request["context"]["identity_contract_version"] == 3
     assert request["grounded_sources"]
     assert "visible_text" not in str(request["context"])
     assert "physical_product" in properties["entity_kind"]["enum"]
