@@ -107,7 +107,8 @@ def test_registry_builds_generic_compatible_provider_from_arbitrary_env_name():
         client=DummyClient(),
     )
 
-    assert isinstance(provider, OpenAICompatibleSemanticProvider)
+    delegate = provider._delegate
+    assert isinstance(delegate, OpenAICompatibleSemanticProvider)
     assert provider.model == "vision-model"
     assert provider.base_url == "https://api.vendor.test/v1"
     assert provider.structured_mode == "prompt_only"
@@ -134,6 +135,7 @@ def test_qwen_omni_auto_selects_streaming_json_mode_and_disables_thinking():
         environ={"DASHSCOPE_API_KEY": "secret"},
         client=DummyClient(),
     )
+    assert isinstance(provider._delegate, OpenAICompatibleSemanticProvider)
     assert provider.compat_profile == "qwen-omni"
     assert provider.structured_mode == "json_object"
     assert provider.enable_thinking is False
@@ -193,7 +195,7 @@ def test_registry_keeps_native_openai_adapter_available():
         client=DummyClient(),
     )
 
-    assert isinstance(provider, OpenAISemanticProvider)
+    assert isinstance(provider._delegate, OpenAISemanticProvider)
     assert provider.model == "gpt-5.6"
     assert provider.request_timeout_seconds == 45
 
