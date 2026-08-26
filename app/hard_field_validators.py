@@ -94,8 +94,8 @@ def _enabled_option_values(values: Iterable[object]) -> list[str]:
     return output
 
 
-def is_closed_selection_semantic_field(semantic_field: dict[str, Any]) -> bool:
-    """Return True only when the current live value control proves a closed domain."""
+def is_selection_semantic_field(semantic_field: dict[str, Any]) -> bool:
+    """Return True when the current value-control family is a selection family."""
 
     controls = _value_controls(semantic_field)
     if controls:
@@ -103,20 +103,37 @@ def is_closed_selection_semantic_field(semantic_field: dict[str, Any]) -> bool:
             str(control.get("field_kind") or "").casefold() in _SELECTION_KINDS
             for control in controls
         )
-    # Legacy serialized fields do not carry controls; a non-empty option list is
-    # the only deterministic evidence that the value domain is closed.
+    return bool(semantic_field.get("options"))
+
+
+def _controls_prove_closed_domain(controls: list[dict[str, Any]]) -> bool:
+    if not controls:
+        return False
+    kinds = [str(control.get("field_kind") or "").casefold() for control in controls]
+    if all(kind in {"radio", "custom_radio"} for kind in kinds):
+        return True
+    if all(kind == "select" for kind in kinds):
+        return True
+    return any(bool(control.get("options")) for control in controls)
+
+
+def is_closed_selection_semantic_field(semantic_field: dict[str, Any]) -> bool:
+    """Return True only when the current live DOM proves a finite option domain.
+
+    Native selects and radio groups are closed even when their current option set
+    is empty. Custom dropdown/autocomplete controls may render options only after
+    interaction; without captured options their domain is not yet proven here and
+    final execution must validate the unique live choice after opening them.
+    """
+
+    controls = _value_controls(semantic_field)
+    if controls:
+        return is_selection_semantic_field(semantic_field) and _controls_prove_closed_domain(controls)
     return bool(semantic_field.get("options"))
 
 
 def executable_value_options(semantic_field: dict[str, Any]) -> list[str]:
-    """Return only values the current live value control can mechanically select.
-
-    Modern fields are control-owned: aggregate semantic options may be stale or
-    polluted by child/qualifier controls, so they are never authoritative once
-    current live controls exist. Radio groups are the one structural exception:
-    coalescing stores their option records on the semantic field while retaining
-    the individual radio controls.
-    """
+    """Return only values the current observed value controls can execute."""
 
     controls = _value_controls(semantic_field)
     if controls:
@@ -232,7 +249,7 @@ def _closed_domain_validation(
                 )
 
     qualifier_controls = _qualifier_controls(semantic_field)
-    if answer.qualifier and qualifier_controls:
+    if answer.qualifier and qualifier_controls and _controls_prove_closed_domain(qualifier_controls):
         qualifiers = executable_qualifier_options(semantic_field)
         if not qualifiers:
             return FieldValidationResult(
@@ -251,13 +268,14 @@ def validate_resolved_answer(
     semantic_field: dict[str, Any],
     answer: ResolvedAnswer,
 ) -> FieldValidationResult:
-    """Apply only deterministic marketplace/control validation before writes.
+    """Apply deterministic marketplace/control validation before writes.
 
     Product meaning is intentionally absent here. Translation, synonyms,
     compatibility, feature interpretation and source conflict judgment belong to
-    the AI field-decision layer. Closed-domain mechanics are live-control facts:
-    a selection answer is executable only when it belongs to the currently
-    enabled option domain.
+    the AI field-decision layer. A proven closed-domain answer is executable only
+    when it belongs to the currently enabled option domain; custom interactive
+    dropdowns whose options are not yet rendered defer their final truth to the
+    exact live-option executor.
     """
 
     if answer.status != RESOLVED:
