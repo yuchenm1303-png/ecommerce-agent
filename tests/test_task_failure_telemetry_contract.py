@@ -54,7 +54,7 @@ def test_failure_diagnostic_keeps_newest_real_process_exception_and_redacts_secr
         artifact_roots=(tmp_path / "real-execution",),
     )
 
-    assert diagnostic["schema"] == 3
+    assert diagnostic["schema"] == 4
     assert diagnostic["diagnostic_sources"]["process_log"] is True
     assert diagnostic["diagnostic_sources"]["execution_report"] is True
     assert diagnostic["failed_stage"] == "验证附加描述"
