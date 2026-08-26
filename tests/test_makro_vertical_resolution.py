@@ -70,6 +70,30 @@ def _ultrasonic_cleaner_hints() -> ListingBootstrapHints:
     )
 
 
+def _protective_glasses_hints() -> ListingBootstrapHints:
+    """Regression fixture: the first AI interpretation is deliberately over-specific."""
+
+    return ListingBootstrapHints(
+        vertical_search_terms=("personalized wooden sunglasses",),
+        brand="",
+        brand_status="unknown",
+        product_summary="Polarized eyewear with a wooden-style frame.",
+        product_identity={
+            "entity_kind": "physical_product",
+            "product_type_en": "personalized wooden sunglasses",
+            "brand": "",
+            "brand_status": "unknown",
+            "product_summary": "Personalized wooden polarized sunglasses.",
+            "confidence": 0.78,
+            "evidence_refs": ["identity:page-title"],
+        },
+        customer_intent="1个偏光防护镜",
+        grounded_product_evidence=(
+            "supplier_product_heading: Polarized protective eyewear with impact-resistant lenses and wooden-style frame",
+        ),
+    )
+
+
 def test_search_plan_contract_has_specific_alternate_broader_and_discriminative_head_roles() -> None:
     request = build_vertical_search_plan_request(_bag_sealer_hints())
     properties = request["json_contract"]["properties"]
@@ -90,8 +114,9 @@ def test_search_plan_contract_has_specific_alternate_broader_and_discriminative_
         "head_noun_query",
     ]
     rules = " ".join(request["rules"]).casefold()
-    assert "specific -> alternate vocabulary -> broader -> discriminative head phrase" in rules
+    assert "core product class -> alternate retail vocabulary -> broader family -> discriminative head phrase" in rules
     assert "do not collapse" in rules
+    assert "initial_product_identity as a hypothesis" in rules
 
 
 def test_search_planner_preserves_specific_alternate_and_broader_then_appends_canonical() -> None:
@@ -117,6 +142,9 @@ def test_search_planner_preserves_specific_alternate_and_broader_then_appends_ca
     )
     request = provider.requests[0]
     assert request["context"]["product_type_en"] == "rechargeable bag sealer"
+    assert request["context"]["initial_product_identity"]["product_type_en"] == "rechargeable bag sealer"
+    assert request["context"]["grounded_supplier_evidence"] == []
+    assert request["context"]["customer_listing_intent"] == ""
 
 
 def test_search_planner_deduplicates_head_and_keeps_canonical_fallback_last() -> None:
@@ -281,7 +309,9 @@ def test_aggregated_chooser_can_only_return_one_exact_live_candidate() -> None:
 
     assert selected == "Home / Kitchen / Bag Sealers"
     request = provider.requests[0]
-    assert request["context"]["product_identity"]["product_type_en"] == "rechargeable bag sealer"
+    assert request["context"]["initial_product_identity"]["product_type_en"] == "rechargeable bag sealer"
+    assert request["context"]["grounded_supplier_evidence"] == []
+    assert request["context"]["customer_listing_intent"] == ""
     assert request["context"]["search_queries_specific_to_broad"] == [
         "bag sealer",
         "bag sealing machine",
@@ -291,6 +321,59 @@ def test_aggregated_chooser_can_only_return_one_exact_live_candidate() -> None:
         "Home / Kitchen / Bag Sealers",
         "Battery / Battery Chargers",
     ]
+
+
+def test_initial_identity_can_be_corrected_by_independent_evidence_and_live_pool() -> None:
+    hints = _protective_glasses_hints()
+    candidates = merge_vertical_search_observations(
+        [
+            (
+                "sunglasses",
+                [
+                    "Fashion / Eyewear / Personalized Wooden Sunglasses",
+                    "Industrial & Scientific Supplies / Safety Products / Protective Glasses",
+                ],
+            )
+        ]
+    )
+    provider = FakeProvider(
+        {
+            "choose_exact_makro_vertical_from_aggregated_live_search": {
+                "selected_vertical": "Industrial & Scientific Supplies / Safety Products / Protective Glasses",
+                "selection_relation": "best_available_fit",
+            }
+        }
+    )
+
+    selected = choose_vertical_candidate_pool(
+        provider,
+        hints,
+        ("sunglasses", "protective glasses"),
+        candidates,
+    )
+
+    assert selected == "Industrial & Scientific Supplies / Safety Products / Protective Glasses"
+    assert len(provider.requests) == 1, "customer intent must disable the old exact-identity shortcut"
+    context = provider.requests[0]["context"]
+    assert context["initial_product_identity"]["product_type_en"] == "personalized wooden sunglasses"
+    assert context["customer_listing_intent"] == "1个偏光防护镜"
+    assert "Polarized protective eyewear" in context["grounded_supplier_evidence"][0]
+    allowed = provider.requests[0]["json_contract"]["properties"]["selected_vertical"]["enum"]
+    assert selected in allowed
+
+
+def test_reconciliation_prompt_never_turns_customer_intent_into_unbounded_authority() -> None:
+    hints = _protective_glasses_hints()
+    candidates = merge_vertical_search_observations(
+        [("protective glasses", ["Industrial / Safety / Protective Glasses"])]
+    )
+    request = build_vertical_pool_choice_request(hints, ("protective glasses",), candidates)
+    rules = " ".join(request["rules"]).casefold()
+
+    assert "initial product identity is an interpretation" in rules
+    assert "customer listing intent is independent context" in rules
+    assert "never let it override supplier evidence" in rules
+    assert "incidental attributes such as material, engraving, personalization" in rules
 
 
 def test_aggregated_chooser_rejects_invented_vertical() -> None:
@@ -325,10 +408,10 @@ def test_pool_prompt_rejects_generic_word_overlap_as_category_evidence() -> None
         candidates,
     )
     rules = " ".join(request["rules"]).casefold()
-    assert "precision for recall" in rules
-    assert "must never add" in rules
     assert "generic word overlap" in rules
-    assert "toilet cleaner" in rules
+    assert "complete breadcrumb" in rules
+    assert "live candidate set is authoritative" in request["system_instruction"].casefold()
+    assert "initial ai identity" in request["system_instruction"].casefold()
 
 
 def test_production_search_collects_global_pool_then_rebinds_to_owner_query_before_click() -> None:
