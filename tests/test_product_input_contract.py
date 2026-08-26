@@ -42,25 +42,44 @@ def test_pack_manifest_may_carry_its_matching_stable_reference_url(tmp_path: Pat
     )
 
 
-def test_pack_manifest_rejects_a_different_product_reference(tmp_path: Path) -> None:
+def test_real_supplier_url_becomes_primary_over_product_pack_reference(tmp_path: Path) -> None:
     manifest = _manifest(
         tmp_path,
         "https://product-pack.invalid/0123456789abcdef01234567",
     )
 
-    with pytest.raises(ValueError, match="身份不一致"):
+    assert (
         validate_product_input(
-            product_url="https://product-pack.invalid/ffffffffffffffffffffffff",
+            product_url="https://detail.1688.com/offer/850845635717.html?sku=black",
             product_pack_manifest=manifest,
         )
+        == "supplier_url"
+    )
 
 
-def test_raw_files_and_supplier_url_are_mutually_exclusive(tmp_path: Path) -> None:
+def test_raw_files_supplement_supplier_url(tmp_path: Path) -> None:
     source = tmp_path / "spec.txt"
     source.write_text("M8 dash camera", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="不能同时"):
+    assert (
         validate_product_input(
-            product_url="https://example.invalid/product",
+            product_url="https://detail.1688.com/offer/850845635717.html?sku=black",
             product_files=[source],
+        )
+        == "supplier_url"
+    )
+
+
+def test_manifest_and_raw_files_cannot_compete_as_two_customer_packs(tmp_path: Path) -> None:
+    manifest = _manifest(
+        tmp_path,
+        "https://product-pack.invalid/0123456789abcdef01234567",
+    )
+    source = tmp_path / "spec.txt"
+    source.write_text("M8 dash camera", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="不能再同时传入原始 product files"):
+        validate_product_input(
+            product_files=[source],
+            product_pack_manifest=manifest,
         )
