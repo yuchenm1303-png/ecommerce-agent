@@ -46,6 +46,7 @@ A Test Lab run is intentionally different from a production smoke test:
 - external socket connections are blocked by `app.test_lab_pytest_plugin`;
 - loopback remains available for local fixture servers, but production CDP ports `9222` and `9333` are explicitly blocked inside pytest;
 - HTTP(S) proxy variables inherited by nested child processes point to a closed loopback port;
+- each suite owns a fresh writable temp root under `logs/test-lab/tmp/`; `TEMP`, `TMP`, `TMPDIR`, and pytest `--basetemp` are all pinned there so host/system temp permissions cannot affect the run;
 - all tests explicitly marked `probe` are excluded from `--all` and targeted suites;
 - Test Lab itself never launches the real Amazon/Makro workflow and never clicks Save or Send to QC.
 
@@ -107,10 +108,12 @@ The intended release sequence is:
 
 Do not use expensive real supplier runs as the first debugging layer.
 
-## Claude Code / local agent use
+## Claude Code / local executor use
 
-A local coding agent should run Test Lab rather than manually clicking through the whole product flow. A useful instruction is:
+Claude Code is an execution-only local runner for this project. It may synchronize the dedicated temporary test clone, run Test Lab, and collect complete failure artifacts. It must not edit source code, tests, configuration, dependencies, or Git history, and it must not propose or apply fixes.
 
-> Run `python tools/test_lab.py --all`. Do not run real Amazon/Makro workflows or use paid AI. Fix root causes for any failing offline regression, rerun only the affected targeted suite, then rerun `--all`.
+A useful instruction is:
+
+> Synchronize the dedicated temporary test clone to the requested `feat/local-test-gui` HEAD and run `python tools/test_lab.py --all --json-report logs/test-lab/latest.json`. Do not run real Amazon/Makro workflows or use paid AI. Do not modify source code, tests, configuration, dependencies, or Git history. If tests fail, preserve the complete stdout/stderr and traceback, list every FAILED/ERROR node, and return those artifacts to ChatGPT for diagnosis and repair.
 
 Manual browser interaction should be reserved for the final live smoke check or for capturing a new marketplace state that existing fixtures cannot represent.
