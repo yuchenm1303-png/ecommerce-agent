@@ -4,6 +4,7 @@ import app.business_fields as business_fields
 from app.business_fields import (
     ACCOUNT_DEFAULT_PROFILE,
     BUSINESS_ATTRIBUTE_ALIASES,
+    FIXED_COMMERCIAL_ACCOUNT_DEFAULTS,
     FIXED_ORDER_QUANTITY_ACCOUNT_DEFAULTS,
     MAKRO_ACCOUNT_FIXED_DEFAULTS,
     ORIGINAL_ACCOUNT_FIXED_DEFAULTS,
@@ -70,14 +71,17 @@ def test_original_account_defaults_are_preserved_for_one_line_revert():
     assert "flipkart_selling_price" not in original
 
 
-def test_current_profile_uses_valid_minimum_and_customer_maximum():
-    assert ACCOUNT_DEFAULT_PROFILE == "fixed_order_quantity"
-    assert MAKRO_ACCOUNT_FIXED_DEFAULTS is FIXED_ORDER_QUANTITY_ACCOUNT_DEFAULTS
+def test_current_profile_uses_fixed_commercial_account_policy():
+    assert ACCOUNT_DEFAULT_PROFILE == "fixed_commercial"
+    assert MAKRO_ACCOUNT_FIXED_DEFAULTS is FIXED_COMMERCIAL_ACCOUNT_DEFAULTS
+    assert MAKRO_ACCOUNT_FIXED_DEFAULTS is not FIXED_ORDER_QUANTITY_ACCOUNT_DEFAULTS
     expected = {
+        "mrp": "6000",
+        "flipkart_selling_price": "5000",
         "minimum_order_quantity": "1",
-        "max_order_quantity_allowed": "6000",
+        "max_order_quantity_allowed": "99",
         "service_profile": "FBS",
-        "shipping_days": "14",
+        "shipping_days": "11",
         "forbid_shipping": "National",
         "country_of_origin": "China",
         "manufacturer_details": "LILI",
@@ -85,8 +89,6 @@ def test_current_profile_uses_valid_minimum_and_customer_maximum():
         "importer_details": "LILI",
     }
     assert {key: value for key, value, _source in MAKRO_ACCOUNT_FIXED_DEFAULTS} == expected
-    assert "mrp" not in expected
-    assert "flipkart_selling_price" not in expected
 
     bundle = generated_business_bundle(URL, sku="812345678901")
     for attribute_key, expected_value in expected.items():
@@ -96,11 +98,6 @@ def test_current_profile_uses_valid_minimum_and_customer_maximum():
         assert items[0].source_type == "config"
         assert items[0].source_reference.startswith("account-default:")
         assert items[0].confidence == 1.0
-
-    assert bundle.candidates(("mrp", *BUSINESS_ATTRIBUTE_ALIASES["mrp"])) == []
-    assert bundle.candidates(
-        ("flipkart_selling_price", *BUSINESS_ATTRIBUTE_ALIASES["flipkart_selling_price"])
-    ) == []
 
 
 def test_account_fixed_labels_are_business_fields_and_skip_product_reasoning():
