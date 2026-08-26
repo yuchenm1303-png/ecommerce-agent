@@ -270,14 +270,17 @@ def select_brand_to_product_info(
     *,
     wait_ms: int = 900,
     recovery_timeout_s: float = _RECOVERY_TIMEOUT_S,
+    diagnostic_brand_override: str = "",
 ) -> tuple[str, Page]:
     """Select Step 2 brand and return the exact Page that owns Step 3.
 
     ``select_brand`` uses the production portal-first live-candidate contract.
-    This wrapper only recovers the known post-Create-New-Listing timeout race and
-    page-target handoff. Existing tabs are excluded by baseline identity;
-    concurrently-created tabs are excluded by origin lineage plus the vertical /
-    vid identity already committed on Step 2.
+    One explicit diagnostic brand override may be forwarded to that same contract;
+    it never bypasses Check Brand or the Step 3 ownership gate. This wrapper only
+    recovers the known post-Create-New-Listing timeout race and page-target handoff.
+    Existing tabs are excluded by baseline identity; concurrently-created tabs are
+    excluded by origin lineage plus the vertical / vid identity already committed
+    on Step 2.
     """
 
     context = page.context
@@ -289,7 +292,13 @@ def select_brand_to_product_info(
     brand = ""
     recoverable_error: RuntimeError | None = None
     try:
-        brand = select_brand(page, provider, hints, wait_ms=wait_ms)
+        brand = select_brand(
+            page,
+            provider,
+            hints,
+            wait_ms=wait_ms,
+            diagnostic_override=diagnostic_brand_override,
+        )
         if is_product_info_step(page):
             if not _matches_transition_identity(page, expected):
                 raise RuntimeError(

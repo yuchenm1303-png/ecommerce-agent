@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Iterator
 
 
 REQUESTED_VERTICAL_ENV = "ECOMMERCE_REQUESTED_VERTICAL"
 _REQUESTED_VERTICAL_LIMIT = 120
+_REQUESTED_VERTICAL_SCOPE: ContextVar[str | None] = ContextVar(
+    "ecommerce_requested_vertical_scope",
+    default=None,
+)
 
 
 def clean_requested_vertical(value: object) -> str:
@@ -13,7 +20,27 @@ def clean_requested_vertical(value: object) -> str:
 
 
 def current_requested_vertical() -> str:
+    scoped = _REQUESTED_VERTICAL_SCOPE.get()
+    if scoped is not None:
+        return scoped
     return clean_requested_vertical(os.getenv(REQUESTED_VERTICAL_ENV, ""))
+
+
+@contextmanager
+def requested_vertical_scope(value: object) -> Iterator[str]:
+    """Temporarily bind one explicit Vertical override without mutating process env.
+
+    The override is context-local so direct workflows can reuse the same strict
+    requested-Vertical contract as Batch/GUI without leaking state into another
+    task or requiring a global environment mutation.
+    """
+
+    cleaned = clean_requested_vertical(value)
+    token = _REQUESTED_VERTICAL_SCOPE.set(cleaned)
+    try:
+        yield cleaned
+    finally:
+        _REQUESTED_VERTICAL_SCOPE.reset(token)
 
 
 def requested_vertical_query(value: object) -> str:
@@ -47,4 +74,5 @@ __all__ = [
     "current_requested_vertical",
     "requested_vertical_matches_label",
     "requested_vertical_query",
+    "requested_vertical_scope",
 ]

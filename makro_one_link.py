@@ -3,8 +3,8 @@
 Order of work:
 1) capture the exact supplier page;
 2) AI resolves a grounded physical Product Identity, then derives category-search hints;
-3) automate Makro Step 1 (Vertical) and Step 2 (Brand), verifying both against
-   the live UI / resulting listing URL;
+3) automate Makro Step 1 (Vertical) and Step 2 (Brand) through the same canonical
+   selectors and Step 2 -> Step 3 ownership transition used by GUI/Batch;
 4) scan the just-created Step 3 live schema;
 5) run the existing one-link Resolver against that exact schema;
 6) optionally run the existing production Step 3 executor.
@@ -18,21 +18,26 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from playwright.sync_api import sync_playwright
 
 from app.browser_session import EdgeHarness, is_cdp_ready
 from app.makro.domain import MakroDomainAdapter
-from app.makro.listing import MAKRO_HOST, MAKRO_SINGLE_LISTING_ROUTE
+from app.makro.listing import parse_makro_listing_url
 from app.makro.listing_creation import (
     MAKRO_NEW_LISTING_URL,
-    is_vertical_step,
-    run_listing_creation,
+    ListingCreationResult,
+    infer_listing_bootstrap,
 )
+from app.makro.requested_vertical import requested_vertical_scope
+from app.makro.step1_entry import prepare_single_step1_page
+from app.makro.step3_transition import dismiss_joyride_overlay, select_brand_to_product_info
+from app.makro.vertical_selection import select_vertical
 from app.providers.registry import ProviderConfigurationError, build_semantic_provider
 from app.providers.usage_telemetry import ensure_usage_journal
 from app.source_capture import SourceAccessBlocked, capture_product_source
+from app.source_snapshot import SourceSnapshot
 from app.workflow_cli import build_one_link_parser, provider_config as _provider_config
 from app.workflow_runtime import (
     build_executor_command,
@@ -75,42 +80,76 @@ def _executor_command(
     )
 
 
-def _is_listing_url(url: str) -> bool:
-    return MAKRO_HOST in str(url or "") and MAKRO_SINGLE_LISTING_ROUTE in str(url or "")
-
-
 def _prepare_step1_page(harness: EdgeHarness):
-    if harness.context is None:
-        raise RuntimeError("Makro Edge context is unavailable")
-    listing_pages = [page for page in harness.context.pages if _is_listing_url(page.url)]
-    if len(listing_pages) > 1:
+    """Compatibility wrapper around the shared Single/Batch Step 1 entry gate."""
+
+    return prepare_single_step1_page(harness)
+
+
+def _run_canonical_listing_creation(
+    page: Any,
+    provider: Any,
+    snapshot: SourceSnapshot,
+    *,
+    image_paths: Iterable[str | Path] = (),
+    vertical_override: str = "",
+    brand_override: str = "",
+) -> tuple[ListingCreationResult, Any]:
+    """Create one draft through the exact same Step 1/2 contracts as GUI/Batch.
+
+    Product Identity remains the shared bootstrap truth source. A diagnostic
+    Vertical override is bound context-locally into the existing strict requested-
+    Vertical contract; a diagnostic Brand override is forwarded to the same native
+    Check Brand flow. Step 2 -> Step 3 may replace the Playwright Page, so callers
+    receive the exact owned Step 3 page rather than assuming the original target
+    survived.
+    """
+
+    hints = infer_listing_bootstrap(
+        provider,
+        snapshot,
+        image_paths=image_paths,
+    )
+    dismiss_joyride_overlay(page)
+    if str(vertical_override or "").strip():
+        with requested_vertical_scope(vertical_override):
+            vertical = select_vertical(page, provider, hints)
+    else:
+        vertical = select_vertical(page, provider, hints)
+
+    brand, step3_page = select_brand_to_product_info(
+        page,
+        provider,
+        hints,
+        diagnostic_brand_override=brand_override,
+    )
+    target = parse_makro_listing_url(str(step3_page.url or ""))
+    actual_vertical = str(target.vertical or "").strip()
+    actual_brand = str(target.brand or "").strip()
+    if not actual_vertical:
+        raise RuntimeError("Makro Step 3 page has no canonical Vertical; refusing to continue")
+    if not actual_brand:
+        raise RuntimeError("Makro Step 3 page has no canonical Brand; refusing to continue")
+    if str(vertical or "").strip() and actual_vertical.casefold() != str(vertical).strip().casefold():
         raise RuntimeError(
-            f"检测到 {len(listing_pages)} 个 Add a Single Listing 标签页；拒绝猜目标。请只保留一个。"
+            "Makro Step 3 Vertical changed after canonical Step 1 selection: "
+            f"selected={vertical!r}, actual={actual_vertical!r}"
         )
-    if listing_pages:
-        page = listing_pages[0]
-        page.set_default_timeout(15_000)
-        page.wait_for_timeout(500)
-        if is_vertical_step(page):
-            return page
+    if str(brand or "").strip() and actual_brand.casefold() != str(brand).strip().casefold():
         raise RuntimeError(
-            "当前唯一 Add Listing 标签页已经不是 Step 1。为避免覆盖已有 draft，程序不会自动离开它；"
-            "请先处理/关闭该 draft，再从一个干净的 Add Listing 开始。"
+            "Makro Step 3 Brand changed after canonical Step 2 selection: "
+            f"selected={brand!r}, actual={actual_brand!r}"
         )
 
-    page = harness.ensure_page()
-    page.set_default_timeout(15_000)
-    page.goto(MAKRO_NEW_LISTING_URL, wait_until="domcontentloaded", timeout=45_000)
-    deadline_ms = 20_000
-    elapsed = 0
-    while elapsed < deadline_ms:
-        if is_vertical_step(page):
-            return page
-        if page.locator('input[type="password"]').count() > 0:
-            raise RuntimeError("Makro 登录状态无效；请先在长期 Edge 中人工登录，再重试。")
-        page.wait_for_timeout(500)
-        elapsed += 500
-    raise RuntimeError("自动进入 Add a Single Listing 后没有出现 Step 1 / Select Vertical。")
+    return (
+        ListingCreationResult(
+            vertical=actual_vertical,
+            brand=actual_brand,
+            page_url=str(step3_page.url or ""),
+            hints=hints,
+        ),
+        step3_page,
+    )
 
 
 def main() -> int:
@@ -182,8 +221,8 @@ def main() -> int:
             )
             if harness.launched_now:
                 raise RuntimeError("Makro Edge unexpectedly entered launch path; aborted")
-            page = _prepare_step1_page(harness)
-            creation = run_listing_creation(
+            page = prepare_single_step1_page(harness)
+            creation, page = _run_canonical_listing_creation(
                 page,
                 provider,
                 captured.snapshot,

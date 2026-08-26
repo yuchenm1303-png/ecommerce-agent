@@ -6,7 +6,9 @@ state for the validated brand.
 
 The current production policy pins Step 2 to ``KEAI``. The previous supplier /
 AI-derived brand path is intentionally retained behind ``BRAND_SELECTION_MODE``
-so it can be restored without rebuilding the brand-selection mechanics.
+so it can be restored without rebuilding the brand-selection mechanics. A caller
+may provide one explicit diagnostic override; it still uses the same native Check
+Brand verification and never bypasses the portal contract.
 """
 
 from __future__ import annotations
@@ -46,9 +48,12 @@ class BrandHints(Protocol):
     brand_status: str
 
 
-def _brand_terms(hints: BrandHints) -> tuple[str, ...]:
-    """Return the active Step 2 query policy without deleting the legacy path."""
+def _brand_terms(hints: BrandHints, *, diagnostic_override: str = "") -> tuple[str, ...]:
+    """Return one active Step 2 query policy without weakening live verification."""
 
+    override = " ".join(str(diagnostic_override or "").split()).strip()
+    if override:
+        return (override,)
     if BRAND_SELECTION_MODE == "fixed":
         brand = str(FIXED_BRAND or "").strip()
         return (brand,) if brand else ()
@@ -91,6 +96,7 @@ def select_brand(
     hints: BrandHints,
     *,
     wait_ms: int = 900,
+    diagnostic_override: str = "",
 ) -> str:
     """Validate the active brand policy through Makro's native Step 2 flow."""
 
@@ -99,7 +105,7 @@ def select_brand(
     if not is_brand_step(page):
         raise RuntimeError("Makro is not on Step 2 / Select Brand")
 
-    terms = _brand_terms(hints)
+    terms = _brand_terms(hints, diagnostic_override=diagnostic_override)
     if not terms:
         raise RuntimeError("Makro Step 2 brand policy produced no brand query")
 
@@ -129,6 +135,7 @@ def select_brand(
     raise RuntimeError(
         "Makro Step 2 did not confirm the configured brand through Check Brand. "
         f"mode={BRAND_SELECTION_MODE!r}, fixed_brand={FIXED_BRAND!r}, "
+        f"diagnostic_override={str(diagnostic_override or '').strip()!r}, "
         f"supplier_brand={str(hints.brand or '').strip()!r}, queries={attempted!r}"
     )
 
