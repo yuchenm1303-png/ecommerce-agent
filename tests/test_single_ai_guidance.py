@@ -21,9 +21,9 @@ def test_model_name_keywords_are_soft_candidate_terms(monkeypatch):
         "inflatable mattress, air bed, camping mattress"
     )
     instruction = str(policy["instruction"])
-    assert "Use only terms that are genuinely relevant" in instruction
-    assert "omit irrelevant or unsupported terms" in instruction
-    assert "never keyword-stuff" in instruction
+    assert "只使用与当前真实商品及销售规格直接相关、且有证据支持的词" in instruction
+    assert "忽略无关或无证据词" in instruction
+    assert "不得堆砌关键词" in instruction
 
 
 def test_ai_guidance_is_context_not_evidence(monkeypatch):
