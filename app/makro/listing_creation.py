@@ -23,7 +23,7 @@ from typing import Any, Iterable, Protocol
 
 from playwright.sync_api import Page
 
-from ..product_identity import infer_product_identity
+from ..product_identity import build_product_identity_sources, infer_product_identity
 from ..source_snapshot import SourceSnapshot
 from .listing import MAKRO_HOME_URL, MAKRO_SINGLE_LISTING_ROUTE, parse_makro_listing_url
 from .portal_adapter import ListingStage, MakroPortalAdapter, normalize_ui_text
@@ -55,6 +55,8 @@ class ListingBootstrapHints:
     brand_status: str
     product_summary: str
     product_identity: dict[str, Any] | None = None
+    customer_intent: str = ""
+    grounded_product_evidence: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +65,8 @@ class ListingBootstrapHints:
             "brand_status": self.brand_status,
             "product_summary": self.product_summary,
             "product_identity": dict(self.product_identity or {}),
+            "customer_intent": self.customer_intent,
+            "grounded_product_evidence": list(self.grounded_product_evidence),
         }
 
 
@@ -134,6 +138,44 @@ def _bounded_supplier_evidence(snapshot: SourceSnapshot) -> dict[str, Any]:
         "visible_text": snapshot.visible_text[:9000],
         "embedded_product_data": embedded,
     }
+
+
+def _grounded_identity_evidence(
+    snapshot: SourceSnapshot,
+    evidence_refs: Iterable[str],
+    *,
+    image_paths: Iterable[str | Path] = (),
+) -> tuple[str, ...]:
+    """Retain the raw text that supported Product Identity as an independent truth source.
+
+    The first AI interpretation is a hypothesis, not the only semantic authority.
+    Later Vertical reconciliation needs the exact grounded supplier snippets that
+    the identity model cited so a live Makro candidate can correct an over-specific
+    or otherwise mistaken identity without making another supplier-page call.
+    """
+
+    wanted = {str(value or "").strip() for value in evidence_refs if str(value or "").strip()}
+    if not wanted:
+        return ()
+    output: list[str] = []
+    used = 0
+    for source in build_product_identity_sources(snapshot, image_paths=image_paths):
+        source_id = str(source.get("source_id") or "").strip()
+        if source_id not in wanted or str(source.get("kind") or "") != "text":
+            continue
+        content = re.sub(r"\s+", " ", str(source.get("content") or "")).strip()
+        if not content:
+            continue
+        source_type = str(source.get("source_type") or "supplier_product_evidence").strip()
+        remaining = 5000 - used
+        if remaining <= 0:
+            break
+        excerpt = content[: min(1200, remaining)]
+        output.append(f"{source_type}: {excerpt}")
+        used += len(excerpt)
+        if len(output) >= 6:
+            break
+    return tuple(output)
 
 
 def build_bootstrap_request(snapshot: SourceSnapshot) -> dict[str, Any]:
@@ -277,12 +319,14 @@ def infer_listing_bootstrap(
     snapshot: SourceSnapshot,
     *,
     image_paths: Iterable[str | Path] = (),
+    listing_intent: str = "",
 ) -> ListingBootstrapHints:
-    """Resolve one grounded Product Identity for taxonomy selection.
+    """Resolve Product Identity while preserving independent evidence for reconciliation.
 
-    Normal Step 1 no longer asks AI to invent marketplace search synonyms. The
-    canonical English product type is retained only as a single bounded search
-    fallback for portals where the live taxonomy DOM cannot be read.
+    Product Identity remains the initial semantic hypothesis. The cited supplier
+    snippets and the customer's listing intent are retained separately so Step 1
+    can correct a mistaken or over-specific first interpretation instead of letting
+    one AI answer become the sole truth source for search and candidate validation.
     """
 
     identity = infer_product_identity(provider, snapshot, image_paths=image_paths)
@@ -294,12 +338,20 @@ def infer_listing_bootstrap(
             "product_summary": identity.product_summary,
         }
     )
+    intent = re.sub(r"\s+", " ", str(listing_intent or "")).strip()[:2000]
+    grounded_evidence = _grounded_identity_evidence(
+        snapshot,
+        identity.evidence_refs,
+        image_paths=image_paths,
+    )
     return ListingBootstrapHints(
         vertical_search_terms=parsed.vertical_search_terms,
         brand=parsed.brand,
         brand_status=parsed.brand_status,
         product_summary=parsed.product_summary,
         product_identity=identity.as_dict(),
+        customer_intent=intent,
+        grounded_product_evidence=grounded_evidence,
     )
 
 
@@ -653,9 +705,6 @@ def _labels_may_be_localized(selected: str, actual: str) -> bool:
 
 def _verify_selected_value(kind: str, selected: str, actual: str) -> str:
     if actual and normalize_label(actual) != normalize_label(selected):
-        # Browser translation can change the displayed label while the URL keeps
-        # Makro's canonical English value. Exact display click + canonical URL is
-        # a valid verification in that specific cross-script case.
         if not _labels_may_be_localized(selected, actual):
             raise RuntimeError(
                 f"Makro {kind} verification failed: selected={selected!r}, actual={actual!r}"
@@ -783,8 +832,6 @@ def _select_vertical_via_taxonomy(
     wait_ms: int,
     max_depth: int = 7,
 ) -> str:
-    """Navigate exact live taxonomy nodes from root to a verified leaf vertical."""
-
     search = _vertical_search_input(page)
     search.fill("")
     page.wait_for_timeout(wait_ms)
@@ -817,8 +864,6 @@ def _select_vertical_via_taxonomy(
         if is_brand_step(page) or _vertical_confirmation_content(page):
             return _complete_vertical_leaf(page, selected)
 
-        # Branch nodes reveal the next live column. Give the SPA a short bounded
-        # settle window, but never reinterpret unrelated page text as children.
         next_ready = False
         for _ in range(12):
             columns = _taxonomy_columns(page)
@@ -846,8 +891,6 @@ def _select_vertical_via_search(
     *,
     wait_ms: int,
 ) -> str:
-    """Bounded compatibility fallback when the live taxonomy DOM is unavailable."""
-
     search = _vertical_search_input(page)
     attempted: list[str] = []
     for term in hints.vertical_search_terms:
@@ -1020,11 +1063,17 @@ def run_listing_creation(
     image_paths: Iterable[str | Path] = (),
     vertical_override: str = "",
     brand_override: str = "",
+    listing_intent: str = "",
 ) -> ListingCreationResult:
     if not is_vertical_step(page):
         raise RuntimeError("Start page must be Makro Step 1 / Select Vertical")
 
-    hints = infer_listing_bootstrap(provider, snapshot, image_paths=image_paths)
+    hints = infer_listing_bootstrap(
+        provider,
+        snapshot,
+        image_paths=image_paths,
+        listing_intent=listing_intent,
+    )
     if vertical_override.strip():
         hints = ListingBootstrapHints(
             vertical_search_terms=(vertical_override.strip(),),
@@ -1032,6 +1081,8 @@ def run_listing_creation(
             brand_status=hints.brand_status,
             product_summary=hints.product_summary,
             product_identity=hints.product_identity,
+            customer_intent=hints.customer_intent,
+            grounded_product_evidence=hints.grounded_product_evidence,
         )
     if brand_override.strip():
         hints = ListingBootstrapHints(
@@ -1040,6 +1091,8 @@ def run_listing_creation(
             brand_status="explicit",
             product_summary=hints.product_summary,
             product_identity=hints.product_identity,
+            customer_intent=hints.customer_intent,
+            grounded_product_evidence=hints.grounded_product_evidence,
         )
 
     vertical = select_vertical(page, provider, hints)
