@@ -89,7 +89,11 @@ def test_select_vertical_prefers_grounded_search_before_taxonomy(monkeypatch) ->
     monkeypatch.setattr(
         vertical_selection,
         "_try_select_via_search",
-        lambda *_args, **_kwargs: ("neck_massager", ["Health / Neck Massager"]),
+        lambda *_args, **_kwargs: (
+            "neck_massager",
+            ["Health / Neck Massager"],
+            ("neck massager",),
+        ),
     )
 
     def taxonomy_must_not_run(_page):
@@ -105,7 +109,11 @@ def test_select_vertical_falls_back_to_structural_taxonomy_when_search_has_no_ca
     taxonomy = FakeTaxonomy([["Health & Beauty"]])
     monkeypatch.setattr(vertical_selection, "_committed_vertical_from_later_stage", lambda _page: "")
     monkeypatch.setattr(vertical_selection, "is_vertical_interaction_ready", lambda _page: True)
-    monkeypatch.setattr(vertical_selection, "_try_select_via_search", lambda *_args, **_kwargs: ("", []))
+    monkeypatch.setattr(
+        vertical_selection,
+        "_try_select_via_search",
+        lambda *_args, **_kwargs: ("", [], ("neck massager",)),
+    )
     monkeypatch.setattr(vertical_selection, "ResilientMakroTaxonomyBrowser", lambda _page: taxonomy)
     monkeypatch.setattr(vertical_selection, "_select_via_taxonomy", lambda *_args, **_kwargs: "neck_massager")
     assert vertical_selection.select_vertical(page, object(), hints, wait_ms=0) == "neck_massager"
