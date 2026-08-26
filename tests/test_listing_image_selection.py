@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from PIL import Image
@@ -12,7 +13,7 @@ from app.listing_images import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RESOLVER = (ROOT / "makro_resolve_ai.py").read_text(encoding="utf-8")
+RESOLVER = (ROOT / "app" / "resolver_pipeline.py").read_text(encoding="utf-8")
 WINDOW = (ROOT / "gui" / "workflow_console_window.py").read_text(encoding="utf-8")
 BATCH = (ROOT / "gui" / "batch_runner.py").read_text(encoding="utf-8")
 REAL = (ROOT / "gui" / "real_execution.py").read_text(encoding="utf-8")
@@ -62,19 +63,20 @@ def test_exact_duplicate_content_is_not_repeated_in_listing_gallery(tmp_path: Pa
     assert selection.assessments[1].reasons == ("duplicate_content",)
 
 
-def test_selection_report_preserves_rejection_reason(tmp_path: Path) -> None:
+def test_selection_report_preserves_paths_and_rejection_reason(tmp_path: Path) -> None:
     strip = _write_image(tmp_path / "strip.png", (649, 45), (255, 255, 255))
     normal = _write_image(tmp_path / "normal.jpg", (330, 330), (10, 30, 50))
     target = tmp_path / "listing-image-selection.json"
 
     selection = select_listing_images([strip, normal])
     write_listing_image_selection(selection, target)
-    text = target.read_text(encoding="utf-8")
+    payload = json.loads(target.read_text(encoding="utf-8"))
 
-    assert '"selected_count": 1' in text
-    assert '"rejected_count": 1' in text
-    assert "short_edge<160" in text
-    assert str(normal) in text
+    assert payload["selected_count"] == 1
+    assert payload["rejected_count"] == 1
+    assert payload["selected"] == [str(normal)]
+    assert payload["assessments"][0]["path"] == str(strip)
+    assert "short_edge<160" in payload["assessments"][0]["reasons"]
 
 
 def test_legacy_resolver_run_is_filtered_by_same_gate(tmp_path: Path) -> None:
@@ -106,7 +108,7 @@ def test_resolver_keeps_raw_ai_evidence_separate_from_listing_images() -> None:
     assert '"primary_source_product_images"' in RESOLVER
     assert '"primary_source_listing_images"' in RESOLVER
     assert '"primary_source_listing_image_selection"' in RESOLVER
-    assert "image_paths = [*(product_images or [str(captured.screenshot_path)]), *extra_images]" in RESOLVER
+    assert "image_paths = [*(product_images or fallback_visual), *list(args.image)]" in RESOLVER
     assert 'outputs.get("primary_source_product_images")' in REAL
 
 
