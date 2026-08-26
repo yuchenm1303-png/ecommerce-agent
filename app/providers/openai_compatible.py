@@ -29,6 +29,7 @@ class OpenAICompatibleResponseError(JSONTaskResponseError, OpenAICompatibleProvi
 
 SUPPORTED_COMPAT_PROFILES = ("generic", "qwen-omni")
 _PROGRESS_INTERVAL_SECONDS = 15.0
+_PRODUCT_FACT_TASK = "resolve_compact_product_facts"
 
 
 def _image_data_uri(path_value: str) -> str:
@@ -42,19 +43,8 @@ def _image_data_uri(path_value: str) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
-def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
-    """Serialize only model-relevant task data; local paths/digests stay local."""
-
-    payload = {
-        "task": request_payload.get("task"),
-        "product_identity": request_payload.get("product_identity") or {},
-        "context": request_payload.get("context") or {},
-        "target_fields": request_payload.get("target_fields") or [],
-        "all_marketplace_fields": request_payload.get("all_marketplace_fields") or [],
-        "rules": request_payload.get("rules") or [],
-        "grounded_sources": [],
-        "json_contract": request_payload.get("json_contract") or {},
-    }
+def _serialized_sources(request_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
     for source in request_payload.get("grounded_sources") or []:
         if not isinstance(source, dict):
             continue
@@ -66,8 +56,43 @@ def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
         if source.get("kind") == "text":
             item["origin"] = source.get("origin", "")
             item["content"] = source.get("content", "")
-        payload["grounded_sources"].append(item)
-    return payload
+        output.append(item)
+    return output
+
+
+def _prompt_payload(request_payload: dict[str, Any]) -> dict[str, Any]:
+    """Serialize only model-relevant task data; local paths/digests stay local.
+
+    Product-fact batches contain the same rules and evidence but different target
+    fields. Put that invariant content first so provider prefix caches can reuse
+    it without changing any semantic input. Other tasks retain their historical
+    serialization order exactly.
+    """
+
+    task = request_payload.get("task")
+    sources = _serialized_sources(request_payload)
+    if task == _PRODUCT_FACT_TASK:
+        return {
+            "task": task,
+            "product_identity": request_payload.get("product_identity") or {},
+            "context": request_payload.get("context") or {},
+            "all_marketplace_fields": request_payload.get("all_marketplace_fields") or [],
+            "rules": request_payload.get("rules") or [],
+            "grounded_sources": sources,
+            "target_fields": request_payload.get("target_fields") or [],
+            "json_contract": request_payload.get("json_contract") or {},
+        }
+
+    return {
+        "task": task,
+        "product_identity": request_payload.get("product_identity") or {},
+        "context": request_payload.get("context") or {},
+        "target_fields": request_payload.get("target_fields") or [],
+        "all_marketplace_fields": request_payload.get("all_marketplace_fields") or [],
+        "rules": request_payload.get("rules") or [],
+        "grounded_sources": sources,
+        "json_contract": request_payload.get("json_contract") or {},
+    }
 
 
 def _task_instruction(request_payload: dict[str, Any]) -> str:
