@@ -3,8 +3,10 @@
 
 ``--all`` executes the repository's complete pytest suite except tests explicitly
 marked ``probe``. Targeted suites remain available for fast stage-level loops.
-Every Test Lab pytest process strips paid AI credentials and installs the socket
-safety plugin; real Amazon/Makro smoke tests intentionally live outside this tool.
+Every Test Lab pytest process strips paid AI credentials, installs the socket
+safety plugin, and runs inside a repository-owned writable temp root so host
+TEMP/TMP policy cannot corrupt collection or fixtures. Real Amazon/Makro smoke
+tests intentionally live outside this tool.
 """
 
 from __future__ import annotations
@@ -143,12 +145,22 @@ def _assert_nodes_exist(nodes: tuple[str, ...]) -> None:
         raise RuntimeError(f"Test Lab references missing test paths: {missing}")
 
 
+def _suite_temp_roots(label: str) -> tuple[Path, Path, Path]:
+    safe_label = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in label).strip("-") or "suite"
+    run_root = ROOT / "logs" / "test-lab" / "tmp" / f"{safe_label}-{os.getpid()}-{time.time_ns()}"
+    system_temp = run_root / "system"
+    pytest_temp = run_root / "pytest"
+    system_temp.mkdir(parents=True, exist_ok=False)
+    return run_root, system_temp, pytest_temp
+
+
 def _pytest_command(
     nodes: tuple[str, ...],
     *,
     verbose: bool,
     fail_fast: bool,
     exclude_probe: bool,
+    pytest_temp: Path,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -157,6 +169,8 @@ def _pytest_command(
         "-p",
         "app.test_lab_pytest_plugin",
         "--disable-warnings",
+        "--basetemp",
+        str(pytest_temp),
     ]
     if not verbose:
         command.append("-q")
@@ -178,15 +192,21 @@ def _run_pytest(
     exclude_probe: bool,
 ) -> dict[str, object]:
     _assert_nodes_exist(nodes)
+    run_root, system_temp, pytest_temp = _suite_temp_roots(label)
+    suite_env = dict(env)
+    for key in ("TEMP", "TMP", "TMPDIR"):
+        suite_env[key] = str(system_temp)
     command = _pytest_command(
         nodes,
         verbose=verbose,
         fail_fast=fail_fast,
         exclude_probe=exclude_probe,
+        pytest_temp=pytest_temp,
     )
     print(f"\n===== TEST LAB · {label.upper()} =====", flush=True)
+    print(f"temp_root={run_root}", flush=True)
     started = time.monotonic()
-    result = subprocess.run(command, cwd=ROOT, env=env, check=False)
+    result = subprocess.run(command, cwd=ROOT, env=suite_env, check=False)
     elapsed = round(time.monotonic() - started, 3)
     status = "PASS" if result.returncode == 0 else "FAIL"
     print(f"TEST_LAB_SUITE {label} {status} elapsed_s={elapsed}", flush=True)
@@ -197,6 +217,7 @@ def _run_pytest(
         "elapsed_seconds": elapsed,
         "tests": list(nodes),
         "probe_tests_excluded": bool(exclude_probe),
+        "temp_root": str(run_root.resolve()),
     }
 
 
