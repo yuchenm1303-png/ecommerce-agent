@@ -41,10 +41,11 @@ def test_browser_restart_invalidates_stale_prepared_tabs() -> None:
 
 
 def test_manager_never_owns_or_closes_makro_browser() -> None:
+    # The GUI owns browser lifecycle coordination, never the external Edge object
+    # itself. Keep the behavioral prohibition instead of locking a docstring.
     assert "browser.close(" not in MANAGER
     assert "context.close(" not in MANAGER
     assert "process.kill(" not in MANAGER
-    assert "never closes the external Edge" in MANAGER
 
 
 def test_auto_recovery_does_not_restart_browser_mid_task() -> None:
