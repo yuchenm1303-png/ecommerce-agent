@@ -5,6 +5,14 @@ External sockets are rejected before bytes leave the machine. Loopback stays
 available for local fixture servers and process tests, but the production Makro
 and Source Edge CDP ports are explicitly forbidden so an offline regression can
 never attach to the user's live browsers by accident.
+
+On Windows Python 3.12.4+ treats ``mkdir(..., 0o700)`` as a private ACL. Some
+restricted desktop-agent sandboxes then cannot reopen directories they created
+with that ACL. Pytest hard-codes ``0o700`` for ``tmp_path``/``--basetemp`` and
+``tempfile`` uses the same mode. Test Lab therefore normalizes only those private
+mkdir calls that land inside its own per-run temp root so the directory inherits
+the already-writable workspace ACL. Paths outside Test Lab keep normal Python
+permission semantics.
 """
 
 from __future__ import annotations
@@ -17,7 +25,9 @@ from typing import Any
 _ORIGINAL_CONNECT = socket.socket.connect
 _ORIGINAL_CONNECT_EX = socket.socket.connect_ex
 _ORIGINAL_CREATE_CONNECTION = socket.create_connection
+_ORIGINAL_MKDIR = os.mkdir
 _BLOCKED_LIVE_CDP_PORTS = {9222, 9333}
+_TEST_LAB_TEMP_ROOT_ENV = "ECOMMERCE_TEST_LAB_TEMP_ROOT"
 _INSTALLED = False
 
 
@@ -79,6 +89,32 @@ def _guarded_create_connection(address: Any, *args: Any, **kwargs: Any) -> socke
     return _ORIGINAL_CREATE_CONNECTION(address, *args, **kwargs)
 
 
+def _inside_test_lab_temp(path: Any) -> bool:
+    root = os.environ.get(_TEST_LAB_TEMP_ROOT_ENV, "").strip()
+    if not root:
+        return False
+    try:
+        root_path = os.path.normcase(os.path.abspath(root))
+        candidate = os.path.normcase(os.path.abspath(os.fsdecode(path)))
+        return os.path.commonpath((root_path, candidate)) == root_path
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _guarded_mkdir(path: Any, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+    effective_mode = mode
+    if os.name == "nt" and dir_fd is None and mode == 0o700 and _inside_test_lab_temp(path):
+        # Windows Python 3.12.4+ maps 0o700 to a private ACL. Under a restricted
+        # desktop-agent token that ACL can lock the creator out on the next open.
+        # 0o777 is ignored by Windows, so the directory inherits the writable ACL
+        # from the Test Lab run root instead of creating an owner-only descriptor.
+        effective_mode = 0o777
+    if dir_fd is None:
+        _ORIGINAL_MKDIR(path, effective_mode)
+    else:
+        _ORIGINAL_MKDIR(path, effective_mode, dir_fd=dir_fd)
+
+
 def pytest_sessionstart(session: Any) -> None:
     global _INSTALLED
     if os.environ.get("ECOMMERCE_TEST_LAB_NO_EXTERNAL") != "1":
@@ -88,6 +124,8 @@ def pytest_sessionstart(session: Any) -> None:
         )
     if _INSTALLED:
         return
+    if os.name == "nt":
+        os.mkdir = _guarded_mkdir  # type: ignore[assignment]
     socket.socket.connect = _guarded_connect  # type: ignore[method-assign]
     socket.socket.connect_ex = _guarded_connect_ex  # type: ignore[method-assign]
     socket.create_connection = _guarded_create_connection
@@ -98,6 +136,8 @@ def pytest_sessionfinish(session: Any, exitstatus: int) -> None:
     global _INSTALLED
     if not _INSTALLED:
         return
+    if os.name == "nt":
+        os.mkdir = _ORIGINAL_MKDIR  # type: ignore[assignment]
     socket.socket.connect = _ORIGINAL_CONNECT  # type: ignore[method-assign]
     socket.socket.connect_ex = _ORIGINAL_CONNECT_EX  # type: ignore[method-assign]
     socket.create_connection = _ORIGINAL_CREATE_CONNECTION
@@ -107,5 +147,5 @@ def pytest_sessionfinish(session: Any, exitstatus: int) -> None:
 def pytest_report_header(config: Any) -> str:
     return (
         "Test Lab safety: external sockets blocked; live CDP 9222/9333 blocked; "
-        "paid AI credentials stripped"
+        "paid AI credentials stripped; Windows 0o700 temp ACLs normalized in Test Lab root"
     )
