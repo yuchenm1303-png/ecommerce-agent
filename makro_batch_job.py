@@ -2,9 +2,9 @@
 
 This is orchestration only. It reuses the canonical source snapshot, Product
 Identity, live Makro taxonomy/brand selection, Step 3 schema scan, Resolver and
-Fill Plan. Each Batch job may also carry its own customer supplemental files;
-they remain evidence for that exact supplier URL rather than becoming a second
-product input.
+Fill Plan. Each Batch job may also carry its own customer listing intent and
+supplemental files; both remain evidence for that exact supplier URL rather than
+becoming a second product input.
 
 No Step 3 writes, Save, image upload, or Send to QC happen here.
 """
@@ -48,6 +48,14 @@ def _args():
         action="append",
         default=[],
         help="Customer supplemental product file for this Batch job. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--listing-intent",
+        default="",
+        help=(
+            "Customer-entered intent for this exact Batch row. It is independent semantic context "
+            "for Product Identity/Vertical reconciliation, not permission to contradict supplier facts."
+        ),
     )
     return parser.parse_args()
 
@@ -112,6 +120,7 @@ def main() -> int:
     run_dir = Path(args.output_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / "run-manifest.json"
+    listing_intent = " ".join(str(args.listing_intent or "").split())[:2000]
     manifest: dict[str, object] = {
         "mode": "full",
         "input_mode": "supplier_url",
@@ -119,6 +128,7 @@ def main() -> int:
         "status": "started",
         "product_url": args.product_url,
         "supplemental_product_files": len(args.product_file),
+        "listing_intent_present": bool(listing_intent),
         "vertical": "",
         "brand": "",
         "makro_target_id": "",
@@ -159,6 +169,7 @@ def main() -> int:
             provider,
             acquired.snapshot,
             image_paths=acquired.evidence_image_paths,
+            listing_intent=listing_intent,
         )
         manifest["product_input"] = product_input_manifest_payload(acquired)
         manifest["bootstrap_source"] = {
@@ -175,6 +186,8 @@ def main() -> int:
         detail = "supplier evidence ready"
         if args.product_file:
             detail += f" + {len(args.product_file)} supplemental file(s)"
+        if listing_intent:
+            detail += " + listing intent"
         _phase("source", "COMPLETE", detail)
 
         with sync_playwright() as playwright:
