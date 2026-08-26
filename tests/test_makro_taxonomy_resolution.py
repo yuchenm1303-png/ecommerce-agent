@@ -42,26 +42,39 @@ def _hints() -> ListingBootstrapHints:
     )
 
 
-def test_taxonomy_path_contract_can_explore_best_available_branch() -> None:
+def test_taxonomy_path_contract_is_one_atomic_selection_key() -> None:
     request = build_taxonomy_path_choice_request(
         _hints(),
         ["Home Improvement"],
         ["Gardening Tools", "Storage Containers"],
     )
-    relation = request["json_contract"]["properties"]["selection_relation"]
-    assert relation["enum"] == [
-        "ancestor_branch",
-        "best_available_branch",
-        "same_product_type",
-        "broader_valid_class",
+    schema = request["json_contract"]
+    assert schema["required"] == ["selection_key"]
+    assert set(schema["properties"]) == {"selection_key"}
+    choices = schema["properties"]["selection_key"]["enum"]
+    assert choices == [
         "none",
+        "ancestor_branch:node_0",
+        "ancestor_branch:node_1",
+        "best_available_branch:node_0",
+        "best_available_branch:node_1",
+        "same_product_type:node_0",
+        "same_product_type:node_1",
+        "broader_valid_class:node_0",
+        "broader_valid_class:node_1",
+    ]
+    assert all(not choice.startswith("none:") for choice in choices)
+    assert request["context"]["live_node_options"] == [
+        {"node_id": "node_0", "label": "Gardening Tools"},
+        {"node_id": "node_1", "label": "Storage Containers"},
     ]
     rules = " ".join(request["rules"]).casefold()
+    assert "atomic" in rules
     assert "best_available_branch" in rules
     assert "physical containment alone" in rules
 
 
-def test_taxonomy_path_rejects_nonempty_node_with_none_relation() -> None:
+def test_taxonomy_path_rejects_legacy_split_field_response() -> None:
     provider = FakeProvider(
         {
             "choose_safe_makro_taxonomy_node": {
@@ -70,7 +83,7 @@ def test_taxonomy_path_rejects_nonempty_node_with_none_relation() -> None:
             }
         }
     )
-    with pytest.raises(ValueError, match="non-empty taxonomy selection"):
+    with pytest.raises(ValueError, match="invalid taxonomy selection_key"):
         choose_taxonomy_path_candidate(
             provider,
             _hints(),
@@ -83,8 +96,7 @@ def test_taxonomy_path_can_choose_practical_best_available_branch() -> None:
     provider = FakeProvider(
         {
             "choose_safe_makro_taxonomy_node": {
-                "selected_node": "Gardening Tools",
-                "selection_relation": "best_available_branch",
+                "selection_key": "best_available_branch:node_0",
             }
         }
     )
@@ -96,12 +108,27 @@ def test_taxonomy_path_can_choose_practical_best_available_branch() -> None:
     ) == "Gardening Tools"
 
 
+def test_taxonomy_path_atomic_key_binds_exact_live_node() -> None:
+    provider = FakeProvider(
+        {
+            "choose_safe_makro_taxonomy_node": {
+                "selection_key": "broader_valid_class:node_1",
+            }
+        }
+    )
+    assert choose_taxonomy_path_candidate(
+        provider,
+        _hints(),
+        ["Home Improvement"],
+        ["Gardening Tools", "Watering Equipment"],
+    ) == "Watering Equipment"
+
+
 def test_taxonomy_path_can_still_return_none_when_every_branch_is_unusable() -> None:
     provider = FakeProvider(
         {
             "choose_safe_makro_taxonomy_node": {
-                "selected_node": "",
-                "selection_relation": "none",
+                "selection_key": "none",
             }
         }
     )
@@ -111,6 +138,23 @@ def test_taxonomy_path_can_still_return_none_when_every_branch_is_unusable() -> 
         ["Home Improvement", "Gardening Tools"],
         ["Storage Containers"],
     ) == ""
+
+
+def test_taxonomy_path_rejects_unknown_atomic_key() -> None:
+    provider = FakeProvider(
+        {
+            "choose_safe_makro_taxonomy_node": {
+                "selection_key": "none:node_0",
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="invalid taxonomy selection_key"):
+        choose_taxonomy_path_candidate(
+            provider,
+            _hints(),
+            ["Home Improvement"],
+            ["Gardening Tools"],
+        )
 
 
 def test_leaf_contract_allows_explicit_best_available_fit() -> None:
