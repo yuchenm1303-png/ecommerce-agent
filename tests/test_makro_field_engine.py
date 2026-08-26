@@ -24,17 +24,19 @@ class SelectedOption:
 
 
 class Locator:
-    def __init__(self, *, value="", text="", attrs=None):
+    def __init__(self, *, value="", text="", attrs=None, live_options=None):
         self.first = self
         self.value = value
         self.text = text
         self.attrs = dict(attrs or {})
+        self.live_options = [dict(item) for item in (live_options or [])]
         self.checked = False
         self.visible = True
         self._count = 1
         self.events: list[str] = []
         self.blurred = False
         self.clicked = 0
+        self.select_calls: list[dict[str, str | None]] = []
 
     def count(self):
         return self._count
@@ -59,7 +61,12 @@ class Locator:
             return self.attrs.get(name, self.value)
         return self.attrs.get(name)
 
+    def evaluate(self, script):
+        assert "el.options" in script
+        return [dict(item) for item in self.live_options]
+
     def select_option(self, label=None, value=None):
+        self.select_calls.append({"label": label, "value": value})
         if label is not None:
             self.selected_label = label
             self.value = label
@@ -178,15 +185,16 @@ def test_number_control_rejects_text_before_any_dom_fill():
 
 
 def test_native_select_can_accept_canonical_value_and_verify_display_label():
+    options = [
+        {"text": "Active", "value": "ACTIVE", "disabled": False},
+        {"text": "Inactive", "value": "INACTIVE", "disabled": False},
+    ]
     c = control(
         "listing_status_0_value",
         kind="select",
-        options=[
-            {"text": "Active", "value": "ACTIVE", "disabled": False},
-            {"text": "Inactive", "value": "INACTIVE", "disabled": False},
-        ],
+        options=options,
     )
-    locator = Locator()
+    locator = Locator(live_options=options)
     page = Page({'[name="listing_status_0_value"]': locator})
     fill_control(page, c, "ACTIVE")
     assert locator.selected_label == "Active"
@@ -194,6 +202,28 @@ def test_native_select_can_accept_canonical_value_and_verify_display_label():
     assert locator.blurred is True
     assert read_control(page, c) == "Active"
     assert values_equivalent(c, "ACTIVE", "Active") is True
+
+
+def test_native_select_rejects_stale_metadata_before_select_option():
+    c = control(
+        "trimming_range_0_value",
+        kind="select",
+        options=[
+            {"text": "0.2 - 0.4 mm", "value": "0.2 - 0.4 mm", "disabled": False},
+        ],
+    )
+    locator = Locator(
+        live_options=[
+            {"text": "0.5 - 1 mm", "value": "0.5 - 1 mm", "disabled": False},
+        ]
+    )
+    page = Page({'[name="trimming_range_0_value"]': locator})
+
+    with pytest.raises(ValueError, match="不在当前 live options"):
+        fill_control(page, c, "0.2 - 0.4 mm")
+
+    assert locator.select_calls == []
+    assert locator.events == []
 
 
 def test_custom_dropdown_refuses_ambiguous_visible_exact_option_instead_of_clicking_last():
