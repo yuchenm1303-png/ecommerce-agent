@@ -334,6 +334,8 @@ Window {{
         anchors.fill: parent
         clip: true
         visible: false
+        layer.enabled: true
+        layer.smooth: true
 
         Image {{
             width: root.width * {_OVERSCAN}
@@ -345,16 +347,6 @@ Window {{
             smooth: true
             cache: true
         }}
-    }}
-
-    ShaderEffectSource {{
-        id: blurTexture
-        anchors.fill: parent
-        sourceItem: blurSource
-        hideSource: true
-        live: root.animationRunning
-        smooth: true
-        visible: false
     }}
 
     Item {{
@@ -394,25 +386,39 @@ Window {{
         visible: false
     }}
 
-    onBlurUrlChanged: blurTexture.scheduleUpdate()
-    onWidthChanged: blurTexture.scheduleUpdate()
-    onHeightChanged: blurTexture.scheduleUpdate()
-    onAnimationRunningChanged: {{
-        if (!animationRunning)
-            blurTexture.scheduleUpdate()
-    }}
-    onGeometryRevisionChanged: glassMaskTexture.scheduleUpdate()
-    Component.onCompleted: {{
-        blurTexture.scheduleUpdate()
-        glassMaskTexture.scheduleUpdate()
-    }}
-
     MultiEffect {{
+        id: glassEffect
         anchors.fill: parent
-        source: blurTexture
+        source: blurSource
         maskEnabled: true
         maskSource: glassMaskTexture
         autoPaddingEnabled: false
+    }}
+
+    ShaderEffectSource {{
+        id: staticGlassTexture
+        anchors.fill: parent
+        sourceItem: glassEffect
+        hideSource: !root.animationRunning
+        live: false
+        smooth: true
+        visible: !root.animationRunning
+    }}
+
+    onBlurUrlChanged: staticGlassTexture.scheduleUpdate()
+    onWidthChanged: staticGlassTexture.scheduleUpdate()
+    onHeightChanged: staticGlassTexture.scheduleUpdate()
+    onAnimationRunningChanged: {{
+        if (!animationRunning)
+            staticGlassTexture.scheduleUpdate()
+    }}
+    onGeometryRevisionChanged: {{
+        glassMaskTexture.scheduleUpdate()
+        staticGlassTexture.scheduleUpdate()
+    }}
+    Component.onCompleted: {{
+        glassMaskTexture.scheduleUpdate()
+        staticGlassTexture.scheduleUpdate()
     }}
 
     Repeater {{

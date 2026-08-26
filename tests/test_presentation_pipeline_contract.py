@@ -47,7 +47,8 @@ def test_glass_mask_texture_refreshes_only_when_geometry_changes() -> None:
     assert "hideSource: true" in NATIVE
     assert "live: false" in NATIVE
     assert "property int geometryRevision: 0" in NATIVE
-    assert "onGeometryRevisionChanged: glassMaskTexture.scheduleUpdate()" in NATIVE
+    assert "onGeometryRevisionChanged:" in NATIVE
+    assert "glassMaskTexture.scheduleUpdate()" in NATIVE
     assert 'quick.setProperty("geometryRevision", self._geometry_revision)' in NATIVE
     assert "maskSource: glassMaskTexture" in NATIVE
     assert "model: glassCardModel" in NATIVE
@@ -61,21 +62,36 @@ def test_glass_mask_texture_refreshes_only_when_geometry_changes() -> None:
     assert "_geometry_revision" in NATIVE
 
 
-def test_static_wallpaper_source_is_cached_without_freezing_card_interaction() -> None:
-    assert "id: blurTexture" in NATIVE
-    assert "sourceItem: blurSource" in NATIVE
-    assert "live: root.animationRunning" in NATIVE
-    assert "onBlurUrlChanged: blurTexture.scheduleUpdate()" in NATIVE
-    assert "onWidthChanged: blurTexture.scheduleUpdate()" in NATIVE
-    assert "onHeightChanged: blurTexture.scheduleUpdate()" in NATIVE
+def test_static_glass_composite_is_cached_without_freezing_card_interaction() -> None:
+    assert "id: glassEffect" in NATIVE
+    assert "source: blurSource" in NATIVE
+    assert "id: staticGlassTexture" in NATIVE
+    assert "sourceItem: glassEffect" in NATIVE
+    assert "hideSource: !root.animationRunning" in NATIVE
+    assert "visible: !root.animationRunning" in NATIVE
+    assert "live: false" in NATIVE
+    assert "onBlurUrlChanged: staticGlassTexture.scheduleUpdate()" in NATIVE
+    assert "onWidthChanged: staticGlassTexture.scheduleUpdate()" in NATIVE
+    assert "onHeightChanged: staticGlassTexture.scheduleUpdate()" in NATIVE
     assert "onAnimationRunningChanged:" in NATIVE
-    assert "blurTexture.scheduleUpdate()" in NATIVE
-    assert "source: blurTexture" in NATIVE
+    assert "staticGlassTexture.scheduleUpdate()" in NATIVE
     assert "scale: cardScale" in NATIVE
     assert "color: Qt.rgba(0, 0, 0, cardAlpha / 255.0)" in NATIVE
 
-    blur_source = NATIVE.split("id: blurSource", 1)[1].split("ShaderEffectSource {{", 1)[0]
-    assert "layer.enabled: true" not in blur_source
+    blur_source = NATIVE.split("id: blurSource", 1)[1].split("id: glassMaskScene", 1)[0]
+    assert "layer.enabled: true" in blur_source
+
+    glass_effect = NATIVE.split("id: glassEffect", 1)[1].split(
+        "id: staticGlassTexture", 1
+    )[0]
+    assert "cardScale" not in glass_effect
+    assert "cardAlpha" not in glass_effect
+
+    live_card_overlay = NATIVE.split("id: staticGlassTexture", 1)[1].split(
+        "FrameAnimation", 1
+    )[0]
+    assert "scale: cardScale" in live_card_overlay
+    assert "cardAlpha" in live_card_overlay
 
 
 def test_background_has_no_python_pointer_timer_and_retains_gpu_scene_graph() -> None:
