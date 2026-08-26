@@ -142,7 +142,7 @@ def sanitize_telemetry_value(
 def _read_json_object(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+    except (OSError, ValueError, UnicodeDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
 
@@ -156,7 +156,7 @@ def _read_diagnostic_events(path: Path) -> list[dict[str, Any]]:
     for line in lines[-_MAX_EVENTS:]:
         try:
             payload = json.loads(line)
-        except (ValueError, json.JSONDecodeError):
+        except ValueError:
             continue
         if isinstance(payload, dict):
             events.append(payload)
@@ -167,7 +167,7 @@ def _discover_process_logs(
     run_dir: Path | None,
     explicit_path: str | Path | None,
 ) -> list[Path]:
-    """Discover stage logs directly from disk, independent of UI phase labels."""
+    """Discover complete stage logs from disk, independent of a stale UI phase."""
 
     candidates: list[Path] = []
     seen: set[str] = set()
@@ -191,20 +191,25 @@ def _discover_process_logs(
             for name in _BATCH_STAGE_LOGS:
                 add(root / name)
 
-    return sorted(candidates, key=lambda path: path.stat().st_mtime_ns)
+    def mtime(path: Path) -> int:
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    return sorted(candidates, key=mtime)
 
 
 def _encoded_text_blob(text: str) -> dict[str, Any]:
     data = text.encode("utf-8")
     compressed = gzip.compress(data, compresslevel=6, mtime=0)
     encoded = base64.b64encode(compressed).decode("ascii")
-    chunks = [
-        encoded[index : index + _STAGE_LOG_CHUNK_CHARS]
-        for index in range(0, len(encoded), _STAGE_LOG_CHUNK_CHARS)
-    ]
     return {
         "encoding": "gzip+base64-chunks",
-        "chunks": chunks,
+        "chunks": [
+            encoded[index : index + _STAGE_LOG_CHUNK_CHARS]
+            for index in range(0, len(encoded), _STAGE_LOG_CHUNK_CHARS)
+        ],
         "line_count": len(text.splitlines()),
         "byte_count": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
@@ -218,17 +223,19 @@ def _read_complete_stage_log(path: Path) -> tuple[dict[str, Any], str]:
     except OSError:
         return {}, ""
     text = _sanitize_text(raw.decode("utf-8", errors="replace"))
-    payload = {
-        "name": path.name,
-        "stage": path.stem,
-        "integrity_scope": "sanitized_utf8_content",
-        **_encoded_text_blob(text),
-    }
-    return payload, text
+    return (
+        {
+            "name": path.name,
+            "stage": path.stem,
+            "integrity_scope": "sanitized_utf8_content",
+            **_encoded_text_blob(text),
+        },
+        text,
+    )
 
 
 def _select_stage_log(paths: list[Path]) -> tuple[Path | None, dict[str, Any], str]:
-    empty_candidate: tuple[Path | None, dict[str, Any], str] = (None, {}, "")
+    empty: tuple[Path | None, dict[str, Any], str] = (None, {}, "")
     for path in reversed(paths):
         payload, text = _read_complete_stage_log(path)
         if not payload:
@@ -236,9 +243,9 @@ def _select_stage_log(paths: list[Path]) -> tuple[Path | None, dict[str, Any], s
         candidate = (path, payload, text)
         if text:
             return candidate
-        if empty_candidate[0] is None:
-            empty_candidate = candidate
-    return empty_candidate
+        if empty[0] is None:
+            empty = candidate
+    return empty
 
 
 def _exception_match(raw_line: str) -> re.Match[str] | None:
@@ -255,28 +262,27 @@ def _exception_match(raw_line: str) -> re.Match[str] | None:
     return None
 
 
-def _extract_all_exceptions(log_text: str) -> list[dict[str, Any]]:
-    exceptions: list[dict[str, Any]] = []
-    for line_number, raw in enumerate(log_text.splitlines(), start=1):
+def _extract_all_exceptions(text: str) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for line_number, raw in enumerate(text.splitlines(), start=1):
         match = _exception_match(raw)
         if not match:
             continue
-        sanitized_line = _sanitize_text(raw)
-        exceptions.append(
+        output.append(
             {
                 "line_number": line_number,
                 "error_type": sanitize_telemetry_text(str(match.group("type") or ""), 240),
                 "message": sanitize_telemetry_text(str(match.group("message") or ""), _MAX_TEXT),
-                "line": sanitize_telemetry_text(sanitized_line, _MAX_TEXT),
+                "line": sanitize_telemetry_text(raw, _MAX_TEXT),
             }
         )
-    return exceptions
+    return output
 
 
-def _extract_all_tracebacks(log_text: str) -> list[dict[str, Any]]:
-    lines = log_text.splitlines()
+def _extract_all_tracebacks(text: str) -> list[dict[str, Any]]:
+    lines = text.splitlines()
     starts = [index for index, line in enumerate(lines) if _TRACEBACK_MARKER in line]
-    tracebacks: list[dict[str, Any]] = []
+    output: list[dict[str, Any]] = []
     for position, start in enumerate(starts):
         next_start = starts[position + 1] if position + 1 < len(starts) else len(lines)
         end = next_start
@@ -284,14 +290,13 @@ def _extract_all_tracebacks(log_text: str) -> list[dict[str, Any]]:
         exception_message = ""
         for index in range(start + 1, next_start):
             match = _exception_match(lines[index])
-            if not match:
-                continue
-            end = index + 1
-            exception_type = sanitize_telemetry_text(str(match.group("type") or ""), 240)
-            exception_message = sanitize_telemetry_text(str(match.group("message") or ""), _MAX_TEXT)
-            break
+            if match:
+                end = index + 1
+                exception_type = sanitize_telemetry_text(str(match.group("type") or ""), 240)
+                exception_message = sanitize_telemetry_text(str(match.group("message") or ""), _MAX_TEXT)
+                break
         block = "\n".join(lines[start:end])
-        tracebacks.append(
+        output.append(
             {
                 "index": position + 1,
                 "start_line": start + 1,
@@ -301,27 +306,29 @@ def _extract_all_tracebacks(log_text: str) -> list[dict[str, Any]]:
                 **_encoded_text_blob(block),
             }
         )
-    return tracebacks
+    return output
 
 
-def _last_traceback_preview(log_text: str, tracebacks: list[dict[str, Any]]) -> str:
+def _last_traceback_preview(text: str, tracebacks: list[dict[str, Any]]) -> str:
     if not tracebacks:
         return ""
     latest = tracebacks[-1]
     start = max(0, int(latest.get("start_line") or 1) - 1)
     end = max(start, int(latest.get("end_line") or start + 1))
-    block = "\n".join(log_text.splitlines()[start:end])
+    block = "\n".join(text.splitlines()[start:end])
     if len(block) <= _MAX_TRACEBACK:
         return sanitize_telemetry_text(block, _MAX_TRACEBACK)
-    keep = max(1, _MAX_TRACEBACK - len(_TRACEBACK_MARKER) - 40)
+    keep = max(1, _MAX_TRACEBACK - len(_TRACEBACK_MARKER) - 48)
     return sanitize_telemetry_text(
-        _TRACEBACK_MARKER + "\n…[preview truncated; full traceback is encoded above]…\n" + block[-keep:],
+        _TRACEBACK_MARKER
+        + "\n…[preview truncated; full traceback is encoded above]…\n"
+        + block[-keep:],
         _MAX_TRACEBACK,
     )
 
 
-def _last_nonempty_line(log_text: str) -> str:
-    for raw in reversed(log_text.splitlines()):
+def _last_nonempty_line(text: str) -> str:
+    for raw in reversed(text.splitlines()):
         if raw.strip():
             return sanitize_telemetry_text(raw.strip(), _MAX_TEXT)
     return ""
@@ -341,11 +348,10 @@ def _compact_event(raw: dict[str, Any]) -> dict[str, Any]:
         "active_stages",
         "context",
     )
-    return sanitize_telemetry_value(
-        {key: raw.get(key) for key in keys if key in raw},
-        max_text=_EVENT_TEXT,
-        max_list=80,
-    )
+    compact = {key: raw.get(key) for key in keys if key in raw}
+    if raw.get("traceback"):
+        compact["traceback"] = "[see failure_diagnostic.traceback]"
+    return sanitize_telemetry_value(compact, max_text=_EVENT_TEXT, max_list=80)
 
 
 def _event_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -381,6 +387,7 @@ def _compact_manifest(payload: dict[str, Any]) -> dict[str, Any]:
         "mode",
         "product_url",
         "workflow_status",
+        "status",
         "vertical",
         "brand",
         "makro_target_id",
@@ -406,37 +413,15 @@ def _latest_execution_report(roots: Iterable[str | Path]) -> tuple[Path | None, 
         root = Path(raw).expanduser()
         if root.is_file() and root.name == "report.json":
             candidates.append(root)
-            continue
-        if root.is_dir():
+        elif root.is_dir():
             candidates.extend(path for path in root.glob("execute-*/report.json") if path.is_file())
     if not candidates:
         return None, {}
-    latest = max(candidates, key=lambda path: path.stat().st_mtime_ns)
+    try:
+        latest = max(candidates, key=lambda path: path.stat().st_mtime_ns)
+    except OSError:
+        latest = candidates[-1]
     return latest, _read_json_object(latest)
-
-
-def _section_report_summary(raw: Any) -> dict[str, Any]:
-    payload = raw if isinstance(raw, dict) else {}
-    keys = (
-        "section",
-        "section_title",
-        "title",
-        "status",
-        "writes_attempted",
-        "validated",
-        "persisted_verified",
-        "validation_failed",
-        "persisted_validation_failed",
-        "fill_error",
-        "save_attempted",
-        "saved",
-        "error",
-    )
-    return sanitize_telemetry_value(
-        {key: payload.get(key) for key in keys if key in payload},
-        max_text=2_000,
-        max_list=40,
-    )
 
 
 def _section_name(payload: dict[str, Any]) -> str:
@@ -467,11 +452,10 @@ def _verification_detail(payload: dict[str, Any]) -> str:
 
 
 def execution_report_failure_summary(payload: dict[str, Any]) -> dict[str, Any]:
-    """Derive executor acceptance failure without using GUI progress as evidence."""
+    """Derive executor acceptance failure without treating GUI progress as evidence."""
 
     if not isinstance(payload, dict) or not payload:
         return {}
-
     sections = payload.get("section_reports")
     if isinstance(sections, list):
         for raw_section in sections:
@@ -489,7 +473,6 @@ def execution_report_failure_summary(payload: dict[str, Any]) -> dict[str, Any]:
                         continue
                     field = _field_name(raw_result)
                     detail = _verification_detail(raw_result)
-                    message = detail or f"字段 {field} 执行状态={status}"
                     return sanitize_telemetry_value(
                         {
                             "source": "execution_report",
@@ -498,12 +481,11 @@ def execution_report_failure_summary(payload: dict[str, Any]) -> dict[str, Any]:
                             "field": field,
                             "status": status,
                             "error_type": error_type,
-                            "error_message": message,
+                            "error_message": detail or f"字段 {field} 执行状态={status}",
                         },
                         max_text=4_000,
                         max_list=40,
                     )
-
             persisted = raw_section.get("persisted_verifications")
             if isinstance(persisted, list):
                 for raw_verification in persisted:
@@ -513,7 +495,6 @@ def execution_report_failure_summary(payload: dict[str, Any]) -> dict[str, Any]:
                     if status in {"", "persisted_verified"}:
                         continue
                     field = _field_name(raw_verification)
-                    detail = str(raw_verification.get("detail") or "").strip()
                     return sanitize_telemetry_value(
                         {
                             "source": "execution_report",
@@ -522,21 +503,14 @@ def execution_report_failure_summary(payload: dict[str, Any]) -> dict[str, Any]:
                             "field": field,
                             "status": status,
                             "error_type": "FieldPersistenceFailure",
-                            "error_message": detail or f"字段 {field} Save 后验证状态={status}",
+                            "error_message": str(raw_verification.get("detail") or f"字段 {field} Save 后验证状态={status}"),
                         },
                         max_text=4_000,
                         max_list=40,
                     )
-
             section_status = str(raw_section.get("status") or "").strip()
             section_error_type = _SECTION_FAILURE_STATUSES.get(section_status)
             if section_error_type:
-                message = str(
-                    raw_section.get("save_error")
-                    or raw_section.get("detail")
-                    or raw_section.get("error")
-                    or f"section {section} 状态={section_status}"
-                ).strip()
                 return sanitize_telemetry_value(
                     {
                         "source": "execution_report",
@@ -545,7 +519,12 @@ def execution_report_failure_summary(payload: dict[str, Any]) -> dict[str, Any]:
                         "field": "",
                         "status": section_status,
                         "error_type": section_error_type,
-                        "error_message": message,
+                        "error_message": str(
+                            raw_section.get("save_error")
+                            or raw_section.get("detail")
+                            or raw_section.get("error")
+                            or f"section {section} 状态={section_status}"
+                        ),
                     },
                     max_text=4_000,
                     max_list=40,
@@ -574,70 +553,52 @@ def execution_report_failure_summary(payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(completion, dict):
         required_blocked = int(completion.get("required_blocked") or 0)
         if required_blocked:
-            return sanitize_telemetry_value(
-                {
-                    "source": "execution_report",
-                    "stage": "执行验收 / required fields",
-                    "section": "",
-                    "field": "",
-                    "status": "required_blocked",
-                    "error_type": "RequiredFieldBlocked",
-                    "error_message": f"required_blocked={required_blocked}",
-                },
-                max_text=4_000,
-                max_list=40,
-            )
+            return {
+                "source": "execution_report",
+                "stage": "执行验收 / required fields",
+                "section": "",
+                "field": "",
+                "status": "required_blocked",
+                "error_type": "RequiredFieldBlocked",
+                "error_message": f"required_blocked={required_blocked}",
+            }
         if not completion.get("required_field_cards_persisted", True):
-            return sanitize_telemetry_value(
-                {
-                    "source": "execution_report",
-                    "stage": "执行验收 / required fields",
-                    "section": "",
-                    "field": "",
-                    "status": "required_not_persisted",
-                    "error_type": "RequiredFieldPersistenceFailure",
-                    "error_message": "required sections not fully persisted",
-                },
-                max_text=4_000,
-                max_list=40,
-            )
+            return {
+                "source": "execution_report",
+                "stage": "执行验收 / required fields",
+                "section": "",
+                "field": "",
+                "status": "required_not_persisted",
+                "error_type": "RequiredFieldPersistenceFailure",
+                "error_message": "required sections not fully persisted",
+            }
         if not completion.get("photos_persisted", True):
-            return sanitize_telemetry_value(
-                {
-                    "source": "execution_report",
-                    "stage": "Product Photos",
-                    "section": "Product Photos",
-                    "field": "",
-                    "status": "photos_not_persisted",
-                    "error_type": "PhotoPersistenceFailure",
-                    "error_message": "Product Photos not persisted",
-                },
-                max_text=4_000,
-                max_list=40,
-            )
+            return {
+                "source": "execution_report",
+                "stage": "Product Photos",
+                "section": "Product Photos",
+                "field": "",
+                "status": "photos_not_persisted",
+                "error_type": "PhotoPersistenceFailure",
+                "error_message": "Product Photos not persisted",
+            }
         if not completion.get("draft_persisted_complete", True):
-            return sanitize_telemetry_value(
-                {
-                    "source": "execution_report",
-                    "stage": "执行验收",
-                    "section": "",
-                    "field": "",
-                    "status": "acceptance_incomplete",
-                    "error_type": "ExecutionAcceptanceFailure",
-                    "error_message": "Full Step 3 persisted acceptance 未完整通过",
-                },
-                max_text=4_000,
-                max_list=40,
-            )
-
+            return {
+                "source": "execution_report",
+                "stage": "执行验收",
+                "section": "",
+                "field": "",
+                "status": "acceptance_incomplete",
+                "error_type": "ExecutionAcceptanceFailure",
+                "error_message": "Full Step 3 persisted acceptance 未完整通过",
+            }
     return {}
 
 
 def _compact_execution_report(payload: dict[str, Any]) -> dict[str, Any]:
     if not payload:
         return {}
-    result: dict[str, Any] = {}
-    for key in (
+    keys = (
         "mode",
         "page_url",
         "makro_target_id",
@@ -652,18 +613,21 @@ def _compact_execution_report(payload: dict[str, Any]) -> dict[str, Any]:
         "send_to_qc_clicked",
         "browser_closed",
         "final_screenshot",
-    ):
-        if key in payload:
-            result[key] = payload.get(key)
+    )
+    result = {key: payload.get(key) for key in keys if key in payload}
     sections = payload.get("section_reports")
     if isinstance(sections, list):
-        result["section_reports"] = [_section_report_summary(item) for item in sections[:12]]
+        result["section_reports"] = [
+            sanitize_telemetry_value(item, max_text=2_000, max_list=60)
+            for item in sections[:12]
+            if isinstance(item, dict)
+        ]
     photos = payload.get("photo_upload")
     if isinstance(photos, dict):
         result["photo_upload"] = sanitize_telemetry_value(photos, max_text=2_000, max_list=60)
-    failure_summary = execution_report_failure_summary(payload)
-    if failure_summary:
-        result["failure_summary"] = failure_summary
+    failure = execution_report_failure_summary(payload)
+    if failure:
+        result["failure_summary"] = failure
     return sanitize_telemetry_value(result, max_text=4_000, max_list=100)
 
 
@@ -677,14 +641,13 @@ def collect_workflow_failure_diagnostic(
     process_log_path: str | Path | None = None,
     artifact_roots: Iterable[str | Path] = (),
 ) -> dict[str, Any]:
-    """Build failure evidence with the complete stage log as the canonical truth.
+    """Build one complete, redacted failure diagnostic.
 
-    When a stage log exists, no GUI phase, manifest field, execution report, or
-    exit-code fallback is allowed to replace its failure evidence. The full
-    sanitized UTF-8 stage log is losslessly gzip/base64 encoded in bounded chunks
-    so both the client and telemetry server can carry it without per-string
-    truncation. ``line_count``, ``byte_count`` and ``sha256`` all describe the
-    reconstructed sanitized stage-log bytes.
+    A discovered stage log is the canonical failure truth. Its complete sanitized
+    UTF-8 content is encoded losslessly with line/byte/SHA-256 integrity metadata;
+    compact previews and execution reports are secondary views only. When no
+    stage log exists, the FAILED workflow event remains a valid fallback and its
+    traceback is preserved instead of being silently discarded.
     """
 
     path = Path(run_dir).expanduser() if str(run_dir or "").strip() else None
@@ -696,19 +659,28 @@ def collect_workflow_failure_diagnostic(
 
     process_paths = _discover_process_logs(path, process_log_path)
     stage_path, stage_log, stage_text = _select_stage_log(process_paths)
-    tracebacks = _extract_all_tracebacks(stage_text) if stage_log else []
-    exceptions = _extract_all_exceptions(stage_text) if stage_log else []
-    traceback_preview = _last_traceback_preview(stage_text, tracebacks)
+
+    failed_event: dict[str, Any] = {}
+    for event in reversed(events):
+        if (
+            str(event.get("event") or "").upper() == "FAILED"
+            or event.get("traceback")
+            or event.get("error_type")
+        ):
+            failed_event = event
+            break
+
+    event_traceback_text = _sanitize_text(str(failed_event.get("traceback") or ""))
+    evidence_text = stage_text or event_traceback_text
+    tracebacks = _extract_all_tracebacks(evidence_text) if evidence_text else []
+    exceptions = _extract_all_exceptions(evidence_text) if evidence_text else []
+    traceback_preview = _last_traceback_preview(evidence_text, tracebacks)
+    if not traceback_preview and event_traceback_text:
+        traceback_preview = sanitize_telemetry_text(event_traceback_text, _MAX_TRACEBACK)
 
     report_path, report_payload = _latest_execution_report(artifact_roots)
     execution_failure = execution_report_failure_summary(report_payload)
     execution_report = _compact_execution_report(report_payload)
-
-    failed_event: dict[str, Any] = {}
-    for event in reversed(events):
-        if str(event.get("event") or "").upper() == "FAILED" or event.get("traceback") or event.get("error_type"):
-            failed_event = event
-            break
 
     if stage_log:
         if exceptions:
@@ -723,7 +695,11 @@ def collect_workflow_failure_diagnostic(
         else:
             raw_error_type = "StageLogFailure"
             raw_error_message = _last_nonempty_line(stage_text) or "stage log captured without an explicit exception line"
-        raw_failed_stage = str(stage_log.get("stage") or (stage_path.stem if stage_path is not None else "stage"))
+        raw_failed_stage = str(
+            fallback_stage
+            or stage_log.get("stage")
+            or (stage_path.stem if stage_path is not None else "stage")
+        )
         truth_source = "stage_log"
     elif failed_event:
         raw_error_message = str(
@@ -734,6 +710,7 @@ def collect_workflow_failure_diagnostic(
         )
         raw_error_type = str(
             failed_event.get("error_type")
+            or (exceptions[-1].get("error_type") if exceptions else "")
             or fallback_error_type
             or "TaskFailure"
         )
@@ -750,16 +727,9 @@ def collect_workflow_failure_diagnostic(
         raw_failed_stage = str(fallback_stage or "unknown")
         truth_source = "caller_fallback"
 
-    error_message = sanitize_telemetry_text(raw_error_message, _MAX_TEXT)
-    error_type = sanitize_telemetry_text(raw_error_type, 240)
-    failed_stage = sanitize_telemetry_text(raw_failed_stage, 500)
-    resolved_mode = sanitize_telemetry_text(
-        str(failed_event.get("mode") or manifest.get("mode") or workflow_mode or ""),
-        120,
-    )
-
     sources = {
         "stage_log": bool(stage_log),
+        "process_log": bool(stage_log),  # compatibility name for older telemetry consumers
         "workflow_diagnostics": bool(events),
         "execution_report": bool(execution_report),
     }
@@ -767,15 +737,19 @@ def collect_workflow_failure_diagnostic(
     if not run_id and path is not None:
         run_id = path.name
 
+    process_log_tail = sanitize_telemetry_text(stage_text[-_MAX_TRACEBACK:], _MAX_TRACEBACK) if stage_text else ""
     payload = {
         "schema": 4,
         "truth_source": truth_source,
         "run_id": run_id,
-        "workflow_mode": resolved_mode,
-        "failed_stage": failed_stage,
+        "workflow_mode": sanitize_telemetry_text(
+            str(failed_event.get("mode") or manifest.get("mode") or workflow_mode or ""),
+            120,
+        ),
+        "failed_stage": sanitize_telemetry_text(raw_failed_stage, 500),
         "ui_phase": sanitize_telemetry_text(str(failed_event.get("ui_phase") or ""), 120),
-        "error_type": error_type,
-        "error_message": error_message,
+        "error_type": sanitize_telemetry_text(raw_error_type, 240),
+        "error_message": sanitize_telemetry_text(raw_error_message, _MAX_TEXT),
         "traceback": traceback_preview,
         "tracebacks": tracebacks,
         "exceptions": exceptions,
@@ -784,7 +758,9 @@ def collect_workflow_failure_diagnostic(
         "line_count": int(stage_log.get("line_count") or 0),
         "byte_count": int(stage_log.get("byte_count") or 0),
         "sha256": str(stage_log.get("sha256") or ""),
-        "active_stages": sanitize_telemetry_value(failed_event.get("active_stages") or [], max_text=240, max_list=80),
+        "active_stages": sanitize_telemetry_value(
+            failed_event.get("active_stages") or [], max_text=240, max_list=80
+        ),
         "elapsed_seconds": float(failed_event.get("elapsed_s") or 0.0),
         "diagnostic_source_available": any(sources.values()),
         "diagnostic_sources": sources,
@@ -798,6 +774,7 @@ def collect_workflow_failure_diagnostic(
         "available_stage_logs": [candidate.name for candidate in process_paths],
         "process_log_name": stage_path.name if stage_path is not None else "",
         "process_log_files": [candidate.name for candidate in process_paths],
+        "process_log_tail": process_log_tail,
         "execution_report_name": report_path.name if report_path is not None else "",
         "execution_report_run": report_path.parent.name if report_path is not None else "",
         "execution_report": execution_report,
