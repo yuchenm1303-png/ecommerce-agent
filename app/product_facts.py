@@ -117,9 +117,8 @@ def _json_schema(fields: list[dict[str, Any]]) -> dict[str, Any]:
                     ],
                 },
             },
-            "model_summary": {"type": "string"},
         },
-        "required": ["facts", "model_summary"],
+        "required": ["facts"],
     }
 
 
@@ -423,7 +422,7 @@ def _packet_from_response(
         schema_sha256=schema_digest(fields),
         source_manifest_sha256=source_manifest_digest(grounding),
         decisions=list(decisions_by_id.values()),
-        model_summary=str(raw.get("model_summary") or "").strip(),
+        model_summary="",
         warnings=warnings,
         extractor=f"{provider_name}+global-product-facts",
     )
