@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -12,7 +13,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
@@ -29,7 +30,11 @@ _CDP_ATTACH_TIMEOUT_MS = 25_000
 _CDP_ATTACH_LOCK_TIMEOUT_S = 90.0
 _CDP_ATTACH_RETRY_DELAY_S = 0.75
 _CDP_ATTACH_LOCK_POLL_S = 0.10
+_CDP_SESSION_WAIT_LOG_S = 5.0
+_CDP_SESSION_ENV_PREFIX = "ECOMMERCE_CDP_SESSION_LEASE_"
 _EXTERNAL_SPAWN_LOCK = threading.Lock()
+_CDP_SESSION_LOCAL_LOCKS_GUARD = threading.Lock()
+_CDP_SESSION_LOCAL_LOCKS: dict[int, threading.RLock] = {}
 
 
 @dataclass
@@ -48,6 +53,13 @@ class SingleEdgeSession:
     launched_now: bool
     cdp_port: int
     profile_dir: Path
+    _session_lease: CdpSessionLease | None = field(default=None, repr=False)
+
+    def detach(self) -> None:
+        lease = self._session_lease
+        self._session_lease = None
+        if lease is not None:
+            lease.release()
 
 
 def cdp_endpoint(port: int = DEFAULT_CDP_PORT) -> str:
@@ -199,10 +211,36 @@ def launch_detached_edge(
     )
 
 
-def _cdp_attach_lock_path(port: int) -> Path:
+def _cdp_lock_root() -> Path:
     root = Path(tempfile.gettempdir()) / "ecommerce-agent-cdp"
     root.mkdir(parents=True, exist_ok=True)
-    return root / f"attach-{int(port)}.lock"
+    return root
+
+
+def _cdp_attach_lock_path(port: int) -> Path:
+    return _cdp_lock_root() / f"attach-{int(port)}.lock"
+
+
+def _cdp_session_lock_path(port: int) -> Path:
+    return _cdp_lock_root() / f"session-{int(port)}.lock"
+
+
+def _cdp_session_owner_path(port: int) -> Path:
+    return _cdp_lock_root() / f"session-{int(port)}.owner.json"
+
+
+def _cdp_session_env_key(port: int) -> str:
+    return f"{_CDP_SESSION_ENV_PREFIX}{int(port)}"
+
+
+def _cdp_session_local_lock(port: int) -> threading.RLock:
+    key = int(port)
+    with _CDP_SESSION_LOCAL_LOCKS_GUARD:
+        lock = _CDP_SESSION_LOCAL_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _CDP_SESSION_LOCAL_LOCKS[key] = lock
+        return lock
 
 
 def _try_lock_handle(handle: object) -> bool:
@@ -242,6 +280,188 @@ def _unlock_handle(handle: object) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
     except OSError:
         pass
+
+
+def _read_cdp_session_owner(port: int) -> dict[str, object]:
+    path = _cdp_session_owner_path(port)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _write_cdp_session_owner(port: int, *, token: str) -> None:
+    path = _cdp_session_owner_path(port)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "port": int(port),
+                "token": token,
+                "owner_pid": os.getpid(),
+                "acquired_unix": time.time(),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+
+class CdpSessionLease:
+    """One exclusive long-lived Edge automation owner, inheritable by child workers."""
+
+    def __init__(
+        self,
+        *,
+        port: int,
+        token: str,
+        local_lock: threading.RLock,
+        handle: object | None,
+        inherited: bool,
+        previous_env: str | None,
+    ) -> None:
+        self.port = int(port)
+        self.token = token
+        self._local_lock = local_lock
+        self._handle = handle
+        self.inherited = bool(inherited)
+        self._previous_env = previous_env
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        try:
+            if not self.inherited:
+                owner = _read_cdp_session_owner(self.port)
+                if str(owner.get("token") or "") == self.token:
+                    try:
+                        _cdp_session_owner_path(self.port).unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+
+                env_key = _cdp_session_env_key(self.port)
+                if os.environ.get(env_key) == self.token:
+                    if self._previous_env is None:
+                        os.environ.pop(env_key, None)
+                    else:
+                        os.environ[env_key] = self._previous_env
+
+                if self._handle is not None:
+                    _unlock_handle(self._handle)
+                    try:
+                        self._handle.close()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    self._handle = None
+                print(
+                    f"CDP_SESSION RELEASED port={self.port} owner_pid={os.getpid()}",
+                    flush=True,
+                )
+        finally:
+            self._local_lock.release()
+
+    def __del__(self) -> None:
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+def acquire_cdp_session_lease(port: int = DEFAULT_CDP_PORT) -> CdpSessionLease:
+    """Queue for exclusive control of one long-lived CDP browser session.
+
+    The lease spans the whole EdgeHarness lifetime, not only connect_over_cdp().
+    Synchronous child processes inherit a cryptographic token and may re-enter the
+    same owner's lease; unrelated jobs must wait until the owner detaches. The OS
+    file lock is released automatically if the owning process crashes.
+    """
+
+    port = int(port)
+    local_lock = _cdp_session_local_lock(port)
+    local_lock.acquire()
+    handle: object | None = None
+    acquired_external = False
+    try:
+        env_key = _cdp_session_env_key(port)
+        inherited_token = str(os.environ.get(env_key) or "").strip()
+        if inherited_token:
+            owner = _read_cdp_session_owner(port)
+            if str(owner.get("token") or "") == inherited_token:
+                print(
+                    f"CDP_SESSION INHERITED port={port} owner_pid={owner.get('owner_pid', '')} child_pid={os.getpid()}",
+                    flush=True,
+                )
+                return CdpSessionLease(
+                    port=port,
+                    token=inherited_token,
+                    local_lock=local_lock,
+                    handle=None,
+                    inherited=True,
+                    previous_env=None,
+                )
+            os.environ.pop(env_key, None)
+
+        lock_path = _cdp_session_lock_path(port)
+        handle = lock_path.open("a+b")
+        handle.seek(0, os.SEEK_END)  # type: ignore[attr-defined]
+        if handle.tell() == 0:  # type: ignore[attr-defined]
+            handle.write(b"0")  # type: ignore[attr-defined]
+            handle.flush()  # type: ignore[attr-defined]
+
+        next_wait_log = time.monotonic() + _CDP_SESSION_WAIT_LOG_S
+        while not _try_lock_handle(handle):
+            now = time.monotonic()
+            if now >= next_wait_log:
+                owner = _read_cdp_session_owner(port)
+                print(
+                    "CDP_SESSION WAIT "
+                    f"port={port} owner_pid={owner.get('owner_pid', '<unknown>')}",
+                    flush=True,
+                )
+                next_wait_log = now + _CDP_SESSION_WAIT_LOG_S
+            time.sleep(_CDP_ATTACH_LOCK_POLL_S)
+        acquired_external = True
+
+        token = secrets.token_hex(16)
+        previous_env = os.environ.get(env_key)
+        os.environ[env_key] = token
+        try:
+            _write_cdp_session_owner(port, token=token)
+        except Exception:
+            if previous_env is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = previous_env
+            raise
+
+        print(
+            f"CDP_SESSION ACQUIRED port={port} owner_pid={os.getpid()}",
+            flush=True,
+        )
+        return CdpSessionLease(
+            port=port,
+            token=token,
+            local_lock=local_lock,
+            handle=handle,
+            inherited=False,
+            previous_env=previous_env,
+        )
+    except Exception:
+        if acquired_external and handle is not None:
+            _unlock_handle(handle)
+        if handle is not None:
+            try:
+                handle.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        local_lock.release()
+        raise
 
 
 @contextmanager
@@ -342,7 +562,7 @@ _choose_page = select_listing_page
 
 
 class EdgeHarness:
-    """Browser-Harness-style session abstraction for the long-lived Makro Edge."""
+    """Exclusive session abstraction for the one long-lived Makro Edge."""
 
     def __init__(
         self,
@@ -355,17 +575,23 @@ class EdgeHarness:
         self.playwright = playwright
         self.profile_dir = Path(profile_dir).resolve()
         self.cdp_port = int(port)
-        self.launched_now = not is_cdp_ready(self.cdp_port)
-        if self.launched_now:
-            launch_detached_edge(
-                profile_dir=self.profile_dir, port=self.cdp_port, start_url=start_url
-            )
         self.browser: Browser | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
         self._watched_page_ids: set[int] = set()
         self._watched_context_ids: set[int] = set()
-        self._connect()
+        self._session_lease: CdpSessionLease | None = None
+        try:
+            self._session_lease = acquire_cdp_session_lease(self.cdp_port)
+            self.launched_now = not is_cdp_ready(self.cdp_port)
+            if self.launched_now:
+                launch_detached_edge(
+                    profile_dir=self.profile_dir, port=self.cdp_port, start_url=start_url
+                )
+            self._connect()
+        except Exception:
+            self._release_session_lease()
+            raise
 
     def _watch_visual_page(self, page: Page) -> None:
         if page.is_closed():
@@ -403,6 +629,12 @@ class EdgeHarness:
         self.page = select_listing_page(self.context)
         self._watch_visual_page(self.page)
 
+    def _release_session_lease(self) -> None:
+        lease = self._session_lease
+        self._session_lease = None
+        if lease is not None:
+            lease.release()
+
     def health_check(self) -> bool:
         return is_cdp_ready(self.cdp_port)
 
@@ -426,6 +658,13 @@ class EdgeHarness:
         self.page = None
         self.context = None
         self.browser = None
+        self._release_session_lease()
+
+    def __del__(self) -> None:
+        try:
+            self._release_session_lease()
+        except Exception:
+            pass
 
 
 def connect_single_edge(
@@ -441,6 +680,8 @@ def connect_single_edge(
         port=port,
         start_url=start_url,
     )
+    lease = harness._session_lease
+    harness._session_lease = None
     return SingleEdgeSession(
         browser=harness.browser,
         context=harness.context,
@@ -448,4 +689,5 @@ def connect_single_edge(
         launched_now=harness.launched_now,
         cdp_port=harness.cdp_port,
         profile_dir=harness.profile_dir,
+        _session_lease=lease,
     )
