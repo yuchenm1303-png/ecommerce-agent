@@ -1,13 +1,13 @@
 """Semantic resolution for Makro Step 1 live Vertical search.
 
-Product Identity answers what the supplier is selling. This module converts that
-identity into a bounded search ladder, merges query-owned live Makro rows, and lets
-AI choose only from that exact live pool. Search terms are retrieval hints, never
-marketplace truth.
+Product Identity is an initial interpretation of what the supplier is selling, not
+an irreversible truth source. Step 1 retains the exact supplier snippets cited by
+that interpretation plus any customer listing intent, converts the combined but
+independent evidence into a bounded retrieval ladder, merges query-owned live Makro
+rows, and reconciles the final choice against the real live pool.
 
-Selection policy is intentionally practical for a sparse marketplace taxonomy:
-prefer the same product type, then a genuine broader class, then the closest
-reasonable live best-fit category when Makro does not expose an exact match.
+The live Makro candidate set remains authoritative: AI may correct an over-specific
+or mistaken initial identity, but it can never invent a marketplace Vertical.
 """
 
 from __future__ import annotations
@@ -82,6 +82,16 @@ def _identity(hints: ListingBootstrapHints) -> dict[str, Any]:
     return dict(hints.product_identity or {})
 
 
+def _reconciliation_context(hints: ListingBootstrapHints) -> dict[str, Any]:
+    """Expose independent evidence channels without collapsing them into one AI fact."""
+
+    return {
+        "initial_product_identity": _identity(hints),
+        "grounded_supplier_evidence": list(hints.grounded_product_evidence),
+        "customer_listing_intent": _clean(hints.customer_intent),
+    }
+
+
 def _canonical_product_type(hints: ListingBootstrapHints) -> str:
     identity = _identity(hints)
     value = _clean(identity.get("product_type_en"))
@@ -99,14 +109,7 @@ def _product_type_query_words(hints: ListingBootstrapHints) -> list[str]:
 
 
 def _usable_head_query_for_product(hints: ListingBootstrapHints, value: object) -> bool:
-    """Reject lossy one-word heads for an already multi-word product identity.
-
-    A bare functional/form noun such as ``cleaner``, ``sleeve`` or ``sealer`` is
-    often dramatically more ambiguous than the grounded product type that produced
-    it. When Product Identity contains at least two meaningful words, the broadest
-    query must retain at least two words so one discriminating signal survives.
-    Single-word product types (for example ``toaster``) may still use one word.
-    """
+    """Reject lossy one-word heads for an already multi-word product identity."""
 
     if not _usable_head_query(value):
         return False
@@ -168,34 +171,40 @@ def _fallback_search_ladder(hints: ListingBootstrapHints) -> tuple[str, ...]:
 
 def build_vertical_search_plan_request(hints: ListingBootstrapHints) -> dict[str, Any]:
     product_type = _canonical_product_type(hints)
+    evidence = _reconciliation_context(hints)
     return {
         "task": "plan_makro_vertical_search_intents",
         "system_instruction": (
-            "Plan a bounded English search ladder for finding one physical product's marketplace "
-            "category. Search strings are retrieval intents only; never claim or invent an actual "
-            "Makro Vertical. JSON only."
+            "Plan a bounded English marketplace-category retrieval ladder for one physical product. "
+            "The initial Product Identity is an AI interpretation, not an irreversible truth source. "
+            "Grounded supplier snippets and customer intent are independent evidence channels. Search "
+            "strings are retrieval hypotheses only; never claim or invent an actual Makro Vertical. JSON only."
         ),
         "prompt_instruction": (
-            "Create a specific-to-broad retrieval ladder from context.product_identity. The goal is "
-            "high recall without letting incidental attributes dominate search. Include conventional "
-            "retail paraphrases so sparse marketplace vocabulary does not depend on one head noun."
+            "Create a specific-to-broad retrieval ladder by reconciling the initial identity with the "
+            "grounded supplier snippets and customer intent. Preserve the core sold product class while "
+            "preventing incidental material, personalization, colour or marketing attributes from trapping "
+            "all queries in one mistaken interpretation. Include conventional retail vocabulary variants."
         ),
         "context": {
             "product_type_en": product_type,
             "product_summary": hints.product_summary,
-            "product_identity": _identity(hints),
+            **evidence,
         },
         "rules": [
-            "specific_queries: return 1 or 2 concise product-type phrases that closely name the physical product.",
-            "alternate_queries: return 0 to 2 conventional retail synonyms/paraphrases for the same physical product class; preserve defining mechanism/form/function but change likely marketplace vocabulary when useful (for example cleaner -> cleaning machine only when it still means the sold device).",
+            "Treat initial_product_identity as a hypothesis supported by evidence, not as the sole authority for every later decision.",
+            "Grounded supplier evidence is factual product evidence. Customer listing intent is useful independent context but must not override plainly contradictory supplier facts.",
+            "specific_queries: return 1 or 2 concise phrases for the core sold physical product class; omit incidental material/personalization/style modifiers unless they define a genuinely different class.",
+            "alternate_queries: return 0 to 2 conventional retail synonyms or function/form paraphrases that could recover the same item when marketplace vocabulary differs.",
+            "When customer intent or grounded evidence supports a materially different but plausible class wording from the initial identity, reserve an alternate query for that supported wording instead of repeating the initial hypothesis.",
             "broader_queries: return 0 to 2 progressively broader product-family phrases by removing qualifiers, not by switching to unrelated products.",
             "head_noun_query: return the shortest useful common class phrase for broad marketplace recall.",
-            "The final ladder must behave like specific -> alternate vocabulary -> broader -> discriminative head phrase.",
-            "If the grounded product type has multiple meaningful words, do not collapse head_noun_query to one bare functional/form noun; keep at least one differentiating modifier (for example ultrasonic cleaner, knee sleeve, bag sealer rather than cleaner, sleeve, sealer).",
-            "Drop model numbers, brand, colour, size, power source, rechargeable/battery wording and marketing adjectives unless they define a genuinely different product class.",
+            "The final ladder must behave like core product class -> alternate retail vocabulary -> broader family -> discriminative head phrase.",
+            "If the product type has multiple meaningful words, do not collapse head_noun_query to one bare functional/form noun; keep at least one differentiating modifier.",
+            "Drop model numbers, brand, colour, size, material, engraving/personalization, power source and marketing adjectives unless they define a genuinely different product class.",
             "Do not use Makro, marketplace, seller, listing, vertical or category as retrieval metadata.",
             "Do not deliberately broaden into accessories or spare parts unless the supplied product itself is one.",
-            "Alternate queries must remain the same sold physical product, not an accessory, use-case object, consumable or neighboring product.",
+            "Alternate queries must remain plausible names for the same sold physical item, not an accessory, consumable or neighboring product.",
         ],
         "json_contract": {
             "type": "object",
@@ -238,8 +247,6 @@ def _with_canonical_product_type_fallback(
     hints: ListingBootstrapHints,
     terms: tuple[str, ...],
 ) -> tuple[str, ...]:
-    """Preserve the ladder and reserve one bounded slot for canonical identity."""
-
     product_type = _canonical_product_type(hints)
     product_key = _query_key(product_type)
     output = list(terms)
@@ -272,7 +279,7 @@ def plan_vertical_search_terms(provider: JSONTaskProvider, hints: ListingBootstr
     fallback = _fallback_search_ladder(hints)
     if fallback:
         return _with_canonical_product_type_fallback(hints, fallback)
-    raise ValueError("Product Identity produced no safe Makro Vertical retrieval intent")
+    raise ValueError("Product evidence produced no safe Makro Vertical retrieval intent")
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,14 +349,6 @@ def _exact_product_type_candidate(
     hints: ListingBootstrapHints,
     candidates: list[VerticalCandidateEvidence],
 ) -> str:
-    """Return one uniquely exact live leaf for the canonical physical product type.
-
-    Exact Makro truth should not be demoted by a probabilistic best-fit decision.
-    This is deliberately narrow: only the live leaf itself may exactly equal the
-    canonical Product Identity type after punctuation/case normalization. Broader,
-    sibling and synonym decisions still go through the semantic chooser.
-    """
-
     product_key = _query_key(_canonical_product_type(hints))
     if not product_key:
         return ""
@@ -390,7 +389,14 @@ def _meaningful_category_tokens(value: object) -> set[str]:
 
 def _product_semantic_tokens(hints: ListingBootstrapHints) -> set[str]:
     identity = _identity(hints)
-    evidence = [_canonical_product_type(hints), hints.product_summary, identity.get("product_type_en", ""), identity.get("product_summary", "")]
+    evidence: list[object] = [
+        _canonical_product_type(hints),
+        hints.product_summary,
+        identity.get("product_type_en", ""),
+        identity.get("product_summary", ""),
+        hints.customer_intent,
+        *hints.grounded_product_evidence,
+    ]
     output: set[str] = set()
     for value in evidence:
         output.update(_meaningful_category_tokens(value))
@@ -406,7 +412,6 @@ def _token_is_supported(token: str, evidence_tokens: set[str]) -> bool:
 
 
 def unsupported_candidate_constraints(hints: ListingBootstrapHints, candidate_label: str) -> tuple[str, ...]:
-    """Describe unsupported leaf qualifiers for diagnostics, not as a hard gate."""
     parts = [part.strip() for part in str(candidate_label or "").split("/") if part.strip()]
     leaf = parts[-1] if parts else str(candidate_label or "").strip()
     candidate_tokens = _meaningful_category_tokens(leaf)
@@ -420,34 +425,39 @@ def build_vertical_pool_choice_request(
     candidates: list[VerticalCandidateEvidence],
 ) -> dict[str, Any]:
     allowed = [item.label for item in candidates]
+    evidence = _reconciliation_context(hints)
     return {
         "task": "choose_exact_makro_vertical_from_aggregated_live_search",
         "system_instruction": (
             "Choose exactly one Makro Vertical from the supplied live candidates. The live candidate set is authoritative; "
-            "never invent a Vertical. Makro taxonomy can be sparse, so choose the closest practical category when an exact class is unavailable. JSON only."
+            "never invent a Vertical. Reconcile the initial AI identity against its cited raw supplier evidence and customer "
+            "intent before deciding. Makro taxonomy can be sparse, so choose the closest practical category when exact is unavailable. JSON only."
         ),
         "prompt_instruction": (
-            "Compare the grounded physical product identity with every live breadcrumb. Rank choices as same product type first, "
-            "genuine broader class second, then closest reasonable live best-fit category when Makro does not expose an exact class."
+            "Compare every live breadcrumb against the independent evidence channels. The initial product identity may be "
+            "over-specific or mistaken. If a real live candidate is better supported by the grounded supplier snippets and "
+            "customer intent, correct the initial hypothesis rather than using that hypothesis to reject the better candidate."
         ),
         "context": {
             "product_summary": hints.product_summary,
-            "product_identity": _identity(hints),
+            **evidence,
             "search_queries_specific_to_broad": list(search_terms),
             "live_candidates": [item.as_dict() for item in candidates],
         },
         "rules": [
             "selected_vertical must be copied exactly from an allowed live candidate label or be empty.",
-            "Search queries are retrieval hints only; broader queries intentionally trade precision for recall, but no query wording is evidence that a returned row is correct.",
-            "Judge the complete breadcrumb, retail context and leaf against the physical product identity.",
+            "Search queries are retrieval hints only; query wording and result rank are not semantic proof that a row is correct.",
+            "Initial product identity is an interpretation, not an immutable truth source. Grounded supplier snippets are independent factual evidence.",
+            "Customer listing intent is independent context: use it to detect and correct a plausible identity misunderstanding, but never let it override supplier evidence that clearly describes a different physical item.",
+            "Distinguish core product class from incidental attributes such as material, engraving, personalization, colour, size or marketing adjectives.",
+            "A live candidate that matches the core function/form supported by raw evidence may be better than a candidate that only matches incidental words from the initial identity.",
             "Use same_product_type when the candidate represents the same physical product class.",
-            "Use broader_valid_class when the candidate is a genuine semantic superclass that contains the product; a strict broader class must never add a different defining capability, mechanism, form, audience or use-case.",
-            "If Makro exposes neither of those, use best_available_fit for the live category that a marketplace operator would most reasonably use to list this product despite taxonomy mismatch.",
+            "Use broader_valid_class when the candidate is a genuine semantic superclass that contains the product; it must not add a different defining capability, mechanism, form, audience or use-case.",
+            "If Makro exposes neither of those, use best_available_fit for the live category a marketplace operator would most reasonably use despite taxonomy mismatch.",
             "For best_available_fit, prefer shared defining function, merchandise context and buyer expectation over literal word overlap.",
-            "A nearby sibling or form-specific class may be used as best_available_fit when the portal offers no better category; do not mislabel it as a broader superclass.",
             "Avoid accessory, spare-part or consumable classes when a non-accessory live option is materially closer to the sold product.",
-            "A candidate returned only because of a generic word overlap (for example cleaner -> toilet cleaner, sleeve -> cable sleeve) is not a valid best_available_fit unless the complete breadcrumb independently matches the sold product.",
-            "Return none only when every live candidate is plainly unrelated and selecting any of them would severely misrepresent what is being sold.",
+            "A candidate returned only because of generic word overlap is not valid unless the complete breadcrumb independently matches the sold product.",
+            "Return none only when every live candidate is plainly unrelated after reconciliation of all independent evidence.",
             "Priority is same_product_type -> broader_valid_class -> best_available_fit -> none.",
         ],
         "json_contract": {
@@ -494,9 +504,13 @@ def choose_vertical_candidate_pool(
 
     if not candidates:
         return ""
-    exact_product_type = _exact_product_type_candidate(hints, candidates)
-    if exact_product_type:
-        return exact_product_type
+    # Customer intent is an independent evidence channel. When present we never
+    # short-circuit on an exact initial-identity label; the live pool must pass the
+    # reconciliation boundary so one early AI interpretation cannot become fate.
+    if not _clean(hints.customer_intent):
+        exact_product_type = _exact_product_type_candidate(hints, candidates)
+        if exact_product_type:
+            return exact_product_type
     raw = provider.extract_json(build_vertical_pool_choice_request(hints, search_terms, candidates))
     if not isinstance(raw, dict):
         raise ValueError("aggregated Vertical chooser response must be a JSON object")
