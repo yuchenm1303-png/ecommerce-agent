@@ -24,14 +24,11 @@ def test_full_gallery_rerun_is_already_persisted(monkeypatch, tmp_path: Path) ->
     monkeypatch.setattr(
         execution,
         "_fresh_photo_state",
-        lambda _adapter: (
-            "#photos",
-            {
-                "completion_count": 5,
-                "capacity": 5,
-                "add_image_tile_count": 0,
-            },
-        ),
+        lambda _adapter: {
+            "completion_count": 5,
+            "capacity": 5,
+            "add_image_tile_count": 0,
+        },
     )
 
     def _cancel(_adapter):
@@ -49,11 +46,11 @@ def test_full_gallery_rerun_is_already_persisted(monkeypatch, tmp_path: Path) ->
 
     assert report["status"] == "persisted_verified"
     assert report["requested"] == 5
-    assert report["already_persisted"] == 5
+    assert report["initial_count"] == 5
     assert report["persisted"] == 5
     assert report["attempted"] == 0
     assert report["staged"] == 0
     assert report["save_attempted"] is False
-    assert report["saved"] is True
+    assert report["saved"] is False
     assert report["restored_collapsed_state"] is True
     assert adapter.cancelled is True
