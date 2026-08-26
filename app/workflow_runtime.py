@@ -16,6 +16,7 @@ from typing import Any
 from app.live_schema import write_live_schema
 from app.makro.direct_visual_hold import is_listing_attribute_field
 from app.makro.domain import MakroDomainAdapter
+from app.makro.listing_draft_identity import listing_draft_identity_from_url
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -36,12 +37,18 @@ def scan_and_write_live_schema(
     fields = [field for field in all_fields if is_listing_attribute_field(field)]
     if not fields:
         raise RuntimeError("Step 3 live schema scan returned zero listing attribute fields")
-    path = write_live_schema(fields, target)
+    draft_identity = listing_draft_identity_from_url(adapter.page.url)
+    path = write_live_schema(
+        fields,
+        target,
+        listing_draft_identity=draft_identity,
+    )
     return path, {
         "listing_attribute_fields": len(fields),
         "semantic_fields_before_filter": len(all_fields),
         "sections": [item.get("title") for item in sections],
         "scan": scan,
+        "listing_draft_identity_bound": True,
     }
 
 

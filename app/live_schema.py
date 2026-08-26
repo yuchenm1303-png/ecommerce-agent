@@ -6,9 +6,14 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
+from .makro.listing_draft_identity import (
+    DRAFT_IDENTITY_FIELD,
+    assert_same_listing_draft,
+    normalized_listing_draft_identity,
+)
 from .source_bundle import normalize_key
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _stable_section(value: object) -> str:
@@ -155,23 +160,40 @@ def _schema_field(field: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def live_schema_payload(semantic_fields: Iterable[dict[str, Any]]) -> dict[str, Any]:
+def live_schema_payload(
+    semantic_fields: Iterable[dict[str, Any]],
+    *,
+    listing_draft_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Serialize the live Makro field contract without values or sensitive state."""
 
-    return {
+    identity = normalized_listing_draft_identity(listing_draft_identity)
+    payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "fields": [_schema_field(field) for field in semantic_fields],
     }
+    if identity is not None:
+        payload["listing_draft_identity"] = identity
+    return payload
 
 
 def write_live_schema(
     semantic_fields: Iterable[dict[str, Any]],
     path: str | Path,
+    *,
+    listing_draft_identity: dict[str, Any] | None = None,
 ) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
-        json.dumps(live_schema_payload(semantic_fields), ensure_ascii=False, indent=2),
+        json.dumps(
+            live_schema_payload(
+                semantic_fields,
+                listing_draft_identity=listing_draft_identity,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
     return target
@@ -184,7 +206,16 @@ def load_live_schema(path: str | Path) -> list[dict[str, Any]]:
     fields = payload.get("fields")
     if not isinstance(fields, list):
         raise ValueError("live schema 缺少 fields 数组。")
-    return [item for item in fields if isinstance(item, dict)]
+    identity = normalized_listing_draft_identity(payload.get("listing_draft_identity"))
+    output: list[dict[str, Any]] = []
+    for raw in fields:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        if identity is not None:
+            item[DRAFT_IDENTITY_FIELD] = dict(identity)
+        output.append(item)
+    return output
 
 
 def schema_field_signature(field: dict[str, Any]) -> tuple[object, ...]:
@@ -211,19 +242,39 @@ def schema_field_signature(field: dict[str, Any]) -> tuple[object, ...]:
 _drift_signature = schema_field_signature
 
 
+def _listing_identity(fields: Iterable[dict[str, Any]]) -> dict[str, str] | None:
+    identities: list[dict[str, str]] = []
+    for field in fields:
+        identity = normalized_listing_draft_identity(field.get(DRAFT_IDENTITY_FIELD))
+        if identity is None:
+            continue
+        if identity not in identities:
+            identities.append(identity)
+    if len(identities) > 1:
+        raise RuntimeError("one live schema contains multiple Makro draft identities")
+    return identities[0] if identities else None
+
+
 def assert_live_schema_matches(
     planned_fields: Iterable[dict[str, Any]],
     current_fields: Iterable[dict[str, Any]],
 ) -> None:
-    """Fail closed when the current page contract changed after AI planning.
+    """Fail closed when page ownership or the live contract changed after planning.
 
-    DOM paths, current values, completion counters, nearby presentation text and
-    render state are ignored. Field identity, requiredness, multiplicity and
-    option contracts must match.
+    The prepared draft identity is checked before field signatures. DOM paths,
+    current values, completion counters, nearby presentation text and render state
+    are ignored. Field identity, requiredness, multiplicity and option contracts
+    must match.
     """
 
-    planned = Counter(schema_field_signature(field) for field in planned_fields)
-    current = Counter(schema_field_signature(field) for field in current_fields)
+    planned_items = list(planned_fields)
+    current_items = list(current_fields)
+    prepared_identity = _listing_identity(planned_items)
+    if prepared_identity is not None:
+        assert_same_listing_draft(prepared_identity, _listing_identity(current_items))
+
+    planned = Counter(schema_field_signature(field) for field in planned_items)
+    current = Counter(schema_field_signature(field) for field in current_items)
     if planned == current:
         return
 

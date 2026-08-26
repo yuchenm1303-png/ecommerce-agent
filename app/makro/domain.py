@@ -23,6 +23,7 @@ from .listing import (
     parse_makro_listing_url,
     wait_for_authenticated_listing,
 )
+from .listing_draft_identity import DRAFT_IDENTITY_FIELD, listing_draft_identity_from_url
 from .locators import click_add_value_for_control, selector_for_control
 from .marketplace_constraints import _is_model_name_field, _strip_known_brand
 from .photos import (
@@ -133,9 +134,9 @@ class MakroDomainAdapter:
         """Persist one section using the canonical section lifecycle policy.
 
         The sections layer owns the production default timeout because it also
-        owns Makro's asynchronous Save/reopen verification contract.  Callers
-        may still supply an explicit timeout for a deliberate bounded override,
-        but the adapter must not silently replace that canonical default.
+        owns Makro's asynchronous Save/reopen verification contract. Callers may
+        still supply an explicit timeout for a deliberate bounded override, but
+        the adapter must not silently replace that canonical default.
         """
 
         if timeout_s is None:
@@ -220,7 +221,14 @@ class MakroDomainAdapter:
         )
 
     def build_semantic_fields(self, controls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return coalesce_radio_semantic_fields(build_semantic_fields(controls))
+        fields = coalesce_radio_semantic_fields(build_semantic_fields(controls))
+        try:
+            identity = listing_draft_identity_from_url(self.page.url)
+        except (ValueError, RuntimeError):
+            return fields
+        for field in fields:
+            field[DRAFT_IDENTITY_FIELD] = dict(identity)
+        return fields
 
     def selector_for(self, control: dict[str, Any]) -> str:
         return selector_for_control(control)
