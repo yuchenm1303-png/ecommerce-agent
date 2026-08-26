@@ -21,13 +21,12 @@ _SAME_PRODUCT_TYPE = "same_product_type"
 _BROADER_VALID_CLASS = "broader_valid_class"
 _BEST_AVAILABLE_FIT = "best_available_fit"
 _NO_VALID_CLASS = "none"
-_PATH_RELATIONS = {
+_SELECTABLE_PATH_RELATIONS = (
     _ANCESTOR_BRANCH,
     _BEST_AVAILABLE_BRANCH,
     _SAME_PRODUCT_TYPE,
     _BROADER_VALID_CLASS,
-    _NO_VALID_CLASS,
-}
+)
 _LEAF_RELATIONS = {
     _SAME_PRODUCT_TYPE,
     _BROADER_VALID_CLASS,
@@ -53,6 +52,53 @@ def _identity(hints: ListingBootstrapHints) -> dict[str, Any]:
     return dict(hints.product_identity or {})
 
 
+def _taxonomy_path_options(allowed: list[str]) -> tuple[list[dict[str, str]], list[str]]:
+    """Build one atomic decision domain for a live taxonomy generation.
+
+    A path choice used to expose selected_node and selection_relation as two
+    independent JSON fields. That schema could express impossible states such as
+    a non-empty node paired with relation='none'. The provider now chooses one
+    opaque enum key whose node ownership and semantic relation are inseparable.
+    """
+
+    nodes = [
+        {"node_id": f"node_{index}", "label": label}
+        for index, label in enumerate(allowed)
+    ]
+    keys = [_NO_VALID_CLASS]
+    keys.extend(
+        f"{relation}:node_{index}"
+        for relation in _SELECTABLE_PATH_RELATIONS
+        for index in range(len(allowed))
+    )
+    return nodes, keys
+
+
+def _decode_taxonomy_path_selection(
+    raw: dict[str, Any],
+    allowed: list[str],
+) -> tuple[str, str]:
+    """Decode the atomic provider choice back to an exact live node + relation."""
+
+    selection_key = str(raw.get("selection_key") or "").strip()
+    _nodes, valid_keys = _taxonomy_path_options(allowed)
+    if selection_key not in set(valid_keys):
+        raise ValueError(f"invalid taxonomy selection_key={selection_key!r}")
+    if selection_key == _NO_VALID_CLASS:
+        return "", _NO_VALID_CLASS
+
+    relation, separator, node_id = selection_key.partition(":")
+    if not separator or relation not in _SELECTABLE_PATH_RELATIONS or not node_id.startswith("node_"):
+        raise ValueError(f"invalid taxonomy selection_key={selection_key!r}")
+    try:
+        index = int(node_id.removeprefix("node_"))
+    except ValueError as exc:
+        raise ValueError(f"invalid taxonomy selection_key={selection_key!r}") from exc
+    if index < 0 or index >= len(allowed):
+        raise ValueError(f"invalid taxonomy selection_key={selection_key!r}")
+    return allowed[index], relation
+
+
 def build_taxonomy_path_choice_request(
     hints: ListingBootstrapHints,
     current_path: list[str],
@@ -65,6 +111,7 @@ def build_taxonomy_path_choice_request(
             if str(item or "").strip()
         )
     )
+    live_node_options, selection_keys = _taxonomy_path_options(allowed)
     return {
         "task": "choose_safe_makro_taxonomy_node",
         "system_instruction": (
@@ -75,16 +122,18 @@ def build_taxonomy_path_choice_request(
         "prompt_instruction": (
             "Evaluate context.current_path + each live node as a marketplace breadcrumb. Prefer strict "
             "taxonomy ancestry; otherwise choose the branch a marketplace operator would most reasonably "
-            "explore for a best-fit listing category."
+            "explore for a best-fit listing category. Return one atomic selection_key from the schema."
         ),
         "context": {
             "product_summary": hints.product_summary,
             "product_identity": _identity(hints),
             "current_path": list(current_path),
             "live_nodes": allowed,
+            "live_node_options": live_node_options,
         },
         "rules": [
-            "selected_node must be copied exactly from live_nodes or be empty.",
+            "selection_key is atomic: return exactly 'none' or '<relation>:<node_id>' from the schema enum; never invent a key.",
+            "Each node_id maps to exactly one label in live_node_options, so node choice and semantic relation cannot be returned independently.",
             "Use ancestor_branch for a genuine marketplace department/product-family ancestor.",
             "Use same_product_type when the node already names the same physical product class.",
             "Use broader_valid_class when the node is a genuine semantic superclass.",
@@ -99,19 +148,12 @@ def build_taxonomy_path_choice_request(
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "selected_node": {"type": "string", "enum": ["", *allowed]},
-                "selection_relation": {
+                "selection_key": {
                     "type": "string",
-                    "enum": [
-                        _ANCESTOR_BRANCH,
-                        _BEST_AVAILABLE_BRANCH,
-                        _SAME_PRODUCT_TYPE,
-                        _BROADER_VALID_CLASS,
-                        _NO_VALID_CLASS,
-                    ],
+                    "enum": selection_keys,
                 },
             },
-            "required": ["selected_node", "selection_relation"],
+            "required": ["selection_key"],
         },
         "strict_json_schema": True,
     }
@@ -125,45 +167,47 @@ def choose_taxonomy_path_candidate(
 ) -> str:
     if not candidates:
         return ""
-    request = build_taxonomy_path_choice_request(hints, current_path, candidates)
+    allowed = list(
+        dict.fromkeys(
+            str(item or "").strip()
+            for item in candidates
+            if str(item or "").strip()
+        )
+    )
+    request = build_taxonomy_path_choice_request(hints, current_path, allowed)
     raw = provider.extract_json(request)
     if not isinstance(raw, dict):
         raise ValueError("taxonomy path chooser response must be a JSON object")
 
-    selected = str(raw.get("selected_node") or "").strip()
-    relation = str(raw.get("selection_relation") or "").strip()
-    if relation not in _PATH_RELATIONS:
-        raise ValueError(f"invalid taxonomy selection_relation={relation!r}")
+    selected, relation = _decode_taxonomy_path_selection(raw, allowed)
     if not selected:
-        if relation != _NO_VALID_CLASS:
-            raise ValueError("empty taxonomy selection requires selection_relation='none'")
         _diag(
             "taxonomy_path_decision",
             {
                 "current_path": list(current_path),
-                "candidates": list(candidates),
+                "candidates": list(allowed),
                 "selected_node": "",
                 "selection_relation": relation,
+                "selection_key": _NO_VALID_CLASS,
             },
         )
         return ""
-    if relation == _NO_VALID_CLASS:
-        raise ValueError("non-empty taxonomy selection cannot use selection_relation='none'")
 
     wanted = normalize_label(selected)
-    matches = [item for item in candidates if normalize_label(item) == wanted]
+    matches = [item for item in allowed if normalize_label(item) == wanted]
     if len(matches) != 1:
         raise ValueError(
-            f"AI returned a taxonomy node that is not one unique live candidate: {selected!r}"
+            f"atomic taxonomy selection did not bind to one unique live candidate: {selected!r}"
         )
     selected = matches[0]
     _diag(
         "taxonomy_path_decision",
         {
             "current_path": list(current_path),
-            "candidates": list(candidates),
+            "candidates": list(allowed),
             "selected_node": selected,
             "selection_relation": relation,
+            "selection_key": str(raw.get("selection_key") or "").strip(),
         },
     )
     return selected
