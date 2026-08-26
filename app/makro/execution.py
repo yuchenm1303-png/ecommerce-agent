@@ -813,6 +813,11 @@ def run_photos(
             report,
             "screenshot_save_failed",
         )
+        try:
+            _cancel_open_photo_transaction(adapter)
+            report["cancelled_unsaved_after_failure"] = True
+        except Exception as cleanup_exc:
+            report["cleanup_error"] = str(cleanup_exc)
         return report
 
     persistence = adapter.verify_persisted_photo_count(
