@@ -8,7 +8,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
@@ -27,10 +27,11 @@ from .source_snapshot import (
     source_snapshot_from_json,
     write_source_snapshot,
 )
+from .supplier_url_identity import supplier_request_identity
 
 
 DEFAULT_SOURCE_CDP_PORT = 9333
-SOURCE_CAPTURE_CACHE_VERSION = 5
+SOURCE_CAPTURE_CACHE_VERSION = 6
 
 _DETAIL_DOCUMENT_PATTERN = re.compile(
     r"detail(?:Url|_url)[^h]{0,48}(https?://[^\\\"'<>\s]+)",
@@ -62,25 +63,9 @@ def validate_source_url(value: str) -> str:
 
 
 def _canonical_source_url(value: str) -> str:
-    """Return the exact cache identity for one supplier product URL.
+    """Return the shared exact supplier request identity used by source cache."""
 
-    Query parameters are part of product identity because many supplier sites use
-    them for SKU/variant routing. A fragment is browser-local navigation state and
-    therefore intentionally excluded. Query order is preserved: repeated/order-
-    sensitive parameters must never be silently rewritten into another request.
-    """
-
-    parsed = urlsplit(validate_source_url(value))
-    path = parsed.path.rstrip("/") or "/"
-    return urlunsplit(
-        (
-            parsed.scheme.lower(),
-            parsed.netloc.lower(),
-            path,
-            parsed.query,
-            "",
-        )
-    )
+    return supplier_request_identity(validate_source_url(value))
 
 
 def _source_cache_key(value: str) -> str:
