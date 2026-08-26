@@ -7,7 +7,16 @@ import makro_execute_listing
 import makro_plan_listing
 import makro_preview_listing
 import makro_resolve_ai
-from app import ai_decisions, compact_evidence, fill_plan, hard_field_validators, image_evidence, product_facts, web_enrichment
+from app import (
+    ai_decisions,
+    compact_evidence,
+    fill_plan,
+    hard_field_validators,
+    image_evidence,
+    product_facts,
+    resolver_pipeline,
+    web_enrichment,
+)
 from app.providers import openai_compatible, openai_semantic
 
 
@@ -32,6 +41,7 @@ def test_legacy_product_semantic_modules_are_not_in_repository():
 def test_production_path_has_no_legacy_semantic_rule_layer():
     modules = (
         makro_resolve_ai,
+        resolver_pipeline,
         makro_plan_listing,
         makro_execute_listing,
         fill_plan,
@@ -59,10 +69,10 @@ def test_production_path_has_no_legacy_semantic_rule_layer():
             assert token not in source, f"{module.__name__} reintroduced {token}"
 
 
-def test_production_resolver_is_product_url_compact_facts_then_unresolved_web_only():
-    source = inspect.getsource(makro_resolve_ai)
+def test_production_resolver_is_normalized_input_compact_facts_then_unresolved_web_only():
+    source = inspect.getsource(resolver_pipeline)
     web_source = inspect.getsource(web_enrichment)
-    assert "capture_product_source(" in source
+    assert "acquire_product_input(" in source
     assert "run_product_facts(" in source
     assert "run_image_evidence(" in source
     assert "run_web_enrichment(" in source
