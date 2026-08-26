@@ -23,6 +23,7 @@ from .fill_plan import (
 from .hard_field_validators import is_numeric_semantic_field, validate_resolved_answer
 from .listing_content_policy import allow_required_fallback
 from .live_schema import load_live_schema, schema_field_signature
+from .makro.field_engine import execution_contract
 from .resolution_types import RESOLVED, ResolvedAnswer
 
 
@@ -128,6 +129,81 @@ def _usable_option(values: Iterable[str]) -> str:
     return cleaned[0] if cleaned else ""
 
 
+def _option_value(option: object) -> str:
+    if isinstance(option, dict):
+        return str(option.get("text") or option.get("value") or "").strip()
+    return str(option or "").strip()
+
+
+def _enabled_options(values: Iterable[object]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        if isinstance(raw, dict) and bool(raw.get("disabled")):
+            continue
+        value = _option_value(raw)
+        key = re.sub(r"\s+", " ", value).strip().casefold()
+        if not value or not key or key in seen:
+            continue
+        seen.add(key)
+        output.append(value)
+    return output
+
+
+def _executable_value_options(field: dict[str, Any]) -> list[str]:
+    """Return only options the current value control can mechanically select.
+
+    A semantic field may carry an aggregate ``field.options`` list, but the live
+    value control is authoritative. In particular, disabled native options must
+    never be promoted to required-field fallbacks, and a typed selection control
+    with no currently selectable options must remain blocked rather than falling
+    through to a free-text ``N/A``/``1`` placeholder.
+    """
+
+    contract = execution_contract(field)
+    controls = [
+        control
+        for control in field.get("controls") or []
+        if isinstance(control, dict)
+        and str(control.get("field_kind") or "").casefold() != "option"
+        and not str(control.get("name") or "").endswith("_qualifier")
+    ]
+    if contract.live_family.split("_", 1)[0] == "selection":
+        direct: list[str] = []
+        for control in controls:
+            direct.extend(_enabled_options(control.get("options") or []))
+        if direct:
+            return list(dict.fromkeys(direct))
+        # Radio groups expose their options on the semantic field after
+        # structural coalescing rather than on each individual radio control.
+        if controls and all(
+            str(control.get("field_kind") or "").casefold()
+            in {"radio", "custom_radio"}
+            for control in controls
+        ):
+            return _enabled_options(field.get("options") or [])
+        # A live closed-domain control with no selectable current option has no
+        # mechanically executable fallback. Never trust an aggregate/stale list.
+        if controls:
+            return []
+    return _enabled_options(field_options(field))
+
+
+def _executable_qualifier_options(field: dict[str, Any]) -> list[str]:
+    controls = [
+        control
+        for control in field.get("controls") or []
+        if isinstance(control, dict)
+        and str(control.get("name") or "").endswith("_qualifier")
+    ]
+    if controls:
+        output: list[str] = []
+        for control in controls:
+            output.extend(_enabled_options(control.get("options") or []))
+        return list(dict.fromkeys(output))
+    return _enabled_options(field_qualifier_options(field))
+
+
 def _has_typed_live_value_control(field: dict[str, Any]) -> bool:
     """Return True once the current value control exposes its mechanical type.
 
@@ -183,12 +259,15 @@ def required_fallback_override(field: dict[str, Any]) -> dict[str, Any]:
     complete the form.
 
     For ordinary required fields that remain BLOCKED after the normal Resolver:
-    - option/radio/select -> first usable live Makro option;
-    - numeric/unit field -> ``1`` and the first usable live qualifier when present;
+    - closed-domain option/radio/select -> first enabled live Makro option;
+    - numeric/unit field -> ``1`` and the first enabled live qualifier when present;
     - remaining free text -> ``N/A``.
 
-    The production executor still rebinds the value to the current live field and
-    runs the existing Makro option/unit hard guards before any browser write.
+    A live selection control with no currently executable option remains BLOCKED.
+    It must never degrade into a free-text placeholder just to make the plan look
+    complete. The production executor still rebinds the value to the current live
+    field and runs the existing Makro option/unit hard guards before any browser
+    write.
     """
 
     if not allow_required_fallback(field):
@@ -198,17 +277,31 @@ def required_fallback_override(field: dict[str, Any]) -> dict[str, Any]:
         )
 
     binding = required_override_binding(field)
-    options = field_options(field)
+    contract = execution_contract(field)
+    options = _executable_value_options(field)
     option = _usable_option(options)
     if option:
         return {
             **binding,
             "values": [option],
             "source_type": "fallback",
-            "reason": "deterministic first valid Makro option for unresolved ordinary required field",
+            "reason": "deterministic first enabled live Makro option for unresolved ordinary required field",
         }
 
-    qualifiers = field_qualifier_options(field)
+    if contract.live_family.split("_", 1)[0] == "selection":
+        label = str(field.get("label") or field.get("attribute_key") or "required field")
+        raise RequiredOverrideError(
+            f"{label} 当前是闭集 selection 控件，但没有可执行的 enabled live option；"
+            "拒绝生成 N/A / 1 / 自由文本 fallback。"
+        )
+
+    qualifier_controls = [
+        control
+        for control in field.get("controls") or []
+        if isinstance(control, dict)
+        and str(control.get("name") or "").endswith("_qualifier")
+    ]
+    qualifiers = _executable_qualifier_options(field)
     qualifier = _usable_option(qualifiers)
     if qualifier:
         return {
@@ -216,8 +309,13 @@ def required_fallback_override(field: dict[str, Any]) -> dict[str, Any]:
             "values": [FALLBACK_NUMERIC_VALUE],
             "qualifier": qualifier,
             "source_type": "fallback",
-            "reason": "deterministic numeric placeholder with first valid Makro qualifier",
+            "reason": "deterministic numeric placeholder with first enabled live Makro qualifier",
         }
+    if qualifier_controls:
+        label = str(field.get("label") or field.get("attribute_key") or "required field")
+        raise RequiredOverrideError(
+            f"{label} 当前 qualifier 控件没有可执行的 enabled live option；拒绝生成不完整 fallback。"
+        )
 
     value = FALLBACK_NUMERIC_VALUE if _looks_numeric(field) else FALLBACK_TEXT_VALUE
     return {
