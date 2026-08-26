@@ -21,6 +21,7 @@ from playwright.sync_api import sync_playwright
 
 from app.browser_page_owner import page_target_id
 from app.browser_session import EdgeHarness, is_cdp_ready
+from app.listing_content_policy import current_listing_intent
 from app.makro.listing_creation import MAKRO_NEW_LISTING_URL, infer_listing_bootstrap
 from app.makro.step1_entry import prepare_owned_step1_page
 from app.product_input import acquire_product_input, product_input_manifest_payload
@@ -120,7 +121,10 @@ def main() -> int:
     run_dir = Path(args.output_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / "run-manifest.json"
-    listing_intent = " ".join(str(args.listing_intent or "").split())[:2000]
+    # GUI Batch already owns a process-local ECOMMERCE_LISTING_INTENT channel.
+    # Explicit CLI input wins for tests/manual invocation; otherwise consume that
+    # isolated job value so telemetry intent and business semantics cannot diverge.
+    listing_intent = " ".join(str(args.listing_intent or current_listing_intent() or "").split())[:2000]
     manifest: dict[str, object] = {
         "mode": "full",
         "input_mode": "supplier_url",
