@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import app.makro.vertical_selection as vertical_selection
+from app.makro.listing_creation import ListingBootstrapHints
 from app.makro.taxonomy_navigation import navigate_live_taxonomy
 
 
@@ -93,14 +94,6 @@ def _choose_soil_tester_path(path: list[str], candidates: list[str]) -> str:
     raise AssertionError((path, candidates))
 
 
-class FakeSearch:
-    def __init__(self) -> None:
-        self.values: list[str] = []
-
-    def fill(self, value: str) -> None:
-        self.values.append(value)
-
-
 class RetryPage:
     def __init__(self) -> None:
         self.waits: list[int] = []
@@ -109,7 +102,17 @@ class RetryPage:
         self.waits.append(milliseconds)
 
     def goto(self, *_args, **_kwargs):
-        raise AssertionError("stale Step 1 retry must not hard-reset the Makro SPA")
+        raise AssertionError("Step 1 retry must not hard-reset the Makro SPA")
+
+
+def _hints() -> ListingBootstrapHints:
+    return ListingBootstrapHints(
+        vertical_search_terms=("air purifier",),
+        brand="",
+        brand_status="unknown",
+        product_summary="portable air purifier",
+        product_identity={"product_type_en": "air purifier"},
+    )
 
 
 def test_taxonomy_backtracks_from_semantically_dead_singleton_branch() -> None:
@@ -242,19 +245,16 @@ def test_taxonomy_mechanical_click_failure_is_not_semantic_backtracking() -> Non
 
 def test_display_label_and_canonical_vertical_slug_are_distinct(monkeypatch) -> None:
     page = RetryPage()
-
-    monkeypatch.setattr(vertical_selection, "_wait_for", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(vertical_selection, "is_brand_step", lambda _page: True)
     monkeypatch.setattr(
         vertical_selection,
-        "_current_target_values",
-        lambda _page: ("air_purifier", ""),
+        "_observe_vertical_brand_transition",
+        lambda *_args, **_kwargs: vertical_selection._VerticalBrandTransitionObservation(
+            brand_step=True,
+            canonical="air_purifier",
+        ),
     )
 
-    selected = vertical_selection._complete_exact_live_vertical(
-        page,
-        "Air Purifiers",
-    )
+    selected = vertical_selection._complete_exact_live_vertical(page, "Air Purifiers")
 
     assert selected == "air_purifier"
 
@@ -277,52 +277,26 @@ def test_stage_enum_can_lag_while_taxonomy_is_structurally_operable(monkeypatch)
     assert vertical_selection.is_vertical_interaction_ready(page) is True
 
 
-def test_stale_partial_taxonomy_uses_exact_live_search_without_spa_reset(monkeypatch) -> None:
+def test_stale_partial_taxonomy_still_uses_grounded_search_first(monkeypatch) -> None:
     page = RetryPage()
-    search = FakeSearch()
-    observed: dict[str, str] = {}
-
-    class StaleTaxonomy:
-        def __init__(self, _page) -> None:
-            pass
-
-        def columns(self) -> list[list[str]]:
-            return [
-                ["Home Appliances", "Electronics"],
-                ["Small Appliances", "Home & Kitchen Appliances"],
-                ["Coffee Bean Grinder"],
-            ]
-
-        def click_node(self, _level: int, _node: str) -> bool:
-            raise AssertionError("stale partial path should use search before tree traversal")
-
+    monkeypatch.setattr(vertical_selection, "_committed_vertical_from_later_stage", lambda _page: "")
     monkeypatch.setattr(vertical_selection, "is_vertical_interaction_ready", lambda _page: True)
-    monkeypatch.setattr(vertical_selection, "_vertical_search_input", lambda _page: search)
-    monkeypatch.setattr(vertical_selection, "ResilientMakroTaxonomyBrowser", StaleTaxonomy)
     monkeypatch.setattr(
         vertical_selection,
-        "navigate_live_taxonomy",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("stale partial path must not enter tree traversal")
+        "_try_select_via_search",
+        lambda *_args, **_kwargs: (
+            "air_purifier",
+            ["Home Appliances / Air Purifiers"],
+            ("air purifier",),
         ),
     )
 
-    def search_fallback(_page, _provider, _hints, *, wait_ms, reason):
-        observed["reason"] = reason
-        return "air_purifier"
+    def taxonomy_must_not_run(_page):
+        raise AssertionError("successful grounded search must not mutate stale taxonomy")
 
-    monkeypatch.setattr(vertical_selection, "_select_via_search_with_context", search_fallback)
+    monkeypatch.setattr(vertical_selection, "ResilientMakroTaxonomyBrowser", taxonomy_must_not_run)
 
-    selected = vertical_selection.select_vertical(
-        page,
-        object(),
-        object(),
-        wait_ms=0,
-    )
-
-    assert selected == "air_purifier"
-    assert search.values == [""]
-    assert "stale partial taxonomy path" in observed["reason"]
+    assert vertical_selection.select_vertical(page, object(), _hints(), wait_ms=0) == "air_purifier"
 
 
 def test_resilient_dom_reader_has_dedicated_singleton_extension_path() -> None:
@@ -340,16 +314,17 @@ def test_retry_selector_never_hard_resets_same_spa_route() -> None:
 
     assert "page.goto(" not in source
     assert "could not reset a stale partial taxonomy path" not in source
-    assert "stale partial taxonomy path from a previous attempt" in source
+    assert "begin_search_query(search)" in source
+    assert "allow_stable_exact=False" in source
 
 
-def test_formal_single_and_batch_share_step1_entry_and_vertical_selector() -> None:
+def test_formal_batch_delegates_to_the_same_step1_vertical_state_machine() -> None:
     single = (ROOT / "makro_gui_workflow.py").read_text(encoding="utf-8")
     batch = (ROOT / "makro_batch_job.py").read_text(encoding="utf-8")
 
     assert "from app.makro.vertical_selection import select_vertical" in single
-    assert "from app.makro.vertical_selection import select_vertical" in batch
     assert "from app.makro.step1_entry import prepare_single_step1_page" in single
     assert "from app.makro.step1_entry import prepare_owned_step1_page" in batch
+    assert "_advance_listing_to_step3" in batch
     assert "_prepare_step1_page" not in single
     assert "def _prepare_owned_step1_page" not in batch
