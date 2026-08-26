@@ -54,7 +54,7 @@ def build_one_link_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--brand",
         default="",
-        help="诊断覆盖；默认只从供应商资料确定，未知时拒绝编造。",
+        help="诊断覆盖；默认使用统一生产 Brand 策略（当前 KEAI），覆盖值仍必须通过 Makro Check Brand 验证。",
     )
 
     parser.add_argument("--profile-dir", default="browser_profiles/makro-edge")
