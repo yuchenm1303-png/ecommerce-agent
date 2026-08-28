@@ -8,6 +8,22 @@ from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
 
 
+def _qt_top_level_window(widget: QWidget) -> QWidget | None:
+    """Resolve QWidget::window without instance attribute lookup.
+
+    Some application widgets expose a Python ``window`` attribute that shadows
+    QWidget.window(). Calling ``widget.window()`` is therefore unsafe: PySide
+    may resolve the instance attribute and attempt to call a QMainWindow object.
+    Dispatching through QWidget's descriptor bypasses that shadowing entirely.
+    """
+
+    try:
+        top = QWidget.window(widget)
+    except (RuntimeError, TypeError):
+        return None
+    return top if isinstance(top, QWidget) else None
+
+
 class StaticPresentationRuntime(QObject):
     """Browser-style presentation owner used only while background drift is off.
 
@@ -76,9 +92,10 @@ class StaticPresentationRuntime(QObject):
     def _enable_widget_tracking(self, widget: QWidget | None) -> None:
         if widget is None:
             return
+        if widget is not self.window and _qt_top_level_window(widget) is not self.window:
+            return
         try:
-            if widget.window() is self.window or widget is self.window:
-                widget.setMouseTracking(True)
+            widget.setMouseTracking(True)
         except RuntimeError:
             return
 
@@ -92,10 +109,7 @@ class StaticPresentationRuntime(QObject):
             return True
         if not isinstance(watched, QWidget):
             return False
-        try:
-            return watched.window() is self.window
-        except RuntimeError:
-            return False
+        return _qt_top_level_window(watched) is self.window
 
     @staticmethod
     def _event_global_pos(event: QEvent) -> QPoint:
