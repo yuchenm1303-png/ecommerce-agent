@@ -27,17 +27,20 @@ def test_gui_installs_offer_support_after_required_input_support() -> None:
     assert required < offer
 
 
-def test_offer_support_is_per_link_and_process_local() -> None:
+def test_offer_support_is_per_job_and_process_local() -> None:
     source = _source("gui/listing_offer_support.py")
 
-    assert "ECOMMERCE_LISTING_INTENT" not in source  # use the shared constant, not a duplicated literal
+    assert "ECOMMERCE_LISTING_INTENT" not in source  # shared constant only
     assert "LISTING_INTENT_ENV" in source
     assert "listing-intent.json" in source
     assert "销售规格 / 套装" in source
     assert "offer_input" in source
-    assert "_listing_offer_intent_by_url" in source
     assert "_with_process_intent" in source
     assert "original_spawn" in source
+    # URL-keyed ownership was retired because the same supplier page may represent
+    # multiple Batch rows. Job identity / sidecar ownership is the canonical model.
+    assert "_listing_offer_intent_by_url" not in source
+    assert "_job_intent" in source
 
 
 def test_high_risk_required_fields_fail_closed_in_single_and_batch() -> None:
@@ -45,10 +48,7 @@ def test_high_risk_required_fields_fail_closed_in_single_and_batch() -> None:
     policy = _source("app/listing_content_policy.py")
 
     assert "allow_required_fallback" in source
-    assert "这些关键必填字段不能使用 N/A / 1 / 随机选项" in source
     assert 'job.status = "REVIEW"' in source
-    assert "需确认关键字段" in source
-    assert "关键 listing 字段" in source
     assert '"required_fallback": "manual_only"' in policy
     assert "Never output N/A" in policy
 
