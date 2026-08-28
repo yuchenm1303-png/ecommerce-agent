@@ -6,35 +6,37 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "gui" / "startup_entrance.py").read_text(encoding="utf-8")
 STABILITY = (ROOT / "gui" / "startup_entrance_stability.py").read_text(encoding="utf-8")
-STATIC_VIEW = (ROOT / "gui" / "static_qml_view.py").read_text(encoding="utf-8")
 RUN = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
-def test_startup_entrance_is_geometry_only_curtain_animation() -> None:
+def test_reference_entrance_visual_timing_is_preserved() -> None:
     for token in (
-        "_REVEAL_DELAY_MS = 48",
+        "_UI_FADE_MS = 300",
+        "_CURTAIN_DELAY_MS = 0",
         "_CURTAIN_MS = 500",
+        "_BACKGROUND_DELAY_MS = 150",
+        "_BACKGROUND_MS = 800",
+        "_UI_SCALE_DELAY_MS = 200",
+        "_UI_SCALE_MS = 650",
+        "_TOTAL_MS = 1000",
+        "_BG_START_SCALE = 1.60",
+        "_UI_START_SCALE = 1.20",
         "_CURTAIN_FRACTION = 0.51",
         'QColor("#333333")',
         "_curve(0.645, 0.045, 0.355, 1.0)",
-        "QVariantAnimation",
-        "self._left_curtain.setGeometry",
-        "self._right_curtain.setGeometry",
+        "_curve(0.25, 0.46, 0.45, 0.94)",
     ):
         assert token in SOURCE
 
-    for forbidden in (
-        "QPainter",
-        "QPixmap",
-        "SmoothPixmapTransform",
-        "_FRAME_MS",
-        "_sharp_scene",
-        "_blur_scene",
-        "_paint_background",
-        "central.render(",
-        "QGraphicsEffect",
-    ):
-        assert forbidden not in SOURCE
+
+def test_startup_uses_one_frozen_widget_snapshot() -> None:
+    assert "central.render(" in SOURCE
+    assert "self._ui_snapshot" in SOURCE
+    assert "for record in self._glass_records:" in SOURCE
+    assert "QPropertyAnimation" not in SOURCE
+    assert "setGraphicsEffect" not in SOURCE
+    assert "QTimer.singleShot(_CAPTURE_DELAY_MS, self._capture_and_reveal)" in SOURCE
+    assert "self.overlay.begin_reveal()" in SOURCE
 
 
 def test_startup_runtime_lifecycle_uses_shared_presentation_clock_only() -> None:
@@ -55,7 +57,7 @@ def test_startup_runtime_lifecycle_uses_shared_presentation_clock_only() -> None
 
 def test_startup_stability_requires_live_paint_and_quiescent_layout() -> None:
     assert "_LAYOUT_POLL_MS = 16" in STABILITY
-    assert "_LAYOUT_STABLE_SAMPLES = 5" in STABILITY
+    assert "_LAYOUT_STABLE_SAMPLES = 4" in STABILITY
     assert "_LAYOUT_SETTLE_TIMEOUT_MS" not in STABILITY
     assert "self._layout_epoch" in STABILITY
     assert "event_type == QEvent.Type.Paint" in STABILITY
@@ -69,29 +71,7 @@ def test_startup_overlay_does_not_occlusion_cull_live_widgets() -> None:
     assert "def _keep_live_surface_paintable" in STABILITY
     assert "self.overlay.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)" in STABILITY
     assert "central.repaint()" in STABILITY
-
-
-def test_quick_scene_creation_stays_after_native_startup_handoff() -> None:
-    # Regression contract for 1da200: installing the controller before shell.show()
-    # must not compile/create/snapshot the unified QML scene. Scene creation starts
-    # only after handoffReady, when the native QWidget/Quick window is already live.
-    assert "revealPreparing = Signal()" not in STABILITY
-    assert "layoutInvalidated = Signal()" not in STABILITY
-    assert "reveal_preparing.connect" not in STATIC_VIEW
-    assert "layout_invalidated.connect" not in STATIC_VIEW
-    assert "_prepare_startup_scene" not in STATIC_VIEW
-    assert "_prepare_startup_snapshot" not in STATIC_VIEW
-    assert "_startup_snapshot_prepared" not in STATIC_VIEW
-
-    init = STATIC_VIEW.split("def __init__", 1)[1].split("@property", 1)[0]
-    assert "self._ensure_scene_loaded()" not in init
-    assert "handoff_ready.connect(self._activate_after_startup)" in init
-
-    activate = STATIC_VIEW.split("def _activate_quick", 1)[1].split(
-        "def _arm_handoff", 1
-    )[0]
-    assert "self._ensure_scene_loaded()" in activate
-    assert "self.bridge.refresh()" in activate
+    assert "frame.repaint()" in STABILITY
 
 
 def test_startup_handoff_waits_for_rendered_quick_frames() -> None:
@@ -101,11 +81,14 @@ def test_startup_handoff_waits_for_rendered_quick_frames() -> None:
     assert "quick.frameSwapped.disconnect(self._on_native_frame_swapped)" in STABILITY
     assert "self._native_frames_remaining = _NATIVE_SETTLE_FRAMES" in STABILITY
     assert "def _on_native_frame_swapped" in STABILITY
-
-    commit = STABILITY.split("def _commit_overlay_handoff", 1)[1].split(
-        "def _resume_effects", 1
+    assert "QTimer.singleShot(_HANDOFF_FRAME_MS, self._settle_live_runtime)" not in STABILITY
+    stage = STABILITY.split("def _stage_finish", 1)[1].split(
+        "def _on_native_frame_swapped", 1
     )[0]
-    assert commit.index("self.handoffReady.emit()") < commit.index("overlay.hide()")
+    assert stage.index("self._arm_native_frame_barrier()") < stage.index(
+        "self._prime_static_runtime()"
+    )
+    assert "overlay.hide()" in STABILITY
 
 
 def test_startup_resumes_shared_clock_only_after_overlay_handoff() -> None:
@@ -118,13 +101,13 @@ def test_startup_resumes_shared_clock_only_after_overlay_handoff() -> None:
     assert "_scroll_local_glass" not in STABILITY
 
 
-def test_formal_launcher_shows_native_shell_before_startup_gate_runs() -> None:
+def test_formal_launcher_uses_stability_gate_after_native_show() -> None:
     assert "entrance = install_startup_entrance(window, visual)" in RUN
     assert "entrance_stability = install_startup_entrance_stability(window, entrance)" in RUN
-    assert "install_static_qml_view(window, visual, entrance_stability)" in RUN
     assert "shell.show()" in RUN
+    assert "entrance.raise_overlay()" in RUN
     assert "entrance_stability.start()" in RUN
-    assert RUN.index("install_static_qml_view(window, visual, entrance_stability)") < RUN.index(
+    assert RUN.index("entrance = install_startup_entrance(window, visual)") < RUN.index(
         "shell.show()"
     )
     assert RUN.index("shell.show()") < RUN.index("entrance_stability.start()")
@@ -133,4 +116,3 @@ def test_formal_launcher_shows_native_shell_before_startup_gate_runs() -> None:
 def test_startup_sources_compile_without_importing_pyside() -> None:
     compile(SOURCE, "gui/startup_entrance.py", "exec")
     compile(STABILITY, "gui/startup_entrance_stability.py", "exec")
-    compile(STATIC_VIEW, "gui/static_qml_view.py", "exec")

@@ -635,14 +635,7 @@ def _tabify_side_panel(window: QMainWindow, workspace_splitter: QSplitter) -> No
     setattr(window, "_ui_polish_side_tabs", True)
 
 
-def _install_console_details_toggle(window: QMainWindow, console: QFrame) -> None:
-    """Toggle console detail visibility without owning body geometry.
-
-    The fixed Single layout is the sole authority for bodySplitter height. This
-    control only changes which console children are visible; it must never resize
-    the splitter or change console min/max constraints.
-    """
-
+def _install_console_collapse(window: QMainWindow, console: QFrame, body: QSplitter) -> None:
     if getattr(window, "_ui_polish_console_collapse", False):
         return
     layout = console.layout()
@@ -668,6 +661,17 @@ def _install_console_details_toggle(window: QMainWindow, console: QFrame) -> Non
                 unit.setVisible(expanded)
         tabs.setVisible(expanded)
         toggle.setText("收起详情" if expanded else "展开详情")
+
+        if expanded:
+            console.setMinimumHeight(230)
+            console.setMaximumHeight(620)
+            available = max(0, body.height() - body.handleWidth())
+            target = min(420, max(240, available - 260))
+            body.setSizes([max(260, available - target), target])
+        else:
+            console.setMinimumHeight(112)
+            console.setMaximumHeight(132)
+            body.setSizes([max(320, body.height() - 122), 122])
         QTimer.singleShot(0, lambda: _schedule_glass(window))
 
     toggle.toggled.connect(apply)
@@ -720,15 +724,16 @@ def install_ui_polish(window: QMainWindow) -> None:
             outer.removeWidget(workspace)
             outer.removeWidget(console_widget)
 
-            # Structural only. page_scroll_layout.py owns every vertical size.
             body = QSplitter(Qt.Orientation.Vertical, root)
             body.setObjectName("bodySplitter")
             body.setChildrenCollapsible(False)
             body.setHandleWidth(9)
+            workspace.setMinimumHeight(260)
             body.addWidget(workspace)
             body.addWidget(console_widget)
             body.setStretchFactor(0, 1)
             body.setStretchFactor(1, 0)
+            body.setSizes([650, 122])
             outer.addWidget(body, 1)
             setattr(window, "_ui_polish_body_splitter", body)
     elif isinstance(body, QSplitter) and body.count():
@@ -783,7 +788,8 @@ def install_ui_polish(window: QMainWindow) -> None:
             tabs.setMinimumHeight(105)
         for table in console.findChildren(QTableWidget):
             _configure_data_table(table)
-        _install_console_details_toggle(window, console)
+        if isinstance(body, QSplitter):
+            _install_console_collapse(window, console, body)
 
     window.setStyleSheet(window.styleSheet() + "\n" + _POLISH_STYLE)
 

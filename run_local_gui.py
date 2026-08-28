@@ -211,13 +211,13 @@ def main() -> int:
     from gui.required_input_support import install_required_input_support
     from gui.restore_snapshot import install_restore_snapshot
     from gui.runtime_assistant import install_runtime_assistant
+    from gui.sakana_toy import install_sakana_toy
     from gui.single_ai_guidance import install_single_ai_guidance
     from gui.single_top_compact import install_single_top_compact
     from gui.smooth_scroll import SmoothWheelFilter
     from gui.startup_entrance import install_startup_entrance
     from gui.startup_entrance_stability import install_startup_entrance_stability
     from gui.static_modal_interaction import install_static_modal_interaction
-    from gui.static_qml_view import install_static_qml_view
     from gui.system_health_telemetry import install_system_health_telemetry
     from gui.ui_data_optimizations import install_ui_data_optimizations
     from gui.ui_maturity import install_mature_ui
@@ -344,11 +344,16 @@ def main() -> int:
         if replacement is not None:
             label.setText(replacement)
     premium_copy = install_premium_copy(window)
+    toy = install_sakana_toy(window)
 
     entrance = install_startup_entrance(window, visual)
     entrance_stability = install_startup_entrance_stability(window, entrance)
-    install_static_qml_view(window, visual, entrance_stability)
 
+    # Keep one permanent application-UI owner. The QQuickWindow is the GPU
+    # background/glass surface; the embedded QWidget tree remains the visible,
+    # interactive business UI for the whole process lifetime. Never install the
+    # QWidget-mirroring Static QML scene here and never hide the native child as a
+    # normal startup handoff. This removes the Quick/Win32 dual-owner deadlock path.
     mark_startup_stage("window_show")
     shell.show()
     effects.raise_()
@@ -356,6 +361,7 @@ def main() -> int:
     product_copy.attach_runtime_assistant(assistant)
     premium_copy.attach_runtime_assistant(assistant)
     assistant.raise_()
+    toy.raise_overlay()
     entrance.raise_overlay()
     entrance_stability.start()
     # Let the native maximized window get its first event-loop turn before the

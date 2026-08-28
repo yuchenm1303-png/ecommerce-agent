@@ -39,6 +39,9 @@ def test_formal_gui_boots_current_product_input_workflow() -> None:
     assert "MainWindow = ProductInputWorkflowMainWindow" in GUI
     assert "install_frozen_process_router(window)" in GUI
     assert "install_managed_makro_browser(window)" in GUI
+    assert "from gui.static_qml_view import install_static_qml_view" not in GUI
+    assert "install_static_qml_view(window, visual, entrance_stability)" not in GUI
+    assert "shell.show()" in GUI
 
 
 def test_legacy_main_is_explicitly_mock_only_and_not_a_production_dependency() -> None:
