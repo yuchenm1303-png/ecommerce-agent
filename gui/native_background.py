@@ -396,8 +396,8 @@ Window {{
         maskEnabled: true
         maskSource: glassMaskTexture
         autoPaddingEnabled: false
-        colorization: 64 / 255.0
-        colorizationColor: "#FF9DCA"
+        colorization: 142 / 255.0
+        colorizationColor: "#56354E"
     }}
 
     FrameAnimation {{
