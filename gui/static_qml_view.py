@@ -153,7 +153,7 @@ Item {
 
 
 class StaticActivityPresenceMirror(QObject):
-    """Mirror the legacy self-painted activity strip into the unified Quick scene."""
+    """Mirror the legacy activity strip as a real child of its Quick card."""
 
     changed = Signal()
 
@@ -166,6 +166,7 @@ class StaticActivityPresenceMirror(QObject):
         controller = getattr(window, "_activity_presence_controller", None)
         candidate = getattr(controller, "widget", None)
         self.widget = candidate if isinstance(candidate, ActivityPresence) else None
+        self._card_frame = self._find_card_frame()
 
         self._x = 0
         self._y = 0
@@ -192,6 +193,92 @@ class StaticActivityPresenceMirror(QObject):
             self.widget.installEventFilter(self)
             self._bind_runtime_sources()
             self.refresh()
+
+    def _find_card_frame(self) -> QFrame | None:
+        widget = self.widget
+        visual = getattr(self.window, "_visual_style", None)
+        glass = getattr(visual, "_glass", None)
+        if widget is None or not isinstance(glass, dict):
+            return None
+        frames = {frame for frame in glass if isinstance(frame, QFrame)}
+        try:
+            current = widget.parentWidget()
+            while current is not None and current is not self.window:
+                if isinstance(current, QFrame) and current in frames:
+                    return current
+                current = current.parentWidget()
+        except RuntimeError:
+            return None
+        return None
+
+    @staticmethod
+    def _descendant_items(root: QQuickItem) -> list[QQuickItem]:
+        items: list[QQuickItem] = []
+        pending = list(root.childItems())
+        while pending:
+            item = pending.pop()
+            items.append(item)
+            try:
+                pending.extend(item.childItems())
+            except RuntimeError:
+                continue
+        return items
+
+    def _quick_card_item(self) -> QQuickItem | None:
+        host = self._host_item
+        frame = self._card_frame
+        if host is None or frame is None:
+            return None
+        try:
+            point = frame.mapTo(self.window, QPoint(0, 0))
+            expected = (
+                float(point.x()),
+                float(point.y()),
+                float(frame.width()),
+                float(frame.height()),
+            )
+        except RuntimeError:
+            return None
+
+        for item in self._descendant_items(host):
+            try:
+                values = (
+                    item.property("cardX"),
+                    item.property("cardY"),
+                    item.property("cardW"),
+                    item.property("cardH"),
+                )
+                if any(value is None for value in values):
+                    continue
+                actual = tuple(float(value) for value in values)
+            except (RuntimeError, TypeError, ValueError):
+                continue
+            if all(abs(actual[index] - expected[index]) <= 0.5 for index in range(4)):
+                return item
+        return None
+
+    def _sync_card_parent(self) -> QMainWindow | QFrame:
+        item = self._item
+        host = self._host_item
+        frame = self._card_frame
+        if item is None or host is None or frame is None:
+            return self.window
+
+        card_item = self._quick_card_item()
+        if card_item is not None:
+            try:
+                if item.parentItem() is not card_item:
+                    item.setParentItem(card_item)
+                return frame
+            except RuntimeError:
+                pass
+
+        try:
+            if item.parentItem() is not host:
+                item.setParentItem(host)
+        except RuntimeError:
+            pass
+        return self.window
 
     def _get_x(self) -> int:
         return self._x
@@ -311,7 +398,8 @@ class StaticActivityPresenceMirror(QObject):
         if widget is None:
             return
         try:
-            point = widget.mapTo(self.window, QPoint(0, 0))
+            origin = self._sync_card_parent()
+            point = widget.mapTo(origin, QPoint(0, 0))
             width = max(0, int(widget.width()))
             height = max(0, int(widget.height()))
             source_visible = bool(
@@ -442,6 +530,7 @@ class StaticQmlViewController(QObject):
             self.engine,
             self,
         )
+        self.bridge.sceneChanged.connect(self.activity_presence.schedule_refresh)
 
         self.fireworks = StaticQuickFireworks()
         self.fireworks.setParent(self)
