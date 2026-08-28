@@ -5,30 +5,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from PySide6.QtCore import QEasingCurve, QObject, QPoint, QPointF, QRectF, Qt
-from PySide6.QtWidgets import (
-    QAbstractItemView,
-    QAbstractSlider,
-    QAbstractSpinBox,
-    QComboBox,
-    QFrame,
-    QLineEdit,
-    QMainWindow,
-    QPlainTextEdit,
-    QTextEdit,
-    QWidget,
-)
+from PySide6.QtWidgets import QFrame, QMainWindow, QWidget
 
 
 _GLASS_NAMES = {"glassCard", "heroCard", "statusCard", "microCard"}
-_EDITOR_TYPES = (
-    QLineEdit,
-    QPlainTextEdit,
-    QTextEdit,
-    QComboBox,
-    QAbstractSpinBox,
-    QAbstractSlider,
-    QAbstractItemView,
-)
 
 _NORMAL_SCALE = 1.00
 _HOVER_SCALE = 1.02
@@ -60,22 +40,6 @@ def _css_ease() -> QEasingCurve:
     return curve
 
 
-def _contains_editor(frame: QFrame) -> bool:
-    """Return True when a glass card owns a real data-entry surface.
-
-    Form controls must remain native QWidget paint/input owners. Transforming their
-    ancestor card freezes the whole subtree into a QGraphicsEffect pixmap while the
-    mouse is pressed; during a focus transfer that creates a one-frame card flash and
-    can make the first click land on the frozen composite instead of the new editor.
-    Form cards therefore never participate in card-level scale/press transforms.
-    """
-
-    for editor_type in _EDITOR_TYPES:
-        if frame.findChild(editor_type) is not None:
-            return True
-    return False
-
-
 @dataclass(slots=True)
 class _CardState:
     frame: QFrame
@@ -103,12 +67,13 @@ class _CardState:
 
 
 class NekroCardInteractionController(QObject):
-    """Card interaction for non-form presentation cards only.
+    """Card interaction with one shared input clock and bounded raster work.
 
-    Cards containing editors deliberately stay outside this controller. Their
-    QWidget subtree must never be frozen/scaled during mouse press or focus transfer;
-    this makes every input field accept the first click deterministically. Decorative
-    and read-only cards keep the existing hover/press presentation behavior.
+    Quick renders the glass shell every presentation step. QWidget card content is
+    captured once when an interaction transition starts and that frozen composite
+    is transformed throughout the 300 ms motion. At the endpoint the real content
+    is thawed again, so inputs remain fully live while steady but the expensive
+    QWidget subtree is not re-rasterized dozens of times during one scale tween.
     """
 
     def __init__(self, window: QMainWindow, visual: Any) -> None:
@@ -129,7 +94,7 @@ class NekroCardInteractionController(QObject):
         self._next_motion_s = 0.0
 
         for frame in window.findChildren(QFrame):
-            if frame.objectName() not in _GLASS_NAMES or _contains_editor(frame):
+            if frame.objectName() not in _GLASS_NAMES:
                 continue
             surface = visual.surface_for(frame)
             if surface is not None:
@@ -162,6 +127,8 @@ class NekroCardInteractionController(QObject):
                 pass
 
     def _recapture_for_motion(self, state: _CardState) -> None:
+        # Switching False -> True clears the previous frozen source so the next
+        # effect draw captures the latest hover/press/focus pixels exactly once.
         self._set_content_frozen(state, False)
         self._set_content_frozen(state, True)
 
@@ -349,6 +316,10 @@ class NekroCardInteractionController(QObject):
             nested = self._nearest_card(frame.childAt(local))
             return nested is None or nested is frame
 
+        # The visual card may be a few pixels larger than its logical QWidget rect
+        # while a hover scale tween is active. Keep ownership inside a small stable
+        # hysteresis band so the pointer cannot repeatedly enter/leave at a screen
+        # or neighbour edge and make the card "bounce".
         expanded = QRectF(logical).adjusted(
             -_HOVER_HYSTERESIS_PX,
             -_HOVER_HYSTERESIS_PX,
@@ -551,6 +522,8 @@ class NekroCardInteractionController(QObject):
 
         now_s = time.perf_counter()
         if preserve_visual:
+            # Freeze exactly the visual state that was under the pointer at click
+            # time. Do not snap the card before the modal has started covering it.
             for frame in tuple(self._moving_frames):
                 state = self.states.get(frame)
                 if state is None:
@@ -578,6 +551,8 @@ class NekroCardInteractionController(QObject):
                 state.moving = False
 
     def settle_suspended_for_modal(self) -> None:
+        """Normalize cards only after an opaque modal layer is covering them."""
+
         if not self._suspended:
             return
         self._moving_frames.clear()
