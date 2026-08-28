@@ -12,16 +12,24 @@ def _body(source: str, start: str, end: str) -> str:
     return source.split(start, 1)[1].split(end, 1)[0]
 
 
+def _without_comments(source: str) -> str:
+    return "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
 def test_native_handoff_runs_after_quick_frame_callback() -> None:
     assert "handoffFrameReady = Signal()" in STATIC_VIEW
     assert "Qt.ConnectionType.QueuedConnection" in STATIC_VIEW
     assert "self.quick.frameSwapped.connect(self._on_handoff_frame_swapped)" in STATIC_VIEW
     assert "self.quick.frameSwapped.disconnect(self._on_handoff_frame_swapped)" in STATIC_VIEW
 
-    frame_callback = _body(
-        STATIC_VIEW,
-        "def _on_handoff_frame_swapped(self) -> None:",
-        "def _disconnect_handoff",
+    frame_callback = _without_comments(
+        _body(
+            STATIC_VIEW,
+            "def _on_handoff_frame_swapped(self) -> None:",
+            "def _disconnect_handoff",
+        )
     )
     for forbidden in (
         "set_overlay_presented",
@@ -42,10 +50,12 @@ def test_reveal_frame_callback_is_observation_only() -> None:
     assert "Qt.ConnectionType.QueuedConnection" in STABILITY
     assert "quick.frameSwapped.connect(self._on_reveal_frame_swapped)" in STABILITY
 
-    frame_callback = _body(
-        STABILITY,
-        "def _on_reveal_frame_swapped(self) -> None:",
-        "def _consume_reveal_frame",
+    frame_callback = _without_comments(
+        _body(
+            STABILITY,
+            "def _on_reveal_frame_swapped(self) -> None:",
+            "def _consume_reveal_frame",
+        )
     )
     for forbidden in (
         "_flush_native_background",
