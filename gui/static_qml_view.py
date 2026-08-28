@@ -7,7 +7,7 @@ from PySide6.QtCore import QEvent, QObject, QPointF, QTimer, Qt, QUrl
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtQml import QQmlComponent
 from PySide6.QtQuick import QQuickItem, QQuickWindow
-from PySide6.QtWidgets import QFrame, QMainWindow
+from PySide6.QtWidgets import QFrame, QMainWindow, QWidget
 
 from .static_qml_bridge import StaticCardModel, StaticQmlBridge
 from .static_qml_fireworks import StaticQuickFireworks
@@ -29,6 +29,7 @@ class StaticQmlViewController(QObject):
         self.quick = self.background.quick_window
         self.engine = self.background.engine
         self.clock = getattr(window, "_presentation_clock", None)
+        self.card_fx = getattr(window, "_nekro_card_fx", None)
         self.toggle = getattr(window, "_background_drift_switch", None)
         self.shell = getattr(window, "_native_window_shell", None)
         self.legacy_fireworks = getattr(window, "_click_fireworks", None)
@@ -37,8 +38,10 @@ class StaticQmlViewController(QObject):
         self._static_requested = False
         self._load_started = False
         self._load_failed = False
-        self._handoff_armed = False
+        self._static_handoff_armed = False
+        self._legacy_handoff_armed = False
         self._legacy_suspended = False
+        self._card_fx_suspended_here = False
         self._pending_drift: bool | None = None
         self.item: QQuickItem | None = None
         self.component: QQmlComponent | None = None
@@ -167,7 +170,7 @@ class StaticQmlViewController(QObject):
         # native_background remains the only blur renderer. Static QML draws only
         # the same black 64/102 overlay, so suppress the old overlay but not blur.
         # Apply to every registered card, including hidden workspace pages, so
-        # returning to legacy can never expose stale alpha=0 state later.
+        # returning to legacy can never expose stale alpha/scale state later.
         for frame in self._all_glass_frames():
             try:
                 self.background.set_card_presentation(frame, scale=1.0, alpha=float(alpha))
@@ -189,6 +192,8 @@ class StaticQmlViewController(QObject):
         self._static_requested = False
         self._switch_timer.stop()
         self._pending_drift = None
+        self._disconnect_static_handoff()
+        self._disconnect_legacy_handoff()
         self.bridge.set_active(False)
         self.fireworks.clear()
         self._set_native_glass_overlay_alpha(64.0)
@@ -197,6 +202,7 @@ class StaticQmlViewController(QObject):
             self.shell.set_overlay_presented(True)
         except RuntimeError:
             pass
+        self._static_active = False
         self._resume_legacy()
         message = reason.strip() or "unknown QML creation failure"
         print(
@@ -233,7 +239,25 @@ class StaticQmlViewController(QObject):
             suspend("static_qml")
             self._legacy_suspended = True
 
+        card_suspend = getattr(self.card_fx, "suspend_for_modal", None)
+        already_suspended = bool(getattr(self.card_fx, "_suspended", False))
+        if callable(card_suspend) and not already_suspended:
+            try:
+                card_suspend()
+                self._card_fx_suspended_here = True
+            except RuntimeError:
+                self._card_fx_suspended_here = False
+
     def _resume_legacy(self) -> None:
+        if self._card_fx_suspended_here:
+            self._card_fx_suspended_here = False
+            card_resume = getattr(self.card_fx, "resume_from_modal", None)
+            if callable(card_resume):
+                try:
+                    card_resume()
+                except RuntimeError:
+                    pass
+
         if not self._legacy_suspended:
             return
         self._legacy_suspended = False
@@ -241,9 +265,46 @@ class StaticQmlViewController(QObject):
         if callable(resume):
             resume("static_qml")
 
+    def _prime_legacy_surface(self) -> None:
+        """Prepare the hidden QWidget/backdrop before native presentation returns."""
+
+        root = self.window.centralWidget()
+        if isinstance(root, QWidget):
+            try:
+                layout = root.layout()
+                if layout is not None:
+                    layout.activate()
+                root.repaint()
+            except RuntimeError:
+                pass
+
+        for frame in self._all_glass_frames():
+            try:
+                if frame.isVisibleTo(self.window):
+                    frame.repaint()
+            except RuntimeError:
+                continue
+
+        geometry_timer = getattr(self.background, "_geometry_timer", None)
+        if geometry_timer is not None:
+            try:
+                geometry_timer.stop()
+            except RuntimeError:
+                pass
+        flush_geometry = getattr(self.background, "_flush_geometry", None)
+        if callable(flush_geometry):
+            try:
+                flush_geometry()
+            except RuntimeError:
+                pass
+
     def _enter_static(self) -> None:
         self._static_requested = True
-        if self._static_active or self._load_failed:
+        if self._legacy_handoff_armed:
+            self._disconnect_legacy_handoff()
+        if self._static_active and self.bridge.active:
+            return
+        if self._load_failed:
             return
         if self.item is None:
             self._ensure_scene_loaded()
@@ -263,29 +324,29 @@ class StaticQmlViewController(QObject):
             return
 
         self._static_active = True
-        self._arm_rendered_handoff()
+        self._arm_static_handoff()
 
-    def _arm_rendered_handoff(self) -> None:
-        if self._handoff_armed:
+    def _arm_static_handoff(self) -> None:
+        if self._static_handoff_armed:
             return
-        self._handoff_armed = True
+        self._static_handoff_armed = True
         try:
             self.quick.frameSwapped.connect(self._commit_static_handoff)
         except (RuntimeError, TypeError):
-            self._handoff_armed = False
+            self._static_handoff_armed = False
             QTimer.singleShot(0, self._commit_static_handoff)
 
-    def _disconnect_handoff(self) -> None:
-        if not self._handoff_armed:
+    def _disconnect_static_handoff(self) -> None:
+        if not self._static_handoff_armed:
             return
-        self._handoff_armed = False
+        self._static_handoff_armed = False
         try:
             self.quick.frameSwapped.disconnect(self._commit_static_handoff)
         except (RuntimeError, TypeError):
             pass
 
     def _commit_static_handoff(self) -> None:
-        self._disconnect_handoff()
+        self._disconnect_static_handoff()
         if not self._static_active or not self._static_requested:
             return
         try:
@@ -293,33 +354,72 @@ class StaticQmlViewController(QObject):
         except RuntimeError:
             self._leave_static()
 
-    def _leave_static(self) -> None:
-        self._static_requested = False
-        self._disconnect_handoff()
-        if not self._static_active:
-            self._set_native_glass_overlay_alpha(64.0)
-            self._set_legacy_fireworks_enabled(True)
-            self._resume_legacy()
+    def _arm_legacy_handoff(self) -> None:
+        if self._legacy_handoff_armed:
+            return
+        self._legacy_handoff_armed = True
+        try:
+            self.quick.frameSwapped.connect(self._commit_legacy_handoff)
+        except (RuntimeError, TypeError):
+            self._legacy_handoff_armed = False
+            QTimer.singleShot(0, self._commit_legacy_handoff)
+
+    def _disconnect_legacy_handoff(self) -> None:
+        if not self._legacy_handoff_armed:
+            return
+        self._legacy_handoff_armed = False
+        try:
+            self.quick.frameSwapped.disconnect(self._commit_legacy_handoff)
+        except (RuntimeError, TypeError):
+            pass
+
+    def _commit_legacy_handoff(self) -> None:
+        self._disconnect_legacy_handoff()
+        if self._static_requested:
             return
 
-        self._static_active = False
-        self.fireworks.clear()
-        self._set_native_glass_overlay_alpha(64.0)
         try:
             self.shell.set_overlay_presented(True)
         except RuntimeError:
             pass
+        self._static_active = False
+        self._set_legacy_fireworks_enabled(True)
+        self._resume_legacy()
+
+    def _leave_static(self) -> None:
+        self._static_requested = False
+        self._disconnect_static_handoff()
+        if not self._static_active:
+            self._disconnect_legacy_handoff()
+            self._set_native_glass_overlay_alpha(64.0)
+            self._set_legacy_fireworks_enabled(True)
+            self._resume_legacy()
+            return
+        if self._legacy_handoff_armed:
+            return
+
+        # QWidget is still hidden at the native HWND boundary here. Rebuild its
+        # backing store and glass geometry first, while the already-rendered static
+        # scene remains the only presentation visible to the user.
+        self._prime_legacy_surface()
+        self.fireworks.clear()
+        self._set_native_glass_overlay_alpha(64.0)
+
+        # Remove static QML from a real Quick frame before the transparent QWidget
+        # child is shown again. Showing the child first lets the still-present QML
+        # scene shine through its transparent regions, which is the duplicated/card-
+        # scrambled frame seen when drift was enabled.
         self.bridge.set_active(False)
         if self.item is not None:
             try:
                 self.item.setVisible(False)
             except RuntimeError:
                 pass
-        self._set_legacy_fireworks_enabled(True)
-        schedule = getattr(self.background, "schedule_mask_update", None)
-        if callable(schedule):
-            schedule()
-        self._resume_legacy()
+        self._arm_legacy_handoff()
+        try:
+            self.quick.requestUpdate()
+        except RuntimeError:
+            self._commit_legacy_handoff()
 
     def _activate_after_startup(self) -> None:
         enabled = bool(getattr(self.clock, "background_drift_enabled", False))
@@ -359,7 +459,8 @@ class StaticQmlViewController(QObject):
 
     def _cleanup(self) -> None:
         self._switch_timer.stop()
-        self._disconnect_handoff()
+        self._disconnect_static_handoff()
+        self._disconnect_legacy_handoff()
         self.fireworks.clear()
         try:
             self.quick.removeEventFilter(self)
