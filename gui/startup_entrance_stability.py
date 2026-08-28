@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Qt
+from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Qt, Signal
 from PySide6.QtWidgets import QFrame, QMainWindow, QWidget
 
 
@@ -31,6 +31,8 @@ class StartupEntranceStabilityGate(QObject):
     At handoff, QWidget paint and Quick frame presentation are both committed
     before the frozen overlay is removed.
     """
+
+    handoffReady = Signal()
 
     def __init__(self, window: QMainWindow, entrance: Any) -> None:
         super().__init__(window)
@@ -101,8 +103,12 @@ class StartupEntranceStabilityGate(QObject):
         if bool(getattr(self.entrance, "_finished", False)):
             return False
 
+        try:
+            central = self.window.centralWidget()
+        except RuntimeError:
+            return False
+
         event_type = event.type()
-        central = self.window.centralWidget()
         if watched is central and event_type == QEvent.Type.Paint:
             self._live_paint_seen = True
 
@@ -336,6 +342,11 @@ class StartupEntranceStabilityGate(QObject):
     def _commit_overlay_handoff(self) -> None:
         self._disconnect_native_frame_barrier()
         self._native_frames_remaining = 0
+
+        # Static Quick is allowed to take presentation ownership only at this
+        # explicit startup boundary. It must never use QObject destruction as a
+        # readiness signal because the same signal is emitted again at shutdown.
+        self.handoffReady.emit()
 
         overlay = self.overlay
         if isinstance(overlay, QWidget):
