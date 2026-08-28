@@ -249,7 +249,7 @@ Item {
                 font.family: d && d.fontFamily ? d.fontFamily : "Microsoft YaHei UI"
                 font.pixelSize: d && d.fontSize ? d.fontSize : 13
                 verticalAlignment: TextInput.AlignVCenter; clip: true
-                onEditingFinished: if (d && !d.readOnly) staticBridge.setText(d.key, text)
+                onTextEdited: if (d && !d.readOnly) staticBridge.setText(d.key, text)
             }
         }
     }
