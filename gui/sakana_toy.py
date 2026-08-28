@@ -2,40 +2,27 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QPixmap, QTransform
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
+
+from gui.sakana_physics import SakanaSpringState, advance_spring, move_spring
 
 
 _TOY_SIZE = 180.0
 _IMAGE_SIZE = _TOY_SIZE / 1.25
 _CANVAS_SIZE = _TOY_SIZE * 1.5
-_FRAME_SECONDS = 1.0 / 60.0
 _LEFT_MARGIN = 24
 _BOTTOM_MARGIN = 18
 _CHARACTER_IMAGE = Path(__file__).resolve().parent / "assets" / "sakana_takina.png"
 
-# Match Sakana Widget's original four-cell controller proportions, scaled up a
-# little for the desktop GUI so it remains visually balanced with the 180 px toy.
+# Match Sakana Widget's four-cell controller proportions, scaled for this GUI.
 _BASE_WIDTH = 156.0
 _BASE_HEIGHT = 34.0
 _BASE_RADIUS = 8.0
 _BASE_ITEM_WIDTH = _BASE_WIDTH / 4.0
-
-
-@dataclass
-class _SpringState:
-    # Takina defaults from Sakana Widget.
-    i: float = 0.08
-    s: float = 0.10
-    d: float = 0.988
-    r: float = 12.0
-    y: float = 2.0
-    t: float = 0.0
-    w: float = 0.0
 
 
 class _SakanaToyWidget(QWidget):
@@ -50,7 +37,7 @@ class _SakanaToyWidget(QWidget):
         side = math.ceil(_CANVAS_SIZE)
         self.setFixedSize(side, side)
 
-        self.state = _SpringState()
+        self.state = SakanaSpringState()
         self.max_rotation = max(30.0, min(60.0, _TOY_SIZE / 5.0))
         self.max_y = _TOY_SIZE / 4.0
         self.min_y = -self.max_y
@@ -65,6 +52,10 @@ class _SakanaToyWidget(QWidget):
         inset = (_CANVAS_SIZE - _TOY_SIZE) / 2.0
         return QPointF(_CANVAS_SIZE / 2.0, _TOY_SIZE + inset)
 
+    @property
+    def image_rect(self) -> QRectF:
+        return QRectF(-_IMAGE_SIZE / 2.0, -_TOY_SIZE, _IMAGE_SIZE, _IMAGE_SIZE)
+
     def base_rect(self) -> QRectF:
         anchor = self.anchor
         return QRectF(
@@ -74,39 +65,46 @@ class _SakanaToyWidget(QWidget):
             _BASE_HEIGHT,
         )
 
+    def _image_transform(self) -> QTransform:
+        transform = QTransform()
+        anchor = self.anchor
+        transform.translate(anchor.x(), anchor.y())
+        transform.rotate(self.state.r)
+        # Sakana CSS: rotate(r) translateX(r) translateY(y), around the bottom
+        # center transform-origin. Qt's painter transform below uses the same order.
+        transform.translate(self.state.r, self.state.y)
+        return transform
+
     def _center_offset(self) -> QPointF:
         angle = math.radians(self.state.r)
         cos_a = math.cos(angle)
         sin_a = math.sin(angle)
-        e = _TOY_SIZE - _IMAGE_SIZE / 2.0
-        x_translate = self.state.r
-        y_translate = self.state.y
+        radius = _TOY_SIZE - _IMAGE_SIZE / 2.0
+        x = self.state.r
+        y = self.state.y
         return QPointF(
-            sin_a * e + cos_a * x_translate - sin_a * y_translate,
-            cos_a * e - cos_a * y_translate - sin_a * x_translate,
+            sin_a * radius + cos_a * x - sin_a * y,
+            cos_a * radius - cos_a * y - sin_a * x,
         )
-
-    def character_center(self) -> QPointF:
-        offset = self._center_offset()
-        anchor = self.anchor
-        return QPointF(anchor.x() + offset.x(), anchor.y() - offset.y())
 
     def character_hit_test(self, point: QPointF) -> bool:
-        center = self.character_center()
-        half = _IMAGE_SIZE * 0.48
-        return (
-            abs(point.x() - center.x()) <= half
-            and abs(point.y() - center.y()) <= half
-        )
+        inverse, invertible = self._image_transform().inverted()
+        if not invertible:
+            return False
+        return self.image_rect.contains(inverse.map(point))
 
     def base_hit_test(self, point: QPointF) -> bool:
         return self.base_rect().contains(point)
 
     def move_spring(self, dx: float, dy: float) -> None:
-        self.state.r = max(-self.max_rotation, min(self.max_rotation, dx * self.state.s))
-        self.state.y = max(self.min_y, min(self.max_y, dy * self.state.s * 2.0))
-        self.state.w = 0.0
-        self.state.t = 0.0
+        move_spring(
+            self.state,
+            dx,
+            dy,
+            max_rotation=self.max_rotation,
+            max_y=self.max_y,
+            min_y=self.min_y,
+        )
         self.update()
 
     @staticmethod
@@ -143,8 +141,6 @@ class _SakanaToyWidget(QWidget):
 
     @staticmethod
     def _draw_github_icon(painter: QPainter, center: QPointF) -> None:
-        # A compact cat-head silhouette keeps the same visual rhythm as the
-        # original GitHub control without introducing another SVG dependency.
         painter.save()
         painter.setBrush(QColor("#555555"))
         painter.setPen(Qt.PenStyle.NoPen)
@@ -166,10 +162,6 @@ class _SakanaToyWidget(QWidget):
 
     def _draw_base(self, painter: QPainter) -> None:
         rect = self.base_rect()
-
-        # Sakana Widget uses #ddd with a soft 0 8px 24px shadow. A pair of
-        # translucent rounded rectangles gives the same lightweight floating base
-        # without a separate graphics-effect object or extra child windows.
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(0, 0, 0, 18))
         painter.drawRoundedRect(rect.translated(0.0, 5.0), _BASE_RADIUS, _BASE_RADIUS)
@@ -208,22 +200,18 @@ class _SakanaToyWidget(QWidget):
         offset = self._center_offset()
         end = QPointF(anchor.x() + offset.x(), anchor.y() - offset.y())
 
+        # Upstream default stroke is #b4b4b4, width 10, round caps.
         pen = QPen(QColor("#b4b4b4"))
-        pen.setWidthF(8.0)
+        pen.setWidthF(10.0)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
         painter.drawLine(QPointF(anchor.x(), anchor.y() - 10.0), end)
 
         painter.save()
-        painter.translate(anchor)
-        painter.rotate(self.state.r)
-        painter.translate(self.state.r, self.state.y)
-        target = QRectF(-_IMAGE_SIZE / 2.0, -_TOY_SIZE, _IMAGE_SIZE, _IMAGE_SIZE)
-        painter.drawPixmap(target, self.pixmap, QRectF(self.pixmap.rect()))
+        painter.setTransform(self._image_transform(), combine=False)
+        painter.drawPixmap(self.image_rect, self.pixmap, QRectF(self.pixmap.rect()))
         painter.restore()
 
-        # The original Sakana control bar is the physical-looking base under the
-        # spring. It also replaces the old standalone grab dot as the move handle.
         self._draw_base(painter)
         painter.end()
 
@@ -245,6 +233,8 @@ class SakanaToyController(QObject):
         self._last_tick = time.monotonic()
         self._running = True
 
+        # requestAnimationFrame on the source site is one spring step per display
+        # frame. A precise 16 ms Qt timer provides that same single-owner cadence.
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.setInterval(16)
@@ -314,6 +304,9 @@ class SakanaToyController(QObject):
             self._position_press_top_left = self.toy.pos()
             self._user_positioned = True
         elif self.toy.character_hit_test(local):
+            # Match Sakana `_onMouseDown`: stop RAF, remember only the press Y,
+            # and zero both velocities. The horizontal drag remains relative to
+            # the widget center rather than the click point.
             self._interaction = "spring"
             self._spring_press_y = event.globalPosition().y()
             self._running = False
@@ -335,9 +328,9 @@ class SakanaToyController(QObject):
             target = self._position_press_top_left + QPoint(round(delta.x()), round(delta.y()))
             self.toy.move(self._clamp_position(target))
         else:
-            center_global = self.toy.mapToGlobal(self.toy.rect().center()).x()
+            center_global_x = self.toy.mapToGlobal(self.toy.rect().center()).x()
             self.toy.move_spring(
-                event.globalPosition().x() - center_global,
+                event.globalPosition().x() - center_global_x,
                 event.globalPosition().y() - self._spring_press_y,
             )
         event.accept()
@@ -351,8 +344,10 @@ class SakanaToyController(QObject):
         if QWidget.mouseGrabber() is self.window:
             self.window.releaseMouse()
         if spring and self.toy.isVisible():
+            # The website does NOT reset `_lastRunUnix` on mouseup. Keeping the
+            # previous tick makes the first released frame use full inertia after
+            # a normal drag, exactly like requestAnimationFrame(this._run).
             self._running = True
-            self._last_tick = time.monotonic()
             self._timer.start()
         if event is not None:
             event.accept()
@@ -363,32 +358,18 @@ class SakanaToyController(QObject):
             self._timer.stop()
             return
 
-        state = self.toy.state
         now = time.monotonic()
-        elapsed = max(0.0, now - self._last_tick)
+        elapsed_ms = max(0.0, (now - self._last_tick) * 1000.0)
         self._last_tick = now
-        step = state.i
-        if elapsed < _FRAME_SECONDS:
-            step = state.i / _FRAME_SECONDS * elapsed
 
-        previous = (state.w, state.r, state.t, state.y)
-        w = state.w - 2.0 * state.r - state.t
-        state.r += w * step * 1.2
-        state.w = w * state.d
-        t = state.t - 2.0 * state.y
-        state.y += t * step * 2.0
-        state.t = t * state.d
-
-        delta = max(
-            abs(previous[0] - state.w),
-            abs(previous[1] - state.r),
-            abs(previous[2] - state.t),
-            abs(previous[3] - state.y),
-        )
-        self.toy.update()
-        if delta < 0.1:
+        if not advance_spring(self.toy.state, elapsed_ms):
+            # Upstream stops before `_draw()` when all four state values are below
+            # threshold, so do not force one extra final repaint here.
             self._running = False
             self._timer.stop()
+            return
+
+        self.toy.update()
 
     def set_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
