@@ -19,6 +19,7 @@ _PARTICLE_DURATION_MS = (900, 1500)
 _RING_DURATION_MS = (1200, 1800)
 _RING_ALPHA_DURATION_MS = (600, 800)
 _EFFECT_PAD = 126
+_FALLBACK_DUPLICATE_WINDOW_S = 0.035
 _DARK_PARTICLE_COLORS = (
     (252, 146, 174),
     (202, 180, 190),
@@ -144,6 +145,7 @@ class ClickFireworksLayer(QWidget):
             )
         )
         self._paint_time_s = now_s
+        self.show()
         self.raise_()
         self.update(_effect_rect(center))
         return True
@@ -226,7 +228,7 @@ class ClickFireworksLayer(QWidget):
 
 
 class ClickFireworks(QObject):
-    """Application-wide click trigger with an animation timer active only in flight."""
+    """Application-wide physical-click trigger with one burst per mouse press."""
 
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
@@ -236,6 +238,8 @@ class ClickFireworks(QObject):
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.setInterval(_FRAME_MS)
         self.timer.timeout.connect(self._tick)
+        self._last_press_identity: tuple[int, int, int, int] | None = None
+        self._last_press_seen_s = 0.0
         app = QApplication.instance()
         if app is None:
             raise RuntimeError("Click fireworks require an active QApplication")
@@ -252,6 +256,36 @@ class ClickFireworks(QObject):
             current = current.parentWidget()
         return False
 
+    def _is_duplicate_press(self, event: QMouseEvent, *, now_s: float) -> bool:
+        """Collapse Qt parent propagation without throttling genuine rapid clicks.
+
+        One physical mouse press can be delivered to a child and then propagated
+        through several QWidget ancestors when handlers ignore it. QApplication
+        event filters observe every delivery, so triggering directly from each one
+        produces several overlapping bursts. QInputEvent.timestamp() stays stable
+        across that propagation chain and gives us the physical-event identity.
+        """
+
+        global_pos = event.globalPosition().toPoint()
+        timestamp = int(event.timestamp())
+        button = int(event.button().value)
+        identity = (timestamp, button, int(global_pos.x()), int(global_pos.y()))
+
+        if timestamp > 0:
+            duplicate = identity == self._last_press_identity
+        else:
+            previous = self._last_press_identity
+            duplicate = bool(
+                previous is not None
+                and previous[1:] == identity[1:]
+                and now_s - self._last_press_seen_s <= _FALLBACK_DUPLICATE_WINDOW_S
+            )
+
+        if not duplicate:
+            self._last_press_identity = identity
+            self._last_press_seen_s = now_s
+        return duplicate
+
     def _tick(self) -> None:
         try:
             active = self.layer.advance(time.perf_counter())
@@ -260,8 +294,7 @@ class ClickFireworks(QObject):
         if not active:
             self.timer.stop()
 
-    def _trigger(self, global_pos: QPoint) -> None:
-        now_s = time.perf_counter()
+    def _trigger(self, global_pos: QPoint, *, now_s: float) -> None:
         if self.layer.spawn(global_pos, now_s=now_s) and not self.timer.isActive():
             self.timer.start()
 
@@ -272,13 +305,21 @@ class ClickFireworks(QObject):
             if watched is self.window or watched is central:
                 QTimer.singleShot(0, self.layer.sync_geometry)
             return False
-        if event_type != QEvent.Type.MouseButtonPress:
+
+        if event_type not in {
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonDblClick,
+        }:
             return False
         if not isinstance(watched, QWidget) or not self._belongs_to_window(watched):
             return False
         if not isinstance(event, QMouseEvent):
             return False
-        self._trigger(event.globalPosition().toPoint())
+
+        now_s = time.perf_counter()
+        if self._is_duplicate_press(event, now_s=now_s):
+            return False
+        self._trigger(event.globalPosition().toPoint(), now_s=now_s)
         return False
 
     def cleanup(self) -> None:
