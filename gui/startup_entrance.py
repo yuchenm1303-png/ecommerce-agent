@@ -149,7 +149,6 @@ class StartupEntranceController(QObject):
         self.overlay = _StartupEntranceOverlay(window, visual)
         self._started = False
         self._finished = False
-        self._card_fx_was_suspended = False
         self._hidden_effects: QWidget | None = None
 
         window.installEventFilter(self)
@@ -173,12 +172,10 @@ class StartupEntranceController(QObject):
                 pass
 
         card_fx = getattr(self.window, "_nekro_card_fx", None)
-        suspend_cards = getattr(card_fx, "suspend_for_modal", None)
+        suspend_cards = getattr(card_fx, "suspend_for_startup", None)
         if callable(suspend_cards):
             try:
-                self._card_fx_was_suspended = bool(getattr(card_fx, "_suspended", False))
-                if not self._card_fx_was_suspended:
-                    suspend_cards()
+                suspend_cards()
             except RuntimeError:
                 pass
 
@@ -209,8 +206,8 @@ class StartupEntranceController(QObject):
             self._hidden_effects = None
 
         card_fx = getattr(self.window, "_nekro_card_fx", None)
-        resume_cards = getattr(card_fx, "resume_from_modal", None)
-        if callable(resume_cards) and not self._card_fx_was_suspended:
+        resume_cards = getattr(card_fx, "resume_from_startup", None)
+        if callable(resume_cards):
             try:
                 resume_cards()
             except RuntimeError:
