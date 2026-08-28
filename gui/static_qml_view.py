@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QTimer, QUrl
+from PySide6.QtCore import QEvent, QObject, QPointF, QTimer, Qt, QUrl
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtQml import QQmlComponent
 from PySide6.QtQuick import QQuickItem, QQuickWindow
