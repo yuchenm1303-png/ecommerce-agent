@@ -145,10 +145,18 @@ def _focus_native_child(overlay_hwnd: int) -> bool:
 
     user32 = ctypes.windll.user32
     overlay = ctypes.c_void_p(overlay_hwnd)
-    user32.SetFocus.argtypes = [ctypes.c_void_p]
-    user32.SetFocus.restype = ctypes.c_void_p
     user32.GetFocus.argtypes = []
     user32.GetFocus.restype = ctypes.c_void_p
+
+    # Focus transfer is a one-way owner -> child handoff. Once the native QWidget
+    # child already owns keyboard focus, calling SetFocus again from its own
+    # FocusIn/focusChanged feedback path can continuously enqueue zero-delay Qt
+    # focus work and starve normal timers/repaints while the app is foreground.
+    if int(user32.GetFocus() or 0) == overlay_hwnd:
+        return True
+
+    user32.SetFocus.argtypes = [ctypes.c_void_p]
+    user32.SetFocus.restype = ctypes.c_void_p
     user32.SetFocus(overlay)
     return int(user32.GetFocus() or 0) == overlay_hwnd
 
@@ -270,8 +278,9 @@ class NativeWindowShell(QObject):
         if not self._overlay_presented:
             return
         if self._belongs_to_overlay(current):
+            # Qt already delivered focus into the QWidget tree. Record the logical
+            # target only; never schedule another native SetFocus from this callback.
             self._last_focus_widget = current
-            self._schedule_widget_focus()
 
     def _schedule_widget_focus(self) -> None:
         if (
@@ -316,22 +325,25 @@ class NativeWindowShell(QObject):
                 QEvent.Type.WindowActivate,
                 QEvent.Type.FocusIn,
             }:
+                # The outer Quick window is the only source allowed to request a
+                # native focus transfer. Child FocusIn is a terminal state, not a
+                # trigger for another handoff.
                 self._schedule_widget_focus()
             elif event_type == QEvent.Type.Close and not self._closing:
                 self._closing = True
                 self.overlay.close()
 
         elif watched is self.overlay:
-            if event_type == QEvent.Type.FocusIn:
-                self._schedule_widget_focus()
-            elif event_type == QEvent.Type.Close and not self._closing:
+            if event_type == QEvent.Type.Close and not self._closing:
                 self._closing = True
                 self.owner.close()
 
         elif isinstance(watched, _KEYBOARD_WIDGET_TYPES):
             if event_type == QEvent.Type.MouseButtonPress:
                 self._last_focus_widget = watched
-                self._schedule_widget_focus()
+                # A click inside the native child is already a valid child-side
+                # focus path. Let Qt assign the logical widget focus without
+                # feeding that event back into native owner activation.
 
         return False
 
