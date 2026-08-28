@@ -74,7 +74,10 @@ def test_local_fill_prompt_reads_compact_grounded_text_and_uses_typed_schema():
     assert request["product_identity"] == {"source_product_url": PRODUCT_URL}
     assert request["strict_json_schema"] is True
     properties = request["json_contract"]["properties"]
-    assert set(properties) == {"facts", "model_summary"}
+    # Product Fact contract v4 intentionally returns only grounded facts. A free-form
+    # model_summary was removed so no uncited prose can become a parallel truth source.
+    assert set(properties) == {"facts"}
+    assert request["json_contract"]["required"] == ["facts"]
     rules = "\n".join(request["rules"])
     assert "physical scope" in rules
     assert "CONFLICT" in rules
