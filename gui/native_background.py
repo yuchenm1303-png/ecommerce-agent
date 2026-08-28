@@ -73,7 +73,7 @@ def _blur_wallpaper(source: QImage, radius: float = 10.0) -> QImage:
 
 
 class GlassCardModel(QAbstractListModel):
-    """Card geometry and discrete presentation targets consumed by Quick."""
+    """Card geometry and interaction state consumed directly by the Quick scene."""
 
     _ROLE_BASE = int(Qt.ItemDataRole.UserRole)
     CARD_X_ROLE = _ROLE_BASE + 1
@@ -329,103 +329,118 @@ Window {{
         cache: true
     }}
 
-    // Each glass card owns only a card-sized offscreen texture.  All cards share
-    // the same decoded pre-blurred wallpaper image; there is no full-window live
-    // ShaderEffectSource or full-window MultiEffect in the steady-state path.
+    Item {{
+        id: blurSource
+        anchors.fill: parent
+        clip: true
+        visible: false
+        layer.enabled: true
+        layer.smooth: true
+
+        Image {{
+            width: root.width * {_OVERSCAN}
+            height: root.height * {_OVERSCAN}
+            x: root.imageX
+            y: root.imageY
+            source: root.blurUrl
+            fillMode: Image.PreserveAspectCrop
+            smooth: true
+            cache: true
+        }}
+    }}
+
+    Item {{
+        id: glassMaskScene
+        anchors.fill: parent
+
+        Repeater {{
+            model: glassCardModel
+            delegate: Item {{
+                x: clipX
+                y: clipY
+                width: Math.max(0, clipW)
+                height: Math.max(0, clipH)
+                clip: true
+                visible: cardVisible && width > 0 && height > 0
+
+                Rectangle {{
+                    x: cardX - clipX
+                    y: cardY - clipY
+                    width: cardW
+                    height: cardH
+                    radius: {_GLASS_RADIUS:.1f}
+                    antialiasing: true
+                    color: "white"
+                }}
+            }}
+        }}
+    }}
+
+    ShaderEffectSource {{
+        id: glassMaskTexture
+        anchors.fill: parent
+        sourceItem: glassMaskScene
+        hideSource: true
+        live: false
+        smooth: true
+        visible: false
+    }}
+
+    MultiEffect {{
+        id: glassEffect
+        anchors.fill: parent
+        source: blurSource
+        maskEnabled: true
+        maskSource: glassMaskTexture
+        autoPaddingEnabled: false
+    }}
+
+    ShaderEffectSource {{
+        id: staticGlassTexture
+        anchors.fill: parent
+        sourceItem: glassEffect
+        hideSource: !root.animationRunning
+        live: false
+        smooth: true
+        visible: !root.animationRunning
+    }}
+
+    onBlurUrlChanged: staticGlassTexture.scheduleUpdate()
+    onWidthChanged: staticGlassTexture.scheduleUpdate()
+    onHeightChanged: staticGlassTexture.scheduleUpdate()
+    onAnimationRunningChanged: {{
+        if (!animationRunning)
+            staticGlassTexture.scheduleUpdate()
+    }}
+    onGeometryRevisionChanged: {{
+        glassMaskTexture.scheduleUpdate()
+        staticGlassTexture.scheduleUpdate()
+    }}
+    Component.onCompleted: {{
+        glassMaskTexture.scheduleUpdate()
+        staticGlassTexture.scheduleUpdate()
+    }}
+
     Repeater {{
         model: glassCardModel
         delegate: Item {{
-            id: clipItem
-            x: clipX
-            y: clipY
-            width: Math.max(0, clipW)
-            height: Math.max(0, clipH)
-            clip: true
-            visible: cardVisible && width > 0 && height > 0
+            x: 0
+            y: 0
+            width: root.width
+            height: root.height
+            clip: false
+            visible: cardVisible
 
-            Item {{
-                id: glassCard
-                x: cardX - clipX
-                y: cardY - clipY
+            Rectangle {{
+                x: cardX
+                y: cardY
                 width: cardW
                 height: cardH
                 scale: cardScale
                 transformOrigin: Item.Center
-
-                readonly property real targetOpacity: 0.82 + 0.18 * Math.max(
-                    0.0,
-                    Math.min(1.0, (Math.max(64.0, cardAlpha) - 64.0) / 38.0)
-                )
-
-                Behavior on scale {{
-                    NumberAnimation {{
-                        duration: 300
-                        easing.type: Easing.BezierSpline
-                        easing.bezierCurve: [0.25, 0.10, 0.25, 1.00, 1.00, 1.00]
-                    }}
-                }}
-
-                Item {{
-                    id: blurSliceSource
-                    anchors.fill: parent
-                    clip: true
-                    visible: false
-                    layer.enabled: true
-                    layer.smooth: true
-
-                    Image {{
-                        width: root.width * {_OVERSCAN}
-                        height: root.height * {_OVERSCAN}
-                        x: root.imageX - cardX
-                        y: root.imageY - cardY
-                        source: root.blurUrl
-                        fillMode: Image.PreserveAspectCrop
-                        smooth: true
-                        cache: true
-                    }}
-                }}
-
-                Rectangle {{
-                    id: glassMaskShape
-                    anchors.fill: parent
-                    radius: {_GLASS_RADIUS:.1f}
-                    antialiasing: true
-                    color: "white"
-                    visible: false
-                }}
-
-                ShaderEffectSource {{
-                    id: glassMaskTexture
-                    anchors.fill: parent
-                    sourceItem: glassMaskShape
-                    hideSource: true
-                    live: false
-                    smooth: true
-                    visible: false
-                    onWidthChanged: scheduleUpdate()
-                    onHeightChanged: scheduleUpdate()
-                    Component.onCompleted: scheduleUpdate()
-                }}
-
-                MultiEffect {{
-                    id: glassEffect
-                    anchors.fill: parent
-                    source: blurSliceSource
-                    maskEnabled: true
-                    maskSource: glassMaskTexture
-                    autoPaddingEnabled: false
-                    colorization: 142 / 255.0
-                    colorizationColor: "#56354E"
-                    opacity: glassCard.targetOpacity
-
-                    Behavior on opacity {{
-                        NumberAnimation {{
-                            duration: 300
-                            easing.type: Easing.BezierSpline
-                            easing.bezierCurve: [0.25, 0.10, 0.25, 1.00, 1.00, 1.00]
-                        }}
-                    }}
-                }}
+                radius: {_GLASS_RADIUS:.1f}
+                antialiasing: true
+                color: Qt.rgba(1, 157 / 255.0, 202 / 255.0, cardAlpha / 255.0)
             }}
         }}
     }}
@@ -450,7 +465,7 @@ Window {{
 
 
 class NativeQuickBackground(QObject):
-    """Quick-owned wallpaper, per-card GPU glass and pointer parallax."""
+    """Quick-owned wallpaper, GPU glass texture mask and parallax presentation."""
 
     def __init__(self, overlay: QMainWindow) -> None:
         super().__init__(overlay)
@@ -540,8 +555,6 @@ class NativeQuickBackground(QObject):
         self.card_model.set_alpha(frame, alpha)
 
     def set_card_presentation(self, frame: QFrame, *, scale: float, alpha: float) -> None:
-        # Python publishes only the discrete interaction target.  The 300 ms
-        # interpolation itself stays entirely in the Quick scene graph.
         self.card_model.set_presentation(frame, scale=scale, alpha=alpha)
 
     def reset_pointer_identity(self) -> None:

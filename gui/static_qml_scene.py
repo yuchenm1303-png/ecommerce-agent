@@ -554,9 +554,23 @@ Item {
                 }
             }
 
-            // The glass body is rendered only once by native_background.py.
-            // This item carries content and interaction; it does not draw a
-            // second color/tint rectangle over the glass.
+            // Keep the known-smooth architecture: native_background.py owns the
+            // cached blur, while this card owns only its tone, content and GPU
+            // transform. No outer clip item or per-card effect pipeline exists.
+            Rectangle {
+                anchors.fill: parent
+                radius: 6
+                color: "#56354E"
+                opacity: (cardHover.hovered || cardPress.pressed) ? 102/255 : 64/255
+                Behavior on opacity {
+                    NumberAnimation {
+                        duration: 300
+                        easing.type: Easing.BezierSpline
+                        easing.bezierCurve: [0.25, 0.10, 0.25, 1.00, 1.00, 1.00]
+                    }
+                }
+            }
+
             Repeater {
                 model: card.cardControls
                 delegate: Loader {
@@ -568,18 +582,8 @@ Item {
                 }
             }
 
-            HoverHandler {
-                id: cardHover
-                acceptedDevices: PointerDevice.Mouse
-                onHoveredChanged: staticBridge.setCardInteraction(card.index, hovered, cardPress.pressed)
-            }
-            TapHandler {
-                id: cardPress
-                target: null
-                acceptedButtons: Qt.LeftButton
-                onPressedChanged: staticBridge.setCardInteraction(card.index, cardHover.hovered, pressed)
-            }
-            Component.onDestruction: staticBridge.resetCardInteractions()
+            HoverHandler { id: cardHover; acceptedDevices: PointerDevice.Mouse }
+            TapHandler { id: cardPress; target: null; acceptedButtons: Qt.LeftButton }
         }
     }
 
