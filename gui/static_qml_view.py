@@ -167,6 +167,7 @@ class StaticActivityPresenceMirror(QObject):
         candidate = getattr(controller, "widget", None)
         self.widget = candidate if isinstance(candidate, ActivityPresence) else None
         self._card_frame = self._find_card_frame()
+        self._card_item: QQuickItem | None = None
 
         self._x = 0
         self._y = 0
@@ -225,6 +226,15 @@ class StaticActivityPresenceMirror(QObject):
         return items
 
     def _quick_card_item(self) -> QQuickItem | None:
+        cached = self._card_item
+        if cached is not None:
+            try:
+                if cached.parentItem() is not None:
+                    return cached
+            except RuntimeError:
+                pass
+            self._card_item = None
+
         host = self._host_item
         frame = self._card_frame
         if host is None or frame is None:
@@ -254,6 +264,7 @@ class StaticActivityPresenceMirror(QObject):
             except (RuntimeError, TypeError, ValueError):
                 continue
             if all(abs(actual[index] - expected[index]) <= 0.5 for index in range(4)):
+                self._card_item = item
                 return item
         return None
 
@@ -271,7 +282,7 @@ class StaticActivityPresenceMirror(QObject):
                     item.setParentItem(card_item)
                 return frame
             except RuntimeError:
-                pass
+                self._card_item = None
 
         try:
             if item.parentItem() is not host:
@@ -339,6 +350,9 @@ class StaticActivityPresenceMirror(QObject):
             pass
 
     def _bind_runtime_sources(self) -> None:
+        # Raw subprocess log lines must not wake presentation.  Detailed progress
+        # converts meaningful log milestones into progress/phase state, and the
+        # bridge sceneChanged hook below catches concrete QWidget checkpoint changes.
         for source_name in ("runner", "execution_runner"):
             source = getattr(self.window, source_name, None)
             for signal_name in (
@@ -346,7 +360,6 @@ class StaticActivityPresenceMirror(QObject):
                 "result_updated",
                 "running_changed",
                 "phase_event",
-                "log",
                 "completed",
                 "failed",
             ):
@@ -354,6 +367,7 @@ class StaticActivityPresenceMirror(QObject):
 
     def attach(self, host_item: QQuickItem) -> None:
         self._host_item = host_item
+        self._card_item = None
         if self.widget is None or self._item is not None:
             return
         if self._component is None:
@@ -415,7 +429,7 @@ class StaticActivityPresenceMirror(QObject):
                 source_visible,
                 str(widget.mode or "STANDBY").upper(),
                 str(widget.detail or "等待任务"),
-                str(widget.meta or "总进度 · 0%"),
+                str(widget.meta or "总进度 · 等待商品任务"),
                 max(0, min(100, int(round(float(widget.target_percent))))),
                 bool(widget.active),
             )
@@ -464,6 +478,7 @@ class StaticActivityPresenceMirror(QObject):
 
     def cleanup(self) -> None:
         self._refresh_timer.stop()
+        self._card_item = None
         widget = self.widget
         self.widget = None
         if widget is not None:
@@ -549,7 +564,6 @@ class StaticQmlViewController(QObject):
 
     @property
     def static_active(self) -> bool:
-        # Retain the established property name for workspace-transition callers.
         return self._quick_active
 
     def _ensure_scene_loaded(self) -> None:
@@ -636,9 +650,6 @@ class StaticQmlViewController(QObject):
         return tuple(frame for frame in glass if isinstance(frame, QFrame))
 
     def _set_native_glass_overlay_alpha(self, alpha: float) -> None:
-        # native_background stays the only blur renderer. The Quick UI owns the
-        # original black 64/102 overlay, so the background's duplicate overlay is
-        # suppressed for the entire lifetime of the unified Quick presentation.
         for frame in self._all_glass_frames():
             try:
                 self.background.set_card_presentation(frame, scale=1.0, alpha=float(alpha))
@@ -743,9 +754,6 @@ class StaticQmlViewController(QObject):
             self._ensure_scene_loaded()
             return
 
-        # Snapshot the still-live QWidget business host before hiding its native
-        # child. From this point onward only the Quick scene is visible, regardless
-        # of whether wallpaper drift is enabled or disabled.
         self.bridge.refresh()
         self.activity_presence.refresh()
         self._suspend_legacy_visuals()
@@ -791,7 +799,6 @@ class StaticQmlViewController(QObject):
             self._fail_scene(str(exc))
 
     def _activate_after_startup(self) -> None:
-        # Drift state no longer selects a renderer. Quick always owns presentation.
         self._activate_quick()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
