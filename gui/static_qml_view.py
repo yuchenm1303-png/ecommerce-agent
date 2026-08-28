@@ -3,12 +3,14 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from PySide6.QtCore import QObject, QTimer, QUrl
+from PySide6.QtCore import QEvent, QObject, QPointF, QTimer, QUrl
+from PySide6.QtGui import QMouseEvent
 from PySide6.QtQml import QQmlComponent
 from PySide6.QtQuick import QQuickItem, QQuickWindow
 from PySide6.QtWidgets import QMainWindow
 
 from .static_qml_bridge import StaticCardModel, StaticQmlBridge
+from .static_qml_fireworks import StaticQuickFireworks
 from .static_qml_scene import STATIC_QML_SOURCE
 
 
@@ -29,6 +31,7 @@ class StaticQmlViewController(QObject):
         self.clock = getattr(window, "_presentation_clock", None)
         self.toggle = getattr(window, "_background_drift_switch", None)
         self.shell = getattr(window, "_native_window_shell", None)
+        self.legacy_fireworks = getattr(window, "_click_fireworks", None)
 
         self._static_active = False
         self._static_requested = False
@@ -53,11 +56,17 @@ class StaticQmlViewController(QObject):
         context.setContextProperty("staticBridge", self.bridge)
         context.setContextProperty("staticCardModel", self.card_model)
 
+        self.fireworks = StaticQuickFireworks()
+        self.fireworks.setParent(self)
+        self.fireworks.setParentItem(self.quick.contentItem())
+        self.fireworks.setZ(30000.0)
+
         self._switch_timer = QTimer(self)
         self._switch_timer.setSingleShot(True)
         self._switch_timer.setInterval(_SWITCH_TRANSITION_MS)
         self._switch_timer.timeout.connect(self._commit_drift_view_switch)
 
+        self.quick.installEventFilter(self)
         self.quick.widthChanged.connect(self._fit_and_refresh)
         self.quick.heightChanged.connect(self._fit_and_refresh)
         if self.toggle is not None:
@@ -67,6 +76,7 @@ class StaticQmlViewController(QObject):
         if handoff_ready is None or not hasattr(handoff_ready, "connect"):
             raise RuntimeError("static QML view requires explicit startup handoff signal")
         handoff_ready.connect(self._activate_after_startup)
+        window.destroyed.connect(self._cleanup)
 
     @property
     def static_active(self) -> bool:
@@ -148,14 +158,21 @@ class StaticQmlViewController(QObject):
             self._enter_static()
 
     def _set_native_glass_overlay_alpha(self, alpha: float) -> None:
-        # native_background remains the only blur renderer.  Static QML draws only
-        # the same black 64/102 overlay so we suppress the legacy black rectangle,
-        # not the original blur mask itself.
+        # native_background remains the only blur renderer. Static QML draws only
+        # the same black 64/102 overlay, so suppress the old overlay but not blur.
         for frame in tuple(getattr(self.bridge, "_card_frames", ())):
             try:
                 self.background.set_card_presentation(frame, scale=1.0, alpha=float(alpha))
             except RuntimeError:
                 continue
+
+    def _set_legacy_fireworks_enabled(self, enabled: bool) -> None:
+        setter = getattr(self.legacy_fireworks, "set_enabled", None)
+        if callable(setter):
+            try:
+                setter(bool(enabled))
+            except RuntimeError:
+                pass
 
     def _fail_scene(self, reason: str) -> None:
         if self._load_failed:
@@ -165,7 +182,9 @@ class StaticQmlViewController(QObject):
         self._switch_timer.stop()
         self._pending_drift = None
         self.bridge.set_active(False)
+        self.fireworks.clear()
         self._set_native_glass_overlay_alpha(64.0)
+        self._set_legacy_fireworks_enabled(True)
         try:
             self.shell.set_overlay_presented(True)
         except RuntimeError:
@@ -179,12 +198,18 @@ class StaticQmlViewController(QObject):
         )
 
     def _fit(self) -> None:
+        width = float(max(1, self.quick.width()))
+        height = float(max(1, self.quick.height()))
         item = self.item
-        if item is None:
-            return
+        if item is not None:
+            try:
+                item.setWidth(width)
+                item.setHeight(height)
+            except RuntimeError:
+                pass
         try:
-            item.setWidth(float(max(1, self.quick.width())))
-            item.setHeight(float(max(1, self.quick.height())))
+            self.fireworks.setWidth(width)
+            self.fireworks.setHeight(height)
         except RuntimeError:
             pass
 
@@ -218,6 +243,7 @@ class StaticQmlViewController(QObject):
 
         self.bridge.refresh()
         self._suspend_legacy()
+        self._set_legacy_fireworks_enabled(False)
         self._fit()
         self._set_native_glass_overlay_alpha(0.0)
         self.bridge.set_active(True)
@@ -263,10 +289,12 @@ class StaticQmlViewController(QObject):
         self._static_requested = False
         self._disconnect_handoff()
         if not self._static_active:
+            self._set_legacy_fireworks_enabled(True)
             self._resume_legacy()
             return
 
         self._static_active = False
+        self.fireworks.clear()
         self._set_native_glass_overlay_alpha(64.0)
         try:
             self.shell.set_overlay_presented(True)
@@ -278,6 +306,7 @@ class StaticQmlViewController(QObject):
                 self.item.setVisible(False)
             except RuntimeError:
                 pass
+        self._set_legacy_fireworks_enabled(True)
         schedule = getattr(self.background, "schedule_mask_update", None)
         if callable(schedule):
             schedule()
@@ -302,6 +331,31 @@ class StaticQmlViewController(QObject):
             self._leave_static()
         else:
             self._enter_static()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if watched is not self.quick or not self._static_active:
+            return False
+        if event.type() not in {
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonDblClick,
+        }:
+            return False
+        if not isinstance(event, QMouseEvent) or event.button() != Qt.MouseButton.LeftButton:
+            return False
+        try:
+            self.fireworks.spawn(QPointF(event.position()))
+        except RuntimeError:
+            pass
+        return False
+
+    def _cleanup(self) -> None:
+        self._switch_timer.stop()
+        self._disconnect_handoff()
+        self.fireworks.clear()
+        try:
+            self.quick.removeEventFilter(self)
+        except RuntimeError:
+            pass
 
 
 def install_static_qml_view(
