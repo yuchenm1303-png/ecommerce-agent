@@ -37,14 +37,15 @@ def _activate_layout_tree(widget: QWidget) -> bool:
 
 
 class WorkspaceLayoutCommitter(QObject):
-    """Own final geometry for both persistent Single/Batch pages.
+    """Own the finite QWidget -> Quick workspace geometry handoff.
 
-    QWidget remains the business/layout source of truth while the unified QQuickWindow
-    owns presentation. A layout transaction therefore has one explicit publication
-    boundary: after modeStack has finished its Resize/Show/LayoutRequest work, this
-    owner settles the persistent page tree and asks the Quick mirror to consume that
-    committed geometry. Quick never needs per-widget geometry event filters and it
-    never depends on pointer input to discover a newer layout.
+    QWidget remains the layout source of truth and QQuickWindow remains the only
+    normal presentation owner. A current-page commit is synchronous so a mode switch
+    cannot expose stale geometry. A top-level Show/Resize gets exactly one deferred
+    settlement pass after Qt has consumed the native size change. LayoutRequest is
+    deliberately not observed: activating layouts can itself generate LayoutRequest,
+    so using that event as a trigger creates a zero-delay self-rearming loop that can
+    starve the startup/Quick first-frame timers.
     """
 
     def __init__(self, window: QMainWindow) -> None:
@@ -58,13 +59,15 @@ class WorkspaceLayoutCommitter(QObject):
         self._settle_timer = QTimer(self)
         self._settle_timer.setSingleShot(True)
         self._settle_timer.setInterval(0)
-        self._settle_timer.timeout.connect(self._settle_stack_layout)
+        self._settle_timer.timeout.connect(self._settle_current_page)
 
         self.stack.installEventFilter(self)
         self.stack.currentChanged.connect(self.commit_current)
         window.destroyed.connect(self.cleanup)
-        self.prime_all()
-        self.commit_current()
+
+        # Prime only the page that can actually be presented. Hidden pages are
+        # committed on demand by workspace_transition before they become current.
+        self.prepare_page(int(self.stack.currentIndex()))
 
     def _commit_batch_responsive(self) -> None:
         workspace = getattr(self.window, "batch_workspace", None)
@@ -130,44 +133,34 @@ class WorkspaceLayoutCommitter(QObject):
             self._committing = False
         self._publish_committed_geometry()
 
-    def prime_all(self) -> None:
-        if self._committing:
-            return
-        self._committing = True
-        try:
-            for index in range(self.stack.count()):
-                self._commit_page(index)
-        finally:
-            self._committing = False
-        self._publish_committed_geometry()
-
     def commit_current(self, _index: int | None = None) -> None:
-        self.prepare_page(int(self.stack.currentIndex()))
+        """Commit the newly current page now, then allow one final event-loop settle."""
 
-    def _schedule_stack_settle(self) -> None:
+        self.prepare_page(int(self.stack.currentIndex()))
+        self._schedule_current_settle()
+
+    def _schedule_current_settle(self) -> None:
         if self._committing or self._settle_timer.isActive():
             return
         self._settle_timer.start()
 
-    def _settle_stack_layout(self) -> None:
-        """Commit after Qt has finished the current top-level layout transaction."""
+    def _settle_current_page(self) -> None:
+        """Run one terminal pass after the current native size/layout transaction."""
 
         if self._committing:
-            self._schedule_stack_settle()
             return
-        self.prime_all()
-        self.commit_current()
+        self.prepare_page(int(self.stack.currentIndex()))
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if watched is self.stack and event.type() in {
             QEvent.Type.Resize,
             QEvent.Type.Show,
-            QEvent.Type.LayoutRequest,
         }:
-            # Resize/Show can arrive before nested QLayouts have consumed their new
-            # rect. Publish only from the coalesced zero-delay settlement boundary,
-            # never from arbitrary child widget events.
-            self._schedule_stack_settle()
+            # These are external/native geometry boundaries. They may occur several
+            # times while maximization settles, but the single-shot timer coalesces
+            # them. Never subscribe to LayoutRequest here: our own layout activation
+            # can generate it and recursively re-arm the zero-delay timer.
+            self._schedule_current_settle()
         return False
 
     def cleanup(self) -> None:
