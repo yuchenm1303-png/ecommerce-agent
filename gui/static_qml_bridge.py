@@ -11,7 +11,6 @@ from PySide6.QtCore import (
     Property,
     QTimer,
     Qt,
-    QUrl,
     Signal,
     Slot,
 )
@@ -45,6 +44,7 @@ _ATOMIC_TYPES = (
     QTableWidget,
     QAbstractButton,
 )
+_REFRESH_FRAME_MS = 16
 
 
 def _qml_color(color: QColor, fallback: str = "#ffffffff") -> str:
@@ -54,6 +54,8 @@ def _qml_color(color: QColor, fallback: str = "#ffffffff") -> str:
 
 
 class StaticCardModel(QAbstractListModel):
+    """Stable card model that updates roles without resetting steady-state delegates."""
+
     _BASE = int(Qt.ItemDataRole.UserRole)
     X = _BASE + 1
     Y = _BASE + 2
@@ -90,20 +92,65 @@ class StaticCardModel(QAbstractListModel):
         self,
         index: QModelIndex,
         role: int = int(Qt.ItemDataRole.DisplayRole),
-    ):  # noqa: ANN201
+    ):
         if not index.isValid() or not 0 <= index.row() < len(self._rows):
             return None
         key = self._KEYS.get(role)
         return self._rows[index.row()].get(key) if key is not None else None
 
-    def replace(self, rows: list[dict[str, Any]]) -> None:
-        self.beginResetModel()
-        self._rows = rows
-        self.endResetModel()
+    @staticmethod
+    def _topology_key(row: dict[str, Any]) -> object:
+        return row.get("_sourceKey")
+
+    def replace(self, rows: list[dict[str, Any]]) -> bool:
+        """Reconcile a settled scene without destroying unchanged QML delegates.
+
+        A model reset is reserved for actual card topology changes (mode switch,
+        cards added/removed/reordered). During ordinary progress/text/button updates
+        the stable delegates remain alive and receive only the roles that changed.
+        """
+
+        same_topology = (
+            len(rows) == len(self._rows)
+            and all(
+                self._topology_key(old) == self._topology_key(new)
+                and self._topology_key(new) is not None
+                for old, new in zip(self._rows, rows)
+            )
+        )
+        if not same_topology:
+            if rows == self._rows:
+                return False
+            self.beginResetModel()
+            self._rows = rows
+            self.endResetModel()
+            return True
+
+        changed = False
+        for row_index, (old, new) in enumerate(zip(self._rows, rows)):
+            roles = [
+                role
+                for role, key in self._KEYS.items()
+                if old.get(key) != new.get(key)
+            ]
+            self._rows[row_index] = new
+            if not roles:
+                continue
+            index = self.index(row_index, 0)
+            self.dataChanged.emit(index, index, roles)
+            changed = True
+        return changed
 
 
 class StaticQmlBridge(QObject):
-    """Expose the existing QWidget UI as data; never invent presentation tokens."""
+    """Expose QWidget business state to one persistent Quick presentation tree.
+
+    QWidget remains the compatibility/business host, but steady presentation updates
+    never rediscover its hierarchy and never reset the complete QML card model. The
+    widget-to-card ownership graph is cached until actual UI topology changes; a
+    16 ms frame gate coalesces state bursts into at most one mirror generation per
+    display frame.
+    """
 
     activeChanged = Signal()
     sceneChanged = Signal()
@@ -129,10 +176,16 @@ class StaticQmlBridge(QObject):
         self._runtime_sources_bound = False
         self._local_input_commit_ids: set[int] = set()
 
+        self._structure_dirty = True
+        self._cached_frames: list[QFrame] = []
+        self._cached_controls: dict[int, tuple[QWidget, ...]] = {}
+        self._cached_atomic_blocked: set[int] = set()
+        self._batch_job_ids: tuple[str, ...] | None = None
+
         self._sakura_url = "data:image/png;base64," + _SAKURA_PNG_B64
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
-        self._refresh_timer.setInterval(0)
+        self._refresh_timer.setInterval(_REFRESH_FRAME_MS)
         self._refresh_timer.timeout.connect(self.refresh)
 
     def _get_active(self) -> bool:
@@ -164,7 +217,7 @@ class StaticQmlBridge(QObject):
             return
         self._runtime_sources_bound = True
         self._connect_state_sources()
-        self._connect_widget_sources()
+        self._rebuild_structure_cache()
 
     @staticmethod
     def _layout_visible(widget: QWidget, window: QMainWindow) -> bool:
@@ -237,8 +290,9 @@ class StaticQmlBridge(QObject):
             return None
         return None
 
-    @staticmethod
-    def _has_atomic_ancestor(widget: QWidget, stop: QWidget) -> bool:
+    def _has_atomic_ancestor(self, widget: QWidget, stop: QWidget) -> bool:
+        if id(widget) in self._cached_atomic_blocked:
+            return True
         try:
             current = widget.parentWidget()
             while current is not None and current is not stop:
@@ -255,14 +309,6 @@ class StaticQmlBridge(QObject):
         return key
 
     def _scroll_clip_data(self, widget: QWidget, origin: QWidget) -> dict[str, Any] | None:
-        """Return the intersection of every ancestor scroll viewport in origin space.
-
-        QWidget automatically clips descendants to QAbstractScrollArea.viewport().
-        The Quick mirror must carry that same presentation boundary explicitly;
-        otherwise flattened Job-card controls can paint through the queue viewport
-        into the Batch action card below it.
-        """
-
         clip: tuple[int, int, int, int] | None = None
         try:
             current = widget.parentWidget()
@@ -491,10 +537,7 @@ class StaticQmlBridge(QObject):
                 if data is None:
                     return None
                 text = widget.text()
-                if widget.objectName() in {"phaseBadge", "appVersionBadge"}:
-                    kind = "badge"
-                else:
-                    kind = "label"
+                kind = "badge" if widget.objectName() in {"phaseBadge", "appVersionBadge"} else "label"
                 data.update(
                     kind=kind,
                     text=text,
@@ -518,7 +561,10 @@ class StaticQmlBridge(QObject):
                 if data is None:
                     return None
                 try:
-                    fill = _qml_color(widget.palette().color(QPalette.ColorRole.Window), "#00000000")
+                    fill = _qml_color(
+                        widget.palette().color(QPalette.ColorRole.Window),
+                        "#00000000",
+                    )
                 except RuntimeError:
                     fill = "#00000000"
                 data.update(kind="panel", fill=fill)
@@ -527,25 +573,79 @@ class StaticQmlBridge(QObject):
             return None
         return None
 
+    def _rebuild_structure_cache(self) -> None:
+        try:
+            widgets = self.window.findChildren(QWidget)
+        except RuntimeError:
+            widgets = []
+
+        frames_list = self._glass_frames()
+        frames = set(frames_list)
+        controls: dict[int, list[QWidget]] = {id(self.window): []}
+        for frame in frames_list:
+            controls[id(frame)] = []
+
+        atomic_blocked: set[int] = set()
+        for widget in widgets:
+            if isinstance(widget, QFrame) and widget in frames:
+                continue
+            try:
+                current = widget.parentWidget()
+                nearest: QFrame | None = None
+                blocked = False
+                while current is not None and current is not self.window:
+                    if isinstance(current, _ATOMIC_TYPES):
+                        blocked = True
+                        break
+                    if nearest is None and isinstance(current, QFrame) and current in frames:
+                        nearest = current
+                    current = current.parentWidget()
+            except RuntimeError:
+                continue
+            if blocked:
+                atomic_blocked.add(id(widget))
+                continue
+            origin = nearest if nearest is not None else self.window
+            controls.setdefault(id(origin), []).append(widget)
+
+        self._cached_frames = frames_list
+        self._cached_controls = {
+            origin_id: tuple(items)
+            for origin_id, items in controls.items()
+        }
+        self._cached_atomic_blocked = atomic_blocked
+        self._targets.clear()
+        self._structure_dirty = False
+        self._connect_widget_sources(widgets)
+
     def _controls_for(
         self,
         origin: QWidget,
         frames: set[QFrame],
     ) -> list[dict[str, Any]]:
         controls: list[dict[str, Any]] = []
-        try:
-            descendants = origin.findChildren(QWidget)
-        except RuntimeError:
-            return controls
-        for widget in descendants:
-            if isinstance(widget, QFrame) and widget in frames:
-                continue
-            nearest = self._nearest_glass(widget, frames)
-            if isinstance(origin, QFrame):
-                if nearest is not origin:
+        cached = self._cached_controls.get(id(origin))
+        if cached is None:
+            try:
+                descendants = origin.findChildren(QWidget)
+            except RuntimeError:
+                return controls
+            candidates: tuple[QWidget, ...] = tuple(descendants)
+            cached_scope = False
+        else:
+            candidates = cached
+            cached_scope = True
+
+        for widget in candidates:
+            if not cached_scope:
+                if isinstance(widget, QFrame) and widget in frames:
                     continue
-            elif nearest is not None:
-                continue
+                nearest = self._nearest_glass(widget, frames)
+                if isinstance(origin, QFrame):
+                    if nearest is not origin:
+                        continue
+                elif nearest is not None:
+                    continue
             data = self._snapshot_widget(widget, origin)
             if data is not None:
                 controls.append(data)
@@ -564,10 +664,11 @@ class StaticQmlBridge(QObject):
 
     def refresh(self) -> None:
         self._refresh_timer.stop()
-        self._targets.clear()
-        self._connect_widget_sources()
+        structure_changed = self._structure_dirty
+        if self._structure_dirty:
+            self._rebuild_structure_cache()
 
-        frames_list = self._glass_frames()
+        frames_list = list(self._cached_frames)
         frames = set(frames_list)
         rows: list[dict[str, Any]] = []
         row_frames: list[QFrame] = []
@@ -585,6 +686,7 @@ class StaticQmlBridge(QObject):
                 continue
             rows.append(
                 {
+                    "_sourceKey": id(frame),
                     "cardX": int(point.x()),
                     "cardY": int(point.y()),
                     "cardW": width,
@@ -596,15 +698,24 @@ class StaticQmlBridge(QObject):
             )
             row_frames.append(frame)
 
+        root_controls = self._controls_for(self.window, frames)
+        root_changed = root_controls != self._root_controls
+        if root_changed:
+            self._root_controls = root_controls
+
         self._card_frames = row_frames
-        self.card_model.replace(rows)
-        self._root_controls = self._controls_for(self.window, frames)
-        self.sceneChanged.emit()
+        card_changed = self.card_model.replace(rows)
+        if structure_changed or card_changed or root_changed:
+            self.sceneChanged.emit()
 
     def schedule_refresh(self, *_args: object) -> None:
         if not self._active or self._refresh_timer.isActive():
             return
         self._refresh_timer.start()
+
+    def schedule_structure_refresh(self, *_args: object) -> None:
+        self._structure_dirty = True
+        self.schedule_refresh()
 
     def _schedule_input_refresh(self, widget: QWidget) -> None:
         if id(widget) in self._local_input_commit_ids:
@@ -619,6 +730,29 @@ class StaticQmlBridge(QObject):
             signal.connect(callback)
         except (RuntimeError, TypeError):
             pass
+
+    @staticmethod
+    def _job_ids(jobs: object) -> tuple[str, ...] | None:
+        if not isinstance(jobs, (list, tuple)):
+            return None
+        output: list[str] = []
+        for job in jobs:
+            job_id = getattr(job, "job_id", None)
+            if job_id is None:
+                return None
+            output.append(str(job_id))
+        return tuple(output)
+
+    def _on_batch_jobs_changed(self, jobs: object = None, *_args: object) -> None:
+        job_ids = self._job_ids(jobs)
+        if job_ids is None:
+            self.schedule_structure_refresh()
+            return
+        if self._batch_job_ids != job_ids:
+            self._batch_job_ids = job_ids
+            self.schedule_structure_refresh()
+            return
+        self.schedule_refresh()
 
     def _connect_state_sources(self) -> None:
         mode_stack = getattr(self.window, "mode_stack", None)
@@ -636,20 +770,19 @@ class StaticQmlBridge(QObject):
                 self._connect(getattr(source, signal_name, None), self.schedule_refresh)
 
         batch_workspace = getattr(self.window, "batch_workspace", None)
+        current_jobs = getattr(batch_workspace, "_jobs", None)
+        self._batch_job_ids = self._job_ids(current_jobs)
         controller = getattr(batch_workspace, "controller", None)
-        for signal_name in (
-            "jobs_changed",
-            "summary_changed",
-            "running_changed",
-            "state_changed",
-        ):
+        self._connect(getattr(controller, "jobs_changed", None), self._on_batch_jobs_changed)
+        for signal_name in ("summary_changed", "running_changed", "state_changed"):
             self._connect(getattr(controller, signal_name, None), self.schedule_refresh)
 
-    def _connect_widget_sources(self) -> None:
-        try:
-            widgets = self.window.findChildren(QWidget)
-        except RuntimeError:
-            return
+    def _connect_widget_sources(self, widgets: list[QWidget] | None = None) -> None:
+        if widgets is None:
+            try:
+                widgets = self.window.findChildren(QWidget)
+            except RuntimeError:
+                return
         for widget in widgets:
             identity = id(widget)
             if identity in self._connected_widget_ids:
@@ -678,7 +811,10 @@ class StaticQmlBridge(QObject):
                 )
             elif isinstance(widget, QAbstractButton):
                 self._connect(widget.toggled, self.schedule_refresh)
-                self._connect(widget.clicked, self.schedule_refresh)
+                # Click handlers may materialize previously-lazy QWidget detail
+                # controls. Re-scan ownership once after a user click, never on
+                # background progress/log updates.
+                self._connect(widget.clicked, self.schedule_structure_refresh)
             elif isinstance(widget, QProgressBar):
                 self._connect(widget.valueChanged, self.schedule_refresh)
             elif isinstance(widget, QTabWidget):
@@ -694,6 +830,8 @@ class StaticQmlBridge(QObject):
                 for bar in (vertical, horizontal):
                     if bar is None:
                         continue
+                    # SmoothWheelFilter intentionally disconnects these exact
+                    # valueChanged callbacks while Quick owns live scrolling.
                     self._connect(bar.valueChanged, self.schedule_refresh)
                     self._connect(bar.rangeChanged, self.schedule_refresh)
 
