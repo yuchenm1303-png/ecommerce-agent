@@ -2,42 +2,41 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
 from typing import Any
 
 from PySide6.QtCore import (
     QEasingCurve,
     QEvent,
     QObject,
-    QPoint,
     QPointF,
     QRectF,
     Qt,
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPixmap, QRegion
-from PySide6.QtWidgets import QFrame, QMainWindow, QWidget
+from PySide6.QtGui import QColor, QPainter, QPixmap
+from PySide6.QtWidgets import QMainWindow, QWidget
 
-from .native_background import _GLASS_RADIUS, _NORMAL_GLASS_ALPHA, _OVERSCAN
+from .native_background import _OVERSCAN
 
 
 _FRAME_MS = 16
 _CAPTURE_DELAY_MS = 48
-_UI_FADE_MS = 300
+_UI_FADE_MS = 620
 _CURTAIN_DELAY_MS = 0
 _CURTAIN_MS = 500
-_BACKGROUND_DELAY_MS = 150
-_BACKGROUND_MS = 800
-_UI_SCALE_DELAY_MS = 200
-_UI_SCALE_MS = 650
+_BACKGROUND_DELAY_MS = 120
+_BACKGROUND_MS = 760
+_UI_SCALE_DELAY_MS = 0
+_UI_SCALE_MS = 0
 _TOTAL_MS = 1000
 
-_BG_START_SCALE = 1.60
-_UI_START_SCALE = 1.20
-_BG_START_DIM = 0.70
+_BG_START_SCALE = 1.16
+_UI_START_SCALE = 1.0
+_BG_START_DIM = 0.46
 _CURTAIN_FRACTION = 0.51
 _CURTAIN_COLOR = QColor("#333333")
+_LIVE_REVEAL_DELAY_MS = 160
 
 
 def _curve(c1x: float, c1y: float, c2x: float, c2y: float) -> QEasingCurve:
@@ -52,7 +51,7 @@ def _curve(c1x: float, c1y: float, c2x: float, c2y: float) -> QEasingCurve:
 
 _CURTAIN_EASE = _curve(0.645, 0.045, 0.355, 1.0)
 _SOFT_EASE = _curve(0.25, 0.46, 0.45, 0.94)
-_OPACITY_EASE = QEasingCurve(QEasingCurve.Type.InOutQuad)
+_REVEAL_EASE = QEasingCurve(QEasingCurve.Type.OutCubic)
 
 
 def _unit_progress(elapsed_ms: float, delay_ms: float, duration_ms: float) -> float:
@@ -63,23 +62,18 @@ def _unit_progress(elapsed_ms: float, delay_ms: float, duration_ms: float) -> fl
     return max(0.0, min(1.0, (elapsed_ms - delay_ms) / duration_ms))
 
 
-def _scaled_about(rect: QRectF, scale: float, center: QPointF) -> QRectF:
-    left = center.x() + (rect.left() - center.x()) * scale
-    top = center.y() + (rect.top() - center.y()) * scale
-    right = center.x() + (rect.right() - center.x()) * scale
-    bottom = center.y() + (rect.bottom() - center.y()) * scale
-    return QRectF(left, top, right - left, bottom - top)
-
-
-@dataclass(slots=True)
-class _GlassRecord:
-    rect: QRectF
-    clip_rect: QRectF
-    alpha: float
-
-
 class _StartupEntranceOverlay(QWidget):
-    """One frozen UI snapshot plus the reference curtain/camera choreography."""
+    """Startup cover that never rasterizes or reconstructs the application UI.
+
+    The previous entrance rendered the live QWidget tree into a pixmap and rebuilt
+    glass cards from a separately sampled geometry set. During the first native
+    maximize/layout pass those two geometry sources could disagree, so the animation
+    showed a provisional card layout and then snapped to the real one at handoff.
+
+    This overlay owns only wallpaper + curtains. The real QWidget/Quick hierarchy is
+    kept alive underneath and is revealed directly once its final geometry is stable.
+    Consequently there is only one source of truth for card positions at startup.
+    """
 
     finished = Signal()
 
@@ -92,14 +86,12 @@ class _StartupEntranceOverlay(QWidget):
         self._sharp_scene = QPixmap()
         self._blur_scene = QPixmap()
         self._scene_key: tuple[int, int] | None = None
-        self._ui_snapshot = QPixmap()
-        self._ui_rect = QRectF()
-        self._glass_records: list[_GlassRecord] = []
         self._reveal_started_s: float | None = None
 
         self.setObjectName("startupEntranceOverlay")
         self.setAutoFillBackground(False)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setGeometry(window.rect())
         self.show()
@@ -109,17 +101,6 @@ class _StartupEntranceOverlay(QWidget):
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.setInterval(_FRAME_MS)
         self._timer.timeout.connect(self._tick)
-
-    def set_snapshot(
-        self,
-        pixmap: QPixmap,
-        rect: QRectF,
-        glass_records: list[_GlassRecord],
-    ) -> None:
-        self._ui_snapshot = QPixmap(pixmap)
-        self._ui_rect = QRectF(rect)
-        self._glass_records = list(glass_records)
-        self.update()
 
     def begin(self) -> None:
         if not self._timer.isActive():
@@ -189,12 +170,10 @@ class _StartupEntranceOverlay(QWidget):
             _BG_START_DIM * (1.0 - eased),
         )
 
-    def _ui_state(self, elapsed_ms: float) -> tuple[float, float]:
-        opacity_raw = _unit_progress(elapsed_ms, 0.0, _UI_FADE_MS)
-        opacity = float(_OPACITY_EASE.valueForProgress(opacity_raw))
-        scale_raw = _unit_progress(elapsed_ms, _UI_SCALE_DELAY_MS, _UI_SCALE_MS)
-        scale_eased = float(_SOFT_EASE.valueForProgress(scale_raw))
-        return _UI_START_SCALE + (1.0 - _UI_START_SCALE) * scale_eased, opacity
+    def _cover_opacity(self, elapsed_ms: float) -> float:
+        raw = _unit_progress(elapsed_ms, _LIVE_REVEAL_DELAY_MS, _UI_FADE_MS)
+        eased = float(_REVEAL_EASE.valueForProgress(raw))
+        return max(0.0, min(1.0, 1.0 - eased))
 
     def _background_target(self, scene: QPixmap, scale: float) -> QRectF:
         center = QRectF(self.rect()).center()
@@ -207,16 +186,19 @@ class _StartupEntranceOverlay(QWidget):
             height,
         )
 
-    def _paint_background(
-        self,
-        painter: QPainter,
-        elapsed_ms: float,
-    ) -> tuple[QPixmap | None, QRectF]:
+    def _paint_background(self, painter: QPainter, elapsed_ms: float) -> None:
         sharp, blur = self._scene_images()
         scale, blur_mix, dim = self._background_state(elapsed_ms)
+        cover_opacity = self._cover_opacity(elapsed_ms)
+        if cover_opacity <= 0.001:
+            return
+
+        painter.save()
+        painter.setOpacity(cover_opacity)
         if sharp is None:
             painter.fillRect(self.rect(), QColor("#17263a"))
-            return blur, QRectF(self.rect())
+            painter.restore()
+            return
 
         target = self._background_target(sharp, scale)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
@@ -231,95 +213,6 @@ class _StartupEntranceOverlay(QWidget):
                 self.rect(),
                 QColor(0, 0, 0, round(max(0.0, min(1.0, dim)) * 255.0)),
             )
-        return blur, target
-
-    @staticmethod
-    def _mapped_source_rect(
-        target: QRectF,
-        background_target: QRectF,
-        source: QPixmap,
-    ) -> QRectF:
-        if (
-            source.isNull()
-            or background_target.width() <= 0.0
-            or background_target.height() <= 0.0
-        ):
-            return QRectF()
-        sx = float(source.width()) / background_target.width()
-        sy = float(source.height()) / background_target.height()
-        return QRectF(
-            (target.x() - background_target.x()) * sx,
-            (target.y() - background_target.y()) * sy,
-            target.width() * sx,
-            target.height() * sy,
-        )
-
-    def _paint_glass_records(
-        self,
-        painter: QPainter,
-        blur: QPixmap | None,
-        background_target: QRectF,
-        ui_scale: float,
-        ui_center: QPointF,
-    ) -> None:
-        if blur is None:
-            return
-        for record in self._glass_records:
-            target = _scaled_about(record.rect, ui_scale, ui_center)
-            clip = _scaled_about(record.clip_rect, ui_scale, ui_center)
-            if target.isEmpty() or clip.isEmpty() or not target.intersects(QRectF(self.rect())):
-                continue
-            source = self._mapped_source_rect(target, background_target, blur)
-            if source.isEmpty():
-                continue
-
-            painter.save()
-            painter.setClipRect(clip)
-            path = QPainterPath()
-            path.addRoundedRect(
-                target,
-                _GLASS_RADIUS * ui_scale,
-                _GLASS_RADIUS * ui_scale,
-            )
-            painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
-            painter.drawPixmap(target, blur, source)
-            painter.fillRect(
-                target,
-                QColor(
-                    0,
-                    0,
-                    0,
-                    round(max(_NORMAL_GLASS_ALPHA, min(255.0, record.alpha))),
-                ),
-            )
-            painter.restore()
-
-    def _paint_ui(
-        self,
-        painter: QPainter,
-        elapsed_ms: float,
-        blur: QPixmap | None,
-        background_target: QRectF,
-    ) -> None:
-        if self._ui_snapshot.isNull() or self._ui_rect.isEmpty():
-            return
-        ui_scale, opacity = self._ui_state(elapsed_ms)
-        if opacity <= 0.001:
-            return
-
-        center = self._ui_rect.center()
-        target = _scaled_about(self._ui_rect, ui_scale, center)
-        painter.save()
-        painter.setOpacity(opacity)
-        self._paint_glass_records(
-            painter,
-            blur,
-            background_target,
-            ui_scale,
-            center,
-        )
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.drawPixmap(target, self._ui_snapshot, QRectF(self._ui_snapshot.rect()))
         painter.restore()
 
     def _paint_curtains(self, painter: QPainter, elapsed_ms: float) -> None:
@@ -345,14 +238,13 @@ class _StartupEntranceOverlay(QWidget):
     def paintEvent(self, _event) -> None:  # noqa: ANN001, N802
         painter = QPainter(self)
         elapsed_ms = self._elapsed_ms()
-        blur, background_target = self._paint_background(painter, elapsed_ms)
-        self._paint_ui(painter, elapsed_ms, blur, background_target)
+        self._paint_background(painter, elapsed_ms)
         self._paint_curtains(painter, elapsed_ms)
         painter.end()
 
 
 class StartupEntranceController(QObject):
-    """Freeze normal presentation, run one snapshot animation, then hand back."""
+    """Reveal the already-settled live interface instead of replaying a UI snapshot."""
 
     def __init__(self, window: QMainWindow, visual: Any) -> None:
         super().__init__(window)
@@ -413,89 +305,11 @@ class StartupEntranceController(QObject):
         self.raise_overlay()
         QTimer.singleShot(_CAPTURE_DELAY_MS, self._capture_and_reveal)
 
-    def _visible_clip(self, frame: QFrame) -> tuple[QRectF, QRectF] | None:
-        try:
-            if not frame.isVisibleTo(self.window) or frame.width() <= 0 or frame.height() <= 0:
-                return None
-            top_left = frame.mapTo(self.window, QPoint(0, 0))
-            rect = QRectF(
-                float(top_left.x()),
-                float(top_left.y()),
-                float(frame.width()),
-                float(frame.height()),
-            )
-            clip = QRectF(self.window.rect())
-            ancestor = frame.parentWidget()
-            while ancestor is not None:
-                ancestor_top_left = ancestor.mapTo(self.window, QPoint(0, 0))
-                ancestor_rect = QRectF(
-                    float(ancestor_top_left.x()),
-                    float(ancestor_top_left.y()),
-                    float(ancestor.width()),
-                    float(ancestor.height()),
-                )
-                clip = clip.intersected(ancestor_rect)
-                if clip.isEmpty() or ancestor is self.window:
-                    break
-                ancestor = ancestor.parentWidget()
-            if rect.intersected(clip).isEmpty():
-                return None
-            return rect, clip
-        except RuntimeError:
-            return None
-
-    def _snapshot_glass_records(self) -> list[_GlassRecord]:
-        records: list[_GlassRecord] = []
-        glass = getattr(self.visual, "_glass", None)
-        if not isinstance(glass, dict):
-            return records
-        for frame, proxy in glass.items():
-            if not isinstance(frame, QFrame):
-                continue
-            geometry = self._visible_clip(frame)
-            if geometry is None:
-                continue
-            rect, clip = geometry
-            try:
-                alpha = float(getattr(proxy, "overlay_alpha", _NORMAL_GLASS_ALPHA))
-            except (RuntimeError, TypeError, ValueError):
-                alpha = _NORMAL_GLASS_ALPHA
-            records.append(_GlassRecord(rect=rect, clip_rect=clip, alpha=alpha))
-        return records
-
-    def _capture_central(self) -> tuple[QPixmap, QRectF]:
-        central = self.window.centralWidget()
-        if central is None or central.width() <= 0 or central.height() <= 0:
-            return QPixmap(), QRectF()
-        dpr = max(1.0, float(central.devicePixelRatioF()))
-        pixmap = QPixmap(
-            max(1, round(float(central.width()) * dpr)),
-            max(1, round(float(central.height()) * dpr)),
-        )
-        pixmap.setDevicePixelRatio(dpr)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        central.render(
-            pixmap,
-            QPoint(0, 0),
-            QRegion(),
-            QWidget.RenderFlag.DrawWindowBackground | QWidget.RenderFlag.DrawChildren,
-        )
-        top_left = central.mapTo(self.window, QPoint(0, 0))
-        return pixmap, QRectF(
-            float(top_left.x()),
-            float(top_left.y()),
-            float(central.width()),
-            float(central.height()),
-        )
-
     def _capture_and_reveal(self) -> None:
+        """Compatibility boundary: no QWidget capture is performed anymore."""
+
         if self._finished:
             return
-        try:
-            pixmap, rect = self._capture_central()
-            self.overlay.set_snapshot(pixmap, rect, self._snapshot_glass_records())
-        except RuntimeError:
-            pass
         self.overlay.begin_reveal()
 
     def _restore_runtime_presentation(self) -> None:
