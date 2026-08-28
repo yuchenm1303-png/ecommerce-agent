@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
-
-import pytest
 
 import app.makro.sections as sections
 import makro_gui_workflow as workflow
@@ -31,9 +30,12 @@ class _FakeContext:
     def __init__(self, page: _FakePage) -> None:
         self.created = page
         self.new_page_calls = 0
+        self.pages: list[_FakePage] = []
 
     def new_page(self) -> _FakePage:
         self.new_page_calls += 1
+        if self.created not in self.pages:
+            self.pages.append(self.created)
         return self.created
 
 
@@ -53,6 +55,7 @@ def test_fresh_full_run_creates_dedicated_owned_makro_tab(monkeypatch) -> None:
     assert owned is page
     assert target_id == "target-fresh-123"
     assert harness.context.new_page_calls == 1
+    assert harness.context.pages == [page]
     assert harness.page is page
     assert page.timeout == 15_000
     assert page.goto_calls == [(workflow.MAKRO_HOME_URL, "commit", 20_000)]
@@ -111,62 +114,26 @@ def test_fill_plan_command_binds_exact_owned_target() -> None:
     assert command[index + 1] == "target-fresh-123"
 
 
-class _ScanPage:
-    def __init__(self) -> None:
-        self.waits: list[int] = []
+def test_section_scan_accumulates_window_and_nested_container_observations() -> None:
+    source = inspect.getsource(sections.scan_section_fields)
 
-    def wait_for_timeout(self, value: int) -> None:
-        self.waits.append(value)
-
-
-def test_section_scan_waits_until_two_consecutive_full_contracts_match(monkeypatch) -> None:
-    page = _ScanPage()
-    passes = iter(
-        [
-            [{"sig": "a"}],
-            [{"sig": "a"}, {"sig": "b"}],
-            [{"sig": "a"}, {"sig": "b"}],
-        ]
-    )
-    calls = 0
-
-    def fake_scan_once(*_args, **_kwargs):
-        nonlocal calls
-        calls += 1
-        return next(passes)
-
-    monkeypatch.setattr(sections, "_scan_section_once", fake_scan_once)
-    monkeypatch.setattr(
-        sections,
-        "_section_scan_signature",
-        lambda controls: tuple(item["sig"] for item in controls),
-    )
-
-    result = sections.scan_section_fields(page, "#additional-description", wait_ms=10)
-
-    assert [item["sig"] for item in result] == ["a", "b"]
-    assert calls == 3
+    assert "capture_controls(page" in source
+    assert "scroll_window(page)" in source
+    assert "find_scroll_containers(page)" in source
+    assert "scroll_container(page, container_path)" in source
+    assert "merged = merge_scans(scans)" in source
+    assert "item.get(\"path\", \"\").startswith(prefix)" in source
 
 
-def test_section_scan_refuses_schema_that_never_stabilizes(monkeypatch) -> None:
-    page = _ScanPage()
-    passes = iter(
-        [
-            [{"sig": "a"}],
-            [{"sig": "a"}, {"sig": "b"}],
-            [{"sig": "a"}, {"sig": "b"}, {"sig": "c"}],
-            [{"sig": "a"}, {"sig": "b"}, {"sig": "c"}, {"sig": "d"}],
-        ]
-    )
-    monkeypatch.setattr(sections, "_scan_section_once", lambda *_args, **_kwargs: next(passes))
-    monkeypatch.setattr(
-        sections,
-        "_section_scan_signature",
-        lambda controls: tuple(item["sig"] for item in controls),
-    )
+def test_section_scan_has_no_retired_consecutive_snapshot_gate() -> None:
+    source = inspect.getsource(sections)
 
-    with pytest.raises(RuntimeError, match="did not stabilize"):
-        sections.scan_section_fields(page, "#additional-description", wait_ms=10)
+    # Current scanner mechanically unions all observations gathered while scrolling.
+    # Stable schema identity is enforced later at the planner/executor boundary,
+    # so the retired per-section _scan_section_once snapshot gate must stay gone.
+    assert "def _scan_section_once" not in source
+    assert "def _section_scan_signature" not in source
+    assert "merge_scans(scans)" in source
 
 
 def test_real_execution_preserves_read_only_target_ownership_contract() -> None:
