@@ -67,13 +67,14 @@ class BatchParallelRuntime:
             *,
             prepare_concurrency: int = 6,
         ):
-            count = normalize_batch_concurrency(prepare_concurrency)
+            requested = normalize_batch_concurrency(prepare_concurrency)
+            active_lanes = min(requested, max(1, len(urls)))
             base_port = int(config.makro_cdp_port)
             runtime.manager.ensure_ready("Batch parallel preparation")
             lanes = ensure_batch_browser_lanes(
                 runtime.project_root,
                 base_port=base_port,
-                count=count,
+                count=active_lanes,
             )
             runtime._lane_count = len(lanes)
             runtime._base_port = base_port
@@ -81,7 +82,7 @@ class BatchParallelRuntime:
             batch = runtime._original_start_prepare(
                 urls,
                 config,
-                prepare_concurrency=count,
+                prepare_concurrency=requested,
             )
             bind_batch_browser_lanes(
                 batch,
