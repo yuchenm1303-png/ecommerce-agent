@@ -260,7 +260,7 @@ def main() -> int:
 
     entrance = install_startup_entrance(window, visual)
     entrance_stability = install_startup_entrance_stability(window, entrance)
-    install_static_qml_view(window, visual, entrance)
+    install_static_qml_view(window, visual, entrance_stability)
 
     mark_startup_stage("window_show")
     shell.show()
