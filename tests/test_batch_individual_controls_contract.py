@@ -26,6 +26,16 @@ def test_one_job_stop_does_not_use_global_batch_stop() -> None:
     assert "self._remove_from_queues(job_id)" in CONTROLS
 
 
+def test_running_job_must_finish_stop_before_delete() -> None:
+    assert "def _require_quiescent_delete" in CONTROLS
+    assert "if not self._job_is_scheduled(job_id)" in CONTROLS
+    assert "请先点击“停止”" in CONTROLS
+    assert "_delete_requested" not in CONTROLS
+    finished = CONTROLS.split("        def finished(_controller: Any, process: Any, exit_code: int) -> None:", 1)[1]
+    finished = finished.split("        self.controller._finished = MethodType(finished, self.controller)", 1)[0]
+    assert "_remove_job_record" not in finished
+
+
 def test_individual_start_keeps_job_owned_intent_files_and_photos() -> None:
     assert "_listing_offer_intent_by_job_id" in CONTROLS
     assert "_supplemental_product_files_by_job_id" in CONTROLS
