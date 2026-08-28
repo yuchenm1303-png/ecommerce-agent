@@ -4,7 +4,7 @@ import math
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPointF, QRectF, Qt
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QPixmap, QTransform
 from PySide6.QtQuick import QQuickPaintedItem, QQuickWindow
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
@@ -12,20 +12,27 @@ from PySide6.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 from gui.sakana_physics import SakanaSpringState, advance_spring, move_spring
 
 
+# Exact Sakana Widget geometry. The 200 px app/main is the positioned widget;
+# its 300 px canvas is centered around that root and overflows by 50 px per side.
 _TOY_SIZE = 200.0
 _IMAGE_SIZE = _TOY_SIZE / 1.25
 _CANVAS_SIZE = _TOY_SIZE * 1.5
+_CANVAS_INSET = (_CANVAS_SIZE - _TOY_SIZE) / 2.0
+_MAIN_CENTER_X = _CANVAS_INSET + _TOY_SIZE / 2.0
 _LEFT_MARGIN = 24.0
 _BOTTOM_MARGIN = 18.0
 _CHARACTER_IMAGE = Path(__file__).resolve().parent / "assets" / "sakana_character.jpg"
 
+# Keep the upstream controller geometry, with only the user-requested visual
+# difference: a plain white controller without symbols.
 _BASE_WIDTH = 112.0
 _BASE_HEIGHT = 24.0
 _BASE_RADIUS = 6.0
+_DEFAULT_REFRESH_HZ = 60.0
 
 
 class _SakanaToyItem(QQuickPaintedItem):
-    """Sakana toy rendered by the application's single QQuickWindow."""
+    """Paint the upstream Sakana canvas inside the application's QQuickWindow."""
 
     def __init__(self, quick: QQuickWindow, controller: "SakanaToyController") -> None:
         super().__init__(quick.contentItem())
@@ -37,6 +44,7 @@ class _SakanaToyItem(QQuickPaintedItem):
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
         self.setAcceptHoverEvents(False)
 
+        # Exact upstream Takina state: i=.08, s=.1, d=.988, r=12, y=2, t=0, w=0.
         self.state = SakanaSpringState()
         self.max_rotation = max(30.0, min(60.0, _TOY_SIZE / 5.0))
         self.max_y = _TOY_SIZE / 4.0
@@ -50,12 +58,12 @@ class _SakanaToyItem(QQuickPaintedItem):
         self._interaction: str | None = None
         self._spring_press_y = 0.0
         self._position_press_global = QPointF()
-        self._position_press_xy = QPointF()
+        self._position_press_root = QPointF()
 
     @property
     def anchor(self) -> QPointF:
-        inset = (_CANVAS_SIZE - _TOY_SIZE) / 2.0
-        return QPointF(_CANVAS_SIZE / 2.0, _TOY_SIZE + inset)
+        # Upstream canvas draw origin after translating the centered 1.5x canvas.
+        return QPointF(_CANVAS_SIZE / 2.0, _TOY_SIZE + _CANVAS_INSET)
 
     @property
     def image_rect(self) -> QRectF:
@@ -74,6 +82,8 @@ class _SakanaToyItem(QQuickPaintedItem):
         transform = QTransform()
         anchor = self.anchor
         transform.translate(anchor.x(), anchor.y())
+        # Mirrors CSS: rotate(r) translateX(r) translateY(y), with transform-origin
+        # at 50% / size px below the image top.
         transform.rotate(self.state.r)
         transform.translate(self.state.r, self.state.y)
         return transform
@@ -143,12 +153,13 @@ class _SakanaToyItem(QQuickPaintedItem):
         if self.base_hit_test(local):
             self._interaction = "position"
             self._position_press_global = event.globalPosition()
-            self._position_press_xy = QPointF(self.x(), self.y())
+            self._position_press_root = self.controller.root_position
             self.controller._user_positioned = True
         elif self.character_hit_test(local):
+            # Upstream _onMouseDown stops RAF, records pageY, and zeros both speeds.
             self._interaction = "spring"
             self._spring_press_y = event.position().y()
-            self.controller._running = False
+            self.controller._pause_spring()
             self.state.w = 0.0
             self.state.t = 0.0
         else:
@@ -160,13 +171,15 @@ class _SakanaToyItem(QQuickPaintedItem):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._interaction == "position":
             delta = event.globalPosition() - self._position_press_global
-            self.controller._move_item(
-                self._position_press_xy.x() + delta.x(),
-                self._position_press_xy.y() + delta.y(),
+            self.controller._move_root(
+                self._position_press_root.x() + delta.x(),
+                self._position_press_root.y() + delta.y(),
             )
         elif self._interaction == "spring":
+            # Upstream uses pageX - main.getBoundingClientRect().centerX and
+            # pageY - mouseDownPageY. The 200 px main center is canvas-local 150.
             self.move_spring(
-                event.position().x() - self.width() / 2.0,
+                event.position().x() - _MAIN_CENTER_X,
                 event.position().y() - self._spring_press_y,
             )
         else:
@@ -181,8 +194,8 @@ class _SakanaToyItem(QQuickPaintedItem):
         spring = self._interaction == "spring"
         self._interaction = None
         if spring and self.isVisible():
-            self.controller._running = True
-            self.quick.requestUpdate()
+            # Upstream mouseup requests the next RAF without resetting _lastRunUnix.
+            self.controller._resume_spring_after_drag()
         event.accept()
 
     def cancel_interaction(self) -> None:
@@ -190,26 +203,39 @@ class _SakanaToyItem(QQuickPaintedItem):
 
 
 class SakanaToyController(QObject):
-    """Own Sakana rendering, physics, drag, visibility and lifecycle."""
+    """Own exact Sakana geometry, frame cadence, drag and visibility."""
 
     def __init__(self, window: QWidget, quick: QQuickWindow) -> None:
         super().__init__(window)
         self.window = window
         self.quick = quick
         self._user_positioned = False
+        self._root_x = 0.0
+        self._root_y = 0.0
+
+        # Browser Sakana runs one physics update per requestAnimationFrame. Do not
+        # tie spring stepping to the application's unrelated global Quick swaps.
         self._last_tick = time.monotonic()
+        self._next_frame_deadline = 0.0
         self._running = True
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._run_animation_frame)
 
         self.toy = _SakanaToyItem(quick, self)
         self.toggle = self._install_toggle()
 
         quick.widthChanged.connect(self._on_window_geometry_changed)
         quick.heightChanged.connect(self._on_window_geometry_changed)
-        quick.frameSwapped.connect(self._on_frame_swapped)
         window.destroyed.connect(self.cleanup)
 
         self._place_default()
         self.set_enabled(True)
+
+    @property
+    def root_position(self) -> QPointF:
+        return QPointF(self._root_x, self._root_y)
 
     def _install_toggle(self) -> QPushButton:
         root = self.window.centralWidget()
@@ -237,35 +263,81 @@ class SakanaToyController(QObject):
         header.addWidget(button, 0, Qt.AlignmentFlag.AlignBottom)
         return button
 
-    def _place_default(self) -> None:
-        self._move_item(
-            _LEFT_MARGIN,
-            max(0.0, float(self.quick.height()) - _CANVAS_SIZE - _BOTTOM_MARGIN),
-        )
+    def _display_refresh_hz(self) -> float:
+        screen = self.quick.screen()
+        if screen is None:
+            return _DEFAULT_REFRESH_HZ
+        refresh = float(screen.refreshRate())
+        if not math.isfinite(refresh) or refresh <= 1.0:
+            return _DEFAULT_REFRESH_HZ
+        return refresh
 
-    def _move_item(self, x: float, y: float) -> None:
-        max_x = max(0.0, float(self.quick.width()) - _CANVAS_SIZE)
-        max_y = max(0.0, float(self.quick.height()) - _CANVAS_SIZE)
-        self.toy.setX(max(0.0, min(max_x, float(x))))
-        self.toy.setY(max(0.0, min(max_y, float(y))))
-
-    def _on_window_geometry_changed(self, *_args: object) -> None:
-        if self._user_positioned:
-            self._move_item(self.toy.x(), self.toy.y())
-        else:
-            self._place_default()
-
-    def _on_frame_swapped(self) -> None:
+    def _schedule_animation_frame(self, *, reset_deadline: bool = False) -> None:
         if not self._running or not self.toy.isVisible():
+            self._timer.stop()
             return
+
+        now = time.monotonic()
+        frame_period = 1.0 / self._display_refresh_hz()
+        if (
+            reset_deadline
+            or self._next_frame_deadline <= 0.0
+            or self._next_frame_deadline < now - frame_period
+        ):
+            self._next_frame_deadline = now
+
+        self._next_frame_deadline += frame_period
+        delay_ms = max(0, round((self._next_frame_deadline - now) * 1000.0))
+        self._timer.start(delay_ms)
+
+    def _pause_spring(self) -> None:
+        self._running = False
+        self._timer.stop()
+
+    def _resume_spring_after_drag(self) -> None:
+        self._running = True
+        self._schedule_animation_frame(reset_deadline=True)
+
+    def _run_animation_frame(self) -> None:
+        if not self._running or not self.toy.isVisible():
+            self._timer.stop()
+            return
+
         now = time.monotonic()
         elapsed_ms = max(0.0, (now - self._last_tick) * 1000.0)
         self._last_tick = now
+
         if not advance_spring(self.toy.state, elapsed_ms):
             self._running = False
+            self._timer.stop()
             return
+
         self.toy.update()
         self.quick.requestUpdate()
+        self._schedule_animation_frame()
+
+    def _place_default(self) -> None:
+        # Position the 200 px Sakana app/main. Its 300 px canvas overflows around it.
+        self._move_root(
+            _LEFT_MARGIN,
+            max(0.0, float(self.quick.height()) - _TOY_SIZE - _BOTTOM_MARGIN),
+        )
+
+    def _move_root(self, x: float, y: float) -> None:
+        max_x = max(0.0, float(self.quick.width()) - _TOY_SIZE)
+        max_y = max(0.0, float(self.quick.height()) - _TOY_SIZE)
+        self._root_x = max(0.0, min(max_x, float(x)))
+        self._root_y = max(0.0, min(max_y, float(y)))
+
+        # The painted item represents only the centered overflow canvas.
+        self.toy.setX(self._root_x - _CANVAS_INSET)
+        self.toy.setY(self._root_y - _CANVAS_INSET)
+
+    def _on_window_geometry_changed(self, *_args: object) -> None:
+        if self._user_positioned:
+            self._move_root(self._root_x, self._root_y)
+        else:
+            self._place_default()
 
     def set_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -278,6 +350,7 @@ class SakanaToyController(QObject):
         if not enabled:
             self.toy.cancel_interaction()
             self._running = False
+            self._timer.stop()
             self.toy.setVisible(False)
             return
 
@@ -285,8 +358,10 @@ class SakanaToyController(QObject):
         self.toy.setZ(32000.0)
         self._running = True
         self._last_tick = time.monotonic()
+        self._next_frame_deadline = 0.0
         self.toy.update()
         self.quick.requestUpdate()
+        self._schedule_animation_frame(reset_deadline=True)
 
     def raise_overlay(self) -> None:
         if self.toy.isVisible():
@@ -295,11 +370,8 @@ class SakanaToyController(QObject):
 
     def cleanup(self) -> None:
         self._running = False
+        self._timer.stop()
         self.toy.cancel_interaction()
-        try:
-            self.quick.frameSwapped.disconnect(self._on_frame_swapped)
-        except (RuntimeError, TypeError):
-            pass
         try:
             self.quick.widthChanged.disconnect(self._on_window_geometry_changed)
             self.quick.heightChanged.disconnect(self._on_window_geometry_changed)
