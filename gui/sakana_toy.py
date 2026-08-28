@@ -34,7 +34,9 @@ class SakanaToyController(QObject):
 
         self.toggle = self._install_toggle()
         self.window.destroyed.connect(self.cleanup)
-        self.set_enabled(True)
+        # Do not create the helper while the native shell is still being assembled.
+        # run_local_gui calls raise_overlay() immediately after shell.show(), which
+        # is the first point where the QQuickWindow HWND has stable native geometry.
 
     def _install_toggle(self) -> QPushButton:
         root = self.window.centralWidget()
@@ -97,11 +99,10 @@ class SakanaToyController(QObject):
         if sys.platform == "win32":
             creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
-        env = os.environ.copy()
         self._process = subprocess.Popen(
             self._child_command(),
             cwd=str(_REPO_ROOT) if not is_frozen() else None,
-            env=env,
+            env=os.environ.copy(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -134,8 +135,8 @@ class SakanaToyController(QObject):
             self._stop_process()
 
     def raise_overlay(self) -> None:
-        # Native z-order and position belong to the child. This method only keeps
-        # the existing startup call site compatible and can recover a dead child.
+        # Called after NativeWindowShell.show(). Starting here gives the helper a
+        # real, visible owner HWND instead of racing shell construction.
         if self._enabled:
             self._start_process()
 
