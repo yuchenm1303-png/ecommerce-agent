@@ -92,8 +92,8 @@ def test_content_policy_keeps_high_value_copy_rules_and_safe_exceptions() -> Non
     keywords = field_content_policy(_field("keywords", "Keywords", multi_value=True))
 
     assert model["policy_id"] == "model_name"
-    assert "South African" in model["instruction"]
-    assert "Omit brand names" in model["instruction"]
+    assert "亚马逊南非站" in model["instruction"]
+    assert "不得出现任何品牌词" in model["instruction"]
     assert model["required_fallback"] == "manual_only"
     assert description["policy_id"] == "description"
     assert "medical-style claims" in description["instruction"]
@@ -147,7 +147,7 @@ def test_listing_intent_turns_sales_package_into_offer_aware_synthesis(monkeypat
     assert package_policy["best_effort"] == "listing_intent_allowed"
     assert allow_best_effort_inference(sales_package) is True
     assert allow_required_fallback(sales_package) is True
-    assert colour_policy["policy_id"] == "listing_intent_scope"
+    assert colour_policy["policy_id"] == "user_listing_context"
     assert colour_policy["listing_intent"] == "黑色净化器 + 2瓶香薰精油"
 
 
