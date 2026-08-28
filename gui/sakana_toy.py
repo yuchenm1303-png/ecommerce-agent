@@ -13,6 +13,7 @@ from app.runtime_paths import is_frozen
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_SAKANA_HELPER_EXE = "EcommerceAgentSakana.exe"
 
 
 class SakanaToyController(QObject):
@@ -73,12 +74,10 @@ class SakanaToyController(QObject):
     def _child_command(self) -> list[str]:
         owner_hwnd = str(self._owner_hwnd())
         if is_frozen():
-            return [
-                str(Path(sys.executable).resolve()),
-                "--sakana-toy-process",
-                "--owner-hwnd",
-                owner_hwnd,
-            ]
+            helper = Path(sys.executable).resolve().with_name(_SAKANA_HELPER_EXE)
+            if not helper.is_file():
+                raise RuntimeError(f"Sakana helper executable is missing: {helper}")
+            return [str(helper), "--owner-hwnd", owner_hwnd]
         return [
             str(Path(sys.executable).resolve()),
             "-m",
