@@ -18,6 +18,8 @@ def _field(slot_count: int):
         "attribute_key": "sales_package",
         "label": "Sales Package",
         "section_heading": "Product Description",
+        "multi_value": True,
+        "has_add_value_control": True,
         "controls": [
             {
                 "name": f"sales_package_{index}_value",
