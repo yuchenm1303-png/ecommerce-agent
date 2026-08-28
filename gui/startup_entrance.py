@@ -16,12 +16,9 @@ _CURTAIN_DELAY_MS = 0
 _CURTAIN_MS = 500
 _BACKGROUND_DELAY_MS = 120
 _BACKGROUND_MS = 760
-_UI_SCALE_DELAY_MS = 0
-_UI_SCALE_MS = 0
 _TOTAL_MS = 1000
 
 _BG_START_SCALE = 1.16
-_UI_START_SCALE = 1.0
 _BG_START_DIM = 0.46
 _CURTAIN_FRACTION = 0.51
 _CURTAIN_COLOR = "#333333"
@@ -29,7 +26,7 @@ _LIVE_REVEAL_DELAY_MS = 160
 _STARTUP_QML_URL = QUrl("inmemory:/StartupEntrance.qml")
 
 
-_STARTUP_QML = r'''
+_STARTUP_QML = r"""
 import QtQuick
 
 Item {
@@ -51,12 +48,10 @@ Item {
     signal finished()
 
     Item {
-        id: backgroundCover
         anchors.fill: parent
         opacity: startupRoot.coverOpacity
 
         Item {
-            id: backgroundScene
             anchors.centerIn: parent
             width: startupRoot.width * __OVERSCAN__
             height: startupRoot.height * __OVERSCAN__
@@ -183,7 +178,7 @@ Item {
             revealTimeline.start()
     }
 }
-'''
+"""
 
 _STARTUP_QML = (
     _STARTUP_QML
@@ -203,8 +198,10 @@ _STARTUP_QML = (
 
 
 class _StartupEntranceOverlay(QObject):
-    """GPU-owned startup cover attached to the application's existing QQuickWindow."""
+    """GPU startup cover with a real asynchronous QQmlComponent lifecycle."""
 
+    ready = Signal()
+    failed = Signal(str)
     finished = Signal()
 
     def __init__(self, window: QMainWindow, visual: Any, parent: QObject) -> None:
@@ -213,29 +210,77 @@ class _StartupEntranceOverlay(QObject):
         self.background = getattr(visual, "background", None)
         self.quick = getattr(self.background, "quick_window", None)
         self.engine = getattr(self.background, "engine", None)
+
         self._component: QQmlComponent | None = None
         self._item: QQuickItem | None = None
-        self._reveal_started = False
+        self._ready = False
+        self._failed = False
+        self._failure_message = ""
+        self._show_requested = True
+        self._reveal_requested = False
+        self._finished_emitted = False
 
         if not isinstance(self.quick, QQuickWindow) or self.engine is None:
             raise RuntimeError("startup entrance requires the shared QQuickWindow")
-        self._create_item()
+        self._load_component()
 
-    def _create_item(self) -> None:
+    @property
+    def is_ready(self) -> bool:
+        return self._ready
+
+    @property
+    def is_failed(self) -> bool:
+        return self._failed
+
+    def _load_component(self) -> None:
         component = QQmlComponent(self.engine, self)
         self._component = component
+        component.statusChanged.connect(self._on_component_status_changed)
         component.setData(_STARTUP_QML.encode("utf-8"), _STARTUP_QML_URL)
-        if component.status() == QQmlComponent.Status.Error:
-            errors = "\n".join(error.toString() for error in component.errors())
-            raise RuntimeError("Startup entrance QML failed: " + errors)
-        if component.status() != QQmlComponent.Status.Ready:
-            raise RuntimeError(f"Startup entrance QML is not ready: {component.status()}")
+        self._handle_component_status(component.status())
+
+    def _disconnect_component_status(self) -> None:
+        component = self._component
+        if component is None:
+            return
+        try:
+            component.statusChanged.disconnect(self._on_component_status_changed)
+        except (RuntimeError, TypeError):
+            pass
+
+    def _on_component_status_changed(self, status: QQmlComponent.Status) -> None:
+        self._handle_component_status(status)
+
+    def _handle_component_status(self, status: QQmlComponent.Status) -> None:
+        if self._ready or self._failed:
+            return
+        if status == QQmlComponent.Status.Loading:
+            return
+        if status == QQmlComponent.Status.Error:
+            component = self._component
+            errors = ""
+            if component is not None:
+                errors = "\n".join(error.toString() for error in component.errors())
+            self._fail("Startup entrance QML failed" + (": " + errors if errors else ""))
+            return
+        if status != QQmlComponent.Status.Ready:
+            return
+        self._create_item_from_ready_component()
+
+    def _create_item_from_ready_component(self) -> None:
+        if self._ready or self._failed:
+            return
+        component = self._component
+        if component is None:
+            self._fail("Startup entrance QML component disappeared before Ready")
+            return
 
         created = component.create(self.engine.rootContext())
         if not isinstance(created, QQuickItem):
             if created is not None:
                 created.deleteLater()
-            raise RuntimeError("Startup entrance QML did not create a QQuickItem")
+            self._fail("Startup entrance QML did not create a QQuickItem")
+            return
 
         created.setParent(self)
         created.setParentItem(self.quick.contentItem())
@@ -250,60 +295,76 @@ class _StartupEntranceOverlay(QObject):
         created.setZ(40000.0)
         try:
             created.finished.connect(self._on_qml_finished)
-        except (AttributeError, RuntimeError, TypeError) as exc:
+        except (AttributeError, RuntimeError, TypeError):
             created.setParentItem(None)
             created.deleteLater()
-            raise RuntimeError("Startup entrance QML has no finish signal") from exc
+            self._fail("Startup entrance QML has no finish signal")
+            return
+
         self._item = created
+        self._ready = True
+        self._disconnect_component_status()
+        self._apply_pending_requests()
+        self.ready.emit()
+
+    def _fail(self, message: str) -> None:
+        if self._failed:
+            return
+        self._failed = True
+        self._failure_message = message
+        self._disconnect_component_status()
+        self.failed.emit(message)
+
+    def _apply_pending_requests(self) -> None:
+        item = self._item
+        if item is None:
+            return
+        try:
+            item.setVisible(self._show_requested)
+            item.setZ(40000.0)
+            if self._reveal_requested:
+                item.setProperty("revealStarted", True)
+            self.quick.requestUpdate()
+        except RuntimeError:
+            self._fail("Startup entrance QML item became unavailable")
+
+    def _emit_finished_once(self) -> None:
+        if self._finished_emitted:
+            return
+        self._finished_emitted = True
+        self.finished.emit()
 
     @Slot()
     def _on_qml_finished(self) -> None:
-        self.finished.emit()
+        self._emit_finished_once()
 
     def begin(self) -> None:
-        item = self._item
-        if item is None:
+        self._show_requested = True
+        if self._failed:
             return
-        try:
-            item.setVisible(True)
-            item.setZ(40000.0)
-            self.quick.requestUpdate()
-        except RuntimeError:
-            pass
+        self._apply_pending_requests()
 
     def begin_reveal(self) -> None:
-        if self._reveal_started:
+        self._reveal_requested = True
+        if self._failed:
+            self._emit_finished_once()
             return
-        self._reveal_started = True
-        item = self._item
-        if item is None:
-            self.finished.emit()
-            return
-        try:
-            item.setProperty("revealStarted", True)
-            self.quick.requestUpdate()
-        except RuntimeError:
-            self.finished.emit()
+        self._apply_pending_requests()
 
     def raise_overlay(self) -> None:
-        item = self._item
-        if item is None:
-            return
-        try:
-            item.setVisible(True)
-            item.setZ(40000.0)
-            self.quick.requestUpdate()
-        except RuntimeError:
-            pass
+        self._show_requested = True
+        self._apply_pending_requests()
 
     def resize_to_window(self) -> None:
-        # anchors.fill keeps the Quick surface fitted by the Scene Graph itself.
-        try:
-            self.quick.requestUpdate()
-        except RuntimeError:
-            pass
+        if self._ready:
+            try:
+                self.quick.requestUpdate()
+            except RuntimeError:
+                pass
 
     def release(self) -> None:
+        self._disconnect_component_status()
+
         item = self._item
         self._item = None
         if item is not None:
@@ -317,6 +378,7 @@ class _StartupEntranceOverlay(QObject):
                 item.deleteLater()
             except RuntimeError:
                 pass
+
         component = self._component
         self._component = None
         if component is not None:
@@ -327,7 +389,7 @@ class _StartupEntranceOverlay(QObject):
 
 
 class StartupEntranceController(QObject):
-    """Reveal the settled Quick workspace with one Scene Graph animation owner."""
+    """Reveal the settled Quick workspace without coupling QML loading to app life."""
 
     def __init__(self, window: QMainWindow, visual: Any) -> None:
         super().__init__(window)
@@ -389,7 +451,7 @@ class StartupEntranceController(QObject):
         QTimer.singleShot(_CAPTURE_DELAY_MS, self._capture_and_reveal)
 
     def _capture_and_reveal(self) -> None:
-        """Compatibility boundary: the reveal is now entirely Scene Graph owned."""
+        """Compatibility timing boundary; no capture is performed."""
 
         if self._finished:
             return
