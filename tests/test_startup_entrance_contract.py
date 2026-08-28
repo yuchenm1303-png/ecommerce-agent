@@ -37,6 +37,15 @@ def test_startup_entrance_is_geometry_only_curtain_animation() -> None:
         assert forbidden not in SOURCE
 
 
+def test_curtain_completion_releases_input_before_handoff() -> None:
+    assert "self.setFocusPolicy(Qt.FocusPolicy.NoFocus)" in SOURCE
+    finish = SOURCE.split("def _on_animation_finished", 1)[1].split(
+        "def _apply_progress", 1
+    )[0]
+    assert "WA_TransparentForMouseEvents" in finish
+    assert finish.index("self.hide()") < finish.index("self.finished.emit()")
+
+
 def test_startup_runtime_lifecycle_uses_shared_presentation_clock_only() -> None:
     freeze = SOURCE.split("def _freeze_runtime_presentation", 1)[1].split(
         "def raise_overlay", 1
@@ -94,13 +103,24 @@ def test_heavy_quick_scene_work_is_prepared_before_visible_reveal() -> None:
     assert "self.bridge.refresh()" in activate
 
 
-def test_startup_handoff_waits_for_rendered_quick_frames() -> None:
-    assert "_NATIVE_SETTLE_FRAMES = 2" in STABILITY
-    assert "def _arm_native_frame_barrier" in STABILITY
-    assert "quick.frameSwapped.connect(self._on_native_frame_swapped)" in STABILITY
-    assert "quick.frameSwapped.disconnect(self._on_native_frame_swapped)" in STABILITY
-    assert "self._native_frames_remaining = _NATIVE_SETTLE_FRAMES" in STABILITY
-    assert "def _on_native_frame_swapped" in STABILITY
+def test_reveal_has_frame_barrier_but_finished_overlay_has_no_liveness_dependency() -> None:
+    assert "_REVEAL_SETTLE_FRAMES = 2" in STABILITY
+    assert "quick.frameSwapped.connect(self._on_reveal_frame_swapped)" in STABILITY
+    assert "quick.frameSwapped.disconnect(self._on_reveal_frame_swapped)" in STABILITY
+    assert "self._reveal_frames_remaining = _REVEAL_SETTLE_FRAMES" in STABILITY
+
+    for forbidden in (
+        "_arm_native_frame_barrier",
+        "_on_native_frame_swapped",
+        "_native_frames_remaining",
+        "_native_frame_quick",
+    ):
+        assert forbidden not in STABILITY
+
+    stage = STABILITY.split("def _stage_finish", 1)[1].split(
+        "def _commit_overlay_handoff", 1
+    )[0]
+    assert "QTimer.singleShot(0, self._commit_overlay_handoff)" in stage
 
     commit = STABILITY.split("def _commit_overlay_handoff", 1)[1].split(
         "def _resume_effects", 1
