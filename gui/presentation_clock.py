@@ -440,9 +440,12 @@ class _StaticCardInputBridge(QObject):
         if not isinstance(watched, QWidget):
             return False
         try:
-            return watched.window() is self.window
-        except RuntimeError:
+            top = watched.window()
+        except (RuntimeError, TypeError):
             return False
+        if not isinstance(top, QWidget):
+            return False
+        return top is self.window
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if self.clock.background_drift_enabled:
