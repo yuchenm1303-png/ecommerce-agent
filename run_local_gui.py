@@ -211,6 +211,7 @@ def main() -> int:
     from gui.required_input_support import install_required_input_support
     from gui.restore_snapshot import install_restore_snapshot
     from gui.runtime_assistant import install_runtime_assistant
+    from gui.sakana_toy import install_sakana_toy
     from gui.single_ai_guidance import install_single_ai_guidance
     from gui.single_top_compact import install_single_top_compact
     from gui.smooth_scroll import SmoothWheelFilter
@@ -343,6 +344,7 @@ def main() -> int:
         if replacement is not None:
             label.setText(replacement)
     premium_copy = install_premium_copy(window)
+    toy = install_sakana_toy(window)
 
     entrance = install_startup_entrance(window, visual)
     entrance_stability = install_startup_entrance_stability(window, entrance)
@@ -359,6 +361,7 @@ def main() -> int:
     product_copy.attach_runtime_assistant(assistant)
     premium_copy.attach_runtime_assistant(assistant)
     assistant.raise_()
+    toy.raise_overlay()
     entrance.raise_overlay()
     entrance_stability.start()
     # Let the native maximized window get its first event-loop turn before the
