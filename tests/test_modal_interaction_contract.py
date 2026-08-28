@@ -113,9 +113,12 @@ def test_detail_start_action_still_uses_canonical_execution_request() -> None:
 def test_required_input_support_still_owns_real_execution_preflight() -> None:
     assert "window._request_real_execution = self.request_start" in REQUIRED
     request = _body(REQUIRED, "def request_start", "def _on_start_clicked")
-    assert "self._all_required_covered()" in request
-    assert "self._merged_overrides()" in request
+    assert "self._write_overrides()" in request
+    assert "self._manual_count()" in request
     assert "self._original_start()" in request
+    # Resolver gaps are now covered by deterministic live-schema fallbacks at this
+    # canonical preflight rather than by the retired all-manual-coverage gate.
+    assert "_all_required_covered" not in request
 
 
 def test_modal_source_compiles_without_importing_pyside() -> None:
