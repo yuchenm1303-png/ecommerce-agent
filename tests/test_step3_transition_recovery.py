@@ -254,7 +254,8 @@ def test_formal_single_and_batch_use_exact_recovered_step3_page() -> None:
     assert "harness.page = page" in GUI_WORKFLOW
     assert "dismiss_joyride_overlay(page)" in GUI_WORKFLOW
 
-    assert "brand, page = select_brand_to_product_info(page, provider, hints)" in BATCH_JOB
+    assert "from makro_gui_workflow import (" in BATCH_JOB
+    assert "_advance_listing_to_step3," in BATCH_JOB
+    assert "page, _vertical, _brand = _advance_listing_to_step3(" in BATCH_JOB
     assert "harness.page = page" in BATCH_JOB
-    assert 'manifest["makro_target_id"] = page_target_id(page)' in BATCH_JOB
-    assert "dismiss_joyride_overlay(page)" in BATCH_JOB
+    assert 'manifest["makro_target_id"] = owned_target_id' in BATCH_JOB
