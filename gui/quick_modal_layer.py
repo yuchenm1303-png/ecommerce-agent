@@ -485,7 +485,7 @@ class QuickModalLayerController(QObject):
         self._visible = False
         self._transitioning = False
         self._refresh_pending = False
-        self._controls: list[dict[str, Any]] = []
+        self._controls: list[Any] = []
         self._modal_x = 0
         self._modal_y = 0
         self._modal_w = 0
@@ -670,7 +670,7 @@ class QuickModalLayerController(QObject):
         bridge_timer = getattr(self.static_bridge, "_refresh_timer", None)
         was_hidden = drawer.isHidden()
         dont_show_on_screen = drawer.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
-        controls: list[dict[str, Any]] = []
+        controls: list[Any] = []
 
         if isinstance(bridge_timer, QTimer):
             bridge_timer.stop()
@@ -704,7 +704,10 @@ class QuickModalLayerController(QObject):
             if isinstance(bridge_timer, QTimer):
                 bridge_timer.stop()
 
-        controls.sort(key=lambda item: (int(item["y"]), int(item["x"])))
+        # Read-only text panes are intentionally represented by persistent
+        # QObject controls while the rest remain dict snapshots. The bridge owns
+        # that mixed representation and therefore also owns its position accessor.
+        controls.sort(key=self.static_bridge._control_position)  # noqa: SLF001
         self._controls = controls
         self.changed.emit()
 
