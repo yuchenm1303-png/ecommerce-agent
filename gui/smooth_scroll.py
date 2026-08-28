@@ -13,19 +13,21 @@ from PySide6.QtWidgets import QAbstractItemView, QAbstractScrollArea, QWidget
 
 @dataclass(slots=True)
 class _ScrollMotion:
+    area: QAbstractScrollArea
     bar: object
     position: float
     target: float
     velocity: float
+    committed_position: float
+    hold_until_s: float = 0.0
 
 
 class QuickScrollState(QObject):
-    """Publish only live scrollbar positions to the Quick presentation.
+    """Publish only transient scrollbar positions to the Quick presentation.
 
-    Widget geometry/content remains owned by StaticQmlBridge. During a scroll glide
-    the bridge model must stay frozen: QML consumes this tiny position map and moves
-    its already-created items on the Scene Graph instead of rebuilding every Job
-    card on each 16 ms scrollbar tick.
+    QWidget remains the committed scroll/layout state owner, but an active gesture
+    is presented entirely by Quick. The hidden QScrollArea is updated once when the
+    glide settles instead of being scrolled on every 16 ms animation tick.
     """
 
     positionsChanged = Signal()
@@ -65,14 +67,20 @@ class QuickScrollState(QObject):
                 pass
         self.sync_area(area)
 
-    def sync_area(self, area: QAbstractScrollArea) -> None:
+    def set_area_position(
+        self,
+        area: QAbstractScrollArea,
+        *,
+        x: float | None = None,
+        y: float | None = None,
+    ) -> None:
         key = self._viewport_key(area)
         if key is None:
             return
         try:
             value = {
-                "x": int(area.horizontalScrollBar().value()),
-                "y": int(area.verticalScrollBar().value()),
+                "x": int(round(area.horizontalScrollBar().value() if x is None else x)),
+                "y": int(round(area.verticalScrollBar().value() if y is None else y)),
             }
         except RuntimeError:
             return
@@ -91,6 +99,9 @@ class QuickScrollState(QObject):
         self._positions = positions
         self.positionsChanged.emit()
 
+    def sync_area(self, area: QAbstractScrollArea) -> None:
+        self.set_area_position(area)
+
     def sync_all(self, areas: list[QAbstractScrollArea]) -> None:
         for area in areas:
             self.watch_area(area)
@@ -103,16 +114,12 @@ class QuickScrollState(QObject):
 
 
 class SmoothScroller(QObject):
-    """Short-lived continuous target follower for discrete mouse wheels.
+    """Continuous Quick-side target follower with one committed QWidget update.
 
-    A classic wheel still emits discrete notches, but those notches only move one
-    persistent target. The visible scrollbar follows that target through a
-    critically damped continuous motion, so successive notches extend the same
-    glide instead of starting separate inertial bursts.
-
-    Precision touchpads already emit pixelDelta() at high frequency. Those remain
-    native/direct so the universal smoothing layer never adds latency to devices
-    that are already continuous.
+    Discrete wheel input extends one persistent spring target. Precision touchpad
+    input moves the Quick presentation directly and is committed after a short idle
+    window. In both cases the hidden QWidget scroll area is kept off the frame hot
+    path and receives only the final settled value.
     """
 
     _STEP_MS = 16
@@ -122,15 +129,20 @@ class SmoothScroller(QObject):
     _STOP_SPEED_PX_S = 5.0
     _REVERSE_VELOCITY_RETENTION = 0.30
     _EXTERNAL_SYNC_TOLERANCE_PX = 3.0
+    _PIXEL_COMMIT_IDLE_S = 0.080
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._animations: dict[int, _ScrollMotion] = {}
+        self._presentation_state: QuickScrollState | None = None
         self._last_tick_s = time.perf_counter()
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.setInterval(self._STEP_MS)
         self._timer.timeout.connect(self._tick)
+
+    def set_presentation_state(self, state: QuickScrollState | None) -> None:
+        self._presentation_state = state
 
     @staticmethod
     def _clamp_position(bar, position: float) -> float:  # noqa: ANN001
@@ -146,45 +158,79 @@ class SmoothScroller(QObject):
         if not self._animations:
             self._timer.stop()
 
-    def cancel(self, bar) -> None:  # noqa: ANN001
-        self._animations.pop(id(bar), None)
-        self._stop_if_idle()
-
-    def scroll_pixels(self, bar, delta_px: float) -> None:  # noqa: ANN001
-        """Apply native high-resolution pixel input without re-quantizing it."""
-
-        self.cancel(bar)
+    def _new_motion(self, area: QAbstractScrollArea) -> _ScrollMotion | None:
         try:
-            current = float(bar.value())
-            target = self._clamp_position(bar, current + float(delta_px))
-            bar.setValue(round(target))
-        except RuntimeError:
-            return
-
-    def add_wheel_delta(self, bar, notch_delta: float) -> None:  # noqa: ANN001
-        """Extend one persistent smooth-scroll target by a fractional wheel notch."""
-
-        if abs(notch_delta) <= 1e-6:
-            return
-        key = id(bar)
-        try:
+            bar = area.verticalScrollBar()
             actual = float(bar.value())
         except RuntimeError:
-            return
+            return None
+        motion = _ScrollMotion(
+            area=area,
+            bar=bar,
+            position=actual,
+            target=actual,
+            velocity=0.0,
+            committed_position=actual,
+        )
+        self._animations[id(bar)] = motion
+        return motion
 
-        motion = self._animations.get(key)
+    def _motion_for(self, area: QAbstractScrollArea) -> _ScrollMotion | None:
+        try:
+            bar = area.verticalScrollBar()
+            actual = float(bar.value())
+        except RuntimeError:
+            return None
+
+        motion = self._animations.get(id(bar))
         if motion is None:
-            motion = _ScrollMotion(
-                bar=bar,
-                position=actual,
-                target=actual,
-                velocity=0.0,
-            )
-            self._animations[key] = motion
-        elif abs(actual - round(motion.position)) > self._EXTERNAL_SYNC_TOLERANCE_PX:
+            return self._new_motion(area)
+
+        if abs(actual - motion.committed_position) > self._EXTERNAL_SYNC_TOLERANCE_PX:
             motion.position = actual
             motion.target = actual
             motion.velocity = 0.0
+            motion.committed_position = actual
+            motion.hold_until_s = 0.0
+            state = self._presentation_state
+            if state is not None:
+                state.sync_area(area)
+        return motion
+
+    def effective_position(self, bar) -> float:  # noqa: ANN001
+        motion = self._animations.get(id(bar))
+        if motion is not None:
+            return float(motion.target)
+        try:
+            return float(bar.value())
+        except RuntimeError:
+            return 0.0
+
+    def scroll_pixels(self, area: QAbstractScrollArea, delta_px: float) -> None:
+        """Present high-resolution pixel input immediately, then commit once idle."""
+
+        motion = self._motion_for(area)
+        if motion is None:
+            return
+        bar = motion.bar
+        target = self._clamp_position(bar, motion.position + float(delta_px))
+        motion.position = target
+        motion.target = target
+        motion.velocity = 0.0
+        motion.hold_until_s = time.perf_counter() + self._PIXEL_COMMIT_IDLE_S
+        state = self._presentation_state
+        if state is not None:
+            state.set_area_position(area, y=target)
+        self._ensure_timer()
+
+    def add_wheel_delta(self, area: QAbstractScrollArea, notch_delta: float) -> None:
+        """Extend one persistent Quick-side spring target by a wheel notch."""
+
+        if abs(notch_delta) <= 1e-6:
+            return
+        motion = self._motion_for(area)
+        if motion is None:
+            return
 
         delta_px = float(notch_delta) * self._WHEEL_TRAVEL_PX
         remaining = motion.target - motion.position
@@ -192,8 +238,23 @@ class SmoothScroller(QObject):
             motion.target = motion.position
             motion.velocity *= self._REVERSE_VELOCITY_RETENTION
 
-        motion.target = self._clamp_position(bar, motion.target + delta_px)
+        motion.target = self._clamp_position(motion.bar, motion.target + delta_px)
+        motion.hold_until_s = 0.0
         self._ensure_timer()
+
+    def _commit_motion(self, key: int, motion: _ScrollMotion, final: float) -> None:
+        final = self._clamp_position(motion.bar, final)
+        motion.committed_position = final
+        motion.position = final
+        motion.target = final
+        state = self._presentation_state
+        if state is not None:
+            state.set_area_position(motion.area, y=final)
+        try:
+            motion.bar.setValue(round(final))
+        except RuntimeError:
+            pass
+        self._animations.pop(key, None)
 
     def _tick(self) -> None:
         now = time.perf_counter()
@@ -201,6 +262,7 @@ class SmoothScroller(QObject):
         self._last_tick_s = now
         omega = self._SPRING_OMEGA
         decay = math.exp(-omega * dt)
+        state = self._presentation_state
 
         for key, motion in list(self._animations.items()):
             bar = motion.bar
@@ -212,10 +274,22 @@ class SmoothScroller(QObject):
                 del self._animations[key]
                 continue
 
-            expected = round(motion.position)
-            if abs(actual - expected) > self._EXTERNAL_SYNC_TOLERANCE_PX:
+            if abs(actual - motion.committed_position) > self._EXTERNAL_SYNC_TOLERANCE_PX:
                 motion.position = actual
-                motion.target = max(minimum, min(maximum, motion.target))
+                motion.target = actual
+                motion.velocity = 0.0
+                motion.committed_position = actual
+                motion.hold_until_s = 0.0
+                if state is not None:
+                    state.sync_area(motion.area)
+                del self._animations[key]
+                continue
+
+            if motion.hold_until_s > now:
+                continue
+            if motion.hold_until_s > 0.0:
+                self._commit_motion(key, motion, motion.target)
+                continue
 
             offset = motion.position - motion.target
             c2 = motion.velocity + omega * offset
@@ -227,16 +301,15 @@ class SmoothScroller(QObject):
 
             motion.position = clamped
             motion.velocity = next_velocity
-            bar.setValue(round(clamped))
+            if state is not None:
+                state.set_area_position(motion.area, y=clamped)
 
             distance = abs(motion.target - motion.position)
             if hit_boundary or (
                 distance <= self._STOP_DISTANCE_PX
                 and abs(motion.velocity) <= self._STOP_SPEED_PX_S
             ):
-                final = max(minimum, min(maximum, motion.target))
-                bar.setValue(round(final))
-                del self._animations[key]
+                self._commit_motion(key, motion, motion.target)
 
         self._stop_if_idle()
 
@@ -259,13 +332,12 @@ class SmoothWheelFilter(QObject):
     def install(self, root: QWidget) -> None:
         self._root = root
         self._quick_state = QuickScrollState(root, self)
+        self._scroller.set_presentation_state(self._quick_state)
         for area in root.findChildren(QAbstractScrollArea):
             self._attach(area)
 
         # Normal presentation now belongs to the existing QQuickWindow while the
-        # QWidget tree remains the canonical scroll/layout state owner. Install the
-        # same wheel router on that Quick owner so input continues to drive the real
-        # QAbstractScrollArea scrollbars after the native QWidget child is hidden.
+        # QWidget tree remains the canonical committed scroll/layout state owner.
         visual = getattr(root, "_visual_style", None)
         background = getattr(visual, "background", None)
         quick_owner = getattr(background, "quick_window", None)
@@ -274,8 +346,7 @@ class SmoothWheelFilter(QObject):
             quick_owner.installEventFilter(self)
 
         # The engine already exists here but StaticQmlView is created later. Expose
-        # the lightweight scroll state before the QML component is compiled so its
-        # bindings never depend on late context-property injection.
+        # the lightweight scroll state before the QML component is compiled.
         engine = getattr(background, "engine", None)
         context_getter = getattr(engine, "rootContext", None)
         if callable(context_getter):
@@ -284,8 +355,6 @@ class SmoothWheelFilter(QObject):
             except RuntimeError:
                 pass
 
-        # StaticQmlBridge is installed later in the same startup turn. Adopt scroll
-        # presentation once the event loop starts, before any user wheel input.
         QTimer.singleShot(0, self._adopt_quick_scroll_presentation)
 
     def _attach(self, area: QAbstractScrollArea) -> None:
@@ -307,8 +376,6 @@ class SmoothWheelFilter(QObject):
         controller = getattr(root, "_static_qml_view_controller", None) if root is not None else None
         bridge = getattr(controller, "bridge", None)
         if bridge is None:
-            # Startup normally installs StaticQmlView before the event loop, but a
-            # zero-delay retry keeps ownership deterministic on slower setups.
             QTimer.singleShot(0, self._adopt_quick_scroll_presentation)
             return
         self._quick_bridge = bridge
@@ -335,15 +402,15 @@ class SmoothWheelFilter(QObject):
         except (RuntimeError, TypeError):
             pass
 
-    @staticmethod
-    def _can_move(area: QAbstractScrollArea, scroll_delta: float) -> bool:
+    def _can_move(self, area: QAbstractScrollArea, scroll_delta: float) -> bool:
         bar = area.verticalScrollBar()
         if bar.maximum() <= bar.minimum():
             return False
+        position = self._scroller.effective_position(bar)
         if scroll_delta > 0.0:
-            return bar.value() < bar.maximum()
+            return position < float(bar.maximum())
         if scroll_delta < 0.0:
-            return bar.value() > bar.minimum()
+            return position > float(bar.minimum())
         return False
 
     @staticmethod
@@ -379,7 +446,7 @@ class SmoothWheelFilter(QObject):
             owner = self._scroll_owner(area, scroll_delta)
             if owner is None:
                 return False
-            self._scroller.scroll_pixels(owner.verticalScrollBar(), scroll_delta)
+            self._scroller.scroll_pixels(owner, scroll_delta)
             return True
 
         if not angle_y:
@@ -388,7 +455,7 @@ class SmoothWheelFilter(QObject):
         owner = self._scroll_owner(area, notch_delta)
         if owner is None:
             return False
-        self._scroller.add_wheel_delta(owner.verticalScrollBar(), notch_delta)
+        self._scroller.add_wheel_delta(owner, notch_delta)
         return True
 
     def _area_at_quick_position(self, x: float, y: float) -> QAbstractScrollArea | None:
@@ -429,8 +496,6 @@ class SmoothWheelFilter(QObject):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             return False
 
-        # Ensure the old full-scene scrollbar listener cannot reappear in the hot
-        # path even if startup ordering was unusual.
         if not self._bridge_scroll_detached:
             self._adopt_quick_scroll_presentation()
 
@@ -451,6 +516,7 @@ class SmoothWheelFilter(QObject):
     def cleanup(self) -> None:
         self._scroller._timer.stop()
         self._scroller._animations.clear()
+        self._scroller.set_presentation_state(None)
         quick_owner = self._quick_owner
         self._quick_owner = None
         if quick_owner is not None:
