@@ -624,7 +624,7 @@ Item {
     }
 
     Repeater {
-        model: 3
+        model: 6
         delegate: Item {
             id: petal
             required property int index
@@ -640,7 +640,7 @@ Item {
             Image { anchors.fill: parent; source: staticBridge.sakuraUrl; smooth: false; rotation: petal.r * 57.295779513 }
             function respawn() {
                 if (Math.random() > 0.4) { petal.x = Math.random() * Math.max(1, staticRoot.width); petal.y = 0 }
-                else { petal.x = staticRoot.width; petal.y = Math.random() * Math.max(1, staticRoot.height) }
+                else { petal.x = staticRoot.width; petal.y = Math.random() * staticRoot.height }
                 petal.s = Math.random(); petal.r = 6.0 * Math.random()
             }
             FrameAnimation {
