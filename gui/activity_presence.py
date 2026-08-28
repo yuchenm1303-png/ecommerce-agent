@@ -5,7 +5,7 @@ import re
 import time
 from typing import Any
 
-from PySide6.QtCore import QObject, QRectF, Qt, QTimer
+from PySide6.QtCore import QObject, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPen, QRadialGradient
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
@@ -60,6 +60,8 @@ class ActivityPresence(QWidget):
     per-frame painting work.
     """
 
+    stateChanged = Signal()
+
     _FRAME_MS = 16
     _PROGRESS_TAU_S = 0.18
     _SWEEP_PERIOD_S = 2.25
@@ -110,17 +112,31 @@ class ActivityPresence(QWidget):
     ) -> None:
         next_target = float(max(0, min(100, int(percent))))
         was_active = self.active
+        previous_state = (
+            self.mode,
+            self.detail,
+            self.meta,
+            self.target_percent,
+            self.active,
+        )
 
         self.mode = str(mode or "STANDBY").upper()
         self.detail = str(detail or "").strip() or "等待任务"
         self.meta = str(meta or "").strip() or f"总进度 · {int(round(next_target))}%"
         self.target_percent = next_target
         self.active = bool(active)
+        state_changed = previous_state != (
+            self.mode,
+            self.detail,
+            self.meta,
+            self.target_percent,
+            self.active,
+        )
+        if state_changed:
+            self.stateChanged.emit()
 
         quick_owned = self._quick_owns_presentation()
         if quick_owned:
-            # The QML mirror owns interpolation/liveness. Never keep a hidden
-            # QWidget PreciseTimer repainting behind the same QQuickWindow.
             self._timer.stop()
             self.display_percent = self.target_percent
             self._motion_time_s = 0.0
