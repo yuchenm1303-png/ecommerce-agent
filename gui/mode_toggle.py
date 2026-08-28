@@ -5,6 +5,7 @@ from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import QAbstractButton, QHBoxLayout, QMainWindow, QVBoxLayout, QWidget
 
 from .settings_modal_surface import install_ai_settings_modal
+from .workspace_layout_commit import install_workspace_layout_commit
 
 
 _CORE_WIDTH = 40.0
@@ -118,6 +119,18 @@ def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
     if mode_stack is None or single_button is None or batch_button is None or not callable(set_mode):
         raise RuntimeError("workspace mode switch requires installed Single/Batch workspace")
 
+    # Both pages are persistent. Establish one geometry owner before the header
+    # switch is exposed so clicking the switch never becomes a layout boundary.
+    install_workspace_layout_commit(window)
+
+    # _set_workspace_mode hides this Single-only header action in Batch mode. Keep
+    # its layout slot so the common header and modeStack geometry are invariant.
+    open_run_button = getattr(window, "open_run_button", None)
+    if isinstance(open_run_button, QWidget):
+        policy = open_run_button.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        open_run_button.setSizePolicy(policy)
+
     legacy_card = single_button.parentWidget()
     if legacy_card is not None:
         legacy_card.setObjectName("")
@@ -138,6 +151,9 @@ def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
 
     def request_mode(checked: bool) -> None:
         target = 1 if checked else 0
+        if target == int(mode_stack.currentIndex()):
+            toggle.set_checked_immediate(target == 1)
+            return
         transition = getattr(window, "_workspace_transition_controller", None)
         request = getattr(transition, "request_mode", None)
         if callable(request):
@@ -150,7 +166,7 @@ def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
     def sync_from_stack(index: int) -> None:
         target = int(index) == 1
         if toggle.isChecked() != target:
-            toggle.setChecked(target)
+            toggle.set_checked_immediate(target)
 
     mode_stack.currentChanged.connect(sync_from_stack)
     header.addWidget(toggle, 0, Qt.AlignmentFlag.AlignBottom)
