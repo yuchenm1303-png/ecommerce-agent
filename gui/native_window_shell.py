@@ -182,10 +182,12 @@ class NativeWindowShell(QObject):
         self._overlay_presented = True
         self._focus_pending = False
         self._last_focus_widget: QWidget | None = None
+        self._last_fitted_owner_size: tuple[int, int] | None = None
 
-        # Resize, expose and width/height notifications can describe the same
-        # native geometry transition. One owned zero-delay timer collapses that
-        # burst into a single SetWindowPos so drag-resize never builds a backlog.
+        # Non-size lifecycle notifications can describe the same native geometry
+        # transition. One owned zero-delay timer collapses those bursts. Actual
+        # width/height changes are committed synchronously below because the Quick
+        # mirror reads QWidget geometry immediately after these owner signals.
         self._fit_timer = QTimer(self)
         self._fit_timer.setSingleShot(True)
         self._fit_timer.setInterval(0)
@@ -214,8 +216,13 @@ class NativeWindowShell(QObject):
 
         owner.installEventFilter(self)
         overlay.installEventFilter(self)
-        owner.widthChanged.connect(self._schedule_native_fit)
-        owner.heightChanged.connect(self._schedule_native_fit)
+
+        # NativeWindowShell is installed before StaticQmlView. Preserve that
+        # ordering as an explicit ownership boundary: first resize the hidden
+        # QWidget business/layout host, then let later Quick subscribers snapshot
+        # the resulting geometry. This prevents mixed old/new resize frames.
+        owner.widthChanged.connect(self._fit_native_child_for_resize)
+        owner.heightChanged.connect(self._fit_native_child_for_resize)
 
         self._keyboard_focus_watch = [
             widget
@@ -264,6 +271,24 @@ class NativeWindowShell(QObject):
         self.overlay.update()
         self._schedule_widget_focus()
 
+    def _owner_size(self) -> tuple[int, int]:
+        try:
+            return max(1, int(self.owner.width())), max(1, int(self.owner.height()))
+        except RuntimeError:
+            return (1, 1)
+
+    def _fit_native_child_for_resize(self, *_args: object) -> None:
+        if self._closing or not self._embedded:
+            return
+
+        # widthChanged and heightChanged normally arrive for the same final QRect.
+        # The owner-size generation prevents the second signal from issuing a
+        # duplicate SetWindowPos while keeping the first fit synchronous.
+        owner_size = self._owner_size()
+        if owner_size == self._last_fitted_owner_size:
+            return
+        self._fit_native_child()
+
     def _schedule_native_fit(self, *_args: object) -> None:
         if self._closing or not self._embedded or self._fit_timer.isActive():
             return
@@ -275,6 +300,7 @@ class NativeWindowShell(QObject):
         if self._closing or not self._embedded:
             return
         _fit_child_to_owner_client(int(self.overlay.winId()), int(self.owner.winId()))
+        self._last_fitted_owner_size = self._owner_size()
 
     def _belongs_to_overlay(self, widget: QWidget | None) -> bool:
         current = widget
@@ -325,7 +351,6 @@ class NativeWindowShell(QObject):
         if watched is self.owner:
             if event_type in {
                 QEvent.Type.Show,
-                QEvent.Type.Resize,
                 QEvent.Type.WindowStateChange,
                 QEvent.Type.Expose,
             }:
