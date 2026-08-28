@@ -21,7 +21,11 @@ from .business_fields import (
     BUSINESS_ATTRIBUTE_ALIASES,
     is_business_question,
 )
-from .hard_field_validators import is_numeric_semantic_field, validate_resolved_answer
+from .hard_field_validators import (
+    has_live_value_control,
+    is_numeric_semantic_field,
+    validate_resolved_answer,
+)
 from .resolution_types import (
     CONFLICT as RESOLVER_CONFLICT,
     MISSING as RESOLVER_MISSING,
@@ -308,10 +312,15 @@ def _hard_guard_values(
     qualifiers = field_qualifier_options(live_field)
     if qualifier:
         if not qualifiers:
-            # Free-text Makro controls can faithfully carry the approved unit in
-            # the same box. Do this before any fixed-unit inference so nearby UI
-            # wording cannot spuriously turn a valid text answer into a conflict.
-            if not options and not is_numeric_semantic_field(live_field):
+            # Inline value+unit only when the live DOM proves that a writable
+            # non-numeric value control actually exists. A schema-only field with
+            # no current control must stay blocked instead of erasing qualifier
+            # evidence before hard validation can see it.
+            if (
+                not options
+                and has_live_value_control(live_field)
+                and not is_numeric_semantic_field(live_field)
+            ):
                 values = _inline_qualifier_values(values, qualifier)
                 qualifier = ""
             elif _fixed_qualifier_rendered(live_field, qualifier):

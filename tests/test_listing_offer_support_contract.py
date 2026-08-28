@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import app.business_fields as business_fields
+from app.listing_content_policy import LISTING_INTENT_ENV, current_listing_intent
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -63,13 +66,22 @@ def test_product_photos_reuse_existing_image_observations_for_offer_ranking() ->
     assert "No new vision call" in source
 
 
-def test_offer_intent_does_not_replace_makro_seller_sku_or_qc_lock() -> None:
-    policy = _source("app/listing_content_policy.py")
+def test_offer_intent_does_not_replace_makro_seller_sku_or_qc_lock(monkeypatch) -> None:
     gui = _source("gui/listing_offer_support.py")
     launcher = _source("run_local_gui.py")
+    product_url = "https://supplier.example/item/42?sku=blue"
+
+    # Seller SKU generation is its own mechanical business channel. Listing intent
+    # may change offer semantics, but it must never feed or replace the SKU value.
+    monkeypatch.setattr(business_fields.secrets, "randbelow", lambda _limit: 123456)
+    sku_without_intent = business_fields.generate_listing_sku(product_url)
+    monkeypatch.setenv(LISTING_INTENT_ENV, "Black purifier + 2 fragrance oils")
+    assert current_listing_intent() == "Black purifier + 2 fragrance oils"
+    sku_with_intent = business_fields.generate_listing_sku(product_url)
+    assert sku_with_intent == sku_without_intent
+    assert len(sku_with_intent) == 12 and sku_with_intent.isdigit()
 
     assert "not the Makro seller SKU identifier" in gui
-    assert "not a product identifier" in policy
     assert "makro_execute_listing.py" not in gui  # reuse controller/executor instead of a second engine
     assert "Send to QC" not in gui
     assert "install_listing_offer_support" in launcher

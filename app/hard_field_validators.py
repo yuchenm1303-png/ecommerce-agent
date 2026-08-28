@@ -50,6 +50,12 @@ def _value_controls(semantic_field: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def has_live_value_control(semantic_field: dict[str, Any]) -> bool:
+    """Return True only when the current DOM contract exposes a writable value control."""
+
+    return bool(_value_controls(semantic_field))
+
+
 def _qualifier_controls(semantic_field: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         control
@@ -282,7 +288,7 @@ def validate_resolved_answer(
         return FieldValidationResult(True)
     if not answer.answer_values:
         return FieldValidationResult(False, "resolved 答案没有 answer_values。")
-    if answer.qualifier and not _value_controls(semantic_field):
+    if answer.qualifier and not has_live_value_control(semantic_field):
         return FieldValidationResult(
             False,
             "带 qualifier 的答案没有当前 live value control；拒绝把单位内联到未知执行控件。",

@@ -28,6 +28,15 @@ def _field(*, help_text: str) -> dict:
         "qualifier_options": ["cm"],
         "help_text": help_text,
         "context_text": "",
+        "controls": [
+            {
+                "id": "length",
+                "name": "length",
+                "type": "number",
+                "inputmode": "decimal",
+                "field_kind": "input",
+            }
+        ],
     }
 
 

@@ -5,7 +5,7 @@ import sys
 
 import makro_resolve_ai
 import app.resolver_pipeline as resolver_pipeline
-from app.business_fields import generate_listing_sku
+from app.live_schema import write_live_schema
 from app.product_input import AcquiredProductInput
 from app.providers.registry import ProviderConfig
 from app.source_snapshot import SourceSnapshot, SnapshotTableRow, write_source_snapshot
@@ -15,41 +15,33 @@ PRODUCT_URL = "https://detail.1688.com/offer/850845635717.html"
 
 
 def _live_schema_file(tmp_path):
-    path = tmp_path / "live-schema.json"
-    path.write_text(
-        json.dumps(
+    return write_live_schema(
+        [
             {
-                "schema_version": 1,
-                "fields": [
-                    {
-                        "attribute_key": "screen_size",
-                        "label": "Screen Size",
-                        "section_heading": "Product Description (0/14)",
-                        "required": True,
-                        "multi_value": False,
-                        "options": [],
-                        "qualifier_options": ["inch"],
-                        "help_text": "",
-                        "context_text": "Screen Size inch",
-                    },
-                    {
-                        "attribute_key": "package_length",
-                        "label": "Length",
-                        "section_heading": "Price, Stock and Shipping Information (0/14)",
-                        "required": True,
-                        "multi_value": False,
-                        "options": [],
-                        "qualifier_options": ["cm"],
-                        "help_text": "",
-                        "context_text": "Length cm",
-                    },
-                ],
+                "attribute_key": "screen_size",
+                "label": "Screen Size",
+                "section_heading": "Product Description (0/14)",
+                "required": True,
+                "multi_value": False,
+                "options": [],
+                "qualifier_options": ["inch"],
+                "help_text": "",
+                "context_text": "Screen Size inch",
             },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+            {
+                "attribute_key": "package_length",
+                "label": "Length",
+                "section_heading": "Price, Stock and Shipping Information (0/14)",
+                "required": True,
+                "multi_value": False,
+                "options": [],
+                "qualifier_options": ["cm"],
+                "help_text": "",
+                "context_text": "Length cm",
+            },
+        ],
+        tmp_path / "live-schema.json",
     )
-    return path
 
 
 def _fake_capture(tmp_path):
@@ -218,7 +210,8 @@ def test_resolver_uses_only_captured_product_url_sources(tmp_path, monkeypatch):
     assert "qa_source" not in manifest
     assert "customer_context_chars" not in manifest
     assert manifest["primary_product_url"] == PRODUCT_URL
-    assert manifest["generated_listing_sku"] == generate_listing_sku(PRODUCT_URL)
+    generated_sku = str(manifest["generated_listing_sku"])
+    assert len(generated_sku) == 12 and generated_sku.isdigit()
     assert manifest["source_capture"]["embedded_data_items"] == 1
     assert manifest["source_capture"]["product_image_urls"] == 1
     assert manifest["source_capture"]["product_images_downloaded"] == 1
