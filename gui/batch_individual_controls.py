@@ -48,9 +48,10 @@ class BatchIndividualControls(QObject):
     """Per-link start/stop/delete on top of the canonical BatchController.
 
     One input row owns at most one current Job. Starting a row schedules only that
-    product; stopping terminates/removes only that Job's queues/process; deleting
-    removes only the current workspace record. Disk artifacts and Makro tabs are
-    deliberately preserved. The controller remains the sole subprocess owner.
+    product; stopping terminates/removes only that Job's queues/process. Deletion
+    is a separate quiescent-state operation and is never combined with process
+    termination. Disk artifacts and Makro tabs are deliberately preserved. The
+    controller remains the sole subprocess owner.
     """
 
     def __init__(self, workspace: QWidget) -> None:
@@ -65,7 +66,6 @@ class BatchIndividualControls(QObject):
         self._rows: dict[int, _RowControls] = {}
         self._cards: dict[str, _CardControls] = {}
         self._stop_requested: set[str] = set()
-        self._delete_requested: set[str] = set()
         self._batch_id = ""
 
         self._install_job_owned_product_files()
@@ -121,7 +121,7 @@ class BatchIndividualControls(QObject):
         except (RuntimeError, TypeError):
             pass
         remove.setText("删除")
-        remove.setToolTip("删除这一条任务/输入；磁盘日志、报告和 Makro 页面保留。")
+        remove.setToolTip("删除这一条任务/输入；运行中请先停止。磁盘日志、报告和 Makro 页面保留。")
 
         index = layout.indexOf(remove)
         insert_at = index if index >= 0 else layout.count()
@@ -179,10 +179,7 @@ class BatchIndividualControls(QObject):
                     job.error = ""
                     job.touch()
 
-            if job_id in self._delete_requested:
-                self._delete_requested.discard(job_id)
-                self._remove_job_record(job_id)
-            elif job_id:
+            if job_id:
                 self.controller._persist_emit()
 
             self._pump_lanes()
@@ -319,18 +316,31 @@ class BatchIndividualControls(QObject):
         QTimer.singleShot(2500, lambda p=process: self._kill_if_running(p))
         self.controller._persist_emit(immediate=True)
 
+    def _require_quiescent_delete(self, job_id: str) -> bool:
+        if not self._job_is_scheduled(job_id):
+            return True
+        QMessageBox.information(
+            self.workspace,
+            f"请先停止 {job_id}",
+            "任务仍在运行、排队或正在停止。\n\n"
+            "请先点击“停止”，等待任务完全进入 STOPPED 后再删除。",
+        )
+        return False
+
     def delete_row(self, row: Any) -> None:
         job = self._row_job(row)
         if job is None:
             self._remove_row_force(row)
             return
 
-        active = self._job_is_scheduled(str(job.job_id))
+        job_id = str(job.job_id)
+        if not self._require_quiescent_delete(job_id):
+            return
+
         answer = QMessageBox.question(
             self.workspace,
             f"删除 {job.job_id}",
-            ("这一条仍在运行/排队，会先只停止该商品。\n\n" if active else "")
-            + "将从当前 Batch 工作区移除该任务和输入行。\n"
+            "将从当前 Batch 工作区移除该任务和输入行。\n"
             "Job 目录、日志、报告和 Makro 页面都会保留。\n\n确认删除？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -339,18 +349,13 @@ class BatchIndividualControls(QObject):
             return
 
         row._delete_after_job = True
-        self.delete_job(str(job.job_id))
-        if self._job(str(job.job_id)) is None:
+        self.delete_job(job_id)
+        if self._job(job_id) is None:
             self._remove_row_force(row)
 
     def delete_job(self, job_id: str) -> None:
         job = self._job(job_id)
-        if job is None:
-            return
-        process = self._process_for_job(job_id)
-        if process is not None:
-            self._delete_requested.add(job_id)
-            self.stop_job(job_id)
+        if job is None or not self._require_quiescent_delete(job_id):
             return
         self._remove_from_queues(job_id)
         self._remove_job_record(job_id)
@@ -456,13 +461,12 @@ class BatchIndividualControls(QObject):
 
     def _confirm_delete_job(self, job_id: str) -> None:
         job = self._job(job_id)
-        if job is None:
+        if job is None or not self._require_quiescent_delete(job_id):
             return
         answer = QMessageBox.question(
             self.workspace,
             f"删除 {job_id}",
-            ("任务仍在运行/排队，会先停止这一件商品。\n\n" if self._job_is_scheduled(job_id) else "")
-            + "只从当前 Batch 工作区删除；磁盘产物和 Makro 页面保留。\n确认删除？",
+            "只从当前 Batch 工作区删除；磁盘产物和 Makro 页面保留。\n确认删除？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -607,7 +611,10 @@ class BatchIndividualControls(QObject):
 
         controls.start.setEnabled(valid and (job is None or terminal))
         controls.stop.setEnabled(bool(job is not None and (scheduled or ready or not terminal)))
-        controls.delete.setEnabled(bool(str(row.url() or "").strip()) or job is not None)
+        controls.delete.setEnabled(
+            bool(str(row.url() or "").strip()) or job is not None
+            and not scheduled
+        )
         controls.start.setText(
             "运行中" if scheduled else "重启" if terminal else "已准备" if ready else "启动"
         )
@@ -620,9 +627,9 @@ class BatchIndividualControls(QObject):
         terminal = str(job.status) in _TERMINAL
         controls.fill.setEnabled(str(job.status) == "READY" and not scheduled)
         controls.stop.setEnabled(scheduled or (str(job.status) == "READY" and not terminal))
-        controls.delete.setEnabled(True)
+        controls.delete.setEnabled(not scheduled)
         controls.hint.setText(
-            "运行中 · 只控制这一件商品"
+            "运行中 · 请先停止后删除"
             if scheduled
             else "READY · 可单独真实填写"
             if str(job.status) == "READY"
