@@ -2,22 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, QPoint, Property, QTimer, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QKeyEvent, QMouseEvent
+from PySide6.QtCore import QEvent, QObject, Property, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtQml import QQmlComponent
 from PySide6.QtQuick import QQuickItem, QQuickWindow
-from PySide6.QtWidgets import (
-    QAbstractButton,
-    QCheckBox,
-    QComboBox,
-    QFrame,
-    QLineEdit,
-    QPlainTextEdit,
-    QSpinBox,
-    QTabWidget,
-    QTableWidget,
-    QWidget,
-)
+from PySide6.QtWidgets import QFrame, QWidget
 
 from .card_details_fast import FastCardDetailController
 from .static_qml_view import StaticQmlViewController
@@ -27,16 +16,6 @@ _OPEN_MS = 260
 _CLOSE_MS = 210
 _DRAWER_TRAVEL_PX = 14
 _MODAL_QML_URL = QUrl("inmemory:/QuickDetailModal.qml")
-_INTERACTIVE_WIDGETS = (
-    QAbstractButton,
-    QLineEdit,
-    QSpinBox,
-    QComboBox,
-    QCheckBox,
-    QPlainTextEdit,
-    QTableWidget,
-    QTabWidget,
-)
 
 
 _QUICK_MODAL_QML = r'''
@@ -533,6 +512,7 @@ class QuickModalLayerController(QObject):
 
         self.quick.installEventFilter(self)
         self.static_bridge.sceneChanged.connect(self._on_main_scene_changed)
+        self.static_bridge.cardDetailRequested.connect(self._open_card_row)
         window.destroyed.connect(self.cleanup)
 
     def _get_presented(self) -> bool:
@@ -677,52 +657,25 @@ class QuickModalLayerController(QObject):
         if self._presented:
             self._refresh_controls()
 
-    @staticmethod
-    def _widget_contains_window_point(widget: QWidget, window: QWidget, point: QPoint) -> bool:
-        try:
-            top_left = widget.mapTo(window, QPoint(0, 0))
-            return (
-                widget.isEnabled()
-                and widget.isVisibleTo(window)
-                and top_left.x() <= point.x() < top_left.x() + widget.width()
-                and top_left.y() <= point.y() < top_left.y() + widget.height()
-            )
-        except RuntimeError:
-            return False
-
-    def _point_hits_interactive_control(self, point: QPoint) -> bool:
-        """Interactive controls own pointer input globally before any card does."""
-
-        try:
-            widgets = self.window.findChildren(QWidget)
-        except RuntimeError:
-            return False
-        return any(
-            isinstance(widget, _INTERACTIVE_WIDGETS)
-            and self._widget_contains_window_point(widget, self.window, point)
-            for widget in widgets
-        )
-
-    def _open_card_at(self, point: QPoint) -> bool:
+    @Slot(int)
+    def _open_card_row(self, row: int) -> None:
         if self._presented or not self.static_view.static_active:
-            return False
-        if self._point_hits_interactive_control(point):
-            return False
-        cards = tuple(getattr(self.details, "_expandable_cards", ()))  # noqa: SLF001
-        for frame in reversed(cards):
-            if not isinstance(frame, QFrame):
-                continue
-            if not self._widget_contains_window_point(frame, self.window, point):
-                continue
-            try:
-                if frame is getattr(self.window, "console", None):
-                    self.details.open_console_details()
-                else:
-                    self.details.open(frame)
-            except RuntimeError:
-                return False
-            return not self.details.drawer.isHidden()
-        return False
+            return
+        frames = tuple(getattr(self.static_bridge, "_card_frames", ()))  # noqa: SLF001
+        row = int(row)
+        if not 0 <= row < len(frames):
+            return
+        frame = frames[row]
+        expandable = tuple(getattr(self.details, "_expandable_cards", ()))  # noqa: SLF001
+        if not isinstance(frame, QFrame) or frame not in expandable:
+            return
+        try:
+            if frame is getattr(self.window, "console", None):
+                self.details.open_console_details()
+            else:
+                self.details.open(frame)
+        except RuntimeError:
+            return
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if watched is not self.quick or not self.static_view.static_active:
@@ -735,13 +688,6 @@ class QuickModalLayerController(QObject):
             if event.key() == Qt.Key.Key_Escape and self._presented:
                 self.closeModal()
                 return True
-            return False
-        if event.type() != QEvent.Type.MouseButtonRelease:
-            return False
-        if not isinstance(event, QMouseEvent) or event.button() != Qt.MouseButton.LeftButton:
-            return False
-        point = event.position().toPoint()
-        self._open_card_at(point)
         return False
 
     @Slot()
@@ -816,6 +762,10 @@ class QuickModalLayerController(QObject):
             pass
         try:
             self.static_bridge.sceneChanged.disconnect(self._on_main_scene_changed)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            self.static_bridge.cardDetailRequested.disconnect(self._open_card_row)
         except (RuntimeError, TypeError):
             pass
         item = self._item
