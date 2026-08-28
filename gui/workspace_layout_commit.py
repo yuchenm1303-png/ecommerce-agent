@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QObject, Qt
+from PySide6.QtCore import QEvent, QObject, QTimer, Qt
 from PySide6.QtWidgets import QLayout, QMainWindow, QStackedWidget, QWidget
 
 from .page_scroll_layout import refresh_single_source_layout
@@ -39,14 +39,12 @@ def _activate_layout_tree(widget: QWidget) -> bool:
 class WorkspaceLayoutCommitter(QObject):
     """Own final geometry for both persistent Single/Batch pages.
 
-    QStackedWidget keeps the inactive page hidden. A hidden subtree can only be
-    pre-laid out approximately because its final Show/current-page constraints have
-    not run yet. The Quick presentation reads QWidget geometry as its visual model,
-    so every currentChanged boundary must synchronously commit the page that just
-    became current before queued QML refreshes are allowed to observe it.
-
-    Global Show/Resize still primes both persistent pages so switching starts from a
-    close pre-layout, but the current page is always the authoritative final commit.
+    QWidget remains the business/layout source of truth while the unified QQuickWindow
+    owns presentation. A layout transaction therefore has one explicit publication
+    boundary: after modeStack has finished its Resize/Show/LayoutRequest work, this
+    owner settles the persistent page tree and asks the Quick mirror to consume that
+    committed geometry. Quick never needs per-widget geometry event filters and it
+    never depends on pointer input to discover a newer layout.
     """
 
     def __init__(self, window: QMainWindow) -> None:
@@ -56,6 +54,12 @@ class WorkspaceLayoutCommitter(QObject):
         if not isinstance(self.stack, QStackedWidget):
             raise RuntimeError("workspace layout owner requires installed modeStack")
         self._committing = False
+
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.setInterval(0)
+        self._settle_timer.timeout.connect(self._settle_stack_layout)
+
         self.stack.installEventFilter(self)
         self.stack.currentChanged.connect(self.commit_current)
         window.destroyed.connect(self.cleanup)
@@ -69,6 +73,26 @@ class WorkspaceLayoutCommitter(QObject):
         if callable(commit):
             try:
                 commit()
+            except RuntimeError:
+                pass
+
+    def _publish_committed_geometry(self) -> None:
+        """Publish one settled QWidget layout generation to the Quick presentation."""
+
+        controller = getattr(self.window, "_static_qml_view_controller", None)
+        bridge = getattr(controller, "bridge", None)
+        schedule_refresh = getattr(bridge, "schedule_refresh", None)
+        if callable(schedule_refresh):
+            try:
+                schedule_refresh()
+            except RuntimeError:
+                pass
+
+        activity = getattr(controller, "activity_presence", None)
+        schedule_activity = getattr(activity, "schedule_refresh", None)
+        if callable(schedule_activity):
+            try:
+                schedule_activity()
             except RuntimeError:
                 pass
 
@@ -104,6 +128,7 @@ class WorkspaceLayoutCommitter(QObject):
             self._commit_page(int(index))
         finally:
             self._committing = False
+        self._publish_committed_geometry()
 
     def prime_all(self) -> None:
         if self._committing:
@@ -114,20 +139,39 @@ class WorkspaceLayoutCommitter(QObject):
                 self._commit_page(index)
         finally:
             self._committing = False
+        self._publish_committed_geometry()
 
     def commit_current(self, _index: int | None = None) -> None:
         self.prepare_page(int(self.stack.currentIndex()))
+
+    def _schedule_stack_settle(self) -> None:
+        if self._committing or self._settle_timer.isActive():
+            return
+        self._settle_timer.start()
+
+    def _settle_stack_layout(self) -> None:
+        """Commit after Qt has finished the current top-level layout transaction."""
+
+        if self._committing:
+            self._schedule_stack_settle()
+            return
+        self.prime_all()
+        self.commit_current()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if watched is self.stack and event.type() in {
             QEvent.Type.Resize,
             QEvent.Type.Show,
+            QEvent.Type.LayoutRequest,
         }:
-            self.prime_all()
-            self.commit_current()
+            # Resize/Show can arrive before nested QLayouts have consumed their new
+            # rect. Publish only from the coalesced zero-delay settlement boundary,
+            # never from arbitrary child widget events.
+            self._schedule_stack_settle()
         return False
 
     def cleanup(self) -> None:
+        self._settle_timer.stop()
         try:
             self.stack.currentChanged.disconnect(self.commit_current)
         except (RuntimeError, TypeError):
