@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TUNING = (ROOT / "gui" / "workspace_transition_tuning.py").read_text(encoding="utf-8")
 TRANSITION = (ROOT / "gui" / "workspace_transition.py").read_text(encoding="utf-8")
+SNAPSHOT = (ROOT / "gui" / "workspace_transition_snapshot.py").read_text(encoding="utf-8")
 RUNNER = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
@@ -23,13 +24,14 @@ def test_slower_profile_changes_timing_only() -> None:
     assert '"_VEIL_PEAK_MS": 210' in TUNING
     assert '"_VEIL_END_MS": 270' in TUNING
 
-    # The stabilized renderer stays byte-level independent of speed tuning.
+    # Speed tuning does not change the geometry-stable snapshot renderer.
     assert "_HOLD_MS = 40" in TRANSITION
     assert "_EXIT_END_MS = 155" in TRANSITION
     assert "_ENTER_START_MS = 175" in TRANSITION
     assert "_TOTAL_MS = 390" in TRANSITION
-    assert "page.render(" in TRANSITION
-    assert "page.grab()" not in TRANSITION
+    assert "page.render(" in SNAPSHOT
+    assert "page.grab()" not in SNAPSHOT
+    assert "grabWindow" not in SNAPSHOT
 
 
 def test_formal_runner_applies_profile_before_installing_transition() -> None:
