@@ -440,7 +440,7 @@ Window {{
                 transformOrigin: Item.Center
                 radius: {_GLASS_RADIUS:.1f}
                 antialiasing: true
-                color: Qt.rgba(0, 0, 0, cardAlpha / 255.0)
+                color: Qt.rgba(1, 157 / 255.0, 202 / 255.0, cardAlpha / 255.0)
             }}
         }}
     }}
