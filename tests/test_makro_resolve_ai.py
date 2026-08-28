@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import inspect
 import json
 import sys
-from types import SimpleNamespace
 
 import makro_resolve_ai
+import app.resolver_pipeline as resolver_pipeline
 from app.business_fields import generate_listing_sku
+from app.product_input import AcquiredProductInput
 from app.providers.registry import ProviderConfig
 from app.source_snapshot import SourceSnapshot, SnapshotTableRow, write_source_snapshot
 
@@ -70,13 +70,18 @@ def _fake_capture(tmp_path):
     detail = capture_dir / "product-images" / "source-image-01.jpg"
     detail.parent.mkdir(parents=True, exist_ok=True)
     detail.write_bytes(b"fake-detail-image")
-    return SimpleNamespace(
+    return AcquiredProductInput(
+        mode="supplier_url",
+        product_reference_url=PRODUCT_URL,
         snapshot_path=snapshot_path,
-        screenshot_path=screenshot_path,
         snapshot=snapshot,
-        launched_now=False,
-        product_image_paths=(detail,),
-        cache_hit=True,
+        supplier_snapshot_paths=(snapshot_path,),
+        customer_snapshot_paths=(),
+        evidence_image_paths=(detail,),
+        listing_image_paths=(),
+        screenshot_path=screenshot_path,
+        source_cache_hit=True,
+        source_edge_launched=False,
     )
 
 
@@ -145,10 +150,7 @@ class FakeProvider:
                         "alternatives": [],
                     }
                 )
-        return {
-            "facts": facts,
-            "model_summary": "fake typed local result",
-        }
+        return {"facts": facts}
 
 
 def test_resolver_uses_only_captured_product_url_sources(tmp_path, monkeypatch):
@@ -157,13 +159,17 @@ def test_resolver_uses_only_captured_product_url_sources(tmp_path, monkeypatch):
     provider = FakeProvider()
     captured_config = {}
 
-    monkeypatch.setattr(makro_resolve_ai, "capture_product_source", lambda *a, **k: _fake_capture(tmp_path))
+    monkeypatch.setattr(
+        resolver_pipeline,
+        "acquire_product_input",
+        lambda **_kwargs: _fake_capture(tmp_path),
+    )
 
     def fake_builder(config):
         captured_config["config"] = config
         return provider
 
-    monkeypatch.setattr(makro_resolve_ai, "build_semantic_provider", fake_builder)
+    monkeypatch.setattr(resolver_pipeline, "build_semantic_provider", fake_builder)
     monkeypatch.setattr(
         sys,
         "argv",
