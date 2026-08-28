@@ -624,6 +624,25 @@ class BatchWorkspace(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "批量填写无法启动", str(exc))
 
+    @staticmethod
+    def _retire_job_card(card: BatchJobCard) -> None:
+        """Retire a card without reparenting an ancestor during child signal dispatch.
+
+        A per-job Delete click emits jobs_changed synchronously while Qt is still
+        dispatching the clicked signal from a QPushButton owned by this card. Calling
+        setParent(None) on the card in that stack mutates the native QWidget ancestry
+        underneath the active child and can crash PySide/Qt at the C++ boundary.
+        Keep ownership with jobs_host, make the stale card non-interactive/invisible,
+        and let Qt destroy it only through the normal deferred-delete boundary.
+        """
+
+        try:
+            card.setEnabled(False)
+            card.hide()
+            card.deleteLater()
+        except RuntimeError:
+            pass
+
     def _apply_jobs(self, jobs: list[BatchJob]) -> None:
         self._jobs = list(jobs)
         batch_id = self.controller.batch.batch_id if self.controller.batch is not None else ""
@@ -646,8 +665,7 @@ class BatchWorkspace(QWidget):
             if job_id in seen:
                 continue
             card = self._job_cards.pop(job_id)
-            card.setParent(None)
-            card.deleteLater()
+            self._retire_job_card(card)
         self.empty_state.setVisible(not jobs)
         self.job_count_label.setText(f"{len(jobs)} JOBS")
         self.execute_button.setEnabled(not self.controller.is_running and any(job.status == "READY" for job in jobs))
@@ -665,10 +683,10 @@ class BatchWorkspace(QWidget):
         pending.append(line)
 
     def _clear_job_cards(self) -> None:
-        for card in self._job_cards.values():
-            card.setParent(None)
-            card.deleteLater()
+        cards = tuple(self._job_cards.values())
         self._job_cards.clear()
+        for card in cards:
+            self._retire_job_card(card)
         self._pending_logs.clear()
         self.empty_state.setVisible(True)
         self.job_count_label.setText("0 JOBS")
