@@ -22,13 +22,7 @@ _LAYOUT_ACTIVITY_EVENTS = {
 
 
 class StartupEntranceStabilityGate(QObject):
-    """Settle QWidget state, transfer presentation to Quick, then reveal in Quick.
-
-    QWidget remains the authoritative startup layout/state host, but it never owns
-    the entrance animation. Once layout is quiescent, the unified QQuickWindow is
-    activated behind the still-closed Quick curtain. Two rendered frames complete
-    the native-child handoff before the GPU reveal timeline is allowed to start.
-    """
+    """Settle QWidget state, wait for the Quick cover, then transfer ownership."""
 
     handoffReady = Signal()
 
@@ -46,6 +40,8 @@ class StartupEntranceStabilityGate(QObject):
         self._layout_epoch = 0
         self._layout_watch: list[QWidget] = []
         self._start_requested = False
+        self._layout_probe_started = False
+        self._overlay_wait_connected = False
         self._reveal_barrier_started = False
         self._reveal_frames_remaining = 0
         self._reveal_frame_quick: Any | None = None
@@ -110,13 +106,66 @@ class StartupEntranceStabilityGate(QObject):
 
         return False
 
+    def _overlay_is_ready(self) -> bool:
+        return bool(getattr(self.overlay, "is_ready", False))
+
+    def _overlay_is_failed(self) -> bool:
+        return bool(getattr(self.overlay, "is_failed", False))
+
+    def _connect_overlay_wait(self) -> None:
+        if self.overlay is None or self._overlay_wait_connected:
+            return
+        try:
+            self.overlay.ready.connect(self._on_overlay_ready)
+            self.overlay.failed.connect(self._on_overlay_failed)
+        except (AttributeError, RuntimeError, TypeError):
+            return
+        self._overlay_wait_connected = True
+
+    def _disconnect_overlay_wait(self) -> None:
+        if self.overlay is None or not self._overlay_wait_connected:
+            return
+        try:
+            self.overlay.ready.disconnect(self._on_overlay_ready)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        try:
+            self.overlay.failed.disconnect(self._on_overlay_failed)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        self._overlay_wait_connected = False
+
     def start(self) -> None:
         if self._start_requested:
             return
         self._start_requested = True
-        raise_overlay = getattr(self.entrance, "raise_overlay", None)
-        if callable(raise_overlay):
-            raise_overlay()
+
+        if self.overlay is None or self._overlay_is_ready() or self._overlay_is_failed():
+            self._start_layout_probe()
+            return
+
+        self._connect_overlay_wait()
+        if self._overlay_is_ready():
+            self._on_overlay_ready()
+        elif self._overlay_is_failed():
+            self._on_overlay_failed()
+
+    def _on_overlay_ready(self) -> None:
+        self._disconnect_overlay_wait()
+        self._start_layout_probe()
+
+    def _on_overlay_failed(self, _message: str = "") -> None:
+        self._disconnect_overlay_wait()
+        self._start_layout_probe()
+
+    def _start_layout_probe(self) -> None:
+        if self._layout_probe_started:
+            return
+        self._layout_probe_started = True
+        if self._overlay_is_ready():
+            raise_overlay = getattr(self.entrance, "raise_overlay", None)
+            if callable(raise_overlay):
+                raise_overlay()
         QTimer.singleShot(0, self._probe_layout)
 
     def _ensure_live_paint(self) -> None:
@@ -127,8 +176,6 @@ class StartupEntranceStabilityGate(QObject):
             return
         try:
             if central.isVisibleTo(self.window):
-                # update(), unlike repaint(), does not synchronously block the GUI
-                # thread while the startup gate is still collecting layout state.
                 central.update()
         except RuntimeError:
             pass
@@ -227,8 +274,7 @@ class StartupEntranceStabilityGate(QObject):
             return
         self._reveal_barrier_started = True
 
-        # No QWidget layout observer is allowed to run during the entrance itself.
-        # From this point forward the visible animation is exclusively Scene Graph.
+        self._disconnect_overlay_wait()
         self._remove_live_surface_watch()
         self._prime_live_runtime()
 
@@ -247,9 +293,6 @@ class StartupEntranceStabilityGate(QObject):
         self._reveal_frame_quick = quick
         self._reveal_frames_remaining = _QUICK_SETTLE_FRAMES
 
-        # Activate the main Quick scene while the startup curtain is still fully
-        # closed. StaticQmlViewController hides the native QWidget child on its
-        # first rendered frame; the second frame settles the unified composition.
         self._emit_handoff_once()
         self._flush_native_background()
 
@@ -287,6 +330,7 @@ class StartupEntranceStabilityGate(QObject):
         if self._finish_started:
             return
         self._finish_started = True
+        self._disconnect_overlay_wait()
         self._disconnect_reveal_frame_barrier()
         self._remove_live_surface_watch()
         try:
