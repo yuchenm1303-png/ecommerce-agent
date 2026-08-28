@@ -88,6 +88,14 @@ class StaticQmlViewController(QObject):
         handoff_ready.connect(self._activate_after_startup)
         window.destroyed.connect(self._cleanup)
 
+        # Quick is the authoritative presentation owner for the normal runtime.
+        # Disable the legacy QWidget animation lane before shell.show() can expose
+        # the first mouse sample. Otherwise a restored QGraphicsEffect card can
+        # enter sourcePixmap() during startup and block the GUI thread before the
+        # Quick handoff has a chance to suspend it. _fail_scene() re-enables this
+        # lane only when the Quick scene genuinely cannot be created.
+        self._suspend_legacy_visuals()
+
         # Compile and create the hidden scene before the visible curtain movement.
         # The lightweight launch surface is still present at this point, so any
         # one-time QML import/component cost cannot steal animation frames later.
