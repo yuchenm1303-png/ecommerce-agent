@@ -160,7 +160,8 @@ class BatchParallelRuntime:
             )
             self._lane_count = len(lanes)
             self._base_port = base_port
-            self._prepared_tokens.update(lane_tokens(lanes))
+            for port, token in lane_tokens(lanes).items():
+                self._prepared_tokens.setdefault(port, token)
             self._decorate_batch_status("READY", "Makro Browser 已扩展")
 
         try:
