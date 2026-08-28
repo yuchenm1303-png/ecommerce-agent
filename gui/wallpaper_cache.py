@@ -5,11 +5,15 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, qVersion
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QPoint, QRectF, QSize, QStandardPaths, Qt, qVersion
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPixmap
+from PySide6.QtWidgets import QFrame, QMainWindow, QWidget
 
 from .native_background import (
     NativeQuickBackground,
+    _GLASS_RADIUS,
+    _NORMAL_GLASS_ALPHA,
+    _OVERSCAN,
     _WALLPAPER_ASSET,
     _blur_wallpaper,
     _decode_wallpaper,
@@ -140,11 +144,335 @@ def install_preblur_cache() -> tuple[Path, Path]:
     return prepare_wallpaper_assets()
 
 
+def _centered_static_view(source: QPixmap, width: int, height: int) -> QPixmap:
+    """Render the centered, zero-drift view with the same 1.06x cover geometry as Quick."""
+
+    width = max(1, int(width))
+    height = max(1, int(height))
+    outer_width = max(width, int(round(width * _OVERSCAN)))
+    outer_height = max(height, int(round(height * _OVERSCAN)))
+    scaled = source.scaled(
+        QSize(outer_width, outer_height),
+        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    crop_x = max(0, (scaled.width() - outer_width) // 2)
+    crop_y = max(0, (scaled.height() - outer_height) // 2)
+    overscanned = scaled.copy(crop_x, crop_y, outer_width, outer_height)
+    view_x = max(0, (outer_width - width) // 2)
+    view_y = max(0, (outer_height - height) // 2)
+    return overscanned.copy(view_x, view_y, width, height)
+
+
+class _StaticWallpaperScene(QWidget):
+    """One cached QWidget surface for the zero-drift wallpaper and fixed glass blur."""
+
+    def __init__(
+        self,
+        overlay: QMainWindow,
+        *,
+        card_model,
+        sharp_path: Path,
+        blur_path: Path,
+    ) -> None:
+        central = overlay.centralWidget()
+        if central is None:
+            raise RuntimeError("Static wallpaper renderer requires a central widget")
+        super().__init__(central)
+        self.overlay = overlay
+        self.card_model = card_model
+        self._central = central
+        self._sharp_source = QPixmap(str(sharp_path))
+        self._blur_source = QPixmap(str(blur_path))
+        if self._sharp_source.isNull() or self._blur_source.isNull():
+            raise RuntimeError("Static wallpaper renderer could not load cached assets")
+        self._scene = QPixmap()
+        self.setObjectName("staticWallpaperScene")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAutoFillBackground(False)
+        self.setGeometry(central.rect())
+        self.lower()
+
+    def rebuild(self) -> None:
+        if self.overlay.width() <= 0 or self.overlay.height() <= 0:
+            return
+        if self._central.width() <= 0 or self._central.height() <= 0:
+            return
+
+        self.setGeometry(self._central.rect())
+        root_width = int(self.overlay.width())
+        root_height = int(self.overlay.height())
+        sharp_view = _centered_static_view(self._sharp_source, root_width, root_height)
+        blur_view = _centered_static_view(self._blur_source, root_width, root_height)
+
+        origin = self._central.mapTo(self.overlay, QPoint(0, 0))
+        scene = QPixmap(self.width(), self.height())
+        scene.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(scene)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawPixmap(-origin.x(), -origin.y(), sharp_view)
+
+        for frame in tuple(self.card_model.cards):
+            try:
+                snapshot = self.card_model._snapshot(frame)
+            except RuntimeError:
+                continue
+            if not bool(snapshot["cardVisible"]):
+                continue
+
+            card_rect = QRectF(
+                float(snapshot["cardX"]) - origin.x(),
+                float(snapshot["cardY"]) - origin.y(),
+                float(snapshot["cardW"]),
+                float(snapshot["cardH"]),
+            )
+            clip_rect = QRectF(
+                float(snapshot["clipX"]) - origin.x(),
+                float(snapshot["clipY"]) - origin.y(),
+                float(snapshot["clipW"]),
+                float(snapshot["clipH"]),
+            )
+            if card_rect.isEmpty() or clip_rect.isEmpty():
+                continue
+
+            path = QPainterPath()
+            path.addRoundedRect(card_rect, _GLASS_RADIUS, _GLASS_RADIUS)
+            painter.save()
+            painter.setClipRect(clip_rect)
+            painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
+            painter.drawPixmap(-origin.x(), -origin.y(), blur_view)
+            painter.restore()
+
+        painter.end()
+        self._scene = scene
+        self.lower()
+        self.update()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802, ANN001
+        if self._scene.isNull():
+            return
+        painter = QPainter(self)
+        painter.drawPixmap(0, 0, self._scene)
+        painter.end()
+
+
+class _StaticCardTint(QWidget):
+    """Card tint that scales with the existing resident QWidget card effect."""
+
+    def __init__(self, frame: QFrame) -> None:
+        super().__init__(frame)
+        self._alpha = _NORMAL_GLASS_ALPHA
+        self.setObjectName("staticGlassTint")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        self.setGeometry(frame.rect())
+        self.lower()
+
+    def set_alpha(self, alpha: float) -> None:
+        alpha = max(0.0, min(255.0, float(alpha)))
+        if abs(self._alpha - alpha) < 0.1:
+            return
+        self._alpha = alpha
+        self.update()
+
+    def sync_geometry(self) -> None:
+        frame = self.parentWidget()
+        if frame is None:
+            return
+        self.setGeometry(frame.rect())
+        self.lower()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802, ANN001
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, int(round(self._alpha))))
+        painter.drawRoundedRect(QRectF(self.rect()), _GLASS_RADIUS, _GLASS_RADIUS)
+        painter.end()
+
+
 class PersistentNativeQuickBackground(NativeQuickBackground):
-    """Native Quick background backed by persistent, already-prepared JPEG assets."""
+    """Dual-mode renderer: static QWidget path off, original Quick path on.
+
+    The QQuickWindow remains the native owner so runtime mode changes never reparent
+    the application window. With drift disabled, an opaque cached QWidget scene
+    covers the dormant Quick surface and card hover updates never touch the Quick
+    model. Enabling drift hides that scene and resumes the unchanged Quick renderer.
+    """
+
+    def __init__(self, overlay: QMainWindow) -> None:
+        self._dynamic_mode = False
+        self._static_scene: _StaticWallpaperScene | None = None
+        self._static_tints: dict[QFrame, _StaticCardTint] = {}
+        self._card_presentations: dict[QFrame, tuple[float, float]] = {}
+        super().__init__(overlay)
+        self._static_scene = _StaticWallpaperScene(
+            overlay,
+            card_model=self.card_model,
+            sharp_path=self._sharp_path,
+            blur_path=self._blur_path,
+        )
+        self._sync_static_cards()
+        self.pause_pointer_animation()
+        self._static_scene.rebuild()
+        self._static_scene.show()
+        self._static_scene.lower()
+
+    @property
+    def dynamic_mode(self) -> bool:
+        return self._dynamic_mode
 
     def _prepare_assets(self) -> None:
         self._sharp_path, self._blur_path = prepare_wallpaper_assets()
+
+    def _ensure_static_tint(self, frame: QFrame) -> _StaticCardTint:
+        tint = self._static_tints.get(frame)
+        if tint is None:
+            tint = _StaticCardTint(frame)
+            self._static_tints[frame] = tint
+        tint.sync_geometry()
+        return tint
+
+    def _sync_static_cards(self) -> None:
+        active_frames = set(self.card_model.cards)
+        for frame in tuple(active_frames):
+            try:
+                tint = self._ensure_static_tint(frame)
+            except RuntimeError:
+                continue
+            scale, alpha = self._card_presentations.get(
+                frame,
+                (1.0, _NORMAL_GLASS_ALPHA),
+            )
+            self._card_presentations[frame] = (scale, alpha)
+            tint.set_alpha(alpha)
+            tint.setVisible(not self._dynamic_mode)
+            if not self._dynamic_mode:
+                tint.lower()
+
+        for frame, tint in tuple(self._static_tints.items()):
+            if frame in active_frames:
+                continue
+            try:
+                tint.hide()
+                tint.deleteLater()
+            except RuntimeError:
+                pass
+            self._static_tints.pop(frame, None)
+            self._card_presentations.pop(frame, None)
+
+    def set_dynamic_mode(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._shutting_down:
+            return
+        if enabled == self._dynamic_mode:
+            if not enabled:
+                self.schedule_mask_update()
+            return
+
+        quick = self.quick_window
+        if enabled:
+            # Prepare the original Quick scene completely while the static QWidget
+            # surface still covers it, then reveal it in one mode transition.
+            self.card_model.sync_geometry()
+            for frame, (scale, alpha) in tuple(self._card_presentations.items()):
+                self.card_model.set_presentation(frame, scale=scale, alpha=alpha)
+            self._geometry_revision += 1
+            if quick is not None:
+                try:
+                    quick.setProperty("geometryRevision", self._geometry_revision)
+                    quick.setProperty("animationRunning", False)
+                except RuntimeError:
+                    pass
+            self._dynamic_mode = True
+            self._sync_static_cards()
+            if self._static_scene is not None:
+                self._static_scene.hide()
+            self.reset_pointer_identity()
+            return
+
+        # Publish the centered static scene before making Quick dormant, so the
+        # switch never exposes an empty background frame.
+        self._dynamic_mode = False
+        self._sync_static_cards()
+        if self._static_scene is not None:
+            self._static_scene.rebuild()
+            self._static_scene.show()
+            self._static_scene.lower()
+        if quick is not None:
+            try:
+                quick.setProperty("animationRunning", False)
+                quick.setProperty("pointerX", 0.0)
+                quick.setProperty("pointerY", 0.0)
+                quick.setProperty("offsetX", 0.0)
+                quick.setProperty("offsetY", 0.0)
+            except RuntimeError:
+                pass
+        self.reset_pointer_identity()
+
+    def set_card_alpha(self, frame: QFrame, alpha: float) -> None:
+        scale, _ = self._card_presentations.get(frame, (1.0, _NORMAL_GLASS_ALPHA))
+        self.set_card_presentation(frame, scale=scale, alpha=alpha)
+
+    def set_card_presentation(self, frame: QFrame, *, scale: float, alpha: float) -> None:
+        scale = max(0.96, min(1.04, float(scale)))
+        alpha = max(0.0, min(255.0, float(alpha)))
+        self._card_presentations[frame] = (scale, alpha)
+        if self._dynamic_mode:
+            super().set_card_presentation(frame, scale=scale, alpha=alpha)
+            return
+
+        try:
+            tint = self._ensure_static_tint(frame)
+            tint.set_alpha(alpha)
+            tint.show()
+            tint.lower()
+        except RuntimeError:
+            pass
+
+    def presentation_tick(self, global_pos: QPoint, *, input_changed: bool) -> None:
+        if not self._dynamic_mode:
+            return
+        super().presentation_tick(global_pos, input_changed=input_changed)
+
+    def _flush_geometry(self) -> None:
+        if self._shutting_down:
+            return
+        if self._dynamic_mode:
+            super()._flush_geometry()
+            return
+
+        self._geometry_dirty = False
+        self._sync_static_cards()
+        if self._static_scene is not None:
+            self._static_scene.rebuild()
+            self._static_scene.show()
+            self._static_scene.lower()
+
+        if self._geometry_dirty and not self._geometry_timer.isActive():
+            self._geometry_timer.start()
+
+    def shutdown(self) -> None:
+        scene = self._static_scene
+        self._static_scene = None
+        if scene is not None:
+            try:
+                scene.hide()
+                scene.deleteLater()
+            except RuntimeError:
+                pass
+        for tint in tuple(self._static_tints.values()):
+            try:
+                tint.hide()
+                tint.deleteLater()
+            except RuntimeError:
+                pass
+        self._static_tints.clear()
+        self._card_presentations.clear()
+        super().shutdown()
 
 
 __all__ = [

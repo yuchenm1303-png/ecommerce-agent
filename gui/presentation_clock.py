@@ -48,10 +48,11 @@ class PresentationClock(QObject):
     tween.  The final settle sample is retained even if the GUI thread was briefly
     blocked, so frozen card content can never be stranded mid-transition.
 
-    Quick owns the first presentation lane. QWidget card/effect work is released
-    after the next QQuickWindow.frameSwapped signal while Quick is animating. When
-    Quick is idle, the QWidget lane flushes immediately. A short starvation timer
-    remains only as a safety net for an occluded or stalled Quick surface.
+    With background drift enabled, Quick owns the first presentation lane and
+    QWidget work is released after the next QQuickWindow.frameSwapped signal.
+    With drift disabled, the background switches to its static QWidget renderer,
+    so the Quick lane is deliberately bypassed and card/effect work flushes on the
+    single active QWidget presentation path.
     """
 
     def __init__(
@@ -114,23 +115,25 @@ class PresentationClock(QObject):
         enabled = bool(enabled)
         self._background_drift_enabled = enabled
         self._last_global = None
+        self._clear_widget_lane()
         try:
             self.background.reset_pointer_identity()
         except (AttributeError, RuntimeError):
             pass
 
-        if enabled:
+        set_dynamic_mode = getattr(self.background, "set_dynamic_mode", None)
+        if callable(set_dynamic_mode):
+            try:
+                set_dynamic_mode(enabled)
+            except RuntimeError:
+                pass
             return
 
-        quick = self._quick_window
-        if quick is None:
-            return
-        try:
-            quick.setProperty("pointerX", 0.0)
-            quick.setProperty("pointerY", 0.0)
-            quick.setProperty("animationRunning", True)
-        except RuntimeError:
-            pass
+        if not enabled:
+            try:
+                self.background.pause_pointer_animation()
+            except (AttributeError, RuntimeError):
+                pass
 
     def _can_run(self) -> bool:
         if self._holds or self._window_paused:
@@ -240,6 +243,8 @@ class PresentationClock(QObject):
         self._widget_samples[-1] = sample
 
     def _quick_lane_active(self) -> bool:
+        if not self._background_drift_enabled:
+            return False
         quick = self._quick_window
         if quick is None:
             return False
@@ -342,10 +347,8 @@ class PresentationClock(QObject):
         else:
             self._sync_cadence(now_s)
 
-        # QWidget work uses the same sampled input, but it is committed only after
-        # Quick presents its frame (or immediately when Quick has no active frame).
-        # Ambient effects keep their existing 16 ms visual budget while card work
-        # disappears completely once the interaction tween has settled.
+        # QWidget work uses the same sampled input. It waits for Quick only while
+        # drift mode is actively producing Quick frames; static mode flushes here.
         self._queue_widget_sample(
             global_pos,
             left_down=left_down,
