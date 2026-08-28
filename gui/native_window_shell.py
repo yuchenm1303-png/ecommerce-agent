@@ -183,6 +183,14 @@ class NativeWindowShell(QObject):
         self._focus_pending = False
         self._last_focus_widget: QWidget | None = None
 
+        # Resize, expose and width/height notifications can describe the same
+        # native geometry transition. One owned zero-delay timer collapses that
+        # burst into a single SetWindowPos so drag-resize never builds a backlog.
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.setInterval(0)
+        self._fit_timer.timeout.connect(self._fit_native_child)
+
         app = QApplication.instance()
         app_icon = app.windowIcon() if app is not None else overlay.windowIcon()
         if not app_icon.isNull():
@@ -235,7 +243,7 @@ class NativeWindowShell(QObject):
         self.owner.showMaximized()
         self._fit_native_child()
         self.overlay.show()
-        QTimer.singleShot(0, self._fit_native_child)
+        self._schedule_native_fit()
         QTimer.singleShot(0, self._restore_widget_focus)
 
     def set_overlay_presented(self, presented: bool) -> None:
@@ -257,11 +265,13 @@ class NativeWindowShell(QObject):
         self._schedule_widget_focus()
 
     def _schedule_native_fit(self, *_args: object) -> None:
-        if self._closing or not self._embedded:
+        if self._closing or not self._embedded or self._fit_timer.isActive():
             return
-        QTimer.singleShot(0, self._fit_native_child)
+        self._fit_timer.start()
 
     def _fit_native_child(self) -> None:
+        if self._fit_timer.isActive():
+            self._fit_timer.stop()
         if self._closing or not self._embedded:
             return
         _fit_child_to_owner_client(int(self.overlay.winId()), int(self.owner.winId()))
@@ -331,11 +341,13 @@ class NativeWindowShell(QObject):
                 self._schedule_widget_focus()
             elif event_type == QEvent.Type.Close and not self._closing:
                 self._closing = True
+                self._fit_timer.stop()
                 self.overlay.close()
 
         elif watched is self.overlay:
             if event_type == QEvent.Type.Close and not self._closing:
                 self._closing = True
+                self._fit_timer.stop()
                 self.owner.close()
 
         elif isinstance(watched, _KEYBOARD_WIDGET_TYPES):
