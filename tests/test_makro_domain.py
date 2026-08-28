@@ -20,9 +20,10 @@ class FakeSelectedOption:
 
 
 class FakeLocator:
-    def __init__(self, value="", selected_label=""):
+    def __init__(self, value="", selected_label="", options=None):
         self.value = value
         self.selected_label = selected_label
+        self.options = list(options or [])
         self.visible = True
         self._count = 1
         self.first = self
@@ -32,6 +33,9 @@ class FakeLocator:
 
     def fill(self, value):
         self.value = value
+
+    def evaluate(self, _script):
+        return list(self.options)
 
     def select_option(self, label=None, value=None):
         self.selected_label = label or value or self.selected_label
@@ -137,6 +141,10 @@ def test_adapter_builds_semantic_fields_and_locator_strategy():
 
 
 def test_adapter_fills_and_reads_browser_execution_shape_without_resolver():
+    select_options = [
+        {"text": "Draft", "value": "Draft", "disabled": False},
+        {"text": "Active", "value": "Active", "disabled": False},
+    ]
     controls = [
         {
             **_control("model_number_0_value"),
@@ -149,17 +157,14 @@ def test_adapter_fills_and_reads_browser_execution_shape_without_resolver():
             "id": "listing_status",
             "label": "Listing Status",
             "section_heading": "Price, Stock and Shipping Information",
-            "options": [
-                {"text": "Draft", "value": "Draft"},
-                {"text": "Active", "value": "Active"},
-            ],
+            "options": select_options,
         },
     ]
     fields = build_semantic_fields(controls)
     page = FakePage(
         {
             '[name="model_number_0_value"]': FakeLocator(),
-            '[name="listing_status_0_value"]': FakeLocator(),
+            '[name="listing_status_0_value"]': FakeLocator(options=select_options),
         }
     )
     adapter = MakroDomainAdapter(page)
