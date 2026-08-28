@@ -222,7 +222,6 @@ def main() -> int:
     from gui.premium_copy import install_premium_copy
     from gui.quick_modal_layer import install_quick_modal_layer
     from gui.required_input_support import install_required_input_support
-    from gui.restore_snapshot import install_restore_snapshot
     from gui.runtime_assistant import install_runtime_assistant
     from gui.sakana_toy import install_sakana_toy
     from gui.single_ai_guidance import install_single_ai_guidance
@@ -328,7 +327,6 @@ def main() -> int:
     quick_window = visual.background.quick_window
     if quick_window is None:
         raise RuntimeError("Native Quick renderer was not created")
-    install_restore_snapshot(window, quick_window)
     shell = install_native_window_shell(window, quick_window)
 
     # One shared 8 ms clock samples QCursor exactly once. Background parallax,
