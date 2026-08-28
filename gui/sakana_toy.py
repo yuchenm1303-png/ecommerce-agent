@@ -1,245 +1,122 @@
 from __future__ import annotations
 
-import math
+import json
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QPixmap, QTransform
-from PySide6.QtQuick import QQuickPaintedItem, QQuickWindow
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QUrl
+from PySide6.QtGui import QColor
+from PySide6.QtQuick import QQuickWindow
+from PySide6.QtWebEngineCore import QWebEngineSettings
+from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
-from gui.sakana_physics import move_spring
-from gui.sakana_runtime import SakanaSpringRuntime
 
-
-# Exact Sakana Widget geometry. The 200 px app/main is the positioned widget;
-# its 300 px canvas is centered around that root and overflows by 50 px per side.
-_TOY_SIZE = 200.0
-_IMAGE_SIZE = _TOY_SIZE / 1.25
-_CANVAS_SIZE = _TOY_SIZE * 1.5
-_CANVAS_INSET = (_CANVAS_SIZE - _TOY_SIZE) / 2.0
-_MAIN_CENTER_X = _CANVAS_INSET + _TOY_SIZE / 2.0
-_LEFT_MARGIN = 24.0
-_BOTTOM_MARGIN = 18.0
+_TOY_SIZE = 200
+_CANVAS_SIZE = 300
+_CANVAS_INSET = 50
+_LEFT_MARGIN = 24
+_BOTTOM_MARGIN = 18
 _CHARACTER_IMAGE = Path(__file__).resolve().parent / "assets" / "sakana_character.png"
 
-# Keep the upstream controller geometry, with only the user-requested visual
-# difference: a plain white controller without symbols.
-_BASE_WIDTH = 112.0
-_BASE_HEIGHT = 24.0
-_BASE_RADIUS = 6.0
+# The pcp.moe bundle supplied for this project is Sakana Widget 2.7.1. Run the
+# published browser build itself so its requestAnimationFrame loop, Date.now()
+# timing, DOM mouse lifecycle, Canvas drawing and CSS transforms are not
+# reimplemented by Qt/Python.
+_SAKANA_JS = "https://cdnjs.cloudflare.com/ajax/libs/sakana-widget/2.7.1/sakana.min.js"
+_SAKANA_CSS = "https://cdnjs.cloudflare.com/ajax/libs/sakana-widget/2.7.1/sakana.min.css"
 
 
-class _SakanaToyItem(QQuickPaintedItem):
-    """Paint the Sakana toy; physics timing lives entirely in SakanaSpringRuntime."""
-
-    def __init__(self, quick: QQuickWindow, controller: "SakanaToyController") -> None:
-        super().__init__(quick.contentItem())
-        self.controller = controller
-        self.setWidth(_CANVAS_SIZE)
-        self.setHeight(_CANVAS_SIZE)
-        self.setZ(32000.0)
-        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
-        self.setAcceptHoverEvents(False)
-        self.setOpaquePainting(False)
-
-        # Exact upstream Takina state is owned by the independent runtime.
-        self.state = controller.runtime.state
-        self.max_rotation = max(30.0, min(60.0, _TOY_SIZE / 5.0))
-        self.max_y = _TOY_SIZE / 4.0
-        self.min_y = -self.max_y
-
-        pixmap = QPixmap(str(_CHARACTER_IMAGE))
-        if pixmap.isNull():
-            raise RuntimeError(f"Unable to load Sakana character image: {_CHARACTER_IMAGE}")
-        self.pixmap = pixmap
-
-        self._interaction: str | None = None
-        self._spring_press_y = 0.0
-        self._position_press_global = QPointF()
-        self._position_press_root = QPointF()
-
-    @property
-    def anchor(self) -> QPointF:
-        return QPointF(_CANVAS_SIZE / 2.0, _TOY_SIZE + _CANVAS_INSET)
-
-    @property
-    def image_rect(self) -> QRectF:
-        return QRectF(-_IMAGE_SIZE / 2.0, -_TOY_SIZE, _IMAGE_SIZE, _IMAGE_SIZE)
-
-    def image_source_rect(self) -> QRectF:
-        width = float(self.pixmap.width())
-        height = float(self.pixmap.height())
-        side = min(width, height)
-        return QRectF((width - side) / 2.0, (height - side) / 2.0, side, side)
-
-    def base_rect(self) -> QRectF:
-        anchor = self.anchor
-        return QRectF(
-            anchor.x() - _BASE_WIDTH / 2.0,
-            anchor.y() - _BASE_HEIGHT,
-            _BASE_WIDTH,
-            _BASE_HEIGHT,
-        )
-
-    def _image_transform(self) -> QTransform:
-        angle = math.radians(self.state.r)
-        cos_a = math.cos(angle)
-        sin_a = math.sin(angle)
-        x = self.state.r
-        y = self.state.y
-        anchor = self.anchor
-        dx = anchor.x() + cos_a * x - sin_a * y
-        dy = anchor.y() + sin_a * x + cos_a * y
-        return QTransform(cos_a, sin_a, -sin_a, cos_a, dx, dy)
-
-    def _center_offset(self) -> QPointF:
-        angle = math.radians(self.state.r)
-        cos_a = math.cos(angle)
-        sin_a = math.sin(angle)
-        radius = _TOY_SIZE - _IMAGE_SIZE / 2.0
-        x = self.state.r
-        y = self.state.y
-        return QPointF(
-            sin_a * radius + cos_a * x - sin_a * y,
-            cos_a * radius - cos_a * y - sin_a * x,
-        )
-
-    def character_hit_test(self, point: QPointF) -> bool:
-        inverse, invertible = self._image_transform().inverted()
-        return bool(invertible and self.image_rect.contains(inverse.map(point)))
-
-    def base_hit_test(self, point: QPointF) -> bool:
-        return self.base_rect().contains(point)
-
-    def move_spring(self, dx: float, dy: float) -> None:
-        move_spring(
-            self.state,
-            dx,
-            dy,
-            max_rotation=self.max_rotation,
-            max_y=self.max_y,
-            min_y=self.min_y,
-        )
-        self.update()
-
-    def paint(self, painter: QPainter) -> None:  # type: ignore[override]
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-
-        anchor = self.anchor
-        offset = self._center_offset()
-        end = QPointF(anchor.x() + offset.x(), anchor.y() - offset.y())
-
-        pen = QPen(QColor("#b4b4b4"))
-        pen.setWidthF(10.0)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(pen)
-        painter.drawLine(QPointF(anchor.x(), anchor.y() - 10.0), end)
-
-        rect = self.base_rect()
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(0, 0, 0, 18))
-        painter.drawRoundedRect(rect.translated(0.0, 5.0), _BASE_RADIUS, _BASE_RADIUS)
-        painter.setBrush(QColor("#ffffff"))
-        painter.drawRoundedRect(rect, _BASE_RADIUS, _BASE_RADIUS)
-
-        painter.save()
-        painter.translate(anchor.x(), anchor.y())
-        painter.rotate(self.state.r)
-        painter.translate(self.state.r, self.state.y)
-        painter.drawPixmap(self.image_rect, self.pixmap, self.image_source_rect())
-        painter.restore()
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if event.button() != Qt.MouseButton.LeftButton or not self.isVisible():
-            event.ignore()
-            return
-
-        local = event.position()
-        if self.base_hit_test(local):
-            self._interaction = "position"
-            self._position_press_global = event.globalPosition()
-            self._position_press_root = self.controller.root_position
-            self.controller._user_positioned = True
-        elif self.character_hit_test(local):
-            self._interaction = "spring"
-            self._spring_press_y = event.position().y()
-            self.controller._pause_spring()
-            self.state.w = 0.0
-            self.state.t = 0.0
-        else:
-            event.ignore()
-            return
-
-        event.accept()
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if self._interaction == "position":
-            delta = event.globalPosition() - self._position_press_global
-            self.controller._move_root(
-                self._position_press_root.x() + delta.x(),
-                self._position_press_root.y() + delta.y(),
-            )
-        elif self._interaction == "spring":
-            self.move_spring(
-                event.position().x() - _MAIN_CENTER_X,
-                event.position().y() - self._spring_press_y,
-            )
-        else:
-            event.ignore()
-            return
-        event.accept()
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if event.button() != Qt.MouseButton.LeftButton or self._interaction is None:
-            event.ignore()
-            return
-        spring = self._interaction == "spring"
-        self._interaction = None
-        if spring and self.isVisible():
-            self.controller._resume_spring_after_drag()
-        event.accept()
-
-    def cancel_interaction(self) -> None:
-        self._interaction = None
+def _html_source() -> str:
+    image_url = QUrl.fromLocalFile(str(_CHARACTER_IMAGE)).toString()
+    return f'''<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="{_SAKANA_CSS}">
+<style>
+html, body {{
+    width: {_CANVAS_SIZE}px;
+    height: {_CANVAS_SIZE}px;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: transparent;
+}}
+#sakana-widget {{
+    position: absolute;
+    left: {_CANVAS_INSET}px;
+    top: {_CANVAS_INSET}px;
+    width: {_TOY_SIZE}px;
+    height: {_TOY_SIZE}px;
+}}
+/* Product-requested visual-only difference: keep the original controller box,
+   but render it plain white without the four symbols. */
+.sakana-widget-ctrl {{
+    background: #ffffff !important;
+}}
+.sakana-widget-ctrl-item {{
+    visibility: hidden !important;
+    pointer-events: none !important;
+}}
+</style>
+</head>
+<body>
+<div id="sakana-widget"></div>
+<script src="{_SAKANA_JS}"></script>
+<script>
+(() => {{
+    const takina = SakanaWidget.getCharacter('takina');
+    takina.image = {json.dumps(image_url)};
+    SakanaWidget.registerCharacter('__ecommerce_agent_character__', takina);
+    window.__sakana = new SakanaWidget({{
+        character: '__ecommerce_agent_character__'
+    }}).mount('#sakana-widget');
+}})();
+</script>
+</body>
+</html>'''
 
 
 class SakanaToyController(QObject):
-    """Own Sakana rendering/input while its physics runtime runs independently."""
+    """Host the original Sakana browser widget without porting its motion logic."""
 
     def __init__(self, window: QWidget, quick: QQuickWindow) -> None:
         super().__init__(window)
         self.window = window
         self.quick = quick
-        self._user_positioned = False
-        self._root_x = 0.0
-        self._root_y = 0.0
+        self._enabled = True
+        self._loaded = False
+        self._shutting_down = False
 
-        # Read the monitor cadence once, then run Sakana on its own timer. The
-        # runtime has no QQuickWindow frame/animation signal connection.
-        screen = quick.screen()
-        refresh_hz = screen.refreshRate() if screen is not None else 60.0
-        self.runtime = SakanaSpringRuntime(
-            self._on_spring_frame,
-            refresh_hz=refresh_hz,
-            parent=self,
+        if not _CHARACTER_IMAGE.is_file():
+            raise RuntimeError(f"Sakana character image is missing: {_CHARACTER_IMAGE}")
+
+        self.view = QWebEngineView()
+        self.view.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.NoDropShadowWindowHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
         )
+        self.view.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.view.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.view.resize(_CANVAS_SIZE, _CANVAS_SIZE)
+        self.view.page().setBackgroundColor(QColor(0, 0, 0, 0))
 
-        self.toy = _SakanaToyItem(quick, self)
+        settings = self.view.settings()
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        self.view.loadFinished.connect(self._on_load_finished)
+
         self.toggle = self._install_toggle()
+        self.quick.installEventFilter(self)
+        self.window.destroyed.connect(self.cleanup)
 
-        # Geometry ownership remains with the host window; spring timing does not.
-        quick.widthChanged.connect(self._on_window_geometry_changed)
-        quick.heightChanged.connect(self._on_window_geometry_changed)
-        window.destroyed.connect(self.cleanup)
-
-        self._place_default()
+        base_url = QUrl.fromLocalFile(str(_CHARACTER_IMAGE.parent) + "/")
+        self.view.setHtml(_html_source(), base_url)
         self.set_enabled(True)
-
-    @property
-    def root_position(self) -> QPointF:
-        return QPointF(self._root_x, self._root_y)
 
     def _install_toggle(self) -> QPushButton:
         root = self.window.centralWidget()
@@ -267,74 +144,99 @@ class SakanaToyController(QObject):
         header.addWidget(button, 0, Qt.AlignmentFlag.AlignBottom)
         return button
 
-    def _on_spring_frame(self) -> None:
-        if self.toy.isVisible():
-            self.toy.update()
+    def _on_load_finished(self, ok: bool) -> None:
+        if self._shutting_down:
+            return
+        self._loaded = bool(ok)
+        handle = self.view.windowHandle()
+        if handle is not None:
+            handle.setTransientParent(self.quick)
+        if not self._enabled and self._loaded:
+            self.view.page().runJavaScript(
+                "if (window.__sakana) window.__sakana.hide();"
+            )
+        self._sync_overlay()
 
-    def _pause_spring(self) -> None:
-        self.runtime.pause()
+    def _sync_overlay(self) -> None:
+        if self._shutting_down:
+            return
+        try:
+            origin = self.quick.mapToGlobal(QPoint(0, 0))
+            x = origin.x() + _LEFT_MARGIN - _CANVAS_INSET
+            y = (
+                origin.y()
+                + self.quick.height()
+                - _TOY_SIZE
+                - _BOTTOM_MARGIN
+                - _CANVAS_INSET
+            )
+            visible = bool(
+                self._enabled
+                and self.quick.isVisible()
+                and not (self.quick.windowState() & Qt.WindowState.WindowMinimized)
+            )
+        except RuntimeError:
+            return
 
-    def _resume_spring_after_drag(self) -> None:
-        self.runtime.resume_after_drag()
-
-    def _place_default(self) -> None:
-        self._move_root(
-            _LEFT_MARGIN,
-            max(0.0, float(self.quick.height()) - _TOY_SIZE - _BOTTOM_MARGIN),
-        )
-
-    def _move_root(self, x: float, y: float) -> None:
-        max_x = max(0.0, float(self.quick.width()) - _TOY_SIZE)
-        max_y = max(0.0, float(self.quick.height()) - _TOY_SIZE)
-        self._root_x = max(0.0, min(max_x, float(x)))
-        self._root_y = max(0.0, min(max_y, float(y)))
-
-        self.toy.setX(self._root_x - _CANVAS_INSET)
-        self.toy.setY(self._root_y - _CANVAS_INSET)
-
-    def _on_window_geometry_changed(self, *_args: object) -> None:
-        if self._user_positioned:
-            self._move_root(self._root_x, self._root_y)
+        self.view.move(int(x), int(y))
+        if visible:
+            self.view.show()
+            self.view.raise_()
         else:
-            self._place_default()
+            self.view.hide()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if watched is self.quick and event.type() in {
+            QEvent.Type.Move,
+            QEvent.Type.Resize,
+            QEvent.Type.Show,
+            QEvent.Type.Hide,
+            QEvent.Type.Expose,
+            QEvent.Type.WindowStateChange,
+        }:
+            self._sync_overlay()
+        return False
 
     def set_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
+        self._enabled = enabled
         if self.toggle.isChecked() != enabled:
             self.toggle.blockSignals(True)
             self.toggle.setChecked(enabled)
             self.toggle.blockSignals(False)
         self.toggle.setText("玩具 · ON" if enabled else "玩具 · OFF")
 
-        if not enabled:
-            self.toy.cancel_interaction()
-            self.runtime.pause()
-            self.toy.setVisible(False)
-            return
-
-        self.toy.setVisible(True)
-        self.toy.setZ(32000.0)
-        self.runtime.start(reset_clock=True)
-        self.toy.update()
+        if self._loaded:
+            script = (
+                "if (window.__sakana) window.__sakana.show();"
+                if enabled
+                else "if (window.__sakana) window.__sakana.hide();"
+            )
+            self.view.page().runJavaScript(script)
+        self._sync_overlay()
 
     def raise_overlay(self) -> None:
-        if self.toy.isVisible():
-            self.toy.setZ(32000.0)
-            self.toy.update()
+        if self._enabled and self.view.isVisible():
+            self.view.raise_()
 
     def cleanup(self) -> None:
-        self.runtime.shutdown()
-        self.toy.cancel_interaction()
+        if self._shutting_down:
+            return
+        self._shutting_down = True
         try:
-            self.quick.widthChanged.disconnect(self._on_window_geometry_changed)
-            self.quick.heightChanged.disconnect(self._on_window_geometry_changed)
-        except (RuntimeError, TypeError):
-            pass
-        try:
-            self.toy.setParentItem(None)
-            self.toy.deleteLater()
+            self.quick.removeEventFilter(self)
         except RuntimeError:
             pass
+        try:
+            if self._loaded:
+                self.view.page().runJavaScript(
+                    "if (window.__sakana) window.__sakana.unmount();"
+                )
+        except RuntimeError:
+            pass
+        self.view.hide()
+        self.view.close()
+        self.view.deleteLater()
 
 
 def install_sakana_toy(window: QWidget) -> SakanaToyController:
