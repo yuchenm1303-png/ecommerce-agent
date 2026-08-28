@@ -4,8 +4,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import QEvent, QEasingCurve, QObject, QPoint, QPointF, QRectF, Qt
-from PySide6.QtGui import QCursor
+from PySide6.QtCore import QEasingCurve, QObject, QPoint, QPointF, QRectF, Qt
 from PySide6.QtWidgets import QFrame, QMainWindow, QWidget
 
 
@@ -67,16 +66,13 @@ class _CardState:
 
 
 class NekroCardInteractionController(QObject):
-    """Two clean card interaction paths selected by wallpaper mode.
+    """Card interaction with one shared input clock and bounded raster work.
 
-    Fixed wallpaper uses native QWidget enter/leave/press/release events. Hover is
-    immediate and only changes the cached static glass tint; there is no polling,
-    sourcePixmap capture, QGraphicsEffect transform, animation frame limiter or
-    concurrent-motion budget in that path.
-
-    Wallpaper drift keeps the established timed scale/alpha path unchanged so the
-    existing Quick background behavior is preserved when the user explicitly turns
-    motion on.
+    Quick renders the glass shell every presentation step. QWidget card content is
+    captured once when an interaction transition starts and that frozen composite
+    is transformed throughout the 300 ms motion. At the endpoint the real content
+    is thawed again, so inputs remain fully live while steady but the expensive
+    QWidget subtree is not re-rasterized dozens of times during one scale tween.
     """
 
     def __init__(self, window: QMainWindow, visual: Any) -> None:
@@ -84,7 +80,6 @@ class NekroCardInteractionController(QObject):
         self.window = window
         self.visual = visual
         self.states: dict[QFrame, _CardState] = {}
-        self._event_owners: dict[QWidget, QFrame] = {}
         self._moving_frames: set[QFrame] = set()
         self._hover_scale_cache: dict[QFrame, float] = {}
         self._hover_scale_cache_key: tuple[int, int, int, int] | None = None
@@ -93,17 +88,18 @@ class NekroCardInteractionController(QObject):
         self.pressed: QFrame | None = None
         self._suspended = False
         self._left_down = False
-        self._dynamic_mode = bool(getattr(visual.background, "dynamic_mode", False))
         self._ease = _css_ease()
         self._motion_interval_s = self._frame_interval_ms() / 1000.0
         self._next_motion_s = 0.0
 
-        self.refresh_cards()
-        window.destroyed.connect(self._cleanup)
+        for frame in window.findChildren(QFrame):
+            if frame.objectName() not in _GLASS_NAMES:
+                continue
+            surface = visual.surface_for(frame)
+            if surface is not None:
+                self.states[frame] = _CardState(frame=frame, surface=surface)
 
-    @property
-    def dynamic_mode(self) -> bool:
-        return self._dynamic_mode
+        window.destroyed.connect(self._cleanup)
 
     def _frame_interval_ms(self) -> int:
         refresh_hz = 60.0
@@ -129,181 +125,9 @@ class NekroCardInteractionController(QObject):
             except RuntimeError:
                 pass
 
-    @staticmethod
-    def _set_dynamic_transform(state: _CardState, enabled: bool) -> None:
-        setter = getattr(state.surface, "set_dynamic_transform_enabled", None)
-        if callable(setter):
-            try:
-                setter(bool(enabled))
-            except RuntimeError:
-                pass
-
-    def _install_event_targets(self, frame: QFrame) -> None:
-        try:
-            frame.setMouseTracking(True)
-        except RuntimeError:
-            return
-
-        targets: tuple[QWidget, ...] = (frame, *frame.findChildren(QWidget))
-        for widget in targets:
-            if widget in self._event_owners:
-                continue
-            if self._nearest_card(widget) is not frame:
-                continue
-            self._event_owners[widget] = frame
-            try:
-                widget.installEventFilter(self)
-            except RuntimeError:
-                self._event_owners.pop(widget, None)
-
-    def refresh_cards(self) -> int:
-        """Register newly-created glass cards without re-installing existing filters."""
-
-        new_frames: list[QFrame] = []
-        for frame in self.window.findChildren(QFrame):
-            if frame.objectName() not in _GLASS_NAMES or frame in self.states:
-                continue
-            surface = self.visual.surface_for(frame)
-            if surface is None:
-                continue
-            state = _CardState(frame=frame, surface=surface)
-            self.states[frame] = state
-            self._set_dynamic_transform(state, self._dynamic_mode)
-            new_frames.append(frame)
-
-        for frame in new_frames:
-            self._install_event_targets(frame)
-
-        self._hover_scale_cache.clear()
-        self._hover_scale_cache_key = None
-        return len(new_frames)
-
-    def set_dynamic_mode(self, enabled: bool) -> None:
-        """Switch card interaction ownership with the wallpaper mode."""
-
-        enabled = bool(enabled)
-        self.refresh_cards()
-        if self._dynamic_mode == enabled:
-            if not enabled:
-                self._sync_static_from_cursor()
-            return
-
-        self._dynamic_mode = enabled
-        self._moving_frames.clear()
-        self._none_samples = 0
-        self._left_down = False
-        self.hovered = None
-        self.pressed = None
-        self._next_motion_s = 0.0
-
-        for state in self.states.values():
-            try:
-                self._set_content_frozen(state, False)
-                self._set_dynamic_transform(state, enabled)
-                state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)
-            except RuntimeError:
-                state.moving = False
-
-        if not enabled:
-            self._sync_static_from_cursor()
-
-    def _static_apply(self, frame: QFrame | None, alpha: float) -> None:
-        if frame is None:
-            return
-        state = self.states.get(frame)
-        if state is None:
-            return
-        try:
-            state.snap(_NORMAL_SCALE, alpha)
-        except RuntimeError:
-            state.moving = False
-
-    def _static_set_hover(self, frame: QFrame | None) -> None:
-        if self._dynamic_mode or self._suspended or self.pressed is not None:
-            return
-        previous = self.hovered
-        if previous is frame:
-            return
-        self.hovered = frame
-        if previous is not None:
-            self._static_apply(previous, _NORMAL_ALPHA)
-        if frame is not None:
-            self._static_apply(frame, _HOVER_ALPHA)
-
-    def _static_begin_press(self, frame: QFrame | None) -> None:
-        if self._dynamic_mode or self._suspended:
-            return
-        previous = self.hovered
-        self._left_down = True
-        self.pressed = frame
-        self.hovered = frame
-        if previous is not None and previous is not frame:
-            self._static_apply(previous, _NORMAL_ALPHA)
-        if frame is not None:
-            self._static_apply(frame, _ACTIVE_ALPHA)
-
-    def _static_end_press(self) -> None:
-        if self._dynamic_mode or self._suspended:
-            return
-        previous = self.pressed
-        self._left_down = False
-        self.pressed = None
-        try:
-            current = self._card_at_global(QCursor.pos())
-        except RuntimeError:
-            current = None
-        self.hovered = current
-        if previous is not None and previous is not current:
-            self._static_apply(previous, _NORMAL_ALPHA)
-        if current is not None:
-            self._static_apply(current, _HOVER_ALPHA)
-
-    def _sync_static_from_cursor(self) -> None:
-        if self._dynamic_mode or self._suspended or self.pressed is not None:
-            return
-        try:
-            current = self._card_at_global(QCursor.pos())
-        except RuntimeError:
-            current = None
-        self._static_set_hover(current)
-
-    @staticmethod
-    def _is_left_button_event(event: QEvent) -> bool:
-        button = getattr(event, "button", None)
-        if not callable(button):
-            return False
-        try:
-            return button() == Qt.MouseButton.LeftButton
-        except RuntimeError:
-            return False
-
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if self._dynamic_mode or self._suspended or not isinstance(watched, QWidget):
-            return False
-        owner = self._event_owners.get(watched)
-        if owner is None:
-            return False
-
-        event_type = event.type()
-        if watched is owner:
-            if event_type == QEvent.Type.Enter:
-                self._static_set_hover(owner)
-            elif event_type == QEvent.Type.Leave:
-                self._sync_static_from_cursor()
-            elif event_type in {QEvent.Type.Hide, QEvent.Type.Close}:
-                if self.pressed is owner:
-                    self.pressed = None
-                if self.hovered is owner:
-                    self.hovered = None
-                self._static_apply(owner, _NORMAL_ALPHA)
-
-        if event_type == QEvent.Type.MouseButtonPress and self._is_left_button_event(event):
-            self._static_begin_press(owner)
-        elif event_type == QEvent.Type.MouseButtonRelease and self._is_left_button_event(event):
-            self._static_end_press()
-        return False
-
     def _recapture_for_motion(self, state: _CardState) -> None:
+        # Switching False -> True clears the previous frozen source so the next
+        # effect draw captures the latest hover/press/focus pixels exactly once.
         self._set_content_frozen(state, False)
         self._set_content_frozen(state, True)
 
@@ -512,7 +336,7 @@ class NekroCardInteractionController(QObject):
         return state.moving
 
     def _advance_motions(self, now_s: float) -> None:
-        if self._suspended or not self._dynamic_mode:
+        if self._suspended:
             return
         for frame in tuple(self._moving_frames):
             state = self.states.get(frame)
@@ -528,7 +352,7 @@ class NekroCardInteractionController(QObject):
                 self._moving_frames.discard(frame)
 
     def _animate_to(self, frame: QFrame | None, *, scale: float, alpha: float) -> None:
-        if self._suspended or not self._dynamic_mode or frame is None:
+        if self._suspended or frame is None:
             return
         state = self.states.get(frame)
         if state is None:
@@ -579,7 +403,7 @@ class NekroCardInteractionController(QObject):
         self._animate_to(frame, scale=_ACTIVE_SCALE, alpha=_ACTIVE_ALPHA)
 
     def _set_hover(self, frame: QFrame | None) -> None:
-        if self._suspended or not self._dynamic_mode or self.pressed is not None:
+        if self._suspended or self.pressed is not None:
             return
         previous = self.hovered
         if previous is frame:
@@ -591,7 +415,7 @@ class NekroCardInteractionController(QObject):
             self._hover(frame)
 
     def _begin_press(self, frame: QFrame | None) -> None:
-        if self._suspended or not self._dynamic_mode:
+        if self._suspended:
             return
         self._none_samples = 0
         if frame is None:
@@ -609,7 +433,7 @@ class NekroCardInteractionController(QObject):
         self._active(frame)
 
     def _end_press(self, global_pos: QPoint) -> None:
-        if self._suspended or not self._dynamic_mode:
+        if self._suspended:
             return
         self._none_samples = 0
         previous = self.pressed
@@ -625,12 +449,7 @@ class NekroCardInteractionController(QObject):
             self._hover(current)
 
     def _sample_input(self, global_pos: QPoint, *, left_down: bool) -> None:
-        if (
-            self._suspended
-            or not self._dynamic_mode
-            or not self.window.isVisible()
-            or self.window.isMinimized()
-        ):
+        if self._suspended or not self.window.isVisible() or self.window.isMinimized():
             return
         if left_down and self._left_down and self.pressed is not None:
             return
@@ -675,7 +494,7 @@ class NekroCardInteractionController(QObject):
         now_s: float,
         input_changed: bool,
     ) -> None:
-        if self._suspended or not self._dynamic_mode:
+        if self._suspended:
             return
         if input_changed:
             self._sample_input(global_pos, left_down=left_down)
@@ -717,19 +536,11 @@ class NekroCardInteractionController(QObject):
                 state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)
             except RuntimeError:
                 state.moving = False
-        if not self._dynamic_mode:
-            self._sync_static_from_cursor()
 
     def _cleanup(self) -> None:
         self._moving_frames.clear()
         self._hover_scale_cache.clear()
         self._hover_scale_cache_key = None
-        for widget in tuple(self._event_owners):
-            try:
-                widget.removeEventFilter(self)
-            except RuntimeError:
-                pass
-        self._event_owners.clear()
         for state in tuple(self.states.values()):
             try:
                 self._set_content_frozen(state, False)
