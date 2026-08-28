@@ -21,7 +21,7 @@ _CANVAS_INSET = (_CANVAS_SIZE - _TOY_SIZE) / 2.0
 _MAIN_CENTER_X = _CANVAS_INSET + _TOY_SIZE / 2.0
 _LEFT_MARGIN = 24.0
 _BOTTOM_MARGIN = 18.0
-_CHARACTER_IMAGE = Path(__file__).resolve().parent / "assets" / "sakana_character.jpg"
+_CHARACTER_IMAGE = Path(__file__).resolve().parent / "assets" / "sakana_character.png"
 
 # Keep the upstream controller geometry, with only the user-requested visual
 # difference: a plain white controller without symbols.
@@ -42,6 +42,7 @@ class _SakanaToyItem(QQuickPaintedItem):
         self.setZ(32000.0)
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
         self.setAcceptHoverEvents(False)
+        self.setOpaquePainting(False)
 
         # Exact upstream Takina state: i=.08, s=.1, d=.988, r=12, y=2, t=0, w=0.
         self.state = SakanaSpringState()
@@ -66,7 +67,17 @@ class _SakanaToyItem(QQuickPaintedItem):
 
     @property
     def image_rect(self) -> QRectF:
+        # The upstream character element is always a 160 x 160 square.
         return QRectF(-_IMAGE_SIZE / 2.0, -_TOY_SIZE, _IMAGE_SIZE, _IMAGE_SIZE)
+
+    def image_source_rect(self) -> QRectF:
+        # CSS uses background-size: cover and background-position: 50% 50%.
+        # Mirror that at draw time without changing, resizing or recompressing the
+        # transparent source asset itself.
+        width = float(self.pixmap.width())
+        height = float(self.pixmap.height())
+        side = min(width, height)
+        return QRectF((width - side) / 2.0, (height - side) / 2.0, side, side)
 
     def base_rect(self) -> QRectF:
         anchor = self.anchor
@@ -78,14 +89,18 @@ class _SakanaToyItem(QQuickPaintedItem):
         )
 
     def _image_transform(self) -> QTransform:
-        transform = QTransform()
+        # CSS: transform-origin: 50% size; transform: rotate(r) translateX(r) translateY(y).
+        # Build the affine matrix explicitly so the character center is mathematically
+        # identical to the rod endpoint instead of relying on Qt transform call order.
+        angle = math.radians(self.state.r)
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        x = self.state.r
+        y = self.state.y
         anchor = self.anchor
-        transform.translate(anchor.x(), anchor.y())
-        # Mirrors CSS: rotate(r) translateX(r) translateY(y), with transform-origin
-        # at 50% / size px below the image top.
-        transform.rotate(self.state.r)
-        transform.translate(self.state.r, self.state.y)
-        return transform
+        dx = anchor.x() + cos_a * x - sin_a * y
+        dy = anchor.y() + sin_a * x + cos_a * y
+        return QTransform(cos_a, sin_a, -sin_a, cos_a, dx, dy)
 
     def _center_offset(self) -> QPointF:
         angle = math.radians(self.state.r)
@@ -125,16 +140,12 @@ class _SakanaToyItem(QQuickPaintedItem):
         offset = self._center_offset()
         end = QPointF(anchor.x() + offset.x(), anchor.y() - offset.y())
 
+        # Upstream z-order: canvas rod (10), controller (30), character (40).
         pen = QPen(QColor("#b4b4b4"))
         pen.setWidthF(10.0)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
         painter.drawLine(QPointF(anchor.x(), anchor.y() - 10.0), end)
-
-        painter.save()
-        painter.setTransform(self._image_transform(), combine=False)
-        painter.drawPixmap(self.image_rect, self.pixmap, QRectF(self.pixmap.rect()))
-        painter.restore()
 
         rect = self.base_rect()
         painter.setPen(Qt.PenStyle.NoPen)
@@ -142,6 +153,11 @@ class _SakanaToyItem(QQuickPaintedItem):
         painter.drawRoundedRect(rect.translated(0.0, 5.0), _BASE_RADIUS, _BASE_RADIUS)
         painter.setBrush(QColor("#ffffff"))
         painter.drawRoundedRect(rect, _BASE_RADIUS, _BASE_RADIUS)
+
+        painter.save()
+        painter.setTransform(self._image_transform(), combine=False)
+        painter.drawPixmap(self.image_rect, self.pixmap, self.image_source_rect())
+        painter.restore()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() != Qt.MouseButton.LeftButton or not self.isVisible():
