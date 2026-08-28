@@ -30,7 +30,14 @@ def test_same_supplier_url_can_be_two_job_owned_offer_scopes() -> None:
     assert "_listing_offer_pending_intents" in source
     assert "_listing_offer_intent_by_job_id" in source
     assert "same supplier page + Black, same supplier page + White" in source
-    assert "normalize_batch_urls" not in source
+    # Duplicate URLs are intentionally preserved because BatchJob identity, not URL,
+    # owns the offer scope. Ensure workspace_start passes the row sequence directly.
+    workspace_start = source.split("def workspace_start", 1)[1].split(
+        "# Deliberately bypass", 1
+    )[0]
+    assert "urls = [item[0] for item in entries]" in workspace_start
+    assert "self.controller.start_prepare(" in workspace_start
+    assert "normalize_batch_urls(" not in workspace_start
 
 
 def test_single_offer_edit_invalidates_prepared_real_execution() -> None:
