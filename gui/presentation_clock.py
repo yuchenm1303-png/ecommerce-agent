@@ -15,6 +15,7 @@ _ACTIVE_PRESENTATION_TICK_MS = 8
 _AMBIENT_PRESENTATION_TICK_MS = 16
 _INTERACTION_GRACE_MS = 360
 _WIDGET_STARVATION_MS = 40
+_BACKGROUND_DRIFT_DEFAULT = True
 
 
 @dataclass(slots=True)
@@ -32,7 +33,7 @@ class BackgroundDriftSwitch(WorkspaceModeSwitch):
         super().__init__(parent)
         self.setObjectName("backgroundDriftSwitch")
         self.setAccessibleName("背景漂移")
-        self.set_checked_immediate(False)
+        self.set_checked_immediate(_BACKGROUND_DRIFT_DEFAULT)
 
     def _sync_tooltip(self, checked: bool) -> None:
         self.setToolTip("背景漂移已开启 · 点击关闭" if checked else "背景漂移已关闭 · 点击开启")
@@ -67,7 +68,7 @@ class PresentationClock(QObject):
         self._last_left_down: bool | None = None
         self._active_until_s = 0.0
         self._card_settle_pending = False
-        self._background_drift_enabled = False
+        self._background_drift_enabled = _BACKGROUND_DRIFT_DEFAULT
         self._widget_lane_enabled = True
 
         self._widget_samples: list[_WidgetSample] = []
@@ -94,7 +95,7 @@ class PresentationClock(QObject):
 
         window.installEventFilter(self)
         window.destroyed.connect(self.cleanup)
-        self.set_background_drift_enabled(False)
+        self.set_background_drift_enabled(_BACKGROUND_DRIFT_DEFAULT)
         self._sync_window_state()
 
     @property
@@ -427,8 +428,7 @@ def _install_background_drift_switch(
     label.setStyleSheet("color: rgba(232, 241, 252, 178);")
 
     toggle = BackgroundDriftSwitch(root)
-    toggle.set_checked_immediate(False)
-    clock.set_background_drift_enabled(False)
+    toggle.set_checked_immediate(clock.background_drift_enabled)
     toggle.toggled.connect(clock.set_background_drift_enabled)
 
     header.addSpacing(10)
