@@ -3,22 +3,20 @@ from __future__ import annotations
 from typing import Any
 
 from PySide6.QtCore import QPoint, QRectF, Qt
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPixmap, QRegion
-from PySide6.QtWidgets import QFrame, QStackedWidget, QWidget
+from PySide6.QtGui import QColor, QPainter, QPixmap
+from PySide6.QtWidgets import QStackedWidget, QWidget
 
-from .native_background import _GLASS_RADIUS, _NORMAL_GLASS_ALPHA, _OVERSCAN
+from .native_background import _OVERSCAN
 
 
-class WorkspaceTransitionSnapshotRenderer:
-    """Build one transition frame from one authoritative QWidget geometry source.
+class WorkspaceTransitionBackdropRenderer:
+    """Capture only the geometry-independent wallpaper behind ``modeStack``.
 
-    The live application deliberately splits rendering: Quick owns wallpaper/glass,
-    while QWidget owns labels, controls, tables and layouts. Sampling those two
-    renderers independently during a QStackedWidget page change can combine a new
-    QWidget geometry with the previous Quick glass mask. Transition frames therefore
-    never sample Quick pixels. They reconstruct wallpaper and glass from the current
-    QWidget card geometry, then render the current page over that same coordinate
-    system. Quick remains the live renderer and is synchronized only for handoff.
+    Older transition code rendered the current QWidget page into an off-screen
+    pixmap and separately rebuilt its glass. That duplicate presentation path was
+    able to observe stale splitter geometry and produce a visibly different layout
+    the instant the mode toggle was clicked. The transition now needs only a neutral
+    cover, so this renderer deliberately has no page/card rendering capability.
     """
 
     def __init__(self, window: QWidget, visual: Any, stack: QStackedWidget) -> None:
@@ -28,7 +26,6 @@ class WorkspaceTransitionSnapshotRenderer:
         self.root = window.centralWidget() if hasattr(window, "centralWidget") else None
         self.background = getattr(visual, "background", None)
         self._sharp = self._load_pixmap("_sharp_path")
-        self._blur = self._load_pixmap("_blur_path")
 
     def _load_pixmap(self, attribute: str) -> QPixmap:
         path = getattr(self.background, attribute, None)
@@ -46,7 +43,7 @@ class WorkspaceTransitionSnapshotRenderer:
             max(1, int(round(self.stack.height() * dpr))),
         )
         frame.setDevicePixelRatio(dpr)
-        frame.fill(Qt.GlobalColor.transparent)
+        frame.fill(QColor(23, 38, 58))
         return frame
 
     def _background_for_stack(self, source: QPixmap) -> QPixmap:
@@ -124,154 +121,7 @@ class WorkspaceTransitionSnapshotRenderer:
         frame = self._background_for_stack(self._sharp)
         if not frame.isNull():
             return frame
-        fallback = self._empty_stack_frame()
-        fallback.fill(QColor(23, 38, 58))
-        return fallback
-
-    def _capture_blur(self) -> QPixmap:
-        return self._background_for_stack(self._blur)
-
-    def _render_current_page(self) -> QPixmap:
-        page = self.stack.currentWidget()
-        if (
-            page is None
-            or self.stack.width() <= 0
-            or self.stack.height() <= 0
-            or page.width() <= 0
-            or page.height() <= 0
-        ):
-            return QPixmap()
-
-        frame = self._empty_stack_frame()
-        target_offset = page.mapTo(self.stack, QPoint(0, 0))
-        page.render(
-            frame,
-            target_offset,
-            QRegion(),
-            QWidget.RenderFlag.DrawChildren,
-        )
-        return frame
-
-    @staticmethod
-    def _scaled_rect(rect: QRectF, scale: float) -> QRectF:
-        if abs(scale - 1.0) <= 1e-6:
-            return QRectF(rect)
-        center = rect.center()
-        width = rect.width() * scale
-        height = rect.height() * scale
-        return QRectF(
-            center.x() - width * 0.5,
-            center.y() - height * 0.5,
-            width,
-            height,
-        )
-
-    def _card_geometry(self, frame: QFrame) -> tuple[QRectF, QRectF] | None:
-        try:
-            if (
-                not frame.isVisibleTo(self.window)
-                or frame.width() <= 0
-                or frame.height() <= 0
-            ):
-                return None
-
-            stack_global = self.stack.mapToGlobal(QPoint(0, 0))
-            frame_global = frame.mapToGlobal(QPoint(0, 0))
-            card_rect = QRectF(
-                float(frame_global.x() - stack_global.x()),
-                float(frame_global.y() - stack_global.y()),
-                float(frame.width()),
-                float(frame.height()),
-            )
-            clip_rect = QRectF(
-                0.0,
-                0.0,
-                float(self.stack.width()),
-                float(self.stack.height()),
-            )
-
-            ancestor = frame.parentWidget()
-            while ancestor is not None:
-                if not ancestor.isVisibleTo(self.window):
-                    return None
-                ancestor_global = ancestor.mapToGlobal(QPoint(0, 0))
-                ancestor_rect = QRectF(
-                    float(ancestor_global.x() - stack_global.x()),
-                    float(ancestor_global.y() - stack_global.y()),
-                    float(ancestor.width()),
-                    float(ancestor.height()),
-                )
-                clip_rect = clip_rect.intersected(ancestor_rect)
-                if clip_rect.isEmpty() or ancestor is self.stack:
-                    break
-                ancestor = ancestor.parentWidget()
-
-            if card_rect.intersected(clip_rect).isEmpty():
-                return None
-            return card_rect, clip_rect
-        except RuntimeError:
-            return None
-
-    def _paint_glass(self, painter: QPainter, blur: QPixmap) -> None:
-        glass = getattr(self.visual, "_glass", None)
-        if not isinstance(glass, dict):
-            return
-
-        for frame, proxy in glass.items():
-            if not isinstance(frame, QFrame):
-                continue
-            geometry = self._card_geometry(frame)
-            if geometry is None:
-                continue
-            card_rect, clip_rect = geometry
-
-            try:
-                scale = float(getattr(proxy, "surface_scale", 1.0))
-            except (RuntimeError, TypeError, ValueError):
-                scale = 1.0
-            scale = max(0.96, min(1.04, scale))
-            target = self._scaled_rect(card_rect, scale)
-
-            try:
-                alpha = float(getattr(proxy, "overlay_alpha", _NORMAL_GLASS_ALPHA))
-            except (RuntimeError, TypeError, ValueError):
-                alpha = _NORMAL_GLASS_ALPHA
-            alpha = max(_NORMAL_GLASS_ALPHA, min(255.0, alpha))
-
-            painter.save()
-            painter.setClipRect(clip_rect)
-            path = QPainterPath()
-            path.addRoundedRect(
-                target,
-                float(_GLASS_RADIUS) * scale,
-                float(_GLASS_RADIUS) * scale,
-            )
-            painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
-            if not blur.isNull():
-                painter.drawPixmap(0, 0, blur)
-            painter.fillRect(target, QColor(0, 0, 0, int(round(alpha))))
-            painter.restore()
-
-    def capture_composite(self) -> QPixmap:
-        neutral = self.capture_neutral()
-        widget_frame = self._render_current_page()
-        if neutral.isNull() and widget_frame.isNull():
-            return QPixmap()
-
-        result = self._empty_stack_frame()
-        painter = QPainter(result)
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-        if neutral.isNull():
-            painter.fillRect(QRectF(self.stack.rect()), QColor(23, 38, 58))
-        else:
-            painter.drawPixmap(0, 0, neutral)
-
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-        self._paint_glass(painter, self._capture_blur())
-        if not widget_frame.isNull():
-            painter.drawPixmap(0, 0, widget_frame)
-        painter.end()
-        return result
+        return self._empty_stack_frame()
 
 
-__all__ = ["WorkspaceTransitionSnapshotRenderer"]
+__all__ = ["WorkspaceTransitionBackdropRenderer"]

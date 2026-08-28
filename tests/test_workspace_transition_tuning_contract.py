@@ -24,13 +24,14 @@ def test_slower_profile_changes_timing_only() -> None:
     assert '"_VEIL_PEAK_MS": 210' in TUNING
     assert '"_VEIL_END_MS": 270' in TUNING
 
-    # Speed tuning does not change the geometry-stable snapshot renderer.
+    # Speed tuning stays independent of the geometry-neutral cover renderer.
     assert "_HOLD_MS = 40" in TRANSITION
     assert "_EXIT_END_MS = 155" in TRANSITION
     assert "_ENTER_START_MS = 175" in TRANSITION
     assert "_TOTAL_MS = 390" in TRANSITION
-    assert "page.render(" in SNAPSHOT
-    assert "page.grab()" not in SNAPSHOT
+    assert "WorkspaceTransitionBackdropRenderer" in SNAPSHOT
+    assert "page.render(" not in SNAPSHOT
+    assert "capture_composite" not in SNAPSHOT
     assert "grabWindow" not in SNAPSHOT
 
 

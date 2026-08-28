@@ -18,29 +18,41 @@ def test_mode_switch_locks_one_transition_viewport() -> None:
 
     request = TRANSITION.split("def request_mode", 1)[1].split("def _elapsed_ms", 1)[0]
     assert request.index("self._lock_surface_geometry()") < request.index(
-        "self._capture_composite()"
+        "self._capture_neutral_background()"
     )
 
 
-def test_transition_frames_are_never_non_uniformly_stretched() -> None:
+def test_backdrop_is_never_non_uniformly_stretched() -> None:
     assert "Qt.AspectRatioMode.KeepAspectRatioByExpanding" in TRANSITION
     assert "Qt.AspectRatioMode.IgnoreAspectRatio" not in TRANSITION
 
 
-def test_mode_click_path_cannot_force_layout_reflow() -> None:
-    forbidden = (
-        "layout.activate()",
-        "page_layout",
-        "_prelayout_target",
-        "prepare_page(",
-        "updateGeometry()",
-        "setGeometry(contents)",
+def test_click_path_has_no_workspace_page_snapshot_or_visible_reflow() -> None:
+    request = TRANSITION.split("def request_mode", 1)[1].split("def _elapsed_ms", 1)[0]
+    assert "capture_composite" not in request
+    assert "page.render(" not in TRANSITION
+    assert "page.render(" not in SNAPSHOT
+    assert "layout.activate()" not in TRANSITION
+
+    # Static QML precommits a hidden target before changing mode synchronously.
+    static_branch = request.split("if self._static_qml_active():", 1)[1].split(
+        "if (", 1
+    )[0]
+    assert static_branch.index("self._commit_target_layout(index)") < static_branch.index(
+        "self._set_mode(index)"
     )
-    for token in forbidden:
-        assert token not in TRANSITION
+
+    # Legacy mode performs its layout commit only after the opaque cover owns the pixels.
+    switch = TRANSITION.split("def _switch_target_under_cover", 1)[1].split(
+        "def _prepare_incoming", 1
+    )[0]
+    prepare = TRANSITION.split("def _prepare_incoming", 1)[1].split("@Slot()", 1)[0]
+    assert "self._surface.set_cover(opacity=1.0" in switch
+    assert "self._set_mode(self._target_index)" in switch
+    assert "self._commit_target_layout(self._target_index)" in prepare
 
 
-def test_persistent_pages_are_precommitted_only_at_global_geometry_boundaries() -> None:
+def test_persistent_pages_are_still_precommitted_at_global_geometry_boundaries() -> None:
     event_filter = LAYOUT_OWNER.split("def eventFilter", 1)[1].split("def cleanup", 1)[0]
     assert "QEvent.Type.Resize" in event_filter
     assert "QEvent.Type.Show" in event_filter
@@ -74,10 +86,13 @@ def test_single_only_header_action_keeps_its_layout_slot_when_hidden() -> None:
     assert "open_run_button.setSizePolicy(policy)" in TOGGLE
 
 
-def test_snapshot_glass_and_qwidget_content_share_one_geometry_source() -> None:
-    assert "def _card_geometry" in SNAPSHOT
-    assert "frame.mapToGlobal" in SNAPSHOT
-    assert "page.render(" in SNAPSHOT
+def test_transition_backdrop_has_no_widget_or_glass_geometry_source() -> None:
+    assert "WorkspaceTransitionBackdropRenderer" in SNAPSHOT
+    assert "QFrame" not in SNAPSHOT
+    assert "_card_geometry" not in SNAPSHOT
+    assert "_paint_glass" not in SNAPSHOT
+    assert "page.render(" not in SNAPSHOT
+    assert "capture_composite" not in SNAPSHOT
     assert "grabWindow" not in SNAPSHOT
 
 
