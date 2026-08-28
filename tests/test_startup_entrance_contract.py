@@ -67,6 +67,21 @@ def test_startup_stability_waits_for_layout_then_stages_live_handoff() -> None:
     assert "overlay.hide()" in STABILITY
 
 
+def test_startup_handoff_waits_for_rendered_quick_frames() -> None:
+    assert "def _arm_native_frame_barrier" in STABILITY
+    assert "quick.frameSwapped.connect(self._on_native_frame_swapped)" in STABILITY
+    assert "quick.frameSwapped.disconnect(self._on_native_frame_swapped)" in STABILITY
+    assert "self._native_frames_remaining = _NATIVE_SETTLE_FRAMES" in STABILITY
+    assert "def _on_native_frame_swapped" in STABILITY
+    assert "QTimer.singleShot(_HANDOFF_FRAME_MS, self._settle_live_runtime)" not in STABILITY
+    stage = STABILITY.split("def _stage_finish", 1)[1].split(
+        "def _on_native_frame_swapped", 1
+    )[0]
+    assert stage.index("self._arm_native_frame_barrier()") < stage.index(
+        "self._prime_static_runtime()"
+    )
+
+
 def test_startup_resumes_shared_clock_only_after_overlay_handoff() -> None:
     assert "QTimer.singleShot(_HANDOFF_FRAME_MS, self._resume_effects)" in STABILITY
     assert "QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_card_fx)" in STABILITY

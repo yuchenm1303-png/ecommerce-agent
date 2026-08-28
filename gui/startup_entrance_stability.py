@@ -35,6 +35,8 @@ class StartupEntranceStabilityGate(QObject):
         self._stable_samples = 0
         self._start_requested = False
         self._handoff_started = False
+        self._native_frames_remaining = 0
+        self._native_frame_quick: Any | None = None
 
         clock = getattr(window, "_presentation_clock", None)
         suspend = getattr(clock, "suspend", None)
@@ -191,6 +193,30 @@ class StartupEntranceStabilityGate(QObject):
                 pass
         self._flush_native_background()
 
+    def _arm_native_frame_barrier(self) -> bool:
+        """Bind handoff to rendered Quick frames rather than GUI-thread time."""
+
+        quick = getattr(self.background, "quick_window", None)
+        if quick is None:
+            return False
+        try:
+            quick.frameSwapped.connect(self._on_native_frame_swapped)
+        except (AttributeError, RuntimeError, TypeError):
+            return False
+        self._native_frame_quick = quick
+        self._native_frames_remaining = _NATIVE_SETTLE_FRAMES
+        return True
+
+    def _disconnect_native_frame_barrier(self) -> None:
+        quick = self._native_frame_quick
+        self._native_frame_quick = None
+        if quick is None:
+            return
+        try:
+            quick.frameSwapped.disconnect(self._on_native_frame_swapped)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+
     def _stage_finish(self) -> None:
         if self._handoff_started:
             return
@@ -200,18 +226,28 @@ class StartupEntranceStabilityGate(QObject):
         except (AttributeError, RuntimeError):
             pass
 
+        frame_barrier_armed = self._arm_native_frame_barrier()
         self._prime_static_runtime()
-        QTimer.singleShot(_HANDOFF_FRAME_MS, self._settle_live_runtime)
+        if not frame_barrier_armed:
+            QTimer.singleShot(0, self._commit_overlay_handoff)
 
-    def _settle_live_runtime(self) -> None:
-        self._flush_native_background()
-        QTimer.singleShot(
-            _HANDOFF_FRAME_MS * max(1, _NATIVE_SETTLE_FRAMES - 1),
-            self._commit_overlay_handoff,
-        )
+    def _on_native_frame_swapped(self) -> None:
+        if self._native_frames_remaining <= 0:
+            return
+        self._native_frames_remaining -= 1
+        if self._native_frames_remaining > 0:
+            # The first swap can complete work already in flight when the final
+            # QWidget/Quick state is published. Force another rendered frame so
+            # the static glass texture itself is guaranteed to be on screen.
+            self._flush_native_background()
+            return
+
+        self._disconnect_native_frame_barrier()
+        QTimer.singleShot(0, self._commit_overlay_handoff)
 
     def _commit_overlay_handoff(self) -> None:
-        self._flush_native_background()
+        self._disconnect_native_frame_barrier()
+        self._native_frames_remaining = 0
 
         overlay = self.overlay
         if isinstance(overlay, QWidget):
