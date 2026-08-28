@@ -28,16 +28,12 @@ _CONTROL_HEIGHT = 24
 _CONTROL_X = _CANVAS_INSET + (_TOY_SIZE - _CONTROL_WIDTH) // 2
 _CONTROL_Y = _CANVAS_INSET + _TOY_SIZE - _CONTROL_HEIGHT
 _CHARACTER_IMAGE = _ROOT / "gui" / "assets" / "sakana_character.png"
+_SAKANA_JS = _ROOT / "gui" / "assets" / "sakana-widget-2.7.1.js"
 
 # This file is intentionally outside the gui package. Starting a helper through
 # `python -m gui...` executes gui/__init__.py first, which imports application
 # access/telemetry code before Sakana can start. The helper must bootstrap only
 # QtWebEngine and the original Sakana browser runtime.
-_SAKANA_JS_SOURCES = (
-    "https://cdn.jsdelivr.net/npm/sakana-widget@2.7.1/lib/sakana.min.js",
-    "https://cdnjs.cloudflare.com/ajax/libs/sakana-widget/2.7.1/sakana.min.js",
-)
-
 # Exact compiled form of Sakana Widget 2.7.1 src/index.scss. Keeping structural
 # CSS local avoids making widget geometry depend on a second remote stylesheet.
 _SAKANA_271_CSS = """
@@ -157,9 +153,16 @@ def _character_data_url() -> str:
     return f"data:image/png;base64,{encoded}"
 
 
-def _html_source() -> str:
-    image_url = _character_data_url()
-    js_sources = json.dumps(_SAKANA_JS_SOURCES)
+def _sakana_js_source() -> str:
+    try:
+        return _SAKANA_JS.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Unable to read local Sakana runtime: {_SAKANA_JS}") from exc
+
+
+def _html_source(*, image_url: str | None = None) -> str:
+    image_url = image_url or _character_data_url()
+    sakana_js = _sakana_js_source()
     return f'''<!doctype html>
 <html>
 <head>
@@ -193,10 +196,9 @@ html, body {{
 </head>
 <body>
 <div id="sakana-widget"></div>
+<script>{sakana_js}</script>
 <script>
 (() => {{
-    const sources = {js_sources};
-
     function mountOriginalSakana() {{
         if (typeof SakanaWidget !== 'function')
             return false;
@@ -212,28 +214,8 @@ html, body {{
         return true;
     }}
 
-    function loadOriginalSakana(index) {{
-        if (index >= sources.length) {{
-            document.documentElement.dataset.sakanaError = 'script-load';
-            return;
-        }}
-        const script = document.createElement('script');
-        script.src = sources[index];
-        script.async = false;
-        script.onload = () => {{
-            if (!mountOriginalSakana()) {{
-                script.remove();
-                loadOriginalSakana(index + 1);
-            }}
-        }};
-        script.onerror = () => {{
-            script.remove();
-            loadOriginalSakana(index + 1);
-        }};
-        document.head.appendChild(script);
-    }}
-
-    loadOriginalSakana(0);
+    if (!mountOriginalSakana())
+        document.documentElement.dataset.sakanaError = 'local-script';
 }})();
 </script>
 </body>

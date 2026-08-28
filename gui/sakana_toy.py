@@ -30,7 +30,7 @@ class SakanaToyController(QObject):
         super().__init__(window)
         self.window = window
         self.quick = quick
-        self._enabled = True
+        self._enabled = False
         self._shutting_down = False
         self._process: subprocess.Popen[bytes] | None = None
         self._log_handle = None
@@ -58,10 +58,10 @@ class SakanaToyController(QObject):
         if not isinstance(header, QHBoxLayout):
             raise RuntimeError("Sakana toy expected the common application header")
 
-        button = QPushButton("玩具 · ON")
+        button = QPushButton("玩具 · OFF")
         button.setObjectName("quietButton")
         button.setCheckable(True)
-        button.setChecked(True)
+        button.setChecked(False)
         button.setMinimumWidth(98)
         button.setToolTip("显示或隐藏左下角弹簧玩具")
         button.setStyleSheet(
