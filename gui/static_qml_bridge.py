@@ -45,12 +45,99 @@ _ATOMIC_TYPES = (
     QAbstractButton,
 )
 _REFRESH_FRAME_MS = 16
+_MAX_MIRRORED_TEXT = 80_000
 
 
 def _qml_color(color: QColor, fallback: str = "#ffffffff") -> str:
     if not color.isValid():
         return fallback
     return f"#{color.alpha():02x}{color.red():02x}{color.green():02x}{color.blue():02x}"
+
+
+class _ReadOnlyTextControl(QObject):
+    """Long-lived live model for read-only text panes in the Quick scene.
+
+    Runtime log documents are high-frequency output streams.  Keeping their QML
+    control identity stable lets textChanged notify only the TextArea binding instead
+    of replacing the containing cardControls QVariantList and rebuilding its Repeater.
+    """
+
+    changed = Signal()
+
+    def __init__(self, parent: QObject) -> None:
+        super().__init__(parent)
+        self._state: dict[str, Any] = {
+            "key": "",
+            "name": "",
+            "x": 0,
+            "y": 0,
+            "w": 0,
+            "h": 0,
+            "enabled": True,
+            "clipEnabled": False,
+            "clipX": 0,
+            "clipY": 0,
+            "clipW": 0,
+            "clipH": 0,
+            "fontSize": 11,
+            "kind": "textedit",
+            "text": "",
+            "readOnly": True,
+            "wrap": False,
+        }
+
+    def _value(self, key: str, default: Any = None) -> Any:
+        return self._state.get(key, default)
+
+    key = Property(str, lambda self: str(self._value("key", "")), notify=changed)
+    name = Property(str, lambda self: str(self._value("name", "")), notify=changed)
+    x = Property(int, lambda self: int(self._value("x", 0)), notify=changed)
+    y = Property(int, lambda self: int(self._value("y", 0)), notify=changed)
+    w = Property(int, lambda self: int(self._value("w", 0)), notify=changed)
+    h = Property(int, lambda self: int(self._value("h", 0)), notify=changed)
+    enabled = Property(bool, lambda self: bool(self._value("enabled", True)), notify=changed)
+    clipEnabled = Property(bool, lambda self: bool(self._value("clipEnabled", False)), notify=changed)
+    clipX = Property(int, lambda self: int(self._value("clipX", 0)), notify=changed)
+    clipY = Property(int, lambda self: int(self._value("clipY", 0)), notify=changed)
+    clipW = Property(int, lambda self: int(self._value("clipW", 0)), notify=changed)
+    clipH = Property(int, lambda self: int(self._value("clipH", 0)), notify=changed)
+    fontSize = Property(int, lambda self: int(self._value("fontSize", 11)), notify=changed)
+    kind = Property(str, lambda self: "textedit", constant=True)
+    text = Property(str, lambda self: str(self._value("text", "")), notify=changed)
+    readOnly = Property(bool, lambda self: True, constant=True)
+    wrap = Property(bool, lambda self: bool(self._value("wrap", False)), notify=changed)
+
+    def sync(self, data: dict[str, Any], *, text: str, wrap: bool) -> None:
+        next_state = {
+            "key": str(data.get("key") or ""),
+            "name": str(data.get("name") or ""),
+            "x": int(data.get("x") or 0),
+            "y": int(data.get("y") or 0),
+            "w": int(data.get("w") or 0),
+            "h": int(data.get("h") or 0),
+            "enabled": bool(data.get("enabled", True)),
+            "clipEnabled": bool(data.get("clipEnabled", False)),
+            "clipX": int(data.get("clipX") or 0),
+            "clipY": int(data.get("clipY") or 0),
+            "clipW": int(data.get("clipW") or 0),
+            "clipH": int(data.get("clipH") or 0),
+            "fontSize": int(data.get("fontSize") or 11),
+            "kind": "textedit",
+            "text": str(text),
+            "readOnly": True,
+            "wrap": bool(wrap),
+        }
+        if next_state == self._state:
+            return
+        self._state = next_state
+        self.changed.emit()
+
+    def sync_text(self, text: str) -> None:
+        text = str(text)
+        if text == self._state.get("text", ""):
+            return
+        self._state["text"] = text
+        self.changed.emit()
 
 
 class StaticCardModel(QAbstractListModel):
@@ -103,13 +190,6 @@ class StaticCardModel(QAbstractListModel):
         return row.get("_sourceKey")
 
     def replace(self, rows: list[dict[str, Any]]) -> bool:
-        """Reconcile a settled scene without destroying unchanged QML delegates.
-
-        A model reset is reserved for actual card topology changes (mode switch,
-        cards added/removed/reordered). During ordinary progress/text/button updates
-        the stable delegates remain alive and receive only the roles that changed.
-        """
-
         same_topology = (
             len(rows) == len(self._rows)
             and all(
@@ -145,11 +225,8 @@ class StaticCardModel(QAbstractListModel):
 class StaticQmlBridge(QObject):
     """Expose QWidget business state to one persistent Quick presentation tree.
 
-    QWidget remains the compatibility/business host, but steady presentation updates
-    never rediscover its hierarchy and never reset the complete QML card model. The
-    widget-to-card ownership graph is cached until actual UI topology changes; a
-    16 ms frame gate coalesces state bursts into at most one mirror generation per
-    display frame.
+    Stable UI topology is cached. Read-only text streams use long-lived QObject
+    controls, so subprocess output updates never rebuild a card or the whole scene.
     """
 
     activeChanged = Signal()
@@ -169,7 +246,7 @@ class StaticQmlBridge(QObject):
         self.background = visual.background
         self.card_model = card_model
         self._active = False
-        self._root_controls: list[dict[str, Any]] = []
+        self._root_controls: list[Any] = []
         self._targets: dict[str, QObject] = {}
         self._card_frames: list[QFrame] = []
         self._connected_widget_ids: set[int] = set()
@@ -181,6 +258,7 @@ class StaticQmlBridge(QObject):
         self._cached_controls: dict[int, tuple[QWidget, ...]] = {}
         self._cached_atomic_blocked: set[int] = set()
         self._batch_job_ids: tuple[str, ...] | None = None
+        self._read_only_text_controls: dict[int, _ReadOnlyTextControl] = {}
 
         self._sakura_url = "data:image/png;base64," + _SAKURA_PNG_B64
         self._refresh_timer = QTimer(self)
@@ -308,6 +386,48 @@ class StaticQmlBridge(QObject):
         self._targets[key] = widget
         return key
 
+    @staticmethod
+    def _plain_text(widget: QPlainTextEdit) -> str:
+        try:
+            text = widget.toPlainText()
+        except RuntimeError:
+            return ""
+        if len(text) > _MAX_MIRRORED_TEXT:
+            return text[-_MAX_MIRRORED_TEXT:]
+        return text
+
+    def _read_only_text_control(
+        self,
+        widget: QPlainTextEdit,
+        data: dict[str, Any],
+    ) -> _ReadOnlyTextControl:
+        identity = id(widget)
+        control = self._read_only_text_controls.get(identity)
+        if control is None:
+            control = _ReadOnlyTextControl(self)
+            self._read_only_text_controls[identity] = control
+        control.sync(
+            data,
+            text=self._plain_text(widget),
+            wrap=(widget.lineWrapMode() != QPlainTextEdit.LineWrapMode.NoWrap),
+        )
+        return control
+
+    def _sync_read_only_text(self, widget: QPlainTextEdit) -> None:
+        control = self._read_only_text_controls.get(id(widget))
+        if control is None:
+            return
+        control.sync_text(self._plain_text(widget))
+
+    @staticmethod
+    def _control_position(control: Any) -> tuple[int, int]:
+        if isinstance(control, dict):
+            return int(control.get("y") or 0), int(control.get("x") or 0)
+        try:
+            return int(control.property("y") or 0), int(control.property("x") or 0)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return 0, 0
+
     def _scroll_clip_data(self, widget: QWidget, origin: QWidget) -> dict[str, Any] | None:
         clip: tuple[int, int, int, int] | None = None
         try:
@@ -384,7 +504,7 @@ class StaticQmlBridge(QObject):
         self,
         widget: QWidget,
         origin: QWidget,
-    ) -> dict[str, Any] | None:
+    ) -> Any:
         if self._has_atomic_ancestor(widget, origin):
             return None
 
@@ -442,13 +562,12 @@ class StaticQmlBridge(QObject):
                 data = self._base(widget, origin)
                 if data is None:
                     return None
-                text = widget.toPlainText()
-                if len(text) > 80_000:
-                    text = text[-80_000:]
+                if widget.isReadOnly():
+                    return self._read_only_text_control(widget, data)
                 data.update(
                     kind="textedit",
-                    text=text,
-                    readOnly=bool(widget.isReadOnly()),
+                    text=self._plain_text(widget),
+                    readOnly=False,
                     wrap=(widget.lineWrapMode() != QPlainTextEdit.LineWrapMode.NoWrap),
                 )
                 return data
@@ -608,6 +727,13 @@ class StaticQmlBridge(QObject):
             origin = nearest if nearest is not None else self.window
             controls.setdefault(id(origin), []).append(widget)
 
+        live_widget_ids = {id(widget) for widget in widgets}
+        for identity, control in tuple(self._read_only_text_controls.items()):
+            if identity in live_widget_ids:
+                continue
+            self._read_only_text_controls.pop(identity, None)
+            control.deleteLater()
+
         self._cached_frames = frames_list
         self._cached_controls = {
             origin_id: tuple(items)
@@ -622,8 +748,8 @@ class StaticQmlBridge(QObject):
         self,
         origin: QWidget,
         frames: set[QFrame],
-    ) -> list[dict[str, Any]]:
-        controls: list[dict[str, Any]] = []
+    ) -> list[Any]:
+        controls: list[Any] = []
         cached = self._cached_controls.get(id(origin))
         if cached is None:
             try:
@@ -649,7 +775,7 @@ class StaticQmlBridge(QObject):
             data = self._snapshot_widget(widget, origin)
             if data is not None:
                 controls.append(data)
-        controls.sort(key=lambda item: (int(item["y"]), int(item["x"])))
+        controls.sort(key=self._control_position)
         return controls
 
     def _hover_scale(self, frame: QFrame) -> float:
@@ -760,8 +886,9 @@ class StaticQmlBridge(QObject):
 
         for source_name in ("runner", "execution_runner"):
             source = getattr(self.window, source_name, None)
+            # Progress pixels already arrive through the concrete QProgressBar and
+            # the dedicated Quick activity mirror. Do not wake the full scene twice.
             for signal_name in (
-                "progress_changed",
                 "result_updated",
                 "running_changed",
                 "completed",
@@ -795,10 +922,16 @@ class StaticQmlBridge(QObject):
                     lambda *_args, source=widget: self._schedule_input_refresh(source),
                 )
             elif isinstance(widget, QPlainTextEdit):
-                self._connect(
-                    widget.textChanged,
-                    lambda *_args, source=widget: self._schedule_input_refresh(source),
-                )
+                if widget.isReadOnly():
+                    self._connect(
+                        widget.textChanged,
+                        lambda *_args, source=widget: self._sync_read_only_text(source),
+                    )
+                else:
+                    self._connect(
+                        widget.textChanged,
+                        lambda *_args, source=widget: self._schedule_input_refresh(source),
+                    )
             elif isinstance(widget, QSpinBox):
                 self._connect(
                     widget.valueChanged,
@@ -811,9 +944,6 @@ class StaticQmlBridge(QObject):
                 )
             elif isinstance(widget, QAbstractButton):
                 self._connect(widget.toggled, self.schedule_refresh)
-                # Click handlers may materialize previously-lazy QWidget detail
-                # controls. Re-scan ownership once after a user click, never on
-                # background progress/log updates.
                 self._connect(widget.clicked, self.schedule_structure_refresh)
             elif isinstance(widget, QProgressBar):
                 self._connect(widget.valueChanged, self.schedule_refresh)
@@ -821,6 +951,11 @@ class StaticQmlBridge(QObject):
                 self._connect(widget.currentChanged, self.schedule_refresh)
 
             if isinstance(widget, QAbstractScrollArea):
+                # Appending read-only runtime text changes scrollbar range/value as
+                # a side effect. Those are presentation details of the text control,
+                # not application layout and must never invalidate the main scene.
+                if isinstance(widget, QPlainTextEdit) and widget.isReadOnly():
+                    continue
                 try:
                     vertical = widget.verticalScrollBar()
                     horizontal = widget.horizontalScrollBar()
@@ -830,8 +965,6 @@ class StaticQmlBridge(QObject):
                 for bar in (vertical, horizontal):
                     if bar is None:
                         continue
-                    # SmoothWheelFilter intentionally disconnects these exact
-                    # valueChanged callbacks while Quick owns live scrolling.
                     self._connect(bar.valueChanged, self.schedule_refresh)
                     self._connect(bar.rangeChanged, self.schedule_refresh)
 
