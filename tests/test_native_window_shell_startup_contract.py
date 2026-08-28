@@ -19,5 +19,31 @@ def test_native_child_is_fitted_after_maximized_owner_show() -> None:
     assert show_index < fit_index < overlay_index
 
 
+def test_native_focus_transfer_is_idempotent() -> None:
+    focus_start = SOURCE.index("def _focus_native_child(")
+    keyboard_start = SOURCE.index("_KEYBOARD_WIDGET_TYPES", focus_start)
+    focus_source = SOURCE[focus_start:keyboard_start]
+
+    assert "if int(user32.GetFocus() or 0) == overlay_hwnd:" in focus_source
+    assert "user32.SetFocus(overlay)" in focus_source
+
+
+def test_qt_child_focus_does_not_feed_back_into_native_focus_transfer() -> None:
+    changed_start = SOURCE.index("def _on_focus_changed(")
+    schedule_start = SOURCE.index("def _schedule_widget_focus(", changed_start)
+    changed_source = SOURCE[changed_start:schedule_start]
+
+    overlay_branch_start = SOURCE.index("elif watched is self.overlay:")
+    keyboard_branch_start = SOURCE.index(
+        "elif isinstance(watched, _KEYBOARD_WIDGET_TYPES):",
+        overlay_branch_start,
+    )
+    overlay_source = SOURCE[overlay_branch_start:keyboard_branch_start]
+
+    assert "self._last_focus_widget = current" in changed_source
+    assert "self._schedule_widget_focus()" not in changed_source
+    assert "QEvent.Type.FocusIn" not in overlay_source
+
+
 def test_native_window_shell_source_compiles() -> None:
     compile(SOURCE, str(ROOT / "gui" / "native_window_shell.py"), "exec")
