@@ -63,8 +63,10 @@ def test_pool_contract_allows_practical_best_available_fit() -> None:
         "none",
     ]
     rules = " ".join(request["rules"]).casefold()
+    system = request["system_instruction"].casefold()
     assert "best_available_fit" in rules
-    assert "closest practical" in rules or "closest reasonable" in rules
+    assert "closest practical category" in system
+    assert "marketplace operator would most reasonably use" in rules
     assert "same_product_type -> broader_valid_class -> best_available_fit -> none" in rules
 
 
