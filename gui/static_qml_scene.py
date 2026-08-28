@@ -167,21 +167,18 @@ Item {
         Item {
             id: toggleRoot
             property var d
-            property bool checked: d ? d.checked : false
             property bool initialized: false
             property real actionPosition: 0.0
 
             function syncPosition() {
-                actionPosition = checked ? 1.0 : 0.0
+                if (!d)
+                    return
+                actionPosition = d.checked ? 1.0 : 0.0
                 if (!initialized)
                     initialized = true
             }
 
-            onCheckedChanged: syncPosition()
-            onDChanged: {
-                if (!initialized && d)
-                    syncPosition()
-            }
+            onDChanged: syncPosition()
 
             Behavior on actionPosition {
                 enabled: toggleRoot.initialized
