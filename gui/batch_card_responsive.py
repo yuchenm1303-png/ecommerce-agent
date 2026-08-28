@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, Qt
-from PySide6.QtWidgets import QLabel, QScrollArea, QSizePolicy, QWidget
+from PySide6.QtWidgets import QLabel, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QWidget
+
+
+_CARD_MARGIN_X = 12
+_CARD_MARGIN_Y = 8
+_CARD_SPACING = 4
+_CARD_BUTTON_HEIGHT = 28
+_CONTROL_MARGIN_X = 8
+_CONTROL_MARGIN_Y = 4
+_CONTROL_SPACING = 6
+_JOB_SPACING = 6
 
 
 class BatchCardResponsiveController(QObject):
-    """Synchronously bind Batch job-card geometry to the visible scroll viewport.
+    """Synchronously own Batch job-card geometry inside the visible viewport.
 
-    Width and vertical content extent are layout ownership, not deferred presentation
-    work. A hidden Batch page must already have its final card widths and scroll range
-    before QStackedWidget exposes it; there is intentionally no zero-delay timer here.
+    The hidden QWidget tree is the authoritative layout/state host for the Quick
+    mirror. Card density therefore belongs here too: one compact geometry contract
+    is applied before the mirror snapshots each card, rather than layering fixed
+    heights or clipping on top of the rendered Quick scene.
     """
 
     def __init__(self, workspace: QWidget) -> None:
@@ -30,6 +41,9 @@ class BatchCardResponsiveController(QObject):
             QSizePolicy.Policy.Ignored,
             QSizePolicy.Policy.Preferred,
         )
+        if self.jobs_layout is not None:
+            self.jobs_layout.setContentsMargins(1, 1, 1, 1)
+            self.jobs_layout.setSpacing(_JOB_SPACING)
         self.viewport.installEventFilter(self)
         self.jobs_host.installEventFilter(self)
 
@@ -50,12 +64,53 @@ class BatchCardResponsiveController(QObject):
             widget.sizePolicy().verticalPolicy(),
         )
 
+    @staticmethod
+    def _single_line(label: QLabel | None) -> None:
+        if not isinstance(label, QLabel):
+            return
+        label.setWordWrap(False)
+        label.setMinimumHeight(0)
+        label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+
+    def _compact_control_strip(self, controls: object | None) -> None:
+        if controls is None:
+            return
+        host = getattr(controls, "host", None)
+        hint = getattr(controls, "hint", None)
+        if isinstance(host, QWidget):
+            host.setMinimumWidth(0)
+            host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            layout = host.layout()
+            if layout is not None:
+                layout.setContentsMargins(
+                    _CONTROL_MARGIN_X,
+                    _CONTROL_MARGIN_Y,
+                    _CONTROL_MARGIN_X,
+                    _CONTROL_MARGIN_Y,
+                )
+                layout.setSpacing(_CONTROL_SPACING)
+        if isinstance(hint, QLabel):
+            self._soft_horizontal(hint)
+            self._single_line(hint)
+        for name in ("run_button", "pause_button", "fill", "stop", "delete"):
+            button = getattr(controls, name, None)
+            if isinstance(button, QPushButton):
+                button.setFixedHeight(_CARD_BUTTON_HEIGHT)
+
     def _apply_card_constraints(self, card: QWidget) -> None:
         card.setMinimumWidth(0)
-        card.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            card.sizePolicy().verticalPolicy(),
-        )
+        card.setMinimumHeight(0)
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+        root = card.layout()
+        if root is not None:
+            root.setContentsMargins(
+                _CARD_MARGIN_X,
+                _CARD_MARGIN_Y,
+                _CARD_MARGIN_X,
+                _CARD_MARGIN_Y,
+            )
+            root.setSpacing(_CARD_SPACING)
 
         for name in (
             "product_label",
@@ -71,33 +126,31 @@ class BatchCardResponsiveController(QObject):
             if isinstance(widget, QWidget):
                 self._soft_horizontal(widget)
 
-        product = getattr(card, "product_label", None)
-        if isinstance(product, QLabel):
-            product.setWordWrap(True)
+        # The list card is a summary surface. Full product/error/log text remains
+        # available through tooltips and the existing detail modal; allowing these
+        # labels to wrap makes a single long value consume an arbitrary card height.
+        for name in ("product_label", "meta_label", "detail_label", "error_label", "log_preview"):
+            self._single_line(getattr(card, name, None))
 
-        meta = getattr(card, "meta_label", None)
-        if isinstance(meta, QLabel):
-            meta.setWordWrap(True)
+        progress = getattr(card, "progress_bar", None)
+        if isinstance(progress, QProgressBar):
+            progress.setFixedHeight(5)
 
-        detail = getattr(card, "detail_label", None)
-        if isinstance(detail, QLabel):
-            detail.setWordWrap(True)
+        for name in ("open_url_button", "open_dir_button", "modal_button", "toggle_button"):
+            button = getattr(card, name, None)
+            if isinstance(button, QPushButton):
+                button.setFixedHeight(_CARD_BUTTON_HEIGHT)
 
-        controls_manager = getattr(self.workspace, "_batch_job_controls", None)
-        controls_map = getattr(controls_manager, "_controls", None)
         job_id = str(getattr(card, "job_id", ""))
-        if isinstance(controls_map, dict):
-            controls = controls_map.get(job_id)
-            host = getattr(controls, "host", None)
-            hint = getattr(controls, "hint", None)
-            if isinstance(host, QWidget):
-                host.setMinimumWidth(0)
-                host.setSizePolicy(
-                    QSizePolicy.Policy.Expanding,
-                    host.sizePolicy().verticalPolicy(),
-                )
-            if isinstance(hint, QWidget):
-                self._soft_horizontal(hint)
+        legacy_manager = getattr(self.workspace, "_batch_job_controls", None)
+        legacy_map = getattr(legacy_manager, "_controls", None)
+        if isinstance(legacy_map, dict):
+            self._compact_control_strip(legacy_map.get(job_id))
+
+        individual_manager = getattr(self.workspace, "_batch_individual_controls", None)
+        individual_map = getattr(individual_manager, "_cards", None)
+        if isinstance(individual_map, dict):
+            self._compact_control_strip(individual_map.get(job_id))
 
     def _elide_url(self, card: QWidget) -> None:
         label = getattr(card, "url_label", None)
