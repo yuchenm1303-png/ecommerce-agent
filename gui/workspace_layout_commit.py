@@ -69,6 +69,26 @@ class WorkspaceLayoutCommitter(QObject):
         # committed on demand by workspace_transition before they become current.
         self.prepare_page(int(self.stack.currentIndex()))
 
+    def _commit_single_fixed(self) -> None:
+        """Commit the authoritative Single splitter policy synchronously.
+
+        ConsoleSummaryMode owns the Single workspaceSplitter/bodySplitter ratios.
+        Its ordinary Resize/currentChanged path is deliberately coalesced by 16 ms,
+        which is appropriate during normal resizing but too late for a Quick mode
+        transition: workspace_transition can refresh and reveal the QML scene before
+        that timer fires. Invoke the existing owner here, inside the same transaction
+        that is about to be published to Quick, so no provisional splitter geometry
+        can cross the presentation boundary.
+        """
+
+        summary = getattr(self.window, "_console_summary_mode", None)
+        apply = getattr(summary, "apply", None)
+        if callable(apply):
+            try:
+                apply()
+            except RuntimeError:
+                pass
+
     def _commit_batch_responsive(self) -> None:
         workspace = getattr(self.window, "batch_workspace", None)
         responsive = getattr(workspace, "_batch_card_responsive", None)
@@ -118,6 +138,13 @@ class WorkspaceLayoutCommitter(QObject):
                 changed = _activate_layout_tree(page) or changed
             if not changed:
                 break
+
+        if int(index) == 0:
+            # Generic QLayout activation cannot substitute for the Single page's
+            # explicit splitter policy. Commit that policy last, then consume the
+            # resulting child geometries before this transaction is published.
+            self._commit_single_fixed()
+            _activate_layout_tree(page)
 
     def prepare_page(self, index: int) -> None:
         """Commit one page immediately from its current visibility/layout state."""
