@@ -609,6 +609,29 @@ class QuickModalLayerController(QObject):
         self._patched = False
         self.details._show_prepared_modal = self._original_show_prepared_modal  # type: ignore[method-assign]  # noqa: SLF001
 
+    def _rollback_open(self) -> None:
+        """Return the shared modal owner to a clean idle state after a failed prepare."""
+
+        self._open_timer.stop()
+        self._close_timer.stop()
+        self._controls = []
+        self._presented = False
+        self._visible = False
+        self._transitioning = False
+        self._refresh_pending = False
+        try:
+            self.details.drawer.hide()
+            self.details.scrim.hide()
+            self.details.backdrop.hide()
+            self.details.backdrop.clear()
+            self.details.ghost.hide()
+            self.details.close_button.setEnabled(True)
+            self.details._selected = None  # noqa: SLF001
+            self.details._modal_ratio = (0.80, 0.80)  # noqa: SLF001
+        except RuntimeError:
+            pass
+        self.changed.emit()
+
     def _show_quick_modal(self, *, ratio: tuple[float, float]) -> None:
         if not self.static_view.static_active:
             self._original_show_prepared_modal(ratio=ratio)
@@ -639,7 +662,13 @@ class QuickModalLayerController(QObject):
         self._modal_h = int(rect.height())
         self._presented = True
         self._visible = False
-        self._refresh_controls(force=True)
+        try:
+            self._refresh_controls(force=True)
+        except Exception:
+            # Modal preparation is a transaction. A malformed/novel mirror control
+            # must never leave presented=True and lock every later shared modal.
+            self._rollback_open()
+            raise
         self.backdropCaptureRequested.emit()
         self.changed.emit()
         QTimer.singleShot(0, self._finish_open)
@@ -704,9 +733,9 @@ class QuickModalLayerController(QObject):
             if isinstance(bridge_timer, QTimer):
                 bridge_timer.stop()
 
-        # Read-only text panes are intentionally represented by persistent
-        # QObject controls while the rest remain dict snapshots. The bridge owns
-        # that mixed representation and therefore also owns its position accessor.
+        # StaticQmlBridge may expose stable QObject-backed controls for hot paths
+        # such as read-only logs. Use its canonical position accessor instead of
+        # assuming every control snapshot is a dict.
         controls.sort(key=self.static_bridge._control_position)  # noqa: SLF001
         self._controls = controls
         self.changed.emit()
