@@ -159,6 +159,9 @@ class ApplicationUpdater(QObject):
             " background: rgba(20,24,34,70); border: 1px solid rgba(255,255,255,28);"
             " border-radius: 10px; font-size: 11px; font-weight: 650; }"
         )
+        version_label.setMinimumWidth(
+            version_label.fontMetrics().horizontalAdvance(version_label.text()) + 28
+        )
 
         check_button = QPushButton("检查更新", self.window)
         check_button.setObjectName("checkUpdateButton")
@@ -171,6 +174,13 @@ class ApplicationUpdater(QObject):
             " font-size: 11px; font-weight: 650; }"
             "QPushButton#checkUpdateButton:hover { background: rgba(255,255,255,30);"
             " border-color: rgba(255,255,255,44); }"
+        )
+        check_button.setMinimumWidth(
+            max(
+                check_button.fontMetrics().horizontalAdvance(text)
+                for text in ("检查更新", "检查中…", "网络较慢…")
+            )
+            + 34
         )
         check_button.clicked.connect(self.manual_check_for_updates)
 
