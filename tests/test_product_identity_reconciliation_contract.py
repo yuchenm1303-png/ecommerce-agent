@@ -31,10 +31,12 @@ def _snapshot() -> SourceSnapshot:
 
 def test_product_identity_request_classifies_core_retail_class_before_descriptive_attributes() -> None:
     request = build_product_identity_request(_snapshot())
+    prompt = request["prompt_instruction"].casefold()
     rules = " ".join(request["rules"]).casefold()
 
     assert request["context"]["identity_contract_version"] == 3
-    assert "core retail class" in request["prompt_instruction"].casefold()
+    assert "core sold product class" in prompt
+    assert "core retail class" in rules
     assert "classification anchor" in rules
     for incidental in ("material", "engraving", "personalization", "colour", "size"):
         assert incidental in rules
@@ -81,6 +83,9 @@ def test_batch_gui_owns_listing_intent_per_child_process_instead_of_global_share
     support = (root / "gui" / "listing_offer_support.py").read_text(encoding="utf-8")
     policy = (root / "app" / "listing_content_policy.py").read_text(encoding="utf-8")
 
-    assert "ECOMMERCE_LISTING_INTENT" in support
+    # GUI consumes the shared constant instead of duplicating the environment key.
+    assert "LISTING_INTENT_ENV" in support
+    assert "ECOMMERCE_LISTING_INTENT" not in support
     assert "ECOMMERCE_LISTING_INTENT" in policy
     assert "current_listing_intent" in policy
+    assert "_with_process_intent" in support
