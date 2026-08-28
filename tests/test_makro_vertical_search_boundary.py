@@ -324,5 +324,9 @@ def test_empty_global_decision_closes_search_and_falls_back_without_click(monkey
 
 def test_select_vertical_searches_before_mutating_taxonomy() -> None:
     source = inspect.getsource(vertical_selection.select_vertical)
-    assert source.index("_try_select_via_search(") < source.index("ResilientMakroTaxonomyBrowser(page)")
-    assert "Taxonomy is a semantic fallback only" in source
+    search_pos = source.index("_try_select_via_search(")
+    taxonomy_pos = source.index("ResilientMakroTaxonomyBrowser(page)")
+    assert search_pos < taxonomy_pos
+    assert "if search_selected:" in source
+    assert "return search_selected" in source
+    assert "_select_via_taxonomy(" in source
