@@ -4,6 +4,7 @@ import sys
 from typing import Any
 
 from PySide6.QtCore import QObject, QTimer, QUrl
+from PySide6.QtQml import QQmlComponent
 from PySide6.QtQuick import QQuickItem, QQuickWindow
 from PySide6.QtWidgets import QMainWindow
 
@@ -17,9 +18,9 @@ _STATIC_QML_URL = QUrl("inmemory:/StaticRoot.qml")
 class StaticQmlViewController(QObject):
     """Drift-off presentation inside the existing Quick scene graph.
 
-    The QQmlApplicationEngine owns QML creation/destruction. Python only binds
-    the engine-created QQuickItem into the already-existing QQuickWindow and
-    switches native presentation ownership after a rendered Quick frame.
+    Component loading is explicitly state-driven: QML is instantiated only after
+    QQmlComponent reaches Ready. A load/create failure leaves the legacy QWidget
+    child presented instead of terminating the application.
     """
 
     def __init__(self, window: QMainWindow, visual: Any, startup_gate: Any) -> None:
@@ -38,8 +39,9 @@ class StaticQmlViewController(QObject):
         self._load_started = False
         self._load_failed = False
         self._handoff_armed = False
-        self._qml_warnings: list[str] = []
+        self._legacy_suspended = False
         self.item: QQuickItem | None = None
+        self.component: QQmlComponent | None = None
 
         if not isinstance(self.quick, QQuickWindow):
             raise RuntimeError("static QML view requires the existing native QQuickWindow")
@@ -53,14 +55,6 @@ class StaticQmlViewController(QObject):
         context = self.engine.rootContext()
         context.setContextProperty("staticBridge", self.bridge)
         context.setContextProperty("staticCardModel", self.card_model)
-
-        self.engine.objectCreated.connect(self._on_qml_object_created)
-        warnings = getattr(self.engine, "warnings", None)
-        if warnings is not None and hasattr(warnings, "connect"):
-            try:
-                warnings.connect(self._on_qml_warnings)
-            except (RuntimeError, TypeError):
-                pass
 
         self.quick.widthChanged.connect(self._fit_and_refresh)
         self.quick.heightChanged.connect(self._fit_and_refresh)
@@ -76,35 +70,17 @@ class StaticQmlViewController(QObject):
     def static_active(self) -> bool:
         return self._static_active
 
-    def _on_qml_warnings(self, warnings: object) -> None:
-        try:
-            for warning in warnings:  # type: ignore[union-attr]
-                text = warning.toString()
-                if text not in self._qml_warnings:
-                    self._qml_warnings.append(text)
-        except (RuntimeError, TypeError):
-            return
-
-    def _find_static_item(self) -> QQuickItem | None:
-        try:
-            for root in self.engine.rootObjects():
-                if isinstance(root, QQuickItem) and root.objectName() == "staticQmlRoot":
-                    return root
-        except RuntimeError:
-            return None
-        return None
-
     def _ensure_scene_loaded(self) -> None:
         if self.item is not None or self._load_started or self._load_failed:
             return
-        self._load_started = True
-        self._qml_warnings.clear()
 
-        # QQmlApplicationEngine owns component readiness and object lifetime.
-        # This avoids calling QQmlComponent.create() while a component is still
-        # Loading, which was the direct cause of the previous startup failure.
+        self._load_started = True
+        component = QQmlComponent(self.engine, self)
+        self.component = component
+        component.statusChanged.connect(self._on_component_status_changed)
+
         try:
-            self.engine.loadData(
+            component.setData(
                 STATIC_QML_SOURCE.encode("utf-8"),
                 _STATIC_QML_URL,
             )
@@ -112,43 +88,90 @@ class StaticQmlViewController(QObject):
             self._fail_scene(str(exc))
             return
 
-        created = self._find_static_item()
-        if created is not None:
-            self._adopt_scene(created)
+        # setData() may complete synchronously. Always inspect the current status
+        # after the call so a Ready/Error transition cannot be missed.
+        self._advance_component_status(component.status())
 
-    def _on_qml_object_created(self, created: QObject | None, url: QUrl) -> None:
-        if url != _STATIC_QML_URL:
-            return
-        if not isinstance(created, QQuickItem):
-            details = "\n".join(self._qml_warnings)
-            self._fail_scene(details or "QML engine returned no QQuickItem")
-            return
-        self._adopt_scene(created)
+    def _on_component_status_changed(self, status: QQmlComponent.Status) -> None:
+        self._advance_component_status(status)
 
-    def _adopt_scene(self, item: QQuickItem) -> None:
-        if self.item is not None:
+    def _advance_component_status(self, status: QQmlComponent.Status) -> None:
+        component = self.component
+        if component is None or self.item is not None or self._load_failed:
             return
-        self.item = item
+
+        if status == QQmlComponent.Status.Loading or status == QQmlComponent.Status.Null:
+            return
+        if status == QQmlComponent.Status.Error:
+            self._fail_scene(self._component_errors())
+            return
+        if status != QQmlComponent.Status.Ready:
+            self._fail_scene(f"unexpected QQmlComponent status: {status}")
+            return
+
+        self._create_ready_scene()
+
+    def _component_errors(self) -> str:
+        component = self.component
+        if component is None:
+            return "QML component unavailable"
         try:
-            item.setParentItem(self.quick.contentItem())
-            item.setVisible(False)
+            errors = [error.toString() for error in component.errors()]
         except RuntimeError as exc:
-            self.item = None
+            return str(exc)
+        return "\n".join(errors) or "QML component creation failed without diagnostics"
+
+    def _create_ready_scene(self) -> None:
+        component = self.component
+        if component is None or component.status() != QQmlComponent.Status.Ready:
+            return
+
+        try:
+            created = component.create(self.engine.rootContext())
+        except RuntimeError as exc:
             self._fail_scene(str(exc))
             return
+
+        if not isinstance(created, QQuickItem):
+            if created is not None:
+                try:
+                    created.deleteLater()
+                except RuntimeError:
+                    pass
+            self._fail_scene(self._component_errors())
+            return
+
+        try:
+            created.setParent(self)
+            created.setParentItem(self.quick.contentItem())
+            created.setVisible(False)
+        except RuntimeError as exc:
+            try:
+                created.deleteLater()
+            except RuntimeError:
+                pass
+            self._fail_scene(str(exc))
+            return
+
+        self.item = created
         self._fit()
         if self._static_requested:
             self._enter_static()
 
     def _fail_scene(self, reason: str) -> None:
+        if self._load_failed:
+            return
         self._load_failed = True
         self._static_requested = False
+        self.bridge.set_active(False)
+
         message = reason.strip() or "unknown QML creation failure"
         print(
             "[static-qml] static scene unavailable; keeping legacy presentation:\n"
             + message,
             file=sys.stderr,
         )
+
         try:
             self.shell.set_overlay_presented(True)
         except RuntimeError:
@@ -170,11 +193,17 @@ class StaticQmlViewController(QObject):
         self.bridge.schedule_refresh()
 
     def _suspend_legacy(self) -> None:
+        if self._legacy_suspended:
+            return
         suspend = getattr(self.clock, "suspend", None)
         if callable(suspend):
             suspend("static_qml")
+            self._legacy_suspended = True
 
     def _resume_legacy(self) -> None:
+        if not self._legacy_suspended:
+            return
+        self._legacy_suspended = False
         resume = getattr(self.clock, "resume", None)
         if callable(resume):
             resume("static_qml")
@@ -211,13 +240,17 @@ class StaticQmlViewController(QObject):
             self._handoff_armed = False
             QTimer.singleShot(0, self._commit_static_handoff)
 
+    def _disconnect_handoff(self) -> None:
+        if not self._handoff_armed:
+            return
+        self._handoff_armed = False
+        try:
+            self.quick.frameSwapped.disconnect(self._commit_static_handoff)
+        except (RuntimeError, TypeError):
+            pass
+
     def _commit_static_handoff(self) -> None:
-        if self._handoff_armed:
-            self._handoff_armed = False
-            try:
-                self.quick.frameSwapped.disconnect(self._commit_static_handoff)
-            except (RuntimeError, TypeError):
-                pass
+        self._disconnect_handoff()
         if not self._static_active or not self._static_requested:
             return
         try:
@@ -227,27 +260,25 @@ class StaticQmlViewController(QObject):
 
     def _leave_static(self) -> None:
         self._static_requested = False
-        if not self._static_active:
-            return
+        self._disconnect_handoff()
 
-        if self._handoff_armed:
-            self._handoff_armed = False
-            try:
-                self.quick.frameSwapped.disconnect(self._commit_static_handoff)
-            except (RuntimeError, TypeError):
-                pass
+        if not self._static_active:
+            self._resume_legacy()
+            return
 
         self._static_active = False
         try:
             self.shell.set_overlay_presented(True)
         except RuntimeError:
             pass
+
         self.bridge.set_active(False)
         if self.item is not None:
             try:
                 self.item.setVisible(False)
             except RuntimeError:
                 pass
+
         schedule = getattr(self.background, "schedule_mask_update", None)
         if callable(schedule):
             schedule()
