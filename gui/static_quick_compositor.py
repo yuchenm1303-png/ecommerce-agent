@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from PySide6.QtCore import (
+    QAbstractAnimation,
     QEasingCurve,
     QEvent,
     QObject,
@@ -254,6 +255,7 @@ class StaticQuickCardCompositor(QObject):
         self._static_enabled = False
         self._cleaned = False
         self._capturing: set[QFrame] = set()
+        self._paint_suppressed_cards: set[QFrame] = set()
         self._dirty_cards: set[QFrame] = set()
         self._dirty_posted = False
         self._geometry_posted = False
@@ -358,6 +360,17 @@ class StaticQuickCardCompositor(QObject):
         layer.surface._surface_scale = _NORMAL_SCALE  # type: ignore[attr-defined]
         layer.surface._overlay_alpha = _NORMAL_ALPHA  # type: ignore[attr-defined]
 
+    def _set_source_visible(self, layer: _Layer, visible: bool) -> None:
+        effect = self._effect(layer)
+        if not isinstance(effect, _StaticScaleEffect):
+            return
+        self._paint_suppressed_cards.add(layer.frame)
+        effect.set_source_visible(visible)
+        QTimer.singleShot(
+            0,
+            lambda frame=layer.frame: self._paint_suppressed_cards.discard(frame),
+        )
+
     def _capture_layer(self, layer: _Layer) -> bool:
         if layer.frame in self._capturing:
             return layer.cached
@@ -379,7 +392,10 @@ class StaticQuickCardCompositor(QObject):
             image.setDevicePixelRatio(pixmap.devicePixelRatio())
             layer.texture.set_snapshot(image, offset)
             layer.cached = True
-            self._prepare_resident_geometry(layer)
+            if layer.active:
+                self._position_active(layer)
+            else:
+                self._prepare_resident_geometry(layer)
             return True
         except RuntimeError:
             return False
@@ -568,7 +584,7 @@ class StaticQuickCardCompositor(QObject):
         layer.texture.setScale(_NORMAL_SCALE)
         layer.tint.setScale(_NORMAL_SCALE)
         layer.tint.setOpacity(_NORMAL_ALPHA / 255.0)
-        effect.set_source_visible(False)
+        self._set_source_visible(layer, False)
         self.background.set_card_presentation(
             layer.frame,
             scale=_NORMAL_SCALE,
@@ -583,7 +599,7 @@ class StaticQuickCardCompositor(QObject):
         layer.group.stop()
         effect = self._effect(layer)
         if isinstance(effect, _StaticScaleEffect):
-            effect.set_source_visible(True)
+            self._set_source_visible(layer, True)
             effect.set_scale(_NORMAL_SCALE)
         self.background.set_card_presentation(
             layer.frame,
@@ -612,7 +628,7 @@ class StaticQuickCardCompositor(QObject):
         if (
             abs(scale - layer.target_scale) <= 1e-5
             and abs(alpha - layer.target_alpha) <= 0.05
-            and layer.group.state() != QParallelAnimationGroup.State.Stopped
+            and layer.group.state() != QAbstractAnimation.State.Stopped
         ):
             return
 
@@ -836,8 +852,13 @@ class StaticQuickCardCompositor(QObject):
         self._dirty_cards.clear()
         self._dirty_posted = False
         self._geometry_posted = False
+        self._paint_suppressed_cards.clear()
 
         if not self._static_enabled:
+            for layer in self._layers.values():
+                layer.cached = False
+                layer.texture.clear()
+                self._park(layer)
             self.quick.hide()
             return
 
@@ -877,8 +898,13 @@ class StaticQuickCardCompositor(QObject):
             return False
 
         card = self._nearest_card(watched)
-        if self._static_enabled and card is not None and card not in self._capturing:
-            if event_type in _DIRTY_EVENTS:
+        if self._static_enabled and card is not None and not self._capturing:
+            suppress_own_paint = bool(
+                watched is card
+                and card in self._paint_suppressed_cards
+                and event_type in {QEvent.Type.Paint, QEvent.Type.UpdateRequest}
+            )
+            if event_type in _DIRTY_EVENTS and not suppress_own_paint:
                 self._mark_dirty(card)
             if event_type in _GEOMETRY_EVENTS:
                 self._schedule_geometry_refresh()
