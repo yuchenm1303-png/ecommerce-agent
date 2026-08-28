@@ -147,9 +147,9 @@ Item {
         Rectangle {
             anchors.fill: parent
             radius: 14
-            color: Qt.rgba(86/255, 53/255, 78/255, 228/255)
+            color: Qt.rgba(220/255, 228/255, 238/255, 188/255)
             border.width: 1
-            border.color: Qt.rgba(1, 1, 1, 88/255)
+            border.color: Qt.rgba(1, 1, 1, 72/255)
         }
 
         MouseArea {
