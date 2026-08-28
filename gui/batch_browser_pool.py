@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 import json
 import urllib.error
 import urllib.request
@@ -17,6 +17,7 @@ from app.browser_session import (
     is_cdp_ready,
     launch_detached_edge,
 )
+from .batch_model import BatchJob, BatchRun
 
 
 _MAKRO_HOST = "seller.makro.co.za"
@@ -69,6 +70,88 @@ def build_batch_browser_lanes(
             )
         )
     return tuple(lanes)
+
+
+def bind_job_browser_lane(
+    job: BatchJob,
+    *,
+    project_root: str | Path,
+    base_port: int,
+    lane_count: int,
+    ordinal: int,
+) -> BatchBrowserLane:
+    """Persist one job's deterministic lane so prepare and execute use one browser."""
+
+    lanes = build_batch_browser_lanes(
+        project_root,
+        base_port=int(base_port),
+        count=max(1, int(lane_count)),
+    )
+    lane = lanes[int(ordinal) % len(lanes)]
+    job.browser_lane = lane.index
+    job.makro_cdp_port = lane.cdp_port
+    job.makro_profile_dir = str(lane.profile_dir)
+    job.touch()
+    return lane
+
+
+def bind_batch_browser_lanes(
+    batch: BatchRun,
+    *,
+    project_root: str | Path,
+    base_port: int,
+) -> tuple[BatchBrowserLane, ...]:
+    """Round-robin all Batch jobs across the bounded persistent lane pool."""
+
+    lanes = build_batch_browser_lanes(
+        project_root,
+        base_port=int(base_port),
+        count=batch.prepare_concurrency,
+    )
+    for ordinal, job in enumerate(batch.jobs):
+        lane = lanes[ordinal % len(lanes)]
+        job.browser_lane = lane.index
+        job.makro_cdp_port = lane.cdp_port
+        job.makro_profile_dir = str(lane.profile_dir)
+        job.touch()
+    return lanes
+
+
+def pop_next_lane_ready_job(
+    queue: list[str],
+    *,
+    jobs: Iterable[BatchJob],
+    processes: dict[Any, tuple[str, str]],
+    stage: str,
+    concurrency: int,
+) -> str | None:
+    """Pop the first queued job whose browser lane is not already active.
+
+    A lane is an exclusive browser process, so two jobs assigned to the same lane
+    must never be started simultaneously. Different lanes remain fully parallel.
+    """
+
+    owned = {str(job.job_id): job for job in jobs}
+    active = [
+        str(job_id)
+        for job_id, active_stage in processes.values()
+        if active_stage == stage
+    ]
+    if len(active) >= max(1, int(concurrency)):
+        return None
+    active_lanes = {
+        int(owned[job_id].browser_lane)
+        for job_id in active
+        if job_id in owned
+    }
+    for index, job_id in enumerate(queue):
+        job = owned.get(str(job_id))
+        if job is None:
+            continue
+        if int(job.browser_lane) in active_lanes:
+            continue
+        return queue.pop(index)
+    return None
 
 
 def browser_lane_token(port: int) -> str:
@@ -238,8 +321,11 @@ def lane_tokens(lanes: tuple[BatchBrowserLane, ...]) -> dict[int, str]:
 
 __all__ = [
     "BatchBrowserLane",
+    "bind_batch_browser_lanes",
+    "bind_job_browser_lane",
     "browser_lane_token",
     "build_batch_browser_lanes",
     "ensure_batch_browser_lanes",
     "lane_tokens",
+    "pop_next_lane_ready_job",
 ]
