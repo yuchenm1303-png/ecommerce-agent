@@ -153,10 +153,26 @@ Item {
     Component {
         id: toggleComponent
         Item {
+            id: toggleRoot
             property var d
             property bool checked: d ? d.checked : false
-            property real actionPosition: checked ? 1.0 : 0.0
+            property bool initialized: false
+            property real actionPosition: 0.0
+
+            function syncPosition() {
+                actionPosition = checked ? 1.0 : 0.0
+                if (!initialized)
+                    initialized = true
+            }
+
+            onCheckedChanged: syncPosition()
+            onDChanged: {
+                if (!initialized && d)
+                    syncPosition()
+            }
+
             Behavior on actionPosition {
+                enabled: toggleRoot.initialized
                 NumberAnimation {
                     duration: 300
                     easing.type: Easing.BezierSpline
