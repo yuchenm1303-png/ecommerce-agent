@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QPointF, QTimer, Qt, QUrl
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtQml import QQmlComponent
 from PySide6.QtQuick import QQuickItem, QQuickWindow
@@ -26,8 +26,6 @@ class StaticQmlViewController(QObject):
     QQuickWindow.
     """
 
-    handoffFrameReady = Signal()
-
     def __init__(self, window: QMainWindow, visual: Any, startup_gate: Any) -> None:
         super().__init__(window)
         self.window = window
@@ -45,9 +43,7 @@ class StaticQmlViewController(QObject):
         self._load_started = False
         self._load_failed = False
         self._handoff_armed = False
-        self._handoff_frame_posted = False
-        self._startup_prepare_requested = False
-        self._startup_snapshot_prepared = False
+        self._card_fx_suspended_here = False
         self.item: QQuickItem | None = None
         self.component: QQmlComponent | None = None
 
@@ -55,16 +51,6 @@ class StaticQmlViewController(QObject):
             raise RuntimeError("unified Quick view requires the existing native QQuickWindow")
         if not callable(getattr(self.shell, "set_overlay_presented", None)):
             raise RuntimeError("unified Quick view requires native child presentation ownership")
-
-        # frameSwapped is a render-boundary signal. Never perform QWidget/Win32
-        # ownership changes from that callback stack: on Windows' threaded Quick
-        # render loop, ShowWindow on the GUI-owned child HWND can otherwise wait on
-        # the GUI thread while the GUI thread is waiting for the render frame. The
-        # queued signal makes the native handoff a normal GUI event-loop turn.
-        self.handoffFrameReady.connect(
-            self._commit_handoff,
-            Qt.ConnectionType.QueuedConnection,
-        )
 
         self.card_model = StaticCardModel(self)
         self.bridge = StaticQmlBridge(window, visual, self.card_model, self)
@@ -83,33 +69,11 @@ class StaticQmlViewController(QObject):
         self.quick.widthChanged.connect(self._fit_and_refresh)
         self.quick.heightChanged.connect(self._fit_and_refresh)
 
-        reveal_preparing = getattr(startup_gate, "revealPreparing", None)
-        layout_invalidated = getattr(startup_gate, "layoutInvalidated", None)
         handoff_ready = getattr(startup_gate, "handoffReady", None)
-        if (
-            reveal_preparing is None
-            or not hasattr(reveal_preparing, "connect")
-            or layout_invalidated is None
-            or not hasattr(layout_invalidated, "connect")
-            or handoff_ready is None
-            or not hasattr(handoff_ready, "connect")
-        ):
-            raise RuntimeError("unified Quick view requires explicit startup lifecycle signals")
-        reveal_preparing.connect(self._prepare_startup_scene)
-        layout_invalidated.connect(self._invalidate_startup_snapshot)
+        if handoff_ready is None or not hasattr(handoff_ready, "connect"):
+            raise RuntimeError("unified Quick view requires explicit startup handoff signal")
         handoff_ready.connect(self._activate_after_startup)
         window.destroyed.connect(self._cleanup)
-
-        # Quick is the authoritative presentation owner for the normal runtime.
-        # Its dedicated suspension hold is independent from startup and modal holds,
-        # so neither lifecycle can accidentally re-enable the legacy QWidget
-        # QGraphicsEffect/sourcePixmap path while Quick owns presentation.
-        self._suspend_legacy_visuals()
-
-        # Compile and create the hidden scene before the visible curtain movement.
-        # The lightweight launch surface is still present at this point, so any
-        # one-time QML import/component cost cannot steal animation frames later.
-        self._ensure_scene_loaded()
 
     @property
     def static_active(self) -> bool:
@@ -189,29 +153,8 @@ class StaticQmlViewController(QObject):
 
         self.item = created
         self._fit()
-        if self._startup_prepare_requested:
-            self._prepare_startup_snapshot()
         if self._quick_requested:
             self._activate_quick()
-
-    def _prepare_startup_scene(self) -> None:
-        if self._load_failed or self._quick_active:
-            return
-        self._startup_prepare_requested = True
-        self._ensure_scene_loaded()
-        if self.item is not None:
-            self._prepare_startup_snapshot()
-
-    def _prepare_startup_snapshot(self) -> None:
-        if self._load_failed or self.item is None or self._quick_active:
-            return
-        self._fit()
-        self.bridge.refresh()
-        self._startup_snapshot_prepared = True
-
-    def _invalidate_startup_snapshot(self) -> None:
-        if not self._quick_active:
-            self._startup_snapshot_prepared = False
 
     def _all_glass_frames(self) -> tuple[QFrame, ...]:
         glass = getattr(self.visual, "_glass", None)
@@ -249,20 +192,24 @@ class StaticQmlViewController(QObject):
         self._set_widget_lane_enabled(False)
         self._set_legacy_fireworks_enabled(False)
 
-        card_suspend = getattr(self.card_fx, "suspend_for_quick_presentation", None)
-        if callable(card_suspend):
+        card_suspend = getattr(self.card_fx, "suspend_for_modal", None)
+        already_suspended = bool(getattr(self.card_fx, "_suspended", False))
+        if callable(card_suspend) and not already_suspended:
             try:
                 card_suspend()
+                self._card_fx_suspended_here = True
             except RuntimeError:
-                pass
+                self._card_fx_suspended_here = False
 
     def _resume_legacy_fallback(self) -> None:
-        card_resume = getattr(self.card_fx, "resume_from_quick_presentation", None)
-        if callable(card_resume):
-            try:
-                card_resume()
-            except RuntimeError:
-                pass
+        if self._card_fx_suspended_here:
+            self._card_fx_suspended_here = False
+            card_resume = getattr(self.card_fx, "resume_from_modal", None)
+            if callable(card_resume):
+                try:
+                    card_resume()
+                except RuntimeError:
+                    pass
         self._set_widget_lane_enabled(True)
         self._set_legacy_fireworks_enabled(True)
 
@@ -271,7 +218,6 @@ class StaticQmlViewController(QObject):
             return
         self._load_failed = True
         self._quick_requested = False
-        self._startup_snapshot_prepared = False
         self._disconnect_handoff()
         self.bridge.set_active(False)
         self.fireworks.clear()
@@ -311,8 +257,6 @@ class StaticQmlViewController(QObject):
 
     def _fit_and_refresh(self, *_args: object) -> None:
         self._fit()
-        if not self._quick_active:
-            self._invalidate_startup_snapshot()
         self.bridge.schedule_refresh()
 
     def _activate_quick(self) -> None:
@@ -325,13 +269,10 @@ class StaticQmlViewController(QObject):
             self._ensure_scene_loaded()
             return
 
-        # The normal path snapshots the live QWidget host while both curtains are
-        # still closed. If geometry changed after that preparation boundary, the
-        # invalidation signal makes this one correctness-preserving refresh run.
-        if not self._startup_snapshot_prepared:
-            self.bridge.refresh()
-        self._startup_snapshot_prepared = False
-
+        # Snapshot the still-live QWidget business host before hiding its native
+        # child. From this point onward only the Quick scene is visible, regardless
+        # of whether wallpaper drift is enabled or disabled.
+        self.bridge.refresh()
         self._suspend_legacy_visuals()
         self._fit()
         self._set_native_glass_overlay_alpha(0.0)
@@ -350,35 +291,22 @@ class StaticQmlViewController(QObject):
         if self._handoff_armed:
             return
         self._handoff_armed = True
-        self._handoff_frame_posted = False
         try:
-            self.quick.frameSwapped.connect(self._on_handoff_frame_swapped)
+            self.quick.frameSwapped.connect(self._commit_handoff)
         except (RuntimeError, TypeError):
             self._handoff_armed = False
-            self._post_handoff_commit()
-
-    def _post_handoff_commit(self) -> None:
-        if self._handoff_frame_posted:
-            return
-        self._handoff_frame_posted = True
-        self.handoffFrameReady.emit()
-
-    def _on_handoff_frame_swapped(self) -> None:
-        # Render-boundary callback: no QWidget, Win32 or Quick mutation here.
-        if self._handoff_armed:
-            self._post_handoff_commit()
+            QTimer.singleShot(0, self._commit_handoff)
 
     def _disconnect_handoff(self) -> None:
         if not self._handoff_armed:
             return
         self._handoff_armed = False
         try:
-            self.quick.frameSwapped.disconnect(self._on_handoff_frame_swapped)
+            self.quick.frameSwapped.disconnect(self._commit_handoff)
         except (RuntimeError, TypeError):
             pass
 
     def _commit_handoff(self) -> None:
-        self._handoff_frame_posted = False
         self._disconnect_handoff()
         if not self._quick_active or not self._quick_requested:
             return

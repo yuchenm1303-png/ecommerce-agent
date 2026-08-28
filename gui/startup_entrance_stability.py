@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QMainWindow, QWidget
 _LAYOUT_POLL_MS = 16
 _LAYOUT_STABLE_SAMPLES = 5
 _HANDOFF_FRAME_MS = 16
-_REVEAL_SETTLE_FRAMES = 2
+_NATIVE_SETTLE_FRAMES = 2
 _LAYOUT_ACTIVITY_EVENTS = {
     QEvent.Type.LayoutRequest,
     QEvent.Type.Resize,
@@ -24,25 +24,13 @@ _LAYOUT_ACTIVITY_EVENTS = {
 class StartupEntranceStabilityGate(QObject):
     """Reveal startup only after the real QWidget + Quick scene is final.
 
-    Geometry stability and two rendered Quick frames are required before the curtain
-    starts opening. Once the curtain itself finishes, however, the visible overlay is
-    released immediately. Renderer handoff may continue afterwards, but application
-    input can never depend on a future frameSwapped signal.
-
-    Presentation ownership is explicit: startup releases only its own card-effect
-    suspension after handoffReady has synchronously allowed the Quick renderer to
-    acquire its independent presentation hold. Modal and Quick ownership therefore
-    cannot be released accidentally by the startup lifecycle.
-
-    Qt Quick frame callbacks are observation-only. Any geometry flush, property
-    mutation, repaint or renderer request is deferred to a queued GUI event-loop turn
-    so the threaded scene graph can never be re-entered from its frame boundary.
+    The gate observes the actual widget tree; it never calls QLayout.activate().
+    Startup layout ownership therefore stays with Qt and the normal responsive
+    controllers. Once geometry has remained unchanged for several frames, two
+    rendered Quick frames are required before the entrance may reveal the live UI.
     """
 
-    revealPreparing = Signal()
-    layoutInvalidated = Signal()
     handoffReady = Signal()
-    revealFrameReady = Signal()
 
     def __init__(self, window: QMainWindow, entrance: Any) -> None:
         super().__init__(window)
@@ -61,13 +49,9 @@ class StartupEntranceStabilityGate(QObject):
         self._reveal_barrier_started = False
         self._reveal_frames_remaining = 0
         self._reveal_frame_quick: Any | None = None
-        self._reveal_frame_posted = False
         self._handoff_started = False
-
-        self.revealFrameReady.connect(
-            self._consume_reveal_frame,
-            Qt.ConnectionType.QueuedConnection,
-        )
+        self._native_frames_remaining = 0
+        self._native_frame_quick: Any | None = None
 
         clock = getattr(window, "_presentation_clock", None)
         suspend = getattr(clock, "suspend", None)
@@ -130,7 +114,6 @@ class StartupEntranceStabilityGate(QObject):
             self._layout_epoch += 1
             self._stable_samples = 0
             self._live_paint_seen = False
-            self.layoutInvalidated.emit()
 
         return False
 
@@ -242,11 +225,6 @@ class StartupEntranceStabilityGate(QObject):
         if self._reveal_barrier_started:
             return
         self._reveal_barrier_started = True
-
-        # Compile/create/snapshot the unified Quick scene while the curtains are
-        # still fully closed. Heavy scene work therefore cannot steal frames from
-        # the visible opening animation.
-        self.revealPreparing.emit()
         self._prime_live_runtime()
 
         quick = getattr(self.background, "quick_window", None)
@@ -259,8 +237,7 @@ class StartupEntranceStabilityGate(QObject):
             self._start_entrance()
             return
         self._reveal_frame_quick = quick
-        self._reveal_frames_remaining = _REVEAL_SETTLE_FRAMES
-        self._reveal_frame_posted = False
+        self._reveal_frames_remaining = _NATIVE_SETTLE_FRAMES
         self._flush_native_background()
 
     def _disconnect_reveal_frame_barrier(self) -> None:
@@ -274,15 +251,6 @@ class StartupEntranceStabilityGate(QObject):
             pass
 
     def _on_reveal_frame_swapped(self) -> None:
-        # Render-boundary callback: report readiness only. Never call repaint,
-        # model sync, setProperty, requestUpdate or native window APIs here.
-        if self._reveal_frames_remaining <= 0 or self._reveal_frame_posted:
-            return
-        self._reveal_frame_posted = True
-        self.revealFrameReady.emit()
-
-    def _consume_reveal_frame(self) -> None:
-        self._reveal_frame_posted = False
         if self._reveal_frames_remaining <= 0:
             return
         self._reveal_frames_remaining -= 1
@@ -290,15 +258,36 @@ class StartupEntranceStabilityGate(QObject):
             self._flush_native_background()
             return
         self._disconnect_reveal_frame_barrier()
-        self._start_entrance()
+        QTimer.singleShot(0, self._start_entrance)
 
     def _start_entrance(self) -> None:
         self._disconnect_reveal_frame_barrier()
         self._reveal_frames_remaining = 0
-        self._reveal_frame_posted = False
         start = getattr(self.entrance, "start", None)
         if callable(start) and not bool(getattr(self.entrance, "_started", False)):
             start()
+
+    def _arm_native_frame_barrier(self) -> bool:
+        quick = getattr(self.background, "quick_window", None)
+        if quick is None:
+            return False
+        try:
+            quick.frameSwapped.connect(self._on_native_frame_swapped)
+        except (AttributeError, RuntimeError, TypeError):
+            return False
+        self._native_frame_quick = quick
+        self._native_frames_remaining = _NATIVE_SETTLE_FRAMES
+        return True
+
+    def _disconnect_native_frame_barrier(self) -> None:
+        quick = self._native_frame_quick
+        self._native_frame_quick = None
+        if quick is None:
+            return
+        try:
+            quick.frameSwapped.disconnect(self._on_native_frame_swapped)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
 
     def _stage_finish(self) -> None:
         if self._handoff_started:
@@ -309,15 +298,27 @@ class StartupEntranceStabilityGate(QObject):
         except (AttributeError, RuntimeError):
             pass
 
-        # The curtain already hid itself synchronously before emitting finished.
-        # Do not make input release depend on a post-animation frameSwapped barrier.
-        self._disconnect_reveal_frame_barrier()
-        self._reveal_frames_remaining = 0
-        self._reveal_frame_posted = False
+        frame_barrier_armed = self._arm_native_frame_barrier()
+        self._prime_live_runtime()
         self._remove_live_surface_watch()
+        if not frame_barrier_armed:
+            QTimer.singleShot(0, self._commit_overlay_handoff)
+
+    def _on_native_frame_swapped(self) -> None:
+        if self._native_frames_remaining <= 0:
+            return
+        self._native_frames_remaining -= 1
+        if self._native_frames_remaining > 0:
+            self._flush_native_background()
+            return
+        self._disconnect_native_frame_barrier()
         QTimer.singleShot(0, self._commit_overlay_handoff)
 
     def _commit_overlay_handoff(self) -> None:
+        self._disconnect_native_frame_barrier()
+        self._native_frames_remaining = 0
+        self.handoffReady.emit()
+
         overlay = self.overlay
         if isinstance(overlay, QWidget):
             try:
@@ -325,11 +326,6 @@ class StartupEntranceStabilityGate(QObject):
                 overlay.deleteLater()
             except RuntimeError:
                 pass
-
-        # Slots run synchronously. StaticQmlViewController therefore acquires its
-        # quick-presentation card hold before startup releases only its own hold.
-        self.handoffReady.emit()
-        self._resume_startup_card_fx()
 
         assistant = getattr(self.window, "_runtime_assistant", None)
         if isinstance(assistant, QWidget):
@@ -339,16 +335,8 @@ class StartupEntranceStabilityGate(QObject):
                 pass
 
         QTimer.singleShot(_HANDOFF_FRAME_MS, self._resume_effects)
-        QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_presentation)
-
-    def _resume_startup_card_fx(self) -> None:
-        card_fx = getattr(self.window, "_nekro_card_fx", None)
-        resume = getattr(card_fx, "resume_from_startup", None)
-        if callable(resume):
-            try:
-                resume()
-            except RuntimeError:
-                pass
+        QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_card_fx)
+        QTimer.singleShot(_HANDOFF_FRAME_MS * 3, self._resume_presentation)
 
     def _resume_effects(self) -> None:
         effects = getattr(self.entrance, "_hidden_effects", None)
@@ -362,6 +350,17 @@ class StartupEntranceStabilityGate(QObject):
             self.entrance._hidden_effects = None  # noqa: SLF001
         except (AttributeError, RuntimeError):
             pass
+
+    def _resume_card_fx(self) -> None:
+        if bool(getattr(self.entrance, "_card_fx_was_suspended", False)):
+            return
+        card_fx = getattr(self.window, "_nekro_card_fx", None)
+        resume = getattr(card_fx, "resume_from_modal", None)
+        if callable(resume):
+            try:
+                resume()
+            except RuntimeError:
+                pass
 
     def _resume_presentation(self) -> None:
         clock = getattr(self.window, "_presentation_clock", None)
