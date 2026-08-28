@@ -113,14 +113,14 @@ Item {
         anchors.fill: parent
         source: workspaceSnapshot
         blurEnabled: true
-        blur: 0.52
-        blurMax: 32
+        blur: 0.42
+        blurMax: 28
         autoPaddingEnabled: false
     }
 
     Rectangle {
         anchors.fill: parent
-        color: Qt.rgba(12/255, 17/255, 26/255, 122/255)
+        color: Qt.rgba(8/255, 12/255, 18/255, 150/255)
         MouseArea {
             anchors.fill: parent
             onClicked: quickModal.closeModal()
@@ -147,9 +147,14 @@ Item {
         Rectangle {
             anchors.fill: parent
             radius: 14
-            color: Qt.rgba(220/255, 228/255, 238/255, 188/255)
+            gradient: Gradient {
+                orientation: Gradient.Vertical
+                GradientStop { position: 0.0; color: Qt.rgba(110/255, 119/255, 129/255, 214/255) }
+                GradientStop { position: 0.46; color: Qt.rgba(92/255, 101/255, 112/255, 210/255) }
+                GradientStop { position: 1.0; color: Qt.rgba(75/255, 84/255, 96/255, 216/255) }
+            }
             border.width: 1
-            border.color: Qt.rgba(1, 1, 1, 72/255)
+            border.color: Qt.rgba(1, 1, 1, 42/255)
         }
 
         MouseArea {
@@ -226,9 +231,9 @@ Item {
         Rectangle {
             property var d
             radius: d && d.name === "cardDetailSection" ? 10 : 8
-            color: d && d.name === "cardDetailSection" ? Qt.rgba(1,1,1,22/255) : (d && d.fill ? d.fill : "transparent")
+            color: d && d.name === "cardDetailSection" ? Qt.rgba(1,1,1,16/255) : (d && d.fill ? d.fill : "transparent")
             border.width: d && d.name === "cardDetailSection" ? 1 : 0
-            border.color: Qt.rgba(1,1,1,24/255)
+            border.color: Qt.rgba(1,1,1,20/255)
         }
     }
 
