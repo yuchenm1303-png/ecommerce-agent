@@ -38,7 +38,8 @@ def test_single_gui_bootstrap_uses_the_same_process_local_listing_intent() -> No
 
     resolve_pos = source.index("listing_intent = current_listing_intent()")
     bootstrap_pos = source.index("hints = infer_listing_bootstrap(")
-    handoff_pos = source.index("listing_intent=listing_intent")
+    bootstrap_call = source[bootstrap_pos : source.index(")", bootstrap_pos) + 1]
 
-    assert resolve_pos < bootstrap_pos < handoff_pos
+    assert resolve_pos < bootstrap_pos
+    assert "listing_intent=listing_intent" in bootstrap_call
     assert '"listing_intent": listing_intent' in source
