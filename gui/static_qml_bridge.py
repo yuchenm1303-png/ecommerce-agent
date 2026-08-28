@@ -18,6 +18,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QFontInfo, QPalette
 from PySide6.QtWidgets import (
     QAbstractButton,
+    QAbstractScrollArea,
     QCheckBox,
     QComboBox,
     QFrame,
@@ -253,6 +254,51 @@ class StaticQmlBridge(QObject):
         self._targets[key] = widget
         return key
 
+    def _scroll_clip_data(self, widget: QWidget, origin: QWidget) -> dict[str, Any] | None:
+        """Return the intersection of every ancestor scroll viewport in origin space.
+
+        QWidget automatically clips descendants to QAbstractScrollArea.viewport().
+        The Quick mirror must carry that same presentation boundary explicitly;
+        otherwise flattened Job-card controls can paint through the queue viewport
+        into the Batch action card below it.
+        """
+
+        clip: tuple[int, int, int, int] | None = None
+        try:
+            current = widget.parentWidget()
+            while current is not None and current is not origin:
+                if isinstance(current, QAbstractScrollArea):
+                    viewport = current.viewport()
+                    point = viewport.mapTo(origin, QPoint(0, 0))
+                    left = int(point.x())
+                    top = int(point.y())
+                    right = left + int(viewport.width())
+                    bottom = top + int(viewport.height())
+                    if clip is None:
+                        clip = (left, top, right, bottom)
+                    else:
+                        clip = (
+                            max(clip[0], left),
+                            max(clip[1], top),
+                            min(clip[2], right),
+                            min(clip[3], bottom),
+                        )
+                    if clip[2] <= clip[0] or clip[3] <= clip[1]:
+                        return None
+                current = current.parentWidget()
+        except RuntimeError:
+            return None
+
+        if clip is None:
+            return None
+        return {
+            "clipEnabled": True,
+            "clipX": clip[0],
+            "clipY": clip[1],
+            "clipW": max(0, clip[2] - clip[0]),
+            "clipH": max(0, clip[3] - clip[1]),
+        }
+
     def _base(
         self,
         widget: QWidget,
@@ -280,7 +326,11 @@ class StaticQmlBridge(QObject):
             "w": width,
             "h": height,
             "enabled": enabled,
+            "clipEnabled": False,
         }
+        clip_data = self._scroll_clip_data(widget, origin)
+        if clip_data is not None:
+            data.update(clip_data)
         data.update(self._font_data(widget))
         return data
 
@@ -633,6 +683,19 @@ class StaticQmlBridge(QObject):
                 self._connect(widget.valueChanged, self.schedule_refresh)
             elif isinstance(widget, QTabWidget):
                 self._connect(widget.currentChanged, self.schedule_refresh)
+
+            if isinstance(widget, QAbstractScrollArea):
+                try:
+                    vertical = widget.verticalScrollBar()
+                    horizontal = widget.horizontalScrollBar()
+                except RuntimeError:
+                    vertical = None
+                    horizontal = None
+                for bar in (vertical, horizontal):
+                    if bar is None:
+                        continue
+                    self._connect(bar.valueChanged, self.schedule_refresh)
+                    self._connect(bar.rangeChanged, self.schedule_refresh)
 
             if isinstance(widget, QTableWidget):
                 try:
