@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Signal
 from PySide6.QtWidgets import QMainWindow, QWidget
 
 
 _LAYOUT_POLL_MS = 16
 _LAYOUT_STABLE_SAMPLES = 5
 _HANDOFF_FRAME_MS = 16
-_NATIVE_SETTLE_FRAMES = 2
+_QUICK_SETTLE_FRAMES = 2
 _LAYOUT_ACTIVITY_EVENTS = {
     QEvent.Type.LayoutRequest,
     QEvent.Type.Resize,
@@ -22,12 +22,12 @@ _LAYOUT_ACTIVITY_EVENTS = {
 
 
 class StartupEntranceStabilityGate(QObject):
-    """Reveal startup only after the real QWidget + Quick scene is final.
+    """Settle QWidget state, transfer presentation to Quick, then reveal in Quick.
 
-    The gate observes the actual widget tree; it never calls QLayout.activate().
-    Startup layout ownership therefore stays with Qt and the normal responsive
-    controllers. Once geometry has remained unchanged for several frames, two
-    rendered Quick frames are required before the entrance may reveal the live UI.
+    QWidget remains the authoritative startup layout/state host, but it never owns
+    the entrance animation. Once layout is quiescent, the unified QQuickWindow is
+    activated behind the still-closed Quick curtain. Two rendered frames complete
+    the native-child handoff before the GPU reveal timeline is allowed to start.
     """
 
     handoffReady = Signal()
@@ -49,16 +49,14 @@ class StartupEntranceStabilityGate(QObject):
         self._reveal_barrier_started = False
         self._reveal_frames_remaining = 0
         self._reveal_frame_quick: Any | None = None
-        self._handoff_started = False
-        self._native_frames_remaining = 0
-        self._native_frame_quick: Any | None = None
+        self._handoff_emitted = False
+        self._finish_started = False
 
         clock = getattr(window, "_presentation_clock", None)
         suspend = getattr(clock, "suspend", None)
         if callable(suspend):
             suspend("startup")
 
-        self._keep_live_surface_paintable()
         self._install_live_surface_watch()
 
         if self.overlay is not None:
@@ -67,11 +65,6 @@ class StartupEntranceStabilityGate(QObject):
             except (AttributeError, RuntimeError, TypeError):
                 pass
             self.overlay.finished.connect(self._stage_finish)
-
-    def _keep_live_surface_paintable(self) -> None:
-        if isinstance(self.overlay, QWidget):
-            self.overlay.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
-            self.overlay.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
 
     def _watch_layout_widget(self, widget: QWidget | None) -> None:
         if not isinstance(widget, QWidget):
@@ -134,7 +127,9 @@ class StartupEntranceStabilityGate(QObject):
             return
         try:
             if central.isVisibleTo(self.window):
-                central.repaint()
+                # update(), unlike repaint(), does not synchronously block the GUI
+                # thread while the startup gate is still collecting layout state.
+                central.update()
         except RuntimeError:
             pass
 
@@ -216,28 +211,46 @@ class StartupEntranceStabilityGate(QObject):
         central = self.window.centralWidget()
         if isinstance(central, QWidget):
             try:
-                central.repaint()
+                central.update()
             except RuntimeError:
                 pass
         self._flush_native_background()
+
+    def _emit_handoff_once(self) -> None:
+        if self._handoff_emitted:
+            return
+        self._handoff_emitted = True
+        self.handoffReady.emit()
 
     def _begin_reveal_frame_barrier(self) -> None:
         if self._reveal_barrier_started:
             return
         self._reveal_barrier_started = True
+
+        # No QWidget layout observer is allowed to run during the entrance itself.
+        # From this point forward the visible animation is exclusively Scene Graph.
+        self._remove_live_surface_watch()
         self._prime_live_runtime()
 
         quick = getattr(self.background, "quick_window", None)
         if quick is None:
+            self._emit_handoff_once()
             self._start_entrance()
             return
         try:
             quick.frameSwapped.connect(self._on_reveal_frame_swapped)
         except (AttributeError, RuntimeError, TypeError):
-            self._start_entrance()
+            self._emit_handoff_once()
+            QTimer.singleShot(0, self._start_entrance)
             return
+
         self._reveal_frame_quick = quick
-        self._reveal_frames_remaining = _NATIVE_SETTLE_FRAMES
+        self._reveal_frames_remaining = _QUICK_SETTLE_FRAMES
+
+        # Activate the main Quick scene while the startup curtain is still fully
+        # closed. StaticQmlViewController hides the native QWidget child on its
+        # first rendered frame; the second frame settles the unified composition.
+        self._emit_handoff_once()
         self._flush_native_background()
 
     def _disconnect_reveal_frame_barrier(self) -> None:
@@ -255,7 +268,10 @@ class StartupEntranceStabilityGate(QObject):
             return
         self._reveal_frames_remaining -= 1
         if self._reveal_frames_remaining > 0:
-            self._flush_native_background()
+            try:
+                self._reveal_frame_quick.requestUpdate()
+            except (AttributeError, RuntimeError):
+                pass
             return
         self._disconnect_reveal_frame_barrier()
         QTimer.singleShot(0, self._start_entrance)
@@ -267,65 +283,20 @@ class StartupEntranceStabilityGate(QObject):
         if callable(start) and not bool(getattr(self.entrance, "_started", False)):
             start()
 
-    def _arm_native_frame_barrier(self) -> bool:
-        quick = getattr(self.background, "quick_window", None)
-        if quick is None:
-            return False
-        try:
-            quick.frameSwapped.connect(self._on_native_frame_swapped)
-        except (AttributeError, RuntimeError, TypeError):
-            return False
-        self._native_frame_quick = quick
-        self._native_frames_remaining = _NATIVE_SETTLE_FRAMES
-        return True
-
-    def _disconnect_native_frame_barrier(self) -> None:
-        quick = self._native_frame_quick
-        self._native_frame_quick = None
-        if quick is None:
-            return
-        try:
-            quick.frameSwapped.disconnect(self._on_native_frame_swapped)
-        except (AttributeError, RuntimeError, TypeError):
-            pass
-
     def _stage_finish(self) -> None:
-        if self._handoff_started:
+        if self._finish_started:
             return
-        self._handoff_started = True
+        self._finish_started = True
+        self._disconnect_reveal_frame_barrier()
+        self._remove_live_surface_watch()
         try:
             self.entrance._finished = True  # noqa: SLF001
         except (AttributeError, RuntimeError):
             pass
 
-        frame_barrier_armed = self._arm_native_frame_barrier()
-        self._prime_live_runtime()
-        self._remove_live_surface_watch()
-        if not frame_barrier_armed:
-            QTimer.singleShot(0, self._commit_overlay_handoff)
-
-    def _on_native_frame_swapped(self) -> None:
-        if self._native_frames_remaining <= 0:
-            return
-        self._native_frames_remaining -= 1
-        if self._native_frames_remaining > 0:
-            self._flush_native_background()
-            return
-        self._disconnect_native_frame_barrier()
-        QTimer.singleShot(0, self._commit_overlay_handoff)
-
-    def _commit_overlay_handoff(self) -> None:
-        self._disconnect_native_frame_barrier()
-        self._native_frames_remaining = 0
-        self.handoffReady.emit()
-
-        overlay = self.overlay
-        if isinstance(overlay, QWidget):
-            try:
-                overlay.hide()
-                overlay.deleteLater()
-            except RuntimeError:
-                pass
+        release = getattr(self.entrance, "release_overlay", None)
+        if callable(release):
+            release()
 
         assistant = getattr(self.window, "_runtime_assistant", None)
         if isinstance(assistant, QWidget):
@@ -338,9 +309,13 @@ class StartupEntranceStabilityGate(QObject):
         QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_card_fx)
         QTimer.singleShot(_HANDOFF_FRAME_MS * 3, self._resume_presentation)
 
+    def _quick_presentation_active(self) -> bool:
+        view = getattr(self.window, "_static_qml_view_controller", None)
+        return bool(getattr(view, "static_active", False))
+
     def _resume_effects(self) -> None:
         effects = getattr(self.entrance, "_hidden_effects", None)
-        if isinstance(effects, QWidget):
+        if isinstance(effects, QWidget) and not self._quick_presentation_active():
             try:
                 effects.show()
                 effects.raise_()
@@ -352,6 +327,8 @@ class StartupEntranceStabilityGate(QObject):
             pass
 
     def _resume_card_fx(self) -> None:
+        if self._quick_presentation_active():
+            return
         if bool(getattr(self.entrance, "_card_fx_was_suspended", False)):
             return
         card_fx = getattr(self.window, "_nekro_card_fx", None)
