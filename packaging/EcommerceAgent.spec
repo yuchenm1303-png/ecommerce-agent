@@ -71,6 +71,23 @@ worker_a = Analysis(
     optimize=0,
 )
 
+# Sakana is deliberately a separate executable/process. Its QApplication,
+# QtWebEngine/Chromium renderer and requestAnimationFrame cadence therefore do
+# not share the listing application's Python/Qt GUI event loop.
+sakana_a = Analysis(
+    [str(ROOT / "gui" / "sakana_process.py")],
+    pathex=[str(ROOT)],
+    binaries=[],
+    datas=[],
+    hiddenimports=[],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=["pytest", "playwright", "velopack"],
+    noarchive=False,
+    optimize=0,
+)
+
 utf8_options = [("X utf8", None, "OPTION")]
 worker_options = [("X utf8", None, "OPTION"), ("u", None, "OPTION")]
 
@@ -118,13 +135,38 @@ worker_exe = EXE(
     contents_directory="_internal",
 )
 
+sakana_pyz = PYZ(sakana_a.pure)
+sakana_exe = EXE(
+    sakana_pyz,
+    sakana_a.scripts,
+    utf8_options,
+    [],
+    exclude_binaries=True,
+    name="EcommerceAgentSakana",
+    icon=str(APP_ICON),
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    contents_directory="_internal",
+)
+
 coll = COLLECT(
     gui_exe,
     worker_exe,
+    sakana_exe,
     gui_a.binaries,
     gui_a.datas,
     worker_a.binaries,
     worker_a.datas,
+    sakana_a.binaries,
+    sakana_a.datas,
     strip=False,
     upx=False,
     upx_exclude=[],
