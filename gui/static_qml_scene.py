@@ -553,7 +553,8 @@ Item {
 
             // Keep the known-smooth architecture: native_background.py owns the
             // cached blur, while this card owns only its tone, content and GPU
-            // transform. No outer clip item or per-card effect pipeline exists.
+            // transform. Scroll viewport clipping is applied only to flattened
+            // child controls below; the card itself remains one unclipped GPU item.
             Rectangle {
                 anchors.fill: parent
                 radius: 6
@@ -568,10 +569,6 @@ Item {
                 }
             }
 
-            // Card-detail input belongs only to uncovered card surface.  This
-            // MouseArea is intentionally below every control Loader, so a field,
-            // button, combo, table or tab receives the pointer first and the
-            // card never competes for the same click.
             MouseArea {
                 id: cardClick
                 anchors.fill: parent
@@ -581,12 +578,26 @@ Item {
 
             Repeater {
                 model: card.cardControls
-                delegate: Loader {
+                delegate: Item {
                     required property var modelData
                     property var d: modelData
-                    x: d.x; y: d.y; width: d.w; height: d.h
-                    sourceComponent: staticRoot.componentFor(d.kind)
-                    onLoaded: if (item) item.d = d
+                    readonly property bool clipped: d && d.clipEnabled
+                    x: clipped ? d.clipX : d.x
+                    y: clipped ? d.clipY : d.y
+                    width: clipped ? d.clipW : d.w
+                    height: clipped ? d.clipH : d.h
+                    clip: clipped
+
+                    Loader {
+                        property var controlData: parent.d
+                        x: parent.clipped ? controlData.x - controlData.clipX : 0
+                        y: parent.clipped ? controlData.y - controlData.clipY : 0
+                        width: controlData ? controlData.w : 0
+                        height: controlData ? controlData.h : 0
+                        sourceComponent: controlData ? staticRoot.componentFor(controlData.kind) : null
+                        onLoaded: if (item) item.d = controlData
+                        onControlDataChanged: if (item) item.d = controlData
+                    }
                 }
             }
 
@@ -596,12 +607,26 @@ Item {
 
     Repeater {
         model: staticBridge.rootControls
-        delegate: Loader {
+        delegate: Item {
             required property var modelData
             property var d: modelData
-            x: d.x; y: d.y; width: d.w; height: d.h
-            sourceComponent: d && d.kind === "toggle" ? null : staticRoot.componentFor(d.kind)
-            onLoaded: if (item) item.d = d
+            readonly property bool clipped: d && d.clipEnabled
+            x: clipped ? d.clipX : d.x
+            y: clipped ? d.clipY : d.y
+            width: clipped ? d.clipW : d.w
+            height: clipped ? d.clipH : d.h
+            clip: clipped
+
+            Loader {
+                property var controlData: parent.d
+                x: parent.clipped ? controlData.x - controlData.clipX : 0
+                y: parent.clipped ? controlData.y - controlData.clipY : 0
+                width: controlData ? controlData.w : 0
+                height: controlData ? controlData.h : 0
+                sourceComponent: controlData && controlData.kind !== "toggle" ? staticRoot.componentFor(controlData.kind) : null
+                onLoaded: if (item) item.d = controlData
+                onControlDataChanged: if (item) item.d = controlData
+            }
         }
     }
 
