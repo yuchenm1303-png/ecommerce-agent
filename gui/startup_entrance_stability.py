@@ -1,25 +1,35 @@
 from __future__ import annotations
 
-import time
 from typing import Any
 
-from PySide6.QtCore import QObject, QPoint, QTimer
+from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Qt
 from PySide6.QtWidgets import QFrame, QMainWindow, QWidget
 
 
 _LAYOUT_POLL_MS = 16
-_LAYOUT_STABLE_SAMPLES = 3
-_LAYOUT_SETTLE_TIMEOUT_MS = 240
+_LAYOUT_STABLE_SAMPLES = 4
 _HANDOFF_FRAME_MS = 16
 _NATIVE_SETTLE_FRAMES = 2
+_LAYOUT_ACTIVITY_EVENTS = {
+    QEvent.Type.LayoutRequest,
+    QEvent.Type.Resize,
+    QEvent.Type.Move,
+    QEvent.Type.Show,
+    QEvent.Type.Hide,
+    QEvent.Type.StyleChange,
+    QEvent.Type.FontChange,
+}
 
 
 class StartupEntranceStabilityGate(QObject):
-    """Keep startup snapshot geometry and the live QWidget/Quick handoff identical.
+    """Make the frozen entrance and the live QWidget/Quick surfaces identical.
 
-    The startup overlay is the sole animated owner until handoff. Runtime card /
-    cursor/parallax presentation is held by the shared PresentationClock and is
-    resumed only after the final covered native geometry frame is committed.
+    The entrance may visually cover the whole window, but it must never occlude
+    the live QWidget backing-store paint underneath. The animation is allowed to
+    start only after the live surface has painted following the last layout
+    mutation and the geometry has then stayed stable for consecutive samples.
+    At handoff, QWidget paint and Quick frame presentation are both committed
+    before the frozen overlay is removed.
     """
 
     def __init__(self, window: QMainWindow, entrance: Any) -> None:
@@ -30,9 +40,11 @@ class StartupEntranceStabilityGate(QObject):
         self.background = getattr(entrance, "background", None)
         self.overlay = getattr(entrance, "overlay", None)
 
-        self._probe_started_s = 0.0
         self._last_signature: tuple[Any, ...] | None = None
         self._stable_samples = 0
+        self._live_paint_seen = False
+        self._layout_epoch = 0
+        self._layout_watch: list[QWidget] = []
         self._start_requested = False
         self._handoff_started = False
         self._native_frames_remaining = 0
@@ -43,6 +55,9 @@ class StartupEntranceStabilityGate(QObject):
         if callable(suspend):
             suspend("startup")
 
+        self._keep_live_surface_paintable()
+        self._install_live_surface_watch()
+
         if self.overlay is not None:
             try:
                 self.overlay.finished.disconnect(self.entrance._finish)  # noqa: SLF001
@@ -50,18 +65,90 @@ class StartupEntranceStabilityGate(QObject):
                 pass
             self.overlay.finished.connect(self._stage_finish)
 
+    def _keep_live_surface_paintable(self) -> None:
+        """Do not let the entrance occlusion-cull the real QWidget tree."""
+
+        if isinstance(self.overlay, QWidget):
+            self.overlay.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+
+    def _watch_layout_widget(self, widget: QWidget | None) -> None:
+        if not isinstance(widget, QWidget):
+            return
+        if any(current is widget for current in self._layout_watch):
+            return
+        widget.installEventFilter(self)
+        self._layout_watch.append(widget)
+
+    def _install_live_surface_watch(self) -> None:
+        self._watch_layout_widget(self.window)
+        self._watch_layout_widget(self.window.centralWidget())
+
+        glass = getattr(self.visual, "_glass", None)
+        if isinstance(glass, dict):
+            for frame in glass:
+                if isinstance(frame, QFrame):
+                    self._watch_layout_widget(frame)
+
+    def _remove_live_surface_watch(self) -> None:
+        for widget in self._layout_watch:
+            try:
+                widget.removeEventFilter(self)
+            except RuntimeError:
+                pass
+        self._layout_watch.clear()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if bool(getattr(self.entrance, "_finished", False)):
+            return False
+
+        event_type = event.type()
+        central = self.window.centralWidget()
+        if watched is central and event_type == QEvent.Type.Paint:
+            self._live_paint_seen = True
+
+        if event_type in _LAYOUT_ACTIVITY_EVENTS:
+            self._layout_epoch += 1
+            self._stable_samples = 0
+            self._live_paint_seen = False
+
+        return False
+
     def start(self) -> None:
         if self._start_requested:
             return
         self._start_requested = True
-        self._probe_started_s = time.perf_counter()
         raise_overlay = getattr(self.entrance, "raise_overlay", None)
         if callable(raise_overlay):
             raise_overlay()
         QTimer.singleShot(0, self._probe_layout)
 
+    def _activate_live_layout(self) -> None:
+        for widget in self._layout_watch:
+            try:
+                layout = widget.layout()
+                if layout is not None:
+                    layout.activate()
+            except RuntimeError:
+                continue
+
+    def _ensure_live_paint(self) -> None:
+        if self._live_paint_seen:
+            return
+        central = self.window.centralWidget()
+        if not isinstance(central, QWidget):
+            return
+        try:
+            if central.isVisibleTo(self.window):
+                central.repaint()
+        except RuntimeError:
+            pass
+
     def _geometry_signature(self) -> tuple[Any, ...]:
-        values: list[Any] = [int(self.window.width()), int(self.window.height())]
+        values: list[Any] = [
+            int(self._layout_epoch),
+            int(self.window.width()),
+            int(self.window.height()),
+        ]
 
         central = self.window.centralWidget()
         if isinstance(central, QWidget):
@@ -126,6 +213,9 @@ class StartupEntranceStabilityGate(QObject):
         if bool(getattr(self.entrance, "_started", False)):
             return
 
+        self._activate_live_layout()
+        self._ensure_live_paint()
+
         signature = self._geometry_signature()
         if signature == self._last_signature:
             self._stable_samples += 1
@@ -133,11 +223,7 @@ class StartupEntranceStabilityGate(QObject):
             self._last_signature = signature
             self._stable_samples = 1
 
-        elapsed_ms = (time.perf_counter() - self._probe_started_s) * 1000.0
-        if (
-            self._stable_samples >= _LAYOUT_STABLE_SAMPLES
-            or elapsed_ms >= _LAYOUT_SETTLE_TIMEOUT_MS
-        ):
+        if self._live_paint_seen and self._stable_samples >= _LAYOUT_STABLE_SAMPLES:
             start = getattr(self.entrance, "start", None)
             if callable(start):
                 start()
@@ -174,6 +260,16 @@ class StartupEntranceStabilityGate(QObject):
                 pass
 
     def _prime_static_runtime(self) -> None:
+        """Synchronously populate the live QWidget backing store before reveal."""
+
+        self._activate_live_layout()
+        central = self.window.centralWidget()
+        if isinstance(central, QWidget):
+            try:
+                central.repaint()
+            except RuntimeError:
+                pass
+
         glass = getattr(self.visual, "_glass", None)
         if isinstance(glass, dict):
             for frame in glass:
@@ -181,16 +277,10 @@ class StartupEntranceStabilityGate(QObject):
                     continue
                 try:
                     if frame.isVisibleTo(self.window):
-                        frame.update()
+                        frame.repaint()
                 except RuntimeError:
                     continue
 
-        central = self.window.centralWidget()
-        if isinstance(central, QWidget):
-            try:
-                central.update()
-            except RuntimeError:
-                pass
         self._flush_native_background()
 
     def _arm_native_frame_barrier(self) -> bool:
@@ -226,6 +316,7 @@ class StartupEntranceStabilityGate(QObject):
         except (AttributeError, RuntimeError):
             pass
 
+        self._remove_live_surface_watch()
         frame_barrier_armed = self._arm_native_frame_barrier()
         self._prime_static_runtime()
         if not frame_barrier_armed:
@@ -236,9 +327,6 @@ class StartupEntranceStabilityGate(QObject):
             return
         self._native_frames_remaining -= 1
         if self._native_frames_remaining > 0:
-            # The first swap can complete work already in flight when the final
-            # QWidget/Quick state is published. Force another rendered frame so
-            # the static glass texture itself is guaranteed to be on screen.
             self._flush_native_background()
             return
 
@@ -264,8 +352,6 @@ class StartupEntranceStabilityGate(QObject):
             except RuntimeError:
                 pass
 
-        # Preserve the established staged handoff: decorative overlay first,
-        # card interactivity second, shared runtime presentation last.
         QTimer.singleShot(_HANDOFF_FRAME_MS, self._resume_effects)
         QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_card_fx)
         QTimer.singleShot(_HANDOFF_FRAME_MS * 3, self._resume_presentation)
