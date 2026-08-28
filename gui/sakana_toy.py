@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
 
@@ -16,8 +16,14 @@ _CANVAS_SIZE = _TOY_SIZE * 1.5
 _FRAME_SECONDS = 1.0 / 60.0
 _LEFT_MARGIN = 24
 _BOTTOM_MARGIN = 18
-_ANCHOR_HIT_RADIUS = 14.0
 _CHARACTER_IMAGE = Path(__file__).resolve().parent / "assets" / "sakana_takina.png"
+
+# Match Sakana Widget's original four-cell controller proportions, scaled up a
+# little for the desktop GUI so it remains visually balanced with the 180 px toy.
+_BASE_WIDTH = 156.0
+_BASE_HEIGHT = 34.0
+_BASE_RADIUS = 8.0
+_BASE_ITEM_WIDTH = _BASE_WIDTH / 4.0
 
 
 @dataclass
@@ -33,7 +39,7 @@ class _SpringState:
 
 
 class _SakanaToyWidget(QWidget):
-    """Transparent Qt rendering of the Sakana spring toy."""
+    """Transparent Qt rendering of the Sakana spring toy and its control base."""
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
@@ -58,6 +64,15 @@ class _SakanaToyWidget(QWidget):
     def anchor(self) -> QPointF:
         inset = (_CANVAS_SIZE - _TOY_SIZE) / 2.0
         return QPointF(_CANVAS_SIZE / 2.0, _TOY_SIZE + inset)
+
+    def base_rect(self) -> QRectF:
+        anchor = self.anchor
+        return QRectF(
+            anchor.x() - _BASE_WIDTH / 2.0,
+            anchor.y() - _BASE_HEIGHT,
+            _BASE_WIDTH,
+            _BASE_HEIGHT,
+        )
 
     def _center_offset(self) -> QPointF:
         angle = math.radians(self.state.r)
@@ -84,11 +99,8 @@ class _SakanaToyWidget(QWidget):
             and abs(point.y() - center.y()) <= half
         )
 
-    def anchor_hit_test(self, point: QPointF) -> bool:
-        anchor = self.anchor
-        dx = point.x() - anchor.x()
-        dy = point.y() - anchor.y()
-        return dx * dx + dy * dy <= _ANCHOR_HIT_RADIUS * _ANCHOR_HIT_RADIUS
+    def base_hit_test(self, point: QPointF) -> bool:
+        return self.base_rect().contains(point)
 
     def move_spring(self, dx: float, dy: float) -> None:
         self.state.r = max(-self.max_rotation, min(self.max_rotation, dx * self.state.s))
@@ -96,6 +108,96 @@ class _SakanaToyWidget(QWidget):
         self.state.w = 0.0
         self.state.t = 0.0
         self.update()
+
+    @staticmethod
+    def _draw_person_icon(painter: QPainter, center: QPointF) -> None:
+        painter.drawEllipse(QRectF(center.x() - 8.0, center.y() - 8.0, 16.0, 16.0))
+        painter.drawEllipse(QRectF(center.x() - 2.7, center.y() - 4.8, 5.4, 5.4))
+        painter.drawArc(
+            QRectF(center.x() - 5.2, center.y() + 0.2, 10.4, 7.0),
+            10 * 16,
+            160 * 16,
+        )
+
+    @staticmethod
+    def _draw_sync_icon(painter: QPainter, center: QPointF) -> None:
+        arc = QRectF(center.x() - 7.5, center.y() - 7.5, 15.0, 15.0)
+        painter.drawArc(arc, 35 * 16, 135 * 16)
+        painter.drawArc(arc, 215 * 16, 135 * 16)
+        painter.drawLine(
+            QPointF(center.x() + 6.5, center.y() - 4.8),
+            QPointF(center.x() + 7.4, center.y() - 0.8),
+        )
+        painter.drawLine(
+            QPointF(center.x() + 6.5, center.y() - 4.8),
+            QPointF(center.x() + 2.8, center.y() - 5.6),
+        )
+        painter.drawLine(
+            QPointF(center.x() - 6.5, center.y() + 4.8),
+            QPointF(center.x() - 7.4, center.y() + 0.8),
+        )
+        painter.drawLine(
+            QPointF(center.x() - 6.5, center.y() + 4.8),
+            QPointF(center.x() - 2.8, center.y() + 5.6),
+        )
+
+    @staticmethod
+    def _draw_github_icon(painter: QPainter, center: QPointF) -> None:
+        # A compact cat-head silhouette keeps the same visual rhythm as the
+        # original GitHub control without introducing another SVG dependency.
+        painter.save()
+        painter.setBrush(QColor("#555555"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(QRectF(center.x() - 7.0, center.y() - 5.2, 14.0, 12.5))
+        painter.drawEllipse(QRectF(center.x() - 3.4, center.y() + 3.4, 6.8, 6.0))
+        painter.restore()
+
+    @staticmethod
+    def _draw_close_icon(painter: QPainter, center: QPointF) -> None:
+        painter.drawEllipse(QRectF(center.x() - 8.0, center.y() - 8.0, 16.0, 16.0))
+        painter.drawLine(
+            QPointF(center.x() - 3.6, center.y() - 3.6),
+            QPointF(center.x() + 3.6, center.y() + 3.6),
+        )
+        painter.drawLine(
+            QPointF(center.x() + 3.6, center.y() - 3.6),
+            QPointF(center.x() - 3.6, center.y() + 3.6),
+        )
+
+    def _draw_base(self, painter: QPainter) -> None:
+        rect = self.base_rect()
+
+        # Sakana Widget uses #ddd with a soft 0 8px 24px shadow. A pair of
+        # translucent rounded rectangles gives the same lightweight floating base
+        # without a separate graphics-effect object or extra child windows.
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 18))
+        painter.drawRoundedRect(rect.translated(0.0, 5.0), _BASE_RADIUS, _BASE_RADIUS)
+        painter.setBrush(QColor("#dddddd"))
+        painter.drawRoundedRect(rect, _BASE_RADIUS, _BASE_RADIUS)
+
+        divider_pen = QPen(QColor(255, 255, 255, 52))
+        divider_pen.setWidthF(1.0)
+        painter.setPen(divider_pen)
+        for index in range(1, 4):
+            x = rect.left() + _BASE_ITEM_WIDTH * index
+            painter.drawLine(QPointF(x, rect.top() + 5.0), QPointF(x, rect.bottom() - 5.0))
+
+        icon_pen = QPen(QColor("#555555"))
+        icon_pen.setWidthF(1.8)
+        icon_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        icon_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(icon_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        centers = [
+            QPointF(rect.left() + _BASE_ITEM_WIDTH * (index + 0.5), rect.center().y())
+            for index in range(4)
+        ]
+        self._draw_person_icon(painter, centers[0])
+        self._draw_sync_icon(painter, centers[1])
+        self._draw_github_icon(painter, centers[2])
+        self._draw_close_icon(painter, centers[3])
 
     def paintEvent(self, event: QEvent) -> None:  # type: ignore[override]
         painter = QPainter(self)
@@ -120,16 +222,14 @@ class _SakanaToyWidget(QWidget):
         painter.drawPixmap(target, self.pixmap, QRectF(self.pixmap.rect()))
         painter.restore()
 
-        # Small visible grab point: dragging it moves the whole toy; dragging
-        # the character itself keeps the original Sakana spring interaction.
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 92))
-        painter.drawEllipse(anchor, 4.0, 4.0)
+        # The original Sakana control bar is the physical-looking base under the
+        # spring. It also replaces the old standalone grab dot as the move handle.
+        self._draw_base(painter)
         painter.end()
 
 
 class SakanaToyController(QObject):
-    """Own Sakana physics, position drag, visibility toggle and lifecycle."""
+    """Own Sakana physics, base drag, visibility toggle and lifecycle."""
 
     def __init__(self, window: QWidget) -> None:
         super().__init__(window)
@@ -208,7 +308,7 @@ class SakanaToyController(QObject):
         if event.button() != Qt.MouseButton.LeftButton or not self.toy.isVisible():
             return False
         local = self._local_from_global(event.globalPosition())
-        if self.toy.anchor_hit_test(local):
+        if self.toy.base_hit_test(local):
             self._interaction = "position"
             self._position_press_global = event.globalPosition()
             self._position_press_top_left = self.toy.pos()
