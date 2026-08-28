@@ -7,7 +7,7 @@ from PySide6.QtCore import QEvent, QObject, QPointF, QTimer, Qt, QUrl
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtQml import QQmlComponent
 from PySide6.QtQuick import QQuickItem, QQuickWindow
-from PySide6.QtWidgets import QMainWindow
+from PySide6.QtWidgets import QFrame, QMainWindow
 
 from .static_qml_bridge import StaticCardModel, StaticQmlBridge
 from .static_qml_fireworks import StaticQuickFireworks
@@ -157,10 +157,18 @@ class StaticQmlViewController(QObject):
         if self._static_requested:
             self._enter_static()
 
+    def _all_glass_frames(self) -> tuple[QFrame, ...]:
+        glass = getattr(self.visual, "_glass", None)
+        if not isinstance(glass, dict):
+            return ()
+        return tuple(frame for frame in glass if isinstance(frame, QFrame))
+
     def _set_native_glass_overlay_alpha(self, alpha: float) -> None:
         # native_background remains the only blur renderer. Static QML draws only
         # the same black 64/102 overlay, so suppress the old overlay but not blur.
-        for frame in tuple(getattr(self.bridge, "_card_frames", ())):
+        # Apply to every registered card, including hidden workspace pages, so
+        # returning to legacy can never expose stale alpha=0 state later.
+        for frame in self._all_glass_frames():
             try:
                 self.background.set_card_presentation(frame, scale=1.0, alpha=float(alpha))
             except RuntimeError:
@@ -289,6 +297,7 @@ class StaticQmlViewController(QObject):
         self._static_requested = False
         self._disconnect_handoff()
         if not self._static_active:
+            self._set_native_glass_overlay_alpha(64.0)
             self._set_legacy_fireworks_enabled(True)
             self._resume_legacy()
             return
