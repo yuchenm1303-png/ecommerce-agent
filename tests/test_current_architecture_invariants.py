@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -76,13 +78,20 @@ def test_stage_log_is_canonical_and_integrity_checked(tmp_path: Path) -> None:
     (diagnostics / "prepare.log").write_text(text, encoding="utf-8")
 
     diagnostic = collect_workflow_failure_diagnostic(workflow, fallback_stage="解析字段")
-    sanitized = "before\nTraceback (most recent call last):\nRuntimeError: failed token=[REDACTED]\n"
-    data = sanitized.encode("utf-8")
+    stage_log = diagnostic["stage_log"]
+    encoded = "".join(stage_log["chunks"])
+    decoded = gzip.decompress(base64.b64decode(encoded)).decode("utf-8")
+    data = decoded.encode("utf-8")
+
     assert diagnostic["schema"] == 4
     assert diagnostic["truth_source"] == "stage_log"
     assert diagnostic["diagnostic_sources"]["stage_log"] is True
     assert diagnostic["diagnostic_sources"]["process_log"] is True
-    assert diagnostic["line_count"] == len(sanitized.splitlines())
+    # Integrity metadata must describe the exact sanitized payload that is shipped,
+    # regardless of the host OS newline representation used by Path.write_text().
+    assert diagnostic["line_count"] == len(decoded.splitlines())
     assert diagnostic["byte_count"] == len(data)
     assert diagnostic["sha256"] == hashlib.sha256(data).hexdigest()
+    assert stage_log["byte_count"] == len(data)
+    assert stage_log["sha256"] == hashlib.sha256(data).hexdigest()
     assert "secret" not in json.dumps(diagnostic, ensure_ascii=False)
