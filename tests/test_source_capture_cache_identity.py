@@ -72,16 +72,18 @@ def test_cached_capture_rejects_snapshot_with_different_trailing_slash_identity(
     assert result is None
 
 
-def test_cached_capture_accepts_same_exact_variant_identity(tmp_path) -> None:
+def test_cached_capture_accepts_same_exact_variant_identity(tmp_path, monkeypatch) -> None:
     requested = "https://supplier.example/item/42?sku=blue#details"
     cache_root = tmp_path / "cache"
     slot = cache_root / source_capture._source_cache_key(requested)
     slot.mkdir(parents=True)
-    write_source_snapshot(
+    snapshot_path = write_source_snapshot(
         _snapshot("https://supplier.example/item/42?sku=blue#source"),
         slot / "source-snapshot.json",
     )
     (slot / "source-page.png").write_bytes(b"fixture")
+    fresh_time = snapshot_path.stat().st_mtime
+    monkeypatch.setattr(source_capture.time, "time", lambda: fresh_time + 1.0)
 
     result = source_capture._cached_capture(
         requested,
