@@ -39,12 +39,10 @@ _CURTAIN_EASE = _curve(0.645, 0.045, 0.355, 1.0)
 class _StartupEntranceOverlay(QWidget):
     """Two lightweight opaque curtains over the already-settled live UI.
 
-    Startup used to resample and blend two full-screen wallpaper pixmaps on every
-    16 ms GUI-thread tick. That made the entrance cost scale directly with display
-    resolution and competed with Qt Quick's render thread. The wallpaper and live
-    interface already exist underneath this overlay, so the entrance only needs to
-    move two solid panels out of the way. QVariantAnimation drives geometry only;
-    no full-screen pixmap, blur, snapshot or custom paint pass exists here.
+    The overlay owns no application input after the curtain has completed. Its
+    visual lifetime is therefore independent from later Qt Quick frame barriers:
+    a missing frameSwapped signal may delay renderer handoff, but can never leave
+    an invisible full-window QWidget intercepting the user's mouse.
     """
 
     finished = Signal()
@@ -60,7 +58,7 @@ class _StartupEntranceOverlay(QWidget):
         self.setAutoFillBackground(False)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self._left_curtain = self._create_curtain("startupLeftCurtain")
         self._right_curtain = self._create_curtain("startupRightCurtain")
@@ -90,6 +88,7 @@ class _StartupEntranceOverlay(QWidget):
         return panel
 
     def begin(self) -> None:
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self._apply_progress(0.0)
         self.show()
         self.raise_()
@@ -117,6 +116,11 @@ class _StartupEntranceOverlay(QWidget):
     def _on_animation_finished(self) -> None:
         self._progress = 1.0
         self._apply_progress(1.0)
+
+        # The curtains are now fully off-screen. Release input and remove the
+        # full-window QWidget synchronously before any renderer handoff work runs.
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.hide()
         self.finished.emit()
 
     def _apply_progress(self, progress: float) -> None:
