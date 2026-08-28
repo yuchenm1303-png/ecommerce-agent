@@ -55,19 +55,27 @@ def test_startup_runtime_lifecycle_uses_shared_presentation_clock_only() -> None
     assert "_background_pointer_hotpath" not in SOURCE
 
 
-def test_startup_stability_waits_for_layout_then_stages_live_handoff() -> None:
+def test_startup_stability_requires_live_paint_and_quiescent_layout() -> None:
     assert "_LAYOUT_POLL_MS = 16" in STABILITY
-    assert "_LAYOUT_STABLE_SAMPLES = 3" in STABILITY
-    assert "_LAYOUT_SETTLE_TIMEOUT_MS = 240" in STABILITY
-    assert "def _geometry_signature" in STABILITY
-    assert "self._stable_samples >= _LAYOUT_STABLE_SAMPLES" in STABILITY
+    assert "_LAYOUT_STABLE_SAMPLES = 4" in STABILITY
+    assert "_LAYOUT_SETTLE_TIMEOUT_MS" not in STABILITY
+    assert "self._layout_epoch" in STABILITY
+    assert "event_type == QEvent.Type.Paint" in STABILITY
+    assert "event_type in _LAYOUT_ACTIVITY_EVENTS" in STABILITY
+    assert "self._live_paint_seen = False" in STABILITY
+    assert "self._live_paint_seen and self._stable_samples >= _LAYOUT_STABLE_SAMPLES" in STABILITY
     assert "self.overlay.finished.disconnect(self.entrance._finish)" in STABILITY
-    assert "_NATIVE_SETTLE_FRAMES = 2" in STABILITY
-    assert "self._flush_native_background()" in STABILITY
-    assert "overlay.hide()" in STABILITY
+
+
+def test_startup_overlay_does_not_occlusion_cull_live_widgets() -> None:
+    assert "def _keep_live_surface_paintable" in STABILITY
+    assert "self.overlay.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)" in STABILITY
+    assert "central.repaint()" in STABILITY
+    assert "frame.repaint()" in STABILITY
 
 
 def test_startup_handoff_waits_for_rendered_quick_frames() -> None:
+    assert "_NATIVE_SETTLE_FRAMES = 2" in STABILITY
     assert "def _arm_native_frame_barrier" in STABILITY
     assert "quick.frameSwapped.connect(self._on_native_frame_swapped)" in STABILITY
     assert "quick.frameSwapped.disconnect(self._on_native_frame_swapped)" in STABILITY
@@ -80,6 +88,7 @@ def test_startup_handoff_waits_for_rendered_quick_frames() -> None:
     assert stage.index("self._arm_native_frame_barrier()") < stage.index(
         "self._prime_static_runtime()"
     )
+    assert "overlay.hide()" in STABILITY
 
 
 def test_startup_resumes_shared_clock_only_after_overlay_handoff() -> None:
