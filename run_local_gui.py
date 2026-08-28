@@ -92,6 +92,7 @@ def main() -> int:
     from gui.batch_workspace_density import install_batch_workspace_density
     from gui.browser_session_manager import install_managed_makro_browser
     from gui.card_details_fast import install_card_details
+    from gui.click_fireworks import install_click_fireworks
     from gui.console_summary_mode import install_console_summary_mode
     from gui.crash_diagnostics_ui import offer_pending_crash_report
     from gui.field_table_transfer import install_field_table_transfer
@@ -236,6 +237,7 @@ def main() -> int:
     card_fx = install_nekro_card_fx(window, visual)
     install_buffered_logs(window)
     effects = install_nekro_effects(window, sakura_count=3)
+    install_click_fireworks(window)
     install_presentation_clock(
         window,
         background=visual.background,
