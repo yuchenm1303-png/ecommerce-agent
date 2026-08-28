@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt
+from PySide6.QtCore import QObject, QTimer, Qt
 from PySide6.QtQuick import QQuickWindow
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
@@ -15,6 +15,7 @@ from app.runtime_paths import is_frozen
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SAKANA_HELPER_EXE = "EcommerceAgentSakana.exe"
 _SAKANA_SOURCE_ENTRY = _REPO_ROOT / "sakana_process.py"
+_SAKANA_LOG = _REPO_ROOT / "_runtime_logs" / "sakana-helper.log"
 
 
 class SakanaToyController(QObject):
@@ -29,9 +30,18 @@ class SakanaToyController(QObject):
         super().__init__(window)
         self.window = window
         self.quick = quick
-        self._enabled = False
+        self._enabled = True
         self._shutting_down = False
         self._process: subprocess.Popen[bytes] | None = None
+        self._log_handle = None
+        self._launch_attempts = 0
+
+        self._launch_timer = QTimer(self)
+        self._launch_timer.setSingleShot(True)
+        self._launch_timer.timeout.connect(self._start_process)
+        self._health_timer = QTimer(self)
+        self._health_timer.setSingleShot(True)
+        self._health_timer.timeout.connect(self._verify_process)
 
         self.toggle = self._install_toggle()
         self.window.destroyed.connect(self.cleanup)
@@ -48,10 +58,10 @@ class SakanaToyController(QObject):
         if not isinstance(header, QHBoxLayout):
             raise RuntimeError("Sakana toy expected the common application header")
 
-        button = QPushButton("玩具 · OFF")
+        button = QPushButton("玩具 · ON")
         button.setObjectName("quietButton")
         button.setCheckable(True)
-        button.setChecked(False)
+        button.setChecked(True)
         button.setMinimumWidth(98)
         button.setToolTip("显示或隐藏左下角弹簧玩具")
         button.setStyleSheet(
@@ -105,16 +115,44 @@ class SakanaToyController(QObject):
         if sys.platform == "win32":
             creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
+        _SAKANA_LOG.parent.mkdir(parents=True, exist_ok=True)
+        if self._log_handle is not None:
+            self._log_handle.close()
+        self._log_handle = _SAKANA_LOG.open("ab")
+        child_env = os.environ.copy()
+        chromium_flags = child_env.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+        smooth_flags = (
+            "--disable-background-timer-throttling "
+            "--disable-renderer-backgrounding "
+            "--disable-backgrounding-occluded-windows "
+            "--disable-frame-rate-limit "
+            "--disable-gpu-vsync"
+        )
+        child_env["QTWEBENGINE_CHROMIUM_FLAGS"] = f"{chromium_flags} {smooth_flags}".strip()
         self._process = subprocess.Popen(
             self._child_command(),
             cwd=str(_REPO_ROOT) if not is_frozen() else None,
-            env=os.environ.copy(),
+            env=child_env,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=self._log_handle,
+            stderr=subprocess.STDOUT,
             creationflags=creationflags,
             close_fds=True,
         )
+        self._launch_attempts += 1
+        self._health_timer.start(700)
+
+    def _verify_process(self) -> None:
+        if self._shutting_down or not self._enabled:
+            return
+        process = self._process
+        if process is not None and process.poll() is None:
+            return
+        self._process = None
+        # During startup Qt can replace the first native QQuickWindow handle.
+        # Retry with a freshly resolved HWND after the event loop settles.
+        if self._launch_attempts < 3:
+            self._launch_timer.start(250)
 
     def _stop_process(self) -> None:
         process = self._process
@@ -136,21 +174,30 @@ class SakanaToyController(QObject):
         self.toggle.setText("玩具 · ON" if enabled else "玩具 · OFF")
 
         if enabled:
-            self._start_process()
+            self._launch_attempts = 0
+            self._launch_timer.start(250)
         else:
+            self._launch_timer.stop()
+            self._health_timer.stop()
             self._stop_process()
 
     def raise_overlay(self) -> None:
-        # Called after NativeWindowShell.show(). Starting here gives the helper a
-        # real, visible owner HWND instead of racing shell construction.
+        # shell.show() does not synchronously stabilize the QQuickWindow HWND.
+        # Launch on a later event-loop turn and retry if that transient owner dies.
         if self._enabled:
-            self._start_process()
+            self._launch_attempts = 0
+            self._launch_timer.start(250)
 
     def cleanup(self) -> None:
         if self._shutting_down:
             return
         self._shutting_down = True
+        self._launch_timer.stop()
+        self._health_timer.stop()
         self._stop_process()
+        if self._log_handle is not None:
+            self._log_handle.close()
+            self._log_handle = None
 
 
 def install_sakana_toy(window: QWidget) -> SakanaToyController:

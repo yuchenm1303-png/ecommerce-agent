@@ -21,7 +21,7 @@ _TOY_SIZE = 200
 _CANVAS_SIZE = 300
 _CANVAS_INSET = 50
 _LEFT_MARGIN = 24
-_BOTTOM_MARGIN = 18
+_BOTTOM_MARGIN = 170
 _OWNER_POLL_MS = 33
 _CONTROL_WIDTH = 112
 _CONTROL_HEIGHT = 24
@@ -70,7 +70,7 @@ class _RECT(ctypes.Structure):
 
 
 class _WindowsOwner:
-    _HWND_TOP = wintypes.HWND(0)
+    _HWND_TOPMOST = wintypes.HWND(-1)
     _SW_HIDE = 0
     _SWP_NOSIZE = 0x0001
     _SWP_NOACTIVATE = 0x0010
@@ -109,11 +109,13 @@ class _WindowsOwner:
     def exists(self) -> bool:
         return bool(self.user32.IsWindow(self.hwnd))
 
-    def should_present(self, child_hwnd: int) -> bool:
-        if not bool(self.user32.IsWindowVisible(self.hwnd)):
-            return False
-        if bool(self.user32.IsIconic(self.hwnd)):
-            return False
+    def available(self) -> bool:
+        # The toy is intentionally independent of the owner's presentation
+        # state. Keep it visible while the application window still exists,
+        # including while that window is minimized or not foreground.
+        return self.exists()
+
+    def active(self, child_hwnd: int) -> bool:
         foreground = int(self.user32.GetForegroundWindow() or 0)
         return foreground in {self.hwnd, int(child_hwnd)}
 
@@ -134,7 +136,7 @@ class _WindowsOwner:
     def present(self, child_hwnd: int, x: int, y: int) -> None:
         if not self.user32.SetWindowPos(
             wintypes.HWND(int(child_hwnd)),
-            self._HWND_TOP,
+            self._HWND_TOPMOST,
             int(x),
             int(y),
             0,
@@ -329,13 +331,18 @@ class SakanaProcessHost:
         self.page = QWebEnginePage(self.profile, self.view)
         self.page.setBackgroundColor(QColor(0, 0, 0, 0))
         self.view.setPage(self.page)
-        self.child_hwnd = int(self.view.winId())
 
         self._presented = False
         self._root_position: tuple[int, int] | None = None
+        self._last_window_position: tuple[int, int] | None = None
         self.drag_filter = _BaseDragFilter(self)
         self.app.installEventFilter(self.drag_filter)
         self.view.setHtml(_html_source())
+        # Materialize the final top-level native window before SetWindowPos.
+        # WA_ShowWithoutActivating and WindowDoesNotAcceptFocus keep this from
+        # stealing focus from the listing window.
+        self.view.show()
+        self.child_hwnd = int(self.view.winId())
         self._sync_owner()
 
         # Only native geometry/lifetime is sampled here. Sakana motion is still
@@ -380,8 +387,7 @@ class SakanaProcessHost:
             return
 
         geometry = self.owner.client_geometry()
-        should_present = geometry is not None and self.owner.should_present(self.child_hwnd)
-        if not should_present:
+        if geometry is None or not self.owner.available():
             if self._presented:
                 self.owner.hide(self.child_hwnd)
                 self._presented = False
@@ -392,8 +398,11 @@ class SakanaProcessHost:
         self._root_position = self._clamp_root(root_x, root_y, width=width, height=height)
         overlay_x = left + self._root_position[0] - _CANVAS_INSET
         overlay_y = top + self._root_position[1] - _CANVAS_INSET
-        self.owner.present(self.child_hwnd, overlay_x, overlay_y)
-        self._presented = True
+        position = (overlay_x, overlay_y)
+        if not self._presented or position != self._last_window_position:
+            self.owner.present(self.child_hwnd, *position)
+            self._last_window_position = position
+            self._presented = True
 
     def cleanup(self) -> None:
         try:
