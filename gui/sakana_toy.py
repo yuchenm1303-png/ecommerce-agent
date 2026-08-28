@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
 
