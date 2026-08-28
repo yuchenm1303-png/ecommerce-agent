@@ -316,9 +316,9 @@ class StartupEntranceStabilityGate(QObject):
         except (AttributeError, RuntimeError):
             pass
 
-        self._remove_live_surface_watch()
         frame_barrier_armed = self._arm_native_frame_barrier()
         self._prime_static_runtime()
+        self._remove_live_surface_watch()
         if not frame_barrier_armed:
             QTimer.singleShot(0, self._commit_overlay_handoff)
 
