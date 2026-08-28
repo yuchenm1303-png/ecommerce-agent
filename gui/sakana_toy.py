@@ -14,6 +14,7 @@ from app.runtime_paths import is_frozen
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SAKANA_HELPER_EXE = "EcommerceAgentSakana.exe"
+_SAKANA_SOURCE_ENTRY = _REPO_ROOT / "sakana_process.py"
 
 
 class SakanaToyController(QObject):
@@ -76,14 +77,19 @@ class SakanaToyController(QObject):
     def _child_command(self) -> list[str]:
         owner_hwnd = str(self._owner_hwnd())
         if is_frozen():
-            helper = Path(sys.executable).resolve().with_name(_SAKANA_HELPER_EXE)
+            helper = Path(sys.executable).with_name(_SAKANA_HELPER_EXE)
             if not helper.is_file():
                 raise RuntimeError(f"Sakana helper executable is missing: {helper}")
             return [str(helper), "--owner-hwnd", owner_hwnd]
+        if not _SAKANA_SOURCE_ENTRY.is_file():
+            raise RuntimeError(f"Sakana source helper is missing: {_SAKANA_SOURCE_ENTRY}")
+        # Preserve the exact interpreter that launched the app. Path.resolve()
+        # follows a Windows venv interpreter back to the base Python executable,
+        # bypassing the venv and its QtWebEngine installation. Running a standalone
+        # script also avoids importing gui/__init__.py and app_access in the helper.
         return [
-            str(Path(sys.executable).resolve()),
-            "-m",
-            "gui.sakana_process",
+            sys.executable,
+            str(_SAKANA_SOURCE_ENTRY),
             "--owner-hwnd",
             owner_hwnd,
         ]
