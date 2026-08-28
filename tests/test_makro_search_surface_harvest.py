@@ -106,4 +106,6 @@ def test_harvest_stops_when_surface_cannot_scroll(monkeypatch) -> None:
     rows = search_surface.harvest_search_rows(page, search, poll_ms=50)
 
     assert rows == ["Only / Visible / Result"]
-    assert resets == [True, False, True]
+    # A non-scrollable result surface is not treated as complete after a single
+    # sample: require two quiet observations, then restore the surface to top.
+    assert resets == [True, False, False, True]
