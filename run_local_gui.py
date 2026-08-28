@@ -120,7 +120,6 @@ def main() -> int:
     from gui.startup_entrance import install_startup_entrance
     from gui.startup_entrance_stability import install_startup_entrance_stability
     from gui.static_modal_interaction import install_static_modal_interaction
-    from gui.static_qml_view import install_static_qml_view
     from gui.system_health_telemetry import install_system_health_telemetry
     from gui.ui_data_optimizations import install_ui_data_optimizations
     from gui.ui_maturity import install_mature_ui
@@ -260,7 +259,6 @@ def main() -> int:
 
     entrance = install_startup_entrance(window, visual)
     entrance_stability = install_startup_entrance_stability(window, entrance)
-    install_static_qml_view(window, visual, entrance_stability)
 
     mark_startup_stage("window_show")
     shell.show()
