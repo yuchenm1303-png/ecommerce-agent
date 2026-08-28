@@ -128,10 +128,20 @@ def test_reveal_has_frame_barrier_but_finished_overlay_has_no_liveness_dependenc
     assert commit.index("overlay.hide()") < commit.index("self.handoffReady.emit()")
 
 
+def test_quick_handoff_never_reenables_legacy_card_raster_lane() -> None:
+    commit = STABILITY.split("def _commit_overlay_handoff", 1)[1].split(
+        "def _resume_effects", 1
+    )[0]
+    assert "_resume_card_fx" not in STABILITY
+    assert "resume_from_modal" not in STABILITY
+    assert "_resume_presentation" in commit
+    assert "self._suspend_legacy_visuals()" in STATIC_VIEW
+    assert "self._resume_legacy_fallback()" in STATIC_VIEW
+
+
 def test_startup_resumes_shared_clock_only_after_overlay_handoff() -> None:
     assert "QTimer.singleShot(_HANDOFF_FRAME_MS, self._resume_effects)" in STABILITY
-    assert "QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_card_fx)" in STABILITY
-    assert "QTimer.singleShot(_HANDOFF_FRAME_MS * 3, self._resume_presentation)" in STABILITY
+    assert "QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_presentation)" in STABILITY
     assert 'resume("startup")' in STABILITY
     assert "_pointer_timer" not in STABILITY
     assert "_background_pointer_hotpath" not in STABILITY
