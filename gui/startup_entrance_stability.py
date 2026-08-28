@@ -28,6 +28,11 @@ class StartupEntranceStabilityGate(QObject):
     starts opening. Once the curtain itself finishes, however, the visible overlay is
     released immediately. Renderer handoff may continue afterwards, but application
     input can never depend on a future frameSwapped signal.
+
+    Presentation ownership is intentionally one-way after a successful Quick handoff:
+    the startup gate resumes only startup-scoped effects/clock work. It never resumes
+    the legacy QWidget card raster lane, because StaticQmlViewController owns that
+    lane and may restore it only on an explicit Quick-scene fallback.
     """
 
     revealPreparing = Signal()
@@ -307,9 +312,11 @@ class StartupEntranceStabilityGate(QObject):
             except RuntimeError:
                 pass
 
+        # Startup owns only the effects/clock hold. The legacy card raster lane is
+        # owned by StaticQmlViewController after handoff and must stay suspended;
+        # it is restored only by that controller's explicit legacy fallback path.
         QTimer.singleShot(_HANDOFF_FRAME_MS, self._resume_effects)
-        QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_card_fx)
-        QTimer.singleShot(_HANDOFF_FRAME_MS * 3, self._resume_presentation)
+        QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_presentation)
 
     def _resume_effects(self) -> None:
         effects = getattr(self.entrance, "_hidden_effects", None)
@@ -323,17 +330,6 @@ class StartupEntranceStabilityGate(QObject):
             self.entrance._hidden_effects = None  # noqa: SLF001
         except (AttributeError, RuntimeError):
             pass
-
-    def _resume_card_fx(self) -> None:
-        if bool(getattr(self.entrance, "_card_fx_was_suspended", False)):
-            return
-        card_fx = getattr(self.window, "_nekro_card_fx", None)
-        resume = getattr(card_fx, "resume_from_modal", None)
-        if callable(resume):
-            try:
-                resume()
-            except RuntimeError:
-                pass
 
     def _resume_presentation(self) -> None:
         clock = getattr(self.window, "_presentation_clock", None)
