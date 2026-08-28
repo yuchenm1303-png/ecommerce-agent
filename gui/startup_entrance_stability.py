@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QMainWindow, QWidget
 _LAYOUT_POLL_MS = 16
 _LAYOUT_STABLE_SAMPLES = 5
 _HANDOFF_FRAME_MS = 16
-_NATIVE_SETTLE_FRAMES = 2
+_REVEAL_SETTLE_FRAMES = 2
 _LAYOUT_ACTIVITY_EVENTS = {
     QEvent.Type.LayoutRequest,
     QEvent.Type.Resize,
@@ -24,11 +24,10 @@ _LAYOUT_ACTIVITY_EVENTS = {
 class StartupEntranceStabilityGate(QObject):
     """Reveal startup only after the real QWidget + Quick scene is final.
 
-    The gate observes the actual widget tree; it never calls QLayout.activate().
-    Startup layout ownership therefore stays with Qt and the normal responsive
-    controllers. Once geometry has remained unchanged for several frames, the
-    unified Quick scene gets a preparation boundary while both curtains are still
-    closed, then two rendered Quick frames are required before the entrance starts.
+    Geometry stability and two rendered Quick frames are required before the curtain
+    starts opening. Once the curtain itself finishes, however, the visible overlay is
+    released immediately. Renderer handoff may continue afterwards, but application
+    input can never depend on a future frameSwapped signal.
     """
 
     revealPreparing = Signal()
@@ -53,8 +52,6 @@ class StartupEntranceStabilityGate(QObject):
         self._reveal_frames_remaining = 0
         self._reveal_frame_quick: Any | None = None
         self._handoff_started = False
-        self._native_frames_remaining = 0
-        self._native_frame_quick: Any | None = None
 
         clock = getattr(window, "_presentation_clock", None)
         suspend = getattr(clock, "suspend", None)
@@ -246,7 +243,7 @@ class StartupEntranceStabilityGate(QObject):
             self._start_entrance()
             return
         self._reveal_frame_quick = quick
-        self._reveal_frames_remaining = _NATIVE_SETTLE_FRAMES
+        self._reveal_frames_remaining = _REVEAL_SETTLE_FRAMES
         self._flush_native_background()
 
     def _disconnect_reveal_frame_barrier(self) -> None:
@@ -276,28 +273,6 @@ class StartupEntranceStabilityGate(QObject):
         if callable(start) and not bool(getattr(self.entrance, "_started", False)):
             start()
 
-    def _arm_native_frame_barrier(self) -> bool:
-        quick = getattr(self.background, "quick_window", None)
-        if quick is None:
-            return False
-        try:
-            quick.frameSwapped.connect(self._on_native_frame_swapped)
-        except (AttributeError, RuntimeError, TypeError):
-            return False
-        self._native_frame_quick = quick
-        self._native_frames_remaining = _NATIVE_SETTLE_FRAMES
-        return True
-
-    def _disconnect_native_frame_barrier(self) -> None:
-        quick = self._native_frame_quick
-        self._native_frame_quick = None
-        if quick is None:
-            return
-        try:
-            quick.frameSwapped.disconnect(self._on_native_frame_swapped)
-        except (AttributeError, RuntimeError, TypeError):
-            pass
-
     def _stage_finish(self) -> None:
         if self._handoff_started:
             return
@@ -307,28 +282,14 @@ class StartupEntranceStabilityGate(QObject):
         except (AttributeError, RuntimeError):
             pass
 
-        frame_barrier_armed = self._arm_native_frame_barrier()
-        self._prime_live_runtime()
+        # The curtain already hid itself synchronously before emitting finished.
+        # Do not make input release depend on a post-animation frameSwapped barrier.
+        self._disconnect_reveal_frame_barrier()
+        self._reveal_frames_remaining = 0
         self._remove_live_surface_watch()
-        if not frame_barrier_armed:
-            QTimer.singleShot(0, self._commit_overlay_handoff)
-
-    def _on_native_frame_swapped(self) -> None:
-        if self._native_frames_remaining <= 0:
-            return
-        self._native_frames_remaining -= 1
-        if self._native_frames_remaining > 0:
-            self._flush_native_background()
-            return
-        self._disconnect_native_frame_barrier()
         QTimer.singleShot(0, self._commit_overlay_handoff)
 
     def _commit_overlay_handoff(self) -> None:
-        self._disconnect_native_frame_barrier()
-        self._native_frames_remaining = 0
-
-        # The fully-open curtain has no reason to stay in the widget stack while
-        # the Quick scene commits its already-prepared first frame.
         overlay = self.overlay
         if isinstance(overlay, QWidget):
             try:
