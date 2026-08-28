@@ -5,11 +5,11 @@ from PySide6.QtWidgets import QLabel, QScrollArea, QSizePolicy, QWidget
 
 
 class BatchCardResponsiveController(QObject):
-    """Synchronously bind Batch job-card width to the visible scroll viewport.
+    """Synchronously bind Batch job-card geometry to the visible scroll viewport.
 
-    Width is layout ownership, not deferred presentation work. A hidden Batch page
-    must already have its final card widths before QStackedWidget exposes it; there
-    is intentionally no zero-delay timer in this controller.
+    Width and vertical content extent are layout ownership, not deferred presentation
+    work. A hidden Batch page must already have its final card widths and scroll range
+    before QStackedWidget exposes it; there is intentionally no zero-delay timer here.
     """
 
     def __init__(self, workspace: QWidget) -> None:
@@ -117,14 +117,24 @@ class BatchCardResponsiveController(QObject):
         label.setText(preview)
         label.setToolTip(url)
 
-    def _sync_width(self) -> None:
+    def _content_height(self) -> int:
+        if self.viewport is None or self.jobs_layout is None:
+            return max(1, int(self.jobs_host.height()))
+        try:
+            self.jobs_layout.invalidate()
+            self.jobs_layout.activate()
+            layout_height = int(self.jobs_layout.sizeHint().height())
+            viewport_height = int(self.viewport.height())
+        except RuntimeError:
+            return max(1, int(self.jobs_host.height()))
+        return max(1, viewport_height, layout_height)
+
+    def _sync_geometry(self) -> None:
         if self.viewport is None or not isinstance(self.jobs_host, QWidget):
             return
         viewport_width = max(1, int(self.viewport.width()))
 
         self.jobs_host.setMaximumWidth(viewport_width)
-        if self.jobs_host.width() != viewport_width:
-            self.jobs_host.resize(viewport_width, self.jobs_host.height())
 
         content_width = viewport_width
         if self.jobs_layout is not None:
@@ -133,30 +143,39 @@ class BatchCardResponsiveController(QObject):
         content_width = max(1, content_width)
 
         cards = getattr(self.workspace, "_job_cards", {})
-        if not isinstance(cards, dict):
-            return
-        for card in cards.values():
-            if not isinstance(card, QWidget):
-                continue
-            self._apply_card_constraints(card)
-            card.setMaximumWidth(content_width)
-            self._elide_url(card)
+        if isinstance(cards, dict):
+            for card in cards.values():
+                if not isinstance(card, QWidget):
+                    continue
+                self._apply_card_constraints(card)
+                card.setMaximumWidth(content_width)
+                self._elide_url(card)
+
+        # QScrollArea normally updates a widgetResizable child's vertical extent
+        # through deferred LayoutRequest/resize events. The hidden QWidget tree is
+        # now a business/layout host behind Quick, so waiting for Expose/minimize is
+        # not a valid geometry boundary. Commit the content extent synchronously from
+        # the authoritative layout sizeHint and make the scrollbar range real now.
+        content_height = self._content_height()
+        self.jobs_host.setMinimumHeight(content_height)
+        if self.jobs_host.width() != viewport_width or self.jobs_host.height() != content_height:
+            self.jobs_host.resize(viewport_width, content_height)
 
     def commit_now(self) -> None:
-        """Commit viewport/card width in the same GUI turn that owns the geometry."""
+        """Commit viewport/card geometry in the same GUI turn that owns the layout."""
 
         if self._committing:
             return
         self._committing = True
         try:
-            self._sync_width()
+            self._sync_geometry()
         except RuntimeError:
             pass
         finally:
             self._committing = False
 
     def schedule_refresh(self) -> None:
-        """Compatibility entry: width refreshes are intentionally synchronous."""
+        """Compatibility entry: geometry refreshes are intentionally synchronous."""
 
         self.commit_now()
 
