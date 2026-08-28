@@ -555,12 +555,12 @@ Item {
             }
 
             // native_background.py still supplies the original pre-blurred glass
-            // mask. This is only its original black 64/102 overlay, now animated
+            // mask. This is the matching sakura-pink 64/102 overlay, animated
             // by the Quick compositor together with the card content.
             Rectangle {
                 anchors.fill: parent
                 radius: 6
-                color: "black"
+                color: Qt.rgba(1, 157/255, 202/255, 1)
                 opacity: (cardHover.hovered || cardPress.pressed) ? 102/255 : 64/255
                 Behavior on opacity {
                     NumberAnimation {
