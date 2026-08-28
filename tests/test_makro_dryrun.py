@@ -15,9 +15,10 @@ class FakeSelectedOption:
 
 
 class FakeLocator:
-    def __init__(self, value="", selected_label=""):
+    def __init__(self, value="", selected_label="", options=None):
         self.value = value
         self.selected_label = selected_label
+        self.options = list(options or [])
         self.checked = False
         self.visible = True
         self._count = 1
@@ -28,6 +29,9 @@ class FakeLocator:
 
     def fill(self, value):
         self.value = value
+
+    def evaluate(self, _script):
+        return list(self.options)
 
     def select_option(self, label=None, value=None):
         if label is not None:
@@ -195,7 +199,12 @@ def test_qualifier_answer_fails_before_value_write_if_qualifier_control_missing(
 
 def test_select_fill_reads_selected_label():
     c = control("colour_0_value", kind="select")
-    page = FakePage({'[name="colour_0_value"]': FakeLocator()})
+    options = [
+        {"text": "Black", "value": "Black", "disabled": False},
+        {"text": "White", "value": "White", "disabled": False},
+    ]
+    c["options"] = options
+    page = FakePage({'[name="colour_0_value"]': FakeLocator(options=options)})
     result = fill_resolved_field(
         page,
         semantic("colour", [c]),
