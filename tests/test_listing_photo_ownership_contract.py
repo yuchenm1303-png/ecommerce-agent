@@ -16,8 +16,11 @@ def test_batch_manual_photos_are_job_owned_and_override_supplier_fallback() -> N
     assert "_match_rows_to_urls" in PHOTO_OWNERSHIP
     assert "defaultdict, deque" in PHOTO_OWNERSHIP
     assert "_replace_upload_image_args" in PHOTO_OWNERSHIP
-    assert 'listing_photos=MANUAL' in PHOTO_OWNERSHIP
-    assert 'supplier_fallback=disabled' in PHOTO_OWNERSHIP
+    # Current UI copy is not an execution contract. Lock the actual override path:
+    # explicit manual images are bound by job id and replace only --upload-image args.
+    assert "self._manual_images_by_job_id" in PHOTO_OWNERSHIP
+    assert "--upload-image" in PHOTO_OWNERSHIP
+    assert "_supplier_listing_images" in PHOTO_OWNERSHIP
 
 
 def test_batch_manual_photos_refresh_again_immediately_before_execute() -> None:
