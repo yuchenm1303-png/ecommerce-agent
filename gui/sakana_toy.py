@@ -4,7 +4,7 @@ import math
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QPixmap, QTransform
 from PySide6.QtQuick import QQuickPaintedItem, QQuickWindow
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
@@ -28,7 +28,6 @@ _CHARACTER_IMAGE = Path(__file__).resolve().parent / "assets" / "sakana_characte
 _BASE_WIDTH = 112.0
 _BASE_HEIGHT = 24.0
 _BASE_RADIUS = 6.0
-_DEFAULT_REFRESH_HZ = 60.0
 
 
 class _SakanaToyItem(QQuickPaintedItem):
@@ -203,7 +202,7 @@ class _SakanaToyItem(QQuickPaintedItem):
 
 
 class SakanaToyController(QObject):
-    """Own exact Sakana geometry, frame cadence, drag and visibility."""
+    """Own exact Sakana geometry, display-frame stepping, drag and visibility."""
 
     def __init__(self, window: QWidget, quick: QQuickWindow) -> None:
         super().__init__(window)
@@ -213,21 +212,18 @@ class SakanaToyController(QObject):
         self._root_x = 0.0
         self._root_y = 0.0
 
-        # Browser Sakana runs one physics update per requestAnimationFrame. Do not
-        # tie spring stepping to the application's unrelated global Quick swaps.
+        # Browser requestAnimationFrame runs on the presentation animation phase.
+        # QQuickWindow.afterAnimating is the GUI-thread equivalent: once per Quick
+        # animation frame, before scene-graph synchronization and painting.
         self._last_tick = time.monotonic()
-        self._next_frame_deadline = 0.0
         self._running = True
-        self._timer = QTimer(self)
-        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._timer.setSingleShot(True)
-        self._timer.timeout.connect(self._run_animation_frame)
 
         self.toy = _SakanaToyItem(quick, self)
         self.toggle = self._install_toggle()
 
         quick.widthChanged.connect(self._on_window_geometry_changed)
         quick.heightChanged.connect(self._on_window_geometry_changed)
+        quick.afterAnimating.connect(self._on_animation_frame)
         window.destroyed.connect(self.cleanup)
 
         self._place_default()
@@ -263,44 +259,15 @@ class SakanaToyController(QObject):
         header.addWidget(button, 0, Qt.AlignmentFlag.AlignBottom)
         return button
 
-    def _display_refresh_hz(self) -> float:
-        screen = self.quick.screen()
-        if screen is None:
-            return _DEFAULT_REFRESH_HZ
-        refresh = float(screen.refreshRate())
-        if not math.isfinite(refresh) or refresh <= 1.0:
-            return _DEFAULT_REFRESH_HZ
-        return refresh
-
-    def _schedule_animation_frame(self, *, reset_deadline: bool = False) -> None:
-        if not self._running or not self.toy.isVisible():
-            self._timer.stop()
-            return
-
-        now = time.monotonic()
-        frame_period = 1.0 / self._display_refresh_hz()
-        if (
-            reset_deadline
-            or self._next_frame_deadline <= 0.0
-            or self._next_frame_deadline < now - frame_period
-        ):
-            self._next_frame_deadline = now
-
-        self._next_frame_deadline += frame_period
-        delay_ms = max(0, round((self._next_frame_deadline - now) * 1000.0))
-        self._timer.start(delay_ms)
-
     def _pause_spring(self) -> None:
         self._running = False
-        self._timer.stop()
 
     def _resume_spring_after_drag(self) -> None:
         self._running = True
-        self._schedule_animation_frame(reset_deadline=True)
+        self.quick.requestUpdate()
 
-    def _run_animation_frame(self) -> None:
+    def _on_animation_frame(self) -> None:
         if not self._running or not self.toy.isVisible():
-            self._timer.stop()
             return
 
         now = time.monotonic()
@@ -309,12 +276,11 @@ class SakanaToyController(QObject):
 
         if not advance_spring(self.toy.state, elapsed_ms):
             self._running = False
-            self._timer.stop()
             return
 
         self.toy.update()
+        # requestAnimationFrame schedules the following frame while _running.
         self.quick.requestUpdate()
-        self._schedule_animation_frame()
 
     def _place_default(self) -> None:
         # Position the 200 px Sakana app/main. Its 300 px canvas overflows around it.
@@ -350,7 +316,6 @@ class SakanaToyController(QObject):
         if not enabled:
             self.toy.cancel_interaction()
             self._running = False
-            self._timer.stop()
             self.toy.setVisible(False)
             return
 
@@ -358,10 +323,8 @@ class SakanaToyController(QObject):
         self.toy.setZ(32000.0)
         self._running = True
         self._last_tick = time.monotonic()
-        self._next_frame_deadline = 0.0
         self.toy.update()
         self.quick.requestUpdate()
-        self._schedule_animation_frame(reset_deadline=True)
 
     def raise_overlay(self) -> None:
         if self.toy.isVisible():
@@ -370,8 +333,11 @@ class SakanaToyController(QObject):
 
     def cleanup(self) -> None:
         self._running = False
-        self._timer.stop()
         self.toy.cancel_interaction()
+        try:
+            self.quick.afterAnimating.disconnect(self._on_animation_frame)
+        except (RuntimeError, TypeError):
+            pass
         try:
             self.quick.widthChanged.disconnect(self._on_window_geometry_changed)
             self.quick.heightChanged.disconnect(self._on_window_geometry_changed)
