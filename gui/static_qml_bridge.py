@@ -106,6 +106,7 @@ class StaticQmlBridge(QObject):
 
     activeChanged = Signal()
     sceneChanged = Signal()
+    cardDetailRequested = Signal(int)
 
     def __init__(
         self,
@@ -125,6 +126,7 @@ class StaticQmlBridge(QObject):
         self._card_frames: list[QFrame] = []
         self._connected_widget_ids: set[int] = set()
         self._runtime_sources_bound = False
+        self._local_input_commit_ids: set[int] = set()
 
         self._sakura_url = "data:image/png;base64," + _SAKURA_PNG_B64
         self._refresh_timer = QTimer(self)
@@ -554,6 +556,11 @@ class StaticQmlBridge(QObject):
             return
         self._refresh_timer.start()
 
+    def _schedule_input_refresh(self, widget: QWidget) -> None:
+        if id(widget) in self._local_input_commit_ids:
+            return
+        self.schedule_refresh()
+
     @staticmethod
     def _connect(signal: Any, callback: Any) -> None:
         if signal is None or not hasattr(signal, "connect"):
@@ -600,13 +607,25 @@ class StaticQmlBridge(QObject):
             self._connected_widget_ids.add(identity)
 
             if isinstance(widget, QLineEdit):
-                self._connect(widget.textChanged, self.schedule_refresh)
+                self._connect(
+                    widget.textChanged,
+                    lambda *_args, source=widget: self._schedule_input_refresh(source),
+                )
             elif isinstance(widget, QPlainTextEdit):
-                self._connect(widget.textChanged, self.schedule_refresh)
+                self._connect(
+                    widget.textChanged,
+                    lambda *_args, source=widget: self._schedule_input_refresh(source),
+                )
             elif isinstance(widget, QSpinBox):
-                self._connect(widget.valueChanged, self.schedule_refresh)
+                self._connect(
+                    widget.valueChanged,
+                    lambda *_args, source=widget: self._schedule_input_refresh(source),
+                )
             elif isinstance(widget, QComboBox):
-                self._connect(widget.currentIndexChanged, self.schedule_refresh)
+                self._connect(
+                    widget.currentIndexChanged,
+                    lambda *_args, source=widget: self._schedule_input_refresh(source),
+                )
             elif isinstance(widget, QAbstractButton):
                 self._connect(widget.toggled, self.schedule_refresh)
                 self._connect(widget.clicked, self.schedule_refresh)
@@ -631,6 +650,12 @@ class StaticQmlBridge(QObject):
 
     def _target(self, key: str) -> QObject | None:
         return self._targets.get(str(key))
+
+    @Slot(int)
+    def requestCardDetail(self, row: int) -> None:  # noqa: N802
+        row = int(row)
+        if self._active and 0 <= row < len(self._card_frames):
+            self.cardDetailRequested.emit(row)
 
     @Slot(int, bool, bool)
     def setCardInteraction(self, row: int, hovered: bool, pressed: bool) -> None:  # noqa: N802
@@ -669,6 +694,10 @@ class StaticQmlBridge(QObject):
     @Slot(str, str)
     def setText(self, key: str, text: str) -> None:  # noqa: N802
         target = self._target(key)
+        if not isinstance(target, (QLineEdit, QPlainTextEdit)):
+            return
+        identity = id(target)
+        self._local_input_commit_ids.add(identity)
         try:
             if isinstance(target, QLineEdit) and not target.isReadOnly():
                 target.setText(str(text))
@@ -676,7 +705,8 @@ class StaticQmlBridge(QObject):
                 target.setPlainText(str(text))
         except RuntimeError:
             pass
-        self.schedule_refresh()
+        finally:
+            self._local_input_commit_ids.discard(identity)
 
     @Slot(str, bool)
     def setChecked(self, key: str, checked: bool) -> None:  # noqa: N802
@@ -691,22 +721,32 @@ class StaticQmlBridge(QObject):
     @Slot(str, float)
     def setValue(self, key: str, value: float) -> None:  # noqa: N802
         target = self._target(key)
+        if not isinstance(target, QSpinBox):
+            return
+        identity = id(target)
+        self._local_input_commit_ids.add(identity)
         try:
-            if isinstance(target, QSpinBox) and target.isEnabled():
+            if target.isEnabled():
                 target.setValue(int(value))
         except RuntimeError:
             pass
-        self.schedule_refresh()
+        finally:
+            self._local_input_commit_ids.discard(identity)
 
     @Slot(str, int)
     def setComboIndex(self, key: str, index: int) -> None:  # noqa: N802
         target = self._target(key)
+        if not isinstance(target, QComboBox):
+            return
+        identity = id(target)
+        self._local_input_commit_ids.add(identity)
         try:
-            if isinstance(target, QComboBox) and target.isEnabled() and 0 <= int(index) < target.count():
+            if target.isEnabled() and 0 <= int(index) < target.count():
                 target.setCurrentIndex(int(index))
         except RuntimeError:
             pass
-        self.schedule_refresh()
+        finally:
+            self._local_input_commit_ids.discard(identity)
 
     @Slot(str, int)
     def setTabIndex(self, key: str, index: int) -> None:  # noqa: N802
