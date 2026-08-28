@@ -5,16 +5,7 @@ import sys
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer
 from PySide6.QtQuick import QQuickWindow
-from PySide6.QtWidgets import (
-    QAbstractItemView,
-    QAbstractSpinBox,
-    QApplication,
-    QComboBox,
-    QLineEdit,
-    QMainWindow,
-    QPlainTextEdit,
-    QWidget,
-)
+from PySide6.QtWidgets import QApplication, QMainWindow
 
 
 _GWL_STYLE = -16
@@ -139,39 +130,14 @@ def _set_native_child_presented(overlay_hwnd: int, presented: bool) -> None:
     )
 
 
-def _focus_native_child(overlay_hwnd: int) -> bool:
-    if sys.platform != "win32" or not overlay_hwnd:
-        return True
-
-    user32 = ctypes.windll.user32
-    overlay = ctypes.c_void_p(overlay_hwnd)
-    user32.GetFocus.argtypes = []
-    user32.GetFocus.restype = ctypes.c_void_p
-
-    # Focus transfer is a one-way owner -> child handoff. Once the native QWidget
-    # child already owns keyboard focus, calling SetFocus again from its own
-    # FocusIn/focusChanged feedback path can continuously enqueue zero-delay Qt
-    # focus work and starve normal timers/repaints while the app is foreground.
-    if int(user32.GetFocus() or 0) == overlay_hwnd:
-        return True
-
-    user32.SetFocus.argtypes = [ctypes.c_void_p]
-    user32.SetFocus.restype = ctypes.c_void_p
-    user32.SetFocus(overlay)
-    return int(user32.GetFocus() or 0) == overlay_hwnd
-
-
-_KEYBOARD_WIDGET_TYPES = (
-    QLineEdit,
-    QAbstractSpinBox,
-    QComboBox,
-    QPlainTextEdit,
-    QAbstractItemView,
-)
-
-
 class NativeWindowShell(QObject):
-    """Native Windows frame with the baseline QWidget tree as one child HWND."""
+    """Own the native Quick frame and keep the QWidget UI as one stable child HWND.
+
+    Foreground activation deliberately has no focus hand-off path. Windows/Qt
+    already focus the child control that the user clicks. Driving SetFocus from
+    QQuickWindow FocusIn/WindowActivate creates an owner->child->owner feedback
+    cycle on Windows' threaded Quick render loop and can starve every GUI timer.
+    """
 
     def __init__(self, overlay: QMainWindow, owner: QQuickWindow) -> None:
         super().__init__(overlay)
@@ -180,8 +146,7 @@ class NativeWindowShell(QObject):
         self._closing = False
         self._embedded = False
         self._overlay_presented = True
-        self._focus_pending = False
-        self._last_focus_widget: QWidget | None = None
+        self._fit_pending = False
 
         app = QApplication.instance()
         app_icon = app.windowIcon() if app is not None else overlay.windowIcon()
@@ -209,17 +174,6 @@ class NativeWindowShell(QObject):
         owner.widthChanged.connect(self._schedule_native_fit)
         owner.heightChanged.connect(self._schedule_native_fit)
 
-        self._keyboard_focus_watch = [
-            widget
-            for widget in overlay.findChildren(QWidget)
-            if isinstance(widget, _KEYBOARD_WIDGET_TYPES)
-        ]
-        for widget in self._keyboard_focus_watch:
-            widget.installEventFilter(self)
-
-        if app is not None:
-            app.focusChanged.connect(self._on_focus_changed)
-
     def show(self) -> None:
         self.owner.create()
         self.overlay.winId()
@@ -235,11 +189,10 @@ class NativeWindowShell(QObject):
         self.owner.showMaximized()
         self._fit_native_child()
         self.overlay.show()
-        QTimer.singleShot(0, self._fit_native_child)
-        QTimer.singleShot(0, self._restore_widget_focus)
+        self._schedule_native_fit()
 
     def set_overlay_presented(self, presented: bool) -> None:
-        """Switch only native presentation; keep the QWidget object tree alive."""
+        """Switch native visibility without changing keyboard-focus ownership."""
 
         presented = bool(presented)
         if self._closing or not self._embedded or presented == self._overlay_presented:
@@ -249,65 +202,21 @@ class NativeWindowShell(QObject):
             _set_native_child_presented(int(self.overlay.winId()), presented)
         else:
             self.overlay.setVisible(presented)
-        if not presented:
-            self._focus_pending = False
-            return
-        self._fit_native_child()
-        self.overlay.update()
-        self._schedule_widget_focus()
+        if presented:
+            self._fit_native_child()
+            self.overlay.update()
 
     def _schedule_native_fit(self, *_args: object) -> None:
-        if self._closing or not self._embedded:
+        if self._closing or not self._embedded or self._fit_pending:
             return
+        self._fit_pending = True
         QTimer.singleShot(0, self._fit_native_child)
 
     def _fit_native_child(self) -> None:
+        self._fit_pending = False
         if self._closing or not self._embedded:
             return
         _fit_child_to_owner_client(int(self.overlay.winId()), int(self.owner.winId()))
-
-    def _belongs_to_overlay(self, widget: QWidget | None) -> bool:
-        current = widget
-        while current is not None:
-            if current is self.overlay:
-                return True
-            current = current.parentWidget()
-        return False
-
-    def _on_focus_changed(self, _old: QWidget | None, current: QWidget | None) -> None:
-        if not self._overlay_presented:
-            return
-        if self._belongs_to_overlay(current):
-            # Qt already delivered focus into the QWidget tree. Record the logical
-            # target only; never schedule another native SetFocus from this callback.
-            self._last_focus_widget = current
-
-    def _schedule_widget_focus(self) -> None:
-        if (
-            self._closing
-            or not self._embedded
-            or not self._overlay_presented
-            or self._focus_pending
-        ):
-            return
-        self._focus_pending = True
-        QTimer.singleShot(0, self._restore_widget_focus)
-
-    def _restore_widget_focus(self) -> None:
-        self._focus_pending = False
-        if self._closing or not self._embedded or not self._overlay_presented:
-            return
-
-        _focus_native_child(int(self.overlay.winId()))
-
-        current = QApplication.focusWidget()
-        if self._belongs_to_overlay(current):
-            self._last_focus_widget = current
-            return
-
-        target = self._last_focus_widget
-        if target is not None and target.isVisible() and target.isEnabled():
-            target.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
@@ -320,15 +229,6 @@ class NativeWindowShell(QObject):
                 QEvent.Type.Expose,
             }:
                 self._schedule_native_fit()
-            if event_type in {
-                QEvent.Type.Show,
-                QEvent.Type.WindowActivate,
-                QEvent.Type.FocusIn,
-            }:
-                # The outer Quick window is the only source allowed to request a
-                # native focus transfer. Child FocusIn is a terminal state, not a
-                # trigger for another handoff.
-                self._schedule_widget_focus()
             elif event_type == QEvent.Type.Close and not self._closing:
                 self._closing = True
                 self.overlay.close()
@@ -337,13 +237,6 @@ class NativeWindowShell(QObject):
             if event_type == QEvent.Type.Close and not self._closing:
                 self._closing = True
                 self.owner.close()
-
-        elif isinstance(watched, _KEYBOARD_WIDGET_TYPES):
-            if event_type == QEvent.Type.MouseButtonPress:
-                self._last_focus_widget = watched
-                # A click inside the native child is already a valid child-side
-                # focus path. Let Qt assign the logical widget focus without
-                # feeding that event back into native owner activation.
 
         return False
 
