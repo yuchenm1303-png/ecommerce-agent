@@ -431,6 +431,37 @@ def _compact_workspace_cards(window: QMainWindow) -> None:
                 layout.setSpacing(4)
 
 
+def _constrain_side_tab_viewport(window: QMainWindow) -> None:
+    """Make the fixed diagnostics tab viewport the sole vertical-size owner.
+
+    The original scrolling side column gave the Reference table a content minimum
+    height. Once the fixed Single layout turns those cards into tab pages, that old
+    minimum must not propagate through QTabWidget and enlarge the current page.
+    Pages may shrink to the tab viewport; scrollable content owns any overflow.
+    """
+
+    side_tabs = getattr(window, "side_detail_tabs", None)
+    if not isinstance(side_tabs, QTabWidget):
+        return
+
+    for index in range(side_tabs.count()):
+        page = side_tabs.widget(index)
+        if not isinstance(page, QWidget):
+            continue
+        page.setMinimumHeight(0)
+        page.setMaximumHeight(16777215)
+        page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    reference_table = getattr(window, "web_table", None)
+    if isinstance(reference_table, QWidget):
+        reference_table.setMinimumHeight(0)
+        reference_table.setMaximumHeight(16777215)
+        reference_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+
+
 def _configure_workspace(window: QMainWindow, body: QSplitter) -> None:
     workspace = body.widget(0) if body.count() > 0 else None
     console = body.widget(1) if body.count() > 1 else None
@@ -467,6 +498,7 @@ def _configure_workspace(window: QMainWindow, body: QSplitter) -> None:
         side_tabs.setMaximumHeight(16777215)
         side_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         _polish_side_tabs(side_tabs)
+        _constrain_side_tab_viewport(window)
 
     console.setMinimumHeight(_CONSOLE_MIN_HEIGHT)
     console.setMaximumHeight(_CONSOLE_MAX_HEIGHT)
