@@ -5,7 +5,6 @@ from typing import Any
 from PySide6.QtCore import (
     QAbstractListModel,
     QByteArray,
-    QEvent,
     QModelIndex,
     QObject,
     QPoint,
@@ -45,19 +44,6 @@ _ATOMIC_TYPES = (
     QTableWidget,
     QAbstractButton,
 )
-
-_PRESENTATION_EVENTS = {
-    QEvent.Type.Move,
-    QEvent.Type.Resize,
-    QEvent.Type.Show,
-    QEvent.Type.Hide,
-    QEvent.Type.LayoutRequest,
-    QEvent.Type.ParentChange,
-    QEvent.Type.EnabledChange,
-    QEvent.Type.StyleChange,
-    QEvent.Type.FontChange,
-    QEvent.Type.PaletteChange,
-}
 
 
 def _qml_color(color: QColor, fallback: str = "#ffffffff") -> str:
@@ -139,7 +125,6 @@ class StaticQmlBridge(QObject):
         self._targets: dict[str, QObject] = {}
         self._card_frames: list[QFrame] = []
         self._connected_widget_ids: set[int] = set()
-        self._layout_watch_ids: set[int] = set()
         self._runtime_sources_bound = False
         self._local_input_commit_ids: set[int] = set()
 
@@ -177,27 +162,8 @@ class StaticQmlBridge(QObject):
         if self._runtime_sources_bound:
             return
         self._runtime_sources_bound = True
-        self._watch_presentation_widget(self.window)
         self._connect_state_sources()
         self._connect_widget_sources()
-
-    def _watch_presentation_widget(self, widget: QWidget) -> None:
-        identity = id(widget)
-        if identity in self._layout_watch_ids:
-            return
-        try:
-            widget.installEventFilter(self)
-        except RuntimeError:
-            return
-        self._layout_watch_ids.add(identity)
-
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if isinstance(watched, QWidget) and event.type() in _PRESENTATION_EVENTS:
-            # QWidget is the authoritative business/layout tree. Geometry and
-            # presentation changes must invalidate the Quick mirror directly;
-            # pointer input is never part of the synchronization contract.
-            self.schedule_refresh()
-        return False
 
     @staticmethod
     def _layout_visible(widget: QWidget, window: QMainWindow) -> bool:
@@ -635,7 +601,6 @@ class StaticQmlBridge(QObject):
         except RuntimeError:
             return
         for widget in widgets:
-            self._watch_presentation_widget(widget)
             identity = id(widget)
             if identity in self._connected_widget_ids:
                 continue
