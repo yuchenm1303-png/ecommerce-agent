@@ -166,6 +166,11 @@ class ClickFireworksLayer(QWidget):
             self.update(dirty)
         return bool(active)
 
+    def clear(self) -> None:
+        self.bursts.clear()
+        self.hide()
+        self.update()
+
     def _draw_particles(self, painter: QPainter, burst: FireworkBurst, elapsed_ms: float) -> None:
         progress = elapsed_ms / max(1.0, burst.particle_duration_ms)
         if progress >= 1.0:
@@ -238,6 +243,7 @@ class ClickFireworks(QObject):
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.setInterval(_FRAME_MS)
         self.timer.timeout.connect(self._tick)
+        self._enabled = True
         self._last_press_identity: tuple[int, int, int, int] | None = None
         self._last_press_seen_s = 0.0
         app = QApplication.instance()
@@ -248,6 +254,23 @@ class ClickFireworks(QObject):
         window.destroyed.connect(self.cleanup)
         QTimer.singleShot(0, self.layer.sync_geometry)
 
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def set_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._enabled:
+            return
+        self._enabled = enabled
+        self._last_press_identity = None
+        self._last_press_seen_s = 0.0
+        if not enabled:
+            self.timer.stop()
+            self.layer.clear()
+        else:
+            self.layer.sync_geometry()
+
     def _belongs_to_window(self, widget: QWidget) -> bool:
         current: QWidget | None = widget
         while current is not None:
@@ -257,14 +280,7 @@ class ClickFireworks(QObject):
         return False
 
     def _is_duplicate_press(self, event: QMouseEvent, *, now_s: float) -> bool:
-        """Collapse Qt parent propagation without throttling genuine rapid clicks.
-
-        One physical mouse press can be delivered to a child and then propagated
-        through several QWidget ancestors when handlers ignore it. QApplication
-        event filters observe every delivery, so triggering directly from each one
-        produces several overlapping bursts. QInputEvent.timestamp() stays stable
-        across that propagation chain and gives us the physical-event identity.
-        """
+        """Collapse Qt parent propagation without throttling genuine rapid clicks."""
 
         global_pos = event.globalPosition().toPoint()
         timestamp = int(event.timestamp())
@@ -287,6 +303,9 @@ class ClickFireworks(QObject):
         return duplicate
 
     def _tick(self) -> None:
+        if not self._enabled:
+            self.timer.stop()
+            return
         try:
             active = self.layer.advance(time.perf_counter())
         except RuntimeError:
@@ -299,6 +318,9 @@ class ClickFireworks(QObject):
             self.timer.start()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if not self._enabled:
+            return False
+
         event_type = event.type()
         central = self.window.centralWidget()
         if event_type in (QEvent.Type.Resize, QEvent.Type.Show):
