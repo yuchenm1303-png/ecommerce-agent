@@ -554,23 +554,9 @@ Item {
                 }
             }
 
-            // native_background.py still supplies the original pre-blurred glass
-            // mask. This is the matching sakura-pink 64/102 overlay, animated
-            // by the Quick compositor together with the card content.
-            Rectangle {
-                anchors.fill: parent
-                radius: 6
-                color: Qt.rgba(1, 157/255, 202/255, 1)
-                opacity: (cardHover.hovered || cardPress.pressed) ? 102/255 : 64/255
-                Behavior on opacity {
-                    NumberAnimation {
-                        duration: 300
-                        easing.type: Easing.BezierSpline
-                        easing.bezierCurve: [0.25, 0.10, 0.25, 1.00, 1.00, 1.00]
-                    }
-                }
-            }
-
+            // The glass body is rendered only once by native_background.py.
+            // This item carries content and interaction; it does not draw a
+            // second color/tint rectangle over the glass.
             Repeater {
                 model: card.cardControls
                 delegate: Loader {
@@ -582,8 +568,18 @@ Item {
                 }
             }
 
-            HoverHandler { id: cardHover; acceptedDevices: PointerDevice.Mouse }
-            TapHandler { id: cardPress; target: null; acceptedButtons: Qt.LeftButton }
+            HoverHandler {
+                id: cardHover
+                acceptedDevices: PointerDevice.Mouse
+                onHoveredChanged: staticBridge.setCardInteraction(card.index, hovered, cardPress.pressed)
+            }
+            TapHandler {
+                id: cardPress
+                target: null
+                acceptedButtons: Qt.LeftButton
+                onPressedChanged: staticBridge.setCardInteraction(card.index, cardHover.hovered, pressed)
+            }
+            Component.onDestruction: staticBridge.resetCardInteractions()
         }
     }
 
