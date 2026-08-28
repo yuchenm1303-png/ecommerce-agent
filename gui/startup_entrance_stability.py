@@ -6,6 +6,8 @@ from typing import Any
 from PySide6.QtCore import QObject, QPoint, QTimer
 from PySide6.QtWidgets import QFrame, QMainWindow, QWidget
 
+from .static_quick_compositor import install_static_quick_card_compositor
+
 
 _LAYOUT_POLL_MS = 16
 _LAYOUT_STABLE_SAMPLES = 3
@@ -299,6 +301,14 @@ class StartupEntranceStabilityGate(QObject):
         resume = getattr(clock, "resume", None)
         if callable(resume):
             resume("startup")
+
+        # Install the drift-off compositor only after the established startup
+        # handoff is fully complete. Drift-on keeps the legacy presentation lane.
+        if self.visual is not None:
+            try:
+                install_static_quick_card_compositor(self.window, self.visual)
+            except RuntimeError:
+                pass
 
 
 def install_startup_entrance_stability(
