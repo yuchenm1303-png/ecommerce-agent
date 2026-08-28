@@ -63,8 +63,8 @@ def install_batch_workspace_density(workspace: QWidget) -> None:
                 hero_widget = hero_item.widget()
                 if hero_widget is not None:
                     hero_widget.hide()
-            source_layout.setContentsMargins(12, 8, 12, 8)
-            source_layout.setSpacing(6)
+            source_layout.setContentsMargins(10, 5, 10, 5)
+            source_layout.setSpacing(4)
         source_card.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Maximum,
