@@ -186,9 +186,6 @@ class NativeWindowShell(QObject):
         owner.widthChanged.connect(self._schedule_native_fit)
         owner.heightChanged.connect(self._schedule_native_fit)
 
-        # Retain deterministic keyboard hand-off only for controls that actually
-        # need keyboard focus.  Labels, cards, buttons and container widgets no
-        # longer send their Resize/Layout/Paint traffic through Python here.
         self._keyboard_focus_watch = [
             widget
             for widget in overlay.findChildren(QWidget)
@@ -211,9 +208,6 @@ class NativeWindowShell(QObject):
         _embed_native_child(int(self.overlay.winId()), int(self.owner.winId()))
         self._embedded = True
 
-        # First presentation should use the full desktop work area while retaining
-        # ordinary Windows maximize/restore behavior.  This is intentionally not
-        # showFullScreen(): the taskbar and native window controls remain available.
         self.owner.showMaximized()
         self._fit_native_child()
         self.overlay.show()
