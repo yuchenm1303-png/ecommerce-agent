@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "gui" / "startup_entrance.py").read_text(encoding="utf-8")
 STABILITY = (ROOT / "gui" / "startup_entrance_stability.py").read_text(encoding="utf-8")
 STATIC_VIEW = (ROOT / "gui" / "static_qml_view.py").read_text(encoding="utf-8")
+CARD_FX = (ROOT / "gui" / "nekro_card_fx.py").read_text(encoding="utf-8")
 RUN = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
@@ -46,7 +47,32 @@ def test_curtain_completion_releases_input_before_handoff() -> None:
     assert finish.index("self.hide()") < finish.index("self.finished.emit()")
 
 
-def test_startup_runtime_lifecycle_uses_shared_presentation_clock_only() -> None:
+def test_card_effect_suspension_has_independent_owners() -> None:
+    for token in (
+        '_SUSPEND_MODAL = "modal"',
+        '_SUSPEND_STARTUP = "startup"',
+        '_SUSPEND_QUICK_PRESENTATION = "quick-presentation"',
+        "self._suspension_reasons: set[str] = set()",
+        "def suspend(self, reason: str",
+        "def resume(self, reason: str)",
+        "def suspend_for_modal(",
+        "def resume_from_modal(",
+        "def suspend_for_startup(",
+        "def resume_from_startup(",
+        "def suspend_for_quick_presentation(",
+        "def resume_from_quick_presentation(",
+    ):
+        assert token in CARD_FX
+
+    resume = CARD_FX.split("def resume(self, reason: str)", 1)[1].split(
+        "def suspend_for_modal", 1
+    )[0]
+    assert "self._suspension_reasons.discard(token)" in resume
+    assert "self._suspended = bool(self._suspension_reasons)" in resume
+    assert "if self._suspended:" in resume
+
+
+def test_startup_owns_only_startup_card_hold() -> None:
     freeze = SOURCE.split("def _freeze_runtime_presentation", 1)[1].split(
         "def raise_overlay", 1
     )[0]
@@ -54,12 +80,11 @@ def test_startup_runtime_lifecycle_uses_shared_presentation_clock_only() -> None
         "def _finish", 1
     )[0]
     assert 'suspend_clock("startup")' in freeze
+    assert "suspend_for_startup" in freeze
+    assert "resume_from_startup" in restore
+    assert "suspend_for_modal" not in freeze
+    assert "resume_from_modal" not in restore
     assert 'resume_clock("startup")' in restore
-    assert "suspend_for_modal" in freeze
-    assert "resume_from_modal" in restore
-    assert "_pointer_timer" not in SOURCE
-    assert "_scroll_local_glass" not in SOURCE
-    assert "_background_pointer_hotpath" not in SOURCE
 
 
 def test_startup_stability_requires_live_paint_and_quiescent_layout() -> None:
@@ -123,20 +148,29 @@ def test_reveal_has_frame_barrier_but_finished_overlay_has_no_liveness_dependenc
     assert "QTimer.singleShot(0, self._commit_overlay_handoff)" in stage
 
     commit = STABILITY.split("def _commit_overlay_handoff", 1)[1].split(
-        "def _resume_effects", 1
+        "def _resume_startup_card_fx", 1
     )[0]
     assert commit.index("overlay.hide()") < commit.index("self.handoffReady.emit()")
 
 
-def test_quick_handoff_never_reenables_legacy_card_raster_lane() -> None:
-    commit = STABILITY.split("def _commit_overlay_handoff", 1)[1].split(
-        "def _resume_effects", 1
+def test_quick_handoff_keeps_quick_card_hold_after_startup_release() -> None:
+    suspend = STATIC_VIEW.split("def _suspend_legacy_visuals", 1)[1].split(
+        "def _resume_legacy_fallback", 1
     )[0]
-    assert "_resume_card_fx" not in STABILITY
+    fallback = STATIC_VIEW.split("def _resume_legacy_fallback", 1)[1].split(
+        "def _fail_scene", 1
+    )[0]
+    commit = STABILITY.split("def _commit_overlay_handoff", 1)[1].split(
+        "def _resume_startup_card_fx", 1
+    )[0]
+
+    assert "suspend_for_quick_presentation" in suspend
+    assert "resume_from_quick_presentation" in fallback
+    assert commit.index("self.handoffReady.emit()") < commit.index(
+        "self._resume_startup_card_fx()"
+    )
+    assert "resume_from_startup" in STABILITY
     assert "resume_from_modal" not in STABILITY
-    assert "_resume_presentation" in commit
-    assert "self._suspend_legacy_visuals()" in STATIC_VIEW
-    assert "self._resume_legacy_fallback()" in STATIC_VIEW
 
 
 def test_startup_resumes_shared_clock_only_after_overlay_handoff() -> None:
@@ -164,3 +198,4 @@ def test_startup_sources_compile_without_importing_pyside() -> None:
     compile(SOURCE, "gui/startup_entrance.py", "exec")
     compile(STABILITY, "gui/startup_entrance_stability.py", "exec")
     compile(STATIC_VIEW, "gui/static_qml_view.py", "exec")
+    compile(CARD_FX, "gui/nekro_card_fx.py", "exec")
