@@ -220,6 +220,7 @@ def main() -> int:
     from gui.product_copy import install_product_copy
     from gui.product_input_window import ProductInputWorkflowMainWindow
     from gui.premium_copy import install_premium_copy
+    from gui.quick_modal_input_guard import install_quick_modal_input_guard
     from gui.quick_modal_layer import install_quick_modal_layer
     from gui.required_input_support import install_required_input_support
     from gui.runtime_assistant import install_runtime_assistant
@@ -361,7 +362,8 @@ def main() -> int:
     entrance = install_startup_entrance(window, visual)
     entrance_stability = install_startup_entrance_stability(window, entrance)
     static_view = install_static_qml_view(window, visual, entrance_stability)
-    install_quick_modal_layer(window, static_view, details)
+    quick_modal = install_quick_modal_layer(window, static_view, details)
+    install_quick_modal_input_guard(window, static_view, quick_modal)
 
     # The normal presentation has one owner: the existing QQuickWindow. QWidget
     # remains alive only as the business/state host and fallback. Detail cards are
