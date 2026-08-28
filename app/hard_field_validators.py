@@ -282,6 +282,11 @@ def validate_resolved_answer(
         return FieldValidationResult(True)
     if not answer.answer_values:
         return FieldValidationResult(False, "resolved 答案没有 answer_values。")
+    if not _value_controls(semantic_field):
+        return FieldValidationResult(
+            False,
+            "当前 live field 没有 executable value control；拒绝把答案标记为 READY。",
+        )
 
     key_names = {
         normalize_key(semantic_field.get("attribute_key")),
