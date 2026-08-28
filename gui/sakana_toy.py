@@ -4,10 +4,9 @@ import base64
 import json
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QUrl
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtQuick import QQuickWindow
-from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
@@ -19,12 +18,30 @@ _LEFT_MARGIN = 24
 _BOTTOM_MARGIN = 18
 _CHARACTER_IMAGE = Path(__file__).resolve().parent / "assets" / "sakana_character.png"
 
-# The pcp.moe bundle supplied for this project is Sakana Widget 2.7.1. Run the
-# published browser build itself so its requestAnimationFrame loop, Date.now()
-# timing, DOM mouse lifecycle, Canvas drawing and CSS transforms are not
-# reimplemented by Qt/Python.
-_SAKANA_JS = "https://cdnjs.cloudflare.com/ajax/libs/sakana-widget/2.7.1/sakana.min.js"
-_SAKANA_CSS = "https://cdnjs.cloudflare.com/ajax/libs/sakana-widget/2.7.1/sakana.min.css"
+# Run the published Sakana Widget 2.7.1 browser build itself. The original JS
+# remains the sole owner of requestAnimationFrame timing, Date.now(), DOM input,
+# Canvas drawing and the r/y/t/w spring state.
+_SAKANA_JS_SOURCES = (
+    "https://cdn.jsdelivr.net/npm/sakana-widget@2.7.1/lib/sakana.min.js",
+    "https://cdnjs.cloudflare.com/ajax/libs/sakana-widget/2.7.1/sakana.min.js",
+)
+
+# Exact compiled form of Sakana Widget 2.7.1 src/index.scss. Keep this local so
+# the widget structure never depends on a second remote stylesheet request.
+_SAKANA_271_CSS = """
+.sakana-widget *,.sakana-widget *::before,.sakana-widget *::after{box-sizing:border-box}
+.sakana-widget-wrapper{pointer-events:none;position:relative;width:100%;height:100%}
+.sakana-widget-app{pointer-events:none;position:relative}
+.sakana-widget-canvas{z-index:10;pointer-events:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%)}
+.sakana-widget-main{z-index:20;pointer-events:none;position:absolute;display:flex;flex-direction:column;justify-content:space-between;align-items:center}
+.sakana-widget-img{z-index:40;cursor:move;pointer-events:auto;position:relative;background:no-repeat 50% 50%;background-size:cover}
+.sakana-widget-ctrl{z-index:30;cursor:pointer;pointer-events:auto;position:relative;height:24px;width:112px;display:flex;border-radius:6px;background-color:#ddd;box-shadow:0 8px 24px rgba(0,0,0,.1)}
+.sakana-widget-ctrl-item{height:24px;width:28px;display:flex;justify-content:center;align-items:center;color:#555;background-color:transparent}
+.sakana-widget-ctrl-item:hover{color:#555;background-color:rgba(255,255,255,.25)}
+.sakana-widget-icon{height:18px;width:18px}
+.sakana-widget-icon--rotate{animation:sakana-widget-spin 2s linear infinite}
+@keyframes sakana-widget-spin{100%{transform:rotate(360deg)}}
+""".strip()
 
 
 def _character_data_url() -> str:
@@ -37,13 +54,14 @@ def _character_data_url() -> str:
 
 def _html_source() -> str:
     image_url = _character_data_url()
+    js_sources = json.dumps(_SAKANA_JS_SOURCES)
     return f'''<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="stylesheet" href="{_SAKANA_CSS}">
 <style>
+{_SAKANA_271_CSS}
 html, body {{
     width: {_CANVAS_SIZE}px;
     height: {_CANVAS_SIZE}px;
@@ -59,8 +77,7 @@ html, body {{
     width: {_TOY_SIZE}px;
     height: {_TOY_SIZE}px;
 }}
-/* Product-requested visual-only difference: keep the original controller box,
-   but render it plain white without the four symbols. */
+/* The only intentional visual differences from upstream. */
 .sakana-widget-ctrl {{
     background: #ffffff !important;
 }}
@@ -72,15 +89,47 @@ html, body {{
 </head>
 <body>
 <div id="sakana-widget"></div>
-<script src="{_SAKANA_JS}"></script>
 <script>
 (() => {{
-    const takina = SakanaWidget.getCharacter('takina');
-    takina.image = {json.dumps(image_url)};
-    SakanaWidget.registerCharacter('__ecommerce_agent_character__', takina);
-    window.__sakana = new SakanaWidget({{
-        character: '__ecommerce_agent_character__'
-    }}).mount('#sakana-widget');
+    const sources = {js_sources};
+
+    function mountOriginalSakana() {{
+        if (typeof SakanaWidget !== 'function')
+            return false;
+        const takina = SakanaWidget.getCharacter('takina');
+        if (!takina)
+            return false;
+        takina.image = {json.dumps(image_url)};
+        SakanaWidget.registerCharacter('__ecommerce_agent_character__', takina);
+        window.__sakana = new SakanaWidget({{
+            character: '__ecommerce_agent_character__'
+        }}).mount('#sakana-widget');
+        document.documentElement.dataset.sakanaReady = '1';
+        return true;
+    }}
+
+    function loadOriginalSakana(index) {{
+        if (index >= sources.length) {{
+            document.documentElement.dataset.sakanaError = 'script-load';
+            return;
+        }}
+        const script = document.createElement('script');
+        script.src = sources[index];
+        script.async = false;
+        script.onload = () => {{
+            if (!mountOriginalSakana()) {{
+                script.remove();
+                loadOriginalSakana(index + 1);
+            }}
+        }};
+        script.onerror = () => {{
+            script.remove();
+            loadOriginalSakana(index + 1);
+        }};
+        document.head.appendChild(script);
+    }}
+
+    loadOriginalSakana(0);
 }})();
 </script>
 </body>
@@ -113,18 +162,16 @@ class SakanaToyController(QObject):
         self.view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.view.resize(_CANVAS_SIZE, _CANVAS_SIZE)
         self.view.page().setBackgroundColor(QColor(0, 0, 0, 0))
-
-        settings = self.view.settings()
-        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
-        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
         self.view.loadFinished.connect(self._on_load_finished)
 
         self.toggle = self._install_toggle()
         self.quick.installEventFilter(self)
         self.window.destroyed.connect(self.cleanup)
 
-        base_url = QUrl.fromLocalFile(str(_CHARACTER_IMAGE.parent) + "/")
-        self.view.setHtml(_html_source(), base_url)
+        # Establish native ownership before the first WebEngine load/show. This
+        # keeps the transparent tool window in the QQuickWindow's z-order group.
+        self._ensure_transient_parent()
+        self.view.setHtml(_html_source())
         self.set_enabled(True)
 
     def _install_toggle(self) -> QPushButton:
@@ -153,22 +200,28 @@ class SakanaToyController(QObject):
         header.addWidget(button, 0, Qt.AlignmentFlag.AlignBottom)
         return button
 
+    def _ensure_transient_parent(self) -> None:
+        if self._shutting_down:
+            return
+        try:
+            self.view.winId()
+            handle = self.view.windowHandle()
+            if handle is not None:
+                handle.setTransientParent(self.quick)
+        except RuntimeError:
+            pass
+
     def _on_load_finished(self, ok: bool) -> None:
         if self._shutting_down:
             return
         self._loaded = bool(ok)
-        handle = self.view.windowHandle()
-        if handle is not None:
-            handle.setTransientParent(self.quick)
-        if not self._enabled and self._loaded:
-            self.view.page().runJavaScript(
-                "if (window.__sakana) window.__sakana.hide();"
-            )
+        self._ensure_transient_parent()
         self._sync_overlay()
 
     def _sync_overlay(self) -> None:
         if self._shutting_down:
             return
+        self._ensure_transient_parent()
         try:
             origin = self.quick.mapToGlobal(QPoint(0, 0))
             x = origin.x() + _LEFT_MARGIN - _CANVAS_INSET
@@ -201,6 +254,7 @@ class SakanaToyController(QObject):
             QEvent.Type.Show,
             QEvent.Type.Hide,
             QEvent.Type.Expose,
+            QEvent.Type.WindowActivate,
             QEvent.Type.WindowStateChange,
         }:
             self._sync_overlay()
@@ -215,17 +269,14 @@ class SakanaToyController(QObject):
             self.toggle.blockSignals(False)
         self.toggle.setText("玩具 · ON" if enabled else "玩具 · OFF")
 
-        if self._loaded:
-            script = (
-                "if (window.__sakana) window.__sakana.show();"
-                if enabled
-                else "if (window.__sakana) window.__sakana.hide();"
-            )
-            self.view.page().runJavaScript(script)
+        # Sakana Widget 2.7.1 exposes unmount(), not show()/hide(). The app toggle
+        # therefore controls only the native host visibility and never mutates the
+        # upstream animation/runtime state.
         self._sync_overlay()
 
     def raise_overlay(self) -> None:
         if self._enabled and self.view.isVisible():
+            self._ensure_transient_parent()
             self.view.raise_()
 
     def cleanup(self) -> None:
