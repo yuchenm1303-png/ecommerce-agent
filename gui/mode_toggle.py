@@ -31,7 +31,7 @@ _ACTION_SIZE = 16.0
 _ACTION_LEFT_OFF = 1.0
 _ACTION_LEFT_ON = 23.0
 _TRANSITION_MS = 300
-_HEADER_REFLOW_MS = 220
+_HEADER_REFLOW_MS = 260
 _TRACK = QColor(255, 255, 255, 0x30)
 _WHITE = QColor(255, 255, 255, 255)
 
@@ -47,15 +47,9 @@ def _original_switch_easing() -> QEasingCurve:
 
 
 def _header_reflow_easing() -> QEasingCurve:
-    """Short, non-bouncy ease for header controls that move with badge width."""
+    """Smooth deceleration without an overshoot or a hard end-stop."""
 
-    curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
-    curve.addCubicBezierSegment(
-        QPointF(0.22, 1.0),
-        QPointF(0.36, 1.0),
-        QPointF(1.0, 1.0),
-    )
-    return curve
+    return QEasingCurve(QEasingCurve.Type.OutCubic)
 
 
 class WorkspaceModeSwitch(QAbstractButton):
@@ -137,16 +131,17 @@ class WorkspaceModeSwitch(QAbstractButton):
 
 
 class _HeaderModeReflowAnimator(QObject):
-    """Animate only the layout delta caused by the changing phase badge text.
+    """Smooth the header layout delta created by SINGLE/BATCH badge text.
 
-    The header is right-anchored after one stretch. SINGLE/BATCH status strings have
-    different intrinsic widths, so QLabel::setText() used to make the version/update
-    controls jump horizontally in one layout pass. currentChanged is emitted before
-    _set_workspace_mode() updates the badge text; use that ordering to freeze the old
-    badge width first, then release the new width through a short QVariantAnimation.
+    The old implementation changed minimumWidth and maximumWidth separately on every
+    animation tick, then restored both original constraints when the animation ended.
+    That generated two layout invalidations per frame and a final extra reflow, which
+    is exactly the visible stutter/snap at the endpoint.
 
-    No widget position is animated directly, so QHBoxLayout remains the sole geometry
-    owner and all neighbouring controls slide naturally with the changing width.
+    This controller uses one fixed-width commit per animation frame. At the endpoint
+    it keeps the measured target as the badge's minimum width and only releases the
+    upper bound. The live geometry therefore remains identical across the handoff,
+    while later, genuinely longer runtime status text can still expand naturally.
     """
 
     def __init__(self, window: QMainWindow, mode_stack: QWidget, badge: QLabel) -> None:
@@ -158,7 +153,9 @@ class _HeaderModeReflowAnimator(QObject):
         self._base_max_width = int(badge.maximumWidth())
         self._start_width = max(1, int(badge.width()))
         self._target_width = self._start_width
+        self._applied_width = self._start_width
         self._generation = 0
+        self._width_cache: dict[str, int] = {}
 
         self._animation = QVariantAnimation(self)
         self._animation.setDuration(_HEADER_REFLOW_MS)
@@ -172,14 +169,14 @@ class _HeaderModeReflowAnimator(QObject):
         current_changed.connect(self._mode_changed)
 
     def _mode_changed(self, _index: int) -> None:
-        """Run synchronously before phase_badge.setText() can trigger a reflow."""
+        """Freeze the exact current width before phase_badge.setText() runs."""
 
         try:
             self._animation.stop()
             self._start_width = max(1, int(self.badge.width()))
             self._target_width = self._start_width
-            self.badge.setMinimumWidth(self._start_width)
-            self.badge.setMaximumWidth(self._start_width)
+            self._applied_width = self._start_width
+            self.badge.setFixedWidth(self._start_width)
         except RuntimeError:
             return
 
@@ -188,22 +185,30 @@ class _HeaderModeReflowAnimator(QObject):
         QTimer.singleShot(0, lambda: self._start_after_text_update(generation))
 
     def _measure_target_width(self) -> int:
-        """Measure the final styled QLabel width without unlocking the live header."""
+        """Measure the final styled label without unlocking the live header."""
+
+        try:
+            text = str(self.badge.text())
+        except RuntimeError:
+            return self._start_width
+
+        cached = self._width_cache.get(text)
+        if cached is not None:
+            return cached
 
         try:
             parent = self.badge.parentWidget()
-            probe = QLabel(self.badge.text(), parent)
+            probe = QLabel(text, parent)
             probe.setObjectName(self.badge.objectName())
             probe.setFont(self.badge.font())
             probe.ensurePolished()
             target = max(1, int(probe.sizeHint().width()))
             probe.deleteLater()
-            return target
         except RuntimeError:
-            try:
-                return max(1, int(self.badge.sizeHint().width()))
-            except RuntimeError:
-                return self._start_width
+            target = self._start_width
+
+        self._width_cache[text] = target
+        return target
 
     def _start_after_text_update(self, generation: int) -> None:
         if generation != self._generation:
@@ -224,21 +229,30 @@ class _HeaderModeReflowAnimator(QObject):
     def _apply_width(self, value: object) -> None:
         try:
             width = max(1, int(round(float(value))))
-            self.badge.setMinimumWidth(width)
-            self.badge.setMaximumWidth(width)
-        except (RuntimeError, TypeError, ValueError):
+        except (TypeError, ValueError):
+            return
+        if width == self._applied_width:
+            return
+        self._applied_width = width
+        try:
+            # setFixedWidth updates both bounds as one QWidget operation, avoiding
+            # two separate layout invalidations for every animation frame.
+            self.badge.setFixedWidth(width)
+        except RuntimeError:
             pass
 
     def _finish(self) -> None:
         try:
-            # Land on the exact measured width first, then restore the badge's
-            # original policy. Because both widths agree, releasing constraints
-            # cannot create a final one-pixel snap.
-            self.badge.setMinimumWidth(self._target_width)
-            self.badge.setMaximumWidth(self._target_width)
-            self.badge.setMinimumWidth(self._base_min_width)
+            target = max(self._base_min_width, int(self._target_width))
+            if self._applied_width != target:
+                self.badge.setFixedWidth(target)
+                self._applied_width = target
+
+            # Preserve the exact landing width as the floor. Releasing only the
+            # upper bound does not alter the current geometry, so there is no
+            # endpoint snap. Longer runtime text remains free to grow later.
+            self.badge.setMinimumWidth(target)
             self.badge.setMaximumWidth(self._base_max_width)
-            self.badge.updateGeometry()
         except RuntimeError:
             pass
 
@@ -299,9 +313,6 @@ def install_workspace_mode_switch(window: QMainWindow) -> WorkspaceModeSwitch:
     if not isinstance(header, QHBoxLayout):
         raise RuntimeError("workspace mode switch expected the common header row")
 
-    # Freeze the old phase-badge width before _set_workspace_mode changes its text.
-    # The 220 ms width interpolation then lets every left neighbour glide to its new
-    # position instead of jumping in a single QHBoxLayout pass.
     _install_header_mode_reflow(window, mode_stack)
 
     toggle = WorkspaceModeSwitch(root)
