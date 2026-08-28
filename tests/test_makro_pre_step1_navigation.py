@@ -97,6 +97,18 @@ class FakePortalPage:
 
 def _install_stage_fakes(monkeypatch) -> None:
     monkeypatch.setattr(step1_entry, "is_vertical_interaction_ready", lambda page: page.state == "step1")
+    monkeypatch.setattr(
+        step1_entry,
+        "_vertical_search_semantics_visible",
+        lambda page: page.state == "step1",
+    )
+
+    def search_input(page):
+        if page.state != "step1":
+            raise RuntimeError("Vertical Search is not mounted")
+        return object()
+
+    monkeypatch.setattr(step1_entry, "_vertical_search_input", search_input)
     monkeypatch.setattr(step1_entry, "is_brand_step", lambda _page: False)
     monkeypatch.setattr(step1_entry, "is_product_info_step", lambda _page: False)
 
