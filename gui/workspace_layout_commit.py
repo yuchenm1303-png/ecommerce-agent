@@ -37,14 +37,16 @@ def _activate_layout_tree(widget: QWidget) -> bool:
 
 
 class WorkspaceLayoutCommitter(QObject):
-    """Own geometry for both persistent Single/Batch pages outside mode switches.
+    """Own final geometry for both persistent Single/Batch pages.
 
-    QStackedWidget keeps the inactive page hidden. Hidden subtrees can otherwise
-    retain stale child geometry until their next Show/LayoutRequest cycle, exposing
-    a provisional layout for one frame when the mode changes. This controller
-    commits both pages only at legitimate global geometry boundaries: installation,
-    stack Show, and stack Resize. It deliberately has no currentChanged/page-Show
-    hook, so clicking the mode switch performs zero layout activation.
+    QStackedWidget keeps the inactive page hidden. A hidden subtree can only be
+    pre-laid out approximately because its final Show/current-page constraints have
+    not run yet. The Quick presentation reads QWidget geometry as its visual model,
+    so every currentChanged boundary must synchronously commit the page that just
+    became current before queued QML refreshes are allowed to observe it.
+
+    Global Show/Resize still primes both persistent pages so switching starts from a
+    close pre-layout, but the current page is always the authoritative final commit.
     """
 
     def __init__(self, window: QMainWindow) -> None:
@@ -55,8 +57,10 @@ class WorkspaceLayoutCommitter(QObject):
             raise RuntimeError("workspace layout owner requires installed modeStack")
         self._committing = False
         self.stack.installEventFilter(self)
+        self.stack.currentChanged.connect(self.commit_current)
         window.destroyed.connect(self.cleanup)
         self.prime_all()
+        self.commit_current()
 
     def _commit_batch_responsive(self) -> None:
         workspace = getattr(self.window, "batch_workspace", None)
@@ -89,7 +93,7 @@ class WorkspaceLayoutCommitter(QObject):
                 break
 
     def prepare_page(self, index: int) -> None:
-        """Explicit precommit hook for startup/global resize code, never transition code."""
+        """Commit one page immediately from its current visibility/layout state."""
 
         if self._committing:
             return
@@ -120,9 +124,14 @@ class WorkspaceLayoutCommitter(QObject):
             QEvent.Type.Show,
         }:
             self.prime_all()
+            self.commit_current()
         return False
 
     def cleanup(self) -> None:
+        try:
+            self.stack.currentChanged.disconnect(self.commit_current)
+        except (RuntimeError, TypeError):
+            pass
         try:
             self.stack.removeEventFilter(self)
         except RuntimeError:
