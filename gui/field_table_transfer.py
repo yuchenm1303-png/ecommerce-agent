@@ -139,7 +139,13 @@ class FieldTableTransfer(QObject):
             writer.writerows(rows)
 
     def _sync_actions(self, *_args: object) -> None:
-        enabled = self.table.rowCount() > 0
+        table = self.table
+        if table is None:
+            return
+        try:
+            enabled = table.rowCount() > 0
+        except RuntimeError:
+            return
         self.copy_button.setEnabled(enabled)
         self.export_button.setEnabled(enabled)
 
