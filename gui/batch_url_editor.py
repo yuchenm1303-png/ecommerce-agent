@@ -20,12 +20,13 @@ from .batch_model import normalize_batch_urls
 
 _URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 _VISIBLE_ROWS = 4
-_ROW_HEIGHT = 40
+_ROW_HEIGHT = 34
 _CONTROL_HEIGHT = 28
-_ROW_SPACING = 4
-_LIST_HEIGHT = (_VISIBLE_ROWS * _ROW_HEIGHT) + ((_VISIBLE_ROWS - 1) * _ROW_SPACING) + 8
-_TOOLBAR_HEIGHT = 40
-_EDITOR_HEIGHT = _TOOLBAR_HEIGHT + _LIST_HEIGHT + 7
+_ROW_SPACING = 2
+_LIST_HEIGHT = (_VISIBLE_ROWS * _ROW_HEIGHT) + ((_VISIBLE_ROWS - 1) * _ROW_SPACING) + 4
+_TOOLBAR_HEIGHT = 34
+_EDITOR_GAP = 3
+_EDITOR_HEIGHT = _TOOLBAR_HEIGHT + _LIST_HEIGHT + _EDITOR_GAP
 
 
 def _extract_urls(text: str) -> list[str]:
@@ -44,8 +45,8 @@ class BatchUrlRow(QFrame):
         self.setFixedHeight(_ROW_HEIGHT)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(7, 5, 7, 5)
-        layout.setSpacing(7)
+        layout.setContentsMargins(7, 3, 7, 3)
+        layout.setSpacing(6)
         layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self.index_label = QLabel(f"{index:02d}")
@@ -185,7 +186,7 @@ class BatchUrlEditor(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(5)
+        root.setSpacing(_EDITOR_GAP)
 
         toolbar = QFrame(self)
         toolbar.setObjectName("batchUrlToolbar")
@@ -219,8 +220,8 @@ class BatchUrlEditor(QWidget):
             "}"
         )
         toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(8, 5, 8, 5)
-        toolbar_layout.setSpacing(8)
+        toolbar_layout.setContentsMargins(8, 4, 8, 4)
+        toolbar_layout.setSpacing(7)
         toolbar_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self.summary = QLabel("0 LINKS · 0 ON")
@@ -282,7 +283,7 @@ class BatchUrlEditor(QWidget):
         self.content.setAutoFillBackground(False)
         self.content.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.rows_layout = QVBoxLayout(self.content)
-        self.rows_layout.setContentsMargins(3, 3, 4, 3)
+        self.rows_layout.setContentsMargins(3, 2, 4, 2)
         self.rows_layout.setSpacing(_ROW_SPACING)
         self.rows_layout.addStretch(1)
         self.scroll.setWidget(self.content)
