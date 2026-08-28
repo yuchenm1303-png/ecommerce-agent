@@ -277,6 +277,24 @@ class BatchParallelRuntime:
         }
 
     def _assert_prepared_lanes_alive(self) -> None:
+        batch = self.controller.batch
+        if batch is None:
+            return
+        legacy = [
+            str(job.job_id)
+            for job in batch.jobs
+            if str(job.makro_target_id or "")
+            and (
+                int(job.makro_cdp_port or 0) <= 0
+                or not str(job.makro_profile_dir or "").strip()
+            )
+        ]
+        if legacy:
+            raise RuntimeError(
+                "这个 Batch 来自并行 browser-lane 所有权引入之前，旧 targetId 无法安全迁移；"
+                f"请重新批量准备。legacy_jobs={legacy}"
+            )
+
         ports = self._expected_job_ports()
         if not ports:
             return
