@@ -156,9 +156,8 @@ Item {
 
     Connections {
         target: quickModal
-        function onChanged() {
-            if (quickModal.presented)
-                workspaceSnapshot.scheduleUpdate()
+        function onBackdropCaptureRequested() {
+            workspaceSnapshot.scheduleUpdate()
         }
     }
 
@@ -463,6 +462,7 @@ class QuickModalLayerController(QObject):
     """Keep detail-card presentation inside the same QQuickWindow as the main UI."""
 
     changed = Signal()
+    backdropCaptureRequested = Signal()
 
     def __init__(
         self,
@@ -483,6 +483,8 @@ class QuickModalLayerController(QObject):
 
         self._presented = False
         self._visible = False
+        self._transitioning = False
+        self._refresh_pending = False
         self._controls: list[dict[str, Any]] = []
         self._modal_x = 0
         self._modal_y = 0
@@ -499,6 +501,11 @@ class QuickModalLayerController(QObject):
                 for frame in self.details._expandable_cards  # noqa: SLF001
                 if frame not in self._excluded_detail_cards
             )
+
+        self._open_timer = QTimer(self)
+        self._open_timer.setSingleShot(True)
+        self._open_timer.setInterval(_OPEN_MS)
+        self._open_timer.timeout.connect(self._finish_open_transition)
 
         self._close_timer = QTimer(self)
         self._close_timer.setSingleShot(True)
@@ -606,9 +613,15 @@ class QuickModalLayerController(QObject):
         if not self.static_view.static_active:
             self._original_show_prepared_modal(ratio=ratio)
             return
+        if self._presented:
+            return
+        self._open_timer.stop()
         self._close_timer.stop()
+        self._transitioning = True
+        self._refresh_pending = False
         self.details._modal_ratio = ratio  # noqa: SLF001
         self.details.scroll.verticalScrollBar().setValue(0)
+        self.details.drawer.hide()
         self.details.ghost.hide()
         self.details.backdrop.hide()
         self.details.scrim.hide()
@@ -618,7 +631,6 @@ class QuickModalLayerController(QObject):
             drawer_layout.activate()
         rect = self.details._drawer_rect()  # noqa: SLF001
         self.details.drawer.setGeometry(rect)
-        self.details.drawer.show()
         self.details.close_button.setEnabled(True)
 
         self._modal_x = int(rect.x())
@@ -627,7 +639,8 @@ class QuickModalLayerController(QObject):
         self._modal_h = int(rect.height())
         self._presented = True
         self._visible = False
-        self._refresh_controls()
+        self._refresh_controls(force=True)
+        self.backdropCaptureRequested.emit()
         self.changed.emit()
         QTimer.singleShot(0, self._finish_open)
 
@@ -636,26 +649,77 @@ class QuickModalLayerController(QObject):
             return
         self._visible = True
         self.changed.emit()
+        self._open_timer.start()
 
-    def _refresh_controls(self) -> None:
-        if not self._presented or self.details.drawer.isHidden():
+    def _finish_open_transition(self) -> None:
+        if not self._presented or not self._visible:
             return
+        self._transitioning = False
+        if self._refresh_pending:
+            self._refresh_pending = False
+            self._refresh_controls(force=True)
+
+    def _refresh_controls(self, *, force: bool = False) -> None:
+        if not self._presented:
+            return
+        if self._transitioning and not force:
+            self._refresh_pending = True
+            return
+
+        drawer = self.details.drawer
+        bridge_timer = getattr(self.static_bridge, "_refresh_timer", None)
+        was_hidden = drawer.isHidden()
+        dont_show_on_screen = drawer.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
         controls: list[dict[str, Any]] = []
+
+        if isinstance(bridge_timer, QTimer):
+            bridge_timer.stop()
+
         try:
-            descendants = self.details.drawer.findChildren(QWidget)
-        except RuntimeError:
-            descendants = []
-        for widget in descendants:
-            data = self.static_bridge._snapshot_widget(widget, self.details.drawer)  # noqa: SLF001
-            if data is not None:
-                controls.append(data)
+            if not dont_show_on_screen:
+                drawer.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+            if was_hidden:
+                drawer.show()
+
+            self.details.body_layout.activate()
+            drawer_layout = drawer.layout()
+            if drawer_layout is not None:
+                drawer_layout.activate()
+
+            try:
+                descendants = drawer.findChildren(QWidget)
+            except RuntimeError:
+                descendants = []
+            for widget in descendants:
+                data = self.static_bridge._snapshot_widget(widget, drawer)  # noqa: SLF001
+                if data is not None:
+                    controls.append(data)
+        finally:
+            if was_hidden:
+                drawer.hide()
+            if not dont_show_on_screen:
+                drawer.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, False)
+            # show()/hide() can schedule a main-scene refresh. It must never run
+            # after the offscreen layout source has been materialized.
+            if isinstance(bridge_timer, QTimer):
+                bridge_timer.stop()
+
         controls.sort(key=lambda item: (int(item["y"]), int(item["x"])))
         self._controls = controls
         self.changed.emit()
 
+    def _queue_controls_refresh(self) -> None:
+        if not self._presented:
+            return
+        if self._transitioning:
+            self._refresh_pending = True
+            return
+        QTimer.singleShot(0, self._refresh_controls)
+
     def _on_main_scene_changed(self) -> None:
-        if self._presented:
-            self._refresh_controls()
+        if not self._presented:
+            return
+        self._queue_controls_refresh()
 
     @Slot(int)
     def _open_card_row(self, row: int) -> None:
@@ -694,6 +758,9 @@ class QuickModalLayerController(QObject):
     def closeModal(self) -> None:  # noqa: N802
         if not self._presented or not self._visible:
             return
+        self._open_timer.stop()
+        self._transitioning = True
+        self._refresh_pending = False
         self._visible = False
         self.changed.emit()
         self._close_timer.start()
@@ -701,6 +768,7 @@ class QuickModalLayerController(QObject):
     def _finish_close(self) -> None:
         if not self._presented:
             return
+        self._open_timer.stop()
         try:
             self.details.close_button.setEnabled(True)
             self.details.drawer.hide()
@@ -715,6 +783,8 @@ class QuickModalLayerController(QObject):
         self._controls = []
         self._presented = False
         self._visible = False
+        self._transitioning = False
+        self._refresh_pending = False
         self.changed.emit()
         self.static_bridge.schedule_refresh()
 
@@ -725,37 +795,42 @@ class QuickModalLayerController(QObject):
             self.closeModal()
             return
         self.static_bridge.click(str(key))
-        QTimer.singleShot(0, self._refresh_controls)
+        self._queue_controls_refresh()
 
     @Slot(str, str)
     def setText(self, key: str, text: str) -> None:  # noqa: N802
         self.static_bridge.setText(str(key), str(text))
-        QTimer.singleShot(0, self._refresh_controls)
+        self._queue_controls_refresh()
 
     @Slot(str, bool)
     def setChecked(self, key: str, checked: bool) -> None:  # noqa: N802
         self.static_bridge.setChecked(str(key), bool(checked))
-        QTimer.singleShot(0, self._refresh_controls)
+        self._queue_controls_refresh()
 
     @Slot(str, float)
     def setValue(self, key: str, value: float) -> None:  # noqa: N802
         self.static_bridge.setValue(str(key), float(value))
-        QTimer.singleShot(0, self._refresh_controls)
+        self._queue_controls_refresh()
 
     @Slot(str, int)
     def setComboIndex(self, key: str, index: int) -> None:  # noqa: N802
         self.static_bridge.setComboIndex(str(key), int(index))
-        QTimer.singleShot(0, self._refresh_controls)
+        self._queue_controls_refresh()
 
     @Slot(str, int)
     def setTabIndex(self, key: str, index: int) -> None:  # noqa: N802
         self.static_bridge.setTabIndex(str(key), int(index))
-        QTimer.singleShot(0, self._refresh_controls)
+        self._queue_controls_refresh()
 
     def cleanup(self) -> None:
+        self._open_timer.stop()
         self._close_timer.stop()
         self._owner_timer.stop()
         self._restore_detail_owner()
+        try:
+            self.details.drawer.hide()
+        except RuntimeError:
+            pass
         try:
             self.quick.removeEventFilter(self)
         except RuntimeError:
