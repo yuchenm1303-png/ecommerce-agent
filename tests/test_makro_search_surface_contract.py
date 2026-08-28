@@ -34,7 +34,7 @@ def test_stable_exact_replay_is_explicit_opt_in_only() -> None:
 
 def test_search_surface_never_accepts_underlay_as_topmost() -> None:
     source = inspect.getsource(search_surface)
-    assert "el === hit || el.contains(hit)" in source
+    assert "hit === el || el.contains(hit)" in source
     assert "hit.contains(el)" not in source
 
 
