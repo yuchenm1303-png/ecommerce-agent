@@ -26,10 +26,13 @@ class StartupEntranceStabilityGate(QObject):
 
     The gate observes the actual widget tree; it never calls QLayout.activate().
     Startup layout ownership therefore stays with Qt and the normal responsive
-    controllers. Once geometry has remained unchanged for several frames, two
-    rendered Quick frames are required before the entrance may reveal the live UI.
+    controllers. Once geometry has remained unchanged for several frames, the
+    unified Quick scene gets a preparation boundary while both curtains are still
+    closed, then two rendered Quick frames are required before the entrance starts.
     """
 
+    revealPreparing = Signal()
+    layoutInvalidated = Signal()
     handoffReady = Signal()
 
     def __init__(self, window: QMainWindow, entrance: Any) -> None:
@@ -114,6 +117,7 @@ class StartupEntranceStabilityGate(QObject):
             self._layout_epoch += 1
             self._stable_samples = 0
             self._live_paint_seen = False
+            self.layoutInvalidated.emit()
 
         return False
 
@@ -225,6 +229,11 @@ class StartupEntranceStabilityGate(QObject):
         if self._reveal_barrier_started:
             return
         self._reveal_barrier_started = True
+
+        # Compile/create/snapshot the unified Quick scene while the curtains are
+        # still fully closed. Heavy scene work therefore cannot steal frames from
+        # the visible opening animation.
+        self.revealPreparing.emit()
         self._prime_live_runtime()
 
         quick = getattr(self.background, "quick_window", None)
@@ -317,8 +326,9 @@ class StartupEntranceStabilityGate(QObject):
     def _commit_overlay_handoff(self) -> None:
         self._disconnect_native_frame_barrier()
         self._native_frames_remaining = 0
-        self.handoffReady.emit()
 
+        # The fully-open curtain has no reason to stay in the widget stack while
+        # the Quick scene commits its already-prepared first frame.
         overlay = self.overlay
         if isinstance(overlay, QWidget):
             try:
@@ -326,6 +336,8 @@ class StartupEntranceStabilityGate(QObject):
                 overlay.deleteLater()
             except RuntimeError:
                 pass
+
+        self.handoffReady.emit()
 
         assistant = getattr(self.window, "_runtime_assistant", None)
         if isinstance(assistant, QWidget):

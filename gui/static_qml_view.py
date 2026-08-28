@@ -44,6 +44,8 @@ class StaticQmlViewController(QObject):
         self._load_failed = False
         self._handoff_armed = False
         self._card_fx_suspended_here = False
+        self._startup_prepare_requested = False
+        self._startup_snapshot_prepared = False
         self.item: QQuickItem | None = None
         self.component: QQmlComponent | None = None
 
@@ -69,11 +71,27 @@ class StaticQmlViewController(QObject):
         self.quick.widthChanged.connect(self._fit_and_refresh)
         self.quick.heightChanged.connect(self._fit_and_refresh)
 
+        reveal_preparing = getattr(startup_gate, "revealPreparing", None)
+        layout_invalidated = getattr(startup_gate, "layoutInvalidated", None)
         handoff_ready = getattr(startup_gate, "handoffReady", None)
-        if handoff_ready is None or not hasattr(handoff_ready, "connect"):
-            raise RuntimeError("unified Quick view requires explicit startup handoff signal")
+        if (
+            reveal_preparing is None
+            or not hasattr(reveal_preparing, "connect")
+            or layout_invalidated is None
+            or not hasattr(layout_invalidated, "connect")
+            or handoff_ready is None
+            or not hasattr(handoff_ready, "connect")
+        ):
+            raise RuntimeError("unified Quick view requires explicit startup lifecycle signals")
+        reveal_preparing.connect(self._prepare_startup_scene)
+        layout_invalidated.connect(self._invalidate_startup_snapshot)
         handoff_ready.connect(self._activate_after_startup)
         window.destroyed.connect(self._cleanup)
+
+        # Compile and create the hidden scene before the visible curtain movement.
+        # The lightweight launch surface is still present at this point, so any
+        # one-time QML import/component cost cannot steal animation frames later.
+        self._ensure_scene_loaded()
 
     @property
     def static_active(self) -> bool:
@@ -153,8 +171,29 @@ class StaticQmlViewController(QObject):
 
         self.item = created
         self._fit()
+        if self._startup_prepare_requested:
+            self._prepare_startup_snapshot()
         if self._quick_requested:
             self._activate_quick()
+
+    def _prepare_startup_scene(self) -> None:
+        if self._load_failed or self._quick_active:
+            return
+        self._startup_prepare_requested = True
+        self._ensure_scene_loaded()
+        if self.item is not None:
+            self._prepare_startup_snapshot()
+
+    def _prepare_startup_snapshot(self) -> None:
+        if self._load_failed or self.item is None or self._quick_active:
+            return
+        self._fit()
+        self.bridge.refresh()
+        self._startup_snapshot_prepared = True
+
+    def _invalidate_startup_snapshot(self) -> None:
+        if not self._quick_active:
+            self._startup_snapshot_prepared = False
 
     def _all_glass_frames(self) -> tuple[QFrame, ...]:
         glass = getattr(self.visual, "_glass", None)
@@ -218,6 +257,7 @@ class StaticQmlViewController(QObject):
             return
         self._load_failed = True
         self._quick_requested = False
+        self._startup_snapshot_prepared = False
         self._disconnect_handoff()
         self.bridge.set_active(False)
         self.fireworks.clear()
@@ -257,6 +297,8 @@ class StaticQmlViewController(QObject):
 
     def _fit_and_refresh(self, *_args: object) -> None:
         self._fit()
+        if not self._quick_active:
+            self._invalidate_startup_snapshot()
         self.bridge.schedule_refresh()
 
     def _activate_quick(self) -> None:
@@ -269,10 +311,13 @@ class StaticQmlViewController(QObject):
             self._ensure_scene_loaded()
             return
 
-        # Snapshot the still-live QWidget business host before hiding its native
-        # child. From this point onward only the Quick scene is visible, regardless
-        # of whether wallpaper drift is enabled or disabled.
-        self.bridge.refresh()
+        # The normal path snapshots the live QWidget host while both curtains are
+        # still closed. If geometry changed after that preparation boundary, the
+        # invalidation signal makes this one correctness-preserving refresh run.
+        if not self._startup_snapshot_prepared:
+            self.bridge.refresh()
+        self._startup_snapshot_prepared = False
+
         self._suspend_legacy_visuals()
         self._fit()
         self._set_native_glass_overlay_alpha(0.0)
