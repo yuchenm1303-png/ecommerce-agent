@@ -8,6 +8,7 @@ import os
 import platform
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -211,7 +212,7 @@ def device_identity() -> tuple[str, str]:
 
 def _installed_version() -> str:
     try:
-        from gui.app_updater import installed_application_version
+        from app.velopack_runtime import installed_application_version
 
         return installed_application_version()
     except Exception:
@@ -407,6 +408,43 @@ def _restore_session() -> ApplicationAccessSession | None:
         return None
 
 
+def _restore_session_responsive(app: QApplication) -> ApplicationAccessSession | None:
+    """Run stored-session I/O off the GUI thread while keeping startup paintable.
+
+    The authorization decision itself is still made by ``_restore_session`` with
+    the exact same refresh, license, offline-grace and timeout rules. Only the
+    execution lane changes: network/DPAPI/filesystem work runs on a worker thread
+    while the main thread services Qt events for the lightweight startup surface.
+    """
+
+    finished = threading.Event()
+    outcome: dict[str, Any] = {"session": None, "error": None}
+
+    def _worker() -> None:
+        try:
+            outcome["session"] = _restore_session()
+        except BaseException as exc:  # preserve the synchronous exception contract
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    worker = threading.Thread(
+        target=_worker,
+        name="listing-studio-access-restore",
+        daemon=True,
+    )
+    worker.start()
+    while not finished.wait(0.016):
+        app.processEvents()
+    worker.join()
+
+    error = outcome["error"]
+    if error is not None:
+        raise error
+    session = outcome["session"]
+    return session if isinstance(session, ApplicationAccessSession) else None
+
+
 def _friendly_error(error: AccessError) -> str:
     return {
         "invalid_credentials": "邮箱或密码错误。",
@@ -542,11 +580,10 @@ class _LoginDialog(QDialog):
 
 
 def ensure_application_access(app: QApplication) -> ApplicationAccessSession | None:
-    del app
     if not bool(getattr(sys, "frozen", False)):
         return ApplicationAccessSession.development()
 
-    restored = _restore_session()
+    restored = _restore_session_responsive(app)
     if restored is not None:
         return restored
 
