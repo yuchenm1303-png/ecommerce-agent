@@ -454,6 +454,7 @@ Item {
                             delegate: Rectangle {
                                 required property var modelData
                                 required property int index
+                                property var rowData: modelData
                                 width: rowsColumn.width
                                 height: 28
                                 color: index % 2 ? Qt.rgba(1,1,1,.035) : "transparent"
@@ -467,7 +468,7 @@ Item {
                                             height: parent.height
                                             leftPadding: 8
                                             rightPadding: 8
-                                            text: modelData && modelData.length > index ? String(modelData[index]) : ""
+                                            text: rowData && rowData.length > index ? String(rowData[index]) : ""
                                             color: "#fff8fc"
                                             verticalAlignment: Text.AlignVCenter
                                             elide: Text.ElideRight
@@ -499,7 +500,7 @@ Item {
             width: cardW
             height: cardH
             transformOrigin: Item.Center
-            scale: ((cardHover.point.pressedButtons & Qt.LeftButton) !== 0) ? 1.0 : cardHover.hovered ? 1.02 : 1.0
+            scale: cardPress.pressed ? 1.0 : cardHover.hovered ? 1.02 : 1.0
 
             Behavior on scale {
                 NumberAnimation {
@@ -554,7 +555,7 @@ Item {
                 anchors.fill: parent
                 radius: staticRoot.cardRadius(card.cardName)
                 color: "black"
-                opacity: (cardHover.hovered || ((cardHover.point.pressedButtons & Qt.LeftButton) !== 0)) ? 102/255 : 64/255
+                opacity: (cardHover.hovered || cardPress.pressed) ? 102/255 : 64/255
                 Behavior on opacity {
                     NumberAnimation {
                         duration: 300
@@ -589,6 +590,10 @@ Item {
             HoverHandler {
                 id: cardHover
                 acceptedDevices: PointerDevice.Mouse
+            }
+            TapHandler {
+                id: cardPress
+                acceptedButtons: Qt.LeftButton
             }
         }
     }
@@ -646,15 +651,19 @@ Item {
         id: pointerHover
         acceptedDevices: PointerDevice.Mouse
     }
+    TapHandler {
+        id: pointerPress
+        acceptedButtons: Qt.LeftButton
+    }
 
     Rectangle {
         id: cursorFollow
-        width: ((pointerHover.point.pressedButtons & Qt.LeftButton) !== 0) ? 9 : 18
+        width: pointerPress.pressed ? 9 : 18
         height: width
         radius: width / 2
         x: pointerHover.point.position.x - width / 2
         y: pointerHover.point.position.y - height / 2
-        color: Qt.rgba(1, 1, 1, ((pointerHover.point.pressedButtons & Qt.LeftButton) !== 0) ? .50 : .25)
+        color: Qt.rgba(1, 1, 1, pointerPress.pressed ? .50 : .25)
         visible: staticRoot.visible && pointerHover.hovered
         z: 20000
         Behavior on x { NumberAnimation { duration: 70; easing.type: Easing.OutQuad } }
