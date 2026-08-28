@@ -18,29 +18,27 @@ def test_overall_timeline_keeps_preparation_at_45_percent() -> None:
     assert "_REAL_OVERALL_SPAN = 55" in ACTIVITY
 
 
-def test_console_bar_uses_live_and_confirmed_progress() -> None:
+def test_console_bar_keeps_fractional_checkpoint_resolution() -> None:
     assert "progress_changed.disconnect(self.console._on_progress)" in PROGRESS
     assert "self.console.progress.setRange(0, 1000)" in PROGRESS
     assert "_confirmed" in PROGRESS
-    assert "_live" in PROGRESS
 
 
-def test_visual_pacing_stays_below_real_checkpoint_ceiling() -> None:
-    assert "cap - self._SOFT_RESERVE" in PROGRESS
-    assert "math.exp" in PROGRESS
-    tick = PROGRESS.split("    def _tick(self) -> None:", 1)[1].split("    def _render", 1)[0]
-    assert "_sync_overall" not in tick
-    sync = PROGRESS.split("    def _sync_overall(self) -> None:", 1)[1].split("    def _confirm", 1)[0]
-    assert "self._confirmed" in sync
-    assert "self._live" not in sync
+def test_progress_bar_mutates_only_from_real_checkpoint_confirmation() -> None:
+    confirm = PROGRESS.split("    def _confirm(self, value: float, detail: str, *, force: bool = False) -> None:", 1)[1].split("    def _render", 1)[0]
+    assert "self.console.progress.setValue(target)" in confirm
+    assert "self._sync_overall()" in confirm
+    assert "def _tick(" not in PROGRESS
+    assert "_soft_target" not in PROGRESS
+    assert "Qt.TimerType.PreciseTimer" not in PROGRESS
+    assert "QTimer" not in PROGRESS
 
 
-def test_detail_shows_confirmed_elapsed_and_heartbeat() -> None:
+def test_detail_stays_checkpoint_driven_and_truthful() -> None:
     assert "已确认" in PROGRESS
     assert "elapsed" in PROGRESS
-    assert '("●··", "·●·", "··●")' in PROGRESS
-    assert "QTimer" in PROGRESS
-    assert "Qt.TimerType.PreciseTimer" in PROGRESS
+    assert "Quick-owned visual motion" in PROGRESS
+    assert "checkpoint-driven only" in PROGRESS
 
 
 def test_resolver_and_fill_plan_have_internal_checkpoints() -> None:
