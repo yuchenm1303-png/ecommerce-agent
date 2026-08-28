@@ -119,7 +119,7 @@ def test_search_plan_contract_has_specific_alternate_broader_and_discriminative_
     assert "initial_product_identity as a hypothesis" in rules
 
 
-def test_search_planner_preserves_specific_alternate_and_broader_then_appends_canonical() -> None:
+def test_search_planner_preserves_role_order_then_appends_canonical() -> None:
     provider = FakeProvider(
         {
             "plan_makro_vertical_search_intents": {
@@ -134,10 +134,10 @@ def test_search_planner_preserves_specific_alternate_and_broader_then_appends_ca
     terms = plan_vertical_search_terms(provider, _bag_sealer_hints())
 
     assert terms == (
-        "bag sealer",
         "heat sealer",
         "bag sealing machine",
         "sealing equipment",
+        "bag sealer",
         "rechargeable bag sealer",
     )
     request = provider.requests[0]
@@ -160,10 +160,10 @@ def test_search_planner_deduplicates_head_and_keeps_canonical_fallback_last() ->
     )
 
     assert plan_vertical_search_terms(provider, _bag_sealer_hints()) == (
-        "bag sealer",
         "heat sealer",
         "bag sealing machine",
         "sealing equipment",
+        "bag sealer",
         "rechargeable bag sealer",
     )
 
@@ -414,15 +414,17 @@ def test_pool_prompt_rejects_generic_word_overlap_as_category_evidence() -> None
     assert "initial ai identity" in request["system_instruction"].casefold()
 
 
-def test_production_search_collects_global_pool_then_rebinds_to_owner_query_before_click() -> None:
+def test_production_search_collects_global_pool_then_reuses_or_rebinds_owned_generation() -> None:
     source = inspect.getsource(vertical_selection._try_select_via_search)
 
     collect_pos = source.index("merge_vertical_search_observations(observations)")
     choose_pos = source.index("choose_vertical_candidate_pool")
-    rebind_pos = source.index("for rebind_index, owner_query in enumerate(owner_queries")
-    click_pos = source.index("click_search_row(search, rebound, allow_stable_exact=False)")
+    current_click_pos = source.index("click_search_row(search, current_row, allow_stable_exact=False)")
+    prior_owner_pos = source.index("prior_owner_queries = tuple(")
+    rebind_pos = source.index("for rebind_index, owner_query in enumerate(prior_owner_queries")
+    rebind_click_pos = source.index("click_search_row(search, rebound, allow_stable_exact=False)")
 
-    assert collect_pos < choose_pos < rebind_pos < click_pos
+    assert collect_pos < choose_pos < current_click_pos < prior_owner_pos < rebind_pos < rebind_click_pos
     assert "matched_queries_for_candidate" in source
     assert "len(exact) != 1" in source
-    assert "could not be re-observed uniquely" in source
+    assert "could not be bound from the current live generation or re-observed uniquely" in source
