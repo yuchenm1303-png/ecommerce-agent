@@ -67,7 +67,14 @@ def main() -> int:
     try:
         from PySide6.QtCore import QTimer, Qt
         from PySide6.QtQuick import QQuickWindow
-        from PySide6.QtWidgets import QApplication, QAbstractScrollArea, QLabel, QSizePolicy
+        from PySide6.QtWidgets import (
+            QApplication,
+            QAbstractScrollArea,
+            QLabel,
+            QSizePolicy,
+            QVBoxLayout,
+            QWidget,
+        )
     except ImportError:
         mark_clean_exit("missing_qt_dependency")
         print(
@@ -78,9 +85,98 @@ def main() -> int:
         )
         return 2
 
+    # Qt must exist before any product-facing GUI module graph is imported. This
+    # gives Windows a real, paintable process surface immediately after launch
+    # instead of making the user wait behind Python imports and network access.
+    mark_startup_stage("qt_application")
+    app = QApplication(sys.argv)
+    app.setApplicationName("ecommerce-agent Listing Studio")
+    app.setOrganizationName("ecommerce-agent")
+    apply_qt_application_icon(app)
+    app.aboutToQuit.connect(lambda: mark_clean_exit("qt_about_to_quit"))
+
+    if _complete_update_e2e_probe():
+        mark_clean_exit("update_e2e_probe")
+        return 0
+
+    mark_startup_stage("startup_surface")
+    startup = QWidget()
+    startup.setObjectName("startupSurface")
+    startup.setWindowTitle("Listing Studio")
+    startup.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+    startup.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+    startup.setFixedSize(430, 172)
+
+    startup_layout = QVBoxLayout(startup)
+    startup_layout.setContentsMargins(30, 26, 30, 26)
+    startup_layout.setSpacing(7)
+    startup_layout.addStretch(1)
+
+    startup_title = QLabel("Listing Studio")
+    startup_title.setObjectName("startupTitle")
+    startup_subtitle = QLabel("ECOMMERCE LISTING AUTOMATION")
+    startup_subtitle.setObjectName("startupSubtitle")
+    startup_status = QLabel("正在初始化应用…")
+    startup_status.setObjectName("startupStatus")
+    startup_status.setWordWrap(True)
+    startup_layout.addWidget(startup_title)
+    startup_layout.addWidget(startup_subtitle)
+    startup_layout.addSpacing(10)
+    startup_layout.addWidget(startup_status)
+    startup_layout.addStretch(1)
+
+    startup.setStyleSheet(
+        """
+        QWidget#startupSurface {
+            background: #202936;
+            border: 1px solid rgba(255, 255, 255, 28);
+            border-radius: 18px;
+            color: #f5f8fb;
+        }
+        QLabel#startupTitle {
+            color: #ffffff;
+            font-size: 25px;
+            font-weight: 760;
+        }
+        QLabel#startupSubtitle {
+            color: rgba(219, 231, 241, 145);
+            font-size: 9px;
+            font-weight: 700;
+            letter-spacing: 1px;
+        }
+        QLabel#startupStatus {
+            color: rgba(227, 238, 246, 190);
+            font-size: 11px;
+        }
+        """
+    )
+    screen = app.primaryScreen()
+    if screen is not None:
+        available = screen.availableGeometry()
+        startup.move(available.center() - startup.rect().center())
+    startup.show()
+    startup.raise_()
+    app.processEvents()
+
+    # Account access is the only product gate that must complete before the real
+    # workspace exists. Import it separately so a stale session/network wait does
+    # not sit behind the rest of the GUI module graph.
+    mark_startup_stage("access_import")
+    from gui.app_access import ensure_application_access, install_application_access
+
+    startup_status.setText("正在验证账号与设备授权…")
+    app.processEvents()
+    mark_startup_stage("access_check")
+    access_session = ensure_application_access(app)
+    if access_session is None:
+        startup.close()
+        mark_clean_exit("access_cancelled")
+        return 0
+
+    startup_status.setText("正在加载工作区组件…")
+    app.processEvents()
     mark_startup_stage("gui_module_imports")
     from gui.activity_presence import install_activity_presence
-    from gui.app_access import ensure_application_access, install_application_access
     from gui.resilient_app_updater import install_application_updater
     from gui.batch_card_responsive import install_batch_card_responsive
     from gui.batch_individual_controls import install_batch_individual_controls
@@ -134,27 +230,14 @@ def main() -> int:
 
     MainWindow = ProductInputWorkflowMainWindow
 
-    mark_startup_stage("qt_application")
-    app = QApplication(sys.argv)
-    app.setApplicationName("ecommerce-agent Listing Studio")
-    app.setOrganizationName("ecommerce-agent")
-    apply_qt_application_icon(app)
-    app.aboutToQuit.connect(lambda: mark_clean_exit("qt_about_to_quit"))
-
-    if _complete_update_e2e_probe():
-        mark_clean_exit("update_e2e_probe")
-        return 0
-
-    mark_startup_stage("access_check")
-    access_session = ensure_application_access(app)
-    if access_session is None:
-        mark_clean_exit("access_cancelled")
-        return 0
-
+    startup_status.setText("正在准备图形界面…")
+    app.processEvents()
     mark_startup_stage("renderer_setup")
     QQuickWindow.setDefaultAlphaBuffer(True)
     install_preblur_cache()
 
+    startup_status.setText("正在构建工作区…")
+    app.processEvents()
     mark_startup_stage("main_window_create")
     window = MainWindow(runtime_root())
     access_controller = install_application_access(window, access_session)
@@ -225,6 +308,8 @@ def main() -> int:
     window._smooth_wheel_filter = smooth_wheel  # type: ignore[attr-defined]
     window.destroyed.connect(smooth_wheel.cleanup)
 
+    startup_status.setText("正在完成启动…")
+    app.processEvents()
     mark_startup_stage("native_shell_create")
     quick_window = visual.background.quick_window
     if quick_window is None:
@@ -273,6 +358,11 @@ def main() -> int:
     assistant.raise_()
     entrance.raise_overlay()
     entrance_stability.start()
+    # Let the native maximized window get its first event-loop turn before the
+    # lightweight launch surface is removed. This prevents a blank desktop gap
+    # without altering the existing entrance animation or its stability gate.
+    QTimer.singleShot(80, startup.close)
+    QTimer.singleShot(160, startup.deleteLater)
     mark_startup_stage("running")
 
     if pending_crash is not None and access_session.enforced:
