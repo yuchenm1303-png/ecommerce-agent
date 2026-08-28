@@ -22,6 +22,7 @@ from .batch_model import BatchJob, BatchRun
 
 _MAKRO_HOST = "seller.makro.co.za"
 _MAKRO_ORIGIN = f"https://{_MAKRO_HOST}"
+_BROWSER_LANE_STAGES = frozenset({"prepare", "execute"})
 
 
 @dataclass(slots=True, frozen=True)
@@ -127,21 +128,29 @@ def pop_next_lane_ready_job(
 ) -> str | None:
     """Pop the first queued job whose browser lane is not already active.
 
-    A lane is an exclusive browser process, so two jobs assigned to the same lane
-    must never be started simultaneously. Different lanes remain fully parallel.
+    Concurrency remains bounded per requested stage, while lane ownership is
+    exclusive across every Makro browser stage. A prepare process and an execute
+    process therefore can never overlap on one Edge lane; different lanes remain
+    fully parallel.
     """
 
     owned = {str(job.job_id): job for job in jobs}
-    active = [
+    same_stage_active = [
         str(job_id)
         for job_id, active_stage in processes.values()
         if active_stage == stage
     ]
-    if len(active) >= max(1, int(concurrency)):
+    if len(same_stage_active) >= max(1, int(concurrency)):
         return None
+
+    browser_active = [
+        str(job_id)
+        for job_id, active_stage in processes.values()
+        if active_stage in _BROWSER_LANE_STAGES
+    ]
     active_lanes = {
         int(owned[job_id].browser_lane)
-        for job_id in active
+        for job_id in browser_active
         if job_id in owned
     }
     for index, job_id in enumerate(queue):
@@ -269,11 +278,12 @@ def ensure_batch_browser_lanes(
     base_port: int,
     count: int,
 ) -> tuple[BatchBrowserLane, ...]:
-    """Start isolated Edge lanes and seed them from the primary Makro login.
+    """Start isolated Edge lanes and seed only newly launched workers.
 
     The primary lane must already be running. Additional Edge processes are
-    launched concurrently. Their Makro cookies/localStorage are then synchronized
-    from the primary browser through CDP; profile files are never copied.
+    launched concurrently. Login state is imported only into workers created by
+    this call; already-running lanes may own live product pages and must never be
+    navigated merely because the pool expands.
     """
 
     lanes = build_batch_browser_lanes(
@@ -289,25 +299,30 @@ def ensure_batch_browser_lanes(
 
     workers = lanes[1:]
 
-    def ensure_lane(lane: BatchBrowserLane) -> None:
+    def ensure_lane(lane: BatchBrowserLane) -> BatchBrowserLane | None:
         if is_cdp_ready(lane.cdp_port, timeout_s=0.5):
-            return
+            return None
         lane.profile_dir.mkdir(parents=True, exist_ok=True)
         launch_detached_edge(
             profile_dir=lane.profile_dir,
             port=lane.cdp_port,
             start_url=DEFAULT_START_URL,
         )
+        return lane
 
     if workers:
         with ThreadPoolExecutor(max_workers=len(workers)) as executor:
-            list(executor.map(ensure_lane, workers))
+            launched = [lane for lane in executor.map(ensure_lane, workers) if lane is not None]
 
-        state = _export_primary_login_state(primary.cdp_port)
-        with ThreadPoolExecutor(max_workers=len(workers)) as executor:
-            futures = [executor.submit(_import_primary_login_state, lane, state) for lane in workers]
-            for future in futures:
-                future.result()
+        if launched:
+            state = _export_primary_login_state(primary.cdp_port)
+            with ThreadPoolExecutor(max_workers=len(launched)) as executor:
+                futures = [
+                    executor.submit(_import_primary_login_state, lane, state)
+                    for lane in launched
+                ]
+                for future in futures:
+                    future.result()
 
     missing = [lane.cdp_port for lane in lanes if not browser_lane_token(lane.cdp_port)]
     if missing:
