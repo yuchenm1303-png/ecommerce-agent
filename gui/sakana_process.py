@@ -33,7 +33,7 @@ _SAKANA_JS_SOURCES = (
 )
 
 # Exact compiled form of Sakana Widget 2.7.1 src/index.scss. Keeping structural
-# CSS local avoids making widget geometry depend on a second network request.
+# CSS local avoids making widget geometry depend on a second remote stylesheet.
 _SAKANA_271_CSS = """
 .sakana-widget *,.sakana-widget *::before,.sakana-widget *::after{box-sizing:border-box}
 .sakana-widget-wrapper{pointer-events:none;position:relative;width:100%;height:100%}
@@ -64,7 +64,11 @@ class _RECT(ctypes.Structure):
 
 
 class _WindowsOwner:
-    GWLP_HWNDPARENT = -8
+    _HWND_TOP = wintypes.HWND(0)
+    _SW_HIDE = 0
+    _SWP_NOSIZE = 0x0001
+    _SWP_NOACTIVATE = 0x0010
+    _SWP_SHOWWINDOW = 0x0040
 
     def __init__(self, hwnd: int) -> None:
         if sys.platform != "win32":
@@ -77,25 +81,35 @@ class _WindowsOwner:
         self.user32.IsWindowVisible.restype = wintypes.BOOL
         self.user32.IsIconic.argtypes = [wintypes.HWND]
         self.user32.IsIconic.restype = wintypes.BOOL
+        self.user32.GetForegroundWindow.argtypes = []
+        self.user32.GetForegroundWindow.restype = wintypes.HWND
         self.user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
         self.user32.GetClientRect.restype = wintypes.BOOL
         self.user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(_POINT)]
         self.user32.ClientToScreen.restype = wintypes.BOOL
-
-        set_owner = getattr(self.user32, "SetWindowLongPtrW", None)
-        if set_owner is None:
-            set_owner = self.user32.SetWindowLongW
-        set_owner.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
-        set_owner.restype = ctypes.c_void_p
-        self._set_owner = set_owner
+        self.user32.SetWindowPos.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        self.user32.SetWindowPos.restype = wintypes.BOOL
+        self.user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        self.user32.ShowWindow.restype = wintypes.BOOL
 
     def exists(self) -> bool:
         return bool(self.user32.IsWindow(self.hwnd))
 
-    def visible(self) -> bool:
-        return bool(self.user32.IsWindowVisible(self.hwnd)) and not bool(
-            self.user32.IsIconic(self.hwnd)
-        )
+    def should_present(self, child_hwnd: int) -> bool:
+        if not bool(self.user32.IsWindowVisible(self.hwnd)):
+            return False
+        if bool(self.user32.IsIconic(self.hwnd)):
+            return False
+        foreground = int(self.user32.GetForegroundWindow() or 0)
+        return foreground in {self.hwnd, int(child_hwnd)}
 
     def client_geometry(self) -> tuple[int, int, int, int] | None:
         rect = _RECT()
@@ -111,16 +125,20 @@ class _WindowsOwner:
             int(rect.bottom - rect.top),
         )
 
-    def own(self, child_hwnd: int) -> None:
-        ctypes.set_last_error(0)
-        self._set_owner(
+    def present(self, child_hwnd: int, x: int, y: int) -> None:
+        if not self.user32.SetWindowPos(
             wintypes.HWND(int(child_hwnd)),
-            self.GWLP_HWNDPARENT,
-            ctypes.c_void_p(self.hwnd),
-        )
-        error = ctypes.get_last_error()
-        if error:
-            raise OSError(error, "Unable to assign Sakana native window owner")
+            self._HWND_TOP,
+            int(x),
+            int(y),
+            0,
+            0,
+            self._SWP_NOSIZE | self._SWP_NOACTIVATE | self._SWP_SHOWWINDOW,
+        ):
+            raise OSError(ctypes.get_last_error(), "Unable to present Sakana overlay")
+
+    def hide(self, child_hwnd: int) -> None:
+        self.user32.ShowWindow(wintypes.HWND(int(child_hwnd)), self._SW_HIDE)
 
 
 def _character_data_url() -> str:
@@ -237,23 +255,21 @@ class SakanaProcessHost:
         self.view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.view.resize(_CANVAS_SIZE, _CANVAS_SIZE)
 
-        # An off-the-record profile belongs only to this process and never shares
-        # browser cache/session state with the listing application.
+        # This browser profile exists only in this helper process; no WebEngine
+        # object or Chromium callback is present in the listing application's loop.
         self.profile = QWebEngineProfile(self.view)
         self.page = QWebEnginePage(self.profile, self.view)
         self.page.setBackgroundColor(QColor(0, 0, 0, 0))
         self.view.setPage(self.page)
-
-        child_hwnd = int(self.view.winId())
-        self.owner.own(child_hwnd)
+        self.child_hwnd = int(self.view.winId())
 
         self._last_position: tuple[int, int] | None = None
-        self._last_visible: bool | None = None
-        self._sync_owner()
+        self._presented = False
         self.view.setHtml(_html_source())
+        self._sync_owner()
 
-        # This timer only follows native owner geometry/lifetime. It never drives
-        # Sakana animation or spring state; Chromium requestAnimationFrame does.
+        # Only native geometry/lifetime is sampled here. Sakana motion is still
+        # Chromium requestAnimationFrame and never uses this timer.
         self.owner_timer = QTimer(self.view)
         self.owner_timer.setTimerType(Qt.TimerType.CoarseTimer)
         self.owner_timer.setInterval(_OWNER_POLL_MS)
@@ -266,24 +282,25 @@ class SakanaProcessHost:
             return
 
         geometry = self.owner.client_geometry()
-        should_show = self.owner.visible() and geometry is not None
-        if geometry is not None:
-            left, top, _width, height = geometry
-            position = (
-                left + _LEFT_MARGIN - _CANVAS_INSET,
-                top + height - _TOY_SIZE - _BOTTOM_MARGIN - _CANVAS_INSET,
-            )
-            if position != self._last_position:
-                self.view.move(*position)
-                self._last_position = position
+        should_present = geometry is not None and self.owner.should_present(self.child_hwnd)
+        if not should_present:
+            if self._presented:
+                self.owner.hide(self.child_hwnd)
+                self._presented = False
+            return
 
-        if should_show != self._last_visible:
-            if should_show:
-                self.view.show()
-                self.view.raise_()
-            else:
-                self.view.hide()
-            self._last_visible = should_show
+        left, top, _width, height = geometry
+        position = (
+            left + _LEFT_MARGIN - _CANVAS_INSET,
+            top + height - _TOY_SIZE - _BOTTOM_MARGIN - _CANVAS_INSET,
+        )
+        # Cross-process GWLP_HWNDPARENT ownership is intentionally avoided: it
+        # was able to leave the Qt tool window non-presented. The helper instead
+        # owns its own top-level tool HWND and explicitly places it at the top of
+        # the active application's non-topmost Z-order without activating it.
+        self.owner.present(self.child_hwnd, *position)
+        self._last_position = position
+        self._presented = True
 
     def cleanup(self) -> None:
         try:
@@ -296,7 +313,10 @@ class SakanaProcessHost:
             )
         except RuntimeError:
             pass
-        self.view.hide()
+        try:
+            self.owner.hide(self.child_hwnd)
+        except (AttributeError, OSError):
+            pass
         self.view.close()
 
 
