@@ -146,15 +146,32 @@ class BatchParallelRuntime:
         config = self.controller.config
         if batch is None or config is None:
             raise RuntimeError("Batch browser lane cannot be assigned before Batch/config exists")
+
+        base_port = self._base_port or int(config.makro_cdp_port)
+        desired_lanes = min(
+            normalize_batch_concurrency(batch.prepare_concurrency),
+            max(1, len(batch.jobs)),
+        )
+        if desired_lanes > self._lane_count:
+            lanes = ensure_batch_browser_lanes(
+                self.project_root,
+                base_port=base_port,
+                count=desired_lanes,
+            )
+            self._lane_count = len(lanes)
+            self._base_port = base_port
+            self._prepared_tokens.update(lane_tokens(lanes))
+            self._decorate_batch_status("READY", "Makro Browser 已扩展")
+
         try:
             ordinal = list(batch.jobs).index(job)
         except ValueError as exc:
             raise RuntimeError(f"Unknown Batch job for browser lane: {job.job_id}") from exc
-        lane_count = self._lane_count or batch.prepare_concurrency
+        lane_count = self._lane_count or desired_lanes
         bind_job_browser_lane(
             job,
             project_root=self.project_root,
-            base_port=self._base_port or int(config.makro_cdp_port),
+            base_port=base_port,
             lane_count=lane_count,
             ordinal=ordinal,
         )
