@@ -6,8 +6,6 @@ from typing import Any
 from PySide6.QtCore import QObject, QPoint, QTimer
 from PySide6.QtWidgets import QFrame, QMainWindow, QWidget
 
-from .static_quick_compositor import install_static_quick_card_compositor
-
 
 _LAYOUT_POLL_MS = 16
 _LAYOUT_STABLE_SAMPLES = 3
@@ -69,15 +67,7 @@ class StartupEntranceStabilityGate(QObject):
         if isinstance(central, QWidget):
             try:
                 top_left = central.mapTo(self.window, QPoint(0, 0))
-                values.extend(
-                    (
-                        "central",
-                        int(top_left.x()),
-                        int(top_left.y()),
-                        int(central.width()),
-                        int(central.height()),
-                    )
-                )
+                values.extend(("central", int(top_left.x()), int(top_left.y()), int(central.width()), int(central.height())))
             except RuntimeError:
                 pass
 
@@ -87,15 +77,7 @@ class StartupEntranceStabilityGate(QObject):
         if isinstance(viewport, QWidget):
             try:
                 top_left = viewport.mapTo(self.window, QPoint(0, 0))
-                values.extend(
-                    (
-                        "viewport",
-                        int(top_left.x()),
-                        int(top_left.y()),
-                        int(viewport.width()),
-                        int(viewport.height()),
-                    )
-                )
+                values.extend(("viewport", int(top_left.x()), int(top_left.y()), int(viewport.width()), int(viewport.height())))
             except RuntimeError:
                 pass
 
@@ -108,15 +90,7 @@ class StartupEntranceStabilityGate(QObject):
                     if not frame.isVisibleTo(self.window):
                         continue
                     top_left = frame.mapTo(self.window, QPoint(0, 0))
-                    values.extend(
-                        (
-                            frame.objectName(),
-                            int(top_left.x()),
-                            int(top_left.y()),
-                            int(frame.width()),
-                            int(frame.height()),
-                        )
-                    )
+                    values.extend((frame.objectName(), int(top_left.x()), int(top_left.y()), int(frame.width()), int(frame.height())))
                 except RuntimeError:
                     continue
 
@@ -136,10 +110,7 @@ class StartupEntranceStabilityGate(QObject):
             self._stable_samples = 1
 
         elapsed_ms = (time.perf_counter() - self._probe_started_s) * 1000.0
-        if (
-            self._stable_samples >= _LAYOUT_STABLE_SAMPLES
-            or elapsed_ms >= _LAYOUT_SETTLE_TIMEOUT_MS
-        ):
+        if self._stable_samples >= _LAYOUT_STABLE_SAMPLES or elapsed_ms >= _LAYOUT_SETTLE_TIMEOUT_MS:
             start = getattr(self.entrance, "start", None)
             if callable(start):
                 start()
@@ -147,8 +118,6 @@ class StartupEntranceStabilityGate(QObject):
         QTimer.singleShot(_LAYOUT_POLL_MS, self._probe_layout)
 
     def _flush_native_background(self) -> None:
-        """Publish final Quick card geometry while the startup overlay covers it."""
-
         background = self.background
         if background is None:
             return
@@ -196,8 +165,6 @@ class StartupEntranceStabilityGate(QObject):
         self._flush_native_background()
 
     def _arm_native_frame_barrier(self) -> bool:
-        """Bind handoff to rendered Quick frames rather than GUI-thread time."""
-
         quick = getattr(self.background, "quick_window", None)
         if quick is None:
             return False
@@ -238,9 +205,6 @@ class StartupEntranceStabilityGate(QObject):
             return
         self._native_frames_remaining -= 1
         if self._native_frames_remaining > 0:
-            # The first swap can complete work already in flight when the final
-            # QWidget/Quick state is published. Force another rendered frame so
-            # the static glass texture itself is guaranteed to be on screen.
             self._flush_native_background()
             return
 
@@ -266,8 +230,6 @@ class StartupEntranceStabilityGate(QObject):
             except RuntimeError:
                 pass
 
-        # Preserve the established staged handoff: decorative overlay first,
-        # card interactivity second, shared runtime presentation last.
         QTimer.singleShot(_HANDOFF_FRAME_MS, self._resume_effects)
         QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_card_fx)
         QTimer.singleShot(_HANDOFF_FRAME_MS * 3, self._resume_presentation)
@@ -302,19 +264,8 @@ class StartupEntranceStabilityGate(QObject):
         if callable(resume):
             resume("startup")
 
-        # Install the drift-off compositor only after the established startup
-        # handoff is fully complete. Drift-on keeps the legacy presentation lane.
-        if self.visual is not None:
-            try:
-                install_static_quick_card_compositor(self.window, self.visual)
-            except RuntimeError:
-                pass
 
-
-def install_startup_entrance_stability(
-    window: QMainWindow,
-    entrance: Any,
-) -> StartupEntranceStabilityGate:
+def install_startup_entrance_stability(window: QMainWindow, entrance: Any) -> StartupEntranceStabilityGate:
     existing = getattr(window, "_startup_entrance_stability", None)
     if isinstance(existing, StartupEntranceStabilityGate):
         return existing
