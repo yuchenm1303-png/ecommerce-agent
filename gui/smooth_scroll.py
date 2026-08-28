@@ -5,8 +5,9 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
+from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer
+from PySide6.QtCore import Property, QEvent, QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtWidgets import QAbstractItemView, QAbstractScrollArea, QWidget
 
 
@@ -16,6 +17,89 @@ class _ScrollMotion:
     position: float
     target: float
     velocity: float
+
+
+class QuickScrollState(QObject):
+    """Publish only live scrollbar positions to the Quick presentation.
+
+    Widget geometry/content remains owned by StaticQmlBridge. During a scroll glide
+    the bridge model must stay frozen: QML consumes this tiny position map and moves
+    its already-created items on the Scene Graph instead of rebuilding every Job
+    card on each 16 ms scrollbar tick.
+    """
+
+    positionsChanged = Signal()
+
+    def __init__(self, root: QWidget, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._root = root
+        self._positions: dict[str, dict[str, int]] = {}
+        self._area_keys: dict[int, str] = {}
+        self._watched_area_ids: set[int] = set()
+
+    def _get_positions(self):  # noqa: ANN201
+        return self._positions
+
+    positions = Property("QVariantMap", _get_positions, notify=positionsChanged)
+
+    def _viewport_key(self, area: QAbstractScrollArea) -> str | None:
+        try:
+            viewport = area.viewport()
+            point = viewport.mapTo(self._root, QPoint(0, 0))
+            return f"{int(point.x())}:{int(point.y())}:{int(viewport.width())}:{int(viewport.height())}"
+        except RuntimeError:
+            return None
+
+    def watch_area(self, area: QAbstractScrollArea) -> None:
+        identity = id(area)
+        if identity not in self._watched_area_ids:
+            self._watched_area_ids.add(identity)
+            try:
+                area.verticalScrollBar().valueChanged.connect(
+                    lambda *_args, source=area: self.sync_area(source)
+                )
+                area.horizontalScrollBar().valueChanged.connect(
+                    lambda *_args, source=area: self.sync_area(source)
+                )
+            except (RuntimeError, TypeError):
+                pass
+        self.sync_area(area)
+
+    def sync_area(self, area: QAbstractScrollArea) -> None:
+        key = self._viewport_key(area)
+        if key is None:
+            return
+        try:
+            value = {
+                "x": int(area.horizontalScrollBar().value()),
+                "y": int(area.verticalScrollBar().value()),
+            }
+        except RuntimeError:
+            return
+
+        identity = id(area)
+        previous_key = self._area_keys.get(identity)
+        previous_value = self._positions.get(key)
+        if previous_key == key and previous_value == value:
+            return
+
+        positions = dict(self._positions)
+        if previous_key is not None and previous_key != key:
+            positions.pop(previous_key, None)
+        positions[key] = value
+        self._area_keys[identity] = key
+        self._positions = positions
+        self.positionsChanged.emit()
+
+    def sync_all(self, areas: list[QAbstractScrollArea]) -> None:
+        for area in areas:
+            self.watch_area(area)
+
+    def clear(self) -> None:
+        self._positions = {}
+        self._area_keys.clear()
+        self._watched_area_ids.clear()
+        self.positionsChanged.emit()
 
 
 class SmoothScroller(QObject):
@@ -168,9 +252,13 @@ class SmoothWheelFilter(QObject):
         self._areas: dict[QObject, QAbstractScrollArea] = {}
         self._root: QWidget | None = None
         self._quick_owner: QObject | None = None
+        self._quick_state: QuickScrollState | None = None
+        self._quick_bridge: Any = None
+        self._bridge_scroll_detached = False
 
     def install(self, root: QWidget) -> None:
         self._root = root
+        self._quick_state = QuickScrollState(root, self)
         for area in root.findChildren(QAbstractScrollArea):
             self._attach(area)
 
@@ -185,14 +273,67 @@ class SmoothWheelFilter(QObject):
             self._quick_owner = quick_owner
             quick_owner.installEventFilter(self)
 
+        # The engine already exists here but StaticQmlView is created later. Expose
+        # the lightweight scroll state before the QML component is compiled so its
+        # bindings never depend on late context-property injection.
+        engine = getattr(background, "engine", None)
+        context_getter = getattr(engine, "rootContext", None)
+        if callable(context_getter):
+            try:
+                context_getter().setContextProperty("quickScrollState", self._quick_state)
+            except RuntimeError:
+                pass
+
+        # StaticQmlBridge is installed later in the same startup turn. Adopt scroll
+        # presentation once the event loop starts, before any user wheel input.
+        QTimer.singleShot(0, self._adopt_quick_scroll_presentation)
+
     def _attach(self, area: QAbstractScrollArea) -> None:
         if isinstance(area, QAbstractItemView):
             area.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        state = self._quick_state
+        if state is not None:
+            state.watch_area(area)
         for watched in (area, area.viewport()):
             if watched in self._areas:
                 continue
             self._areas[watched] = area
             watched.installEventFilter(self)
+        if self._bridge_scroll_detached:
+            self._detach_bridge_value_refresh(area)
+
+    def _adopt_quick_scroll_presentation(self) -> None:
+        root = self._root
+        controller = getattr(root, "_static_qml_view_controller", None) if root is not None else None
+        bridge = getattr(controller, "bridge", None)
+        if bridge is None:
+            # Startup normally installs StaticQmlView before the event loop, but a
+            # zero-delay retry keeps ownership deterministic on slower setups.
+            QTimer.singleShot(0, self._adopt_quick_scroll_presentation)
+            return
+        self._quick_bridge = bridge
+        self._bridge_scroll_detached = True
+        for area in set(self._areas.values()):
+            self._detach_bridge_value_refresh(area)
+        state = self._quick_state
+        if state is not None:
+            state.sync_all(list(set(self._areas.values())))
+
+    def _detach_bridge_value_refresh(self, area: QAbstractScrollArea) -> None:
+        bridge = self._quick_bridge
+        if bridge is None:
+            return
+        callback = getattr(bridge, "schedule_refresh", None)
+        if callback is None:
+            return
+        try:
+            area.verticalScrollBar().valueChanged.disconnect(callback)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            area.horizontalScrollBar().valueChanged.disconnect(callback)
+        except (RuntimeError, TypeError):
+            pass
 
     @staticmethod
     def _can_move(area: QAbstractScrollArea, scroll_delta: float) -> bool:
@@ -273,22 +414,25 @@ class SmoothWheelFilter(QObject):
         candidates.sort(key=lambda item: item[0])
         return candidates[0][1]
 
-    def _publish_scroll_geometry(self) -> None:
-        root = self._root
-        controller = getattr(root, "_static_qml_view_controller", None) if root is not None else None
-        bridge = getattr(controller, "bridge", None)
-        schedule = getattr(bridge, "schedule_refresh", None)
-        if callable(schedule):
-            try:
-                schedule()
-            except RuntimeError:
-                pass
-
     def eventFilter(self, watched: QObject, event) -> bool:  # noqa: ANN001, N802
+        area = self._areas.get(watched)
+        if area is not None and event.type() in {
+            QEvent.Type.Resize,
+            QEvent.Type.Show,
+        }:
+            state = self._quick_state
+            if state is not None:
+                state.sync_area(area)
+
         if event.type() != QEvent.Type.Wheel:
             return False
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             return False
+
+        # Ensure the old full-scene scrollbar listener cannot reappear in the hot
+        # path even if startup ordering was unusual.
+        if not self._bridge_scroll_detached:
+            self._adopt_quick_scroll_presentation()
 
         if watched is self._quick_owner:
             position = event.position()
@@ -298,14 +442,11 @@ class SmoothWheelFilter(QObject):
         if area is None:
             return False
 
-        consumed = self._scroll_area_delta(
+        return self._scroll_area_delta(
             area,
             pixel_y=float(event.pixelDelta().y()),
             angle_y=float(event.angleDelta().y()),
         )
-        if consumed:
-            self._publish_scroll_geometry()
-        return consumed
 
     def cleanup(self) -> None:
         self._scroller._timer.stop()
@@ -323,4 +464,9 @@ class SmoothWheelFilter(QObject):
             except RuntimeError:
                 pass
         self._areas.clear()
+        state = self._quick_state
+        self._quick_state = None
+        if state is not None:
+            state.clear()
+        self._quick_bridge = None
         self._root = None
