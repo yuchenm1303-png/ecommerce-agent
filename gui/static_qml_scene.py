@@ -335,6 +335,7 @@ Item {
                 anchors.margins: 6
                 clip: true
                 TextArea {
+                    id: textArea
                     text: d ? d.text : ""
                     color: "#f3eaf0"
                     readOnly: d ? d.readOnly : true
@@ -344,7 +345,10 @@ Item {
                     background: null
                     font.family: d && d.mono ? "Cascadia Mono" : "Segoe UI"
                     font.pixelSize: d && d.fontSize ? d.fontSize : 12
-                    onEditingFinished: if (d && !d.readOnly) staticBridge.setText(d.key, text)
+                    onActiveFocusChanged: {
+                        if (!activeFocus && d && !d.readOnly)
+                            staticBridge.setText(d.key, text)
+                    }
                 }
             }
         }
