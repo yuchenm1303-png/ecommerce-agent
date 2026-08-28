@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRectF, QSize, QStandardPaths, Qt, qVersion
-from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPixmap
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPixmap, QRegion
 from PySide6.QtWidgets import QFrame, QMainWindow, QWidget
 
 from .native_background import (
@@ -165,7 +165,14 @@ def _centered_static_view(source: QPixmap, width: int, height: int) -> QPixmap:
 
 
 class _StaticWallpaperScene(QWidget):
-    """One cached QWidget surface for the zero-drift wallpaper and fixed glass blur."""
+    """Direct, damage-driven QWidget renderer for the zero-drift scene.
+
+    Wallpaper views are resized only when the native root size changes. Geometry
+    changes merely refresh the lightweight card rectangles and invalidate the old
+    and new glass regions; no full-window intermediate pixmap is ever composed.
+    """
+
+    _DAMAGE_PAD = 2
 
     def __init__(
         self,
@@ -186,10 +193,11 @@ class _StaticWallpaperScene(QWidget):
         self._blur_source = QPixmap(str(blur_path))
         if self._sharp_source.isNull() or self._blur_source.isNull():
             raise RuntimeError("Static wallpaper renderer could not load cached assets")
-        self._scene = QPixmap()
         self._cached_root_size: tuple[int, int] | None = None
         self._sharp_view = QPixmap()
         self._blur_view = QPixmap()
+        self._origin = QPoint(0, 0)
+        self._card_records: dict[QFrame, tuple[QRectF, QRectF]] = {}
         self.setObjectName("staticWallpaperScene")
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
@@ -197,37 +205,23 @@ class _StaticWallpaperScene(QWidget):
         self.setGeometry(central.rect())
         self.lower()
 
-    def rebuild(self) -> None:
-        if self.overlay.width() <= 0 or self.overlay.height() <= 0:
-            return
-        if self._central.width() <= 0 or self._central.height() <= 0:
-            return
+    def _record_region(self, record: tuple[QRectF, QRectF] | None) -> QRegion:
+        if record is None:
+            return QRegion()
+        visible = record[0].intersected(record[1])
+        if visible.isEmpty():
+            return QRegion()
+        rect = visible.toAlignedRect().adjusted(
+            -self._DAMAGE_PAD,
+            -self._DAMAGE_PAD,
+            self._DAMAGE_PAD,
+            self._DAMAGE_PAD,
+        )
+        rect = rect.intersected(self.rect())
+        return QRegion(rect) if not rect.isEmpty() else QRegion()
 
-        self.setGeometry(self._central.rect())
-        root_width = int(self.overlay.width())
-        root_height = int(self.overlay.height())
-        root_size = (root_width, root_height)
-        if self._cached_root_size != root_size:
-            self._sharp_view = _centered_static_view(
-                self._sharp_source,
-                root_width,
-                root_height,
-            )
-            self._blur_view = _centered_static_view(
-                self._blur_source,
-                root_width,
-                root_height,
-            )
-            self._cached_root_size = root_size
-
-        origin = self._central.mapTo(self.overlay, QPoint(0, 0))
-        scene = QPixmap(self.width(), self.height())
-        scene.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(scene)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.drawPixmap(-origin.x(), -origin.y(), self._sharp_view)
-
+    def _snapshot_cards(self, origin: QPoint) -> dict[QFrame, tuple[QRectF, QRectF]]:
+        records: dict[QFrame, tuple[QRectF, QRectF]] = {}
         for frame in tuple(self.card_model.cards):
             try:
                 snapshot = self.card_model._snapshot(frame)
@@ -250,25 +244,87 @@ class _StaticWallpaperScene(QWidget):
             )
             if card_rect.isEmpty() or clip_rect.isEmpty():
                 continue
+            if card_rect.intersected(clip_rect).isEmpty():
+                continue
+            records[frame] = (card_rect, clip_rect)
+        return records
+
+    def rebuild(self) -> None:
+        if self.overlay.width() <= 0 or self.overlay.height() <= 0:
+            return
+        if self._central.width() <= 0 or self._central.height() <= 0:
+            return
+
+        previous_geometry = self.geometry()
+        target_geometry = self._central.rect()
+        geometry_changed = previous_geometry != target_geometry
+        if geometry_changed:
+            self.setGeometry(target_geometry)
+
+        root_width = int(self.overlay.width())
+        root_height = int(self.overlay.height())
+        root_size = (root_width, root_height)
+        root_size_changed = self._cached_root_size != root_size
+        if root_size_changed:
+            self._sharp_view = _centered_static_view(
+                self._sharp_source,
+                root_width,
+                root_height,
+            )
+            self._blur_view = _centered_static_view(
+                self._blur_source,
+                root_width,
+                root_height,
+            )
+            self._cached_root_size = root_size
+
+        origin = self._central.mapTo(self.overlay, QPoint(0, 0))
+        origin_changed = origin != self._origin
+        previous_records = self._card_records
+        current_records = self._snapshot_cards(origin)
+        self._origin = origin
+        self._card_records = current_records
+        self.lower()
+
+        if root_size_changed or geometry_changed or origin_changed:
+            self.update()
+            return
+
+        damage = QRegion()
+        for frame in set(previous_records) | set(current_records):
+            old_record = previous_records.get(frame)
+            new_record = current_records.get(frame)
+            if old_record == new_record:
+                continue
+            damage = damage.united(self._record_region(old_record))
+            damage = damage.united(self._record_region(new_record))
+
+        if not damage.isEmpty():
+            self.update(damage)
+
+    def paintEvent(self, event) -> None:  # noqa: N802, ANN001
+        if self._sharp_view.isNull() or self._blur_view.isNull():
+            return
+
+        damage = event.region()
+        painter = QPainter(self)
+        painter.setClipRegion(damage)
+        painter.drawPixmap(-self._origin.x(), -self._origin.y(), self._sharp_view)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        for card_rect, clip_rect in self._card_records.values():
+            visible_rect = card_rect.intersected(clip_rect)
+            if visible_rect.isEmpty() or not damage.intersects(visible_rect.toAlignedRect()):
+                continue
 
             path = QPainterPath()
             path.addRoundedRect(card_rect, _GLASS_RADIUS, _GLASS_RADIUS)
             painter.save()
-            painter.setClipRect(clip_rect)
+            painter.setClipRect(clip_rect, Qt.ClipOperation.IntersectClip)
             painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
-            painter.drawPixmap(-origin.x(), -origin.y(), self._blur_view)
+            painter.drawPixmap(-self._origin.x(), -self._origin.y(), self._blur_view)
             painter.restore()
 
-        painter.end()
-        self._scene = scene
-        self.lower()
-        self.update()
-
-    def paintEvent(self, _event) -> None:  # noqa: N802, ANN001
-        if self._scene.isNull():
-            return
-        painter = QPainter(self)
-        painter.drawPixmap(0, 0, self._scene)
         painter.end()
 
 
@@ -309,20 +365,30 @@ class _StaticCardTint(QWidget):
 
 
 class PersistentNativeQuickBackground(NativeQuickBackground):
-    """Dual-mode renderer: static QWidget path off, original Quick path on.
+    """Dual-mode renderer with a minimal steady-state static path.
 
-    The QQuickWindow remains the native owner so runtime mode changes never reparent
-    the application window. With drift disabled, an opaque cached QWidget scene
-    covers the dormant Quick surface and card hover updates never touch the Quick
-    model. Enabling drift hides that scene and resumes the unchanged Quick renderer.
+    The QQuickWindow remains the native HWND owner. Static mode hides its entire
+    Quick content tree, disables persistent scene-graph/graphics retention and
+    releases GPU resources; QWidget alone paints the fixed wallpaper/glass scene.
+    Dynamic mode restores the original Quick content and keeps the static QWidget
+    cover until the first presented Quick frame so mode changes never flash blank.
     """
 
     def __init__(self, overlay: QMainWindow) -> None:
         self._dynamic_mode = False
+        self._awaiting_dynamic_frame = False
         self._static_scene: _StaticWallpaperScene | None = None
         self._static_tints: dict[QFrame, _StaticCardTint] = {}
         self._card_presentations: dict[QFrame, tuple[float, float]] = {}
         super().__init__(overlay)
+
+        quick = self.quick_window
+        if quick is not None:
+            try:
+                quick.frameSwapped.connect(self._on_dynamic_frame_ready)
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+
         self._static_scene = _StaticWallpaperScene(
             overlay,
             card_model=self.card_model,
@@ -334,6 +400,7 @@ class PersistentNativeQuickBackground(NativeQuickBackground):
         self._static_scene.rebuild()
         self._static_scene.show()
         self._static_scene.lower()
+        self._set_quick_scene_active(False, release=True)
 
     @property
     def dynamic_mode(self) -> bool:
@@ -341,6 +408,33 @@ class PersistentNativeQuickBackground(NativeQuickBackground):
 
     def _prepare_assets(self) -> None:
         self._sharp_path, self._blur_path = prepare_wallpaper_assets()
+
+    def _static_cover_visible(self) -> bool:
+        return bool(not self._dynamic_mode or self._awaiting_dynamic_frame)
+
+    def _set_quick_scene_active(self, active: bool, *, release: bool = False) -> None:
+        quick = self.quick_window
+        if quick is None:
+            return
+        try:
+            content = quick.contentItem()
+            if active:
+                quick.setPersistentGraphics(True)
+                quick.setPersistentSceneGraph(True)
+                if content is not None:
+                    content.setVisible(True)
+                quick.requestUpdate()
+                return
+
+            quick.setProperty("animationRunning", False)
+            if content is not None:
+                content.setVisible(False)
+            quick.setPersistentGraphics(False)
+            quick.setPersistentSceneGraph(False)
+            if release:
+                quick.releaseResources()
+        except (AttributeError, RuntimeError, TypeError):
+            pass
 
     def _ensure_static_tint(self, frame: QFrame) -> _StaticCardTint:
         tint = self._static_tints.get(frame)
@@ -352,6 +446,7 @@ class PersistentNativeQuickBackground(NativeQuickBackground):
 
     def _sync_static_cards(self) -> None:
         active_frames = set(self.card_model.cards)
+        static_visible = self._static_cover_visible()
         for frame in tuple(active_frames):
             try:
                 tint = self._ensure_static_tint(frame)
@@ -363,8 +458,8 @@ class PersistentNativeQuickBackground(NativeQuickBackground):
             )
             self._card_presentations[frame] = (scale, alpha)
             tint.set_alpha(alpha)
-            tint.setVisible(not self._dynamic_mode)
-            if not self._dynamic_mode:
+            tint.setVisible(static_visible)
+            if static_visible:
                 tint.lower()
 
         for frame, tint in tuple(self._static_tints.items()):
@@ -378,6 +473,18 @@ class PersistentNativeQuickBackground(NativeQuickBackground):
             self._static_tints.pop(frame, None)
             self._card_presentations.pop(frame, None)
 
+    def _on_dynamic_frame_ready(self) -> None:
+        if self._shutting_down or not self._dynamic_mode or not self._awaiting_dynamic_frame:
+            return
+        self._awaiting_dynamic_frame = False
+        scene = self._static_scene
+        if scene is not None:
+            try:
+                scene.hide()
+            except RuntimeError:
+                pass
+        self._sync_static_cards()
+
     def set_dynamic_mode(self, enabled: bool) -> None:
         enabled = bool(enabled)
         if self._shutting_down:
@@ -389,8 +496,7 @@ class PersistentNativeQuickBackground(NativeQuickBackground):
 
         quick = self.quick_window
         if enabled:
-            # Prepare the original Quick scene completely while the static QWidget
-            # surface still covers it, then reveal it in one mode transition.
+            # Restore exactly the Quick/GPU presentation state before exposing it.
             self.card_model.sync_geometry()
             for frame, (scale, alpha) in tuple(self._card_presentations.items()):
                 self.card_model.set_presentation(frame, scale=scale, alpha=alpha)
@@ -401,21 +507,30 @@ class PersistentNativeQuickBackground(NativeQuickBackground):
                     quick.setProperty("animationRunning", False)
                 except RuntimeError:
                     pass
+
             self._dynamic_mode = True
+            self._awaiting_dynamic_frame = True
             self._sync_static_cards()
-            if self._static_scene is not None:
-                self._static_scene.hide()
+            scene = self._static_scene
+            if scene is not None:
+                try:
+                    scene.show()
+                    scene.lower()
+                except RuntimeError:
+                    pass
+            self._set_quick_scene_active(True)
             self.reset_pointer_identity()
             return
 
-        # Publish the centered static scene before making Quick dormant, so the
-        # switch never exposes an empty background frame.
+        # Make the complete QWidget scene visible before suspending/releasing Quick.
         self._dynamic_mode = False
+        self._awaiting_dynamic_frame = False
         self._sync_static_cards()
-        if self._static_scene is not None:
-            self._static_scene.rebuild()
-            self._static_scene.show()
-            self._static_scene.lower()
+        scene = self._static_scene
+        if scene is not None:
+            scene.rebuild()
+            scene.show()
+            scene.lower()
         if quick is not None:
             try:
                 quick.setProperty("animationRunning", False)
@@ -425,6 +540,7 @@ class PersistentNativeQuickBackground(NativeQuickBackground):
                 quick.setProperty("offsetY", 0.0)
             except RuntimeError:
                 pass
+        self._set_quick_scene_active(False, release=True)
         self.reset_pointer_identity()
 
     def set_card_alpha(self, frame: QFrame, alpha: float) -> None:
@@ -457,6 +573,8 @@ class PersistentNativeQuickBackground(NativeQuickBackground):
             return
         if self._dynamic_mode:
             super()._flush_geometry()
+            if self._awaiting_dynamic_frame and self._static_scene is not None:
+                self._static_scene.rebuild()
             return
 
         self._geometry_dirty = False
@@ -470,6 +588,14 @@ class PersistentNativeQuickBackground(NativeQuickBackground):
             self._geometry_timer.start()
 
     def shutdown(self) -> None:
+        quick = self.quick_window
+        if quick is not None:
+            try:
+                quick.frameSwapped.disconnect(self._on_dynamic_frame_ready)
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+
+        self._awaiting_dynamic_frame = False
         scene = self._static_scene
         self._static_scene = None
         if scene is not None:
