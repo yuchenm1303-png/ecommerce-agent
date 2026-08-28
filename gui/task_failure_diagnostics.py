@@ -29,6 +29,11 @@ _INLINE_QUERY_SECRET_RE = re.compile(
     r"([?&](?:api[_-]?key|key|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|pwd|authorization|auth|signature|sig|sign|credential|session|sessionid)=)([^&#\s\"'<>]+)",
     re.IGNORECASE,
 )
+_INLINE_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?P<prefix>(?<![A-Za-z0-9_])(?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|pwd|authorization|auth|signature|sig|sign|credential|session|sessionid|cookie)\s*[:=]\s*)"
+    r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\r\n]+)",
+    re.IGNORECASE,
+)
 _BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+\-/=]{8,}", re.IGNORECASE)
 _EXCEPTION_LINE_RE = re.compile(
     r"^(?P<type>(?:[A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z_][A-Za-z0-9_]*):(?:\s*(?P<message>.*))?$"
@@ -87,6 +92,10 @@ def _sanitize_text(value: str) -> str:
     text = str(value or "")
     text = _URL_RE.sub(lambda match: sanitize_telemetry_url(match.group(0)), text)
     text = _INLINE_QUERY_SECRET_RE.sub(r"\1[REDACTED]", text)
+    text = _INLINE_SECRET_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]",
+        text,
+    )
     return _BEARER_RE.sub("Bearer [REDACTED]", text)
 
 
