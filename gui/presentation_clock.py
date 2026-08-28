@@ -322,15 +322,23 @@ class PresentationClock(QObject):
         except RuntimeError:
             pass
 
-    def _queue_static_pointer_sample(self, *, button_edge: bool = False) -> None:
+    def _queue_static_pointer_sample(
+        self,
+        *,
+        button_edge: bool = False,
+        left_down_override: bool | None = None,
+    ) -> None:
         """Publish one native pointer boundary/button event to the existing card lane."""
 
         if self._background_drift_enabled or not self._can_run():
             return
         try:
             global_pos = QCursor.pos()
+            if left_down_override is None:
+                left_down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
+            else:
+                left_down = bool(left_down_override)
             point = (int(global_pos.x()), int(global_pos.y()))
-            left_down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
         except RuntimeError:
             return
 
@@ -417,6 +425,12 @@ class PresentationClock(QObject):
         if event_type in {QEvent.Type.Enter, QEvent.Type.Leave}:
             if isinstance(watched, QFrame) and watched in states:
                 self._queue_static_pointer_sample()
+                if event_type == QEvent.Type.Leave:
+                    # The established card controller intentionally tolerates one
+                    # transient "no card" sample. Polling used to provide the
+                    # confirmation sample automatically; event-driven static input
+                    # supplies exactly one confirmation and nothing more.
+                    QTimer.singleShot(0, self._queue_static_pointer_sample)
             return False
 
         if event_type in {QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease}:
@@ -427,7 +441,10 @@ class PresentationClock(QObject):
                         return False
                 except RuntimeError:
                     return False
-            self._queue_static_pointer_sample(button_edge=True)
+            self._queue_static_pointer_sample(
+                button_edge=True,
+                left_down_override=(event_type == QEvent.Type.MouseButtonPress),
+            )
         return False
 
     def cleanup(self) -> None:
