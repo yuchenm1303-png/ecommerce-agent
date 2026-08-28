@@ -508,6 +508,13 @@ class QuickModalLayerController(QObject):
         self._original_show_prepared_modal = self.details._show_prepared_modal  # noqa: SLF001
         self._component: QQmlComponent | None = None
         self._item: QQuickItem | None = None
+        self._excluded_detail_cards = self._resolve_excluded_detail_cards()
+        if self._excluded_detail_cards:
+            self.details._expandable_cards = tuple(  # noqa: SLF001
+                frame
+                for frame in self.details._expandable_cards  # noqa: SLF001
+                if frame not in self._excluded_detail_cards
+            )
 
         self._close_timer = QTimer(self)
         self._close_timer.setSingleShot(True)
@@ -542,6 +549,22 @@ class QuickModalLayerController(QObject):
     modalY = Property(int, lambda self: self._modal_y, notify=changed)
     modalW = Property(int, lambda self: self._modal_w, notify=changed)
     modalH = Property(int, lambda self: self._modal_h, notify=changed)
+
+    def _resolve_excluded_detail_cards(self) -> set[QFrame]:
+        """Cards that are control surfaces, not drill-down presentation cards."""
+
+        workspace = getattr(self.window, "batch_workspace", None)
+        editor = getattr(workspace, "_batch_url_editor", None)
+        if not isinstance(editor, QWidget):
+            return set()
+
+        expandable = set(getattr(self.details, "_expandable_cards", ()))  # noqa: SLF001
+        current: QWidget | None = editor
+        while current is not None:
+            if isinstance(current, QFrame) and current in expandable:
+                return {current}
+            current = current.parentWidget()
+        return set()
 
     def _sync_quick_owner(self) -> None:
         if bool(getattr(self.static_view, "_load_failed", False)):
@@ -655,16 +678,18 @@ class QuickModalLayerController(QObject):
             top_left = widget.mapTo(window, QPoint(0, 0))
             return (
                 widget.isEnabled()
-                and not widget.isHidden()
+                and widget.isVisibleTo(window)
                 and top_left.x() <= point.x() < top_left.x() + widget.width()
                 and top_left.y() <= point.y() < top_left.y() + widget.height()
             )
         except RuntimeError:
             return False
 
-    def _point_hits_interactive_child(self, frame: QFrame, point: QPoint) -> bool:
+    def _point_hits_interactive_control(self, point: QPoint) -> bool:
+        """Interactive controls own pointer input globally before any card does."""
+
         try:
-            widgets = frame.findChildren(QWidget)
+            widgets = self.window.findChildren(QWidget)
         except RuntimeError:
             return False
         return any(
@@ -676,14 +701,14 @@ class QuickModalLayerController(QObject):
     def _open_card_at(self, point: QPoint) -> bool:
         if self._presented or not self.static_view.static_active:
             return False
+        if self._point_hits_interactive_control(point):
+            return False
         cards = tuple(getattr(self.details, "_expandable_cards", ()))  # noqa: SLF001
         for frame in reversed(cards):
             if not isinstance(frame, QFrame):
                 continue
             if not self._widget_contains_window_point(frame, self.window, point):
                 continue
-            if self._point_hits_interactive_child(frame, point):
-                return False
             try:
                 if frame is getattr(self.window, "console", None):
                     self.details.open_console_details()
