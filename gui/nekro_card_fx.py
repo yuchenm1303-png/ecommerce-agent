@@ -24,7 +24,8 @@ _REFERENCE_EDGE_GROWTH_PX = (
 )
 _MIN_NEIGHBOR_GAP_PX = 1.0
 _WINDOW_EDGE_GAP_PX = 1.0
-_HOVER_NONE_GRACE_SAMPLES = 1
+_HOVER_HYSTERESIS_PX = 4.0
+_HOVER_NONE_GRACE_SAMPLES = 2
 _MAX_MOTION_HZ = 90.0
 _MAX_CONCURRENT_MOTIONS = 2
 
@@ -309,10 +310,23 @@ class NekroCardInteractionController(QObject):
             local = frame.mapFromGlobal(global_pos)
         except RuntimeError:
             return False
-        if not frame.rect().contains(local):
-            return False
-        nested = self._nearest_card(frame.childAt(local))
-        return nested is None or nested is frame
+
+        logical = frame.rect()
+        if logical.contains(local):
+            nested = self._nearest_card(frame.childAt(local))
+            return nested is None or nested is frame
+
+        # The visual card may be a few pixels larger than its logical QWidget rect
+        # while a hover scale tween is active. Keep ownership inside a small stable
+        # hysteresis band so the pointer cannot repeatedly enter/leave at a screen
+        # or neighbour edge and make the card "bounce".
+        expanded = QRectF(logical).adjusted(
+            -_HOVER_HYSTERESIS_PX,
+            -_HOVER_HYSTERESIS_PX,
+            _HOVER_HYSTERESIS_PX,
+            _HOVER_HYSTERESIS_PX,
+        )
+        return expanded.contains(QPointF(local))
 
     def _advance_state(self, state: _CardState, now_s: float) -> bool:
         if not state.moving:
@@ -502,15 +516,48 @@ class NekroCardInteractionController(QObject):
             self._advance_motions(now_s)
             self._next_motion_s = now_s + self._motion_interval_s
 
-    def suspend_for_modal(self) -> None:
+    def suspend_for_modal(self, *, preserve_visual: bool = False) -> None:
         if self._suspended:
             return
+
+        now_s = time.perf_counter()
+        if preserve_visual:
+            # Freeze exactly the visual state that was under the pointer at click
+            # time. Do not snap the card before the modal has started covering it.
+            for frame in tuple(self._moving_frames):
+                state = self.states.get(frame)
+                if state is None:
+                    continue
+                try:
+                    self._advance_state(state, now_s)
+                except RuntimeError:
+                    state.moving = False
+
         self._suspended = True
         self._moving_frames.clear()
         self._none_samples = 0
         self._left_down = False
         self.hovered = None
         self.pressed = None
+
+        for state in self.states.values():
+            try:
+                self._set_content_frozen(state, False)
+                if preserve_visual:
+                    state.snap(state.current_scale, state.current_alpha)
+                else:
+                    state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)
+            except RuntimeError:
+                state.moving = False
+
+    def settle_suspended_for_modal(self) -> None:
+        """Normalize cards only after an opaque modal layer is covering them."""
+
+        if not self._suspended:
+            return
+        self._moving_frames.clear()
+        self._hover_scale_cache.clear()
+        self._hover_scale_cache_key = None
         for state in self.states.values():
             try:
                 self._set_content_frozen(state, False)
