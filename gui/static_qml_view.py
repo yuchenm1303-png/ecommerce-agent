@@ -147,6 +147,16 @@ class StaticQmlViewController(QObject):
         if self._static_requested:
             self._enter_static()
 
+    def _set_native_glass_overlay_alpha(self, alpha: float) -> None:
+        # native_background remains the only blur renderer.  Static QML draws only
+        # the same black 64/102 overlay so we suppress the legacy black rectangle,
+        # not the original blur mask itself.
+        for frame in tuple(getattr(self.bridge, "_card_frames", ())):
+            try:
+                self.background.set_card_presentation(frame, scale=1.0, alpha=float(alpha))
+            except RuntimeError:
+                continue
+
     def _fail_scene(self, reason: str) -> None:
         if self._load_failed:
             return
@@ -155,9 +165,8 @@ class StaticQmlViewController(QObject):
         self._switch_timer.stop()
         self._pending_drift = None
         self.bridge.set_active(False)
-        self.bridge.resetCardInteractions()
+        self._set_native_glass_overlay_alpha(64.0)
         try:
-            self.quick.setProperty("staticCardAnimation", False)
             self.shell.set_overlay_presented(True)
         except RuntimeError:
             pass
@@ -210,10 +219,7 @@ class StaticQmlViewController(QObject):
         self.bridge.refresh()
         self._suspend_legacy()
         self._fit()
-        try:
-            self.quick.setProperty("staticCardAnimation", True)
-        except RuntimeError:
-            pass
+        self._set_native_glass_overlay_alpha(0.0)
         self.bridge.set_active(True)
         try:
             self.item.setVisible(True)
@@ -261,11 +267,7 @@ class StaticQmlViewController(QObject):
             return
 
         self._static_active = False
-        try:
-            self.quick.setProperty("staticCardAnimation", False)
-        except RuntimeError:
-            pass
-        self.bridge.resetCardInteractions()
+        self._set_native_glass_overlay_alpha(64.0)
         try:
             self.shell.set_overlay_presented(True)
         except RuntimeError:
@@ -287,9 +289,7 @@ class StaticQmlViewController(QObject):
             self._enter_static()
 
     def _on_drift_changed(self, enabled: bool) -> None:
-        # Preserve the established 300 ms switch animation before swapping the
-        # rendering owner.  The business preference itself changes immediately;
-        # only the visual owner waits for the existing switch motion to finish.
+        # Preserve the original switch's 300 ms motion before changing render owner.
         self._pending_drift = bool(enabled)
         self._switch_timer.start()
 
