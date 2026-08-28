@@ -25,6 +25,17 @@ Item {
         return null
     }
 
+    function scrollViewportKey(x, y, w, h) {
+        return Math.round(x) + ":" + Math.round(y) + ":" + Math.round(w) + ":" + Math.round(h)
+    }
+
+    function scrollPosition(key) {
+        if (!key)
+            return null
+        var positions = quickScrollState.positions
+        return positions && positions[key] !== undefined ? positions[key] : null
+    }
+
     property var workspaceToggleData: rootControl("workspaceModeSwitch")
     property var backgroundDriftToggleData: rootControl("backgroundDriftSwitch")
 
@@ -579,9 +590,45 @@ Item {
             Repeater {
                 model: card.cardControls
                 delegate: Item {
+                    id: cardControlViewport
                     required property var modelData
                     property var d: modelData
                     readonly property bool clipped: d && d.clipEnabled
+                    readonly property string viewportKey: clipped ? staticRoot.scrollViewportKey(
+                        card.cardX + d.clipX,
+                        card.cardY + d.clipY,
+                        d.clipW,
+                        d.clipH
+                    ) : ""
+                    property real scrollOriginX: 0
+                    property real scrollOriginY: 0
+                    property bool scrollOriginReady: false
+                    readonly property var currentScrollPosition: clipped ? staticRoot.scrollPosition(viewportKey) : null
+                    readonly property real scrollDx: scrollOriginReady && currentScrollPosition ? scrollOriginX - Number(currentScrollPosition.x) : 0
+                    readonly property real scrollDy: scrollOriginReady && currentScrollPosition ? scrollOriginY - Number(currentScrollPosition.y) : 0
+
+                    function captureScrollOrigin() {
+                        var position = clipped ? staticRoot.scrollPosition(viewportKey) : null
+                        if (position) {
+                            scrollOriginX = Number(position.x)
+                            scrollOriginY = Number(position.y)
+                            scrollOriginReady = true
+                        } else {
+                            scrollOriginX = 0
+                            scrollOriginY = 0
+                            scrollOriginReady = false
+                        }
+                    }
+
+                    function recaptureScrollOrigin() {
+                        scrollOriginReady = false
+                        Qt.callLater(captureScrollOrigin)
+                    }
+
+                    Component.onCompleted: captureScrollOrigin()
+                    onDChanged: recaptureScrollOrigin()
+                    onViewportKeyChanged: recaptureScrollOrigin()
+
                     x: clipped ? d.clipX : d.x
                     y: clipped ? d.clipY : d.y
                     width: clipped ? d.clipW : d.w
@@ -590,8 +637,8 @@ Item {
 
                     Loader {
                         property var controlData: parent.d
-                        x: parent.clipped ? controlData.x - controlData.clipX : 0
-                        y: parent.clipped ? controlData.y - controlData.clipY : 0
+                        x: parent.clipped ? controlData.x - controlData.clipX + parent.scrollDx : 0
+                        y: parent.clipped ? controlData.y - controlData.clipY + parent.scrollDy : 0
                         width: controlData ? controlData.w : 0
                         height: controlData ? controlData.h : 0
                         sourceComponent: controlData ? staticRoot.componentFor(controlData.kind) : null
@@ -608,9 +655,45 @@ Item {
     Repeater {
         model: staticBridge.rootControls
         delegate: Item {
+            id: rootControlViewport
             required property var modelData
             property var d: modelData
             readonly property bool clipped: d && d.clipEnabled
+            readonly property string viewportKey: clipped ? staticRoot.scrollViewportKey(
+                d.clipX,
+                d.clipY,
+                d.clipW,
+                d.clipH
+            ) : ""
+            property real scrollOriginX: 0
+            property real scrollOriginY: 0
+            property bool scrollOriginReady: false
+            readonly property var currentScrollPosition: clipped ? staticRoot.scrollPosition(viewportKey) : null
+            readonly property real scrollDx: scrollOriginReady && currentScrollPosition ? scrollOriginX - Number(currentScrollPosition.x) : 0
+            readonly property real scrollDy: scrollOriginReady && currentScrollPosition ? scrollOriginY - Number(currentScrollPosition.y) : 0
+
+            function captureScrollOrigin() {
+                var position = clipped ? staticRoot.scrollPosition(viewportKey) : null
+                if (position) {
+                    scrollOriginX = Number(position.x)
+                    scrollOriginY = Number(position.y)
+                    scrollOriginReady = true
+                } else {
+                    scrollOriginX = 0
+                    scrollOriginY = 0
+                    scrollOriginReady = false
+                }
+            }
+
+            function recaptureScrollOrigin() {
+                scrollOriginReady = false
+                Qt.callLater(captureScrollOrigin)
+            }
+
+            Component.onCompleted: captureScrollOrigin()
+            onDChanged: recaptureScrollOrigin()
+            onViewportKeyChanged: recaptureScrollOrigin()
+
             x: clipped ? d.clipX : d.x
             y: clipped ? d.clipY : d.y
             width: clipped ? d.clipW : d.w
@@ -619,8 +702,8 @@ Item {
 
             Loader {
                 property var controlData: parent.d
-                x: parent.clipped ? controlData.x - controlData.clipX : 0
-                y: parent.clipped ? controlData.y - controlData.clipY : 0
+                x: parent.clipped ? controlData.x - controlData.clipX + parent.scrollDx : 0
+                y: parent.clipped ? controlData.y - controlData.clipY + parent.scrollDy : 0
                 width: controlData ? controlData.w : 0
                 height: controlData ? controlData.h : 0
                 sourceComponent: controlData && controlData.kind !== "toggle" ? staticRoot.componentFor(controlData.kind) : null
