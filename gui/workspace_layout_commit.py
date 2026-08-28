@@ -42,10 +42,15 @@ class WorkspaceLayoutCommitter(QObject):
     QWidget remains the layout source of truth and QQuickWindow remains the only
     normal presentation owner. A current-page commit is synchronous so a mode switch
     cannot expose stale geometry. A top-level Show/Resize gets exactly one deferred
-    settlement pass after Qt has consumed the native size change. LayoutRequest is
-    deliberately not observed: activating layouts can itself generate LayoutRequest,
-    so using that event as a trigger creates a zero-delay self-rearming loop that can
-    starve the startup/Quick first-frame timers.
+    settlement pass after Qt has consumed the native size change. Dynamic Batch job
+    mutations are a separate explicit boundary: every jobs_changed emission reaches
+    this owner only after the workspace, responsive width controller and per-job
+    control injector have finished their synchronous QWidget mutations. The complete
+    Batch page is then settled before the later Quick bridge listener can snapshot it.
+
+    LayoutRequest is deliberately not observed: activating layouts can itself generate
+    LayoutRequest, so using that event as a trigger creates a zero-delay self-rearming
+    loop that can starve the startup/Quick first-frame timers.
     """
 
     def __init__(self, window: QMainWindow) -> None:
@@ -55,6 +60,7 @@ class WorkspaceLayoutCommitter(QObject):
         if not isinstance(self.stack, QStackedWidget):
             raise RuntimeError("workspace layout owner requires installed modeStack")
         self._committing = False
+        self._batch_jobs_signal = None
 
         self._settle_timer = QTimer(self)
         self._settle_timer.setSingleShot(True)
@@ -63,11 +69,44 @@ class WorkspaceLayoutCommitter(QObject):
 
         self.stack.installEventFilter(self)
         self.stack.currentChanged.connect(self.commit_current)
+        self._bind_batch_geometry_boundary()
         window.destroyed.connect(self.cleanup)
 
         # Prime only the page that can actually be presented. Hidden pages are
         # committed on demand by workspace_transition before they become current.
         self.prepare_page(int(self.stack.currentIndex()))
+
+    def _bind_batch_geometry_boundary(self) -> None:
+        workspace = getattr(self.window, "batch_workspace", None)
+        controller = getattr(workspace, "controller", None)
+        jobs_changed = getattr(controller, "jobs_changed", None)
+        if jobs_changed is None or not hasattr(jobs_changed, "connect"):
+            return
+        try:
+            jobs_changed.connect(self._commit_visible_batch_jobs)
+            self._batch_jobs_signal = jobs_changed
+        except (RuntimeError, TypeError):
+            self._batch_jobs_signal = None
+
+    def _commit_visible_batch_jobs(self, *_args: object) -> None:
+        """Settle all dynamic Batch card structure before Quick observes jobs_changed.
+
+        Signal installation order is intentional: BatchWorkspace creates/updates the
+        cards first, BatchCardResponsive fixes their width next, BatchIndividualControls
+        injects the per-job controls after that, and this owner is installed after all
+        three. StaticQmlBridge is installed later. Therefore this synchronous commit is
+        the single geometry publication fence between QWidget mutation and Scene Graph
+        mirroring; no provisional button/card coordinates can cross it.
+        """
+
+        if self._committing:
+            return
+        try:
+            if int(self.stack.currentIndex()) != 1:
+                return
+        except RuntimeError:
+            return
+        self.prepare_page(1)
 
     def _commit_single_fixed(self) -> None:
         """Commit the authoritative Single splitter policy synchronously.
@@ -192,6 +231,13 @@ class WorkspaceLayoutCommitter(QObject):
 
     def cleanup(self) -> None:
         self._settle_timer.stop()
+        signal = self._batch_jobs_signal
+        self._batch_jobs_signal = None
+        if signal is not None:
+            try:
+                signal.disconnect(self._commit_visible_batch_jobs)
+            except (RuntimeError, TypeError):
+                pass
         try:
             self.stack.currentChanged.disconnect(self.commit_current)
         except (RuntimeError, TypeError):
