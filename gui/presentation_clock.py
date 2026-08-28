@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import Any
 
 from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer
@@ -11,23 +10,12 @@ from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QMainWindow, QV
 from .mode_toggle import WorkspaceModeSwitch
 
 
-_ACTIVE_PRESENTATION_TICK_MS = 8
-_AMBIENT_PRESENTATION_TICK_MS = 16
-_INTERACTION_GRACE_MS = 360
-_WIDGET_STARVATION_MS = 40
+_LEGACY_FRAME_MS = 16
 _BACKGROUND_DRIFT_DEFAULT = True
 
 
-@dataclass(slots=True)
-class _WidgetSample:
-    global_pos: QPoint
-    left_down: bool
-    input_changed: bool
-    button_edge: bool
-
-
 class BackgroundDriftSwitch(WorkspaceModeSwitch):
-    """Established micro-switch visuals for the wallpaper pointer parallax."""
+    """Established micro-switch visuals for wallpaper pointer parallax."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -40,13 +28,16 @@ class BackgroundDriftSwitch(WorkspaceModeSwitch):
 
 
 class PresentationClock(QObject):
-    """Adaptive pointer clock with independent Quick and legacy-widget lanes.
+    """Event-driven presentation coordinator.
 
-    The Quick background drift lane and the legacy QWidget card/effects lane are
-    deliberately independent.  Once the Quick UI owns presentation, the widget lane
-    can be disabled completely while pointer sampling continues only when background
-    drift is enabled.  This keeps the unified Quick renderer free of hidden QWidget
-    animation work without changing the legacy fallback path.
+    Normal presentation belongs to QQuickWindow. Pointer motion is forwarded only
+    when Qt actually delivers a pointer event; the Quick scene's own FrameAnimation
+    performs the visual interpolation. There is therefore no 8/16 ms Python cursor
+    polling loop while the normal Quick UI is active.
+
+    The small timer below exists only for the legacy QWidget fallback lane, where
+    QWidget sakura/card effects still require time-based ticks. StaticQmlView disables
+    that lane as soon as the unified Quick scene owns presentation.
     """
 
     def __init__(
@@ -62,45 +53,39 @@ class PresentationClock(QObject):
         self.background = background
         self.card_fx = card_fx
         self.effects = effects
-        self._holds: set[str] = set()
-        self._window_paused = False
-        self._last_global: tuple[int, int] | None = None
-        self._last_left_down: bool | None = None
-        self._active_until_s = 0.0
-        self._card_settle_pending = False
-        self._background_drift_enabled = _BACKGROUND_DRIFT_DEFAULT
-        self._widget_lane_enabled = True
-
-        self._widget_samples: list[_WidgetSample] = []
-        self._widget_flush_posted = False
         self._quick_window = getattr(background, "quick_window", None)
 
+        self._holds: set[str] = set()
+        self._window_paused = False
+        self._background_drift_enabled = _BACKGROUND_DRIFT_DEFAULT
+        self._widget_lane_enabled = True
+        self._last_legacy_global: tuple[int, int] | None = None
+        self._last_legacy_left: bool | None = None
+
+        # Keep the historical public attribute name for compatibility, but this
+        # timer is now strictly a legacy-fallback clock. In normal Quick mode it is
+        # stopped for the entire application lifetime.
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self.timer.setInterval(_AMBIENT_PRESENTATION_TICK_MS)
-        self.timer.timeout.connect(self._tick)
-
-        self._widget_watchdog = QTimer(self)
-        self._widget_watchdog.setSingleShot(True)
-        self._widget_watchdog.setTimerType(Qt.TimerType.PreciseTimer)
-        self._widget_watchdog.setInterval(_WIDGET_STARVATION_MS)
-        self._widget_watchdog.timeout.connect(self._flush_widget_lane)
-
-        quick = self._quick_window
-        if quick is not None:
-            try:
-                quick.frameSwapped.connect(self._on_quick_frame_swapped)
-            except (AttributeError, RuntimeError, TypeError):
-                self._quick_window = None
+        self.timer.setInterval(_LEGACY_FRAME_MS)
+        self.timer.timeout.connect(self._legacy_tick)
 
         window.installEventFilter(self)
+        quick = self._quick_window
+        if isinstance(quick, QObject):
+            quick.installEventFilter(self)
         window.destroyed.connect(self.cleanup)
+
         self.set_background_drift_enabled(_BACKGROUND_DRIFT_DEFAULT)
         self._sync_window_state()
 
     @property
     def running(self) -> bool:
-        return bool(self.timer.isActive() and not self._holds and not self._window_paused)
+        return bool(
+            not self._holds
+            and not self._window_paused
+            and (self._widget_lane_enabled or self._background_drift_enabled)
+        )
 
     @property
     def background_drift_enabled(self) -> bool:
@@ -111,156 +96,40 @@ class PresentationClock(QObject):
         return self._widget_lane_enabled
 
     def set_widget_lane_enabled(self, enabled: bool) -> None:
-        """Enable legacy QWidget card/effect work without affecting Quick drift."""
-
         enabled = bool(enabled)
         if enabled == self._widget_lane_enabled:
             return
         self._widget_lane_enabled = enabled
-        self._clear_widget_lane()
-        self._card_settle_pending = False
-        self._active_until_s = 0.0
-        self._last_left_down = None
-        if enabled:
-            self._last_global = None
+        self._last_legacy_global = None
+        self._last_legacy_left = None
         self._sync_window_state()
+
+    def _center_background(self) -> None:
+        quick = self._quick_window
+        if quick is None:
+            return
+        try:
+            quick.setProperty("pointerX", 0.0)
+            quick.setProperty("pointerY", 0.0)
+            quick.setProperty("animationRunning", True)
+        except RuntimeError:
+            pass
 
     def set_background_drift_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
+        if enabled == self._background_drift_enabled:
+            if not enabled:
+                self._center_background()
+            return
         self._background_drift_enabled = enabled
-        self._last_global = None
         try:
             self.background.reset_pointer_identity()
         except (AttributeError, RuntimeError):
             pass
-
         if not enabled:
-            quick = self._quick_window
-            if quick is not None:
-                try:
-                    quick.setProperty("pointerX", 0.0)
-                    quick.setProperty("pointerY", 0.0)
-                    quick.setProperty("animationRunning", True)
-                except RuntimeError:
-                    pass
+            self._center_background()
 
-        # In unified Quick mode the clock is intentionally asleep while drift is
-        # off. Toggling drift on must therefore be able to start it directly.
-        self._sync_window_state()
-
-    def _can_run(self) -> bool:
-        if self._holds or self._window_paused:
-            return False
-        if not self._widget_lane_enabled and not self._background_drift_enabled:
-            return False
-        try:
-            return bool(self.window.isVisible() and not self.window.isMinimized())
-        except RuntimeError:
-            return False
-
-    def _set_tick_interval(self, interval_ms: int) -> None:
-        interval_ms = int(interval_ms)
-        if self.timer.interval() != interval_ms:
-            self.timer.setInterval(interval_ms)
-
-    def _mark_interaction_active(self, now_s: float) -> None:
-        self._active_until_s = max(
-            self._active_until_s,
-            now_s + (_INTERACTION_GRACE_MS / 1000.0),
-        )
-        if self._widget_lane_enabled:
-            self._card_settle_pending = True
-        self._set_tick_interval(_ACTIVE_PRESENTATION_TICK_MS)
-
-    def _sync_cadence(self, now_s: float) -> None:
-        interval = (
-            _ACTIVE_PRESENTATION_TICK_MS
-            if now_s < self._active_until_s
-            else _AMBIENT_PRESENTATION_TICK_MS
-        )
-        self._set_tick_interval(interval)
-
-    def _sync_window_state(self) -> None:
-        try:
-            self._window_paused = bool(
-                not self.window.isVisible() or self.window.isMinimized()
-            )
-        except RuntimeError:
-            self._window_paused = True
-
-        if self._can_run():
-            if not self.timer.isActive():
-                self._reset_input_identity()
-                self._set_tick_interval(_AMBIENT_PRESENTATION_TICK_MS)
-                self.timer.start()
-        else:
-            self.timer.stop()
-            self._clear_widget_lane()
-
-    def _reset_input_identity(self) -> None:
-        self._last_global = None
-        self._last_left_down = None
-        self._active_until_s = 0.0
-        self._card_settle_pending = False
-        self._clear_widget_lane()
-        try:
-            self.background.reset_pointer_identity()
-        except (AttributeError, RuntimeError):
-            pass
-
-    def _clear_widget_lane(self) -> None:
-        self._widget_samples.clear()
-        self._widget_flush_posted = False
-        self._widget_watchdog.stop()
-
-    def suspend(self, reason: str) -> None:
-        token = str(reason or "presentation").strip() or "presentation"
-        self._holds.add(token)
-        self.timer.stop()
-        self._active_until_s = 0.0
-        self._card_settle_pending = False
-        self._clear_widget_lane()
-        try:
-            self.background.pause_pointer_animation()
-        except (AttributeError, RuntimeError):
-            pass
-
-    def resume(self, reason: str) -> None:
-        token = str(reason or "presentation").strip() or "presentation"
-        self._holds.discard(token)
-        self._reset_input_identity()
-        self._sync_window_state()
-
-    def _queue_widget_sample(
-        self,
-        global_pos: QPoint,
-        *,
-        left_down: bool,
-        input_changed: bool,
-        button_edge: bool,
-    ) -> None:
-        if not self._widget_lane_enabled:
-            return
-        sample = _WidgetSample(
-            global_pos=QPoint(global_pos),
-            left_down=bool(left_down),
-            input_changed=bool(input_changed),
-            button_edge=bool(button_edge),
-        )
-        if not self._widget_samples:
-            self._widget_samples.append(sample)
-            return
-
-        if button_edge or self._widget_samples[-1].button_edge:
-            self._widget_samples.append(sample)
-            return
-
-        sample.input_changed = bool(
-            sample.input_changed or self._widget_samples[-1].input_changed
-        )
-        self._widget_samples[-1] = sample
-
-    def _quick_lane_active(self) -> bool:
+    def _quick_available(self) -> bool:
         quick = self._quick_window
         if quick is None:
             return False
@@ -269,76 +138,86 @@ class PresentationClock(QObject):
                 quick.isVisible()
                 and quick.isExposed()
                 and not (quick.windowState() & Qt.WindowState.WindowMinimized)
-                and quick.property("animationRunning")
             )
         except (AttributeError, RuntimeError, TypeError):
             return False
 
-    def _schedule_widget_lane(self) -> None:
-        if not self._widget_lane_enabled or not self._widget_samples:
-            return
-        if self._quick_lane_active():
-            if not self._widget_watchdog.isActive():
-                self._widget_watchdog.start()
-            return
-        self._flush_widget_lane()
-
-    def _on_quick_frame_swapped(self) -> None:
-        if (
-            not self._widget_lane_enabled
-            or not self._widget_samples
-            or self._widget_flush_posted
-        ):
-            return
-        self._widget_flush_posted = True
-        QTimer.singleShot(0, self._flush_widget_lane_after_swap)
-
-    def _flush_widget_lane_after_swap(self) -> None:
-        self._widget_flush_posted = False
-        self._flush_widget_lane()
-
-    def _flush_widget_lane(self) -> None:
-        if not self._widget_lane_enabled:
-            self._clear_widget_lane()
-            return
-        if not self._widget_samples:
-            self._widget_watchdog.stop()
-            return
-
-        samples = self._widget_samples
-        self._widget_samples = []
-        self._widget_watchdog.stop()
-        now_s = time.perf_counter()
-        card_active = now_s < self._active_until_s
-        card_due = card_active or self._card_settle_pending
-
-        if card_due:
-            for sample in samples:
-                try:
-                    self.card_fx.presentation_tick(
-                        sample.global_pos,
-                        left_down=sample.left_down,
-                        now_s=now_s,
-                        input_changed=sample.input_changed,
-                    )
-                except RuntimeError:
-                    pass
-
-            if not card_active:
-                self._card_settle_pending = False
-
-        latest = samples[-1]
+    def _sync_window_state(self) -> None:
         try:
-            self.effects.presentation_tick(
-                latest.global_pos,
-                left_down=latest.left_down,
-                now_s=now_s,
-            )
+            paused = bool(not self.window.isVisible() or self.window.isMinimized())
         except RuntimeError:
+            paused = True
+        quick = self._quick_window
+        if quick is not None:
+            try:
+                paused = paused or bool(quick.windowState() & Qt.WindowState.WindowMinimized)
+            except RuntimeError:
+                pass
+        self._window_paused = paused
+
+        legacy_should_run = bool(
+            self._widget_lane_enabled
+            and not self._holds
+            and not self._window_paused
+        )
+        if legacy_should_run:
+            if not self.timer.isActive():
+                self._last_legacy_global = None
+                self._last_legacy_left = None
+                self.timer.start()
+        else:
+            self.timer.stop()
+
+    def suspend(self, reason: str) -> None:
+        token = str(reason or "presentation").strip() or "presentation"
+        self._holds.add(token)
+        self.timer.stop()
+        try:
+            self.background.pause_pointer_animation()
+        except (AttributeError, RuntimeError):
             pass
 
-    def _tick(self) -> None:
-        if not self._can_run():
+    def resume(self, reason: str) -> None:
+        token = str(reason or "presentation").strip() or "presentation"
+        self._holds.discard(token)
+        self._last_legacy_global = None
+        self._last_legacy_left = None
+        try:
+            self.background.reset_pointer_identity()
+        except (AttributeError, RuntimeError):
+            pass
+        self._sync_window_state()
+
+    def _publish_quick_pointer(self, event: QEvent) -> None:
+        if (
+            not self._background_drift_enabled
+            or self._holds
+            or self._window_paused
+            or not self._quick_available()
+        ):
+            return
+
+        quick = self._quick_window
+        if quick is None:
+            return
+        position_getter = getattr(event, "position", None)
+        try:
+            if callable(position_getter):
+                position = position_getter()
+                local = QPoint(round(float(position.x())), round(float(position.y())))
+                global_pos = quick.mapToGlobal(local)
+            else:
+                global_pos = QCursor.pos()
+            self.background.presentation_tick(global_pos, input_changed=True)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return
+
+    def _legacy_tick(self) -> None:
+        if (
+            not self._widget_lane_enabled
+            or self._holds
+            or self._window_paused
+        ):
             self._sync_window_state()
             return
 
@@ -349,60 +228,84 @@ class PresentationClock(QObject):
         except RuntimeError:
             return
 
+        previous_left = self._last_legacy_left
+        input_changed = point != self._last_legacy_global or left_down != previous_left
+        self._last_legacy_global = point
+        self._last_legacy_left = left_down
         now_s = time.perf_counter()
-        previous_left = self._last_left_down
-        input_changed = point != self._last_global or left_down != previous_left
-        button_edge = previous_left is not None and left_down != previous_left
-        self._last_global = point
-        self._last_left_down = left_down
 
-        if input_changed:
-            self._mark_interaction_active(now_s)
-            if self._background_drift_enabled:
-                try:
-                    self.background.presentation_tick(global_pos, input_changed=True)
-                except RuntimeError:
-                    pass
-        else:
-            self._sync_cadence(now_s)
+        if self._background_drift_enabled and input_changed:
+            try:
+                self.background.presentation_tick(global_pos, input_changed=True)
+            except RuntimeError:
+                pass
 
-        if self._widget_lane_enabled:
-            self._queue_widget_sample(
+        try:
+            self.card_fx.presentation_tick(
                 global_pos,
                 left_down=left_down,
+                now_s=now_s,
                 input_changed=input_changed,
-                button_edge=button_edge,
             )
-            self._schedule_widget_lane()
+        except RuntimeError:
+            pass
+        try:
+            self.effects.presentation_tick(
+                global_pos,
+                left_down=left_down,
+                now_s=now_s,
+            )
+        except RuntimeError:
+            pass
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if watched is not self.window:
+        event_type = event.type()
+
+        if watched is self.window:
+            if event_type in {
+                QEvent.Type.Show,
+                QEvent.Type.Hide,
+                QEvent.Type.WindowStateChange,
+            }:
+                QTimer.singleShot(0, self._sync_window_state)
             return False
-        if event.type() in {
-            QEvent.Type.Show,
-            QEvent.Type.Hide,
-            QEvent.Type.WindowStateChange,
-        }:
-            QTimer.singleShot(0, self._sync_window_state)
+
+        if watched is self._quick_window:
+            if event_type in {
+                QEvent.Type.Show,
+                QEvent.Type.Hide,
+                QEvent.Type.Expose,
+                QEvent.Type.WindowStateChange,
+            }:
+                QTimer.singleShot(0, self._sync_window_state)
+                return False
+
+            if event_type in {
+                QEvent.Type.MouseMove,
+                QEvent.Type.HoverMove,
+                QEvent.Type.Enter,
+            }:
+                self._publish_quick_pointer(event)
+            elif event_type == QEvent.Type.Leave and self._background_drift_enabled:
+                self._center_background()
+            return False
+
         return False
 
     def cleanup(self) -> None:
         self.timer.stop()
-        self._active_until_s = 0.0
-        self._card_settle_pending = False
-        self._clear_widget_lane()
         self._holds.clear()
-        quick = self._quick_window
-        self._quick_window = None
-        if quick is not None:
-            try:
-                quick.frameSwapped.disconnect(self._on_quick_frame_swapped)
-            except (AttributeError, RuntimeError, TypeError):
-                pass
         try:
             self.window.removeEventFilter(self)
         except RuntimeError:
             pass
+        quick = self._quick_window
+        self._quick_window = None
+        if isinstance(quick, QObject):
+            try:
+                quick.removeEventFilter(self)
+            except RuntimeError:
+                pass
 
 
 def _install_background_drift_switch(
