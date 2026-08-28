@@ -187,6 +187,9 @@ class _StaticWallpaperScene(QWidget):
         if self._sharp_source.isNull() or self._blur_source.isNull():
             raise RuntimeError("Static wallpaper renderer could not load cached assets")
         self._scene = QPixmap()
+        self._cached_root_size: tuple[int, int] | None = None
+        self._sharp_view = QPixmap()
+        self._blur_view = QPixmap()
         self.setObjectName("staticWallpaperScene")
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
@@ -203,8 +206,19 @@ class _StaticWallpaperScene(QWidget):
         self.setGeometry(self._central.rect())
         root_width = int(self.overlay.width())
         root_height = int(self.overlay.height())
-        sharp_view = _centered_static_view(self._sharp_source, root_width, root_height)
-        blur_view = _centered_static_view(self._blur_source, root_width, root_height)
+        root_size = (root_width, root_height)
+        if self._cached_root_size != root_size:
+            self._sharp_view = _centered_static_view(
+                self._sharp_source,
+                root_width,
+                root_height,
+            )
+            self._blur_view = _centered_static_view(
+                self._blur_source,
+                root_width,
+                root_height,
+            )
+            self._cached_root_size = root_size
 
         origin = self._central.mapTo(self.overlay, QPoint(0, 0))
         scene = QPixmap(self.width(), self.height())
@@ -212,7 +226,7 @@ class _StaticWallpaperScene(QWidget):
         painter = QPainter(scene)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.drawPixmap(-origin.x(), -origin.y(), sharp_view)
+        painter.drawPixmap(-origin.x(), -origin.y(), self._sharp_view)
 
         for frame in tuple(self.card_model.cards):
             try:
@@ -242,7 +256,7 @@ class _StaticWallpaperScene(QWidget):
             painter.save()
             painter.setClipRect(clip_rect)
             painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
-            painter.drawPixmap(-origin.x(), -origin.y(), blur_view)
+            painter.drawPixmap(-origin.x(), -origin.y(), self._blur_view)
             painter.restore()
 
         painter.end()
