@@ -323,8 +323,10 @@ def test_formal_batch_delegates_to_the_same_step1_vertical_state_machine() -> No
     batch = (ROOT / "makro_batch_job.py").read_text(encoding="utf-8")
 
     assert "from app.makro.vertical_selection import select_vertical" in single
-    assert "from app.makro.step1_entry import prepare_single_step1_page" in single
+    assert "from app.makro.step1_entry import prepare_owned_step1_page, prepare_single_step1_page" in single
     assert "from app.makro.step1_entry import prepare_owned_step1_page" in batch
-    assert "_advance_listing_to_step3" in batch
+    assert "from makro_gui_workflow import (" in batch
+    assert "_advance_listing_to_step3," in batch
+    assert "page, _vertical, _brand = _advance_listing_to_step3(" in batch
     assert "_prepare_step1_page" not in single
     assert "def _prepare_owned_step1_page" not in batch
