@@ -33,11 +33,16 @@ class StartupEntranceStabilityGate(QObject):
     suspension after handoffReady has synchronously allowed the Quick renderer to
     acquire its independent presentation hold. Modal and Quick ownership therefore
     cannot be released accidentally by the startup lifecycle.
+
+    Qt Quick frame callbacks are observation-only. Any geometry flush, property
+    mutation, repaint or renderer request is deferred to a queued GUI event-loop turn
+    so the threaded scene graph can never be re-entered from its frame boundary.
     """
 
     revealPreparing = Signal()
     layoutInvalidated = Signal()
     handoffReady = Signal()
+    revealFrameReady = Signal()
 
     def __init__(self, window: QMainWindow, entrance: Any) -> None:
         super().__init__(window)
@@ -56,7 +61,13 @@ class StartupEntranceStabilityGate(QObject):
         self._reveal_barrier_started = False
         self._reveal_frames_remaining = 0
         self._reveal_frame_quick: Any | None = None
+        self._reveal_frame_posted = False
         self._handoff_started = False
+
+        self.revealFrameReady.connect(
+            self._consume_reveal_frame,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
         clock = getattr(window, "_presentation_clock", None)
         suspend = getattr(clock, "suspend", None)
@@ -249,6 +260,7 @@ class StartupEntranceStabilityGate(QObject):
             return
         self._reveal_frame_quick = quick
         self._reveal_frames_remaining = _REVEAL_SETTLE_FRAMES
+        self._reveal_frame_posted = False
         self._flush_native_background()
 
     def _disconnect_reveal_frame_barrier(self) -> None:
@@ -262,6 +274,15 @@ class StartupEntranceStabilityGate(QObject):
             pass
 
     def _on_reveal_frame_swapped(self) -> None:
+        # Render-boundary callback: report readiness only. Never call repaint,
+        # model sync, setProperty, requestUpdate or native window APIs here.
+        if self._reveal_frames_remaining <= 0 or self._reveal_frame_posted:
+            return
+        self._reveal_frame_posted = True
+        self.revealFrameReady.emit()
+
+    def _consume_reveal_frame(self) -> None:
+        self._reveal_frame_posted = False
         if self._reveal_frames_remaining <= 0:
             return
         self._reveal_frames_remaining -= 1
@@ -269,11 +290,12 @@ class StartupEntranceStabilityGate(QObject):
             self._flush_native_background()
             return
         self._disconnect_reveal_frame_barrier()
-        QTimer.singleShot(0, self._start_entrance)
+        self._start_entrance()
 
     def _start_entrance(self) -> None:
         self._disconnect_reveal_frame_barrier()
         self._reveal_frames_remaining = 0
+        self._reveal_frame_posted = False
         start = getattr(self.entrance, "start", None)
         if callable(start) and not bool(getattr(self.entrance, "_started", False)):
             start()
@@ -291,6 +313,7 @@ class StartupEntranceStabilityGate(QObject):
         # Do not make input release depend on a post-animation frameSwapped barrier.
         self._disconnect_reveal_frame_barrier()
         self._reveal_frames_remaining = 0
+        self._reveal_frame_posted = False
         self._remove_live_surface_watch()
         QTimer.singleShot(0, self._commit_overlay_handoff)
 
