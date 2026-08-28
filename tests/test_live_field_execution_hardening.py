@@ -214,6 +214,14 @@ class _SelectLocator:
     def wait_for(self, state="visible"):
         assert state == "visible"
 
+    def evaluate(self, _script):
+        # Production re-reads the native select's current DOM options immediately
+        # before mutation. The fixture must model that Playwright contract.
+        return [
+            {"text": "DRAFT", "value": "DRAFT", "disabled": False},
+            {"text": "ACTIVE", "value": "ACTIVE", "disabled": False},
+        ]
+
     def select_option(self, label=None, value=None):
         assert label == "ACTIVE" or value == "ACTIVE"
 
