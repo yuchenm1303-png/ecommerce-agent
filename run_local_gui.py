@@ -101,13 +101,22 @@ def main() -> int:
 
     mark_startup_stage("startup_surface")
     startup = QWidget()
-    startup.setObjectName("startupSurface")
+    startup.setObjectName("startupWindow")
     startup.setWindowTitle("Listing Studio")
     startup.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+    startup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     startup.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
     startup.setFixedSize(430, 172)
 
-    startup_layout = QVBoxLayout(startup)
+    startup_outer = QVBoxLayout(startup)
+    startup_outer.setContentsMargins(1, 1, 1, 1)
+    startup_outer.setSpacing(0)
+
+    startup_surface = QWidget(startup)
+    startup_surface.setObjectName("startupSurface")
+    startup_outer.addWidget(startup_surface)
+
+    startup_layout = QVBoxLayout(startup_surface)
     startup_layout.setContentsMargins(30, 26, 30, 26)
     startup_layout.setSpacing(7)
     startup_layout.addStretch(1)
@@ -127,9 +136,12 @@ def main() -> int:
 
     startup.setStyleSheet(
         """
+        QWidget#startupWindow {
+            background: transparent;
+        }
         QWidget#startupSurface {
-            background: #202936;
-            border: 1px solid rgba(255, 255, 255, 28);
+            background-color: #202936;
+            border: 1px solid rgba(255, 255, 255, 24);
             border-radius: 18px;
             color: #f5f8fb;
         }
