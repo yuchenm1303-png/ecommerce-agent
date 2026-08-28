@@ -120,7 +120,6 @@ def main() -> int:
     from gui.startup_entrance import install_startup_entrance
     from gui.startup_entrance_stability import install_startup_entrance_stability
     from gui.static_modal_interaction import install_static_modal_interaction
-    from gui.static_presentation_runtime import install_static_presentation_runtime
     from gui.system_health_telemetry import install_system_health_telemetry
     from gui.ui_data_optimizations import install_ui_data_optimizations
     from gui.ui_maturity import install_mature_ui
@@ -231,21 +230,15 @@ def main() -> int:
     install_restore_snapshot(window, quick_window)
     shell = install_native_window_shell(window, quick_window)
 
-    # Drift-on presentation keeps its established shared clock. Drift-off uses
-    # a separate browser-style event runtime so pointer intent is immediate and
-    # never waits for polling, a widget queue or Quick frameSwapped.
+    # One shared 8 ms clock samples QCursor exactly once. Background parallax,
+    # card interaction and the lightweight sakura/cursor surface consume that
+    # same sample and apply their own cadence budgets.
     card_fx = install_nekro_card_fx(window, visual)
     install_buffered_logs(window)
     effects = install_nekro_effects(window, sakura_count=3)
-    presentation_clock = install_presentation_clock(
+    install_presentation_clock(
         window,
         background=visual.background,
-        card_fx=card_fx,
-        effects=effects,
-    )
-    install_static_presentation_runtime(
-        window,
-        clock=presentation_clock,
         card_fx=card_fx,
         effects=effects,
     )

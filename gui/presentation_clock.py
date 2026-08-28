@@ -6,7 +6,7 @@ from typing import Any
 
 from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer
 from PySide6.QtGui import QCursor
-from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QMainWindow, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QMainWindow, QVBoxLayout, QWidget
 
 from .mode_toggle import WorkspaceModeSwitch
 
@@ -41,10 +41,17 @@ class BackgroundDriftSwitch(WorkspaceModeSwitch):
 class PresentationClock(QObject):
     """One adaptive input clock with explicit Quick -> QWidget ordering.
 
-    The established drifting path is preserved. When drift is disabled, card
-    boundary/button intent is injected by a separate static input bridge while
-    this clock continues to drive the existing 300 ms card tween and ambient
-    effects. No renderer, Quick lifetime or visual parameter changes by mode.
+    Ambient visual work already has a 16 ms frame budget, so idle presentation
+    sampling runs at that cadence instead of waking Python every 8 ms forever.
+    Any pointer/button change immediately promotes the shared clock to the original
+    8 ms interaction cadence for long enough to cover the complete 300 ms card
+    tween.  The final settle sample is retained even if the GUI thread was briefly
+    blocked, so frozen card content can never be stranded mid-transition.
+
+    Quick owns the first presentation lane. QWidget card/effect work is released
+    after the next QQuickWindow.frameSwapped signal while Quick is animating. When
+    Quick is idle, the QWidget lane flushes immediately. A short starvation timer
+    remains only as a safety net for an occluded or stalled Quick surface.
     """
 
     def __init__(
@@ -290,6 +297,8 @@ class PresentationClock(QObject):
                     pass
 
             if not card_active:
+                # One final call after the interaction window guarantees that a
+                # delayed event loop still snaps any 300 ms tween to its endpoint.
                 self._card_settle_pending = False
 
         latest = samples[-1]
@@ -302,61 +311,9 @@ class PresentationClock(QObject):
         except RuntimeError:
             pass
 
-    def queue_static_card_event(
-        self,
-        *,
-        button_edge: bool = False,
-        left_down_override: bool | None = None,
-    ) -> None:
-        if self._background_drift_enabled or not self._can_run():
-            return
-        try:
-            global_pos = QCursor.pos()
-            if left_down_override is None:
-                left_down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
-            else:
-                left_down = bool(left_down_override)
-            point = (int(global_pos.x()), int(global_pos.y()))
-        except RuntimeError:
-            return
-
-        previous_left = self._last_left_down
-        edge = bool(button_edge or (previous_left is not None and left_down != previous_left))
-        self._last_global = point
-        self._last_left_down = left_down
-        self._mark_interaction_active(time.perf_counter())
-        self._queue_widget_sample(
-            global_pos,
-            left_down=left_down,
-            input_changed=True,
-            button_edge=edge,
-        )
-        self._schedule_widget_lane()
-
     def _tick(self) -> None:
         if not self._can_run():
             self._sync_window_state()
-            return
-
-        if not self._background_drift_enabled:
-            try:
-                global_pos = QCursor.pos()
-                point = (int(global_pos.x()), int(global_pos.y()))
-                left_down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
-            except RuntimeError:
-                return
-
-            now_s = time.perf_counter()
-            self._last_global = point
-            self._last_left_down = left_down
-            self._sync_cadence(now_s)
-            self._queue_widget_sample(
-                global_pos,
-                left_down=left_down,
-                input_changed=False,
-                button_edge=False,
-            )
-            self._schedule_widget_lane()
             return
 
         try:
@@ -375,6 +332,8 @@ class PresentationClock(QObject):
 
         if input_changed:
             self._mark_interaction_active(now_s)
+            # Background parallax is opt-in. Card/cursor interactions keep using
+            # the same shared pointer clock regardless of this preference.
             if self._background_drift_enabled:
                 try:
                     self.background.presentation_tick(global_pos, input_changed=True)
@@ -383,6 +342,10 @@ class PresentationClock(QObject):
         else:
             self._sync_cadence(now_s)
 
+        # QWidget work uses the same sampled input, but it is committed only after
+        # Quick presents its frame (or immediately when Quick has no active frame).
+        # Ambient effects keep their existing 16 ms visual budget while card work
+        # disappears completely once the interaction tween has settled.
         self._queue_widget_sample(
             global_pos,
             left_down=left_down,
@@ -419,73 +382,6 @@ class PresentationClock(QObject):
             self.window.removeEventFilter(self)
         except RuntimeError:
             pass
-
-
-class _StaticCardInputBridge(QObject):
-    """Native card boundary/button events used only while drift is disabled."""
-
-    def __init__(self, window: QMainWindow, clock: PresentationClock, card_fx: Any) -> None:
-        super().__init__(window)
-        self.window = window
-        self.clock = clock
-        self.card_fx = card_fx
-        self._app = QApplication.instance()
-        if self._app is not None:
-            self._app.installEventFilter(self)
-        window.destroyed.connect(self.cleanup)
-
-    def _belongs_to_window(self, watched: QObject) -> bool:
-        if watched is self.window:
-            return True
-        if not isinstance(watched, QWidget):
-            return False
-        try:
-            top = watched.window()
-        except (RuntimeError, TypeError):
-            return False
-        if not isinstance(top, QWidget):
-            return False
-        return top is self.window
-
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if self.clock.background_drift_enabled:
-            return False
-        if not self._belongs_to_window(watched):
-            return False
-
-        event_type = event.type()
-        states = getattr(self.card_fx, "states", {})
-
-        if event_type in {QEvent.Type.Enter, QEvent.Type.Leave}:
-            card = watched if isinstance(watched, QFrame) and watched in states else None
-            if card is not None:
-                self.clock.queue_static_card_event()
-                if event_type == QEvent.Type.Leave:
-                    QTimer.singleShot(0, self.clock.queue_static_card_event)
-            return False
-
-        if event_type in {QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease}:
-            button = getattr(event, "button", None)
-            if callable(button):
-                try:
-                    if button() != Qt.MouseButton.LeftButton:
-                        return False
-                except RuntimeError:
-                    return False
-            self.clock.queue_static_card_event(
-                button_edge=True,
-                left_down_override=(event_type == QEvent.Type.MouseButtonPress),
-            )
-        return False
-
-    def cleanup(self) -> None:
-        app = self._app
-        self._app = None
-        if app is not None:
-            try:
-                app.removeEventFilter(self)
-            except RuntimeError:
-                pass
 
 
 def _install_background_drift_switch(
@@ -542,11 +438,6 @@ def install_presentation_clock(
         effects=effects,
     )
     window._presentation_clock = clock  # type: ignore[attr-defined]
-    window._static_card_input_bridge = _StaticCardInputBridge(  # type: ignore[attr-defined]
-        window,
-        clock,
-        card_fx,
-    )
     _install_background_drift_switch(window, clock)
     return clock
 
