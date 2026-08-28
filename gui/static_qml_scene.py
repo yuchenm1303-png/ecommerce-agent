@@ -16,18 +16,6 @@ Item {
     z: 10000
     focus: visible
 
-    function rootControl(name) {
-        var controls = staticBridge.rootControls
-        for (var i = 0; i < controls.length; ++i) {
-            if (controls[i].name === name)
-                return controls[i]
-        }
-        return null
-    }
-
-    property var workspaceToggleData: rootControl("workspaceModeSwitch")
-    property var backgroundDriftToggleData: rootControl("backgroundDriftSwitch")
-
     function componentFor(kind) {
         if (kind === "label") return labelComponent
         if (kind === "badge") return badgeComponent
@@ -554,9 +542,23 @@ Item {
                 }
             }
 
-            // The glass body is rendered only once by native_background.py.
-            // This item carries content and interaction; it does not draw a
-            // second color/tint rectangle over the glass.
+            // native_background.py still supplies the original pre-blurred glass
+            // mask. This is only its original black 64/102 overlay, now animated
+            // by the Quick compositor together with the card content.
+            Rectangle {
+                anchors.fill: parent
+                radius: 6
+                color: "black"
+                opacity: (cardHover.hovered || cardPress.pressed) ? 102/255 : 64/255
+                Behavior on opacity {
+                    NumberAnimation {
+                        duration: 300
+                        easing.type: Easing.BezierSpline
+                        easing.bezierCurve: [0.25, 0.10, 0.25, 1.00, 1.00, 1.00]
+                    }
+                }
+            }
+
             Repeater {
                 model: card.cardControls
                 delegate: Loader {
@@ -568,18 +570,8 @@ Item {
                 }
             }
 
-            HoverHandler {
-                id: cardHover
-                acceptedDevices: PointerDevice.Mouse
-                onHoveredChanged: staticBridge.setCardInteraction(card.index, hovered, cardPress.pressed)
-            }
-            TapHandler {
-                id: cardPress
-                target: null
-                acceptedButtons: Qt.LeftButton
-                onPressedChanged: staticBridge.setCardInteraction(card.index, cardHover.hovered, pressed)
-            }
-            Component.onDestruction: staticBridge.resetCardInteractions()
+            HoverHandler { id: cardHover; acceptedDevices: PointerDevice.Mouse }
+            TapHandler { id: cardPress; target: null; acceptedButtons: Qt.LeftButton }
         }
     }
 
@@ -589,34 +581,9 @@ Item {
             required property var modelData
             property var d: modelData
             x: d.x; y: d.y; width: d.w; height: d.h
-            sourceComponent: d && d.kind === "toggle" ? null : staticRoot.componentFor(d.kind)
+            sourceComponent: staticRoot.componentFor(d.kind)
             onLoaded: if (item) item.d = d
         }
-    }
-
-    // The two header switches are global controls, not workspace content. Keep
-    // each Loader alive for the entire Quick scene lifetime so refreshing one
-    // switch cannot destroy/recreate the other and replay its initialization.
-    Loader {
-        id: workspaceToggleLoader
-        property var d: staticRoot.workspaceToggleData
-        x: d ? d.x : 0; y: d ? d.y : 0
-        width: d ? d.w : 0; height: d ? d.h : 0
-        visible: d !== null
-        sourceComponent: toggleComponent
-        onLoaded: if (item) item.d = d
-        onDChanged: if (item) item.d = d
-    }
-
-    Loader {
-        id: backgroundDriftToggleLoader
-        property var d: staticRoot.backgroundDriftToggleData
-        x: d ? d.x : 0; y: d ? d.y : 0
-        width: d ? d.w : 0; height: d ? d.h : 0
-        visible: d !== null
-        sourceComponent: toggleComponent
-        onLoaded: if (item) item.d = d
-        onDChanged: if (item) item.d = d
     }
 
     Repeater {

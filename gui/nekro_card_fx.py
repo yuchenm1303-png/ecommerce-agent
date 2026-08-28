@@ -29,10 +29,6 @@ _HOVER_NONE_GRACE_SAMPLES = 2
 _MAX_MOTION_HZ = 90.0
 _MAX_CONCURRENT_MOTIONS = 2
 
-_SUSPEND_MODAL = "modal"
-_SUSPEND_STARTUP = "startup"
-_SUSPEND_QUICK_PRESENTATION = "quick-presentation"
-
 
 def _css_ease() -> QEasingCurve:
     curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
@@ -78,10 +74,6 @@ class NekroCardInteractionController(QObject):
     is transformed throughout the 300 ms motion. At the endpoint the real content
     is thawed again, so inputs remain fully live while steady but the expensive
     QWidget subtree is not re-rasterized dozens of times during one scale tween.
-
-    Suspension is ownership-based. Startup, modal UI and the authoritative Quick
-    presentation hold independent reasons, so one subsystem can never accidentally
-    resume the legacy QGraphicsEffect/sourcePixmap path on behalf of another.
     """
 
     def __init__(self, window: QMainWindow, visual: Any) -> None:
@@ -95,9 +87,6 @@ class NekroCardInteractionController(QObject):
         self._none_samples = 0
         self.hovered: QFrame | None = None
         self.pressed: QFrame | None = None
-        self._suspension_reasons: set[str] = set()
-        # Keep the established compatibility flag for callers that only need to
-        # know whether any owner currently holds the legacy card lane suspended.
         self._suspended = False
         self._left_down = False
         self._ease = _css_ease()
@@ -527,21 +516,14 @@ class NekroCardInteractionController(QObject):
             self._advance_motions(now_s)
             self._next_motion_s = now_s + self._motion_interval_s
 
-    def suspend(self, reason: str, *, preserve_visual: bool = False) -> None:
-        token = str(reason or "presentation").strip() or "presentation"
-        if token in self._suspension_reasons:
-            return
-
-        already_suspended = bool(self._suspension_reasons)
-        self._suspension_reasons.add(token)
-        self._suspended = True
-        if already_suspended:
+    def suspend_for_modal(self, *, preserve_visual: bool = False) -> None:
+        if self._suspended:
             return
 
         now_s = time.perf_counter()
         if preserve_visual:
             # Freeze exactly the visual state that was under the pointer at click
-            # time. Do not snap the card before the covering surface has appeared.
+            # time. Do not snap the card before the modal has started covering it.
             for frame in tuple(self._moving_frames):
                 state = self.states.get(frame)
                 if state is None:
@@ -551,6 +533,7 @@ class NekroCardInteractionController(QObject):
                 except RuntimeError:
                     state.moving = False
 
+        self._suspended = True
         self._moving_frames.clear()
         self._none_samples = 0
         self._left_down = False
@@ -567,16 +550,25 @@ class NekroCardInteractionController(QObject):
             except RuntimeError:
                 state.moving = False
 
-    def resume(self, reason: str) -> None:
-        token = str(reason or "presentation").strip() or "presentation"
-        if token not in self._suspension_reasons:
-            return
+    def settle_suspended_for_modal(self) -> None:
+        """Normalize cards only after an opaque modal layer is covering them."""
 
-        self._suspension_reasons.discard(token)
-        self._suspended = bool(self._suspension_reasons)
-        if self._suspended:
+        if not self._suspended:
             return
+        self._moving_frames.clear()
+        self._hover_scale_cache.clear()
+        self._hover_scale_cache_key = None
+        for state in self.states.values():
+            try:
+                self._set_content_frozen(state, False)
+                state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)
+            except RuntimeError:
+                state.moving = False
 
+    def resume_from_modal(self) -> None:
+        if not self._suspended:
+            return
+        self._suspended = False
         self._moving_frames.clear()
         self._hover_scale_cache.clear()
         self._hover_scale_cache_key = None
@@ -592,42 +584,7 @@ class NekroCardInteractionController(QObject):
             except RuntimeError:
                 state.moving = False
 
-    def suspend_for_modal(self, *, preserve_visual: bool = False) -> None:
-        self.suspend(_SUSPEND_MODAL, preserve_visual=preserve_visual)
-
-    def settle_suspended_for_modal(self) -> None:
-        """Normalize cards only after an opaque modal layer is covering them."""
-
-        if _SUSPEND_MODAL not in self._suspension_reasons:
-            return
-        self._moving_frames.clear()
-        self._hover_scale_cache.clear()
-        self._hover_scale_cache_key = None
-        for state in self.states.values():
-            try:
-                self._set_content_frozen(state, False)
-                state.snap(_NORMAL_SCALE, _NORMAL_ALPHA)
-            except RuntimeError:
-                state.moving = False
-
-    def resume_from_modal(self) -> None:
-        self.resume(_SUSPEND_MODAL)
-
-    def suspend_for_startup(self) -> None:
-        self.suspend(_SUSPEND_STARTUP)
-
-    def resume_from_startup(self) -> None:
-        self.resume(_SUSPEND_STARTUP)
-
-    def suspend_for_quick_presentation(self) -> None:
-        self.suspend(_SUSPEND_QUICK_PRESENTATION)
-
-    def resume_from_quick_presentation(self) -> None:
-        self.resume(_SUSPEND_QUICK_PRESENTATION)
-
     def _cleanup(self) -> None:
-        self._suspension_reasons.clear()
-        self._suspended = False
         self._moving_frames.clear()
         self._hover_scale_cache.clear()
         self._hover_scale_cache_key = None

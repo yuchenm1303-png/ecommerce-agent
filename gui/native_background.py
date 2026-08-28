@@ -368,11 +368,8 @@ Window {{
                     y: cardY - clipY
                     width: cardW
                     height: cardH
-                    scale: cardScale
-                    transformOrigin: Item.Center
                     radius: {_GLASS_RADIUS:.1f}
                     antialiasing: true
-                    opacity: 0.82 + 0.18 * Math.max(0.0, Math.min(1.0, (Math.max(64.0, cardAlpha) - 64.0) / 38.0))
                     color: "white"
                 }}
             }}
@@ -384,7 +381,7 @@ Window {{
         anchors.fill: parent
         sourceItem: glassMaskScene
         hideSource: true
-        live: true
+        live: false
         smooth: true
         visible: false
     }}
@@ -396,8 +393,56 @@ Window {{
         maskEnabled: true
         maskSource: glassMaskTexture
         autoPaddingEnabled: false
-        colorization: 142 / 255.0
-        colorizationColor: "#56354E"
+    }}
+
+    ShaderEffectSource {{
+        id: staticGlassTexture
+        anchors.fill: parent
+        sourceItem: glassEffect
+        hideSource: !root.animationRunning
+        live: false
+        smooth: true
+        visible: !root.animationRunning
+    }}
+
+    onBlurUrlChanged: staticGlassTexture.scheduleUpdate()
+    onWidthChanged: staticGlassTexture.scheduleUpdate()
+    onHeightChanged: staticGlassTexture.scheduleUpdate()
+    onAnimationRunningChanged: {{
+        if (!animationRunning)
+            staticGlassTexture.scheduleUpdate()
+    }}
+    onGeometryRevisionChanged: {{
+        glassMaskTexture.scheduleUpdate()
+        staticGlassTexture.scheduleUpdate()
+    }}
+    Component.onCompleted: {{
+        glassMaskTexture.scheduleUpdate()
+        staticGlassTexture.scheduleUpdate()
+    }}
+
+    Repeater {{
+        model: glassCardModel
+        delegate: Item {{
+            x: 0
+            y: 0
+            width: root.width
+            height: root.height
+            clip: false
+            visible: cardVisible
+
+            Rectangle {{
+                x: cardX
+                y: cardY
+                width: cardW
+                height: cardH
+                scale: cardScale
+                transformOrigin: Item.Center
+                radius: {_GLASS_RADIUS:.1f}
+                antialiasing: true
+                color: Qt.rgba(0, 0, 0, cardAlpha / 255.0)
+            }}
+        }}
     }}
 
     FrameAnimation {{
