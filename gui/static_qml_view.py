@@ -350,20 +350,9 @@ class StaticActivityPresenceMirror(QObject):
             pass
 
     def _bind_runtime_sources(self) -> None:
-        # Raw subprocess log lines must not wake presentation.  Detailed progress
-        # converts meaningful log milestones into progress/phase state, and the
-        # bridge sceneChanged hook below catches concrete QWidget checkpoint changes.
-        for source_name in ("runner", "execution_runner"):
-            source = getattr(self.window, source_name, None)
-            for signal_name in (
-                "progress_changed",
-                "result_updated",
-                "running_changed",
-                "phase_event",
-                "completed",
-                "failed",
-            ):
-                self._connect(getattr(source, signal_name, None))
+        widget = self.widget
+        if widget is not None:
+            self._connect(getattr(widget, "stateChanged", None))
 
     def attach(self, host_item: QQuickItem) -> None:
         self._host_item = host_item
@@ -429,7 +418,7 @@ class StaticActivityPresenceMirror(QObject):
                 source_visible,
                 str(widget.mode or "STANDBY").upper(),
                 str(widget.detail or "等待任务"),
-                str(widget.meta or "总进度 · 等待商品任务"),
+                str(widget.meta or "总进度 · 0%"),
                 max(0, min(100, int(round(float(widget.target_percent))))),
                 bool(widget.active),
             )
