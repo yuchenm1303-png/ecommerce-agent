@@ -18,11 +18,9 @@ _LEFT_MARGIN = 24
 _BOTTOM_MARGIN = 18
 _CHARACTER_IMAGE = Path(__file__).resolve().parent / "assets" / "sakana_takina.png"
 
-# Match Sakana Widget's four-cell controller proportions, scaled for this GUI.
 _BASE_WIDTH = 156.0
 _BASE_HEIGHT = 34.0
 _BASE_RADIUS = 8.0
-_BASE_ITEM_WIDTH = _BASE_WIDTH / 4.0
 
 
 class _SakanaToyWidget(QWidget):
@@ -107,89 +105,13 @@ class _SakanaToyWidget(QWidget):
         )
         self.update()
 
-    @staticmethod
-    def _draw_person_icon(painter: QPainter, center: QPointF) -> None:
-        painter.drawEllipse(QRectF(center.x() - 8.0, center.y() - 8.0, 16.0, 16.0))
-        painter.drawEllipse(QRectF(center.x() - 2.7, center.y() - 4.8, 5.4, 5.4))
-        painter.drawArc(
-            QRectF(center.x() - 5.2, center.y() + 0.2, 10.4, 7.0),
-            10 * 16,
-            160 * 16,
-        )
-
-    @staticmethod
-    def _draw_sync_icon(painter: QPainter, center: QPointF) -> None:
-        arc = QRectF(center.x() - 7.5, center.y() - 7.5, 15.0, 15.0)
-        painter.drawArc(arc, 35 * 16, 135 * 16)
-        painter.drawArc(arc, 215 * 16, 135 * 16)
-        painter.drawLine(
-            QPointF(center.x() + 6.5, center.y() - 4.8),
-            QPointF(center.x() + 7.4, center.y() - 0.8),
-        )
-        painter.drawLine(
-            QPointF(center.x() + 6.5, center.y() - 4.8),
-            QPointF(center.x() + 2.8, center.y() - 5.6),
-        )
-        painter.drawLine(
-            QPointF(center.x() - 6.5, center.y() + 4.8),
-            QPointF(center.x() - 7.4, center.y() + 0.8),
-        )
-        painter.drawLine(
-            QPointF(center.x() - 6.5, center.y() + 4.8),
-            QPointF(center.x() - 2.8, center.y() + 5.6),
-        )
-
-    @staticmethod
-    def _draw_github_icon(painter: QPainter, center: QPointF) -> None:
-        painter.save()
-        painter.setBrush(QColor("#555555"))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(QRectF(center.x() - 7.0, center.y() - 5.2, 14.0, 12.5))
-        painter.drawEllipse(QRectF(center.x() - 3.4, center.y() + 3.4, 6.8, 6.0))
-        painter.restore()
-
-    @staticmethod
-    def _draw_close_icon(painter: QPainter, center: QPointF) -> None:
-        painter.drawEllipse(QRectF(center.x() - 8.0, center.y() - 8.0, 16.0, 16.0))
-        painter.drawLine(
-            QPointF(center.x() - 3.6, center.y() - 3.6),
-            QPointF(center.x() + 3.6, center.y() + 3.6),
-        )
-        painter.drawLine(
-            QPointF(center.x() + 3.6, center.y() - 3.6),
-            QPointF(center.x() - 3.6, center.y() + 3.6),
-        )
-
     def _draw_base(self, painter: QPainter) -> None:
         rect = self.base_rect()
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(0, 0, 0, 18))
         painter.drawRoundedRect(rect.translated(0.0, 5.0), _BASE_RADIUS, _BASE_RADIUS)
-        painter.setBrush(QColor("#dddddd"))
+        painter.setBrush(QColor("#ffffff"))
         painter.drawRoundedRect(rect, _BASE_RADIUS, _BASE_RADIUS)
-
-        divider_pen = QPen(QColor(255, 255, 255, 52))
-        divider_pen.setWidthF(1.0)
-        painter.setPen(divider_pen)
-        for index in range(1, 4):
-            x = rect.left() + _BASE_ITEM_WIDTH * index
-            painter.drawLine(QPointF(x, rect.top() + 5.0), QPointF(x, rect.bottom() - 5.0))
-
-        icon_pen = QPen(QColor("#555555"))
-        icon_pen.setWidthF(1.8)
-        icon_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        icon_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(icon_pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-
-        centers = [
-            QPointF(rect.left() + _BASE_ITEM_WIDTH * (index + 0.5), rect.center().y())
-            for index in range(4)
-        ]
-        self._draw_person_icon(painter, centers[0])
-        self._draw_sync_icon(painter, centers[1])
-        self._draw_github_icon(painter, centers[2])
-        self._draw_close_icon(painter, centers[3])
 
     def paintEvent(self, event: QEvent) -> None:  # type: ignore[override]
         painter = QPainter(self)
