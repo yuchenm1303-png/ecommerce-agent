@@ -238,6 +238,7 @@ def main() -> int:
     from gui.update_runtime import install_update_runtime
     from gui.usage_telemetry import install_usage_telemetry
     from gui.wallpaper_cache import install_preblur_cache
+    from gui.workspace_layout_commit import install_workspace_layout_commit
     from gui.workspace_transition import install_workspace_transition
     from gui.workspace_transition_tuning import apply_workspace_transition_tuning
 
@@ -309,6 +310,7 @@ def main() -> int:
     install_cooperative_pause(window)
     install_activity_presence(window)
     install_detailed_preparation_progress(window)
+    install_workspace_layout_commit(window)
     visual.refresh_glass_frames()
 
     # Low-frequency table/log work is optimized separately from rendering. It no
