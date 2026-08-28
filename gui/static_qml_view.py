@@ -43,7 +43,6 @@ class StaticQmlViewController(QObject):
         self._load_started = False
         self._load_failed = False
         self._handoff_armed = False
-        self._card_fx_suspended_here = False
         self._startup_prepare_requested = False
         self._startup_snapshot_prepared = False
         self.item: QQuickItem | None = None
@@ -89,11 +88,9 @@ class StaticQmlViewController(QObject):
         window.destroyed.connect(self._cleanup)
 
         # Quick is the authoritative presentation owner for the normal runtime.
-        # Disable the legacy QWidget animation lane before shell.show() can expose
-        # the first mouse sample. Otherwise a restored QGraphicsEffect card can
-        # enter sourcePixmap() during startup and block the GUI thread before the
-        # Quick handoff has a chance to suspend it. _fail_scene() re-enables this
-        # lane only when the Quick scene genuinely cannot be created.
+        # Its dedicated suspension hold is independent from startup and modal holds,
+        # so neither lifecycle can accidentally re-enable the legacy QWidget
+        # QGraphicsEffect/sourcePixmap path while Quick owns presentation.
         self._suspend_legacy_visuals()
 
         # Compile and create the hidden scene before the visible curtain movement.
@@ -239,24 +236,20 @@ class StaticQmlViewController(QObject):
         self._set_widget_lane_enabled(False)
         self._set_legacy_fireworks_enabled(False)
 
-        card_suspend = getattr(self.card_fx, "suspend_for_modal", None)
-        already_suspended = bool(getattr(self.card_fx, "_suspended", False))
-        if callable(card_suspend) and not already_suspended:
+        card_suspend = getattr(self.card_fx, "suspend_for_quick_presentation", None)
+        if callable(card_suspend):
             try:
                 card_suspend()
-                self._card_fx_suspended_here = True
             except RuntimeError:
-                self._card_fx_suspended_here = False
+                pass
 
     def _resume_legacy_fallback(self) -> None:
-        if self._card_fx_suspended_here:
-            self._card_fx_suspended_here = False
-            card_resume = getattr(self.card_fx, "resume_from_modal", None)
-            if callable(card_resume):
-                try:
-                    card_resume()
-                except RuntimeError:
-                    pass
+        card_resume = getattr(self.card_fx, "resume_from_quick_presentation", None)
+        if callable(card_resume):
+            try:
+                card_resume()
+            except RuntimeError:
+                pass
         self._set_widget_lane_enabled(True)
         self._set_legacy_fireworks_enabled(True)
 
