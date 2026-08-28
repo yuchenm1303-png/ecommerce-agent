@@ -208,6 +208,7 @@ def main() -> int:
     from gui.product_copy import install_product_copy
     from gui.product_input_window import ProductInputWorkflowMainWindow
     from gui.premium_copy import install_premium_copy
+    from gui.quick_modal_layer import install_quick_modal_layer
     from gui.required_input_support import install_required_input_support
     from gui.restore_snapshot import install_restore_snapshot
     from gui.runtime_assistant import install_runtime_assistant
@@ -217,7 +218,7 @@ def main() -> int:
     from gui.smooth_scroll import SmoothWheelFilter
     from gui.startup_entrance import install_startup_entrance
     from gui.startup_entrance_stability import install_startup_entrance_stability
-    from gui.static_modal_interaction import install_static_modal_interaction
+    from gui.static_qml_view import install_static_qml_view
     from gui.system_health_telemetry import install_system_health_telemetry
     from gui.ui_data_optimizations import install_ui_data_optimizations
     from gui.ui_maturity import install_mature_ui
@@ -272,7 +273,6 @@ def main() -> int:
     details.attach_mature(mature)
     install_page_scroll_layout(window, visual)
     install_console_summary_mode(window)
-    install_static_modal_interaction(window, details)
     install_field_table_transfer(window)
 
     window.install_mode_workspace()
@@ -348,12 +348,13 @@ def main() -> int:
 
     entrance = install_startup_entrance(window, visual)
     entrance_stability = install_startup_entrance_stability(window, entrance)
+    static_view = install_static_qml_view(window, visual, entrance_stability)
+    install_quick_modal_layer(window, static_view, details)
 
-    # Keep one permanent application-UI owner. The QQuickWindow is the GPU
-    # background/glass surface; the embedded QWidget tree remains the visible,
-    # interactive business UI for the whole process lifetime. Never install the
-    # QWidget-mirroring Static QML scene here and never hide the native child as a
-    # normal startup handoff. This removes the Quick/Win32 dual-owner deadlock path.
+    # The normal presentation has one owner: the existing QQuickWindow. QWidget
+    # remains alive only as the business/state host and fallback. Detail cards are
+    # mirrored by quick_modal_layer into the same Scene Graph, so opening a modal
+    # never switches renderer or starts QWidget opacity/snapshot animation lanes.
     mark_startup_stage("window_show")
     shell.show()
     effects.raise_()
