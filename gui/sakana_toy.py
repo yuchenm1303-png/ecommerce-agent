@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -26,8 +27,16 @@ _SAKANA_JS = "https://cdnjs.cloudflare.com/ajax/libs/sakana-widget/2.7.1/sakana.
 _SAKANA_CSS = "https://cdnjs.cloudflare.com/ajax/libs/sakana-widget/2.7.1/sakana.min.css"
 
 
+def _character_data_url() -> str:
+    try:
+        encoded = base64.b64encode(_CHARACTER_IMAGE.read_bytes()).decode("ascii")
+    except OSError as exc:
+        raise RuntimeError(f"Unable to read Sakana character image: {_CHARACTER_IMAGE}") from exc
+    return f"data:image/png;base64,{encoded}"
+
+
 def _html_source() -> str:
-    image_url = QUrl.fromLocalFile(str(_CHARACTER_IMAGE)).toString()
+    image_url = _character_data_url()
     return f'''<!doctype html>
 <html>
 <head>
