@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QTimer, Qt, QUrl
+from PySide6.QtCore import QEvent, QObject, QPointF, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtQml import QQmlComponent
 from PySide6.QtQuick import QQuickItem, QQuickWindow
@@ -26,6 +26,8 @@ class StaticQmlViewController(QObject):
     QQuickWindow.
     """
 
+    handoffFrameReady = Signal()
+
     def __init__(self, window: QMainWindow, visual: Any, startup_gate: Any) -> None:
         super().__init__(window)
         self.window = window
@@ -43,6 +45,7 @@ class StaticQmlViewController(QObject):
         self._load_started = False
         self._load_failed = False
         self._handoff_armed = False
+        self._handoff_frame_posted = False
         self._startup_prepare_requested = False
         self._startup_snapshot_prepared = False
         self.item: QQuickItem | None = None
@@ -52,6 +55,16 @@ class StaticQmlViewController(QObject):
             raise RuntimeError("unified Quick view requires the existing native QQuickWindow")
         if not callable(getattr(self.shell, "set_overlay_presented", None)):
             raise RuntimeError("unified Quick view requires native child presentation ownership")
+
+        # frameSwapped is a render-boundary signal. Never perform QWidget/Win32
+        # ownership changes from that callback stack: on Windows' threaded Quick
+        # render loop, ShowWindow on the GUI-owned child HWND can otherwise wait on
+        # the GUI thread while the GUI thread is waiting for the render frame. The
+        # queued signal makes the native handoff a normal GUI event-loop turn.
+        self.handoffFrameReady.connect(
+            self._commit_handoff,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
         self.card_model = StaticCardModel(self)
         self.bridge = StaticQmlBridge(window, visual, self.card_model, self)
@@ -337,22 +350,35 @@ class StaticQmlViewController(QObject):
         if self._handoff_armed:
             return
         self._handoff_armed = True
+        self._handoff_frame_posted = False
         try:
-            self.quick.frameSwapped.connect(self._commit_handoff)
+            self.quick.frameSwapped.connect(self._on_handoff_frame_swapped)
         except (RuntimeError, TypeError):
             self._handoff_armed = False
-            QTimer.singleShot(0, self._commit_handoff)
+            self._post_handoff_commit()
+
+    def _post_handoff_commit(self) -> None:
+        if self._handoff_frame_posted:
+            return
+        self._handoff_frame_posted = True
+        self.handoffFrameReady.emit()
+
+    def _on_handoff_frame_swapped(self) -> None:
+        # Render-boundary callback: no QWidget, Win32 or Quick mutation here.
+        if self._handoff_armed:
+            self._post_handoff_commit()
 
     def _disconnect_handoff(self) -> None:
         if not self._handoff_armed:
             return
         self._handoff_armed = False
         try:
-            self.quick.frameSwapped.disconnect(self._commit_handoff)
+            self.quick.frameSwapped.disconnect(self._on_handoff_frame_swapped)
         except (RuntimeError, TypeError):
             pass
 
     def _commit_handoff(self) -> None:
+        self._handoff_frame_posted = False
         self._disconnect_handoff()
         if not self._quick_active or not self._quick_requested:
             return
