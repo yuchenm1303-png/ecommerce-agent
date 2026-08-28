@@ -545,7 +545,7 @@ Item {
 
             x: cardX; y: cardY; width: cardW; height: cardH
             transformOrigin: Item.Center
-            scale: cardPress.pressed ? 1.0 : cardHover.hovered ? hoverScale : 1.0
+            scale: cardClick.pressed ? 1.0 : cardHover.hovered ? hoverScale : 1.0
             Behavior on scale {
                 NumberAnimation {
                     duration: 300
@@ -561,7 +561,7 @@ Item {
                 anchors.fill: parent
                 radius: 6
                 color: "#56354E"
-                opacity: (cardHover.hovered || cardPress.pressed) ? 102/255 : 64/255
+                opacity: (cardHover.hovered || cardClick.pressed) ? 102/255 : 64/255
                 Behavior on opacity {
                     NumberAnimation {
                         duration: 300
@@ -569,6 +569,17 @@ Item {
                         easing.bezierCurve: [0.25, 0.10, 0.25, 1.00, 1.00, 1.00]
                     }
                 }
+            }
+
+            // Card-detail input belongs only to uncovered card surface.  This
+            // MouseArea is intentionally below every control Loader, so a field,
+            // button, combo, table or tab receives the pointer first and the
+            // card never competes for the same click.
+            MouseArea {
+                id: cardClick
+                anchors.fill: parent
+                acceptedButtons: Qt.LeftButton
+                onClicked: staticBridge.requestCardDetail(card.index)
             }
 
             Repeater {
@@ -583,7 +594,6 @@ Item {
             }
 
             HoverHandler { id: cardHover; acceptedDevices: PointerDevice.Mouse }
-            TapHandler { id: cardPress; target: null; acceptedButtons: Qt.LeftButton }
         }
     }
 
