@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QCursor, QPainter, QPixmap
+from PySide6.QtGui import QColor, QCursor, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QApplication,
     QFrame,
     QGraphicsEffect,
     QMainWindow,
+    QWidget,
 )
 
 from .wallpaper_cache import PersistentNativeQuickBackground as NativeQuickBackground
@@ -19,6 +20,33 @@ _NORMAL_GLASS_ALPHA = 64.0
 _EFFECT_BOUND_SCALE = 1.04
 _CONTENT_EDGE_STEP_PX = 0.18
 _NORMAL_SCALE_EPSILON = 1e-5
+_WALLPAPER_DIM_ALPHA = 48
+
+
+class _WallpaperReadabilityVeil(QWidget):
+    """One passive luminance layer between the Quick wallpaper and QWidget content."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAutoFillBackground(False)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.sync_geometry()
+        self.lower()
+        self.show()
+
+    def sync_geometry(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        self.setGeometry(parent.rect())
+        self.lower()
+
+    def paintEvent(self, _event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, _WALLPAPER_DIM_ALPHA))
+        painter.end()
 
 
 class _CardScaleEffect(QGraphicsEffect):
@@ -230,6 +258,11 @@ class NativeVisualStyleController(QObject):
 
         window.setStyleSheet(window.styleSheet() + "\n" + NEKRO_STYLE)
         self.background = NativeQuickBackground(window)
+        self._wallpaper_veil = (
+            _WallpaperReadabilityVeil(self.central)
+            if self.central is not None
+            else None
+        )
         for frame in window.findChildren(QFrame):
             if frame.objectName() in _GLASS_NAMES:
                 frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -309,13 +342,20 @@ class NativeVisualStyleController(QObject):
         self._cursor_installed = True
 
     def _sync_glass(self) -> None:
+        if self._wallpaper_veil is not None:
+            self._wallpaper_veil.sync_geometry()
         for surface in self._glass.values():
             surface.sync_geometry()
         self.background.schedule_mask_update()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if watched is self.central and event.type() == QEvent.Type.Paint:
-            return True
+        if watched is self.central:
+            event_type = event.type()
+            if event_type in (QEvent.Type.Resize, QEvent.Type.Show):
+                if self._wallpaper_veil is not None:
+                    self._wallpaper_veil.sync_geometry()
+            if event_type == QEvent.Type.Paint:
+                return True
         return False
 
     def _cleanup(self) -> None:
