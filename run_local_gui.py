@@ -84,6 +84,7 @@ def main() -> int:
     from gui.resilient_app_updater import install_application_updater
     from gui.batch_card_responsive import install_batch_card_responsive
     from gui.batch_individual_controls import install_batch_individual_controls
+    from gui.batch_parallel_runtime import install_batch_parallel_runtime
     from gui.batch_product_files import install_batch_product_files
     from gui.cooperative_pause import install_cooperative_pause
     from gui.batch_sku_spec_ui import install_batch_sku_spec_ui
@@ -198,6 +199,7 @@ def main() -> int:
     install_workspace_mode_switch(window)
     install_frozen_process_router(window)
     install_managed_makro_browser(window)
+    install_batch_parallel_runtime(window)
     install_required_input_support(window)
     install_listing_offer_support(window)
     install_single_ai_guidance(window)
