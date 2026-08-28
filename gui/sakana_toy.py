@@ -11,16 +11,22 @@ from PySide6.QtWidgets import QApplication, QHBoxLayout, QPushButton, QVBoxLayou
 from gui.sakana_physics import SakanaSpringState, advance_spring, move_spring
 
 
-_TOY_SIZE = 180.0
+# Sakana Widget upstream defaults. The custom character artwork, left-bottom
+# placement, plain white controller and top-right visibility toggle are the only
+# intentional product-level differences kept by this desktop port.
+_TOY_SIZE = 200.0
 _IMAGE_SIZE = _TOY_SIZE / 1.25
 _CANVAS_SIZE = _TOY_SIZE * 1.5
 _LEFT_MARGIN = 24
 _BOTTOM_MARGIN = 18
 _CHARACTER_IMAGE = Path(__file__).resolve().parent / "assets" / "sakana_takina.png"
 
-_BASE_WIDTH = 156.0
-_BASE_HEIGHT = 34.0
-_BASE_RADIUS = 8.0
+# Upstream controller geometry: 4 * 28px, 24px high, 6px radius. Symbols are
+# intentionally omitted per the desktop UI requirement, but geometry is kept.
+_BASE_WIDTH = 112.0
+_BASE_HEIGHT = 24.0
+_BASE_RADIUS = 6.0
+_DEFAULT_REFRESH_HZ = 60.0
 
 
 class _SakanaToyWidget(QWidget):
@@ -35,6 +41,8 @@ class _SakanaToyWidget(QWidget):
         side = math.ceil(_CANVAS_SIZE)
         self.setFixedSize(side, side)
 
+        # The reference page uses Takina, so preserve the upstream Takina state:
+        # i=.08, s=.1, d=.988, r=12, y=2, t=0, w=0.
         self.state = SakanaSpringState()
         self.max_rotation = max(30.0, min(60.0, _TOY_SIZE / 5.0))
         self.max_y = _TOY_SIZE / 4.0
@@ -68,8 +76,8 @@ class _SakanaToyWidget(QWidget):
         anchor = self.anchor
         transform.translate(anchor.x(), anchor.y())
         transform.rotate(self.state.r)
-        # Sakana CSS: rotate(r) translateX(r) translateY(y), around the bottom
-        # center transform-origin. Qt's painter transform below uses the same order.
+        # Upstream CSS: rotate(r) translateX(r) translateY(y), with transform
+        # origin at 50% / size px (bottom-center axis of the 200px widget).
         transform.translate(self.state.r, self.state.y)
         return transform
 
@@ -122,7 +130,7 @@ class _SakanaToyWidget(QWidget):
         offset = self._center_offset()
         end = QPointF(anchor.x() + offset.x(), anchor.y() - offset.y())
 
-        # Upstream default stroke is #b4b4b4, width 10, round caps.
+        # Upstream default rod: #b4b4b4, 10px, round caps.
         pen = QPen(QColor("#b4b4b4"))
         pen.setWidthF(10.0)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -139,7 +147,7 @@ class _SakanaToyWidget(QWidget):
 
 
 class SakanaToyController(QObject):
-    """Own Sakana physics, base drag, visibility toggle and lifecycle."""
+    """Own Sakana physics, frame scheduling, drag, visibility and lifecycle."""
 
     def __init__(self, window: QWidget) -> None:
         super().__init__(window)
@@ -152,14 +160,16 @@ class SakanaToyController(QObject):
         self._position_press_global = QPointF()
         self._position_press_top_left = QPoint()
         self._user_positioned = False
-        self._last_tick = time.monotonic()
-        self._running = True
 
-        # requestAnimationFrame on the source site is one spring step per display
-        # frame. A precise 16 ms Qt timer provides that same single-owner cadence.
+        # Upstream uses Date.now() plus requestAnimationFrame. Keep exactly one
+        # physics step per display frame and the same elapsed-time input to the
+        # Sakana equations instead of imposing a fixed 16ms cadence.
+        self._last_tick = time.monotonic()
+        self._next_frame_deadline = 0.0
+        self._running = True
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._timer.setInterval(16)
+        self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._step_physics)
 
         self.toggle = self._install_toggle()
@@ -199,6 +209,33 @@ class SakanaToyController(QObject):
         header.addWidget(button, 0, Qt.AlignmentFlag.AlignBottom)
         return button
 
+    def _display_refresh_hz(self) -> float:
+        screen = self.window.screen()
+        if screen is None:
+            return _DEFAULT_REFRESH_HZ
+        refresh = float(screen.refreshRate())
+        if not math.isfinite(refresh) or refresh <= 1.0:
+            return _DEFAULT_REFRESH_HZ
+        return refresh
+
+    def _schedule_next_frame(self, *, reset_deadline: bool = False) -> None:
+        if not self._running or not self.toy.isVisible():
+            self._timer.stop()
+            return
+
+        now = time.monotonic()
+        frame_period = 1.0 / self._display_refresh_hz()
+        if (
+            reset_deadline
+            or self._next_frame_deadline <= 0.0
+            or self._next_frame_deadline < now - frame_period
+        ):
+            self._next_frame_deadline = now
+
+        self._next_frame_deadline += frame_period
+        delay_ms = max(0, round((self._next_frame_deadline - now) * 1000.0))
+        self._timer.start(delay_ms)
+
     def _place_default(self) -> None:
         self.toy.move(
             _LEFT_MARGIN,
@@ -226,9 +263,8 @@ class SakanaToyController(QObject):
             self._position_press_top_left = self.toy.pos()
             self._user_positioned = True
         elif self.toy.character_hit_test(local):
-            # Match Sakana `_onMouseDown`: stop RAF, remember only the press Y,
-            # and zero both velocities. The horizontal drag remains relative to
-            # the widget center rather than the click point.
+            # Upstream `_onMouseDown`: stop RAF, remember press pageY, zero both
+            # velocities. Horizontal displacement remains relative to main center.
             self._interaction = "spring"
             self._spring_press_y = event.globalPosition().y()
             self._running = False
@@ -266,11 +302,10 @@ class SakanaToyController(QObject):
         if QWidget.mouseGrabber() is self.window:
             self.window.releaseMouse()
         if spring and self.toy.isVisible():
-            # The website does NOT reset `_lastRunUnix` on mouseup. Keeping the
-            # previous tick makes the first released frame use full inertia after
-            # a normal drag, exactly like requestAnimationFrame(this._run).
+            # Upstream mouseup does not reset `_lastRunUnix`; it only requests the
+            # next animation frame. Preserve that exact first-release-step timing.
             self._running = True
-            self._timer.start()
+            self._schedule_next_frame(reset_deadline=True)
         if event is not None:
             event.accept()
         return True
@@ -285,13 +320,13 @@ class SakanaToyController(QObject):
         self._last_tick = now
 
         if not advance_spring(self.toy.state, elapsed_ms):
-            # Upstream stops before `_draw()` when all four state values are below
-            # threshold, so do not force one extra final repaint here.
+            # Upstream stops before `_draw()` once all four values are below cut.
             self._running = False
             self._timer.stop()
             return
 
         self.toy.update()
+        self._schedule_next_frame()
 
     def set_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -312,7 +347,7 @@ class SakanaToyController(QObject):
         self.toy.raise_()
         self._running = True
         self._last_tick = time.monotonic()
-        self._timer.start()
+        self._schedule_next_frame(reset_deadline=True)
 
     def raise_overlay(self) -> None:
         if self.toy.isVisible():
