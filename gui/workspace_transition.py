@@ -24,7 +24,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .native_background import _GLASS_NAMES, _OVERSCAN
+from .native_background import _GLASS_NAMES
+from .native_background import _OVERSCAN
 
 
 # Large top-level workspaces get more time than the tiny 300 ms switch control.
@@ -197,8 +198,8 @@ class _WorkspaceTransitionSurface(QWidget):
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         painter = QPainter(self)
 
-        # CompositionMode_Source is deliberate: the opaque Fuji base writes
-        # every pixel in the viewport, so nothing from native Quick glass can leak through.
+        # CompositionMode_Source is deliberate: the opaque Fuji base owns the
+        # viewport. Nothing from the live page or native Quick glass can leak through.
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         painter.fillRect(self.rect(), QColor(23, 38, 58))
         if not self._neutral.isNull():
