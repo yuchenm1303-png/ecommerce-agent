@@ -9,11 +9,11 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Sequence
 
-from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QEvent, QObject, QTimer, Qt
+from PySide6.QtGui import QColor, QMouseEvent
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 
 _ROOT = Path(__file__).resolve().parent
@@ -23,6 +23,10 @@ _CANVAS_INSET = 50
 _LEFT_MARGIN = 24
 _BOTTOM_MARGIN = 18
 _OWNER_POLL_MS = 33
+_CONTROL_WIDTH = 112
+_CONTROL_HEIGHT = 24
+_CONTROL_X = _CANVAS_INSET + (_TOY_SIZE - _CONTROL_WIDTH) // 2
+_CONTROL_Y = _CANVAS_INSET + _TOY_SIZE - _CONTROL_HEIGHT
 _CHARACTER_IMAGE = _ROOT / "gui" / "assets" / "sakana_character.png"
 
 # This file is intentionally outside the gui package. Starting a helper through
@@ -43,7 +47,7 @@ _SAKANA_271_CSS = """
 .sakana-widget-canvas{z-index:10;pointer-events:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%)}
 .sakana-widget-main{z-index:20;pointer-events:none;position:absolute;display:flex;flex-direction:column;justify-content:space-between;align-items:center}
 .sakana-widget-img{z-index:40;cursor:move;pointer-events:auto;position:relative;background:no-repeat 50% 50%;background-size:cover}
-.sakana-widget-ctrl{z-index:30;cursor:pointer;pointer-events:auto;position:relative;height:24px;width:112px;display:flex;border-radius:6px;background-color:#ddd;box-shadow:0 8px 24px rgba(0,0,0,.1)}
+.sakana-widget-ctrl{z-index:30;cursor:move;pointer-events:auto;position:relative;height:24px;width:112px;display:flex;border-radius:6px;background-color:#ddd;box-shadow:0 8px 24px rgba(0,0,0,.1)}
 .sakana-widget-ctrl-item{height:24px;width:28px;display:flex;justify-content:center;align-items:center;color:#555;background-color:transparent}
 .sakana-widget-ctrl-item:hover{color:#555;background-color:rgba(255,255,255,.25)}
 .sakana-widget-icon{height:18px;width:18px}
@@ -234,6 +238,70 @@ html, body {{
 </html>'''
 
 
+class _BaseDragFilter(QObject):
+    """Move only the native toy host while the white Sakana base is dragged."""
+
+    def __init__(self, host: "SakanaProcessHost") -> None:
+        super().__init__(host.view)
+        self.host = host
+        self._dragging = False
+        self._press_global = None
+        self._press_root = (0, 0)
+
+    def _belongs_to_view(self, watched: QObject) -> bool:
+        if not isinstance(watched, QWidget):
+            return False
+        current: QWidget | None = watched
+        while current is not None:
+            if current is self.host.view:
+                return True
+            current = current.parentWidget()
+        return False
+
+    def _base_hit(self, event: QMouseEvent) -> bool:
+        point = self.host.view.mapFromGlobal(event.globalPosition().toPoint())
+        return (
+            _CONTROL_X <= point.x() < _CONTROL_X + _CONTROL_WIDTH
+            and _CONTROL_Y <= point.y() < _CONTROL_Y + _CONTROL_HEIGHT
+        )
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if not self._belongs_to_view(watched):
+            return False
+        event_type = event.type()
+        if not isinstance(event, QMouseEvent):
+            return False
+
+        if event_type == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.LeftButton and self._base_hit(event):
+                self._dragging = True
+                self._press_global = event.globalPosition().toPoint()
+                self._press_root = self.host.root_position
+                return True
+            return False
+
+        if event_type == QEvent.Type.MouseMove and self._dragging:
+            if not (event.buttons() & Qt.MouseButton.LeftButton):
+                self._dragging = False
+                self._press_global = None
+                return True
+            current = event.globalPosition().toPoint()
+            if self._press_global is not None:
+                delta = current - self._press_global
+                self.host.set_root_position(
+                    self._press_root[0] + delta.x(),
+                    self._press_root[1] + delta.y(),
+                )
+            return True
+
+        if event_type == QEvent.Type.MouseButtonRelease and self._dragging:
+            self._dragging = False
+            self._press_global = None
+            return True
+
+        return False
+
+
 class SakanaProcessHost:
     """Own the Sakana WebEngine surface in a process independent of the app UI."""
 
@@ -264,6 +332,9 @@ class SakanaProcessHost:
         self.child_hwnd = int(self.view.winId())
 
         self._presented = False
+        self._root_position: tuple[int, int] | None = None
+        self.drag_filter = _BaseDragFilter(self)
+        self.app.installEventFilter(self.drag_filter)
         self.view.setHtml(_html_source())
         self._sync_owner()
 
@@ -274,6 +345,34 @@ class SakanaProcessHost:
         self.owner_timer.setInterval(_OWNER_POLL_MS)
         self.owner_timer.timeout.connect(self._sync_owner)
         self.owner_timer.start()
+
+    @property
+    def root_position(self) -> tuple[int, int]:
+        geometry = self.owner.client_geometry()
+        if geometry is None:
+            return self._root_position or (_LEFT_MARGIN, 0)
+        _left, _top, width, height = geometry
+        if self._root_position is None:
+            self._root_position = (
+                min(_LEFT_MARGIN, max(0, width - _TOY_SIZE)),
+                max(0, height - _TOY_SIZE - _BOTTOM_MARGIN),
+            )
+        return self._clamp_root(*self._root_position, width=width, height=height)
+
+    @staticmethod
+    def _clamp_root(x: int, y: int, *, width: int, height: int) -> tuple[int, int]:
+        return (
+            max(0, min(int(x), max(0, int(width) - _TOY_SIZE))),
+            max(0, min(int(y), max(0, int(height) - _TOY_SIZE))),
+        )
+
+    def set_root_position(self, x: int, y: int) -> None:
+        geometry = self.owner.client_geometry()
+        if geometry is None:
+            return
+        _left, _top, width, height = geometry
+        self._root_position = self._clamp_root(x, y, width=width, height=height)
+        self._sync_owner()
 
     def _sync_owner(self) -> None:
         if not self.owner.exists():
@@ -288,18 +387,22 @@ class SakanaProcessHost:
                 self._presented = False
             return
 
-        left, top, _width, height = geometry
-        position = (
-            left + _LEFT_MARGIN - _CANVAS_INSET,
-            top + height - _TOY_SIZE - _BOTTOM_MARGIN - _CANVAS_INSET,
-        )
-        self.owner.present(self.child_hwnd, *position)
+        left, top, width, height = geometry
+        root_x, root_y = self.root_position
+        self._root_position = self._clamp_root(root_x, root_y, width=width, height=height)
+        overlay_x = left + self._root_position[0] - _CANVAS_INSET
+        overlay_y = top + self._root_position[1] - _CANVAS_INSET
+        self.owner.present(self.child_hwnd, overlay_x, overlay_y)
         self._presented = True
 
     def cleanup(self) -> None:
         try:
             self.owner_timer.stop()
         except (AttributeError, RuntimeError):
+            pass
+        try:
+            self.app.removeEventFilter(self.drag_filter)
+        except RuntimeError:
             pass
         try:
             self.page.runJavaScript(
