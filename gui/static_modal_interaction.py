@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, Qt, QTimer, Signal
-from PySide6.QtGui import QKeyEvent, QMouseEvent, QPainter, QPixmap, QRegion
-from PySide6.QtWidgets import QFrame, QLabel, QMainWindow, QWidget
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, Qt, QTimer
+from PySide6.QtGui import QKeyEvent
+from PySide6.QtWidgets import (
+    QFrame,
+    QGraphicsOpacityEffect,
+    QLabel,
+    QMainWindow,
+    QWidget,
+)
 
 from .card_details_fast import FastCardDetailController
 
 
-_OPEN_MS = 500
-_CLOSE_MS = 300
+_OPEN_MS = 260
+_CLOSE_MS = 210
+_DRAWER_TRAVEL_PX = 14
 
 _STATE_IDLE = "idle"
 _STATE_OPENING = "opening"
@@ -18,182 +25,27 @@ _STATE_OPEN = "open"
 _STATE_CLOSING = "closing"
 
 
-def _css_ease() -> QEasingCurve:
-    curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
-    curve.addCubicBezierSegment(
-        QPointF(0.25, 0.10),
-        QPointF(0.25, 1.00),
-        QPointF(1.00, 1.00),
-    )
-    return curve
+def _open_ease() -> QEasingCurve:
+    return QEasingCurve(QEasingCurve.Type.OutCubic)
 
 
-def _css_ease_in_out() -> QEasingCurve:
-    curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
-    curve.addCubicBezierSegment(
-        QPointF(0.42, 0.00),
-        QPointF(0.58, 1.00),
-        QPointF(1.00, 1.00),
-    )
-    return curve
-
-
-def _empty_surface_frame(widget: QWidget) -> QPixmap:
-    dpr = max(1.0, float(widget.devicePixelRatioF()))
-    width = max(1, int(round(widget.width() * dpr)))
-    height = max(1, int(round(widget.height() * dpr)))
-    frame = QPixmap(width, height)
-    frame.setDevicePixelRatio(dpr)
-    frame.fill(Qt.GlobalColor.transparent)
-    return frame
-
-
-def _fit_frame(source: QPixmap, widget: QWidget) -> QPixmap:
-    if source.isNull() or widget.width() <= 0 or widget.height() <= 0:
-        return QPixmap(source)
-
-    dpr = max(1.0, float(widget.devicePixelRatioF()))
-    target_width = max(1, int(round(widget.width() * dpr)))
-    target_height = max(1, int(round(widget.height() * dpr)))
-    same_pixels = source.width() == target_width and source.height() == target_height
-    same_dpr = abs(float(source.devicePixelRatio()) - dpr) <= 1e-3
-    if same_pixels and same_dpr:
-        return QPixmap(source)
-
-    fitted = source.scaled(
-        target_width,
-        target_height,
-        Qt.AspectRatioMode.IgnoreAspectRatio,
-        Qt.TransformationMode.SmoothTransformation,
-    )
-    fitted.setDevicePixelRatio(dpr)
-    return fitted
-
-
-class _ModalTransitionSurface(QWidget):
-    """The only animated visual owner for modal transitions."""
-
-    clicked = Signal()
-
-    def __init__(self, parent: QWidget) -> None:
-        super().__init__(parent)
-        self.setObjectName("cardDetailTransitionSurface")
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.setAutoFillBackground(False)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._base = QPixmap()
-        self._top = QPixmap()
-        self._progress = 0.0
-        self._capture_suppressed = False
-        self._live_underlay = False
-        self.hide()
-
-    def _sync_opaque_attribute(self) -> None:
-        opaque = not self._capture_suppressed and not self._live_underlay
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, opaque)
-
-    def set_capture_suppressed(self, suppressed: bool) -> None:
-        suppressed = bool(suppressed)
-        if suppressed == self._capture_suppressed:
-            return
-        self._capture_suppressed = suppressed
-        self._sync_opaque_attribute()
-
-    def set_hold_frame(self, frame: QPixmap) -> None:
-        self._live_underlay = False
-        self._sync_opaque_attribute()
-        self._base = _fit_frame(frame, self)
-        self._top = QPixmap()
-        self._progress = 0.0
-        self.update()
-
-    def set_transition_frames(self, base: QPixmap, top: QPixmap, progress: float) -> None:
-        self._live_underlay = False
-        self._sync_opaque_attribute()
-        self._base = _fit_frame(base, self)
-        self._top = _fit_frame(top, self)
-        self._progress = max(0.0, min(1.0, float(progress)))
-        self.update()
-
-    def set_live_underlay_fade(self, top: QPixmap, progress: float) -> None:
-        self._live_underlay = True
-        self._sync_opaque_attribute()
-        self._base = QPixmap()
-        self._top = _fit_frame(top, self)
-        self._progress = max(0.0, min(1.0, float(progress)))
-        self.update()
-
-    def clear_frames(self) -> None:
-        self._base = QPixmap()
-        self._top = QPixmap()
-        self._progress = 0.0
-        self._live_underlay = False
-        self._sync_opaque_attribute()
-        self.update()
-
-    def set_progress(self, value: float) -> None:
-        value = max(0.0, min(1.0, float(value)))
-        if abs(value - self._progress) <= 1e-6:
-            return
-        self._progress = value
-        self.update()
-
-    def _draw_fitted(self, painter: QPainter, frame: QPixmap) -> None:
-        if frame.isNull():
-            return
-        logical = frame.deviceIndependentSize()
-        if (
-            abs(float(logical.width()) - float(self.width())) <= 0.5
-            and abs(float(logical.height()) - float(self.height())) <= 0.5
-        ):
-            painter.drawPixmap(0, 0, frame)
-            return
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.drawPixmap(self.rect(), frame, frame.rect())
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
-
-    def paintEvent(self, _event) -> None:  # type: ignore[override]
-        if self._capture_suppressed:
-            return
-        painter = QPainter(self)
-        if self._live_underlay:
-            if self._progress > 0.0 and not self._top.isNull():
-                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-                painter.setOpacity(self._progress)
-                self._draw_fitted(painter, self._top)
-            painter.end()
-            return
-
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-        if self._progress >= 1.0 - 1e-6 and not self._top.isNull():
-            self._draw_fitted(painter, self._top)
-            painter.end()
-            return
-        if not self._base.isNull():
-            self._draw_fitted(painter, self._base)
-        else:
-            painter.fillRect(self.rect(), Qt.GlobalColor.black)
-        if self._progress > 0.0 and not self._top.isNull():
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-            painter.setOpacity(self._progress)
-            self._draw_fitted(painter, self._top)
-        painter.end()
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
-            event.accept()
-            return
-        super().mousePressEvent(event)
+def _close_ease() -> QEasingCurve:
+    return QEasingCurve(QEasingCurve.Type.InOutCubic)
 
 
 class StaticModalInteractionController(QObject):
-    """One transition surface plus one real interactive modal.
+    """Stable live modal animation with one geometry owner.
 
-    Runtime presentation is frozen with one named hold on PresentationClock.
-    Card state and the truthful progress widget keep their own explicit lifecycle;
-    there are no background/effects/pointer timer compatibility branches.
+    The old implementation cross-faded two full-window raster snapshots. That made
+    the transition depend on the exact instant a hovered/scaled card was captured,
+    and a root resize had to snap the animation to an endpoint. The result was the
+    visible button/card trail and occasional edge bounce reported by users.
+
+    This controller never rasterizes or animates the workspace. The live workspace
+    remains the only underlay. Only the absolute-positioned modal layers animate:
+    a blurred backdrop fades in, the scrim fades in, and the drawer travels a small
+    fixed distance while fading. Drawer geometry is recomputed from the current root
+    rect every frame, so resizing/maximizing cannot create a stale edge target.
     """
 
     def __init__(self, window: QMainWindow, details: FastCardDetailController) -> None:
@@ -210,28 +62,37 @@ class StaticModalInteractionController(QObject):
         self._passive_labels: dict[QLabel, bool] = {}
         self._state = _STATE_IDLE
         self._progress = 0.0
-        self._fallback_active = False
         self._underlay_suspended = False
-        self._modal_closed_for_motion = False
+        self._underlay_settled = False
         self._activity_timer_was_active = False
 
         self._motion_started_s = 0.0
         self._motion_duration_s = 0.001
         self._motion_from = 0.0
         self._motion_to = 0.0
-        self._motion_easing = _css_ease()
-        self._entry_workspace_frame = QPixmap()
+        self._motion_easing = _open_ease()
 
         self._original_show_prepared_modal = self.details._show_prepared_modal  # noqa: SLF001
         self._original_close = self.details.close
 
-        self.details.drawer.setGraphicsEffect(None)
+        # Opacity effects are attached only to the three absolute modal layers.
+        # They never participate in the workspace layout or card geometry.
+        self._drawer_opacity = QGraphicsOpacityEffect(self.details.drawer)
+        self._drawer_opacity.setOpacity(0.0)
+        self.details.drawer.setGraphicsEffect(self._drawer_opacity)
+
+        self._scrim_opacity = QGraphicsOpacityEffect(self.details.scrim)
+        self._scrim_opacity.setOpacity(0.0)
+        self.details.scrim.setGraphicsEffect(self._scrim_opacity)
+
+        self._backdrop_opacity = QGraphicsOpacityEffect(self.details.backdrop)
+        self._backdrop_opacity.setOpacity(0.0)
+        self.details.backdrop.setGraphicsEffect(self._backdrop_opacity)
+
+        self.details.ghost.hide()
         self.details.backdrop.hide()
         self.details.scrim.hide()
-        self.details.ghost.hide()
-
-        self._transition = _ModalTransitionSurface(self.root)
-        self._transition.clicked.connect(self.request_close)
+        self.details.drawer.hide()
 
         self._motion_timer = QTimer(self)
         self._motion_timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -277,15 +138,24 @@ class StaticModalInteractionController(QObject):
             pass
         self.details.scrim.clicked.connect(self.request_close)
 
+    def _card_fx(self):  # noqa: ANN201
+        return getattr(self.window, "_nekro_card_fx", None)
+
     def _suspend_underlay(self) -> None:
         if self._underlay_suspended:
             return
         self._underlay_suspended = True
+        self._underlay_settled = False
 
-        card_fx = getattr(self.window, "_nekro_card_fx", None)
+        card_fx = self._card_fx()
         suspend_cards = getattr(card_fx, "suspend_for_modal", None)
         if callable(suspend_cards):
             try:
+                # Preserve the exact hover/press pixels the user clicked. The
+                # modal fade starts over that same live state, so there is no
+                # pre-animation snap back to scale 1.0.
+                suspend_cards(preserve_visual=True)
+            except TypeError:
                 suspend_cards()
             except RuntimeError:
                 pass
@@ -310,12 +180,26 @@ class StaticModalInteractionController(QObject):
             except RuntimeError:
                 pass
 
+    def _settle_hidden_underlay(self) -> None:
+        if not self._underlay_suspended or self._underlay_settled:
+            return
+        card_fx = self._card_fx()
+        settle = getattr(card_fx, "settle_suspended_for_modal", None)
+        if callable(settle):
+            try:
+                settle()
+                self._underlay_settled = True
+                return
+            except RuntimeError:
+                pass
+        self._underlay_settled = True
+
     def _resume_underlay(self) -> None:
         if not self._underlay_suspended:
             return
         self._underlay_suspended = False
 
-        card_fx = getattr(self.window, "_nekro_card_fx", None)
+        card_fx = self._card_fx()
         resume_cards = getattr(card_fx, "resume_from_modal", None)
         if callable(resume_cards):
             try:
@@ -339,6 +223,7 @@ class StaticModalInteractionController(QObject):
             except RuntimeError:
                 pass
         self._activity_timer_was_active = False
+        self._underlay_settled = False
 
         if self.background is not None:
             schedule_geometry = getattr(self.background, "schedule_mask_update", None)
@@ -349,43 +234,39 @@ class StaticModalInteractionController(QObject):
                     pass
 
     def _sync_modal_geometry(self) -> None:
-        self._transition.setGeometry(self.root.rect())
         self.details.backdrop.setGeometry(self.root.rect())
         self.details.scrim.setGeometry(self.root.rect())
-        self.details.drawer.setGeometry(self.details._drawer_rect())  # noqa: SLF001
+        target = self.details._drawer_rect()  # noqa: SLF001
+        offset = round(_DRAWER_TRAVEL_PX * (1.0 - self._progress))
+        moved = target.translated(0, offset)
+        self.details.drawer.setGeometry(moved)
+
+    def _prepare_live_modal(self, *, ratio: tuple[float, float], blurred) -> None:  # noqa: ANN001
+        self.details._modal_ratio = ratio  # noqa: SLF001
+        self.details.backdrop.setPixmap(blurred)
+        self.details.scroll.verticalScrollBar().setValue(0)
+        self.details.ghost.hide()
+
+        # Modal-only layouts may be committed here; the workspace itself is never
+        # activated or resized by the transition.
         self.details.body_layout.activate()
         drawer_layout = self.details.drawer.layout()
         if drawer_layout is not None:
             drawer_layout.activate()
 
-    def _show_real_modal(self, blurred: QPixmap) -> None:
-        self.details.backdrop.setPixmap(blurred)
-        self.details.scroll.verticalScrollBar().setValue(0)
-        self.details.ghost.hide()
+        self._progress = 0.0
         self._sync_modal_geometry()
+        self._drawer_opacity.setOpacity(0.0)
+        self._scrim_opacity.setOpacity(0.0)
+        self._backdrop_opacity.setOpacity(0.0)
+
         self.details.backdrop.show()
         self.details.backdrop.raise_()
         self.details.scrim.show()
         self.details.scrim.raise_()
         self.details.drawer.show()
         self.details.drawer.raise_()
-        self._transition.raise_()
-
-    def _render_root_without_transition(self) -> QPixmap:
-        if self.root.width() <= 0 or self.root.height() <= 0:
-            return QPixmap()
-        frame = _empty_surface_frame(self.root)
-        self._transition.set_capture_suppressed(True)
-        try:
-            self.root.render(
-                frame,
-                QPoint(0, 0),
-                QRegion(),
-                QWidget.RenderFlag.DrawChildren,
-            )
-        finally:
-            self._transition.set_capture_suppressed(False)
-        return frame
+        self.details.close_button.setEnabled(False)
 
     def _frame_interval_ms(self) -> int:
         refresh_hz = 60.0
@@ -397,77 +278,68 @@ class StaticModalInteractionController(QObject):
                     refresh_hz = candidate
             except (RuntimeError, TypeError, ValueError):
                 pass
-        target_hz = max(60.0, min(240.0, refresh_hz))
-        return max(4, int(1000.0 / target_hz))
+        target_hz = max(60.0, min(144.0, refresh_hz))
+        return max(5, int(round(1000.0 / target_hz)))
 
     def _stop_animation(self) -> None:
         self._motion_timer.stop()
 
-    def _start_fade(self, *, end: float, duration_ms: int, easing: QEasingCurve) -> None:
+    def _start_motion(self, *, end: float, duration_ms: int, easing: QEasingCurve) -> None:
         self._motion_timer.stop()
         self._motion_from = float(self._progress)
         self._motion_to = max(0.0, min(1.0, float(end)))
-        self._motion_duration_s = max(0.001, float(duration_ms) / 1000.0)
+        distance = abs(self._motion_to - self._motion_from)
+        self._motion_duration_s = max(0.001, (float(duration_ms) * max(0.18, distance)) / 1000.0)
         self._motion_easing = easing
         self._motion_started_s = time.perf_counter()
         self._motion_timer.setInterval(self._frame_interval_ms())
         self._motion_timer.start()
 
-    def _set_progress(self, value: float) -> None:
-        value = max(0.0, min(1.0, float(value)))
-        self._progress = value
-        self._transition.set_progress(value)
+    def _apply_visual_state(self, progress: float) -> None:
+        progress = max(0.0, min(1.0, float(progress)))
+        self._progress = progress
+        self._sync_modal_geometry()
+
+        # The drawer leads the transition slightly; the blur/scrim catch up behind
+        # it. All curves are monotonic, so there is no overshoot or edge rebound.
+        drawer_alpha = progress
+        backdrop_alpha = min(1.0, progress * 1.10)
+        scrim_alpha = min(1.0, progress * 1.18)
+        self._drawer_opacity.setOpacity(drawer_alpha)
+        self._backdrop_opacity.setOpacity(backdrop_alpha)
+        self._scrim_opacity.setOpacity(scrim_alpha)
 
     def _advance_motion(self) -> None:
         elapsed_s = max(0.0, time.perf_counter() - self._motion_started_s)
         linear = min(1.0, elapsed_s / self._motion_duration_s)
         eased = float(self._motion_easing.valueForProgress(linear))
         value = self._motion_from + (self._motion_to - self._motion_from) * eased
-        self._set_progress(value)
+        self._apply_visual_state(value)
         if linear >= 1.0:
             self._motion_timer.stop()
-            self._set_progress(self._motion_to)
+            self._apply_visual_state(self._motion_to)
             self._finish_motion()
-
-    def _prepare_open_transition(self, *, ratio: tuple[float, float]) -> None:
-        self.details._modal_ratio = ratio  # noqa: SLF001
-        self._sync_modal_geometry()
-        entry = self.details._capture_source()  # noqa: SLF001
-        if entry.isNull():
-            raise RuntimeError("failed to capture modal entry frame")
-        self._entry_workspace_frame = _fit_frame(entry, self.root)
-        blurred = self.details._blur_pixmap(entry)  # noqa: SLF001
-        if blurred.isNull():
-            raise RuntimeError("failed to prepare modal blur")
-
-        self._transition.set_hold_frame(self._entry_workspace_frame)
-        self._transition.show()
-        self._transition.raise_()
-        self._transition.repaint()
-
-        self._show_real_modal(blurred)
-        final_modal = self._render_root_without_transition()
-        if final_modal.isNull():
-            raise RuntimeError("failed to capture final live modal frame")
-        self._transition.set_transition_frames(
-            self._entry_workspace_frame,
-            final_modal,
-            0.0,
-        )
-        self._transition.raise_()
-        self._transition.repaint()
-        self._progress = 0.0
-        self._modal_closed_for_motion = False
 
     def _show_with_animation(self, *, ratio: tuple[float, float]) -> None:
         if self._state != _STATE_IDLE or not self.details.drawer.isHidden():
             return
+
+        # Capture only the static blur source. It is never used as an animated
+        # workspace frame, so card/button geometry cannot leave raster trails.
+        try:
+            source = self.details._capture_source()  # noqa: SLF001
+            blurred = self.details._blur_pixmap(source)  # noqa: SLF001
+            if source.isNull() or blurred.isNull():
+                raise RuntimeError("modal backdrop capture failed")
+        except Exception:
+            self._fallback_open(ratio)
+            return
+
         self._suspend_underlay()
-        self._fallback_active = False
         self._state = _STATE_OPENING
         try:
-            self._prepare_open_transition(ratio=ratio)
-            self._start_fade(end=1.0, duration_ms=_OPEN_MS, easing=_css_ease())
+            self._prepare_live_modal(ratio=ratio, blurred=blurred)
+            self._start_motion(end=1.0, duration_ms=_OPEN_MS, easing=_open_ease())
         except Exception:
             self._fallback_open(ratio)
 
@@ -480,120 +352,77 @@ class StaticModalInteractionController(QObject):
     def _finish_open(self) -> None:
         if self._state != _STATE_OPENING:
             return
-        self._progress = 1.0
-        self._transition.hide()
-        self._transition.clear_frames()
+        self._apply_visual_state(1.0)
         self._state = _STATE_OPEN
+        self.details.close_button.setEnabled(True)
         self.details.close_button.setFocus(Qt.FocusReason.OtherFocusReason)
 
-    def _prepare_close_transition(self) -> None:
-        current_modal = self.details._capture_source()  # noqa: SLF001
-        if current_modal.isNull():
-            raise RuntimeError("failed to capture current modal frame")
-        current_modal = _fit_frame(current_modal, self.root)
-
-        self._sync_modal_geometry()
-        self._transition.set_hold_frame(current_modal)
-        self._transition.show()
-        self._transition.raise_()
-        self._transition.repaint()
-
-        if not self.details.drawer.isHidden():
-            self._original_close()
-        self._modal_closed_for_motion = True
-
-        self._resume_underlay()
-        self.root.update()
-        self._transition.set_live_underlay_fade(current_modal, 1.0)
-        self._transition.raise_()
-        self._progress = 1.0
+        # Once the blur is fully opaque, normalize the hidden hover state. The
+        # eventual close therefore reveals an already-stable workspace instead of
+        # snapping the clicked card back to rest on the final frame.
+        self._settle_hidden_underlay()
 
     def request_close(self, *_args: object) -> None:
-        if self._fallback_active:
-            self._fallback_close()
+        if self._state == _STATE_IDLE:
+            if not self.details.drawer.isHidden():
+                self._fallback_close()
             return
         if self._state == _STATE_CLOSING:
             return
 
-        if self._state in {_STATE_OPENING, _STATE_OPEN}:
-            self._stop_animation()
-            prior_progress = max(0.0, min(1.0, float(self._progress)))
-            try:
-                self._prepare_close_transition()
-            except Exception:
-                self._fallback_close()
-                return
-            self._state = _STATE_CLOSING
-            duration = _CLOSE_MS
-            if prior_progress < 1.0:
-                duration = max(1, int(round(_CLOSE_MS * prior_progress)))
-            self._start_fade(end=0.0, duration_ms=duration, easing=_css_ease_in_out())
-            return
-
-        if self._state == _STATE_IDLE and not self.details.drawer.isHidden():
-            self._fallback_close()
+        # A very early click is allowed to reverse smoothly from its current
+        # progress. If the modal has already become visually dominant, normalize
+        # the hidden underlay before it is revealed again.
+        if self._progress >= 0.72:
+            self._settle_hidden_underlay()
+        self.details.close_button.setEnabled(False)
+        self._state = _STATE_CLOSING
+        self._stop_animation()
+        self._start_motion(end=0.0, duration_ms=_CLOSE_MS, easing=_close_ease())
 
     def _finish_close(self) -> None:
         if self._state != _STATE_CLOSING:
             return
-        self._progress = 0.0
-        self._transition.set_progress(0.0)
-        if not self._modal_closed_for_motion:
-            try:
-                self._original_close()
-            except RuntimeError:
-                pass
-        self._transition.hide()
-        self._transition.clear_frames()
-        self._entry_workspace_frame = QPixmap()
-        self._modal_closed_for_motion = False
-        self._fallback_active = False
+
+        # If close interrupted the first part of opening, briefly normalize the
+        # underlay while the modal layers still own the last transition turn.
+        self._settle_hidden_underlay()
+        self._apply_visual_state(0.0)
+        self.details.drawer.hide()
+        self.details.scrim.hide()
+        self.details.backdrop.hide()
+        self.details.backdrop.clear()
+        self.details.ghost.hide()
+        self.details.close_button.setEnabled(True)
+        self.details._selected = None  # noqa: SLF001
+        self.details._modal_ratio = (0.80, 0.80)  # noqa: SLF001
         self._state = _STATE_IDLE
-        if self._underlay_suspended:
-            self._resume_underlay()
+        self._resume_underlay()
         self.root.update()
 
     def _fallback_open(self, ratio: tuple[float, float]) -> None:
         self._stop_animation()
-        self._transition.hide()
-        self._transition.clear_frames()
-        self._entry_workspace_frame = QPixmap()
-        self._modal_closed_for_motion = False
         try:
             self._original_close()
         except RuntimeError:
             pass
         try:
             self._original_show_prepared_modal(ratio=ratio)
-            self._fallback_active = True
             self._state = _STATE_OPEN
+            self._progress = 1.0
         except Exception:
-            self._fallback_active = False
             self._state = _STATE_IDLE
+            self._progress = 0.0
             self._resume_underlay()
 
     def _fallback_close(self) -> None:
         self._stop_animation()
-        self._transition.hide()
-        self._transition.clear_frames()
-        self._entry_workspace_frame = QPixmap()
-        self._modal_closed_for_motion = False
         try:
             self._original_close()
         finally:
-            self._fallback_active = False
             self._state = _STATE_IDLE
+            self._progress = 0.0
             self._resume_underlay()
-
-    def _snap_motion_for_resize(self) -> None:
-        if self._state not in {_STATE_OPENING, _STATE_CLOSING}:
-            return
-        target = self._motion_to
-        self._stop_animation()
-        self._sync_modal_geometry()
-        self._progress = target
-        self._transition.set_progress(target)
-        self._finish_motion()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if watched is self.root:
@@ -605,11 +434,14 @@ class StaticModalInteractionController(QObject):
                 }:
                     self.request_close()
                     return True
-            elif event_type == QEvent.Type.Resize:
-                if self._state in {_STATE_OPENING, _STATE_CLOSING}:
-                    QTimer.singleShot(0, self._snap_motion_for_resize)
-                elif self._state == _STATE_OPEN:
-                    self._sync_modal_geometry()
+            elif event_type == QEvent.Type.Resize and self._state in {
+                _STATE_OPENING,
+                _STATE_OPEN,
+                _STATE_CLOSING,
+            }:
+                # Retarget from the same normalized progress instead of snapping to
+                # an animation endpoint when the window hits an edge/maximize zone.
+                QTimer.singleShot(0, lambda: self._apply_visual_state(self._progress))
         return False
 
     def cleanup(self) -> None:
@@ -618,12 +450,8 @@ class StaticModalInteractionController(QObject):
             self._original_close()
         except RuntimeError:
             pass
-        self._transition.hide()
-        self._transition.clear_frames()
-        self._entry_workspace_frame = QPixmap()
-        self._fallback_active = False
-        self._modal_closed_for_motion = False
         self._state = _STATE_IDLE
+        self._progress = 0.0
         self._resume_underlay()
 
         try:
@@ -636,10 +464,6 @@ class StaticModalInteractionController(QObject):
             pass
         try:
             self.details.scrim.clicked.disconnect(self.request_close)
-        except (RuntimeError, TypeError):
-            pass
-        try:
-            self._transition.clicked.disconnect(self.request_close)
         except (RuntimeError, TypeError):
             pass
         try:
@@ -660,16 +484,18 @@ class StaticModalInteractionController(QObject):
             except RuntimeError:
                 pass
         self._passive_labels.clear()
-        try:
-            self._transition.deleteLater()
-        except RuntimeError:
-            pass
 
 
 def install_static_modal_interaction(
     window: QMainWindow,
     details: FastCardDetailController,
 ) -> StaticModalInteractionController:
+    existing = getattr(window, "_static_modal_interaction", None)
+    if isinstance(existing, StaticModalInteractionController):
+        return existing
     controller = StaticModalInteractionController(window, details)
     window._static_modal_interaction = controller  # type: ignore[attr-defined]
     return controller
+
+
+__all__ = ["StaticModalInteractionController", "install_static_modal_interaction"]
