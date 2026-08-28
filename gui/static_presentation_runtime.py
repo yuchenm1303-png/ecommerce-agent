@@ -5,17 +5,11 @@ from typing import Any
 
 from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer
 from PySide6.QtGui import QCursor
-from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
+from PySide6.QtWidgets import QApplication, QFrame, QMainWindow, QWidget
 
 
 def _qt_top_level_window(widget: QWidget) -> QWidget | None:
-    """Resolve QWidget::window without instance attribute lookup.
-
-    Some application widgets expose a Python ``window`` attribute that shadows
-    QWidget.window(). Calling ``widget.window()`` is therefore unsafe: PySide
-    may resolve the instance attribute and attempt to call a QMainWindow object.
-    Dispatching through QWidget's descriptor bypasses that shadowing entirely.
-    """
+    """Resolve QWidget::window without instance attribute lookup."""
 
     try:
         top = QWidget.window(widget)
@@ -25,18 +19,16 @@ def _qt_top_level_window(widget: QWidget) -> QWidget | None:
 
 
 class StaticPresentationRuntime(QObject):
-    """Browser-style presentation owner used only while background drift is off.
+    """Event-only card input for the non-drifting presentation path.
 
-    Static mode is event driven: native mouse events update interaction intent
-    immediately and one visual frame pump advances only the already-established
-    card tween plus sakura/cursor surface. There is no QCursor polling, widget
-    sample queue, Quick frameSwapped wait, renderer switch or alternate glass
-    implementation in this path.
+    This object never changes widget geometry, never enables mouse tracking on the
+    widget tree, never blocks PresentationClock and never owns a second frame
+    timer. Native enter/leave/press/release events update the existing card state
+    machine immediately; PresentationClock remains the single animation clock for
+    the established 300 ms tween and ambient effects.
 
-    Background-drift mode remains owned by PresentationClock. This controller
-    only blocks that clock's timeout signal while static mode is active and
-    removes the previous static input bridge; when drift is enabled it stops
-    itself and unblocks the original clock without changing its implementation.
+    When background drift is enabled this filter becomes inert. The original
+    drifting presentation path remains owned entirely by PresentationClock.
     """
 
     def __init__(
@@ -51,32 +43,14 @@ class StaticPresentationRuntime(QObject):
         self.window = window
         self.clock = clock
         self.card_fx = card_fx
-        self.effects = effects
-        self._static_enabled = False
+        self.effects = effects  # Kept only for install signature compatibility.
         self._cleaned = False
-        self._left_down = False
-        self._last_global: QPoint | None = None
         self._app = QApplication.instance()
-        self._toggle = getattr(window, "_background_drift_switch", None)
-
-        interval_s = float(getattr(card_fx, "_motion_interval_s", 1.0 / 60.0) or (1.0 / 60.0))
-        self._frame_timer = QTimer(self)
-        self._frame_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._frame_timer.setInterval(max(4, int(round(interval_s * 1000.0))))
-        self._frame_timer.timeout.connect(self._frame)
 
         self._remove_legacy_static_bridge()
-        self._enable_mouse_tracking_tree()
         if self._app is not None:
             self._app.installEventFilter(self)
-        if self._toggle is not None:
-            try:
-                self._toggle.toggled.connect(self._on_drift_changed)
-            except (AttributeError, RuntimeError, TypeError):
-                self._toggle = None
-
         window.destroyed.connect(self.cleanup)
-        self._on_drift_changed(bool(getattr(clock, "background_drift_enabled", False)))
 
     def _remove_legacy_static_bridge(self) -> None:
         bridge = getattr(self.window, "_static_card_input_bridge", None)
@@ -89,27 +63,51 @@ class StaticPresentationRuntime(QObject):
         if hasattr(self.window, "_static_card_input_bridge"):
             self.window._static_card_input_bridge = None  # type: ignore[attr-defined]
 
-    def _enable_widget_tracking(self, widget: QWidget | None) -> None:
-        if widget is None:
-            return
-        if widget is not self.window and _qt_top_level_window(widget) is not self.window:
-            return
-        try:
-            widget.setMouseTracking(True)
-        except RuntimeError:
-            return
-
-    def _enable_mouse_tracking_tree(self) -> None:
-        self._enable_widget_tracking(self.window)
-        for widget in self.window.findChildren(QWidget):
-            self._enable_widget_tracking(widget)
-
     def _belongs_to_window(self, watched: QObject) -> bool:
         if watched is self.window:
             return True
         if not isinstance(watched, QWidget):
             return False
         return _qt_top_level_window(watched) is self.window
+
+    def _can_present_static(self) -> bool:
+        if self._cleaned or bool(getattr(self.clock, "background_drift_enabled", False)):
+            return False
+        if getattr(self.clock, "_holds", None):
+            return False
+        try:
+            return bool(self.window.isVisible() and not self.window.isMinimized())
+        except RuntimeError:
+            return False
+
+    def _nearest_card(self, widget: QWidget | None) -> QFrame | None:
+        resolver = getattr(self.card_fx, "_nearest_card", None)
+        if callable(resolver):
+            try:
+                card = resolver(widget)
+            except RuntimeError:
+                card = None
+            return card if isinstance(card, QFrame) else None
+
+        states = getattr(self.card_fx, "states", {})
+        current = widget
+        while current is not None:
+            if isinstance(current, QFrame) and current in states:
+                return current
+            if current is self.window:
+                break
+            current = current.parentWidget()
+        return None
+
+    def _card_at_global(self, global_pos: QPoint) -> QFrame | None:
+        resolver = getattr(self.card_fx, "_card_at_global", None)
+        if not callable(resolver):
+            return None
+        try:
+            card = resolver(global_pos)
+        except RuntimeError:
+            return None
+        return card if isinstance(card, QFrame) else None
 
     @staticmethod
     def _event_global_pos(event: QEvent) -> QPoint:
@@ -130,206 +128,117 @@ class StaticPresentationRuntime(QObject):
         except RuntimeError:
             return QPoint()
 
-    def _can_present(self) -> bool:
-        if not self._static_enabled or self._cleaned:
-            return False
-        if getattr(self.clock, "_holds", None):
-            return False
-        try:
-            return bool(self.window.isVisible() and not self.window.isMinimized())
-        except RuntimeError:
-            return False
-
-    def _sample_effect_pointer(self, global_pos: QPoint) -> None:
-        sampler = getattr(self.effects, "_sample_pointer", None)
-        if callable(sampler):
+    def _wake_card_animation(self) -> None:
+        wake = getattr(self.clock, "_mark_interaction_active", None)
+        if callable(wake):
             try:
-                sampler(global_pos, left_down=self._left_down)
-                return
+                wake(time.perf_counter())
             except RuntimeError:
-                return
+                pass
 
-        try:
-            self.effects.presentation_tick(
-                global_pos,
-                left_down=self._left_down,
-                now_s=time.perf_counter(),
-            )
-        except RuntimeError:
-            pass
-
-    def _publish_pointer(self, global_pos: QPoint, *, input_changed: bool) -> None:
-        if not self._can_present():
+    def _set_hover(self, card: QFrame | None) -> None:
+        setter = getattr(self.card_fx, "_set_hover", None)
+        if not callable(setter):
             return
-        self._last_global = QPoint(global_pos)
-        now_s = time.perf_counter()
         try:
-            self.card_fx.presentation_tick(
-                global_pos,
-                left_down=self._left_down,
-                now_s=now_s,
-                input_changed=input_changed,
-            )
+            setter(card)
         except RuntimeError:
-            pass
-        self._sample_effect_pointer(global_pos)
+            return
+        self._wake_card_animation()
 
-    def _confirm_leave(self) -> None:
-        if not self._can_present():
+    def _begin_press(self, card: QFrame | None) -> None:
+        begin = getattr(self.card_fx, "_begin_press", None)
+        if not callable(begin):
+            return
+        try:
+            begin(card)
+        except RuntimeError:
+            return
+        self._wake_card_animation()
+
+    def _end_press(self, global_pos: QPoint) -> None:
+        end = getattr(self.card_fx, "_end_press", None)
+        if not callable(end):
+            return
+        try:
+            end(global_pos)
+        except RuntimeError:
+            return
+        self._wake_card_animation()
+
+    def _sync_hover_from_cursor(self) -> None:
+        if not self._can_present_static():
             return
         try:
             global_pos = QPoint(QCursor.pos())
         except RuntimeError:
             return
-        self._publish_pointer(global_pos, input_changed=True)
+        self._set_hover(self._card_at_global(global_pos))
 
-    def _sync_pointer_once(self) -> None:
-        if not self._can_present():
-            return
+    @staticmethod
+    def _is_left_button(event: QEvent) -> bool:
+        getter = getattr(event, "button", None)
+        if not callable(getter):
+            return True
         try:
-            global_pos = QPoint(QCursor.pos())
+            return getter() == Qt.MouseButton.LeftButton
         except RuntimeError:
-            return
-        self._publish_pointer(global_pos, input_changed=True)
-
-    def _frame(self) -> None:
-        if not self._can_present():
-            return
-        global_pos = self._last_global
-        if global_pos is None:
-            try:
-                global_pos = QPoint(QCursor.pos())
-            except RuntimeError:
-                return
-            self._last_global = QPoint(global_pos)
-
-        now_s = time.perf_counter()
-        try:
-            self.card_fx.presentation_tick(
-                global_pos,
-                left_down=self._left_down,
-                now_s=now_s,
-                input_changed=False,
-            )
-        except RuntimeError:
-            pass
-        try:
-            self.effects.presentation_tick(
-                global_pos,
-                left_down=self._left_down,
-                now_s=now_s,
-            )
-        except RuntimeError:
-            pass
-
-    def _enter_static(self) -> None:
-        if self._cleaned:
-            return
-        self._static_enabled = True
-        self._left_down = False
-        self._last_global = None
-
-        timer = getattr(self.clock, "timer", None)
-        if timer is not None:
-            try:
-                timer.blockSignals(True)
-            except RuntimeError:
-                pass
-        clear_lane = getattr(self.clock, "_clear_widget_lane", None)
-        if callable(clear_lane):
-            try:
-                clear_lane()
-            except RuntimeError:
-                pass
-
-        if not self._frame_timer.isActive():
-            self._frame_timer.start()
-        QTimer.singleShot(0, self._sync_pointer_once)
-
-    def _leave_static(self) -> None:
-        self._static_enabled = False
-        self._frame_timer.stop()
-        timer = getattr(self.clock, "timer", None)
-        if timer is not None:
-            try:
-                timer.blockSignals(False)
-            except RuntimeError:
-                pass
-
-    def _on_drift_changed(self, enabled: bool) -> None:
-        if bool(enabled):
-            self._leave_static()
-        else:
-            self._enter_static()
+            return False
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         event_type = event.type()
 
-        if event_type == QEvent.Type.ChildAdded and self._belongs_to_window(watched):
-            child_getter = getattr(event, "child", None)
-            child = child_getter() if callable(child_getter) else None
-            if isinstance(child, QWidget):
-                QTimer.singleShot(0, lambda widget=child: self._enable_widget_tracking(widget))
-            return False
-
-        if not self._can_present() or not self._belongs_to_window(watched):
-            return False
-
-        if event_type not in {
-            QEvent.Type.MouseMove,
-            QEvent.Type.Enter,
-            QEvent.Type.Leave,
-            QEvent.Type.MouseButtonPress,
-            QEvent.Type.MouseButtonRelease,
-        }:
-            return False
-
-        global_pos = self._event_global_pos(event)
-
-        if event_type in {QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease}:
-            button_getter = getattr(event, "button", None)
-            if callable(button_getter):
+        if event_type == QEvent.Type.WindowDeactivate and watched is self.window:
+            if self._can_present_static():
                 try:
-                    if button_getter() != Qt.MouseButton.LeftButton:
-                        self._publish_pointer(global_pos, input_changed=True)
-                        return False
+                    global_pos = QPoint(QCursor.pos())
                 except RuntimeError:
-                    return False
-            self._left_down = event_type == QEvent.Type.MouseButtonPress
+                    global_pos = QPoint()
+                self._end_press(global_pos)
+                self._set_hover(None)
+            return False
 
-        self._publish_pointer(global_pos, input_changed=True)
+        if not self._can_present_static() or not self._belongs_to_window(watched):
+            return False
 
-        if event_type == QEvent.Type.Leave and getattr(self.card_fx, "hovered", None) is not None:
-            QTimer.singleShot(0, self._confirm_leave)
+        if event_type == QEvent.Type.Enter:
+            widget = watched if isinstance(watched, QWidget) else None
+            card = self._nearest_card(widget)
+            if card is not None:
+                self._set_hover(card)
+            return False
+
+        if event_type == QEvent.Type.Leave:
+            if getattr(self.card_fx, "hovered", None) is not None:
+                QTimer.singleShot(0, self._sync_hover_from_cursor)
+            return False
+
+        if event_type == QEvent.Type.MouseButtonPress:
+            if not self._is_left_button(event):
+                return False
+            widget = watched if isinstance(watched, QWidget) else None
+            card = self._nearest_card(widget)
+            if card is None:
+                card = self._card_at_global(self._event_global_pos(event))
+            self._begin_press(card)
+            return False
+
+        if event_type == QEvent.Type.MouseButtonRelease:
+            if self._is_left_button(event):
+                self._end_press(self._event_global_pos(event))
+            return False
+
         return False
 
     def cleanup(self) -> None:
         if self._cleaned:
             return
         self._cleaned = True
-        self._static_enabled = False
-        self._frame_timer.stop()
-
-        toggle = self._toggle
-        self._toggle = None
-        if toggle is not None:
-            try:
-                toggle.toggled.disconnect(self._on_drift_changed)
-            except (AttributeError, RuntimeError, TypeError):
-                pass
-
         app = self._app
         self._app = None
         if app is not None:
             try:
                 app.removeEventFilter(self)
-            except RuntimeError:
-                pass
-
-        timer = getattr(self.clock, "timer", None)
-        if timer is not None:
-            try:
-                timer.blockSignals(False)
             except RuntimeError:
                 pass
 
