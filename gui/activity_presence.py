@@ -26,9 +26,6 @@ _MODE_COLORS = {
     "FAILED": QColor("#f18da0"),
 }
 
-# The read-only preparation owns the first 45% of the end-to-end experience.
-# Real browser execution resumes from exactly that point instead of resetting to
-# zero, so the user sees one monotonic product-level 0 -> 100 timeline.
 _PREP_OVERALL_END = 45
 _REAL_OVERALL_START = 45
 _REAL_OVERALL_SPAN = 55
@@ -57,9 +54,10 @@ _PHOTO_LINE = re.compile(
 class ActivityPresence(QWidget):
     """Compact time-driven heartbeat for truthful end-to-end progress.
 
-    Business telemetry owns the target percentage. The widget only eases its
-    painted fill toward that target and animates decorative liveness cues. It
-    never increments work progress on a timer.
+    Business telemetry owns the target percentage. QWidget animation is retained
+    only for the real legacy fallback. Once the unified Quick scene owns visible
+    presentation, this object becomes a passive business-state host and does no
+    per-frame painting work.
     """
 
     _FRAME_MS = 16
@@ -93,6 +91,14 @@ class ActivityPresence(QWidget):
     def percent(self) -> int:
         return int(round(self.target_percent))
 
+    def _quick_owns_presentation(self) -> bool:
+        try:
+            top_level = self.window()
+            controller = getattr(top_level, "_static_qml_view_controller", None)
+            return bool(getattr(controller, "static_active", False))
+        except RuntimeError:
+            return False
+
     def set_activity(
         self,
         mode: str,
@@ -111,9 +117,15 @@ class ActivityPresence(QWidget):
         self.target_percent = next_target
         self.active = bool(active)
 
-        # A new product may legitimately reset a previous 100% state. Within one
-        # run the controller is monotonic, so backwards animation is never used
-        # as fake work.
+        quick_owned = self._quick_owns_presentation()
+        if quick_owned:
+            # The QML mirror owns interpolation/liveness. Never keep a hidden
+            # QWidget PreciseTimer repainting behind the same QQuickWindow.
+            self._timer.stop()
+            self.display_percent = self.target_percent
+            self._motion_time_s = 0.0
+            return
+
         if self.active and (not was_active or self.target_percent + 0.5 < self.display_percent):
             self.display_percent = self.target_percent
             self._motion_time_s = 0.0
@@ -130,6 +142,12 @@ class ActivityPresence(QWidget):
         self.update()
 
     def _animate(self) -> None:
+        if self._quick_owns_presentation():
+            self._timer.stop()
+            self.display_percent = self.target_percent
+            self._motion_time_s = 0.0
+            return
+
         now = time.perf_counter()
         dt = max(0.0, min(0.050, now - self._last_frame_s))
         self._last_frame_s = now
@@ -279,8 +297,6 @@ class ActivityPresence(QWidget):
                 1.5,
             )
 
-        # This shimmer communicates liveness while a real operation is waiting;
-        # it never changes completed_w or target_percent.
         if self.active:
             sweep_phase = (self._motion_time_s / self._SWEEP_PERIOD_S) % 1.0
             glow_w = min(92.0, max(54.0, track_w * 0.075))
@@ -404,8 +420,6 @@ class ActivityPresenceController(QObject):
             )
 
     def _on_prep_progress(self, percent: int, text: str) -> None:
-        # Existing phase percentage remains a fallback for partial/diagnostic
-        # modes. Full-mode detail comes from phase/log telemetry below.
         if str(getattr(self.window.runner, "mode", "full")) != "full":
             self._set_prep(int(percent), str(text or "准备中"), active=self._prep_running)
 
@@ -502,9 +516,6 @@ class ActivityPresenceController(QObject):
             self._set_real(self._real_internal, self._real_detail, active=False, meta=self._real_meta())
 
     def _on_real_progress(self, percent: int, text: str) -> None:
-        # Before field telemetry appears, retain the canonical runner's pre-write
-        # milestones. Once GUI_EXEC_FIELD starts, field-level events are more
-        # precise than the old section-level 20-point jumps and take precedence.
         if not self._real_field_seen:
             fallback = min(10, max(0, int(percent)))
             self._set_real(fallback, str(text or "真实填写中"), active=self._real_running, meta=self._real_meta())
