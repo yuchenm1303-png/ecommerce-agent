@@ -439,7 +439,7 @@ class StaticQmlBridge(QObject):
                 if data is None:
                     return None
                 text = widget.text()
-                if widget.objectName() == "phaseBadge":
+                if widget.objectName() in {"phaseBadge", "appVersionBadge"}:
                     kind = "badge"
                 else:
                     kind = "label"
