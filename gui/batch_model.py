@@ -53,6 +53,9 @@ class BatchJob:
     required_blocked: int = 0
     product_name: str = ""
     makro_target_id: str = ""
+    browser_lane: int = 0
+    makro_cdp_port: int = 0
+    makro_profile_dir: str = ""
     run_dir: str = ""
     execution_report: str = ""
     image_count: int = 0
