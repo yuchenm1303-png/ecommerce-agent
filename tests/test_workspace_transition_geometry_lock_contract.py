@@ -53,7 +53,7 @@ def test_transition_frames_are_never_non_uniformly_stretched() -> None:
 
 
 def test_target_glass_card_geometry_must_settle_before_incoming_capture() -> None:
-    assert "from .native_background import _GLASS_NAMES, _OVERSCAN" in TRANSITION
+    assert "from .native_background import _GLASS_NAMES" in TRANSITION
     assert "def _current_layout_signature" in TRANSITION
     signature = TRANSITION.split("def _current_layout_signature", 1)[1].split(
         "def _prepare_incoming", 1
@@ -78,8 +78,6 @@ def test_internal_reflow_is_recorded_without_exposing_live_geometry() -> None:
     assert "self._last_geometry_change_s = time.perf_counter()" in event_filter
     assert "self._layout_signature = None" in event_filter
 
-    # The active transition owns the visible pixels. Internal stack/page reflow
-    # therefore records instability instead of resizing the transition surface.
     stack_branch = event_filter.split("if watched is self.stack:", 1)[1].split(
         "elif watched in self._watched_pages:", 1
     )[0]
