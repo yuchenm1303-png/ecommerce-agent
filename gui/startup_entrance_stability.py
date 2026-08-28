@@ -29,10 +29,10 @@ class StartupEntranceStabilityGate(QObject):
     released immediately. Renderer handoff may continue afterwards, but application
     input can never depend on a future frameSwapped signal.
 
-    Presentation ownership is intentionally one-way after a successful Quick handoff:
-    the startup gate resumes only startup-scoped effects/clock work. It never resumes
-    the legacy QWidget card raster lane, because StaticQmlViewController owns that
-    lane and may restore it only on an explicit Quick-scene fallback.
+    Presentation ownership is explicit: startup releases only its own card-effect
+    suspension after handoffReady has synchronously allowed the Quick renderer to
+    acquire its independent presentation hold. Modal and Quick ownership therefore
+    cannot be released accidentally by the startup lifecycle.
     """
 
     revealPreparing = Signal()
@@ -303,7 +303,10 @@ class StartupEntranceStabilityGate(QObject):
             except RuntimeError:
                 pass
 
+        # Slots run synchronously. StaticQmlViewController therefore acquires its
+        # quick-presentation card hold before startup releases only its own hold.
         self.handoffReady.emit()
+        self._resume_startup_card_fx()
 
         assistant = getattr(self.window, "_runtime_assistant", None)
         if isinstance(assistant, QWidget):
@@ -312,11 +315,17 @@ class StartupEntranceStabilityGate(QObject):
             except RuntimeError:
                 pass
 
-        # Startup owns only the effects/clock hold. The legacy card raster lane is
-        # owned by StaticQmlViewController after handoff and must stay suspended;
-        # it is restored only by that controller's explicit legacy fallback path.
         QTimer.singleShot(_HANDOFF_FRAME_MS, self._resume_effects)
         QTimer.singleShot(_HANDOFF_FRAME_MS * 2, self._resume_presentation)
+
+    def _resume_startup_card_fx(self) -> None:
+        card_fx = getattr(self.window, "_nekro_card_fx", None)
+        resume = getattr(card_fx, "resume_from_startup", None)
+        if callable(resume):
+            try:
+                resume()
+            except RuntimeError:
+                pass
 
     def _resume_effects(self) -> None:
         effects = getattr(self.entrance, "_hidden_effects", None)
