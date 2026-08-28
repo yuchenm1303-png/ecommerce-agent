@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import math
 import re
 import time
 from typing import Any
 
-from PySide6.QtCore import QObject, QTimer, Qt
+from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QSizePolicy
 
 
@@ -18,9 +17,8 @@ _PHASE_DETAIL = {
     "plan": "Step 3 · Resolver / Fill Plan",
 }
 
-# Hard ceilings are real backend checkpoints. The visible activity head may move
-# inside the current band, but it never crosses the next checkpoint until the
-# backend emits evidence that the step actually advanced.
+# Hard ceilings are real backend checkpoints. Progress published into QWidget
+# state is checkpoint-driven only; the visible Quick scene owns interpolation.
 _SEGMENTS = {
     "scan": (2.0, 24.0, "Source Capture / Product Identity"),
     "cold": (26.0, 34.0, "Step 1 · Vertical"),
@@ -67,17 +65,14 @@ _AI_PREFIX = re.compile(r"^\[(AI|IMAGE|LOCAL|WEB|INFERENCE)\]\s+(.*)$", re.IGNOR
 
 
 class DetailedPreparationProgress(QObject):
-    """Dense live progress for the preparation-only bar.
+    """Checkpoint-driven preparation progress with Quick-owned visual motion.
 
-    ``_confirmed`` is business truth. ``_live`` is a visual activity head that
-    smoothly approaches the current hard checkpoint ceiling while work is alive.
-    The label always shows both values. The upper end-to-end Activity Presence
-    receives only ``_confirmed`` and therefore never advances on timer pacing.
+    ``_confirmed`` is the only progress value published into the QWidget state
+    tree. The previous 80 ms PreciseTimer continuously changed QProgressBar and
+    therefore made ``StaticQmlBridge`` reset the complete card model every tick.
+    The visible application is Quick-owned, so interpolation belongs in the Scene
+    Graph; this controller now publishes only real backend checkpoints.
     """
-
-    _TICK_MS = 80
-    _FOLLOW_TAU_S = 0.22
-    _SOFT_RESERVE = 0.55
 
     def __init__(self, window: Any) -> None:
         super().__init__(window)
@@ -86,13 +81,11 @@ class DetailedPreparationProgress(QObject):
         self.console = window.console
 
         self._confirmed = 0.0
-        self._live = 0.0
         self._segment = "scan"
         self._resolver_pass = ""
         self._running = False
         self._detail = "等待任务"
         self._step_started = time.perf_counter()
-        self._last_tick = self._step_started
         self._last_label = ""
 
         try:
@@ -100,7 +93,8 @@ class DetailedPreparationProgress(QObject):
         except (TypeError, RuntimeError):
             pass
 
-        # 0.1% render resolution removes the old whole-number visual stepping.
+        # Keep 0.1% storage resolution for fractional real checkpoints. The value
+        # changes only when telemetry confirms new work; Quick animates the pixels.
         self.console.progress.setRange(0, 1000)
         self.console.progress.setValue(0)
         self.console.progress.setFormat("%p%")
@@ -109,11 +103,6 @@ class DetailedPreparationProgress(QObject):
             QSizePolicy.Policy.Ignored,
             QSizePolicy.Policy.Preferred,
         )
-
-        self._timer = QTimer(self)
-        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._timer.setInterval(self._TICK_MS)
-        self._timer.timeout.connect(self._tick)
 
         self.runner.running_changed.connect(self._on_running_changed)
         self.runner.progress_changed.connect(self._on_runner_progress)
@@ -156,45 +145,22 @@ class DetailedPreparationProgress(QObject):
         changed = abs(next_value - self._confirmed) > 0.001
         self._confirmed = next_value
         self._set_detail(detail)
+
+        # This is the only progress-bar mutation path. One real checkpoint causes
+        # at most one Quick scene refresh instead of the old 12.5 resets/second.
+        target = int(round(self._confirmed * 10.0))
+        if self.console.progress.value() != target:
+            self.console.progress.setValue(target)
         if changed:
             self._sync_overall()
-        if self._confirmed >= 100.0:
-            self._live = 100.0
-            self.console.progress.setValue(1000)
-
-    def _soft_target(self, now: float) -> float:
-        if not self._running or not self._full_mode() or self._confirmed >= 100.0:
-            return self._confirmed
-        _start, cap, _label = self._segment_info()
-        ceiling = max(self._confirmed, cap - self._SOFT_RESERVE)
-        if ceiling <= self._confirmed:
-            return self._confirmed
-        elapsed = max(0.0, now - self._step_started)
-        span = ceiling - self._confirmed
-        tau = min(16.0, max(5.5, 4.5 + span * 0.55))
-        return self._confirmed + span * (1.0 - math.exp(-elapsed / tau))
-
-    def _tick(self) -> None:
-        if not self._running:
-            return
-        now = time.perf_counter()
-        dt = max(0.001, min(0.08, now - self._last_tick))
-        self._last_tick = now
-        desired = max(self._live, self._confirmed, self._soft_target(now))
-        delta = desired - self._live
-        if delta > 0.001:
-            alpha = 1.0 - math.exp(-dt / self._FOLLOW_TAU_S)
-            self._live = min(100.0, self._live + delta * alpha)
-            self.console.progress.setValue(int(round(self._live * 10.0)))
-        self._render(now)
+        self._render(time.perf_counter())
 
     def _render(self, now: float) -> None:
         elapsed = max(0.0, now - self._step_started)
-        pulse = ("●··", "·●·", "··●")[int(elapsed * 3.0) % 3]
         if self._running and self._full_mode():
             text = (
-                f"准备 {self._live:04.1f}% · 已确认 {self._confirmed:02.0f}% · "
-                f"{self._detail} · {elapsed:04.1f}s · {pulse}"
+                f"准备 {self._confirmed:04.1f}% · 已确认 {self._confirmed:02.0f}% · "
+                f"{self._detail} · {elapsed:04.1f}s"
             )
         else:
             text = f"准备 {self._confirmed:02.0f}% · {self._detail}"
@@ -206,23 +172,15 @@ class DetailedPreparationProgress(QObject):
     def _on_running_changed(self, running: bool) -> None:
         self._running = bool(running)
         now = time.perf_counter()
-        self._last_tick = now
         if running:
             self._confirmed = 0.0
-            self._live = 0.0
             self._segment = "scan"
             self._resolver_pass = ""
             self._set_detail("初始化商品准备流程")
-            self.console.progress.setValue(0)
+            if self.console.progress.value() != 0:
+                self.console.progress.setValue(0)
             self._sync_overall()
-            if not self._timer.isActive():
-                self._timer.start()
-        else:
-            self._timer.stop()
-            if self._confirmed >= 100.0:
-                self._live = 100.0
-                self.console.progress.setValue(1000)
-            self._render(now)
+        self._render(now)
 
     def _on_runner_progress(self, percent: int, text: str) -> None:
         if not self._full_mode():
@@ -251,6 +209,7 @@ class DetailedPreparationProgress(QObject):
                 "FAILED · " + str(event.get("error") or _PHASE_DETAIL[phase]),
                 reset_clock=False,
             )
+            self._render(time.perf_counter())
 
     def _resolver_checkpoint(self, key: str, detail: str = "") -> None:
         if self._resolver_pass not in {"cold", "hot"}:
