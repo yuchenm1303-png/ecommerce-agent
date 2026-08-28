@@ -31,7 +31,9 @@ def test_batch_source_navigation_is_prefetched_before_parallel_prepare() -> None
     assert "self._source_queue" in RUNNER
     assert 'source_active = any(stage == "source"' in RUNNER
     assert "Batch source cache miss" in JOB
-    assert "captured.cache_hit" in JOB
+    # Batch preparation consumes the canonical AcquiredProductInput cache flag,
+    # not the pre-refactor CaptureResult variable name.
+    assert "acquired.source_cache_hit" in JOB
 
 
 def test_batch_reuses_canonical_business_pipeline_and_executor() -> None:
@@ -90,16 +92,18 @@ def test_batch_and_single_are_separate_full_workspaces_in_one_window() -> None:
     assert "批量填写 READY" in WORKSPACE
 
 
-def test_batch_job_surface_keeps_independent_live_logs_and_owned_tab_metadata() -> None:
+def test_batch_job_surface_keeps_independent_lossless_logs_and_owned_tab_metadata() -> None:
     assert "_JOB_LOG_LINE" in WORKSPACE
     assert "self.controller.log.connect(self._append_controller_log)" in WORKSPACE
     assert "def append_log(self, line: str)" in WORKSPACE
-    assert "setMaximumBlockCount(_MAX_JOB_LOG_LINES)" in WORKSPACE
+    # Per-job UI history is intentionally lossless; do not reintroduce a
+    # QPlainTextEdit maximum-block truncation after the FIFO logging root fix.
+    assert "self._logs: deque[str] = deque()" in WORKSPACE
+    assert "setMaximumBlockCount(" not in WORKSPACE
     assert "Makro targetId" in WORKSPACE
     assert "Execution report" in WORKSPACE
     assert "READY  {job.ready}" in WORKSPACE
     assert "BLOCKED  {job.blocked}" in WORKSPACE
-    assert "owned tab 状态、实时进度和独立日志" in WORKSPACE
 
 
 def test_batch_never_enables_send_to_qc() -> None:
