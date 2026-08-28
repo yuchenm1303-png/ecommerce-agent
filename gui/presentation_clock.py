@@ -39,20 +39,11 @@ class BackgroundDriftSwitch(WorkspaceModeSwitch):
 
 
 class PresentationClock(QObject):
-    """One adaptive input clock with explicit Quick -> QWidget ordering.
+    """Adaptive presentation clock for the parts that actually need sampling.
 
-    Ambient visual work already has a 16 ms frame budget, so idle presentation
-    sampling runs at that cadence instead of waking Python every 8 ms forever.
-    Any pointer/button change immediately promotes the shared clock to the original
-    8 ms interaction cadence for long enough to cover the complete 300 ms card
-    tween.  The final settle sample is retained even if the GUI thread was briefly
-    blocked, so frozen card content can never be stranded mid-transition.
-
-    With background drift enabled, Quick owns the first presentation lane and
-    QWidget work is released after the next QQuickWindow.frameSwapped signal.
-    With drift disabled, the background switches to its static QWidget renderer,
-    so the Quick lane is deliberately bypassed and card/effect work flushes on the
-    single active QWidget presentation path.
+    Fixed-wallpaper card hover is event-driven and never enters this clock. The
+    timer remains responsible for the cursor/sakura layer and, only when wallpaper
+    drift is enabled, the established Quick background plus dynamic card animation.
     """
 
     def __init__(
@@ -127,6 +118,15 @@ class PresentationClock(QObject):
                 set_dynamic_mode(enabled)
             except RuntimeError:
                 pass
+
+        set_card_mode = getattr(self.card_fx, "set_dynamic_mode", None)
+        if callable(set_card_mode):
+            try:
+                set_card_mode(enabled)
+            except RuntimeError:
+                pass
+
+        if callable(set_dynamic_mode):
             return
 
         if not enabled:
@@ -153,7 +153,7 @@ class PresentationClock(QObject):
             self._active_until_s,
             now_s + (_INTERACTION_GRACE_MS / 1000.0),
         )
-        self._card_settle_pending = True
+        self._card_settle_pending = self._background_drift_enabled
         self._set_tick_interval(_ACTIVE_PRESENTATION_TICK_MS)
 
     def _sync_cadence(self, now_s: float) -> None:
@@ -289,7 +289,7 @@ class PresentationClock(QObject):
         card_active = now_s < self._active_until_s
         card_due = card_active or self._card_settle_pending
 
-        if card_due:
+        if self._background_drift_enabled and card_due:
             for sample in samples:
                 try:
                     self.card_fx.presentation_tick(
@@ -302,9 +302,9 @@ class PresentationClock(QObject):
                     pass
 
             if not card_active:
-                # One final call after the interaction window guarantees that a
-                # delayed event loop still snaps any 300 ms tween to its endpoint.
                 self._card_settle_pending = False
+        elif not card_active:
+            self._card_settle_pending = False
 
         latest = samples[-1]
         try:
@@ -337,8 +337,6 @@ class PresentationClock(QObject):
 
         if input_changed:
             self._mark_interaction_active(now_s)
-            # Background parallax is opt-in. Card/cursor interactions keep using
-            # the same shared pointer clock regardless of this preference.
             if self._background_drift_enabled:
                 try:
                     self.background.presentation_tick(global_pos, input_changed=True)
@@ -347,8 +345,6 @@ class PresentationClock(QObject):
         else:
             self._sync_cadence(now_s)
 
-        # QWidget work uses the same sampled input. It waits for Quick only while
-        # drift mode is actively producing Quick frames; static mode flushes here.
         self._queue_widget_sample(
             global_pos,
             left_down=left_down,

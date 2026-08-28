@@ -22,13 +22,12 @@ _NORMAL_SCALE_EPSILON = 1e-5
 
 
 class _CardScaleEffect(QGraphicsEffect):
-    """Transform one complete QWidget card composite without touching its layout.
+    """Dynamic-mode card transform used only while wallpaper drift is enabled.
 
-    The effect stays enabled for the whole card lifetime and keeps one stable maximum
-    output bound. Transition start/end therefore never toggles QGraphicsEffect state
-    or its bounding rect, avoiding backing-store-wide invalidation. At rest drawSource
-    keeps the live QWidget subtree visible. During a short tween one current
-    sourcePixmap is frozen and reused until the card returns to rest.
+    Static mode never installs this effect. The fixed-wallpaper path therefore keeps
+    the live QWidget tree on its ordinary backing store with no sourcePixmap capture
+    or per-frame card transform work. Dynamic mode retains the established frozen
+    composite behavior so the existing Quick wallpaper path is unchanged.
     """
 
     def __init__(self, parent: QObject) -> None:
@@ -153,7 +152,12 @@ class _CardScaleEffect(QGraphicsEffect):
 
 
 class NativeGlassProxy(QObject):
-    """Publish one card interaction to Quick glass and its QWidget composite."""
+    """Bridge one card to the active glass renderer.
+
+    Fixed-wallpaper mode is intentionally simple: only the cached static tint alpha
+    changes and the QWidget card remains fully live. The QGraphicsEffect exists only
+    in dynamic wallpaper mode where the previous Quick/GPU presentation is retained.
+    """
 
     def __init__(self, frame: QFrame, background: NativeQuickBackground) -> None:
         super().__init__(frame)
@@ -161,8 +165,9 @@ class NativeGlassProxy(QObject):
         self.background = background
         self._surface_scale = 1.0
         self._overlay_alpha = _NORMAL_GLASS_ALPHA
-        self._scale_effect = _CardScaleEffect(frame)
-        frame.setGraphicsEffect(self._scale_effect)
+        self._scale_effect: _CardScaleEffect | None = None
+        if bool(getattr(background, "dynamic_mode", False)):
+            self.set_dynamic_transform_enabled(True)
 
     @property
     def surface_scale(self) -> float:
@@ -172,25 +177,65 @@ class NativeGlassProxy(QObject):
     def overlay_alpha(self) -> float:
         return self._overlay_alpha
 
+    def set_dynamic_transform_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        effect = self._scale_effect
+        if enabled:
+            if effect is None:
+                effect = _CardScaleEffect(self.frame)
+                self.frame.setGraphicsEffect(effect)
+                self._scale_effect = effect
+                effect.set_scale(self._surface_scale)
+            return
+
+        self._surface_scale = 1.0
+        if effect is None:
+            return
+        self._scale_effect = None
+        try:
+            effect.set_frozen(False)
+            effect.set_scale(1.0)
+        except RuntimeError:
+            pass
+        try:
+            self.frame.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
+
     def set_content_frozen(self, frozen: bool) -> None:
-        self._scale_effect.set_frozen(frozen)
+        effect = self._scale_effect
+        if effect is None:
+            return
+        try:
+            effect.set_frozen(frozen)
+        except RuntimeError:
+            self._scale_effect = None
 
     def set_interaction(self, *, scale: float, overlay_alpha: float) -> None:
-        scale = max(0.96, min(1.04, float(scale)))
+        dynamic = bool(getattr(self.background, "dynamic_mode", False))
+        requested_scale = max(0.96, min(1.04, float(scale))) if dynamic else 1.0
         overlay_alpha = max(_NORMAL_GLASS_ALPHA, min(255.0, float(overlay_alpha)))
+        self.set_dynamic_transform_enabled(dynamic)
+
         if (
-            abs(scale - self._surface_scale) < 0.0001
+            abs(requested_scale - self._surface_scale) < 0.0001
             and abs(overlay_alpha - self._overlay_alpha) < 0.1
         ):
             return
-        self._surface_scale = scale
+
+        self._surface_scale = requested_scale
         self._overlay_alpha = overlay_alpha
         self.background.set_card_presentation(
             self.frame,
-            scale=scale,
+            scale=requested_scale,
             alpha=overlay_alpha,
         )
-        self._scale_effect.set_scale(scale)
+        effect = self._scale_effect
+        if effect is not None:
+            try:
+                effect.set_scale(requested_scale)
+            except RuntimeError:
+                self._scale_effect = None
 
     def sync_geometry(self) -> None:
         self.background.schedule_mask_update()
@@ -202,11 +247,9 @@ class NativeGlassProxy(QObject):
                 scale=1.0,
                 alpha=_NORMAL_GLASS_ALPHA,
             )
-            self._scale_effect.set_frozen(False)
-            self._scale_effect.set_scale(1.0)
-            self.frame.setGraphicsEffect(None)
         except RuntimeError:
             pass
+        self.set_dynamic_transform_enabled(False)
 
 
 class NativeVisualStyleController(QObject):
@@ -252,6 +295,10 @@ class NativeVisualStyleController(QObject):
         ]
         if not new_frames:
             self.background.schedule_mask_update()
+            card_fx = getattr(self.window, "_nekro_card_fx", None)
+            refresh_cards = getattr(card_fx, "refresh_cards", None)
+            if callable(refresh_cards):
+                refresh_cards()
             return 0
 
         model = self.background.card_model
@@ -292,6 +339,11 @@ class NativeVisualStyleController(QObject):
                 lambda *_: QTimer.singleShot(0, self.background.schedule_mask_update)
             )
             self._mode_stack_glass_connected = True
+
+        card_fx = getattr(self.window, "_nekro_card_fx", None)
+        refresh_cards = getattr(card_fx, "refresh_cards", None)
+        if callable(refresh_cards):
+            refresh_cards()
 
         QTimer.singleShot(0, self.background.schedule_mask_update)
         return len(new_frames)
