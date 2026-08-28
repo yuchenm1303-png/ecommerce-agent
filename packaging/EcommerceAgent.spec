@@ -71,11 +71,11 @@ worker_a = Analysis(
     optimize=0,
 )
 
-# Sakana is deliberately a separate executable/process. Its QApplication,
-# QtWebEngine/Chromium renderer and requestAnimationFrame cadence therefore do
-# not share the listing application's Python/Qt GUI event loop.
+# Sakana is deliberately a separate executable/process. Its standalone entry is
+# outside the gui package so PyInstaller does not execute/package gui/__init__.py
+# and application-access bootstrap code into the helper process.
 sakana_a = Analysis(
-    [str(ROOT / "gui" / "sakana_process.py")],
+    [str(ROOT / "sakana_process.py")],
     pathex=[str(ROOT)],
     binaries=[],
     datas=[],
