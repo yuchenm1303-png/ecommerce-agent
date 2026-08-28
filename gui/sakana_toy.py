@@ -155,7 +155,10 @@ class _SakanaToyItem(QQuickPaintedItem):
         painter.drawRoundedRect(rect, _BASE_RADIUS, _BASE_RADIUS)
 
         painter.save()
-        painter.setTransform(self._image_transform(), combine=False)
+        anchor = self.anchor
+        painter.translate(anchor.x(), anchor.y())
+        painter.rotate(self.state.r)
+        painter.translate(self.state.r, self.state.y)
         painter.drawPixmap(self.image_rect, self.pixmap, self.image_source_rect())
         painter.restore()
 
