@@ -483,7 +483,10 @@ class QuickBatchList(QAbstractListModel):
         "canStop",
         "canDelete",
     )
-    _ROLES = {name: _BASE + index + 1 for index, name in enumerate(_ROLE_NAMES)}
+    _ROLES = {
+        name: int(Qt.ItemDataRole.UserRole) + index + 1
+        for index, name in enumerate(_ROLE_NAMES)
+    }
     _ROLE_KEYS = {role: name for name, role in _ROLES.items()}
 
     presentationChanged = Signal()
