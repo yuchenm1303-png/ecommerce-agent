@@ -12,6 +12,7 @@ TRANSPORT = (ROOT / "app" / "cdp_transport_lane.py").read_text(encoding="utf-8")
 PARALLEL = (ROOT / "gui" / "batch_parallel_runtime.py").read_text(encoding="utf-8")
 WORKFLOW = (ROOT / "makro_gui_workflow.py").read_text(encoding="utf-8")
 EXECUTOR = (ROOT / "makro_execute_listing.py").read_text(encoding="utf-8")
+OWNED_EXECUTOR = (ROOT / "makro_execute_owned.py").read_text(encoding="utf-8")
 MODEL = (ROOT / "gui" / "batch_model.py").read_text(encoding="utf-8")
 RUNNER = (ROOT / "gui" / "batch_runner.py").read_text(encoding="utf-8")
 WORKSPACE = (ROOT / "gui" / "batch_workspace.py").read_text(encoding="utf-8")
@@ -47,6 +48,7 @@ def test_batch_reuses_canonical_business_pipeline_and_executor() -> None:
     assert "_run_resolver_pair" in STEP3
     assert "_resolver_pair_for_pack" in STEP3
     assert '"makro_execute_listing.py"' in RUNNER
+    assert "from makro_execute_listing import main as execute_main" in OWNED_EXECUTOR
     assert '"--all-step3"' in RUNNER
     assert '"--allow-section-save"' in RUNNER
     assert '"--upload-image"' in RUNNER
@@ -58,8 +60,17 @@ def test_batch_browser_transport_is_single_while_ai_remains_parallel() -> None:
     assert JOB.index("harness.detach()") < JOB.index("complete_batch_step3_from_schema(")
     assert "transport-lane-" in TRANSPORT
     assert "_try_lock_handle" in TRANSPORT
-    assert "python_args_under_transport_lane" in PARALLEL
-    assert "mode=exclusive-write" in PARALLEL
+    assert "exclusive_cdp_transport_lane(port)" in OWNED_EXECUTOR
+    assert "poison_matches_current_generation(port)" in OWNED_EXECUTOR
+    assert 'routed[0] = "makro_execute_owned.py"' in PARALLEL
+    assert "mode=in-process-owned-worker" in PARALLEL
+
+
+def test_transport_lane_is_ownership_only_and_never_launches_a_child_runtime() -> None:
+    assert "subprocess" not in TRANSPORT
+    assert "sys.executable" not in TRANSPORT
+    assert "python_args_under_transport_lane" not in TRANSPORT
+    assert "app.cdp_transport_lane" not in PARALLEL
 
 
 def test_batch_top_level_rejects_cross_workspace_overlap_before_session_lease() -> None:
