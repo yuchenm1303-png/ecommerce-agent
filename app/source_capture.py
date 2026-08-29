@@ -10,6 +10,7 @@ from .cdp_automation_health import (
     mark_cdp_poisoned,
     probe_cdp_automation,
 )
+from .cdp_transport_lane import exclusive_cdp_transport_lane
 from .update_browser_gate import close_managed_browser
 
 
@@ -28,8 +29,6 @@ validate_source_url = _engine.validate_source_url
 
 
 def __getattr__(name: str):
-    # Preserve direct diagnostic/test access to implementation helpers without
-    # duplicating them in this lifecycle facade.
     return getattr(_engine, name)
 
 
@@ -79,79 +78,19 @@ def capture_product_source(
     cache_ttl_seconds: int = 900,
     force_refresh: bool = False,
 ) -> CapturedProductSource:
-    """Capture once, rotating only a proven-poisoned dedicated Source Edge.
+    """Capture through one exclusive Source Edge transport generation.
 
-    Ordinary supplier navigation/rendering failures are never converted into a
-    browser restart. Recovery is entered only when the failure is specifically
-    from CDP transport/attach, after the capture engine has already released its
-    session lease. The dedicated 9333 Edge profile is preserved, so cookies and
-    supplier login state survive the process rotation.
+    The entire first attempt and any proven-CDP recovery are one 9333 transport
+    ownership transaction. Another process cannot attach to the same Source Edge
+    between a failed transport and its safe generation replacement. Ordinary page
+    navigation/rendering failures still never trigger a browser restart.
     """
 
     source_url = validate_source_url(url)
     port = int(cdp_port)
     profile = Path(profile_dir).resolve()
 
-    try:
-        captured = _capture_once(
-            source_url,
-            output_dir=output_dir,
-            profile_dir=profile,
-            cdp_port=port,
-            initial_wait_ms=initial_wait_ms,
-            scroll_wait_ms=scroll_wait_ms,
-            max_scroll_steps=max_scroll_steps,
-            max_visible_text_chars=max_visible_text_chars,
-            use_current_page=use_current_page,
-            cache_dir=cache_dir,
-            cache_ttl_seconds=cache_ttl_seconds,
-            force_refresh=force_refresh,
-        )
-        if not captured.cache_hit:
-            clear_cdp_poison(port)
-        return captured
-    except Exception as exc:
-        if not looks_like_cdp_transport_failure(exc):
-            raise
-
-        poison = mark_cdp_poisoned(port, reason=str(exc))
-        print(
-            "SOURCE_CDP POISONED "
-            f"port={port} generation={poison.get('endpoint_token', '')}",
-            flush=True,
-        )
-
-        closed = close_managed_browser(port=port, deadline_s=6.0)
-        if not closed.ok:
-            raise RuntimeError(
-                "Source Edge automation transport is poisoned, but the dedicated browser "
-                f"could not be safely rotated: {closed.detail}"
-            ) from exc
-
-        launch_detached_edge(
-            profile_dir=profile,
-            port=port,
-            start_url=source_url,
-        )
-        probe = probe_cdp_automation(port, timeout_ms=8_000)
-        if not probe.automation_ready:
-            mark_cdp_poisoned(
-                port,
-                endpoint_token=probe.endpoint_token,
-                reason=probe.error or "Source Edge recovery probe failed",
-            )
-            raise RuntimeError(
-                "Source Edge was restarted with its existing profile, but Playwright "
-                f"automation is still unavailable: {probe.error or probe.state}"
-            ) from exc
-
-        clear_cdp_poison(port)
-        print(
-            "SOURCE_CDP RECOVERED "
-            f"port={port} generation={probe.endpoint_token}",
-            flush=True,
-        )
-
+    with exclusive_cdp_transport_lane(port):
         try:
             captured = _capture_once(
                 source_url,
@@ -167,13 +106,73 @@ def capture_product_source(
                 cache_ttl_seconds=cache_ttl_seconds,
                 force_refresh=force_refresh,
             )
-        except Exception as retry_exc:
-            if looks_like_cdp_transport_failure(retry_exc):
-                mark_cdp_poisoned(port, reason=str(retry_exc))
-            raise
-        if not captured.cache_hit:
+            if not captured.cache_hit:
+                clear_cdp_poison(port)
+            return captured
+        except Exception as exc:
+            if not looks_like_cdp_transport_failure(exc):
+                raise
+
+            poison = mark_cdp_poisoned(port, reason=str(exc))
+            print(
+                "SOURCE_CDP POISONED "
+                f"port={port} generation={poison.get('endpoint_token', '')}",
+                flush=True,
+            )
+
+            closed = close_managed_browser(port=port, deadline_s=6.0)
+            if not closed.ok:
+                raise RuntimeError(
+                    "Source Edge automation transport is poisoned, but the dedicated browser "
+                    f"could not be safely rotated: {closed.detail}"
+                ) from exc
+
+            launch_detached_edge(
+                profile_dir=profile,
+                port=port,
+                start_url=source_url,
+            )
+            probe = probe_cdp_automation(port, timeout_ms=8_000)
+            if not probe.automation_ready:
+                mark_cdp_poisoned(
+                    port,
+                    endpoint_token=probe.endpoint_token,
+                    reason=probe.error or "Source Edge recovery probe failed",
+                )
+                raise RuntimeError(
+                    "Source Edge was restarted with its existing profile, but Playwright "
+                    f"automation is still unavailable: {probe.error or probe.state}"
+                ) from exc
+
             clear_cdp_poison(port)
-        return captured
+            print(
+                "SOURCE_CDP RECOVERED "
+                f"port={port} generation={probe.endpoint_token}",
+                flush=True,
+            )
+
+            try:
+                captured = _capture_once(
+                    source_url,
+                    output_dir=output_dir,
+                    profile_dir=profile,
+                    cdp_port=port,
+                    initial_wait_ms=initial_wait_ms,
+                    scroll_wait_ms=scroll_wait_ms,
+                    max_scroll_steps=max_scroll_steps,
+                    max_visible_text_chars=max_visible_text_chars,
+                    use_current_page=use_current_page,
+                    cache_dir=cache_dir,
+                    cache_ttl_seconds=cache_ttl_seconds,
+                    force_refresh=force_refresh,
+                )
+            except Exception as retry_exc:
+                if looks_like_cdp_transport_failure(retry_exc):
+                    mark_cdp_poisoned(port, reason=str(retry_exc))
+                raise
+            if not captured.cache_hit:
+                clear_cdp_poison(port)
+            return captured
 
 
 __all__ = [
