@@ -15,6 +15,7 @@ _HELPER_SCRIPTS = frozenset(
         "makro_gui_workflow.py",
         "makro_product_pack_workflow.py",
         "makro_execute_listing.py",
+        "makro_execute_owned.py",
         "makro_batch_source.py",
         "makro_batch_job.py",
         "makro_resolve_ai.py",
@@ -47,7 +48,13 @@ def route_process_start(
     current_executable: str | None = None,
     worker_executable: str | None = None,
 ) -> tuple[str, list[str]]:
-    """Route known internal Python children to the packaged console worker."""
+    """Route known internal Python children to the packaged console worker.
+
+    Production GUI code launches normal helper script argv in both development
+    and installed builds. The installed router changes only the executable host;
+    helper code never has to guess whether ``sys.executable`` means python.exe or
+    EcommerceAgent.exe.
+    """
 
     args = [str(value) for value in arguments]
     if not args:
