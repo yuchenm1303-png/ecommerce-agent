@@ -12,7 +12,12 @@ from urllib.parse import urlsplit
 
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
-from .browser_session import cdp_endpoint, is_cdp_ready, launch_detached_edge
+from .browser_session import (
+    _connect_browser_resilient,
+    acquire_cdp_session_lease,
+    is_cdp_ready,
+    launch_detached_edge,
+)
 from .browser_visual_hud import (
     arm_browser_visual_hud,
     browser_visual_hud_status,
@@ -160,23 +165,30 @@ def _discover_detail_images(
 
 
 def _connect_source_edge(playwright, *, profile_dir: Path, port: int, start_url: str):
-    launched_now = not is_cdp_ready(port)
-    if launched_now:
-        launch_detached_edge(profile_dir=profile_dir, port=port, start_url=start_url)
-    browser = playwright.chromium.connect_over_cdp(cdp_endpoint(port))
-    contexts = list(browser.contexts)
-    if not contexts:
-        raise RuntimeError("已连接 source Edge，但没有 browser context。")
-    context = contexts[0]
-    pages = list(context.pages)
-    page = pages[-1] if pages else context.new_page()
-    arm_browser_visual_hud(
-        page,
-        title="正在读取商品页面",
-        thought="Listing Studio 正在连接供应商商品页并准备采集页面证据。",
-        phase=0,
-    )
-    return browser, context, page, launched_now
+    """Own one Source Edge session and attach through the shared resilient CDP path."""
+
+    session_lease = acquire_cdp_session_lease(port)
+    try:
+        launched_now = not is_cdp_ready(port)
+        if launched_now:
+            launch_detached_edge(profile_dir=profile_dir, port=port, start_url=start_url)
+        browser = _connect_browser_resilient(playwright, port)
+        contexts = list(browser.contexts)
+        if not contexts:
+            raise RuntimeError("已连接 source Edge，但没有 browser context。")
+        context = contexts[0]
+        pages = list(context.pages)
+        page = pages[-1] if pages else context.new_page()
+        arm_browser_visual_hud(
+            page,
+            title="正在读取商品页面",
+            thought="Listing Studio 正在连接供应商商品页并准备采集页面证据。",
+            phase=0,
+        )
+        return browser, context, page, launched_now, session_lease
+    except Exception:
+        session_lease.release()
+        raise
 
 
 def _is_navigation_context_error(exc: BaseException) -> bool:
@@ -523,7 +535,7 @@ def capture_product_source(
 
     target_dir.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as playwright:
-        _, context, page, launched_now = _connect_source_edge(
+        _, context, page, launched_now, source_session_lease = _connect_source_edge(
             playwright,
             profile_dir=Path(profile_dir).resolve(),
             port=int(cdp_port),
@@ -658,6 +670,8 @@ def capture_product_source(
                 destroy=True,
             )
             raise
+        finally:
+            source_session_lease.release()
 
     _refresh_capture_cache(source_url, target_dir, cache_root)
     return CapturedProductSource(
