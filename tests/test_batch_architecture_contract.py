@@ -78,8 +78,31 @@ def test_batch_top_level_rejects_cross_workspace_overlap_before_session_lease() 
         "        def start_execution(", 1
     )[0]
     assert "runtime._assert_top_level_idle()" in start
-    assert start.index("runtime._assert_top_level_idle()") < start.index("runtime.manager.ensure_ready(")
+    assert start.index("runtime._assert_top_level_idle()") < start.index(
+        "runtime._ensure_start_generation("
+    )
     assert start.index("runtime._assert_top_level_idle()") < start.index("runtime._ensure_owner(")
+
+
+def test_batch_start_hot_path_never_runs_a_speculative_playwright_probe() -> None:
+    start = PARALLEL.split("        def start_prepare(", 1)[1].split(
+        "        def start_execution(", 1
+    )[0]
+    gate = PARALLEL.split("    def _ensure_start_generation(", 1)[1].split(
+        "    def _install_controller_routing(", 1
+    )[0]
+    init = PARALLEL.split("    def __init__(", 1)[1].split("    def _assert_top_level_idle(", 1)[0]
+
+    assert "manager._original_batch_prepare" not in PARALLEL
+    assert 'getattr(self.manager, "_original_batch_prepare", None)' in init
+    assert 'getattr(self.manager, "_original_batch_execute", None)' in init
+    assert "runtime.manager.ensure_ready" not in start
+    assert "probe_cdp_automation" not in start
+    assert "probe_cdp_automation" not in gate
+    assert "poison_matches_current_generation(requested_port)" in gate
+    assert "not is_cdp_ready(" in gate
+    assert "self.manager.ensure_ready(reason)" in gate
+    assert "timeout_s=0.25" in gate
 
 
 def test_ready_job_can_execute_while_other_batch_jobs_keep_preparing() -> None:
