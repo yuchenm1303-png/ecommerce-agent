@@ -1,26 +1,29 @@
-"""Prepare one batch listing on a dedicated Makro browser tab.
+"""Prepare one Batch listing with one exclusive Makro browser transport phase.
 
-This is orchestration only. It reuses the canonical source snapshot, Product
-Identity, live Makro taxonomy/brand selection, Step 3 schema scan, Resolver and
-Fill Plan. Each Batch job may also carry its own customer listing intent and
-supplemental files; both remain evidence for that exact supplier URL rather than
-becoming a second product input.
+Source/Product Identity and Resolver work remain independently parallel across
+jobs. Only real Makro browser control is serialized through the shared CDP
+transport lane: Step 1, Step 2 and the Step 3 schema capture run on the owned tab,
+then the Playwright transport is released before Resolver/Fill Plan computation.
 
 No Step 3 writes, Save, image upload, or Send to QC happen here.
 """
 
 from __future__ import annotations
 
-import json
-import os
 import traceback
 from pathlib import Path
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+from app.batch_step3_prepare import (
+    capture_batch_step3_schema,
+    complete_batch_step3_from_schema,
+)
 from app.browser_page_owner import page_target_id
 from app.browser_session import EdgeHarness, is_cdp_ready
+from app.cdp_automation_health import looks_like_cdp_transport_failure, mark_cdp_poisoned
+from app.cdp_transport_lane import exclusive_cdp_transport_lane
 from app.listing_content_policy import current_listing_intent
 from app.makro.listing_creation import MAKRO_NEW_LISTING_URL, infer_listing_bootstrap
 from app.makro.step1_entry import prepare_owned_step1_page
@@ -32,12 +35,9 @@ from makro_gui_workflow import (
     _advance_listing_to_step3,
     _listing_stage,
     _phase,
-    _prepare_step3,
     _write_manifest,
 )
-from makro_product_pack_workflow import _prepare_step3_pack
 
-_BATCH_TARGET_ENV = "MAKRO_BATCH_TARGET_ID"
 _STEP1_TRANSIENT_ATTEMPTS = 3
 _STEP1_TRANSIENT_BACKOFF_MS = 750
 
@@ -64,13 +64,9 @@ def _args():
 def _prepare_owned_step1_with_recovery(page):
     """Retry only transient Playwright navigation timeouts on the owned tab.
 
-    ``prepare_owned_step1_page`` is already state-driven and idempotent: every
-    invocation inspects the current Makro page before deciding the next action.
-    A ``page.goto`` timeout therefore must not make the job fail immediately;
-    Makro may already have reached Dashboard/Listings while Playwright was still
-    waiting for DOMContentLoaded. Re-entering the state machine lets it continue
-    from the page that actually exists. Unknown Step 2/3 ownership remains
-    handled by the shared workflow state machine and is never navigated backward.
+    ``prepare_owned_step1_page`` is state-driven and idempotent. A navigation
+    timeout can therefore re-enter the current Makro state without navigating a
+    verified Step 2/3 draft backwards.
     """
 
     for attempt in range(1, _STEP1_TRANSIENT_ATTEMPTS + 1):
@@ -121,9 +117,6 @@ def main() -> int:
     run_dir = Path(args.output_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / "run-manifest.json"
-    # GUI Batch already owns a process-local ECOMMERCE_LISTING_INTENT channel.
-    # Explicit CLI input wins for tests/manual invocation; otherwise consume that
-    # isolated job value so telemetry intent and business semantics cannot diverge.
     listing_intent = " ".join(str(args.listing_intent or current_listing_intent() or "").split())[:2000]
     manifest: dict[str, object] = {
         "mode": "full",
@@ -194,66 +187,89 @@ def main() -> int:
             detail += " + listing intent"
         _phase("source", "COMPLETE", detail)
 
-        with sync_playwright() as playwright:
-            harness = EdgeHarness(
-                playwright,
-                profile_dir=Path(args.profile_dir).resolve(),
-                port=args.cdp_port,
-                start_url=MAKRO_NEW_LISTING_URL,
-            )
-            if harness.launched_now or harness.context is None:
-                raise RuntimeError("Makro Edge unexpectedly entered launch path; aborted")
+        current = "step1"
+        live_schema: Path | None = None
+        vertical = ""
+        page_url = ""
 
-            page = harness.context.new_page()
-            harness.page = page
-            target_id = page_target_id(page)
-            manifest["makro_target_id"] = target_id
-            _write_manifest(manifest_path, manifest)
+        # The lane is the real cross-process transport owner. Multiple Batch jobs
+        # may perform source/AI work concurrently, but only one process may own a
+        # live Playwright transport to the shared Makro Edge at a time.
+        with exclusive_cdp_transport_lane(args.cdp_port):
+            with sync_playwright() as playwright:
+                harness: EdgeHarness | None = None
+                try:
+                    harness = EdgeHarness(
+                        playwright,
+                        profile_dir=Path(args.profile_dir).resolve(),
+                        port=args.cdp_port,
+                        start_url=MAKRO_NEW_LISTING_URL,
+                    )
+                    if harness.launched_now or harness.context is None:
+                        raise RuntimeError("Makro Edge unexpectedly entered launch path; aborted")
 
-            def prepare_owned_current_page():
-                return _prepare_owned_step1_with_recovery(page)
+                    page = harness.context.new_page()
+                    harness.page = page
+                    target_id = page_target_id(page)
+                    manifest["makro_target_id"] = target_id
+                    _write_manifest(manifest_path, manifest)
 
-            page, _vertical, _brand = _advance_listing_to_step3(
-                page=page,
-                prepare_step1=prepare_owned_current_page,
-                provider=provider,
-                hints=hints,
-                manifest=manifest,
-                manifest_path=manifest_path,
-                allow_initial_later_stage=False,
-                set_current=set_current_phase,
-            )
-            harness.page = page
-            owned_target_id = page_target_id(page)
-            manifest["makro_target_id"] = owned_target_id
-            manifest["page_url"] = page.url
-            _write_manifest(manifest_path, manifest)
+                    def prepare_owned_current_page():
+                        return _prepare_owned_step1_with_recovery(page)
 
-            current = "step3"
-            _phase("step3", "START")
-            previous_target = os.environ.get(_BATCH_TARGET_ENV)
-            os.environ[_BATCH_TARGET_ENV] = owned_target_id
-            try:
-                if acquired.pack_manifest_path is not None:
-                    _prepare_step3_pack(
+                    page, _vertical, _brand = _advance_listing_to_step3(
+                        page=page,
+                        prepare_step1=prepare_owned_current_page,
+                        provider=provider,
+                        hints=hints,
+                        manifest=manifest,
+                        manifest_path=manifest_path,
+                        allow_initial_later_stage=False,
+                        set_current=set_current_phase,
+                    )
+                    harness.page = page
+                    owned_target_id = page_target_id(page)
+                    manifest["makro_target_id"] = owned_target_id
+
+                    current = "step3"
+                    _phase("step3", "START")
+                    live_schema, vertical, _brand, page_url = capture_batch_step3_schema(
                         args,
                         run_dir=run_dir,
                         page=page,
                         manifest=manifest,
-                        pack_manifest=acquired.pack_manifest_path,
                     )
-                else:
-                    _prepare_step3(args, run_dir=run_dir, page=page, manifest=manifest)
-            finally:
-                if previous_target is None:
-                    os.environ.pop(_BATCH_TARGET_ENV, None)
-                else:
-                    os.environ[_BATCH_TARGET_ENV] = previous_target
-            manifest["page_url"] = page.url
-            manifest["status"] = "prepare_complete"
-            _write_manifest(manifest_path, manifest)
-            _phase("step3", "COMPLETE", "current Resolver + Fill Plan")
-            harness.detach()
+                    manifest["status"] = "step3_schema_captured"
+                    _write_manifest(manifest_path, manifest)
+                finally:
+                    if harness is not None:
+                        harness.detach()
+
+        if live_schema is None or not vertical:
+            raise RuntimeError("Batch Step 3 browser phase did not produce a captured live schema")
+
+        print(
+            "BATCH_CDP_BROWSER_PHASE COMPLETE "
+            f"port={args.cdp_port} target={manifest.get('makro_target_id', '')} "
+            "transport_released_before_resolver=True",
+            flush=True,
+        )
+
+        # Pure AI/planning work now runs outside the one browser transport lane,
+        # so other jobs can enter their own Step1/2/schema browser phase while
+        # this job spends time in image evidence, Resolver and Fill Plan.
+        complete_batch_step3_from_schema(
+            args,
+            run_dir=run_dir,
+            live_schema=live_schema,
+            vertical=vertical,
+            manifest=manifest,
+            pack_manifest=acquired.pack_manifest_path,
+        )
+        manifest["page_url"] = page_url
+        manifest["status"] = "prepare_complete"
+        _write_manifest(manifest_path, manifest)
+        _phase("step3", "COMPLETE", "captured schema + current Resolver + Fill Plan")
 
         print(
             "BATCH JOB COMPLETE writes=0 save=False send_to_qc=False "
@@ -269,6 +285,8 @@ def main() -> int:
         traceback.print_exc()
         return 2
     except Exception as exc:
+        if looks_like_cdp_transport_failure(exc):
+            mark_cdp_poisoned(args.cdp_port, reason=str(exc))
         manifest["status"] = "failed"
         manifest["error"] = str(exc)
         _write_manifest(manifest_path, manifest)
