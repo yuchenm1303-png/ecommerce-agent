@@ -26,13 +26,15 @@ def _set_cli_option(args: list[str], name: str, value: str) -> None:
 
 
 class BatchParallelRuntime:
-    """Run concurrent Batch jobs as isolated targetId tabs in one Makro Edge.
+    """Run concurrent Batch jobs on one Edge with one real CDP transport lane.
 
-    The GUI process owns one long-lived CDP session lease. Child workers inherit
-    that owner's token and may attach concurrently to the same Edge without
-    queueing for the external session lock. Product isolation is targetId-based:
-    every prepare job creates its own tab and execute must return to that exact
-    persisted targetId. No worker Edge profiles or secondary CDP ports exist.
+    The GUI process owns the long-lived logical browser session. Source/Product
+    Identity and Resolver work may run concurrently across jobs, but browser
+    control is serialized at the transport boundary: each prepare worker owns the
+    lane only through Step1/2 + Step3 schema capture, then releases it before AI.
+    Execute workers are launched through the same lane wrapper. targetId remains
+    the per-product tab ownership boundary; no worker Edge profiles or secondary
+    Makro CDP ports exist.
     """
 
     def __init__(self, window: Any) -> None:
@@ -79,7 +81,7 @@ class BatchParallelRuntime:
             assert runtime._owner is not None
             bind_batch_shared_browser(batch, runtime._owner.browser)
             _controller._persist_emit(immediate=True)
-            runtime._decorate_batch_status("READY", "单浏览器并行已接管")
+            runtime._decorate_batch_status("READY", "单浏览器 transport lane 已接管")
             return batch
 
         def start_execution(
@@ -109,6 +111,22 @@ class BatchParallelRuntime:
                     f"[{job_id}] BROWSER_TAB port={job.makro_cdp_port} "
                     f"target={target or 'new-owned-tab'}"
                 )
+                if stage == "execute":
+                    # Actual writes must never coexist as multiple Playwright
+                    # transports against the one long-lived Makro Edge. Keep the
+                    # existing process concurrency/queue, but route every writer
+                    # through the same cross-process transport lane.
+                    routed = [
+                        "-m",
+                        "app.cdp_transport_lane",
+                        "--port",
+                        str(job.makro_cdp_port),
+                        "--",
+                        *routed,
+                    ]
+                    _controller._emit_log_now(
+                        f"[{job_id}] BROWSER_TRANSPORT_LANE port={job.makro_cdp_port} mode=exclusive-write"
+                    )
             runtime._original_spawn(job_id, stage, routed)
 
         def start_source(_controller: Any, job_id: str) -> None:
@@ -225,11 +243,12 @@ class BatchParallelRuntime:
         port = int(self._owner.browser.cdp_port)
         parallelism = max(1, int(self._parallelism or 1))
         label.setText(
-            f"Makro Browser · {state} · {detail} · 单 Edge {port} · {parallelism} Tabs 并行"
+            f"Makro Browser · {state} · {detail} · 单 Edge {port} · {parallelism} Jobs / 1 transport lane"
         )
         label.setToolTip(
-            "Batch 只使用一个 Makro Edge。GUI 持有唯一 CDP session owner；"
-            "并发子任务继承同一 owner token，每件商品只操作自己持久化的 targetId Tab。"
+            "Batch 只使用一个 Makro Edge 和一条真实 Playwright/CDP transport。"
+            "多个任务仍可并行做 Source/AI；浏览器阶段按 owned targetId 进入唯一 transport lane，"
+            "避免多个 Playwright transport 同时控制同一 Chromium generation。"
         )
 
 
