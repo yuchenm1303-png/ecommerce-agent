@@ -341,24 +341,168 @@ Item {
     Component {
         id: spinBoxComponent
         Item {
+            id: spinRoot
             property var d
+            property int localValue: d ? Number(d.value) : 0
+            readonly property string fieldLabel: {
+                if (!d) return ""
+                if (d.name === "makroCdpSpin") return "Makro CDP"
+                if (d.name === "sourceCdpSpin") return "Source CDP"
+                if (d.name === "makroWorkersSpin") return "Makro Workers"
+                return ""
+            }
+            readonly property real stepperWidth: 26
+
+            function clampValue(value) {
+                if (!d) return Math.round(value)
+                return Math.max(Number(d.minimum), Math.min(Number(d.maximum), Math.round(value)))
+            }
+
+            function commitValue(value) {
+                if (!d || !d.enabled) return
+                localValue = clampValue(value)
+                staticBridge.setValue(d.key, localValue)
+            }
+
+            function stepBy(direction) {
+                commitValue(localValue + direction)
+            }
+
+            onDChanged: if (d) localValue = Number(d.value)
+
             HoverHandler { id: spinHover }
+
             Rectangle {
-                anchors.fill: parent; radius: 7
+                anchors.fill: parent
+                radius: 7
                 color: staticRoot.fieldFill(spinHover.hovered, spinEditor.activeFocus)
                 border.width: 1
                 border.color: staticRoot.fieldBorder(spinHover.hovered, spinEditor.activeFocus)
+                opacity: d && d.enabled ? 1.0 : 0.62
             }
-            TextInput {
-                id: spinEditor
-                anchors.fill: parent; leftPadding: 11; rightPadding: 11
-                text: d ? String(d.value) : "0"; color: "white"
-                selectionColor: Qt.rgba(1, 1, 1, 58/255); selectedTextColor: "white"
+
+            Text {
+                id: spinLabel
+                x: 12
+                y: 0
+                height: parent.height
+                visible: spinRoot.fieldLabel.length > 0
+                text: spinRoot.fieldLabel
+                color: Qt.rgba(1, 1, 1, 205/255)
                 font.family: d && d.fontFamily ? d.fontFamily : "Microsoft YaHei UI"
                 font.pixelSize: d && d.fontSize ? d.fontSize : 13
+                font.weight: Font.Medium
+                verticalAlignment: Text.AlignVCenter
+            }
+
+            TextInput {
+                id: spinEditor
+                x: spinLabel.visible ? spinLabel.x + spinLabel.implicitWidth + 10 : 12
+                y: 0
+                width: Math.max(28, stepper.x - x - 8)
+                height: parent.height
+                text: String(spinRoot.localValue)
+                enabled: d ? d.enabled : false
+                color: "white"
+                selectionColor: Qt.rgba(1, 1, 1, 58/255)
+                selectedTextColor: "white"
+                font.family: d && d.fontFamily ? d.fontFamily : "Microsoft YaHei UI"
+                font.pixelSize: d && d.fontSize ? d.fontSize : 13
+                font.weight: Font.DemiBold
+                horizontalAlignment: TextInput.AlignLeft
                 verticalAlignment: TextInput.AlignVCenter
-                validator: IntValidator { bottom: d ? d.minimum : -2147483647; top: d ? d.maximum : 2147483647 }
-                onEditingFinished: if (d) staticBridge.setValue(d.key, Number(text))
+                validator: IntValidator {
+                    bottom: d ? d.minimum : -2147483647
+                    top: d ? d.maximum : 2147483647
+                }
+                onTextEdited: {
+                    var parsed = Number(text)
+                    if (isFinite(parsed))
+                        spinRoot.localValue = spinRoot.clampValue(parsed)
+                }
+                onEditingFinished: spinRoot.commitValue(Number(text))
+                Keys.onUpPressed: spinRoot.stepBy(1)
+                Keys.onDownPressed: spinRoot.stepBy(-1)
+            }
+
+            Item {
+                id: stepper
+                width: spinRoot.stepperWidth
+                anchors.top: parent.top
+                anchors.bottom: parent.bottom
+                anchors.right: parent.right
+
+                Rectangle {
+                    x: 0
+                    y: 1
+                    width: 1
+                    height: Math.max(0, parent.height - 2)
+                    color: Qt.rgba(1, 1, 1, 30/255)
+                }
+
+                Rectangle {
+                    id: stepUp
+                    x: 1
+                    y: 1
+                    width: parent.width - 2
+                    height: Math.floor((parent.height - 2) / 2)
+                    radius: 5
+                    color: upTap.pressed
+                        ? Qt.rgba(1, 1, 1, 58/255)
+                        : upHover.hovered
+                            ? Qt.rgba(1, 1, 1, 36/255)
+                            : "transparent"
+                    HoverHandler { id: upHover }
+                    TapHandler {
+                        id: upTap
+                        acceptedButtons: Qt.LeftButton
+                        enabled: d ? d.enabled : false
+                        onTapped: spinRoot.stepBy(1)
+                    }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "▲"
+                        color: d && d.enabled ? Qt.rgba(1,1,1,205/255) : Qt.rgba(1,1,1,76/255)
+                        font.pixelSize: 7
+                    }
+                }
+
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.leftMargin: 4
+                    anchors.rightMargin: 4
+                    height: 1
+                    color: Qt.rgba(1, 1, 1, 22/255)
+                }
+
+                Rectangle {
+                    id: stepDown
+                    x: 1
+                    y: Math.ceil(parent.height / 2)
+                    width: parent.width - 2
+                    height: Math.max(0, parent.height - y - 1)
+                    radius: 5
+                    color: downTap.pressed
+                        ? Qt.rgba(1, 1, 1, 58/255)
+                        : downHover.hovered
+                            ? Qt.rgba(1, 1, 1, 36/255)
+                            : "transparent"
+                    HoverHandler { id: downHover }
+                    TapHandler {
+                        id: downTap
+                        acceptedButtons: Qt.LeftButton
+                        enabled: d ? d.enabled : false
+                        onTapped: spinRoot.stepBy(-1)
+                    }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "▼"
+                        color: d && d.enabled ? Qt.rgba(1,1,1,205/255) : Qt.rgba(1,1,1,76/255)
+                        font.pixelSize: 7
+                    }
+                }
             }
         }
     }
