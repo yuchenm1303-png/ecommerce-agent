@@ -605,10 +605,16 @@ Item {
                 maskEnabled: true
                 maskSource: cardRoundMask
                 autoPaddingEnabled: false
-                colorizationColor: "#B4467B"
-                colorization: (cardHover.hovered || cardClick.pressed) ? 165/255 : 128/255
-                Behavior on colorization {
-                    NumberAnimation {
+            }
+
+            Rectangle {
+                id: cardRoseOverlay
+                anchors.fill: parent
+                radius: 6
+                antialiasing: true
+                color: Qt.rgba(1, 157/255, 202/255, (cardHover.hovered || cardClick.pressed) ? 102/255 : 64/255)
+                Behavior on color {
+                    ColorAnimation {
                         duration: 300
                         easing.type: Easing.BezierSpline
                         easing.bezierCurve: [0.25, 0.10, 0.25, 1.00, 1.00, 1.00]
