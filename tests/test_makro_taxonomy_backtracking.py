@@ -299,14 +299,15 @@ def test_stale_partial_taxonomy_still_uses_grounded_search_first(monkeypatch) ->
     assert vertical_selection.select_vertical(page, object(), _hints(), wait_ms=0) == "air_purifier"
 
 
-def test_resilient_dom_reader_has_dedicated_singleton_extension_path() -> None:
-    source = (ROOT / "app" / "makro" / "taxonomy_resilient.py").read_text(encoding="utf-8")
+def test_resilient_dom_reader_reuses_the_owned_step1_surface() -> None:
+    resilient = (ROOT / "app" / "makro" / "taxonomy_resilient.py").read_text(encoding="utf-8")
+    owned = (ROOT / "app" / "makro" / "catalog_taxonomy.py").read_text(encoding="utf-8")
 
-    assert "p.scrollable && p.items.length >= 2" in source
-    assert "p.clickableCount < 1 || p.items.length < 1" in source
-    assert "p.x <= rightmost.x + 24" in source
-    assert "p.x > rightmost.x + 360" in source
-    assert source.count("for (let depth = 0; depth < 7 && kept.length; depth++)") == 2
+    assert "CatalogTaxonomyBrowser" in resilient
+    assert "document.querySelectorAll('body *')" not in resilient
+    assert "STEP1_SURFACE_MARKERS" in owned
+    assert "Hard ownership boundary" in owned
+    assert "sidebar_navigation_eligible" in (ROOT / "app" / "makro" / "vertical_catalog.py").read_text(encoding="utf-8")
 
 
 def test_retry_selector_never_hard_resets_same_spa_route() -> None:
