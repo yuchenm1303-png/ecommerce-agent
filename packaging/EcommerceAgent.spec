@@ -30,6 +30,7 @@ velopack_datas, velopack_binaries, velopack_hiddenimports = collect_all("velopac
 
 gui_datas = [
     (str(ROOT / "gui" / "assets"), "gui/assets"),
+    (str(ROOT / "native" / "sakana-helper" / "assets"), "native/sakana/assets"),
     (str(APP_ACCESS_SOURCE), "gui"),
     (str(ROOT / "THIRD_PARTY_NOTICES.md"), "."),
     (str(BUILD_METADATA / "VERSION"), "packaging"),
@@ -67,23 +68,6 @@ worker_a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=["PySide6", "pytest", "velopack"],
-    noarchive=False,
-    optimize=0,
-)
-
-# Sakana is deliberately a separate executable/process. Its standalone entry is
-# outside the gui package so PyInstaller does not execute/package gui/__init__.py
-# and application-access bootstrap code into the helper process.
-sakana_a = Analysis(
-    [str(ROOT / "sakana_process.py")],
-    pathex=[str(ROOT)],
-    binaries=[],
-    datas=[],
-    hiddenimports=[],
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=["pytest", "playwright", "velopack"],
     noarchive=False,
     optimize=0,
 )
@@ -135,38 +119,13 @@ worker_exe = EXE(
     contents_directory="_internal",
 )
 
-sakana_pyz = PYZ(sakana_a.pure)
-sakana_exe = EXE(
-    sakana_pyz,
-    sakana_a.scripts,
-    utf8_options,
-    [],
-    exclude_binaries=True,
-    name="EcommerceAgentSakana",
-    icon=str(APP_ICON),
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,
-    console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-    contents_directory="_internal",
-)
-
 coll = COLLECT(
     gui_exe,
     worker_exe,
-    sakana_exe,
     gui_a.binaries,
     gui_a.datas,
     worker_a.binaries,
     worker_a.datas,
-    sakana_a.binaries,
-    sakana_a.datas,
     strip=False,
     upx=False,
     upx_exclude=[],

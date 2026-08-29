@@ -19,6 +19,7 @@ on:
       - "gui/frozen_process_router.py"
       - "run_packaged_worker.py"
       - "run_local_gui.py"
+      - "native/sakana-helper/**"
       - "packaging/**"
       - "scripts/build_windows.ps1"
       - "scripts/test_velopack_update_e2e.ps1"
@@ -91,8 +92,9 @@ jobs:
           $update = Join-Path $installDir "Update.exe"
           $gui = Join-Path $installDir "current\EcommerceAgent.exe"
           $worker = Join-Path $installDir "current\EcommerceAgentWorker.exe"
+          $sakana = Join-Path $installDir "current\_internal\native\sakana\helper\EcommerceAgentSakana.exe"
           $versionFile = Join-Path $installDir "current\_internal\packaging\VERSION"
-          foreach ($required in @($stub, $update, $gui, $worker, $versionFile)) {
+          foreach ($required in @($stub, $update, $gui, $worker, $sakana, $versionFile)) {
             if (-not (Test-Path $required)) { throw "Velopack installed component missing: $required" }
           }
           $installedVersion = (Get-Content $versionFile -Raw).Trim()

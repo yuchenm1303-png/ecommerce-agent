@@ -81,8 +81,10 @@ $VelopackDir = Join-Path $ArtifactDir "velopack"
 $SetupAlias = Join-Path $ArtifactDir "EcommerceAgent-Setup-$Version.exe"
 $PortableAlias = Join-Path $ArtifactDir "EcommerceAgent-$Version-portable.zip"
 $IconFile = Join-Path $Root "packaging\app_icon.ico"
+$SakanaProject = Join-Path $Root "native\sakana-helper\EcommerceAgentSakana.vcxproj"
+$SakanaPublishDir = Join-Path $Root "build\sakana-helper"
 
-foreach ($Path in @($AppDir, $WorkDir, $VelopackDir, $SetupAlias, $PortableAlias, $IconFile)) {
+foreach ($Path in @($AppDir, $WorkDir, $SakanaPublishDir, $VelopackDir, $SetupAlias, $PortableAlias, $IconFile)) {
     if (Test-Path $Path) { Remove-Item $Path -Recurse -Force }
 }
 New-Item -ItemType Directory -Force -Path $DistRoot, $WorkDir, $ArtifactDir, $VelopackDir | Out-Null
@@ -100,6 +102,17 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path $IconFile)) {
 }
 
 Write-Host "[3/5] Building PyInstaller onedir application v$Version"
+$VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $VsWhere)) { throw "Visual Studio Build Tools locator missing: $VsWhere" }
+$MsBuildRoot = & $VsWhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -latest -property installationPath
+if ([string]::IsNullOrWhiteSpace($MsBuildRoot)) { throw "MSVC Build Tools workload is missing" }
+$MsBuild = Join-Path $MsBuildRoot "MSBuild\Current\Bin\MSBuild.exe"
+& $MsBuild $SakanaProject /restore /m /p:Configuration=Release /p:Platform=x64
+if ($LASTEXITCODE -ne 0) { throw "Native WebView2 Sakana helper build failed: $LASTEXITCODE" }
+$NativeOutput = Join-Path $Root "native\sakana-helper\bin\Release"
+New-Item -ItemType Directory -Force -Path $SakanaPublishDir | Out-Null
+Copy-Item (Join-Path $NativeOutput "*") $SakanaPublishDir -Recurse -Force
+
 $PreviousBuildVersion = $env:ECOMMERCE_AGENT_BUILD_VERSION
 $env:ECOMMERCE_AGENT_BUILD_VERSION = $Version
 try {
@@ -121,9 +134,14 @@ finally {
 }
 if ($PyInstallerExitCode -ne 0) { throw "PyInstaller failed: $PyInstallerExitCode" }
 
+$SakanaDestination = Join-Path $AppDir "_internal\native\sakana\helper"
+New-Item -ItemType Directory -Force -Path $SakanaDestination | Out-Null
+Copy-Item (Join-Path $SakanaPublishDir "*") $SakanaDestination -Recurse -Force
+
 $GuiExe = Join-Path $AppDir "EcommerceAgent.exe"
 $WorkerExe = Join-Path $AppDir "EcommerceAgentWorker.exe"
-foreach ($Required in @($GuiExe, $WorkerExe)) {
+$SakanaExe = Join-Path $SakanaDestination "EcommerceAgentSakana.exe"
+foreach ($Required in @($GuiExe, $WorkerExe, $SakanaExe)) {
     if (-not (Test-Path $Required)) { throw "Packaging output missing: $Required" }
 }
 

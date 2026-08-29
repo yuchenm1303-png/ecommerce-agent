@@ -51,3 +51,9 @@ test-results/
 /packaging/app_icon.ico
 # PyInstaller auto-generates a root spec when packaging the E2E parent probe
 /EcommerceAgent.spec
+
+# Native Sakana helper build output. Source assets and the vendored WebView2
+# compile-time SDK remain tracked; generated binaries are produced by MSBuild.
+/native/sakana-helper/bin/
+/native/sakana-helper/obj-native/
+/native/sakana-helper/obj-managed-stale/
