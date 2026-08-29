@@ -68,6 +68,7 @@ Item {
     }
 
     property var workspaceToggleData: rootControl("workspaceModeSwitch")
+    property var runtimeAssistantToggleData: rootControl("runtimeAssistantSwitch")
     property var backgroundDriftToggleData: rootControl("backgroundDriftSwitch")
 
     function componentFor(kind) {
@@ -813,12 +814,23 @@ Item {
         }
     }
 
-    // The two header switches are global controls, not workspace content. Keep
-    // each Loader alive for the entire Quick scene lifetime so refreshing one
-    // switch cannot destroy/recreate the other and replay its initialization.
+    // Header switches are global controls, not workspace content. Keep each
+    // Loader alive for the entire Quick scene lifetime so refreshing one switch
+    // cannot destroy/recreate another and replay its initialization.
     Loader {
         id: workspaceToggleLoader
         property var d: staticRoot.workspaceToggleData
+        x: d ? d.x : 0; y: d ? d.y : 0
+        width: d ? d.w : 0; height: d ? d.h : 0
+        visible: d !== null
+        sourceComponent: toggleComponent
+        onLoaded: if (item) item.d = d
+        onDChanged: if (item) item.d = d
+    }
+
+    Loader {
+        id: runtimeAssistantToggleLoader
+        property var d: staticRoot.runtimeAssistantToggleData
         x: d ? d.x : 0; y: d ? d.y : 0
         width: d ? d.w : 0; height: d ? d.h : 0
         visible: d !== null
