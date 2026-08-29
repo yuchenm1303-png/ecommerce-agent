@@ -100,6 +100,7 @@ def test_pyinstaller_is_onedir_and_embeds_velopack_runtime_hook() -> None:
     assert 'name="EcommerceAgentWorker"' in SPEC
     assert "console=False" in SPEC
     assert "console=True" in SPEC
+    assert 'collect_all("playwright")' in SPEC
     assert 'collect_all("velopack")' in SPEC
     assert 'runtime_hooks=[str(VELOPACK_RUNTIME_HOOK)]' in SPEC
     assert 'name="EcommerceAgent"' in SPEC[SPEC.index("coll = COLLECT"):]
@@ -112,7 +113,7 @@ def test_velopack_toolchain_is_pinned_and_build_replaces_inno() -> None:
     assert "dotnet tool restore" in BUILD
     assert "dotnet tool run vpk -- @PackArgs" in BUILD
     assert '"pack"' in BUILD
-    assert '"--packId", "EcommerceAgent"' in BUILD
+    assert '"--packId", $PackId' in BUILD
     assert '"--mainExe", "EcommerceAgent.exe"' in BUILD
     assert '"--runtime", "win-x64"' in BUILD
     assert "ISCC.exe" not in BUILD
@@ -144,7 +145,7 @@ def test_build_discovers_native_assets_and_never_guesses_velopack_package_names(
     assert '[string]$Target[0].FileName' in BUILD
     assert '[IO.Path]::GetFileName($FileName) -ne $FileName' in BUILD
     assert 'Join-Path $VelopackDir "$PackId-Setup.exe"' not in BUILD
-    assert 'Join-Path $VelopackDir "$PackId-Portable.zip"' not in BUILD
+    assert 'Join-Path $VelopackDir "$PackId-Portabled.zip"' not in BUILD
     assert '"$PackId-$Version-full.nupkg"' not in BUILD
 
 
