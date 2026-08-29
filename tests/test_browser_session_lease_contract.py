@@ -22,7 +22,7 @@ def _isolate_lease_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     bs._CDP_SESSION_LOCAL_LOCKS.clear()
 
 
-def test_same_owner_can_reenter_for_synchronous_child_without_deadlock(
+def test_same_business_owner_can_reenter_lease_without_granting_transport_ownership(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -54,6 +54,44 @@ def test_same_owner_can_reenter_for_synchronous_child_without_deadlock(
     assert env_key not in os.environ
 
 
+def test_active_transport_marker_blocks_nested_edge_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = 39225
+    env_key = bs._cdp_transport_env_key(port)
+    monkeypatch.delenv(env_key, raising=False)
+
+    owner = bs.acquire_cdp_transport_owner(port)
+    try:
+        assert os.environ[env_key] == owner.token
+        with pytest.raises(RuntimeError, match="禁止.*独立 EdgeHarness/connect_over_cdp"):
+            bs.acquire_cdp_transport_owner(port)
+        assert os.environ[env_key] == owner.token
+    finally:
+        owner.release()
+
+    assert env_key not in os.environ
+
+
+def test_transport_ownership_is_port_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port_a = 39226
+    port_b = 39227
+    monkeypatch.delenv(bs._cdp_transport_env_key(port_a), raising=False)
+    monkeypatch.delenv(bs._cdp_transport_env_key(port_b), raising=False)
+
+    first = bs.acquire_cdp_transport_owner(port_a)
+    second = bs.acquire_cdp_transport_owner(port_b)
+    try:
+        assert first.token != second.token
+        assert os.environ[bs._cdp_transport_env_key(port_a)] == first.token
+        assert os.environ[bs._cdp_transport_env_key(port_b)] == second.token
+    finally:
+        second.release()
+        first.release()
+
+
 def test_stale_inherited_token_cannot_bypass_root_ownership(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -76,12 +114,14 @@ def test_stale_inherited_token_cannot_bypass_root_ownership(
         lease.release()
 
 
-def test_edge_harness_holds_session_lease_until_detach(
+def test_edge_harness_holds_session_and_transport_ownership_until_detach(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     lease = _FakeLease()
+    transport = _FakeLease()
     monkeypatch.setattr(bs, "acquire_cdp_session_lease", lambda _port: lease)
+    monkeypatch.setattr(bs, "acquire_cdp_transport_owner", lambda _port: transport)
     monkeypatch.setattr(bs, "is_cdp_ready", lambda _port, **_kw: True)
 
     def fake_connect(self: bs.EdgeHarness) -> None:
@@ -97,21 +137,26 @@ def test_edge_harness_holds_session_lease_until_detach(
         port=39223,
     )
     assert lease.release_calls == 0
+    assert transport.release_calls == 0
 
     harness.detach()
+    assert transport.release_calls == 1
     assert lease.release_calls == 1
 
     # detach is intentionally idempotent; callers may clean up in finally blocks.
     harness.detach()
+    assert transport.release_calls == 1
     assert lease.release_calls == 1
 
 
-def test_edge_harness_releases_session_lease_when_attach_fails(
+def test_edge_harness_releases_session_and_transport_when_attach_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     lease = _FakeLease()
+    transport = _FakeLease()
     monkeypatch.setattr(bs, "acquire_cdp_session_lease", lambda _port: lease)
+    monkeypatch.setattr(bs, "acquire_cdp_transport_owner", lambda _port: transport)
     monkeypatch.setattr(bs, "is_cdp_ready", lambda _port, **_kw: True)
 
     def broken_connect(_self: bs.EdgeHarness) -> None:
@@ -126,9 +171,11 @@ def test_edge_harness_releases_session_lease_when_attach_fails(
             port=39224,
         )
 
+    assert transport.release_calls == 1
     assert lease.release_calls == 1
 
 
-def test_session_ownership_is_port_scoped() -> None:
+def test_session_and_transport_ownership_are_port_scoped() -> None:
     assert bs._cdp_session_lock_path(9222) != bs._cdp_session_lock_path(9333)
     assert bs._cdp_session_env_key(9222) != bs._cdp_session_env_key(9333)
+    assert bs._cdp_transport_env_key(9222) != bs._cdp_transport_env_key(9333)

@@ -47,7 +47,7 @@ class FakeAdapter:
         return self.listing
 
 
-def test_planner_inherits_batch_owned_target_from_job_environment(monkeypatch) -> None:
+def test_planner_inherits_batch_owned_target_as_metadata(monkeypatch) -> None:
     monkeypatch.setenv(makro_plan_listing._BATCH_TARGET_ENV, "target-job-002")
     args = makro_plan_listing.build_parser().parse_args(_plan_args())
     assert args.makro_target_id == "target-job-002"
@@ -116,11 +116,18 @@ def test_owned_planner_rejects_target_that_is_no_longer_a_listing(monkeypatch) -
         makro_plan_listing._owned_listing_page(harness, "wrong-page")
 
 
-def test_single_mode_keeps_unique_listing_tab_guard() -> None:
-    source = inspect.getsource(makro_plan_listing.main)
+def test_scan_mode_keeps_unique_listing_tab_guard() -> None:
+    source = inspect.getsource(makro_plan_listing._scan_live_schema)
     assert "if args.makro_target_id:" in source
     assert "_owned_listing_page(harness, args.makro_target_id)" in source
     assert "_assert_single_listing_tab(harness.context)" in source
+
+
+def test_final_plan_mode_cannot_reenter_batch_browser_transport() -> None:
+    source = inspect.getsource(makro_plan_listing._plan_from_captured_schema)
+    assert "EdgeHarness" not in source
+    assert "sync_playwright" not in source
+    assert "connect_over_cdp" not in source
 
 
 def test_batch_refreshes_target_before_propagating_planner_ownership() -> None:

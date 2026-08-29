@@ -32,6 +32,7 @@ _CDP_ATTACH_RETRY_DELAY_S = 0.75
 _CDP_ATTACH_LOCK_POLL_S = 0.10
 _CDP_SESSION_WAIT_LOG_S = 5.0
 _CDP_SESSION_ENV_PREFIX = "ECOMMERCE_CDP_SESSION_LEASE_"
+_CDP_TRANSPORT_ENV_PREFIX = "ECOMMERCE_CDP_TRANSPORT_OWNER_"
 _EXTERNAL_SPAWN_LOCK = threading.Lock()
 _CDP_SESSION_LOCAL_LOCKS_GUARD = threading.Lock()
 _CDP_SESSION_LOCAL_LOCKS: dict[int, threading.RLock] = {}
@@ -54,8 +55,13 @@ class SingleEdgeSession:
     cdp_port: int
     profile_dir: Path
     _session_lease: CdpSessionLease | None = field(default=None, repr=False)
+    _transport_owner: CdpTransportOwner | None = field(default=None, repr=False)
 
     def detach(self) -> None:
+        transport_owner = self._transport_owner
+        self._transport_owner = None
+        if transport_owner is not None:
+            transport_owner.release()
         lease = self._session_lease
         self._session_lease = None
         if lease is not None:
@@ -233,6 +239,77 @@ def _cdp_session_env_key(port: int) -> str:
     return f"{_CDP_SESSION_ENV_PREFIX}{int(port)}"
 
 
+def _cdp_transport_env_key(port: int) -> str:
+    return f"{_CDP_TRANSPORT_ENV_PREFIX}{int(port)}"
+
+
+class CdpTransportOwner:
+    """Process-tree ownership marker for one active Playwright CDP transport.
+
+    ``CdpSessionLease`` expresses logical/business ownership and is intentionally
+    inheritable by Batch child workers. This marker is different: inheriting it
+    means a parent process still owns an active Playwright transport for the same
+    CDP port, so a child must reuse the parent's browser observation/result rather
+    than opening another ``connect_over_cdp`` transport underneath it.
+    """
+
+    def __init__(self, *, port: int, token: str, previous_env: str | None) -> None:
+        self.port = int(port)
+        self.token = token
+        self._previous_env = previous_env
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        env_key = _cdp_transport_env_key(self.port)
+        if os.environ.get(env_key) == self.token:
+            if self._previous_env is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = self._previous_env
+        print(
+            f"CDP_TRANSPORT RELEASED port={self.port} owner_pid={os.getpid()}",
+            flush=True,
+        )
+
+    def __del__(self) -> None:
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+def acquire_cdp_transport_owner(port: int = DEFAULT_CDP_PORT) -> CdpTransportOwner:
+    """Claim the one active transport slot for this process tree and CDP port.
+
+    The marker is deliberately inherited through normal subprocess environment
+    propagation. A nested child therefore fails before touching Chromium instead
+    of creating a second Playwright transport while its parent still owns one.
+    Unrelated Batch worker processes do not inherit one another's marker, so the
+    existing top-level per-job transport model remains unchanged.
+    """
+
+    port = int(port)
+    env_key = _cdp_transport_env_key(port)
+    existing = str(os.environ.get(env_key) or "").strip()
+    if existing:
+        raise RuntimeError(
+            f"Makro Edge CDP {port} 已由当前进程树中的父级 Playwright transport 控制；"
+            "禁止在其仍存活时再次创建独立 EdgeHarness/connect_over_cdp。"
+            "请复用父级 Page/Context 或先结束父级 transport。"
+        )
+    token = f"{os.getpid()}:{secrets.token_hex(16)}"
+    previous_env = os.environ.get(env_key)
+    os.environ[env_key] = token
+    print(
+        f"CDP_TRANSPORT ACQUIRED port={port} owner_pid={os.getpid()}",
+        flush=True,
+    )
+    return CdpTransportOwner(port=port, token=token, previous_env=previous_env)
+
+
 def _cdp_session_local_lock(port: int) -> threading.RLock:
     key = int(port)
     with _CDP_SESSION_LOCAL_LOCKS_GUARD:
@@ -310,7 +387,12 @@ def _write_cdp_session_owner(port: int, *, token: str) -> None:
 
 
 class CdpSessionLease:
-    """One exclusive long-lived Edge automation owner, inheritable by child workers."""
+    """Exclusive logical browser-session owner, inheritable by trusted children.
+
+    This lease protects one business/browser-session ownership domain. It does
+    *not* authorize a child to create a nested Playwright transport; transport
+    ownership is enforced separately by ``CdpTransportOwner``.
+    """
 
     def __init__(
         self,
@@ -374,11 +456,12 @@ class CdpSessionLease:
 
 
 def acquire_cdp_session_lease(port: int = DEFAULT_CDP_PORT) -> CdpSessionLease:
-    """Queue for exclusive control of one long-lived CDP browser session.
+    """Queue for exclusive logical ownership of one long-lived CDP browser.
 
     The lease spans the whole EdgeHarness lifetime, not only connect_over_cdp().
-    Synchronous child processes inherit a cryptographic token and may re-enter the
-    same owner's lease; unrelated jobs must wait until the owner detaches. The OS
+    Trusted synchronous child processes may inherit the same *business* owner so
+    unrelated jobs stay excluded. Inheritance never grants permission to create a
+    nested Playwright transport; ``EdgeHarness`` claims that separately. The OS
     file lock is released automatically if the owning process crashes.
     """
 
@@ -562,7 +645,7 @@ _choose_page = select_listing_page
 
 
 class EdgeHarness:
-    """Exclusive session abstraction for the one long-lived Makro Edge."""
+    """One Playwright transport over the long-lived Makro Edge for this process tree."""
 
     def __init__(
         self,
@@ -581,8 +664,10 @@ class EdgeHarness:
         self._watched_page_ids: set[int] = set()
         self._watched_context_ids: set[int] = set()
         self._session_lease: CdpSessionLease | None = None
+        self._transport_owner: CdpTransportOwner | None = None
         try:
             self._session_lease = acquire_cdp_session_lease(self.cdp_port)
+            self._transport_owner = acquire_cdp_transport_owner(self.cdp_port)
             self.launched_now = not is_cdp_ready(self.cdp_port)
             if self.launched_now:
                 launch_detached_edge(
@@ -590,6 +675,7 @@ class EdgeHarness:
                 )
             self._connect()
         except Exception:
+            self._release_transport_owner()
             self._release_session_lease()
             raise
 
@@ -629,6 +715,12 @@ class EdgeHarness:
         self.page = select_listing_page(self.context)
         self._watch_visual_page(self.page)
 
+    def _release_transport_owner(self) -> None:
+        owner = self._transport_owner
+        self._transport_owner = None
+        if owner is not None:
+            owner.release()
+
     def _release_session_lease(self) -> None:
         lease = self._session_lease
         self._session_lease = None
@@ -636,6 +728,15 @@ class EdgeHarness:
             lease.release()
 
     def health_check(self) -> bool:
+        if self.browser is None or self.context is None:
+            return False
+        try:
+            is_connected = getattr(self.browser, "is_connected", None)
+            if callable(is_connected) and not bool(is_connected()):
+                return False
+            list(self.context.pages)
+        except Exception:
+            return False
         return is_cdp_ready(self.cdp_port)
 
     def select_page(self) -> Page:
@@ -647,9 +748,11 @@ class EdgeHarness:
 
     def ensure_page(self) -> Page:
         if not self.health_check():
-            raise RuntimeError("长期 Makro Edge 的 CDP 端点不可达，无法继续。")
+            raise RuntimeError("长期 Makro Edge 的自动化 transport 不可用，无法继续。")
         if self.page is None or self.page.is_closed():
-            self._connect()
+            if self.context is None:
+                raise RuntimeError("Edge harness 已失去 browser context，拒绝隐式二次 attach。")
+            self.page = select_listing_page(self.context)
         assert self.page is not None
         self._watch_visual_page(self.page)
         return self.page
@@ -658,10 +761,12 @@ class EdgeHarness:
         self.page = None
         self.context = None
         self.browser = None
+        self._release_transport_owner()
         self._release_session_lease()
 
     def __del__(self) -> None:
         try:
+            self._release_transport_owner()
             self._release_session_lease()
         except Exception:
             pass
@@ -681,7 +786,9 @@ def connect_single_edge(
         start_url=start_url,
     )
     lease = harness._session_lease
+    transport_owner = harness._transport_owner
     harness._session_lease = None
+    harness._transport_owner = None
     return SingleEdgeSession(
         browser=harness.browser,
         context=harness.context,
@@ -690,4 +797,5 @@ def connect_single_edge(
         cdp_port=harness.cdp_port,
         profile_dir=harness.profile_dir,
         _session_lease=lease,
+        _transport_owner=transport_owner,
     )
