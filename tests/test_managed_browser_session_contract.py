@@ -32,20 +32,24 @@ def test_single_and_batch_share_one_browser_instead_of_spawning_per_job() -> Non
     assert "execute_concurrency" in MANAGER
 
 
-def test_browser_restart_invalidates_stale_prepared_tabs() -> None:
-    assert "webSocketDebuggerUrl" in MANAGER
+def test_browser_generation_uses_endpoint_identity_plus_automation_probe() -> None:
+    assert "cdp_endpoint_token(" in MANAGER
+    assert "probe_cdp_automation(" in MANAGER
+    assert "poison_matches_current_generation(" in MANAGER
     assert "self._generation += 1" in MANAGER
     assert "self._single_prepared_generation != self._generation" in MANAGER
     assert "self._batch_prepare_generation != self._generation" in MANAGER
     assert "owned-tab targetId 已失效" in MANAGER
 
 
-def test_manager_never_owns_or_closes_makro_browser() -> None:
-    # The GUI owns browser lifecycle coordination, never the external Edge object
-    # itself. Keep the behavioral prohibition instead of locking a docstring.
+def test_manager_never_directly_closes_playwright_browser_objects() -> None:
+    # Browser-process rotation belongs to the GUI lifecycle owner and must go
+    # through the PID-verified update_browser_gate helper. Never close a shared
+    # Playwright Browser/Context object or kill an arbitrary process directly.
     assert "browser.close(" not in MANAGER
     assert "context.close(" not in MANAGER
     assert "process.kill(" not in MANAGER
+    assert "close_managed_browser(" in MANAGER
 
 
 def test_auto_recovery_does_not_restart_browser_mid_task() -> None:
