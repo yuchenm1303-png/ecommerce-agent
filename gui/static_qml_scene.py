@@ -605,7 +605,7 @@ Item {
                 maskEnabled: true
                 maskSource: cardRoundMask
                 autoPaddingEnabled: false
-                colorizationColor: "#9B6F8D"
+                colorizationColor: "#FF9DCA"
                 colorization: (cardHover.hovered || cardClick.pressed) ? 180/255 : 142/255
                 Behavior on colorization {
                     NumberAnimation {
