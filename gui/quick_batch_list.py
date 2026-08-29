@@ -395,11 +395,16 @@ Item {
 
                 Loader {
                     width: parent.width
-                    active: jobCard.expanded
+                    height: jobCard.expanded ? 216 : 0
+                    active: height > 0
+                    visible: height > 0
+                    clip: true
+                    Behavior on height {
+                        NumberAnimation { duration: 150; easing.type: Easing.InOutCubic }
+                    }
                     sourceComponent: Component {
                         Rectangle {
-                            width: body.width
-                            height: 216
+                            anchors.fill: parent
                             radius: 9
                             color: Qt.rgba(5/255, 15/255, 30/255, 72/255)
                             border.width: 1
