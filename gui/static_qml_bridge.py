@@ -936,7 +936,9 @@ class StaticQmlBridge(QObject):
             return False
         if name == "batchUrlRemoveButton":
             return True
-        return name == "batchToolbarButton" and text in {"+ 添加链接", "批量粘贴"}
+        if name == "batchToolbarButton" and text in {"+ 添加链接", "批量粘贴"}:
+            return True
+        return text in {"展开详情 / 日志", "收起详情 / 日志"}
 
     def _on_batch_jobs_changed(self, jobs: object = None, *_args: object) -> None:
         job_ids = self._job_ids(jobs)
