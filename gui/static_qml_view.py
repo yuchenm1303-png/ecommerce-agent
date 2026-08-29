@@ -801,6 +801,29 @@ class StaticQmlViewController(QObject):
     def _activate_after_startup(self) -> None:
         self._activate_quick()
 
+    def _commit_quick_editor_before_pointer_action(self, event: QMouseEvent) -> None:
+        """Commit the focused Quick editor before a pointer action outside it.
+
+        Most visible buttons are TapHandler-backed Items rather than focus-taking
+        controls. Without this boundary, TextInput.editingFinished never fires when
+        the user types a SpinBox value and immediately clicks an action button, so
+        the hidden QWidget business-state owner can still hold the previous value.
+        """
+
+        try:
+            focus_item = self.quick.activeFocusItem()
+        except RuntimeError:
+            return
+        if not isinstance(focus_item, QQuickItem):
+            return
+        try:
+            local = focus_item.mapFromScene(QPointF(event.position()))
+            if focus_item.contains(local):
+                return
+            focus_item.setFocus(False)
+        except RuntimeError:
+            pass
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if watched is not self.quick or not self._quick_active:
             return False
@@ -811,6 +834,7 @@ class StaticQmlViewController(QObject):
             return False
         if not isinstance(event, QMouseEvent) or event.button() != Qt.MouseButton.LeftButton:
             return False
+        self._commit_quick_editor_before_pointer_action(event)
         try:
             self.fireworks.spawn(QPointF(event.position()))
         except RuntimeError:
