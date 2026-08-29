@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import argparse
 import os
 import secrets
-import subprocess
-import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Iterator
 
 from .browser_session import _cdp_lock_root, _try_lock_handle, _unlock_handle
 
@@ -26,29 +23,14 @@ def _transport_lane_lock_path(port: int) -> Path:
     return _cdp_lock_root() / f"transport-lane-{int(port)}.lock"
 
 
-def python_args_under_transport_lane(port: int, argv: Sequence[str]) -> list[str]:
-    """Route one Python browser entrypoint through the canonical CDP lane."""
-
-    command = [str(value) for value in argv]
-    if not command:
-        raise ValueError("transport lane requires a Python child command")
-    return [
-        "-m",
-        "app.cdp_transport_lane",
-        "--port",
-        str(int(port)),
-        "--",
-        *command,
-    ]
-
-
 @contextmanager
 def exclusive_cdp_transport_lane(port: int) -> Iterator[None]:
     """Own the only active Playwright transport lane for one local CDP port.
 
-    ``cdp_attach_guard`` only serializes the handshake. Formal GUI browser jobs
-    need a stronger invariant: while one job owns a live Playwright transport, no
-    sibling process may create another transport to the same long-lived Edge.
+    This module is deliberately an ownership primitive, not a process launcher.
+    Browser workers acquire the lane inside their own process before creating a
+    Playwright transport. That keeps source-Python and installed frozen runtimes
+    identical and prevents accidental ``sys.executable`` recursion into the GUI.
 
     The OS file lock spans the caller's browser-control phase and is released by
     the kernel if the worker crashes. A process-tree marker makes accidental
@@ -111,36 +93,8 @@ def exclusive_cdp_transport_lane(port: int) -> Iterator[None]:
             pass
 
 
-def _run_child_under_lane(port: int, argv: list[str]) -> int:
-    if not argv:
-        raise ValueError("transport lane runner requires a child command")
-    with exclusive_cdp_transport_lane(port):
-        result = subprocess.run([sys.executable, *argv], check=False)
-    return int(result.returncode)
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Run one Python browser worker under the exclusive CDP transport lane."
-    )
-    parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("command", nargs=argparse.REMAINDER)
-    args = parser.parse_args()
-    command = list(args.command)
-    if command and command[0] == "--":
-        command = command[1:]
-    if not command:
-        raise SystemExit("missing child Python command after --")
-    return _run_child_under_lane(args.port, command)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 __all__ = [
     "exclusive_cdp_transport_lane",
-    "python_args_under_transport_lane",
     "_transport_lane_env_key",
     "_transport_lane_lock_path",
 ]
