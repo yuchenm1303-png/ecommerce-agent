@@ -44,6 +44,13 @@ _ATOMIC_TYPES = (
     QTableWidget,
     QAbstractButton,
 )
+_HEADER_TOGGLE_NAMES = frozenset(
+    {
+        "workspaceModeSwitch",
+        "runtimeAssistantSwitch",
+        "backgroundDriftSwitch",
+    }
+)
 _REFRESH_FRAME_MS = 16
 _MAX_MIRRORED_TEXT = 80_000
 
@@ -709,7 +716,7 @@ class StaticQmlBridge(QObject):
                 data = self._base(widget, origin)
                 if data is None:
                     return None
-                if widget.objectName() in {"workspaceModeSwitch", "backgroundDriftSwitch"}:
+                if widget.objectName() in _HEADER_TOGGLE_NAMES:
                     data.update(kind="toggle", checked=bool(widget.isChecked()))
                     return data
                 name = widget.objectName()
