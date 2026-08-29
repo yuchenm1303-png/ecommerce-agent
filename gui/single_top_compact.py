@@ -3,7 +3,15 @@ from __future__ import annotations
 from typing import Any
 
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtWidgets import QBoxLayout, QFrame, QLabel, QSpinBox, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QBoxLayout,
+    QFrame,
+    QLabel,
+    QSizePolicy,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
 
 
 _TOP_CARD_MIN = 272
@@ -13,6 +21,7 @@ _SINGLE_PAGE_SPACING = 6
 _INTENT_DETAIL_EXTRA = 112
 _LEFT_LABEL_WIDTH = 112
 _MIDDLE_LABEL_WIDTH = 132
+_FORM_ROW_SPACING = 8
 _STAGE_BUTTON_WIDTH = 176
 _DETAIL_BUTTON_WIDTH = 70
 
@@ -53,17 +62,30 @@ def _ancestor_card(widget: QWidget | None) -> QFrame | None:
 
 
 def _set_compact_height(widget: object) -> None:
-    if isinstance(widget, QWidget):
-        widget.setMinimumHeight(_CONTROL_HEIGHT)
-        widget.setMaximumHeight(_CONTROL_HEIGHT)
+    if not isinstance(widget, QWidget):
+        return
+    widget.setFixedHeight(_CONTROL_HEIGHT)
+    policy = widget.sizePolicy()
+    if policy.verticalPolicy() != QSizePolicy.Policy.Fixed:
+        widget.setSizePolicy(policy.horizontalPolicy(), QSizePolicy.Policy.Fixed)
 
 
-def _label(row: QBoxLayout | None, text: str) -> QLabel | None:
-    if not isinstance(row, QBoxLayout):
-        return None
+def _widget_index(row: QBoxLayout | None, target: QWidget | None) -> int:
+    if not isinstance(row, QBoxLayout) or not isinstance(target, QWidget):
+        return -1
     for index in range(row.count()):
+        if row.itemAt(index).widget() is target:
+            return index
+    return -1
+
+
+def _label_before(row: QBoxLayout | None, target: QWidget | None) -> QLabel | None:
+    target_index = _widget_index(row, target)
+    if target_index <= 0 or not isinstance(row, QBoxLayout):
+        return None
+    for index in range(target_index - 1, -1, -1):
         widget = row.itemAt(index).widget()
-        if isinstance(widget, QLabel) and widget.text() == text:
+        if isinstance(widget, QLabel):
             return widget
     return None
 
@@ -71,14 +93,17 @@ def _label(row: QBoxLayout | None, text: str) -> QLabel | None:
 def _set_label_column(label: QLabel | None, width: int) -> None:
     if not isinstance(label, QLabel):
         return
-    label.setMinimumWidth(int(width))
-    label.setMaximumWidth(int(width))
+    label.setContentsMargins(0, 0, 0, 0)
+    label.setFixedSize(int(width), _CONTROL_HEIGHT)
+    label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
     label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
 
-def _align_row_controls(row: QBoxLayout | None) -> None:
+def _normalize_form_row(row: QBoxLayout | None) -> None:
     if not isinstance(row, QBoxLayout):
         return
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(_FORM_ROW_SPACING)
     for index in range(row.count()):
         widget = row.itemAt(index).widget()
         if isinstance(widget, QWidget):
@@ -110,9 +135,9 @@ def _apply(window: Any) -> None:
     if not isinstance(card, QFrame) or not isinstance(layout, QVBoxLayout):
         return
 
-    # This is the final geometry owner for the Single source card. Keep one
-    # symmetric content grid so labels, fields and buttons share the same visual
-    # baselines before StaticQmlBridge snapshots them.
+    # This is the final geometry owner for the Single source card. Every form row
+    # uses the same left edge, label column, control height and vertical baseline
+    # before StaticQmlBridge snapshots it for the visible Quick scene.
     layout.setContentsMargins(16, 8, 16, 9)
     layout.setSpacing(4)
 
@@ -121,37 +146,45 @@ def _apply(window: Any) -> None:
         header.setSpacing(8)
         header.setContentsMargins(0, 0, 0, 1)
 
-    url_row = _row_for(layout, url_input if isinstance(url_input, QWidget) else None)
     offer_input = getattr(window, "listing_intent_input", None)
-    offer_row = _row_for(layout, offer_input if isinstance(offer_input, QWidget) else None)
     ai_guidance_input = getattr(window, "ai_guidance_input", None)
-    guidance_row = _row_for(layout, ai_guidance_input if isinstance(ai_guidance_input, QWidget) else None)
+    model_keywords_input = getattr(window, "model_name_keywords_input", None)
     stage_button = getattr(window, "step1_button", None)
-    stage_row = _row_for(layout, stage_button if isinstance(stage_button, QWidget) else None)
     source_port = getattr(window, "source_port", None)
-    source_row = _row_for(layout, source_port if isinstance(source_port, QWidget) else None)
     settings_toggle = getattr(window, "real_settings_toggle", None)
+
+    url_row = _row_for(layout, url_input if isinstance(url_input, QWidget) else None)
+    offer_row = _row_for(layout, offer_input if isinstance(offer_input, QWidget) else None)
+    guidance_row = _row_for(layout, ai_guidance_input if isinstance(ai_guidance_input, QWidget) else None)
+    stage_row = _row_for(layout, stage_button if isinstance(stage_button, QWidget) else None)
+    source_row = _row_for(layout, source_port if isinstance(source_port, QWidget) else None)
     settings_row = _row_for(layout, settings_toggle if isinstance(settings_toggle, QWidget) else None)
 
+    for row in (offer_row, guidance_row, source_row):
+        _normalize_form_row(row)
     for row, spacing in (
         (url_row, 10),
-        (offer_row, 8),
-        (guidance_row, 8),
         (stage_row, 10),
-        (source_row, 8),
         (settings_row, 10),
     ):
         if isinstance(row, QBoxLayout):
-            row.setSpacing(spacing)
             row.setContentsMargins(0, 0, 0, 0)
-            _align_row_controls(row)
+            row.setSpacing(spacing)
+            for index in range(row.count()):
+                widget = row.itemAt(index).widget()
+                if isinstance(widget, QWidget):
+                    row.setAlignment(widget, Qt.AlignmentFlag.AlignVCenter)
 
-    # Product-offer and AI-guidance rows now share an actual label column rather
-    # than unrelated minimum widths. The mid-row Model Name label has its own
-    # stable column so both guidance editors sit on predictable baselines.
-    _set_label_column(_label(offer_row, "销售规格 / 套装"), _LEFT_LABEL_WIDTH)
-    _set_label_column(_label(guidance_row, "AI 引导"), _LEFT_LABEL_WIDTH)
-    _set_label_column(_label(guidance_row, "Model Name 流量词"), _MIDDLE_LABEL_WIDTH)
+    # Resolve labels by their structural relationship to each editor, not by
+    # display text. Copy changes therefore cannot silently break the geometry.
+    _set_label_column(_label_before(offer_row, offer_input), _LEFT_LABEL_WIDTH)
+    _set_label_column(_label_before(guidance_row, ai_guidance_input), _LEFT_LABEL_WIDTH)
+    _set_label_column(_label_before(guidance_row, model_keywords_input), _MIDDLE_LABEL_WIDTH)
+
+    for widget in (offer_input, ai_guidance_input, model_keywords_input):
+        if isinstance(widget, QWidget):
+            _set_compact_height(widget)
+            widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     detail_button = getattr(window, "listing_intent_detail_button", None)
     if isinstance(detail_button, QWidget):
@@ -195,6 +228,13 @@ def _apply(window: Any) -> None:
     ):
         _set_compact_height(getattr(window, name, None))
 
+    # Commit the final QWidget geometry synchronously. Quick must never snapshot
+    # an intermediate size-hint state and then present slightly different column
+    # origins for adjacent rows.
+    layout.invalidate()
+    layout.activate()
+    card.updateGeometry()
+
     detail_host = getattr(window, "listing_intent_detail_host", None)
     set_single_top_detail_expanded(
         window,
@@ -207,6 +247,8 @@ def _apply(window: Any) -> None:
         single_layout = single_page.layout() if isinstance(single_page, QWidget) else None
         if isinstance(single_layout, QVBoxLayout):
             single_layout.setSpacing(_SINGLE_PAGE_SPACING)
+            single_layout.invalidate()
+            single_layout.activate()
 
     visual = getattr(window, "_visual_style", None)
     refresh = getattr(visual, "refresh_glass_frames", None)
