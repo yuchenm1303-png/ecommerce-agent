@@ -15,12 +15,11 @@ _JOB_SPACING = 6
 
 
 class BatchCardResponsiveController(QObject):
-    """Synchronously own Batch job-card geometry inside the visible viewport.
+    """Keep the legacy Batch fallback cards compact without owning scroll extent.
 
-    The hidden QWidget tree is the authoritative layout/state host for the Quick
-    mirror. Card density therefore belongs here too: one compact geometry contract
-    is applied before the mirror snapshots each card, rather than layering fixed
-    heights or clipping on top of the rendered Quick scene.
+    QScrollArea is now fallback-only; Qt owns its content height and scrollbar range.
+    This controller only applies card width/density when card topology or viewport
+    width changes. Runtime job-state updates do not trigger layout work.
     """
 
     def __init__(self, workspace: QWidget) -> None:
@@ -31,38 +30,38 @@ class BatchCardResponsiveController(QObject):
         self.jobs_layout = getattr(workspace, "jobs_layout", None)
         self.viewport = self.scroll.viewport() if isinstance(self.scroll, QScrollArea) else None
         self._committing = False
+        self._known_cards: tuple[int, ...] = ()
+        self._jobs_signal = None
 
         if self.viewport is None or not isinstance(self.jobs_host, QWidget):
             return
 
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.jobs_host.setMinimumWidth(0)
-        self.jobs_host.setSizePolicy(
-            QSizePolicy.Policy.Ignored,
-            QSizePolicy.Policy.Preferred,
-        )
+        self.jobs_host.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         if self.jobs_layout is not None:
             self.jobs_layout.setContentsMargins(1, 1, 1, 1)
             self.jobs_layout.setSpacing(_JOB_SPACING)
         self.viewport.installEventFilter(self)
-        self.jobs_host.installEventFilter(self)
 
         controller = getattr(workspace, "controller", None)
         jobs_changed = getattr(controller, "jobs_changed", None)
         if jobs_changed is not None and hasattr(jobs_changed, "connect"):
-            jobs_changed.connect(lambda _jobs: self.commit_now())
+            try:
+                jobs_changed.connect(self._on_jobs_changed)
+                self._jobs_signal = jobs_changed
+            except (RuntimeError, TypeError):
+                self._jobs_signal = None
 
         self.commit_now()
+        workspace.destroyed.connect(self.cleanup)
 
     @staticmethod
     def _soft_horizontal(widget: QWidget | None) -> None:
         if widget is None:
             return
         widget.setMinimumWidth(0)
-        widget.setSizePolicy(
-            QSizePolicy.Policy.Ignored,
-            widget.sizePolicy().verticalPolicy(),
-        )
+        widget.setSizePolicy(QSizePolicy.Policy.Ignored, widget.sizePolicy().verticalPolicy())
 
     @staticmethod
     def _single_line(label: QLabel | None) -> None:
@@ -104,12 +103,7 @@ class BatchCardResponsiveController(QObject):
 
         root = card.layout()
         if root is not None:
-            root.setContentsMargins(
-                _CARD_MARGIN_X,
-                _CARD_MARGIN_Y,
-                _CARD_MARGIN_X,
-                _CARD_MARGIN_Y,
-            )
+            root.setContentsMargins(_CARD_MARGIN_X, _CARD_MARGIN_Y, _CARD_MARGIN_X, _CARD_MARGIN_Y)
             root.setSpacing(_CARD_SPACING)
 
         for name in (
@@ -126,9 +120,6 @@ class BatchCardResponsiveController(QObject):
             if isinstance(widget, QWidget):
                 self._soft_horizontal(widget)
 
-        # The list card is a summary surface. Full product/error/log text remains
-        # available through tooltips and the existing detail modal; allowing these
-        # labels to wrap makes a single long value consume an arbitrary card height.
         for name in ("product_label", "meta_label", "detail_label", "error_label", "log_preview"):
             self._single_line(getattr(card, name, None))
 
@@ -158,88 +149,77 @@ class BatchCardResponsiveController(QObject):
         url = str(getattr(job, "product_url", "") or "")
         if not isinstance(label, QLabel) or not url:
             return
-
         available = int(label.width())
         if available <= 40:
             available = max(80, int(card.width()) - 36)
-        preview = label.fontMetrics().elidedText(
-            url,
-            Qt.TextElideMode.ElideMiddle,
-            max(80, available),
+        label.setText(
+            label.fontMetrics().elidedText(
+                url,
+                Qt.TextElideMode.ElideMiddle,
+                max(80, available),
+            )
         )
-        label.setText(preview)
         label.setToolTip(url)
 
-    def _content_height(self) -> int:
-        if self.viewport is None or self.jobs_layout is None:
-            return max(1, int(self.jobs_host.height()))
-        try:
-            self.jobs_layout.invalidate()
-            self.jobs_layout.activate()
-            layout_height = int(self.jobs_layout.sizeHint().height())
-            viewport_height = int(self.viewport.height())
-        except RuntimeError:
-            return max(1, int(self.jobs_host.height()))
-        return max(1, viewport_height, layout_height)
+    def _card_ids(self) -> tuple[int, ...]:
+        cards = getattr(self.workspace, "_job_cards", None)
+        if not isinstance(cards, dict):
+            return ()
+        return tuple(id(card) for card in cards.values() if isinstance(card, QWidget))
 
-    def _sync_geometry(self) -> None:
-        if self.viewport is None or not isinstance(self.jobs_host, QWidget):
+    def _on_jobs_changed(self, _jobs: object = None) -> None:
+        topology = self._card_ids()
+        if topology == self._known_cards:
             return
-        viewport_width = max(1, int(self.viewport.width()))
-
-        self.jobs_host.setMaximumWidth(viewport_width)
-
-        content_width = viewport_width
-        if self.jobs_layout is not None:
-            margins = self.jobs_layout.contentsMargins()
-            content_width -= margins.left() + margins.right()
-        content_width = max(1, content_width)
-
-        cards = getattr(self.workspace, "_job_cards", {})
-        if isinstance(cards, dict):
-            for card in cards.values():
-                if not isinstance(card, QWidget):
-                    continue
-                self._apply_card_constraints(card)
-                card.setMaximumWidth(content_width)
-                self._elide_url(card)
-
-        # QScrollArea normally updates a widgetResizable child's vertical extent
-        # through deferred LayoutRequest/resize events. The hidden QWidget tree is
-        # now a business/layout host behind Quick, so waiting for Expose/minimize is
-        # not a valid geometry boundary. Commit the content extent synchronously from
-        # the authoritative layout sizeHint and make the scrollbar range real now.
-        content_height = self._content_height()
-        self.jobs_host.setMinimumHeight(content_height)
-        if self.jobs_host.width() != viewport_width or self.jobs_host.height() != content_height:
-            self.jobs_host.resize(viewport_width, content_height)
+        self.commit_now()
 
     def commit_now(self) -> None:
-        """Commit viewport/card geometry in the same GUI turn that owns the layout."""
-
-        if self._committing:
+        if self._committing or self.viewport is None:
             return
         self._committing = True
         try:
-            self._sync_geometry()
+            viewport_width = max(1, int(self.viewport.width()))
+            content_width = viewport_width
+            if self.jobs_layout is not None:
+                margins = self.jobs_layout.contentsMargins()
+                content_width -= margins.left() + margins.right()
+            content_width = max(1, content_width)
+
+            cards = getattr(self.workspace, "_job_cards", None)
+            if isinstance(cards, dict):
+                for card in cards.values():
+                    if not isinstance(card, QWidget):
+                        continue
+                    self._apply_card_constraints(card)
+                    card.setMaximumWidth(content_width)
+                    self._elide_url(card)
+            self._known_cards = self._card_ids()
         except RuntimeError:
             pass
         finally:
             self._committing = False
 
     def schedule_refresh(self) -> None:
-        """Compatibility entry: geometry refreshes are intentionally synchronous."""
-
         self.commit_now()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if watched in {self.viewport, self.jobs_host} and event.type() in {
-            QEvent.Type.Resize,
-            QEvent.Type.Show,
-            QEvent.Type.LayoutRequest,
-        }:
+        if watched is self.viewport and event.type() in {QEvent.Type.Resize, QEvent.Type.Show}:
             self.commit_now()
         return False
+
+    def cleanup(self) -> None:
+        signal = self._jobs_signal
+        self._jobs_signal = None
+        if signal is not None:
+            try:
+                signal.disconnect(self._on_jobs_changed)
+            except (RuntimeError, TypeError):
+                pass
+        if self.viewport is not None:
+            try:
+                self.viewport.removeEventFilter(self)
+            except RuntimeError:
+                pass
 
 
 def install_batch_card_responsive(workspace: QWidget) -> BatchCardResponsiveController:

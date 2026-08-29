@@ -10,6 +10,7 @@ from PySide6.QtQuick import QQuickItem, QQuickWindow
 from PySide6.QtWidgets import QFrame, QMainWindow
 
 from .activity_presence import ActivityPresence
+from .quick_batch_list import QuickBatchList
 from .static_qml_bridge import StaticCardModel, StaticQmlBridge
 from .static_qml_fireworks import StaticQuickFireworks
 from .static_qml_scene import STATIC_QML_SOURCE
@@ -528,6 +529,9 @@ class StaticQmlViewController(QObject):
         context.setContextProperty("staticBridge", self.bridge)
         context.setContextProperty("staticCardModel", self.card_model)
 
+        self.quick_batch = QuickBatchList(window, visual, self.engine, self)
+        context.setContextProperty("quickBatchList", self.quick_batch)
+
         self.activity_presence = StaticActivityPresenceMirror(
             window,
             self.quick,
@@ -535,6 +539,7 @@ class StaticQmlViewController(QObject):
             self,
         )
         self.bridge.sceneChanged.connect(self.activity_presence.schedule_refresh)
+        self.bridge.sceneChanged.connect(self.quick_batch.refresh_geometry)
 
         self.fireworks = StaticQuickFireworks()
         self.fireworks.setParent(self)
@@ -619,6 +624,7 @@ class StaticQmlViewController(QObject):
             created.setParentItem(self.quick.contentItem())
             created.setVisible(False)
             self.activity_presence.attach(created)
+            self.quick_batch.attach(created)
         except RuntimeError as exc:
             try:
                 created.deleteLater()
@@ -693,6 +699,7 @@ class StaticQmlViewController(QObject):
         self._quick_requested = False
         self._disconnect_handoff()
         self.bridge.set_active(False)
+        self.quick_batch.restore_legacy()
         self.fireworks.clear()
         self._set_native_glass_overlay_alpha(64.0)
         if self.item is not None:
@@ -732,6 +739,7 @@ class StaticQmlViewController(QObject):
         self._fit()
         self.bridge.schedule_refresh()
         self.activity_presence.schedule_refresh()
+        self.quick_batch.refresh_geometry()
 
     def _activate_quick(self) -> None:
         self._quick_requested = True
@@ -743,8 +751,11 @@ class StaticQmlViewController(QObject):
             self._ensure_scene_loaded()
             return
 
+        if self.quick_batch.prepare_quick():
+            self.bridge.schedule_structure_refresh()
         self.bridge.refresh()
         self.activity_presence.refresh()
+        self.quick_batch.refresh_geometry()
         self._suspend_legacy_visuals()
         self._fit()
         self._set_native_glass_overlay_alpha(0.0)
@@ -808,6 +819,7 @@ class StaticQmlViewController(QObject):
 
     def _cleanup(self) -> None:
         self._disconnect_handoff()
+        self.quick_batch.cleanup()
         self.activity_presence.cleanup()
         self.fireworks.clear()
         try:

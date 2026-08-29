@@ -37,20 +37,12 @@ def _activate_layout_tree(widget: QWidget) -> bool:
 
 
 class WorkspaceLayoutCommitter(QObject):
-    """Own the finite QWidget -> Quick workspace geometry handoff.
+    """Own finite QWidget -> Quick geometry commits at real layout boundaries.
 
-    QWidget remains the layout source of truth and QQuickWindow remains the only
-    normal presentation owner. A current-page commit is synchronous so a mode switch
-    cannot expose stale geometry. A top-level Show/Resize gets exactly one deferred
-    settlement pass after Qt has consumed the native size change. Dynamic Batch job
-    mutations are a separate explicit boundary: every jobs_changed emission reaches
-    this owner only after the workspace, responsive width controller and per-job
-    control injector have finished their synchronous QWidget mutations. The complete
-    Batch page is then settled before the later Quick bridge listener can snapshot it.
-
-    LayoutRequest is deliberately not observed: activating layouts can itself generate
-    LayoutRequest, so using that event as a trigger creates a zero-delay self-rearming
-    loop that can starve the startup/Quick first-frame timers.
+    Normal runtime state changes are not layout transactions. Only page changes and
+    native resize/show boundaries settle the QWidget layout tree before Quick reads
+    geometry. Batch job-state publishing no longer forces recursive layout activation;
+    the Quick-owned Batch ListView renders job rows directly from the Batch model.
     """
 
     def __init__(self, window: QMainWindow) -> None:
@@ -60,7 +52,6 @@ class WorkspaceLayoutCommitter(QObject):
         if not isinstance(self.stack, QStackedWidget):
             raise RuntimeError("workspace layout owner requires installed modeStack")
         self._committing = False
-        self._batch_jobs_signal = None
 
         self._settle_timer = QTimer(self)
         self._settle_timer.setSingleShot(True)
@@ -69,57 +60,11 @@ class WorkspaceLayoutCommitter(QObject):
 
         self.stack.installEventFilter(self)
         self.stack.currentChanged.connect(self.commit_current)
-        self._bind_batch_geometry_boundary()
         window.destroyed.connect(self.cleanup)
 
-        # Prime only the page that can actually be presented. Hidden pages are
-        # committed on demand by workspace_transition before they become current.
         self.prepare_page(int(self.stack.currentIndex()))
 
-    def _bind_batch_geometry_boundary(self) -> None:
-        workspace = getattr(self.window, "batch_workspace", None)
-        controller = getattr(workspace, "controller", None)
-        jobs_changed = getattr(controller, "jobs_changed", None)
-        if jobs_changed is None or not hasattr(jobs_changed, "connect"):
-            return
-        try:
-            jobs_changed.connect(self._commit_visible_batch_jobs)
-            self._batch_jobs_signal = jobs_changed
-        except (RuntimeError, TypeError):
-            self._batch_jobs_signal = None
-
-    def _commit_visible_batch_jobs(self, *_args: object) -> None:
-        """Settle all dynamic Batch card structure before Quick observes jobs_changed.
-
-        Signal installation order is intentional: BatchWorkspace creates/updates the
-        cards first, BatchCardResponsive fixes their width next, BatchIndividualControls
-        injects the per-job controls after that, and this owner is installed after all
-        three. StaticQmlBridge is installed later. Therefore this synchronous commit is
-        the single geometry publication fence between QWidget mutation and Scene Graph
-        mirroring; no provisional button/card coordinates can cross it.
-        """
-
-        if self._committing:
-            return
-        try:
-            if int(self.stack.currentIndex()) != 1:
-                return
-        except RuntimeError:
-            return
-        self.prepare_page(1)
-
     def _commit_single_fixed(self) -> None:
-        """Commit the authoritative Single splitter policy synchronously.
-
-        ConsoleSummaryMode owns the Single workspaceSplitter/bodySplitter ratios.
-        Its ordinary Resize/currentChanged path is deliberately coalesced by 16 ms,
-        which is appropriate during normal resizing but too late for a Quick mode
-        transition: workspace_transition can refresh and reveal the QML scene before
-        that timer fires. Invoke the existing owner here, inside the same transaction
-        that is about to be published to Quick, so no provisional splitter geometry
-        can cross the presentation boundary.
-        """
-
         summary = getattr(self.window, "_console_summary_mode", None)
         apply = getattr(summary, "apply", None)
         if callable(apply):
@@ -139,8 +84,6 @@ class WorkspaceLayoutCommitter(QObject):
                 pass
 
     def _publish_committed_geometry(self) -> None:
-        """Publish one settled QWidget layout generation to the Quick presentation."""
-
         controller = getattr(self.window, "_static_qml_view_controller", None)
         bridge = getattr(controller, "bridge", None)
         schedule_refresh = getattr(bridge, "schedule_refresh", None)
@@ -155,6 +98,14 @@ class WorkspaceLayoutCommitter(QObject):
         if callable(schedule_activity):
             try:
                 schedule_activity()
+            except RuntimeError:
+                pass
+
+        quick_batch = getattr(controller, "quick_batch", None)
+        refresh_batch = getattr(quick_batch, "refresh_geometry", None)
+        if callable(refresh_batch):
+            try:
+                refresh_batch()
             except RuntimeError:
                 pass
 
@@ -179,15 +130,10 @@ class WorkspaceLayoutCommitter(QObject):
                 break
 
         if int(index) == 0:
-            # Generic QLayout activation cannot substitute for the Single page's
-            # explicit splitter policy. Commit that policy last, then consume the
-            # resulting child geometries before this transaction is published.
             self._commit_single_fixed()
             _activate_layout_tree(page)
 
     def prepare_page(self, index: int) -> None:
-        """Commit one page immediately from its current visibility/layout state."""
-
         if self._committing:
             return
         if int(index) < 0 or int(index) >= self.stack.count():
@@ -200,8 +146,6 @@ class WorkspaceLayoutCommitter(QObject):
         self._publish_committed_geometry()
 
     def commit_current(self, _index: int | None = None) -> None:
-        """Commit the newly current page now, then allow one final event-loop settle."""
-
         self.prepare_page(int(self.stack.currentIndex()))
         self._schedule_current_settle()
 
@@ -211,33 +155,17 @@ class WorkspaceLayoutCommitter(QObject):
         self._settle_timer.start()
 
     def _settle_current_page(self) -> None:
-        """Run one terminal pass after the current native size/layout transaction."""
-
         if self._committing:
             return
         self.prepare_page(int(self.stack.currentIndex()))
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if watched is self.stack and event.type() in {
-            QEvent.Type.Resize,
-            QEvent.Type.Show,
-        }:
-            # These are external/native geometry boundaries. They may occur several
-            # times while maximization settles, but the single-shot timer coalesces
-            # them. Never subscribe to LayoutRequest here: our own layout activation
-            # can generate it and recursively re-arm the zero-delay timer.
+        if watched is self.stack and event.type() in {QEvent.Type.Resize, QEvent.Type.Show}:
             self._schedule_current_settle()
         return False
 
     def cleanup(self) -> None:
         self._settle_timer.stop()
-        signal = self._batch_jobs_signal
-        self._batch_jobs_signal = None
-        if signal is not None:
-            try:
-                signal.disconnect(self._commit_visible_batch_jobs)
-            except (RuntimeError, TypeError):
-                pass
         try:
             self.stack.currentChanged.disconnect(self.commit_current)
         except (RuntimeError, TypeError):
