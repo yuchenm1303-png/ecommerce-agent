@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QBoxLayout, QFrame, QVBoxLayout, QWidget
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtWidgets import QBoxLayout, QFrame, QLabel, QVBoxLayout, QWidget
+
+from .numeric_field_chrome import install_numeric_field_chrome
 
 
 _TOP_CARD_MIN = 272
@@ -11,6 +13,10 @@ _TOP_CARD_MAX = 282
 _CONTROL_HEIGHT = 30
 _SINGLE_PAGE_SPACING = 6
 _INTENT_DETAIL_EXTRA = 112
+_LEFT_LABEL_WIDTH = 112
+_MIDDLE_LABEL_WIDTH = 132
+_STAGE_BUTTON_WIDTH = 176
+_DETAIL_BUTTON_WIDTH = 70
 
 
 def _contains_widget(layout: Any, target: QWidget) -> bool:
@@ -18,10 +24,13 @@ def _contains_widget(layout: Any, target: QWidget) -> bool:
         return False
     for index in range(layout.count()):
         item = layout.itemAt(index)
-        if item.widget() is target:
+        widget = item.widget()
+        if widget is target:
             return True
         child = item.layout()
         if child is not None and _contains_widget(child, target):
+            return True
+        if isinstance(widget, QWidget) and _contains_widget(widget.layout(), target):
             return True
     return False
 
@@ -51,6 +60,33 @@ def _set_compact_height(widget: object) -> None:
         widget.setMaximumHeight(_CONTROL_HEIGHT)
 
 
+def _label(row: QBoxLayout | None, text: str) -> QLabel | None:
+    if not isinstance(row, QBoxLayout):
+        return None
+    for index in range(row.count()):
+        widget = row.itemAt(index).widget()
+        if isinstance(widget, QLabel) and widget.text() == text:
+            return widget
+    return None
+
+
+def _set_label_column(label: QLabel | None, width: int) -> None:
+    if not isinstance(label, QLabel):
+        return
+    label.setMinimumWidth(int(width))
+    label.setMaximumWidth(int(width))
+    label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+
+def _align_row_controls(row: QBoxLayout | None) -> None:
+    if not isinstance(row, QBoxLayout):
+        return
+    for index in range(row.count()):
+        widget = row.itemAt(index).widget()
+        if isinstance(widget, QWidget):
+            row.setAlignment(widget, Qt.AlignmentFlag.AlignVCenter)
+
+
 def set_single_top_detail_expanded(window: Any, expanded: bool) -> None:
     """Resize the Single source card only while the explicit detail editor is open."""
 
@@ -76,9 +112,10 @@ def _apply(window: Any) -> None:
     if not isinstance(card, QFrame) or not isinstance(layout, QVBoxLayout):
         return
 
-    # Win the final startup geometry pass after listing_offer_support and the
-    # historical page_scroll_layout zero-time refresh have both installed.
-    layout.setContentsMargins(14, 8, 38, 9)
+    # This is the final geometry owner for the Single source card. Keep one
+    # symmetric content grid so labels, fields and buttons share the same visual
+    # baselines before StaticQmlBridge snapshots them.
+    layout.setContentsMargins(16, 8, 16, 9)
     layout.setSpacing(4)
 
     header = layout.itemAt(0).layout() if layout.count() else None
@@ -100,15 +137,48 @@ def _apply(window: Any) -> None:
 
     for row, spacing in (
         (url_row, 10),
-        (offer_row, 9),
+        (offer_row, 8),
         (guidance_row, 8),
         (stage_row, 10),
-        (source_row, 10),
+        (source_row, 8),
         (settings_row, 10),
     ):
         if isinstance(row, QBoxLayout):
             row.setSpacing(spacing)
             row.setContentsMargins(0, 0, 0, 0)
+            _align_row_controls(row)
+
+    # Product-offer and AI-guidance rows now share an actual label column rather
+    # than unrelated minimum widths. The mid-row Model Name label has its own
+    # stable column so both guidance editors sit on predictable baselines.
+    _set_label_column(_label(offer_row, "销售规格 / 套装"), _LEFT_LABEL_WIDTH)
+    _set_label_column(_label(guidance_row, "AI 引导"), _LEFT_LABEL_WIDTH)
+    _set_label_column(_label(guidance_row, "Model Name 流量词"), _MIDDLE_LABEL_WIDTH)
+
+    detail_button = getattr(window, "listing_intent_detail_button", None)
+    if isinstance(detail_button, QWidget):
+        detail_button.setMinimumWidth(_DETAIL_BUTTON_WIDTH)
+        detail_button.setMaximumWidth(_DETAIL_BUTTON_WIDTH)
+
+    for name in ("step1_button", "step2_button", "step3_button"):
+        button = getattr(window, name, None)
+        if isinstance(button, QWidget):
+            button.setMinimumWidth(_STAGE_BUTTON_WIDTH)
+            button.setMaximumWidth(_STAGE_BUTTON_WIDTH)
+
+    vertical_input = getattr(window, "vertical_input", None)
+    if isinstance(vertical_input, QWidget):
+        vertical_input.setMinimumWidth(260)
+        vertical_input.setMaximumWidth(340)
+
+    # Restore the prompt and +/- controls that native QSpinBox chrome loses in
+    # the Quick mirror. The underlying source_port QSpinBox remains the business
+    # value owner; the renderer-neutral chrome is only presentation.
+    install_numeric_field_chrome(
+        source_port,
+        prompt_width=_LEFT_LABEL_WIDTH,
+        value_width=78,
+    )
 
     for name in (
         "url_input",
