@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSpinBox,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -18,7 +19,9 @@ from PySide6.QtWidgets import (
 _FIELD_HEIGHT = 30
 _PROMPT_WIDTH = 112
 _VALUE_WIDTH = 78
-_STEP_BUTTON_WIDTH = 30
+_STEPPER_WIDTH = 24
+_STEPPER_HALF_HEIGHT = _FIELD_HEIGHT // 2
+_STEPPER_GLYPH_PX = 7
 
 
 def _find_owner_layout(layout: QLayout | None, target: QWidget) -> tuple[QBoxLayout, int] | None:
@@ -46,6 +49,19 @@ def _step(spinbox: QSpinBox, direction: int) -> None:
     spinbox.setValue(spinbox.value() + int(direction) * spinbox.singleStep())
 
 
+def _step_button(spinbox: QSpinBox, text: str, direction: int, parent: QWidget) -> QPushButton:
+    button = QPushButton(text, parent)
+    button.setObjectName("quietButton")
+    button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    button.setToolTip(f"{'增加' if direction > 0 else '减少'} {spinbox.singleStep()}")
+    button.setFixedSize(_STEPPER_WIDTH, _STEPPER_HALF_HEIGHT)
+    font = button.font()
+    font.setPixelSize(_STEPPER_GLYPH_PX)
+    button.setFont(font)
+    button.clicked.connect(lambda: _step(spinbox, direction))
+    return button
+
+
 def install_numeric_field_chrome(
     spinbox: QSpinBox | None,
     *,
@@ -55,10 +71,9 @@ def install_numeric_field_chrome(
 ) -> QFrame | None:
     """Replace one bare QSpinBox slot with a renderer-neutral numeric field.
 
-    The original QSpinBox remains the sole business-state owner. The surrounding
-    prompt and +/- buttons are ordinary Qt widgets, so both the QWidget fallback and
-    the StaticQmlBridge see exactly the same presentation structure instead of asking
-    QML to reconstruct native QSpinBox prefix/button chrome.
+    The original QSpinBox remains the sole business-state owner. The presentation
+    chrome is built from ordinary Qt widgets so QWidget fallback and the Quick mirror
+    expose the same prompt, value and compact stacked up/down stepper.
     """
 
     if not isinstance(spinbox, QSpinBox):
@@ -103,36 +118,47 @@ def install_numeric_field_chrome(
     prompt_box.setFixedSize(max(72, int(prompt_width)), _FIELD_HEIGHT)
 
     owner.removeWidget(spinbox)
-    spinbox.setParent(chrome)
+
+    value_cluster = QWidget(chrome)
+    value_cluster.setObjectName("numericValueCluster")
+    value_cluster.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+    value_cluster.setFixedSize(max(58, int(value_width)) + _STEPPER_WIDTH, _FIELD_HEIGHT)
+    value_row = QHBoxLayout(value_cluster)
+    value_row.setContentsMargins(0, 0, 0, 0)
+    value_row.setSpacing(0)
+
+    spinbox.setParent(value_cluster)
     spinbox.setPrefix("")
     spinbox.setSuffix("")
     spinbox.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-    spinbox.setMinimumWidth(max(58, int(value_width)))
-    spinbox.setMaximumWidth(max(58, int(value_width)))
-    spinbox.setFixedHeight(_FIELD_HEIGHT)
+    spinbox.setFixedSize(max(58, int(value_width)), _FIELD_HEIGHT)
 
-    decrement = QPushButton("−", chrome)
-    decrement.setObjectName("quietButton")
-    decrement.setToolTip(f"减少 {spinbox.singleStep()}")
-    decrement.setFixedSize(_STEP_BUTTON_WIDTH, _FIELD_HEIGHT)
-    decrement.clicked.connect(lambda: _step(spinbox, -1))
+    stepper = QWidget(value_cluster)
+    stepper.setObjectName("numericFieldStepper")
+    stepper.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+    stepper.setFixedSize(_STEPPER_WIDTH, _FIELD_HEIGHT)
+    stepper_layout = QVBoxLayout(stepper)
+    stepper_layout.setContentsMargins(0, 0, 0, 0)
+    stepper_layout.setSpacing(0)
 
-    increment = QPushButton("+", chrome)
-    increment.setObjectName("quietButton")
-    increment.setToolTip(f"增加 {spinbox.singleStep()}")
-    increment.setFixedSize(_STEP_BUTTON_WIDTH, _FIELD_HEIGHT)
-    increment.clicked.connect(lambda: _step(spinbox, 1))
+    increment = _step_button(spinbox, "▲", 1, stepper)
+    decrement = _step_button(spinbox, "▼", -1, stepper)
+    stepper_layout.addWidget(increment)
+    stepper_layout.addWidget(decrement)
 
+    value_row.addWidget(spinbox)
+    value_row.addWidget(stepper)
     row.addWidget(prompt_box)
-    row.addWidget(spinbox)
-    row.addWidget(decrement)
-    row.addWidget(increment)
+    row.addWidget(value_cluster)
 
     owner.insertWidget(index, chrome, stretch, alignment)
     chrome.show()
+    value_cluster.show()
     spinbox.show()
+    stepper.show()
 
     chrome._numeric_prompt = prompt_box  # type: ignore[attr-defined]
+    chrome._numeric_stepper = stepper  # type: ignore[attr-defined]
     chrome._numeric_decrement = decrement  # type: ignore[attr-defined]
     chrome._numeric_increment = increment  # type: ignore[attr-defined]
     spinbox._numeric_field_chrome = chrome  # type: ignore[attr-defined]
