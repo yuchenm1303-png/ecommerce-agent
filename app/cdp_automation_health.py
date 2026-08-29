@@ -73,9 +73,9 @@ def probe_cdp_automation(
 ) -> CdpAutomationProbe:
     """Distinguish endpoint reachability from usable Playwright automation.
 
-    This is intentionally a short-lived *idle-boundary* probe. Callers must not
-    run it while a task already owns a Playwright transport for the same browser.
-    The existing cross-process attach guard serializes the handshake itself.
+    This is intentionally a short-lived idle-boundary probe. Callers must not run
+    it while a task already owns the real browser transport. The attach guard
+    serializes the probe handshake itself.
     """
 
     port = int(port)
@@ -98,7 +98,6 @@ def probe_cdp_automation(
                 is_connected = getattr(browser, "is_connected", None)
                 if callable(is_connected) and not bool(is_connected()):
                     raise RuntimeError("Playwright transport disconnected during automation probe")
-                # Do not call browser.close(): the Edge process is externally owned.
                 return CdpAutomationProbe(
                     state=AUTOMATION_READY,
                     endpoint_token=token,
@@ -106,7 +105,6 @@ def probe_cdp_automation(
                     page_count=page_count,
                 )
     except Exception as exc:
-        # Re-read the token because Chromium can disappear during the handshake.
         current = cdp_endpoint_token(port)
         if not current:
             return CdpAutomationProbe(
@@ -178,23 +176,33 @@ def poison_matches_current_generation(
     if not current:
         return False
     if marked and marked != current:
-        # Poison belongs to a browser generation that has already been replaced.
         clear_cdp_poison(port)
         return False
     return str(payload.get("state") or "").upper() == POISONED
 
 
 def looks_like_cdp_transport_failure(value: BaseException | str) -> bool:
-    """Return True only for browser-control failures, never ordinary page timeouts."""
+    """Return True only when Chromium automation is broken, not ownership misuse.
+
+    A transport-lane/parent-owner rejection proves the safety contract worked; it
+    says nothing about Chromium health and must never trigger POISONED recovery.
+    """
 
     text = str(value or "").casefold()
+    ownership_markers = (
+        "禁止嵌套",
+        "transport lane",
+        "已由当前进程树中的父级 playwright transport 控制",
+        "禁止在其仍存活时再次创建独立 edgeharness/connect_over_cdp",
+    )
+    if any(marker in text for marker in ownership_markers):
+        return False
+
     strong_markers = (
         "playwright attach 连续失败",
         "connect_over_cdp",
         "cdp handshake",
-        "cdp transport",
         "ws connected",
-        "已由当前进程树中的父级 playwright transport 控制",
     )
     if any(marker in text for marker in strong_markers):
         return True
