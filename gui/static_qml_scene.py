@@ -24,11 +24,12 @@ Item {
     // Runtime-only developer controls for tuning the real card surface.  The
     // values live on the authoritative Quick scene, so every visible card uses
     // exactly the same tone while the tuner is open.  Nothing is persisted.
-    property int glassRed: 43
+    property int glassRed: 85
     property int glassGreen: 53
     property int glassBlue: 92
     property int glassNormalAlpha: 64
     property int glassHoverAlpha: 102
+    readonly property bool glassTunerEnabled: false
     property bool glassTunerVisible: false
 
     function hexByte(value) {
@@ -39,7 +40,7 @@ Item {
     readonly property string glassHex: "#" + hexByte(glassRed) + hexByte(glassGreen) + hexByte(glassBlue)
 
     function resetGlassTuner() {
-        glassRed = 43
+        glassRed = 85
         glassGreen = 53
         glassBlue = 92
         glassNormalAlpha = 64
@@ -837,9 +838,8 @@ Item {
         onDChanged: if (item) item.d = d
     }
 
-    // Temporary in-program tuner.  It manipulates the same properties consumed
-    // by the production card rectangles, so the preview is the actual UI rather
-    // than a separate approximation.  Close it when evaluating hover animation.
+    // Hidden developer tuner. It is kept in the scene for future visual tuning,
+    // but the production UI owns no visible entry while glassTunerEnabled is false.
     Rectangle {
         id: glassTunerButton
         width: 92
@@ -850,6 +850,8 @@ Item {
         anchors.rightMargin: 18
         radius: 7
         z: 40000
+        visible: staticRoot.glassTunerEnabled
+        enabled: visible
         color: glassTunerHover.hovered ? Qt.rgba(0,0,0,178/255) : Qt.rgba(0,0,0,138/255)
         border.width: 1
         border.color: Qt.rgba(1,1,1,42/255)
@@ -881,7 +883,7 @@ Item {
         anchors.rightMargin: 18
         radius: 10
         z: 40000
-        visible: staticRoot.glassTunerVisible
+        visible: staticRoot.glassTunerEnabled && staticRoot.glassTunerVisible
         enabled: visible
         color: Qt.rgba(9/255, 15/255, 28/255, 244/255)
         border.width: 1
