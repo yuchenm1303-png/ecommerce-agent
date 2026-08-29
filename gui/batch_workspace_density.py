@@ -7,11 +7,10 @@ from PySide6.QtWidgets import (
     QLabel,
     QLayout,
     QSizePolicy,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
-
-from .numeric_field_chrome import install_numeric_field_chrome
 
 
 _SUMMARY_META = (
@@ -35,6 +34,23 @@ def _hide_layout_tree(layout: QLayout | None) -> None:
             widget.hide()
         if child_layout is not None:
             _hide_layout_tree(child_layout)
+
+
+def _prepare_numeric_field(
+    workspace: QWidget,
+    attribute: str,
+    object_name: str,
+    width: int,
+) -> None:
+    spinbox = getattr(workspace, attribute, None)
+    if not isinstance(spinbox, QSpinBox):
+        return
+    # Keep the original QSpinBox as the only business and fallback owner. Quick
+    # renders its integrated prefix/value/stepper from this stable semantic name.
+    spinbox.setObjectName(object_name)
+    spinbox.setMinimumWidth(width)
+    spinbox.setMaximumWidth(width)
+    spinbox.setFixedHeight(30)
 
 
 def install_batch_workspace_density(workspace: QWidget) -> None:
@@ -72,23 +88,12 @@ def install_batch_workspace_density(workspace: QWidget) -> None:
             QSizePolicy.Policy.Maximum,
         )
 
-    # QML intentionally does not emulate platform QSpinBox chrome. Build the
-    # prompt/value/stepper structure once in the authoritative QWidget layout so
-    # both renderers expose the same controls and the original QSpinBox remains
-    # the sole value owner used by BatchController.
-    numeric_chromes = []
-    for field_name, prompt_width, value_width in (
-        ("makro_port", 102, 76),
-        ("source_port", 102, 76),
-        ("worker_count", 118, 62),
-    ):
-        chrome = install_numeric_field_chrome(
-            getattr(workspace, field_name, None),
-            prompt_width=prompt_width,
-            value_width=value_width,
-        )
-        if chrome is not None:
-            numeric_chromes.append(chrome)
+    # The three settings stay as genuine QSpinBox controls. Their prefixes are
+    # already the canonical labels; only stable semantic names and compact widths
+    # are needed for the unified Quick renderer.
+    _prepare_numeric_field(workspace, "makro_port", "makroCdpSpin", 176)
+    _prepare_numeric_field(workspace, "source_port", "sourceCdpSpin", 176)
+    _prepare_numeric_field(workspace, "worker_count", "makroWorkersSpin", 190)
 
     # Keep the six overview cards visible and useful instead of reducing them to
     # tiny pills. They remain one row, with an additional explanatory line.
@@ -166,7 +171,6 @@ def install_batch_workspace_density(workspace: QWidget) -> None:
             QSizePolicy.Policy.Maximum,
         )
 
-    setattr(workspace, "_batch_numeric_chromes", numeric_chromes)
     setattr(workspace, "_batch_summary_detail_labels", detail_labels)
     setattr(workspace, "_batch_density_installed", True)
 
