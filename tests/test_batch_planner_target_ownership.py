@@ -6,6 +6,7 @@ import pytest
 
 import makro_batch_job
 import makro_plan_listing
+from app import batch_step3_prepare
 
 
 PRODUCT_URL = "https://example.test/product/123"
@@ -130,10 +131,16 @@ def test_final_plan_mode_cannot_reenter_batch_browser_transport() -> None:
     assert "connect_over_cdp" not in source
 
 
-def test_batch_refreshes_target_before_propagating_planner_ownership() -> None:
+def test_batch_refreshes_target_then_releases_browser_before_final_planning() -> None:
     source = inspect.getsource(makro_batch_job.main)
     assert "owned_target_id = page_target_id(page)" in source
     assert 'manifest["makro_target_id"] = owned_target_id' in source
-    assert "os.environ[_BATCH_TARGET_ENV] = owned_target_id" in source
-    assert "_prepare_step3(args, run_dir=run_dir, page=page, manifest=manifest)" in source
-    assert "os.environ.pop(_BATCH_TARGET_ENV, None)" in source
+    assert "capture_batch_step3_schema(" in source
+    assert "harness.detach()" in source
+    assert "complete_batch_step3_from_schema(" in source
+    assert source.index("harness.detach()") < source.index("complete_batch_step3_from_schema(")
+
+    planner = inspect.getsource(batch_step3_prepare.complete_batch_step3_from_schema)
+    assert 'makro_target_id=str(manifest.get("makro_target_id") or "")' in planner
+    assert "EdgeHarness" not in planner
+    assert "sync_playwright" not in planner
