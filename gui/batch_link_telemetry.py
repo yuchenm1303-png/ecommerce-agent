@@ -40,6 +40,34 @@ def _safe(value: Any, *, depth: int = 0) -> Any:
     return sanitize_telemetry_value(value, depth=depth, max_text=_MAX_TEXT, max_list=_MAX_LIST)
 
 
+def _audit_payload(audit: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize telemetry while preserving the exact supplier URL needed for replay.
+
+    Supplier URLs are canonical task input, not diagnostic prose. Monitoring must
+    retain the exact submitted request (including query parameters) so owner-side
+    reproduction uses the same URL the client executed. Only these structured URL
+    fields bypass generic secret redaction; logs, errors and diagnostics remain
+    sanitized normally.
+    """
+
+    safe = _safe(audit)
+    if not isinstance(safe, dict):
+        return {}
+
+    product_url = _text(audit.get("product_url", ""), 4_096)
+    safe["product_url"] = product_url
+
+    input_data = safe.get("input_data")
+    if isinstance(input_data, dict):
+        input_data["supplier_url"] = product_url
+
+    result_data = safe.get("result_data")
+    if isinstance(result_data, dict):
+        result_data["product_url"] = product_url
+
+    return safe
+
+
 def _job_ordinal(job_id: object) -> int:
     match = _JOB_ID_RE.fullmatch(str(job_id or "").strip())
     if not match:
@@ -463,7 +491,7 @@ class BatchLinkTelemetryController(QObject):
         return str(uuid.uuid5(uuid.NAMESPACE_URL, f"listing-studio://batch-link/{batch_id}/{job_id}"))
 
     def _signature(self, audit: dict[str, Any]) -> str:
-        return json.dumps(_safe(audit), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return json.dumps(_audit_payload(audit), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
     def _publish_all(self, force_terminal: bool = False) -> None:
         if not self._enabled():
@@ -517,7 +545,7 @@ class BatchLinkTelemetryController(QObject):
             "session_id": session_id,
             "telemetry_token": session.telemetry_token,
             "app_version": self.access.installed_version,
-            "audit": _safe(audit),
+            "audit": _audit_payload(audit),
         }
         request = QNetworkRequest(QUrl(self.access.telemetry_function_url))
         request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
