@@ -612,7 +612,7 @@ Item {
                 anchors.fill: parent
                 radius: 6
                 antialiasing: true
-                color: Qt.rgba(1, 157/255, 202/255, (cardHover.hovered || cardClick.pressed) ? 102/255 : 64/255)
+                color: Qt.rgba(1, 157/255, 202/255, (cardHover.hovered || cardClick.pressed) ? 51/255 : 32/255)
                 Behavior on color {
                     ColorAnimation {
                         duration: 300
