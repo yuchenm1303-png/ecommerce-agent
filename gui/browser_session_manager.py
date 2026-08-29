@@ -31,6 +31,10 @@ class ManagedMakroBrowser(QObject):
     boundaries; it never opens a health-probe transport while a task already owns
     the browser. A poisoned generation is rotated only when idle, using the same
     dedicated profile so login state survives while all old targetIds are invalidated.
+
+    Formal top-level workspaces are mutually exclusive. Batch owns its own
+    internal concurrency/transport lane; Single and Batch must never overlap and
+    accidentally create independent Playwright transports against the same Edge.
     """
 
     status_changed = Signal(str, str)
@@ -191,7 +195,6 @@ class ManagedMakroBrowser(QObject):
     def _looks_like_makro_cdp_failure(self, message: str) -> bool:
         text = str(message or "").casefold()
         if "9333" in text and str(self.port) not in text:
-            # Source Edge owns its own recovery path; never poison Makro 9222 for it.
             return False
         return looks_like_cdp_transport_failure(message)
 
@@ -220,8 +223,6 @@ class ManagedMakroBrowser(QObject):
         return self._is_busy()
 
     def begin_update_quiesce(self) -> tuple[bool, str]:
-        """Atomically stop new browser/task work before updater preflight."""
-
         if self._update_quiesced:
             return True, ""
         if self._is_busy():
@@ -235,8 +236,6 @@ class ManagedMakroBrowser(QObject):
         return True, ""
 
     def wait_for_update_quiesce(self, timeout_s: float = 20.0) -> tuple[bool, str]:
-        """Wait off the Qt thread for any already-started Edge launch to settle."""
-
         thread = self._launch_thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(0.0, float(timeout_s)))
@@ -247,8 +246,6 @@ class ManagedMakroBrowser(QObject):
         return True, ""
 
     def resume_after_update_failure(self) -> None:
-        """Restore normal browser lifecycle when handoff/preflight is cancelled."""
-
         if not self._update_quiesced:
             return
         self._update_quiesced = False
@@ -263,6 +260,11 @@ class ManagedMakroBrowser(QObject):
     def _assert_task_start_allowed(self) -> None:
         if self._update_quiesced:
             raise RuntimeError("Listing Studio 正在准备更新，暂时不能启动新的上架任务。")
+        if self._is_busy():
+            raise RuntimeError(
+                "已有 Single/真实填写/Batch 浏览器工作域正在运行。"
+                "为保证一个 Makro Edge 只存在一个正式自动化工作域，请等待当前任务结束后再启动。"
+            )
 
     def _recover_poisoned_locked(self, reason: str, previous_token: str) -> bool:
         if self._is_busy():
@@ -322,8 +324,6 @@ class ManagedMakroBrowser(QObject):
                             "Makro Browser automation generation 已标记失效；"
                             "当前任务结束前不会中途重启。"
                         )
-                    # A running worker already owns the real transport. Never open a
-                    # second health-probe transport underneath it.
                     return False
 
                 probe = probe_cdp_automation(self.port, timeout_ms=self._PROBE_TIMEOUT_MS)
