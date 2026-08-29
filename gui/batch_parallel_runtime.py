@@ -4,6 +4,8 @@ from pathlib import Path
 from types import MethodType
 from typing import Any
 
+from app.browser_session import is_cdp_ready
+from app.cdp_automation_health import poison_matches_current_generation
 from .batch_browser_session import (
     BatchSharedBrowserOwner,
     bind_batch_shared_browser,
@@ -53,6 +55,14 @@ class BatchParallelRuntime:
     Execute workers enter the lane inside the packaged/source-neutral execution
     host itself. targetId remains the per-product tab ownership boundary; no
     worker Edge profiles or secondary Makro CDP ports exist.
+
+    Browser automation health is maintained asynchronously by ManagedMakroBrowser.
+    A user click must never launch a speculative Playwright health transport on the
+    Qt GUI thread. The hot path validates only the local endpoint/generation poison
+    marker, establishes the logical Batch session owner, and lets the actual worker
+    transport be the authoritative automation proof. Full recovery is invoked only
+    when the endpoint is genuinely down or the current generation is already marked
+    poisoned.
     """
 
     def __init__(self, window: Any) -> None:
@@ -63,10 +73,17 @@ class BatchParallelRuntime:
         if self.manager is None:
             raise RuntimeError("Batch parallel runtime requires ManagedMakroBrowser")
 
+        # ManagedMakroBrowser is installed first and keeps the canonical raw
+        # BatchController methods here. BatchParallelRuntime becomes the sole Batch
+        # start owner afterwards, so the same click is not routed through a second
+        # synchronous ensure_ready() gate.
+        self._original_start_prepare = getattr(self.manager, "_original_batch_prepare", None)
+        self._original_start_execution = getattr(self.manager, "_original_batch_execute", None)
+        if self._original_start_prepare is None or self._original_start_execution is None:
+            raise RuntimeError("Batch parallel runtime requires canonical BatchController starts")
+
         self._owner: BatchSharedBrowserOwner | None = None
         self._parallelism = 0
-        self._original_start_prepare = self.controller.start_prepare
-        self._original_start_execution = self.controller.start_execution
         self._original_spawn = self.controller._spawn
         self._original_start_source = self.controller._start_source
 
@@ -78,11 +95,35 @@ class BatchParallelRuntime:
         self.window.destroyed.connect(lambda *_args: self._release_owner())
 
     def _assert_top_level_idle(self) -> None:
+        if self.manager.update_quiesced:
+            raise RuntimeError("Listing Studio 正在准备更新，暂时不能启动新的 Batch。")
         if self.manager.is_busy():
             raise RuntimeError(
                 "已有 Single/真实填写/Batch 浏览器工作域正在运行。"
                 "Batch 不会在另一个正式工作域持有 Makro Browser 时等待或抢占 session lease。"
             )
+
+    def _ensure_start_generation(self, reason: str, port: int) -> None:
+        """Recover only an actually unavailable/poisoned generation.
+
+        Healthy Batch starts deliberately do not call ``probe_cdp_automation``.
+        The manager already maintains that proof in the background, while each
+        real prepare/execute worker performs the authoritative Playwright attach
+        inside the exclusive transport lane. This keeps the GUI click path free
+        from a 6-second Playwright startup/attach wait without weakening failure
+        detection or recovery.
+        """
+
+        requested_port = int(port)
+        if requested_port != int(self.manager.port):
+            raise RuntimeError(
+                f"Batch Makro CDP {requested_port} 与 GUI 托管端口 {self.manager.port} 不一致。"
+            )
+        if poison_matches_current_generation(requested_port) or not is_cdp_ready(
+            requested_port,
+            timeout_s=0.25,
+        ):
+            self.manager.ensure_ready(reason)
 
     def _install_controller_routing(self) -> None:
         runtime = self
@@ -97,8 +138,9 @@ class BatchParallelRuntime:
             runtime._assert_top_level_idle()
             requested = normalize_batch_concurrency(prepare_concurrency)
             runtime._parallelism = min(requested, max(1, len(urls)))
-            runtime.manager.ensure_ready("Batch single-browser preparation")
-            runtime._ensure_owner(int(config.makro_cdp_port))
+            port = int(config.makro_cdp_port)
+            runtime._ensure_start_generation("Batch preparation", port)
+            runtime._ensure_owner(port)
             batch = runtime._original_start_prepare(
                 urls,
                 config,
@@ -118,6 +160,10 @@ class BatchParallelRuntime:
             execute_concurrency: int = 6,
         ) -> None:
             runtime._assert_top_level_idle()
+            config = _controller.config
+            if config is None:
+                raise RuntimeError("Batch execution requires runtime config")
+            runtime._ensure_start_generation("Batch execution", int(config.makro_cdp_port))
             runtime._assert_prepared_browser_alive()
             runtime._parallelism = normalize_batch_concurrency(execute_concurrency)
             runtime._original_start_execution(
