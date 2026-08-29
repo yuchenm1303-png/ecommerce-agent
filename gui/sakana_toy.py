@@ -123,7 +123,7 @@ class SakanaToyController(QObject):
             command.append("--start-hidden")
         return command
 
-    def _show_prepared_process(self) -> bool:
+    def _set_process_visible(self, visible: bool) -> bool:
         process = self._process
         if sys.platform != "win32" or process is None or process.poll() is not None:
             return False
@@ -139,7 +139,7 @@ class SakanaToyController(QObject):
             pid = ctypes.c_ulong()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if pid.value == process.pid:
-                user32.PostMessageW(hwnd, message, 1, 0)
+                user32.PostMessageW(hwnd, message, int(visible), 0)
                 found = True
             return True
 
@@ -152,7 +152,7 @@ class SakanaToyController(QObject):
         current = self._process
         if current is not None and current.poll() is None:
             if self._enabled:
-                self._show_prepared_process()
+                self._set_process_visible(True)
             return
 
         creationflags = 0
@@ -182,7 +182,7 @@ class SakanaToyController(QObject):
         process = self._process
         if process is not None and process.poll() is None:
             if self._enabled:
-                self._show_prepared_process()
+                self._set_process_visible(True)
             return
         self._process = None
         # During startup Qt can replace the first native QQuickWindow handle.
@@ -214,12 +214,14 @@ class SakanaToyController(QObject):
             # The window is already stable when this user-driven toggle fires.
             # Queue startup for the next event-loop turn so the button repaints,
             # but do not add an artificial delay before the cold helper launch.
-            if not self._show_prepared_process():
+            if not self._set_process_visible(True):
                 self._launch_timer.start(0)
         else:
             self._launch_timer.stop()
             self._health_timer.stop()
-            self._stop_process()
+            # Keep the prepared WebView2 process alive for instant subsequent
+            # toggles. Development changes are picked up when the GUI restarts.
+            self._set_process_visible(False)
 
     def raise_overlay(self) -> None:
         # shell.show() does not synchronously stabilize the QQuickWindow HWND.
