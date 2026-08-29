@@ -673,10 +673,22 @@ Item {
 
                     Loader {
                         property var controlData: parent.d
+                        readonly property bool keepAlive: !controlData || !parent.clipped
+                            || controlData.kind === "lineedit"
+                            || controlData.kind === "spinbox"
+                            || controlData.kind === "combo"
+                            || (controlData.kind === "textedit" && !controlData.readOnly)
+                        readonly property real preloadMargin: Math.max(240, parent.height * 0.75)
+                        readonly property bool nearViewport: keepAlive
+                            || (x + width >= -preloadMargin
+                                && x <= parent.width + preloadMargin
+                                && y + height >= -preloadMargin
+                                && y <= parent.height + preloadMargin)
                         x: parent.clipped ? controlData.x - controlData.clipX + parent.scrollDx : 0
                         y: parent.clipped ? controlData.y - controlData.clipY + parent.scrollDy : 0
                         width: controlData ? controlData.w : 0
                         height: controlData ? controlData.h : 0
+                        active: nearViewport
                         sourceComponent: controlData ? staticRoot.componentFor(controlData.kind) : null
                         onLoaded: if (item) item.d = controlData
                         onControlDataChanged: if (item) item.d = controlData
@@ -738,10 +750,22 @@ Item {
 
             Loader {
                 property var controlData: parent.d
+                readonly property bool keepAlive: !controlData || !parent.clipped
+                    || controlData.kind === "lineedit"
+                    || controlData.kind === "spinbox"
+                    || controlData.kind === "combo"
+                    || (controlData.kind === "textedit" && !controlData.readOnly)
+                readonly property real preloadMargin: Math.max(240, parent.height * 0.75)
+                readonly property bool nearViewport: keepAlive
+                    || (x + width >= -preloadMargin
+                        && x <= parent.width + preloadMargin
+                        && y + height >= -preloadMargin
+                        && y <= parent.height + preloadMargin)
                 x: parent.clipped ? controlData.x - controlData.clipX + parent.scrollDx : 0
                 y: parent.clipped ? controlData.y - controlData.clipY + parent.scrollDy : 0
                 width: controlData ? controlData.w : 0
                 height: controlData ? controlData.h : 0
+                active: nearViewport
                 sourceComponent: controlData && controlData.kind !== "toggle" ? staticRoot.componentFor(controlData.kind) : null
                 onLoaded: if (item) item.d = controlData
                 onControlDataChanged: if (item) item.d = controlData
