@@ -267,6 +267,7 @@ Item {
     Component {
         id: lineEditComponent
         Item {
+            id: lineEditRoot
             property var d
             HoverHandler { id: lineHover }
             Rectangle {
@@ -275,30 +276,64 @@ Item {
                 border.width: 1
                 border.color: staticRoot.fieldBorder(lineHover.hovered, editor.activeFocus)
             }
-            Text {
-                anchors.fill: parent; anchors.leftMargin: 11; anchors.rightMargin: 11
-                text: d && d.placeholder ? d.placeholder : ""
-                visible: editor.text.length === 0 && !editor.activeFocus
-                color: Qt.rgba(1, 1, 1, 96/255)
-                font.family: d && d.fontFamily ? d.fontFamily : "Microsoft YaHei UI"
-                font.pixelSize: d && d.fontSize ? d.fontSize : 13
-                verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight
+            Item {
+                id: editorViewport
+                anchors.fill: parent
+                anchors.leftMargin: 11
+                anchors.rightMargin: 11
+                clip: true
+
+                Text {
+                    anchors.fill: parent
+                    text: d && d.placeholder ? d.placeholder : ""
+                    visible: editor.text.length === 0 && !editor.activeFocus
+                    color: Qt.rgba(1, 1, 1, 96/255)
+                    font.family: d && d.fontFamily ? d.fontFamily : "Microsoft YaHei UI"
+                    font.pixelSize: d && d.fontSize ? d.fontSize : 13
+                    verticalAlignment: Text.AlignVCenter
+                    elide: Text.ElideRight
+                }
+                TextInput {
+                    id: editor
+                    anchors.fill: parent
+                    text: d ? d.text : ""
+                    readOnly: d ? d.readOnly : true
+                    color: "white"
+                    selectionColor: Qt.rgba(1, 1, 1, 58/255); selectedTextColor: "white"
+                    font.family: d && d.fontFamily ? d.fontFamily : "Microsoft YaHei UI"
+                    font.pixelSize: d && d.fontSize ? d.fontSize : 13
+                    horizontalAlignment: TextInput.AlignLeft
+                    verticalAlignment: TextInput.AlignVCenter
+                    clip: true
+                    onTextEdited: if (d && !d.readOnly) staticBridge.setText(d.key, text)
+                    onActiveFocusChanged: if (!activeFocus) cursorPosition = 0
+                    onTextChanged: if (!activeFocus) cursorPosition = 0
+                    Component.onCompleted: if (!activeFocus) cursorPosition = 0
+                }
             }
-            TextInput {
-                id: editor
-                anchors.fill: parent; leftPadding: 11; rightPadding: 11
-                text: d ? d.text : ""
-                readOnly: d ? d.readOnly : true
-                color: "white"
-                selectionColor: Qt.rgba(1, 1, 1, 58/255); selectedTextColor: "white"
-                font.family: d && d.fontFamily ? d.fontFamily : "Microsoft YaHei UI"
-                font.pixelSize: d && d.fontSize ? d.fontSize : 13
-                horizontalAlignment: TextInput.AlignLeft
-                verticalAlignment: TextInput.AlignVCenter; clip: true
-                onTextEdited: if (d && !d.readOnly) staticBridge.setText(d.key, text)
-                onActiveFocusChanged: if (!activeFocus) cursorPosition = 0
-                onTextChanged: if (!activeFocus) cursorPosition = 0
-                Component.onCompleted: if (!activeFocus) cursorPosition = 0
+            MouseArea {
+                anchors.left: parent.left
+                anchors.top: parent.top
+                anchors.bottom: parent.bottom
+                width: 11
+                enabled: d ? d.enabled : false
+                cursorShape: Qt.IBeamCursor
+                onClicked: {
+                    editor.forceActiveFocus()
+                    editor.cursorPosition = 0
+                }
+            }
+            MouseArea {
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.bottom: parent.bottom
+                width: 11
+                enabled: d ? d.enabled : false
+                cursorShape: Qt.IBeamCursor
+                onClicked: {
+                    editor.forceActiveFocus()
+                    editor.cursorPosition = editor.length
+                }
             }
         }
     }
