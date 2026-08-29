@@ -541,8 +541,8 @@ def capture_product_source(
             port=int(cdp_port),
             start_url=source_url,
         )
-        page.set_default_timeout(15_000)
         try:
+            page.set_default_timeout(15_000)
             if use_current_page:
                 if page.url in {"", "about:blank"}:
                     raise RuntimeError("--source-use-current-page 时 source Edge 没有已打开网页。")
