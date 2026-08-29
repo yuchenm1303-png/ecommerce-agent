@@ -4,7 +4,6 @@ from pathlib import Path
 from types import MethodType
 from typing import Any
 
-from app.cdp_transport_lane import python_args_under_transport_lane
 from .batch_browser_session import (
     BatchSharedBrowserOwner,
     bind_batch_shared_browser,
@@ -26,6 +25,24 @@ def _set_cli_option(args: list[str], name: str, value: str) -> None:
         args[index + 1] = value
 
 
+def _route_execute_to_owned_worker(args: list[str]) -> list[str]:
+    """Route the canonical executor through its in-process transport owner.
+
+    Keep the first argv item as a normal helper script name. The frozen process
+    router can therefore send the installed build to EcommerceAgentWorker.exe,
+    while source-Python runs continue to use python.exe. No launcher assumes that
+    ``sys.executable`` is a Python interpreter.
+    """
+
+    routed = list(args)
+    if not routed or Path(routed[0]).name.casefold() != "makro_execute_listing.py":
+        raise RuntimeError(
+            "Batch execute routing expected makro_execute_listing.py as the canonical executor"
+        )
+    routed[0] = "makro_execute_owned.py"
+    return routed
+
+
 class BatchParallelRuntime:
     """Run concurrent Batch jobs on one Edge with one real CDP transport lane.
 
@@ -33,9 +50,9 @@ class BatchParallelRuntime:
     Identity and Resolver work may run concurrently across jobs, but browser
     control is serialized at the transport boundary: each prepare worker owns the
     lane only through Step1/2 + Step3 schema capture, then releases it before AI.
-    Execute workers are launched through the same lane wrapper. targetId remains
-    the per-product tab ownership boundary; no worker Edge profiles or secondary
-    Makro CDP ports exist.
+    Execute workers enter the lane inside the packaged/source-neutral execution
+    host itself. targetId remains the per-product tab ownership boundary; no
+    worker Edge profiles or secondary Makro CDP ports exist.
     """
 
     def __init__(self, window: Any) -> None:
@@ -122,9 +139,10 @@ class BatchParallelRuntime:
                     f"target={target or 'new-owned-tab'}"
                 )
                 if stage == "execute":
-                    routed = python_args_under_transport_lane(job.makro_cdp_port, routed)
+                    routed = _route_execute_to_owned_worker(routed)
                     _controller._emit_log_now(
-                        f"[{job_id}] BROWSER_TRANSPORT_LANE port={job.makro_cdp_port} mode=exclusive-write"
+                        f"[{job_id}] BROWSER_TRANSPORT_LANE port={job.makro_cdp_port} "
+                        "mode=in-process-owned-worker"
                     )
             runtime._original_spawn(job_id, stage, routed)
 
