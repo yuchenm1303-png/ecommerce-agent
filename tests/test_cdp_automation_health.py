@@ -37,7 +37,7 @@ def test_endpoint_alive_is_not_automation_ready_until_playwright_attach(monkeypa
 
     monkeypatch.setattr(health, "sync_playwright", lambda: BrokenPlaywrightContext())
 
-    probe = health.probe_cdp_automation(9222, timeout_ms=1000)
+    probe = health.probe_cdp_automation(9222, timeout_ms=1000, transport_lane_owned=True)
 
     assert probe.endpoint_alive is True
     assert probe.automation_ready is False
@@ -51,7 +51,7 @@ def test_probe_requires_real_context_inventory(monkeypatch) -> None:
     browser = SimpleNamespace(contexts=[], is_connected=lambda: True)
     monkeypatch.setattr(health, "sync_playwright", lambda: _PlaywrightContext(browser))
 
-    probe = health.probe_cdp_automation(9222, timeout_ms=1000)
+    probe = health.probe_cdp_automation(9222, timeout_ms=1000, transport_lane_owned=True)
 
     assert probe.state == health.POISONED
     assert "without a browser context" in probe.error
@@ -64,11 +64,35 @@ def test_successful_probe_is_automation_ready(monkeypatch) -> None:
     browser = SimpleNamespace(contexts=[context], is_connected=lambda: True)
     monkeypatch.setattr(health, "sync_playwright", lambda: _PlaywrightContext(browser))
 
-    probe = health.probe_cdp_automation(9222, timeout_ms=1000)
+    probe = health.probe_cdp_automation(9222, timeout_ms=1000, transport_lane_owned=True)
 
     assert probe.state == health.AUTOMATION_READY
     assert probe.context_count == 1
     assert probe.page_count == 2
+
+
+def test_normal_probe_acquires_transport_lane(monkeypatch) -> None:
+    entered: list[int] = []
+
+    class Lane:
+        def __enter__(self):
+            entered.append(9222)
+            return None
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            return None
+
+    monkeypatch.setattr(health, "cdp_endpoint_token", lambda _port: "ws://generation-lane")
+    monkeypatch.setattr(health, "exclusive_cdp_transport_lane", lambda port: Lane())
+    monkeypatch.setattr(health, "cdp_attach_guard", lambda *_a, **_k: nullcontext())
+    context = SimpleNamespace(pages=[])
+    browser = SimpleNamespace(contexts=[context], is_connected=lambda: True)
+    monkeypatch.setattr(health, "sync_playwright", lambda: _PlaywrightContext(browser))
+
+    probe = health.probe_cdp_automation(9222, timeout_ms=1000)
+
+    assert probe.state == health.AUTOMATION_READY
+    assert entered == [9222]
 
 
 def test_poison_marker_is_bound_to_one_browser_generation(monkeypatch, tmp_path: Path) -> None:
