@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import Property, QEvent, QObject, QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import Property, QEvent, QObject, QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtWidgets import QAbstractItemView, QAbstractScrollArea, QWidget
 
 
@@ -23,11 +23,11 @@ class _ScrollMotion:
 
 
 class QuickScrollState(QObject):
-    """Publish only transient scrollbar positions to the Quick presentation.
+    """Publish transient scrollbar positions without recomputing viewport geometry per frame.
 
-    QWidget remains the committed scroll/layout state owner, but an active gesture
-    is presented entirely by Quick. The hidden QScrollArea is updated once when the
-    glide settles instead of being scrolled on every 16 ms animation tick.
+    QWidget remains the committed scroll/layout state owner, while Quick owns active
+    scroll presentation. Viewport identity changes only when layout geometry changes,
+    so it is cached independently from the high-frequency transient scroll position.
     """
 
     positionsChanged = Signal()
@@ -44,13 +44,21 @@ class QuickScrollState(QObject):
 
     positions = Property("QVariantMap", _get_positions, notify=positionsChanged)
 
-    def _viewport_key(self, area: QAbstractScrollArea) -> str | None:
+    def _compute_viewport_key(self, area: QAbstractScrollArea) -> str | None:
         try:
             viewport = area.viewport()
             point = viewport.mapTo(self._root, QPoint(0, 0))
             return f"{int(point.x())}:{int(point.y())}:{int(viewport.width())}:{int(viewport.height())}"
         except RuntimeError:
             return None
+
+    def _viewport_key(self, area: QAbstractScrollArea, *, refresh: bool = False) -> str | None:
+        identity = id(area)
+        if not refresh:
+            cached = self._area_keys.get(identity)
+            if cached is not None:
+                return cached
+        return self._compute_viewport_key(area)
 
     def watch_area(self, area: QAbstractScrollArea) -> None:
         identity = id(area)
@@ -65,7 +73,7 @@ class QuickScrollState(QObject):
                 )
             except (RuntimeError, TypeError):
                 pass
-        self.sync_area(area)
+        self.sync_area(area, refresh_geometry=True)
 
     def set_area_position(
         self,
@@ -73,8 +81,9 @@ class QuickScrollState(QObject):
         *,
         x: float | None = None,
         y: float | None = None,
+        refresh_geometry: bool = False,
     ) -> None:
-        key = self._viewport_key(area)
+        key = self._viewport_key(area, refresh=refresh_geometry)
         if key is None:
             return
         try:
@@ -99,8 +108,8 @@ class QuickScrollState(QObject):
         self._positions = positions
         self.positionsChanged.emit()
 
-    def sync_area(self, area: QAbstractScrollArea) -> None:
-        self.set_area_position(area)
+    def sync_area(self, area: QAbstractScrollArea, *, refresh_geometry: bool = False) -> None:
+        self.set_area_position(area, refresh_geometry=refresh_geometry)
 
     def sync_all(self, areas: list[QAbstractScrollArea]) -> None:
         for area in areas:
@@ -318,6 +327,14 @@ class SmoothWheelFilter(QObject):
     """Universal nested scrolling for both QWidget and the unified Quick owner."""
 
     _ANGLE_UNITS_PER_NOTCH = 120.0
+    _GEOMETRY_EVENTS = {
+        QEvent.Type.Move,
+        QEvent.Type.Resize,
+        QEvent.Type.Show,
+        QEvent.Type.Hide,
+        QEvent.Type.LayoutRequest,
+        QEvent.Type.ParentChange,
+    }
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -328,6 +345,8 @@ class SmoothWheelFilter(QObject):
         self._quick_state: QuickScrollState | None = None
         self._quick_bridge: Any = None
         self._bridge_scroll_detached = False
+        self._quick_hit_rects: dict[int, tuple[QRect, QAbstractScrollArea]] = {}
+        self._quick_hit_geometry_dirty = True
 
     def install(self, root: QWidget) -> None:
         self._root = root
@@ -368,6 +387,7 @@ class SmoothWheelFilter(QObject):
                 continue
             self._areas[watched] = area
             watched.installEventFilter(self)
+        self._quick_hit_geometry_dirty = True
         if self._bridge_scroll_detached:
             self._detach_bridge_value_refresh(area)
 
@@ -385,6 +405,7 @@ class SmoothWheelFilter(QObject):
         state = self._quick_state
         if state is not None:
             state.sync_all(list(set(self._areas.values())))
+        self._quick_hit_geometry_dirty = True
 
     def _detach_bridge_value_refresh(self, area: QAbstractScrollArea) -> None:
         bridge = self._quick_bridge
@@ -458,12 +479,14 @@ class SmoothWheelFilter(QObject):
         self._scroller.add_wheel_delta(owner, notch_delta)
         return True
 
-    def _area_at_quick_position(self, x: float, y: float) -> QAbstractScrollArea | None:
+    def _refresh_quick_hit_geometry(self) -> None:
         root = self._root
         if root is None:
-            return None
-        point = QPoint(round(float(x)), round(float(y)))
-        candidates: list[tuple[int, QAbstractScrollArea]] = []
+            self._quick_hit_rects = {}
+            self._quick_hit_geometry_dirty = False
+            return
+
+        hit_rects: dict[int, tuple[QRect, QAbstractScrollArea]] = {}
         for area in set(self._areas.values()):
             try:
                 if not area.isVisibleTo(root):
@@ -471,27 +494,53 @@ class SmoothWheelFilter(QObject):
                 viewport = area.viewport()
                 top_left = viewport.mapTo(root, QPoint(0, 0))
                 rect = viewport.rect().translated(top_left)
-                if not rect.contains(point):
+                if rect.width() <= 0 or rect.height() <= 0:
                     continue
-                candidates.append((max(1, rect.width() * rect.height()), area))
+                hit_rects[id(area)] = (rect, area)
             except RuntimeError:
                 continue
-        if not candidates:
+        self._quick_hit_rects = hit_rects
+        self._quick_hit_geometry_dirty = False
+
+    def _area_at_quick_position(self, x: float, y: float) -> QAbstractScrollArea | None:
+        if self._root is None:
             return None
-        candidates.sort(key=lambda item: item[0])
-        return candidates[0][1]
+        if self._quick_hit_geometry_dirty:
+            self._refresh_quick_hit_geometry()
+
+        point = QPoint(round(float(x)), round(float(y)))
+        best_area: QAbstractScrollArea | None = None
+        best_area_pixels: int | None = None
+        for rect, area in self._quick_hit_rects.values():
+            if not rect.contains(point):
+                continue
+            pixels = max(1, rect.width() * rect.height())
+            if best_area_pixels is None or pixels < best_area_pixels:
+                best_area = area
+                best_area_pixels = pixels
+        return best_area
+
+    def _geometry_changed(self, area: QAbstractScrollArea) -> None:
+        self._quick_hit_geometry_dirty = True
+        state = self._quick_state
+        if state is not None:
+            state.sync_area(area, refresh_geometry=True)
 
     def eventFilter(self, watched: QObject, event) -> bool:  # noqa: ANN001, N802
+        event_type = event.type()
         area = self._areas.get(watched)
-        if area is not None and event.type() in {
+        if area is not None and event_type in self._GEOMETRY_EVENTS:
+            self._geometry_changed(area)
+
+        if watched is self._quick_owner and event_type in {
             QEvent.Type.Resize,
             QEvent.Type.Show,
+            QEvent.Type.Expose,
+            QEvent.Type.WindowStateChange,
         }:
-            state = self._quick_state
-            if state is not None:
-                state.sync_area(area)
+            self._quick_hit_geometry_dirty = True
 
-        if event.type() != QEvent.Type.Wheel:
+        if event_type != QEvent.Type.Wheel:
             return False
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             return False
@@ -530,6 +579,8 @@ class SmoothWheelFilter(QObject):
             except RuntimeError:
                 pass
         self._areas.clear()
+        self._quick_hit_rects.clear()
+        self._quick_hit_geometry_dirty = True
         state = self._quick_state
         self._quick_state = None
         if state is not None:
