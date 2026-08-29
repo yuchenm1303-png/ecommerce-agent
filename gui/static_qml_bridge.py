@@ -499,6 +499,11 @@ class StaticQmlBridge(QObject):
             return
         control.sync_value(ratio=ratio, text=text)
 
+    def _uses_live_controls(self, origin: QWidget) -> bool:
+        if origin is self.window:
+            return True
+        return any(origin is frame for frame in self._cached_frames)
+
     @staticmethod
     def _control_position(control: Any) -> tuple[int, int]:
         if isinstance(control, dict):
@@ -584,6 +589,7 @@ class StaticQmlBridge(QObject):
         if self._has_atomic_ancestor(widget, origin):
             return None
 
+        live_controls = self._uses_live_controls(origin)
         try:
             if isinstance(widget, QTabBar):
                 tabs = widget.parentWidget()
@@ -638,13 +644,22 @@ class StaticQmlBridge(QObject):
                 data = self._base(widget, origin)
                 if data is None:
                     return None
+                wrap = widget.lineWrapMode() != QPlainTextEdit.LineWrapMode.NoWrap
                 if widget.isReadOnly():
-                    return self._read_only_text_control(widget, data)
+                    if live_controls:
+                        return self._read_only_text_control(widget, data)
+                    data.update(
+                        kind="textedit",
+                        text=self._plain_text(widget),
+                        readOnly=True,
+                        wrap=wrap,
+                    )
+                    return data
                 data.update(
                     kind="textedit",
                     text=self._plain_text(widget),
                     readOnly=False,
-                    wrap=(widget.lineWrapMode() != QPlainTextEdit.LineWrapMode.NoWrap),
+                    wrap=wrap,
                 )
                 return data
 
@@ -714,7 +729,11 @@ class StaticQmlBridge(QObject):
                 data = self._base(widget, origin)
                 if data is None:
                     return None
-                return self._progress_control(widget, data)
+                if live_controls:
+                    return self._progress_control(widget, data)
+                ratio, text = self._progress_values(widget)
+                data.update(kind="progress", ratio=ratio, text=text)
+                return data
 
             if isinstance(widget, QLabel):
                 data = self._base(widget, origin)
