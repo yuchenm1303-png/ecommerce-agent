@@ -5,6 +5,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from typing import Any
 from playwright.sync_api import sync_playwright
 
 from .browser_session import cdp_attach_guard, cdp_endpoint
+from .cdp_transport_lane import exclusive_cdp_transport_lane
 
 
 ENDPOINT_DOWN = "ENDPOINT_DOWN"
@@ -70,12 +72,14 @@ def probe_cdp_automation(
     port: int,
     *,
     timeout_ms: int = 6_000,
+    transport_lane_owned: bool = False,
 ) -> CdpAutomationProbe:
     """Distinguish endpoint reachability from usable Playwright automation.
 
-    This is intentionally a short-lived idle-boundary probe. Callers must not run
-    it while a task already owns the real browser transport. The attach guard
-    serializes the probe handshake itself.
+    A health probe is itself a real Playwright transport, so it obeys the same
+    exclusive transport ownership contract as business automation. Normal GUI
+    idle probes acquire the lane here. A recovery flow that already owns the lane
+    must pass ``transport_lane_owned=True`` to avoid reacquiring its own lock.
     """
 
     port = int(port)
@@ -83,27 +87,29 @@ def probe_cdp_automation(
     if not token:
         return CdpAutomationProbe(state=ENDPOINT_DOWN)
 
+    lane = nullcontext() if transport_lane_owned else exclusive_cdp_transport_lane(port)
     try:
         guard_timeout = max(3.0, (max(1_000, int(timeout_ms)) / 1000.0) + 2.0)
-        with cdp_attach_guard(port, timeout_s=guard_timeout):
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.connect_over_cdp(
-                    cdp_endpoint(port),
-                    timeout=max(1_000, int(timeout_ms)),
-                )
-                contexts = list(browser.contexts)
-                if not contexts:
-                    raise RuntimeError("CDP attach completed without a browser context")
-                page_count = sum(len(list(context.pages)) for context in contexts)
-                is_connected = getattr(browser, "is_connected", None)
-                if callable(is_connected) and not bool(is_connected()):
-                    raise RuntimeError("Playwright transport disconnected during automation probe")
-                return CdpAutomationProbe(
-                    state=AUTOMATION_READY,
-                    endpoint_token=token,
-                    context_count=len(contexts),
-                    page_count=page_count,
-                )
+        with lane:
+            with cdp_attach_guard(port, timeout_s=guard_timeout):
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.connect_over_cdp(
+                        cdp_endpoint(port),
+                        timeout=max(1_000, int(timeout_ms)),
+                    )
+                    contexts = list(browser.contexts)
+                    if not contexts:
+                        raise RuntimeError("CDP attach completed without a browser context")
+                    page_count = sum(len(list(context.pages)) for context in contexts)
+                    is_connected = getattr(browser, "is_connected", None)
+                    if callable(is_connected) and not bool(is_connected()):
+                        raise RuntimeError("Playwright transport disconnected during automation probe")
+                    return CdpAutomationProbe(
+                        state=AUTOMATION_READY,
+                        endpoint_token=token,
+                        context_count=len(contexts),
+                        page_count=page_count,
+                    )
     except Exception as exc:
         current = cdp_endpoint_token(port)
         if not current:
