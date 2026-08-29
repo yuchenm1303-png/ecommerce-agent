@@ -3,9 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtWidgets import QBoxLayout, QFrame, QLabel, QVBoxLayout, QWidget
-
-from .numeric_field_chrome import install_numeric_field_chrome
+from PySide6.QtWidgets import QBoxLayout, QFrame, QLabel, QSpinBox, QVBoxLayout, QWidget
 
 
 _TOP_CARD_MIN = 272
@@ -171,14 +169,14 @@ def _apply(window: Any) -> None:
         vertical_input.setMinimumWidth(260)
         vertical_input.setMaximumWidth(340)
 
-    # Restore the prompt and +/- controls that native QSpinBox chrome loses in
-    # the Quick mirror. The underlying source_port QSpinBox remains the business
-    # value owner; the renderer-neutral chrome is only presentation.
-    install_numeric_field_chrome(
-        source_port,
-        prompt_width=_LEFT_LABEL_WIDTH,
-        value_width=78,
-    )
+    # Keep the original QSpinBox intact. Quick owns only its presentation and
+    # uses this semantic name to render Source CDP + value + stacked stepper as
+    # one control; QWidget fallback retains the native prefix and arrows.
+    if isinstance(source_port, QSpinBox):
+        source_port.setObjectName("sourceCdpSpin")
+        source_port.setMinimumWidth(176)
+        source_port.setMaximumWidth(176)
+        source_port.setFixedHeight(_CONTROL_HEIGHT)
 
     for name in (
         "url_input",
