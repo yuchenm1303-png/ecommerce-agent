@@ -145,7 +145,7 @@ def test_build_discovers_native_assets_and_never_guesses_velopack_package_names(
     assert '[string]$Target[0].FileName' in BUILD
     assert '[IO.Path]::GetFileName($FileName) -ne $FileName' in BUILD
     assert 'Join-Path $VelopackDir "$PackId-Setup.exe"' not in BUILD
-    assert 'Join-Path $VelopackDir "$PackId-Portabled.zip"' not in BUILD
+    assert 'Join-Path $VelopackDir "$PackId-Portable.zip"' not in BUILD
     assert '"$PackId-$Version-full.nupkg"' not in BUILD
 
 
