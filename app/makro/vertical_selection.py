@@ -241,11 +241,12 @@ def _wait_for_canonical_vertical(page: Page, *, timeout_s: float = 10.0) -> str:
 class _VerticalBrandTransitionObservation:
     """One coherent read of the Step 1 confirmation -> Step 2 boundary.
 
-    Confirmation text alone is not executable state. A Step 1 confirmation is
-    actionable only when the same observation also proves that it belongs to the
-    selected live Vertical and yields the exact current Select Brand action. This
-    prevents a React render gap from being promoted to a successful readiness
-    check and eliminates the old check-then-requery TOCTOU boundary.
+    The confirmation is accepted from either Makro's semantic confirmation content
+    or the structural state the live portal actually renders after a Vertical is
+    chosen: Step 1 is still active, the selected leaf is visible in the rendered
+    confirmation/details, and the exact Select Brand action exists. Keeping these
+    facts in one observation preserves the atomic TOCTOU protection without making
+    a canonical URL mutation or one fixed confirmation sentence a precondition.
     """
 
     brand_step: bool = False
@@ -282,23 +283,40 @@ def _observe_vertical_brand_transition(
         )
 
     try:
-        confirmation_visible = bool(_vertical_confirmation_content(page))
+        selected_visible = not selected_value or _selected_label_visible(page, selected_value)
     except Exception:
-        confirmation_visible = False
-    if not confirmation_visible:
-        return _VerticalBrandTransitionObservation(canonical=canonical_value)
+        selected_visible = False
+    try:
+        action = _vertical_select_brand_button(page)
+    except Exception:
+        action = None
+    try:
+        semantic_confirmation = bool(_vertical_confirmation_content(page))
+    except Exception:
+        semantic_confirmation = False
+    try:
+        vertical_step = bool(is_vertical_step(page))
+    except Exception:
+        vertical_step = False
 
-    selected_visible = not selected_value or _selected_label_visible(page, selected_value)
+    structural_confirmation = bool(
+        vertical_step
+        and selected_visible
+        and action is not None
+    )
+    confirmation_visible = bool(semantic_confirmation or structural_confirmation)
+
+    if not confirmation_visible:
+        return _VerticalBrandTransitionObservation(
+            selected_visible=selected_visible,
+            canonical=canonical_value,
+        )
     if not selected_visible:
         return _VerticalBrandTransitionObservation(
             confirmation_visible=True,
             canonical=canonical_value,
         )
 
-    try:
-        action = _vertical_select_brand_button(page)
-    except Exception:
-        action = None
     return _VerticalBrandTransitionObservation(
         confirmation_visible=True,
         selected_visible=True,
