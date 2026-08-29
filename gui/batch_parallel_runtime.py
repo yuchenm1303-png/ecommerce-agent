@@ -4,6 +4,7 @@ from pathlib import Path
 from types import MethodType
 from typing import Any
 
+from app.cdp_transport_lane import python_args_under_transport_lane
 from .batch_browser_session import (
     BatchSharedBrowserOwner,
     bind_batch_shared_browser,
@@ -59,6 +60,13 @@ class BatchParallelRuntime:
         self.controller.jobs_changed.connect(lambda _jobs: self._release_if_safe())
         self.window.destroyed.connect(lambda *_args: self._release_owner())
 
+    def _assert_top_level_idle(self) -> None:
+        if self.manager.is_busy():
+            raise RuntimeError(
+                "已有 Single/真实填写/Batch 浏览器工作域正在运行。"
+                "Batch 不会在另一个正式工作域持有 Makro Browser 时等待或抢占 session lease。"
+            )
+
     def _install_controller_routing(self) -> None:
         runtime = self
 
@@ -69,6 +77,7 @@ class BatchParallelRuntime:
             *,
             prepare_concurrency: int = 6,
         ):
+            runtime._assert_top_level_idle()
             requested = normalize_batch_concurrency(prepare_concurrency)
             runtime._parallelism = min(requested, max(1, len(urls)))
             runtime.manager.ensure_ready("Batch single-browser preparation")
@@ -91,6 +100,7 @@ class BatchParallelRuntime:
             upload_images: bool,
             execute_concurrency: int = 6,
         ) -> None:
+            runtime._assert_top_level_idle()
             runtime._assert_prepared_browser_alive()
             runtime._parallelism = normalize_batch_concurrency(execute_concurrency)
             runtime._original_start_execution(
@@ -112,18 +122,7 @@ class BatchParallelRuntime:
                     f"target={target or 'new-owned-tab'}"
                 )
                 if stage == "execute":
-                    # Actual writes must never coexist as multiple Playwright
-                    # transports against the one long-lived Makro Edge. Keep the
-                    # existing process concurrency/queue, but route every writer
-                    # through the same cross-process transport lane.
-                    routed = [
-                        "-m",
-                        "app.cdp_transport_lane",
-                        "--port",
-                        str(job.makro_cdp_port),
-                        "--",
-                        *routed,
-                    ]
+                    routed = python_args_under_transport_lane(job.makro_cdp_port, routed)
                     _controller._emit_log_now(
                         f"[{job_id}] BROWSER_TRANSPORT_LANE port={job.makro_cdp_port} mode=exclusive-write"
                     )
