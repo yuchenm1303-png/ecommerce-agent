@@ -12,11 +12,15 @@ on:
       - "app/velopack_runtime.py"
       - "app/update_browser_gate.py"
       - "app/browser_session.py"
+      - "app/cdp_transport_lane.py"
       - "gui/app_updater.py"
       - "gui/browser_session_manager.py"
       - "gui/resilient_app_updater.py"
       - "gui/update_runtime.py"
       - "gui/frozen_process_router.py"
+      - "gui/batch_parallel_runtime.py"
+      - "makro_execute_listing.py"
+      - "makro_execute_owned.py"
       - "run_packaged_worker.py"
       - "run_local_gui.py"
       - "native/sakana-helper/**"
@@ -28,6 +32,8 @@ on:
       - "requirements.txt"
       - "requirements-gui.txt"
       - "requirements-build.txt"
+      - "tests/test_batch_architecture_contract.py"
+      - "tests/test_cdp_transport_lane.py"
       - "tests/test_windows_packaging_contract.py"
       - "tests/test_velopack_update_contract.py"
       - "tests/test_app_update_ui_contract.py"
@@ -68,7 +74,9 @@ jobs:
             tests/test_windows_packaging_contract.py `
             tests/test_velopack_update_contract.py `
             tests/test_app_update_ui_contract.py `
-            tests/test_updater_browser_shutdown_contract.py
+            tests/test_updater_browser_shutdown_contract.py `
+            tests/test_batch_architecture_contract.py `
+            tests/test_cdp_transport_lane.py
 
       - name: Build Velopack installer and portable package
         shell: pwsh
@@ -103,6 +111,8 @@ jobs:
           }
           & $worker --self-test
           if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
+          & $worker makro_execute_owned.py --help
+          if ($LASTEXITCODE -ne 0) { throw "Installed owned-execute worker dispatch failed: $LASTEXITCODE" }
 
           $uninstall = Start-Process -FilePath $update -ArgumentList @("--silent", "uninstall") -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "Velopack uninstall failed: $($uninstall.ExitCode)" }
