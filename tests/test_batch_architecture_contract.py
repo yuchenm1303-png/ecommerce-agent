@@ -7,6 +7,9 @@ ROOT = Path(__file__).resolve().parents[1]
 OWNER = (ROOT / "app" / "browser_page_owner.py").read_text(encoding="utf-8")
 SOURCE = (ROOT / "makro_batch_source.py").read_text(encoding="utf-8")
 JOB = (ROOT / "makro_batch_job.py").read_text(encoding="utf-8")
+STEP3 = (ROOT / "app" / "batch_step3_prepare.py").read_text(encoding="utf-8")
+TRANSPORT = (ROOT / "app" / "cdp_transport_lane.py").read_text(encoding="utf-8")
+PARALLEL = (ROOT / "gui" / "batch_parallel_runtime.py").read_text(encoding="utf-8")
 WORKFLOW = (ROOT / "makro_gui_workflow.py").read_text(encoding="utf-8")
 EXECUTOR = (ROOT / "makro_execute_listing.py").read_text(encoding="utf-8")
 MODEL = (ROOT / "gui" / "batch_model.py").read_text(encoding="utf-8")
@@ -31,8 +34,6 @@ def test_batch_source_navigation_is_prefetched_before_parallel_prepare() -> None
     assert "self._source_queue" in RUNNER
     assert 'source_active = any(stage == "source"' in RUNNER
     assert "Batch source cache miss" in JOB
-    # Batch preparation consumes the canonical AcquiredProductInput cache flag,
-    # not the pre-refactor CaptureResult variable name.
     assert "acquired.source_cache_hit" in JOB
 
 
@@ -41,11 +42,24 @@ def test_batch_reuses_canonical_business_pipeline_and_executor() -> None:
     assert "_advance_listing_to_step3" in JOB
     assert "select_vertical(page, provider, hints)" in WORKFLOW
     assert "select_brand_to_product_info(page, provider, hints)" in WORKFLOW
-    assert "_prepare_step3(args, run_dir=run_dir, page=page, manifest=manifest)" in JOB
+    assert "capture_batch_step3_schema(" in JOB
+    assert "complete_batch_step3_from_schema(" in JOB
+    assert "_run_resolver_pair" in STEP3
+    assert "_resolver_pair_for_pack" in STEP3
     assert '"makro_execute_listing.py"' in RUNNER
     assert '"--all-step3"' in RUNNER
     assert '"--allow-section-save"' in RUNNER
     assert '"--upload-image"' in RUNNER
+
+
+def test_batch_browser_transport_is_single_while_ai_remains_parallel() -> None:
+    assert "exclusive_cdp_transport_lane(args.cdp_port)" in JOB
+    assert "transport_released_before_resolver=True" in JOB
+    assert JOB.index("harness.detach()") < JOB.index("complete_batch_step3_from_schema(")
+    assert "transport-lane-" in TRANSPORT
+    assert "_try_lock_handle" in TRANSPORT
+    assert '"-m",\n                        "app.cdp_transport_lane"' in PARALLEL
+    assert "mode=exclusive-write" in PARALLEL
 
 
 def test_ready_job_can_execute_while_other_batch_jobs_keep_preparing() -> None:
@@ -96,8 +110,6 @@ def test_batch_job_surface_keeps_independent_lossless_logs_and_owned_tab_metadat
     assert "_JOB_LOG_LINE" in WORKSPACE
     assert "self.controller.log.connect(self._append_controller_log)" in WORKSPACE
     assert "def append_log(self, line: str)" in WORKSPACE
-    # Per-job UI history is intentionally lossless; do not reintroduce a
-    # QPlainTextEdit maximum-block truncation after the FIFO logging root fix.
     assert "self._logs: deque[str] = deque()" in WORKSPACE
     assert "setMaximumBlockCount(" not in WORKSPACE
     assert "Makro targetId" in WORKSPACE
