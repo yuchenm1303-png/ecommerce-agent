@@ -67,9 +67,46 @@ Item {
         return positions && positions[key] !== undefined ? positions[key] : null
     }
 
+    function partitionControls(controls, rootX, rootY) {
+        var loose = []
+        var groups = []
+        var byKey = {}
+        if (!controls)
+            return { loose: loose, groups: groups }
+        for (var i = 0; i < controls.length; ++i) {
+            var d = controls[i]
+            if (!d || !d.clipEnabled) {
+                if (d)
+                    loose.push(d)
+                continue
+            }
+            var clipX = Number(d.clipX)
+            var clipY = Number(d.clipY)
+            var clipW = Number(d.clipW)
+            var clipH = Number(d.clipH)
+            var key = scrollViewportKey(rootX + clipX, rootY + clipY, clipW, clipH)
+            var group = byKey[key]
+            if (!group) {
+                group = {
+                    key: key,
+                    x: clipX,
+                    y: clipY,
+                    w: clipW,
+                    h: clipH,
+                    controls: []
+                }
+                byKey[key] = group
+                groups.push(group)
+            }
+            group.controls.push(d)
+        }
+        return { loose: loose, groups: groups }
+    }
+
     property var workspaceToggleData: rootControl("workspaceModeSwitch")
     property var runtimeAssistantToggleData: rootControl("runtimeAssistantSwitch")
     property var backgroundDriftToggleData: rootControl("backgroundDriftSwitch")
+    property var rootControlBuckets: partitionControls(staticBridge.rootControls, 0, 0)
 
     function componentFor(kind) {
         if (kind === "label") return labelComponent
@@ -582,6 +619,7 @@ Item {
             required property string cardName
             required property real hoverScale
             required property var cardControls
+            property var controlBuckets: staticRoot.partitionControls(cardControls, cardX, cardY)
 
             x: cardX; y: cardY; width: cardW; height: cardH
             transformOrigin: Item.Center
@@ -664,28 +702,45 @@ Item {
                 onClicked: staticBridge.requestCardDetail(card.index)
             }
 
+            // Controls outside a scroll area are ordinary card children.
             Repeater {
-                model: card.cardControls
-                delegate: Item {
-                    id: cardControlViewport
+                model: card.controlBuckets.loose
+                delegate: Loader {
                     required property var modelData
-                    property var d: modelData
-                    readonly property bool clipped: d && d.clipEnabled
-                    readonly property string viewportKey: clipped ? staticRoot.scrollViewportKey(
-                        card.cardX + d.clipX,
-                        card.cardY + d.clipY,
-                        d.clipW,
-                        d.clipH
-                    ) : ""
+                    property var controlData: modelData
+                    x: controlData ? controlData.x : 0
+                    y: controlData ? controlData.y : 0
+                    width: controlData ? controlData.w : 0
+                    height: controlData ? controlData.h : 0
+                    sourceComponent: controlData ? staticRoot.componentFor(controlData.kind) : null
+                    onLoaded: if (item) item.d = controlData
+                    onControlDataChanged: if (item) item.d = controlData
+                }
+            }
+
+            // One viewport owns one clip and one scroll transform. Every mirrored
+            // Job control inside that viewport rides the same Scene Graph node.
+            Repeater {
+                model: card.controlBuckets.groups
+                delegate: Item {
+                    id: cardScrollViewport
+                    required property var modelData
+                    property var group: modelData
                     property real scrollOriginX: 0
                     property real scrollOriginY: 0
                     property bool scrollOriginReady: false
-                    readonly property var currentScrollPosition: clipped ? staticRoot.scrollPosition(viewportKey) : null
+                    readonly property var currentScrollPosition: staticRoot.scrollPosition(group ? group.key : "")
                     readonly property real scrollDx: scrollOriginReady && currentScrollPosition ? scrollOriginX - Number(currentScrollPosition.x) : 0
                     readonly property real scrollDy: scrollOriginReady && currentScrollPosition ? scrollOriginY - Number(currentScrollPosition.y) : 0
 
+                    x: group ? group.x : 0
+                    y: group ? group.y : 0
+                    width: group ? group.w : 0
+                    height: group ? group.h : 0
+                    clip: true
+
                     function captureScrollOrigin() {
-                        var position = clipped ? staticRoot.scrollPosition(viewportKey) : null
+                        var position = staticRoot.scrollPosition(group ? group.key : "")
                         if (position) {
                             scrollOriginX = Number(position.x)
                             scrollOriginY = Number(position.y)
@@ -697,30 +752,30 @@ Item {
                         }
                     }
 
-                    function recaptureScrollOrigin() {
-                        scrollOriginReady = false
-                        Qt.callLater(captureScrollOrigin)
-                    }
-
                     Component.onCompleted: captureScrollOrigin()
-                    onDChanged: recaptureScrollOrigin()
-                    onViewportKeyChanged: recaptureScrollOrigin()
+                    onGroupChanged: Qt.callLater(captureScrollOrigin)
 
-                    x: clipped ? d.clipX : d.x
-                    y: clipped ? d.clipY : d.y
-                    width: clipped ? d.clipW : d.w
-                    height: clipped ? d.clipH : d.h
-                    clip: clipped
+                    Item {
+                        id: cardScrollContent
+                        x: cardScrollViewport.scrollDx
+                        y: cardScrollViewport.scrollDy
+                        width: cardScrollViewport.width
+                        height: cardScrollViewport.height
 
-                    Loader {
-                        property var controlData: parent.d
-                        x: parent.clipped ? controlData.x - controlData.clipX + parent.scrollDx : 0
-                        y: parent.clipped ? controlData.y - controlData.clipY + parent.scrollDy : 0
-                        width: controlData ? controlData.w : 0
-                        height: controlData ? controlData.h : 0
-                        sourceComponent: controlData ? staticRoot.componentFor(controlData.kind) : null
-                        onLoaded: if (item) item.d = controlData
-                        onControlDataChanged: if (item) item.d = controlData
+                        Repeater {
+                            model: cardScrollViewport.group ? cardScrollViewport.group.controls : []
+                            delegate: Loader {
+                                required property var modelData
+                                property var controlData: modelData
+                                x: controlData ? controlData.x - cardScrollViewport.group.x : 0
+                                y: controlData ? controlData.y - cardScrollViewport.group.y : 0
+                                width: controlData ? controlData.w : 0
+                                height: controlData ? controlData.h : 0
+                                sourceComponent: controlData ? staticRoot.componentFor(controlData.kind) : null
+                                onLoaded: if (item) item.d = controlData
+                                onControlDataChanged: if (item) item.d = controlData
+                            }
+                        }
                     }
                 }
             }
@@ -729,28 +784,44 @@ Item {
         }
     }
 
+    // Root controls outside scroll areas remain direct children.
     Repeater {
-        model: staticBridge.rootControls
-        delegate: Item {
-            id: rootControlViewport
+        model: staticRoot.rootControlBuckets.loose
+        delegate: Loader {
             required property var modelData
-            property var d: modelData
-            readonly property bool clipped: d && d.clipEnabled
-            readonly property string viewportKey: clipped ? staticRoot.scrollViewportKey(
-                d.clipX,
-                d.clipY,
-                d.clipW,
-                d.clipH
-            ) : ""
+            property var controlData: modelData
+            x: controlData ? controlData.x : 0
+            y: controlData ? controlData.y : 0
+            width: controlData ? controlData.w : 0
+            height: controlData ? controlData.h : 0
+            sourceComponent: controlData && controlData.kind !== "toggle" ? staticRoot.componentFor(controlData.kind) : null
+            onLoaded: if (item) item.d = controlData
+            onControlDataChanged: if (item) item.d = controlData
+        }
+    }
+
+    // Root-level scroll areas use the same one-viewport/one-transform ownership.
+    Repeater {
+        model: staticRoot.rootControlBuckets.groups
+        delegate: Item {
+            id: rootScrollViewport
+            required property var modelData
+            property var group: modelData
             property real scrollOriginX: 0
             property real scrollOriginY: 0
             property bool scrollOriginReady: false
-            readonly property var currentScrollPosition: clipped ? staticRoot.scrollPosition(viewportKey) : null
+            readonly property var currentScrollPosition: staticRoot.scrollPosition(group ? group.key : "")
             readonly property real scrollDx: scrollOriginReady && currentScrollPosition ? scrollOriginX - Number(currentScrollPosition.x) : 0
             readonly property real scrollDy: scrollOriginReady && currentScrollPosition ? scrollOriginY - Number(currentScrollPosition.y) : 0
 
+            x: group ? group.x : 0
+            y: group ? group.y : 0
+            width: group ? group.w : 0
+            height: group ? group.h : 0
+            clip: true
+
             function captureScrollOrigin() {
-                var position = clipped ? staticRoot.scrollPosition(viewportKey) : null
+                var position = staticRoot.scrollPosition(group ? group.key : "")
                 if (position) {
                     scrollOriginX = Number(position.x)
                     scrollOriginY = Number(position.y)
@@ -762,30 +833,29 @@ Item {
                 }
             }
 
-            function recaptureScrollOrigin() {
-                scrollOriginReady = false
-                Qt.callLater(captureScrollOrigin)
-            }
-
             Component.onCompleted: captureScrollOrigin()
-            onDChanged: recaptureScrollOrigin()
-            onViewportKeyChanged: recaptureScrollOrigin()
+            onGroupChanged: Qt.callLater(captureScrollOrigin)
 
-            x: clipped ? d.clipX : d.x
-            y: clipped ? d.clipY : d.y
-            width: clipped ? d.clipW : d.w
-            height: clipped ? d.clipH : d.h
-            clip: clipped
+            Item {
+                x: rootScrollViewport.scrollDx
+                y: rootScrollViewport.scrollDy
+                width: rootScrollViewport.width
+                height: rootScrollViewport.height
 
-            Loader {
-                property var controlData: parent.d
-                x: parent.clipped ? controlData.x - controlData.clipX + parent.scrollDx : 0
-                y: parent.clipped ? controlData.y - controlData.clipY + parent.scrollDy : 0
-                width: controlData ? controlData.w : 0
-                height: controlData ? controlData.h : 0
-                sourceComponent: controlData && controlData.kind !== "toggle" ? staticRoot.componentFor(controlData.kind) : null
-                onLoaded: if (item) item.d = controlData
-                onControlDataChanged: if (item) item.d = controlData
+                Repeater {
+                    model: rootScrollViewport.group ? rootScrollViewport.group.controls : []
+                    delegate: Loader {
+                        required property var modelData
+                        property var controlData: modelData
+                        x: controlData ? controlData.x - rootScrollViewport.group.x : 0
+                        y: controlData ? controlData.y - rootScrollViewport.group.y : 0
+                        width: controlData ? controlData.w : 0
+                        height: controlData ? controlData.h : 0
+                        sourceComponent: controlData && controlData.kind !== "toggle" ? staticRoot.componentFor(controlData.kind) : null
+                        onLoaded: if (item) item.d = controlData
+                        onControlDataChanged: if (item) item.d = controlData
+                    }
+                }
             }
         }
     }
