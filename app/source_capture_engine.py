@@ -1,0 +1,698 @@
+from __future__ import annotations
+
+import hashlib
+import html
+import json
+import re
+import shutil
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from playwright.sync_api import Error as PlaywrightError, sync_playwright
+
+from .browser_session import (
+    _connect_browser_resilient,
+    acquire_cdp_session_lease,
+    is_cdp_ready,
+    launch_detached_edge,
+)
+from .browser_visual_hud import (
+    arm_browser_visual_hud,
+    browser_visual_hud_status,
+    finish_browser_visual_hud,
+    set_browser_visual_hud_capture_safe,
+)
+from .source_snapshot import (
+    SourceAccessBlocked,
+    SourceCaptureError,
+    SourceSnapshot,
+    capture_page_snapshot,
+    source_snapshot_from_json,
+    write_source_snapshot,
+)
+from .supplier_url_identity import supplier_request_identity
+
+
+DEFAULT_SOURCE_CDP_PORT = 9333
+SOURCE_CAPTURE_CACHE_VERSION = 6
+
+_DETAIL_DOCUMENT_PATTERN = re.compile(
+    r"detail(?:Url|_url)[^h]{0,48}(https?://[^\\\"'<>\s]+)",
+    re.IGNORECASE,
+)
+_IMAGE_URL_PATTERN = re.compile(
+    r"(?:(?:https?:)?\\?/\\?/)[^\\\"'<>\s]+?\.(?:jpe?g|png|webp|gif|avif)(?:\?[^\\\"'<>\s]*)?",
+    re.IGNORECASE,
+)
+_NO_EVALUATE_ARG = object()
+
+
+@dataclass(slots=True, frozen=True)
+class CapturedProductSource:
+    snapshot_path: Path
+    screenshot_path: Path
+    snapshot: SourceSnapshot
+    launched_now: bool
+    product_image_paths: tuple[Path, ...] = ()
+    cache_hit: bool = False
+
+
+def validate_source_url(value: str) -> str:
+    url = value.strip()
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("product URL 必须是完整 http/https URL。")
+    return url
+
+
+def _canonical_source_url(value: str) -> str:
+    """Return the shared exact supplier request identity used by source cache."""
+
+    return supplier_request_identity(validate_source_url(value))
+
+
+def _source_cache_key(value: str) -> str:
+    payload = f"v{SOURCE_CAPTURE_CACHE_VERSION}|{_canonical_source_url(value)}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def _unescape_embedded(value: str) -> str:
+    return html.unescape(value).replace(r"\/", "/")
+
+
+def _detail_document_urls(snapshot: SourceSnapshot, *, max_urls: int = 4) -> list[str]:
+    """Extract bounded, exact-page detail documents exposed by embedded page data."""
+
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw in snapshot.embedded_data:
+        text = _unescape_embedded(raw)
+        for match in _DETAIL_DOCUMENT_PATTERN.finditer(text):
+            url = match.group(1).rstrip("\\")
+            try:
+                url = validate_source_url(url)
+            except ValueError:
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            output.append(url)
+            if len(output) >= max_urls:
+                return output
+    return output
+
+
+def _detail_image_urls_from_text(value: str, *, max_urls: int = 32) -> list[str]:
+    """Extract image assets from one supplier detail document without interpreting them."""
+
+    text = _unescape_embedded(value)
+    output: list[str] = []
+    seen: set[str] = set()
+    for match in _IMAGE_URL_PATTERN.finditer(text):
+        url = match.group(0).replace(r"\/", "/")
+        if url.startswith("//"):
+            url = "https:" + url
+        try:
+            url = validate_source_url(url)
+        except ValueError:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        output.append(url)
+        if len(output) >= max_urls:
+            break
+    return output
+
+
+def _discover_detail_images(
+    context,
+    snapshot: SourceSnapshot,
+    *,
+    max_documents: int = 4,
+    max_images: int = 32,
+) -> tuple[list[str], list[str]]:
+    """Fetch supplier-declared detail documents and return their exact image URLs."""
+
+    documents = _detail_document_urls(snapshot, max_urls=max_documents)
+    images: list[str] = []
+    seen: set[str] = set()
+    for document_url in documents:
+        response = None
+        try:
+            response = context.request.get(document_url, timeout=15_000, fail_on_status_code=False)
+            if not response.ok:
+                continue
+            body = response.text()
+            for image_url in _detail_image_urls_from_text(body, max_urls=max_images):
+                if image_url in seen:
+                    continue
+                seen.add(image_url)
+                images.append(image_url)
+                if len(images) >= max_images:
+                    return documents, images
+        except Exception:
+            continue
+        finally:
+            if response is not None:
+                try:
+                    response.dispose()
+                except Exception:
+                    pass
+    return documents, images
+
+
+def _connect_source_edge(playwright, *, profile_dir: Path, port: int, start_url: str):
+    """Own one Source Edge session and attach through the shared resilient CDP path."""
+
+    session_lease = acquire_cdp_session_lease(port)
+    try:
+        launched_now = not is_cdp_ready(port)
+        if launched_now:
+            launch_detached_edge(profile_dir=profile_dir, port=port, start_url=start_url)
+        browser = _connect_browser_resilient(playwright, port)
+        contexts = list(browser.contexts)
+        if not contexts:
+            raise RuntimeError("已连接 source Edge，但没有 browser context。")
+        context = contexts[0]
+        pages = list(context.pages)
+        page = pages[-1] if pages else context.new_page()
+        arm_browser_visual_hud(
+            page,
+            title="正在读取商品页面",
+            thought="Listing Studio 正在连接供应商商品页并准备采集页面证据。",
+            phase=0,
+        )
+        return browser, context, page, launched_now, session_lease
+    except Exception:
+        session_lease.release()
+        raise
+
+
+def _is_navigation_context_error(exc: BaseException) -> bool:
+    text = str(exc).casefold()
+    return "execution context was destroyed" in text and "navigation" in text
+
+
+def _wait_for_navigation_recovery(page, *, settle_ms: int) -> None:
+    """Wait for a replacement execution context after a supplier-side navigation.
+
+    1688 may perform a canonical/client redirect after DOMContentLoaded. That is
+    normal page behavior and must not abort a source capture. Only the specific
+    transient execution-context error is retried; unrelated Playwright failures
+    still fail closed.
+    """
+
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15_000)
+    except PlaywrightError:
+        pass
+    page.wait_for_timeout(max(250, min(1_500, int(settle_ms) or 250)))
+    browser_visual_hud_status(
+        page,
+        "正在跟随商品页跳转",
+        "供应商页面发生正常跳转，正在重新绑定当前页面并继续采集。",
+        phase=1,
+    )
+
+
+def _evaluate_with_navigation_retry(
+    page,
+    expression: str,
+    arg=_NO_EVALUATE_ARG,
+    *,
+    settle_ms: int,
+    attempts: int = 4,
+):
+    for attempt in range(max(1, attempts)):
+        try:
+            if arg is _NO_EVALUATE_ARG:
+                return page.evaluate(expression)
+            return page.evaluate(expression, arg)
+        except PlaywrightError as exc:
+            if not _is_navigation_context_error(exc) or attempt + 1 >= attempts:
+                raise
+            _wait_for_navigation_recovery(page, settle_ms=settle_ms)
+    raise RuntimeError("unreachable navigation retry state")
+
+
+def _load_lazy_page(page, *, initial_wait_ms: int, scroll_wait_ms: int, max_scroll_steps: int) -> None:
+    browser_visual_hud_status(
+        page,
+        "正在展开商品页面",
+        "正在滚动页面，加载懒加载商品文字、规格和图片。",
+        phase=2,
+    )
+    if initial_wait_ms:
+        page.wait_for_timeout(initial_wait_ms)
+    stable_rounds = 0
+    previous_height = 0
+    for step_index in range(max_scroll_steps):
+        if step_index and step_index % 12 == 0:
+            browser_visual_hud_status(
+                page,
+                "正在扫描商品页面",
+                f"已继续滚动加载页面内容 · pass {step_index + 1}",
+                phase=2,
+            )
+        state = _evaluate_with_navigation_retry(
+            page,
+            """() => ({
+                y: window.scrollY,
+                h: Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0),
+                vh: window.innerHeight || 800
+            })""",
+            settle_ms=scroll_wait_ms,
+        )
+        height = int(state.get("h") or 0)
+        y = int(state.get("y") or 0)
+        viewport = max(400, int(state.get("vh") or 800))
+        if height <= 0:
+            break
+        if y + viewport >= height - 8:
+            stable_rounds = stable_rounds + 1 if height == previous_height else 0
+            if stable_rounds >= 2:
+                break
+        _evaluate_with_navigation_retry(
+            page,
+            "(step) => window.scrollBy(0, step)",
+            max(300, int(viewport * 0.85)),
+            settle_ms=scroll_wait_ms,
+        )
+        if scroll_wait_ms:
+            page.wait_for_timeout(scroll_wait_ms)
+        previous_height = height
+    _evaluate_with_navigation_retry(
+        page,
+        "() => window.scrollTo(0, 0)",
+        settle_ms=scroll_wait_ms,
+    )
+    if scroll_wait_ms:
+        page.wait_for_timeout(scroll_wait_ms)
+    browser_visual_hud_status(
+        page,
+        "商品页面已展开",
+        "可见页面内容已经完成滚动加载，准备提取结构化商品信息。",
+        phase=2,
+    )
+
+
+def _capture_snapshot_with_navigation_retry(
+    page,
+    *,
+    requested_url: str,
+    max_visible_text_chars: int,
+    settle_ms: int,
+    attempts: int = 4,
+) -> SourceSnapshot:
+    for attempt in range(max(1, attempts)):
+        try:
+            return capture_page_snapshot(
+                page,
+                requested_url=requested_url,
+                max_visible_text_chars=max_visible_text_chars,
+            )
+        except PlaywrightError as exc:
+            if not _is_navigation_context_error(exc) or attempt + 1 >= attempts:
+                raise
+            _wait_for_navigation_recovery(page, settle_ms=settle_ms)
+    raise RuntimeError("unreachable snapshot retry state")
+
+
+def _compact_playwright_error(exc: BaseException) -> str:
+    return re.sub(r"\s+", " ", str(exc or "")).strip()[:500]
+
+
+def _screenshot_with_navigation_retry(
+    page,
+    path: Path,
+    *,
+    settle_ms: int,
+    attempts: int = 4,
+) -> tuple[bool, str]:
+    """Capture screenshot evidence without making browser rendering a hard gate.
+
+    Product pages may be too long or too dynamic for Chrome's full-page bitmap
+    capture. Any Playwright/CDP screenshot failure therefore falls back to the
+    current viewport. If both modes fail, the caller can continue with downloaded
+    product images; only loss of *all* visual evidence is fatal.
+    """
+
+    failures: list[str] = []
+    for full_page, mode in ((True, "full-page"), (False, "viewport")):
+        for attempt in range(max(1, attempts)):
+            try:
+                page.screenshot(path=str(path), full_page=full_page)
+                if failures:
+                    return True, f"{failures[-1]}; {mode} fallback succeeded"
+                return True, ""
+            except PlaywrightError as exc:
+                summary = _compact_playwright_error(exc)
+                if _is_navigation_context_error(exc) and attempt + 1 < attempts:
+                    _wait_for_navigation_recovery(page, settle_ms=settle_ms)
+                    continue
+                failures.append(f"{mode} screenshot failed: {summary}")
+                break
+
+    return False, " | ".join(failures)
+
+
+def _image_extension(content_type: str, url: str) -> str:
+    mime = content_type.split(";", 1)[0].strip().casefold()
+    by_mime = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "image/avif": ".avif",
+    }
+    if mime in by_mime:
+        return by_mime[mime]
+    suffix = Path(urlsplit(url).path).suffix.lower()
+    return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"} else ".img"
+
+
+def _download_page_images(context, image_urls: list[str], output_dir: Path, *, max_images: int = 32) -> tuple[Path, ...]:
+    """Download large images already exposed by the exact page; no image semantics here."""
+
+    if not image_urls:
+        return ()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    saved: list[Path] = []
+    seen_hashes: set[str] = set()
+
+    for url in image_urls:
+        if len(saved) >= max_images:
+            break
+        response = None
+        try:
+            response = context.request.get(url, timeout=15_000, fail_on_status_code=False)
+            if not response.ok:
+                continue
+            headers = {str(k).casefold(): str(v) for k, v in response.headers.items()}
+            content_type = headers.get("content-type", "")
+            if content_type and not content_type.casefold().startswith("image/"):
+                continue
+            body = response.body()
+            if len(body) < 4_096:
+                continue
+            digest = hashlib.sha256(body).hexdigest()
+            if digest in seen_hashes:
+                continue
+            seen_hashes.add(digest)
+            ext = _image_extension(content_type, url)
+            path = output_dir / f"source-image-{len(saved) + 1:02d}-{digest[:10]}{ext}"
+            path.write_bytes(body)
+            saved.append(path)
+        except Exception:
+            continue
+        finally:
+            if response is not None:
+                try:
+                    response.dispose()
+                except Exception:
+                    pass
+    return tuple(saved)
+
+
+def _cached_capture(
+    source_url: str,
+    *,
+    output_dir: Path,
+    cache_dir: Path | None,
+    cache_ttl_seconds: int,
+) -> CapturedProductSource | None:
+    if cache_dir is None or cache_ttl_seconds <= 0:
+        return None
+    slot = cache_dir / _source_cache_key(source_url)
+    snapshot = slot / "source-snapshot.json"
+    screenshot = slot / "source-page.png"
+    cached_images = slot / "product-images"
+    cached_image_files = tuple(
+        sorted(path for path in cached_images.glob("*") if path.is_file())
+    ) if cached_images.is_dir() else ()
+    if not snapshot.is_file() or (not screenshot.is_file() and not cached_image_files):
+        return None
+    age = time.time() - snapshot.stat().st_mtime
+    if age < 0 or age > cache_ttl_seconds:
+        return None
+
+    try:
+        cached_snapshot = source_snapshot_from_json(snapshot)
+        if _canonical_source_url(cached_snapshot.requested_url) != _canonical_source_url(source_url):
+            return None
+    except Exception:
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_snapshot = output_dir / "source-snapshot.json"
+    output_screenshot = output_dir / "source-page.png"
+    output_images = output_dir / "product-images"
+    shutil.copy2(snapshot, output_snapshot)
+    if output_screenshot.exists():
+        output_screenshot.unlink()
+    if screenshot.is_file():
+        shutil.copy2(screenshot, output_screenshot)
+    if output_images.exists():
+        shutil.rmtree(output_images)
+    if cached_image_files:
+        shutil.copytree(cached_images, output_images)
+
+    product_images = tuple(
+        sorted(path for path in output_images.glob("*") if path.is_file())
+    ) if output_images.is_dir() else ()
+    return CapturedProductSource(
+        snapshot_path=output_snapshot,
+        screenshot_path=output_screenshot,
+        snapshot=cached_snapshot,
+        launched_now=False,
+        product_image_paths=product_images,
+        cache_hit=True,
+    )
+
+
+def _refresh_capture_cache(source_url: str, source_dir: Path, cache_dir: Path | None) -> None:
+    if cache_dir is None:
+        return
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    slot = cache_dir / _source_cache_key(source_url)
+    temp = cache_dir / f".{slot.name}.tmp"
+    if temp.exists():
+        shutil.rmtree(temp)
+    shutil.copytree(source_dir, temp)
+    if slot.exists():
+        shutil.rmtree(slot)
+    temp.replace(slot)
+
+
+def capture_product_source(
+    url: str,
+    *,
+    output_dir: str | Path,
+    profile_dir: str | Path = "browser_profiles/source-edge",
+    cdp_port: int = DEFAULT_SOURCE_CDP_PORT,
+    initial_wait_ms: int = 1800,
+    scroll_wait_ms: int = 180,
+    max_scroll_steps: int = 120,
+    max_visible_text_chars: int = 120_000,
+    use_current_page: bool = False,
+    cache_dir: str | Path | None = None,
+    cache_ttl_seconds: int = 900,
+    force_refresh: bool = False,
+) -> CapturedProductSource:
+    """Capture one exact supplier page and its automatically discovered large images.
+
+    A short-lived byte cache makes immediate hot reruns use the exact same source
+    universe, so semantic caches can be meaningfully tested. It is transport
+    caching only, not a product-fact layer. `force_refresh` or `use_current_page`
+    bypasses reuse and performs a fresh capture.
+    """
+
+    source_url = validate_source_url(url)
+    if initial_wait_ms < 0 or scroll_wait_ms < 0:
+        raise ValueError("source wait 参数不能为负数。")
+    if max_scroll_steps < 1:
+        raise ValueError("max_scroll_steps 必须 >= 1。")
+    if max_visible_text_chars < 1_000:
+        raise ValueError("max_visible_text_chars 不能小于 1000。")
+    if cache_ttl_seconds < 0:
+        raise ValueError("cache_ttl_seconds 不能为负数。")
+
+    target_dir = Path(output_dir)
+    cache_root = Path(cache_dir) if cache_dir is not None else None
+    if not force_refresh and not use_current_page:
+        cached = _cached_capture(
+            source_url,
+            output_dir=target_dir,
+            cache_dir=cache_root,
+            cache_ttl_seconds=int(cache_ttl_seconds),
+        )
+        if cached is not None:
+            return cached
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as playwright:
+        _, context, page, launched_now, source_session_lease = _connect_source_edge(
+            playwright,
+            profile_dir=Path(profile_dir).resolve(),
+            port=int(cdp_port),
+            start_url=source_url,
+        )
+        try:
+            page.set_default_timeout(15_000)
+            if use_current_page:
+                if page.url in {"", "about:blank"}:
+                    raise RuntimeError("--source-use-current-page 时 source Edge 没有已打开网页。")
+            else:
+                browser_visual_hud_status(
+                    page,
+                    "正在打开商品链接",
+                    "正在导航到供应商商品页；页面加载后 HUD 会自动续接。",
+                    phase=0,
+                )
+                page.goto(source_url, wait_until="domcontentloaded", timeout=45_000)
+
+            browser_visual_hud_status(
+                page,
+                "商品页面已打开",
+                "正在读取当前页面并准备加载完整商品内容。",
+                phase=1,
+            )
+            _load_lazy_page(
+                page,
+                initial_wait_ms=int(initial_wait_ms),
+                scroll_wait_ms=int(scroll_wait_ms),
+                max_scroll_steps=int(max_scroll_steps),
+            )
+
+            browser_visual_hud_status(
+                page,
+                "正在提取商品信息",
+                "正在读取页面文字、表格、JSON-LD 与嵌入式商品数据。",
+                phase=2,
+            )
+            snapshot = _capture_snapshot_with_navigation_retry(
+                page,
+                requested_url=source_url,
+                max_visible_text_chars=int(max_visible_text_chars),
+                settle_ms=int(scroll_wait_ms),
+            )
+
+            browser_visual_hud_status(
+                page,
+                "正在检索详情资源",
+                "正在根据商品页已经公开的详情文档继续整理规格图片与证据链接。",
+                phase=2,
+            )
+            detail_documents, detail_images = _discover_detail_images(context, snapshot)
+            combined_images: list[str] = []
+            seen_images: set[str] = set()
+            for image_url in [*detail_images, *snapshot.image_urls]:
+                if image_url and image_url not in seen_images:
+                    seen_images.add(image_url)
+                    combined_images.append(image_url)
+            snapshot.image_urls = combined_images
+            if detail_documents:
+                snapshot.meta["detail_document_urls"] = json.dumps(
+                    detail_documents,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                snapshot.meta["detail_image_count"] = str(len(detail_images))
+
+            browser_visual_hud_status(
+                page,
+                "正在整理商品图片",
+                f"发现 {len(snapshot.image_urls)} 个页面图片候选，正在保存可用商品图。",
+                phase=3,
+            )
+            product_image_dir = target_dir / "product-images"
+            if product_image_dir.exists():
+                shutil.rmtree(product_image_dir)
+            product_images = _download_page_images(
+                context,
+                snapshot.image_urls,
+                product_image_dir,
+            )
+
+            browser_visual_hud_status(
+                page,
+                "正在生成页面证据",
+                "即将截取供应商页面证据；HUD 会在截图瞬间自动隐藏。",
+                phase=3,
+            )
+            screenshot_path = target_dir / "source-page.png"
+            if screenshot_path.exists():
+                screenshot_path.unlink()
+            set_browser_visual_hud_capture_safe(page, True)
+            try:
+                screenshot_ok, screenshot_note = _screenshot_with_navigation_retry(
+                    page,
+                    screenshot_path,
+                    settle_ms=int(scroll_wait_ms),
+                )
+            finally:
+                set_browser_visual_hud_capture_safe(page, False)
+
+            if screenshot_note:
+                snapshot.warnings.append(screenshot_note)
+            snapshot.meta["screenshot_available"] = "true" if screenshot_ok else "false"
+            snapshot.meta["product_images_downloaded"] = str(len(product_images))
+            snapshot_path = write_source_snapshot(snapshot, target_dir / "source-snapshot.json")
+
+            if not screenshot_ok and not product_images:
+                raise SourceCaptureError(
+                    "商品页面结构化资料已采集，但没有获得可用视觉证据：商品原图下载为空，且浏览器整页/当前窗口截图均失败。"
+                    + (f" screenshot={screenshot_note}" if screenshot_note else "")
+                )
+
+            finish_browser_visual_hud(
+                page,
+                success=True,
+                title="商品页信息提取完成",
+                thought=(
+                    f"已完成商品页面采集 · 商品图 {len(product_images)} 张 · "
+                    "结构化证据已写入本次任务。"
+                ),
+                hold_ms=420,
+                destroy=True,
+            )
+        except Exception:
+            finish_browser_visual_hud(
+                page,
+                success=False,
+                title="商品页采集未完成",
+                thought="浏览器采集已停止，Listing Studio 会保留当前页面和错误现场。",
+                hold_ms=260,
+                destroy=True,
+            )
+            raise
+        finally:
+            source_session_lease.release()
+
+    _refresh_capture_cache(source_url, target_dir, cache_root)
+    return CapturedProductSource(
+        snapshot_path=snapshot_path,
+        screenshot_path=screenshot_path,
+        snapshot=snapshot,
+        launched_now=launched_now,
+        product_image_paths=product_images,
+        cache_hit=False,
+    )
+
+
+__all__ = [
+    "CapturedProductSource",
+    "DEFAULT_SOURCE_CDP_PORT",
+    "SourceAccessBlocked",
+    "SOURCE_CAPTURE_CACHE_VERSION",
+    "_canonical_source_url",
+    "_detail_document_urls",
+    "_detail_image_urls_from_text",
+    "_source_cache_key",
+    "capture_product_source",
+    "validate_source_url",
+]

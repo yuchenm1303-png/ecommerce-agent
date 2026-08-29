@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
 import threading
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
@@ -13,17 +10,32 @@ from PySide6.QtWidgets import QLabel, QVBoxLayout
 from app.browser_session import (
     DEFAULT_CDP_PORT,
     DEFAULT_START_URL,
-    cdp_endpoint,
-    is_cdp_ready,
     launch_detached_edge,
 )
+from app.cdp_automation_health import (
+    cdp_endpoint_token,
+    clear_cdp_poison,
+    looks_like_cdp_transport_failure,
+    mark_cdp_poisoned,
+    poison_matches_current_generation,
+    probe_cdp_automation,
+)
+from app.update_browser_gate import close_managed_browser
 
 
 class ManagedMakroBrowser(QObject):
-    """Own the formal GUI's one long-lived Makro browser session."""
+    """Own the formal GUI's one long-lived Makro browser generation.
+
+    Endpoint reachability, browser identity and Playwright automation health are
+    deliberately separate. The GUI probes automation only at idle lifecycle
+    boundaries; it never opens a health-probe transport while a task already owns
+    the browser. A poisoned generation is rotated only when idle, using the same
+    dedicated profile so login state survives while all old targetIds are invalidated.
+    """
 
     status_changed = Signal(str, str)
     _POLL_MS = 1500
+    _PROBE_TIMEOUT_MS = 6_000
 
     def __init__(self, window: Any, *, port: int = DEFAULT_CDP_PORT) -> None:
         super().__init__(window)
@@ -69,7 +81,7 @@ class ManagedMakroBrowser(QObject):
         token = self._cdp_instance_token()
         if token:
             self._instance_token = token
-            self._emit_status("READY", "Makro Browser 已连接 · 登录会话由专用 Profile 复用")
+            self._emit_status("CHECKING", "检测到 Makro Browser · 正在验证自动化控制")
         else:
             self._emit_status("STARTING", "Makro Browser 未运行 · 正在自动启动")
 
@@ -127,8 +139,11 @@ class ManagedMakroBrowser(QObject):
     def _apply_status(self, state: str, detail: str) -> None:
         color = {
             "READY": "#8fe1b9",
+            "CHECKING": "#f4cb7a",
             "STARTING": "#f4cb7a",
             "LOGIN": "#f4cb7a",
+            "POISONED": "#f18da0",
+            "RECOVERING": "#8fc5ff",
             "OFFLINE": "#f18da0",
             "ERROR": "#f18da0",
             "UPDATING": "#8fc5ff",
@@ -142,14 +157,7 @@ class ManagedMakroBrowser(QObject):
             self._batch_label.setStyleSheet(f"color: {color};")
 
     def _cdp_instance_token(self) -> str:
-        try:
-            with urllib.request.urlopen(
-                f"{cdp_endpoint(self.port)}/json/version", timeout=0.45
-            ) as response:
-                payload = json.loads(response.read().decode("utf-8", errors="replace"))
-            return str(payload.get("webSocketDebuggerUrl") or "").strip()
-        except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
-            return ""
+        return cdp_endpoint_token(self.port, timeout_s=0.45)
 
     def _observe_instance(self, token: str) -> None:
         token = str(token or "").strip()
@@ -158,6 +166,17 @@ class ManagedMakroBrowser(QObject):
         if self._instance_token and token != self._instance_token:
             self._generation += 1
         self._instance_token = token
+
+    def _observe_recovered_instance(self, token: str, previous_token: str) -> None:
+        """Commit a recovered generation even if Chromium reuses its WS token."""
+
+        token = str(token or "").strip()
+        previous = str(previous_token or "").strip()
+        if previous and token == previous:
+            self._generation += 1
+            self._instance_token = token
+            return
+        self._observe_instance(token)
 
     @staticmethod
     def _looks_like_login_failure(message: str) -> bool:
@@ -169,11 +188,26 @@ class ManagedMakroBrowser(QObject):
             )
         )
 
+    def _looks_like_makro_cdp_failure(self, message: str) -> bool:
+        text = str(message or "").casefold()
+        if "9333" in text and str(self.port) not in text:
+            # Source Edge owns its own recovery path; never poison Makro 9222 for it.
+            return False
+        return looks_like_cdp_transport_failure(message)
+
     def _observe_failure(self, message: str) -> None:
         if self._looks_like_login_failure(message):
             self._emit_status(
                 "LOGIN",
                 "需要登录 · 请在已打开的 Makro Browser 完成正常登录后直接重试",
+            )
+            return
+        if self._looks_like_makro_cdp_failure(message):
+            token = self._cdp_instance_token()
+            mark_cdp_poisoned(self.port, endpoint_token=token, reason=message)
+            self._emit_status(
+                "POISONED",
+                "浏览器自动化通道失效 · 当前任务会安全失败，空闲后自动恢复",
             )
 
     def _is_busy(self) -> bool:
@@ -230,62 +264,145 @@ class ManagedMakroBrowser(QObject):
         if self._update_quiesced:
             raise RuntimeError("Listing Studio 正在准备更新，暂时不能启动新的上架任务。")
 
+    def _recover_poisoned_locked(self, reason: str, previous_token: str) -> bool:
+        if self._is_busy():
+            raise RuntimeError(
+                "Makro Browser automation generation 已失效，但当前任务仍在运行；"
+                "为保护现场不会中途重启，任务结束后会自动恢复。"
+            )
+
+        self._emit_status("RECOVERING", f"{reason} · 正在安全重建 Makro Browser")
+        closed = close_managed_browser(port=self.port, deadline_s=6.0)
+        if not closed.ok:
+            self._emit_status("ERROR", f"无法安全关闭失效浏览器：{closed.detail}")
+            raise RuntimeError(
+                "Makro Browser automation 已失效，但无法证明并安全关闭专用 Edge；"
+                f"已保留现场。{closed.detail}"
+            )
+
+        launch_detached_edge(
+            profile_dir=self.profile_dir,
+            port=self.port,
+            start_url=DEFAULT_START_URL,
+        )
+        probe = probe_cdp_automation(self.port, timeout_ms=self._PROBE_TIMEOUT_MS)
+        if not probe.automation_ready:
+            mark_cdp_poisoned(
+                self.port,
+                endpoint_token=probe.endpoint_token,
+                reason=probe.error or "recovery automation probe failed",
+            )
+            self._emit_status("POISONED", "新浏览器已启动，但自动化控制仍不可用")
+            raise RuntimeError(
+                "Makro Browser 已用原 Profile 重启，但 Playwright 自动化探针仍失败："
+                f"{probe.error or probe.state}"
+            )
+
+        self._observe_recovered_instance(probe.endpoint_token, previous_token)
+        clear_cdp_poison(self.port)
+        self._emit_status(
+            "READY",
+            "Makro Browser 已安全重建 · 原登录 Profile 已保留 · 旧 owned tabs 已失效",
+        )
+        return True
+
     def ensure_ready(self, reason: str = "task") -> bool:
         if self._update_quiesced:
             raise RuntimeError("Makro Browser 已进入更新冻结状态，不能在安装前重新启动。")
-        token = self._cdp_instance_token()
-        if token:
-            self._observe_instance(token)
-            self._emit_status("READY", "Makro Browser 已连接 · 复用现有登录会话")
-            return False
 
-        self._emit_status("STARTING", f"{reason} · 正在恢复 Makro Browser")
         with self._launch_lock:
             if self._update_quiesced:
                 raise RuntimeError("Makro Browser 已进入更新冻结状态，已取消后台恢复。")
+
             token = self._cdp_instance_token()
             if token:
-                self._observe_instance(token)
-                self._emit_status("READY", "Makro Browser 已恢复 · 复用专用 Profile")
-                return False
+                if self._is_busy():
+                    if poison_matches_current_generation(self.port, token):
+                        raise RuntimeError(
+                            "Makro Browser automation generation 已标记失效；"
+                            "当前任务结束前不会中途重启。"
+                        )
+                    # A running worker already owns the real transport. Never open a
+                    # second health-probe transport underneath it.
+                    return False
+
+                probe = probe_cdp_automation(self.port, timeout_ms=self._PROBE_TIMEOUT_MS)
+                if probe.automation_ready:
+                    self._observe_instance(probe.endpoint_token)
+                    clear_cdp_poison(self.port)
+                    self._emit_status("READY", "Makro Browser 自动化就绪 · 复用现有登录会话")
+                    return False
+
+                mark_cdp_poisoned(
+                    self.port,
+                    endpoint_token=probe.endpoint_token or token,
+                    reason=probe.error or probe.state,
+                )
+                self._emit_status(
+                    "POISONED",
+                    "CDP 端点仍在线，但 Playwright 自动化不可用",
+                )
+                return self._recover_poisoned_locked(reason, token)
+
+            if self._is_busy():
+                raise RuntimeError(
+                    "Makro Browser 在任务运行期间离线；为保护当前页面现场不会中途启动新 generation。"
+                )
+
+            self._emit_status("STARTING", f"{reason} · 正在启动 Makro Browser")
             try:
                 launch_detached_edge(
                     profile_dir=self.profile_dir,
                     port=self.port,
                     start_url=DEFAULT_START_URL,
                 )
-                token = self._cdp_instance_token()
-                if not token or not is_cdp_ready(self.port):
-                    raise RuntimeError("Edge 已启动但 CDP 尚未就绪")
-                self._observe_instance(token)
+                probe = probe_cdp_automation(self.port, timeout_ms=self._PROBE_TIMEOUT_MS)
+                if not probe.automation_ready:
+                    mark_cdp_poisoned(
+                        self.port,
+                        endpoint_token=probe.endpoint_token,
+                        reason=probe.error or probe.state,
+                    )
+                    raise RuntimeError(
+                        "Edge 已启动但 Playwright automation probe 未通过："
+                        f"{probe.error or probe.state}"
+                    )
+                self._observe_instance(probe.endpoint_token)
+                clear_cdp_poison(self.port)
                 self._emit_status("READY", "Makro Browser 已自动启动 · 专用登录 Profile 已载入")
                 return True
             except Exception as exc:
                 if self._update_quiesced:
                     raise RuntimeError("更新准备期间已取消 Makro Browser 自动恢复。") from exc
-                self._emit_status("ERROR", f"Makro Browser 启动失败：{exc}")
+                if self._state != "POISONED":
+                    self._emit_status("ERROR", f"Makro Browser 启动失败：{exc}")
                 raise RuntimeError(
-                    "无法自动启动 Makro Browser。请确认 Microsoft Edge 已安装且内部浏览器端口未被其他程序占用。"
+                    "无法建立可自动化的 Makro Browser。请确认 Microsoft Edge 已安装且专用浏览器端口未被其他程序占用。"
                 ) from exc
 
     def ensure_async(self) -> None:
-        if self._update_quiesced:
+        if self._update_quiesced or self._is_busy():
             return
         if self._launch_thread is not None and self._launch_thread.is_alive():
             return
-        if self._cdp_instance_token():
-            self._poll()
+
+        token = self._cdp_instance_token()
+        if (
+            token
+            and self._state == "READY"
+            and not poison_matches_current_generation(self.port, token)
+        ):
             return
 
         def worker() -> None:
             try:
-                self.ensure_ready("GUI startup")
+                self.ensure_ready("GUI background recovery")
             except Exception:
                 pass
 
         self._launch_thread = threading.Thread(
             target=worker,
-            name="managed-makro-edge-start",
+            name="managed-makro-edge-lifecycle",
             daemon=True,
         )
         self._launch_thread.start()
@@ -297,13 +414,40 @@ class ManagedMakroBrowser(QObject):
         if token:
             previous_generation = self._generation
             self._observe_instance(token)
-            if self._generation != previous_generation:
+            generation_changed = self._generation != previous_generation
+
+            if generation_changed:
+                if self._is_busy():
+                    self._emit_status(
+                        "OFFLINE",
+                        "浏览器在任务运行中被替换 · 当前任务会安全失败，空闲后自动恢复",
+                    )
+                    return
                 self._emit_status(
-                    "READY",
-                    "Makro Browser 已重新连接 · 旧准备页/owned tab 已失效",
+                    "CHECKING",
+                    "检测到新的 Makro Browser generation · 正在验证自动化控制",
                 )
-            elif self._state not in {"READY", "LOGIN"}:
-                self._emit_status("READY", "Makro Browser 已连接 · 复用专用 Profile")
+                self.ensure_async()
+                return
+
+            if poison_matches_current_generation(self.port, token):
+                if self._is_busy():
+                    if self._state != "POISONED":
+                        self._emit_status(
+                            "POISONED",
+                            "自动化通道已失效 · 当前任务会安全失败，空闲后自动恢复",
+                        )
+                    return
+                if self._state != "RECOVERING":
+                    self._emit_status("RECOVERING", "失效 browser generation 正在等待安全重建")
+                self.ensure_async()
+                return
+
+            if self._state not in {"READY", "LOGIN"}:
+                if self._is_busy():
+                    return
+                self._emit_status("CHECKING", "CDP 端点在线 · 正在验证 Playwright automation")
+                self.ensure_async()
             return
 
         if self._is_busy():
