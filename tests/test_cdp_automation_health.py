@@ -82,6 +82,17 @@ def test_poison_marker_is_bound_to_one_browser_generation(monkeypatch, tmp_path:
     )
     assert health.poison_matches_current_generation(9222, "ws://generation-old") is True
 
-    # A new browser generation must not inherit poison from the old one.
     assert health.poison_matches_current_generation(9222, "ws://generation-new") is False
     assert not path.exists()
+
+
+def test_ownership_rejection_is_not_browser_poison() -> None:
+    assert health.looks_like_cdp_transport_failure(
+        "CDP transport lane 9222 已由当前进程树中的父级浏览器阶段持有；禁止嵌套启动第二个浏览器控制阶段。"
+    ) is False
+    assert health.looks_like_cdp_transport_failure(
+        "Makro Edge CDP 9222 已由当前进程树中的父级 Playwright transport 控制；禁止在其仍存活时再次创建独立 EdgeHarness/connect_over_cdp。"
+    ) is False
+    assert health.looks_like_cdp_transport_failure(
+        "BrowserType.connect_over_cdp: Timeout 25000ms exceeded after <ws connected>"
+    ) is True
