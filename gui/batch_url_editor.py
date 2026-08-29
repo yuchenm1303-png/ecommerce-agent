@@ -69,6 +69,7 @@ class BatchUrlRow(QFrame):
 
         self.remove_button = QPushButton("删除")
         self.remove_button.setObjectName("batchUrlRemoveButton")
+        self.remove_button.setProperty("quickStructureMutation", True)
         self.remove_button.setToolTip("删除此链接")
         self.remove_button.setFixedSize(48, _CONTROL_HEIGHT)
         self.remove_button.clicked.connect(lambda: self.editor.remove_row(self))
@@ -245,10 +246,12 @@ class BatchUrlEditor(QWidget):
 
         self.paste_button = QPushButton("批量粘贴")
         self.paste_button.setObjectName("batchToolbarButton")
+        self.paste_button.setProperty("quickStructureMutation", True)
         self.paste_button.setFixedHeight(26)
         self.paste_button.clicked.connect(self.paste_urls)
         self.add_button = QPushButton("+ 添加链接")
         self.add_button.setObjectName("batchToolbarButton")
+        self.add_button.setProperty("quickStructureMutation", True)
         self.add_button.setFixedHeight(26)
         self.add_button.clicked.connect(lambda: self.add_row())
 
@@ -440,6 +443,7 @@ def install_batch_url_editor(workspace: QWidget) -> BatchUrlEditor:
             clear_button.clicked.disconnect()
         except (RuntimeError, TypeError):
             pass
+        clear_button.setProperty("quickStructureMutation", True)
         clear_button.clicked.connect(editor.clear)
 
     is_running = bool(getattr(workspace, "is_running", False))
