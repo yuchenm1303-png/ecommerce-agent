@@ -626,15 +626,7 @@ class BatchWorkspace(QWidget):
 
     @staticmethod
     def _retire_job_card(card: BatchJobCard) -> None:
-        """Retire a card without reparenting an ancestor during child signal dispatch.
-
-        A per-job Delete click emits jobs_changed synchronously while Qt is still
-        dispatching the clicked signal from a QPushButton owned by this card. Calling
-        setParent(None) on the card in that stack mutates the native QWidget ancestry
-        underneath the active child and can crash PySide/Qt at the C++ boundary.
-        Keep ownership with jobs_host, make the stale card non-interactive/invisible,
-        and let Qt destroy it only through the normal deferred-delete boundary.
-        """
+        """Retire a card without reparenting an ancestor during child signal dispatch."""
 
         try:
             card.setEnabled(False)
@@ -643,12 +635,21 @@ class BatchWorkspace(QWidget):
         except RuntimeError:
             pass
 
-    def _apply_jobs(self, jobs: list[BatchJob]) -> None:
-        self._jobs = list(jobs)
-        batch_id = self.controller.batch.batch_id if self.controller.batch is not None else ""
-        if batch_id != self._batch_id:
-            self._batch_id = batch_id
-            self._clear_job_cards()
+    def _quick_task_list_owns_presentation(self) -> bool:
+        """Return whether the legacy QScrollArea is outside the visible QWidget tree."""
+
+        try:
+            return self.job_scroll.parentWidget() is None
+        except RuntimeError:
+            return False
+
+    def _retire_legacy_job_cards(self) -> None:
+        cards = tuple(self._job_cards.values())
+        self._job_cards.clear()
+        for card in cards:
+            self._retire_job_card(card)
+
+    def _sync_legacy_job_cards(self, jobs: list[BatchJob]) -> None:
         seen: set[str] = set()
         for job in jobs:
             seen.add(job.job_id)
@@ -666,9 +667,26 @@ class BatchWorkspace(QWidget):
                 continue
             card = self._job_cards.pop(job_id)
             self._retire_job_card(card)
+
+    def _apply_jobs(self, jobs: list[BatchJob]) -> None:
+        self._jobs = list(jobs)
+        batch_id = self.controller.batch.batch_id if self.controller.batch is not None else ""
+        if batch_id != self._batch_id:
+            self._batch_id = batch_id
+            self._clear_job_cards()
+
+        if self._quick_task_list_owns_presentation():
+            # Quick owns the Batch list. Do not maintain a second hidden QWidget
+            # representation on every 180 ms state publication.
+            self._retire_legacy_job_cards()
+        else:
+            self._sync_legacy_job_cards(self._jobs)
+
         self.empty_state.setVisible(not jobs)
         self.job_count_label.setText(f"{len(jobs)} JOBS")
-        self.execute_button.setEnabled(not self.controller.is_running and any(job.status == "READY" for job in jobs))
+        self.execute_button.setEnabled(
+            not self.controller.is_running and any(job.status == "READY" for job in jobs)
+        )
 
     def _append_controller_log(self, text: str) -> None:
         match = _JOB_LOG_LINE.match(str(text or "").strip())
@@ -683,10 +701,7 @@ class BatchWorkspace(QWidget):
         pending.append(line)
 
     def _clear_job_cards(self) -> None:
-        cards = tuple(self._job_cards.values())
-        self._job_cards.clear()
-        for card in cards:
-            self._retire_job_card(card)
+        self._retire_legacy_job_cards()
         self._pending_logs.clear()
         self.empty_state.setVisible(True)
         self.job_count_label.setText("0 JOBS")
@@ -752,7 +767,10 @@ class BatchWorkspace(QWidget):
         if not callable(open_custom) or not isinstance(body_layout, QVBoxLayout):
             return False
         card = self._job_cards.get(job.job_id)
-        live_log = card.log_text() if card is not None else ""
+        if card is not None:
+            live_log = card.log_text()
+        else:
+            live_log = "\n".join(self._pending_logs.get(job.job_id, ()))
 
         def populate() -> None:
             summary = QLabel(
