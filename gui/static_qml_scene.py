@@ -21,6 +21,31 @@ Item {
     readonly property real wallpaperScale: 1.06
     readonly property var backgroundWindow: Window.window
 
+    // Runtime-only developer controls for tuning the real card surface.  The
+    // values live on the authoritative Quick scene, so every visible card uses
+    // exactly the same tone while the tuner is open.  Nothing is persisted.
+    property int glassRed: 43
+    property int glassGreen: 53
+    property int glassBlue: 92
+    property int glassNormalAlpha: 64
+    property int glassHoverAlpha: 102
+    property bool glassTunerVisible: false
+
+    function hexByte(value) {
+        var text = Math.max(0, Math.min(255, Math.round(value))).toString(16).toUpperCase()
+        return text.length < 2 ? "0" + text : text
+    }
+
+    readonly property string glassHex: "#" + hexByte(glassRed) + hexByte(glassGreen) + hexByte(glassBlue)
+
+    function resetGlassTuner() {
+        glassRed = 43
+        glassGreen = 53
+        glassBlue = 92
+        glassNormalAlpha = 64
+        glassHoverAlpha = 102
+    }
+
     function rootControl(name) {
         var controls = staticBridge.rootControls
         for (var i = 0; i < controls.length; ++i) {
@@ -567,9 +592,9 @@ Item {
                 }
             }
 
-            // One card root owns blur, rose tone, content and interaction. The
-            // legacy native glass is removed from the mask when Quick takes over,
-            // so there is no stationary glass surface underneath this transform.
+            // One card root owns blur, tone, content and interaction. The legacy
+            // native glass is removed from the mask when Quick takes over, so
+            // there is no stationary glass surface underneath this transform.
             Item {
                 id: cardBlurSource
                 anchors.fill: parent
@@ -612,8 +637,16 @@ Item {
                 anchors.fill: parent
                 radius: 6
                 antialiasing: true
-                color: Qt.rgba(43/255, 53/255, 92/255, (cardHover.hovered || cardClick.pressed) ? 102/255 : 64/255)
+                color: Qt.rgba(
+                    staticRoot.glassRed/255,
+                    staticRoot.glassGreen/255,
+                    staticRoot.glassBlue/255,
+                    (cardHover.hovered || cardClick.pressed)
+                        ? staticRoot.glassHoverAlpha/255
+                        : staticRoot.glassNormalAlpha/255
+                )
                 Behavior on color {
+                    enabled: !staticRoot.glassTunerVisible
                     ColorAnimation {
                         duration: 300
                         easing.type: Easing.BezierSpline
@@ -802,6 +835,205 @@ Item {
         sourceComponent: toggleComponent
         onLoaded: if (item) item.d = d
         onDChanged: if (item) item.d = d
+    }
+
+    // Temporary in-program tuner.  It manipulates the same properties consumed
+    // by the production card rectangles, so the preview is the actual UI rather
+    // than a separate approximation.  Close it when evaluating hover animation.
+    Rectangle {
+        id: glassTunerButton
+        width: 92
+        height: 30
+        anchors.top: parent.top
+        anchors.topMargin: 78
+        anchors.right: parent.right
+        anchors.rightMargin: 18
+        radius: 7
+        z: 40000
+        color: glassTunerHover.hovered ? Qt.rgba(0,0,0,178/255) : Qt.rgba(0,0,0,138/255)
+        border.width: 1
+        border.color: Qt.rgba(1,1,1,42/255)
+
+        HoverHandler { id: glassTunerHover }
+        TapHandler {
+            acceptedButtons: Qt.LeftButton
+            onTapped: staticRoot.glassTunerVisible = !staticRoot.glassTunerVisible
+        }
+        Text {
+            anchors.fill: parent
+            text: staticRoot.glassTunerVisible ? "关闭调色" : "玻璃调色"
+            color: "white"
+            font.family: "Microsoft YaHei UI"
+            font.pixelSize: 12
+            font.weight: Font.DemiBold
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+    }
+
+    Rectangle {
+        id: glassTunerPanel
+        width: 356
+        height: 382
+        anchors.top: glassTunerButton.bottom
+        anchors.topMargin: 8
+        anchors.right: parent.right
+        anchors.rightMargin: 18
+        radius: 10
+        z: 40000
+        visible: staticRoot.glassTunerVisible
+        enabled: visible
+        color: Qt.rgba(9/255, 15/255, 28/255, 244/255)
+        border.width: 1
+        border.color: Qt.rgba(1,1,1,52/255)
+
+        MouseArea {
+            anchors.fill: parent
+            acceptedButtons: Qt.AllButtons
+            preventStealing: true
+        }
+
+        Column {
+            anchors.fill: parent
+            anchors.margins: 16
+            spacing: 5
+
+            Row {
+                width: parent.width
+                height: 36
+                spacing: 10
+                Rectangle {
+                    width: 36
+                    height: 36
+                    radius: 7
+                    color: Qt.rgba(
+                        staticRoot.glassRed/255,
+                        staticRoot.glassGreen/255,
+                        staticRoot.glassBlue/255,
+                        1
+                    )
+                    border.width: 1
+                    border.color: Qt.rgba(1,1,1,70/255)
+                }
+                Column {
+                    width: parent.width - 46
+                    height: 36
+                    Text {
+                        text: "真实卡片玻璃调色"
+                        color: "white"
+                        font.family: "Microsoft YaHei UI"
+                        font.pixelSize: 14
+                        font.weight: Font.Bold
+                    }
+                    Text {
+                        text: staticRoot.glassHex + "   RGB " + staticRoot.glassRed + ", " + staticRoot.glassGreen + ", " + staticRoot.glassBlue
+                        color: Qt.rgba(1,1,1,180/255)
+                        font.family: "Cascadia Mono"
+                        font.pixelSize: 10
+                    }
+                }
+            }
+
+            Text {
+                text: "红色  R     " + staticRoot.glassRed
+                color: Qt.rgba(1,1,1,220/255)
+                font.pixelSize: 11
+            }
+            Slider {
+                width: parent.width
+                height: 28
+                from: 0; to: 255; stepSize: 1
+                value: staticRoot.glassRed
+                onMoved: staticRoot.glassRed = Math.round(value)
+            }
+
+            Text {
+                text: "绿色  G     " + staticRoot.glassGreen
+                color: Qt.rgba(1,1,1,220/255)
+                font.pixelSize: 11
+            }
+            Slider {
+                width: parent.width
+                height: 28
+                from: 0; to: 255; stepSize: 1
+                value: staticRoot.glassGreen
+                onMoved: staticRoot.glassGreen = Math.round(value)
+            }
+
+            Text {
+                text: "蓝色  B     " + staticRoot.glassBlue
+                color: Qt.rgba(1,1,1,220/255)
+                font.pixelSize: 11
+            }
+            Slider {
+                width: parent.width
+                height: 28
+                from: 0; to: 255; stepSize: 1
+                value: staticRoot.glassBlue
+                onMoved: staticRoot.glassBlue = Math.round(value)
+            }
+
+            Text {
+                text: "平时颜色深浅     " + staticRoot.glassNormalAlpha + " / 255"
+                color: Qt.rgba(1,1,1,220/255)
+                font.pixelSize: 11
+            }
+            Slider {
+                width: parent.width
+                height: 28
+                from: 0; to: 255; stepSize: 1
+                value: staticRoot.glassNormalAlpha
+                onMoved: staticRoot.glassNormalAlpha = Math.round(value)
+            }
+
+            Text {
+                text: "鼠标移上去后的颜色深浅     " + staticRoot.glassHoverAlpha + " / 255"
+                color: Qt.rgba(1,1,1,220/255)
+                font.pixelSize: 11
+            }
+            Slider {
+                width: parent.width
+                height: 28
+                from: 0; to: 255; stepSize: 1
+                value: staticRoot.glassHoverAlpha
+                onMoved: staticRoot.glassHoverAlpha = Math.round(value)
+            }
+
+            Row {
+                width: parent.width
+                height: 32
+                spacing: 8
+
+                Rectangle {
+                    width: 126
+                    height: 30
+                    radius: 7
+                    color: resetHover.hovered ? Qt.rgba(1,1,1,54/255) : Qt.rgba(1,1,1,34/255)
+                    border.width: 1
+                    border.color: Qt.rgba(1,1,1,42/255)
+                    HoverHandler { id: resetHover }
+                    TapHandler { onTapped: staticRoot.resetGlassTuner() }
+                    Text {
+                        anchors.fill: parent
+                        text: "恢复当前默认值"
+                        color: "white"
+                        font.pixelSize: 11
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+
+                Text {
+                    width: parent.width - 134
+                    height: 30
+                    text: "把 HEX + 两个深浅值发给我即可"
+                    color: Qt.rgba(1,1,1,145/255)
+                    font.pixelSize: 9
+                    verticalAlignment: Text.AlignVCenter
+                    wrapMode: Text.WordWrap
+                }
+            }
+        }
     }
 
     Repeater {
