@@ -34,6 +34,7 @@ on:
       - "requirements-build.txt"
       - "tests/test_batch_architecture_contract.py"
       - "tests/test_cdp_transport_lane.py"
+      - "tests/test_execute_owned_worker.py"
       - "tests/test_windows_packaging_contract.py"
       - "tests/test_velopack_update_contract.py"
       - "tests/test_app_update_ui_contract.py"
@@ -76,7 +77,8 @@ jobs:
             tests/test_app_update_ui_contract.py `
             tests/test_updater_browser_shutdown_contract.py `
             tests/test_batch_architecture_contract.py `
-            tests/test_cdp_transport_lane.py
+            tests/test_cdp_transport_lane.py `
+            tests/test_execute_owned_worker.py
 
       - name: Build Velopack installer and portable package
         shell: pwsh
