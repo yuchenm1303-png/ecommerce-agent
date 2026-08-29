@@ -32,6 +32,15 @@ def test_single_and_batch_share_one_browser_instead_of_spawning_per_job() -> Non
     assert "execute_concurrency" in MANAGER
 
 
+def test_formal_top_level_browser_workspaces_cannot_overlap() -> None:
+    gate = MANAGER.split("    def _assert_task_start_allowed(self) -> None:", 1)[1].split(
+        "    def _recover_poisoned_locked", 1
+    )[0]
+    assert "if self._is_busy():" in gate
+    assert "一个 Makro Edge 只存在一个正式自动化工作域" in gate
+    assert MANAGER.count("self._assert_task_start_allowed()") >= 4
+
+
 def test_browser_generation_uses_endpoint_identity_plus_automation_probe() -> None:
     assert "cdp_endpoint_token(" in MANAGER
     assert "probe_cdp_automation(" in MANAGER
@@ -43,9 +52,6 @@ def test_browser_generation_uses_endpoint_identity_plus_automation_probe() -> No
 
 
 def test_manager_never_directly_closes_playwright_browser_objects() -> None:
-    # Browser-process rotation belongs to the GUI lifecycle owner and must go
-    # through the PID-verified update_browser_gate helper. Never close a shared
-    # Playwright Browser/Context object or kill an arbitrary process directly.
     assert "browser.close(" not in MANAGER
     assert "context.close(" not in MANAGER
     assert "process.kill(" not in MANAGER
