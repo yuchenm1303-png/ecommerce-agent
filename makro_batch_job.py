@@ -22,7 +22,11 @@ from app.batch_step3_prepare import (
 )
 from app.browser_page_owner import page_target_id
 from app.browser_session import EdgeHarness, is_cdp_ready
-from app.cdp_automation_health import looks_like_cdp_transport_failure, mark_cdp_poisoned
+from app.cdp_automation_health import (
+    looks_like_cdp_transport_failure,
+    mark_cdp_poisoned,
+    poison_matches_current_generation,
+)
 from app.cdp_transport_lane import exclusive_cdp_transport_lane
 from app.listing_content_policy import current_listing_intent
 from app.makro.listing_creation import MAKRO_NEW_LISTING_URL, infer_listing_bootstrap
@@ -62,12 +66,7 @@ def _args():
 
 
 def _prepare_owned_step1_with_recovery(page):
-    """Retry only transient Playwright navigation timeouts on the owned tab.
-
-    ``prepare_owned_step1_page`` is state-driven and idempotent. A navigation
-    timeout can therefore re-enter the current Makro state without navigating a
-    verified Step 2/3 draft backwards.
-    """
+    """Retry only transient Playwright navigation timeouts on the owned tab."""
 
     for attempt in range(1, _STEP1_TRANSIENT_ATTEMPTS + 1):
         try:
@@ -192,10 +191,16 @@ def main() -> int:
         vertical = ""
         page_url = ""
 
-        # The lane is the real cross-process transport owner. Multiple Batch jobs
-        # may perform source/AI work concurrently, but only one process may own a
-        # live Playwright transport to the shared Makro Edge at a time.
         with exclusive_cdp_transport_lane(args.cdp_port):
+            # One worker may discover that the current browser generation is
+            # poisoned while sibling workers are already queued for the lane.
+            # They must not repeat the same 25s x 3 attach against that generation.
+            if poison_matches_current_generation(args.cdp_port):
+                raise RuntimeError(
+                    "Makro Browser automation generation 已标记失效；"
+                    "该 Batch worker 不再尝试 attach，等待 GUI 在 Batch 空闲边界安全恢复。"
+                )
+
             with sync_playwright() as playwright:
                 harness: EdgeHarness | None = None
                 try:
@@ -255,9 +260,6 @@ def main() -> int:
             flush=True,
         )
 
-        # Pure AI/planning work now runs outside the one browser transport lane,
-        # so other jobs can enter their own Step1/2/schema browser phase while
-        # this job spends time in image evidence, Resolver and Fill Plan.
         complete_batch_step3_from_schema(
             args,
             run_dir=run_dir,
