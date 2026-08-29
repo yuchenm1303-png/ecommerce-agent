@@ -58,8 +58,17 @@ def test_batch_browser_transport_is_single_while_ai_remains_parallel() -> None:
     assert JOB.index("harness.detach()") < JOB.index("complete_batch_step3_from_schema(")
     assert "transport-lane-" in TRANSPORT
     assert "_try_lock_handle" in TRANSPORT
-    assert '"-m",\n                        "app.cdp_transport_lane"' in PARALLEL
+    assert "python_args_under_transport_lane" in PARALLEL
     assert "mode=exclusive-write" in PARALLEL
+
+
+def test_batch_top_level_rejects_cross_workspace_overlap_before_session_lease() -> None:
+    start = PARALLEL.split("        def start_prepare(", 1)[1].split(
+        "        def start_execution(", 1
+    )[0]
+    assert "runtime._assert_top_level_idle()" in start
+    assert start.index("runtime._assert_top_level_idle()") < start.index("runtime.manager.ensure_ready(")
+    assert start.index("runtime._assert_top_level_idle()") < start.index("runtime._ensure_owner(")
 
 
 def test_ready_job_can_execute_while_other_batch_jobs_keep_preparing() -> None:
