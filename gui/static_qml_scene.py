@@ -293,8 +293,12 @@ Item {
                 selectionColor: Qt.rgba(1, 1, 1, 58/255); selectedTextColor: "white"
                 font.family: d && d.fontFamily ? d.fontFamily : "Microsoft YaHei UI"
                 font.pixelSize: d && d.fontSize ? d.fontSize : 13
+                horizontalAlignment: TextInput.AlignLeft
                 verticalAlignment: TextInput.AlignVCenter; clip: true
                 onTextEdited: if (d && !d.readOnly) staticBridge.setText(d.key, text)
+                onActiveFocusChanged: if (!activeFocus) cursorPosition = 0
+                onTextChanged: if (!activeFocus) cursorPosition = 0
+                Component.onCompleted: if (!activeFocus) cursorPosition = 0
             }
         }
     }
