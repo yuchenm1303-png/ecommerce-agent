@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from app.app_branding import application_icon_bytes
+from gui.frozen_process_router import route_process_start
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = (ROOT / "app" / "runtime_paths.py").read_text(encoding="utf-8")
@@ -15,6 +16,7 @@ ICON_DATA = (ROOT / "app" / "app_icon_data.py").read_text(encoding="utf-8")
 ICON_GENERATOR = (ROOT / "scripts" / "generate_app_icon.py").read_text(encoding="utf-8")
 ROUTER = (ROOT / "gui" / "frozen_process_router.py").read_text(encoding="utf-8")
 WORKER = (ROOT / "run_packaged_worker.py").read_text(encoding="utf-8")
+OWNED_EXECUTOR = (ROOT / "makro_execute_owned.py").read_text(encoding="utf-8")
 RUN = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 QUICK_BATCH = (ROOT / "gui" / "quick_batch_list.py").read_text(encoding="utf-8")
 SPEC = (ROOT / "packaging" / "EcommerceAgent.spec").read_text(encoding="utf-8")
@@ -27,6 +29,7 @@ def test_packaging_python_sources_compile() -> None:
         (ROOT / "app" / "runtime_paths.py", RUNTIME),
         (ROOT / "app" / "velopack_runtime.py", VELOPACK_RUNTIME),
         (ROOT / "packaging" / "velopack_runtime_hook.py", RUNTIME_HOOK),
+        (ROOT / "makro_execute_owned.py", OWNED_EXECUTOR),
         (ROOT / "run_local_gui.py", RUN),
         (ROOT / "gui" / "quick_batch_list.py", QUICK_BATCH),
     ):
@@ -72,8 +75,24 @@ def test_frozen_runtime_keeps_mutable_state_outside_versioned_current_dir() -> N
 
 def test_gui_worker_routing_contract_remains_unchanged() -> None:
     assert '"EcommerceAgentWorker.exe"' in ROUTER
+    assert '"makro_execute_owned.py"' in ROUTER
+    assert '"execute-owned": ("makro_execute_owned.py", execute_owned_main)' in WORKER
     assert 'if argv[0] == "--self-test":' in WORKER
     assert "from playwright.sync_api import sync_playwright" in WORKER
+
+
+def test_frozen_owned_execute_routes_to_worker_exe_not_gui_exe(tmp_path: Path) -> None:
+    gui = tmp_path / "EcommerceAgent.exe"
+    worker = tmp_path / "EcommerceAgentWorker.exe"
+    program, args = route_process_start(
+        str(gui),
+        ["makro_execute_owned.py", "--help"],
+        frozen=True,
+        current_executable=str(gui),
+        worker_executable=str(worker),
+    )
+    assert Path(program) == worker.resolve()
+    assert args == ["makro_execute_owned.py", "--help"]
 
 
 def test_pyinstaller_is_onedir_and_embeds_velopack_runtime_hook() -> None:
@@ -93,7 +112,7 @@ def test_velopack_toolchain_is_pinned_and_build_replaces_inno() -> None:
     assert "dotnet tool restore" in BUILD
     assert "dotnet tool run vpk -- @PackArgs" in BUILD
     assert '"pack"' in BUILD
-    assert '"--packId", $PackId' in BUILD
+    assert '"--packId", "EcommerceAgent"' in BUILD
     assert '"--mainExe", "EcommerceAgent.exe"' in BUILD
     assert '"--runtime", "win-x64"' in BUILD
     assert "ISCC.exe" not in BUILD
@@ -107,6 +126,8 @@ def test_windows_ci_smokes_canonical_velopack_layout_and_uninstall() -> None:
     assert '"--silent", "--installto", $installDir' in WINDOWS
     assert 'Join-Path $installDir "Update.exe"' in WINDOWS
     assert 'Join-Path $installDir "current\\EcommerceAgent.exe"' in WINDOWS
+    assert '& $worker makro_execute_owned.py --help' in WINDOWS
+    assert "Installed owned-execute worker dispatch failed" in WINDOWS
     assert 'ArgumentList @("--silent", "uninstall")' in WINDOWS
     assert "Velopack uninstall left installation root behind" in WINDOWS
     assert "Inno Setup" not in WINDOWS
