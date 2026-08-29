@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 
@@ -15,6 +16,7 @@ ICON_GENERATOR = (ROOT / "scripts" / "generate_app_icon.py").read_text(encoding=
 ROUTER = (ROOT / "gui" / "frozen_process_router.py").read_text(encoding="utf-8")
 WORKER = (ROOT / "run_packaged_worker.py").read_text(encoding="utf-8")
 RUN = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
+QUICK_BATCH = (ROOT / "gui" / "quick_batch_list.py").read_text(encoding="utf-8")
 SPEC = (ROOT / "packaging" / "EcommerceAgent.spec").read_text(encoding="utf-8")
 BUILD = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
 WINDOWS = (ROOT / ".github" / "workflows" / "windows-package.yml").read_text(encoding="utf-8")
@@ -26,8 +28,17 @@ def test_packaging_python_sources_compile() -> None:
         (ROOT / "app" / "velopack_runtime.py", VELOPACK_RUNTIME),
         (ROOT / "packaging" / "velopack_runtime_hook.py", RUNTIME_HOOK),
         (ROOT / "run_local_gui.py", RUN),
+        (ROOT / "gui" / "quick_batch_list.py", QUICK_BATCH),
     ):
         compile(source, str(path), "exec")
+
+
+def test_quick_batch_role_initialization_is_import_safe() -> None:
+    assert "_ROLES = {name: _BASE + index + 1" not in QUICK_BATCH
+    assert "name: int(Qt.ItemDataRole.UserRole) + index + 1" in QUICK_BATCH
+    module = importlib.import_module("gui.quick_batch_list")
+    assert module.QuickBatchList._ROLES
+    assert module.QuickBatchList._ROLE_KEYS
 
 
 def test_approved_application_icon_is_preserved() -> None:
