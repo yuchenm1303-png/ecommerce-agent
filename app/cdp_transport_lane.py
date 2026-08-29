@@ -8,7 +8,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
 
 from .browser_session import _cdp_lock_root, _try_lock_handle, _unlock_handle
 
@@ -26,13 +26,29 @@ def _transport_lane_lock_path(port: int) -> Path:
     return _cdp_lock_root() / f"transport-lane-{int(port)}.lock"
 
 
+def python_args_under_transport_lane(port: int, argv: Sequence[str]) -> list[str]:
+    """Route one Python browser entrypoint through the canonical CDP lane."""
+
+    command = [str(value) for value in argv]
+    if not command:
+        raise ValueError("transport lane requires a Python child command")
+    return [
+        "-m",
+        "app.cdp_transport_lane",
+        "--port",
+        str(int(port)),
+        "--",
+        *command,
+    ]
+
+
 @contextmanager
 def exclusive_cdp_transport_lane(port: int) -> Iterator[None]:
     """Own the only active Playwright transport lane for one local CDP port.
 
-    ``cdp_attach_guard`` only serializes the handshake. Batch workers need a
-    stronger invariant: while one worker owns a live Playwright transport, no
-    sibling worker may create another transport to the same long-lived Edge.
+    ``cdp_attach_guard`` only serializes the handshake. Formal GUI browser jobs
+    need a stronger invariant: while one job owns a live Playwright transport, no
+    sibling process may create another transport to the same long-lived Edge.
 
     The OS file lock spans the caller's browser-control phase and is released by
     the kernel if the worker crashes. A process-tree marker makes accidental
@@ -124,6 +140,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "exclusive_cdp_transport_lane",
+    "python_args_under_transport_lane",
     "_transport_lane_env_key",
     "_transport_lane_lock_path",
 ]
