@@ -14,9 +14,6 @@ from .cdp_transport_lane import exclusive_cdp_transport_lane
 from .update_browser_gate import close_managed_browser
 
 
-# Keep the historical public import surface stable while the large page-capture
-# engine remains focused on one capture attempt. This module owns only the
-# dedicated Source Edge lifecycle around that engine.
 CapturedProductSource = _engine.CapturedProductSource
 DEFAULT_SOURCE_CDP_PORT = _engine.DEFAULT_SOURCE_CDP_PORT
 SourceAccessBlocked = _engine.SourceAccessBlocked
@@ -132,7 +129,11 @@ def capture_product_source(
                 port=port,
                 start_url=source_url,
             )
-            probe = probe_cdp_automation(port, timeout_ms=8_000)
+            probe = probe_cdp_automation(
+                port,
+                timeout_ms=8_000,
+                transport_lane_owned=True,
+            )
             if not probe.automation_ready:
                 mark_cdp_poisoned(
                     port,
