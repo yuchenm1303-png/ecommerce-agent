@@ -174,7 +174,9 @@ Item {
     Component {
         id: buttonComponent
         Item {
+            id: buttonRoot
             property var d
+            readonly property real textInset: Math.min(14, Math.max(6, width * 0.15))
             HoverHandler { id: buttonHover }
             TapHandler {
                 id: buttonTap
@@ -191,8 +193,8 @@ Item {
             }
             Text {
                 anchors.fill: parent
-                anchors.leftMargin: 14
-                anchors.rightMargin: 14
+                anchors.leftMargin: buttonRoot.textInset
+                anchors.rightMargin: buttonRoot.textInset
                 text: d ? d.text : ""
                 color: d && d.enabled ? "white" : Qt.rgba(1, 1, 1, 76/255)
                 font.family: d && d.fontFamily ? d.fontFamily : "Microsoft YaHei UI"
