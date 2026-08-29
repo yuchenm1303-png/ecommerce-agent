@@ -6,6 +6,8 @@ from __future__ import annotations
 STATIC_QML_SOURCE = r'''
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Window
+import QtQuick.Effects
 
 Item {
     id: staticRoot
@@ -15,6 +17,9 @@ Item {
     enabled: visible
     z: 10000
     focus: visible
+
+    readonly property real wallpaperScale: 1.06
+    readonly property var backgroundWindow: Window.window
 
     function rootControl(name) {
         var controls = staticBridge.rootControls
@@ -562,16 +567,47 @@ Item {
                 }
             }
 
-            // Keep the known-smooth architecture: native_background.py owns the
-            // cached blur, while this card owns only its tone, content and GPU
-            // transform. Scroll viewport clipping is applied only to flattened
-            // child controls below; the card itself remains one unclipped GPU item.
+            // One card root owns blur, rose tone, content and interaction. The
+            // legacy native glass is removed from the mask when Quick takes over,
+            // so there is no stationary glass surface underneath this transform.
+            Item {
+                id: cardBlurSource
+                anchors.fill: parent
+                visible: false
+                layer.enabled: true
+                layer.smooth: true
+
+                Image {
+                    width: staticRoot.width * staticRoot.wallpaperScale
+                    height: staticRoot.height * staticRoot.wallpaperScale
+                    x: (staticRoot.backgroundWindow ? Number(staticRoot.backgroundWindow.imageX) : (staticRoot.width - width) / 2) - card.x
+                    y: (staticRoot.backgroundWindow ? Number(staticRoot.backgroundWindow.imageY) : (staticRoot.height - height) / 2) - card.y
+                    source: staticRoot.backgroundWindow ? staticRoot.backgroundWindow.blurUrl : ""
+                    fillMode: Image.PreserveAspectCrop
+                    smooth: true
+                    cache: true
+                }
+            }
+
             Rectangle {
+                id: cardRoundMask
                 anchors.fill: parent
                 radius: 6
-                color: "#56354E"
-                opacity: (cardHover.hovered || cardClick.pressed) ? 102/255 : 64/255
-                Behavior on opacity {
+                visible: false
+                color: "white"
+                layer.enabled: true
+            }
+
+            MultiEffect {
+                id: cardGlassBody
+                anchors.fill: parent
+                source: cardBlurSource
+                maskEnabled: true
+                maskSource: cardRoundMask
+                autoPaddingEnabled: false
+                colorizationColor: "#56354E"
+                colorization: (cardHover.hovered || cardClick.pressed) ? 180/255 : 142/255
+                Behavior on colorization {
                     NumberAnimation {
                         duration: 300
                         easing.type: Easing.BezierSpline

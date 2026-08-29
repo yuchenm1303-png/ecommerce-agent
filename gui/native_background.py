@@ -12,6 +12,7 @@ from PySide6.QtCore import (
     QObject,
     QPoint,
     QRectF,
+    Signal,
     Qt,
     QTimer,
     QUrl,
@@ -74,6 +75,8 @@ def _blur_wallpaper(source: QImage, radius: float = 10.0) -> QImage:
 
 class GlassCardModel(QAbstractListModel):
     """Card geometry and interaction state consumed directly by the Quick scene."""
+
+    maskInvalidated = Signal()
 
     _ROLE_BASE = int(Qt.ItemDataRole.UserRole)
     CARD_X_ROLE = _ROLE_BASE + 1
@@ -269,12 +272,15 @@ class GlassCardModel(QAbstractListModel):
         alpha = max(0.0, min(255.0, float(alpha)))
         state = self._states[row]
         roles: list[int] = []
+        previous_alpha = float(state["cardAlpha"])
         if abs(float(state["cardScale"]) - scale) >= 0.0001:
             state["cardScale"] = scale
             roles.append(self.SCALE_ROLE)
-        if abs(float(state["cardAlpha"]) - alpha) >= 0.1:
+        if abs(previous_alpha - alpha) >= 0.1:
             state["cardAlpha"] = alpha
             roles.append(self.ALPHA_ROLE)
+            if (previous_alpha <= 0.1) != (alpha <= 0.1):
+                self.maskInvalidated.emit()
         if roles:
             index = self.index(row, 0)
             self.dataChanged.emit(index, index, roles)
@@ -370,6 +376,7 @@ Window {{
                     height: cardH
                     radius: {_GLASS_RADIUS:.1f}
                     antialiasing: true
+                    visible: cardAlpha > 0.1
                     color: "white"
                 }}
             }}
@@ -482,6 +489,7 @@ class NativeQuickBackground(QObject):
             if frame.objectName() in _GLASS_NAMES
         ]
         self.card_model = GlassCardModel(overlay, self._cards, self)
+        self.card_model.maskInvalidated.connect(self._invalidate_glass_mask)
         self._geometry_watch: set[QObject] = {overlay}
         for frame in self._cards:
             current: QWidget | None = frame
@@ -550,6 +558,19 @@ class NativeQuickBackground(QObject):
         blurred = _blur_wallpaper(image)
         if blurred.isNull() or not blurred.save(str(self._blur_path), "JPG", 92):
             raise RuntimeError("Failed to create the pre-blurred wallpaper")
+
+    def _invalidate_glass_mask(self) -> None:
+        if self._shutting_down:
+            return
+        self._geometry_revision += 1
+        quick = self.quick_window
+        if quick is None:
+            return
+        try:
+            quick.setProperty("geometryRevision", self._geometry_revision)
+            quick.requestUpdate()
+        except RuntimeError:
+            pass
 
     def set_card_alpha(self, frame: QFrame, alpha: float) -> None:
         self.card_model.set_alpha(frame, alpha)
