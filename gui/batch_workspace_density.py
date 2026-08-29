@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .numeric_field_chrome import install_numeric_field_chrome
+
 
 _SUMMARY_META = (
     ("TOTAL · 全部任务", "本批次全部商品"),
@@ -69,6 +71,24 @@ def install_batch_workspace_density(workspace: QWidget) -> None:
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Maximum,
         )
+
+    # QML intentionally does not emulate platform QSpinBox chrome. Build the
+    # prompt/value/stepper structure once in the authoritative QWidget layout so
+    # both renderers expose the same controls and the original QSpinBox remains
+    # the sole value owner used by BatchController.
+    numeric_chromes = []
+    for field_name, prompt_width, value_width in (
+        ("makro_port", 102, 76),
+        ("source_port", 102, 76),
+        ("worker_count", 118, 62),
+    ):
+        chrome = install_numeric_field_chrome(
+            getattr(workspace, field_name, None),
+            prompt_width=prompt_width,
+            value_width=value_width,
+        )
+        if chrome is not None:
+            numeric_chromes.append(chrome)
 
     # Keep the six overview cards visible and useful instead of reducing them to
     # tiny pills. They remain one row, with an additional explanatory line.
@@ -146,6 +166,7 @@ def install_batch_workspace_density(workspace: QWidget) -> None:
             QSizePolicy.Policy.Maximum,
         )
 
+    setattr(workspace, "_batch_numeric_chromes", numeric_chromes)
     setattr(workspace, "_batch_summary_detail_labels", detail_labels)
     setattr(workspace, "_batch_density_installed", True)
 
