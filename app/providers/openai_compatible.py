@@ -29,15 +29,34 @@ class OpenAICompatibleResponseError(JSONTaskResponseError, OpenAICompatibleProvi
 SUPPORTED_COMPAT_PROFILES = ("generic", "qwen-omni")
 _PROGRESS_INTERVAL_SECONDS = 15.0
 _PRODUCT_FACT_TASK = "resolve_compact_product_facts"
+_CANONICAL_JPEG_DATA_URI_PREFIX = "data:image/jpeg;base64,"
 
 
 def _image_data_uri(path_value: str) -> str:
-    """Serialize one captured image from its bytes, never from its filename."""
+    """Return one model-ready image payload with exactly one normalization boundary.
+
+    Image-evidence requests already carry canonical JPEG bytes produced by the shared
+    media boundary. Those bytes are forwarded verbatim. Other callers may still pass
+    local source paths; they are normalized here once for backward compatibility.
+    """
+
+    value = str(path_value or "").strip()
+    if value.startswith(_CANONICAL_JPEG_DATA_URI_PREFIX):
+        encoded = value[len(_CANONICAL_JPEG_DATA_URI_PREFIX) :]
+        try:
+            if not encoded:
+                raise ValueError("empty payload")
+            base64.b64decode(encoded, validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise OpenAICompatibleProviderError(
+                "OpenAI-compatible provider 收到无效的 canonical JPEG data URI。"
+            ) from exc
+        return value
 
     try:
-        data, media = read_image_media(path_value)
+        data, media = read_image_media(value)
     except ImageMediaError as exc:
-        raise OpenAICompatibleProviderError(f"OpenAI-compatible provider 无法读取图片：{path_value}") from exc
+        raise OpenAICompatibleProviderError(f"OpenAI-compatible provider 无法读取图片：{value}") from exc
     encoded = base64.b64encode(data).decode("ascii")
     return f"data:{media.mime_type};base64,{encoded}"
 

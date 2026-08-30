@@ -1,28 +1,25 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
-import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any, Iterable, Protocol
 
-from PIL import Image, ImageOps, UnidentifiedImageError
-
 from .failure_contract import FailureScope, classify_provider_failure
-from .image_media import ImageMediaError, read_image_media
+from .image_media import ImageMediaError, normalize_image_media
 from .providers.usage_telemetry import usage_request_context
 from .semantic_grounding import GroundedSource, IMAGE_KIND, TEXT_KIND
 
 
-IMAGE_EVIDENCE_CONTRACT_VERSION = 3
-IMAGE_EVIDENCE_CACHE_VERSION = 3
+IMAGE_EVIDENCE_CONTRACT_VERSION = 4
+IMAGE_EVIDENCE_CACHE_VERSION = 4
 _IMAGE_BATCH_MAX_ATTEMPTS = 3
 _IMAGE_BATCH_BACKOFF_SECONDS = (0.35, 0.85)
-_AI_IMAGE_INPUT_VERSION = 2
+_AI_IMAGE_INPUT_VERSION = 3
 _AI_IMAGE_MAX_LONG_EDGE = 2048
 _AI_IMAGE_MAX_PIXEL_AREA = 4_000_000
 _AI_IMAGE_MAX_BYTES = 4 * 1024 * 1024
@@ -211,7 +208,7 @@ def image_evidence_contract_digest() -> str:
             "schema": "exact keyed per-image observations",
             "model_image_input": {
                 "version": _AI_IMAGE_INPUT_VERSION,
-                "media_contract": "content-verified canonical-jpeg",
+                "media_contract": "single-pass-canonical-jpeg-data-uri",
                 "max_long_edge": _AI_IMAGE_MAX_LONG_EDGE,
                 "max_pixel_area": _AI_IMAGE_MAX_PIXEL_AREA,
                 "max_bytes": _AI_IMAGE_MAX_BYTES,
@@ -241,82 +238,46 @@ def _cache_path(root: Path, provider: JSONTaskProvider, namespace: str, source: 
     return root / f"image-observation-{_cache_key(provider, namespace, source)}.json"
 
 
-def _prepare_model_input_source(source: GroundedSource, output_dir: Path) -> GroundedSource:
-    """Create one canonical provider transport image without changing provenance.
+def _prepare_model_input_source(source: GroundedSource) -> GroundedSource:
+    """Canonicalize one image exactly once and carry the verified bytes to the provider.
 
-    Raw supplier artifacts are evidence and may use opaque suffixes such as .img.
-    Model transport is a different boundary: bytes must establish supported image
-    media, Pillow must be able to decode them, and the payload is always emitted as
-    bounded RGB JPEG. A malformed supplier artifact is rejected here before a model
-    batch is created, so it can be isolated without poisoning valid images.
+    Supplier artifacts remain immutable provenance. This transport boundary reads the
+    original file, decodes it once, emits one bounded RGB JPEG, and embeds those exact
+    verified bytes as a data URI. Downstream providers must forward that payload
+    verbatim instead of reopening or re-normalizing a temporary file.
     """
 
     path = Path(source.image_path)
     try:
-        _raw, _media = read_image_media(path)
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ImageEvidenceError(f"{source.source_id}: unable to read image file: {path}") from exc
+
+    try:
+        canonical, media = normalize_image_media(
+            raw,
+            source=path.name,
+            max_long_edge=_AI_IMAGE_MAX_LONG_EDGE,
+            max_pixel_area=_AI_IMAGE_MAX_PIXEL_AREA,
+            max_bytes=_AI_IMAGE_MAX_BYTES,
+            jpeg_quality=_AI_IMAGE_JPEG_QUALITY,
+        )
     except ImageMediaError as exc:
         raise ImageEvidenceError(f"{source.source_id}: {exc}") from exc
 
-    try:
-        with Image.open(path) as opened:
-            frame = ImageOps.exif_transpose(opened)
-            frame.load()
-    except (UnidentifiedImageError, OSError, ValueError) as exc:
-        raise ImageEvidenceError(f"{source.source_id}: image payload is not decodable") from exc
-
-    width, height = int(frame.width), int(frame.height)
-    if width <= 0 or height <= 0:
-        raise ImageEvidenceError(f"{source.source_id}: image has invalid dimensions")
-
-    scale = min(
-        1.0,
-        _AI_IMAGE_MAX_LONG_EDGE / max(width, height),
-        math.sqrt(_AI_IMAGE_MAX_PIXEL_AREA / (width * height)),
-    )
-    target_size = (
-        max(1, int(round(width * scale))),
-        max(1, int(round(height * scale))),
-    )
-    if target_size != frame.size:
-        resampling = getattr(Image, "Resampling", Image).LANCZOS
-        frame = frame.resize(target_size, resampling)
-
-    if "A" in frame.getbands():
-        rgba = frame.convert("RGBA")
-        flattened = Image.new("RGB", rgba.size, "white")
-        flattened.paste(rgba, mask=rgba.getchannel("A"))
-        frame = flattened
-    else:
-        frame = frame.convert("RGB")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    digest = source.sha256[:24] or hashlib.sha256(str(path).encode()).hexdigest()[:24]
-    target = output_dir / f"{digest}.jpg"
-    quality = _AI_IMAGE_JPEG_QUALITY
-    frame.save(target, format="JPEG", quality=quality, optimize=True)
-
-    while target.stat().st_size > _AI_IMAGE_MAX_BYTES and max(frame.size) > 768:
-        next_size = (
-            max(1, int(round(frame.width * 0.82))),
-            max(1, int(round(frame.height * 0.82))),
-        )
-        resampling = getattr(Image, "Resampling", Image).LANCZOS
-        frame = frame.resize(next_size, resampling)
-        quality = max(68, quality - 5)
-        frame.save(target, format="JPEG", quality=quality, optimize=True)
-
-    if target.stat().st_size > _AI_IMAGE_MAX_BYTES:
+    if media.mime_type != "image/jpeg":
         raise ImageEvidenceError(
-            f"{source.source_id}: canonical image exceeds {_AI_IMAGE_MAX_BYTES} byte transport budget"
+            f"{source.source_id}: canonical image transport must be JPEG, got {media.mime_type}"
         )
 
+    data_uri = "data:image/jpeg;base64," + base64.b64encode(canonical).decode("ascii")
     return GroundedSource(
         source_id=source.source_id,
         source_type=source.source_type,
         kind=source.kind,
         origin=source.origin,
         content=source.content,
-        image_path=str(target),
+        image_path=data_uri,
         sha256=source.sha256,
     )
 
@@ -491,11 +452,13 @@ def run_image_evidence(
 ) -> ImageEvidenceRunResult:
     """Resolve image evidence through one validated, bounded transport boundary.
 
-    Supplier artifacts remain immutable provenance. Every uncached image is first
-    content-validated and canonicalized into a temporary JPEG. Local media failures
-    and provider-side media inspection/rejection are isolated to the smallest image
-    unit. A rejected multi-image request is split into single-image requests exactly
-    once; rejected singles become warnings while valid siblings continue. Account,
+    Supplier artifacts remain immutable provenance. Every uncached image is
+    canonicalized once into bounded JPEG bytes before any model request. Local media
+    failures are isolated before batching; the verified bytes then travel inline to
+    the provider so no temporary-file reopen or second normalization exists.
+    Provider-side media rejection is still isolated to the smallest image unit. A
+    rejected multi-image request is split into single-image requests exactly once;
+    rejected singles become warnings while valid siblings continue. Account,
     authentication and non-media provider failures remain fail-closed. Text evidence
     lets a run continue when some or all images are unusable.
     """
@@ -549,102 +512,97 @@ def run_image_evidence(
     preparation_warnings: list[str] = []
     preparation_failed_images: list[str] = []
 
-    temporary = TemporaryDirectory(prefix="ecommerce-image-evidence-")
-    try:
-        prepared_root = Path(temporary.name)
-        prepared_pending: list[GroundedSource] = []
-        for source in pending:
-            try:
-                prepared_pending.append(_prepare_model_input_source(source, prepared_root))
-            except ImageEvidenceError as exc:
-                preparation_failed_images.append(source.source_id)
-                preparation_warnings.append(
-                    f"image evidence skipped {source.source_id} before model call: {exc}"
-                )
+    prepared_pending: list[GroundedSource] = []
+    for source in pending:
+        try:
+            prepared_pending.append(_prepare_model_input_source(source))
+        except ImageEvidenceError as exc:
+            preparation_failed_images.append(source.source_id)
+            preparation_warnings.append(
+                f"image evidence skipped {source.source_id} before model call: {exc}"
+            )
 
-        initial_batches = [
-            prepared_pending[index : index + int(batch_size)]
-            for index in range(0, len(prepared_pending), int(batch_size))
-        ]
+    initial_batches = [
+        prepared_pending[index : index + int(batch_size)]
+        for index in range(0, len(prepared_pending), int(batch_size))
+    ]
 
-        def execute(batch_specs: list[tuple[int, list[GroundedSource]]]) -> list[_BatchResult]:
-            completed: list[_BatchResult] = []
-            if not batch_specs:
-                return completed
-            with ThreadPoolExecutor(
-                max_workers=min(int(concurrency), len(batch_specs)),
-                thread_name_prefix="image-evidence",
-            ) as executor:
-                futures = {
-                    executor.submit(_run_batch, provider, index, batch): index
-                    for index, batch in batch_specs
-                }
-                for future in as_completed(futures):
-                    run = future.result()
-                    completed.append(run)
-                    all_runs.append(run)
-                    if run.warning:
-                        continue
-                    for observation in run.observations:
-                        observations[observation.image_id] = observation
-                        _write_cached_observation(
-                            observation,
-                            source=source_by_id[observation.image_id],
-                            cache_root=cache_root,
-                            provider=provider,
-                            cache_namespace=cache_namespace,
-                        )
+    def execute(batch_specs: list[tuple[int, list[GroundedSource]]]) -> list[_BatchResult]:
+        completed: list[_BatchResult] = []
+        if not batch_specs:
             return completed
+        with ThreadPoolExecutor(
+            max_workers=min(int(concurrency), len(batch_specs)),
+            thread_name_prefix="image-evidence",
+        ) as executor:
+            futures = {
+                executor.submit(_run_batch, provider, index, batch): index
+                for index, batch in batch_specs
+            }
+            for future in as_completed(futures):
+                run = future.result()
+                completed.append(run)
+                all_runs.append(run)
+                if run.warning:
+                    continue
+                for observation in run.observations:
+                    observations[observation.image_id] = observation
+                    _write_cached_observation(
+                        observation,
+                        source=source_by_id[observation.image_id],
+                        cache_root=cache_root,
+                        provider=provider,
+                        cache_namespace=cache_namespace,
+                    )
+        return completed
 
-        initial_specs = [
-            (index, batch)
-            for index, batch in enumerate(initial_batches, start=1)
-        ]
-        initial_runs = execute(initial_specs)
+    initial_specs = [
+        (index, batch)
+        for index, batch in enumerate(initial_batches, start=1)
+    ]
+    initial_runs = execute(initial_specs)
 
-        fatal_initial = [
-            run
-            for run in initial_runs
-            if run.warning
-            and run.error is not None
-            and not _is_batch_local_degradable_error(run.error)
-        ]
-        if fatal_initial:
-            raise ImageEvidenceError("; ".join(run.warning for run in fatal_initial))
+    fatal_initial = [
+        run
+        for run in initial_runs
+        if run.warning
+        and run.error is not None
+        and not _is_batch_local_degradable_error(run.error)
+    ]
+    if fatal_initial:
+        raise ImageEvidenceError("; ".join(run.warning for run in fatal_initial))
 
-        split_runs = [
-            run
-            for run in initial_runs
-            if run.warning
-            and run.error is not None
-            and _should_split_failed_batch(run.error, len(run.images))
-        ]
-        final_failures.extend(
-            run
-            for run in initial_runs
-            if run.warning and run not in split_runs
-        )
+    split_runs = [
+        run
+        for run in initial_runs
+        if run.warning
+        and run.error is not None
+        and _should_split_failed_batch(run.error, len(run.images))
+    ]
+    final_failures.extend(
+        run
+        for run in initial_runs
+        if run.warning and run not in split_runs
+    )
 
-        next_index = len(initial_specs) + 1
-        recovery_specs: list[tuple[int, list[GroundedSource]]] = []
-        for run in split_runs:
-            for source in run.images:
-                recovery_specs.append((next_index, [source]))
-                next_index += 1
+    next_index = len(initial_specs) + 1
+    recovery_specs: list[tuple[int, list[GroundedSource]]] = []
+    for run in split_runs:
+        for source in run.images:
+            recovery_specs.append((next_index, [source]))
+            next_index += 1
 
-        recovery_runs = execute(recovery_specs)
-        fatal_recovery = [
-            run
-            for run in recovery_runs
-            if run.warning
-            and run.error is not None
-            and not _is_batch_local_degradable_error(run.error)
-        ]
-        if fatal_recovery:
-            raise ImageEvidenceError("; ".join(run.warning for run in fatal_recovery))
-        final_failures.extend(run for run in recovery_runs if run.warning)
-    finally:
-        temporary.cleanup()
+    recovery_runs = execute(recovery_specs)
+    fatal_recovery = [
+        run
+        for run in recovery_runs
+        if run.warning
+        and run.error is not None
+        and not _is_batch_local_degradable_error(run.error)
+    ]
+    if fatal_recovery:
+        raise ImageEvidenceError("; ".join(run.warning for run in fatal_recovery))
+    final_failures.extend(run for run in recovery_runs if run.warning)
 
     ordered = [
         observations[source.source_id]
