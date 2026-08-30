@@ -39,7 +39,7 @@ from .supplier_url_identity import supplier_request_identity
 
 
 DEFAULT_SOURCE_CDP_PORT = 9333
-SOURCE_CAPTURE_CACHE_VERSION = 7
+SOURCE_CAPTURE_CACHE_VERSION = 8
 _DETAIL_DOCUMENT_MAX_BYTES = 8 * 1024 * 1024
 _PRODUCT_IMAGE_MAX_BYTES = 64 * 1024 * 1024
 _PRODUCT_IMAGES_TOTAL_MAX_BYTES = 256 * 1024 * 1024
@@ -421,16 +421,19 @@ def _discover_product_gallery_images(
     settle_ms: int,
     max_images: int = 24,
 ) -> list[str]:
-    """Discover DOM images owned by the current product media surface.
+    """Discover the complete current-product media gallery without requiring manual clicks.
 
-    The browser layer does not guess final listing relevance; it only separates a
-    product/gallery-shaped surface from generic page imagery. The downstream image
-    evidence + semantic listing ranker remains the final meaning gate.
+    Explicit gallery ownership is stronger evidence than current visibility or thumbnail
+    dimensions. Static DOM references are harvested first, then bounded non-navigating
+    thumbnail controls are activated only to hydrate high-resolution media that the page
+    loads lazily after selection. No product meaning is inferred here; downstream image
+    quality and semantic ranking remain the final upload gates.
     """
 
     raw = _evaluate_with_navigation_retry(
         page,
-        r"""() => {
+        r"""async () => {
+          const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
           const visible = (el) => {
             const style = getComputedStyle(el);
             const rect = el.getBoundingClientRect();
@@ -438,17 +441,26 @@ def _discover_product_gallery_images(
               && rect.width > 0 && rect.height > 0;
           };
           const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-          const positive = /(gallery|product[-_\s]*(image|media)|pdp[-_\s]*(image|media)|image[-_\s]*gallery|media[-_\s]*gallery|thumbnail|thumbs)/i;
+          const positive = /(gallery|carousel|swiper|product[-_\s]*(image|media)|pdp[-_\s]*(image|media)|image[-_\s]*gallery|media[-_\s]*gallery|thumbnail|thumbs)/i;
           const negative = /(recommend|related|similar|sponsor|banner|logo|header|footer|navigation|\bnav\b|advert|promo|cross[-_\s]*sell|recently)/i;
+          const sourceAttr = /(src|image|media|zoom|large|full|original|hero)/i;
           const titleTokens = new Set(
             clean(document.querySelector('h1')?.innerText || document.title)
               .toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length >= 4)
           );
           const output = [];
           const seen = new Set();
+          const controls = [];
+          const controlSeen = new Set();
+
           const push = (raw) => {
-            const value = clean(raw);
+            let value = clean(raw).replace(/\\\//g, '/');
             if (!value || value.startsWith('data:') || value.startsWith('blob:')) return;
+            const embedded = value.match(/https?:\/\/[^\s"'<>\\]+/g);
+            if (embedded && embedded.length && embedded[0] !== value) {
+              for (const item of embedded) push(item);
+              return;
+            }
             try {
               const absolute = new URL(value, document.baseURI).href;
               if (!/^https?:/i.test(absolute) || seen.has(absolute)) return;
@@ -456,55 +468,131 @@ def _discover_product_gallery_images(
               output.push(absolute);
             } catch (_) {}
           };
-          const pushImgSources = (img) => {
-            push(img.currentSrc);
-            for (const name of ['data-zoom-image', 'data-large-image', 'data-original', 'data-src', 'data-lazy-src', 'src']) {
-              push(img.getAttribute(name));
-            }
-            const srcset = clean(img.getAttribute('srcset'));
-            if (srcset) {
-              const candidates = srcset.split(',').map((part) => clean(part).split(/\s+/)[0]).filter(Boolean);
-              if (candidates.length) push(candidates[candidates.length - 1]);
+
+          const pushSrcset = (srcset) => {
+            const candidates = clean(srcset)
+              .split(',')
+              .map((part) => clean(part).split(/\s+/)[0])
+              .filter(Boolean);
+            for (let index = candidates.length - 1; index >= 0; index -= 1) {
+              push(candidates[index]);
             }
           };
 
-          for (const img of document.images) {
-            if (!visible(img)) continue;
-            const nw = Number(img.naturalWidth || 0);
-            const nh = Number(img.naturalHeight || 0);
-            if (Math.max(nw, nh) < 160) continue;
+          const pushElementSources = (element) => {
+            if (!element) return;
+            push(element.currentSrc);
+            for (const attr of [...(element.attributes || [])]) {
+              if (!sourceAttr.test(attr.name)) continue;
+              push(attr.value);
+            }
+            pushSrcset(element.getAttribute?.('srcset'));
+            const picture = element.closest?.('picture');
+            if (picture) {
+              for (const source of picture.querySelectorAll('source[srcset]')) {
+                pushSrcset(source.getAttribute('srcset'));
+              }
+            }
+          };
 
-            const context = [];
+          const contextFor = (img) => {
+            const parts = [];
             let node = img;
-            for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
-              context.push(clean([
+            for (let depth = 0; node && depth < 7; depth += 1, node = node.parentElement) {
+              parts.push(clean([
                 node.id,
                 node.className,
                 node.getAttribute?.('role'),
                 node.getAttribute?.('aria-label'),
                 node.getAttribute?.('data-testid'),
+                node.getAttribute?.('data-component'),
               ].filter(Boolean).join(' ')));
             }
-            const contextText = context.join(' ');
-            if (negative.test(contextText)) continue;
+            return parts.join(' ');
+          };
 
-            const rect = img.getBoundingClientRect();
-            const altTokens = new Set(
-              clean(img.alt || img.title).toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length >= 4)
-            );
-            let titleMatches = 0;
-            for (const token of altTokens) if (titleTokens.has(token)) titleMatches += 1;
+          const pushOwnedSources = (img) => {
+            pushElementSources(img);
+            let node = img.parentElement;
+            for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
+              if (node.tagName === 'A') push(node.getAttribute('href'));
+              for (const attr of [...(node.attributes || [])]) {
+                if (!sourceAttr.test(attr.name)) continue;
+                push(attr.value);
+              }
+              for (const source of node.querySelectorAll?.(':scope > picture source[srcset], :scope > source[srcset]') || []) {
+                pushSrcset(source.getAttribute('srcset'));
+              }
+            }
+          };
 
-            let score = 0;
-            if (positive.test(contextText)) score += 5;
-            if (titleMatches >= 2) score += 3;
-            else if (titleMatches === 1) score += 1;
-            if (rect.width >= 180 && rect.height >= 180) score += 2;
-            if (nw * nh >= 80000) score += 1;
-            if (img.closest('main')) score += 1;
-            if (score >= 6) pushImgSources(img);
+          const rememberControl = (img) => {
+            const control = img.closest('button,[role="button"],[role="option"],[aria-selected],li');
+            if (!control || controlSeen.has(control)) return;
+            if (control.tagName === 'A' || control.getAttribute('href')) return;
+            controlSeen.add(control);
+            controls.push(control);
+          };
+
+          const collect = () => {
+            for (const img of document.images) {
+              const contextText = contextFor(img);
+              if (negative.test(contextText)) continue;
+              const galleryOwned = positive.test(contextText);
+              if (galleryOwned) {
+                pushOwnedSources(img);
+                rememberControl(img);
+                continue;
+              }
+
+              if (!visible(img)) continue;
+              const nw = Number(img.naturalWidth || 0);
+              const nh = Number(img.naturalHeight || 0);
+              if (Math.max(nw, nh) < 160) continue;
+
+              const rect = img.getBoundingClientRect();
+              const altTokens = new Set(
+                clean(img.alt || img.title).toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length >= 4)
+              );
+              let titleMatches = 0;
+              for (const token of altTokens) if (titleTokens.has(token)) titleMatches += 1;
+
+              let score = 0;
+              if (titleMatches >= 2) score += 3;
+              else if (titleMatches === 1) score += 1;
+              if (rect.width >= 180 && rect.height >= 180) score += 2;
+              if (nw * nh >= 80000) score += 1;
+              if (img.closest('main')) score += 1;
+              if (score >= 6) pushElementSources(img);
+            }
+          };
+
+          collect();
+          const initiallySelected = controls.find((control) => {
+            const selected = clean(control.getAttribute('aria-selected')).toLowerCase();
+            const current = clean(control.getAttribute('aria-current')).toLowerCase();
+            const classes = clean(control.className);
+            return selected === 'true' || current === 'true' || /(^|\s)(active|selected)(\s|$)/i.test(classes);
+          }) || null;
+
+          for (const control of controls.slice(0, 12)) {
+            if (!document.contains(control)) continue;
+            try {
+              control.click();
+              await wait(120);
+              collect();
+            } catch (_) {}
           }
-          return output.slice(0, 24);
+
+          if (initiallySelected && document.contains(initiallySelected)) {
+            try {
+              initiallySelected.click();
+              await wait(80);
+              collect();
+            } catch (_) {}
+          }
+
+          return output.slice(0, 48);
         }""",
         settle_ms=settle_ms,
     )
