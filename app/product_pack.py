@@ -34,6 +34,9 @@ _MAX_SINGLE_FILE_BYTES = 64 * 1024 * 1024
 _MAX_ARCHIVE_EXPANDED_BYTES = 512 * 1024 * 1024
 _MAX_VISIBLE_TEXT_CHARS = 160_000
 _MAX_TABLE_ROWS = 12_000
+_OWNERSHIP_MARKER = ".ecommerce-product-pack-v1"
+_OWNED_CHILD_DIRS = ("raw", "unpacked", "snapshots", "embedded-images")
+_OWNED_FILES = ("bootstrap-source.json", "product-pack.json")
 
 
 class ProductPackError(ValueError):
@@ -135,6 +138,39 @@ def _validate_input_path(path: Path) -> None:
         )
 
 
+def _prepare_owned_root(root: Path) -> None:
+    """Prepare only a directory previously owned by this Product Pack writer.
+
+    The intake API used to delete whatever output_dir the caller supplied. Normal
+    workflows always use a dedicated run child, so there is no business reason for
+    this low-level function to have recursive-delete authority over an arbitrary
+    existing directory.
+    """
+
+    if root.exists() and not root.is_dir():
+        raise ProductPackError(f"商品资料包输出路径不是目录：{root}")
+    if not root.exists():
+        root.mkdir(parents=True, exist_ok=False)
+    else:
+        entries = list(root.iterdir())
+        marker = root / _OWNERSHIP_MARKER
+        if entries and not marker.is_file():
+            raise ProductPackError(
+                f"拒绝覆盖非 Product Pack 管理目录：{root}。请使用新的任务输出目录。"
+            )
+        for name in _OWNED_CHILD_DIRS:
+            child = root / name
+            if child.is_dir():
+                shutil.rmtree(child)
+            elif child.exists():
+                child.unlink()
+        for name in _OWNED_FILES:
+            child = root / name
+            if child.is_file() or child.is_symlink():
+                child.unlink()
+    (root / _OWNERSHIP_MARKER).write_text("owned\n", encoding="ascii")
+
+
 def _copy_input(path: Path, raw_dir: Path, ordinal: int) -> Path:
     raw_dir.mkdir(parents=True, exist_ok=True)
     target = raw_dir / f"{ordinal:03d}-{_safe_name(path.name)}"
@@ -151,6 +187,25 @@ def _safe_zip_member(name: str) -> PurePosixPath | None:
     if path.suffix.casefold() not in (SUPPORTED_DOCUMENT_SUFFIXES | SUPPORTED_IMAGE_SUFFIXES):
         return None
     return path
+
+
+def _validate_office_archive_budget(path: Path, *, label: str) -> None:
+    """Bound OOXML expansion before a parser materializes compressed members."""
+
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ProductPackError(f"{label} 文件损坏：{path.name}") from exc
+    expanded = 0
+    with archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            if info.file_size < 0 or info.file_size > _MAX_SINGLE_FILE_BYTES:
+                raise ProductPackError(f"{label} 内部成员过大：{info.filename}")
+            expanded += int(info.file_size)
+            if expanded > _MAX_ARCHIVE_EXPANDED_BYTES:
+                raise ProductPackError(f"{label} 解压后的内部数据超过安全上限：{path.name}")
 
 
 def _expand_zip(path: Path, target_dir: Path) -> list[Path]:
@@ -228,27 +283,59 @@ def _text_snapshot(path: Path) -> list[SourceSnapshot]:
 
 def _csv_snapshot(path: Path, *, delimiter: str) -> list[SourceSnapshot]:
     text = _decode_text(path.read_bytes(), label=path.name)
-    rows = list(csv.reader(text.splitlines(), delimiter=delimiter))
-    nonempty = [row for row in rows if any(str(cell).strip() for cell in row)]
-    if not nonempty:
-        raise ProductPackError(f"表格文件没有可用内容：{path.name}")
-    headers = [str(value).strip() for value in nonempty[0]]
+    reader = csv.reader(text.splitlines(), delimiter=delimiter)
+    headers: list[str] | None = None
     structured: list[SnapshotTableRow] = []
     rendered: list[str] = []
-    for row_number, row in enumerate(nonempty, start=1):
-        rendered.append(f"row {row_number}: " + " | ".join(str(value).strip() for value in row if str(value).strip()))
-        if row_number == 1:
+    rendered_chars = 0
+    row_number = 0
+    truncated = False
+
+    for raw_row in reader:
+        if not any(str(cell).strip() for cell in raw_row):
             continue
-        for column_index, raw in enumerate(row, start=1):
-            value = str(raw).strip()
-            if not value:
-                continue
-            header = headers[column_index - 1] if column_index <= len(headers) else ""
-            structured.append(SnapshotTableRow(key=header or f"Column {column_index}", value=value, table_index=1, row_index=row_number))
-    return [_new_snapshot(path=path, title=path.name, visible_text="\n".join(rendered), table_rows=structured, meta={"table_format": path.suffix.casefold().lstrip(".")})]
+        row_number += 1
+        row = [str(value).strip() for value in raw_row]
+        if headers is None:
+            headers = row
+        if rendered_chars < _MAX_VISIBLE_TEXT_CHARS:
+            line = f"row {row_number}: " + " | ".join(value for value in row if value)
+            rendered.append(line)
+            rendered_chars += len(line) + 1
+        if row_number > 1 and len(structured) < _MAX_TABLE_ROWS:
+            for column_index, value in enumerate(row, start=1):
+                if not value or len(structured) >= _MAX_TABLE_ROWS:
+                    continue
+                header = headers[column_index - 1] if column_index <= len(headers) else ""
+                structured.append(
+                    SnapshotTableRow(
+                        key=header or f"Column {column_index}",
+                        value=value,
+                        table_index=1,
+                        row_index=row_number,
+                    )
+                )
+        if rendered_chars >= _MAX_VISIBLE_TEXT_CHARS and len(structured) >= _MAX_TABLE_ROWS:
+            truncated = True
+            break
+
+    if headers is None:
+        raise ProductPackError(f"表格文件没有可用内容：{path.name}")
+    warnings = ["table evidence reached the existing Product Pack snapshot budget"] if truncated else []
+    return [
+        _new_snapshot(
+            path=path,
+            title=path.name,
+            visible_text="\n".join(rendered),
+            table_rows=structured,
+            meta={"table_format": path.suffix.casefold().lstrip(".")},
+            warnings=warnings,
+        )
+    ]
 
 
 def _excel_snapshots(path: Path) -> list[SourceSnapshot]:
+    _validate_office_archive_budget(path, label="Excel")
     try:
         workbook = load_workbook(path, read_only=True, data_only=True)
     except Exception as exc:
@@ -256,25 +343,68 @@ def _excel_snapshots(path: Path) -> list[SourceSnapshot]:
     snapshots: list[SourceSnapshot] = []
     try:
         for sheet_index, sheet in enumerate(workbook.worksheets, start=1):
-            rows = [tuple(cell for cell in row) for row in sheet.iter_rows(values_only=True) if any(cell not in (None, "") for cell in row)]
-            if not rows:
-                continue
-            headers = [str(value).strip() if value not in (None, "") else "" for value in rows[0]]
+            headers: list[str] | None = None
             structured: list[SnapshotTableRow] = []
             rendered: list[str] = [f"Sheet: {sheet.title}"]
-            for data_index, row in enumerate(rows, start=1):
-                values = ["" if value is None else str(value).strip() for value in row]
-                rendered.append(f"row {data_index}: " + " | ".join(value for value in values if value))
-                if data_index == 1:
+            rendered_chars = len(rendered[0]) + 1
+            data_index = 0
+            truncated = False
+
+            for raw_row in sheet.iter_rows(values_only=True):
+                if not any(cell not in (None, "") for cell in raw_row):
                     continue
-                nonempty = [(index, value) for index, value in enumerate(values, start=1) if value]
-                if len(nonempty) == 2 and not all(headers):
-                    structured.append(SnapshotTableRow(key=nonempty[0][1], value=nonempty[1][1], table_index=sheet_index, row_index=data_index))
-                    continue
-                for column_index, value in nonempty:
-                    header = headers[column_index - 1] if column_index <= len(headers) else ""
-                    structured.append(SnapshotTableRow(key=header or f"Column {column_index}", value=value, table_index=sheet_index, row_index=data_index))
-            snapshots.append(_new_snapshot(path=path, title=f"{path.name} · {sheet.title}", visible_text="\n".join(rendered), table_rows=structured, fragment=f"sheet={sheet_index}", meta={"sheet_name": sheet.title, "sheet_index": str(sheet_index)}))
+                data_index += 1
+                values = ["" if value is None else str(value).strip() for value in raw_row]
+                if headers is None:
+                    headers = values
+                if rendered_chars < _MAX_VISIBLE_TEXT_CHARS:
+                    line = f"row {data_index}: " + " | ".join(value for value in values if value)
+                    rendered.append(line)
+                    rendered_chars += len(line) + 1
+                if data_index > 1 and len(structured) < _MAX_TABLE_ROWS:
+                    nonempty = [(index, value) for index, value in enumerate(values, start=1) if value]
+                    if len(nonempty) == 2 and not all(headers):
+                        structured.append(
+                            SnapshotTableRow(
+                                key=nonempty[0][1],
+                                value=nonempty[1][1],
+                                table_index=sheet_index,
+                                row_index=data_index,
+                            )
+                        )
+                    else:
+                        for column_index, value in nonempty:
+                            if len(structured) >= _MAX_TABLE_ROWS:
+                                break
+                            header = headers[column_index - 1] if column_index <= len(headers) else ""
+                            structured.append(
+                                SnapshotTableRow(
+                                    key=header or f"Column {column_index}",
+                                    value=value,
+                                    table_index=sheet_index,
+                                    row_index=data_index,
+                                )
+                            )
+                if rendered_chars >= _MAX_VISIBLE_TEXT_CHARS and len(structured) >= _MAX_TABLE_ROWS:
+                    truncated = True
+                    break
+
+            if headers is None:
+                continue
+            snapshots.append(
+                _new_snapshot(
+                    path=path,
+                    title=f"{path.name} · {sheet.title}",
+                    visible_text="\n".join(rendered),
+                    table_rows=structured,
+                    fragment=f"sheet={sheet_index}",
+                    meta={"sheet_name": sheet.title, "sheet_index": str(sheet_index)},
+                    warnings=(
+                        ["worksheet evidence reached the existing Product Pack snapshot budget"]
+                        if truncated else []
+                    ),
+                )
+            )
     finally:
         workbook.close()
     if not snapshots:
@@ -283,6 +413,7 @@ def _excel_snapshots(path: Path) -> list[SourceSnapshot]:
 
 
 def _docx_snapshots(path: Path, media_dir: Path) -> tuple[list[SourceSnapshot], list[Path]]:
+    _validate_office_archive_budget(path, label="Word")
     try:
         archive = zipfile.ZipFile(path)
     except zipfile.BadZipFile as exc:
@@ -290,6 +421,7 @@ def _docx_snapshots(path: Path, media_dir: Path) -> tuple[list[SourceSnapshot], 
     paragraphs: list[str] = []
     rows: list[SnapshotTableRow] = []
     images: list[Path] = []
+    text_chars = 0
     with archive:
         try:
             document_xml = archive.read("word/document.xml")
@@ -299,36 +431,65 @@ def _docx_snapshots(path: Path, media_dir: Path) -> tuple[list[SourceSnapshot], 
         namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
         for paragraph in root.iter(namespace + "p"):
             text = "".join(node.text or "" for node in paragraph.iter(namespace + "t")).strip()
-            if text:
+            if text and text_chars < _MAX_VISIBLE_TEXT_CHARS:
                 paragraphs.append(text)
+                text_chars += len(text) + 1
         table_index = 0
         for table in root.iter(namespace + "tbl"):
+            if len(rows) >= _MAX_TABLE_ROWS:
+                break
             table_index += 1
             row_index = 0
             for row in table.findall(namespace + "tr"):
+                if len(rows) >= _MAX_TABLE_ROWS:
+                    break
                 row_index += 1
                 cells: list[str] = []
                 for cell in row.findall(namespace + "tc"):
-                    text = " ".join(node.text or "" for node in cell.iter(namespace + "t") if (node.text or "").strip()).strip()
+                    text = " ".join(
+                        node.text or ""
+                        for node in cell.iter(namespace + "t")
+                        if (node.text or "").strip()
+                    ).strip()
                     cells.append(text)
                 nonempty = [value for value in cells if value]
                 if len(nonempty) >= 2:
-                    rows.append(SnapshotTableRow(key=nonempty[0], value=" | ".join(nonempty[1:]), table_index=table_index, row_index=row_index))
+                    rows.append(
+                        SnapshotTableRow(
+                            key=nonempty[0],
+                            value=" | ".join(nonempty[1:]),
+                            table_index=table_index,
+                            row_index=row_index,
+                        )
+                    )
         media_dir.mkdir(parents=True, exist_ok=True)
-        for name in archive.namelist():
-            posix = PurePosixPath(name)
-            if len(posix.parts) < 3 or posix.parts[:2] != ("word", "media") or posix.suffix.casefold() not in SUPPORTED_IMAGE_SUFFIXES:
+        for info in archive.infolist():
+            posix = PurePosixPath(info.filename)
+            if (
+                info.is_dir()
+                or len(posix.parts) < 3
+                or posix.parts[:2] != ("word", "media")
+                or posix.suffix.casefold() not in SUPPORTED_IMAGE_SUFFIXES
+            ):
                 continue
-            data = archive.read(name)
-            if len(data) < 1024:
+            if info.file_size < 1024:
                 continue
+            data = archive.read(info)
             digest = hashlib.sha256(data).hexdigest()
-            target = media_dir / f"{_safe_name(path.stem)}-{len(images) + 1:03d}-{digest[:10]}{posix.suffix.casefold()}"
+            target = media_dir / (
+                f"{_safe_name(path.stem)}-{len(images) + 1:03d}-{digest[:10]}{posix.suffix.casefold()}"
+            )
             target.write_bytes(data)
             images.append(target)
     if not paragraphs and not rows and not images:
         raise ProductPackError(f"Word 没有可读取内容：{path.name}")
-    snapshot = _new_snapshot(path=path, title=path.name, visible_text="\n".join(paragraphs) or f"Word document: {path.name}", table_rows=rows, meta={"embedded_images": str(len(images))})
+    snapshot = _new_snapshot(
+        path=path,
+        title=path.name,
+        visible_text="\n".join(paragraphs) or f"Word document: {path.name}",
+        table_rows=rows,
+        meta={"embedded_images": str(len(images))},
+    )
     return [snapshot], images
 
 
@@ -351,11 +512,21 @@ def _pdf_snapshots(path: Path) -> list[SourceSnapshot]:
         if not text:
             empty_pages += 1
             continue
-        snapshots.append(_new_snapshot(path=path, title=f"{path.name} · Page {page_index}", visible_text=text, fragment=f"page={page_index}", meta={"page": str(page_index), "page_count": str(len(reader.pages))}))
+        snapshots.append(
+            _new_snapshot(
+                path=path,
+                title=f"{path.name} · Page {page_index}",
+                visible_text=text,
+                fragment=f"page={page_index}",
+                meta={"page": str(page_index), "page_count": str(len(reader.pages))},
+            )
+        )
     if not snapshots:
         raise ProductPackError(f"PDF 没有可提取文字：{path.name}。扫描版 PDF 请同时上传原始页面图片。")
     if empty_pages:
-        snapshots[0].warnings.append(f"{empty_pages} page(s) contained no extractable text; scanned pages require image evidence.")
+        snapshots[0].warnings.append(
+            f"{empty_pages} page(s) contained no extractable text; scanned pages require image evidence."
+        )
     return snapshots
 
 
@@ -406,7 +577,9 @@ def _bootstrap_snapshot(snapshots: list[SourceSnapshot], files: list[ProductPack
         if len(rows) < _MAX_TABLE_ROWS:
             rows.extend(snapshot.table_rows[: _MAX_TABLE_ROWS - len(rows)])
     if not text_parts:
-        text_parts.append("Customer product pack files:\n" + "\n".join(file.stored_path for file in files))
+        text_parts.append(
+            "Customer product pack files:\n" + "\n".join(file.stored_path for file in files)
+        )
     return SourceSnapshot(
         requested_url="product-pack://local",
         final_url="product-pack://local",
@@ -414,15 +587,21 @@ def _bootstrap_snapshot(snapshots: list[SourceSnapshot], files: list[ProductPack
         captured_at=_utc_now(),
         visible_text="\n\n".join(text_parts),
         table_rows=rows,
-        meta={"input_mode": "customer_product_pack", "stored_files": str(len(files)), "document_snapshots": str(len(snapshots))},
+        meta={
+            "input_mode": "customer_product_pack",
+            "stored_files": str(len(files)),
+            "document_snapshots": str(len(snapshots)),
+        },
     )
 
 
 def _pack_reference(files: Iterable[ProductPackFile]) -> str:
     digest = hashlib.sha256()
     for item in sorted(files, key=lambda value: (value.sha256, value.stored_path)):
-        digest.update(item.sha256.encode("ascii")); digest.update(b"\0")
-        digest.update(item.stored_path.encode("utf-8")); digest.update(b"\0")
+        digest.update(item.sha256.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(item.stored_path.encode("utf-8"))
+        digest.update(b"\0")
     return f"https://{PRODUCT_PACK_URL_HOST}/{digest.hexdigest()[:24]}"
 
 
@@ -436,9 +615,7 @@ def capture_product_pack(paths: Iterable[str | Path], *, output_dir: str | Path)
         raise ProductPackError(f"一次最多接收 {_MAX_INPUT_FILES} 个商品资料文件。")
 
     root = Path(output_dir).resolve()
-    if root.exists():
-        shutil.rmtree(root)
-    root.mkdir(parents=True, exist_ok=True)
+    _prepare_owned_root(root)
     raw_dir = root / "raw"
     unpacked_dir = root / "unpacked"
     snapshot_dir = root / "snapshots"
@@ -464,13 +641,24 @@ def capture_product_pack(paths: Iterable[str | Path], *, output_dir: str | Path)
             stored.unlink(missing_ok=True)
             continue
         seen_sha.add(digest)
-        stored_files.append(ProductPackFile(original_path=str(original.resolve()), stored_path=str(stored.resolve()), sha256=digest, size_bytes=stored.stat().st_size, suffix=stored.suffix.casefold(), kind=_kind_for_suffix(stored.suffix)))
+        stored_files.append(
+            ProductPackFile(
+                original_path=str(original.resolve()),
+                stored_path=str(stored.resolve()),
+                sha256=digest,
+                size_bytes=stored.stat().st_size,
+                suffix=stored.suffix.casefold(),
+                kind=_kind_for_suffix(stored.suffix),
+            )
+        )
         if stored.suffix.casefold() == ".zip":
             try:
                 expanded = _expand_zip(stored, unpacked_dir / f"archive-{ordinal:03d}")
             except ProductPackError as exc:
                 warnings.append(str(exc))
-                rejected_files.append({"path": str(original), "stage": "archive", "error": str(exc)})
+                rejected_files.append(
+                    {"path": str(original), "stage": "archive", "error": str(exc)}
+                )
                 continue
             for child in expanded:
                 try:
@@ -481,7 +669,16 @@ def capture_product_pack(paths: Iterable[str | Path], *, output_dir: str | Path)
                 if child_digest in seen_sha:
                     continue
                 seen_sha.add(child_digest)
-                stored_files.append(ProductPackFile(original_path=f"{original.resolve()}::{child.name}", stored_path=str(child.resolve()), sha256=child_digest, size_bytes=child.stat().st_size, suffix=child.suffix.casefold(), kind=_kind_for_suffix(child.suffix)))
+                stored_files.append(
+                    ProductPackFile(
+                        original_path=f"{original.resolve()}::{child.name}",
+                        stored_path=str(child.resolve()),
+                        sha256=child_digest,
+                        size_bytes=child.stat().st_size,
+                        suffix=child.suffix.casefold(),
+                        kind=_kind_for_suffix(child.suffix),
+                    )
+                )
                 parse_paths.append(child)
         else:
             parse_paths.append(stored)
@@ -510,7 +707,9 @@ def capture_product_pack(paths: Iterable[str | Path], *, output_dir: str | Path)
                 _validate_image(image)
             except ProductPackError as exc:
                 warnings.append(str(exc))
-                rejected_files.append({"path": str(image), "stage": "embedded_image", "error": str(exc)})
+                rejected_files.append(
+                    {"path": str(image), "stage": "embedded_image", "error": str(exc)}
+                )
                 continue
             images.append(image)
 
@@ -550,13 +749,56 @@ def capture_product_pack(paths: Iterable[str | Path], *, output_dir: str | Path)
     }
     manifest_path = root / "product-pack.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    return ProductPackCapture(manifest_path=manifest_path, product_reference_url=reference_url, bootstrap_snapshot_path=bootstrap_path, bootstrap_snapshot=bootstrap, customer_snapshot_paths=snapshot_paths, evidence_image_paths=evidence_images, listing_image_paths=listing_images, stored_files=tuple(stored_files), warnings=tuple(warnings))
+    return ProductPackCapture(
+        manifest_path=manifest_path,
+        product_reference_url=reference_url,
+        bootstrap_snapshot_path=bootstrap_path,
+        bootstrap_snapshot=bootstrap,
+        customer_snapshot_paths=snapshot_paths,
+        evidence_image_paths=evidence_images,
+        listing_image_paths=listing_images,
+        stored_files=tuple(stored_files),
+        warnings=tuple(warnings),
+    )
+
+
+def _manifest_file(
+    root: Path,
+    raw: Any,
+    *,
+    label: str,
+    required: bool,
+) -> Path | None:
+    text = str(raw or "").strip()
+    if not text:
+        if required:
+            raise ProductPackError(f"商品资料包缺少 {label}。")
+        return None
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve()
+    except OSError as exc:
+        raise ProductPackError(f"商品资料包 {label} 路径无效：{candidate}") from exc
+    try:
+        inside = resolved.is_relative_to(root)
+    except AttributeError:  # pragma: no cover - Python < 3.9 compatibility guard
+        inside = root == resolved or root in resolved.parents
+    if not inside:
+        raise ProductPackError(f"商品资料包 {label} 越出资料包目录：{resolved}")
+    if not resolved.is_file():
+        if required:
+            raise ProductPackError(f"商品资料包缺少 {label}：{resolved}")
+        return None
+    return resolved
 
 
 def load_product_pack_manifest(path: str | Path) -> dict[str, Any]:
-    source = Path(path)
+    source = Path(path).resolve()
     if not source.is_file():
         raise FileNotFoundError(f"商品资料包 manifest 不存在：{source}")
+    root = source.parent.resolve()
     payload = json.loads(source.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("schema_version") != PRODUCT_PACK_SCHEMA_VERSION:
         raise ProductPackError("商品资料包 manifest 版本无效。")
@@ -565,9 +807,15 @@ def load_product_pack_manifest(path: str | Path) -> dict[str, Any]:
     reference = str(payload.get("product_reference_url") or "").strip()
     if not reference.startswith(f"https://{PRODUCT_PACK_URL_HOST}/"):
         raise ProductPackError("商品资料包 product_reference_url 无效。")
-    bootstrap = Path(str(payload.get("bootstrap_snapshot") or ""))
-    if not bootstrap.is_file():
-        raise ProductPackError(f"商品资料包缺少 bootstrap_snapshot：{bootstrap}")
+
+    bootstrap = _manifest_file(
+        root,
+        payload.get("bootstrap_snapshot"),
+        label="bootstrap_snapshot",
+        required=True,
+    )
+    assert bootstrap is not None
+    payload["bootstrap_snapshot"] = str(bootstrap)
 
     warnings = list(payload.get("warnings") or [])
     for key in ("customer_snapshots", "evidence_images", "listing_images"):
@@ -576,17 +824,39 @@ def load_product_pack_manifest(path: str | Path) -> dict[str, Any]:
             raise ProductPackError(f"商品资料包 {key} 必须是数组。")
         present: list[str] = []
         for value in values:
-            candidate = Path(str(value))
-            if candidate.is_file():
+            candidate = _manifest_file(root, value, label=key, required=False)
+            if candidate is not None:
                 present.append(str(candidate))
             else:
-                warnings.append(f"商品资料包可选派生文件缺失，已跳过 {key}: {candidate}")
+                warnings.append(f"商品资料包可选派生文件缺失，已跳过 {key}: {value}")
         payload[key] = present
+
+    stored_files = payload.get("stored_files") or []
+    if not isinstance(stored_files, list):
+        raise ProductPackError("商品资料包 stored_files 必须是数组。")
+    for index, item in enumerate(stored_files, start=1):
+        if not isinstance(item, dict):
+            raise ProductPackError(f"商品资料包 stored_files[{index}] 格式无效。")
+        stored_path = str(item.get("stored_path") or "").strip()
+        if not stored_path:
+            continue
+        # Stored artifacts may no longer be needed after derivation, but a manifest
+        # must never be able to point a resolver at an arbitrary file outside root.
+        candidate = Path(stored_path)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = candidate.resolve()
+        try:
+            inside = resolved.is_relative_to(root)
+        except AttributeError:  # pragma: no cover
+            inside = root == resolved or root in resolved.parents
+        if not inside:
+            raise ProductPackError(
+                f"商品资料包 stored_files[{index}] 越出资料包目录：{resolved}"
+            )
+
     payload["warnings"] = warnings
     if not payload.get("customer_snapshots") and not payload.get("evidence_images"):
-        # The bootstrap itself remains canonical evidence; image-only/text-only packs
-        # can legitimately have one side empty, but both derived universes missing
-        # means the stored pack can no longer support field resolution safely.
         bootstrap_snapshot = json.loads(bootstrap.read_text(encoding="utf-8"))
         if not str(bootstrap_snapshot.get("visible_text") or "").strip():
             raise ProductPackError("商品资料包没有剩余可用文本或图片证据。")
