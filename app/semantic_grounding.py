@@ -71,6 +71,7 @@ class GroundedSource:
 @dataclass(slots=True)
 class GroundingCatalog:
     sources: list[GroundedSource] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         seen: set[str] = set()
@@ -109,6 +110,7 @@ class GroundingCatalog:
             "source_count": len(self.sources),
             "logical_source_count": self.logical_source_count,
             "sources": [source.as_manifest_dict() for source in self.sources],
+            "warnings": list(self.warnings),
         }
 
 
@@ -185,12 +187,7 @@ def _structured_assignments(value: str) -> list[str]:
 
 
 def _compact_embedded_data(items: Iterable[str]) -> list[str]:
-    """Keep exact product/variant records while discarding generic page scripts.
-
-    Source snapshots remain untouched on disk. This function only builds the
-    compact, citable text view sent to AI. It deliberately uses structural page
-    markers rather than product-category or marketplace-field semantics.
-    """
+    """Keep exact product/variant records while discarding generic page scripts."""
 
     candidates: list[str] = []
     seen: set[str] = set()
@@ -215,9 +212,6 @@ def _compact_embedded_data(items: Iterable[str]) -> list[str]:
             seen.add(fingerprint)
             candidates.append(exact)
 
-    # Capture currently emits overlapping windows around nearby structured-data
-    # markers. Keeping only the longest exact container is lossless and prevents
-    # the same page JSON from being sent repeatedly.
     kept: list[str] = []
     kept_folded: list[str] = []
     for value in sorted(candidates, key=len, reverse=True):
@@ -236,11 +230,7 @@ def _compact_visible_text(value: str) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
-    # Delivery destinations depend on the signed-in browser/session, not the
-    # product. Preserve the surrounding labels while dropping the address.
     text = re.sub(r"(?m)(^|\n)送至\s*\n[^\n]*(?=\n预计)", r"\1送至\n预计", text)
-    # Marketplace price explanations are generic legal boilerplate and the
-    # captured tail can end at a different character while the page is loading.
     for marker in ("【平台活动下价格】", "【非平台活动下价格】"):
         index = text.find(marker)
         if index >= 0:
@@ -445,14 +435,7 @@ def _sources_from_snapshot(
 
 
 def _product_pack_customer_snapshots(snapshot_path: str | Path) -> tuple[Path, ...] | None:
-    """Expand a Product Pack bootstrap snapshot back to its exact file snapshots.
-
-    The bootstrap snapshot exists only to identify the product before Makro Step 1.
-    Field resolution, planning and execution must cite the original normalized
-    document/page/sheet snapshots instead of that merged bootstrap text. Returning
-    ``None`` means this is an ordinary supplier snapshot; an empty tuple is a valid
-    image-only Product Pack.
-    """
+    """Expand a Product Pack bootstrap snapshot back to its exact file snapshots."""
 
     path = Path(snapshot_path)
     if not path.is_file():
@@ -473,11 +456,33 @@ def _product_pack_customer_snapshots(snapshot_path: str | Path) -> tuple[Path, .
     values = payload.get("customer_snapshots") or []
     if not isinstance(values, list):
         raise ValueError("Product Pack customer_snapshots 必须是数组。")
-    snapshots = tuple(Path(str(value)).resolve() for value in values if str(value).strip())
-    missing = [str(value) for value in snapshots if not value.is_file()]
-    if missing:
-        raise FileNotFoundError("Product Pack customer snapshot 缺失：" + " | ".join(missing[:5]))
-    return snapshots
+    return tuple(Path(str(value)).resolve() for value in values if str(value).strip())
+
+
+def _append_optional_snapshot(
+    sources: list[GroundedSource],
+    warnings: list[str],
+    path: str | Path,
+    *,
+    prefix: str,
+    source_type: str,
+    ordinal: int,
+    max_chars: int,
+    overlap_chars: int,
+) -> None:
+    try:
+        sources.extend(
+            _sources_from_snapshot(
+                path,
+                prefix=prefix,
+                source_type=source_type,
+                ordinal=ordinal,
+                max_chars=max_chars,
+                overlap_chars=overlap_chars,
+            )
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        warnings.append(f"optional {source_type} artifact skipped: {path}: {exc}")
 
 
 def build_grounding_catalog(
@@ -492,19 +497,27 @@ def build_grounding_catalog(
 ) -> GroundingCatalog:
     """Create the exact raw source universe visible to the field-filling AI.
 
-    Customer Product Pack bootstrap snapshots are automatically expanded to their
-    exact normalized file/page/sheet snapshots. This keeps Resolver, read-only
-    planner and real executor on one provenance contract without caller-specific
-    branching or a second listing engine.
+    Supplier snapshots are the canonical minimum and remain fail-closed. Optional
+    images, customer attachments and official enrichment snapshots each own their
+    own failure domain: a missing/corrupt optional artifact is recorded as a warning
+    and does not invalidate unrelated evidence. Product Pack bootstrap snapshots are
+    expanded to their normalized customer snapshots, with missing members degraded
+    individually as long as the bootstrap itself remains valid.
     """
 
     sources: list[GroundedSource] = []
+    warnings: list[str] = []
 
     for index, raw_path in enumerate(image_paths, start=1):
         path = Path(raw_path)
         if not path.is_file():
-            raise FileNotFoundError(f"商品图片不存在：{path}")
-        digest = _sha256_bytes(path.read_bytes())
+            warnings.append(f"optional product image skipped: {path}: file missing")
+            continue
+        try:
+            digest = _sha256_bytes(path.read_bytes())
+        except OSError as exc:
+            warnings.append(f"optional product image skipped: {path}: {exc}")
+            continue
         sources.append(
             GroundedSource(
                 source_id=f"image:{index:03d}:{digest[:12]}",
@@ -518,20 +531,22 @@ def build_grounding_catalog(
 
     supplier_index = 0
     customer_index = 0
+    supplier_seen = False
     for path in supplier_snapshots:
+        supplier_seen = True
         expanded = _product_pack_customer_snapshots(path)
         if expanded is not None:
             for customer_path in expanded:
                 customer_index += 1
-                sources.extend(
-                    _sources_from_snapshot(
-                        customer_path,
-                        prefix="customer-file",
-                        source_type="customer_file",
-                        ordinal=customer_index,
-                        max_chars=max_text_chars,
-                        overlap_chars=overlap_chars,
-                    )
+                _append_optional_snapshot(
+                    sources,
+                    warnings,
+                    customer_path,
+                    prefix="customer-file",
+                    source_type="customer_file",
+                    ordinal=customer_index,
+                    max_chars=max_text_chars,
+                    overlap_chars=overlap_chars,
                 )
             continue
 
@@ -549,27 +564,27 @@ def build_grounding_catalog(
 
     for path in customer_snapshots:
         customer_index += 1
-        sources.extend(
-            _sources_from_snapshot(
-                path,
-                prefix="customer-file",
-                source_type="customer_file",
-                ordinal=customer_index,
-                max_chars=max_text_chars,
-                overlap_chars=overlap_chars,
-            )
+        _append_optional_snapshot(
+            sources,
+            warnings,
+            path,
+            prefix="customer-file",
+            source_type="customer_file",
+            ordinal=customer_index,
+            max_chars=max_text_chars,
+            overlap_chars=overlap_chars,
         )
 
     for index, path in enumerate(official_snapshots, start=1):
-        sources.extend(
-            _sources_from_snapshot(
-                path,
-                prefix="official",
-                source_type="official_web",
-                ordinal=index,
-                max_chars=max_text_chars,
-                overlap_chars=overlap_chars,
-            )
+        _append_optional_snapshot(
+            sources,
+            warnings,
+            path,
+            prefix="official",
+            source_type="official_web",
+            ordinal=index,
+            max_chars=max_text_chars,
+            overlap_chars=overlap_chars,
         )
 
     if supplemental_text.strip():
@@ -593,4 +608,11 @@ def build_grounding_catalog(
                 )
             )
 
-    return GroundingCatalog(sources=sources)
+    if supplier_seen and not any(
+        source.source_type in {"supplier_web", "customer_file"}
+        and source.kind == TEXT_KIND
+        for source in sources
+    ) and not any(source.kind == IMAGE_KIND for source in sources):
+        raise ValueError("canonical supplier/product-pack evidence produced no usable grounded source")
+
+    return GroundingCatalog(sources=sources, warnings=warnings)
