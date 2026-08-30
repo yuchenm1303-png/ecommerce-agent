@@ -202,3 +202,55 @@ def test_ai_may_reject_all_candidates_when_none_are_useful(tmp_path: Path) -> No
     assert result.status == "ai_ranked"
     assert result.selected == ()
     assert result.semantically_rejected_count == 1
+
+
+def test_customer_auxiliary_images_never_compete_for_auto_listing_slots(tmp_path: Path) -> None:
+    supplier = _write_image(tmp_path / "supplier.jpg", (245, 245, 245))
+    auxiliary = _write_image(tmp_path / "auxiliary.jpg", (120, 140, 160))
+    snapshot = tmp_path / "source-snapshot.json"
+    _write_snapshot(snapshot)
+    manifest_path = _write_manifest(tmp_path, [auxiliary, supplier], snapshot)
+
+    product_pack = tmp_path / "product-pack.json"
+    product_pack.write_text(
+        json.dumps(
+            {
+                "evidence_images": [str(auxiliary)],
+                "listing_images": [str(auxiliary)],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["outputs"]["product_pack_manifest"] = str(product_pack)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    provider = _FakeProvider(
+        {
+            "selected_image_ids": ["image_01"],
+            "decisions": {
+                "image_01": {
+                    "selected": True,
+                    "reason": "This is the supplier product image.",
+                }
+            },
+            "summary": "Use the supplier photo only.",
+        }
+    )
+
+    result = finalize_supplier_listing_images(tmp_path, provider)
+
+    assert result.selected == (supplier,)
+    grounded_sources = provider.requests[0]["grounded_sources"]
+    assert isinstance(grounded_sources, list)
+    assert len(grounded_sources) == 1
+    assert Path(grounded_sources[0]["image_path"]) == supplier
+
+    report = json.loads((tmp_path / "listing-image-selection.json").read_text(encoding="utf-8"))
+    assert report["transport_rejected"] == [
+        {
+            "source_index": 1,
+            "path": str(auxiliary),
+            "reason": "customer_auxiliary_not_auto_listing_candidate",
+        }
+    ]
