@@ -32,6 +32,18 @@ _PLACEHOLDER_SOURCE_TOKENS = (
 )
 
 
+class PhotoUploadError(RuntimeError):
+    """Base error for one logical Product Photos transaction."""
+
+
+class PhotoPreSubmitError(PhotoUploadError):
+    """The source/portal failed before any file bytes were submitted to Makro."""
+
+
+class PhotoPostSubmitUncertainError(PhotoUploadError):
+    """File bytes were submitted but exact slot ownership could not be proven."""
+
+
 @dataclass(slots=True)
 class PhotoUploadResult:
     """State of listing images accepted into the open Product Photos editor."""
@@ -86,14 +98,6 @@ def _meaningful_slot_sources(slot: dict[str, Any] | None) -> set[str]:
 
 
 def _slot_is_empty(slot: dict[str, Any]) -> bool:
-    """Return Makro's DOM-level uploadable state for one thumbnail role.
-
-    A visible plus remains the portal's own empty-role contract because blank
-    cards may contain decorative image elements. Transactional upload acceptance
-    is intentionally decided elsewhere by comparing this exact slot before and
-    after one submitted file.
-    """
-
     if bool(slot.get("has_check")):
         return False
     return bool(slot.get("has_plus"))
@@ -125,8 +129,6 @@ def _slot_diagnostic_payload(state: dict[str, Any], slot_id: str) -> dict[str, A
 
 
 def _photo_surface(page: Page, section_path: str):
-    """Return the nearest Product Photos ancestor that owns the five thumbnails."""
-
     current = page.locator(section_path)
     if current.count() != 1:
         return current
@@ -194,8 +196,6 @@ def _slot_snapshot(page: Page, section_path: str) -> list[dict[str, Any]]:
 
 
 def _uploading_visible(page: Page, section_path: str) -> bool:
-    """Return whether Makro currently renders an Uploading status."""
-
     surface = _photo_surface(page, section_path)
     matches = surface.get_by_text(re.compile(r"\bUploading\b", re.IGNORECASE))
     for index in range(matches.count()):
@@ -268,8 +268,6 @@ def _surface_slot_ids(state: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _photo_surface_is_ready(state: dict[str, Any]) -> bool:
-    """A Product Photos editor is usable only after all five fixed roles exist."""
-
     return bool(state.get("found")) and _surface_slot_ids(state) == tuple(sorted(PHOTO_SLOT_IDS))
 
 
@@ -279,14 +277,6 @@ def _wait_for_photo_surface_ready(
     *,
     timeout_ms: int = PHOTO_SURFACE_READY_TIMEOUT_MS,
 ) -> tuple[str, dict[str, Any]]:
-    """Reacquire React-owned Product Photos until all five roles are stable.
-
-    Makro marks the card expanded before the gallery subtree has necessarily
-    finished rendering.  Capacity and slot ownership must therefore never be
-    derived from a partial subtree. Two consecutive complete snapshots are the
-    readiness postcondition; an incomplete surface fails closed with diagnostics.
-    """
-
     timeout_ms = max(1, int(timeout_ms))
     deadline = time.monotonic() + timeout_ms / 1000.0
     stable_samples = 0
@@ -342,8 +332,6 @@ def inspect_product_photos(page: Page) -> dict[str, Any]:
 
 
 def _raw_file_input(page: Page, section_path: str):
-    """Return Makro's one shared Product Photos file input."""
-
     inputs = _photo_surface(page, section_path).locator('input[type="file"]')
     usable = []
     for index in range(inputs.count()):
@@ -366,8 +354,6 @@ def _next_empty_photo_slot(
     *,
     consumed_slot_ids: set[str] | None = None,
 ) -> tuple[str, Any] | None:
-    """Return the first DOM-empty role not already consumed by this transaction."""
-
     consumed = consumed_slot_ids or set()
     surface = _photo_surface(page, section_path)
     snapshots = {str(slot.get("id")): slot for slot in _slot_snapshot(page, section_path)}
@@ -389,8 +375,6 @@ def _next_empty_photo_slot(
 
 
 def _visible_upload_photo_button(page: Page, section_path: str):
-    """Return the active role panel's visible blue Upload Photo control."""
-
     surface = _photo_surface(page, section_path)
     text_matches = surface.get_by_text("Upload Photo", exact=True)
     visible = []
@@ -430,15 +414,6 @@ def _open_photo_slot_upload_panel(
     click_timeout_ms: int = 1_500,
     panel_timeout_ms: int = 2_000,
 ) -> tuple[str, Any]:
-    """Trigger one thumbnail and prove success by the resulting upload panel.
-
-    Playwright can raise TimeoutError after the physical click has already been
-    delivered while it waits for a navigation signal that is irrelevant to this
-    in-page Makro interaction. The click call is therefore not the truth source.
-    The operation succeeds only when the Product Photos Upload Photo control
-    becomes visible; if it does not, a click timeout remains a real failure.
-    """
-
     click_timeout_detail = ""
     try:
         slot.click(timeout=click_timeout_ms, force=True)
@@ -481,8 +456,6 @@ def _acceptance_signal(
     before_add_tiles: int | None = None,
     target_slot_id: str | None = None,
 ) -> str:
-    """Backward-compatible page-level acceptance helper used by diagnostics/tests."""
-
     empty_slots = {str(value) for value in state.get("empty_slot_ids") or []}
     if target_slot_id and target_slot_id not in empty_slots:
         return "target_slot_consumed"
@@ -534,13 +507,6 @@ def _target_slot_acceptance_signal(
     after_state: dict[str, Any],
     slot_id: str,
 ) -> tuple[str, set[str]]:
-    """Return evidence created by this exact slot transaction.
-
-    Pre-existing decorative images are harmless because only sources that appear
-    after the file submission and were absent from this same slot beforehand are
-    accepted as preview evidence.
-    """
-
     before_slot = _slot_from_state(before_state, slot_id)
     after_slot = _slot_from_state(after_state, slot_id)
     before_sources = _meaningful_slot_sources(before_slot)
@@ -588,16 +554,6 @@ def _wait_for_target_slot_completion(
     uploading_timeout_ms: int = 60_000,
     accepted_stability_ms: int = 750,
 ) -> dict[str, Any]:
-    """Confirm one submitted file by evidence from the exact target role.
-
-    Strong Makro signals (new check, consumed plus, completion growth) complete
-    immediately. A new target-slot preview is also valid, but only when it is new
-    relative to this same slot's pre-submit snapshot, remains stable, and Makro is
-    no longer reporting Uploading. This removes both historical failure modes:
-    decorative images cannot cause false success, and a stale plus cannot cause a
-    false timeout after a real preview has arrived.
-    """
-
     if not _slot_from_state(before_state, slot_id):
         raise RuntimeError(f"Product Photos 提交前状态缺少目标图片槽 #{slot_id}。")
 
@@ -672,9 +628,9 @@ def _wait_for_target_slot_completion(
 
 
 def _normalize_for_makro_upload(source: Path, destination_dir: Path) -> tuple[Path, dict[str, Any]]:
-    """Create a predictable RGB baseline JPEG derivative for Makro upload only."""
-
     source = source.expanduser().resolve()
+    if not source.is_file():
+        raise PhotoPreSubmitError(f"上传图片不存在或不是文件：{source}")
     destination_dir.mkdir(parents=True, exist_ok=True)
     try:
         with Image.open(source) as opened:
@@ -708,7 +664,7 @@ def _normalize_for_makro_upload(source: Path, destination_dir: Path) -> tuple[Pa
             )
             final_size = tuple(int(value) for value in image.size)
     except (UnidentifiedImageError, OSError, ValueError) as exc:
-        raise RuntimeError(f"图片无法标准化为 Makro JPEG：{source} ({exc})") from exc
+        raise PhotoPreSubmitError(f"图片无法标准化为 Makro JPEG：{source} ({exc})") from exc
 
     return target, {
         "source_format": source_format,
@@ -737,6 +693,7 @@ class _DynamicPhotoFileTarget:
         self._selected = False
         self.last_acceptance: dict[str, Any] = {}
         self.upload_meta: dict[str, Any] = {}
+        self.submitted = False
 
     def _current_path(self) -> str:
         section = find_section(self.page, PRODUCT_PHOTOS_SECTION)
@@ -745,95 +702,105 @@ class _DynamicPhotoFileTarget:
 
     def set_input_files(self, files: str | Path) -> None:
         source = Path(files).expanduser().resolve()
-        current_path = self._current_path()
-        current_path, before_state = _wait_for_photo_surface_ready(
-            self.page,
-            current_path,
-            timeout_ms=self.timeout_ms,
-        )
-        if self.slot_id not in {str(value) for value in before_state.get("empty_slot_ids") or []}:
-            raise RuntimeError(f"Product Photos 目标图片槽 #{self.slot_id} 已不是空槽，拒绝重复提交。")
-
-        surface = _photo_surface(self.page, current_path)
-        slot = surface.locator(f"#{self.slot_id}")
-        if slot.count() != 1:
-            raise RuntimeError(f"Product Photos 找不到目标图片槽 #{self.slot_id}。")
-        if not slot.is_visible():
-            raise RuntimeError(f"Product Photos 图片槽 #{self.slot_id} 当前不可见。")
-
-        browser_visual_hud_target(
-            slot,
-            "准备上传图片",
-            f"正在定位 Product Photos 图片槽 {self.slot_id}，下一步会打开真实上传控件。",
-            phase=2,
-        )
-
-        with tempfile.TemporaryDirectory(prefix="makro-photo-") as temp_dir:
-            upload_path, upload_meta = _normalize_for_makro_upload(source, Path(temp_dir))
-            self.upload_meta = upload_meta
-
-            slot.evaluate("el => el.scrollIntoView({block: 'nearest', inline: 'nearest'})")
-            current_path, upload_button = _open_photo_slot_upload_panel(
+        self.submitted = False
+        try:
+            current_path = self._current_path()
+            current_path, before_state = _wait_for_photo_surface_ready(
                 self.page,
                 current_path,
-                slot,
-                self.slot_id,
+                timeout_ms=self.timeout_ms,
             )
+            if self.slot_id not in {str(value) for value in before_state.get("empty_slot_ids") or []}:
+                raise RuntimeError(f"Product Photos 目标图片槽 #{self.slot_id} 已不是空槽，拒绝重复提交。")
+
+            surface = _photo_surface(self.page, current_path)
+            slot = surface.locator(f"#{self.slot_id}")
+            if slot.count() != 1:
+                raise RuntimeError(f"Product Photos 找不到目标图片槽 #{self.slot_id}。")
+            if not slot.is_visible():
+                raise RuntimeError(f"Product Photos 图片槽 #{self.slot_id} 当前不可见。")
 
             browser_visual_hud_target(
-                upload_button,
-                "正在打开图片选择",
-                f"已进入 {self.slot_id} 上传面板，准备点击真实 Upload Photo 按钮。",
-                phase=3,
+                slot,
+                "准备上传图片",
+                f"正在定位 Product Photos 图片槽 {self.slot_id}，下一步会打开真实上传控件。",
+                phase=2,
             )
 
-            shared = _raw_file_input(self.page, current_path)
-            try:
-                with self.page.expect_file_chooser(timeout=1_500) as chooser_info:
-                    upload_button.click(timeout=1_500, force=True)
-                browser_visual_hud_status(
+            with tempfile.TemporaryDirectory(prefix="makro-photo-") as temp_dir:
+                upload_path, upload_meta = _normalize_for_makro_upload(source, Path(temp_dir))
+                self.upload_meta = upload_meta
+
+                slot.evaluate("el => el.scrollIntoView({block: 'nearest', inline: 'nearest'})")
+                current_path, upload_button = _open_photo_slot_upload_panel(
                     self.page,
-                    "正在提交商品图片",
-                    f"正在把 {source.name} 提交到 {self.slot_id}，等待 Makro 接收。",
+                    current_path,
+                    slot,
+                    self.slot_id,
+                )
+
+                browser_visual_hud_target(
+                    upload_button,
+                    "正在打开图片选择",
+                    f"已进入 {self.slot_id} 上传面板，准备点击真实 Upload Photo 按钮。",
                     phase=3,
                 )
-                chooser_info.value.set_files(str(upload_path))
-            except PlaywrightTimeoutError:
-                if shared is None:
-                    deadline = time.monotonic() + 1.5
-                    while time.monotonic() < deadline:
-                        current_path = self._current_path()
-                        shared = _raw_file_input(self.page, current_path)
-                        if shared is not None:
-                            break
-                        self.page.wait_for_timeout(50)
-                if shared is None:
-                    raise RuntimeError(
-                        f"#{self.slot_id} 已点击 Upload Photo，但没有 file chooser，"
-                        "也找不到共享 input[type=file]。"
+
+                shared = _raw_file_input(self.page, current_path)
+                try:
+                    with self.page.expect_file_chooser(timeout=1_500) as chooser_info:
+                        upload_button.click(timeout=1_500, force=True)
+                    browser_visual_hud_status(
+                        self.page,
+                        "正在提交商品图片",
+                        f"正在把 {source.name} 提交到 {self.slot_id}，等待 Makro 接收。",
+                        phase=3,
                     )
-                browser_visual_hud_status(
-                    self.page,
-                    "正在提交商品图片",
-                    f"正在通过页面文件输入把 {source.name} 提交到 {self.slot_id}。",
-                    phase=3,
+                    chooser_info.value.set_files(str(upload_path))
+                    self.submitted = True
+                except PlaywrightTimeoutError:
+                    if shared is None:
+                        deadline = time.monotonic() + 1.5
+                        while time.monotonic() < deadline:
+                            current_path = self._current_path()
+                            shared = _raw_file_input(self.page, current_path)
+                            if shared is not None:
+                                break
+                            self.page.wait_for_timeout(50)
+                    if shared is None:
+                        raise RuntimeError(
+                            f"#{self.slot_id} 已点击 Upload Photo，但没有 file chooser，"
+                            "也找不到共享 input[type=file]。"
+                        )
+                    browser_visual_hud_status(
+                        self.page,
+                        "正在提交商品图片",
+                        f"正在通过页面文件输入把 {source.name} 提交到 {self.slot_id}。",
+                        phase=3,
+                    )
+                    shared.set_input_files(str(upload_path))
+                    self.submitted = True
+
+                print(
+                    f"GUI_EXEC_PHOTO\tSUBMITTED\t{self.slot_id}\t{source.name}\t"
+                    f"{upload_meta['source_format']}->JPEG\t{upload_meta['upload_size']}",
+                    flush=True,
                 )
-                shared.set_input_files(str(upload_path))
 
-            print(
-                f"GUI_EXEC_PHOTO\tSUBMITTED\t{self.slot_id}\t{source.name}\t"
-                f"{upload_meta['source_format']}->JPEG\t{upload_meta['upload_size']}",
-                flush=True,
-            )
-
-            self.last_acceptance = _wait_for_target_slot_completion(
-                self.page,
-                current_path,
-                self.slot_id,
-                before_state=before_state,
-                soft_timeout_ms=self.timeout_ms,
-                uploading_timeout_ms=max(self.timeout_ms, 60_000),
-            )
+                self.last_acceptance = _wait_for_target_slot_completion(
+                    self.page,
+                    current_path,
+                    self.slot_id,
+                    before_state=before_state,
+                    soft_timeout_ms=self.timeout_ms,
+                    uploading_timeout_ms=max(self.timeout_ms, 60_000),
+                )
+        except PhotoPreSubmitError:
+            raise
+        except Exception as exc:
+            if self.submitted:
+                raise PhotoPostSubmitUncertainError(str(exc)) from exc
+            raise PhotoPreSubmitError(str(exc)) from exc
 
         self._selected = True
         browser_visual_hud_status(
@@ -886,8 +853,6 @@ def _wait_for_staged_signal(
     target_slot_id: str | None = None,
     timeout_ms: int,
 ) -> dict[str, Any]:
-    """Legacy page-level poll retained for callers/tests outside the upload transaction."""
-
     deadline = time.monotonic() + timeout_ms / 1000.0
     latest = _photo_state(page, section_path)
     while time.monotonic() < deadline:
@@ -913,10 +878,18 @@ def upload_product_photos(
     *,
     timeout_ms: int = 8_000,
 ) -> PhotoUploadResult:
-    """Stage images transactionally into Makro's five fixed roles; never Save."""
+    """Stage independent source files while preserving slot-ownership safety.
+
+    Invalid/missing/undecodable files fail before browser submission and are
+    rejected individually. Once file bytes have been submitted to a concrete
+    thumbnail role, inability to prove that role's acceptance stops the sequence;
+    continuing after that boundary could assign the next product image to the wrong
+    Makro slot.
+    """
 
     timeout_ms = max(1, int(timeout_ms))
     resolved_paths: list[Path] = []
+    input_rejections: list[dict[str, Any]] = []
     seen: set[str] = set()
     for raw in image_paths:
         path = Path(raw).expanduser().resolve()
@@ -925,27 +898,43 @@ def upload_product_photos(
             continue
         seen.add(key)
         if not path.is_file():
-            return PhotoUploadResult(status="invalid_input", detail=f"上传图片不存在或不是文件：{path}")
+            input_rejections.append(
+                {
+                    "path": str(path),
+                    "status": "rejected_pre_submit",
+                    "detail": f"上传图片不存在或不是文件：{path}",
+                    "failure_scope": "image",
+                }
+            )
+            continue
         resolved_paths.append(path)
 
     if not resolved_paths:
+        if input_rejections:
+            return PhotoUploadResult(
+                status="no_usable_input",
+                attempted=0,
+                staged=0,
+                items=input_rejections,
+                detail="所有请求图片都在提交 Makro 前被机械校验拒绝；没有改变任何图片槽。",
+            )
         return PhotoUploadResult(status="skipped", detail="没有传入 --upload-image。")
 
     browser_visual_hud_status(
         page,
         "正在上传商品图片",
-        f"Product Photos 将依次处理 {len(resolved_paths)} 张已授权图片。",
+        f"Product Photos 将依次处理 {len(resolved_paths)} 张可用候选图片。",
         phase=1,
     )
 
     section = find_section(page, PRODUCT_PHOTOS_SECTION)
     if section is None:
-        return PhotoUploadResult(status="not_found", detail="当前页面找不到 Product Photos section。")
+        return PhotoUploadResult(status="not_found", items=input_rejections, detail="当前页面找不到 Product Photos section。")
     open_section_for_edit(page, section)
     section = find_section(page, PRODUCT_PHOTOS_SECTION) or section
     section_path = str(section.get("path") or "")
     if not section_path:
-        return PhotoUploadResult(status="not_found", detail="Product Photos section 缺少稳定 DOM path。")
+        return PhotoUploadResult(status="not_found", items=input_rejections, detail="Product Photos section 缺少稳定 DOM path。")
 
     section_path, state = _wait_for_photo_surface_ready(
         page,
@@ -961,23 +950,40 @@ def upload_product_photos(
         capacity=capacity,
         accept=str(((state.get("file_inputs") or [{}])[0]).get("accept") or ""),
         multiple=False,
+        items=list(input_rejections),
     )
 
     consumed_slots: set[str] = set()
+    pre_submit_rejected = len(input_rejections)
+    post_submit_uncertain = False
+    operational_stop = False
     for path in resolved_paths:
         section = find_section(page, PRODUCT_PHOTOS_SECTION) or section
         section_path = str(section.get("path") or section_path)
-        section_path, _ready_state = _wait_for_photo_surface_ready(
-            page,
-            section_path,
-            timeout_ms=timeout_ms,
-        )
-        target = _select_file_input(
-            page,
-            section_path,
-            consumed_slot_ids=consumed_slots,
-            timeout_ms=timeout_ms,
-        )
+        try:
+            section_path, _ready_state = _wait_for_photo_surface_ready(
+                page,
+                section_path,
+                timeout_ms=timeout_ms,
+            )
+            target = _select_file_input(
+                page,
+                section_path,
+                consumed_slot_ids=consumed_slots,
+                timeout_ms=timeout_ms,
+            )
+        except Exception as exc:
+            result.items.append(
+                {
+                    "path": str(path),
+                    "status": "gallery_unavailable",
+                    "detail": str(exc),
+                    "failure_scope": "photo_section",
+                }
+            )
+            operational_stop = True
+            break
+
         if target is None:
             result.items.append(
                 {
@@ -985,65 +991,108 @@ def upload_product_photos(
                     "status": "slot_missing",
                     "detail": "完整五槽结构已就绪，但没有下一个未消费的逻辑空 #thumbnail_N 图片框。",
                     "consumed_slots": sorted(consumed_slots),
+                    "failure_scope": "photo_section",
                 }
             )
+            operational_stop = True
             break
 
         result.attempted += 1
         try:
             target.set_input_files(str(path))
-            settled = dict(target.last_acceptance)
-            consumed_slots.add(target.slot_id)
-            result.staged += 1
-            result.items.append(
-                {
-                    "path": str(path),
-                    "status": "staged",
-                    "slot_id": target.slot_id,
-                    "acceptance_signal": settled.get("acceptance_signal"),
-                    "new_target_sources": settled.get("new_target_sources") or [],
-                    "target_slot_before": settled.get("target_slot_before") or {},
-                    "target_slot_after": settled.get("target_slot_after") or {},
-                    "uploading_seen": bool(settled.get("uploading_seen")),
-                    "consumed_slots": sorted(consumed_slots),
-                    "upload_meta": target.upload_meta,
-                    "timeout_ms": timeout_ms,
-                }
-            )
-        except Exception as exc:
-            live_state = _photo_state(page, section_path)
+        except PhotoPreSubmitError as exc:
+            pre_submit_rejected += 1
             print(
-                f"GUI_EXEC_PHOTO\tERROR\t{target.slot_id}\t{path.name}\t{exc}",
+                f"GUI_EXEC_PHOTO\tREJECTED_PRE_SUBMIT\t{target.slot_id}\t{path.name}\t{exc}",
                 flush=True,
             )
             result.items.append(
                 {
                     "path": str(path),
-                    "status": "upload_error",
+                    "status": "rejected_pre_submit",
                     "slot_id": target.slot_id,
                     "detail": str(exc),
-                    "target_slot_after_error": _slot_diagnostic_payload(live_state, target.slot_id),
                     "consumed_slots": sorted(consumed_slots),
                     "timeout_ms": timeout_ms,
+                    "failure_scope": "image",
                 }
             )
-            # After a submitted file cannot be confirmed, the target role may be
-            # consumed on Makro even if the DOM has not settled. Continuing would
-            # risk assigning the next image to the wrong role, so fail closed.
+            continue
+        except PhotoPostSubmitUncertainError as exc:
+            post_submit_uncertain = True
+            try:
+                live_state = _photo_state(page, section_path)
+                after_error = _slot_diagnostic_payload(live_state, target.slot_id)
+            except Exception:
+                after_error = {}
+            print(
+                f"GUI_EXEC_PHOTO\tPOST_SUBMIT_UNCERTAIN\t{target.slot_id}\t{path.name}\t{exc}",
+                flush=True,
+            )
+            result.items.append(
+                {
+                    "path": str(path),
+                    "status": "post_submit_uncertain",
+                    "slot_id": target.slot_id,
+                    "detail": str(exc),
+                    "target_slot_after_error": after_error,
+                    "consumed_slots": sorted(consumed_slots),
+                    "timeout_ms": timeout_ms,
+                    "failure_scope": "slot_transaction",
+                }
+            )
             break
+
+        settled = dict(target.last_acceptance)
+        consumed_slots.add(target.slot_id)
+        result.staged += 1
+        result.items.append(
+            {
+                "path": str(path),
+                "status": "staged",
+                "slot_id": target.slot_id,
+                "acceptance_signal": settled.get("acceptance_signal"),
+                "new_target_sources": settled.get("new_target_sources") or [],
+                "target_slot_before": settled.get("target_slot_before") or {},
+                "target_slot_after": settled.get("target_slot_after") or {},
+                "uploading_seen": bool(settled.get("uploading_seen")),
+                "consumed_slots": sorted(consumed_slots),
+                "upload_meta": target.upload_meta,
+                "timeout_ms": timeout_ms,
+            }
+        )
 
     section = find_section(page, PRODUCT_PHOTOS_SECTION) or section
     section_path = str(section.get("path") or section_path)
-    final_state = _photo_state(page, section_path)
-    result.final_count = final_state.get("completion_count")
-    if result.staged == len(resolved_paths):
+    try:
+        final_state = _photo_state(page, section_path)
+        result.final_count = final_state.get("completion_count")
+    except Exception:
+        result.final_count = result.initial_count
+
+    eligible_after_rejection = max(0, len(resolved_paths) - (pre_submit_rejected - len(input_rejections)))
+    if post_submit_uncertain:
+        result.status = "post_submit_uncertain"
+        result.detail = (
+            f"已确认 staged={result.staged}，但后续文件已提交而目标槽状态无法证明；"
+            "已停止，禁止继续分配下一张图片。"
+        )
+    elif operational_stop:
+        result.status = "partial_staged" if result.staged else "staging_unconfirmed"
+        result.detail = (
+            f"已确认 staged={result.staged}；Product Photos 运行表面随后不可安全操作，已停止。"
+        )
+    elif result.staged == eligible_after_rejection:
         result.status = "staged"
-        result.detail = f"{result.staged}/{len(resolved_paths)} 个固定 thumbnail 图片槽已事务确认，等待 Save。"
+        result.detail = (
+            f"{result.staged}/{eligible_after_rejection} 张可提交图片已事务确认；"
+            f"另有 {pre_submit_rejected} 张在提交前被隔离，等待 Save。"
+        )
     elif result.staged > 0:
         result.status = "partial_staged"
         result.detail = (
-            f"仅 {result.staged}/{len(resolved_paths)} 个固定 thumbnail 图片槽事务确认；"
-            "遇到不确定槽状态后已停止，未继续冒险上传。"
+            f"仅 {result.staged}/{eligible_after_rejection} 个可提交图片槽事务确认；"
+            "未继续冒险上传。"
         )
     else:
         result.status = "staging_unconfirmed"
@@ -1058,8 +1107,6 @@ def verify_persisted_photo_count(
     expected_added: int,
     timeout_ms: int = 10_000,
 ) -> dict[str, Any]:
-    """Poll the collapsed Product Photos counter after its Save transaction."""
-
     if expected_added <= 0:
         state = inspect_product_photos(page)
         return {
@@ -1105,3 +1152,17 @@ def verify_persisted_photo_count(
             "不能证明图片已持久化。"
         ),
     }
+
+
+__all__ = [
+    "PHOTO_SLOT_IDS",
+    "PRODUCT_PHOTOS_SECTION",
+    "PhotoPostSubmitUncertainError",
+    "PhotoPreSubmitError",
+    "PhotoUploadError",
+    "PhotoUploadResult",
+    "inspect_product_photos",
+    "parse_completion_counter",
+    "upload_product_photos",
+    "verify_persisted_photo_count",
+]
