@@ -12,7 +12,7 @@ from .providers.usage_telemetry import usage_request_context
 from .source_snapshot import source_snapshot_from_json
 
 
-LISTING_IMAGE_RANKING_VERSION = 3
+LISTING_IMAGE_RANKING_VERSION = 4
 MAX_AUTO_LISTING_IMAGES = 5
 
 
@@ -100,21 +100,68 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _build_candidates(raw_images: list[object]) -> tuple[list[_Candidate], list[dict[str, Any]]]:
-    """Build the AI candidate universe with transport checks only.
+def _customer_owned_image_paths(outputs: dict[str, Any]) -> set[Path]:
+    """Return images explicitly owned by the customer's auxiliary Product Pack.
 
-    Product meaning, importance, visual similarity, main-image quality and gallery
-    ordering deliberately do not exist in this layer. A local file only needs to
-    contain decodable pixels. Exact byte-identical copies are collapsed because
-    sending the same payload twice cannot add semantic information.
+    This is an intent boundary, not an image-quality rule. Auxiliary evidence may be
+    inspected for product facts but must never compete with supplier photos for an
+    automatic Makro Product Photos slot. Explicit manual Product Photos are handled
+    by the separate GUI upload-intent path and therefore never enter this ranker.
     """
 
+    manifest_text = str(outputs.get("product_pack_manifest") or "").strip()
+    if not manifest_text:
+        return set()
+    manifest_path = Path(manifest_text).expanduser().resolve()
+    if not manifest_path.is_file():
+        return set()
+    try:
+        payload = _read_json(manifest_path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return set()
+    if not isinstance(payload, dict):
+        return set()
+
+    values = [
+        *(payload.get("evidence_images") or []),
+        *(payload.get("listing_images") or []),
+    ]
+    return {
+        Path(str(value)).expanduser().resolve()
+        for value in values
+        if str(value or "").strip()
+    }
+
+
+def _build_candidates(
+    raw_images: list[object],
+    *,
+    excluded_paths: set[Path] | None = None,
+) -> tuple[list[_Candidate], list[dict[str, Any]]]:
+    """Build the AI candidate universe with transport and ownership checks only.
+
+    Product meaning, importance, visual similarity, main-image quality and gallery
+    ordering deliberately do not exist in this layer. A supplier image only needs
+    to contain decodable pixels. Exact byte-identical copies are collapsed because
+    sending the exact same payload twice cannot add semantic information.
+    """
+
+    excluded = excluded_paths or set()
     candidates: list[_Candidate] = []
     rejected: list[dict[str, Any]] = []
     seen_hashes: set[str] = set()
 
     for source_index, raw in enumerate(raw_images, start=1):
         path = Path(str(raw or "")).expanduser().resolve()
+        if path in excluded:
+            rejected.append(
+                {
+                    "source_index": source_index,
+                    "path": str(path),
+                    "reason": "customer_auxiliary_not_auto_listing_candidate",
+                }
+            )
+            continue
         if not path.is_file():
             rejected.append(
                 {"source_index": source_index, "path": str(path), "reason": "missing_file"}
@@ -223,9 +270,9 @@ def build_listing_image_ranking_request(
 ) -> dict[str, Any]:
     """Ask one multimodal model to make the complete photo decision.
 
-    The model sees every candidate image together. `selected_image_ids` is already
-    the final upload order; Python never applies a second role table, score formula,
-    visual fingerprint, background heuristic or source-order ranking afterwards.
+    The model sees every supplier candidate image together. `selected_image_ids` is
+    already the final upload order; Python never applies a second role table, score
+    formula, visual fingerprint, background heuristic or source-order ranking.
     """
 
     candidate_ids = [candidate.image_id for candidate in candidates]
@@ -325,12 +372,12 @@ def _selection_report(
     selected_ids = list(ranking.selected_ids) if ranking is not None else []
     selected_set = set(selected_ids)
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "policy": {
             "version": LISTING_IMAGE_RANKING_VERSION,
             "kind": "ai-owned-multimodal-listing-photo-selection",
             "max_auto_listing_images": MAX_AUTO_LISTING_IMAGES,
-            "pre_ai_filter": "decodable-local-image-and-exact-byte-duplicate-only",
+            "pre_ai_filter": "explicit-ownership-boundary-plus-decodable-image-and-exact-byte-duplicate-only",
             "semantic_owner": "multimodal_ai",
             "duplicate_owner": "multimodal_ai_except_exact_byte_duplicates",
             "ordering": "selected_image_ids_verbatim",
@@ -369,9 +416,9 @@ def finalize_supplier_listing_images(
 
     This stage intentionally has no Python-side image-role priority, importance
     score, white-background score, entropy score, visual similarity threshold or
-    source-order preference. The only pre-AI exclusions are technical failures and
-    exact byte-identical copies. If this AI call fails, the caller keeps the prior
-    mechanical compatibility result instead of publishing a fabricated ranking.
+    source-order preference. Pre-AI exclusions are limited to explicit customer
+    auxiliary ownership, technical failures and exact byte-identical copies. If the
+    AI call fails, the caller keeps the prior mechanical compatibility result.
     """
 
     root = Path(run_dir).expanduser().resolve()
@@ -398,7 +445,10 @@ def finalize_supplier_listing_images(
     if not isinstance(raw_images, list):
         raise ListingImageRankingError("primary_source_product_images must be an array")
 
-    candidates, transport_rejected = _build_candidates(raw_images)
+    candidates, transport_rejected = _build_candidates(
+        raw_images,
+        excluded_paths=_customer_owned_image_paths(outputs),
+    )
     selection_path = Path(
         str(outputs.get("primary_source_listing_image_selection") or root / "listing-image-selection.json")
     ).expanduser().resolve()
