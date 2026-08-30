@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -13,23 +12,20 @@ class _FakeProvider:
     name = "fake-semantic"
     model = "fake-model"
 
-    def __init__(self, decisions: dict[str, dict[str, object]]) -> None:
-        self.decisions = decisions
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
         self.calls = 0
+        self.requests: list[dict[str, object]] = []
 
     def extract_json(self, request_payload: dict[str, object]) -> dict[str, object]:
         self.calls += 1
-        assert request_payload["task"] == "rank_supplier_listing_images"
-        return {"decisions": self.decisions, "summary": "ok"}
+        self.requests.append(request_payload)
+        return self.payload
 
 
 def _write_image(path: Path, color: tuple[int, int, int]) -> Path:
     Image.new("RGB", (600, 600), color).save(path)
     return path.resolve()
-
-
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _write_snapshot(path: Path) -> None:
@@ -58,13 +54,7 @@ def _write_snapshot(path: Path) -> None:
     )
 
 
-def _write_manifest(
-    run_dir: Path,
-    *,
-    images: list[Path],
-    observations: Path,
-    snapshot: Path,
-) -> Path:
+def _write_manifest(run_dir: Path, images: list[Path], snapshot: Path) -> Path:
     selection = run_dir / "listing-image-selection.json"
     manifest = run_dir / "run-manifest.json"
     manifest.write_text(
@@ -82,7 +72,6 @@ def _write_manifest(
                     "primary_source_product_images": [str(path) for path in images],
                     "primary_source_listing_images": [str(path) for path in images],
                     "primary_source_listing_image_selection": str(selection),
-                    "image_observations": str(observations),
                 },
             },
             ensure_ascii=False,
@@ -92,189 +81,124 @@ def _write_manifest(
     return manifest
 
 
-def test_semantic_ranker_rejects_unrelated_first_image_and_promotes_hero(tmp_path: Path) -> None:
+def test_multimodal_ai_owns_relevance_and_final_upload_order(tmp_path: Path) -> None:
     unrelated = _write_image(tmp_path / "01-unrelated.jpg", (230, 230, 230))
-    hero = _write_image(tmp_path / "02-hero.jpg", (250, 250, 250))
-    detail = _write_image(tmp_path / "03-detail.jpg", (180, 180, 180))
+    alternate = _write_image(tmp_path / "02-alternate.jpg", (180, 180, 180))
+    hero = _write_image(tmp_path / "03-hero.jpg", (250, 250, 250))
 
-    observations = tmp_path / "image-observations.json"
-    observations.write_text(
-        json.dumps(
-            [
-                {
-                    "image_id": "source-image:1",
-                    "origin": str(unrelated),
-                    "sha256": _sha256(unrelated),
-                    "visible_text": "Kitchen Blender 900W",
-                    "facts": [
-                        {
-                            "name": "product type",
-                            "scope": "product_body",
-                            "value": "blender",
-                            "qualifier": "",
-                            "evidence_text": "The image shows a countertop blender.",
-                        }
-                    ],
-                    "notes": "A different kitchen appliance product.",
-                },
-                {
-                    "image_id": "source-image:2",
-                    "origin": str(hero),
-                    "sha256": _sha256(hero),
-                    "visible_text": "Acme 18V",
-                    "facts": [
-                        {
-                            "name": "product type",
-                            "scope": "product_body",
-                            "value": "cordless drill",
-                            "qualifier": "",
-                            "evidence_text": "Full cordless drill is visible on a clean background.",
-                        }
-                    ],
-                    "notes": "Whole Acme drill, centered and unobstructed.",
-                },
-                {
-                    "image_id": "source-image:3",
-                    "origin": str(detail),
-                    "sha256": _sha256(detail),
-                    "visible_text": "18V",
-                    "facts": [
-                        {
-                            "name": "voltage",
-                            "scope": "product_body",
-                            "value": "18V",
-                            "qualifier": "",
-                            "evidence_text": "Close-up label on the same drill body.",
-                        }
-                    ],
-                    "notes": "Useful close-up of the target drill.",
-                },
-            ],
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
     snapshot = tmp_path / "source-snapshot.json"
     _write_snapshot(snapshot)
-    manifest_path = _write_manifest(
-        tmp_path,
-        images=[unrelated, hero, detail],
-        observations=observations,
-        snapshot=snapshot,
-    )
+    manifest_path = _write_manifest(tmp_path, [unrelated, alternate, hero], snapshot)
 
     provider = _FakeProvider(
         {
-            "image_01": {
-                "relevant": False,
-                "role": "unrelated",
-                "main_image_score": 0,
-                "gallery_score": 0,
-                "reason": "Different product category from the target cordless drill.",
+            "selected_image_ids": ["image_03", "image_02"],
+            "decisions": {
+                "image_01": {
+                    "selected": False,
+                    "reason": "Different product and not useful for this listing.",
+                },
+                "image_02": {
+                    "selected": True,
+                    "reason": "Useful alternate view of the target product.",
+                },
+                "image_03": {
+                    "selected": True,
+                    "reason": "Strongest main image of the exact target product.",
+                },
             },
-            "image_02": {
-                "relevant": True,
-                "role": "hero",
-                "main_image_score": 98,
-                "gallery_score": 96,
-                "reason": "Exact target product, full view, clean composition.",
-            },
-            "image_03": {
-                "relevant": True,
-                "role": "detail",
-                "main_image_score": 25,
-                "gallery_score": 88,
-                "reason": "Relevant close-up that belongs after the full-product image.",
-            },
+            "summary": "Use the clean hero first, then the alternate view.",
         }
     )
 
     result = finalize_supplier_listing_images(tmp_path, provider)
 
     assert provider.calls == 1
-    assert result.status == "ranked"
-    assert result.selected == (hero, detail)
+    assert result.status == "ai_ranked"
+    assert result.selected == (hero, alternate)
+
+    request = provider.requests[0]
+    assert request["task"] == "select_and_order_supplier_listing_images"
+    grounded_sources = request["grounded_sources"]
+    assert isinstance(grounded_sources, list)
+    assert [item["source_id"] for item in grounded_sources] == [
+        "image_01",
+        "image_02",
+        "image_03",
+    ]
+    assert all(item["kind"] == "image" for item in grounded_sources)
+    assert [Path(item["image_path"]) for item in grounded_sources] == [
+        unrelated,
+        alternate,
+        hero,
+    ]
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["outputs"]["primary_source_listing_images"] == [str(hero), str(detail)]
-    assert manifest["source_capture"]["listing_images"] == [str(hero), str(detail)]
-    assert manifest["listing_image_ranking"]["semantic_rejected_count"] == 1
+    assert manifest["outputs"]["primary_source_listing_images"] == [
+        str(hero),
+        str(alternate),
+    ]
+    assert manifest["listing_image_ranking"]["selected_ids"] == ["image_03", "image_02"]
+    assert manifest["listing_image_ranking"]["strategy"] == (
+        "multimodal_ai_owns_semantics_duplicates_and_order"
+    )
     assert manifest["total_model_calls"] == 5
 
     report = json.loads((tmp_path / "listing-image-selection.json").read_text(encoding="utf-8"))
-    assert report["selected"] == [str(hero), str(detail)]
-    assert report["semantic_ranking"]["selected_ids"] == ["image_02", "image_03"]
+    assert report["policy"]["semantic_owner"] == "multimodal_ai"
+    assert report["policy"]["ordering"] == "selected_image_ids_verbatim"
+    assert report["selected"] == [str(hero), str(alternate)]
 
 
-def test_ranker_keeps_mechanically_safe_photos_when_ai_observations_are_missing(tmp_path: Path) -> None:
+def test_ranker_does_not_depend_on_upstream_image_observations(tmp_path: Path) -> None:
     image = _write_image(tmp_path / "only.jpg", (240, 240, 240))
-    observations = tmp_path / "image-observations.json"
-    observations.write_text("[]", encoding="utf-8")
     snapshot = tmp_path / "source-snapshot.json"
     _write_snapshot(snapshot)
-    manifest_path = _write_manifest(
-        tmp_path,
-        images=[image],
-        observations=observations,
-        snapshot=snapshot,
-    )
-    provider = _FakeProvider({})
+    manifest_path = _write_manifest(tmp_path, [image], snapshot)
 
-    result = finalize_supplier_listing_images(tmp_path, provider)
-
-    assert provider.calls == 0
-    assert result.status == "mechanical_fallback_no_ai_observations"
-    assert result.selected == (image,)
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["outputs"]["primary_source_listing_images"] == [str(image)]
-    assert manifest["listing_image_ranking"]["semantic_rejected_count"] == 0
-    assert manifest["listing_image_ranking"]["fallback_candidate_count"] == 1
-
-
-def test_ranker_rejects_observed_unrelated_but_keeps_unobserved_safe_fallback(tmp_path: Path) -> None:
-    unrelated = _write_image(tmp_path / "01-unrelated.jpg", (210, 210, 210))
-    fallback = _write_image(tmp_path / "02-fallback.jpg", (245, 245, 245))
-    observations = tmp_path / "image-observations.json"
-    observations.write_text(
-        json.dumps(
-            [
-                {
-                    "image_id": "source-image:1",
-                    "origin": str(unrelated),
-                    "sha256": _sha256(unrelated),
-                    "visible_text": "Other product",
-                    "facts": [],
-                    "notes": "Different product.",
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
-    snapshot = tmp_path / "source-snapshot.json"
-    _write_snapshot(snapshot)
-    manifest_path = _write_manifest(
-        tmp_path,
-        images=[unrelated, fallback],
-        observations=observations,
-        snapshot=snapshot,
-    )
     provider = _FakeProvider(
         {
-            "image_01": {
-                "relevant": False,
-                "role": "unrelated",
-                "main_image_score": 0,
-                "gallery_score": 0,
-                "reason": "Different target product.",
-            }
+            "selected_image_ids": ["image_01"],
+            "decisions": {
+                "image_01": {
+                    "selected": True,
+                    "reason": "The image directly shows the exact target product.",
+                }
+            },
+            "summary": "One useful product image is available.",
         }
     )
 
     result = finalize_supplier_listing_images(tmp_path, provider)
 
     assert provider.calls == 1
-    assert result.status == "ranked_with_mechanical_fallback"
-    assert result.selected == (fallback,)
+    assert result.selected == (image,)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["outputs"]["primary_source_listing_images"] == [str(fallback)]
-    assert manifest["listing_image_ranking"]["semantic_rejected_count"] == 1
+    assert "image_observations" not in manifest["outputs"]
+    assert manifest["outputs"]["primary_source_listing_images"] == [str(image)]
+
+
+def test_ai_may_reject_all_candidates_when_none_are_useful(tmp_path: Path) -> None:
+    image = _write_image(tmp_path / "unrelated.jpg", (100, 150, 200))
+    snapshot = tmp_path / "source-snapshot.json"
+    _write_snapshot(snapshot)
+    _write_manifest(tmp_path, [image], snapshot)
+
+    provider = _FakeProvider(
+        {
+            "selected_image_ids": [],
+            "decisions": {
+                "image_01": {
+                    "selected": False,
+                    "reason": "The image is unrelated to the exact target product.",
+                }
+            },
+            "summary": "No candidate belongs in the listing.",
+        }
+    )
+
+    result = finalize_supplier_listing_images(tmp_path, provider)
+
+    assert result.status == "ai_ranked"
+    assert result.selected == ()
+    assert result.semantically_rejected_count == 1
