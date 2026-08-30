@@ -17,6 +17,8 @@ from app.live_schema import write_live_schema
 from app.makro.direct_visual_hold import is_listing_attribute_field
 from app.makro.domain import MakroDomainAdapter
 from app.makro.listing_draft_identity import listing_draft_identity_from_url
+from app.makro.listing_preflight import CORE_FORM_SECTIONS
+from app.makro.sections import base_section_title
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,6 +35,23 @@ def scan_and_write_live_schema(
         wait_ms=wait_ms,
         max_scroll_steps=max_scroll_steps,
     )
+
+    failures = list(scan.get("section_failures") or []) if isinstance(scan, dict) else []
+    core = {base_section_title(value).casefold() for value in CORE_FORM_SECTIONS}
+    core_failures = [
+        item
+        for item in failures
+        if base_section_title(str((item or {}).get("section") or "")).casefold() in core
+    ]
+    if core_failures:
+        raise RuntimeError(
+            "Step 3 live schema could not establish every core form section: "
+            + " | ".join(
+                f"{item.get('section')}: {item.get('error')}"
+                for item in core_failures[:6]
+            )
+        )
+
     all_fields = adapter.build_semantic_fields(controls)
     fields = [field for field in all_fields if is_listing_attribute_field(field)]
     if not fields:
@@ -48,6 +67,10 @@ def scan_and_write_live_schema(
         "semantic_fields_before_filter": len(all_fields),
         "sections": [item.get("title") for item in sections],
         "scan": scan,
+        "section_failures": failures,
+        "degraded_optional_sections": [
+            item for item in failures if item not in core_failures
+        ],
         "listing_draft_identity_bound": True,
     }
 
@@ -164,9 +187,9 @@ def build_executor_command(
         if str(item)
     ]
     screenshot = str(outputs.get("primary_source_screenshot") or "")
-    evidence_images = product_images or ([screenshot] if screenshot else [])
-    if not decision_packet or not snapshot or not evidence_images:
-        raise RuntimeError("Resolver manifest is missing final decisions / source snapshot / evidence images")
+    evidence_images = product_images or ([screenshot] if screenshot and Path(screenshot).is_file() else [])
+    if not decision_packet or not snapshot:
+        raise RuntimeError("Resolver manifest is missing final decisions / canonical source snapshot")
 
     product_url = str(resolver_manifest.get("primary_product_url") or args.product_url)
     executor_script = Path(script_path) if script_path is not None else _PROJECT_ROOT / "makro_execute_listing.py"
