@@ -7,7 +7,7 @@ There are only two execution modes:
 - ``--all-step3 --allow-section-save``: persisted Step 3 acceptance. It uses the
   exact read-only-planned live schema and AI decision packet, fills each core
   card, saves it, re-opens it and verifies persisted values. Product Photos is
-  staged, saved and verified separately.
+  staged, saved and verified separately when validated upload images are supplied.
 
 Before any browser write, the decision packet is rebound to the exact current
 product sources and the current Makro schema must match the planning schema.
@@ -439,12 +439,21 @@ def _completion_summary(
     )
     additional = by_section.get("Additional Description", {})
     additional_ok = additional.get("status") in {"persisted_verified", "no_candidates"}
-    photos_ok = bool(
+
+    photos_requested = bool(
+        photo_report and int(photo_report.get("requested") or 0) > 0
+    )
+    photos_persisted = bool(
         photo_report
         and photo_report.get("status") == "persisted_verified"
         and int((photo_report.get("persistence") or {}).get("final_count") or 0) >= 1
     )
-    draft_persisted_complete = required_persisted and additional_ok and photos_ok
+    photo_requirement_satisfied = bool(
+        photo_report and (not photos_requested or photos_persisted)
+    )
+    draft_persisted_complete = (
+        required_persisted and additional_ok and photo_requirement_satisfied
+    )
     review_persisted = sum(
         int(report.get("review_candidates_persisted") or 0)
         for report in section_reports
@@ -453,7 +462,9 @@ def _completion_summary(
     return {
         "required_field_cards_persisted": required_persisted,
         "additional_description_ok": additional_ok,
-        "photos_persisted": photos_ok,
+        "photos_requested": photos_requested,
+        "photos_persisted": photos_persisted,
+        "photo_requirement_satisfied": photo_requirement_satisfied,
         "review_candidates_persisted": review_persisted,
         "required_blocked": required_blocked,
         "draft_persisted_complete": draft_persisted_complete,

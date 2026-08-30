@@ -8,7 +8,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
@@ -24,6 +24,8 @@ from .browser_visual_hud import (
     finish_browser_visual_hud,
     set_browser_visual_hud_capture_safe,
 )
+from .image_media import ImageMediaError, normalize_image_media
+from .listing_images import select_listing_images
 from .public_resource_fetch import fetch_public_resource
 from .source_snapshot import (
     SourceAccessBlocked,
@@ -37,7 +39,7 @@ from .supplier_url_identity import supplier_request_identity
 
 
 DEFAULT_SOURCE_CDP_PORT = 9333
-SOURCE_CAPTURE_CACHE_VERSION = 6
+SOURCE_CAPTURE_CACHE_VERSION = 7
 _DETAIL_DOCUMENT_MAX_BYTES = 8 * 1024 * 1024
 _PRODUCT_IMAGE_MAX_BYTES = 64 * 1024 * 1024
 _PRODUCT_IMAGES_TOTAL_MAX_BYTES = 256 * 1024 * 1024
@@ -132,6 +134,90 @@ def _detail_image_urls_from_text(value: str, *, max_urls: int = 32) -> list[str]
     return output
 
 
+def _normalize_discovered_image_url(value: object, *, base_url: str) -> str:
+    raw = html.unescape(str(value or "")).strip().replace(r"\/", "/")
+    if not raw or raw.startswith(("data:", "blob:")):
+        return ""
+    try:
+        absolute = urljoin(base_url, raw)
+        return validate_source_url(absolute)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _unique_image_urls(values: list[str], *, max_images: int = 32) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        value = str(raw or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        output.append(value)
+        if len(output) >= max_images:
+            break
+    return output
+
+
+def _structured_product_image_urls(snapshot: SourceSnapshot, *, max_images: int = 24) -> list[str]:
+    """Extract only images explicitly owned by JSON-LD Product objects."""
+
+    base_url = snapshot.final_url or snapshot.requested_url
+    output: list[str] = []
+    seen: set[str] = set()
+
+    def push(raw: object) -> None:
+        value = _normalize_discovered_image_url(raw, base_url=base_url)
+        if not value or value in seen or len(output) >= max_images:
+            return
+        seen.add(value)
+        output.append(value)
+
+    def collect_image_value(value: object) -> None:
+        if len(output) >= max_images:
+            return
+        if isinstance(value, str):
+            push(value)
+            return
+        if isinstance(value, list):
+            for item in value:
+                collect_image_value(item)
+            return
+        if not isinstance(value, dict):
+            return
+        for key in ("contentUrl", "url", "thumbnailUrl", "src"):
+            if key in value:
+                collect_image_value(value.get(key))
+
+    def walk(value: object) -> None:
+        if len(output) >= max_images:
+            return
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+            return
+        if not isinstance(value, dict):
+            return
+
+        raw_types = value.get("@type")
+        types = raw_types if isinstance(raw_types, list) else [raw_types]
+        is_product = any(
+            "product" in str(item or "").casefold()
+            for item in types
+        )
+        if is_product:
+            for key in ("image", "images"):
+                if key in value:
+                    collect_image_value(value.get(key))
+
+        for key in ("@graph", "itemListElement", "mainEntity", "mainEntityOfPage"):
+            if key in value:
+                walk(value.get(key))
+
+    walk(snapshot.json_ld)
+    return output
+
+
 def _context_cookies(context, url: str) -> tuple[dict[str, object], ...]:
     try:
         raw = context.cookies(url)
@@ -149,10 +235,10 @@ def _discover_detail_images(
 ) -> tuple[list[str], list[str]]:
     """Read bounded public detail documents exposed by the exact supplier page.
 
-    The supplier page itself is user-selected. URLs found inside that page are not:
-    they are therefore fetched through the pinned public-resource transport so a
-    malicious page cannot turn automatic enrichment into a localhost/private-net
-    request or an unbounded body allocation.
+    Detail-document images are deliberately a fallback source. They are useful on
+    marketplaces that keep high-resolution media in a detail payload, but the
+    document may also contain recommendation and decoration assets and therefore
+    must never outrank explicit Product/gallery ownership.
     """
 
     documents = _detail_document_urls(snapshot, max_urls=max_documents)
@@ -328,6 +414,108 @@ def _capture_snapshot_with_navigation_retry(
     raise RuntimeError("unreachable snapshot retry state")
 
 
+def _discover_product_gallery_images(
+    page,
+    snapshot: SourceSnapshot,
+    *,
+    settle_ms: int,
+    max_images: int = 24,
+) -> list[str]:
+    """Discover DOM images owned by the current product media surface.
+
+    The browser layer does not guess final listing relevance; it only separates a
+    product/gallery-shaped surface from generic page imagery. The downstream image
+    evidence + semantic listing ranker remains the final meaning gate.
+    """
+
+    raw = _evaluate_with_navigation_retry(
+        page,
+        r"""() => {
+          const visible = (el) => {
+            const style = getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden'
+              && rect.width > 0 && rect.height > 0;
+          };
+          const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+          const positive = /(gallery|product[-_\s]*(image|media)|pdp[-_\s]*(image|media)|image[-_\s]*gallery|media[-_\s]*gallery|thumbnail|thumbs)/i;
+          const negative = /(recommend|related|similar|sponsor|banner|logo|header|footer|navigation|\bnav\b|advert|promo|cross[-_\s]*sell|recently)/i;
+          const titleTokens = new Set(
+            clean(document.querySelector('h1')?.innerText || document.title)
+              .toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length >= 4)
+          );
+          const output = [];
+          const seen = new Set();
+          const push = (raw) => {
+            const value = clean(raw);
+            if (!value || value.startsWith('data:') || value.startsWith('blob:')) return;
+            try {
+              const absolute = new URL(value, document.baseURI).href;
+              if (!/^https?:/i.test(absolute) || seen.has(absolute)) return;
+              seen.add(absolute);
+              output.push(absolute);
+            } catch (_) {}
+          };
+          const pushImgSources = (img) => {
+            push(img.currentSrc);
+            for (const name of ['data-zoom-image', 'data-large-image', 'data-original', 'data-src', 'data-lazy-src', 'src']) {
+              push(img.getAttribute(name));
+            }
+            const srcset = clean(img.getAttribute('srcset'));
+            if (srcset) {
+              const candidates = srcset.split(',').map((part) => clean(part).split(/\s+/)[0]).filter(Boolean);
+              if (candidates.length) push(candidates[candidates.length - 1]);
+            }
+          };
+
+          for (const img of document.images) {
+            if (!visible(img)) continue;
+            const nw = Number(img.naturalWidth || 0);
+            const nh = Number(img.naturalHeight || 0);
+            if (Math.max(nw, nh) < 160) continue;
+
+            const context = [];
+            let node = img;
+            for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+              context.push(clean([
+                node.id,
+                node.className,
+                node.getAttribute?.('role'),
+                node.getAttribute?.('aria-label'),
+                node.getAttribute?.('data-testid'),
+              ].filter(Boolean).join(' ')));
+            }
+            const contextText = context.join(' ');
+            if (negative.test(contextText)) continue;
+
+            const rect = img.getBoundingClientRect();
+            const altTokens = new Set(
+              clean(img.alt || img.title).toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length >= 4)
+            );
+            let titleMatches = 0;
+            for (const token of altTokens) if (titleTokens.has(token)) titleMatches += 1;
+
+            let score = 0;
+            if (positive.test(contextText)) score += 5;
+            if (titleMatches >= 2) score += 3;
+            else if (titleMatches === 1) score += 1;
+            if (rect.width >= 180 && rect.height >= 180) score += 2;
+            if (nw * nh >= 80000) score += 1;
+            if (img.closest('main')) score += 1;
+            if (score >= 6) pushImgSources(img);
+          }
+          return output.slice(0, 24);
+        }""",
+        settle_ms=settle_ms,
+    )
+    base_url = snapshot.final_url or snapshot.requested_url
+    normalized = [
+        _normalize_discovered_image_url(item, base_url=base_url)
+        for item in (raw if isinstance(raw, list) else [])
+    ]
+    return _unique_image_urls([item for item in normalized if item], max_images=max_images)
+
+
 def _compact_playwright_error(exc: BaseException) -> str:
     return re.sub(r"\s+", " ", str(exc or "")).strip()[:500]
 
@@ -359,22 +547,6 @@ def _screenshot_with_navigation_retry(
     return False, " | ".join(failures)
 
 
-def _image_extension(content_type: str, url: str) -> str:
-    mime = content_type.split(";", 1)[0].strip().casefold()
-    by_mime = {
-        "image/jpeg": ".jpg",
-        "image/jpg": ".jpg",
-        "image/png": ".png",
-        "image/webp": ".webp",
-        "image/gif": ".gif",
-        "image/avif": ".avif",
-    }
-    if mime in by_mime:
-        return by_mime[mime]
-    suffix = Path(urlsplit(url).path).suffix.lower()
-    return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"} else ".img"
-
-
 def _download_page_images(
     context,
     image_urls: list[str],
@@ -382,14 +554,21 @@ def _download_page_images(
     *,
     max_images: int = 32,
 ) -> tuple[Path, ...]:
+    """Download only technically decodable raster images and normalize to JPEG.
+
+    Response headers and URL suffixes are advisory at best. The image decoder is
+    the transport authority, so HTML/error payloads and unsupported pseudo-images
+    never enter product evidence or reach the multimodal provider.
+    """
+
     if not image_urls:
         return ()
     output_dir.mkdir(parents=True, exist_ok=True)
     saved: list[Path] = []
     seen_hashes: set[str] = set()
-    total_bytes = 0
+    total_source_bytes = 0
     for url in image_urls:
-        if len(saved) >= max_images or total_bytes >= _PRODUCT_IMAGES_TOTAL_MAX_BYTES:
+        if len(saved) >= max_images or total_source_bytes >= _PRODUCT_IMAGES_TOTAL_MAX_BYTES:
             break
         try:
             response = fetch_public_resource(
@@ -398,26 +577,77 @@ def _download_page_images(
                 timeout_seconds=15.0,
                 cookies=_context_cookies(context, url),
             )
-            content_type = response.content_type
-            if content_type and not content_type.casefold().startswith("image/"):
-                continue
             body = response.body
-            if len(body) < 4_096:
-                continue
-            if total_bytes + len(body) > _PRODUCT_IMAGES_TOTAL_MAX_BYTES:
+            if total_source_bytes + len(body) > _PRODUCT_IMAGES_TOTAL_MAX_BYTES:
                 break
-            digest = hashlib.sha256(body).hexdigest()
+            normalized, media = normalize_image_media(body, source=response.final_url or url)
+            digest = hashlib.sha256(normalized).hexdigest()
             if digest in seen_hashes:
                 continue
             seen_hashes.add(digest)
-            ext = _image_extension(content_type, response.final_url)
-            path = output_dir / f"source-image-{len(saved) + 1:02d}-{digest[:10]}{ext}"
-            path.write_bytes(body)
+            path = output_dir / f"source-image-{len(saved) + 1:02d}-{digest[:10]}{media.extension}"
+            path.write_bytes(normalized)
             saved.append(path)
-            total_bytes += len(body)
+            total_source_bytes += len(body)
+        except ImageMediaError:
+            continue
         except Exception:
             continue
     return tuple(saved)
+
+
+def _select_product_image_tier(
+    context,
+    tiers: list[tuple[str, list[str]]],
+    output_dir: Path,
+) -> tuple[str, list[str], tuple[Path, ...]]:
+    """Choose the first image source tier that yields upload-viable product media.
+
+    Every tier is isolated while being evaluated. This prevents an early banner,
+    thumbnail or corrupt resource from blocking a stronger fallback source. If no
+    tier reaches the central listing-image quality gate, preserve the first tier
+    that at least produced decodable pixels for AI evidence instead of fabricating
+    an upload candidate.
+    """
+
+    stage_root = output_dir.with_name(f".{output_dir.name}-staging")
+    if stage_root.exists():
+        shutil.rmtree(stage_root)
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    stage_root.mkdir(parents=True, exist_ok=True)
+
+    first_decodable: tuple[str, list[str], tuple[Path, ...]] | None = None
+    chosen: tuple[str, list[str], tuple[Path, ...]] | None = None
+    try:
+        for index, (name, raw_urls) in enumerate(tiers, start=1):
+            urls = _unique_image_urls(raw_urls)
+            if not urls:
+                continue
+            tier_dir = stage_root / f"{index:02d}-{name}"
+            paths = _download_page_images(context, urls, tier_dir)
+            if paths and first_decodable is None:
+                first_decodable = (name, urls, paths)
+            if paths and select_listing_images(paths).selected:
+                chosen = (name, urls, paths)
+                break
+
+        if chosen is None:
+            chosen = first_decodable
+        if chosen is None:
+            return "none", [], ()
+
+        name, urls, paths = chosen
+        output_dir.mkdir(parents=True, exist_ok=True)
+        final_paths: list[Path] = []
+        for path in paths:
+            target = output_dir / path.name
+            shutil.copy2(path, target)
+            final_paths.append(target)
+        return name, urls, tuple(final_paths)
+    finally:
+        if stage_root.exists():
+            shutil.rmtree(stage_root)
 
 
 def _cached_capture(
@@ -576,43 +806,55 @@ def capture_product_source(
                 max_visible_text_chars=int(max_visible_text_chars),
                 settle_ms=int(scroll_wait_ms),
             )
+            generic_images = list(snapshot.image_urls)
+            structured_images = _structured_product_image_urls(snapshot)
+            gallery_images = _discover_product_gallery_images(
+                page,
+                snapshot,
+                settle_ms=int(scroll_wait_ms),
+            )
+            owned_images = _unique_image_urls([*structured_images, *gallery_images])
 
             browser_visual_hud_status(
                 page,
                 "正在检索详情资源",
-                "正在根据商品页已经公开的详情文档继续整理规格图片与证据链接。",
+                "当前商品图库优先；正在整理仅用于兜底的公开详情图片资源。",
                 phase=2,
             )
             detail_documents, detail_images = _discover_detail_images(context, snapshot)
-            combined_images: list[str] = []
-            seen_images: set[str] = set()
-            for image_url in [*detail_images, *snapshot.image_urls]:
-                if image_url and image_url not in seen_images:
-                    seen_images.add(image_url)
-                    combined_images.append(image_url)
-            snapshot.image_urls = combined_images
             if detail_documents:
                 snapshot.meta["detail_document_urls"] = json.dumps(
                     detail_documents,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
-                snapshot.meta["detail_image_count"] = str(len(detail_images))
+            snapshot.meta["structured_product_image_count"] = str(len(structured_images))
+            snapshot.meta["gallery_image_count"] = str(len(gallery_images))
+            snapshot.meta["generic_visible_image_count"] = str(len(generic_images))
+            snapshot.meta["detail_image_count"] = str(len(detail_images))
 
             browser_visual_hud_status(
                 page,
                 "正在整理商品图片",
-                f"发现 {len(snapshot.image_urls)} 个页面图片候选，正在保存可用商品图。",
+                (
+                    f"商品图库 {len(owned_images)} 个候选；"
+                    "将逐层验证真实图片，异常资源会直接丢弃。"
+                ),
                 phase=3,
             )
             product_image_dir = target_dir / "product-images"
-            if product_image_dir.exists():
-                shutil.rmtree(product_image_dir)
-            product_images = _download_page_images(
+            image_source, selected_urls, product_images = _select_product_image_tier(
                 context,
-                snapshot.image_urls,
+                [
+                    ("product_structured_gallery", owned_images),
+                    ("visible_dom_fallback", generic_images),
+                    ("detail_document_fallback", detail_images),
+                ],
                 product_image_dir,
             )
+            snapshot.image_urls = selected_urls
+            snapshot.meta["product_image_source"] = image_source
+            snapshot.meta["product_image_candidate_count"] = str(len(selected_urls))
 
             browser_visual_hud_status(
                 page,
@@ -655,7 +897,7 @@ def capture_product_source(
                 title="商品页信息提取完成",
                 thought=(
                     f"已完成商品页面采集 · 商品图 {len(product_images)} 张 · "
-                    "结构化证据已写入本次任务。"
+                    f"来源 {image_source} · 结构化证据已写入本次任务。"
                 ),
                 hold_ms=420,
                 destroy=True,
@@ -693,6 +935,7 @@ __all__ = [
     "_detail_document_urls",
     "_detail_image_urls_from_text",
     "_source_cache_key",
+    "_structured_product_image_urls",
     "capture_product_source",
     "validate_source_url",
 ]
