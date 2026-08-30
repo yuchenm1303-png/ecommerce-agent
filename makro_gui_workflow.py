@@ -504,9 +504,11 @@ def _plan_command(
     product_images = [
         str(value).strip()
         for value in outputs.get("primary_source_product_images") or []
-        if str(value).strip()
+        if str(value).strip() and Path(str(value)).is_file()
     ]
-    evidence_images = product_images or ([screenshot] if screenshot else [])
+    evidence_images = product_images or (
+        [screenshot] if screenshot and Path(screenshot).is_file() else []
+    )
     product_url = str(resolver_manifest.get("primary_product_url") or args.product_url).strip()
     if not decision_packet or not snapshot:
         raise RuntimeError(
@@ -581,6 +583,15 @@ def _run_resolver_pair(
     run_dir: Path,
     live_schema: Path,
 ) -> tuple[Path, dict[str, Any], Path, dict[str, Any]]:
+    """Produce one canonical resolver result plus an optional cache replay proof.
+
+    COLD is the business computation and remains fail-closed. HOT/CACHE is a
+    diagnostic replay of the same semantic cache contract; once COLD has produced
+    a complete manifest, a replay transport/process/manifest failure cannot erase
+    the already-valid business result. The fallback is explicit in diagnostics and
+    in the manifest object consumed by the planner.
+    """
+
     cold_root = run_dir / "02-cold-resolver"
     hot_root = run_dir / "03-hot-resolver"
     cold_root.mkdir(parents=True, exist_ok=True)
@@ -603,10 +614,43 @@ def _run_resolver_pair(
 
     diag_event("hot_resolver", "START", output_root=str(hot_root), live_schema=str(live_schema))
     hot_command = _resolver_command(args, live_schema, hot_root)
-    _run(hot_command, "STEP 3 CURRENT RESOLVER · HOT/CACHE")
-    hot_run = _single_run_dir(hot_root, "resolve-ai-")
-    hot_manifest_path = hot_run / "run-manifest.json"
-    hot_manifest = json.loads(hot_manifest_path.read_text(encoding="utf-8"))
+    try:
+        _run(hot_command, "STEP 3 CURRENT RESOLVER · HOT/CACHE")
+        hot_run = _single_run_dir(hot_root, "resolve-ai-")
+        hot_manifest_path = hot_run / "run-manifest.json"
+        hot_manifest = json.loads(hot_manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        fallback_manifest = dict(cold_manifest)
+        fallback_manifest["hot_cache_replay"] = {
+            "status": "degraded",
+            "canonical_resolver": "cold",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+        diag_event(
+            "hot_resolver",
+            "DEGRADED",
+            output_root=str(hot_root),
+            canonical_manifest=str(cold_manifest_path.resolve()),
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        print(
+            "RESOLVER_REPLAY_WARNING HOT/CACHE replay failed after canonical COLD success; "
+            "continuing with the verified COLD resolver artifact.",
+            flush=True,
+        )
+        return (
+            cold_manifest_path,
+            cold_manifest,
+            cold_manifest_path,
+            fallback_manifest,
+        )
+
+    hot_manifest["hot_cache_replay"] = {
+        "status": "complete",
+        "canonical_resolver": "hot_cache",
+    }
     diag_event(
         "hot_resolver",
         "COMPLETE",
@@ -678,6 +722,7 @@ def _prepare_step3(
     manifest["cold_resolver_manifest"] = str(cold_path.resolve())
     manifest["resolver_manifest"] = str(hot_path.resolve())
     manifest["resolver_summary"] = hot_manifest.get("final_decision_summary")
+    manifest["resolver_replay"] = hot_manifest.get("hot_cache_replay") or {}
     diag_event(
         "resolver_pair",
         "COMPLETE",
@@ -685,6 +730,7 @@ def _prepare_step3(
         hot_manifest=str(hot_path.resolve()),
         cold_summary=cold_manifest.get("final_decision_summary") or {},
         hot_summary=hot_manifest.get("final_decision_summary") or {},
+        replay=manifest["resolver_replay"],
     )
 
     plan_root = run_dir / "04-fill-plan"
