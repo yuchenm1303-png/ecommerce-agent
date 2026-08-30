@@ -79,6 +79,8 @@ def test_stable_publish_requires_signing_but_development_build_contract_remains_
     assert "VPK_AZURE_TRUSTED_SIGN_FILE: ${{ secrets.VPK_AZURE_TRUSTED_SIGN_FILE }}" in workflow
     assert "VPK_SIGN_PARAMS: ${{ secrets.VPK_SIGN_PARAMS }}" in workflow
     assert "package is unsigned. This is acceptable for development/E2E only" in build_script
+    assert '$PackArgs += @("--azureTrustedSignFile", $AzureTrustedSignFile)' in build_script
+    assert '$PackArgs += @("--signParams", $SignParams)' in build_script
 
 
 def test_portal_device_allocation_is_serialized_in_database() -> None:
