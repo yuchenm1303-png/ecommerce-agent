@@ -42,6 +42,7 @@ from app.semantic_grounding import build_grounding_catalog
 from app.source_bundle import normalize_key
 
 PRODUCT_PHOTOS = "Product Photos"
+DIAGNOSTIC_SCREENSHOT_TIMEOUT_MS = 5_000
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -349,173 +350,25 @@ def _fill_one_section(
     recheck_wait_ms: int,
     run_dir: Path,
 ) -> dict[str, Any]:
-    candidates = _section_candidates(
+    """Delegate to the one canonical Step 3 execution policy.
+
+    Local import avoids a module-initialization cycle because the canonical
+    execution module intentionally imports the pure helper functions above.
+    """
+
+    from app.makro.execution import fill_one_section
+
+    return fill_one_section(
+        adapter,
         plan,
         section_title,
         include_review_candidates=include_review_candidates,
+        persist=persist,
+        scroll_wait_ms=scroll_wait_ms,
+        max_scroll_steps=max_scroll_steps,
+        recheck_wait_ms=recheck_wait_ms,
+        run_dir=run_dir,
     )
-    report: dict[str, Any] = {
-        "section": section_title,
-        "candidate_count": len(candidates),
-        "writes_attempted": 0,
-        "review_candidates_attempted": 0,
-        "validated": 0,
-        "validation_failed": 0,
-        "fill_error": 0,
-        "skipped_existing": 0,
-        "skipped_live_match": 0,
-        "save_attempted": False,
-        "saved": False,
-        "persisted_verified": 0,
-        "review_candidates_persisted": 0,
-        "persisted_validation_failed": 0,
-        "results": [],
-        "persisted_verifications": [],
-    }
-    if not candidates:
-        report["status"] = "no_candidates"
-        return report
-
-    try:
-        section_path, live = _open_and_index_section(
-            adapter,
-            section_title,
-            wait_ms=scroll_wait_ms,
-            max_scroll_steps=max_scroll_steps,
-        )
-    except Exception as exc:
-        report["status"] = "section_error"
-        report["detail"] = str(exc)
-        return report
-
-    validated_identities: set[tuple[str, str, str]] = set()
-    for item in candidates:
-        mode = preview_mode_for_item(
-            item,
-            include_review_candidates=include_review_candidates,
-        )
-        base_payload = _base_result_payload(item, mode)
-        matches = live.get(_item_identity(item), [])
-        if len(matches) != 1:
-            report["skipped_live_match"] += 1
-            report["results"].append(
-                {
-                    **base_payload,
-                    "execution_status": "skipped_live_match",
-                    "detail": f"展开 section 后 live field 匹配数={len(matches)}，期望恰好 1。",
-                }
-            )
-            continue
-
-        semantic_field = matches[0]
-        if _has_existing_value(semantic_field):
-            report["skipped_existing"] += 1
-            report["results"].append(
-                {
-                    **base_payload,
-                    "execution_status": "skipped_existing",
-                    "detail": "当前控件已有非 placeholder 值；不覆盖。",
-                }
-            )
-            continue
-
-        answer = execution_answer_for_item(
-            item,
-            include_review_candidates=include_review_candidates,
-        )
-        report["writes_attempted"] += 1
-        if mode == "review":
-            report["review_candidates_attempted"] += 1
-        verification = adapter.fill_resolved_field(
-            semantic_field,
-            answer,
-            section_path=section_path,
-            recheck_wait_ms=recheck_wait_ms,
-        )
-        if verification.status == "validated":
-            report["validated"] += 1
-            validated_identities.add(_item_identity(item))
-        elif verification.status == "fill_error":
-            report["fill_error"] += 1
-        else:
-            report["validation_failed"] += 1
-        report["results"].append(
-            {
-                **base_payload,
-                "execution_status": verification.status,
-                "verification": verification.as_dict(),
-            }
-        )
-
-    before_save = run_dir / f"{_safe_name(section_title)}-before-save.png"
-    adapter.page.screenshot(path=str(before_save), full_page=True)
-    report["screenshot_before_save"] = str(before_save.resolve())
-
-    if not persist:
-        report["status"] = "preview_open"
-        return report
-
-    report["save_attempted"] = True
-    try:
-        adapter.save_section(section_title)
-        report["saved"] = True
-        persisted, errors = _verify_saved_values(
-            adapter,
-            candidates,
-            validated_identities,
-            section_title,
-            include_review_candidates=include_review_candidates,
-            wait_ms=scroll_wait_ms,
-            max_scroll_steps=max_scroll_steps,
-        )
-        report["persisted_verifications"] = persisted
-        report["persisted_verified"] = sum(
-            1 for item in persisted if item.get("status") == "persisted_verified"
-        )
-        report["review_candidates_persisted"] = sum(
-            1
-            for item in persisted
-            if item.get("status") == "persisted_verified"
-            and item.get("preview_mode") == "review"
-        )
-        report["persisted_validation_failed"] = len(persisted) - report["persisted_verified"]
-        report["post_save_errors"] = errors
-
-        after_save = run_dir / f"{_safe_name(section_title)}-after-save-reopen.png"
-        adapter.page.screenshot(path=str(after_save), full_page=True)
-        report["screenshot_after_save"] = str(after_save.resolve())
-
-        # Re-open verification is read-only; Cancel only collapses that read-only
-        # edit transaction. The already-saved values remain persisted.
-        adapter.cancel_section(section_title)
-        execution_incomplete = bool(
-            report["validation_failed"]
-            or report["fill_error"]
-            or report["skipped_live_match"]
-        )
-        if errors or report["persisted_validation_failed"]:
-            report["status"] = "persisted_validation_failed"
-        elif execution_incomplete:
-            report["status"] = "partial_persisted"
-        else:
-            report["status"] = "persisted_verified"
-    except Exception as exc:
-        report["status"] = "save_failed"
-        report["save_error"] = str(exc)
-        live_section = adapter.find_section(section_title)
-        if live_section is not None and not live_section.get("has_edit"):
-            path = str(live_section.get("path") or "")
-            if path:
-                report["visible_errors_after_save_failure"] = adapter.visible_section_errors(path)
-            failed_shot = run_dir / f"{_safe_name(section_title)}-save-failed.png"
-            adapter.page.screenshot(path=str(failed_shot), full_page=True)
-            report["screenshot_save_failed"] = str(failed_shot.resolve())
-            try:
-                adapter.cancel_section(section_title)
-                report["cancelled_unsaved_after_failure"] = True
-            except Exception as cleanup_exc:
-                report["cleanup_error"] = str(cleanup_exc)
-    return report
 
 
 def _run_photos(
@@ -526,61 +379,17 @@ def _run_photos(
     upload_timeout_ms: int,
     run_dir: Path,
 ) -> dict[str, Any]:
-    if not image_paths:
-        return {
-            "status": "skipped",
-            "detail": "没有传入 --upload-image；没有执行 Product Photos。",
-        }
+    """Delegate Product Photos to the canonical submission-boundary policy."""
 
-    staged = adapter.upload_product_photos(image_paths, timeout_ms=upload_timeout_ms)
-    report = staged.as_dict()
-    staged_shot = run_dir / "Product-Photos-staged.png"
-    adapter.page.screenshot(path=str(staged_shot), full_page=True)
-    report["screenshot_staged"] = str(staged_shot.resolve())
-    report["save_attempted"] = False
-    report["saved"] = False
+    from app.makro.execution import run_photos
 
-    if not allow_save or staged.staged <= 0:
-        return report
-
-    report["save_attempted"] = True
-    try:
-        adapter.save_section(PRODUCT_PHOTOS)
-        report["saved"] = True
-        persistence = adapter.verify_persisted_photo_count(
-            initial_count=staged.initial_count,
-            expected_added=staged.staged,
-        )
-        report["persistence"] = persistence
-        report["status"] = persistence["status"]
-
-        section = adapter.find_section(PRODUCT_PHOTOS)
-        if section is not None:
-            adapter.open_section_for_edit(section)
-            reopened = adapter.inspect_product_photos()
-            report["reopened_state"] = {
-                "completion_count": reopened.get("completion_count"),
-                "capacity": reopened.get("capacity"),
-                "visible_image_count": reopened.get("visible_image_count"),
-            }
-            saved_shot = run_dir / "Product-Photos-after-save-reopen.png"
-            adapter.page.screenshot(path=str(saved_shot), full_page=True)
-            report["screenshot_after_save"] = str(saved_shot.resolve())
-            adapter.cancel_section(PRODUCT_PHOTOS)
-    except Exception as exc:
-        report["status"] = "save_failed"
-        report["save_error"] = str(exc)
-        live = adapter.find_section(PRODUCT_PHOTOS)
-        if live is not None and not live.get("has_edit"):
-            path = str(live.get("path") or "")
-            if path:
-                report["visible_errors_after_save_failure"] = adapter.visible_section_errors(path)
-            try:
-                adapter.cancel_section(PRODUCT_PHOTOS)
-                report["cancelled_unsaved_after_failure"] = True
-            except Exception as cleanup_exc:
-                report["cleanup_error"] = str(cleanup_exc)
-    return report
+    return run_photos(
+        adapter,
+        image_paths,
+        allow_save=allow_save,
+        upload_timeout_ms=upload_timeout_ms,
+        run_dir=run_dir,
+    )
 
 
 def _totals(section_reports: list[dict[str, Any]]) -> dict[str, int]:
@@ -593,6 +402,7 @@ def _totals(section_reports: list[dict[str, Any]]) -> dict[str, int]:
         "fill_error",
         "skipped_existing",
         "skipped_live_match",
+        "optional_prewrite_skipped",
         "persisted_verified",
         "review_candidates_persisted",
         "persisted_validation_failed",
@@ -654,6 +464,20 @@ def _completion_summary(
         ),
         "send_to_qc_allowed_by_this_runner": False,
     }
+
+
+def _capture_optional_screenshot(page: Any, path: Path) -> dict[str, str]:
+    """Keep presentation evidence outside the business acceptance contract."""
+
+    try:
+        page.screenshot(
+            path=str(path),
+            full_page=True,
+            timeout=DIAGNOSTIC_SCREENSHOT_TIMEOUT_MS,
+        )
+        return {"status": "captured", "path": str(path.resolve()), "error": ""}
+    except Exception as exc:
+        return {"status": "failed", "path": "", "error": f"{type(exc).__name__}: {exc}"}
 
 
 def main() -> int:
@@ -739,8 +563,6 @@ def main() -> int:
             if is_listing_attribute_field(field)
         ]
 
-        # Last pre-write boundary: the page must still be the exact schema the AI
-        # saw. No stale decision packet can reach a field write.
         assert_live_schema_matches(planned_live_fields, semantic_fields)
         plan = build_live_fill_plan(
             decision_packet,
@@ -830,7 +652,7 @@ def main() -> int:
             else None
         )
         final_screenshot = run_dir / "step3-final.png"
-        page.screenshot(path=str(final_screenshot), full_page=True)
+        final_screenshot_capture = _capture_optional_screenshot(page, final_screenshot)
         payload = {
             "mode": "all_step3_persisted_acceptance" if args.all_step3 else "single_section_review",
             "page_url": page.url,
@@ -853,6 +675,7 @@ def main() -> int:
             "completion": completion,
             "trusted_input_items": len(product_context.trusted_inputs.bundle.evidence),
             "grounded_source_count": len(grounding.sources),
+            "grounding_warnings": list(grounding.warnings),
             "decision_warnings": decision_packet.warnings,
             "section_save_attempted": sum(
                 1 for item in section_reports if item.get("save_attempted")
@@ -862,7 +685,8 @@ def main() -> int:
             ) + int(bool(photo_report and photo_report.get("saved"))),
             "send_to_qc_clicked": False,
             "browser_closed": False,
-            "final_screenshot": str(final_screenshot.resolve()),
+            "final_screenshot": final_screenshot_capture.get("path", ""),
+            "final_screenshot_capture": final_screenshot_capture,
         }
         report_path = run_dir / "report.json"
         report_path.write_text(
@@ -893,7 +717,10 @@ def main() -> int:
             print(f"autofill_safe_complete={completion['autofill_safe_complete']}")
         print("Send to QC=False。")
         print(f"报告：{report_path.resolve()}")
-        print(f"最终截图：{final_screenshot.resolve()}")
+        if final_screenshot_capture.get("status") == "captured":
+            print(f"最终截图：{final_screenshot.resolve()}")
+        else:
+            print("最终截图：未生成；截图属于辅助诊断，不影响业务验收。")
 
         harness.detach()
         return 0
