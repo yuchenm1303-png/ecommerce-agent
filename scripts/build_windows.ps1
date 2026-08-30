@@ -57,6 +57,40 @@ function Resolve-VelopackFullPackage {
     return $Package
 }
 
+function Resolve-VelopackDeltaPackage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$ReleaseIndex,
+        [Parameter(Mandatory = $true)][string]$PackageId,
+        [Parameter(Mandatory = $true)][string]$PackageVersion
+    )
+
+    if (-not (Test-Path $ReleaseIndex)) { throw "Velopack release index missing: $ReleaseIndex" }
+    $Feed = Get-Content $ReleaseIndex -Raw -Encoding UTF8 | ConvertFrom-Json
+    $Target = @($Feed.Assets | Where-Object {
+        [string]$_.PackageId -eq $PackageId -and
+        [string]$_.Version -eq $PackageVersion -and
+        [string]$_.Type -eq "Delta"
+    })
+    if ($Target.Count -ne 1) {
+        throw "Velopack release index must contain exactly one Delta asset for $PackageId v$PackageVersion; found $($Target.Count)"
+    }
+
+    $FileName = [string]$Target[0].FileName
+    if ([string]::IsNullOrWhiteSpace($FileName) -or [IO.Path]::GetFileName($FileName) -ne $FileName) {
+        throw "Unsafe Velopack delta filename in release index: '$FileName'"
+    }
+    $PackagePath = Join-Path $Directory $FileName
+    if (-not (Test-Path $PackagePath -PathType Leaf)) {
+        throw "Velopack release index points to missing delta package: $PackagePath"
+    }
+    $Package = Get-Item $PackagePath
+    if ([int64]$Target[0].Size -ne [int64]$Package.Length) {
+        throw "Velopack release index/delta size mismatch for $FileName"
+    }
+    return $Package
+}
+
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = (Get-Content (Join-Path $Root "packaging\VERSION") -Raw).Trim()
@@ -72,6 +106,7 @@ $PackId = "Smirel.ListingStudio"
 $PackTitle = "Listing Studio"
 $PackAuthors = "Smirel"
 $ShouldRunUpdateE2E = [bool]$RunUpdateE2E -or ($env:GITHUB_WORKFLOW -eq "Publish Update")
+$IsStablePublication = ($env:GITHUB_WORKFLOW -eq "Publish Update")
 
 $DistRoot = Join-Path $Root "dist"
 $AppDir = Join-Path $DistRoot "EcommerceAgent"
@@ -89,19 +124,34 @@ foreach ($Path in @($AppDir, $WorkDir, $SakanaPublishDir, $VelopackDir, $SetupAl
 }
 New-Item -ItemType Directory -Force -Path $DistRoot, $WorkDir, $ArtifactDir, $VelopackDir | Out-Null
 
-Write-Host "[1/5] Restoring pinned Velopack CLI"
+Write-Host "[1/6] Restoring pinned Velopack CLI"
 & dotnet tool restore
 if ($LASTEXITCODE -ne 0) { throw "dotnet tool restore failed: $LASTEXITCODE" }
 & dotnet tool run vpk -- --help *> $null
 if ($LASTEXITCODE -ne 0) { throw "Pinned Velopack CLI failed to start: $LASTEXITCODE" }
 
-Write-Host "[2/5] Generating application icon"
+Write-Host "[2/6] Hydrating previous Stable release for delta generation"
+& dotnet tool run vpk -- download github `
+    --repoUrl "https://github.com/yuchenm1303-png/ecommerce-agent" `
+    --channel $Channel `
+    --outputDir $VelopackDir `
+    --timeout 10
+$PreviousReleaseDownloaded = ($LASTEXITCODE -eq 0)
+$global:LASTEXITCODE = 0
+if (-not $PreviousReleaseDownloaded) {
+    if ($IsStablePublication) {
+        throw "Stable publication requires the previous public Velopack release so a delta update can be generated."
+    }
+    Write-Warning "Previous Velopack release was not available; development package will contain a Full update only."
+}
+
+Write-Host "[3/6] Generating application icon"
 & python (Join-Path $Root "scripts\generate_app_icon.py") --output $IconFile
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $IconFile)) {
     throw "Application icon generation failed"
 }
 
-Write-Host "[3/5] Building PyInstaller onedir application v$Version"
+Write-Host "[4/6] Building PyInstaller onedir application v$Version"
 $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $VsWhere)) { throw "Visual Studio Build Tools locator missing: $VsWhere" }
 $MsBuildRoot = & $VsWhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -latest -property installationPath
@@ -145,7 +195,7 @@ foreach ($Required in @($GuiExe, $WorkerExe, $SakanaExe)) {
     if (-not (Test-Path $Required)) { throw "Packaging output missing: $Required" }
 }
 
-Write-Host "[4/5] Verifying frozen GUI and worker"
+Write-Host "[5/6] Verifying frozen GUI and worker"
 $PreviousImportProbe = $env:ECOMMERCE_AGENT_PACKAGE_IMPORT_PROBE
 $env:ECOMMERCE_AGENT_PACKAGE_IMPORT_PROBE = "1"
 try {
@@ -164,7 +214,7 @@ if ($GuiProbeExitCode -ne 0) { throw "Packaged GUI import probe failed: $GuiProb
 & $WorkerExe --self-test
 if ($LASTEXITCODE -ne 0) { throw "Packaged worker self-test failed: $LASTEXITCODE" }
 
-Write-Host "[5/5] Packing standard Velopack release"
+Write-Host "[6/6] Packing standard Velopack release with delta optimization"
 $AzureTrustedSignFile = [string]$env:VPK_AZURE_TRUSTED_SIGN_FILE
 $SignParams = [string]$env:VPK_SIGN_PARAMS
 if (-not [string]::IsNullOrWhiteSpace($AzureTrustedSignFile) -and -not [string]::IsNullOrWhiteSpace($SignParams)) {
@@ -194,7 +244,8 @@ $PackArgs = @(
     "--packAuthors", $PackAuthors,
     "--packTitle", $PackTitle,
     "--icon", $IconFile,
-    "--mainExe", "EcommerceAgent.exe"
+    "--mainExe", "EcommerceAgent.exe",
+    "--delta", "BestSize"
 )
 if (-not [string]::IsNullOrWhiteSpace($AzureTrustedSignFile)) {
     $PackArgs += @("--azureTrustedSignFile", $AzureTrustedSignFile)
@@ -211,7 +262,7 @@ if ($LASTEXITCODE -ne 0) { throw "Velopack pack failed: $LASTEXITCODE" }
 
 # Native artifact names are a Velopack implementation detail and may include
 # channel/runtime qualifiers. Setup/portable are discovered from the clean output
-# directory; the update package itself is resolved only through the release feed.
+# directory; update packages are resolved only through the release feed.
 $NativeSetup = Get-SingleVelopackArtifact -Directory $VelopackDir -Filter "$PackId*-Setup.exe" -Label "setup bundle"
 $NativePortable = Get-SingleVelopackArtifact -Directory $VelopackDir -Filter "$PackId*-Portable.zip" -Label "portable bundle"
 $ReleaseIndex = Join-Path $VelopackDir "releases.$Channel.json"
@@ -220,6 +271,14 @@ $FullPackage = Resolve-VelopackFullPackage `
     -ReleaseIndex $ReleaseIndex `
     -PackageId $PackId `
     -PackageVersion $Version
+$DeltaPackage = $null
+if ($PreviousReleaseDownloaded) {
+    $DeltaPackage = Resolve-VelopackDeltaPackage `
+        -Directory $VelopackDir `
+        -ReleaseIndex $ReleaseIndex `
+        -PackageId $PackId `
+        -PackageVersion $Version
+}
 
 Copy-Item $NativeSetup.FullName $SetupAlias -Force
 Copy-Item $NativePortable.FullName $PortableAlias -Force
@@ -244,6 +303,9 @@ Write-Host "  Velopack feed : $VelopackDir"
 Write-Host "  Native setup  : $($NativeSetup.Name)"
 Write-Host "  Native portable: $($NativePortable.Name)"
 Write-Host "  Full package  : $($FullPackage.Name)"
+if ($null -ne $DeltaPackage) {
+    Write-Host "  Delta package : $($DeltaPackage.Name)"
+}
 Write-Host "  Installer     : $SetupAlias"
 Write-Host "  Portable      : $PortableAlias"
 Write-Host "  App dir       : $AppDir"
