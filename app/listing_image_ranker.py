@@ -13,7 +13,7 @@ from .providers.usage_telemetry import usage_request_context
 from .source_snapshot import source_snapshot_from_json
 
 
-LISTING_IMAGE_RANKING_VERSION = 1
+LISTING_IMAGE_RANKING_VERSION = 2
 MAX_AUTO_LISTING_IMAGES = 5
 LISTING_IMAGE_ROLES = (
     "hero",
@@ -294,7 +294,7 @@ def build_listing_image_ranking_request(
             "You are the final semantic gate for ecommerce listing photos. Decide whether every candidate image "
             "belongs to the exact target product and classify its useful gallery role. The image pixels were already "
             "inspected by an upstream vision stage; use only the supplied target product context, AI image observations "
-            "and mechanical visual metrics. Never guess relevance when the upstream observation is missing. JSON only."
+            "and mechanical visual metrics. JSON only."
         ),
         "prompt_instruction": (
             "Evaluate every candidate independently against context.target_product. Reject unrelated products and noisy "
@@ -308,7 +308,6 @@ def build_listing_image_ranking_request(
             "Return one decision for every candidate image_id exactly once.",
             "relevant=true only when the observation supports that the image depicts the exact target sellable product, an included item, its dimensions, its use, or its packaging.",
             "Reject recommendation products, other models or contradictory variants, unrelated accessories, seller logos, payment/shipping graphics, badges, category/navigation art, screenshots and generic banners.",
-            "If ai_observation_available=false, set relevant=false, role=uncertain and do not guess from geometry or source order.",
             "role=hero only for a strong primary photo: exact target product, whole product clearly visible, unobstructed, simple/clean composition, no dense text overlay or collage.",
             "role=product is an alternate whole-product view that is relevant but less ideal than a hero image.",
             "Use detail for useful close-ups, dimensions for measurement diagrams, lifestyle for in-use scenes, included_item for included components, and packaging for box/package views.",
@@ -331,9 +330,13 @@ def _parse_decisions(raw: Any, candidates: list[_Candidate]) -> dict[str, Ranked
     if set(payload) != expected:
         raise ListingImageRankingError("listing image ranker did not return the exact candidate partition")
 
-    by_id = {candidate.image_id: candidate for candidate in candidates}
     output: dict[str, RankedImageDecision] = {}
-    for image_id in expected:
+    for candidate in candidates:
+        image_id = candidate.image_id
+        if not candidate.observation_available:
+            raise ListingImageRankingError(
+                f"{image_id} reached semantic ranking without an upstream AI observation"
+            )
         item = payload.get(image_id)
         if not isinstance(item, dict):
             raise ListingImageRankingError(f"{image_id} decision must be an object")
@@ -352,15 +355,7 @@ def _parse_decisions(raw: Any, candidates: list[_Candidate]) -> dict[str, Ranked
             raise ListingImageRankingError(f"{image_id}.gallery_score must be integer 0..100")
         if not reason:
             raise ListingImageRankingError(f"{image_id}.reason is required")
-
-        candidate = by_id[image_id]
-        if not candidate.observation_available:
-            relevant = False
-            role = "uncertain"
-            main_score = 0
-            gallery_score = 0
-            reason = "No upstream AI image observation was available; automatic upload is fail-closed."
-        elif role in {"unrelated", "uncertain"}:
+        if role in {"unrelated", "uncertain"}:
             relevant = False
 
         output[image_id] = RankedImageDecision(
@@ -372,6 +367,20 @@ def _parse_decisions(raw: Any, candidates: list[_Candidate]) -> dict[str, Ranked
             reason=reason,
         )
     return output
+
+
+def _mechanical_fallback_decision(candidate: _Candidate) -> RankedImageDecision:
+    return RankedImageDecision(
+        image_id=candidate.image_id,
+        relevant=True,
+        role="uncertain",
+        main_image_score=0,
+        gallery_score=0,
+        reason=(
+            "Upstream AI observation was unavailable; retained only as a mechanically safe "
+            "supplier product-image fallback instead of deleting the photo set."
+        ),
+    )
 
 
 def _ordered_candidates(
@@ -426,13 +435,13 @@ def _selection_report(
 ) -> dict[str, Any]:
     selected_ids = {candidate.image_id for candidate in selected}
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "policy": {
             "version": LISTING_IMAGE_RANKING_VERSION,
             "kind": "mechanical-quality-gate-then-ai-semantic-ranking",
             "max_auto_listing_images": MAX_AUTO_LISTING_IMAGES,
             "ordering": "best-main-image-then-role-priority-and-ai-gallery-score",
-            "fail_closed_without_ai_observation": True,
+            "missing_ai_observation": "mechanically-safe-fallback-after-semantic-images",
         },
         "selected": [str(candidate.assessment.path) for candidate in selected],
         "selected_count": len(selected),
@@ -440,6 +449,8 @@ def _selection_report(
         "mechanical": mechanical.as_dict(),
         "semantic_ranking": {
             "candidate_count": len(candidates),
+            "observed_candidate_count": sum(1 for candidate in candidates if candidate.observation_available),
+            "fallback_candidate_count": sum(1 for candidate in candidates if not candidate.observation_available),
             "selected_ids": [candidate.image_id for candidate in selected],
             "decisions": [
                 {
@@ -455,18 +466,77 @@ def _selection_report(
     }
 
 
+def _publish_selection(
+    *,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    outputs: dict[str, Any],
+    selection_path: Path,
+    mechanical: Any,
+    candidates: list[_Candidate],
+    decisions: dict[str, RankedImageDecision],
+    selected_candidates: list[_Candidate],
+    status: str,
+    model_calls: int,
+    semantically_rejected: int,
+) -> ListingImageRankingResult:
+    selected_paths = tuple(candidate.assessment.path for candidate in selected_candidates)
+    report = _selection_report(
+        mechanical=mechanical,
+        candidates=candidates,
+        decisions=decisions,
+        selected=selected_candidates,
+    )
+    _write_json_atomic(selection_path, report)
+
+    outputs["primary_source_listing_images"] = [str(path) for path in selected_paths]
+    outputs["primary_source_listing_image_selection"] = str(selection_path)
+    manifest["outputs"] = outputs
+    source_capture = manifest.get("source_capture") or {}
+    if isinstance(source_capture, dict):
+        source_capture["listing_image_policy_version"] = LISTING_IMAGE_RANKING_VERSION
+        source_capture["listing_images_selected"] = len(selected_paths)
+        source_capture["listing_images"] = [str(path) for path in selected_paths]
+        source_capture["listing_images_rejected"] = len(mechanical.assessments) - len(selected_paths)
+        manifest["source_capture"] = source_capture
+    manifest["listing_image_ranking"] = {
+        "version": LISTING_IMAGE_RANKING_VERSION,
+        "status": status,
+        "strategy": "semantic_rank_observed_then_mechanical_fallback_for_unobserved",
+        "model_calls": model_calls,
+        "mechanical_candidate_count": len(candidates),
+        "observed_candidate_count": sum(1 for candidate in candidates if candidate.observation_available),
+        "fallback_candidate_count": sum(1 for candidate in candidates if not candidate.observation_available),
+        "semantic_rejected_count": semantically_rejected,
+        "selected_count": len(selected_paths),
+        "selected": [str(path) for path in selected_paths],
+        "selection_report": str(selection_path),
+    }
+    if model_calls:
+        manifest["total_model_calls"] = int(manifest.get("total_model_calls") or 0) + model_calls
+    _write_json_atomic(manifest_path, manifest)
+
+    return ListingImageRankingResult(
+        status=status,
+        selected=selected_paths,
+        model_calls=model_calls,
+        mechanical_candidate_count=len(candidates),
+        semantically_rejected_count=semantically_rejected,
+        selection_report=selection_path,
+    )
+
+
 def finalize_supplier_listing_images(
     run_dir: str | Path,
     provider: JSONTaskProvider,
 ) -> ListingImageRankingResult:
-    """Replace automatic supplier-photo output with relevance-aware ranked photos.
+    """Publish relevance-aware supplier photos without turning AI outages into zero photos.
 
-    The existing mechanical selector remains the file-safety boundary. This stage
-    runs only for supplier URL inputs after the normal image-evidence pass has
-    completed, so it can compare the exact product context against AI observations
-    that already inspected the pixels. It performs one cheap text-only semantic
-    decision call, never gives the model browser/upload control, and writes only the
-    curated output list consumed by the existing Makro photo transaction.
+    Mechanical validation remains the file-safety boundary. Candidates with an
+    upstream image observation are semantically filtered and ranked. A missing
+    observation means "unknown", not "unrelated": mechanically safe supplier
+    images are retained as a bounded fallback after semantically ranked images.
+    Positive AI rejection still removes an observed unrelated image.
     """
 
     root = Path(run_dir).expanduser().resolve()
@@ -504,11 +574,12 @@ def finalize_supplier_listing_images(
     if not candidates:
         outputs["primary_source_listing_images"] = []
         report = {
-            "schema_version": 2,
+            "schema_version": 3,
             "policy": {
                 "version": LISTING_IMAGE_RANKING_VERSION,
                 "kind": "mechanical-quality-gate-then-ai-semantic-ranking",
                 "max_auto_listing_images": MAX_AUTO_LISTING_IMAGES,
+                "missing_ai_observation": "mechanically-safe-fallback-after-semantic-images",
             },
             "selected": [],
             "selected_count": 0,
@@ -534,53 +605,31 @@ def finalize_supplier_listing_images(
             selection_report=selection_path,
         )
 
-    if not any(candidate.observation_available for candidate in candidates):
-        outputs["primary_source_listing_images"] = []
-        empty_decisions = {
-            candidate.image_id: RankedImageDecision(
-                image_id=candidate.image_id,
-                relevant=False,
-                role="uncertain",
-                main_image_score=0,
-                gallery_score=0,
-                reason="No upstream AI image observation was available; automatic upload is fail-closed.",
-            )
+    observed = [candidate for candidate in candidates if candidate.observation_available]
+    fallback = [candidate for candidate in candidates if not candidate.observation_available]
+
+    if not observed:
+        decisions = {
+            candidate.image_id: _mechanical_fallback_decision(candidate)
             for candidate in candidates
         }
-        report = _selection_report(
+        return _publish_selection(
+            manifest=manifest,
+            manifest_path=manifest_path,
+            outputs=outputs,
+            selection_path=selection_path,
             mechanical=mechanical,
             candidates=candidates,
-            decisions=empty_decisions,
-            selected=[],
-        )
-        _write_json_atomic(selection_path, report)
-        source_capture = manifest.get("source_capture") or {}
-        if isinstance(source_capture, dict):
-            source_capture["listing_images_selected"] = 0
-            source_capture["listing_images"] = []
-            source_capture["listing_images_rejected"] = len(mechanical.assessments)
-            manifest["source_capture"] = source_capture
-        manifest["outputs"] = outputs
-        manifest["listing_image_ranking"] = {
-            "version": LISTING_IMAGE_RANKING_VERSION,
-            "status": "no_ai_observations",
-            "model_calls": 0,
-            "selected_count": 0,
-            "semantic_rejected_count": len(candidates),
-        }
-        _write_json_atomic(manifest_path, manifest)
-        return ListingImageRankingResult(
-            status="no_ai_observations",
-            selected=(),
+            decisions=decisions,
+            selected_candidates=candidates[:MAX_AUTO_LISTING_IMAGES],
+            status="mechanical_fallback_no_ai_observations",
             model_calls=0,
-            mechanical_candidate_count=len(candidates),
-            semantically_rejected_count=len(candidates),
-            selection_report=selection_path,
+            semantically_rejected=0,
         )
 
     request = build_listing_image_ranking_request(
         product_context=_product_context(manifest),
-        candidates=candidates,
+        candidates=observed,
     )
     with usage_request_context(
         task=str(request.get("task") or ""),
@@ -588,53 +637,46 @@ def finalize_supplier_listing_images(
         model=str(getattr(provider, "model", "")),
     ):
         raw = provider.extract_json(request)
-    decisions = _parse_decisions(raw, candidates)
-    ordered = _ordered_candidates(candidates, decisions)
-    selected_candidates = ordered[:MAX_AUTO_LISTING_IMAGES]
-    selected_paths = tuple(candidate.assessment.path for candidate in selected_candidates)
-    semantically_rejected = sum(
-        1 for candidate in candidates if not decisions[candidate.image_id].relevant
+    semantic_decisions = _parse_decisions(raw, observed)
+    decisions = dict(semantic_decisions)
+    decisions.update(
+        {
+            candidate.image_id: _mechanical_fallback_decision(candidate)
+            for candidate in fallback
+        }
     )
 
-    report = _selection_report(
+    ordered = _ordered_candidates(observed, semantic_decisions)
+    selected_candidates = ordered[:MAX_AUTO_LISTING_IMAGES]
+    if len(selected_candidates) < MAX_AUTO_LISTING_IMAGES:
+        selected_ids = {candidate.image_id for candidate in selected_candidates}
+        for candidate in fallback:
+            if candidate.image_id in selected_ids:
+                continue
+            selected_candidates.append(candidate)
+            selected_ids.add(candidate.image_id)
+            if len(selected_candidates) >= MAX_AUTO_LISTING_IMAGES:
+                break
+
+    semantically_rejected = sum(
+        1
+        for candidate in observed
+        if not semantic_decisions[candidate.image_id].relevant
+    )
+    used_fallback = any(not candidate.observation_available for candidate in selected_candidates)
+    status = "ranked_with_mechanical_fallback" if used_fallback else "ranked"
+    return _publish_selection(
+        manifest=manifest,
+        manifest_path=manifest_path,
+        outputs=outputs,
+        selection_path=selection_path,
         mechanical=mechanical,
         candidates=candidates,
         decisions=decisions,
-        selected=selected_candidates,
-    )
-    _write_json_atomic(selection_path, report)
-
-    outputs["primary_source_listing_images"] = [str(path) for path in selected_paths]
-    outputs["primary_source_listing_image_selection"] = str(selection_path)
-    manifest["outputs"] = outputs
-    source_capture = manifest.get("source_capture") or {}
-    if isinstance(source_capture, dict):
-        source_capture["listing_image_policy_version"] = LISTING_IMAGE_RANKING_VERSION
-        source_capture["listing_images_selected"] = len(selected_paths)
-        source_capture["listing_images"] = [str(path) for path in selected_paths]
-        source_capture["listing_images_rejected"] = len(mechanical.assessments) - len(selected_paths)
-        manifest["source_capture"] = source_capture
-    manifest["listing_image_ranking"] = {
-        "version": LISTING_IMAGE_RANKING_VERSION,
-        "status": "ranked",
-        "strategy": "mechanical_gate_then_target_aware_ai_semantic_ranking",
-        "model_calls": 1,
-        "mechanical_candidate_count": len(candidates),
-        "semantic_rejected_count": semantically_rejected,
-        "selected_count": len(selected_paths),
-        "selected": [str(path) for path in selected_paths],
-        "selection_report": str(selection_path),
-    }
-    manifest["total_model_calls"] = int(manifest.get("total_model_calls") or 0) + 1
-    _write_json_atomic(manifest_path, manifest)
-
-    return ListingImageRankingResult(
-        status="ranked",
-        selected=selected_paths,
+        selected_candidates=selected_candidates,
+        status=status,
         model_calls=1,
-        mechanical_candidate_count=len(candidates),
-        semantically_rejected_count=semantically_rejected,
-        selection_report=selection_path,
+        semantically_rejected=semantically_rejected,
     )
 
 

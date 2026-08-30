@@ -206,7 +206,7 @@ def test_semantic_ranker_rejects_unrelated_first_image_and_promotes_hero(tmp_pat
     assert report["semantic_ranking"]["selected_ids"] == ["image_02", "image_03"]
 
 
-def test_ranker_fails_closed_when_upstream_ai_never_observed_images(tmp_path: Path) -> None:
+def test_ranker_keeps_mechanically_safe_photos_when_ai_observations_are_missing(tmp_path: Path) -> None:
     image = _write_image(tmp_path / "only.jpg", (240, 240, 240))
     observations = tmp_path / "image-observations.json"
     observations.write_text("[]", encoding="utf-8")
@@ -223,8 +223,58 @@ def test_ranker_fails_closed_when_upstream_ai_never_observed_images(tmp_path: Pa
     result = finalize_supplier_listing_images(tmp_path, provider)
 
     assert provider.calls == 0
-    assert result.status == "no_ai_observations"
-    assert result.selected == ()
+    assert result.status == "mechanical_fallback_no_ai_observations"
+    assert result.selected == (image,)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["outputs"]["primary_source_listing_images"] == []
-    assert manifest["listing_image_ranking"]["status"] == "no_ai_observations"
+    assert manifest["outputs"]["primary_source_listing_images"] == [str(image)]
+    assert manifest["listing_image_ranking"]["semantic_rejected_count"] == 0
+    assert manifest["listing_image_ranking"]["fallback_candidate_count"] == 1
+
+
+def test_ranker_rejects_observed_unrelated_but_keeps_unobserved_safe_fallback(tmp_path: Path) -> None:
+    unrelated = _write_image(tmp_path / "01-unrelated.jpg", (210, 210, 210))
+    fallback = _write_image(tmp_path / "02-fallback.jpg", (245, 245, 245))
+    observations = tmp_path / "image-observations.json"
+    observations.write_text(
+        json.dumps(
+            [
+                {
+                    "image_id": "source-image:1",
+                    "origin": str(unrelated),
+                    "sha256": _sha256(unrelated),
+                    "visible_text": "Other product",
+                    "facts": [],
+                    "notes": "Different product.",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    snapshot = tmp_path / "source-snapshot.json"
+    _write_snapshot(snapshot)
+    manifest_path = _write_manifest(
+        tmp_path,
+        images=[unrelated, fallback],
+        observations=observations,
+        snapshot=snapshot,
+    )
+    provider = _FakeProvider(
+        {
+            "image_01": {
+                "relevant": False,
+                "role": "unrelated",
+                "main_image_score": 0,
+                "gallery_score": 0,
+                "reason": "Different target product.",
+            }
+        }
+    )
+
+    result = finalize_supplier_listing_images(tmp_path, provider)
+
+    assert provider.calls == 1
+    assert result.status == "ranked_with_mechanical_fallback"
+    assert result.selected == (fallback,)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["outputs"]["primary_source_listing_images"] == [str(fallback)]
+    assert manifest["listing_image_ranking"]["semantic_rejected_count"] == 1

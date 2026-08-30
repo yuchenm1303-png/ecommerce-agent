@@ -9,10 +9,13 @@ from typing import Any, Iterable
 from PIL import Image, UnidentifiedImageError
 
 
-LISTING_IMAGE_POLICY_VERSION = 1
+LISTING_IMAGE_POLICY_VERSION = 2
 MIN_LISTING_IMAGE_SHORT_EDGE = 160
 MIN_LISTING_IMAGE_PIXEL_AREA = 80_000
 MAX_LISTING_IMAGE_ASPECT_RATIO = 4.0
+PERCEPTUAL_DUPLICATE_HAMMING_MAX = 5
+PERCEPTUAL_DUPLICATE_COLOR_DELTA_MAX = 18
+PERCEPTUAL_DUPLICATE_ASPECT_DELTA_MAX = 0.06
 
 
 @dataclass(slots=True, frozen=True)
@@ -56,14 +59,17 @@ class ListingImageSelection:
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "policy": {
                 "version": LISTING_IMAGE_POLICY_VERSION,
                 "kind": "mechanical-listing-image-quality-gate",
                 "min_short_edge": MIN_LISTING_IMAGE_SHORT_EDGE,
                 "min_pixel_area": MIN_LISTING_IMAGE_PIXEL_AREA,
                 "max_aspect_ratio": MAX_LISTING_IMAGE_ASPECT_RATIO,
-                "dedupe": "exact-content-sha256",
+                "dedupe": "exact-sha256-plus-conservative-perceptual-signature",
+                "perceptual_hamming_max": PERCEPTUAL_DUPLICATE_HAMMING_MAX,
+                "perceptual_color_delta_max": PERCEPTUAL_DUPLICATE_COLOR_DELTA_MAX,
+                "perceptual_aspect_delta_max": PERCEPTUAL_DUPLICATE_ASPECT_DELTA_MAX,
                 "ordering": "preserve-source-order",
             },
             "selected": [str(path) for path in self.selected],
@@ -81,11 +87,53 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _resampling(name: str):
+    namespace = getattr(Image, "Resampling", Image)
+    return getattr(namespace, name)
+
+
+def _perceptual_signature(image: Image.Image) -> tuple[int, tuple[int, int, int]]:
+    """Return a conservative visual fingerprint stable across resize/JPEG changes."""
+
+    rgb = image.convert("RGB")
+    gray = rgb.convert("L").resize((9, 8), _resampling("LANCZOS"))
+    pixels = list(gray.getdata())
+    difference_hash = 0
+    bit = 0
+    for row in range(8):
+        offset = row * 9
+        for column in range(8):
+            if pixels[offset + column] > pixels[offset + column + 1]:
+                difference_hash |= 1 << bit
+            bit += 1
+    average = rgb.resize((1, 1), _resampling("BOX")).getpixel((0, 0))
+    return difference_hash, tuple(int(channel) for channel in average)
+
+
+def _looks_like_visual_duplicate(
+    signature: tuple[int, tuple[int, int, int]],
+    aspect_ratio: float,
+    seen: list[tuple[int, tuple[int, int, int], float]],
+) -> bool:
+    dhash, average = signature
+    for seen_hash, seen_average, seen_aspect in seen:
+        aspect_delta = abs(aspect_ratio - seen_aspect) / max(aspect_ratio, seen_aspect, 1.0)
+        if aspect_delta > PERCEPTUAL_DUPLICATE_ASPECT_DELTA_MAX:
+            continue
+        if (dhash ^ seen_hash).bit_count() > PERCEPTUAL_DUPLICATE_HAMMING_MAX:
+            continue
+        if max(abs(left - right) for left, right in zip(average, seen_average)) > PERCEPTUAL_DUPLICATE_COLOR_DELTA_MAX:
+            continue
+        return True
+    return False
+
+
 def _assessment_for_path(
     raw: str | Path,
     *,
     source_index: int,
     seen_hashes: set[str],
+    seen_signatures: list[tuple[int, tuple[int, int, int], float]],
 ) -> ListingImageAssessment:
     path = Path(raw).expanduser().resolve()
     if not path.is_file():
@@ -103,8 +151,9 @@ def _assessment_for_path(
 
     try:
         with Image.open(path) as opened:
+            opened.load()
             width, height = (int(opened.width), int(opened.height))
-            opened.verify()
+            signature = _perceptual_signature(opened)
         sha256 = _file_sha256(path)
     except (UnidentifiedImageError, OSError, ValueError):
         return ListingImageAssessment(
@@ -137,8 +186,11 @@ def _assessment_for_path(
     aspect_ratio = max(width, height) / short_edge
     reasons: list[str] = []
 
-    if sha256 in seen_hashes:
+    exact_duplicate = sha256 in seen_hashes
+    if exact_duplicate:
         reasons.append("duplicate_content")
+    elif _looks_like_visual_duplicate(signature, aspect_ratio, seen_signatures):
+        reasons.append("duplicate_visual")
     if short_edge < MIN_LISTING_IMAGE_SHORT_EDGE:
         reasons.append(f"short_edge<{MIN_LISTING_IMAGE_SHORT_EDGE}")
     if pixel_area < MIN_LISTING_IMAGE_PIXEL_AREA:
@@ -149,6 +201,7 @@ def _assessment_for_path(
     eligible = not reasons
     if eligible:
         seen_hashes.add(sha256)
+        seen_signatures.append((signature[0], signature[1], aspect_ratio))
 
     return ListingImageAssessment(
         path=path,
@@ -166,21 +219,23 @@ def _assessment_for_path(
 def select_listing_images(image_paths: Iterable[str | Path]) -> ListingImageSelection:
     """Select upload-safe Listing Photos without changing the evidence universe.
 
-    This gate is deliberately product/category agnostic. It checks only file
-    decodability, exact duplicates and geometry that distinguishes useful image
-    surfaces from strips/banners/sprites. Input order is preserved so Python does
-    not invent product-image semantics or ranking.
+    This gate is deliberately product/category agnostic. It checks file
+    decodability, geometry, exact duplicates and conservative visual duplicates.
+    Input order is preserved so Python does not invent product-image semantics or
+    ranking; semantic relevance and gallery ordering remain the AI ranker's job.
     """
 
     assessments: list[ListingImageAssessment] = []
     selected: list[Path] = []
     seen_hashes: set[str] = set()
+    seen_signatures: list[tuple[int, tuple[int, int, int], float]] = []
 
     for source_index, raw in enumerate(image_paths, start=1):
         assessment = _assessment_for_path(
             raw,
             source_index=source_index,
             seen_hashes=seen_hashes,
+            seen_signatures=seen_signatures,
         )
         assessments.append(assessment)
         if assessment.eligible:
@@ -228,6 +283,9 @@ __all__ = [
     "MAX_LISTING_IMAGE_ASPECT_RATIO",
     "MIN_LISTING_IMAGE_PIXEL_AREA",
     "MIN_LISTING_IMAGE_SHORT_EDGE",
+    "PERCEPTUAL_DUPLICATE_ASPECT_DELTA_MAX",
+    "PERCEPTUAL_DUPLICATE_COLOR_DELTA_MAX",
+    "PERCEPTUAL_DUPLICATE_HAMMING_MAX",
     "ListingImageAssessment",
     "ListingImageSelection",
     "listing_images_from_resolver_outputs",
