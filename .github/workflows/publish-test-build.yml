@@ -16,10 +16,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: publish-test-build
+  cancel-in-progress: false
+
 jobs:
   publish-test-build:
-    runs-on: windows-latest
-    timeout-minutes: 60
+    runs-on: windows-2025
+    timeout-minutes: 65
     env:
       SOURCE_REF: ${{ inputs.source_ref }}
       PACKAGE_VERSION: ${{ inputs.package_version }}
@@ -32,6 +36,15 @@ jobs:
         with:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 0
+
+      - name: Require dispatcher/source workflow parity
+        shell: pwsh
+        run: |
+          $source = (Get-Content ".github\workflows\publish-test-build.yml" -Raw -Encoding UTF8).Replace("`r`n", "`n").TrimEnd()
+          $dispatcher = (& git show "origin/main:.github/workflows/publish-test-build.yml" | Out-String).Replace("`r`n", "`n").TrimEnd()
+          if ($LASTEXITCODE -ne 0 -or $source -ne $dispatcher) {
+            throw "Publish Test Build workflow drift detected between main dispatcher and selected source_ref. Synchronize the workflow before packaging."
+          }
 
       - name: Resolve test build identity
         id: build
@@ -51,25 +64,25 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.11.9"
           cache: pip
+          cache-dependency-path: requirements-release.lock
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "8.0.x"
+          dotnet-version: "8.0.424"
 
-      - name: Install build dependencies
+      - name: Install isolated release environment
         shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r requirements-gui.txt -r requirements-build.txt
-          dotnet tool restore
+        run: .\scripts\install_release_environment.ps1
 
-      - name: Velopack contracts
+      - name: Release and Velopack contracts
         shell: pwsh
         run: |
           python -m pytest -q `
+            tests/test_release_parity_contract.py `
+            tests/test_security_boundaries.py `
             tests/test_windows_packaging_contract.py `
             tests/test_velopack_update_contract.py `
             tests/test_app_update_ui_contract.py `
@@ -79,7 +92,12 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifacts | Out-Null
-          "Pre-release validation build from ${{ steps.build.outputs.sha }}" | Set-Content artifacts\test-notes.md -Encoding utf8
+          @(
+            "# Listing Studio Test ${{ steps.build.outputs.version }}", "",
+            "Pre-release validation build.", "",
+            "Source commit: ${{ steps.build.outputs.sha }}", "",
+            "Release environment: requirements-release.lock"
+          ) | Set-Content artifacts\test-notes.md -Encoding utf8
           .\scripts\build_windows.ps1 `
             -Version "${{ steps.build.outputs.version }}" `
             -Channel $env:VELOPACK_CHANNEL `
@@ -113,9 +131,10 @@ jobs:
           if ($nativePortable.Count -ne 1) { throw "Expected exactly one native test Portable, found $($nativePortable.Count)" }
           foreach ($required in @(
             "artifacts\EcommerceAgent-Setup-$version.exe",
-            "artifacts\EcommerceAgent-$version-portable.zip"
+            "artifacts\EcommerceAgent-$version-portable.zip",
+            "artifacts\release-environment.json"
           )) {
-            if (-not (Test-Path $required)) { throw "Prerelease friendly asset missing before publish: $required" }
+            if (-not (Test-Path $required -PathType Leaf)) { throw "Prerelease asset missing before publish: $required" }
           }
           "target_full=$targetFull" >> $env:GITHUB_ENV
           "native_setup=$($nativeSetup[0].Name)" >> $env:GITHUB_ENV
@@ -160,6 +179,7 @@ jobs:
           gh release upload "${{ steps.build.outputs.tag }}" `
             "artifacts\EcommerceAgent-Setup-${{ steps.build.outputs.version }}.exe" `
             "artifacts\EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip" `
+            "artifacts\release-environment.json" `
             --clobber
           if ($LASTEXITCODE -ne 0) { throw "Friendly prerelease asset upload failed: $LASTEXITCODE" }
 
@@ -167,10 +187,11 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ steps.build.outputs.tag }}"
-          $draft = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          $draft = gh release view $tag --json tagName,isDraft,isPrerelease,targetCommitish,assets | ConvertFrom-Json
           if ($draft.tagName -ne $tag) { throw "Test draft tag mismatch" }
           if (-not $draft.isDraft) { throw "Test release became public before verification" }
           if (-not $draft.isPrerelease) { throw "Test draft is not marked prerelease" }
+          if ([string]$draft.targetCommitish -ne "${{ steps.build.outputs.sha }}") { throw "Test draft source commit mismatch" }
           $names = @($draft.assets | ForEach-Object { $_.name })
           foreach ($expected in @(
             $env:target_full,
@@ -178,7 +199,8 @@ jobs:
             $env:native_setup,
             $env:native_portable,
             "EcommerceAgent-Setup-${{ steps.build.outputs.version }}.exe",
-            "EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip"
+            "EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip",
+            "release-environment.json"
           )) {
             if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
               throw "Draft prerelease asset missing: $expected"
@@ -196,10 +218,11 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ steps.build.outputs.tag }}"
-          $release = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          $release = gh release view $tag --json tagName,isDraft,isPrerelease,targetCommitish,assets | ConvertFrom-Json
           if ($release.tagName -ne $tag) { throw "Published test tag mismatch" }
           if ($release.isDraft) { throw "Test release is still a draft" }
           if (-not $release.isPrerelease) { throw "Test release was not published as prerelease" }
+          if ([string]$release.targetCommitish -ne "${{ steps.build.outputs.sha }}") { throw "Published test source commit mismatch" }
           $names = @($release.assets | ForEach-Object { $_.name })
           foreach ($expected in @(
             $env:target_full,
@@ -207,7 +230,8 @@ jobs:
             $env:native_setup,
             $env:native_portable,
             "EcommerceAgent-Setup-${{ steps.build.outputs.version }}.exe",
-            "EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip"
+            "EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip",
+            "release-environment.json"
           )) {
             if ([string]::IsNullOrWhiteSpace($expected) -or $expected -notin $names) {
               throw "Published prerelease asset missing: $expected"
@@ -257,6 +281,7 @@ jobs:
           path: |
             artifacts/EcommerceAgent-Setup-${{ steps.build.outputs.version }}.exe
             artifacts/EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip
+            artifacts/release-environment.json
             artifacts/velopack/*
           if-no-files-found: error
           retention-days: 7
