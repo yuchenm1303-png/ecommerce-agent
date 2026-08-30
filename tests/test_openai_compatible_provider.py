@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import time
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from app.providers.openai_compatible import (
     OpenAICompatibleProviderError,
@@ -53,6 +55,7 @@ class SlowCreate:
 
 class SlowClient:
     def __init__(self, seconds: float):
+        self.seconds = seconds
         self.create_api = SlowCreate(seconds)
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create_api.create))
 
@@ -105,7 +108,9 @@ def valid_json():
 
 
 def _png_bytes() -> bytes:
-    return b"\x89PNG\r\n\x1a\n" + b"provider-test-image"
+    buffer = BytesIO()
+    Image.new("RGB", (16, 12), (220, 220, 220)).save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def test_prompt_only_provider_parses_json_and_keeps_api_key_and_paths_out_of_prompt(tmp_path):
@@ -136,7 +141,7 @@ def test_prompt_only_provider_parses_json_and_keeps_api_key_and_paths_out_of_pro
     user_content = kwargs["messages"][1]["content"]
     image_items = [item for item in user_content if item.get("type") == "image_url"]
     assert len(image_items) == 1
-    assert "data:image/png;base64," in repr(image_items[0])
+    assert "data:image/jpeg;base64," in repr(image_items[0])
     assert "detail" not in image_items[0]["image_url"]
 
 
