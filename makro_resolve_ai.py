@@ -8,11 +8,14 @@ best-effort inference. This command never opens or modifies Makro.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
+from app.listing_image_ranker import finalize_supplier_listing_images
 from app.providers.registry import (
     ProviderConfig,
     ProviderConfigurationError,
     SUPPORTED_PROVIDERS,
+    build_semantic_provider,
 )
 from app.resolver_pipeline import (
     SUPPLIER_EXECUTION_MODEL,
@@ -136,8 +139,65 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolver_run_dirs(root: Path) -> dict[str, Path]:
+    if not root.is_dir():
+        return {}
+    return {
+        str(path.resolve()): path.resolve()
+        for path in root.glob("resolve-ai-*")
+        if path.is_dir()
+    }
+
+
+def _new_resolver_run(root: Path, before: set[str]) -> Path | None:
+    candidates = [
+        path
+        for key, path in _resolver_run_dirs(root).items()
+        if key not in before
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+
+
 def main() -> int:
-    return run_resolver(build_parser().parse_args())
+    args = build_parser().parse_args()
+    output_root = Path(args.output_dir).expanduser().resolve()
+    before = set(_resolver_run_dirs(output_root))
+
+    status = run_resolver(args)
+    if status != 0:
+        return status
+
+    run_dir = _new_resolver_run(output_root, before)
+    if run_dir is None:
+        print(
+            "listing_image_ranking=SKIP detail=无法唯一定位本次 Resolver 输出目录；保留机械选图结果。",
+            flush=True,
+        )
+        return status
+
+    try:
+        ranking_provider = build_semantic_provider(provider_config(args))
+        set_progress(ranking_provider, "PHOTO-RANK")
+        result = finalize_supplier_listing_images(run_dir, ranking_provider)
+        selected = len(result.selected)
+        print(
+            f"listing_image_ranking={result.status.upper()} selected={selected} "
+            f"candidates={result.mechanical_candidate_count} "
+            f"semantic_rejected={result.semantically_rejected_count} "
+            f"calls={result.model_calls}",
+            flush=True,
+        )
+    except Exception as exc:
+        # The existing mechanical gate remains a safe compatibility fallback if
+        # semantic ranking itself is temporarily unavailable. Field resolution is
+        # already complete, so a ranking outage must not corrupt that successful run.
+        print(
+            f"listing_image_ranking=FALLBACK_MECHANICAL detail={exc}",
+            flush=True,
+        )
+    return status
 
 
 if __name__ == "__main__":
