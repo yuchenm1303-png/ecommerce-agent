@@ -26,6 +26,28 @@ _DEFAULT_MAX_BYTES = 4 * 1024 * 1024
 _DEFAULT_JPEG_QUALITY = 88
 
 
+def has_decodable_image_pixels(path_value: str | Path) -> bool:
+    """Return whether a local artifact contains image pixels that can reach the AI.
+
+    This is a transport-boundary check only. It does not classify the image, rank it,
+    inspect product meaning, or decide whether the image is useful evidence. Files
+    that cannot produce pixels cannot be represented to a vision model and are kept
+    out of multimodal requests before semantic reasoning begins.
+    """
+
+    path = Path(path_value)
+    if not path.is_file():
+        return False
+    try:
+        with Image.open(path) as opened:
+            if int(opened.width) <= 0 or int(opened.height) <= 0:
+                return False
+            opened.load()
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
+        return False
+    return True
+
+
 def normalize_image_media(
     data: bytes,
     *,
@@ -147,6 +169,7 @@ __all__ = [
     "ImageMediaError",
     "ImageMediaType",
     "detect_image_media",
+    "has_decodable_image_pixels",
     "normalize_image_media",
     "read_image_media",
     "require_image_media",
