@@ -12,15 +12,16 @@ from typing import Any, Iterable, Protocol
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from .image_media import ImageMediaError, read_image_media
 from .providers.usage_telemetry import usage_request_context
 from .semantic_grounding import GroundedSource, IMAGE_KIND, TEXT_KIND
 
 
-IMAGE_EVIDENCE_CONTRACT_VERSION = 2
-IMAGE_EVIDENCE_CACHE_VERSION = 2
+IMAGE_EVIDENCE_CONTRACT_VERSION = 3
+IMAGE_EVIDENCE_CACHE_VERSION = 3
 _IMAGE_BATCH_MAX_ATTEMPTS = 3
 _IMAGE_BATCH_BACKOFF_SECONDS = (0.35, 0.85)
-_AI_IMAGE_INPUT_VERSION = 1
+_AI_IMAGE_INPUT_VERSION = 2
 _AI_IMAGE_MAX_LONG_EDGE = 2048
 _AI_IMAGE_MAX_PIXEL_AREA = 4_000_000
 _AI_IMAGE_MAX_BYTES = 4 * 1024 * 1024
@@ -209,6 +210,7 @@ def image_evidence_contract_digest() -> str:
             "schema": "exact keyed per-image observations",
             "model_image_input": {
                 "version": _AI_IMAGE_INPUT_VERSION,
+                "media_contract": "content-verified canonical-jpeg",
                 "max_long_edge": _AI_IMAGE_MAX_LONG_EDGE,
                 "max_pixel_area": _AI_IMAGE_MAX_PIXEL_AREA,
                 "max_bytes": _AI_IMAGE_MAX_BYTES,
@@ -238,73 +240,74 @@ def _cache_path(root: Path, provider: JSONTaskProvider, namespace: str, source: 
     return root / f"image-observation-{_cache_key(provider, namespace, source)}.json"
 
 
-def _model_input_source(source: GroundedSource, output_dir: Path) -> GroundedSource:
-    """Return a bounded transport image while preserving the original evidence identity.
+def _prepare_model_input_source(source: GroundedSource, output_dir: Path) -> GroundedSource:
+    """Create one canonical provider transport image without changing provenance.
 
-    Raw supplier images stay untouched and keep their original source_id/origin/sha256.
-    Only the local byte payload sent to the multimodal provider is resized/re-encoded
-    when it exceeds a conservative pixel or byte budget. This keeps large storefront
-    assets from turning one batch into an unbounded model request without changing
-    citation provenance or the later Listing Photos selection.
+    Raw supplier artifacts are evidence and may use opaque suffixes such as .img.
+    Model transport is a different boundary: bytes must establish supported image
+    media, Pillow must be able to decode them, and the payload is always emitted as
+    bounded RGB JPEG. A malformed supplier artifact is rejected here before a model
+    batch is created, so it can be isolated without poisoning valid images.
     """
 
     path = Path(source.image_path)
-    if not path.is_file():
-        return source
+    try:
+        _raw, _media = read_image_media(path)
+    except ImageMediaError as exc:
+        raise ImageEvidenceError(f"{source.source_id}: {exc}") from exc
 
     try:
-        byte_count = path.stat().st_size
         with Image.open(path) as opened:
             frame = ImageOps.exif_transpose(opened)
-            width, height = int(frame.width), int(frame.height)
-            if width <= 0 or height <= 0:
-                return source
-            needs_prepare = bool(
-                max(width, height) > _AI_IMAGE_MAX_LONG_EDGE
-                or width * height > _AI_IMAGE_MAX_PIXEL_AREA
-                or byte_count > _AI_IMAGE_MAX_BYTES
-            )
-            if not needs_prepare:
-                return source
-
             frame.load()
-            scale = min(
-                1.0,
-                _AI_IMAGE_MAX_LONG_EDGE / max(width, height),
-                math.sqrt(_AI_IMAGE_MAX_PIXEL_AREA / (width * height)),
-            )
-            target_size = (
-                max(1, int(round(width * scale))),
-                max(1, int(round(height * scale))),
-            )
-            if target_size != frame.size:
-                resampling = getattr(Image, "Resampling", Image).LANCZOS
-                frame = frame.resize(target_size, resampling)
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ImageEvidenceError(f"{source.source_id}: image payload is not decodable") from exc
 
-            if "A" in frame.getbands():
-                rgba = frame.convert("RGBA")
-                flattened = Image.new("RGB", rgba.size, "white")
-                flattened.paste(rgba, mask=rgba.getchannel("A"))
-                frame = flattened
-            else:
-                frame = frame.convert("RGB")
+    width, height = int(frame.width), int(frame.height)
+    if width <= 0 or height <= 0:
+        raise ImageEvidenceError(f"{source.source_id}: image has invalid dimensions")
 
-            output_dir.mkdir(parents=True, exist_ok=True)
-            target = output_dir / f"{source.sha256[:24] or hashlib.sha256(str(path).encode()).hexdigest()[:24]}.jpg"
-            quality = _AI_IMAGE_JPEG_QUALITY
-            frame.save(target, format="JPEG", quality=quality, optimize=True)
+    scale = min(
+        1.0,
+        _AI_IMAGE_MAX_LONG_EDGE / max(width, height),
+        math.sqrt(_AI_IMAGE_MAX_PIXEL_AREA / (width * height)),
+    )
+    target_size = (
+        max(1, int(round(width * scale))),
+        max(1, int(round(height * scale))),
+    )
+    if target_size != frame.size:
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        frame = frame.resize(target_size, resampling)
 
-            while target.stat().st_size > _AI_IMAGE_MAX_BYTES and max(frame.size) > 768:
-                next_size = (
-                    max(1, int(round(frame.width * 0.82))),
-                    max(1, int(round(frame.height * 0.82))),
-                )
-                resampling = getattr(Image, "Resampling", Image).LANCZOS
-                frame = frame.resize(next_size, resampling)
-                quality = max(68, quality - 5)
-                frame.save(target, format="JPEG", quality=quality, optimize=True)
-    except (UnidentifiedImageError, OSError, ValueError):
-        return source
+    if "A" in frame.getbands():
+        rgba = frame.convert("RGBA")
+        flattened = Image.new("RGB", rgba.size, "white")
+        flattened.paste(rgba, mask=rgba.getchannel("A"))
+        frame = flattened
+    else:
+        frame = frame.convert("RGB")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    digest = source.sha256[:24] or hashlib.sha256(str(path).encode()).hexdigest()[:24]
+    target = output_dir / f"{digest}.jpg"
+    quality = _AI_IMAGE_JPEG_QUALITY
+    frame.save(target, format="JPEG", quality=quality, optimize=True)
+
+    while target.stat().st_size > _AI_IMAGE_MAX_BYTES and max(frame.size) > 768:
+        next_size = (
+            max(1, int(round(frame.width * 0.82))),
+            max(1, int(round(frame.height * 0.82))),
+        )
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        frame = frame.resize(next_size, resampling)
+        quality = max(68, quality - 5)
+        frame.save(target, format="JPEG", quality=quality, optimize=True)
+
+    if target.stat().st_size > _AI_IMAGE_MAX_BYTES:
+        raise ImageEvidenceError(
+            f"{source.source_id}: canonical image exceeds {_AI_IMAGE_MAX_BYTES} byte transport budget"
+        )
 
     return GroundedSource(
         source_id=source.source_id,
@@ -346,17 +349,13 @@ def _exception_text(exc: BaseException) -> str:
 
 
 def _is_retryable_image_batch_error(exc: BaseException) -> bool:
-    """Retry only model-output/structured-response failures, never account/config errors."""
-
     if isinstance(exc, ImageEvidenceError):
         return True
-
     text = _exception_text(exc)
     if "openai-compatible api 未返回可解析的 json object" in text:
         return True
     if "openai-compatible api 返回空文本" in text:
         return True
-
     return (
         "response_format" in text
         and (
@@ -367,8 +366,7 @@ def _is_retryable_image_batch_error(exc: BaseException) -> bool:
 
 
 def _is_wall_clock_timeout(exc: BaseException) -> bool:
-    text = _exception_text(exc)
-    return "whole-request wall-clock deadline exceeded" in text
+    return "whole-request wall-clock deadline exceeded" in _exception_text(exc)
 
 
 def _is_batch_local_degradable_error(exc: BaseException) -> bool:
@@ -423,13 +421,12 @@ def _run_batch(provider: JSONTaskProvider, index: int, images: list[GroundedSour
                 delay = _IMAGE_BATCH_BACKOFF_SECONDS[min(attempt - 1, len(_IMAGE_BATCH_BACKOFF_SECONDS) - 1)]
                 time.sleep(delay)
 
-    attempts = model_calls
     return _BatchResult(
         index=index,
         images=batch_images,
         observations=[],
         model_calls=model_calls,
-        warning=f"image evidence batch {index} failed after {attempts} model attempt(s): {last_error}",
+        warning=f"image evidence batch {index} failed after {model_calls} model attempt(s): {last_error}",
         error=last_error,
     )
 
@@ -475,15 +472,13 @@ def run_image_evidence(
     cache_dir: str | Path | None = None,
     cache_namespace: str = "",
 ) -> ImageEvidenceRunResult:
-    """Resolve image evidence with bounded transport payloads and per-batch recovery.
+    """Resolve image evidence through one validated, bounded transport boundary.
 
-    Successful observations become durable cache entries immediately, so another
-    concurrent batch cannot invalidate already-paid work. A whole-request wall-clock
-    timeout on a multi-image batch is recovered once by splitting that batch into
-    independent single-image requests. Remaining timeout/structured-output failures
-    are isolated to those images; the pipeline continues when any usable image or
-    text evidence remains. Unknown provider/account/configuration failures still fail
-    closed rather than being silently downgraded.
+    Supplier artifacts remain immutable provenance. Every uncached image is first
+    content-validated and canonicalized into a temporary JPEG. Media preparation
+    failures are isolated per image and never spend a model call. Valid batches keep
+    the existing retry/split policy; account/config/provider failures still fail
+    closed. Text evidence lets a run continue when some or all images are unusable.
     """
 
     if not 1 <= int(batch_size) <= 8:
@@ -532,10 +527,22 @@ def run_image_evidence(
 
     all_runs: list[_BatchResult] = []
     final_failures: list[_BatchResult] = []
+    preparation_warnings: list[str] = []
+    preparation_failed_images: list[str] = []
+
     temporary = TemporaryDirectory(prefix="ecommerce-image-evidence-")
     try:
         prepared_root = Path(temporary.name)
-        prepared_pending = [_model_input_source(source, prepared_root) for source in pending]
+        prepared_pending: list[GroundedSource] = []
+        for source in pending:
+            try:
+                prepared_pending.append(_prepare_model_input_source(source, prepared_root))
+            except ImageEvidenceError as exc:
+                preparation_failed_images.append(source.source_id)
+                preparation_warnings.append(
+                    f"image evidence skipped {source.source_id} before model call: {exc}"
+                )
+
         initial_batches = [
             prepared_pending[index : index + int(batch_size)]
             for index in range(0, len(prepared_pending), int(batch_size))
@@ -561,10 +568,9 @@ def run_image_evidence(
                         continue
                     for observation in run.observations:
                         observations[observation.image_id] = observation
-                        original_source = source_by_id[observation.image_id]
                         _write_cached_observation(
                             observation,
-                            source=original_source,
+                            source=source_by_id[observation.image_id],
                             cache_root=cache_root,
                             provider=provider,
                             cache_namespace=cache_namespace,
@@ -627,8 +633,10 @@ def run_image_evidence(
         for source in images
         if source.source_id in observations
     ]
-    warnings = tuple(run.warning for run in final_failures if run.warning)
-    failed_images = tuple(
+    warnings = tuple(preparation_warnings) + tuple(
+        run.warning for run in final_failures if run.warning
+    )
+    failed_images = tuple(preparation_failed_images) + tuple(
         source.source_id
         for run in final_failures
         for source in run.images
@@ -646,7 +654,7 @@ def run_image_evidence(
         model_calls=sum(run.model_calls for run in all_runs),
         cache_hits=cache_hits,
         batch_count=len(all_runs),
-        failed_batches=len(final_failures),
+        failed_batches=len(final_failures) + len(preparation_failed_images),
         elapsed_seconds=time.monotonic() - started,
         warnings=warnings,
         failed_images=failed_images,
@@ -661,3 +669,17 @@ def write_image_observations(observations: Iterable[ImageObservation], path: str
         encoding="utf-8",
     )
     return target
+
+
+__all__ = [
+    "IMAGE_EVIDENCE_CACHE_VERSION",
+    "IMAGE_EVIDENCE_CONTRACT_VERSION",
+    "ImageEvidenceError",
+    "ImageEvidenceRunResult",
+    "ImageFactObservation",
+    "ImageObservation",
+    "build_image_evidence_request",
+    "image_evidence_contract_digest",
+    "run_image_evidence",
+    "write_image_observations",
+]
