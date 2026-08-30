@@ -25,7 +25,6 @@ from .browser_visual_hud import (
     set_browser_visual_hud_capture_safe,
 )
 from .image_media import ImageMediaError, normalize_image_media
-from .listing_images import select_listing_images
 from .public_resource_fetch import fetch_public_resource
 from .source_snapshot import (
     SourceAccessBlocked,
@@ -39,10 +38,11 @@ from .supplier_url_identity import supplier_request_identity
 
 
 DEFAULT_SOURCE_CDP_PORT = 9333
-SOURCE_CAPTURE_CACHE_VERSION = 8
+SOURCE_CAPTURE_CACHE_VERSION = 9
 _DETAIL_DOCUMENT_MAX_BYTES = 8 * 1024 * 1024
 _PRODUCT_IMAGE_MAX_BYTES = 64 * 1024 * 1024
 _PRODUCT_IMAGES_TOTAL_MAX_BYTES = 256 * 1024 * 1024
+_PRODUCT_IMAGE_CANDIDATE_LIMIT = 32
 
 _DETAIL_DOCUMENT_PATTERN = re.compile(
     r"detail(?:Url|_url)[^h]{0,48}(https?://[^\\\"'<>\s]+)",
@@ -160,7 +160,7 @@ def _unique_image_urls(values: list[str], *, max_images: int = 32) -> list[str]:
 
 
 def _structured_product_image_urls(snapshot: SourceSnapshot, *, max_images: int = 24) -> list[str]:
-    """Extract only images explicitly owned by JSON-LD Product objects."""
+    """Extract images explicitly owned by JSON-LD Product objects."""
 
     base_url = snapshot.final_url or snapshot.requested_url
     output: list[str] = []
@@ -201,10 +201,7 @@ def _structured_product_image_urls(snapshot: SourceSnapshot, *, max_images: int 
 
         raw_types = value.get("@type")
         types = raw_types if isinstance(raw_types, list) else [raw_types]
-        is_product = any(
-            "product" in str(item or "").casefold()
-            for item in types
-        )
+        is_product = any("product" in str(item or "").casefold() for item in types)
         if is_product:
             for key in ("image", "images"):
                 if key in value:
@@ -233,13 +230,7 @@ def _discover_detail_images(
     max_documents: int = 4,
     max_images: int = 32,
 ) -> tuple[list[str], list[str]]:
-    """Read bounded public detail documents exposed by the exact supplier page.
-
-    Detail-document images are deliberately a fallback source. They are useful on
-    marketplaces that keep high-resolution media in a detail payload, but the
-    document may also contain recommendation and decoration assets and therefore
-    must never outrank explicit Product/gallery ownership.
-    """
+    """Read bounded public detail documents exposed by the exact supplier page."""
 
     documents = _detail_document_urls(snapshot, max_urls=max_documents)
     images: list[str] = []
@@ -421,13 +412,11 @@ def _discover_product_gallery_images(
     settle_ms: int,
     max_images: int = 24,
 ) -> list[str]:
-    """Discover the complete current-product media gallery without requiring manual clicks.
+    """Discover and hydrate the current page's product-media surface.
 
-    Explicit gallery ownership is stronger evidence than current visibility or thumbnail
-    dimensions. Static DOM references are harvested first, then bounded non-navigating
-    thumbnail controls are activated only to hydrate high-resolution media that the page
-    loads lazily after selection. No product meaning is inferred here; downstream image
-    quality and semantic ranking remain the final upload gates.
+    This is acquisition only. Final relevance, duplicate handling, main-image
+    choice and ordering belong to the AI photo selector after all candidate
+    sources have been merged.
     """
 
     raw = _evaluate_with_navigation_retry(
@@ -640,14 +629,9 @@ def _download_page_images(
     image_urls: list[str],
     output_dir: Path,
     *,
-    max_images: int = 32,
+    max_images: int = _PRODUCT_IMAGE_CANDIDATE_LIMIT,
 ) -> tuple[Path, ...]:
-    """Download only technically decodable raster images and normalize to JPEG.
-
-    Response headers and URL suffixes are advisory at best. The image decoder is
-    the transport authority, so HTML/error payloads and unsupported pseudo-images
-    never enter product evidence or reach the multimodal provider.
-    """
+    """Download decodable raster images and exact-dedupe their normalized bytes."""
 
     if not image_urls:
         return ()
@@ -689,53 +673,43 @@ def _select_product_image_tier(
     tiers: list[tuple[str, list[str]]],
     output_dir: Path,
 ) -> tuple[str, list[str], tuple[Path, ...]]:
-    """Choose the first image source tier that yields upload-viable product media.
+    """Merge candidate sources instead of choosing a program-defined winning tier.
 
-    Every tier is isolated while being evaluated. This prevents an early banner,
-    thumbnail or corrupt resource from blocking a stronger fallback source. If no
-    tier reaches the central listing-image quality gate, preserve the first tier
-    that at least produced decodable pixels for AI evidence instead of fabricating
-    an upload candidate.
+    Source provenance influences only bounded retrieval order. No tier is allowed to
+    suppress later candidates merely because it produced one decodable image. The
+    merged image set is handed to AI, which owns relevance, redundancy, importance
+    and final ordering.
     """
 
-    stage_root = output_dir.with_name(f".{output_dir.name}-staging")
-    if stage_root.exists():
-        shutil.rmtree(stage_root)
     if output_dir.exists():
         shutil.rmtree(output_dir)
-    stage_root.mkdir(parents=True, exist_ok=True)
 
-    first_decodable: tuple[str, list[str], tuple[Path, ...]] | None = None
-    chosen: tuple[str, list[str], tuple[Path, ...]] | None = None
-    try:
-        for index, (name, raw_urls) in enumerate(tiers, start=1):
-            urls = _unique_image_urls(raw_urls)
-            if not urls:
+    merged_urls: list[str] = []
+    seen: set[str] = set()
+    for _name, raw_urls in tiers:
+        for url in raw_urls:
+            value = str(url or "").strip()
+            if not value or value in seen:
                 continue
-            tier_dir = stage_root / f"{index:02d}-{name}"
-            paths = _download_page_images(context, urls, tier_dir)
-            if paths and first_decodable is None:
-                first_decodable = (name, urls, paths)
-            if paths and select_listing_images(paths).selected:
-                chosen = (name, urls, paths)
+            seen.add(value)
+            merged_urls.append(value)
+            if len(merged_urls) >= _PRODUCT_IMAGE_CANDIDATE_LIMIT:
                 break
+        if len(merged_urls) >= _PRODUCT_IMAGE_CANDIDATE_LIMIT:
+            break
 
-        if chosen is None:
-            chosen = first_decodable
-        if chosen is None:
-            return "none", [], ()
+    if not merged_urls:
+        return "none", [], ()
 
-        name, urls, paths = chosen
-        output_dir.mkdir(parents=True, exist_ok=True)
-        final_paths: list[Path] = []
-        for path in paths:
-            target = output_dir / path.name
-            shutil.copy2(path, target)
-            final_paths.append(target)
-        return name, urls, tuple(final_paths)
-    finally:
-        if stage_root.exists():
-            shutil.rmtree(stage_root)
+    paths = _download_page_images(
+        context,
+        merged_urls,
+        output_dir,
+        max_images=_PRODUCT_IMAGE_CANDIDATE_LIMIT,
+    )
+    if not paths:
+        return "none", merged_urls, ()
+    return "merged_candidates", merged_urls, paths
 
 
 def _cached_capture(
@@ -906,7 +880,7 @@ def capture_product_source(
             browser_visual_hud_status(
                 page,
                 "正在检索详情资源",
-                "当前商品图库优先；正在整理仅用于兜底的公开详情图片资源。",
+                "正在补充公开详情图片候选，之后统一交给 AI 判断。",
                 phase=2,
             )
             detail_documents, detail_images = _discover_detail_images(context, snapshot)
@@ -924,10 +898,7 @@ def capture_product_source(
             browser_visual_hud_status(
                 page,
                 "正在整理商品图片",
-                (
-                    f"商品图库 {len(owned_images)} 个候选；"
-                    "将逐层验证真实图片，异常资源会直接丢弃。"
-                ),
+                "正在合并商品图库、页面图片和详情图片；程序不提前判断图片重要性。",
                 phase=3,
             )
             product_image_dir = target_dir / "product-images"
@@ -935,8 +906,8 @@ def capture_product_source(
                 context,
                 [
                     ("product_structured_gallery", owned_images),
-                    ("visible_dom_fallback", generic_images),
-                    ("detail_document_fallback", detail_images),
+                    ("visible_dom", generic_images),
+                    ("detail_document", detail_images),
                 ],
                 product_image_dir,
             )
@@ -984,8 +955,8 @@ def capture_product_source(
                 success=True,
                 title="商品页信息提取完成",
                 thought=(
-                    f"已完成商品页面采集 · 商品图 {len(product_images)} 张 · "
-                    f"来源 {image_source} · 结构化证据已写入本次任务。"
+                    f"已完成商品页面采集 · 图片候选 {len(product_images)} 张 · "
+                    "语义筛选与排序交给 AI。"
                 ),
                 hold_ms=420,
                 destroy=True,

@@ -85,30 +85,34 @@ def test_download_rejects_non_image_payload_and_normalizes_real_pixels(
         assert opened.size == (360, 360)
 
 
-def test_image_source_tier_falls_back_when_earlier_pixels_are_not_listing_viable(
+def test_image_sources_are_merged_before_ai_instead_of_program_tier_selection(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    captured_urls: list[str] = []
+
     def fake_download(_context, urls: list[str], output_dir: Path, *, max_images: int = 32):
-        del max_images
+        captured_urls.extend(urls)
         output_dir.mkdir(parents=True, exist_ok=True)
-        path = output_dir / "source-image-01.jpg"
-        size = (649, 45) if urls == ["strip"] else (679, 762)
-        Image.new("RGB", size, (20, 40, 60)).save(path)
-        return (path,)
+        paths: list[Path] = []
+        for index, _url in enumerate(urls[:max_images], start=1):
+            path = output_dir / f"source-image-{index:02d}.jpg"
+            Image.new("RGB", (300 + index, 300), (20 * index, 40, 60)).save(path)
+            paths.append(path)
+        return tuple(paths)
 
     monkeypatch.setattr("app.source_capture_engine._download_page_images", fake_download)
     source, urls, paths = _select_product_image_tier(
         None,
         [
-            ("product_structured_gallery", ["strip"]),
-            ("visible_dom_fallback", ["product"]),
+            ("product_structured_gallery", ["gallery-a", "shared"]),
+            ("visible_dom", ["shared", "visible-b"]),
+            ("detail_document", ["detail-c"]),
         ],
         tmp_path / "product-images",
     )
 
-    assert source == "visible_dom_fallback"
-    assert urls == ["product"]
-    assert len(paths) == 1
-    with Image.open(paths[0]) as opened:
-        assert opened.size == (679, 762)
+    assert source == "merged_candidates"
+    assert urls == ["gallery-a", "shared", "visible-b", "detail-c"]
+    assert captured_urls == urls
+    assert len(paths) == 4
