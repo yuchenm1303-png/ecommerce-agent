@@ -196,6 +196,12 @@ $PackArgs = @(
     "--icon", $IconFile,
     "--mainExe", "EcommerceAgent.exe"
 )
+if (-not [string]::IsNullOrWhiteSpace($AzureTrustedSignFile)) {
+    $PackArgs += @("--azureTrustedSignFile", $AzureTrustedSignFile)
+}
+elseif (-not [string]::IsNullOrWhiteSpace($SignParams)) {
+    $PackArgs += @("--signParams", $SignParams)
+}
 if (-not [string]::IsNullOrWhiteSpace($ReleaseNotesPath)) {
     $resolvedNotes = (Resolve-Path $ReleaseNotesPath).Path
     $PackArgs += @("--releaseNotes", $resolvedNotes)
