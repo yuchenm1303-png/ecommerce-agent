@@ -104,6 +104,15 @@ def _latest_file(root: Path, pattern: str) -> Path | None:
     return max(matches, key=lambda path: path.stat().st_mtime_ns) if matches else None
 
 
+def _same_path(left: Path | None, right: Path | None) -> bool:
+    if left is None or right is None:
+        return False
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return left == right
+
+
 def latest_live_schema(run_dir: Path) -> Path | None:
     manifest = _workflow_manifest(run_dir)
     direct = _path(manifest.get("live_schema"))
@@ -113,12 +122,26 @@ def latest_live_schema(run_dir: Path) -> Path | None:
 
 
 def latest_resolver_manifest(run_dir: Path, phase_dir: str) -> Path | None:
+    """Return the canonical business resolver artifact for the requested phase.
+
+    For the HOT-facing call this intentionally follows workflow.resolver_manifest:
+    a degraded cache replay is allowed to point back to the already-valid COLD
+    artifact. Callers that need replay telemetry must use latest_hot_replay_manifest
+    instead of treating that canonical fallback as a successful HOT execution.
+    """
+
     manifest = _workflow_manifest(run_dir)
     key = "cold_resolver_manifest" if "cold" in phase_dir else "resolver_manifest"
     direct = _path(manifest.get(key))
     if direct is not None and direct.is_file():
         return direct
     return _latest_file(run_dir / phase_dir, "resolve-ai-*/run-manifest.json")
+
+
+def latest_hot_replay_manifest(run_dir: Path) -> Path | None:
+    """Return only an artifact physically produced by the HOT/CACHE replay."""
+
+    return _latest_file(run_dir / "03-hot-resolver", "resolve-ai-*/run-manifest.json")
 
 
 def latest_fill_plan(run_dir: Path) -> Path | None:
@@ -324,39 +347,62 @@ def load_run_result(run_dir: str | Path) -> RunResult:
     )
 
     cold_manifest_path = latest_resolver_manifest(root, "02-cold-resolver")
-    hot_manifest_path = latest_resolver_manifest(root, "03-hot-resolver")
+    resolver_manifest_path = latest_resolver_manifest(root, "03-hot-resolver")
+    hot_replay_manifest_path = latest_hot_replay_manifest(root)
     plan_path = latest_fill_plan(root)
     plan_manifest_path = latest_plan_manifest(root)
     scan_manifest_path = latest_scan_manifest(root)
     live_schema_path = latest_live_schema(root)
 
     cold_manifest = _read_json(cold_manifest_path) if cold_manifest_path else {}
-    hot_manifest = _read_json(hot_manifest_path) if hot_manifest_path else {}
+    resolver_manifest = _read_json(resolver_manifest_path) if resolver_manifest_path else {}
+    hot_replay_manifest = (
+        _read_json(hot_replay_manifest_path) if hot_replay_manifest_path else {}
+    )
     plan_manifest = _read_json(plan_manifest_path) if plan_manifest_path else {}
     scan_manifest = _read_json(scan_manifest_path) if scan_manifest_path else {}
 
+    replay = workflow.get("resolver_replay") or {}
+    replay_status = str(replay.get("status") or "").strip().casefold()
     result.cold = _phase_stats(cold_manifest)
-    result.hot = _phase_stats(hot_manifest)
-    result.resolver = hot_manifest
+    if replay_status == "degraded":
+        # The canonical resolver_manifest intentionally points at COLD on replay
+        # degradation. Never present those COLD counters as a successful HOT pass.
+        result.hot = PhaseStats()
+    elif hot_replay_manifest:
+        result.hot = _phase_stats(hot_replay_manifest)
+    elif resolver_manifest and not _same_path(resolver_manifest_path, cold_manifest_path):
+        # Compatibility for older runs that predate explicit resolver_replay data.
+        result.hot = _phase_stats(resolver_manifest)
+    else:
+        result.hot = PhaseStats()
+
+    result.resolver = resolver_manifest
     result.product_url = str(
-        hot_manifest.get("primary_product_url")
+        resolver_manifest.get("primary_product_url")
         or cold_manifest.get("primary_product_url")
         or result.product_url
     )
 
     safety_inputs = [
         item
-        for item in (workflow, scan_manifest, cold_manifest, hot_manifest, plan_manifest)
+        for item in (
+            workflow,
+            scan_manifest,
+            cold_manifest,
+            hot_replay_manifest,
+            plan_manifest,
+        )
         if item
     ]
     result.safety = _safety_from_manifests(safety_inputs)
 
     decisions_payload: dict[str, Any] = {}
-    decision_path = _path_from_manifest(hot_manifest, "outputs.final_decisions")
+    decision_path = _path_from_manifest(resolver_manifest, "outputs.final_decisions")
     if decision_path is not None and decision_path.is_file():
         decisions_payload = _read_json(decision_path)
-    elif hot_manifest_path:
-        fallback = hot_manifest_path.parent / "ai-decisions.json"
+    elif resolver_manifest_path:
+        fallback = resolver_manifest_path.parent / "ai-decisions.json"
         if fallback.is_file():
             decisions_payload = _read_json(fallback)
 
@@ -366,7 +412,7 @@ def load_run_result(run_dir: str | Path) -> RunResult:
     decisions_by_id = {
         str(item.get("field_id") or ""): item for item in decisions
     }
-    final_summary = hot_manifest.get("final_decision_summary") or {}
+    final_summary = resolver_manifest.get("final_decision_summary") or {}
     result.missing = int(final_summary.get("missing") or 0)
     result.conflict = int(final_summary.get("conflict") or 0)
     if not final_summary:
@@ -377,7 +423,7 @@ def load_run_result(run_dir: str | Path) -> RunResult:
             str(item.get("status") or "").casefold() == "conflict" for item in decisions
         )
 
-    web_by_ref = _load_web_reference_map(decisions_payload, hot_manifest)
+    web_by_ref = _load_web_reference_map(decisions_payload, resolver_manifest)
 
     plan_payload = _read_json(plan_path) if plan_path else {}
     result.plan_summary = dict(
