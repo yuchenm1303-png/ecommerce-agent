@@ -1,24 +1,47 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+from PIL import Image
 
 import app.image_evidence as image_evidence
 from app.image_evidence import ImageEvidenceError, run_image_evidence
-from app.semantic_grounding import GroundedSource, IMAGE_KIND
+from app.semantic_grounding import GroundedSource, IMAGE_KIND, TEXT_KIND
 
 
-def images(count: int) -> list[GroundedSource]:
-    return [
-        GroundedSource(
-            source_id=f"image:{index:03d}",
-            source_type="product_image",
-            kind=IMAGE_KIND,
-            origin=f"image-{index}.jpg",
-            image_path=f"image-{index}.jpg",
-            sha256=f"{index:064x}",
+def _write_jpeg(path: Path, *, size: tuple[int, int] = (32, 24)) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", size, "white").save(path, format="JPEG")
+
+
+def images(count: int, root: Path) -> list[GroundedSource]:
+    output: list[GroundedSource] = []
+    for index in range(1, count + 1):
+        path = root / f"image-{index}.jpg"
+        _write_jpeg(path)
+        output.append(
+            GroundedSource(
+                source_id=f"image:{index:03d}",
+                source_type="product_image",
+                kind=IMAGE_KIND,
+                origin=f"image-{index}.jpg",
+                image_path=str(path),
+                sha256=f"{index:064x}",
+            )
         )
-        for index in range(1, count + 1)
-    ]
+    return output
+
+
+def text_source() -> GroundedSource:
+    return GroundedSource(
+        source_id="text:001",
+        source_type="supplier_visible_text",
+        kind=TEXT_KIND,
+        origin="supplier page",
+        content="Product title and grounded product specifications are available.",
+        sha256="f" * 64,
+    )
 
 
 def _success_response(request):
@@ -93,13 +116,13 @@ class WrongPartitionThenSuccessProvider:
 
 def test_image_evidence_is_mechanically_batched_and_cached_per_image(tmp_path):
     provider = FakeImageProvider()
-    sources = images(7)
+    sources = images(7, tmp_path / "raw")
     first = run_image_evidence(
         provider,
         sources,
         batch_size=3,
         concurrency=3,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
         cache_namespace="contract-a",
     )
     second = run_image_evidence(
@@ -107,7 +130,7 @@ def test_image_evidence_is_mechanically_batched_and_cached_per_image(tmp_path):
         sources,
         batch_size=2,
         concurrency=2,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
         cache_namespace="contract-a",
     )
 
@@ -123,7 +146,7 @@ def test_image_evidence_is_mechanically_batched_and_cached_per_image(tmp_path):
 
 def test_image_request_has_no_marketplace_schema_or_non_image_sources(tmp_path):
     provider = FakeImageProvider()
-    run_image_evidence(provider, images(2), batch_size=2, cache_dir=tmp_path)
+    run_image_evidence(provider, images(2, tmp_path / "raw"), batch_size=2, cache_dir=tmp_path / "cache")
     request = provider.requests[0]
     assert request["task"] == "extract_independent_product_image_evidence"
     assert request["target_fields"] == []
@@ -140,10 +163,10 @@ def test_transient_response_format_json_failure_retries_and_recovers(tmp_path, m
 
     result = run_image_evidence(
         provider,
-        images(2),
+        images(2, tmp_path / "raw"),
         batch_size=2,
         concurrency=1,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
     )
 
     assert provider.calls == 2
@@ -159,10 +182,10 @@ def test_transient_response_format_json_failure_is_bounded_to_three_attempts(tmp
     with pytest.raises(ImageEvidenceError, match="failed after 3 model attempt"):
         run_image_evidence(
             provider,
-            images(2),
+            images(2, tmp_path / "raw"),
             batch_size=2,
             concurrency=1,
-            cache_dir=tmp_path,
+            cache_dir=tmp_path / "cache",
         )
 
     assert provider.calls == 3
@@ -174,10 +197,10 @@ def test_invalid_model_partition_is_retried_once_and_can_recover(tmp_path, monke
 
     result = run_image_evidence(
         provider,
-        images(2),
+        images(2, tmp_path / "raw"),
         batch_size=2,
         concurrency=1,
-        cache_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
     )
 
     assert provider.calls == 2
@@ -190,8 +213,100 @@ def test_non_retryable_image_batch_failure_stops_immediately(tmp_path):
     with pytest.raises(ImageEvidenceError, match="vision unavailable"):
         run_image_evidence(
             provider,
-            images(2),
+            images(2, tmp_path / "raw"),
             batch_size=2,
-            cache_dir=tmp_path,
+            cache_dir=tmp_path / "cache",
         )
     assert provider.calls == 1
+
+
+def test_opaque_valid_supplier_image_is_canonicalized_before_provider_transport(tmp_path):
+    opaque = tmp_path / "source-image-23.img"
+    _write_jpeg(opaque)
+    source = GroundedSource(
+        source_id="image:023",
+        source_type="product_image",
+        kind=IMAGE_KIND,
+        origin="supplier opaque image",
+        image_path=str(opaque),
+        sha256="2" * 64,
+    )
+    provider = FakeImageProvider()
+
+    result = run_image_evidence(provider, [source, text_source()], cache_dir=tmp_path / "cache")
+
+    assert len(result.observations) == 1
+    request_source = provider.requests[0]["grounded_sources"][0]
+    assert request_source["source_id"] == source.source_id
+    assert request_source["sha256"] == source.sha256
+    assert Path(request_source["image_path"]).suffix == ".jpg"
+    assert request_source["image_path"] != source.image_path
+
+
+def test_corrupt_supplier_image_isolated_before_model_call_when_other_evidence_exists(tmp_path):
+    valid = images(1, tmp_path / "raw")[0]
+    corrupt_path = tmp_path / "source-image-23.img"
+    corrupt_path.write_bytes(b"not-an-image" * 1024)
+    corrupt = GroundedSource(
+        source_id="image:023",
+        source_type="product_image",
+        kind=IMAGE_KIND,
+        origin="supplier corrupt image",
+        image_path=str(corrupt_path),
+        sha256="3" * 64,
+    )
+    provider = FakeImageProvider()
+
+    result = run_image_evidence(
+        provider,
+        [valid, corrupt, text_source()],
+        batch_size=3,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert provider.calls == 1
+    assert provider.requests[0]["image_ids"] == [valid.source_id]
+    assert [item.image_id for item in result.observations] == [valid.source_id]
+    assert result.failed_images == (corrupt.source_id,)
+    assert result.failed_batches == 1
+    assert "before model call" in result.warnings[0]
+
+
+def test_all_corrupt_images_can_degrade_to_grounded_text_without_model_call(tmp_path):
+    corrupt_path = tmp_path / "source-image-23.img"
+    corrupt_path.write_bytes(b"not-an-image" * 1024)
+    corrupt = GroundedSource(
+        source_id="image:023",
+        source_type="product_image",
+        kind=IMAGE_KIND,
+        origin="supplier corrupt image",
+        image_path=str(corrupt_path),
+        sha256="4" * 64,
+    )
+    provider = FakeImageProvider()
+
+    result = run_image_evidence(provider, [corrupt, text_source()], cache_dir=tmp_path / "cache")
+
+    assert provider.calls == 0
+    assert result.observations == []
+    assert result.failed_images == (corrupt.source_id,)
+    assert result.failed_batches == 1
+
+
+def test_all_corrupt_images_without_text_fail_with_precise_pre_model_error(tmp_path):
+    corrupt_path = tmp_path / "source-image-23.img"
+    corrupt_path.write_bytes(b"not-an-image" * 1024)
+    corrupt = GroundedSource(
+        source_id="image:023",
+        source_type="product_image",
+        kind=IMAGE_KIND,
+        origin="supplier corrupt image",
+        image_path=str(corrupt_path),
+        sha256="5" * 64,
+    )
+    provider = FakeImageProvider()
+
+    with pytest.raises(ImageEvidenceError, match="all image evidence failed"):
+        run_image_evidence(provider, [corrupt], cache_dir=tmp_path / "cache")
+
+    assert provider.calls == 0
