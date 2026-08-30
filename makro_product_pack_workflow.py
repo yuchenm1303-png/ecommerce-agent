@@ -21,6 +21,7 @@ from app.product_input import acquire_product_input, product_input_manifest_payl
 from app.providers.registry import ProviderConfigurationError, build_semantic_provider
 from app.source_capture import SourceAccessBlocked
 from app.workflow_cli import build_one_link_parser, provider_config
+from app.workflow_diagnostics import diag_event
 from app.workflow_runtime import (
     build_resolver_command as _resolver_command,
     run_command as _run,
@@ -63,6 +64,15 @@ def _resolver_pair_for_pack(
     live_schema: Path,
     pack_manifest: Path,
 ) -> tuple[Path, dict[str, Any], Path, dict[str, Any]]:
+    """Run one canonical Product Pack resolver plus a diagnostic cache replay.
+
+    The COLD pass is the business computation and remains fail-closed. The HOT
+    pass is only a replay/integrity proof for the semantic cache. Once COLD has
+    produced a complete resolver manifest, a later replay process/manifest error
+    cannot erase that valid product result. The planner receives the COLD result
+    with an explicit degraded replay marker in that case.
+    """
+
     cold_root = run_dir / "02-cold-resolver"
     hot_root = run_dir / "03-hot-resolver"
     cold_root.mkdir(parents=True, exist_ok=True)
@@ -77,10 +87,42 @@ def _resolver_pair_for_pack(
 
     hot_command = _resolver_command(args, live_schema, hot_root)
     hot_command.extend(["--product-pack-manifest", str(pack_manifest)])
-    _run(hot_command, "STEP 3 CURRENT RESOLVER · HOT/CACHE")
-    hot_run = _single_run_dir(hot_root, "resolve-ai-")
-    hot_manifest_path = hot_run / "run-manifest.json"
-    hot_manifest = json.loads(hot_manifest_path.read_text(encoding="utf-8"))
+    try:
+        _run(hot_command, "STEP 3 CURRENT RESOLVER · HOT/CACHE")
+        hot_run = _single_run_dir(hot_root, "resolve-ai-")
+        hot_manifest_path = hot_run / "run-manifest.json"
+        hot_manifest = json.loads(hot_manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        fallback_manifest = dict(cold_manifest)
+        fallback_manifest["hot_cache_replay"] = {
+            "status": "degraded",
+            "canonical_resolver": "cold",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+        diag_event(
+            "product_pack_hot_resolver",
+            "DEGRADED",
+            canonical_manifest=str(cold_manifest_path.resolve()),
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        print(
+            "RESOLVER_REPLAY_WARNING Product Pack HOT/CACHE replay failed after canonical COLD success; "
+            "continuing with the verified COLD resolver artifact.",
+            flush=True,
+        )
+        return (
+            cold_manifest_path,
+            cold_manifest,
+            cold_manifest_path,
+            fallback_manifest,
+        )
+
+    hot_manifest["hot_cache_replay"] = {
+        "status": "complete",
+        "canonical_resolver": "hot_cache",
+    }
     return cold_manifest_path, cold_manifest, hot_manifest_path, hot_manifest
 
 
@@ -124,6 +166,7 @@ def _prepare_step3_pack(
     manifest["cold_resolver_manifest"] = str(cold_path.resolve())
     manifest["resolver_manifest"] = str(hot_path.resolve())
     manifest["resolver_summary"] = hot_manifest.get("final_decision_summary")
+    manifest["resolver_replay"] = hot_manifest.get("hot_cache_replay") or {}
 
     plan_root = run_dir / "04-fill-plan"
     plan_root.mkdir(parents=True, exist_ok=True)
