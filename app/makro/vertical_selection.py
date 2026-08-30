@@ -4,16 +4,9 @@ One production decision boundary owns Step 1: Makro must supply every selectable
 Vertical. Product Identity supplies semantics and AI plans a bounded retrieval
 ladder. Every query is sampled into its own fresh query-owned generation first;
 only after the bounded ladder is complete are those exact live rows merged and
-ranked as one evidence pool. If the globally selected candidate is still uniquely
-present in the currently active query generation, that already-grounded live row is
-clicked directly with no redundant search. Only candidates owned by an earlier
-query require a fresh owner-query rebind before clicking. Every click is still
-verified against the resulting canonical Vertical before Step 2 is accepted.
-
-This separation prevents one noisy query from making an early decision while also
-minimizing Makro state transitions at the mutation boundary. Browse taxonomy is the
-semantic fallback when the complete live search pool contains no acceptable class.
-The workflow never invents a Makro Vertical and never clicks Send to QC.
+ranked as one evidence pool. Query-local DOM failures stay inside that retrieval
+attempt; the remaining queries and taxonomy fallback continue. Once a concrete
+live row is selected, ownership/canonical verification remains fail-closed.
 """
 
 from __future__ import annotations
@@ -37,6 +30,7 @@ from .listing_creation import (
     is_vertical_step,
     normalize_label,
 )
+from .portal_interruptions import reconcile_portal_interruptions
 from .search_surface import (
     begin_search_query,
     click_search_row,
@@ -194,14 +188,6 @@ def _verify_retry_canonical(
     actual_canonical: str,
     selected_visible: bool,
 ) -> None:
-    """Require independent proof that the resulting canonical is the clicked leaf.
-
-    A changed URL is not evidence of correctness. Direct search -> Step 2
-    transitions must have a display/slug equivalent canonical. A visible Step 1
-    confirmation may serve as independent proof for portals whose canonical slug
-    is not linguistically equivalent to the display label.
-    """
-
     previous = str(previous_canonical or "").strip()
     actual = str(actual_canonical or "").strip()
     equivalent = _display_slug_equivalent(selected, actual)
@@ -239,16 +225,6 @@ def _wait_for_canonical_vertical(page: Page, *, timeout_s: float = 10.0) -> str:
 
 @dataclass(frozen=True, slots=True)
 class _VerticalBrandTransitionObservation:
-    """One coherent read of the Step 1 confirmation -> Step 2 boundary.
-
-    The confirmation is accepted from either Makro's semantic confirmation content
-    or the structural state the live portal actually renders after a Vertical is
-    chosen: Step 1 is still active, the selected leaf is visible in the rendered
-    confirmation/details, and the exact Select Brand action exists. Keeping these
-    facts in one observation preserves the atomic TOCTOU protection without making
-    a canonical URL mutation or one fixed confirmation sentence a precondition.
-    """
-
     brand_step: bool = False
     confirmation_visible: bool = False
     selected_visible: bool = False
@@ -326,14 +302,24 @@ def _observe_vertical_brand_transition(
 
 
 def _vertical_confirmation_ready(page: Page, selected: str = "") -> bool:
-    """Return true only for Step 2 or one atomically actionable confirmation.
-
-    Taxonomy navigation also uses this readiness boundary. Stale confirmation text,
-    the wrong leaf, or a render interval in which Select Brand is absent is now
-    pending state rather than success.
-    """
-
     return _observe_vertical_brand_transition(page, selected).actionable
+
+
+def _wait_for_brand_step_after_select(page: Page) -> bool:
+    """Reconcile only safe presentation interruptions while Step 2 settles."""
+
+    def ready(current: Page) -> bool:
+        if is_brand_step(current):
+            return True
+        handled = reconcile_portal_interruptions(current)
+        if handled:
+            _vertical_diag(
+                "select_brand_interruption_reconciled",
+                {"handled": handled, "page_url": str(current.url or "")},
+            )
+        return bool(is_brand_step(current))
+
+    return _wait_for(ready, page, timeout_s=20.0)
 
 
 def _complete_exact_live_vertical(
@@ -401,12 +387,21 @@ def _complete_exact_live_vertical(
             "selected_leaf": verify_as,
             "canonical_before_brand": canonical_before_brand,
             "selected_visible_confirmation": selected_visible,
-            "action": "click_observed_action_then_verify_step2",
+            "action": "click_observed_action_then_reconcile_step2",
         },
     )
     button.click(timeout=5000)
-    if not _wait_for(is_brand_step, page, timeout_s=15.0):
-        raise RuntimeError("Makro Step 1 triggered the verified Select Brand action, but Step 2 did not appear")
+    if not _wait_for_brand_step_after_select(page):
+        diagnostics = {
+            "url": str(page.url or ""),
+            "brand_step": bool(is_brand_step(page)),
+            "vertical_step": bool(is_vertical_step(page)),
+            "body_prefix": str(_body_text(page) or "")[:700],
+        }
+        raise RuntimeError(
+            "Makro Step 1 triggered the verified Select Brand action, but no verified Step 2 state "
+            f"appeared after safe interruption reconciliation; diagnostics={json.dumps(diagnostics, ensure_ascii=False)}"
+        )
 
     canonical_after = _wait_for_canonical_vertical(page)
     if not canonical_after:
@@ -422,8 +417,6 @@ def _complete_exact_live_vertical(
 
 
 def _close_vertical_search(search, page: Page, *, wait_ms: int) -> None:
-    """End one query generation without requiring Makro to destroy old DOM."""
-
     try:
         search.fill("")
     except Exception as exc:
@@ -442,14 +435,15 @@ def _close_vertical_search(search, page: Page, *, wait_ms: int) -> None:
 
 def _run_vertical_search_query(
     page: Page,
-    search,
     term: str,
     *,
     wait_ms: int,
-) -> list[str]:
-    """Run one isolated discovery generation and return only generation-owned rows."""
+):
+    """Run one query with a freshly reacquired search owner."""
 
+    search = _vertical_search_input(page)
     _close_vertical_search(search, page, wait_ms=wait_ms)
+    search = _vertical_search_input(page)
     generation = begin_search_query(search)
     if generation <= 0:
         raise RuntimeError(
@@ -483,7 +477,21 @@ def _run_vertical_search_query(
             "sample": rows[:8],
         },
     )
-    return rows
+    return rows, search
+
+
+def _search_attempt_is_locally_recoverable(page: Page) -> bool:
+    try:
+        if page.is_closed():
+            return False
+    except Exception:
+        return False
+    try:
+        if is_product_info_step(page) or is_brand_step(page):
+            return False
+    except Exception:
+        return False
+    return True
 
 
 def _try_select_via_search(
@@ -493,17 +501,36 @@ def _try_select_via_search(
     *,
     wait_ms: int,
 ) -> tuple[str, list[str], tuple[str, ...]]:
-    """Sample all queries, decide globally, then reuse current live state when safe."""
+    """Sample all safe query attempts, then decide globally from successful generations."""
 
-    search = _vertical_search_input(page)
     planned_terms = plan_vertical_search_terms(provider, hints)
     observations: list[tuple[str, list[str]]] = []
+    successful: list[tuple[str, list[str], object]] = []
     observed: list[str] = []
     observed_keys: set[str] = set()
 
     for query_index, term in enumerate(planned_terms, start=1):
-        rows = _run_vertical_search_query(page, search, term, wait_ms=wait_ms)
+        try:
+            rows, search = _run_vertical_search_query(page, term, wait_ms=wait_ms)
+        except Exception as exc:
+            if not _search_attempt_is_locally_recoverable(page):
+                raise
+            observations.append((term, []))
+            _vertical_diag(
+                "query_failed",
+                {
+                    "query_index": query_index,
+                    "query_count": len(planned_terms),
+                    "query": term,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "action": "continue_remaining_queries_then_taxonomy",
+                },
+            )
+            continue
+
         observations.append((term, rows))
+        successful.append((term, rows, search))
         for row in rows:
             key = normalize_label(row)
             if not key or key in observed_keys:
@@ -526,8 +553,7 @@ def _try_select_via_search(
     selected = choose_vertical_candidate_pool(provider, hints, planned_terms, pool)
     owner_queries = matched_queries_for_candidate(pool, selected) if selected else ()
     selected_key = normalize_label(selected) if selected else ""
-    active_query = planned_terms[-1] if planned_terms else ""
-    active_rows = observations[-1][1] if observations else []
+    active_query, active_rows, active_search = successful[-1] if successful else ("", [], None)
     active_exact = [row for row in active_rows if normalize_label(row) == selected_key] if selected_key else []
     active_owned = bool(
         selected
@@ -545,6 +571,7 @@ def _try_select_via_search(
         "pooled_query_decision",
         {
             "query_count": len(planned_terms),
+            "successful_query_count": len(successful),
             "candidate_count": len(pool),
             "selected_vertical": selected,
             "owner_queries": list(owner_queries),
@@ -555,7 +582,11 @@ def _try_select_via_search(
         },
     )
     if not selected:
-        _close_vertical_search(search, page, wait_ms=wait_ms)
+        if active_search is not None:
+            try:
+                _close_vertical_search(active_search, page, wait_ms=wait_ms)
+            except Exception:
+                pass
         return "", observed, planned_terms
     if not owner_queries:
         raise RuntimeError(
@@ -563,7 +594,7 @@ def _try_select_via_search(
             f"selected={selected!r}"
         )
 
-    if active_owned:
+    if active_owned and active_search is not None:
         _vertical_diag(
             "selected_row_binding",
             {
@@ -577,7 +608,7 @@ def _try_select_via_search(
         if len(active_exact) == 1:
             current_row = active_exact[0]
             previous_canonical, _ = _current_target_values(page)
-            if click_search_row(search, current_row, allow_stable_exact=False):
+            if click_search_row(active_search, current_row, allow_stable_exact=False):
                 return (
                     _complete_exact_live_vertical(
                         page,
@@ -605,7 +636,23 @@ def _try_select_via_search(
         if normalize_label(owner) != normalize_label(active_query)
     )
     for rebind_index, owner_query in enumerate(prior_owner_queries, start=1):
-        rows = _run_vertical_search_query(page, search, owner_query, wait_ms=wait_ms)
+        try:
+            rows, search = _run_vertical_search_query(page, owner_query, wait_ms=wait_ms)
+        except Exception as exc:
+            if not _search_attempt_is_locally_recoverable(page):
+                raise
+            _vertical_diag(
+                "selected_row_rebind_failed",
+                {
+                    "rebind_index": rebind_index,
+                    "query": owner_query,
+                    "selected_vertical": selected,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "action": "try_next_owner_query",
+                },
+            )
+            continue
         exact = [row for row in rows if normalize_label(row) == selected_key]
         _vertical_diag(
             "selected_row_rebind",
@@ -625,11 +672,7 @@ def _try_select_via_search(
         previous_canonical, _ = _current_target_values(page)
         clicked = click_search_row(search, rebound, allow_stable_exact=False)
         if not clicked:
-            raise RuntimeError(
-                "Makro Step 1 re-observed the globally selected Vertical in a fresh query-owned generation "
-                "but could not bind that exact current row for clicking; "
-                f"selected={rebound!r}; query={owner_query!r}"
-            )
+            continue
         return (
             _complete_exact_live_vertical(
                 page,
@@ -643,8 +686,8 @@ def _try_select_via_search(
 
     raise RuntimeError(
         "Makro Step 1 selected a grounded Vertical from the aggregated live pool, but that exact row "
-        "could not be bound from the current live generation or re-observed uniquely in another "
-        f"query generation that originally owned it; selected={selected!r}; owner_queries={' | '.join(owner_queries)}"
+        "could not be rebound from any query generation that originally owned it; "
+        f"selected={selected!r}; owner_queries={' | '.join(owner_queries)}"
     )
 
 
@@ -815,8 +858,6 @@ def select_vertical(
     *,
     wait_ms: int = 800,
 ) -> str:
-    """Select one verified live Makro Vertical through the shared resolver."""
-
     committed = _committed_vertical_from_later_stage(page)
     if committed:
         return committed
