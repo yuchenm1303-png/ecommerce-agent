@@ -24,6 +24,7 @@ from .browser_visual_hud import (
     finish_browser_visual_hud,
     set_browser_visual_hud_capture_safe,
 )
+from .public_resource_fetch import fetch_public_resource
 from .source_snapshot import (
     SourceAccessBlocked,
     SourceCaptureError,
@@ -37,6 +38,9 @@ from .supplier_url_identity import supplier_request_identity
 
 DEFAULT_SOURCE_CDP_PORT = 9333
 SOURCE_CAPTURE_CACHE_VERSION = 6
+_DETAIL_DOCUMENT_MAX_BYTES = 8 * 1024 * 1024
+_PRODUCT_IMAGE_MAX_BYTES = 64 * 1024 * 1024
+_PRODUCT_IMAGES_TOTAL_MAX_BYTES = 256 * 1024 * 1024
 
 _DETAIL_DOCUMENT_PATTERN = re.compile(
     r"detail(?:Url|_url)[^h]{0,48}(https?://[^\\\"'<>\s]+)",
@@ -60,6 +64,13 @@ class CapturedProductSource:
 
 
 def validate_source_url(value: str) -> str:
+    """Validate user-supplied primary navigation syntax only.
+
+    Primary supplier navigation remains intentionally provider/domain agnostic.
+    The stricter public-network policy applies only to automatic secondary
+    resources discovered by the page itself, not to the user's explicit URL.
+    """
+
     url = value.strip()
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -121,6 +132,14 @@ def _detail_image_urls_from_text(value: str, *, max_urls: int = 32) -> list[str]
     return output
 
 
+def _context_cookies(context, url: str) -> tuple[dict[str, object], ...]:
+    try:
+        raw = context.cookies(url)
+    except Exception:
+        return ()
+    return tuple(item for item in raw if isinstance(item, dict))
+
+
 def _discover_detail_images(
     context,
     snapshot: SourceSnapshot,
@@ -128,15 +147,27 @@ def _discover_detail_images(
     max_documents: int = 4,
     max_images: int = 32,
 ) -> tuple[list[str], list[str]]:
+    """Read bounded public detail documents exposed by the exact supplier page.
+
+    The supplier page itself is user-selected. URLs found inside that page are not:
+    they are therefore fetched through the pinned public-resource transport so a
+    malicious page cannot turn automatic enrichment into a localhost/private-net
+    request or an unbounded body allocation.
+    """
+
     documents = _detail_document_urls(snapshot, max_urls=max_documents)
     images: list[str] = []
     seen: set[str] = set()
+    referer = snapshot.final_url or snapshot.requested_url
     for document_url in documents:
-        response = None
         try:
-            response = context.request.get(document_url, timeout=15_000, fail_on_status_code=False)
-            if not response.ok:
-                continue
+            response = fetch_public_resource(
+                document_url,
+                max_bytes=_DETAIL_DOCUMENT_MAX_BYTES,
+                timeout_seconds=15.0,
+                cookies=_context_cookies(context, document_url),
+                referer=referer,
+            )
             body = response.text()
             for image_url in _detail_image_urls_from_text(body, max_urls=max_images):
                 if image_url in seen:
@@ -147,12 +178,6 @@ def _discover_detail_images(
                     return documents, images
         except Exception:
             continue
-        finally:
-            if response is not None:
-                try:
-                    response.dispose()
-                except Exception:
-                    pass
     return documents, images
 
 
@@ -350,43 +375,48 @@ def _image_extension(content_type: str, url: str) -> str:
     return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"} else ".img"
 
 
-def _download_page_images(context, image_urls: list[str], output_dir: Path, *, max_images: int = 32) -> tuple[Path, ...]:
+def _download_page_images(
+    context,
+    image_urls: list[str],
+    output_dir: Path,
+    *,
+    max_images: int = 32,
+) -> tuple[Path, ...]:
     if not image_urls:
         return ()
     output_dir.mkdir(parents=True, exist_ok=True)
     saved: list[Path] = []
     seen_hashes: set[str] = set()
+    total_bytes = 0
     for url in image_urls:
-        if len(saved) >= max_images:
+        if len(saved) >= max_images or total_bytes >= _PRODUCT_IMAGES_TOTAL_MAX_BYTES:
             break
-        response = None
         try:
-            response = context.request.get(url, timeout=15_000, fail_on_status_code=False)
-            if not response.ok:
-                continue
-            headers = {str(k).casefold(): str(v) for k, v in response.headers.items()}
-            content_type = headers.get("content-type", "")
+            response = fetch_public_resource(
+                url,
+                max_bytes=_PRODUCT_IMAGE_MAX_BYTES,
+                timeout_seconds=15.0,
+                cookies=_context_cookies(context, url),
+            )
+            content_type = response.content_type
             if content_type and not content_type.casefold().startswith("image/"):
                 continue
-            body = response.body()
+            body = response.body
             if len(body) < 4_096:
                 continue
+            if total_bytes + len(body) > _PRODUCT_IMAGES_TOTAL_MAX_BYTES:
+                break
             digest = hashlib.sha256(body).hexdigest()
             if digest in seen_hashes:
                 continue
             seen_hashes.add(digest)
-            ext = _image_extension(content_type, url)
+            ext = _image_extension(content_type, response.final_url)
             path = output_dir / f"source-image-{len(saved) + 1:02d}-{digest[:10]}{ext}"
             path.write_bytes(body)
             saved.append(path)
+            total_bytes += len(body)
         except Exception:
             continue
-        finally:
-            if response is not None:
-                try:
-                    response.dispose()
-                except Exception:
-                    pass
     return tuple(saved)
 
 
@@ -611,8 +641,13 @@ def capture_product_source(
                 )
             snapshot.meta["screenshot_available"] = "true" if screenshot_ok else "false"
             snapshot.meta["product_images_downloaded"] = str(len(product_images))
-            snapshot.meta["visual_evidence_available"] = "true" if (screenshot_ok or product_images) else "false"
-            snapshot_path = write_source_snapshot(snapshot, target_dir / "source-snapshot.json")
+            snapshot.meta["visual_evidence_available"] = (
+                "true" if (screenshot_ok or product_images) else "false"
+            )
+            snapshot_path = write_source_snapshot(
+                snapshot,
+                target_dir / "source-snapshot.json",
+            )
 
             finish_browser_visual_hud(
                 page,
