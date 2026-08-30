@@ -9,13 +9,10 @@ from typing import Any, Iterable
 from PIL import Image, UnidentifiedImageError
 
 
-LISTING_IMAGE_POLICY_VERSION = 2
+LISTING_IMAGE_POLICY_VERSION = 3
 MIN_LISTING_IMAGE_SHORT_EDGE = 160
 MIN_LISTING_IMAGE_PIXEL_AREA = 80_000
 MAX_LISTING_IMAGE_ASPECT_RATIO = 4.0
-PERCEPTUAL_DUPLICATE_HAMMING_MAX = 5
-PERCEPTUAL_DUPLICATE_COLOR_DELTA_MAX = 18
-PERCEPTUAL_DUPLICATE_ASPECT_DELTA_MAX = 0.06
 
 
 @dataclass(slots=True, frozen=True)
@@ -48,7 +45,7 @@ class ListingImageAssessment:
 
 @dataclass(slots=True, frozen=True)
 class ListingImageSelection:
-    """Derived Listing Photos candidates; raw source evidence remains untouched."""
+    """Mechanical compatibility set; AI owns semantic listing-photo decisions."""
 
     selected: tuple[Path, ...]
     assessments: tuple[ListingImageAssessment, ...]
@@ -59,17 +56,15 @@ class ListingImageSelection:
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "policy": {
                 "version": LISTING_IMAGE_POLICY_VERSION,
-                "kind": "mechanical-listing-image-quality-gate",
+                "kind": "mechanical-listing-image-compatibility-gate",
                 "min_short_edge": MIN_LISTING_IMAGE_SHORT_EDGE,
                 "min_pixel_area": MIN_LISTING_IMAGE_PIXEL_AREA,
                 "max_aspect_ratio": MAX_LISTING_IMAGE_ASPECT_RATIO,
-                "dedupe": "exact-sha256-plus-conservative-perceptual-signature",
-                "perceptual_hamming_max": PERCEPTUAL_DUPLICATE_HAMMING_MAX,
-                "perceptual_color_delta_max": PERCEPTUAL_DUPLICATE_COLOR_DELTA_MAX,
-                "perceptual_aspect_delta_max": PERCEPTUAL_DUPLICATE_ASPECT_DELTA_MAX,
+                "dedupe": "exact-content-sha256-only",
+                "semantic_ranking": "none",
                 "ordering": "preserve-source-order",
             },
             "selected": [str(path) for path in self.selected],
@@ -87,53 +82,11 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _resampling(name: str):
-    namespace = getattr(Image, "Resampling", Image)
-    return getattr(namespace, name)
-
-
-def _perceptual_signature(image: Image.Image) -> tuple[int, tuple[int, int, int]]:
-    """Return a conservative visual fingerprint stable across resize/JPEG changes."""
-
-    rgb = image.convert("RGB")
-    gray = rgb.convert("L").resize((9, 8), _resampling("LANCZOS"))
-    pixels = list(gray.getdata())
-    difference_hash = 0
-    bit = 0
-    for row in range(8):
-        offset = row * 9
-        for column in range(8):
-            if pixels[offset + column] > pixels[offset + column + 1]:
-                difference_hash |= 1 << bit
-            bit += 1
-    average = rgb.resize((1, 1), _resampling("BOX")).getpixel((0, 0))
-    return difference_hash, tuple(int(channel) for channel in average)
-
-
-def _looks_like_visual_duplicate(
-    signature: tuple[int, tuple[int, int, int]],
-    aspect_ratio: float,
-    seen: list[tuple[int, tuple[int, int, int], float]],
-) -> bool:
-    dhash, average = signature
-    for seen_hash, seen_average, seen_aspect in seen:
-        aspect_delta = abs(aspect_ratio - seen_aspect) / max(aspect_ratio, seen_aspect, 1.0)
-        if aspect_delta > PERCEPTUAL_DUPLICATE_ASPECT_DELTA_MAX:
-            continue
-        if (dhash ^ seen_hash).bit_count() > PERCEPTUAL_DUPLICATE_HAMMING_MAX:
-            continue
-        if max(abs(left - right) for left, right in zip(average, seen_average)) > PERCEPTUAL_DUPLICATE_COLOR_DELTA_MAX:
-            continue
-        return True
-    return False
-
-
 def _assessment_for_path(
     raw: str | Path,
     *,
     source_index: int,
     seen_hashes: set[str],
-    seen_signatures: list[tuple[int, tuple[int, int, int], float]],
 ) -> ListingImageAssessment:
     path = Path(raw).expanduser().resolve()
     if not path.is_file():
@@ -151,11 +104,10 @@ def _assessment_for_path(
 
     try:
         with Image.open(path) as opened:
-            opened.load()
             width, height = (int(opened.width), int(opened.height))
-            signature = _perceptual_signature(opened)
+            opened.verify()
         sha256 = _file_sha256(path)
-    except (UnidentifiedImageError, OSError, ValueError):
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
         return ListingImageAssessment(
             path=path,
             source_index=source_index,
@@ -186,11 +138,8 @@ def _assessment_for_path(
     aspect_ratio = max(width, height) / short_edge
     reasons: list[str] = []
 
-    exact_duplicate = sha256 in seen_hashes
-    if exact_duplicate:
+    if sha256 in seen_hashes:
         reasons.append("duplicate_content")
-    elif _looks_like_visual_duplicate(signature, aspect_ratio, seen_signatures):
-        reasons.append("duplicate_visual")
     if short_edge < MIN_LISTING_IMAGE_SHORT_EDGE:
         reasons.append(f"short_edge<{MIN_LISTING_IMAGE_SHORT_EDGE}")
     if pixel_area < MIN_LISTING_IMAGE_PIXEL_AREA:
@@ -201,7 +150,6 @@ def _assessment_for_path(
     eligible = not reasons
     if eligible:
         seen_hashes.add(sha256)
-        seen_signatures.append((signature[0], signature[1], aspect_ratio))
 
     return ListingImageAssessment(
         path=path,
@@ -217,25 +165,23 @@ def _assessment_for_path(
 
 
 def select_listing_images(image_paths: Iterable[str | Path]) -> ListingImageSelection:
-    """Select upload-safe Listing Photos without changing the evidence universe.
+    """Build only the legacy mechanical compatibility set.
 
-    This gate is deliberately product/category agnostic. It checks file
-    decodability, geometry, exact duplicates and conservative visual duplicates.
-    Input order is preserved so Python does not invent product-image semantics or
-    ranking; semantic relevance and gallery ordering remain the AI ranker's job.
+    This function deliberately does not judge product relevance, image importance,
+    main-image quality or visual similarity. Those semantic decisions belong to the
+    multimodal listing-image AI. Geometry remains here only for legacy source-capture
+    compatibility and emergency fallback behavior.
     """
 
     assessments: list[ListingImageAssessment] = []
     selected: list[Path] = []
     seen_hashes: set[str] = set()
-    seen_signatures: list[tuple[int, tuple[int, int, int], float]] = []
 
     for source_index, raw in enumerate(image_paths, start=1):
         assessment = _assessment_for_path(
             raw,
             source_index=source_index,
             seen_hashes=seen_hashes,
-            seen_signatures=seen_signatures,
         )
         assessments.append(assessment)
         if assessment.eligible:
@@ -248,18 +194,24 @@ def select_listing_images(image_paths: Iterable[str | Path]) -> ListingImageSele
 
 
 def listing_images_from_resolver_outputs(outputs: dict[str, Any]) -> tuple[Path, ...]:
-    """Return the canonical auto-upload image set for new and legacy Resolver runs.
+    """Return the canonical image list published by the Resolver.
 
-    New manifests publish ``primary_source_listing_images`` explicitly. Legacy
-    manifests only have raw evidence images, so the same quality gate is applied
-    at consumption time. An explicit empty curated list remains empty and never
-    falls back to raw evidence or a page screenshot.
+    New Resolver runs publish the AI-selected list explicitly. Legacy runs only have
+    raw product images, so the mechanical compatibility gate remains a fallback for
+    those old artifacts. An explicit empty AI list stays empty.
     """
 
     if "primary_source_listing_images" in outputs:
         values = outputs.get("primary_source_listing_images") or []
-    else:
-        values = outputs.get("primary_source_product_images") or []
+        if not isinstance(values, (list, tuple)):
+            return ()
+        return tuple(
+            Path(value).expanduser().resolve()
+            for value in values
+            if Path(value).expanduser().resolve().is_file()
+        )
+
+    values = outputs.get("primary_source_product_images") or []
     if not isinstance(values, (list, tuple)):
         return ()
     return select_listing_images(values).selected
@@ -283,9 +235,6 @@ __all__ = [
     "MAX_LISTING_IMAGE_ASPECT_RATIO",
     "MIN_LISTING_IMAGE_PIXEL_AREA",
     "MIN_LISTING_IMAGE_SHORT_EDGE",
-    "PERCEPTUAL_DUPLICATE_ASPECT_DELTA_MAX",
-    "PERCEPTUAL_DUPLICATE_COLOR_DELTA_MAX",
-    "PERCEPTUAL_DUPLICATE_HAMMING_MAX",
     "ListingImageAssessment",
     "ListingImageSelection",
     "listing_images_from_resolver_outputs",
