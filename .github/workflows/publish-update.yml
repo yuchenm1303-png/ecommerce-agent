@@ -14,8 +14,9 @@ on:
         default: "auto"
         type: string
       validated_test_tag:
-        description: "Required published test-* prerelease for the same source commit and version"
-        required: true
+        description: "Optional validated test-* prerelease; leave blank to publish Stable directly"
+        required: false
+        default: ""
         type: string
       title:
         description: "Release title"
@@ -143,14 +144,15 @@ jobs:
           Write-Host "Resolved Stable version: $resolved"
           Write-Host "Resolved unique release name: $releaseName"
 
-      - name: Verify validated Test candidate
+      - name: Verify optional Test candidate
+        if: ${{ inputs.validated_test_tag != '' }}
         shell: pwsh
         run: |
           $tag = ([string]"${{ inputs.validated_test_tag }}").Trim()
           $version = "${{ steps.version.outputs.version }}"
           $sourceSha = "${{ steps.source.outputs.sha }}"
           $short = $sourceSha.Substring(0, 8)
-          if ([string]::IsNullOrWhiteSpace($tag) -or $tag -notlike "test-$version-$short-*") {
+          if ($tag -notlike "test-$version-$short-*") {
             throw "Validated Test tag must match test-$version-$short-* for the exact Stable source commit"
           }
 
@@ -197,11 +199,15 @@ jobs:
         run: |
           Set-Content "packaging\VERSION" $env:UPDATE_VERSION -Encoding ascii -NoNewline
           New-Item -ItemType Directory -Force artifacts | Out-Null
+          $validatedTest = ([string]$env:VALIDATED_TEST_TAG).Trim()
+          if ([string]::IsNullOrWhiteSpace($validatedTest)) {
+            $validatedTest = "not used (direct Stable publication)"
+          }
           @(
             "# $env:UPDATE_TITLE", "", $env:UPDATE_NOTES, "",
             "Version: $env:UPDATE_VERSION",
             "Source commit: ${{ steps.source.outputs.sha }}",
-            "Validated test: $env:VALIDATED_TEST_TAG"
+            "Validated test: $validatedTest"
           ) | Set-Content "artifacts\release-notes.md" -Encoding utf8
 
       - name: Set up Python
