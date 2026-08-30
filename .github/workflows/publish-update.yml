@@ -42,6 +42,8 @@ jobs:
       UPDATE_NOTES: ${{ inputs.release_notes }}
       GH_TOKEN: ${{ github.token }}
       VELOPACK_CHANNEL: win-x64-stable
+      VPK_AZURE_TRUSTED_SIGN_FILE: ${{ secrets.VPK_AZURE_TRUSTED_SIGN_FILE }}
+      VPK_SIGN_PARAMS: ${{ secrets.VPK_SIGN_PARAMS }}
 
     steps:
       - name: Checkout selected source revision
@@ -49,6 +51,21 @@ jobs:
         with:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 0
+
+      - name: Require Stable code signing
+        shell: pwsh
+        run: |
+          $azure = [string]$env:VPK_AZURE_TRUSTED_SIGN_FILE
+          $params = [string]$env:VPK_SIGN_PARAMS
+          if ([string]::IsNullOrWhiteSpace($azure) -and [string]::IsNullOrWhiteSpace($params)) {
+            throw "Stable publication requires code signing. Configure VPK_AZURE_TRUSTED_SIGN_FILE or VPK_SIGN_PARAMS as a repository secret. Development builds remain allowed to be unsigned."
+          }
+          if (-not [string]::IsNullOrWhiteSpace($azure) -and -not [string]::IsNullOrWhiteSpace($params)) {
+            throw "Configure exactly one Stable signing mode, not both."
+          }
+          if (-not [string]::IsNullOrWhiteSpace($azure) -and -not (Test-Path $azure -PathType Leaf)) {
+            throw "Stable Azure signing metadata file is not present on the runner: $azure"
+          }
 
       - name: Capture source commit
         id: source
