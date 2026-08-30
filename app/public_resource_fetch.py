@@ -30,7 +30,7 @@ class PublicResourceResponse:
         for item in content_type.split(";")[1:]:
             name, sep, value = item.strip().partition("=")
             if sep and name.casefold() == "charset":
-                charset = value.strip().strip('"\'')
+                charset = value.strip().strip("\"'")
                 break
         for encoding in (charset, "utf-8", "gb18030", "latin-1"):
             if not encoding:
