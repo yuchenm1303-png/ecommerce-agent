@@ -68,8 +68,6 @@ def validate_source_url(value: str) -> str:
 
 
 def _canonical_source_url(value: str) -> str:
-    """Return the shared exact supplier request identity used by source cache."""
-
     return supplier_request_identity(validate_source_url(value))
 
 
@@ -83,8 +81,6 @@ def _unescape_embedded(value: str) -> str:
 
 
 def _detail_document_urls(snapshot: SourceSnapshot, *, max_urls: int = 4) -> list[str]:
-    """Extract bounded, exact-page detail documents exposed by embedded page data."""
-
     output: list[str] = []
     seen: set[str] = set()
     for raw in snapshot.embedded_data:
@@ -105,8 +101,6 @@ def _detail_document_urls(snapshot: SourceSnapshot, *, max_urls: int = 4) -> lis
 
 
 def _detail_image_urls_from_text(value: str, *, max_urls: int = 32) -> list[str]:
-    """Extract image assets from one supplier detail document without interpreting them."""
-
     text = _unescape_embedded(value)
     output: list[str] = []
     seen: set[str] = set()
@@ -134,8 +128,6 @@ def _discover_detail_images(
     max_documents: int = 4,
     max_images: int = 32,
 ) -> tuple[list[str], list[str]]:
-    """Fetch supplier-declared detail documents and return their exact image URLs."""
-
     documents = _detail_document_urls(snapshot, max_urls=max_documents)
     images: list[str] = []
     seen: set[str] = set()
@@ -165,8 +157,6 @@ def _discover_detail_images(
 
 
 def _connect_source_edge(playwright, *, profile_dir: Path, port: int, start_url: str):
-    """Own one Source Edge session and attach through the shared resilient CDP path."""
-
     session_lease = acquire_cdp_session_lease(port)
     try:
         launched_now = not is_cdp_ready(port)
@@ -197,14 +187,6 @@ def _is_navigation_context_error(exc: BaseException) -> bool:
 
 
 def _wait_for_navigation_recovery(page, *, settle_ms: int) -> None:
-    """Wait for a replacement execution context after a supplier-side navigation.
-
-    1688 may perform a canonical/client redirect after DOMContentLoaded. That is
-    normal page behavior and must not abort a source capture. Only the specific
-    transient execution-context error is retried; unrelated Playwright failures
-    still fail closed.
-    """
-
     try:
         page.wait_for_load_state("domcontentloaded", timeout=15_000)
     except PlaywrightError:
@@ -332,13 +314,7 @@ def _screenshot_with_navigation_retry(
     settle_ms: int,
     attempts: int = 4,
 ) -> tuple[bool, str]:
-    """Capture screenshot evidence without making browser rendering a hard gate.
-
-    Product pages may be too long or too dynamic for Chrome's full-page bitmap
-    capture. Any Playwright/CDP screenshot failure therefore falls back to the
-    current viewport. If both modes fail, the caller can continue with downloaded
-    product images; only loss of *all* visual evidence is fatal.
-    """
+    """Capture optional screenshot evidence without changing source outcome."""
 
     failures: list[str] = []
     for full_page, mode in ((True, "full-page"), (False, "viewport")):
@@ -355,7 +331,6 @@ def _screenshot_with_navigation_retry(
                     continue
                 failures.append(f"{mode} screenshot failed: {summary}")
                 break
-
     return False, " | ".join(failures)
 
 
@@ -376,14 +351,11 @@ def _image_extension(content_type: str, url: str) -> str:
 
 
 def _download_page_images(context, image_urls: list[str], output_dir: Path, *, max_images: int = 32) -> tuple[Path, ...]:
-    """Download large images already exposed by the exact page; no image semantics here."""
-
     if not image_urls:
         return ()
     output_dir.mkdir(parents=True, exist_ok=True)
     saved: list[Path] = []
     seen_hashes: set[str] = set()
-
     for url in image_urls:
         if len(saved) >= max_images:
             break
@@ -434,7 +406,7 @@ def _cached_capture(
     cached_image_files = tuple(
         sorted(path for path in cached_images.glob("*") if path.is_file())
     ) if cached_images.is_dir() else ()
-    if not snapshot.is_file() or (not screenshot.is_file() and not cached_image_files):
+    if not snapshot.is_file():
         return None
     age = time.time() - snapshot.stat().st_mtime
     if age < 0 or age > cache_ttl_seconds:
@@ -503,13 +475,7 @@ def capture_product_source(
     cache_ttl_seconds: int = 900,
     force_refresh: bool = False,
 ) -> CapturedProductSource:
-    """Capture one exact supplier page and its automatically discovered large images.
-
-    A short-lived byte cache makes immediate hot reruns use the exact same source
-    universe, so semantic caches can be meaningfully tested. It is transport
-    caching only, not a product-fact layer. `force_refresh` or `use_current_page`
-    bypasses reuse and performs a fresh capture.
-    """
+    """Capture one exact supplier page with independently optional visual evidence."""
 
     source_url = validate_source_url(url)
     if initial_wait_ms < 0 or scroll_wait_ms < 0:
@@ -639,15 +605,14 @@ def capture_product_source(
 
             if screenshot_note:
                 snapshot.warnings.append(screenshot_note)
+            if not screenshot_ok and not product_images:
+                snapshot.warnings.append(
+                    "visual evidence unavailable; canonical text/table/structured source snapshot remains usable"
+                )
             snapshot.meta["screenshot_available"] = "true" if screenshot_ok else "false"
             snapshot.meta["product_images_downloaded"] = str(len(product_images))
+            snapshot.meta["visual_evidence_available"] = "true" if (screenshot_ok or product_images) else "false"
             snapshot_path = write_source_snapshot(snapshot, target_dir / "source-snapshot.json")
-
-            if not screenshot_ok and not product_images:
-                raise SourceCaptureError(
-                    "商品页面结构化资料已采集，但没有获得可用视觉证据：商品原图下载为空，且浏览器整页/当前窗口截图均失败。"
-                    + (f" screenshot={screenshot_note}" if screenshot_note else "")
-                )
 
             finish_browser_visual_hud(
                 page,
