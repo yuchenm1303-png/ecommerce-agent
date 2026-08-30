@@ -1,16 +1,10 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 from app.makro import vertical_selection
-
-_FIXTURE = Path(__file__).parent / "fixtures" / "regressions" / "ultrasonic_cleaner_current_generation.json"
 
 
 class _FakeProvider:
-    def extract_json(self, payload):
-        raise AssertionError("incident replay must not call paid or fake AI; chooser is replayed deterministically")
+    pass
 
 
 class _FakePage:
@@ -22,46 +16,59 @@ class _FakeSearch:
     pass
 
 
-def test_ultrasonic_cleaner_incident_does_not_repeat_active_owner_query(monkeypatch) -> None:
-    fixture = json.loads(_FIXTURE.read_text(encoding="utf-8"))
-    planned = tuple(fixture["planned_terms"])
-    observations = {key: list(value) for key, value in fixture["observations"].items()}
-    selected = fixture["historical_selected_vertical"]
+def test_dyson_incident_selects_current_live_row_and_never_replays_owner_query(monkeypatch) -> None:
+    selected = "Health & Beauty / Hair Care / Electric Hair Curlers"
+    unrelated = "Home Improvement Tools / Hardware & Electricals / Electrical Plugs"
+    planned = (
+        "Dyson Airwrap HS05 Complete Long",
+        "Dyson Airwrap multi-styler long",
+        "Dyson hot air styler",
+        "Dyson curling iron set",
+        "Dyson Airwrap",
+        "electric hair curler",
+        "hair curler",
+    )
+    search = _FakeSearch()
     calls: list[str] = []
-    clicks: list[tuple[str, bool]] = []
+    decisions: list[str] = []
+    clicked: list[str] = []
 
     hints = vertical_selection.ListingBootstrapHints(
-        (fixture["product_type"],),
-        "",
-        "unknown",
-        fixture["product_type"],
+        ("electric hair curler",),
+        "Dyson",
+        "explicit",
+        "Dyson Airwrap HS05 Complete Long wired electric hair curler set",
     )
 
-    monkeypatch.setattr(vertical_selection, "_vertical_search_input", lambda _page: _FakeSearch())
-    monkeypatch.setattr(vertical_selection, "plan_vertical_search_terms", lambda _provider, _hints: planned)
+    monkeypatch.setattr(vertical_selection, "plan_vertical_search_terms", lambda *_args: planned)
 
-    def run_query(_page, _search, term, *, wait_ms):
+    def run_query(_page, term, *, wait_ms):
         _ = wait_ms
         calls.append(term)
-        return list(observations[term])
+        if term == "hair curler":
+            raise AssertionError("the query after the AI selection must never run")
+        rows = [selected, unrelated] if term == "electric hair curler" else [unrelated]
+        return rows, search
+
+    def choose(_provider, _hints, terms, _candidates):
+        term = terms[0]
+        decisions.append(term)
+        return selected if term == "electric hair curler" else ""
 
     monkeypatch.setattr(vertical_selection, "_run_vertical_search_query", run_query)
-    monkeypatch.setattr(
-        vertical_selection,
-        "choose_vertical_candidate_pool",
-        lambda _provider, _hints, terms, pool: selected,
-    )
+    monkeypatch.setattr(vertical_selection, "choose_vertical_candidate_pool", choose)
+    monkeypatch.setattr(vertical_selection, "_current_target_values", lambda _page: ("", ""))
 
     def click(_search, label, *, allow_stable_exact=False):
-        clicks.append((label, allow_stable_exact))
+        assert allow_stable_exact is False
+        clicked.append(label)
         return True
 
     monkeypatch.setattr(vertical_selection, "click_search_row", click)
-    monkeypatch.setattr(vertical_selection, "_current_target_values", lambda _page: ("", ""))
     monkeypatch.setattr(
         vertical_selection,
         "_complete_exact_live_vertical",
-        lambda _page, _label, **_kwargs: "lens_cleaner",
+        lambda _page, _label, **_kwargs: "electric_hair_curler",
     )
 
     resolved, observed, terms = vertical_selection._try_select_via_search(
@@ -71,9 +78,11 @@ def test_ultrasonic_cleaner_incident_does_not_repeat_active_owner_query(monkeypa
         wait_ms=50,
     )
 
-    assert resolved == "lens_cleaner"
+    assert resolved == "electric_hair_curler"
     assert terms == planned
-    assert calls == list(planned)
-    assert calls.count(fixture["expected_owner_query"]) == 1
-    assert observed[-1] == selected
-    assert clicks == [(selected, False)]
+    assert calls == list(planned[:6])
+    assert decisions == list(planned[:6])
+    assert calls.count("electric hair curler") == 1
+    assert "hair curler" not in calls
+    assert selected in observed
+    assert clicked == [selected]

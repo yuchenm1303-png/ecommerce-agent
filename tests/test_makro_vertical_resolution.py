@@ -258,7 +258,7 @@ def test_search_query_guard_rejects_platform_pollution_without_blocking_real_pro
     assert vertical_resolution._usable_query("category 6 cable") is True
 
 
-def test_live_candidates_are_aggregated_across_queries_before_selection() -> None:
+def test_live_candidate_evidence_builder_deduplicates_rows() -> None:
     candidates = merge_vertical_search_observations(
         [
             (
@@ -284,7 +284,7 @@ def test_live_candidates_are_aggregated_across_queries_before_selection() -> Non
     assert candidates[0].best_rank == 1
 
 
-def test_aggregated_chooser_can_only_return_one_exact_live_candidate() -> None:
+def test_ai_chooser_can_only_return_one_exact_live_candidate() -> None:
     candidates = merge_vertical_search_observations(
         [
             ("bag sealer", ["Home / Kitchen / Bag Sealers", "Battery / Battery Chargers"]),
@@ -323,6 +323,30 @@ def test_aggregated_chooser_can_only_return_one_exact_live_candidate() -> None:
     ]
 
 
+def test_automatic_exact_product_type_candidate_still_goes_through_ai() -> None:
+    exact = "Home / Kitchen / Rechargeable Bag Sealer"
+    hints = _bag_sealer_hints()
+    candidates = merge_vertical_search_observations(
+        [("rechargeable bag sealer", [exact])]
+    )
+    provider = FakeProvider(
+        {
+            "choose_exact_makro_vertical_from_aggregated_live_search": {
+                "selected_vertical": exact,
+                "selection_relation": "same_product_type",
+            }
+        }
+    )
+
+    assert choose_vertical_candidate_pool(
+        provider,
+        hints,
+        ("rechargeable bag sealer",),
+        candidates,
+    ) == exact
+    assert len(provider.requests) == 1
+
+
 def test_initial_identity_can_be_corrected_by_independent_evidence_and_live_pool() -> None:
     hints = _protective_glasses_hints()
     candidates = merge_vertical_search_observations(
@@ -353,7 +377,7 @@ def test_initial_identity_can_be_corrected_by_independent_evidence_and_live_pool
     )
 
     assert selected == "Industrial & Scientific Supplies / Safety Products / Protective Glasses"
-    assert len(provider.requests) == 1, "customer intent must disable the old exact-identity shortcut"
+    assert len(provider.requests) == 1
     context = provider.requests[0]["context"]
     assert context["initial_product_identity"]["product_type_en"] == "personalized wooden sunglasses"
     assert context["customer_listing_intent"] == "1个偏光防护镜"
@@ -376,7 +400,7 @@ def test_reconciliation_prompt_never_turns_customer_intent_into_unbounded_author
     assert "incidental attributes such as material, engraving, personalization" in rules
 
 
-def test_aggregated_chooser_rejects_invented_vertical() -> None:
+def test_ai_chooser_rejects_invented_vertical() -> None:
     candidates = merge_vertical_search_observations(
         [("bag sealer", ["Home / Kitchen / Bag Sealers"])]
     )
@@ -389,7 +413,7 @@ def test_aggregated_chooser_rejects_invented_vertical() -> None:
         }
     )
 
-    with pytest.raises(ValueError, match="not one unique aggregated live candidate"):
+    with pytest.raises(ValueError, match="not one unique current live candidate"):
         choose_vertical_candidate_pool(
             provider,
             _bag_sealer_hints(),
@@ -412,19 +436,19 @@ def test_pool_prompt_rejects_generic_word_overlap_as_category_evidence() -> None
     assert "complete breadcrumb" in rules
     assert "live candidate set is authoritative" in request["system_instruction"].casefold()
     assert "initial ai identity" in request["system_instruction"].casefold()
+    assert "return none" in request["prompt_instruction"].casefold()
 
 
-def test_production_search_collects_global_pool_then_reuses_or_rebinds_owned_generation() -> None:
+def test_production_search_decides_and_clicks_inside_same_live_generation() -> None:
     source = inspect.getsource(vertical_selection._try_select_via_search)
 
-    collect_pos = source.index("merge_vertical_search_observations(observations)")
-    choose_pos = source.index("choose_vertical_candidate_pool")
-    current_click_pos = source.index("click_search_row(search, current_row, allow_stable_exact=False)")
-    prior_owner_pos = source.index("prior_owner_queries = tuple(")
-    rebind_pos = source.index("for rebind_index, owner_query in enumerate(prior_owner_queries")
-    rebind_click_pos = source.index("click_search_row(search, rebound, allow_stable_exact=False)")
+    query_pos = source.index("_run_vertical_search_query(page, term")
+    pool_pos = source.index("merge_vertical_search_observations(((term, rows),))")
+    choose_pos = source.index("choose_vertical_candidate_pool(")
+    click_pos = source.index("click_search_row(search, current_row, allow_stable_exact=False)")
 
-    assert collect_pos < choose_pos < current_click_pos < prior_owner_pos < rebind_pos < rebind_click_pos
-    assert "matched_queries_for_candidate" in source
-    assert "len(exact) != 1" in source
-    assert "could not be bound from the current live generation or re-observed uniquely" in source
+    assert query_pos < pool_pos < choose_pos < click_pos
+    assert "matched_queries_for_candidate" not in source
+    assert "prior_owner_queries" not in source
+    assert "selected_row_rebind" not in source
+    assert "rebind" not in source.casefold()

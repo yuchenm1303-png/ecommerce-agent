@@ -1,13 +1,12 @@
 """Semantic resolution for Makro Step 1 live Vertical search.
 
 Product Identity is an initial interpretation of what the supplier is selling, not
-an irreversible truth source. Step 1 retains the exact supplier snippets cited by
-that interpretation plus any customer listing intent, converts the combined but
-independent evidence into a bounded retrieval ladder, merges query-owned live Makro
-rows, and reconciles the final choice against the real live pool.
+an irreversible truth source. Step 1 keeps the supplier evidence and customer intent
+separate, lets AI plan a bounded retrieval ladder, and lets AI choose only from the
+Makro rows that are live in the current search generation.
 
-The live Makro candidate set remains authoritative: AI may correct an over-specific
-or mistaken initial identity, but it can never invent a marketplace Vertical.
+The live Makro candidate set is authoritative: AI may correct an over-specific or
+mistaken initial identity, but it can never invent a marketplace Vertical.
 """
 
 from __future__ import annotations
@@ -345,17 +344,6 @@ def merge_vertical_search_observations(
     return merged[: max(1, int(max_candidates))]
 
 
-def _exact_product_type_candidate(
-    hints: ListingBootstrapHints,
-    candidates: list[VerticalCandidateEvidence],
-) -> str:
-    product_key = _query_key(_canonical_product_type(hints))
-    if not product_key:
-        return ""
-    matches = [item.label for item in candidates if _query_key(item.leaf_label) == product_key]
-    return matches[0] if len(matches) == 1 else ""
-
-
 def _stem_category_token(token: str) -> str:
     value = str(token or "").casefold().strip()
     if len(value) > 4 and value.endswith("ies"):
@@ -429,14 +417,13 @@ def build_vertical_pool_choice_request(
     return {
         "task": "choose_exact_makro_vertical_from_aggregated_live_search",
         "system_instruction": (
-            "Choose exactly one Makro Vertical from the supplied live candidates. The live candidate set is authoritative; "
-            "never invent a Vertical. Reconcile the initial AI identity against its cited raw supplier evidence and customer "
-            "intent before deciding. Makro taxonomy can be sparse, so choose the closest practical category when exact is unavailable. JSON only."
+            "Choose exactly one Makro Vertical from the supplied current live candidates, or return none. "
+            "The current live candidate set is authoritative; never invent a Vertical. Reconcile the initial AI identity "
+            "against its cited raw supplier evidence and customer intent before deciding. JSON only."
         ),
         "prompt_instruction": (
-            "Compare every live breadcrumb against the independent evidence channels. The initial product identity may be "
-            "over-specific or mistaken. If a real live candidate is better supported by the grounded supplier snippets and "
-            "customer intent, correct the initial hypothesis rather than using that hypothesis to reject the better candidate."
+            "Decide only from the rows that are live in this search generation. If none of them is a valid fit, return none "
+            "so the caller can continue the planned retrieval ladder. Do not select an unrelated row merely to avoid none."
         ),
         "context": {
             "product_summary": hints.product_summary,
@@ -453,11 +440,10 @@ def build_vertical_pool_choice_request(
             "A live candidate that matches the core function/form supported by raw evidence may be better than a candidate that only matches incidental words from the initial identity.",
             "Use same_product_type when the candidate represents the same physical product class.",
             "Use broader_valid_class when the candidate is a genuine semantic superclass that contains the product; it must not add a different defining capability, mechanism, form, audience or use-case.",
-            "If Makro exposes neither of those, use best_available_fit for the live category a marketplace operator would most reasonably use despite taxonomy mismatch.",
-            "For best_available_fit, prefer shared defining function, merchandise context and buyer expectation over literal word overlap.",
-            "Avoid accessory, spare-part or consumable classes when a non-accessory live option is materially closer to the sold product.",
+            "Use best_available_fit only when one current live row is genuinely the marketplace's closest practical class for the sold product.",
+            "Avoid accessory, spare-part or consumable classes when the sold product is not one.",
             "A candidate returned only because of generic word overlap is not valid unless the complete breadcrumb independently matches the sold product.",
-            "Return none only when every live candidate is plainly unrelated after reconciliation of all independent evidence.",
+            "Return none whenever the current live rows are unrelated or too weak to justify a category choice; later retrieval queries may provide better rows.",
             "Priority is same_product_type -> broader_valid_class -> best_available_fit -> none.",
         ],
         "json_contract": {
@@ -504,16 +490,9 @@ def choose_vertical_candidate_pool(
 
     if not candidates:
         return ""
-    # Customer intent is an independent evidence channel. When present we never
-    # short-circuit on an exact initial-identity label; the live pool must pass the
-    # reconciliation boundary so one early AI interpretation cannot become fate.
-    if not _clean(hints.customer_intent):
-        exact_product_type = _exact_product_type_candidate(hints, candidates)
-        if exact_product_type:
-            return exact_product_type
     raw = provider.extract_json(build_vertical_pool_choice_request(hints, search_terms, candidates))
     if not isinstance(raw, dict):
-        raise ValueError("aggregated Vertical chooser response must be a JSON object")
+        raise ValueError("live Vertical chooser response must be a JSON object")
     selected = _clean(raw.get("selected_vertical"))
     relation = _clean(raw.get("selection_relation")).casefold()
     if not relation:
@@ -529,16 +508,8 @@ def choose_vertical_candidate_pool(
     wanted = normalize_label(selected)
     matches = [item.label for item in candidates if normalize_label(item.label) == wanted]
     if len(matches) != 1:
-        raise ValueError(f"AI returned a Vertical that is not one unique aggregated live candidate: {selected!r}")
+        raise ValueError(f"AI returned a Vertical that is not one unique current live candidate: {selected!r}")
     return matches[0]
-
-
-def matched_queries_for_candidate(candidates: list[VerticalCandidateEvidence], selected: str) -> tuple[str, ...]:
-    wanted = normalize_label(selected)
-    matches = [item for item in candidates if normalize_label(item.label) == wanted]
-    if len(matches) != 1:
-        return ()
-    return matches[0].matched_queries
 
 
 __all__ = [
@@ -546,7 +517,6 @@ __all__ = [
     "build_vertical_pool_choice_request",
     "build_vertical_search_plan_request",
     "choose_vertical_candidate_pool",
-    "matched_queries_for_candidate",
     "merge_vertical_search_observations",
     "plan_vertical_search_terms",
     "unsupported_candidate_constraints",

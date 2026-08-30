@@ -1,12 +1,12 @@
 """Makro Step 1 Vertical resolution.
 
-One production decision boundary owns Step 1: Makro must supply every selectable
-Vertical. Product Identity supplies semantics and AI plans a bounded retrieval
-ladder. Every query is sampled into its own fresh query-owned generation first;
-only after the bounded ladder is complete are those exact live rows merged and
-ranked as one evidence pool. Query-local DOM failures stay inside that retrieval
-attempt; the remaining queries and taxonomy fallback continue. Once a concrete
-live row is selected, ownership/canonical verification remains fail-closed.
+One production decision boundary owns Step 1: Makro supplies the selectable
+Verticals, AI plans a bounded retrieval ladder, and AI decides directly from the
+rows that are live in each current search generation. When AI chooses one current
+live row, that exact row is clicked immediately; the workflow never re-runs an old
+query to re-judge or re-bind an already chosen category. Query-local DOM failures
+stay inside that retrieval attempt, and the existing taxonomy fallback remains for
+runs where AI selects none from every live search generation.
 """
 
 from __future__ import annotations
@@ -45,7 +45,6 @@ from .taxonomy_resolution import (
 )
 from .vertical_resolution import (
     choose_vertical_candidate_pool,
-    matched_queries_for_candidate,
     merge_vertical_search_observations,
     plan_vertical_search_terms,
 )
@@ -501,13 +500,12 @@ def _try_select_via_search(
     *,
     wait_ms: int,
 ) -> tuple[str, list[str], tuple[str, ...]]:
-    """Sample all safe query attempts, then decide globally from successful generations."""
+    """Let AI decide from each current live generation and click immediately."""
 
     planned_terms = plan_vertical_search_terms(provider, hints)
-    observations: list[tuple[str, list[str]]] = []
-    successful: list[tuple[str, list[str], object]] = []
     observed: list[str] = []
     observed_keys: set[str] = set()
+    last_search = None
 
     for query_index, term in enumerate(planned_terms, start=1):
         try:
@@ -515,7 +513,6 @@ def _try_select_via_search(
         except Exception as exc:
             if not _search_attempt_is_locally_recoverable(page):
                 raise
-            observations.append((term, []))
             _vertical_diag(
                 "query_failed",
                 {
@@ -524,171 +521,74 @@ def _try_select_via_search(
                     "query": term,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
-                    "action": "continue_remaining_queries_then_taxonomy",
+                    "action": "continue_next_query",
                 },
             )
             continue
 
-        observations.append((term, rows))
-        successful.append((term, rows, search))
+        last_search = search
         for row in rows:
             key = normalize_label(row)
             if not key or key in observed_keys:
                 continue
             observed_keys.add(key)
             observed.append(row)
+
+        current_candidates = merge_vertical_search_observations(((term, rows),))
+        selected = choose_vertical_candidate_pool(
+            provider,
+            hints,
+            (term,),
+            current_candidates,
+        )
         _vertical_diag(
-            "query_observation",
+            "query_decision",
             {
                 "query_index": query_index,
                 "query_count": len(planned_terms),
                 "query": term,
                 "fresh_row_count": len(rows),
-                "action": "collect_for_global_pool",
+                "candidate_count": len(current_candidates),
+                "selected_vertical": selected,
+                "action": "click_current_generation" if selected else "continue_next_query",
                 "sample": rows[:8],
             },
         )
-
-    pool = merge_vertical_search_observations(observations)
-    selected = choose_vertical_candidate_pool(provider, hints, planned_terms, pool)
-    owner_queries = matched_queries_for_candidate(pool, selected) if selected else ()
-    selected_key = normalize_label(selected) if selected else ""
-    active_query, active_rows, active_search = successful[-1] if successful else ("", [], None)
-    active_exact = [row for row in active_rows if normalize_label(row) == selected_key] if selected_key else []
-    active_owned = bool(
-        selected
-        and active_query
-        and any(normalize_label(owner) == normalize_label(active_query) for owner in owner_queries)
-    )
-    decision_action = (
-        "click_current_generation"
-        if active_owned and len(active_exact) == 1
-        else "rebind_prior_owner_query"
-        if selected
-        else "fallback_to_taxonomy"
-    )
-    _vertical_diag(
-        "pooled_query_decision",
-        {
-            "query_count": len(planned_terms),
-            "successful_query_count": len(successful),
-            "candidate_count": len(pool),
-            "selected_vertical": selected,
-            "owner_queries": list(owner_queries),
-            "active_query": active_query,
-            "active_exact_match_count": len(active_exact),
-            "action": decision_action,
-            "sample": [item.label for item in pool[:8]],
-        },
-    )
-    if not selected:
-        if active_search is not None:
-            try:
-                _close_vertical_search(active_search, page, wait_ms=wait_ms)
-            except Exception:
-                pass
-        return "", observed, planned_terms
-    if not owner_queries:
-        raise RuntimeError(
-            "Makro Step 1 pooled Vertical decision lost query ownership evidence; "
-            f"selected={selected!r}"
-        )
-
-    if active_owned and active_search is not None:
-        _vertical_diag(
-            "selected_row_binding",
-            {
-                "query": active_query,
-                "selected_vertical": selected,
-                "exact_match_count": len(active_exact),
-                "binding_mode": "current_generation",
-                "action": "click_current_generation" if len(active_exact) == 1 else "try_other_owner_query",
-            },
-        )
-        if len(active_exact) == 1:
-            current_row = active_exact[0]
-            previous_canonical, _ = _current_target_values(page)
-            if click_search_row(active_search, current_row, allow_stable_exact=False):
-                return (
-                    _complete_exact_live_vertical(
-                        page,
-                        current_row,
-                        previous_canonical=previous_canonical,
-                        verification_label=_search_result_leaf(current_row),
-                    ),
-                    observed,
-                    planned_terms,
-                )
-            _vertical_diag(
-                "selected_row_binding",
-                {
-                    "query": active_query,
-                    "selected_vertical": selected,
-                    "exact_match_count": 1,
-                    "binding_mode": "current_generation",
-                    "action": "current_generation_bind_failed_try_other_owner",
-                },
-            )
-
-    prior_owner_queries = tuple(
-        owner
-        for owner in owner_queries
-        if normalize_label(owner) != normalize_label(active_query)
-    )
-    for rebind_index, owner_query in enumerate(prior_owner_queries, start=1):
-        try:
-            rows, search = _run_vertical_search_query(page, owner_query, wait_ms=wait_ms)
-        except Exception as exc:
-            if not _search_attempt_is_locally_recoverable(page):
-                raise
-            _vertical_diag(
-                "selected_row_rebind_failed",
-                {
-                    "rebind_index": rebind_index,
-                    "query": owner_query,
-                    "selected_vertical": selected,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                    "action": "try_next_owner_query",
-                },
-            )
+        if not selected:
             continue
+
+        selected_key = normalize_label(selected)
         exact = [row for row in rows if normalize_label(row) == selected_key]
-        _vertical_diag(
-            "selected_row_rebind",
-            {
-                "rebind_index": rebind_index,
-                "rebind_count": len(prior_owner_queries),
-                "query": owner_query,
-                "selected_vertical": selected,
-                "exact_match_count": len(exact),
-                "action": "click_fresh_generation" if len(exact) == 1 else "try_next_owner_query",
-            },
-        )
         if len(exact) != 1:
-            continue
+            raise RuntimeError(
+                "Makro Step 1 AI selected a Vertical that is not one unique row in the current live "
+                f"search generation; selected={selected!r}; query={term!r}; exact_match_count={len(exact)}"
+            )
 
-        rebound = exact[0]
+        current_row = exact[0]
         previous_canonical, _ = _current_target_values(page)
-        clicked = click_search_row(search, rebound, allow_stable_exact=False)
-        if not clicked:
-            continue
+        if not click_search_row(search, current_row, allow_stable_exact=False):
+            raise RuntimeError(
+                "Makro Step 1 AI selected one current live Vertical, but that exact current row could "
+                f"not be clicked; selected={current_row!r}; query={term!r}"
+            )
         return (
             _complete_exact_live_vertical(
                 page,
-                rebound,
+                current_row,
                 previous_canonical=previous_canonical,
-                verification_label=_search_result_leaf(rebound),
+                verification_label=_search_result_leaf(current_row),
             ),
             observed,
             planned_terms,
         )
 
-    raise RuntimeError(
-        "Makro Step 1 selected a grounded Vertical from the aggregated live pool, but that exact row "
-        "could not be rebound from any query generation that originally owned it; "
-        f"selected={selected!r}; owner_queries={' | '.join(owner_queries)}"
-    )
+    if last_search is not None:
+        try:
+            _close_vertical_search(last_search, page, wait_ms=wait_ms)
+        except Exception:
+            pass
+    return "", observed, planned_terms
 
 
 def _select_via_search_with_context(
@@ -710,8 +610,8 @@ def _select_via_search_with_context(
     attempted = " | ".join(attempted_terms)
     rows = " | ".join(observed[:20]) if observed else "<none>"
     raise RuntimeError(
-        f"Makro Step 1 {reason}; aggregated exact-live Vertical Search found no verified result from: "
-        f"{attempted}; observed query-owned rows: {rows}"
+        f"Makro Step 1 {reason}; AI selected no Vertical from the current live search generations: "
+        f"{attempted}; observed live rows: {rows}"
     )
 
 
@@ -881,8 +781,8 @@ def select_vertical(
     attempted = " | ".join(attempted_terms)
     rows = " | ".join(observed[:20]) if observed else "<none>"
     raise RuntimeError(
-        "Makro Step 1 could not resolve a verified Vertical through aggregated query-owned live search "
-        f"or bounded live taxonomy; search_terms={attempted}; observed query-owned rows={rows}"
+        "Makro Step 1 could not resolve a verified Vertical through direct current-generation AI selection "
+        f"or bounded live taxonomy; search_terms={attempted}; observed live rows={rows}"
     )
 
 
