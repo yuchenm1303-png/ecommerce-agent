@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
+from .image_media import has_decodable_image_pixels
 from .source_snapshot import SourceSnapshot
 
 
@@ -211,6 +212,8 @@ def build_product_identity_sources(
         if normalized in seen_images or not path.is_file():
             continue
         seen_images.add(normalized)
+        if not has_decodable_image_pixels(path):
+            continue
         image_count += 1
         sources.append(
             {
