@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
+from .failure_contract import is_provider_media_rejection
 from .source_snapshot import SourceSnapshot
 
 
@@ -373,13 +374,7 @@ def _parse_product_identity(raw: Any, *, allowed_refs: set[str]) -> ProductIdent
     )
 
 
-def infer_product_identity(
-    provider: JSONTaskProvider,
-    snapshot: SourceSnapshot,
-    *,
-    image_paths: Iterable[str | Path] = (),
-) -> ProductIdentity:
-    request = build_product_identity_request(snapshot, image_paths=image_paths)
+def _identity_from_request(provider: JSONTaskProvider, request: dict[str, Any]) -> ProductIdentity:
     allowed_refs = {
         str(item.get("source_id") or "")
         for item in request.get("grounded_sources") or []
@@ -388,6 +383,49 @@ def infer_product_identity(
     if not allowed_refs:
         raise ProductIdentityError("product identity has no grounded evidence sources")
     return _parse_product_identity(provider.extract_json(request), allowed_refs=allowed_refs)
+
+
+def infer_product_identity(
+    provider: JSONTaskProvider,
+    snapshot: SourceSnapshot,
+    *,
+    image_paths: Iterable[str | Path] = (),
+) -> ProductIdentity:
+    """Infer identity while keeping optional media inside its own failure domain.
+
+    Text/structured supplier evidence is the canonical minimum. Images are useful
+    corroboration but an individual provider moderation/decoder rejection must not
+    veto otherwise sufficient product evidence. Only a media-scoped provider error
+    is allowed to retry without images; auth, quota, transport and semantic identity
+    failures retain their normal fail-closed behavior.
+    """
+
+    images = tuple(image_paths)
+    request = build_product_identity_request(snapshot, image_paths=images)
+    try:
+        return _identity_from_request(provider, request)
+    except Exception as exc:
+        has_media = any(
+            str(item.get("kind") or "") == "image"
+            for item in request.get("grounded_sources") or []
+            if isinstance(item, dict)
+        )
+        if not has_media or not is_provider_media_rejection(exc):
+            raise
+
+        text_request = build_product_identity_request(snapshot, image_paths=())
+        text_sources = [
+            item
+            for item in text_request.get("grounded_sources") or []
+            if isinstance(item, dict) and str(item.get("kind") or "") == "text"
+        ]
+        if not text_sources:
+            raise
+        print(
+            "PRODUCT_IDENTITY_WARNING provider rejected optional image evidence; retrying with canonical text/structured evidence only",
+            flush=True,
+        )
+        return _identity_from_request(provider, text_request)
 
 
 def build_vertical_search_terms_request(identity: ProductIdentity) -> dict[str, Any]:
