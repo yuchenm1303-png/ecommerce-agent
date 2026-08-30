@@ -22,21 +22,13 @@ from .source_snapshot import SourceSnapshot, SnapshotTableRow, write_source_snap
 PRODUCT_PACK_SCHEMA_VERSION = 1
 PRODUCT_PACK_URL_HOST = "product-pack.invalid"
 SUPPORTED_DOCUMENT_SUFFIXES = {
-    ".pdf",
-    ".docx",
-    ".xlsx",
-    ".xlsm",
-    ".csv",
-    ".tsv",
-    ".txt",
-    ".md",
+    ".pdf", ".docx", ".xlsx", ".xlsm", ".csv", ".tsv", ".txt", ".md",
 }
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
 SUPPORTED_ARCHIVE_SUFFIXES = {".zip"}
 SUPPORTED_PRODUCT_PACK_SUFFIXES = (
     SUPPORTED_DOCUMENT_SUFFIXES | SUPPORTED_IMAGE_SUFFIXES | SUPPORTED_ARCHIVE_SUFFIXES
 )
-
 _MAX_INPUT_FILES = 200
 _MAX_SINGLE_FILE_BYTES = 64 * 1024 * 1024
 _MAX_ARCHIVE_EXPANDED_BYTES = 512 * 1024 * 1024
@@ -154,9 +146,7 @@ def _copy_input(path: Path, raw_dir: Path, ordinal: int) -> Path:
 
 def _safe_zip_member(name: str) -> PurePosixPath | None:
     path = PurePosixPath(name)
-    if path.is_absolute() or ".." in path.parts:
-        return None
-    if not path.name:
+    if path.is_absolute() or ".." in path.parts or not path.name:
         return None
     if path.suffix.casefold() not in (SUPPORTED_DOCUMENT_SUFFIXES | SUPPORTED_IMAGE_SUFFIXES):
         return None
@@ -212,14 +202,9 @@ def _snapshot_origin(path: Path, fragment: str = "") -> str:
 
 
 def _new_snapshot(
-    *,
-    path: Path,
-    title: str,
-    visible_text: str,
-    table_rows: Iterable[SnapshotTableRow] = (),
-    fragment: str = "",
-    meta: dict[str, str] | None = None,
-    warnings: Iterable[str] = (),
+    *, path: Path, title: str, visible_text: str,
+    table_rows: Iterable[SnapshotTableRow] = (), fragment: str = "",
+    meta: dict[str, str] | None = None, warnings: Iterable[str] = (),
 ) -> SourceSnapshot:
     origin = _snapshot_origin(path, fragment)
     return SourceSnapshot(
@@ -229,11 +214,7 @@ def _new_snapshot(
         captured_at=_utc_now(),
         visible_text=str(visible_text or "")[:_MAX_VISIBLE_TEXT_CHARS],
         table_rows=list(table_rows)[:_MAX_TABLE_ROWS],
-        meta={
-            "input_mode": "customer_product_pack",
-            "file_name": path.name,
-            **(meta or {}),
-        },
+        meta={"input_mode": "customer_product_pack", "file_name": path.name, **(meta or {})},
         warnings=list(warnings),
     )
 
@@ -251,15 +232,11 @@ def _csv_snapshot(path: Path, *, delimiter: str) -> list[SourceSnapshot]:
     nonempty = [row for row in rows if any(str(cell).strip() for cell in row)]
     if not nonempty:
         raise ProductPackError(f"表格文件没有可用内容：{path.name}")
-
     headers = [str(value).strip() for value in nonempty[0]]
     structured: list[SnapshotTableRow] = []
     rendered: list[str] = []
     for row_number, row in enumerate(nonempty, start=1):
-        rendered.append(
-            f"row {row_number}: "
-            + " | ".join(str(value).strip() for value in row if str(value).strip())
-        )
+        rendered.append(f"row {row_number}: " + " | ".join(str(value).strip() for value in row if str(value).strip()))
         if row_number == 1:
             continue
         for column_index, raw in enumerate(row, start=1):
@@ -267,24 +244,8 @@ def _csv_snapshot(path: Path, *, delimiter: str) -> list[SourceSnapshot]:
             if not value:
                 continue
             header = headers[column_index - 1] if column_index <= len(headers) else ""
-            key = header or f"Column {column_index}"
-            structured.append(
-                SnapshotTableRow(
-                    key=key,
-                    value=value,
-                    table_index=1,
-                    row_index=row_number,
-                )
-            )
-    return [
-        _new_snapshot(
-            path=path,
-            title=path.name,
-            visible_text="\n".join(rendered),
-            table_rows=structured,
-            meta={"table_format": path.suffix.casefold().lstrip(".")},
-        )
-    ]
+            structured.append(SnapshotTableRow(key=header or f"Column {column_index}", value=value, table_index=1, row_index=row_number))
+    return [_new_snapshot(path=path, title=path.name, visible_text="\n".join(rendered), table_rows=structured, meta={"table_format": path.suffix.casefold().lstrip(".")})]
 
 
 def _excel_snapshots(path: Path) -> list[SourceSnapshot]:
@@ -295,11 +256,7 @@ def _excel_snapshots(path: Path) -> list[SourceSnapshot]:
     snapshots: list[SourceSnapshot] = []
     try:
         for sheet_index, sheet in enumerate(workbook.worksheets, start=1):
-            rows = [
-                tuple(cell for cell in row)
-                for row in sheet.iter_rows(values_only=True)
-                if any(cell not in (None, "") for cell in row)
-            ]
+            rows = [tuple(cell for cell in row) for row in sheet.iter_rows(values_only=True) if any(cell not in (None, "") for cell in row)]
             if not rows:
                 continue
             headers = [str(value).strip() if value not in (None, "") else "" for value in rows[0]]
@@ -307,42 +264,17 @@ def _excel_snapshots(path: Path) -> list[SourceSnapshot]:
             rendered: list[str] = [f"Sheet: {sheet.title}"]
             for data_index, row in enumerate(rows, start=1):
                 values = ["" if value is None else str(value).strip() for value in row]
-                rendered.append(
-                    f"row {data_index}: " + " | ".join(value for value in values if value)
-                )
+                rendered.append(f"row {data_index}: " + " | ".join(value for value in values if value))
                 if data_index == 1:
                     continue
                 nonempty = [(index, value) for index, value in enumerate(values, start=1) if value]
                 if len(nonempty) == 2 and not all(headers):
-                    structured.append(
-                        SnapshotTableRow(
-                            key=nonempty[0][1],
-                            value=nonempty[1][1],
-                            table_index=sheet_index,
-                            row_index=data_index,
-                        )
-                    )
+                    structured.append(SnapshotTableRow(key=nonempty[0][1], value=nonempty[1][1], table_index=sheet_index, row_index=data_index))
                     continue
                 for column_index, value in nonempty:
                     header = headers[column_index - 1] if column_index <= len(headers) else ""
-                    structured.append(
-                        SnapshotTableRow(
-                            key=header or f"Column {column_index}",
-                            value=value,
-                            table_index=sheet_index,
-                            row_index=data_index,
-                        )
-                    )
-            snapshots.append(
-                _new_snapshot(
-                    path=path,
-                    title=f"{path.name} · {sheet.title}",
-                    visible_text="\n".join(rendered),
-                    table_rows=structured,
-                    fragment=f"sheet={sheet_index}",
-                    meta={"sheet_name": sheet.title, "sheet_index": str(sheet_index)},
-                )
-            )
+                    structured.append(SnapshotTableRow(key=header or f"Column {column_index}", value=value, table_index=sheet_index, row_index=data_index))
+            snapshots.append(_new_snapshot(path=path, title=f"{path.name} · {sheet.title}", visible_text="\n".join(rendered), table_rows=structured, fragment=f"sheet={sheet_index}", meta={"sheet_name": sheet.title, "sheet_index": str(sheet_index)}))
     finally:
         workbook.close()
     if not snapshots:
@@ -355,7 +287,6 @@ def _docx_snapshots(path: Path, media_dir: Path) -> tuple[list[SourceSnapshot], 
         archive = zipfile.ZipFile(path)
     except zipfile.BadZipFile as exc:
         raise ProductPackError(f"Word 文件损坏：{path.name}") from exc
-
     paragraphs: list[str] = []
     rows: list[SnapshotTableRow] = []
     images: list[Path] = []
@@ -378,27 +309,15 @@ def _docx_snapshots(path: Path, media_dir: Path) -> tuple[list[SourceSnapshot], 
                 row_index += 1
                 cells: list[str] = []
                 for cell in row.findall(namespace + "tc"):
-                    text = " ".join(
-                        node.text or "" for node in cell.iter(namespace + "t") if (node.text or "").strip()
-                    ).strip()
+                    text = " ".join(node.text or "" for node in cell.iter(namespace + "t") if (node.text or "").strip()).strip()
                     cells.append(text)
                 nonempty = [value for value in cells if value]
                 if len(nonempty) >= 2:
-                    rows.append(
-                        SnapshotTableRow(
-                            key=nonempty[0],
-                            value=" | ".join(nonempty[1:]),
-                            table_index=table_index,
-                            row_index=row_index,
-                        )
-                    )
-
+                    rows.append(SnapshotTableRow(key=nonempty[0], value=" | ".join(nonempty[1:]), table_index=table_index, row_index=row_index))
         media_dir.mkdir(parents=True, exist_ok=True)
         for name in archive.namelist():
             posix = PurePosixPath(name)
-            if len(posix.parts) < 3 or posix.parts[:2] != ("word", "media"):
-                continue
-            if posix.suffix.casefold() not in SUPPORTED_IMAGE_SUFFIXES:
+            if len(posix.parts) < 3 or posix.parts[:2] != ("word", "media") or posix.suffix.casefold() not in SUPPORTED_IMAGE_SUFFIXES:
                 continue
             data = archive.read(name)
             if len(data) < 1024:
@@ -407,24 +326,16 @@ def _docx_snapshots(path: Path, media_dir: Path) -> tuple[list[SourceSnapshot], 
             target = media_dir / f"{_safe_name(path.stem)}-{len(images) + 1:03d}-{digest[:10]}{posix.suffix.casefold()}"
             target.write_bytes(data)
             images.append(target)
-
     if not paragraphs and not rows and not images:
         raise ProductPackError(f"Word 没有可读取内容：{path.name}")
-    visible = "\n".join(paragraphs)
-    snapshot = _new_snapshot(
-        path=path,
-        title=path.name,
-        visible_text=visible or f"Word document: {path.name}",
-        table_rows=rows,
-        meta={"embedded_images": str(len(images))},
-    )
+    snapshot = _new_snapshot(path=path, title=path.name, visible_text="\n".join(paragraphs) or f"Word document: {path.name}", table_rows=rows, meta={"embedded_images": str(len(images))})
     return [snapshot], images
 
 
 def _pdf_snapshots(path: Path) -> list[SourceSnapshot]:
     try:
         from pypdf import PdfReader
-    except ImportError as exc:  # pragma: no cover - dependency contract
+    except ImportError as exc:
         raise ProductPackError("读取 PDF 需要 pypdf；请重新安装 requirements.txt。") from exc
     try:
         reader = PdfReader(str(path))
@@ -440,23 +351,11 @@ def _pdf_snapshots(path: Path) -> list[SourceSnapshot]:
         if not text:
             empty_pages += 1
             continue
-        snapshots.append(
-            _new_snapshot(
-                path=path,
-                title=f"{path.name} · Page {page_index}",
-                visible_text=text,
-                fragment=f"page={page_index}",
-                meta={"page": str(page_index), "page_count": str(len(reader.pages))},
-            )
-        )
+        snapshots.append(_new_snapshot(path=path, title=f"{path.name} · Page {page_index}", visible_text=text, fragment=f"page={page_index}", meta={"page": str(page_index), "page_count": str(len(reader.pages))}))
     if not snapshots:
-        raise ProductPackError(
-            f"PDF 没有可提取文字：{path.name}。扫描版 PDF 请同时上传原始页面图片。"
-        )
+        raise ProductPackError(f"PDF 没有可提取文字：{path.name}。扫描版 PDF 请同时上传原始页面图片。")
     if empty_pages:
-        snapshots[0].warnings.append(
-            f"{empty_pages} page(s) contained no extractable text; scanned pages require image evidence."
-        )
+        snapshots[0].warnings.append(f"{empty_pages} page(s) contained no extractable text; scanned pages require image evidence.")
     return snapshots
 
 
@@ -507,9 +406,7 @@ def _bootstrap_snapshot(snapshots: list[SourceSnapshot], files: list[ProductPack
         if len(rows) < _MAX_TABLE_ROWS:
             rows.extend(snapshot.table_rows[: _MAX_TABLE_ROWS - len(rows)])
     if not text_parts:
-        text_parts.append(
-            "Customer product pack files:\n" + "\n".join(file.stored_path for file in files)
-        )
+        text_parts.append("Customer product pack files:\n" + "\n".join(file.stored_path for file in files))
     return SourceSnapshot(
         requested_url="product-pack://local",
         final_url="product-pack://local",
@@ -517,43 +414,26 @@ def _bootstrap_snapshot(snapshots: list[SourceSnapshot], files: list[ProductPack
         captured_at=_utc_now(),
         visible_text="\n\n".join(text_parts),
         table_rows=rows,
-        meta={
-            "input_mode": "customer_product_pack",
-            "stored_files": str(len(files)),
-            "document_snapshots": str(len(snapshots)),
-        },
+        meta={"input_mode": "customer_product_pack", "stored_files": str(len(files)), "document_snapshots": str(len(snapshots))},
     )
 
 
 def _pack_reference(files: Iterable[ProductPackFile]) -> str:
     digest = hashlib.sha256()
     for item in sorted(files, key=lambda value: (value.sha256, value.stored_path)):
-        digest.update(item.sha256.encode("ascii"))
-        digest.update(b"\0")
-        digest.update(item.stored_path.encode("utf-8"))
-        digest.update(b"\0")
+        digest.update(item.sha256.encode("ascii")); digest.update(b"\0")
+        digest.update(item.stored_path.encode("utf-8")); digest.update(b"\0")
     return f"https://{PRODUCT_PACK_URL_HOST}/{digest.hexdigest()[:24]}"
 
 
-def capture_product_pack(
-    paths: Iterable[str | Path],
-    *,
-    output_dir: str | Path,
-) -> ProductPackCapture:
-    """Persist and normalize one customer-supplied product evidence pack.
-
-    Documents are converted into citable SourceSnapshot units, images remain exact
-    byte evidence, and the original bytes are copied under the run directory. No
-    marketplace-field semantics are inferred here; this is mechanical intake only.
-    """
+def capture_product_pack(paths: Iterable[str | Path], *, output_dir: str | Path) -> ProductPackCapture:
+    """Normalize each customer artifact independently and require usable evidence overall."""
 
     originals = [Path(value).expanduser() for value in paths]
     if not originals:
         raise ProductPackError("请至少选择一个商品资料文件。")
     if len(originals) > _MAX_INPUT_FILES:
         raise ProductPackError(f"一次最多接收 {_MAX_INPUT_FILES} 个商品资料文件。")
-    for path in originals:
-        _validate_input_path(path)
 
     root = Path(output_dir).resolve()
     if root.exists():
@@ -566,65 +446,72 @@ def capture_product_pack(
 
     stored_files: list[ProductPackFile] = []
     parse_paths: list[Path] = []
-    original_by_stored: dict[Path, str] = {}
     seen_sha: set[str] = set()
+    warnings: list[str] = []
+    rejected_files: list[dict[str, str]] = []
 
     for ordinal, original in enumerate(originals, start=1):
-        stored = _copy_input(original, raw_dir, ordinal)
-        digest = _sha256_path(stored)
+        try:
+            _validate_input_path(original)
+            stored = _copy_input(original, raw_dir, ordinal)
+            digest = _sha256_path(stored)
+        except (ProductPackError, OSError) as exc:
+            warning = str(exc)
+            warnings.append(warning)
+            rejected_files.append({"path": str(original), "stage": "intake", "error": warning})
+            continue
         if digest in seen_sha:
             stored.unlink(missing_ok=True)
             continue
         seen_sha.add(digest)
-        stored_files.append(
-            ProductPackFile(
-                original_path=str(original.resolve()),
-                stored_path=str(stored.resolve()),
-                sha256=digest,
-                size_bytes=stored.stat().st_size,
-                suffix=stored.suffix.casefold(),
-                kind=_kind_for_suffix(stored.suffix),
-            )
-        )
+        stored_files.append(ProductPackFile(original_path=str(original.resolve()), stored_path=str(stored.resolve()), sha256=digest, size_bytes=stored.stat().st_size, suffix=stored.suffix.casefold(), kind=_kind_for_suffix(stored.suffix)))
         if stored.suffix.casefold() == ".zip":
-            expanded = _expand_zip(stored, unpacked_dir / f"archive-{ordinal:03d}")
+            try:
+                expanded = _expand_zip(stored, unpacked_dir / f"archive-{ordinal:03d}")
+            except ProductPackError as exc:
+                warnings.append(str(exc))
+                rejected_files.append({"path": str(original), "stage": "archive", "error": str(exc)})
+                continue
             for child in expanded:
-                child_digest = _sha256_path(child)
+                try:
+                    child_digest = _sha256_path(child)
+                except OSError as exc:
+                    warnings.append(f"ZIP 成员读取失败：{child.name}: {exc}")
+                    continue
                 if child_digest in seen_sha:
                     continue
                 seen_sha.add(child_digest)
-                stored_files.append(
-                    ProductPackFile(
-                        original_path=f"{original.resolve()}::{child.name}",
-                        stored_path=str(child.resolve()),
-                        sha256=child_digest,
-                        size_bytes=child.stat().st_size,
-                        suffix=child.suffix.casefold(),
-                        kind=_kind_for_suffix(child.suffix),
-                    )
-                )
+                stored_files.append(ProductPackFile(original_path=f"{original.resolve()}::{child.name}", stored_path=str(child.resolve()), sha256=child_digest, size_bytes=child.stat().st_size, suffix=child.suffix.casefold(), kind=_kind_for_suffix(child.suffix)))
                 parse_paths.append(child)
-                original_by_stored[child] = str(original.resolve())
         else:
             parse_paths.append(stored)
-            original_by_stored[stored] = str(original.resolve())
 
     snapshots: list[SourceSnapshot] = []
     images: list[Path] = []
-    warnings: list[str] = []
     for path in parse_paths:
         if path.suffix.casefold() in SUPPORTED_IMAGE_SUFFIXES:
-            _validate_image(path)
+            try:
+                _validate_image(path)
+            except ProductPackError as exc:
+                warnings.append(str(exc))
+                rejected_files.append({"path": str(path), "stage": "image", "error": str(exc)})
+                continue
             images.append(path)
             continue
         try:
             parsed, embedded_images = _parse_document(path, media_dir)
         except ProductPackError as exc:
             warnings.append(str(exc))
+            rejected_files.append({"path": str(path), "stage": "document", "error": str(exc)})
             continue
         snapshots.extend(parsed)
         for image in embedded_images:
-            _validate_image(image)
+            try:
+                _validate_image(image)
+            except ProductPackError as exc:
+                warnings.append(str(exc))
+                rejected_files.append({"path": str(image), "stage": "embedded_image", "error": str(exc)})
+                continue
             images.append(image)
 
     if not snapshots and not images:
@@ -633,11 +520,15 @@ def capture_product_pack(
 
     snapshot_paths = _write_snapshots(snapshots, snapshot_dir)
     bootstrap = _bootstrap_snapshot(snapshots, stored_files)
+    bootstrap.warnings.extend(warnings)
     bootstrap_path = write_source_snapshot(bootstrap, root / "bootstrap-source.json")
 
     image_dedup: dict[str, Path] = {}
     for image in images:
-        image_dedup.setdefault(_sha256_path(image), image)
+        try:
+            image_dedup.setdefault(_sha256_path(image), image)
+        except OSError as exc:
+            warnings.append(f"图片读取失败，已跳过：{image}: {exc}")
     evidence_images = tuple(image_dedup.values())
     listing_selection = select_listing_images(evidence_images)
     listing_images = tuple(listing_selection.selected)
@@ -654,22 +545,12 @@ def capture_product_pack(
         "evidence_images": [str(path.resolve()) for path in evidence_images],
         "listing_images": [str(path.resolve()) for path in listing_images],
         "listing_image_rejected": listing_selection.rejected_count,
+        "rejected_files": rejected_files,
         "warnings": warnings,
     }
     manifest_path = root / "product-pack.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    return ProductPackCapture(
-        manifest_path=manifest_path,
-        product_reference_url=reference_url,
-        bootstrap_snapshot_path=bootstrap_path,
-        bootstrap_snapshot=bootstrap,
-        customer_snapshot_paths=snapshot_paths,
-        evidence_image_paths=evidence_images,
-        listing_image_paths=listing_images,
-        stored_files=tuple(stored_files),
-        warnings=tuple(warnings),
-    )
+    return ProductPackCapture(manifest_path=manifest_path, product_reference_url=reference_url, bootstrap_snapshot_path=bootstrap_path, bootstrap_snapshot=bootstrap, customer_snapshot_paths=snapshot_paths, evidence_image_paths=evidence_images, listing_image_paths=listing_images, stored_files=tuple(stored_files), warnings=tuple(warnings))
 
 
 def load_product_pack_manifest(path: str | Path) -> dict[str, Any]:
@@ -684,17 +565,31 @@ def load_product_pack_manifest(path: str | Path) -> dict[str, Any]:
     reference = str(payload.get("product_reference_url") or "").strip()
     if not reference.startswith(f"https://{PRODUCT_PACK_URL_HOST}/"):
         raise ProductPackError("商品资料包 product_reference_url 无效。")
-    for key in ("bootstrap_snapshot",):
-        value = Path(str(payload.get(key) or ""))
-        if not value.is_file():
-            raise ProductPackError(f"商品资料包缺少 {key}：{value}")
+    bootstrap = Path(str(payload.get("bootstrap_snapshot") or ""))
+    if not bootstrap.is_file():
+        raise ProductPackError(f"商品资料包缺少 bootstrap_snapshot：{bootstrap}")
+
+    warnings = list(payload.get("warnings") or [])
     for key in ("customer_snapshots", "evidence_images", "listing_images"):
         values = payload.get(key) or []
         if not isinstance(values, list):
             raise ProductPackError(f"商品资料包 {key} 必须是数组。")
-        missing = [str(value) for value in values if not Path(str(value)).is_file()]
-        if missing:
-            raise ProductPackError(f"商品资料包 {key} 文件缺失：" + " | ".join(missing[:5]))
+        present: list[str] = []
+        for value in values:
+            candidate = Path(str(value))
+            if candidate.is_file():
+                present.append(str(candidate))
+            else:
+                warnings.append(f"商品资料包可选派生文件缺失，已跳过 {key}: {candidate}")
+        payload[key] = present
+    payload["warnings"] = warnings
+    if not payload.get("customer_snapshots") and not payload.get("evidence_images"):
+        # The bootstrap itself remains canonical evidence; image-only/text-only packs
+        # can legitimately have one side empty, but both derived universes missing
+        # means the stored pack can no longer support field resolution safely.
+        bootstrap_snapshot = json.loads(bootstrap.read_text(encoding="utf-8"))
+        if not str(bootstrap_snapshot.get("visible_text") or "").strip():
+            raise ProductPackError("商品资料包没有剩余可用文本或图片证据。")
     return payload
 
 
