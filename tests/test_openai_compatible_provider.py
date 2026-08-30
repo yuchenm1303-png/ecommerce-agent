@@ -104,9 +104,13 @@ def valid_json():
     )
 
 
+def _png_bytes() -> bytes:
+    return b"\x89PNG\r\n\x1a\n" + b"provider-test-image"
+
+
 def test_prompt_only_provider_parses_json_and_keeps_api_key_and_paths_out_of_prompt(tmp_path):
-    image = tmp_path / "front.png"
-    image.write_bytes(b"not-a-real-png-but-local-bytes")
+    image = tmp_path / "front.img"
+    image.write_bytes(_png_bytes())
     client = FakeClient(f"```json\n{valid_json()}\n```")
     provider = OpenAICompatibleSemanticProvider(
         model="vision-model",
@@ -168,8 +172,8 @@ def test_best_effort_context_reaches_model_without_grounded_only_instruction():
 
 
 def test_explicit_high_detail_is_only_sent_when_requested(tmp_path):
-    image = tmp_path / "front.png"
-    image.write_bytes(b"image-bytes")
+    image = tmp_path / "front.img"
+    image.write_bytes(_png_bytes())
     client = FakeClient(valid_json())
     provider = OpenAICompatibleSemanticProvider(
         model="vision-model",
@@ -236,7 +240,7 @@ def test_missing_image_is_rejected_before_api_call(tmp_path):
         base_url="https://api.vendor.test/v1",
         client=client,
     )
-    with pytest.raises(OpenAICompatibleProviderError, match="找不到图片"):
+    with pytest.raises(OpenAICompatibleProviderError, match="无法读取图片"):
         provider.extract_json(request_payload(str(tmp_path / "missing.png")))
     assert not client.create_api.calls
 

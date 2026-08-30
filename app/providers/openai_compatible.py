@@ -3,13 +3,12 @@ from __future__ import annotations
 import base64
 import contextvars
 import json
-import mimetypes
 import queue
 import threading
 import time
-from pathlib import Path
 from typing import Any, Callable
 
+from ..image_media import ImageMediaError, read_image_media
 from .errors import JSONTaskProviderError, JSONTaskResponseError, JSONTaskTransportError
 from .transient_retry import run_with_transient_retry
 from .usage_telemetry import instrument_openai_client, usage_request_context
@@ -33,14 +32,14 @@ _PRODUCT_FACT_TASK = "resolve_compact_product_facts"
 
 
 def _image_data_uri(path_value: str) -> str:
-    path = Path(path_value)
-    if not path.is_file():
-        raise OpenAICompatibleProviderError(f"OpenAI-compatible provider 找不到图片：{path}")
-    mime, _ = mimetypes.guess_type(path.name)
-    if not mime or not mime.startswith("image/"):
-        raise OpenAICompatibleProviderError(f"无法识别图片 MIME type：{path}")
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
+    """Serialize one captured image from its bytes, never from its filename."""
+
+    try:
+        data, media = read_image_media(path_value)
+    except ImageMediaError as exc:
+        raise OpenAICompatibleProviderError(f"OpenAI-compatible provider 无法读取图片：{path_value}") from exc
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{media.mime_type};base64,{encoded}"
 
 
 def _serialized_sources(request_payload: dict[str, Any]) -> list[dict[str, Any]]:
