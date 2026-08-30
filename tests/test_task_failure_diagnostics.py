@@ -94,3 +94,60 @@ def test_collects_failed_workflow_event_traceback_timeline_and_manifest(tmp_path
     encoded = json.dumps(diagnostic, ensure_ascii=False)
     assert "do-not-upload" not in encoded
     assert "[REDACTED]" in encoded
+
+
+def test_single_gui_workflow_log_is_discovered_as_canonical_failure_truth(tmp_path) -> None:
+    run_dir = tmp_path / "workflow-full-20260830-084806-062232"
+    run_dir.mkdir()
+    (run_dir / "run-manifest.json").write_text(
+        json.dumps({"status": "failed", "mode": "full"}),
+        encoding="utf-8",
+    )
+    failed_event = {
+        "ts": "2026-08-30T00:50:49.684+00:00",
+        "stage": "step3",
+        "event": "FAILED",
+        "mode": "full",
+        "ui_phase": "plan",
+        "error_type": "RuntimeError",
+        "error": "STEP 3 CURRENT RESOLVER · COLD failed with exit code 1",
+        "active_stages": ["diagnostics", "workflow", "step3", "cold_resolver"],
+    }
+    (run_dir / "workflow-diagnostics.jsonl").write_text(
+        json.dumps(failed_event) + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "gui-workflow.log").write_text(
+        "===== STEP 3 CURRENT RESOLVER · COLD =====\n"
+        "Traceback (most recent call last):\n"
+        "  File \"makro_resolve_ai.py\", line 99, in main\n"
+        "ValueError: resolver failed token=child-secret\n"
+        "Traceback (most recent call last):\n"
+        "  File \"makro_gui_workflow.py\", line 575, in _run\n"
+        "RuntimeError: STEP 3 CURRENT RESOLVER · COLD failed with exit code 1\n",
+        encoding="utf-8",
+    )
+
+    diagnostic = collect_workflow_failure_diagnostic(
+        run_dir,
+        fallback_error="STEP 3 CURRENT RESOLVER · COLD failed with exit code 1",
+        fallback_error_type="TaskFailure",
+        fallback_stage="listing_prepare",
+        workflow_mode="full",
+    )
+
+    assert diagnostic["truth_source"] == "stage_log"
+    assert diagnostic["failed_stage"] == "step3"
+    assert diagnostic["stage_log_name"] == "gui-workflow.log"
+    assert diagnostic["process_log_name"] == "gui-workflow.log"
+    assert diagnostic["available_stage_logs"] == ["gui-workflow.log"]
+    assert diagnostic["diagnostic_sources"]["stage_log"] is True
+    assert diagnostic["line_count"] == 7
+    assert diagnostic["byte_count"] > 0
+    assert len(diagnostic["sha256"]) == 64
+    assert diagnostic["traceback_count"] == 2
+    assert diagnostic["exception_count"] == 2
+    assert diagnostic["exceptions"][0]["error_type"] == "ValueError"
+    encoded = json.dumps(diagnostic, ensure_ascii=False)
+    assert "child-secret" not in encoded
+    assert "token=[REDACTED]" in encoded

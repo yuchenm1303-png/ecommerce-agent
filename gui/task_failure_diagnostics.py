@@ -48,6 +48,7 @@ _EXCEPTION_TYPE_NAMES = {
     "SystemExit",
 }
 _TRACEBACK_MARKER = "Traceback (most recent call last):"
+_SINGLE_STAGE_LOGS = ("gui-workflow.log",)
 _BATCH_STAGE_LOGS = ("source.log", "prepare.log", "execute.log")
 _FIELD_FAILURE_STATUSES = {
     "fill_error": "FieldFillError",
@@ -196,6 +197,11 @@ def _discover_process_logs(
 
     add(explicit_path)
     if run_dir is not None:
+        # Single-link preparation owns one durable merged stdout/stderr journal at
+        # the workflow root. Discover it from the run itself so telemetry never
+        # depends on a runner-specific path hint surviving the failure callback.
+        for name in _SINGLE_STAGE_LOGS:
+            add(run_dir / name)
         for root in (run_dir / "diagnostics", run_dir.parent / "diagnostics"):
             for name in _BATCH_STAGE_LOGS:
                 add(root / name)
@@ -705,7 +711,8 @@ def collect_workflow_failure_diagnostic(
             raw_error_type = "StageLogFailure"
             raw_error_message = _last_nonempty_line(stage_text) or "stage log captured without an explicit exception line"
         raw_failed_stage = str(
-            fallback_stage
+            failed_event.get("stage")
+            or fallback_stage
             or stage_log.get("stage")
             or (stage_path.stem if stage_path is not None else "stage")
         )
