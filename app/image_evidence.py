@@ -12,6 +12,7 @@ from typing import Any, Iterable, Protocol
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from .failure_contract import FailureScope, classify_provider_failure
 from .image_media import ImageMediaError, read_image_media
 from .providers.usage_telemetry import usage_request_context
 from .semantic_grounding import GroundedSource, IMAGE_KIND, TEXT_KIND
@@ -369,8 +370,22 @@ def _is_wall_clock_timeout(exc: BaseException) -> bool:
     return "whole-request wall-clock deadline exceeded" in _exception_text(exc)
 
 
+def _provider_media_rejected(exc: BaseException) -> bool:
+    return classify_provider_failure(exc, media_present=True).scope is FailureScope.IMAGE
+
+
 def _is_batch_local_degradable_error(exc: BaseException) -> bool:
-    return bool(_is_wall_clock_timeout(exc) or _is_retryable_image_batch_error(exc))
+    return bool(
+        _is_wall_clock_timeout(exc)
+        or _is_retryable_image_batch_error(exc)
+        or _provider_media_rejected(exc)
+    )
+
+
+def _should_split_failed_batch(exc: BaseException, image_count: int) -> bool:
+    if image_count <= 1:
+        return False
+    return bool(_is_wall_clock_timeout(exc) or _provider_media_rejected(exc))
 
 
 def _run_batch(provider: JSONTaskProvider, index: int, images: list[GroundedSource]) -> _BatchResult:
@@ -416,6 +431,8 @@ def _run_batch(provider: JSONTaskProvider, index: int, images: list[GroundedSour
                 )
             except Exception as exc:
                 last_error = exc
+                if _provider_media_rejected(exc):
+                    break
                 if attempt >= _IMAGE_BATCH_MAX_ATTEMPTS or not _is_retryable_image_batch_error(exc):
                     break
                 delay = _IMAGE_BATCH_BACKOFF_SECONDS[min(attempt - 1, len(_IMAGE_BATCH_BACKOFF_SECONDS) - 1)]
@@ -475,10 +492,12 @@ def run_image_evidence(
     """Resolve image evidence through one validated, bounded transport boundary.
 
     Supplier artifacts remain immutable provenance. Every uncached image is first
-    content-validated and canonicalized into a temporary JPEG. Media preparation
-    failures are isolated per image and never spend a model call. Valid batches keep
-    the existing retry/split policy; account/config/provider failures still fail
-    closed. Text evidence lets a run continue when some or all images are unusable.
+    content-validated and canonicalized into a temporary JPEG. Local media failures
+    and provider-side media inspection/rejection are isolated to the smallest image
+    unit. A rejected multi-image request is split into single-image requests exactly
+    once; rejected singles become warnings while valid siblings continue. Account,
+    authentication and non-media provider failures remain fail-closed. Text evidence
+    lets a run continue when some or all images are unusable.
     """
 
     if not 1 <= int(batch_size) <= 8:
@@ -598,8 +617,7 @@ def run_image_evidence(
             for run in initial_runs
             if run.warning
             and run.error is not None
-            and _is_wall_clock_timeout(run.error)
-            and len(run.images) > 1
+            and _should_split_failed_batch(run.error, len(run.images))
         ]
         final_failures.extend(
             run
@@ -636,12 +654,15 @@ def run_image_evidence(
     warnings = tuple(preparation_warnings) + tuple(
         run.warning for run in final_failures if run.warning
     )
-    failed_images = tuple(preparation_failed_images) + tuple(
-        source.source_id
-        for run in final_failures
-        for source in run.images
-        if source.source_id not in observations
-    )
+    failed_images = tuple(dict.fromkeys(
+        [*preparation_failed_images]
+        + [
+            source.source_id
+            for run in final_failures
+            for source in run.images
+            if source.source_id not in observations
+        ]
+    ))
 
     if images and not ordered and warnings and not text_evidence_available:
         raise ImageEvidenceError(
