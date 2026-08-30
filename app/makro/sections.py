@@ -65,6 +65,7 @@ _FIND_SECTIONS_SCRIPT = (
     + "\n}"
 )
 
+
 def find_sections(page: Page) -> list[dict[str, Any]]:
     """List all listing section cards with title and expanded state."""
     return page.evaluate(_FIND_SECTIONS_SCRIPT)
@@ -73,12 +74,6 @@ def find_sections(page: Page) -> list[dict[str, Any]]:
 def _await_section_cards(
     page: Page, *, wait_ms: int = 500, timeout_s: float = 30.0
 ) -> list[dict[str, Any]]:
-    """Poll until at least one Step 3 section card is rendered.
-
-    The section cards and their attribute fields load asynchronously after the
-    listing draft / vertical attribute schema is ready. Scanning before that
-    would find zero fields, so wait for the first card to appear.
-    """
     sections = find_sections(page)
     deadline = time.monotonic() + timeout_s
     while not sections and time.monotonic() < deadline:
@@ -123,6 +118,13 @@ def scan_section_fields(
     return [item for item in merged if item.get("path", "").startswith(prefix)]
 
 
+def _page_is_closed(page: Page) -> bool:
+    try:
+        return bool(page.is_closed())
+    except Exception:
+        return True
+
+
 def scan_sections(
     page: Page,
     *,
@@ -130,11 +132,13 @@ def scan_sections(
     wait_ms: int = 350,
     max_scroll_steps: int = 200,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    """Expand every listing section that has EDIT, scan it, then discard scan-only state.
+    """Scan each Step 3 card as an independent read-only transaction.
 
-    This function is intentionally read-only from the caller's perspective: a
-    section opened only for discovery is Cancelled immediately afterwards. Real
-    fill/persist workflows use :func:`save_section` explicitly instead.
+    A card-local render/EDIT/scan/cleanup failure is returned in ``section_failures``
+    so the caller can apply the business minimum (core card vs optional card).
+    Browser/page loss is never downgraded. This keeps discovery mechanical and
+    prevents one optional React card from erasing a valid schema from unrelated
+    cards while preserving fail-closed ownership semantics.
     """
 
     sections = _await_section_cards(page)
@@ -142,65 +146,92 @@ def scan_sections(
         "sections_found": len(sections),
         "sections_expanded_by_scan": 0,
         "sections_cancelled": 0,
+        "section_failures": [],
     }
     section_results: list[dict[str, Any]] = []
     flat_scans: list[list[dict[str, Any]]] = []
 
     for section in sections:
-        title = section.get("title", "")
-        current_section = find_section(page, title) or section
-        section_path = current_section.get("path")
-        if not section_path:
-            continue
+        title = str(section.get("title") or "")
+        was_collapsed = False
+        opened_by_scan = False
+        try:
+            current_section = find_section(page, title) or section
+            section_path = str(current_section.get("path") or "")
+            if not section_path:
+                raise RuntimeError("section has no stable DOM path")
 
-        was_collapsed = bool(current_section.get("has_edit"))
-        expanded = not was_collapsed
-        if was_collapsed:
-            open_section_for_edit(page, current_section)
-            stats["sections_expanded_by_scan"] += 1
-            expanded = True
+            was_collapsed = bool(current_section.get("has_edit"))
+            expanded = not was_collapsed
+            if was_collapsed:
+                open_section_for_edit(page, current_section)
+                opened_by_scan = True
+                stats["sections_expanded_by_scan"] += 1
+                expanded = True
 
-        # Expanding a card can make React replace it with a newly rendered
-        # node. Reacquire the card by its stable title instead of continuing
-        # with the collapsed card's now-stale structural path.
-        ready_section = _wait_for_section_fields(
-            page, title, wait_ms=wait_ms, timeout_s=10.0
-        )
-        current_section = ready_section or find_section(page, title) or current_section
-        section_path = current_section.get("path")
-        if not section_path:
-            continue
+            ready_section = _wait_for_section_fields(
+                page, title, wait_ms=wait_ms, timeout_s=10.0
+            )
+            current_section = ready_section or find_section(page, title) or current_section
+            section_path = str(current_section.get("path") or "")
+            if not section_path:
+                raise RuntimeError("expanded section lost its stable DOM path")
+            if ready_section is None and bool(current_section.get("has_fields")) is False:
+                raise RuntimeError("section fields did not become ready within the render window")
 
-        controls = scan_section_fields(
-            page,
-            section_path,
-            include_values=include_values,
-            wait_ms=wait_ms,
-            max_scroll_steps=max_scroll_steps,
-        )
-        for item in controls:
-            if not item.get("section_heading"):
-                item["section_heading"] = title
+            controls = scan_section_fields(
+                page,
+                section_path,
+                include_values=include_values,
+                wait_ms=wait_ms,
+                max_scroll_steps=max_scroll_steps,
+            )
+            for item in controls:
+                if not item.get("section_heading"):
+                    item["section_heading"] = title
 
-        semantic_fields = build_semantic_fields(controls)
-        section_results.append(
-            {
-                "title": title,
-                "expanded": expanded,
-                "image_count": section.get("image_count"),
-                "field_count": sum(
-                    1 for item in controls if item.get("field_kind") != "option"
-                ),
-                "semantic_field_count": len(semantic_fields),
-                "semantic_fields": semantic_fields,
-                "controls": controls,
-            }
-        )
-        flat_scans.append(controls)
-
-        if was_collapsed:
-            cancel_section(page, title, wait_ms=wait_ms)
-            stats["sections_cancelled"] += 1
+            semantic_fields = build_semantic_fields(controls)
+            section_results.append(
+                {
+                    "title": title,
+                    "expanded": expanded,
+                    "image_count": section.get("image_count"),
+                    "field_count": sum(
+                        1 for item in controls if item.get("field_kind") != "option"
+                    ),
+                    "semantic_field_count": len(semantic_fields),
+                    "semantic_fields": semantic_fields,
+                    "controls": controls,
+                }
+            )
+            flat_scans.append(controls)
+        except Exception as exc:
+            if _page_is_closed(page):
+                raise
+            stats["section_failures"].append(
+                {
+                    "section": title,
+                    "stage": "scan",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+        finally:
+            if opened_by_scan and not _page_is_closed(page):
+                try:
+                    current = find_section(page, title)
+                    if current is not None and not current.get("has_edit"):
+                        cancel_section(page, title, wait_ms=wait_ms)
+                        stats["sections_cancelled"] += 1
+                except Exception as cleanup_exc:
+                    stats["section_failures"].append(
+                        {
+                            "section": title,
+                            "stage": "cleanup",
+                            "error_type": type(cleanup_exc).__name__,
+                            "error": str(cleanup_exc),
+                        }
+                    )
 
     flat_controls = merge_scans(flat_scans)
     return section_results, flat_controls, stats
@@ -209,14 +240,6 @@ def scan_sections(
 def _wait_for_section_fields(
     page: Page, section_title: str, *, wait_ms: int, timeout_s: float
 ) -> dict[str, Any] | None:
-    """Return the current section node once its actual fields have rendered.
-
-    Makro exposes the Cancel/Save actions before its asynchronous attribute
-    form has finished rendering.  Treating Cancel as readiness races the form
-    load and can produce an empty live schema immediately after Step 2. React
-    may also replace the card while expanding it, so every poll resolves the
-    card again by its stable title rather than retaining a structural DOM path.
-    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         section = find_section(page, section_title)
@@ -227,8 +250,6 @@ def _wait_for_section_fields(
 
 
 def base_section_title(title: str) -> str:
-    """Return a stable Makro section identity, ignoring UI-only suffixes."""
-
     normalized = re.sub(r"\s*\(\d+\s*/\s*\d+\)\s*$", "", title).strip()
     normalized = re.sub(
         r"\s*\(\s*optional\s*\)\s*$", "", normalized, flags=re.IGNORECASE
@@ -237,8 +258,6 @@ def base_section_title(title: str) -> str:
 
 
 def find_section(page: Page, wanted: str) -> dict[str, Any] | None:
-    """Return the section card whose normalized title equals ``wanted``."""
-
     wanted_base = base_section_title(wanted).casefold()
     for section in find_sections(page):
         if base_section_title(str(section.get("title") or "")).casefold() == wanted_base:
@@ -254,8 +273,6 @@ def _wait_for_section_state(
     timeout_s: float = 5.0,
     poll_ms: int = 150,
 ) -> dict[str, Any] | None:
-    """Reacquire a React-owned card until its business postcondition is true."""
-
     deadline = time.monotonic() + max(0.1, float(timeout_s))
     latest: dict[str, Any] | None = None
     while time.monotonic() < deadline:
@@ -270,8 +287,6 @@ def _wait_for_section_state(
 
 
 def open_section_for_edit(page: Page, section: dict[str, Any]) -> None:
-    """Trigger EDIT and prove the exact card entered its expanded state."""
-
     if not section.get("has_edit"):
         return
     title = str(section.get("title") or "").strip()
@@ -296,8 +311,6 @@ def open_section_for_edit(page: Page, section: dict[str, Any]) -> None:
 
 
 def visible_section_errors(page: Page, section_path: str) -> list[str]:
-    """Return visible Makro validation messages inside one expanded card."""
-
     card = page.locator(section_path)
     texts: list[str] = []
     selectors = ".form-error, [role='alert'], [class*='FormError'], [class*='error' i]"
@@ -312,8 +325,6 @@ def visible_section_errors(page: Page, section_path: str) -> list[str]:
 
 
 def collapsed_error_badges(page: Page, section_title: str) -> list[str]:
-    """Read a collapsed-card validation summary such as ``1 Error``."""
-
     section = find_section(page, section_title)
     if section is None or not section.get("path"):
         return []
@@ -325,8 +336,6 @@ def collapsed_error_badges(page: Page, section_title: str) -> list[str]:
 
 
 def cancel_section(page: Page, section_title: str, *, wait_ms: int = 450) -> None:
-    """Trigger Cancel and prove the target card returned to collapsed state."""
-
     section = find_section(page, section_title)
     if section is None:
         raise RuntimeError(f"Cancel 前找不到 section：{section_title}")
@@ -355,16 +364,7 @@ def cancel_section(page: Page, section_title: str, *, wait_ms: int = 450) -> Non
 
 
 def save_section(page: Page, section_title: str, *, timeout_s: float = 45.0) -> None:
-    """Trigger one Step 3 Save and prove Makro accepted persistence.
-
-    Playwright's click completion is not the persistence truth: a browser can
-    dispatch the Save and then time out waiting for navigation/settling.  Such a
-    timeout is reconciled against the same business postcondition as a normal
-    click.  Success requires the card to collapse back to ``EDIT`` with no
-    validation badge; genuine click errors still propagate immediately.
-
-    This function never clicks Send to QC.
-    """
+    """Trigger one Step 3 Save and prove Makro accepted persistence."""
 
     section = find_section(page, section_title)
     if section is None:
