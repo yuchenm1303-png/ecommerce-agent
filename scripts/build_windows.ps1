@@ -8,36 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-function Remove-BlankVelopackEnvironment {
-    # Velopack 1.2.0 binds every VPK_* variable through .NET Configuration before
-    # command execution. GitHub Actions materializes missing secrets as empty job
-    # environment variables, and typed options (for example FileInfo) cannot bind
-    # an empty string. Normalize the actual PowerShell Env: provider that child
-    # processes inherit, rather than mutating only selected names through the
-    # System.Environment API. This also protects future typed VPK_* options.
-    $BlankNames = @(
-        Get-ChildItem Env: | Where-Object {
-            $_.Name -like "VPK_*" -and [string]::IsNullOrWhiteSpace([string]$_.Value)
-        } | ForEach-Object { $_.Name }
-    )
-    foreach ($Name in $BlankNames) {
-        Remove-Item -LiteralPath "Env:$Name" -ErrorAction Stop
-    }
-
-    $RemainingBlank = @(
-        Get-ChildItem Env: | Where-Object {
-            $_.Name -like "VPK_*" -and [string]::IsNullOrWhiteSpace([string]$_.Value)
-        }
-    )
-    if ($RemainingBlank.Count -ne 0) {
-        throw "Unable to remove blank Velopack environment variables: $($RemainingBlank.Name -join ', ')"
-    }
-    if ($BlankNames.Count -gt 0) {
-        Write-Host "Ignoring blank Velopack environment variables: $($BlankNames -join ', ')"
-    }
-}
-
-Remove-BlankVelopackEnvironment
+. (Join-Path $PSScriptRoot "velopack_cli.ps1")
 
 function Get-SingleVelopackArtifact {
     param(
@@ -158,17 +129,18 @@ New-Item -ItemType Directory -Force -Path $DistRoot, $WorkDir, $ArtifactDir, $Ve
 Write-Host "[1/6] Restoring pinned Velopack CLI"
 & dotnet tool restore
 if ($LASTEXITCODE -ne 0) { throw "dotnet tool restore failed: $LASTEXITCODE" }
-& dotnet tool run vpk -- --help *> $null
-if ($LASTEXITCODE -ne 0) { throw "Pinned Velopack CLI failed to start: $LASTEXITCODE" }
+$VpkExitCode = Invoke-RepositoryVelopack -Arguments @("--help")
+if ($VpkExitCode -ne 0) { throw "Pinned Velopack CLI failed to start: $VpkExitCode" }
 
 Write-Host "[2/6] Hydrating previous Stable release for delta generation"
-& dotnet tool run vpk -- download github `
-    --repoUrl "https://github.com/yuchenm1303-png/ecommerce-agent" `
-    --channel $Channel `
-    --outputDir $VelopackDir `
-    --timeout 10
-$PreviousReleaseDownloaded = ($LASTEXITCODE -eq 0)
-$global:LASTEXITCODE = 0
+$PreviousReleaseExitCode = Invoke-RepositoryVelopack -Arguments @(
+    "download", "github",
+    "--repoUrl", "https://github.com/yuchenm1303-png/ecommerce-agent",
+    "--channel", $Channel,
+    "--outputDir", $VelopackDir,
+    "--timeout", "10"
+)
+$PreviousReleaseDownloaded = ($PreviousReleaseExitCode -eq 0)
 if (-not $PreviousReleaseDownloaded) {
     if ($IsStablePublication) {
         throw "Stable publication requires the previous public Velopack release so a delta update can be generated."
@@ -288,8 +260,8 @@ if (-not [string]::IsNullOrWhiteSpace($ReleaseNotesPath)) {
     $resolvedNotes = (Resolve-Path $ReleaseNotesPath).Path
     $PackArgs += @("--releaseNotes", $resolvedNotes)
 }
-& dotnet tool run vpk -- @PackArgs
-if ($LASTEXITCODE -ne 0) { throw "Velopack pack failed: $LASTEXITCODE" }
+$VpkExitCode = Invoke-RepositoryVelopack -Arguments $PackArgs
+if ($VpkExitCode -ne 0) { throw "Velopack pack failed: $VpkExitCode" }
 
 # Native artifact names are a Velopack implementation detail and may include
 # channel/runtime qualifiers. Setup/portable are discovered from the clean output
