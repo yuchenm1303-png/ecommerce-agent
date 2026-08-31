@@ -27,12 +27,7 @@ _FALSE_VALUES = {"0", "false", "no", "n", "否", "无", "unchecked", "off"}
 
 @dataclass(slots=True, frozen=True)
 class FieldExecutionContract:
-    """Pure mechanical execution contract derived from the current live field.
-
-    Harvested registry metadata can be attached to a semantic field as
-    ``execution_family``/``schema_execution_family``, but it never overrides the
-    current DOM. The DOM decides which adapter may actually write the control.
-    """
+    """Pure mechanical execution contract derived from the current live field."""
 
     live_family: str
     schema_family: str
@@ -91,7 +86,10 @@ def _value_controls(semantic_field: dict[str, Any]) -> list[dict[str, Any]]:
     return output
 
 
-def _primary_control(semantic_field: dict[str, Any], controls: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _primary_control(
+    semantic_field: dict[str, Any],
+    controls: list[dict[str, Any]],
+) -> dict[str, Any] | None:
     key = str(semantic_field.get("attribute_key") or "")
     for control in controls:
         if key and str(control.get("id") or "") == key:
@@ -99,7 +97,10 @@ def _primary_control(semantic_field: dict[str, Any], controls: list[dict[str, An
     return controls[0] if controls else None
 
 
-def _live_base_family(control: dict[str, Any] | None, controls: list[dict[str, Any]]) -> str:
+def _live_base_family(
+    control: dict[str, Any] | None,
+    controls: list[dict[str, Any]],
+) -> str:
     if not control:
         return "unsupported"
     if is_radio_group(controls):
@@ -118,15 +119,15 @@ def _live_base_family(control: dict[str, Any] | None, controls: list[dict[str, A
     return "unsupported"
 
 
-def execution_contract(semantic_field: dict[str, Any], answer: Any | None = None) -> FieldExecutionContract:
+def execution_contract(
+    semantic_field: dict[str, Any],
+    answer: Any | None = None,
+) -> FieldExecutionContract:
     controls = _value_controls(semantic_field)
     primary = _primary_control(semantic_field, controls)
     base = _live_base_family(primary, controls)
     values = list(getattr(answer, "answer_values", None) or []) if answer is not None else []
     multi = bool(semantic_field.get("multi_value")) or len(values) > 1
-    # Qualification is a property of the live DOM, not of answer metadata.
-    # A fixed rendered suffix such as CM/KG has no qualifier control and remains
-    # a plain numeric field; unit compatibility is checked at the mutation boundary.
     qualifier = bool(qualifier_controls(semantic_field))
     suffixes: list[str] = []
     if multi:
@@ -152,7 +153,11 @@ def execution_contract(semantic_field: dict[str, Any], answer: Any | None = None
     )
 
 
-def _single_locator(page: Any, control: dict[str, Any], section_path: str | None) -> tuple[Any, str]:
+def _single_locator(
+    page: Any,
+    control: dict[str, Any],
+    section_path: str | None,
+) -> tuple[Any, str]:
     selector = scoped_selector_for_control(section_path, control)
     all_locator = page.locator(selector)
     count = all_locator.count()
@@ -204,14 +209,7 @@ def _boolean_target(value: object) -> bool:
 
 
 def _commit_value(locator: Any, *, dispatch_value_events: bool) -> None:
-    """Finish one live-control mutation using the browser event contract.
-
-    Playwright ``fill`` changes the DOM value and emits ``input``, but Makro's
-    controlled React fields do not all commit their model state on the same
-    event.  Every editable value therefore finishes with deterministic
-    input/change/blur semantics before any readback or repeatable-slot action.
-    This is mechanical DOM behaviour only; it contains no field-specific rules.
-    """
+    """Finish one live-control mutation using Makro's browser event contract."""
 
     if dispatch_value_events:
         dispatch = getattr(locator, "dispatch_event", None)
@@ -248,14 +246,6 @@ def _matched_option(control: dict[str, Any], value: object) -> dict[str, Any] | 
 
 
 def _native_select_options(locator: Any) -> list[dict[str, Any]]:
-    """Read the actual native select domain at the final mutation boundary.
-
-    Earlier semantic scans are intentionally not trusted here: Makro's React form
-    can rebuild dependent option sets after another field changes. A native select
-    write is therefore authorized only by the options owned by the current DOM
-    node immediately before ``select_option``.
-    """
-
     raw = locator.evaluate(
         "el => Array.from(el.options || []).map(opt => ({"
         "text: String(opt.textContent || '').replace(/\\s+/g, ' ').trim(),"
@@ -265,6 +255,61 @@ def _native_select_options(locator: Any) -> list[dict[str, Any]]:
     )
     if not isinstance(raw, list):
         raise RuntimeError("当前 native select 无法返回 live option domain；拒绝写入。")
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _custom_live_options(
+    page: Any,
+    fallback: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Read the currently visible popup domain after opening a custom select.
+
+    Makro rebuilds dependent dropdowns when a qualifier changes. Scan-time option
+    metadata can therefore be stale even after the control itself has been rebound.
+    The final mutation boundary must authorize the value against the popup that is
+    actually visible now, exactly as native ``select`` already does.
+    """
+
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return [dict(item) for item in (fallback or [])]
+    raw = evaluate(
+        r"""() => {
+          const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+          const visible = el => {
+            if (!el) return false;
+            if (el.closest && el.closest('[hidden], [aria-hidden="true"]')) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden'
+              && rect.width > 0 && rect.height > 0;
+          };
+          const out = [];
+          const seen = new Set();
+          document.querySelectorAll(
+            "[role='option'], li[data-value], li[data-testid*='option' i], [class*='option' i]"
+          ).forEach(el => {
+            if (!visible(el)) return;
+            const text = clean(el.innerText || el.textContent);
+            const value = clean(el.getAttribute('data-value'))
+              || clean(el.getAttribute('value'))
+              || clean(el.getAttribute('data-key'));
+            if (!text && !value) return;
+            const key = `${text}\u0000${value}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+            out.push({
+              text,
+              value,
+              disabled: el.getAttribute('aria-disabled') === 'true'
+                || Boolean(el.disabled),
+            });
+          });
+          return out;
+        }"""
+    )
+    if not isinstance(raw, list):
+        raise RuntimeError("当前 custom select 无法返回 live option domain；拒绝写入。")
     return [item for item in raw if isinstance(item, dict)]
 
 
@@ -283,7 +328,12 @@ def _click_unique_visible_text(page: Any, text: str) -> None:
     visible[0].click()
 
 
-def fill_control(page: Any, control: dict[str, Any], value: str, section_path: str | None = None) -> str:
+def fill_control(
+    page: Any,
+    control: dict[str, Any],
+    value: str,
+    section_path: str | None = None,
+) -> str:
     locator, selector = _single_locator(page, control, section_path)
     _ensure_writable(locator, control, selector)
     locator.wait_for(state="visible")
@@ -328,9 +378,18 @@ def fill_control(page: Any, control: dict[str, Any], value: str, section_path: s
         return selector
 
     if kind in _SELECT_KINDS:
-        matched = _matched_option(control, value)
-        target_text = str((matched or {}).get("text") or value).strip()
         locator.click()
+        live_control = dict(control)
+        live_control["options"] = _custom_live_options(
+            page,
+            fallback=list(control.get("options") or []),
+        )
+        matched = _matched_option(live_control, value)
+        if matched is None:
+            raise ValueError("当前 custom select 没有 enabled live options；拒绝写入。")
+        target_text = str(matched.get("text") or matched.get("value") or "").strip()
+        if not target_text:
+            raise ValueError(f"live option {matched!r} 没有可点击 text/value。")
         _click_unique_visible_text(page, target_text)
         _commit_value(locator, dispatch_value_events=False)
         return selector
@@ -489,20 +548,28 @@ def read_radio_group(
             raw_value = locator.get_attribute("value")
         except Exception:
             raw_value = None
-        selected.append(str(raw_value or control.get("value") or control.get("label") or "true").strip())
+        selected.append(
+            str(raw_value or control.get("value") or control.get("label") or "true").strip()
+        )
     if len(selected) != 1:
         raise RuntimeError(f"radio group 当前选中数量={len(selected)}，期望恰好 1 个。")
     return selected[0]
 
 
 def radio_group_values_equivalent(
-    controls: list[dict[str, Any]], expected: object, actual: object
+    controls: list[dict[str, Any]],
+    expected: object,
+    actual: object,
 ) -> bool:
     if _norm(expected) == _norm(actual):
         return True
     expected_key = _norm(expected)
     actual_key = _norm(actual)
-    return any(expected_key in _radio_aliases(control) and actual_key in _radio_aliases(control) for control in controls)
+    return any(
+        expected_key in _radio_aliases(control)
+        and actual_key in _radio_aliases(control)
+        for control in controls
+    )
 
 
 __all__ = [
