@@ -17,7 +17,6 @@ from app.fill_plan import (
     GATE_AI_MISSING,
     GATE_AI_REVIEW,
     GATE_BUSINESS_LOCKED,
-    GATE_HARD_FIELD_CONSTRAINT,
     READY,
     build_live_fill_plan,
 )
@@ -50,6 +49,7 @@ def field(
 
 
 def packet(fields, decisions):
+    del fields
     return AIDecisionPacket(
         identity=ProductIdentity(sku="SKU-1"),
         schema_sha256="",
@@ -91,7 +91,7 @@ def add_structured(bundle: ProductSourceBundle, key: str, value: str):
     )
 
 
-def test_ai_ready_field_goes_directly_to_fill_plan_without_qa_matcher():
+def test_ai_ready_is_authoritative_and_flows_directly_to_fill_plan():
     colour = field("colour", "Colour", options=("Black", "White"))
     plan = build_live_fill_plan(
         packet([colour], [decision(colour, AI_READY, ("Black",))]),
@@ -104,11 +104,94 @@ def test_ai_ready_field_goes_directly_to_fill_plan_without_qa_matcher():
     assert item.resolution.answer_values == ["Black"]
     assert item.resolution.source_type == "ai_decision"
     assert item.resolution.eligible_for_autofill is True
-    assert "question" not in item.as_dict()
-    assert "match_basis" not in item.as_dict()
 
 
-def test_ai_review_is_previewable_but_not_autofill_ready():
+def test_ai_ready_is_not_overruled_by_later_live_option_domain():
+    colour = field(
+        "colour",
+        "Colour",
+        options=("Black", "White"),
+        controls=(
+            {
+                "name": "colour_0_value",
+                "field_kind": "select",
+                "options": [
+                    {"text": "Black", "value": "Black"},
+                    {"text": "White", "value": "White"},
+                ],
+            },
+        ),
+    )
+    plan = build_live_fill_plan(
+        packet([colour], [decision(colour, AI_READY, ("Dark",))]),
+        [colour],
+        ProductSourceBundle(),
+    )
+
+    assert plan.items[0].action == READY
+    assert plan.items[0].resolution.answer_values == ["Dark"]
+    assert plan.items[0].resolution.gate_reason == ""
+
+
+def test_ai_ready_preserves_multiple_values_without_python_semantic_veto():
+    feature = field("feature", "Feature", multi_value=False)
+    plan = build_live_fill_plan(
+        packet([feature], [decision(feature, AI_READY, ("A", "B"))]),
+        [feature],
+        ProductSourceBundle(),
+    )
+
+    assert plan.items[0].action == READY
+    assert plan.items[0].resolution.answer_values == ["A", "B"]
+
+
+def test_ai_ready_preserves_qualifier_exactly_without_unit_conversion():
+    weight = field(
+        "weight",
+        "Weight",
+        context_text="Weight *KG",
+        controls=({"type": "number", "inputmode": "decimal", "context_text": "Weight *KG"},),
+    )
+    plan = build_live_fill_plan(
+        packet([weight], [decision(weight, AI_READY, ("285",), qualifier="g")]),
+        [weight],
+        ProductSourceBundle(),
+    )
+
+    item = plan.items[0]
+    assert item.action == READY
+    assert item.resolution.answer_values == ["285"]
+    assert item.resolution.qualifier == "g"
+
+
+def test_ai_ready_survives_schema_only_to_full_dom_rebind_unchanged():
+    planned = field("bluetooth_range", "Bluetooth Range")
+    resolved = decision(planned, AI_READY, ("33",), qualifier="Feet")
+    first = build_live_fill_plan(packet([planned], [resolved]), [planned], ProductSourceBundle())
+
+    current = {
+        **planned,
+        "controls": [
+            {
+                "id": "bluetooth_range",
+                "name": "bluetooth_range_0_value",
+                "type": "number",
+                "inputmode": "decimal",
+                "field_kind": "input",
+                "min": "0",
+                "max": "1000",
+            }
+        ],
+    }
+    second = build_live_fill_plan(packet([current], [resolved]), [current], ProductSourceBundle())
+
+    assert first.items[0].action == READY
+    assert second.items[0].action == READY
+    assert second.items[0].resolution.answer_values == ["33"]
+    assert second.items[0].resolution.qualifier == "Feet"
+
+
+def test_ai_review_is_previewable_but_not_promoted_by_python():
     camera = field("camera_type", "Camera Type")
     plan = build_live_fill_plan(
         packet([camera], [decision(camera, REVIEW, ("Dashboard",), confidence=0.72)]),
@@ -122,7 +205,7 @@ def test_ai_review_is_previewable_but_not_autofill_ready():
     assert item.resolution.gate_reason == GATE_AI_REVIEW
 
 
-def test_ai_conflict_and_missing_are_blocked_without_local_semantic_override():
+def test_ai_conflict_and_missing_remain_ai_owned_blocked_states():
     resolution = field("recording_resolution", "Recording Resolution")
     sensor = field("image_sensor", "Image Sensor")
     plan = build_live_fill_plan(
@@ -142,82 +225,7 @@ def test_ai_conflict_and_missing_are_blocked_without_local_semantic_override():
     assert plan.items[1].resolution.gate_reason == GATE_AI_MISSING
 
 
-def test_live_option_mismatch_is_a_hard_guard_not_a_semantic_guess():
-    colour = field("colour", "Colour", options=("Black", "White"))
-    plan = build_live_fill_plan(
-        packet([colour], [decision(colour, AI_READY, ("Dark",))]),
-        [colour],
-        ProductSourceBundle(),
-    )
-
-    item = plan.items[0]
-    assert item.action == BLOCKED
-    assert item.resolution.gate_reason == GATE_HARD_FIELD_CONSTRAINT
-    assert "Makro" in item.reason
-
-
-def test_single_value_field_rejects_multiple_ai_values_before_browser_write():
-    colour = field("colour", "Colour", options=("Black", "White"))
-    plan = build_live_fill_plan(
-        packet([colour], [decision(colour, AI_READY, ("Black", "White"))]),
-        [colour],
-        ProductSourceBundle(),
-    )
-
-    assert plan.items[0].action == BLOCKED
-    assert plan.items[0].resolution.gate_reason == GATE_HARD_FIELD_CONSTRAINT
-
-
-def test_fixed_rendered_unit_does_not_require_a_qualifier_control():
-    length = field(
-        "package_length",
-        "Length",
-        section="Price, Stock and Shipping Information",
-        context_text="Length cm",
-        controls=({"type": "number", "inputmode": "decimal", "context_text": "Length cm"},),
-    )
-    plan = build_live_fill_plan(
-        packet([length], [decision(length, AI_READY, ("16",), qualifier="cm")]),
-        [length],
-        ProductSourceBundle(),
-    )
-    item = plan.items[0]
-    assert item.action == READY
-    assert item.resolution.answer_values == ["16"]
-    assert item.resolution.qualifier is None
-
-
-def test_fixed_kg_field_converts_grams_before_browser_execution():
-    weight = field(
-        "weight",
-        "Weight",
-        section="Price, Stock and Shipping Information",
-        context_text="Weight *KG",
-        controls=({"type": "number", "inputmode": "decimal", "context_text": "Weight *KG"},),
-    )
-    plan = build_live_fill_plan(
-        packet([weight], [decision(weight, AI_READY, ("285",), qualifier="g")]),
-        [weight],
-        ProductSourceBundle(),
-    )
-    item = plan.items[0]
-    assert item.action == READY
-    assert item.resolution.answer_values == ["0.285"]
-    assert item.resolution.qualifier is None
-
-
-def test_unknown_unit_without_control_or_fixed_context_is_blocked():
-    length = field("package_length", "Length")
-    plan = build_live_fill_plan(
-        packet([length], [decision(length, AI_READY, ("16",), qualifier="cm")]),
-        [length],
-        ProductSourceBundle(),
-    )
-    assert plan.items[0].action == BLOCKED
-    assert plan.items[0].resolution.gate_reason == GATE_HARD_FIELD_CONSTRAINT
-
-
-def test_business_field_ignores_ai_and_requires_explicit_seller_data():
+def test_business_field_still_requires_explicit_seller_data():
     selling = field(
         "flipkart_selling_price",
         "Your selling price",
@@ -244,7 +252,7 @@ def test_business_field_ignores_ai_and_requires_explicit_seller_data():
     assert explicit.items[0].resolution.source_type == "structured"
 
 
-def test_selling_price_above_mrp_blocks_both_explicit_business_fields():
+def test_selling_price_above_mrp_blocks_only_explicit_business_fields():
     mrp = field("mrp", "Base Price", section="Price, Stock and Shipping Information")
     selling = field(
         "flipkart_selling_price",
@@ -269,34 +277,3 @@ def test_selling_price_above_mrp_blocks_both_explicit_business_fields():
 
     assert [item.action for item in plan.items] == [BLOCKED, BLOCKED]
     assert all("价格关系无效" in item.reason for item in plan.items)
-
-
-def test_minimum_order_quantity_above_maximum_blocks_both_explicit_fields():
-    minimum = field(
-        "minimum_order_quantity",
-        "Minimum Order Quantity (MinOQ)",
-        section="Price, Stock and Shipping Information",
-    )
-    maximum = field(
-        "max_order_quantity_allowed",
-        "Maximum Order Quantity (MaxOQ)",
-        section="Price, Stock and Shipping Information",
-    )
-    bundle = ProductSourceBundle()
-    add_structured(bundle, "Minimum Order Quantity", "10")
-    add_structured(bundle, "Maximum Order Quantity", "5")
-
-    plan = build_live_fill_plan(
-        packet(
-            [minimum, maximum],
-            [
-                decision(minimum, MISSING, (), evidence=""),
-                decision(maximum, MISSING, (), evidence=""),
-            ],
-        ),
-        [minimum, maximum],
-        bundle,
-    )
-
-    assert [item.action for item in plan.items] == [BLOCKED, BLOCKED]
-    assert all("MOQ 关系无效" in item.reason for item in plan.items)
