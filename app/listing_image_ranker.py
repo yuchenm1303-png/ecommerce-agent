@@ -15,6 +15,7 @@ from .source_snapshot import SourceSnapshot, source_snapshot_from_json
 
 LISTING_IMAGE_RANKING_VERSION = 6
 MAX_AUTO_LISTING_IMAGES = 5
+OWNERSHIP_BATCH_SIZE = 6
 
 _IMAGE_OWNERSHIP_CLASSES = (
     "EXACT_TARGET",
@@ -115,6 +116,7 @@ class ListingImageRankingResult:
 class _ParsedOwnership:
     decisions: dict[str, ImageOwnershipDecision]
     summary: str
+    model_calls: int = 1
 
     @property
     def eligible_ids(self) -> tuple[str, ...]:
@@ -438,13 +440,68 @@ def _run_ownership_request(
     request: dict[str, Any],
     candidates: list[_Candidate],
 ) -> _ParsedOwnership:
-    with usage_request_context(
-        task=str(request.get("task") or ""),
-        provider=str(getattr(provider, "name", "")),
-        model=str(getattr(provider, "model", "")),
-    ):
-        raw = provider.extract_json(request)
-    return _parse_ownership(raw, candidates)
+    """Execute Ownership in bounded image batches and merge only exact partitions.
+
+    The semantic contract is identical for every batch. Batching is only a transport
+    boundary so large supplier candidate sets cannot monopolize one 120-second
+    multimodal request. If any batch fails, the exception propagates and the caller's
+    existing fail-closed path clears the automatic gallery.
+    """
+
+    if not candidates:
+        return _ParsedOwnership(decisions={}, summary="", model_calls=0)
+
+    parsed_batches: list[_ParsedOwnership] = []
+    attempted_calls = 0
+    for start in range(0, len(candidates), OWNERSHIP_BATCH_SIZE):
+        batch = candidates[start : start + OWNERSHIP_BATCH_SIZE]
+        batch_ids = [candidate.image_id for candidate in batch]
+        batch_request = dict(request)
+        context = dict(request.get("context") or {})
+        context["candidate_image_ids"] = batch_ids
+        batch_request["context"] = context
+        batch_request["grounded_sources"] = [candidate.as_source() for candidate in batch]
+        batch_request["json_contract"] = _ownership_schema(batch_ids)
+
+        attempted_calls += 1
+        try:
+            with usage_request_context(
+                task=str(batch_request.get("task") or ""),
+                provider=str(getattr(provider, "name", "")),
+                model=str(getattr(provider, "model", "")),
+            ):
+                raw = provider.extract_json(batch_request)
+            parsed_batches.append(_parse_ownership(raw, batch))
+        except Exception as exc:
+            try:
+                setattr(exc, "listing_image_ownership_model_calls", attempted_calls)
+            except Exception:
+                pass
+            raise
+
+    merged_decisions: dict[str, ImageOwnershipDecision] = {}
+    summaries: list[str] = []
+    for parsed in parsed_batches:
+        for image_id, decision in parsed.decisions.items():
+            if image_id in merged_decisions:
+                raise ListingImageRankingError(
+                    f"duplicate ownership decision across batches: {image_id}"
+                )
+            merged_decisions[image_id] = decision
+        if parsed.summary:
+            summaries.append(parsed.summary)
+
+    expected_ids = [candidate.image_id for candidate in candidates]
+    if set(merged_decisions) != set(expected_ids):
+        raise ListingImageRankingError(
+            "batched listing image ownership did not cover the exact candidate partition"
+        )
+
+    return _ParsedOwnership(
+        decisions={image_id: merged_decisions[image_id] for image_id in expected_ids},
+        summary=" | ".join(summaries),
+        model_calls=attempted_calls,
+    )
 
 
 def _ranking_schema(candidate_ids: list[str]) -> dict[str, Any]:
@@ -619,6 +676,7 @@ def _selection_report(
             "version": LISTING_IMAGE_RANKING_VERSION,
             "kind": "grounded-identity-two-stage-ai-listing-photo-selection",
             "max_auto_listing_images": MAX_AUTO_LISTING_IMAGES,
+            "ownership_batch_size": OWNERSHIP_BATCH_SIZE,
             "pre_ai_filter": "explicit-ownership-boundary-plus-decodable-image-and-exact-byte-duplicate-only",
             "target_identity_source": "product-focused-structured-supplier-evidence-without-page-body-or-candidate-images",
             "ownership_semantic_owner": "multimodal_ai",
@@ -823,6 +881,7 @@ def finalize_supplier_listing_images(
         )
         model_calls += 1
         ownership = _run_ownership_request(provider, ownership_request, candidates)
+        model_calls += max(0, ownership.model_calls - 1)
 
         eligible_set = set(ownership.eligible_ids)
         eligible_candidates = [
@@ -867,6 +926,10 @@ def finalize_supplier_listing_images(
             ranking=ranking,
         )
     except Exception as exc:
+        attempted_ownership_calls = int(
+            getattr(exc, "listing_image_ownership_model_calls", 1) or 1
+        )
+        model_calls += max(0, attempted_ownership_calls - 1)
         report = _selection_report(
             candidates=candidates,
             transport_rejected=transport_rejected,
@@ -906,6 +969,7 @@ def finalize_supplier_listing_images(
 __all__ = [
     "LISTING_IMAGE_RANKING_VERSION",
     "MAX_AUTO_LISTING_IMAGES",
+    "OWNERSHIP_BATCH_SIZE",
     "ImageOwnershipDecision",
     "ListingImageRankingError",
     "ListingImageRankingResult",
