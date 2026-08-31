@@ -12,15 +12,18 @@ class _FakeProvider:
     name = "fake-semantic"
     model = "fake-model"
 
-    def __init__(self, payload: dict[str, object]) -> None:
-        self.payload = payload
+    def __init__(self, responses: dict[str, dict[str, object]]) -> None:
+        self.responses = responses
         self.calls = 0
         self.requests: list[dict[str, object]] = []
 
     def extract_json(self, request_payload: dict[str, object]) -> dict[str, object]:
         self.calls += 1
         self.requests.append(request_payload)
-        return self.payload
+        task = str(request_payload.get("task") or "")
+        if task not in self.responses:
+            raise AssertionError(f"unexpected AI task: {task}")
+        return self.responses[task]
 
 
 def _write_image(path: Path, color: tuple[int, int, int]) -> Path:
@@ -37,7 +40,10 @@ def _write_snapshot(path: Path) -> None:
                 "final_url": "https://supplier.example/item/1",
                 "title": "Acme Cordless Drill 18V Black",
                 "captured_at": "2026-08-30T00:00:00Z",
-                "visible_text": "Acme Cordless Drill 18V Black with battery and charger",
+                "visible_text": (
+                    "Acme Cordless Drill 18V Black with battery and charger. "
+                    "Customers also viewed Corn Flakes Full Cream Milk Vaseline Lotion."
+                ),
                 "table_rows": [
                     {"key": "Brand", "value": "Acme", "table_index": 0, "row_index": 0},
                     {"key": "Voltage", "value": "18V", "table_index": 0, "row_index": 1},
@@ -81,10 +87,21 @@ def _write_manifest(run_dir: Path, images: list[Path], snapshot: Path) -> Path:
     return manifest
 
 
-def test_multimodal_ai_owns_relevance_and_final_upload_order(tmp_path: Path) -> None:
-    unrelated = _write_image(tmp_path / "01-unrelated.jpg", (230, 230, 230))
-    alternate = _write_image(tmp_path / "02-alternate.jpg", (180, 180, 180))
-    hero = _write_image(tmp_path / "03-hero.jpg", (250, 250, 250))
+def _identity_response() -> dict[str, object]:
+    return {
+        "entity_kind": "physical_product",
+        "product_type_en": "cordless drill",
+        "brand_identity": "Acme",
+        "product_summary": "Acme 18V black cordless drill with battery and charger",
+        "confidence": 0.98,
+        "evidence_refs": ["identity:page-title", "identity:attribute:0:0"],
+    }
+
+
+def test_ai_ownership_filters_unrelated_page_products_before_gallery_ranking(tmp_path: Path) -> None:
+    unrelated = _write_image(tmp_path / "01-corn-flakes.jpg", (230, 230, 230))
+    alternate = _write_image(tmp_path / "02-drill-side.jpg", (180, 180, 180))
+    hero = _write_image(tmp_path / "03-drill-hero.jpg", (250, 250, 250))
 
     snapshot = tmp_path / "source-snapshot.json"
     _write_snapshot(snapshot)
@@ -92,116 +109,128 @@ def test_multimodal_ai_owns_relevance_and_final_upload_order(tmp_path: Path) -> 
 
     provider = _FakeProvider(
         {
-            "selected_image_ids": ["image_03", "image_02"],
-            "decisions": {
-                "image_01": {
-                    "selected": False,
-                    "reason": "Different product and not useful for this listing.",
+            "infer_grounded_supplier_product_identity": _identity_response(),
+            "classify_supplier_listing_image_ownership": {
+                "decisions": {
+                    "image_01": {
+                        "classification": "OTHER_PRODUCT",
+                        "confidence": 0.99,
+                        "reason": "Corn flakes are a different sellable product.",
+                    },
+                    "image_02": {
+                        "classification": "EXACT_TARGET",
+                        "confidence": 0.97,
+                        "reason": "The image depicts the exact black cordless drill.",
+                    },
+                    "image_03": {
+                        "classification": "EXACT_TARGET",
+                        "confidence": 0.99,
+                        "reason": "The image depicts the exact black cordless drill and kit.",
+                    },
                 },
-                "image_02": {
-                    "selected": True,
-                    "reason": "Useful alternate view of the target product.",
-                },
-                "image_03": {
-                    "selected": True,
-                    "reason": "Strongest main image of the exact target product.",
-                },
+                "summary": "Only image_02 and image_03 belong to the target product.",
             },
-            "summary": "Use the clean hero first, then the alternate view.",
+            "verify_and_order_exact_supplier_gallery": {
+                "selected_image_ids": ["image_03", "image_02"],
+                "decisions": {
+                    "image_02": {
+                        "selected": True,
+                        "reason": "Useful alternate view of the exact target.",
+                    },
+                    "image_03": {
+                        "selected": True,
+                        "reason": "Strongest main image of the exact target.",
+                    },
+                },
+                "summary": "Use the hero first, then the alternate view.",
+            },
         }
     )
 
     result = finalize_supplier_listing_images(tmp_path, provider)
 
-    assert provider.calls == 1
+    assert provider.calls == 3
     assert result.status == "ai_ranked"
     assert result.selected == (hero, alternate)
+    assert result.model_calls == 3
+    assert [request["task"] for request in provider.requests] == [
+        "infer_grounded_supplier_product_identity",
+        "classify_supplier_listing_image_ownership",
+        "verify_and_order_exact_supplier_gallery",
+    ]
 
-    request = provider.requests[0]
-    assert request["task"] == "select_and_order_supplier_listing_images"
-    grounded_sources = request["grounded_sources"]
-    assert isinstance(grounded_sources, list)
-    assert [item["source_id"] for item in grounded_sources] == [
+    identity_sources = provider.requests[0]["grounded_sources"]
+    assert isinstance(identity_sources, list)
+    assert "Corn Flakes" not in json.dumps(identity_sources, ensure_ascii=False)
+
+    ownership_sources = provider.requests[1]["grounded_sources"]
+    assert isinstance(ownership_sources, list)
+    assert [item["source_id"] for item in ownership_sources] == [
         "image_01",
         "image_02",
         "image_03",
     ]
-    assert all(item["kind"] == "image" for item in grounded_sources)
-    assert [Path(item["image_path"]) for item in grounded_sources] == [
-        unrelated,
-        alternate,
-        hero,
-    ]
+
+    gallery_sources = provider.requests[2]["grounded_sources"]
+    assert isinstance(gallery_sources, list)
+    assert [item["source_id"] for item in gallery_sources] == ["image_02", "image_03"]
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["outputs"]["primary_source_listing_images"] == [
         str(hero),
         str(alternate),
     ]
-    assert manifest["listing_image_ranking"]["selected_ids"] == ["image_03", "image_02"]
     assert manifest["listing_image_ranking"]["strategy"] == (
-        "multimodal_ai_owns_semantics_duplicates_and_order"
+        "grounded_identity_then_ai_ownership_then_gallery_verification"
     )
-    assert manifest["total_model_calls"] == 5
+    assert manifest["listing_image_ranking"]["ownership_eligible_count"] == 2
+    assert manifest["total_model_calls"] == 7
 
     report = json.loads((tmp_path / "listing-image-selection.json").read_text(encoding="utf-8"))
-    assert report["policy"]["semantic_owner"] == "multimodal_ai"
-    assert report["policy"]["ordering"] == "selected_image_ids_verbatim"
+    assert report["policy"]["ownership_semantic_owner"] == "multimodal_ai"
+    assert report["policy"]["gallery_semantic_owner"] == "multimodal_ai"
+    assert report["policy"]["precision_policy"] == "fewer_correct_images_over_quota_fill"
     assert report["selected"] == [str(hero), str(alternate)]
+    assert report["candidates"][0]["ownership"]["classification"] == "OTHER_PRODUCT"
+    assert report["candidates"][0]["gallery"] is None
 
 
-def test_ranker_does_not_depend_on_upstream_image_observations(tmp_path: Path) -> None:
-    image = _write_image(tmp_path / "only.jpg", (240, 240, 240))
+def test_ownership_ai_may_reject_all_candidates_without_forcing_gallery_fill(tmp_path: Path) -> None:
+    unrelated = _write_image(tmp_path / "milk.jpg", (100, 150, 200))
     snapshot = tmp_path / "source-snapshot.json"
     _write_snapshot(snapshot)
-    manifest_path = _write_manifest(tmp_path, [image], snapshot)
+    manifest_path = _write_manifest(tmp_path, [unrelated], snapshot)
 
     provider = _FakeProvider(
         {
-            "selected_image_ids": ["image_01"],
-            "decisions": {
-                "image_01": {
-                    "selected": True,
-                    "reason": "The image directly shows the exact target product.",
-                }
+            "infer_grounded_supplier_product_identity": _identity_response(),
+            "classify_supplier_listing_image_ownership": {
+                "decisions": {
+                    "image_01": {
+                        "classification": "OTHER_PRODUCT",
+                        "confidence": 0.99,
+                        "reason": "The image is milk, not the target cordless drill.",
+                    }
+                },
+                "summary": "No candidate belongs to the target product.",
             },
-            "summary": "One useful product image is available.",
         }
     )
 
     result = finalize_supplier_listing_images(tmp_path, provider)
 
-    assert provider.calls == 1
-    assert result.selected == (image,)
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert "image_observations" not in manifest["outputs"]
-    assert manifest["outputs"]["primary_source_listing_images"] == [str(image)]
-
-
-def test_ai_may_reject_all_candidates_when_none_are_useful(tmp_path: Path) -> None:
-    image = _write_image(tmp_path / "unrelated.jpg", (100, 150, 200))
-    snapshot = tmp_path / "source-snapshot.json"
-    _write_snapshot(snapshot)
-    _write_manifest(tmp_path, [image], snapshot)
-
-    provider = _FakeProvider(
-        {
-            "selected_image_ids": [],
-            "decisions": {
-                "image_01": {
-                    "selected": False,
-                    "reason": "The image is unrelated to the exact target product.",
-                }
-            },
-            "summary": "No candidate belongs in the listing.",
-        }
-    )
-
-    result = finalize_supplier_listing_images(tmp_path, provider)
-
-    assert result.status == "ai_ranked"
+    assert provider.calls == 2
+    assert result.status == "ai_ownership_empty"
     assert result.selected == ()
     assert result.semantically_rejected_count == 1
+    assert [request["task"] for request in provider.requests] == [
+        "infer_grounded_supplier_product_identity",
+        "classify_supplier_listing_image_ownership",
+    ]
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["outputs"]["primary_source_listing_images"] == []
+    assert manifest["listing_image_ranking"]["selected_count"] == 0
 
 
 def test_customer_auxiliary_images_never_compete_for_auto_listing_slots(tmp_path: Path) -> None:
@@ -227,24 +256,37 @@ def test_customer_auxiliary_images_never_compete_for_auto_listing_slots(tmp_path
 
     provider = _FakeProvider(
         {
-            "selected_image_ids": ["image_01"],
-            "decisions": {
-                "image_01": {
-                    "selected": True,
-                    "reason": "This is the supplier product image.",
-                }
+            "infer_grounded_supplier_product_identity": _identity_response(),
+            "classify_supplier_listing_image_ownership": {
+                "decisions": {
+                    "image_01": {
+                        "classification": "EXACT_TARGET",
+                        "confidence": 0.99,
+                        "reason": "The supplier image depicts the exact target drill.",
+                    }
+                },
+                "summary": "The supplier image belongs to the target product.",
             },
-            "summary": "Use the supplier photo only.",
+            "verify_and_order_exact_supplier_gallery": {
+                "selected_image_ids": ["image_01"],
+                "decisions": {
+                    "image_01": {
+                        "selected": True,
+                        "reason": "Use the exact supplier product image.",
+                    }
+                },
+                "summary": "One exact target image is available.",
+            },
         }
     )
 
     result = finalize_supplier_listing_images(tmp_path, provider)
 
     assert result.selected == (supplier,)
-    grounded_sources = provider.requests[0]["grounded_sources"]
-    assert isinstance(grounded_sources, list)
-    assert len(grounded_sources) == 1
-    assert Path(grounded_sources[0]["image_path"]) == supplier
+    ownership_sources = provider.requests[1]["grounded_sources"]
+    assert isinstance(ownership_sources, list)
+    assert len(ownership_sources) == 1
+    assert Path(ownership_sources[0]["image_path"]) == supplier
 
     report = json.loads((tmp_path / "listing-image-selection.json").read_text(encoding="utf-8"))
     assert report["transport_rejected"] == [
