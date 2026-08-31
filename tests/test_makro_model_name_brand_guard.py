@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from app.makro.domain import MakroDomainAdapter
 from app.resolution_types import RESOLVED, ResolvedAnswer
 
@@ -20,28 +18,32 @@ def _answer(value: str) -> ResolvedAnswer:
         status=RESOLVED,
         answer=value,
         answer_values=[value],
+        source_type="ai_decision",
     )
 
 
-def test_model_name_uses_committed_listing_brand_when_packet_brand_is_missing() -> None:
+def test_model_name_execution_preserves_ai_value_even_when_listing_brand_matches() -> None:
     adapter = MakroDomainAdapter(_Page())
     original = _answer("Dexmary Air Purifier")
     field = {"attribute_key": "model_name", "label": "Model Name"}
 
     constrained = adapter._constrained_execution_answer(field, original)
 
-    assert constrained.answer == "Air Purifier"
-    assert constrained.answer_values == ["Air Purifier"]
+    assert constrained.answer == "Dexmary Air Purifier"
+    assert constrained.answer_values == ["Dexmary Air Purifier"]
     assert original.answer == "Dexmary Air Purifier"
     assert original.answer_values == ["Dexmary Air Purifier"]
 
 
-def test_model_name_brand_only_fails_closed() -> None:
+def test_model_name_brand_only_is_not_downgraded_by_python() -> None:
     adapter = MakroDomainAdapter(_Page())
+    original = _answer("Dexmary")
     field = {"attribute_key": "model_name", "label": "Model Name"}
 
-    with pytest.raises(RuntimeError, match="去除当前 Brand 后为空"):
-        adapter._constrained_execution_answer(field, _answer("Dexmary"))
+    constrained = adapter._constrained_execution_answer(field, original)
+
+    assert constrained.answer == "Dexmary"
+    assert constrained.answer_values == ["Dexmary"]
 
 
 def test_non_model_field_is_untouched() -> None:
