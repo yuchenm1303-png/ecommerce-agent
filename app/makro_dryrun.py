@@ -241,6 +241,130 @@ def _read_qualifiers(
     return passed, actual, selectors
 
 
+def _stabilize_qualified_context(
+    page: Page,
+    semantic_field: dict[str, Any],
+    expected_qualifier: str,
+    value_count: int,
+    *,
+    section_path: str | None,
+    timeout_ms: int,
+) -> tuple[list[str], list[str]]:
+    """Wait until qualifier state and the dependent value controls are stable.
+
+    A qualifier is structural context for Makro composite fields. Changing it may
+    synchronously succeed while React replaces the numeric/text input immediately
+    afterwards. Two consecutive successful live reads are required before value
+    mutation starts. Every poll resolves fresh locators, so no pre-render DOM node
+    is retained across the qualifier transition.
+    """
+
+    controls = _value_controls(semantic_field)
+    poll_ms = 100
+    max_polls = max(2, max(400, int(timeout_ms)) // poll_ms)
+    per_read_timeout_ms = max(250, min(1_000, int(timeout_ms) or 250))
+    stable_reads = 0
+    last_qualifiers: list[str] = []
+    selectors: list[str] = []
+    last_error: Exception | None = None
+
+    for attempt in range(max_polls):
+        try:
+            qualifier_ok, qualifier_actual, qualifier_selectors = _read_qualifiers(
+                page,
+                semantic_field,
+                expected_qualifier,
+                value_count,
+                section_path=section_path,
+                timeout_ms=per_read_timeout_ms,
+            )
+            last_qualifiers = qualifier_actual
+            for selector in qualifier_selectors:
+                if selector not in selectors:
+                    selectors.append(selector)
+
+            for control in controls[:value_count]:
+                selector = scoped_selector_for_control(section_path, control)
+                if selector not in selectors:
+                    selectors.append(selector)
+                _read_control(
+                    page,
+                    control,
+                    section_path=section_path,
+                    timeout_ms=per_read_timeout_ms,
+                )
+
+            if qualifier_ok:
+                stable_reads += 1
+                if stable_reads >= 2:
+                    return last_qualifiers, selectors
+            else:
+                stable_reads = 0
+        except Exception as exc:
+            last_error = exc
+            stable_reads = 0
+
+        if attempt + 1 < max_polls:
+            page.wait_for_timeout(poll_ms)
+
+    if last_error is not None:
+        raise RuntimeError(
+            "qualifier 已提交，但依赖 value control 在 React 重渲染后未稳定："
+            f"{last_error}"
+        ) from last_error
+    raise RuntimeError(
+        "qualifier 已提交，但等待 React 稳定后仍未保持目标值；"
+        f"expected={expected_qualifier!r} actual={last_qualifiers!r}"
+    )
+
+
+def _prepare_qualified_context(
+    page: Page,
+    semantic_field: dict[str, Any],
+    expected_qualifier: str,
+    value_count: int,
+    *,
+    section_path: str | None,
+    settle_timeout_ms: int,
+) -> list[str]:
+    """Commit qualifier context before touching any dependent value control."""
+
+    selectors: list[str] = []
+    for qualifier_control in _qualifier_targets(semantic_field, value_count):
+        selector = scoped_selector_for_control(section_path, qualifier_control)
+        current = _read_control(
+            page,
+            qualifier_control,
+            section_path=section_path,
+            timeout_ms=3_000,
+        )
+        if selector not in selectors:
+            selectors.append(selector)
+        if values_equivalent(qualifier_control, expected_qualifier, current):
+            continue
+        written_selector = _fill_control(
+            page,
+            qualifier_control,
+            expected_qualifier,
+            section_path=section_path,
+        )
+        if written_selector not in selectors:
+            selectors.append(written_selector)
+
+    _, stable_selectors = _stabilize_qualified_context(
+        page,
+        semantic_field,
+        expected_qualifier,
+        value_count,
+        section_path=section_path,
+        timeout_ms=settle_timeout_ms,
+    )
+    for selector in stable_selectors:
+        if selector not in selectors:
+            selectors.append(selector)
+    return selectors
+
+
 def verify_resolved_field(
     page: Page,
     semantic_field: dict[str, Any],
@@ -343,29 +467,30 @@ def fill_resolved_field(
         )
 
     controls = _value_controls(semantic_field)
-    qualifier_targets = _qualifier_targets(semantic_field, len(values)) if answer.qualifier else []
     selectors: list[str] = []
     actual: list[str] = []
     try:
+        if answer.qualifier:
+            for selector in _prepare_qualified_context(
+                page,
+                semantic_field,
+                answer.qualifier,
+                len(values),
+                section_path=section_path,
+                settle_timeout_ms=max(800, int(recheck_wait_ms)),
+            ):
+                if selector not in selectors:
+                    selectors.append(selector)
+
         if is_radio_group(controls):
-            selectors.append(
-                fill_radio_group(page, controls, values[0], section_path=section_path)
-            )
+            selector = fill_radio_group(page, controls, values[0], section_path=section_path)
+            if selector not in selectors:
+                selectors.append(selector)
         else:
             for control, value in zip(controls, values):
-                selectors.append(
-                    _fill_control(page, control, value, section_path=section_path)
-                )
-        if answer.qualifier:
-            for qualifier_control in qualifier_targets:
-                selectors.append(
-                    _fill_control(
-                        page,
-                        qualifier_control,
-                        answer.qualifier,
-                        section_path=section_path,
-                    )
-                )
+                selector = _fill_control(page, control, value, section_path=section_path)
+                if selector not in selectors:
+                    selectors.append(selector)
 
         actual, read_selectors = _read_values(
             page,
@@ -377,7 +502,7 @@ def fill_resolved_field(
         for selector in read_selectors:
             if selector not in selectors:
                 selectors.append(selector)
-        immediate_qualifier_ok, _, qualifier_selectors = _read_qualifiers(
+        immediate_qualifier_ok, immediate_qualifiers, qualifier_selectors = _read_qualifiers(
             page,
             semantic_field,
             answer.qualifier,
@@ -399,7 +524,7 @@ def fill_resolved_field(
                 section_path=section_path,
                 timeout_ms=3_000,
             )
-            settled_qualifier_ok, _, _ = _read_qualifiers(
+            settled_qualifier_ok, settled_qualifiers, _ = _read_qualifiers(
                 page,
                 semantic_field,
                 answer.qualifier,
@@ -429,12 +554,16 @@ def fill_resolved_field(
         elif immediate_passed:
             passed = False
             detail = (
-                f"填写后立即回读一致，但等待 {recheck_wait_ms}ms 后值被重置为 {settled!r}；"
+                f"填写后立即回读一致，但等待 {recheck_wait_ms}ms 后发生状态变化；"
+                f"settled_values={settled!r} settled_qualifier={settled_qualifiers!r}；"
                 "疑似 React 重渲染回滚，未视为 validated。"
             )
         else:
             passed = False
-            detail = "Generic Field Engine 写入后字段值/qualifier 回读与期望不一致。"
+            detail = (
+                "Generic Field Engine 写入后字段值/qualifier 回读与期望不一致；"
+                f"actual_values={actual!r} actual_qualifier={immediate_qualifiers!r}。"
+            )
 
         return FillVerification(
             attribute_key=answer.attribute_key,
