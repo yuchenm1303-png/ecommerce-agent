@@ -24,6 +24,7 @@ from app.browser_page_owner import find_page_by_target_id
 from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness
 from app.business_fields import generate_listing_sku, generated_business_bundle
 from app.evidence_contract import ProductIdentity
+from app.failure_contract import run_cli_with_failure_journal
 from app.fill_plan import build_live_fill_plan
 from app.fill_plan_report import write_fill_plan_json, write_fill_plan_xlsx
 from app.live_schema import load_live_schema, write_live_schema
@@ -334,4 +335,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(
+        run_cli_with_failure_journal(main, stage="makro_plan_listing")
+    )
