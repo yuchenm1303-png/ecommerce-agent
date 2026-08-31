@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import pytest
+
 from app.ai_decisions import FieldDecision, READY as AI_READY, field_options, field_qualifier_options
 from app.fill_plan import _hard_guard_values
 from app.live_schema import live_schema_payload
-from app.required_overrides import required_fallback_override
+from app.required_overrides import RequiredOverrideError, required_fallback_override
 
 
 def _depth_field() -> dict[str, object]:
@@ -13,26 +15,18 @@ def _depth_field() -> dict[str, object]:
         "section_heading": "Additional Description (0/12)",
         "required": True,
         "multi_value": False,
-        # Raw semantic aggregation can contain qualifier options here even
-        # though the primary value control itself is a free numeric input.
         "options": ["cm"],
         "qualifier_options": [],
         "help_text": "",
         "context_text": "",
         "controls": [
-            {
-                "name": "depth",
-                "options": [],
-            },
-            {
-                "name": "depth_qualifier",
-                "options": ["cm"],
-            },
+            {"name": "depth", "options": []},
+            {"name": "depth_qualifier", "options": ["cm"]},
         ],
     }
 
 
-def test_numeric_unit_field_does_not_treat_unit_as_value_option():
+def test_schema_still_separates_value_options_from_qualifier_options():
     field = _depth_field()
 
     assert field_options(field) == []
@@ -43,44 +37,16 @@ def test_numeric_unit_field_does_not_treat_unit_as_value_option():
     assert schema_field["qualifier_options"] == ["cm"]
 
 
-def test_required_depth_fallback_passes_the_same_production_hard_guard():
-    field = _depth_field()
-    fallback = required_fallback_override(field)
-
-    assert fallback["values"] == ["1"]
-    assert fallback["qualifier"] == "cm"
-
-    decision = FieldDecision(
-        field_id=str(fallback["field_id"]),
-        status=AI_READY,
-        values=list(fallback["values"]),
-        qualifier=str(fallback["qualifier"]),
-    )
-    values, qualifier, error = _hard_guard_values(field, decision)
-
-    assert error is None
-    assert values == ["1"]
-    assert qualifier == "cm"
+def test_required_placeholder_generation_is_disabled():
+    with pytest.raises(RequiredOverrideError, match="自动 N/A / 1 / 首选项兜底已禁用"):
+        required_fallback_override(_depth_field())
 
 
-def test_free_text_field_folds_detached_qualifier_into_value():
+def test_ai_qualified_value_is_preserved_exactly_for_free_text_control():
     field = {
         "attribute_key": "ideal_room_size",
         "label": "Ideal Room Size",
-        "section_heading": "Additional Description",
-        "required": False,
-        "multi_value": False,
-        "options": [],
-        "qualifier_options": [],
-        "controls": [
-            {
-                "id": "ideal_room_size",
-                "name": "ideal_room_size",
-                "field_kind": "input",
-                "type": "text",
-                "options": [],
-            }
-        ],
+        "controls": [{"type": "text", "field_kind": "input"}],
     }
     decision = FieldDecision(
         field_id="unused",
@@ -92,28 +58,15 @@ def test_free_text_field_folds_detached_qualifier_into_value():
     values, qualifier, error = _hard_guard_values(field, decision)
 
     assert error is None
-    assert values == ["1000 square feet"]
-    assert qualifier == ""
+    assert values == ["1000"]
+    assert qualifier == "square_feet"
 
 
-def test_free_text_field_does_not_duplicate_unit_already_in_value():
+def test_ai_value_is_not_reformatted_when_unit_already_appears_in_value():
     field = {
         "attribute_key": "water_tank_capacity",
         "label": "Water Tank Capacity",
-        "section_heading": "Additional Description",
-        "required": False,
-        "multi_value": False,
-        "options": [],
-        "qualifier_options": [],
-        "controls": [
-            {
-                "id": "water_tank_capacity",
-                "name": "water_tank_capacity",
-                "field_kind": "input",
-                "type": "text",
-                "options": [],
-            }
-        ],
+        "controls": [{"type": "text", "field_kind": "input"}],
     }
     decision = FieldDecision(
         field_id="unused",
@@ -126,25 +79,19 @@ def test_free_text_field_does_not_duplicate_unit_already_in_value():
 
     assert error is None
     assert values == ["95 fl oz"]
-    assert qualifier == ""
+    assert qualifier == "fl oz"
 
 
-def test_numeric_field_without_unit_contract_still_fails_closed():
+def test_numeric_control_does_not_veto_or_rewrite_ai_qualifier():
     field = {
         "attribute_key": "capacity",
         "label": "Capacity",
-        "section_heading": "Additional Description",
-        "required": False,
-        "multi_value": False,
-        "options": [],
-        "qualifier_options": [],
         "controls": [
             {
                 "id": "capacity",
                 "name": "capacity",
                 "field_kind": "input",
                 "type": "number",
-                "options": [],
                 "context_text": "",
             }
         ],
@@ -158,27 +105,21 @@ def test_numeric_field_without_unit_contract_still_fails_closed():
 
     values, qualifier, error = _hard_guard_values(field, decision)
 
+    assert error is None
     assert values == ["95"]
     assert qualifier == "fl oz"
-    assert error is not None
 
 
-def test_numeric_field_accepts_exact_local_fixed_unit():
+def test_fixed_rendered_unit_does_not_consume_ai_qualifier():
     field = {
         "attribute_key": "length",
         "label": "Length",
-        "section_heading": "Additional Description",
-        "required": False,
-        "multi_value": False,
-        "options": [],
-        "qualifier_options": [],
         "controls": [
             {
                 "id": "length",
                 "name": "length",
                 "field_kind": "input",
                 "type": "number",
-                "options": [],
                 "context_text": "Length cm",
             }
         ],
@@ -194,24 +135,15 @@ def test_numeric_field_accepts_exact_local_fixed_unit():
 
     assert error is None
     assert values == ["17"]
-    assert qualifier == ""
+    assert qualifier == "cm"
 
 
-def test_real_value_select_options_are_still_preserved():
+def test_real_value_select_options_are_still_available_as_schema_context():
     field = {
         "attribute_key": "colour",
         "label": "Colour",
-        "section_heading": "Product Description (0/10)",
-        "required": True,
-        "multi_value": False,
         "options": ["Select One", "White", "Black"],
-        "qualifier_options": [],
-        "controls": [
-            {
-                "name": "colour",
-                "options": ["Select One", "White", "Black"],
-            }
-        ],
+        "controls": [{"name": "colour", "options": ["Select One", "White", "Black"]}],
     }
 
     assert field_options(field) == ["Select One", "White", "Black"]
