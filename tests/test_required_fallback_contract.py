@@ -8,11 +8,14 @@ import pytest
 from app.ai_decisions import field_id
 from app.fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem
 from app.required_overrides import (
+    FALLBACK_NUMERIC_VALUE,
+    FALLBACK_SOURCE_REFERENCE,
+    FALLBACK_TEXT_VALUE,
     RequiredOverrideError,
     apply_required_overrides,
     required_fallback_override,
 )
-from app.resolution_types import MISSING, ResolutionRecord
+from app.resolution_types import MISSING, RESOLVED, ResolutionRecord
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,22 +68,120 @@ def _blocked_item(field):
     )
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
-        _field(),
-        _field(attribute_key="model_name", label="Model Name"),
-        _field(attribute_key="type", label="Type", options=["Select One", "Room", "Car"]),
-        _field(attribute_key="package_weight", label="Package Weight", qualifier_options=["kg", "g"]),
-        _field(attribute_key="colour", label="Colour", options=["Select One", "Orange", "Black"]),
-    ],
-)
-def test_python_never_synthesizes_required_product_answers(field):
-    with pytest.raises(RequiredOverrideError, match="自动 N/A / 1 / 首选项兜底已禁用"):
+def test_free_text_required_gap_uses_na_after_ai_misses():
+    fallback = required_fallback_override(_field())
+
+    assert fallback["values"] == [FALLBACK_TEXT_VALUE]
+    assert FALLBACK_TEXT_VALUE == "N/A"
+    assert fallback["source_type"] == "fallback"
+
+
+def test_numeric_or_unit_required_gap_uses_one():
+    fallback = required_fallback_override(
+        _field(
+            attribute_key="package_weight",
+            label="Package Weight",
+            qualifier_options=["kg", "g"],
+        )
+    )
+
+    assert fallback["values"] == [FALLBACK_NUMERIC_VALUE]
+    assert FALLBACK_NUMERIC_VALUE == "1"
+    assert fallback["qualifier"] == "kg"
+
+
+def test_select_required_gap_uses_first_real_live_option():
+    fallback = required_fallback_override(
+        _field(
+            attribute_key="colour",
+            label="Colour",
+            options=["Select One", "Orange", "Black"],
+        )
+    )
+
+    assert fallback["values"] == ["Orange"]
+
+
+def test_live_select_uses_only_enabled_option():
+    fallback = required_fallback_override(
+        _field(
+            attribute_key="trimming_range",
+            label="Trimming Range",
+            options=["0.2 - 0.4 mm", "0.5 - 1 mm"],
+            controls=[
+                {
+                    "name": "trimming_range_0_value",
+                    "field_kind": "select",
+                    "options": [
+                        {"text": "0.2 - 0.4 mm", "value": "0.2 - 0.4 mm", "disabled": True},
+                        {"text": "0.5 - 1 mm", "value": "0.5 - 1 mm", "disabled": False},
+                    ],
+                }
+            ],
+        )
+    )
+
+    assert fallback["values"] == ["0.5 - 1 mm"]
+
+
+def test_selection_without_executable_option_fails_closed():
+    field = _field(
+        attribute_key="trimming_range",
+        label="Trimming Range",
+        options=["0.2 - 0.4 mm"],
+        controls=[
+            {
+                "name": "trimming_range_0_value",
+                "field_kind": "select",
+                "options": [
+                    {"text": "0.2 - 0.4 mm", "value": "0.2 - 0.4 mm", "disabled": True}
+                ],
+            }
+        ],
+    )
+
+    with pytest.raises(RequiredOverrideError, match="selection 控件"):
         required_fallback_override(field)
 
 
-def test_explicit_user_decision_can_resolve_ai_missing_required_field():
+def test_fallback_promotes_only_ai_missing_required_field():
+    live = _field(attribute_key="colour", label="Colour", options=["Orange", "Black"])
+    item = _blocked_item(live)
+    plan = LiveFillPlan([item])
+
+    result = apply_required_overrides(plan, [live], [required_fallback_override(live)])
+
+    assert result["applied"] == 1
+    assert result["sources"]["fallback"] == 1
+    assert item.action == READY
+    assert item.resolution.answer_values == ["Orange"]
+    assert item.resolution.source_type == "fallback"
+    assert item.resolution.source_reference == FALLBACK_SOURCE_REFERENCE
+
+
+def test_ai_ready_is_never_replaced_by_fallback():
+    live = _field(attribute_key="colour", label="Colour", options=["Orange", "Black"])
+    item = _blocked_item(live)
+    item.action = READY
+    item.reason = "AI READY authoritative"
+    item.resolution.status = RESOLVED
+    item.resolution.answer = "Black"
+    item.resolution.answer_values = ["Black"]
+    item.resolution.source_type = "ai_decision"
+    item.resolution.source_reference = "source:ai"
+    item.resolution.eligible_for_autofill = True
+    plan = LiveFillPlan([item])
+
+    result = apply_required_overrides(plan, [live], [required_fallback_override(live)])
+
+    assert result["applied"] == 0
+    assert result["skipped_current_ready"] == 1
+    assert item.action == READY
+    assert item.resolution.answer_values == ["Black"]
+    assert item.resolution.source_type == "ai_decision"
+
+
+def test_explicit_user_value_still_wins_for_ai_missing_required_field():
     live = _field(attribute_key="colour", label="Colour", options=["Orange", "Black"])
     item = _blocked_item(live)
     plan = LiveFillPlan([item])
@@ -88,41 +189,44 @@ def test_explicit_user_decision_can_resolve_ai_missing_required_field():
     result = apply_required_overrides(
         plan,
         [live],
-        [{"field_id": field_id(live), "values": ["Purple"], "source_type": "user"}],
+        [{"field_id": field_id(live), "values": ["Black"], "source_type": "user"}],
     )
 
     assert result["applied"] == 1
+    assert result["sources"]["user"] == 1
     assert item.action == READY
-    assert item.resolution.answer_values == ["Purple"]
+    assert item.resolution.answer_values == ["Black"]
     assert item.resolution.source_type == "user"
     assert item.resolution.source_reference == "user:required-override"
 
 
-def test_legacy_automatic_override_cannot_promote_ai_missing():
-    live = _field(attribute_key="colour", label="Colour", options=["Orange", "Black"])
+def test_persisted_fallback_is_recomputed_from_current_live_field():
+    live = _field(attribute_key="model_name", label="Model Name")
     item = _blocked_item(live)
     plan = LiveFillPlan([item])
+    persisted = {
+        "field_id": field_id(live),
+        "values": ["stale placeholder"],
+        "source_type": "fallback",
+    }
 
-    result = apply_required_overrides(
-        plan,
-        [live],
-        [{"field_id": field_id(live), "values": ["Orange"], "source_type": "fallback"}],
-    )
+    result = apply_required_overrides(plan, [live], [persisted])
 
-    assert result["applied"] == 0
-    assert result["ignored_automatic"] == 1
-    assert item.action == BLOCKED
+    assert result["applied"] == 1
+    assert result["fallback_recomputed_live"] == 1
+    assert item.resolution.answer_values == [FALLBACK_TEXT_VALUE]
+    assert item.resolution.source_type == "fallback"
 
 
-def test_gui_required_preflight_has_no_second_ai_or_synthetic_fallback():
+def test_gui_required_preflight_has_no_second_ai_but_has_fallback():
     assert "QProcess" not in GUI_SOURCE
     assert "makro_complete_required.py" not in GUI_SOURCE
-    assert "required_fallback_override" not in GUI_SOURCE
-    assert "自动兜底 0" in GUI_SOURCE
+    assert "required_fallback_override" in GUI_SOURCE
+    assert "留空将自动填" in GUI_SOURCE
     assert "ai_calls=0" in GUI_SOURCE
 
 
-def test_gui_manual_value_is_mandatory_for_non_ready_required_field():
+def test_gui_manual_value_is_optional_and_empty_value_gets_fallback():
     support = __import__(
         "gui.required_input_support",
         fromlist=["RequiredInputSupport"],
@@ -132,8 +236,7 @@ def test_gui_manual_value_is_mandatory_for_non_ready_required_field():
     request = inspect.getsource(support.request_start)
 
     assert "self.values" in GUI_SOURCE
-    assert "source_type\": \"user" in merged
-    assert "required_fallback_override" not in merged
-    assert "confirmed == total" in sync
-    assert "not self._all_required_confirmed()" in request
+    assert "required_fallback_override(field)" in merged
+    assert "automatic = len(self.fields) - manual" in sync
+    assert "not self._all_required_confirmed()" not in request
     assert ".text()" not in merged
