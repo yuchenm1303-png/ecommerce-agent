@@ -1,0 +1,260 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "image-selection-v1",
+  "purpose": "Measure supplier Product Photos precision before changing production image-selection architecture.",
+  "principle": "Wrong-product and wrong-variant leaks are hard failures. Missing a useful support image is secondary.",
+  "data_policy": {
+    "preferred_source": "real supplier-page captures imported from production listing-image-selection.json",
+    "synthetic_images_in_baseline": false,
+    "stock_images_in_baseline": false,
+    "ground_truth_owner": "human_review",
+    "previous_ai_prediction_is_ground_truth": false,
+    "target_identity_rule": "Use the exact sale unit: brand, model, variant, size, pack count, bundle composition and other SKU-defining facts that are actually known.",
+    "candidate_rule": "Keep realistic page contamination. Do not sanitize the pool before evaluation except for unreadable files and exact byte duplicates handled by production parity.",
+    "privacy": "cases, cache and runs stay local and are gitignored"
+  },
+  "suite_gates": {
+    "hard": {
+      "wrong_product_leak_count": 0,
+      "variant_leak_count": 0,
+      "safe_gallery_rate": 1.0,
+      "all_negative_case_pass_rate": 1.0
+    },
+    "quality_targets": {
+      "main_image_hit_at_1_min": 0.8,
+      "precision_at_5_micro_min": 0.98,
+      "recall_at_5_micro_min": 0.55,
+      "ndcg_at_5_mean_min": 0.75
+    },
+    "order_bias_targets_for_shuffle_subset": {
+      "repeat": 3,
+      "seed": 17,
+      "selection_jaccard_min": 0.8,
+      "top1_stability_rate_min": 0.75
+    }
+  },
+  "candidate_mix_rules": {
+    "normal_case_target_count": "16-24",
+    "stress_case_target_count": 32,
+    "positive_count_when_available": "3-6",
+    "hard_negative_count_when_applicable": "4-10",
+    "easy_negative_count_when_applicable": "2-6",
+    "page_asset_count_when_available": "0-4",
+    "main_image_positive_required": true,
+    "input_order_must_not_encode_ground_truth": true
+  },
+  "ground_truth_grades": {
+    "3": "strongest valid main-image candidate",
+    "2": "useful exact-product support image",
+    "1": "correct product but weak, redundant or low-information support image",
+    "0": "forbidden for automatic upload"
+  },
+  "case_blueprints": [
+    {
+      "case_id": "B01_obvious_page_pollution",
+      "suites": ["baseline", "hard_negative", "shuffle"],
+      "risk": "Recommendations or unrelated products from the same supplier page enter Product Photos.",
+      "candidate_target": 20,
+      "required_mix": {
+        "EXACT_TARGET": "3-5",
+        "TARGET_PACKAGING_OR_DETAIL": "1-2",
+        "OTHER_PRODUCT": "8-12",
+        "PAGE_ASSET": "1-3"
+      },
+      "construction": "Use a real page with visually unrelated recommendations such as food, cosmetics, tools or household items mixed around the target product.",
+      "pass_focus": "Zero OTHER_PRODUCT or PAGE_ASSET selected."
+    },
+    {
+      "case_id": "B02_same_category_other_brand",
+      "suites": ["baseline", "hard_negative"],
+      "risk": "AI recognizes product category but confuses another brand/model as the target.",
+      "candidate_target": 20,
+      "required_mix": {
+        "EXACT_TARGET": "3-5",
+        "TARGET_PACKAGING_OR_DETAIL": "1-2",
+        "OTHER_PRODUCT_same_category": "6-10",
+        "OTHER_PRODUCT_other_category": "2-4"
+      },
+      "construction": "Target and negatives should share product type and general shape but differ in brand/model identity.",
+      "pass_focus": "Category similarity must never be sufficient for selection."
+    },
+    {
+      "case_id": "B03_same_brand_other_line",
+      "suites": ["baseline", "hard_negative", "shuffle"],
+      "risk": "Brand match dominates exact product identity.",
+      "candidate_target": 20,
+      "required_mix": {
+        "EXACT_TARGET": "3-5",
+        "TARGET_PACKAGING_OR_DETAIL": "1-2",
+        "OTHER_PRODUCT_same_brand": "6-10",
+        "OTHER_PRODUCT_other_brand": "2-4"
+      },
+      "construction": "Use products from the same brand with similar packaging but different line/model/function.",
+      "pass_focus": "Same brand is not enough; exact product line must match."
+    },
+    {
+      "case_id": "B04_same_model_colour_variant",
+      "suites": ["baseline", "variant", "shuffle"],
+      "risk": "Exact model but wrong colour is treated as interchangeable.",
+      "candidate_target": 18,
+      "required_mix": {
+        "EXACT_TARGET": "3-5",
+        "TARGET_PACKAGING_OR_DETAIL": "1-2",
+        "SAME_PRODUCT_OTHER_VARIANT_colour": "5-8",
+        "OTHER_PRODUCT": "2-4"
+      },
+      "construction": "Prefer products where colour is a sellable SKU choice and body shape is otherwise nearly identical.",
+      "pass_focus": "Zero wrong-colour variant selected."
+    },
+    {
+      "case_id": "B05_same_model_size_capacity_variant",
+      "suites": ["baseline", "variant"],
+      "risk": "50 ml vs 100 ml, 500 GB vs 1 TB, small vs large, or similar capacity differences leak into the gallery.",
+      "candidate_target": 18,
+      "required_mix": {
+        "EXACT_TARGET": "3-5",
+        "TARGET_PACKAGING_OR_DETAIL": "1-2",
+        "SAME_PRODUCT_OTHER_VARIANT_size": "5-8",
+        "OTHER_PRODUCT": "2-4"
+      },
+      "construction": "Choose a visually near-identical SKU where size/capacity is encoded by packaging text or small physical differences.",
+      "pass_focus": "Zero size/capacity variant selected."
+    },
+    {
+      "case_id": "B06_pack_count_variant",
+      "suites": ["baseline", "variant"],
+      "risk": "Single unit, two-pack, multipack or quantity bundle are mixed.",
+      "candidate_target": 18,
+      "required_mix": {
+        "EXACT_TARGET": "3-5",
+        "TARGET_PACKAGING_OR_DETAIL": "1-2",
+        "SAME_PRODUCT_OTHER_VARIANT_pack_count": "5-8",
+        "OTHER_PRODUCT": "2-4"
+      },
+      "construction": "Target must have an explicit sale-unit count. Include near-identical images showing a different count.",
+      "pass_focus": "Zero pack-count mismatch selected."
+    },
+    {
+      "case_id": "B07_bundle_vs_standalone",
+      "suites": ["baseline", "variant", "shuffle"],
+      "risk": "Kit/bundle and standalone item are treated as the same sale unit.",
+      "candidate_target": 22,
+      "required_mix": {
+        "EXACT_TARGET": "3-4",
+        "TARGET_PACKAGING_OR_DETAIL": "2-4",
+        "SAME_PRODUCT_OTHER_VARIANT_bundle_configuration": "6-10",
+        "OTHER_PRODUCT_accessory_not_included": "2-4"
+      },
+      "construction": "Good examples are tool+battery+charger kits, camera kits, appliance bundles or sets with optional accessories.",
+      "pass_focus": "Gallery must preserve exact bundle composition."
+    },
+    {
+      "case_id": "B08_included_component_detail",
+      "suites": ["baseline", "bundle_semantics"],
+      "risk": "A legitimate included component detail is incorrectly rejected, or an unrelated accessory is incorrectly accepted.",
+      "candidate_target": 20,
+      "required_mix": {
+        "EXACT_TARGET": "2-4",
+        "TARGET_PACKAGING_OR_DETAIL_included_component": "3-5",
+        "OTHER_PRODUCT_accessory_not_included": "4-7",
+        "OTHER_PRODUCT": "2-4"
+      },
+      "construction": "Target identity must explicitly state included components so Ground Truth is unambiguous.",
+      "pass_focus": "Included components may be selected as support images; non-included accessories must never be selected."
+    },
+    {
+      "case_id": "B09_packaging_detail_and_near_duplicates",
+      "suites": ["baseline", "ranking"],
+      "risk": "Correct support images are lost while redundant near-duplicates crowd out a useful gallery.",
+      "candidate_target": 20,
+      "required_mix": {
+        "EXACT_TARGET_main_quality": "2-3",
+        "EXACT_TARGET_near_duplicate": "4-7",
+        "TARGET_PACKAGING_OR_DETAIL": "3-5",
+        "OTHER_PRODUCT": "2-4"
+      },
+      "construction": "Include repeated angles/crops plus packaging, dimensions or meaningful detail views. Exact-byte duplicates are not useful because production already removes them.",
+      "pass_focus": "Safety first, then useful non-redundant ordering and a valid hero at position 1."
+    },
+    {
+      "case_id": "B10_visual_only_no_text",
+      "suites": ["baseline", "visual_reasoning"],
+      "risk": "Model relies on OCR/keywords instead of actual visual product identity.",
+      "candidate_target": 18,
+      "required_mix": {
+        "EXACT_TARGET_low_text": "3-5",
+        "TARGET_PACKAGING_OR_DETAIL_low_text": "1-2",
+        "OTHER_PRODUCT_visually_distinct_low_text": "4-6",
+        "OTHER_PRODUCT_visually_similar_low_text": "3-5"
+      },
+      "construction": "Prefer images where logos and text are absent, tiny or unreadable; the object shape/configuration should carry the decision.",
+      "pass_focus": "Correct classification must remain strong without readable keywords."
+    },
+    {
+      "case_id": "B11_text_critical_sku",
+      "suites": ["baseline", "variant", "ocr"],
+      "risk": "Visually near-identical SKUs require reading model/size/flavour/capacity text and the model ignores it.",
+      "candidate_target": 20,
+      "required_mix": {
+        "EXACT_TARGET": "3-5",
+        "TARGET_PACKAGING_OR_DETAIL": "1-2",
+        "SAME_PRODUCT_OTHER_VARIANT_text_critical": "7-10",
+        "OTHER_PRODUCT": "2-3"
+      },
+      "construction": "Choose cases where the decisive SKU fact is visible in packaging/model text and geometry alone is insufficient.",
+      "pass_focus": "Zero text-critical variant leak."
+    },
+    {
+      "case_id": "B12_all_negative_32_candidate_stress",
+      "suites": ["baseline", "hard_negative", "stress", "shuffle"],
+      "risk": "Model feels forced to select something even though no safe target image exists.",
+      "candidate_target": 32,
+      "required_mix": {
+        "SAME_PRODUCT_OTHER_VARIANT": "8-12",
+        "OTHER_PRODUCT_same_category_or_brand": "10-14",
+        "OTHER_PRODUCT_other": "4-8",
+        "PAGE_ASSET_or_UNCERTAIN": "0-4",
+        "AUTO_ALLOWED_TOTAL": 0
+      },
+      "construction": "Use a target identity with zero exact-target candidate image. Include several highly tempting near matches, not only obviously wrong products.",
+      "pass_focus": "Final selected gallery must be exactly empty. Any selected image is a hard failure."
+    }
+  ],
+  "execution_plan": [
+    {
+      "phase": 1,
+      "name": "baseline_single_pass",
+      "strategy": "current-v6",
+      "mode": "live",
+      "repeat": 1,
+      "shuffle": false,
+      "purpose": "Measure current production-equivalent image semantics with minimum AI spend."
+    },
+    {
+      "phase": 2,
+      "name": "replay_and_report_review",
+      "strategy": "current-v6",
+      "mode": "replay",
+      "purpose": "Review failures and metrics without additional AI calls."
+    },
+    {
+      "phase": 3,
+      "name": "order_bias_subset",
+      "strategy": "current-v6",
+      "mode": "live",
+      "repeat": 3,
+      "shuffle": true,
+      "seed": 17,
+      "suite": "shuffle",
+      "purpose": "Only after the single-pass baseline, test whether candidate order changes semantic decisions."
+    },
+    {
+      "phase": 4,
+      "name": "reranker_ab",
+      "condition": "Only after current-v6 baseline is labelled and frozen",
+      "strategies": ["current-v6", "qwen-vl-rerank-v1"],
+      "purpose": "Compare both strategies on the exact same frozen cases before any production migration."
+    }
+  ],
+  "promotion_rule": "A new strategy cannot replace production if it has any wrong-product leak, variant leak, or all-negative failure that current-v6 does not have. Safety regression vetoes cost or ranking improvements."
+}
