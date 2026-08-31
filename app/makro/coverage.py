@@ -1,9 +1,14 @@
 """Safe synthetic interaction coverage for Makro listing controls.
 
-This module answers one question only: can the browser execution layer operate
-an empty Makro field reliably? It does not resolve product facts and never
-persists changes. Each field is tested in its own open -> exercise -> Cancel
-transaction so every attempt starts from a clean, unsaved section state.
+This module answers one question only: can the *production browser execution
+layer* operate an empty Makro field reliably?  It does not resolve product facts
+and never persists changes.  Each field is tested in its own open -> exercise ->
+Cancel transaction so every attempt starts from a clean, unsaved section state.
+
+A critical invariant is that coverage never owns a second mutation engine.  All
+writes and authoritative readback/equivalence checks delegate to
+``app.makro.field_engine``.  Otherwise a synthetic probe could pass while the
+production Field Engine uses different React event/selection semantics.
 """
 
 from __future__ import annotations
@@ -14,6 +19,15 @@ from typing import Any
 
 from playwright.sync_api import Page
 
+from .field_engine import (
+    fill_control as _engine_fill_control,
+    fill_radio_group as _engine_fill_radio_group,
+    is_radio_group as _engine_is_radio_group,
+    radio_group_values_equivalent as _engine_radio_group_values_equivalent,
+    read_control as _engine_read_control,
+    read_radio_group as _engine_read_radio_group,
+    values_equivalent as _engine_values_equivalent,
+)
 from .locators import scoped_selector_for_control
 
 PASS = "pass"
@@ -157,7 +171,7 @@ def choose_option(control: dict[str, Any], *, avoid: str | None = None) -> str |
 
 
 def _static_unit_suffix(control: dict[str, Any]) -> str:
-    """Infer a short, non-interactive suffix such as ``K`` from field context."""
+    """Infer a short, non-interactive suffix such as ``CM`` from field context."""
 
     label = str(control.get("label") or "").strip()
     context = str(control.get("context_text") or "").strip()
@@ -170,8 +184,8 @@ def _static_unit_suffix(control: dict[str, Any]) -> str:
         return ""
     if "select" in tail.casefold():
         return ""
-    if re.fullmatch(r"[A-Za-z0-9°%µμ/.\- ]{1,12}", tail):
-        return tail
+    if re.fullmatch(r"[A-Za-z0-9°%µμ/.\- *]{1,12}", tail):
+        return tail.strip("* ")
     return ""
 
 
@@ -184,7 +198,9 @@ def field_shape(semantic_field: dict[str, Any]) -> str:
     qualifiers = _qualifier_controls(semantic_field)
     suffix = _static_unit_suffix(primary)
 
-    if kind == "select":
+    if _engine_is_radio_group(controls):
+        base = "radio-group"
+    elif kind == "select":
         base = "native-select"
     elif kind in {"dropdown", "autocomplete", "listbox"}:
         base = "custom-dropdown"
@@ -240,6 +256,13 @@ def _unique_visible_locator(page: Page, section_path: str, control: dict[str, An
 
 
 def _read_control(locator: Any, control: dict[str, Any]) -> str:
+    """Local read helper retained for visual-hold final verification.
+
+    Actual coverage pass/fail uses the production Field Engine's ``read_control``
+    below.  This helper intentionally accepts an already-resolved locator because
+    ``visual_hold`` imports it for one final whole-section read without mutation.
+    """
+
     kind = str(control.get("field_kind") or "input")
     if kind == "select":
         return locator.locator("option:checked").inner_text(timeout=3_000).strip()
@@ -294,39 +317,6 @@ def _choose_custom_option(page: Page, locator: Any) -> str | None:
     return options[0] if options else None
 
 
-def _write_control(page: Page, locator: Any, control: dict[str, Any], candidate: str) -> None:
-    kind = str(control.get("field_kind") or "input")
-    if kind in {
-        "input", "textarea", "contenteditable", "custom_textbox",
-        "custom_searchbox", "custom_spinbutton",
-    }:
-        locator.fill(candidate)
-        return
-    if kind == "select":
-        locator.select_option(label=candidate)
-        return
-    if kind in {"dropdown", "autocomplete", "listbox"}:
-        locator.click()
-        page.get_by_text(candidate, exact=True).last.click()
-        return
-    if kind in {"checkbox", "custom_checkbox"}:
-        desired = _norm(candidate) == "true"
-        try:
-            locator.set_checked(desired)
-        except Exception:
-            current = _norm(locator.get_attribute("aria-checked") or "false") == "true"
-            if current != desired:
-                locator.click()
-        return
-    if kind in {"radio", "custom_radio"}:
-        try:
-            locator.check()
-        except Exception:
-            locator.click()
-        return
-    raise ValueError(f"暂不支持控件类型：{kind}")
-
-
 def _candidate_for_control(
     page: Page,
     locator: Any,
@@ -349,13 +339,15 @@ def _candidate_for_control(
             current = _norm(locator.get_attribute("aria-checked") or "false") == "true"
         return "false" if current else "true"
     if kind in {"radio", "custom_radio"}:
-        return "true"
+        return None
     if kind == "custom_slider":
         return None
     return _synthetic_text(control, ordinal, numeric=numeric)
 
 
 def _equivalent(expected: str, actual: str, control: dict[str, Any]) -> bool:
+    """Compatibility helper used by visual-hold final readback."""
+
     kind = str(control.get("field_kind") or "")
     if kind in {"dropdown", "autocomplete", "listbox"}:
         return _norm(expected) == _norm(actual) or _norm(expected) in _norm(actual)
@@ -372,24 +364,71 @@ def _exercise_one_control(
     recheck_wait_ms: int,
     avoid_option: str | None = None,
 ) -> tuple[bool, str | None, str, str, str, str]:
-    locator, selector = _unique_visible_locator(page, section_path, control)
+    """Exercise one control through the exact production mutation/readback path."""
+
+    locator, _ = _unique_visible_locator(page, section_path, control)
     candidate = _candidate_for_control(
         page, locator, control, ordinal, numeric=numeric, avoid_option=avoid_option
     )
     if candidate is None:
+        selector = scoped_selector_for_control(section_path, control)
         return False, None, "", "", selector, "没有可安全生成的测试值/真实选项。"
 
-    _write_control(page, locator, control, candidate)
-    immediate = _read_control(locator, control)
+    selector = _engine_fill_control(page, control, candidate, section_path)
+    immediate = _engine_read_control(
+        page, control, section_path, timeout_ms=3_000
+    )
     page.wait_for_timeout(recheck_wait_ms)
-    locator2, _ = _unique_visible_locator(page, section_path, control)
-    settled = _read_control(locator2, control)
+    settled = _engine_read_control(
+        page, control, section_path, timeout_ms=3_000
+    )
 
-    passed = _equivalent(candidate, immediate, control) and _equivalent(candidate, settled, control)
+    passed = (
+        _engine_values_equivalent(control, candidate, immediate)
+        and _engine_values_equivalent(control, candidate, settled)
+    )
     detail = (
-        "立即回读和 React 渲染周期后的二次回读均一致。"
+        "生产 Field Engine 写入后，立即回读和 React 渲染周期后的二次回读均一致。"
         if passed
-        else f"回读不一致：immediate={immediate!r}, settled={settled!r}"
+        else f"生产 Field Engine 回读不一致：immediate={immediate!r}, settled={settled!r}"
+    )
+    return passed, candidate, immediate, settled, selector, detail
+
+
+def _radio_candidate(controls: list[dict[str, Any]]) -> str | None:
+    """Pick an explicit captured alias; production group matching remains fail-closed."""
+
+    for control in controls:
+        for key in ("value", "aria_label", "id", "label"):
+            candidate = str(control.get(key) or "").strip()
+            if candidate:
+                return candidate
+    return None
+
+
+def _exercise_radio_group(
+    page: Page,
+    section_path: str,
+    controls: list[dict[str, Any]],
+    *,
+    recheck_wait_ms: int,
+) -> tuple[bool, str | None, str, str, str, str]:
+    candidate = _radio_candidate(controls)
+    if candidate is None:
+        return False, None, "", "", "", "radio group 没有可安全选择的明确 value/label。"
+
+    selector = _engine_fill_radio_group(page, controls, candidate, section_path)
+    immediate = _engine_read_radio_group(page, controls, section_path)
+    page.wait_for_timeout(recheck_wait_ms)
+    settled = _engine_read_radio_group(page, controls, section_path)
+    passed = (
+        _engine_radio_group_values_equivalent(controls, candidate, immediate)
+        and _engine_radio_group_values_equivalent(controls, candidate, settled)
+    )
+    detail = (
+        "生产 Field Engine 按完整 radio group 选择，并在 React 渲染后保持唯一选中值。"
+        if passed
+        else f"radio group 回读不一致：immediate={immediate!r}, settled={settled!r}"
     )
     return passed, candidate, immediate, settled, selector, detail
 
@@ -420,12 +459,12 @@ def _click_add_value_if_present(locator: Any) -> dict[str, Any]:
 
 
 def _match_field(fields: list[dict[str, Any]], attribute_key: str, label: str) -> dict[str, Any] | None:
-    for field in fields:
-        if str(field.get("attribute_key") or "") != attribute_key:
+    for field_item in fields:
+        if str(field_item.get("attribute_key") or "") != attribute_key:
             continue
-        if label and str(field.get("label") or "") != label:
+        if label and str(field_item.get("label") or "") != label:
             continue
-        return field
+        return field_item
     return None
 
 
@@ -454,8 +493,8 @@ def exercise_live_field(
         result.detail = "semantic field 没有可操作的 value control。"
         return result
 
-    primary = controls[0]
     qualifiers = _qualifier_controls(semantic_field)
+    primary = controls[0]
     numeric = (
         bool(qualifiers)
         or bool(_static_unit_suffix(primary))
@@ -465,11 +504,25 @@ def exercise_live_field(
     )
 
     try:
-        passed, candidate, immediate, settled, selector, detail = _exercise_one_control(
-            page, section_path, primary, ordinal,
-            numeric=numeric, recheck_wait_ms=recheck_wait_ms,
-        )
-        result.selectors.append(selector)
+        if _engine_is_radio_group(controls):
+            passed, candidate, immediate, settled, selector, detail = _exercise_radio_group(
+                page,
+                section_path,
+                controls,
+                recheck_wait_ms=recheck_wait_ms,
+            )
+        else:
+            passed, candidate, immediate, settled, selector, detail = _exercise_one_control(
+                page,
+                section_path,
+                primary,
+                ordinal,
+                numeric=numeric,
+                recheck_wait_ms=recheck_wait_ms,
+            )
+
+        if selector:
+            result.selectors.append(selector)
         if candidate is not None:
             result.candidate.append(candidate)
         result.immediate.append(immediate)
@@ -480,8 +533,12 @@ def exercise_live_field(
 
         if qualifiers:
             q_passed, q_candidate, q_immediate, q_settled, q_selector, q_detail = _exercise_one_control(
-                page, section_path, qualifiers[0], ordinal + 50,
-                numeric=False, recheck_wait_ms=recheck_wait_ms,
+                page,
+                section_path,
+                qualifiers[0],
+                ordinal + 50,
+                numeric=False,
+                recheck_wait_ms=recheck_wait_ms,
             )
             result.selectors.append(q_selector)
             if q_candidate is not None:
@@ -492,14 +549,16 @@ def exercise_live_field(
                 result.detail = f"主值通过；qualifier 失败：{q_detail}"
                 return result
 
-        if exercise_multi_value:
+        if exercise_multi_value and not _engine_is_radio_group(controls):
             live_primary, _ = _unique_visible_locator(page, section_path, primary)
             add = _click_add_value_if_present(live_primary)
             result.plus_available = bool(add.get("available"))
             if result.plus_available:
                 page.wait_for_timeout(300)
                 refreshed_controls = adapter.scan_section_fields(
-                    section_path, include_values=True, wait_ms=wait_ms,
+                    section_path,
+                    include_values=True,
+                    wait_ms=wait_ms,
                     max_scroll_steps=max_scroll_steps,
                 )
                 refreshed_fields = adapter.build_semantic_fields(refreshed_controls)
@@ -520,10 +579,15 @@ def exercise_live_field(
                     or bool(_static_unit_suffix(second))
                     or str(second.get("type") or "").casefold() == "number"
                     or str(second.get("inputmode") or "").casefold() in {"numeric", "decimal"}
+                    or str(second.get("field_kind") or "") in {"custom_spinbutton", "custom_slider"}
                 )
                 p2, c2, i2, s2, sel2, d2 = _exercise_one_control(
-                    page, section_path, second, ordinal + 100,
-                    numeric=second_numeric, recheck_wait_ms=recheck_wait_ms,
+                    page,
+                    section_path,
+                    second,
+                    ordinal + 100,
+                    numeric=second_numeric,
+                    recheck_wait_ms=recheck_wait_ms,
                     avoid_option=result.candidate[0] if result.candidate else None,
                 )
                 result.selectors.append(sel2)
@@ -538,11 +602,13 @@ def exercise_live_field(
 
         result.status = PASS
         if result.plus_available:
-            result.detail = "主控件稳定回读通过；+ 新增槽位也填写并稳定回读通过。"
+            result.detail = "生产 Field Engine 主值通过；+ 新增槽位也填写并稳定回读通过。"
         elif qualifiers:
-            result.detail = "主值与 qualifier 均填写并稳定回读通过。"
+            result.detail = "生产 Field Engine 主值与 qualifier 均填写并稳定回读通过。"
+        elif _engine_is_radio_group(controls):
+            result.detail = "生产 Field Engine 完整 radio group 选择并稳定回读通过。"
         else:
-            result.detail = "控件填写并在 React 渲染周期后稳定回读通过。"
+            result.detail = "生产 Field Engine 写入并在 React 渲染周期后稳定回读通过。"
         return result
     except Exception as exc:
         result.detail = str(exc)
@@ -597,27 +663,33 @@ def discover_fields(
         live = adapter.find_section(section_title) or section
         section_path = str(live.get("path") or "")
         controls = adapter.scan_section_fields(
-            section_path, include_values=True, wait_ms=wait_ms,
+            section_path,
+            include_values=True,
+            wait_ms=wait_ms,
             max_scroll_steps=max_scroll_steps,
         )
         fields = adapter.build_semantic_fields(controls)
         targets: list[dict[str, str]] = []
         for field_item in fields:
             if semantic_field_is_empty(field_item):
-                targets.append({
-                    "attribute_key": str(field_item.get("attribute_key") or ""),
-                    "label": str(field_item.get("label") or ""),
-                })
+                targets.append(
+                    {
+                        "attribute_key": str(field_item.get("attribute_key") or ""),
+                        "label": str(field_item.get("label") or ""),
+                    }
+                )
             else:
-                skipped.append(CoverageResult(
-                    section=str(field_item.get("section_heading") or section_title),
-                    subsection=str(field_item.get("subsection_heading") or ""),
-                    attribute_key=str(field_item.get("attribute_key") or ""),
-                    label=str(field_item.get("label") or ""),
-                    shape=field_shape(field_item),
-                    status=SKIPPED_EXISTING,
-                    detail="当前字段已有非 placeholder 值；默认不覆盖已有数据。",
-                ))
+                skipped.append(
+                    CoverageResult(
+                        section=str(field_item.get("section_heading") or section_title),
+                        subsection=str(field_item.get("subsection_heading") or ""),
+                        attribute_key=str(field_item.get("attribute_key") or ""),
+                        label=str(field_item.get("label") or ""),
+                        shape=field_shape(field_item),
+                        status=SKIPPED_EXISTING,
+                        detail="当前字段已有非 placeholder 值；默认不覆盖已有数据。",
+                    )
+                )
         return targets, skipped
     finally:
         cancel_section(adapter, section_title)
@@ -635,7 +707,10 @@ def run_section_coverage(
     """Test each empty field in an isolated unsaved transaction."""
 
     targets, skipped = discover_fields(
-        adapter, section_title, wait_ms=wait_ms, max_scroll_steps=max_scroll_steps
+        adapter,
+        section_title,
+        wait_ms=wait_ms,
+        max_scroll_steps=max_scroll_steps,
     )
     results = list(skipped)
 
@@ -646,35 +721,56 @@ def run_section_coverage(
             live = adapter.find_section(section_title) or section
             section_path = str(live.get("path") or "")
             controls = adapter.scan_section_fields(
-                section_path, include_values=True, wait_ms=wait_ms,
+                section_path,
+                include_values=True,
+                wait_ms=wait_ms,
                 max_scroll_steps=max_scroll_steps,
             )
             fields = adapter.build_semantic_fields(controls)
-            field_item = _match_field(fields, identity["attribute_key"], identity["label"])
+            field_item = _match_field(
+                fields,
+                identity["attribute_key"],
+                identity["label"],
+            )
             if field_item is None:
-                results.append(CoverageResult(
-                    section=section_title, subsection="",
-                    attribute_key=identity["attribute_key"], label=identity["label"],
-                    shape="unknown", status=NOT_FOUND,
-                    detail="重新打开 section 后未找到该字段。",
-                ))
+                results.append(
+                    CoverageResult(
+                        section=section_title,
+                        subsection="",
+                        attribute_key=identity["attribute_key"],
+                        label=identity["label"],
+                        shape="unknown",
+                        status=NOT_FOUND,
+                        detail="重新打开 section 后未找到该字段。",
+                    )
+                )
                 continue
             if not semantic_field_is_empty(field_item):
-                results.append(CoverageResult(
-                    section=str(field_item.get("section_heading") or section_title),
-                    subsection=str(field_item.get("subsection_heading") or ""),
-                    attribute_key=identity["attribute_key"], label=identity["label"],
-                    shape=field_shape(field_item), status=SKIPPED_EXISTING,
-                    detail="测试前字段已出现非 placeholder 值；为保护现有数据未覆盖。",
-                ))
+                results.append(
+                    CoverageResult(
+                        section=str(field_item.get("section_heading") or section_title),
+                        subsection=str(field_item.get("subsection_heading") or ""),
+                        attribute_key=identity["attribute_key"],
+                        label=identity["label"],
+                        shape=field_shape(field_item),
+                        status=SKIPPED_EXISTING,
+                        detail="测试前字段已出现非 placeholder 值；为保护现有数据未覆盖。",
+                    )
+                )
                 continue
 
-            results.append(exercise_live_field(
-                adapter, field_item, section_path, ordinal,
-                recheck_wait_ms=recheck_wait_ms,
-                exercise_multi_value=exercise_multi_value,
-                wait_ms=wait_ms, max_scroll_steps=max_scroll_steps,
-            ))
+            results.append(
+                exercise_live_field(
+                    adapter,
+                    field_item,
+                    section_path,
+                    ordinal,
+                    recheck_wait_ms=recheck_wait_ms,
+                    exercise_multi_value=exercise_multi_value,
+                    wait_ms=wait_ms,
+                    max_scroll_steps=max_scroll_steps,
+                )
+            )
         finally:
             cancel_section(adapter, section_title)
 
