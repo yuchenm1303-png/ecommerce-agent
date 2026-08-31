@@ -6,7 +6,6 @@ import re
 import subprocess
 import sys
 import time
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -54,7 +53,13 @@ _PHASE_LINE = re.compile(
 
 
 class ReadOnlyRunner(QObject):
-    """GUI bridge to the current staged one-link acceptance workflow."""
+    """GUI bridge to the current staged one-link acceptance workflow.
+
+    Browser lifecycle/readiness belongs to ``ManagedMakroBrowser`` in the formal
+    GUI, and the child workflow owns the canonical CDP attach. This bridge does
+    no network/CDP preflight on the Qt click stack: after cheap local validation
+    it creates the run journal and starts QProcess immediately.
+    """
 
     log = Signal(str)
     phase_changed = Signal(str)
@@ -91,7 +96,6 @@ class ReadOnlyRunner(QObject):
         if mode not in _MODE_PHASES:
             raise ValueError(f"未知 workflow mode={mode!r}")
         self._validate_config(config, mode=mode)
-        self._assert_makro_cdp_available(config.makro_cdp_port)
 
         self.config = config
         self.mode = mode
@@ -203,18 +207,6 @@ class ReadOnlyRunner(QObject):
             raise ValueError("Makro CDP 端口无效。")
         if not (1 <= int(config.source_cdp_port) <= 65535):
             raise ValueError("Source CDP 端口无效。")
-
-    def _assert_makro_cdp_available(self, port: int) -> None:
-        try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/json/version", timeout=1.2
-            ) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"HTTP {response.status}")
-        except Exception as exc:
-            raise RuntimeError(
-                f"Makro Browser/CDP 127.0.0.1:{port} 当前不可用；正式 GUI 浏览器管理器未能在任务开始前恢复它。"
-            ) from exc
 
     def _start_process(self, args: list[str]) -> None:
         process = QProcess(self)
