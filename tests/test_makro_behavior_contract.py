@@ -96,7 +96,15 @@ def test_selectable_qualifier_is_a_different_contract_from_fixed_unit() -> None:
 
 def test_repeatable_add_requires_real_add_slot_evidence() -> None:
     observation = observe_field(
-        _field(key="ingredients", label="Ingredients", context="Ingredients", input_type="text", inputmode="", multi=True, add=True)
+        _field(
+            key="ingredients",
+            label="Ingredients",
+            context="Ingredients",
+            input_type="text",
+            inputmode="",
+            multi=True,
+            add=True,
+        )
     )
 
     level, _ = verification_level(observation, _result(observation))
@@ -130,6 +138,36 @@ def test_pre_rendered_repeatable_slots_do_not_pass_on_first_slot_only() -> None:
     assert observation.signature.commit_model == "repeatable_slots"
     level, _ = verification_level(observation, _result(observation))
     assert level == UNVERIFIED
+
+
+def test_radio_group_is_one_selection_not_repeatable_slots() -> None:
+    field = _field(
+        key="organic",
+        label="Organic",
+        context="Organic",
+        kind="radio",
+        input_type="radio",
+        inputmode="",
+    )
+    field["controls"] = [
+        {
+            **field["controls"][0],
+            "id": "organic_yes",
+            "name": "organic",
+            "value": "Yes",
+        },
+        {
+            **field["controls"][0],
+            "id": "organic_no",
+            "name": "organic",
+            "value": "No",
+        },
+    ]
+
+    signature = signature_for_field(field)
+    assert signature.base_family == "selection"
+    assert signature.cardinality == "single"
+    assert signature.commit_model == "selection"
 
 
 def test_direct_field_stable_readback_is_mechanically_verified() -> None:
