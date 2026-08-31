@@ -70,15 +70,18 @@ def test_office_archive_uses_expanded_size_budget(tmp_path: Path, monkeypatch: p
         product_pack._validate_office_archive_budget(archive_path, label="Excel")
 
 
-def test_stable_publish_requires_signing_but_development_build_contract_remains_separate() -> None:
+def test_stable_publish_allows_unsigned_release_but_validates_optional_signing_configuration() -> None:
     root = Path(__file__).resolve().parents[1]
     workflow = (root / ".github" / "workflows" / "publish-update.yml").read_text(encoding="utf-8")
     build_script = (root / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
 
-    assert "Require Stable code signing" in workflow
+    assert "Validate optional Stable code signing" in workflow
+    assert "Stable publication is unsigned" in workflow
+    assert "Stable publication requires code signing" not in workflow
+    assert "Configure exactly one Stable signing mode, not both." in workflow
     assert "VPK_AZURE_TRUSTED_SIGN_FILE: ${{ secrets.VPK_AZURE_TRUSTED_SIGN_FILE }}" in workflow
     assert "VPK_SIGN_PARAMS: ${{ secrets.VPK_SIGN_PARAMS }}" in workflow
-    assert "package is unsigned. This is acceptable for development/E2E only" in build_script
+    assert "package is unsigned" in build_script
     assert '$PackArgs += @("--azureTrustedSignFile", $AzureTrustedSignFile)' in build_script
     assert '$PackArgs += @("--signParams", $SignParams)' in build_script
 
