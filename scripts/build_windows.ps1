@@ -8,18 +8,36 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-# Velopack binds VPK_* environment variables before command execution. GitHub
-# Actions materializes an unset secret as an existing empty environment variable;
-# typed options such as VPK_AZURE_TRUSTED_SIGN_FILE then fail while converting
-# "" to FileInfo. Optional signing configuration has one canonical meaning here:
-# blank means absent. Normalize that process environment once, before any vpk
-# command, while preserving every non-blank value unchanged.
-foreach ($OptionalVelopackEnv in @("VPK_AZURE_TRUSTED_SIGN_FILE", "VPK_SIGN_PARAMS")) {
-    $OptionalVelopackValue = [Environment]::GetEnvironmentVariable($OptionalVelopackEnv, "Process")
-    if ($null -ne $OptionalVelopackValue -and [string]::IsNullOrWhiteSpace($OptionalVelopackValue)) {
-        [Environment]::SetEnvironmentVariable($OptionalVelopackEnv, $null, "Process")
+function Remove-BlankVelopackEnvironment {
+    # Velopack 1.2.0 binds every VPK_* variable through .NET Configuration before
+    # command execution. GitHub Actions materializes missing secrets as empty job
+    # environment variables, and typed options (for example FileInfo) cannot bind
+    # an empty string. Normalize the actual PowerShell Env: provider that child
+    # processes inherit, rather than mutating only selected names through the
+    # System.Environment API. This also protects future typed VPK_* options.
+    $BlankNames = @(
+        Get-ChildItem Env: | Where-Object {
+            $_.Name -like "VPK_*" -and [string]::IsNullOrWhiteSpace([string]$_.Value)
+        } | ForEach-Object { $_.Name }
+    )
+    foreach ($Name in $BlankNames) {
+        Remove-Item -LiteralPath "Env:$Name" -ErrorAction Stop
+    }
+
+    $RemainingBlank = @(
+        Get-ChildItem Env: | Where-Object {
+            $_.Name -like "VPK_*" -and [string]::IsNullOrWhiteSpace([string]$_.Value)
+        }
+    )
+    if ($RemainingBlank.Count -ne 0) {
+        throw "Unable to remove blank Velopack environment variables: $($RemainingBlank.Name -join ', ')"
+    }
+    if ($BlankNames.Count -gt 0) {
+        Write-Host "Ignoring blank Velopack environment variables: $($BlankNames -join ', ')"
     }
 }
+
+Remove-BlankVelopackEnvironment
 
 function Get-SingleVelopackArtifact {
     param(
