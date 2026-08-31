@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from app.ai_decisions import field_id
 from app.fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem
 from app.live_schema import write_live_schema
 from app.required_overrides import (
     apply_required_overrides,
     load_required_blocked_fields,
+    required_fallback_override,
     write_required_fallback_overrides,
 )
 from app.resolution_types import MISSING, ResolutionRecord
@@ -100,44 +100,44 @@ def test_required_blocked_binding_preserves_repeated_same_label_fields(tmp_path:
     ]
 
 
-def test_shared_batch_writer_generates_no_automatic_overrides(tmp_path: Path) -> None:
+def test_shared_batch_writer_creates_one_fallback_per_required_occurrence(tmp_path: Path) -> None:
     fields = [_field(help_text="outer package length"), _field(help_text="product length")]
     schema = write_live_schema(fields, tmp_path / "live-schema.json")
     plan = tmp_path / "fill-plan.json"
     _write_plan(plan, 2)
 
     summary = write_required_fallback_overrides(plan, schema)
+    payload = json.loads((tmp_path / "required-overrides.json").read_text(encoding="utf-8"))
 
-    assert summary["count"] == 0
-    assert summary["blocked_required"] == 2
-    assert summary["automatic_fallback_disabled"] is True
-    assert not (tmp_path / "required-overrides.json").exists()
+    assert summary["count"] == 2
+    assert len(payload["overrides"]) == 2
+    assert all(item["source_type"] == "fallback" for item in payload["overrides"])
+    assert all(item["values"] == ["1"] for item in payload["overrides"])
+    assert all(item["qualifier"] == "cm" for item in payload["overrides"])
 
 
-def test_executor_applies_explicit_user_values_per_repeated_occurrence() -> None:
+def test_executor_fallback_application_does_not_collapse_repeated_plan_items() -> None:
     fields = [_field(help_text="outer package length"), _field(help_text="product length")]
     plan = LiveFillPlan(items=[_blocked_item(), _blocked_item()])
-    overrides = [
-        {"field_id": field_id(fields[0]), "values": ["12"], "qualifier": "cm", "source_type": "user"},
-        {"field_id": field_id(fields[1]), "values": ["18"], "qualifier": "cm", "source_type": "user"},
-    ]
+    overrides = [required_fallback_override(field) for field in fields]
 
     summary = apply_required_overrides(plan, fields, overrides, planned_fields=fields)
 
     assert summary["applied"] == 2
+    assert summary["sources"]["fallback"] == 2
     assert [item.action for item in plan.items] == [READY, READY]
     assert plan.required_blocked_count == 0
-    assert [item.resolution.answer_values for item in plan.items] == [["12"], ["18"]]
+    assert [item.resolution.answer_values for item in plan.items] == [["1"], ["1"]]
     assert [item.resolution.qualifier for item in plan.items] == ["cm", "cm"]
-    assert all(item.resolution.source_type == "user" for item in plan.items)
 
 
-def test_batch_and_single_share_no_automatic_fallback_policy() -> None:
+def test_batch_and_single_share_required_fallback_backend() -> None:
     batch = (ROOT / "gui" / "batch_runner.py").read_text(encoding="utf-8")
     single = (ROOT / "gui" / "required_input_support.py").read_text(encoding="utf-8")
-    backend = (ROOT / "app" / "required_overrides.py").read_text(encoding="utf-8")
 
     assert "write_required_fallback_overrides" in batch
+    assert "latest_fill_plan" in batch
+    assert "[required-fallback]" in batch
+    assert '"makro_execute_listing.py"' in batch
     assert "load_required_blocked_fields" in single
-    assert "automatic_fallback_disabled" in backend
-    assert "required_fallback_override" not in single
+    assert "required_fallback_override" in single
