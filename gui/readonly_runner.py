@@ -54,18 +54,7 @@ _PHASE_LINE = re.compile(
 
 
 class ReadOnlyRunner(QObject):
-    """GUI bridge to the current staged one-link acceptance workflow.
-
-    ``full`` is the product-facing new-listing entrypoint. Every GUI invocation
-    starts a fresh ownership context and therefore never injects an implicit
-    ``--resume-current-url`` from a previous failure. Backend resume remains an
-    explicit CLI capability for diagnostics/recovery tooling only.
-
-    Child-process output stays on the Qt event loop only long enough to decode
-    protocol markers and publish lightweight signals. Complete run logs are
-    journaled on a dedicated writer thread so stdout bursts cannot turn into
-    synchronous filesystem stalls on the GUI presentation lane.
-    """
+    """GUI bridge to the current staged one-link acceptance workflow."""
 
     log = Signal(str)
     phase_changed = Signal(str)
@@ -90,6 +79,7 @@ class ReadOnlyRunner(QObject):
         self._phase_started: dict[str, tuple[float, str]] = {}
         self._completed_active: set[str] = set()
         self._journal: AsyncRunJournal | None = None
+        self.last_journal_error = ""
 
     @property
     def is_running(self) -> bool:
@@ -110,6 +100,7 @@ class ReadOnlyRunner(QObject):
         self._stdout_tail = ""
         self._phase_started.clear()
         self._completed_active.clear()
+        self.last_journal_error = ""
 
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         self.run_dir = self.project_root / "logs" / "gui-runs" / f"workflow-{mode}-{stamp}"
@@ -125,33 +116,20 @@ class ReadOnlyRunner(QObject):
         script = "makro_product_pack_workflow.py" if is_pack else "makro_gui_workflow.py"
         args = [
             script,
-            "--mode",
-            mode,
-            "--provider",
-            config.provider,
-            "--base-url",
-            config.base_url,
-            "--model",
-            config.local_model,
-            "--fact-model",
-            config.fact_model,
-            "--web-search-model",
-            config.web_model,
-            "--api-key-env",
-            config.api_key_env,
-            "--structured-mode",
-            "json_object",
+            "--mode", mode,
+            "--provider", config.provider,
+            "--base-url", config.base_url,
+            "--model", config.local_model,
+            "--fact-model", config.fact_model,
+            "--web-search-model", config.web_model,
+            "--api-key-env", config.api_key_env,
+            "--structured-mode", "json_object",
             "--disable-thinking",
-            "--cdp-port",
-            str(config.makro_cdp_port),
-            "--source-cdp-port",
-            str(config.source_cdp_port),
-            "--source-cache-dir",
-            str(source_cache),
-            "--semantic-cache-dir",
-            str(semantic_cache),
-            "--output-dir",
-            str(self.run_dir),
+            "--cdp-port", str(config.makro_cdp_port),
+            "--source-cdp-port", str(config.source_cdp_port),
+            "--source-cache-dir", str(source_cache),
+            "--semantic-cache-dir", str(semantic_cache),
+            "--output-dir", str(self.run_dir),
         ]
         if is_pack:
             for path in product_files:
@@ -298,7 +276,6 @@ class ReadOnlyRunner(QObject):
         detail = (detail or "").strip()
         index, label = _PHASE_META[phase]
         now_wall = datetime.now().astimezone().isoformat(timespec="seconds")
-
         if state == "start":
             self.current_phase = phase
             self._phase_started[phase] = (time.monotonic(), now_wall)
@@ -316,15 +293,9 @@ class ReadOnlyRunner(QObject):
             self._emit_progress(label)
             return
 
-        started_mono, started_wall = self._phase_started.get(
-            phase, (time.monotonic(), now_wall)
-        )
+        started_mono, started_wall = self._phase_started.get(phase, (time.monotonic(), now_wall))
         elapsed = max(0.0, time.monotonic() - started_mono)
-        status = {
-            "complete": "completed",
-            "failed": "failed",
-            "skipped": "skipped",
-        }[state]
+        status = {"complete": "completed", "failed": "failed", "skipped": "skipped"}[state]
         if status == "completed" and phase in _MODE_PHASES[self.mode]:
             self._completed_active.add(phase)
         self.phase_event.emit(
@@ -348,24 +319,36 @@ class ReadOnlyRunner(QObject):
         percent = round(100 * len(self._completed_active) / max(1, len(active)))
         self.progress_changed.emit(percent, f"{self.mode} · {len(self._completed_active)}/{len(active)} · {detail}")
 
-    def _process_finished(
-        self, exit_code: int, _exit_status: QProcess.ExitStatus
-    ) -> None:
+    def _process_finished(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
         self._read_output()
         self._flush_tail()
-        self._close_journal()
+        journal_error = self._close_journal()
         self.process = None
         if self._stopping:
             self.running_changed.emit(False)
             self.phase_changed.emit("已停止")
-            self.failed.emit("测试已由用户停止；浏览器现场保留。")
+            message = "测试已由用户停止；浏览器现场保留。"
+            if journal_error:
+                message += f" 日志持久化异常：{journal_error}"
+            self.failed.emit(message)
             return
 
         if exit_code != 0:
             message = self._manifest_error() or f"{self.mode} workflow 退出码={exit_code}。请查看 Live Console。"
+            if journal_error:
+                message += f" 日志持久化异常：{journal_error}"
             self.running_changed.emit(False)
             self.phase_changed.emit("失败")
             self.failed.emit(message)
+            return
+
+        if journal_error:
+            self.running_changed.emit(False)
+            self.phase_changed.emit("失败")
+            self.failed.emit(
+                "workflow 子进程已结束，但完整日志无法可靠落盘；"
+                f"为保证遥测完整性本次不接受为成功：{journal_error}"
+            )
             return
 
         try:
@@ -396,26 +379,36 @@ class ReadOnlyRunner(QObject):
         return str(payload.get("error") or "").strip()
 
     def _process_error(self, error: QProcess.ProcessError) -> None:
-        if self._stopping:
+        if self._stopping or error != QProcess.FailedToStart:
             return
-        if error == QProcess.FailedToStart:
-            self.process = None
-            self._close_journal()
-            self.running_changed.emit(False)
-            self.failed.emit("GUI workflow Python 子进程启动失败。")
+        process = self.process
+        error_string = process.errorString() if process is not None else "unknown QProcess startup error"
+        message = f"QProcess FailedToStart: {error_string}"
+        self._emit_log(message)
+        self.process = None
+        journal_error = self._close_journal()
+        self.running_changed.emit(False)
+        if journal_error:
+            message += f" | journal={journal_error}"
+        self.failed.emit("GUI workflow Python 子进程启动失败。" + message)
 
     def _start_journal(self, path: Path) -> None:
         self._close_journal()
+        self.last_journal_error = ""
         self._journal = AsyncRunJournal(path)
 
-    def _close_journal(self) -> None:
+    def _close_journal(self) -> str:
         journal = self._journal
         self._journal = None
-        if journal is not None:
-            journal.close()
+        if journal is None:
+            return self.last_journal_error
+        error = journal.close()
+        if error is not None:
+            self.last_journal_error = f"{type(error).__name__}: {error}"
+        return self.last_journal_error
 
     def _emit_log(self, line: str) -> None:
         self.log.emit(line)
         journal = self._journal
-        if journal is not None:
-            journal.append(line)
+        if journal is not None and not journal.append(line) and journal.error is not None:
+            self.last_journal_error = journal.error_text
