@@ -14,7 +14,6 @@ from ..browser_visual_hud import browser_visual_hud_status, browser_visual_hud_t
 from .sections import find_section, open_section_for_edit
 
 PRODUCT_PHOTOS_SECTION = "Product Photos"
-PHOTO_SLOT_IDS = tuple(f"thumbnail_{index}" for index in range(5))
 PHOTO_SURFACE_READY_TIMEOUT_MS = 8_000
 PHOTO_SURFACE_STABLE_SAMPLES = 2
 MAX_UPLOAD_EDGE = 4096
@@ -137,8 +136,7 @@ def _photo_surface(page: Page, section_path: str):
         if current.count() != 1:
             break
         slot_count = current.locator('[id^="thumbnail_"]').count()
-        input_count = current.locator('input[type="file"]').count()
-        if slot_count >= 5 or (slot_count > 0 and input_count > 0):
+        if slot_count > 0:
             return current
         best = current
         parent = current.locator("xpath=..")
@@ -161,10 +159,11 @@ def _slot_snapshot(page: Page, section_path: str) -> list[dict[str, Any]]:
           };
           const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
           const slots = [];
-          for (let index = 0; index < 5; index += 1) {
-            const id = `thumbnail_${index}`;
-            const slot = surface.querySelector(`#${id}`);
-            if (!slot) continue;
+          for (const slot of Array.from(surface.querySelectorAll('[id^="thumbnail_"]'))) {
+            const id = clean(slot.id);
+            const match = /^thumbnail_(\d+)$/.exec(id);
+            if (!match) continue;
+            const index = Number(match[1]);
             const plus = Array.from(slot.querySelectorAll('i.fa-plus, .fa-plus')).find(visible) || null;
             const check = Array.from(slot.querySelectorAll('i.fa-check, .fa-check, .fa-check-circle')).find(visible) || null;
             const labelCandidates = Array.from(slot.querySelectorAll('span'))
@@ -183,6 +182,7 @@ def _slot_snapshot(page: Page, section_path: str) -> list[dict[str, Any]]:
               image_sources: images,
             });
           }
+          slots.sort((left, right) => left.index - right.index);
           return slots;
         }"""
     )
@@ -243,7 +243,7 @@ def _photo_state(page: Page, section_path: str) -> dict[str, Any]:
         "found": True,
         "title": title,
         "completion_count": counter[0] if counter else None,
-        "capacity": counter[1] if counter else (5 if len(slots) == 5 else None),
+        "capacity": counter[1] if counter else (len(slots) or None),
         "slot_count": len(slots),
         "slots": slots,
         "empty_slot_ids": empty_slot_ids,
@@ -259,16 +259,28 @@ def _photo_state(page: Page, section_path: str) -> dict[str, Any]:
 
 def _surface_slot_ids(state: dict[str, Any]) -> tuple[str, ...]:
     return tuple(
-        sorted(
-            str(slot.get("id") or "")
-            for slot in state.get("slots") or []
-            if str(slot.get("id") or "")
+        str(slot.get("id") or "")
+        for slot in sorted(
+            (dict(slot) for slot in state.get("slots") or [] if str(slot.get("id") or "")),
+            key=lambda slot: int(slot.get("index") or 0),
         )
     )
 
 
 def _photo_surface_is_ready(state: dict[str, Any]) -> bool:
-    return bool(state.get("found")) and _surface_slot_ids(state) == tuple(sorted(PHOTO_SLOT_IDS))
+    if not bool(state.get("found")):
+        return False
+    slot_ids = _surface_slot_ids(state)
+    if not slot_ids:
+        return False
+    raw_capacity = state.get("capacity")
+    if raw_capacity is None:
+        return True
+    try:
+        capacity = int(raw_capacity)
+    except (TypeError, ValueError):
+        return False
+    return capacity > 0 and len(slot_ids) == capacity
 
 
 def _wait_for_photo_surface_ready(
@@ -280,6 +292,7 @@ def _wait_for_photo_surface_ready(
     timeout_ms = max(1, int(timeout_ms))
     deadline = time.monotonic() + timeout_ms / 1000.0
     stable_samples = 0
+    stable_slot_ids: tuple[str, ...] | None = None
     latest: dict[str, Any] = {}
     live_path = section_path
 
@@ -287,8 +300,13 @@ def _wait_for_photo_surface_ready(
         section = find_section(page, PRODUCT_PHOTOS_SECTION)
         live_path = str((section or {}).get("path") or live_path)
         latest = _photo_state(page, live_path)
+        current_slot_ids = _surface_slot_ids(latest)
         if _photo_surface_is_ready(latest):
-            stable_samples += 1
+            if current_slot_ids == stable_slot_ids:
+                stable_samples += 1
+            else:
+                stable_slot_ids = current_slot_ids
+                stable_samples = 1
             if stable_samples >= PHOTO_SURFACE_STABLE_SAMPLES:
                 latest["surface_ready"] = True
                 latest["surface_stable_samples"] = stable_samples
@@ -296,12 +314,13 @@ def _wait_for_photo_surface_ready(
                 return live_path, latest
         else:
             stable_samples = 0
+            stable_slot_ids = None
 
         if time.monotonic() >= deadline:
             raise RuntimeError(
-                "Product Photos 已展开，但固定图片槽结构未稳定就绪；"
-                f"timeout_ms={timeout_ms}, expected_slots={list(PHOTO_SLOT_IDS)}, "
-                f"observed_slots={list(_surface_slot_ids(latest))}, "
+                "Product Photos 已展开，但实时图片槽结构未稳定就绪；"
+                f"timeout_ms={timeout_ms}, declared_capacity={latest.get('capacity')}, "
+                f"observed_slots={list(current_slot_ids)}, "
                 f"completion={latest.get('completion_count')}/{latest.get('capacity')}."
             )
         page.wait_for_timeout(100)
@@ -356,12 +375,15 @@ def _next_empty_photo_slot(
 ) -> tuple[str, Any] | None:
     consumed = consumed_slot_ids or set()
     surface = _photo_surface(page, section_path)
-    snapshots = {str(slot.get("id")): slot for slot in _slot_snapshot(page, section_path)}
-    for slot_id in PHOTO_SLOT_IDS:
-        if slot_id in consumed:
+    snapshots = sorted(
+        _slot_snapshot(page, section_path),
+        key=lambda slot: int(slot.get("index") or 0),
+    )
+    for snapshot in snapshots:
+        slot_id = str(snapshot.get("id") or "")
+        if not slot_id or slot_id in consumed:
             continue
-        snapshot = snapshots.get(slot_id)
-        if not snapshot or not bool(snapshot.get("is_empty")):
+        if not bool(snapshot.get("is_empty")):
             continue
         slot = surface.locator(f"#{slot_id}")
         if slot.count() != 1:
@@ -989,7 +1011,7 @@ def upload_product_photos(
                 {
                     "path": str(path),
                     "status": "slot_missing",
-                    "detail": "完整五槽结构已就绪，但没有下一个未消费的逻辑空 #thumbnail_N 图片框。",
+                    "detail": "当前实时图片槽中没有下一个未消费的空 thumbnail 图片框。",
                     "consumed_slots": sorted(consumed_slots),
                     "failure_scope": "photo_section",
                 }
@@ -1096,7 +1118,7 @@ def upload_product_photos(
         )
     else:
         result.status = "staging_unconfirmed"
-        result.detail = "没有任何固定 thumbnail 图片槽形成可证明的本次上传接受证据。"
+        result.detail = "没有任何实时 thumbnail 图片槽形成可证明的本次上传接受证据。"
     return result
 
 
@@ -1155,7 +1177,6 @@ def verify_persisted_photo_count(
 
 
 __all__ = [
-    "PHOTO_SLOT_IDS",
     "PRODUCT_PHOTOS_SECTION",
     "PhotoPostSubmitUncertainError",
     "PhotoPreSubmitError",
