@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from app.listing_image_ranker import finalize_supplier_listing_images
@@ -13,15 +14,47 @@ class _SequenceProvider:
     name = "fixture"
     model = "fixture-model"
 
-    def __init__(self, responses: list[dict[str, object]]) -> None:
+    def __init__(self, responses: list[dict[str, object] | BaseException]) -> None:
         self.responses = list(responses)
         self.requests: list[dict[str, object]] = []
 
     def extract_json(self, request_payload):
         self.requests.append(request_payload)
         if not self.responses:
-            raise AssertionError("unexpected ranking call")
-        return self.responses.pop(0)
+            raise AssertionError("unexpected AI call")
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+def _identity() -> dict[str, object]:
+    return {
+        "entity_kind": "physical_product",
+        "product_type_en": "cordless drill",
+        "brand_identity": "__UNKNOWN__",
+        "product_summary": "18V cordless drill kit",
+        "confidence": 0.95,
+        "evidence_refs": ["identity:page-title"],
+    }
+
+
+def _ownership(classification: str = "EXACT_TARGET") -> dict[str, object]:
+    return {
+        "decisions": {
+            "image_01": {
+                "classification": classification,
+                "confidence": 0.98,
+                "reason": "ownership decision for image 1",
+            },
+            "image_02": {
+                "classification": classification,
+                "confidence": 0.97,
+                "reason": "ownership decision for image 2",
+            },
+        },
+        "summary": "ownership pass complete",
+    }
 
 
 def _decision(selected: bool, reason: str) -> dict[str, object]:
@@ -47,9 +80,9 @@ def _resolver_run(tmp_path: Path) -> tuple[Path, Path, Path]:
         SourceSnapshot(
             requested_url="https://supplier.example/item/42",
             final_url="https://supplier.example/item/42",
-            title="Exact target product",
+            title="18V cordless drill kit",
             captured_at="2026-08-31T00:00:00+00:00",
-            visible_text="Exact target product listing",
+            visible_text="18V cordless drill kit plus unrelated recommendation names",
         ),
         run_dir / "source-snapshot.json",
     )
@@ -74,45 +107,60 @@ def _resolver_run(tmp_path: Path) -> tuple[Path, Path, Path]:
         json.dumps(manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    return run_dir, first, second
+    return run_dir, first.resolve(), second.resolve()
 
 
-def test_first_empty_result_is_rechecked_before_supplier_gallery_is_removed(tmp_path) -> None:
-    run_dir, first, _second = _resolver_run(tmp_path)
-    provider = _SequenceProvider(
-        [
-            _ranking([], reason="first pass was overly strict"),
-            _ranking(["image_01"], reason="reinspection confirms exact product"),
-        ]
-    )
-
-    result = finalize_supplier_listing_images(run_dir, provider)
-
-    assert result.selected == (first.resolve(),)
-    assert result.model_calls == 2
-    assert len(provider.requests) == 2
-    assert provider.requests[1]["task"] == "confirm_empty_supplier_listing_gallery"
-    manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
-    assert manifest["outputs"]["primary_source_listing_images"] == [str(first.resolve())]
-    assert manifest["listing_image_ranking"]["zero_selection_confirmation_performed"] is True
-    assert manifest["listing_image_ranking"]["zero_selection_confirmed"] is False
-    assert manifest["total_model_calls"] == 2
-
-
-def test_empty_supplier_gallery_requires_two_matching_zero_decisions(tmp_path) -> None:
+def test_final_gallery_may_be_empty_without_a_recall_biased_rescue_pass(tmp_path: Path) -> None:
     run_dir, _first, _second = _resolver_run(tmp_path)
     provider = _SequenceProvider(
         [
-            _ranking([], reason="no exact product visible"),
-            _ranking([], reason="second inspection also finds no exact product"),
+            _identity(),
+            _ownership(),
+            _ranking([], reason="No candidate is safe enough for automatic upload."),
         ]
     )
 
     result = finalize_supplier_listing_images(run_dir, provider)
 
     assert result.selected == ()
-    assert result.model_calls == 2
+    assert result.status == "ai_ranked_empty"
+    assert result.model_calls == 3
+    assert [request["task"] for request in provider.requests] == [
+        "infer_grounded_supplier_product_identity",
+        "classify_supplier_listing_image_ownership",
+        "verify_and_order_exact_supplier_gallery",
+    ]
+    assert all(request["task"] != "confirm_empty_supplier_listing_gallery" for request in provider.requests)
+
     manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
     assert manifest["outputs"]["primary_source_listing_images"] == []
-    assert manifest["listing_image_ranking"]["zero_selection_confirmation_performed"] is True
-    assert manifest["listing_image_ranking"]["zero_selection_confirmed"] is True
+    assert manifest["listing_image_ranking"]["status"] == "ai_ranked_empty"
+    assert manifest["listing_image_ranking"]["precision_first"] is True
+    assert manifest["total_model_calls"] == 3
+
+
+def test_semantic_ai_failure_clears_old_mechanical_gallery_before_raising(tmp_path: Path) -> None:
+    run_dir, first, second = _resolver_run(tmp_path)
+    provider = _SequenceProvider(
+        [
+            _identity(),
+            RuntimeError("vision provider unavailable"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="vision provider unavailable"):
+        finalize_supplier_listing_images(run_dir, provider)
+
+    manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["outputs"]["primary_source_listing_images"] == []
+    assert manifest["source_capture"]["listing_images"] == []
+    assert manifest["listing_image_ranking"]["status"] == "failed_closed"
+    assert manifest["listing_image_ranking"]["error"]["type"] == "RuntimeError"
+    assert manifest["listing_image_ranking"]["selected_count"] == 0
+    assert str(first) not in manifest["outputs"]["primary_source_listing_images"]
+    assert str(second) not in manifest["outputs"]["primary_source_listing_images"]
+
+    report = json.loads((run_dir / "listing-image-selection.json").read_text(encoding="utf-8"))
+    assert report["status"] == "failed_closed"
+    assert report["policy"]["program_semantic_fallback"] == "none"
+    assert report["error"]["message"] == "vision provider unavailable"
