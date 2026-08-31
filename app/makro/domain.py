@@ -14,7 +14,7 @@ from typing import Any, Iterable
 from playwright.sync_api import Page
 
 from ..makro_dryrun import FillVerification, fill_resolved_field, verify_resolved_field
-from .field_engine import fill_control as fill_live_control
+from .field_engine import execution_contract, fill_control as fill_live_control
 from .fields import build_semantic_fields, scroll_and_capture
 from .listing import (
     MakroListingTarget,
@@ -44,6 +44,15 @@ from .sections import (
     visible_section_errors,
 )
 from .semantic_normalize import coalesce_radio_semantic_fields
+from .unit_contract import fixed_rendered_unit
+
+
+_PLAIN_TEXT_EXECUTION_FAMILIES = {
+    "text",
+    "text_multi",
+    "long_text",
+    "long_text_multi",
+}
 
 
 def _value_controls(field: dict[str, Any]) -> list[dict[str, Any]]:
@@ -61,6 +70,40 @@ def _qualifier_controls(field: dict[str, Any]) -> list[dict[str, Any]]:
         for control in field.get("controls") or []
         if str(control.get("name") or "").endswith("_qualifier")
     ]
+
+
+def _answer_values(answer: Any) -> list[str]:
+    values = [
+        str(value).strip()
+        for value in list(getattr(answer, "answer_values", []) or [])
+        if str(value).strip()
+    ]
+    if values:
+        return values
+    scalar = str(getattr(answer, "answer", "") or "").strip()
+    return [scalar] if scalar else []
+
+
+def _serialize_plain_text_qualifier(value: str, qualifier: str) -> str:
+    """Serialize one approved value+qualifier pair for a plain text live control.
+
+    The operation is deliberately mechanical: it preserves the AI-approved value
+    and qualifier, merely rendering the two pieces into the single string shape
+    required by a DOM control that exposes no separate qualifier contract.
+    """
+
+    text = str(value or "").strip()
+    unit = str(qualifier or "").strip()
+    if not text or not unit:
+        return text
+
+    folded_text = text.casefold()
+    folded_unit = unit.casefold()
+    if folded_text.endswith(folded_unit):
+        prefix = text[: len(text) - len(unit)]
+        if not prefix or prefix[-1].isspace() or prefix[-1].isdigit() or not prefix[-1].isalnum():
+            return text
+    return f"{text} {unit}"
 
 
 def _same_semantic_field(
@@ -263,51 +306,81 @@ class MakroDomainAdapter:
     ) -> Any:
         """Apply final DOM-known Makro mechanics without changing product semantics.
 
+        AI owns product semantics. This boundary only projects an approved answer
+        into the shape the current live control can mechanically execute. A plain
+        text/long-text control has one value channel, so an approved qualifier is
+        serialized into that value. Numeric fields, fixed-unit fields and real
+        qualifier controls keep their strict unit contracts unchanged.
+
         The committed Brand lives in the current listing URL even when an older
         decision packet does not carry product_identity.brand. Makro rejects that
-        exact Brand token inside Model Name, so remove it at the final write and
-        verification boundary. The original plan/answer object is never mutated.
+        exact Brand token inside Model Name, so remove it at the same final write
+        and verification boundary. The original plan/answer object is never mutated.
         """
 
+        constrained = answer
+        qualifier = str(getattr(constrained, "qualifier", "") or "").strip()
+        if qualifier:
+            contract = execution_contract(semantic_field, constrained)
+            if (
+                contract.live_family in _PLAIN_TEXT_EXECUTION_FAMILIES
+                and not fixed_rendered_unit(semantic_field)
+            ):
+                values = _answer_values(constrained)
+                if values:
+                    rendered = [
+                        _serialize_plain_text_qualifier(value, qualifier)
+                        for value in values
+                    ]
+                    projected = copy(constrained)
+                    projected.answer_values = rendered
+                    projected.answer = rendered[0]
+                    projected.qualifier = None
+                    detail = str(getattr(projected, "detail", "") or "").strip()
+                    suffix = "Makro plain-text control serialized approved qualifier into value."
+                    projected.detail = f"{detail} | {suffix}" if detail else suffix
+                    constrained = projected
+                    label = str(
+                        semantic_field.get("label")
+                        or semantic_field.get("attribute_key")
+                        or "field"
+                    ).replace("\t", " ").replace("\n", " ")
+                    print(
+                        f"GUI_EXEC_CONSTRAINT\t{label}\tqualifier_serialized\t{qualifier}",
+                        flush=True,
+                    )
+
         if not _is_model_name_field(semantic_field):
-            return answer
+            return constrained
         target = self.current_target()
         brand = str((target.brand if target else None) or "").strip()
         if not brand:
-            return answer
+            return constrained
 
-        values = [
-            str(value).strip()
-            for value in list(getattr(answer, "answer_values", []) or [])
-            if str(value).strip()
-        ]
+        values = _answer_values(constrained)
         if not values:
-            scalar = str(getattr(answer, "answer", "") or "").strip()
-            if scalar:
-                values = [scalar]
-        if not values:
-            return answer
+            return constrained
 
         cleaned = [_strip_known_brand(value, brand) for value in values]
         if cleaned == values:
-            return answer
+            return constrained
         meaningful = [value for value in cleaned if value]
         if not meaningful:
             raise RuntimeError(
                 "Makro Model Name 去除当前 Brand 后为空；拒绝编造替代型号。"
             )
 
-        constrained = copy(answer)
-        constrained.answer_values = meaningful
-        constrained.answer = meaningful[0]
-        detail = str(getattr(constrained, "detail", "") or "").strip()
+        projected = copy(constrained)
+        projected.answer_values = meaningful
+        projected.answer = meaningful[0]
+        detail = str(getattr(projected, "detail", "") or "").strip()
         suffix = f"Makro Model Name removed committed Brand {brand!r}."
-        constrained.detail = f"{detail} | {suffix}" if detail else suffix
+        projected.detail = f"{detail} | {suffix}" if detail else suffix
         print(
             f"GUI_EXEC_CONSTRAINT\tModel Name\tbrand_removed\t{brand}",
             flush=True,
         )
-        return constrained
+        return projected
 
     def _seed_repeatable_slot(
         self,
