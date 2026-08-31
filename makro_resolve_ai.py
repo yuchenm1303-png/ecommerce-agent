@@ -11,6 +11,7 @@ import argparse
 from pathlib import Path
 
 from app.failure_contract import run_cli_with_failure_journal
+from app.image_optimization_gate import image_optimization_enabled
 from app.listing_image_ranker import finalize_supplier_listing_images
 from app.providers.registry import (
     ProviderConfig,
@@ -170,6 +171,14 @@ def main() -> int:
     if status != 0:
         return status
 
+    if not image_optimization_enabled():
+        print(
+            "listing_image_ranking=LEGACY image_optimization=OFF "
+            "detail=保留 Resolver 机械图片选择，不启动额外图像 AI",
+            flush=True,
+        )
+        return status
+
     run_dir = _new_resolver_run(output_root, before)
     if run_dir is None:
         print(
@@ -185,18 +194,18 @@ def main() -> int:
         result = finalize_supplier_listing_images(run_dir, ranking_provider)
         selected = len(result.selected)
         print(
-            f"listing_image_ranking={result.status.upper()} selected={selected} "
+            f"listing_image_ranking={result.status.upper()} image_optimization=ON selected={selected} "
             f"candidates={result.mechanical_candidate_count} "
             f"semantic_rejected={result.semantically_rejected_count} "
             f"calls={result.model_calls}",
             flush=True,
         )
     except Exception as exc:
-        # finalize_supplier_listing_images publishes an empty automatic gallery before
-        # surfacing semantic/AI failures. Keep successful field resolution available
-        # for manual Product Photos, but never restore the old mechanical image list.
+        # The opt-in semantic path owns its own fail-closed behavior. The default
+        # legacy path never enters this branch.
         print(
-            f"listing_image_ranking=FAIL_CLOSED automatic_product_photos=0 detail={exc}",
+            f"listing_image_ranking=FAIL_CLOSED image_optimization=ON "
+            f"automatic_product_photos=0 detail={exc}",
             flush=True,
         )
     return status
