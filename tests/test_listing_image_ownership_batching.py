@@ -35,8 +35,10 @@ class _BatchProvider:
             "decisions": {
                 image_id: {
                     "visual_subject": "product photo",
-                    "visible_identity": "",
-                    "visible_configuration": "",
+                    "visible_identity": "Brand Target",
+                    "visible_configuration": "target configuration",
+                    "target_match_evidence": "Synthetic pixels positively establish the target identity.",
+                    "target_identity_gaps": "",
                     "classification": "EXACT_TARGET",
                     "confidence": 0.9,
                     "reason": "synthetic exact-target decision",
