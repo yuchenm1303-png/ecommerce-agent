@@ -149,12 +149,14 @@ def test_batch_and_single_are_separate_full_workspaces_in_one_window() -> None:
     assert "批量填写 READY" in WORKSPACE
 
 
-def test_batch_job_surface_keeps_independent_lossless_logs_and_owned_tab_metadata() -> None:
+def test_batch_job_surface_keeps_bounded_ui_logs_and_owned_tab_metadata() -> None:
     assert "_JOB_LOG_LINE" in WORKSPACE
     assert "self.controller.log.connect(self._append_controller_log)" in WORKSPACE
     assert "def append_log(self, line: str)" in WORKSPACE
-    assert "self._logs: deque[str] = deque()" in WORKSPACE
-    assert "setMaximumBlockCount(" not in WORKSPACE
+    assert "self._logs: deque[str] = log_buffer()" in WORKSPACE
+    assert "setMaximumBlockCount(" in WORKSPACE
+    assert "AsyncRunJournal(log_path)" in RUNNER
+    assert "deque(maxlen=BATCH_LOG_PENDING_LINES)" in RUNNER
     assert "Makro targetId" in WORKSPACE
     assert "Execution report" in WORKSPACE
     assert "READY  {job.ready}" in WORKSPACE

@@ -35,9 +35,10 @@ def test_supplier_url_remains_primary_when_customer_files_supplement_it() -> Non
     assert validate_product_input(product_url=url) == "supplier_url"
 
 
-def test_batch_runtime_keeps_lossless_fifo_preview_and_never_authorizes_qc() -> None:
+def test_batch_runtime_keeps_lossless_disk_journal_bounded_preview_and_never_authorizes_qc() -> None:
     source = (Path(__file__).resolve().parents[1] / "gui" / "batch_runner.py").read_text(encoding="utf-8")
-    assert "self._pending_log_preview: deque[str] = deque()" in source
+    assert "deque(maxlen=BATCH_LOG_PENDING_LINES)" in source
+    assert "emitted < BATCH_LOG_FLUSH_LINES" in source
     assert "journal.append(line)" in source
     assert "self.batch.send_to_qc = False" in source
 

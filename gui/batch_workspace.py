@@ -31,6 +31,7 @@ from .batch_model import (
     normalize_batch_urls,
 )
 from .batch_runner import BatchController
+from .batch_log_buffer import BATCH_LOG_PREVIEW_CHARS, display_log_line, log_buffer
 from .readonly_runner import RunnerConfig
 
 
@@ -88,7 +89,7 @@ class BatchJobCard(QFrame):
         self.job_id = job_id
         self._job: BatchJob | None = None
         self._details_callback = details_callback
-        self._logs: deque[str] = deque()
+        self._logs: deque[str] = log_buffer()
         self._log_view: QPlainTextEdit | None = None
         self._expanded = False
 
@@ -278,13 +279,13 @@ class BatchJobCard(QFrame):
         self._update_details_meta()
 
     def append_log(self, line: str) -> None:
-        clean = str(line or "").strip()
+        clean = display_log_line(line)
         if not clean:
             return
         self._logs.append(clean)
-        preview = clean if len(clean) <= 190 else clean[:187] + "..."
+        preview = clean if len(clean) <= BATCH_LOG_PREVIEW_CHARS else clean[: BATCH_LOG_PREVIEW_CHARS - 3] + "..."
         self.log_preview.setText(preview)
-        self.log_preview.setToolTip(clean)
+        self.log_preview.setToolTip(preview)
         if self._log_view is not None:
             self._log_view.appendPlainText(clean)
 
@@ -342,6 +343,7 @@ class BatchJobCard(QFrame):
         if self._log_view is not None:
             return
         viewer = QPlainTextEdit()
+        viewer.document().setMaximumBlockCount(self._logs.maxlen or 0)
         viewer.setObjectName("cardDetailTextView")
         viewer.setReadOnly(True)
         viewer.setMinimumHeight(170)
@@ -697,8 +699,8 @@ class BatchWorkspace(QWidget):
         if card is not None:
             card.append_log(line)
             return
-        pending = self._pending_logs.setdefault(job_id, deque())
-        pending.append(line)
+        pending = self._pending_logs.setdefault(job_id, log_buffer())
+        pending.append(display_log_line(line))
 
     def _clear_job_cards(self) -> None:
         self._retire_legacy_job_cards()

@@ -14,6 +14,7 @@ from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signa
 from app.listing_images import listing_images_from_resolver_outputs
 from app.required_overrides import write_required_fallback_overrides
 from .async_run_journal import AsyncRunJournal
+from .batch_log_buffer import BATCH_LOG_FLUSH_LINES, BATCH_LOG_PENDING_LINES
 from .batch_model import (
     BATCH_WORKER_DEFAULT,
     BatchJob,
@@ -58,8 +59,8 @@ class BatchController(QObject):
     token and has a separate bounded concurrency.
 
     Child-process stdout is durably journaled per job/stage while the control-tower
-    surface receives a rate-limited FIFO preview. The preview is lossless: every
-    complete stdout/stderr line stays queued until it has been emitted to the GUI.
+    surface receives a bounded, rate-limited preview. Complete stdout/stderr stays
+    lossless in the per-stage diagnostics journal, not in GUI memory.
     """
 
     jobs_changed = Signal(object)
@@ -83,7 +84,7 @@ class BatchController(QObject):
         self._journals: dict[QProcess, AsyncRunJournal] = {}
         self._stopping = False
         self._execution_images = False
-        self._pending_log_preview: deque[str] = deque()
+        self._pending_log_preview: deque[str] = deque(maxlen=BATCH_LOG_PENDING_LINES)
         self._state_dirty = False
 
         self._log_preview_timer = QTimer(self)
@@ -652,8 +653,12 @@ class BatchController(QObject):
         if not self._pending_log_preview:
             return
         self._log_preview_timer.stop()
-        while self._pending_log_preview:
+        emitted = 0
+        while self._pending_log_preview and emitted < BATCH_LOG_FLUSH_LINES:
             self.log.emit(self._pending_log_preview.popleft())
+            emitted += 1
+        if self._pending_log_preview:
+            self._log_preview_timer.start()
 
     def _persist_emit(self, *, immediate: bool = False) -> None:
         if self.batch is None:

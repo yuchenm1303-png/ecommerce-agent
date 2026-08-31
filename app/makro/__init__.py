@@ -7,7 +7,6 @@ browser domain adapter. Product-semantic resolution intentionally lives outside
 this package and is AI-first.
 """
 
-from .domain import MakroDomainAdapter
 from .fields import (
     build_semantic_fields,
     capture_controls,
@@ -42,6 +41,21 @@ from .sections import (
     scan_sections,
 )
 from .snapshot import sanitize_dom_snapshot
+
+
+def __getattr__(name: str):
+    """Load the domain facade only when callers request its public export.
+
+    Low-level modules such as ``app.makro_dryrun`` import field-engine helpers
+    through this package. Eagerly importing the domain facade here would make
+    that path recurse back into the partially initialized dry-run module.
+    """
+
+    if name == "MakroDomainAdapter":
+        from .domain import MakroDomainAdapter
+
+        return MakroDomainAdapter
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "MAKRO_HOME_URL",

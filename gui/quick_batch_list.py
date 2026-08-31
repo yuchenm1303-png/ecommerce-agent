@@ -18,11 +18,14 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
     Slot,
+    QTimer,
 )
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtQml import QQmlComponent
 from PySide6.QtQuick import QQuickItem
 from PySide6.QtWidgets import QBoxLayout, QFrame, QMainWindow, QSizePolicy, QWidget
+
+from .batch_log_buffer import BATCH_LOG_PREVIEW_CHARS, display_log_line, log_buffer
 
 
 _JOB_LOG_LINE = re.compile(r"^\[(JOB-\d+)(?:\s*·[^\]]+)?\]\s?(.*)$")
@@ -509,6 +512,11 @@ class QuickBatchList(QAbstractListModel):
         self._rows: list[dict[str, Any]] = []
         self._expanded: set[str] = set()
         self._logs: dict[str, deque[str]] = {}
+        self._dirty_log_text: set[str] = set()
+        self._log_text_timer = QTimer(self)
+        self._log_text_timer.setSingleShot(True)
+        self._log_text_timer.setInterval(250)
+        self._log_text_timer.timeout.connect(self._flush_log_text)
 
         self._active = False
         self._card_attached = False
@@ -589,7 +597,7 @@ class QuickBatchList(QAbstractListModel):
             except RuntimeError:
                 continue
             if lines:
-                self._logs[str(job_id)] = deque(lines)
+                self._logs[str(job_id)] = log_buffer(lines)
 
     @staticmethod
     def _phase_text(progress: int) -> str:
@@ -612,7 +620,7 @@ class QuickBatchList(QAbstractListModel):
             )
         )
 
-    def _snapshot_job(self, job: Any) -> dict[str, Any]:
+    def _snapshot_job(self, job: Any, *, refresh_log_text: bool = False) -> dict[str, Any]:
         job_id = str(getattr(job, "job_id", ""))
         status = str(getattr(job, "status", "QUEUED") or "QUEUED")
         progress = max(0, min(100, int(getattr(job, "progress", 0) or 0)))
@@ -645,7 +653,11 @@ class QuickBatchList(QAbstractListModel):
             "errorText": str(getattr(job, "error", "") or ""),
             "logPreview": log_preview,
             "detailsText": self._details_text(job),
-            "logText": "\n".join(logs) if expanded and logs else "",
+            "logText": (
+                "\n".join(logs)
+                if refresh_log_text and expanded and logs
+                else self._existing_log_text(job_id) if expanded else ""
+            ),
             "expanded": expanded,
             "canOpenUrl": bool(str(getattr(job, "product_url", "") or "")),
             "canOpenDir": bool(run_dir),
@@ -664,6 +676,7 @@ class QuickBatchList(QAbstractListModel):
             and all(old.get("jobId") == new.get("jobId") for old, new in zip(self._rows, next_rows))
         )
         if not same_topology:
+            next_rows = [self._snapshot_job(job, refresh_log_text=True) for job in jobs]
             self.beginResetModel()
             self._rows = next_rows
             self.endResetModel()
@@ -683,7 +696,7 @@ class QuickBatchList(QAbstractListModel):
 
     @Slot(str)
     def append_log(self, line: str) -> None:
-        clean = str(line or "").strip()
+        clean = display_log_line(line)
         if not clean:
             return
         match = _JOB_LOG_LINE.match(clean)
@@ -691,19 +704,42 @@ class QuickBatchList(QAbstractListModel):
             return
         job_id = match.group(1)
         message = match.group(2).strip() or clean
-        logs = self._logs.setdefault(job_id, deque())
+        logs = self._logs.setdefault(job_id, log_buffer())
         logs.append(message)
         row_index = self._row_index(job_id)
         if row_index < 0:
             return
         row = self._rows[row_index]
         changed = [self._ROLES["logPreview"]]
-        row["logPreview"] = message
+        row["logPreview"] = (
+            message if len(message) <= BATCH_LOG_PREVIEW_CHARS else message[: BATCH_LOG_PREVIEW_CHARS - 3] + "..."
+        )
         if row.get("expanded"):
-            row["logText"] = "\n".join(logs)
-            changed.append(self._ROLES["logText"])
+            self._dirty_log_text.add(job_id)
+            if not self._log_text_timer.isActive():
+                self._log_text_timer.start()
         index = self.index(row_index, 0)
         self.dataChanged.emit(index, index, changed)
+
+    def _existing_log_text(self, job_id: str) -> str:
+        row_index = self._row_index(job_id)
+        if row_index < 0:
+            return ""
+        return str(self._rows[row_index].get("logText", "") or "")
+
+    def _flush_log_text(self) -> None:
+        dirty = tuple(self._dirty_log_text)
+        self._dirty_log_text.clear()
+        for job_id in dirty:
+            row_index = self._row_index(job_id)
+            if row_index < 0:
+                continue
+            row = self._rows[row_index]
+            if not row.get("expanded"):
+                continue
+            row["logText"] = "\n".join(self._logs.get(job_id, ()))
+            index = self.index(row_index, 0)
+            self.dataChanged.emit(index, index, [self._ROLES["logText"]])
 
     def _row_index(self, job_id: str) -> int:
         for index, row in enumerate(self._rows):
@@ -728,7 +764,8 @@ class QuickBatchList(QAbstractListModel):
         job = self._job(job_id)
         if row_index < 0 or job is None:
             return
-        new = self._snapshot_job(job)
+        self._dirty_log_text.discard(job_id)
+        new = self._snapshot_job(job, refresh_log_text=True)
         self._rows[row_index] = new
         index = self.index(row_index, 0)
         self.dataChanged.emit(
