@@ -27,6 +27,7 @@ _IMAGE_OWNERSHIP_CLASSES = (
 _AUTO_ELIGIBLE_OWNERSHIP_CLASSES = frozenset(
     {"EXACT_TARGET", "TARGET_PACKAGING_OR_DETAIL"}
 )
+_IMAGE_OWNERSHIP_PROTOCOL = "pixel_visual_facts_then_target_relationship_v2"
 
 
 class ListingImageRankingError(RuntimeError):
@@ -65,6 +66,9 @@ class ImageOwnershipDecision:
     classification: str
     confidence: float
     reason: str
+    visual_subject: str = ""
+    visible_identity: str = ""
+    visible_configuration: str = ""
 
     @property
     def auto_eligible(self) -> bool:
@@ -73,6 +77,9 @@ class ImageOwnershipDecision:
     def as_dict(self) -> dict[str, Any]:
         return {
             "image_id": self.image_id,
+            "visual_subject": self.visual_subject,
+            "visible_identity": self.visible_identity,
+            "visible_configuration": self.visible_configuration,
             "classification": self.classification,
             "confidence": self.confidence,
             "reason": self.reason,
@@ -286,6 +293,9 @@ def _ownership_schema(candidate_ids: list[str]) -> dict[str, Any]:
         "type": "object",
         "additionalProperties": False,
         "properties": {
+            "visual_subject": {"type": "string", "minLength": 1},
+            "visible_identity": {"type": "string"},
+            "visible_configuration": {"type": "string"},
             "classification": {
                 "type": "string",
                 "enum": list(_IMAGE_OWNERSHIP_CLASSES),
@@ -293,7 +303,14 @@ def _ownership_schema(candidate_ids: list[str]) -> dict[str, Any]:
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "reason": {"type": "string", "minLength": 1},
         },
-        "required": ["classification", "confidence", "reason"],
+        "required": [
+            "visual_subject",
+            "visible_identity",
+            "visible_configuration",
+            "classification",
+            "confidence",
+            "reason",
+        ],
     }
     return {
         "type": "object",
@@ -316,28 +333,37 @@ def build_listing_image_ownership_request(
     product_context: dict[str, Any],
     candidates: list[_Candidate],
 ) -> dict[str, Any]:
-    """Ask AI only whether each broad supplier image belongs to the exact sale unit."""
+    """Ask AI for pixel-grounded visual facts first, then exact sale-unit ownership."""
 
     candidate_ids = [candidate.image_id for candidate in candidates]
     return {
         "task": "classify_supplier_listing_image_ownership",
         "system_instruction": (
-            "You are the semantic ownership gate for ecommerce Product Photos. Inspect every candidate image "
-            "against one already-grounded target product identity. Classify what each image actually depicts. "
-            "Do not rank photos and do not try to fill a gallery quota. JSON only."
+            "You are the semantic ownership gate for ecommerce Product Photos. For every candidate, first record "
+            "concise facts that are actually visible in the image pixels, then compare those visual facts with the "
+            "already-grounded target product identity and classify the relationship. Do not rank photos and do not "
+            "try to fill a gallery quota. JSON only."
         ),
         "prompt_instruction": (
-            "Classify every image_id independently, while comparing the candidates together when useful. "
-            "Precision is more important than recall: when exact target ownership or exact variant cannot be "
-            "verified, use UNCERTAIN or SAME_PRODUCT_OTHER_VARIANT instead of promoting the image."
+            "For each image_id, complete visual_subject, visible_identity and visible_configuration from pixels "
+            "before assigning classification. OCR/readable packaging text is one visual signal, not the sole signal. "
+            "Do not copy target fields into visual facts unless they are genuinely visible in that image. Precision "
+            "is more important than recall: when exact target ownership or exact variant cannot be verified, use "
+            "UNCERTAIN or SAME_PRODUCT_OTHER_VARIANT instead of promoting the image."
         ),
         "context": {
             "target_product": product_context,
             "candidate_image_ids": candidate_ids,
+            "decision_protocol": _IMAGE_OWNERSHIP_PROTOCOL,
             "auto_eligible_classifications": sorted(_AUTO_ELIGIBLE_OWNERSHIP_CLASSES),
         },
         "rules": [
             "Inspect the actual pixels of every supplied candidate before classifying it.",
+            "visual_subject must briefly state what product/object/media the pixels depict, without saying whether it matches the target.",
+            "visible_identity must contain only brand/model/size/count/variant text or markings actually visible in the pixels; use an empty string when none is readable.",
+            "visible_configuration must briefly record visible colour, form, package count, kit/bundle composition, attachments, packaging/detail context or other variant-relevant visual facts; use an empty string when not discernible.",
+            "Visual facts are observations, not conclusions: never write 'matches target', 'same product', or silently copy target_product facts that are not visible in the candidate.",
+            "Only after recording visual facts, compare them with target_product to assign classification.",
             "EXACT_TARGET means the image depicts the exact sellable target product and exact supported variant/configuration.",
             "TARGET_PACKAGING_OR_DETAIL means packaging, a close detail, dimensions, an in-use view, or an included component that clearly belongs to this exact target sale unit.",
             "Use SAME_PRODUCT_OTHER_VARIANT for a different colour, size, model, count, flavour, configuration, bundle or other sellable variant even when the product family is the same.",
@@ -345,7 +371,7 @@ def build_listing_image_ownership_request(
             "Use PAGE_ASSET for logos, banners, navigation graphics, seller decoration, advertisements or other non-product page media.",
             "Use UNCERTAIN whenever pixels and target identity do not establish exact ownership strongly enough for an automatic marketplace upload.",
             "For kits or bundles, a component is TARGET_PACKAGING_OR_DETAIL only when target_product explicitly supports that component as part of the offered sale unit.",
-            "Do not use candidate/source order as evidence that an image belongs to the target product.",
+            "Do not use candidate/source order, DOM text, nearby page copy, filenames or URLs as semantic evidence of image ownership.",
             "A visually similar item is not enough: exact product/variant ownership is required for automatic upload eligibility.",
             "Return one decision for every candidate_image_id and no others.",
         ],
@@ -396,6 +422,9 @@ def _parse_ownership(raw: Any, candidates: list[_Candidate]) -> _ParsedOwnership
             classification=classification,
             confidence=confidence,
             reason=reason,
+            visual_subject=_compact_text(item.get("visual_subject"), 240),
+            visible_identity=_compact_text(item.get("visible_identity"), 240),
+            visible_configuration=_compact_text(item.get("visible_configuration"), 320),
         )
 
     return _ParsedOwnership(
@@ -593,6 +622,8 @@ def _selection_report(
             "pre_ai_filter": "explicit-ownership-boundary-plus-decodable-image-and-exact-byte-duplicate-only",
             "target_identity_source": "product-focused-structured-supplier-evidence-without-page-body-or-candidate-images",
             "ownership_semantic_owner": "multimodal_ai",
+            "ownership_decision_protocol": _IMAGE_OWNERSHIP_PROTOCOL,
+            "ownership_visual_facts_required_by_contract": True,
             "gallery_semantic_owner": "multimodal_ai",
             "auto_eligible_ownership_classes": sorted(_AUTO_ELIGIBLE_OWNERSHIP_CLASSES),
             "precision_policy": "fewer_correct_images_over_quota_fill",
@@ -669,6 +700,7 @@ def _publish_manifest_state(
         "version": LISTING_IMAGE_RANKING_VERSION,
         "status": status,
         "strategy": "grounded_identity_then_ai_ownership_then_gallery_verification",
+        "ownership_decision_protocol": _IMAGE_OWNERSHIP_PROTOCOL,
         "precision_first": True,
         "model_calls": model_calls,
         "candidate_count": len(candidates),
@@ -699,6 +731,7 @@ def finalize_supplier_listing_images(
     """Select automatic Product Photos with two independent semantic AI stages.
 
     Acquisition remains intentionally broad and mechanical. The first AI stage
+    records compact pixel-grounded visual facts for every candidate and only then
     establishes exact image ownership against a clean target-product identity. The
     second AI stage sees only ownership-approved candidates, independently verifies
     consistency and emits the final 0..5 upload order. Python never re-ranks, fills
