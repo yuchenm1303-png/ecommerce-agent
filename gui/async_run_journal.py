@@ -1,22 +1,18 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
-from pathlib import Path
 
 
 class AsyncRunJournal:
-    """Write runtime telemetry off the Qt GUI thread without losing tail lines.
+    """FIFO runtime journal with an explicit durability/error contract.
 
-    QProcess stdout is delivered on the GUI event loop. Runtime logging must not
-    turn every output line into a synchronous open/write/close syscall on that
-    same loop, because browser execution can emit large bursts. The journal keeps
-    one file handle on a daemon writer and uses an unbounded FIFO queue.
-
-    ``close()`` is a durability barrier: after it returns every line accepted by
-    ``append()`` has either been flushed to disk or ``error`` records the writer
-    failure. Failure diagnostics are allowed to read a stage log only after this
-    barrier completes, so terminal telemetry can never race an unfinished writer.
+    Every string accepted by ``append`` is queued in order. ``close`` drains the
+    queue, flushes and fsyncs the file, then returns the writer exception (if any).
+    Callers can therefore distinguish a complete durable log from a logging-I/O
+    failure instead of silently assuming that a daemon writer succeeded.
     """
 
     _STOP = object()
@@ -38,30 +34,37 @@ class AsyncRunJournal:
     def error(self) -> BaseException | None:
         return self._error
 
-    def append(self, line: str) -> None:
-        if self._closed or self._error is not None:
-            return
-        self._queue.put(str(line))
+    @property
+    def error_text(self) -> str:
+        error = self._error
+        return f"{type(error).__name__}: {error}" if error is not None else ""
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._queue.put(self._STOP)
-        self._thread.join()
+    def append(self, line: str) -> bool:
+        if self._closed or self._error is not None:
+            return False
+        self._queue.put(str(line))
+        return True
+
+    def close(self) -> BaseException | None:
+        if not self._closed:
+            self._closed = True
+            self._queue.put(self._STOP)
+            self._thread.join()
+        return self._error
 
     def _run(self) -> None:
         pending: list[str] = []
         pending_bytes = 0
 
-        def flush(handle) -> None:  # noqa: ANN001
+        def flush(handle, *, durable: bool = False) -> None:  # noqa: ANN001
             nonlocal pending_bytes
-            if not pending:
-                return
-            handle.write("\n".join(pending) + "\n")
+            if pending:
+                handle.write("\n".join(pending) + "\n")
+                pending.clear()
+                pending_bytes = 0
             handle.flush()
-            pending.clear()
-            pending_bytes = 0
+            if durable:
+                os.fsync(handle.fileno())
 
         try:
             with self.path.open("a", encoding="utf-8", buffering=64 * 1024) as handle:
@@ -83,7 +86,7 @@ class AsyncRunJournal:
                             text = str(tail)
                             pending.append(text)
                             pending_bytes += len(text.encode("utf-8", errors="replace")) + 1
-                        flush(handle)
+                        flush(handle, durable=True)
                         return
 
                     text = str(item)
@@ -91,7 +94,7 @@ class AsyncRunJournal:
                     pending_bytes += len(text.encode("utf-8", errors="replace")) + 1
                     if len(pending) >= 96 or pending_bytes >= 64 * 1024:
                         flush(handle)
-        except BaseException as exc:  # logging must never take the GUI down
+        except BaseException as exc:  # logging failure is surfaced through close/error
             self._error = exc
 
 
