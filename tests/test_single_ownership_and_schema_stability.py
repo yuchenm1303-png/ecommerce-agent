@@ -14,16 +14,36 @@ class _FakePage:
         self.timeout = 0
         self.goto_calls: list[tuple[str, str, int]] = []
         self.waits: list[int] = []
+        self.closed = False
 
     def set_default_timeout(self, value: int) -> None:
         self.timeout = value
 
-    def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
+    def goto(self, url: str, *, wait_until: str, timeout: int):
         self.goto_calls.append((url, wait_until, timeout))
         self.url = url
+        return SimpleNamespace(from_service_worker=False)
 
     def wait_for_timeout(self, value: int) -> None:
         self.waits.append(value)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeCdpSession:
+    def __init__(self) -> None:
+        self.commands: list[tuple[str, object | None]] = []
+        self.detached = False
+
+    def on(self, _event: str, _handler) -> None:
+        return None
+
+    def send(self, command: str, payload=None) -> None:
+        self.commands.append((command, payload))
+
+    def detach(self) -> None:
+        self.detached = True
 
 
 class _FakeContext:
@@ -31,12 +51,18 @@ class _FakeContext:
         self.created = page
         self.new_page_calls = 0
         self.pages: list[_FakePage] = []
+        self.cdp_sessions: list[_FakeCdpSession] = []
 
     def new_page(self) -> _FakePage:
         self.new_page_calls += 1
         if self.created not in self.pages:
             self.pages.append(self.created)
         return self.created
+
+    def new_cdp_session(self, _page: _FakePage) -> _FakeCdpSession:
+        session = _FakeCdpSession()
+        self.cdp_sessions.append(session)
+        return session
 
 
 class _FakeHarness:
@@ -59,6 +85,49 @@ def test_fresh_full_run_creates_dedicated_owned_makro_tab(monkeypatch) -> None:
     assert harness.page is page
     assert page.timeout == 15_000
     assert page.goto_calls == [(workflow.MAKRO_HOME_URL, "commit", 20_000)]
+    assert harness.context.cdp_sessions[0].commands == [
+        ("Network.enable", None),
+        ("Network.setBypassServiceWorker", {"bypass": True}),
+    ]
+    assert harness.context.cdp_sessions[0].detached is True
+
+
+def test_fresh_owned_tab_retries_with_new_target_and_closes_failed_blank(monkeypatch) -> None:
+    class _FailingPage(_FakePage):
+        def goto(self, url: str, *, wait_until: str, timeout: int):
+            self.goto_calls.append((url, wait_until, timeout))
+            raise TimeoutError("simulated stalled navigation")
+
+    class _SequenceContext:
+        def __init__(self, pages: list[_FakePage]) -> None:
+            self.pending = list(pages)
+            self.pages: list[_FakePage] = []
+            self.cdp_sessions: list[_FakeCdpSession] = []
+
+        def new_page(self) -> _FakePage:
+            page = self.pending.pop(0)
+            self.pages.append(page)
+            return page
+
+        def new_cdp_session(self, _page: _FakePage) -> _FakeCdpSession:
+            session = _FakeCdpSession()
+            self.cdp_sessions.append(session)
+            return session
+
+    failed = _FailingPage()
+    recovered = _FakePage()
+    context = _SequenceContext([failed, recovered])
+    harness = SimpleNamespace(context=context, page=None)
+    monkeypatch.setattr(workflow, "page_target_id", lambda current: "target-recovered")
+
+    owned, target_id = workflow._create_fresh_owned_page(harness)
+
+    assert failed.closed is True
+    assert recovered.closed is False
+    assert owned is recovered
+    assert target_id == "target-recovered"
+    assert len(context.cdp_sessions) == 2
+    assert all(session.detached for session in context.cdp_sessions)
 
 
 def test_owned_checkpoint_refreshes_target_after_page_replacement(monkeypatch, tmp_path: Path) -> None:

@@ -167,9 +167,121 @@ def _create_fresh_owned_page(harness: EdgeHarness) -> tuple[Any, str]:
         existing_page_count=len(harness.context.pages),
         start_url=MAKRO_HOME_URL,
     )
-    page = harness.context.new_page()
-    page.set_default_timeout(15_000)
-    page.goto(MAKRO_HOME_URL, wait_until="commit", timeout=20_000)
+    page = None
+    last_error: Exception | None = None
+    for attempt in range(1, 3):
+        page = harness.context.new_page()
+        page.set_default_timeout(15_000)
+        cdp_session = None
+        navigation_events: list[dict[str, Any]] = []
+        navigation_started = time.monotonic()
+
+        def _record_network_event(kind: str, payload: dict[str, Any]) -> None:
+            if len(navigation_events) >= 40:
+                return
+            resource_type = str(payload.get("type") or "")
+            if resource_type and resource_type != "Document":
+                return
+            event: dict[str, Any] = {
+                "kind": kind,
+                "elapsed_ms": round((time.monotonic() - navigation_started) * 1000),
+                "request_id": str(payload.get("requestId") or ""),
+                "resource_type": resource_type,
+            }
+            if kind == "request":
+                request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+                event.update(
+                    url=str(request.get("url") or ""),
+                    method=str(request.get("method") or ""),
+                    redirect=bool(payload.get("redirectResponse")),
+                )
+            elif kind == "response":
+                response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+                timing = response.get("timing") if isinstance(response.get("timing"), dict) else {}
+                event.update(
+                    url=str(response.get("url") or ""),
+                    status=int(response.get("status") or 0),
+                    protocol=str(response.get("protocol") or ""),
+                    remote_ip=str(response.get("remoteIPAddress") or ""),
+                    from_disk_cache=bool(response.get("fromDiskCache")),
+                    from_service_worker=bool(response.get("fromServiceWorker")),
+                    timing={
+                        key: timing.get(key)
+                        for key in (
+                            "dnsStart",
+                            "dnsEnd",
+                            "connectStart",
+                            "connectEnd",
+                            "sslStart",
+                            "sslEnd",
+                            "sendStart",
+                            "sendEnd",
+                            "receiveHeadersStart",
+                            "receiveHeadersEnd",
+                        )
+                        if timing.get(key) is not None
+                    },
+                )
+            elif kind == "failed":
+                event.update(
+                    error_text=str(payload.get("errorText") or ""),
+                    blocked_reason=str(payload.get("blockedReason") or ""),
+                    canceled=bool(payload.get("canceled")),
+                )
+            navigation_events.append(event)
+
+        navigation_error = ""
+        try:
+            cdp_session = harness.context.new_cdp_session(page)
+            cdp_session.on(
+                "Network.requestWillBeSent",
+                lambda payload: _record_network_event("request", payload),
+            )
+            cdp_session.on(
+                "Network.responseReceived",
+                lambda payload: _record_network_event("response", payload),
+            )
+            cdp_session.on(
+                "Network.loadingFailed",
+                lambda payload: _record_network_event("failed", payload),
+            )
+            cdp_session.send("Network.enable")
+            cdp_session.send("Network.setBypassServiceWorker", {"bypass": True})
+            response = page.goto(MAKRO_HOME_URL, wait_until="commit", timeout=20_000)
+            if response is not None and bool(response.from_service_worker):
+                raise RuntimeError("Makro owned-tab navigation was still served by a Service Worker")
+            last_error = None
+        except Exception as exc:
+            last_error = exc
+            navigation_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            if last_error is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            diag_event(
+                "owned_tab_navigation",
+                "FAILED" if navigation_error else "COMPLETE",
+                attempt=attempt,
+                service_worker_bypassed=True,
+                start_url=MAKRO_HOME_URL,
+                elapsed_ms=round((time.monotonic() - navigation_started) * 1000),
+                page_url=str(page.url or "") if last_error is None else "closed_after_failure",
+                navigation_error=navigation_error,
+                network_events=navigation_events,
+            )
+            if cdp_session is not None:
+                try:
+                    cdp_session.detach()
+                except Exception:
+                    pass
+        if last_error is None:
+            break
+
+    if last_error is not None:
+        raise last_error
+    assert page is not None
     page.wait_for_timeout(250)
     target_id = page_target_id(page)
     harness.page = page
