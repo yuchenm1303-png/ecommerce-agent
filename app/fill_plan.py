@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
@@ -21,17 +20,11 @@ from .business_fields import (
     BUSINESS_ATTRIBUTE_ALIASES,
     is_business_question,
 )
-from .hard_field_validators import (
-    has_live_value_control,
-    is_numeric_semantic_field,
-    validate_resolved_answer,
-)
 from .resolution_types import (
     CONFLICT as RESOLVER_CONFLICT,
     MISSING as RESOLVER_MISSING,
     NEEDS_REVIEW,
     RESOLVED,
-    ResolvedAnswer,
     ResolutionRecord,
 )
 from .source_bundle import ProductSourceBundle, SourceEvidence, normalize_key
@@ -136,218 +129,24 @@ class LiveFillPlan:
         }
 
 
-def _exact_option(value: str, options: list[str]) -> str | None:
-    wanted = normalize_key(value)
-    matches = [option for option in options if normalize_key(option) == wanted]
-    return matches[0] if len(matches) == 1 else None
-
-
-def _unit_context_texts(live_field: dict[str, Any]) -> list[str]:
-    """Return only field-local wording suitable for deterministic unit matching.
-
-    The broad context captured around a Makro attribute can include sibling
-    attributes and their units. Using that entire block as unit identity caused a
-    Length field to see a neighbouring mass unit. Prefer direct field/control
-    metadata and accept compact control context only when it is genuinely local.
-    """
-
-    output: list[str] = []
-    seen: set[str] = set()
-
-    def add(value: object, *, compact_only: bool = False) -> None:
-        text = re.sub(r"\s+", " ", str(value or "")).strip()
-        if not text or (compact_only and len(text) > 80):
-            return
-        key = text.casefold()
-        if key not in seen:
-            seen.add(key)
-            output.append(text)
-
-    add(live_field.get("help_text"))
-    add(live_field.get("context_text"), compact_only=True)
-    for control in live_field.get("controls") or []:
-        if not isinstance(control, dict):
-            continue
-        for key in ("help_text", "placeholder", "aria_label"):
-            add(control.get(key))
-        add(control.get("context_text"), compact_only=True)
-    return output
-
-
-def _qualifier_render_aliases(qualifier: str) -> tuple[tuple[str, bool], ...]:
-    """Return conservative visual aliases for one already-approved unit token.
-
-    Parenthetical one-letter annotations are a common display distinction rather
-    than a separate Makro qualifier control: ``dB(A)`` may be rendered as ``dB``
-    or ``dBA`` beside a numeric input. Only that narrow shape is normalized. The
-    boolean marks the bare-base alias so it can explicitly reject a different
-    parenthetical annotation such as ``dB(C)``.
-    """
-
-    token = re.sub(r"\s+", " ", qualifier.strip())
-    if not token:
-        return ()
-    aliases: list[tuple[str, bool]] = [(token, False)]
-    match = re.fullmatch(
-        r"(?P<base>[A-Za-z][A-Za-z0-9%°/._-]*?)\s*\(\s*(?P<annotation>[A-Za-z])\s*\)",
-        token,
-    )
-    if match:
-        base = match.group("base").strip()
-        annotation = match.group("annotation").strip()
-        aliases.append((f"{base}{annotation}", False))
-        aliases.append((base, True))
-
-    output: list[tuple[str, bool]] = []
-    seen: set[str] = set()
-    for alias, bare_base in aliases:
-        key = alias.casefold()
-        if key and key not in seen:
-            seen.add(key)
-            output.append((alias, bare_base))
-    return tuple(output)
-
-
-def _fixed_qualifier_rendered(live_field: dict[str, Any], qualifier: str) -> bool:
-    """Return True only when a deterministic unit alias is visibly field-local."""
-
-    aliases = _qualifier_render_aliases(qualifier)
-    if not aliases:
-        return False
-    texts = _unit_context_texts(live_field)
-    for alias, bare_base in aliases:
-        tail_guard = r"(?![0-9A-Za-z_])"
-        if bare_base:
-            # dB(A) may map to a bare `dB` display, but must never silently accept
-            # another explicit weighting such as dB(C).
-            tail_guard = r"(?![0-9A-Za-z_]|\s*\()"
-        pattern = re.compile(
-            rf"(?<![0-9A-Za-z_]){re.escape(alias)}{tail_guard}",
-            re.IGNORECASE,
-        )
-        if any(pattern.search(text) for text in texts):
-            return True
-    return False
-
-
-_UNIT_SCALE: dict[str, tuple[str, Decimal]] = {
-    "mg": ("mass", Decimal("0.001")),
-    "g": ("mass", Decimal("1")),
-    "kg": ("mass", Decimal("1000")),
-    "oz": ("mass", Decimal("28.349523125")),
-    "lbs": ("mass", Decimal("453.59237")),
-    "mm": ("length", Decimal("1")),
-    "cm": ("length", Decimal("10")),
-    "m": ("length", Decimal("1000")),
-    "inch": ("length", Decimal("25.4")),
-}
-
-
-def _fixed_rendered_unit(live_field: dict[str, Any]) -> str:
-    matches = [unit for unit in _UNIT_SCALE if _fixed_qualifier_rendered(live_field, unit)]
-    return matches[0] if len(matches) == 1 else ""
-
-
-def _convert_unit_values(values: list[str], source: str, target: str) -> list[str] | None:
-    source_kind, source_scale = _UNIT_SCALE[source]
-    target_kind, target_scale = _UNIT_SCALE[target]
-    if source_kind != target_kind:
-        return None
-    output: list[str] = []
-    for value in values:
-        try:
-            converted = Decimal(value.strip()) * source_scale / target_scale
-        except (InvalidOperation, ValueError):
-            return None
-        rendered = format(converted.normalize(), "f")
-        output.append(rendered.rstrip("0").rstrip(".") if "." in rendered else rendered)
-    return output
-
-
-def _inline_qualifier_values(values: list[str], qualifier: str) -> list[str]:
-    """Losslessly serialize value+unit into one free-text Makro control.
-
-    When Makro exposes no separate qualifier selector and the primary control is
-    ordinary text, keeping the unit in a detached ``qualifier`` is an artificial
-    representation mismatch. Fold it into the value instead; numeric controls
-    never use this path.
-    """
-
-    rendered_qualifier = re.sub(r"[_\s]+", " ", qualifier.strip()).strip()
-    if not rendered_qualifier:
-        return values
-    suffix_key = re.sub(r"[^0-9a-z]+", "", rendered_qualifier.casefold())
-    output: list[str] = []
-    for raw in values:
-        value = str(raw).strip()
-        value_key = re.sub(r"[^0-9a-z]+", "", value.casefold())
-        if suffix_key and value_key.endswith(suffix_key):
-            output.append(value)
-        else:
-            output.append(f"{value} {rendered_qualifier}".strip())
-    return output
-
-
 def _hard_guard_values(
     live_field: dict[str, Any],
     decision: FieldDecision,
 ) -> tuple[list[str], str, str | None]:
-    values = list(decision.values)
-    if not bool(live_field.get("multi_value")) and len(values) > 1:
-        return values, decision.qualifier, "单值 Makro 字段收到多个 values。"
+    """Compatibility helper that preserves a decision exactly.
 
-    options = field_options(live_field)
-    if options:
-        canonical: list[str] = []
-        for value in values:
-            matched = _exact_option(value, options)
-            if matched is None:
-                return values, decision.qualifier, (
-                    f"value={value!r} 不等于当前 Makro 的唯一有效 option。"
-                )
-            canonical.append(matched)
-        values = canonical
+    Historically this function compared AI values with live options, rewrote
+    qualifiers, inlined units and converted measurements.  That made Python a
+    second product-decision engine and allowed a later DOM scan to turn an AI
+    READY into BLOCKED.  Product semantics now have one owner: the Resolver.
 
-    qualifier = decision.qualifier.strip()
-    qualifiers = field_qualifier_options(live_field)
-    if qualifier:
-        if not qualifiers:
-            # Inline value+unit only when the live DOM proves that a writable
-            # non-numeric value control actually exists. A schema-only field with
-            # no current control must stay blocked instead of erasing qualifier
-            # evidence before hard validation can see it.
-            if (
-                not options
-                and has_live_value_control(live_field)
-                and not is_numeric_semantic_field(live_field)
-            ):
-                values = _inline_qualifier_values(values, qualifier)
-                qualifier = ""
-            elif _fixed_qualifier_rendered(live_field, qualifier):
-                qualifier = ""
-            else:
-                source_unit = qualifier.casefold()
-                target_unit = _fixed_rendered_unit(live_field)
-                if source_unit in _UNIT_SCALE and target_unit:
-                    converted = _convert_unit_values(values, source_unit, target_unit)
-                    if converted is not None:
-                        values = converted
-                        qualifier = ""
-                    else:
-                        return values, qualifier, "qualifier 与 Makro 固定单位不兼容。"
-                else:
-                    return values, qualifier, "返回了 qualifier，但当前 Makro 字段既没有 qualifier 控件，也没有显示相同的固定单位。"
-        else:
-            matched = _exact_option(qualifier, qualifiers)
-            if matched is None:
-                return values, qualifier, (
-                    f"qualifier={qualifier!r} 不等于当前 Makro 的唯一有效单位。"
-                )
-            qualifier = matched
+    The live field is intentionally ignored here.  Mechanical compatibility is
+    tested only while the browser actually binds/writes/reads the control, where
+    failures are execution failures and never semantic re-decisions.
+    """
 
-    if decision.status in {AI_READY, REVIEW} and not values:
-        return values, qualifier, "决策没有可执行 value。"
-    return values, qualifier, None
+    del live_field
+    return list(decision.values), str(decision.qualifier or "").strip(), None
 
 
 def _provenance(decision: FieldDecision) -> list[dict[str, Any]]:
@@ -372,50 +171,25 @@ def _record_base(live_field: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _apply_hard_field_validation(live_field: dict[str, Any], record: ResolutionRecord) -> None:
-    if record.status != RESOLVED or not record.eligible_for_autofill:
-        return
-    result = validate_resolved_answer(
-        live_field,
-        ResolvedAnswer(
-            attribute_key=record.attribute_key,
-            label=record.label,
-            status=RESOLVED,
-            answer=record.answer,
-            answer_values=list(record.answer_values),
-            qualifier=record.qualifier,
-            source_type=record.source_type,
-            source_reference=record.source_reference,
-            evidence=record.evidence,
-            confidence=record.confidence,
-            detail=record.detail,
-        ),
-    )
-    if result.valid:
-        return
-    record.status = NEEDS_REVIEW
-    record.eligible_for_autofill = False
-    record.preview_eligible = False
-    record.gate_reason = GATE_HARD_FIELD_CONSTRAINT
-    record.detail = result.detail
-
-
 def _decision_record(live_field: dict[str, Any], decision: FieldDecision) -> ResolutionRecord:
-    values, qualifier, hard_error = _hard_guard_values(live_field, decision)
+    """Map the AI status into execution state without changing AI content."""
+
+    values = list(decision.values)
+    qualifier = str(decision.qualifier or "").strip()
     base = _record_base(live_field)
     source_reference = decision.citations[0].source_reference if decision.citations else None
     evidence = " | ".join(citation.evidence_text for citation in decision.citations)
 
     if decision.status == AI_READY:
         status = RESOLVED
-        eligible = hard_error is None
+        eligible = True
         preview = False
-        gate = "" if eligible else GATE_HARD_FIELD_CONSTRAINT
+        gate = ""
     elif decision.status == REVIEW:
         status = NEEDS_REVIEW
         eligible = False
-        preview = hard_error is None and bool(values) and bool(decision.citations)
-        gate = GATE_AI_REVIEW if hard_error is None else GATE_HARD_FIELD_CONSTRAINT
+        preview = bool(values) and bool(decision.citations)
+        gate = GATE_AI_REVIEW
     elif decision.status == CONFLICT:
         status = RESOLVER_CONFLICT
         eligible = False
@@ -427,7 +201,7 @@ def _decision_record(live_field: dict[str, Any], decision: FieldDecision) -> Res
         preview = False
         gate = GATE_AI_MISSING
 
-    record = ResolutionRecord(
+    return ResolutionRecord(
         **base,
         status=status,
         answer=" + ".join(values) if values else None,
@@ -437,14 +211,12 @@ def _decision_record(live_field: dict[str, Any], decision: FieldDecision) -> Res
         source_type="ai_decision",
         source_reference=source_reference,
         evidence=evidence or None,
-        detail=hard_error or decision.reason,
+        detail=decision.reason,
         eligible_for_autofill=eligible,
         preview_eligible=preview,
         gate_reason=gate,
         provenance=_provenance(decision),
     )
-    _apply_hard_field_validation(live_field, record)
-    return record
 
 
 def _is_business_field(live_field: dict[str, Any]) -> bool:
@@ -464,6 +236,12 @@ def _business_record(
     live_field: dict[str, Any],
     business_bundle: ProductSourceBundle,
 ) -> ResolutionRecord:
+    """Resolve seller-owned business fields from explicit seller/config evidence.
+
+    These values are not product-semantic AI claims.  They remain deterministic so
+    SKU, stock, price and order-policy data come only from seller-owned inputs.
+    """
+
     base = _record_base(live_field)
     attribute_key = base["attribute_key"]
     label = base["label"]
@@ -551,27 +329,21 @@ def _business_record(
             candidate.source_reference,
         ),
     )[0]
-    structural = FieldDecision(
-        field_id=field_id(live_field),
-        status=AI_READY,
-        values=_business_values(selected),
-        confidence=selected.confidence,
-    )
-    values, qualifier, hard_error = _hard_guard_values(live_field, structural)
-    record = ResolutionRecord(
+    values = _business_values(selected)
+    return ResolutionRecord(
         **base,
-        status=RESOLVED if hard_error is None else NEEDS_REVIEW,
+        status=RESOLVED,
         answer=" + ".join(values) if values else None,
         answer_values=values,
-        qualifier=qualifier or None,
+        qualifier=None,
         confidence=selected.confidence,
         source_type=selected.source_type,
         source_reference=selected.source_reference,
         evidence=selected.evidence_text or None,
-        detail=hard_error or "explicit seller/business input",
-        eligible_for_autofill=hard_error is None,
+        detail="explicit seller/business input",
+        eligible_for_autofill=True,
         preview_eligible=False,
-        gate_reason="" if hard_error is None else GATE_HARD_FIELD_CONSTRAINT,
+        gate_reason="",
         provenance=[
             {
                 "key": candidate.key,
@@ -584,8 +356,6 @@ def _business_record(
             for candidate in agreeing
         ],
     )
-    _apply_hard_field_validation(live_field, record)
-    return record
 
 
 def _decimal_answer(item: LiveFillPlanItem) -> Decimal | None:
@@ -611,6 +381,8 @@ def _block(items: list[LiveFillPlanItem], keys: tuple[str, ...], detail: str) ->
 
 
 def _apply_business_relations(items: list[LiveFillPlanItem]) -> None:
+    """Apply relations only to seller/business fields, never AI product fields."""
+
     by_key = {item.attribute_key: item for item in items}
     mrp = by_key.get("mrp")
     selling = by_key.get("flipkart_selling_price")
@@ -640,7 +412,14 @@ def build_live_fill_plan(
     semantic_fields: Iterable[dict[str, Any]],
     business_bundle: ProductSourceBundle,
 ) -> LiveFillPlan:
-    """Turn AI decisions into browser work without locally re-solving product meaning."""
+    """Bind authoritative AI decisions to live field identities.
+
+    This layer does not solve product meaning, compare AI values with marketplace
+    options, normalize units, rewrite text or downgrade READY.  Its only product
+    job is identity binding.  AI READY therefore remains READY from planning
+    through real execution unless the browser mechanically fails to perform the
+    write.
+    """
 
     fields = list(semantic_fields)
     decisions = {decision.field_id: decision for decision in decision_packet.decisions}
@@ -658,7 +437,7 @@ def build_live_fill_plan(
             resolution = _business_record(live_field, business_bundle)
             action = READY if resolution.eligible_for_autofill else BLOCKED
             reason = (
-                "显式 seller/business 数据通过硬约束。"
+                "显式 seller/business 数据已绑定。"
                 if action == READY
                 else resolution.detail
             )
@@ -674,11 +453,11 @@ def build_live_fill_plan(
             resolution = _decision_record(live_field, decision)
             action = READY if resolution.eligible_for_autofill else BLOCKED
             if action == READY:
-                reason = "AI 字段决策、grounded citations 与 Makro 硬约束均通过。"
+                reason = "AI READY authoritative; executor only performs mechanical write/readback/persistence checks."
             elif resolution.preview_eligible:
-                reason = "AI 给出可执行候选，但自身判断为 REVIEW；只允许显式人工 review。"
+                reason = "AI status=REVIEW；只允许显式人工 review，不由 Python 改判。"
             else:
-                reason = resolution.detail or "AI 决策未通过执行硬约束。"
+                reason = resolution.detail or "AI decision is not READY."
 
         items.append(
             LiveFillPlanItem(
