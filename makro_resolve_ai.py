@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from app.failure_contract import run_cli_with_failure_journal
 from app.listing_image_ranker import finalize_supplier_listing_images
 from app.providers.registry import (
     ProviderConfig,
@@ -202,6 +203,8 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(
+            run_cli_with_failure_journal(main, stage="makro_resolve_ai")
+        )
     except ProviderConfigurationError as exc:
         raise SystemExit(str(exc)) from exc
