@@ -1,57 +1,25 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any, Iterable
 
-from .ai_decisions import READY as AI_READY, FieldDecision, field_id
-from .fill_plan import (
-    BLOCKED,
-    READY,
-    LiveFillPlan,
-    LiveFillPlanItem,
-    _apply_business_relations,
-    _hard_guard_values,
-)
-from .hard_field_validators import (
-    executable_qualifier_options,
-    executable_value_options,
-    is_numeric_semantic_field,
-    is_selection_semantic_field,
-    validate_resolved_answer,
-)
-from .listing_content_policy import allow_required_fallback
+from .ai_decisions import field_id
+from .fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem, _apply_business_relations
 from .live_schema import load_live_schema, schema_field_signature
-from .resolution_types import RESOLVED, ResolvedAnswer
+from .resolution_types import RESOLVED
 
 
+# Kept as compatibility constants for old imports/artifacts.  Production no longer
+# generates either value automatically.
 FALLBACK_TEXT_VALUE = "N/A"
 FALLBACK_NUMERIC_VALUE = "1"
 FALLBACK_SOURCE_REFERENCE = "system:required-placeholder"
 REQUIRED_OVERRIDES_FILENAME = "required-overrides.json"
-_OPTION_PLACEHOLDERS = {
-    "select",
-    "select one",
-    "choose",
-    "choose one",
-    "please select",
-    "-- select --",
-}
-_NUMERIC_NAME_HINT = re.compile(
-    r"(?:^|\b)(?:price|cost|qty|quantity|stock|weight|length|width|height|depth|volume|capacity|"
-    r"size|moq|minimum order|warranty|power|voltage|current|frequency|diameter|thickness|"
-    r"count|number of|pack size)(?:\b|$)",
-    re.IGNORECASE,
-)
-_NUMERIC_UNIT_HINT = re.compile(
-    r"(?:^|\s)(?:kg|g|mg|cm|mm|ml|l|m|w|v|hz|mah|wh|gb|mb|tb)(?:\s|$)",
-    re.IGNORECASE,
-)
 
 
 class RequiredOverrideError(ValueError):
-    """Raised when a required-field completion value cannot be bound safely."""
+    """Raised when an explicit required-field override cannot be bound safely."""
 
 
 def load_required_overrides(path: str | Path) -> list[dict[str, Any]]:
@@ -75,8 +43,6 @@ def _field_identity(field: dict[str, Any]) -> tuple[str, str, str]:
 
 
 def _schema_signature_payload(field: dict[str, Any]) -> list[Any]:
-    """JSON-safe form of the exact identity used by live-schema drift checks."""
-
     signature = schema_field_signature(field)
     return [
         str(signature[0]),
@@ -107,12 +73,7 @@ def _schema_signature_key(payload: object) -> str | None:
 
 
 def required_override_binding(field: dict[str, Any]) -> dict[str, Any]:
-    """Persist both the display-era field id and its stable schema identity.
-
-    ``field_id`` is still the first-choice address. The schema signature is a
-    fail-closed rebind key for the case where an equivalent current DOM field is
-    represented slightly differently from the serialized planning field.
-    """
+    """Persist both display-era field id and stable schema identity."""
 
     return {
         "field_id": field_id(field),
@@ -120,146 +81,23 @@ def required_override_binding(field: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _usable_option(values: Iterable[str]) -> str:
-    cleaned = [str(value).strip() for value in values if str(value).strip()]
-    for value in cleaned:
-        if value.casefold() not in _OPTION_PLACEHOLDERS:
-            return value
-    return cleaned[0] if cleaned else ""
-
-
-def _has_typed_live_value_control(field: dict[str, Any]) -> bool:
-    """Return True once the current value control exposes its mechanical type.
-
-    Modern live scans always include ``field_kind/type/role/inputmode``. When
-    those facts exist they are authoritative even when the control is *not*
-    numeric; legacy label heuristics must not overrule a proven text/select DOM
-    control merely because prose help text contains words such as ``current``.
-    """
-
-    for control in field.get("controls") or []:
-        if not isinstance(control, dict):
-            continue
-        if str(control.get("name") or "").endswith("_qualifier"):
-            continue
-        if any(
-            str(control.get(key) or "").strip()
-            for key in ("field_kind", "type", "role", "inputmode")
-        ):
-            return True
-    return False
-
-
-def _looks_numeric(field: dict[str, Any]) -> bool:
-    # Current live DOM control metadata is authoritative. Stable field identity
-    # is only a backward-compatibility fallback for old serialized schemas that
-    # predate control metadata. Free-form help/context prose is never allowed to
-    # turn a named text field numeric; it may contribute only an explicit unit.
-    if is_numeric_semantic_field(field):
-        return True
-    if _has_typed_live_value_control(field):
-        return False
-
-    identity_text = " | ".join(
-        re.sub(r"[_-]+", " ", str(field.get(key) or ""))
-        for key in ("attribute_key", "label")
-    )
-    if _NUMERIC_NAME_HINT.search(identity_text):
-        return True
-
-    unit_text = " | ".join(
-        str(field.get(key) or "") for key in ("help_text", "context_text")
-    )
-    return bool(_NUMERIC_UNIT_HINT.search(unit_text))
-
-
 def required_fallback_override(field: dict[str, Any]) -> dict[str, Any]:
-    """Build one deterministic, non-AI fallback for an ordinary required field.
+    """Automatic required-field placeholders are intentionally disabled.
 
-    Seller-critical listing/title/package/identifier/compliance fields are
-    explicitly excluded by ``listing_content_policy``. Those fields must be
-    resolved from evidence/offer intent or explicitly confirmed by the user;
-    they may never become ``N/A``, ``1`` or an arbitrary first option merely to
-    complete the form.
-
-    For ordinary required fields that remain BLOCKED after the normal Resolver:
-    - selection family -> first enabled executable Makro option, never free text;
-    - numeric/unit field -> ``1`` and the first enabled live qualifier when present;
-    - remaining free text -> ``N/A``.
-
-    A live selection control with no currently executable option remains BLOCKED.
-    It must never degrade into a free-text placeholder just to make the plan look
-    complete. All option-domain truth comes from ``hard_field_validators`` so the
-    planner, override layer and production executor share one mechanical contract.
+    AI REVIEW/CONFLICT/MISSING is a real unresolved state.  Python must not turn
+    it into READY by choosing ``N/A``, ``1`` or the first marketplace option.
     """
 
-    if not allow_required_fallback(field):
-        label = str(field.get("label") or field.get("attribute_key") or "required field")
-        raise RequiredOverrideError(
-            f"{label} 是关键 listing 必填字段，禁止使用 N/A / 1 / 随机 option 兜底；请提供准确值。"
-        )
-
-    binding = required_override_binding(field)
-    options = executable_value_options(field)
-    option = _usable_option(options)
-    if option:
-        return {
-            **binding,
-            "values": [option],
-            "source_type": "fallback",
-            "reason": "deterministic first enabled live Makro option for unresolved ordinary required field",
-        }
-
-    if is_selection_semantic_field(field):
-        label = str(field.get("label") or field.get("attribute_key") or "required field")
-        raise RequiredOverrideError(
-            f"{label} 当前是 selection 控件，但没有可执行的 enabled live option；"
-            "拒绝生成 N/A / 1 / 自由文本 fallback。"
-        )
-
-    qualifier_controls = [
-        control
-        for control in field.get("controls") or []
-        if isinstance(control, dict)
-        and str(control.get("name") or "").endswith("_qualifier")
-    ]
-    qualifiers = executable_qualifier_options(field)
-    qualifier = _usable_option(qualifiers)
-    if qualifier:
-        return {
-            **binding,
-            "values": [FALLBACK_NUMERIC_VALUE],
-            "qualifier": qualifier,
-            "source_type": "fallback",
-            "reason": "deterministic numeric placeholder with first enabled live Makro qualifier",
-        }
-    if qualifier_controls:
-        label = str(field.get("label") or field.get("attribute_key") or "required field")
-        raise RequiredOverrideError(
-            f"{label} 当前 qualifier 控件没有可执行的 enabled live option；拒绝生成不完整 fallback。"
-        )
-
-    value = FALLBACK_NUMERIC_VALUE if _looks_numeric(field) else FALLBACK_TEXT_VALUE
-    return {
-        **binding,
-        "values": [value],
-        "source_type": "fallback",
-        "reason": "deterministic placeholder for unresolved ordinary required field",
-    }
+    label = str(field.get("label") or field.get("attribute_key") or "required field")
+    raise RequiredOverrideError(
+        f"{label} 未由 AI 决策为 READY；自动 N/A / 1 / 首选项兜底已禁用，请由用户明确提供值。"
+    )
 
 
 def _bind_plan_items_to_fields(
     plan: LiveFillPlan,
     semantic_fields: Iterable[dict[str, Any]],
 ) -> dict[str, LiveFillPlanItem]:
-    """Bind every current field to its Fill Plan item without collapsing duplicates.
-
-    Some Makro verticals expose repeated labels such as several ``Length`` fields.
-    A dict keyed only by attribute/label/section silently overwrites those items.
-    Plan construction and semantic-field scanning preserve occurrence order, so
-    repeated identities are bound one-by-one inside their identity bucket.
-    """
-
     item_buckets: dict[tuple[str, str, str], list[LiveFillPlanItem]] = {}
     for item in plan.items:
         item_buckets.setdefault(_item_identity(item), []).append(item)
@@ -296,11 +134,7 @@ def load_required_blocked_fields(
     fill_plan_path: str | Path,
     live_schema_path: str | Path,
 ) -> list[dict[str, Any]]:
-    """Return unresolved required fields using occurrence-aware schema binding.
-
-    This is shared by Single GUI and Batch. It reads only the existing read-only
-    Fill Plan plus its live schema and never calls AI or touches the browser.
-    """
+    """Return required fields whose authoritative AI action is still BLOCKED."""
 
     payload = json.loads(Path(fill_plan_path).read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
@@ -373,17 +207,12 @@ def build_required_fallback_overrides(
     fill_plan_path: str | Path,
     live_schema_path: str | Path,
 ) -> list[dict[str, Any]]:
-    """Build deterministic fallbacks only for ordinary unresolved required fields.
+    """Compatibility API: automatic fallback generation is permanently empty."""
 
-    Protected fields are intentionally omitted. Their unresolved state remains a
-    real execution gate until an explicit user override is provided.
-    """
-
-    return [
-        required_fallback_override(item["field"])
-        for item in load_required_blocked_fields(fill_plan_path, live_schema_path)
-        if allow_required_fallback(item["field"])
-    ]
+    # Still load/bind the artifacts so corrupt plan/schema pairs fail loudly, but
+    # never synthesize a value from them.
+    load_required_blocked_fields(fill_plan_path, live_schema_path)
+    return []
 
 
 def write_required_fallback_overrides(
@@ -392,55 +221,62 @@ def write_required_fallback_overrides(
     *,
     output_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Persist ordinary Batch/Single deterministic fallback instructions.
+    """Compatibility API used by Batch; remove stale synthetic overrides."""
 
-    Protected required fields never appear in this file. The executor recomputes
-    every persisted ordinary fallback against the current DOM before writing, so
-    this file remains a bounded instruction set rather than trusted product data.
-    If no ordinary fallback remains, a stale fallback file is removed.
-    """
-
-    schema_path = Path(live_schema_path).resolve()
-    target = (
-        Path(output_path).resolve()
-        if output_path is not None
-        else schema_path.with_name(REQUIRED_OVERRIDES_FILENAME)
-    )
-    overrides = build_required_fallback_overrides(fill_plan_path, schema_path)
-    if not overrides:
-        if target.exists():
-            target.unlink()
-        return {"path": "", "count": 0, "field_ids": []}
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps({"overrides": overrides}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    blocked = load_required_blocked_fields(fill_plan_path, live_schema_path)
+    target = Path(output_path) if output_path is not None else Path(live_schema_path).resolve().with_name(REQUIRED_OVERRIDES_FILENAME)
+    if target.exists():
+        try:
+            payload = load_required_overrides(target)
+        except Exception:
+            payload = []
+        # Never delete explicit user-owned values.  Batch normally has none; a
+        # stale all-fallback artifact from older versions is safe to remove.
+        if payload and any(str(item.get("source_type") or "").casefold() not in {"fallback", "system"} for item in payload):
+            return {
+                "path": str(target.resolve()),
+                "count": 0,
+                "blocked_required": len(blocked),
+                "automatic_fallback_disabled": True,
+                "preserved_explicit_overrides": True,
+            }
+        target.unlink()
     return {
-        "path": str(target),
-        "count": len(overrides),
-        "field_ids": [str(item.get("field_id") or "") for item in overrides],
+        "path": "",
+        "count": 0,
+        "blocked_required": len(blocked),
+        "automatic_fallback_disabled": True,
+        "preserved_explicit_overrides": False,
     }
 
 
-def _source_metadata(override: dict[str,Any]) -> tuple[str, str, float, str]:
-    source_type = str(override.get("source_type") or "user").strip().casefold()
-    if source_type == "user":
-        return (
-            "user",
-            "user:required-field-input",
-            1.0,
-            "Explicit value supplied by the user for an unresolved required Makro field.",
-        )
-    if source_type == "fallback":
-        return (
-            "fallback",
-            FALLBACK_SOURCE_REFERENCE,
-            0.0,
-            "Deterministic non-AI placeholder used only because the ordinary required field remained unresolved.",
-        )
-    raise RequiredOverrideError(f"不支持 required override source_type={source_type!r}。")
+def _override_target(
+    override: dict[str, Any],
+    fields: list[dict[str, Any]],
+) -> dict[str, Any]:
+    identifier = str(override.get("field_id") or "").strip()
+    if identifier:
+        matches = [field for field in fields if field_id(field) == identifier]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise RequiredOverrideError(f"override field_id={identifier} 匹配多个 live fields。")
+
+    wanted_signature = _schema_signature_key(override.get("schema_signature"))
+    if wanted_signature:
+        matches = [
+            field
+            for field in fields
+            if _schema_signature_key(_schema_signature_payload(field)) == wanted_signature
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise RequiredOverrideError("override schema_signature 匹配多个 live fields。")
+
+    raise RequiredOverrideError(
+        f"required override 无法唯一绑定当前 live field：field_id={identifier or '<missing>'}。"
+    )
 
 
 def apply_required_overrides(
@@ -450,203 +286,65 @@ def apply_required_overrides(
     *,
     planned_fields: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Promote unresolved required fields using explicit user or safe ordinary fallback values.
-
-    No AI/search pass exists here. Explicit user values may resolve protected or
-    ordinary required fields. A ``source_type=fallback`` override is accepted only
-    when the current live field is still eligible for generic fallback; otherwise
-    it fails closed. Both paths are revalidated against the current live Makro
-    option/unit hard guards. Existing READY items are never replaced here.
-
-    A persisted ordinary fallback is an instruction to recompute the deterministic
-    value from the *current* live DOM field, so an old ``N/A`` cannot survive when
-    Makro now proves that control is numeric. Explicit user values are never
-    recomputed.
-
-    Binding is deliberately two-stage. Exact current ``field_id`` wins. If that
-    presentation-sensitive id changed while the production live-schema drift gate
-    still considers the field equivalent, the stable schema signature may rebind
-    it only when exactly one current field matches. Zero or multiple matches fail
-    closed before any browser write.
-    """
+    """Apply explicit user decisions only; never manufacture product answers."""
 
     fields = list(semantic_fields)
-    planned = list(planned_fields or [])
+    # Force occurrence-aware plan/live binding before any mutation.
+    by_field_id = _bind_plan_items_to_fields(plan, fields)
+    del planned_fields
 
-    fields_by_id: dict[str, list[dict[str, Any]]] = {}
-    fields_by_signature: dict[str, list[dict[str, Any]]] = {}
-    for field in fields:
-        fields_by_id.setdefault(field_id(field), []).append(field)
-        signature_key = _schema_signature_key(_schema_signature_payload(field))
-        if signature_key is not None:
-            fields_by_signature.setdefault(signature_key, []).append(field)
-
-    planned_by_id: dict[str, list[dict[str, Any]]] = {}
-    for field in planned:
-        planned_by_id.setdefault(field_id(field), []).append(field)
-
-    items_by_field_id = _bind_plan_items_to_fields(plan, fields)
     applied: list[str] = []
-    source_counts = {"user": 0, "fallback": 0}
-    rebound_by_schema_signature = 0
-    skipped_current_ready = 0
-    fallback_recomputed_live = 0
+    skipped_ready = 0
+    ignored_automatic = 0
 
-    for index, override in enumerate(overrides, start=1):
-        identifier = str(override.get("field_id") or "").strip()
-        if not identifier:
-            raise RequiredOverrideError(f"override[{index}] 缺少 field_id。")
-
-        direct = fields_by_id.get(identifier, [])
-        if len(direct) > 1:
-            raise RequiredOverrideError(
-                f"override[{index}] field_id={identifier} 在当前 live schema 中不唯一；拒绝猜目标。"
-            )
-
-        live_field: dict[str, Any] | None = direct[0] if direct else None
-        if live_field is None:
-            signature_payload = override.get("schema_signature")
-            signature_key = _schema_signature_key(signature_payload)
-
-            # Backward compatibility for an override file produced before stable
-            # signatures were persisted: recover the signature from the exact
-            # planned field id that already passed the production schema drift gate.
-            if signature_key is None and planned:
-                planned_matches = planned_by_id.get(identifier, [])
-                if len(planned_matches) > 1:
-                    raise RequiredOverrideError(
-                        f"override[{index}] field_id={identifier} 在 planned live schema 中不唯一；拒绝猜目标。"
-                    )
-                if len(planned_matches) == 1:
-                    signature_key = _schema_signature_key(
-                        _schema_signature_payload(planned_matches[0])
-                    )
-
-            if signature_key is None:
-                raise RequiredOverrideError(
-                    f"override[{index}] field_id={identifier} 不属于当前 live schema，且没有可验证的稳定 schema identity。"
-                )
-
-            rebound = fields_by_signature.get(signature_key, [])
-            if len(rebound) != 1:
-                raise RequiredOverrideError(
-                    f"override[{index}] field_id={identifier} 无法唯一重绑到当前 live schema；"
-                    f" stable_matches={len(rebound)}。"
-                )
-            live_field = rebound[0]
-            rebound_by_schema_signature += 1
-
-        current_identifier = field_id(live_field)
-        item = items_by_field_id.get(current_identifier)
-        if item is None:
-            raise RequiredOverrideError(
-                f"override[{index}] 无法绑定到当前 Fill Plan：{identifier}"
-            )
-        if not item.required:
-            raise RequiredOverrideError(f"{item.label} 不是 required 字段；补充值只用于未解决必填项。")
-        if item.action != BLOCKED:
-            # The current Resolver/live-control contract already has a READY
-            # answer. A stale persisted override must never replace it and must
-            # not turn an otherwise valid run into a preflight failure.
-            skipped_current_ready += 1
+    for raw in overrides:
+        if not isinstance(raw, dict):
             continue
+        source_type = str(raw.get("source_type") or "user").strip().casefold()
+        if source_type in {"fallback", "system"}:
+            ignored_automatic += 1
+            continue
+        if source_type != "user":
+            raise RequiredOverrideError(
+                f"required override source_type={source_type!r} 不受支持；只接受明确 user override。"
+            )
 
-        source_type, source_reference, confidence, evidence = _source_metadata(override)
-        effective_override = override
-        if source_type == "fallback":
-            # required_fallback_override performs the current protected-field
-            # policy check before recomputing any placeholder.
-            effective_override = required_fallback_override(live_field)
-            fallback_recomputed_live += 1
+        field = _override_target(raw, fields)
+        identifier = field_id(field)
+        item = by_field_id[identifier]
+        if item.action == READY:
+            skipped_ready += 1
+            continue
+        if not item.required:
+            raise RequiredOverrideError(f"{item.label} 不是 required 字段，拒绝 required override。")
 
-        raw_values = effective_override.get("values")
-        if raw_values is None:
-            raw_values = [effective_override.get("value")]
-        if not isinstance(raw_values, list):
-            raise RequiredOverrideError(f"{item.label} 的 values 必须是数组。")
-        values = [str(value).strip() for value in raw_values if str(value or "").strip()]
+        values = [str(value).strip() for value in raw.get("values") or [] if str(value).strip()]
         if not values:
-            raise RequiredOverrideError(f"{item.label} 的补充值为空。")
+            raise RequiredOverrideError(f"{item.label} 的明确用户 override 没有 values。")
+        qualifier = str(raw.get("qualifier") or "").strip()
 
-        reason = str(effective_override.get("reason") or "").strip()
-        decision = FieldDecision(
-            field_id=current_identifier,
-            status=AI_READY,
-            values=values,
-            qualifier=str(effective_override.get("qualifier") or "").strip(),
-            confidence=confidence,
-            reason=(
-                reason
-                or (
-                    "deterministic fallback for unresolved ordinary required field"
-                    if source_type == "fallback"
-                    else "explicit user value for unresolved required field"
-                )
-            ),
-        )
-        canonical_values, qualifier, hard_error = _hard_guard_values(live_field, decision)
-        if hard_error:
-            raise RequiredOverrideError(f"{item.label}: {hard_error}")
-
-        hard_validation = validate_resolved_answer(
-            live_field,
-            ResolvedAnswer(
-                attribute_key=item.attribute_key,
-                label=item.label,
-                status=RESOLVED,
-                answer=" + ".join(canonical_values),
-                answer_values=list(canonical_values),
-                qualifier=qualifier or None,
-                confidence=confidence,
-                source_type=source_type,
-                source_reference=source_reference,
-                evidence=evidence,
-                detail=reason,
-            ),
-        )
-        if not hard_validation.valid:
-            raise RequiredOverrideError(f"{item.label}: {hard_validation.detail}")
-
-        record = item.resolution
-        record.status = RESOLVED
-        record.answer = " + ".join(canonical_values)
-        record.answer_values = canonical_values
-        record.qualifier = qualifier or None
-        record.confidence = confidence
-        record.source_type = source_type
-        record.source_reference = source_reference
-        record.evidence = evidence
-        record.detail = (
-            "deterministic required-field fallback"
-            if source_type == "fallback"
-            else "explicit user input"
-        )
-        record.eligible_for_autofill = True
-        record.preview_eligible = False
-        record.gate_reason = ""
-        record.provenance = [
-            {
-                "source_reference": source_reference,
-                "evidence_text": evidence,
-                "source_type": source_type,
-                "confidence": confidence,
-            }
-        ]
         item.action = READY
-        item.reason = (
-            "未解决的普通 Makro 必填项已使用非 AI 的固定兜底值。"
-            if source_type == "fallback"
-            else "用户补充了 Resolver 未能确定的 Makro 必填值。"
-        )
-        applied.append(current_identifier)
-        source_counts[source_type] += 1
+        item.reason = "explicit user decision"
+        item.resolution.status = RESOLVED
+        item.resolution.answer_values = values
+        item.resolution.answer = " + ".join(values)
+        item.resolution.qualifier = qualifier or None
+        item.resolution.confidence = 1.0
+        item.resolution.source_type = "user"
+        item.resolution.source_reference = "user:required-override"
+        item.resolution.evidence = None
+        item.resolution.detail = str(raw.get("reason") or "explicit user decision").strip()
+        item.resolution.eligible_for_autofill = True
+        item.resolution.preview_eligible = False
+        item.resolution.gate_reason = ""
+        applied.append(identifier)
 
     _apply_business_relations(plan.items)
     return {
         "applied": len(applied),
         "field_ids": applied,
-        "sources": source_counts,
-        "rebound_by_schema_signature": rebound_by_schema_signature,
-        "skipped_current_ready": skipped_current_ready,
-        "fallback_recomputed_live": fallback_recomputed_live,
+        "skipped_current_ready": skipped_ready,
+        "ignored_automatic": ignored_automatic,
+        "fallback_recomputed_live": 0,
+        "automatic_fallback_disabled": True,
     }
