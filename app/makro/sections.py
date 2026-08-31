@@ -6,8 +6,9 @@ This module owns the section lifecycle for every Step 3 card:
 - open only that card's EDIT control;
 - scan fields inside that card;
 - Cancel only that card when the caller explicitly wants to discard edits;
-- Save only that card and prove Makro accepted the save by observing collapse
-  back to EDIT with no residual validation badge.
+- Save only that card and prove Makro accepted persistence by observing collapse
+  back to EDIT; residual validation badges are completion state, not persistence
+  failure, and are verified separately by the execution layer.
 
 It never clicks Send to QC and contains no product/category-specific field list.
 """
@@ -364,7 +365,14 @@ def cancel_section(page: Page, section_title: str, *, wait_ms: int = 450) -> Non
 
 
 def save_section(page: Page, section_title: str, *, timeout_s: float = 45.0) -> None:
-    """Trigger one Step 3 Save and prove Makro accepted persistence."""
+    """Trigger one Step 3 Save and prove the section crossed its persistence boundary.
+
+    Makro may collapse a saved card back to EDIT while still displaying a red
+    validation badge (for example 15/16 mandatory attributes). Collapse means the
+    section transaction was accepted and persisted; the badge describes listing
+    completeness and must not be reclassified as a failed Save. Field-level
+    verification and completion accounting happen after this primitive returns.
+    """
 
     section = find_section(page, section_title)
     if section is None:
@@ -383,52 +391,21 @@ def save_section(page: Page, section_title: str, *, timeout_s: float = 45.0) -> 
     trigger = trigger_transition(lambda: save.first.click())
 
     deadline = time.monotonic() + timeout_s
-    clean_collapsed_samples = 0
-    last_badges: list[str] = []
+    collapsed_samples = 0
     while time.monotonic() < deadline:
         page.wait_for_timeout(250)
         live = find_section(page, section_title)
         if live is None or not live.get("has_edit"):
-            clean_collapsed_samples = 0
+            collapsed_samples = 0
             continue
 
-        last_badges = collapsed_error_badges(page, section_title)
-        if last_badges:
-            clean_collapsed_samples = 0
-            continue
-
-        clean_collapsed_samples += 1
-        if clean_collapsed_samples >= 2:
+        collapsed_samples += 1
+        if collapsed_samples >= 2:
             return
 
     live = find_section(page, section_title)
     if live is not None and live.get("has_edit"):
-        badges = collapsed_error_badges(page, section_title)
-        if not badges:
-            return
-
-        field_errors: list[str] = []
-        try:
-            open_section_for_edit(page, live)
-            page.wait_for_timeout(400)
-            expanded = find_section(page, section_title)
-            expanded_path = str((expanded or {}).get("path") or "")
-            if expanded_path:
-                field_errors = visible_section_errors(page, expanded_path)
-        except Exception:
-            pass
-        detail = "；字段错误：" + " | ".join(field_errors) if field_errors else ""
-        trigger_detail = (
-            "；Save click 曾 timeout，但后置状态仍未通过验证"
-            if trigger.timed_out
-            else ""
-        )
-        raise RuntimeError(
-            f"{section_title} 保存后仍有 Makro validation error："
-            + " | ".join(badges or last_badges)
-            + detail
-            + trigger_detail
-        )
+        return
 
     live_path = str((live or {}).get("path") or path)
     errors = visible_section_errors(page, live_path)
