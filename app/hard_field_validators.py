@@ -126,10 +126,9 @@ def _controls_prove_closed_domain(controls: list[dict[str, Any]]) -> bool:
 def is_closed_selection_semantic_field(semantic_field: dict[str, Any]) -> bool:
     """Return True only when the current live DOM proves a finite option domain.
 
-    Native selects and radio groups are closed even when their current option set
-    is empty. Custom dropdown/autocomplete controls may render options only after
-    interaction; without captured options their domain is not yet proven here and
-    final execution must validate the unique live choice after opening them.
+    These helpers remain available for non-AI inputs and diagnostics.  Validated
+    AI decisions bypass this semantic gate entirely; the browser executor is the
+    only authority on whether an exact value can mechanically be written.
     """
 
     controls = _value_controls(semantic_field)
@@ -169,12 +168,7 @@ def executable_qualifier_options(semantic_field: dict[str, Any]) -> list[str]:
 
 
 def is_numeric_semantic_field(semantic_field: dict[str, Any]) -> bool:
-    """Return True when the current live control itself is numeric.
-
-    This is the shared DOM contract for both hard validation and deterministic
-    required-field fallbacks. Field labels are not authoritative: Makro can use
-    names such as ``Pick Pack SLA`` or ``Air Flow Level`` for real number inputs.
-    """
+    """Return True when the current live control itself is numeric."""
 
     control = _primary_control(semantic_field)
     if control is None:
@@ -244,7 +238,7 @@ def _closed_domain_validation(
         if not options:
             return FieldValidationResult(
                 False,
-                "当前 live selection 控件没有 enabled executable option；拒绝把自由文本答案标记为 READY。",
+                "当前 live selection 控件没有 enabled executable option。",
             )
         allowed = {_norm(value): value for value in options if _norm(value)}
         for value in answer.answer_values:
@@ -274,24 +268,30 @@ def validate_resolved_answer(
     semantic_field: dict[str, Any],
     answer: ResolvedAnswer,
 ) -> FieldValidationResult:
-    """Apply deterministic marketplace/control validation before writes.
+    """Validate non-AI inputs without re-deciding validated AI product semantics.
 
-    Product meaning is intentionally absent here. Translation, synonyms,
-    compatibility, feature interpretation and source conflict judgment belong to
-    the AI field-decision layer. A proven closed-domain answer is executable only
-    when it belongs to the currently enabled option domain; custom interactive
-    dropdowns whose options are not yet rendered defer their final truth to the
-    exact live-option executor.
+    A ``source_type == 'ai_decision'`` answer is authoritative.  This function
+    must never turn it from READY into BLOCKED because a later DOM scan renders a
+    different input type, option list, unit control, min/max, maxlength, or other
+    presentation contract.  The executor still performs exact field binding,
+    control interaction, readback, Save and persistence verification; an
+    impossible browser operation is reported as an execution failure, not as a
+    competing product decision.
+
+    Non-AI inputs (for example explicit seller/business configuration) retain the
+    deterministic validation helpers below.
     """
 
     if answer.status != RESOLVED:
+        return FieldValidationResult(True)
+    if str(answer.source_type or "").casefold() == "ai_decision":
         return FieldValidationResult(True)
     if not answer.answer_values:
         return FieldValidationResult(False, "resolved 答案没有 answer_values。")
     if answer.qualifier and not has_live_value_control(semantic_field):
         return FieldValidationResult(
             False,
-            "带 qualifier 的答案没有当前 live value control；拒绝把单位内联到未知执行控件。",
+            "带 qualifier 的非 AI 答案没有当前 live value control。",
         )
 
     key_names = {
