@@ -24,6 +24,7 @@ from .core import (
     load_case,
     run_evaluation,
 )
+from .ground_truth import apply_ground_truth_labels
 
 
 DEFAULT_ROOT = Path("evals/image_selection")
@@ -68,12 +69,15 @@ def _build_provider(args: argparse.Namespace) -> tuple[Any | None, dict[str, Any
     return build_semantic_provider(config), identity
 
 
+def _case_json_path(case_value: str, cases_root: str | Path) -> Path:
+    case_arg = Path(case_value)
+    return case_arg if case_arg.is_file() else Path(cases_root) / str(case_value) / "case.json"
+
+
 def _selected_cases(args: argparse.Namespace):
     root = Path(args.cases_root)
     if args.case:
-        case_arg = Path(args.case)
-        path = case_arg if case_arg.is_file() else root / str(args.case) / "case.json"
-        return [load_case(path)]
+        return [load_case(_case_json_path(str(args.case), root))]
     return discover_cases(root, suite=args.suite)
 
 
@@ -236,6 +240,18 @@ def _cmd_capture_case(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_apply_ground_truth(args: argparse.Namespace) -> int:
+    case_path = _case_json_path(str(args.case), args.cases_root)
+    path = apply_ground_truth_labels(case_json=case_path, labels_json=args.labels)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    print(f"labelled={path}")
+    print(f"candidate_count={len(payload.get('candidates') or [])}")
+    print(f"label_status={payload.get('label_status')}")
+    print("ai_calls=0")
+    print("listing_actions=0")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m tools.image_selection_lab",
@@ -277,6 +293,15 @@ def build_parser() -> argparse.ArgumentParser:
     capture_parser.add_argument("--target-model", default="", help="optional human-provided exact model/SKU family")
     capture_parser.add_argument("--target-variant", default="", help="optional human-provided exact variant")
     capture_parser.set_defaults(handler=_cmd_capture_case)
+
+    label_parser = sub.add_parser(
+        "apply-ground-truth",
+        help="apply one reviewed ground-truth label set to an exact local capture-case without AI",
+    )
+    label_parser.add_argument("--case", required=True, help="case id or direct case.json path")
+    label_parser.add_argument("--labels", required=True, help="reviewed ground-truth JSON")
+    label_parser.add_argument("--cases-root", default=str(DEFAULT_ROOT / "cases"))
+    label_parser.set_defaults(handler=_cmd_apply_ground_truth)
     return parser
 
 
