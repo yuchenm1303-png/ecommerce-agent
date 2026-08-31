@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .locators import scoped_selector_for_control
+from .unit_contract import qualifier_controls
 
 
 _TEXT_KINDS = {
@@ -90,14 +91,6 @@ def _value_controls(semantic_field: dict[str, Any]) -> list[dict[str, Any]]:
     return output
 
 
-def _qualifier_controls(semantic_field: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        control
-        for control in semantic_field.get("controls") or []
-        if str(control.get("name") or "").endswith("_qualifier")
-    ]
-
-
 def _primary_control(semantic_field: dict[str, Any], controls: list[dict[str, Any]]) -> dict[str, Any] | None:
     key = str(semantic_field.get("attribute_key") or "")
     for control in controls:
@@ -131,7 +124,10 @@ def execution_contract(semantic_field: dict[str, Any], answer: Any | None = None
     base = _live_base_family(primary, controls)
     values = list(getattr(answer, "answer_values", None) or []) if answer is not None else []
     multi = bool(semantic_field.get("multi_value")) or len(values) > 1
-    qualifier = bool(getattr(answer, "qualifier", None)) or bool(_qualifier_controls(semantic_field))
+    # Qualification is a property of the live DOM, not of answer metadata.
+    # A fixed rendered suffix such as CM/KG has no qualifier control and remains
+    # a plain numeric field; unit compatibility is checked at the mutation boundary.
+    qualifier = bool(qualifier_controls(semantic_field))
     suffixes: list[str] = []
     if multi:
         suffixes.append("multi")

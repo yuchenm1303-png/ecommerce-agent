@@ -17,6 +17,11 @@ from .makro.field_engine import (
     values_equivalent,
 )
 from .makro.locators import scoped_selector_for_control, selector_for_control  # noqa: F401
+from .makro.unit_contract import (
+    fixed_rendered_unit,
+    qualifier_controls as _live_qualifier_controls,
+    validate_answer_unit,
+)
 from .resolution_types import RESOLVED, ResolvedAnswer
 
 
@@ -69,12 +74,7 @@ def _value_controls(semantic_field: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _qualifier_controls(semantic_field: dict[str, Any]) -> list[dict[str, Any]]:
-    controls = [
-        control
-        for control in semantic_field.get("controls") or []
-        if str(control.get("name") or "").endswith("_qualifier")
-    ]
-    return sorted(controls, key=_qualifier_index)
+    return sorted(_live_qualifier_controls(semantic_field), key=_qualifier_index)
 
 
 def _qualifier_targets(
@@ -162,9 +162,10 @@ def _preflight_answer_capacity(
             f"答案有 {len(values)} 个值，但当前页面只有 {len(controls)} 个 value control；"
             "未执行任何部分写入。"
         )
-    if answer.qualifier:
-        if not _qualifier_controls(semantic_field):
-            return "答案包含 qualifier，但当前 semantic field 没有 qualifier control；未执行写入。"
+    unit_error = validate_answer_unit(semantic_field, answer.qualifier)
+    if unit_error:
+        return unit_error
+    if answer.qualifier and _qualifier_controls(semantic_field):
         try:
             _qualifier_targets(semantic_field, len(values))
         except ValueError as exc:
@@ -224,7 +225,9 @@ def _read_qualifiers(
         return True, [], []
     controls = _qualifier_targets(semantic_field, value_count)
     if not controls:
-        return False, [], []
+        unit_error = validate_answer_unit(semantic_field, expected_qualifier)
+        fixed = fixed_rendered_unit(semantic_field)
+        return unit_error is None, ([fixed] if fixed else []), []
     actual: list[str] = []
     selectors: list[str] = []
     passed = True
@@ -470,7 +473,10 @@ def fill_resolved_field(
     selectors: list[str] = []
     actual: list[str] = []
     try:
-        if answer.qualifier:
+        # Only a real live qualifier control may trigger qualifier mutation.
+        # Fixed units are immutable value context and were compatibility-checked
+        # in preflight, so their numeric value is written directly.
+        if answer.qualifier and _qualifier_controls(semantic_field):
             for selector in _prepare_qualified_context(
                 page,
                 semantic_field,

@@ -141,13 +141,17 @@ def fill_one_section(
     recheck_wait_ms: int,
     run_dir: Path,
 ) -> dict[str, Any]:
-    """Execute one Step 3 card with failure scope aligned to mutation scope.
+    """Execute one Step 3 card with field-local failure ownership.
 
-    Optional candidates that fail a purely pre-write bind/mechanical preflight are
-    isolated before they can affect the card transaction. Required candidates keep
-    fail-closed behavior. Once any field write starts, a non-validated readback may
-    represent partial React state and therefore aborts/cancels the whole unsaved
-    card transaction. Save verifies only the exact candidates actually written.
+    A field that cannot bind, pass mechanical preflight, fill, or validate fails
+    only that field. Later fields continue. Every field that validates remains a
+    candidate for Save and persistence verification. We never Cancel an open card
+    merely because a sibling field failed; if Makro itself rejects Save, the card
+    is deliberately left open so already-entered values are not discarded by our
+    executor.
+
+    Only loss of the section execution surface itself stops iteration because at
+    that point there is no trustworthy live transaction in which to continue.
     """
 
     candidates = _section_candidates(
@@ -192,7 +196,8 @@ def fill_one_section(
 
     validated_identities: set[tuple[str, str, str]] = set()
     executed_candidates: list[Any] = []
-    transaction_failed = False
+    structural_failure = False
+
     for item in candidates:
         mode = preview_mode_for_item(
             item,
@@ -205,15 +210,15 @@ def fill_one_section(
         live_section = adapter.find_section(section_title)
         if live_section is None or live_section.get("has_edit"):
             report["validation_failed"] += 1
-            report["aborted_on_field"] = item.label
+            report["stopped_on_field"] = item.label
             report["results"].append(
                 {
                     **base_payload,
                     "execution_status": "section_transaction_lost",
-                    "detail": "字段写入前目标 section 已不存在或意外折叠；未继续执行。",
+                    "detail": "字段写入前目标 section 已不存在或意外折叠；执行面已丢失，无法安全继续后续字段。",
                 }
             )
-            transaction_failed = True
+            structural_failure = True
             break
 
         try:
@@ -225,15 +230,15 @@ def fill_one_section(
             )
         except Exception as exc:
             report["validation_failed"] += 1
-            report["aborted_on_field"] = item.label
+            report["stopped_on_field"] = item.label
             report["results"].append(
                 {
                     **base_payload,
                     "execution_status": "live_refresh_failed",
-                    "detail": f"字段写入前刷新当前 React live schema 失败：{exc}",
+                    "detail": f"字段写入前刷新当前 React live schema 失败，执行面不可用：{exc}",
                 }
             )
-            transaction_failed = True
+            structural_failure = True
             break
 
         matches = live.get(identity, [])
@@ -253,19 +258,17 @@ def fill_one_section(
                 )
                 continue
             report["validation_failed"] += 1
-            report["aborted_on_field"] = item.label
             report["results"].append(
                 {
                     **base_payload,
                     "execution_status": "required_live_match_failed",
                     "detail": (
                         f"必填字段写入前重新扫描后 live field 匹配数={len(matches)}，期望恰好 1；"
-                        "当前 section 事务已中止。"
+                        "仅该字段失败，继续处理同 section 的其他字段。"
                     ),
                 }
             )
-            transaction_failed = True
-            break
+            continue
 
         answer = execution_answer_for_item(
             item,
@@ -288,19 +291,17 @@ def fill_one_section(
                 )
                 continue
             report["validation_failed"] += 1
-            report["aborted_on_field"] = item.label
             report["results"].append(
                 {
                     **base_payload,
                     "execution_status": "preflight_rejected",
                     "detail": (
-                        "当前必填 live field 与 Fill Plan 答案的机械契约不再兼容；"
-                        f"未写入：{hard_validation.detail}"
+                        "当前必填 live field 与 Fill Plan 答案的机械契约不兼容；"
+                        f"仅该字段未写入，继续处理其他字段：{hard_validation.detail}"
                     ),
                 }
             )
-            transaction_failed = True
-            break
+            continue
 
         report["writes_attempted"] += 1
         if mode == "review":
@@ -314,16 +315,14 @@ def fill_one_section(
             )
         except Exception as exc:
             report["fill_error"] += 1
-            report["aborted_on_field"] = item.label
             report["results"].append(
                 {
                     **base_payload,
                     "execution_status": "fill_exception",
-                    "detail": str(exc),
+                    "detail": f"该字段填写异常；保留当前页面状态并继续其他字段：{exc}",
                 }
             )
-            transaction_failed = True
-            break
+            continue
 
         if verification.status == "validated":
             report["validated"] += 1
@@ -340,50 +339,35 @@ def fill_one_section(
                 "verification": verification.as_dict(),
             }
         )
-        if verification.status != "validated":
-            report["aborted_on_field"] = item.label
-            transaction_failed = True
-            break
 
-    execution_incomplete = bool(
-        transaction_failed
-        or report["validation_failed"]
-        or report["fill_error"]
-        or report["validated"] != report["writes_attempted"]
-    )
-    if execution_incomplete:
-        failed_shot = run_dir / f"{_safe_name(section_title)}-transaction-failed.png"
+    report["field_failures"] = int(report["validation_failed"]) + int(report["fill_error"])
+
+    if structural_failure:
+        failed_shot = run_dir / f"{_safe_name(section_title)}-execution-surface-lost.png"
         _capture_diagnostic_screenshot(
             adapter,
             failed_shot,
             report,
-            "screenshot_transaction_failed",
+            "screenshot_execution_surface_lost",
         )
-        if persist:
-            try:
-                if _cancel_open_section_transaction(adapter, section_title):
-                    report["cancelled_unsaved_after_failure"] = True
-            except Exception as cleanup_exc:
-                report["cleanup_error"] = str(cleanup_exc)
-            report["status"] = "execution_failed_unsaved"
-            report["detail"] = (
-                "section 内发生必填字段失败或写入后的不确定状态；"
-                "已放弃本 section 的未保存事务，没有点击 Save。"
-            )
-        else:
-            report["status"] = "preview_failed"
+        report["status"] = "section_execution_lost"
+        report["detail"] = (
+            "section 本身的 live 执行面已丢失，无法继续或可靠 Save；"
+            "执行器没有主动 Cancel，也没有回滚此前字段。"
+        )
         return report
 
     if not executed_candidates:
-        try:
-            if _cancel_open_section_transaction(adapter, section_title):
-                report["cancelled_no_write_transaction"] = True
-        except Exception as cleanup_exc:
-            report["cleanup_error"] = str(cleanup_exc)
-        report["status"] = "no_candidates"
+        if report["writes_attempted"] == 0:
+            try:
+                if _cancel_open_section_transaction(adapter, section_title):
+                    report["cancelled_no_write_transaction"] = True
+            except Exception as cleanup_exc:
+                report["cleanup_error"] = str(cleanup_exc)
+        report["status"] = "no_validated_writes"
         report["detail"] = (
-            f"本 section 的 {report['optional_prewrite_skipped']} 个候选均为写入前可选字段局部跳过；"
-            "没有字段被修改，也没有点击 Save。"
+            "本 section 没有任何通过回读验证的写入，因此没有可安全持久化的字段；"
+            "若曾发生写入尝试，当前页面状态保持原样，不做整栏回滚。"
         )
         return report
 
@@ -396,7 +380,7 @@ def fill_one_section(
     )
 
     if not persist:
-        report["status"] = "preview_open"
+        report["status"] = "preview_partial" if report["field_failures"] else "preview_open"
         return report
 
     report["save_attempted"] = True
@@ -430,6 +414,11 @@ def fill_one_section(
         diagnostics = _collect_save_failure_diagnostics(adapter, section_title)
         report["save_failure_diagnostics"] = diagnostics
         report["visible_errors_after_save_failure"] = diagnostics.get("visible_errors", [])
+        report["unsaved_values_preserved"] = True
+        report["detail"] = (
+            "Makro 拒绝了 section Save；执行器保留当前已填写页面状态，"
+            "不再通过 Cancel 把同栏其他字段一起清空。"
+        )
         failed_shot = run_dir / f"{_safe_name(section_title)}-save-failed.png"
         _capture_diagnostic_screenshot(
             adapter,
@@ -437,17 +426,16 @@ def fill_one_section(
             report,
             "screenshot_save_failed",
         )
-        try:
-            live_section = adapter.find_section(section_title)
-            if live_section is not None and not live_section.get("has_edit"):
-                adapter.cancel_section(section_title)
-                report["cancelled_unsaved_after_failure"] = True
-        except Exception as cleanup_exc:
-            report["cleanup_error"] = str(cleanup_exc)
         return report
 
     if errors or report["persisted_validation_failed"]:
         report["status"] = "persisted_validation_failed"
+    elif report["field_failures"]:
+        report["status"] = "persisted_partial"
+        report["detail"] = (
+            f"已持久化并复核 {report['persisted_verified']} 个成功字段；"
+            f"另有 {report['field_failures']} 个字段独立失败，没有触发整栏回滚。"
+        )
     else:
         report["status"] = "persisted_verified"
 
