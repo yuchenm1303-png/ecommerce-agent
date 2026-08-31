@@ -145,10 +145,9 @@ def fill_one_section(
 
     A field that cannot bind, pass mechanical preflight, fill, or validate fails
     only that field. Later fields continue. Every field that validates remains a
-    candidate for Save and persistence verification. We never Cancel an open card
-    merely because a sibling field failed; if Makro itself rejects Save, the card
-    is deliberately left open so already-entered values are not discarded by our
-    executor.
+    candidate for Save and persistence verification. Section collapse after Save
+    is the persistence boundary; a residual Makro validation badge describes
+    completeness and does not erase values that Makro already persisted.
 
     Only loss of the section execution surface itself stops iteration because at
     that point there is no trustworthy live transaction in which to continue.
@@ -414,10 +413,9 @@ def fill_one_section(
         diagnostics = _collect_save_failure_diagnostics(adapter, section_title)
         report["save_failure_diagnostics"] = diagnostics
         report["visible_errors_after_save_failure"] = diagnostics.get("visible_errors", [])
-        report["unsaved_values_preserved"] = True
         report["detail"] = (
-            "Makro 拒绝了 section Save；执行器保留当前已填写页面状态，"
-            "不再通过 Cancel 把同栏其他字段一起清空。"
+            "Makro section 在 Save 后没有恢复 EDIT，无法证明持久化；"
+            "只保留现场诊断，不把该状态误报成已保存。"
         )
         failed_shot = run_dir / f"{_safe_name(section_title)}-save-failed.png"
         _capture_diagnostic_screenshot(
@@ -430,6 +428,10 @@ def fill_one_section(
 
     if errors or report["persisted_validation_failed"]:
         report["status"] = "persisted_validation_failed"
+        report["detail"] = (
+            f"Makro 已持久化并复核 {report['persisted_verified']} 个成功字段；"
+            "残余 validation error 只表示该 section 尚未完整，不再阻断后续 section。"
+        )
     elif report["field_failures"]:
         report["status"] = "persisted_partial"
         report["detail"] = (
@@ -462,10 +464,12 @@ def _fresh_photo_state(adapter: MakroDomainAdapter) -> dict[str, Any]:
     return adapter.inspect_product_photos()
 
 
-def _cancel_open_photo_transaction(adapter: MakroDomainAdapter) -> None:
+def _cancel_open_photo_transaction(adapter: MakroDomainAdapter) -> bool:
     live = adapter.find_section(PRODUCT_PHOTOS)
-    if live is not None and not live.get("has_edit"):
-        adapter.cancel_section(PRODUCT_PHOTOS)
+    if live is None or live.get("has_edit"):
+        return False
+    adapter.cancel_section(PRODUCT_PHOTOS)
+    return True
 
 
 def _photo_upload_budget(
@@ -479,48 +483,77 @@ def _photo_upload_budget(
         available = max(0, capacity - initial_count)
     else:
         available = visible_empty_slots
-    upload_count = min(requested, available)
     return {
         "available_slots": available,
-        "upload_count": upload_count,
-        "omitted_count": requested - upload_count,
+        "upload_count": min(requested, available),
+        "omitted_count": max(0, requested - available),
         "capacity": capacity,
     }
 
 
-def _persisted_gallery_report(
-    *, requested: int, initial_count: int, capacity: int | None,
-    available_slots: int, omitted_paths: list[Path], request_status: str, detail: str,
+def _photo_base_report(
+    *,
+    requested_unique: int,
+    valid_requested: int,
+    initial_count: int,
+    capacity: int | None,
+    available_slots: int,
+    rejected_input: list[dict[str, Any]],
 ) -> dict[str, Any]:
     return {
-        "status": "persisted_verified",
-        "request_status": request_status,
-        "request_complete": not omitted_paths,
-        "capacity_limited": bool(omitted_paths),
-        "requested": requested,
+        "status": "running",
+        "request_status": "complete",
+        "request_complete": not rejected_input,
+        "capacity_limited": False,
+        "requested": requested_unique,
+        "valid_requested": valid_requested,
+        "rejected_pre_submit": list(rejected_input),
         "available_slots": available_slots,
+        "initial_count": initial_count,
+        "final_count": initial_count,
+        "capacity": capacity,
         "attempted": 0,
         "staged": 0,
         "persisted": initial_count,
         "persisted_this_run": 0,
-        "initial_count": initial_count,
-        "final_count": initial_count,
-        "capacity": capacity,
-        "omitted_count": len(omitted_paths),
-        "omitted_due_capacity": [str(path) for path in omitted_paths],
+        "omitted_count": 0,
+        "omitted_due_capacity": [],
         "listing_photo_requirement_satisfied": initial_count >= 1,
+        "items": list(rejected_input),
+        "save_attempted": False,
+        "save_count": 0,
+        "saved": False,
         "persistence": {
-            "status": "persisted_verified",
+            "status": "persisted_verified" if initial_count >= 0 else "unknown",
             "initial_count": initial_count,
             "final_count": initial_count,
             "expected_added": 0,
         },
-        "items": [],
-        "save_attempted": False,
-        "save_count": 0,
-        "saved": False,
-        "detail": detail,
     }
+
+
+def _cancel_failed_photo_transaction(
+    adapter: MakroDomainAdapter,
+    report: dict[str, Any],
+    *,
+    image: Path,
+) -> bool:
+    """Discard only the current image's unsaved slot transaction.
+
+    Production persists every accepted image before the next image starts, so a
+    Cancel here cannot erase a previously successful sibling image.
+    """
+
+    try:
+        cancelled = _cancel_open_photo_transaction(adapter)
+        if cancelled:
+            report.setdefault("cancelled_image_transactions", []).append(str(image))
+        return True
+    except Exception as exc:
+        report.setdefault("photo_transaction_cleanup_errors", []).append(
+            {"path": str(image), "error": str(exc)}
+        )
+        return False
 
 
 def run_photos(
@@ -531,13 +564,14 @@ def run_photos(
     upload_timeout_ms: int,
     run_dir: Path,
 ) -> dict[str, Any]:
-    """Persist the safely accepted subset of explicit listing images.
+    """Execute Product Photos with one persistence transaction per image.
 
-    Missing inputs and media decode failures are image-scoped and do not veto
-    valid siblings or an already-persisted gallery. A post-submit uncertain slot is
-    different: the unsaved gallery is cancelled and never Save'd because the next
-    logical slot cannot be trusted. Capacity omissions are explicit but do not make
-    a persisted draft invalid.
+    The old gallery-wide transaction coupled unrelated images: if image N became
+    post-submit uncertain, Cancel discarded images 0..N-1 even when their exact
+    slots had already been accepted. Production now uses a strict image-owned
+    transaction boundary: stage one image, Save it, verify the completion counter,
+    then move to the next image. A failed image may Cancel only its own unsaved
+    transaction, so later failures can never erase earlier persisted successes.
     """
 
     resolved: list[Path] = []
@@ -563,7 +597,6 @@ def run_photos(
             continue
         resolved.append(path)
 
-    requested = len(resolved)
     initial_section = adapter.find_section(PRODUCT_PHOTOS)
     initial_was_collapsed = bool(initial_section and initial_section.get("has_edit"))
     try:
@@ -575,7 +608,7 @@ def run_photos(
             "request_complete": False,
             "capacity_limited": False,
             "requested": requested_unique,
-            "valid_requested": requested,
+            "valid_requested": len(resolved),
             "rejected_pre_submit": rejected_input,
             "attempted": 0,
             "staged": 0,
@@ -597,24 +630,24 @@ def run_photos(
 
     try:
         budget = _photo_upload_budget(
-            requested=requested,
+            requested=len(resolved),
             initial_count=initial_count,
             capacity=capacity,
             visible_empty_slots=visible_empty_slots,
         )
     except ValueError as exc:
-        try:
-            if initial_was_collapsed:
+        if initial_was_collapsed:
+            try:
                 _cancel_open_photo_transaction(adapter)
-        except Exception:
-            pass
+            except Exception:
+                pass
         return {
             "status": "capacity_state_invalid",
             "request_status": "capacity_state_invalid",
             "request_complete": False,
             "capacity_limited": False,
             "requested": requested_unique,
-            "valid_requested": requested,
+            "valid_requested": len(resolved),
             "rejected_pre_submit": rejected_input,
             "attempted": 0,
             "staged": 0,
@@ -633,280 +666,236 @@ def run_photos(
         }
 
     available_slots = int(budget["available_slots"] or 0)
-    upload_count = int(budget["upload_count"] or 0)
-    pending = resolved[:upload_count]
-    omitted = resolved[upload_count:]
-
-    if requested == 0:
-        if initial_count >= 1:
-            report = _persisted_gallery_report(
-                requested=requested_unique,
-                initial_count=initial_count,
-                capacity=capacity,
-                available_slots=available_slots,
-                omitted_paths=[],
-                request_status="degraded_input" if rejected_input else "not_requested",
-                detail=(
-                    "请求图片均在提交前被隔离；现有 Product Photos 已满足至少 1 张持久化图片要求。"
-                    if rejected_input
-                    else "没有传入 --upload-image；现有 Product Photos 已满足至少 1 张持久化图片要求。"
-                ),
-            )
-            report["rejected_pre_submit"] = rejected_input
-            report["request_complete"] = not rejected_input
-        else:
-            report = {
-                "status": "skipped",
-                "request_status": "invalid_input" if rejected_input else "not_requested",
-                "request_complete": not rejected_input,
-                "capacity_limited": False,
-                "requested": requested_unique,
-                "valid_requested": 0,
-                "rejected_pre_submit": rejected_input,
-                "available_slots": available_slots,
-                "attempted": 0,
-                "staged": 0,
-                "persisted": 0,
-                "persisted_this_run": 0,
-                "initial_count": 0,
-                "final_count": 0,
-                "capacity": capacity,
-                "omitted_count": 0,
-                "omitted_due_capacity": [],
-                "listing_photo_requirement_satisfied": False,
-                "persistence": {
-                    "status": "missing_required_photo",
-                    "initial_count": 0,
-                    "final_count": 0,
-                    "expected_added": 0,
-                },
-                "items": list(rejected_input),
-                "save_attempted": False,
-                "save_count": 0,
-                "saved": False,
-                "detail": (
-                    "没有任何可提交图片，且当前 Product Photos 没有已持久化图片。"
-                ),
-            }
-        if initial_was_collapsed:
-            try:
-                _cancel_open_photo_transaction(adapter)
-                report["restored_collapsed_state"] = True
-            except Exception as cleanup_exc:
-                report["post_skip_cleanup_error"] = str(cleanup_exc)
-        return report
-
-    if not pending:
-        if initial_count < 1:
-            report = {
-                "status": "capacity_unavailable",
-                "request_status": "skipped_no_capacity",
-                "request_complete": False,
-                "capacity_limited": True,
-                "requested": requested_unique,
-                "valid_requested": requested,
-                "rejected_pre_submit": rejected_input,
-                "available_slots": available_slots,
-                "attempted": 0,
-                "staged": 0,
-                "persisted": 0,
-                "persisted_this_run": 0,
-                "initial_count": initial_count,
-                "final_count": initial_count,
-                "capacity": capacity,
-                "omitted_count": len(omitted),
-                "omitted_due_capacity": [str(path) for path in omitted],
-                "listing_photo_requirement_satisfied": False,
-                "items": list(rejected_input),
-                "save_attempted": False,
-                "save_count": 0,
-                "saved": False,
-                "detail": "Product Photos 没有可用图片槽，同时当前 listing 也没有任何已持久化图片。",
-            }
-        else:
-            report = _persisted_gallery_report(
-                requested=requested_unique,
-                initial_count=initial_count,
-                capacity=capacity,
-                available_slots=available_slots,
-                omitted_paths=omitted,
-                request_status="skipped_no_capacity",
-                detail=(
-                    f"Product Photos 已占用 {initial_count}/{capacity or initial_count}；"
-                    f"没有剩余槽位，本次 {len(omitted)} 张可用图片未尝试上传，不影响已持久化草稿。"
-                ),
-            )
-            report["rejected_pre_submit"] = rejected_input
-            report["request_complete"] = False if rejected_input or omitted else True
-            report["warning"] = (
-                f"图片容量已满：requested={requested_unique}, omitted={len(omitted)}, "
-                f"rejected={len(rejected_input)}, existing={initial_count}, capacity={capacity}."
-            )
-        if initial_was_collapsed:
-            try:
-                _cancel_open_photo_transaction(adapter)
-                report["restored_collapsed_state"] = True
-            except Exception as cleanup_exc:
-                report["post_capacity_cleanup_error"] = str(cleanup_exc)
-        return report
-
-    report: dict[str, Any] = {
-        "status": "running",
-        "request_status": "degraded_input" if rejected_input else ("capacity_limited" if omitted else "complete"),
-        "request_complete": not rejected_input and not omitted,
-        "capacity_limited": bool(omitted),
-        "requested": requested_unique,
-        "valid_requested": requested,
-        "rejected_pre_submit": list(rejected_input),
-        "available_slots": available_slots,
-        "initial_count": initial_count,
-        "final_count": initial_count,
-        "capacity": capacity,
-        "attempted": 0,
-        "staged": 0,
-        "persisted": initial_count,
-        "persisted_this_run": 0,
-        "omitted_count": len(omitted),
-        "omitted_due_capacity": [str(path) for path in omitted],
-        "listing_photo_requirement_satisfied": initial_count >= 1,
-        "items": list(rejected_input),
-        "save_attempted": False,
-        "save_count": 0,
-        "saved": False,
-    }
-
-    try:
-        staged_result = adapter.upload_product_photos(
-            [str(image) for image in pending],
-            timeout_ms=upload_timeout_ms,
-        )
-        staged_payload = staged_result.as_dict()
-        report["attempted"] = int(staged_payload.get("attempted") or 0)
-        report["staged"] = int(staged_payload.get("staged") or 0)
-        stage_items = list(staged_payload.get("items") or [])
-        report["items"].extend(stage_items)
-        report["rejected_pre_submit"].extend(
-            item for item in stage_items if item.get("status") == "rejected_pre_submit"
-        )
-        report["staging_status"] = str(staged_payload.get("status") or "")
-        report["staging_detail"] = str(staged_payload.get("detail") or "")
-    except Exception as exc:
-        report["status"] = "incomplete_upload"
-        report["staging_status"] = "transaction_error"
-        report["staging_error"] = str(exc)
-        report["detail"] = "Product Photos 精确槽位上传事务异常，中止本次图片 Save。"
-
-    staged_shot = run_dir / "Product-Photos-staged.png"
-    _capture_diagnostic_screenshot(
-        adapter,
-        staged_shot,
-        report,
-        "screenshot_staged",
+    report = _photo_base_report(
+        requested_unique=requested_unique,
+        valid_requested=len(resolved),
+        initial_count=initial_count,
+        capacity=capacity,
+        available_slots=available_slots,
+        rejected_input=rejected_input,
     )
 
-    staging_status = str(report.get("staging_status") or "")
-    expected_new = int(report.get("staged") or 0)
-    if staging_status != "staged" or expected_new <= 0:
-        if initial_count >= 1 and staging_status in {"staged", "no_usable_input"}:
-            try:
-                _cancel_open_photo_transaction(adapter)
-                report["cancelled_unsaved_no_new_photo"] = True
-            except Exception as exc:
-                report["cleanup_error"] = str(exc)
-            report["status"] = "persisted_verified"
-            report["persistence"] = {
-                "status": "persisted_verified",
-                "initial_count": initial_count,
-                "final_count": initial_count,
-                "expected_added": 0,
-            }
-            report["detail"] = "新请求图片均在提交前被隔离；现有持久化图片保持有效。"
-            return report
-
-        if "detail" not in report:
-            report["detail"] = (
-                f"图片暂存状态={staging_status or 'unknown'}, staged={expected_new}；"
-                "未达到可安全 Save 的完整槽位事务边界。"
-            )
+    if initial_was_collapsed:
         try:
             _cancel_open_photo_transaction(adapter)
-            report["cancelled_unsaved_partial"] = True
+            report["restored_collapsed_state_after_inspection"] = True
         except Exception as exc:
-            report["cleanup_error"] = str(exc)
+            report["inspection_cleanup_error"] = str(exc)
+            report["status"] = "photo_surface_cleanup_failed"
+            report["request_status"] = "photo_surface_cleanup_failed"
+            report["request_complete"] = False
+            return report
+
+    if not resolved:
+        report["request_status"] = "degraded_input" if rejected_input else "not_requested"
+        report["request_complete"] = not rejected_input
+        report["status"] = "persisted_verified" if initial_count >= 1 else "skipped"
+        report["detail"] = (
+            "没有新的可提交图片；现有持久化图片已满足 listing 要求。"
+            if initial_count >= 1
+            else "没有新的可提交图片，且当前 listing 没有已持久化图片。"
+        )
+        return report
+
+    if available_slots <= 0:
+        report["capacity_limited"] = True
+        report["omitted_count"] = len(resolved)
+        report["omitted_due_capacity"] = [str(path) for path in resolved]
+        report["request_complete"] = False
+        report["request_status"] = "skipped_no_capacity"
+        report["status"] = "persisted_verified" if initial_count >= 1 else "capacity_unavailable"
+        report["detail"] = (
+            "Product Photos 已满；现有持久化图片保持不变。"
+            if initial_count >= 1
+            else "Product Photos 没有可用槽位，且当前 listing 没有任何已持久化图片。"
+        )
         return report
 
     if not allow_save:
-        report["status"] = "staged"
-        report["detail"] = f"{expected_new} 个安全图片槽已事务确认，等待一次 Save。"
+        preview_paths = resolved[:available_slots]
+        omitted = resolved[available_slots:]
+        staged_result = adapter.upload_product_photos(
+            [str(path) for path in preview_paths],
+            timeout_ms=upload_timeout_ms,
+        )
+        payload = staged_result.as_dict()
+        report["attempted"] = int(payload.get("attempted") or 0)
+        report["staged"] = int(payload.get("staged") or 0)
+        report["items"].extend(list(payload.get("items") or []))
+        report["omitted_count"] = len(omitted)
+        report["omitted_due_capacity"] = [str(path) for path in omitted]
+        report["capacity_limited"] = bool(omitted)
+        report["request_complete"] = (
+            not rejected_input
+            and not omitted
+            and str(payload.get("status") or "") == "staged"
+            and report["staged"] == len(preview_paths)
+        )
+        report["request_status"] = "complete" if report["request_complete"] else "preview_partial"
+        report["status"] = "staged" if report["staged"] else str(payload.get("status") or "preview_failed")
+        report["detail"] = str(payload.get("detail") or "")
         return report
 
-    report["save_attempted"] = True
-    try:
-        adapter.save_section(PRODUCT_PHOTOS)
-        report["save_count"] = 1
-        report["saved"] = True
-    except Exception as exc:
-        report["status"] = "save_failed"
-        report["save_error"] = str(exc)
-        report["save_failure_diagnostics"] = _collect_save_failure_diagnostics(adapter, PRODUCT_PHOTOS)
-        report["detail"] = f"{expected_new} 个安全图片槽已填写，但 Product Photos Save 被 Makro 拒绝。"
-        failed_shot = run_dir / "Product-Photos-save-failed.png"
-        _capture_diagnostic_screenshot(adapter, failed_shot, report, "screenshot_save_failed")
+    current_count = initial_count
+    failed_transactions = 0
+    omitted: list[Path] = []
+    operational_stop = False
+
+    for index, image in enumerate(resolved):
+        if report["persisted_this_run"] >= available_slots:
+            omitted.extend(resolved[index:])
+            break
+
         try:
-            _cancel_open_photo_transaction(adapter)
-            report["cancelled_unsaved_after_failure"] = True
-        except Exception as cleanup_exc:
-            report["cleanup_error"] = str(cleanup_exc)
-        return report
+            staged_result = adapter.upload_product_photos(
+                [str(image)],
+                timeout_ms=upload_timeout_ms,
+            )
+            payload = staged_result.as_dict()
+        except Exception as exc:
+            failed_transactions += 1
+            report["attempted"] += 1
+            report["items"].append(
+                {
+                    "path": str(image),
+                    "status": "transaction_error",
+                    "detail": str(exc),
+                    "failure_scope": "image_transaction",
+                }
+            )
+            if not _cancel_failed_photo_transaction(adapter, report, image=image):
+                operational_stop = True
+                break
+            continue
 
-    persistence = adapter.verify_persisted_photo_count(
-        initial_count=initial_count,
-        expected_added=expected_new,
+        report["attempted"] += int(payload.get("attempted") or 0)
+        stage_items = [dict(item) for item in list(payload.get("items") or [])]
+        for item in stage_items:
+            if item.get("status") == "rejected_pre_submit":
+                report["rejected_pre_submit"].append(dict(item))
+
+        staged_count = int(payload.get("staged") or 0)
+        stage_status = str(payload.get("status") or "")
+        if stage_status != "staged" or staged_count != 1:
+            failed_transactions += 1
+            report["items"].extend(stage_items)
+            if not stage_items:
+                report["items"].append(
+                    {
+                        "path": str(image),
+                        "status": stage_status or "staging_unconfirmed",
+                        "detail": str(payload.get("detail") or ""),
+                        "failure_scope": "image_transaction",
+                    }
+                )
+            if not _cancel_failed_photo_transaction(adapter, report, image=image):
+                operational_stop = True
+                break
+            continue
+
+        report["staged"] += 1
+        report["save_attempted"] = True
+        try:
+            adapter.save_section(PRODUCT_PHOTOS)
+            report["save_count"] += 1
+        except Exception as exc:
+            failed_transactions += 1
+            for item in stage_items:
+                item["status"] = "save_failed"
+                item["save_error"] = str(exc)
+            report["items"].extend(stage_items)
+            report.setdefault("save_failures", []).append(
+                {
+                    "path": str(image),
+                    "error": str(exc),
+                    "diagnostics": _collect_save_failure_diagnostics(adapter, PRODUCT_PHOTOS),
+                }
+            )
+            if not _cancel_failed_photo_transaction(adapter, report, image=image):
+                operational_stop = True
+                break
+            continue
+
+        persistence = adapter.verify_persisted_photo_count(
+            initial_count=current_count,
+            expected_added=1,
+        )
+        if persistence.get("status") != "persisted_verified":
+            failed_transactions += 1
+            for item in stage_items:
+                item["status"] = "persistence_failed"
+                item["persistence"] = dict(persistence)
+            report["items"].extend(stage_items)
+            report.setdefault("persistence_failures", []).append(
+                {"path": str(image), **dict(persistence)}
+            )
+            raw_final = persistence.get("final_count")
+            if raw_final is not None and int(raw_final) > current_count:
+                current_count = int(raw_final)
+            if not _cancel_failed_photo_transaction(adapter, report, image=image):
+                operational_stop = True
+            else:
+                operational_stop = True
+            break
+
+        current_count = int(persistence.get("final_count") or (current_count + 1))
+        report["persisted_this_run"] += 1
+        report["persisted"] = current_count
+        report["final_count"] = current_count
+        report["saved"] = True
+        for item in stage_items:
+            item["status"] = "persisted_verified"
+            item["persistence"] = dict(persistence)
+        report["items"].extend(stage_items)
+
+    if omitted:
+        report["capacity_limited"] = True
+        report["omitted_count"] = len(omitted)
+        report["omitted_due_capacity"] = [str(path) for path in omitted]
+
+    report["persisted"] = current_count
+    report["final_count"] = current_count
+    report["listing_photo_requirement_satisfied"] = current_count >= 1
+    report["persistence"] = {
+        "status": "persisted_verified" if current_count >= initial_count else "validation_failed",
+        "initial_count": initial_count,
+        "final_count": current_count,
+        "expected_added": report["persisted_this_run"],
+    }
+    report["request_complete"] = bool(
+        not rejected_input
+        and not report["rejected_pre_submit"]
+        and not omitted
+        and failed_transactions == 0
+        and not operational_stop
+        and report["persisted_this_run"] == len(resolved)
     )
-    report["persistence"] = persistence
-    report["final_count"] = persistence.get("final_count")
-    if persistence.get("status") != "persisted_verified":
-        report["status"] = "persistence_failed"
-        report["saved"] = False
-        report["persisted"] = initial_count
-        report["persisted_this_run"] = 0
-        report["detail"] = "Product Photos Save 已点击，但完成计数没有达到本次安全暂存子集的预期。"
-        return report
 
-    final_count = int(persistence.get("final_count") or (initial_count + expected_new))
-    report["persisted"] = final_count
-    report["persisted_this_run"] = expected_new
-    report["listing_photo_requirement_satisfied"] = final_count >= 1
-    report["status"] = "persisted_verified"
-    report["saved"] = True
-    if rejected_input or len(report["rejected_pre_submit"]) > len(rejected_input) or omitted:
-        report["request_complete"] = False
+    if report["request_complete"]:
+        report["request_status"] = "complete"
+        report["status"] = "persisted_verified"
+        report["detail"] = (
+            f"Product Photos 已逐张独立持久化并复核：{current_count}/{capacity or current_count}。"
+        )
+    elif current_count >= 1:
+        report["request_status"] = "partial_persisted"
+        report["status"] = "persisted_verified"
         report["warning"] = (
-            f"图片请求局部降级：requested={requested_unique}, uploaded={expected_new}, "
-            f"rejected={len(report['rejected_pre_submit'])}, omitted_capacity={len(omitted)}, "
-            f"final={final_count}/{capacity or final_count}."
+            f"图片请求局部完成：requested={requested_unique}, persisted_this_run={report['persisted_this_run']}, "
+            f"failed_transactions={failed_transactions}, omitted_capacity={len(omitted)}, final={current_count}."
         )
         report["detail"] = (
-            f"Product Photos 已安全保存 {expected_new} 张；"
-            "提交前无效图片与超容量图片均按各自故障域隔离。"
+            "至少一张图片已可靠持久化；失败图片只回滚自己的未保存事务，"
+            "不会再撤销先前成功图片。"
         )
     else:
-        report["detail"] = f"Product Photos 已按固定槽位完整保存：{final_count}/{capacity or final_count}。"
+        report["request_status"] = "incomplete_upload"
+        report["status"] = "incomplete_upload"
+        report["detail"] = "没有任何图片形成可证明的持久化结果。"
 
-    section = adapter.find_section(PRODUCT_PHOTOS)
-    if section is not None:
-        adapter.open_section_for_edit(section)
-        reopened = adapter.inspect_product_photos()
-        report["reopened_state"] = {
-            "completion_count": reopened.get("completion_count"),
-            "capacity": reopened.get("capacity"),
-            "visible_image_count": reopened.get("visible_image_count"),
-            "remaining_empty_slots": reopened.get("add_image_tile_count"),
-        }
-        saved_shot = run_dir / "Product-Photos-after-save-reopen.png"
-        _capture_diagnostic_screenshot(adapter, saved_shot, report, "screenshot_after_save")
-        try:
-            adapter.cancel_section(PRODUCT_PHOTOS)
-        except Exception as cleanup_exc:
-            report["post_save_cleanup_error"] = str(cleanup_exc)
+    if operational_stop:
+        report["operational_stop"] = True
+
+    final_shot = run_dir / "Product-Photos-final.png"
+    _capture_diagnostic_screenshot(adapter, final_shot, report, "screenshot_final")
     return report
