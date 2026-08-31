@@ -11,11 +11,12 @@ from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 _MAX_TEXT = 12_000
 _MAX_TRACEBACK = 24_000
+_MAX_TRACEBACK_ITEM = 4_000
 _MAX_EVENTS = 48
 _MAX_STAGE_SUMMARY = 40
 _MAX_LIST = 500
 _EVENT_TEXT = 2_000
-_STAGE_LOG_CHUNK_CHARS = 8_000
+_STAGE_LOG_CHUNK_CHARS = 24_000
 _SECRET_KEY_RE = re.compile(
     r"(^|_)(api[_-]?key|token|secret|password|authorization|cookie|refresh[_-]?token|access[_-]?token)($|_)",
     re.IGNORECASE,
@@ -49,7 +50,7 @@ _EXCEPTION_TYPE_NAMES = {
 }
 _TRACEBACK_MARKER = "Traceback (most recent call last):"
 _SINGLE_STAGE_LOGS = ("gui-workflow.log",)
-_BATCH_STAGE_LOGS = ("source.log", "prepare.log", "execute.log")
+_DEDICATED_STAGE_LOGS = ("source.log", "prepare.log", "execute.log")
 _FIELD_FAILURE_STATUSES = {
     "fill_error": "FieldFillError",
     "validation_failed": "FieldValidationFailure",
@@ -74,7 +75,6 @@ def sanitize_telemetry_url(value: str) -> str:
         return _INLINE_QUERY_SECRET_RE.sub(r"\1[REDACTED]", raw)
     if parts.scheme.casefold() not in {"http", "https"} or not parts.netloc:
         return _INLINE_QUERY_SECRET_RE.sub(r"\1[REDACTED]", raw)
-
     query_parts: list[str] = []
     for item in parts.query.split("&") if parts.query else []:
         name, sep, _value = item.partition("=")
@@ -82,10 +82,7 @@ def sanitize_telemetry_url(value: str) -> str:
             decoded_name = unquote_plus(name).strip()
         except Exception:
             decoded_name = name.strip()
-        if sep and _SECRET_QUERY_RE.fullmatch(decoded_name):
-            query_parts.append(f"{name}=[REDACTED]")
-        else:
-            query_parts.append(item)
+        query_parts.append(f"{name}=[REDACTED]" if sep and _SECRET_QUERY_RE.fullmatch(decoded_name) else item)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "&".join(query_parts), parts.fragment))
 
 
@@ -131,21 +128,11 @@ def sanitize_telemetry_value(
             output[name] = (
                 "[REDACTED]"
                 if _SECRET_KEY_RE.search(name)
-                else sanitize_telemetry_value(
-                    item,
-                    depth=depth + 1,
-                    max_text=max_text,
-                    max_list=max_list,
-                )
+                else sanitize_telemetry_value(item, depth=depth + 1, max_text=max_text, max_list=max_list)
             )
         return output
     if hasattr(value, "__dict__"):
-        return sanitize_telemetry_value(
-            vars(value),
-            depth=depth + 1,
-            max_text=max_text,
-            max_list=max_list,
-        )
+        return sanitize_telemetry_value(vars(value), depth=depth + 1, max_text=max_text, max_list=max_list)
     return sanitize_telemetry_text(str(value), max_text)
 
 
@@ -173,11 +160,8 @@ def _read_diagnostic_events(path: Path) -> list[dict[str, Any]]:
     return events
 
 
-def _discover_process_logs(
-    run_dir: Path | None,
-    explicit_path: str | Path | None,
-) -> list[Path]:
-    """Discover complete stage logs from disk, independent of a stale UI phase."""
+def _discover_process_logs(run_dir: Path | None, explicit_path: str | Path | None) -> list[Path]:
+    """Discover every durable workflow/stage log, independent of the current UI phase."""
 
     candidates: list[Path] = []
     seen: set[str] = set()
@@ -197,13 +181,10 @@ def _discover_process_logs(
 
     add(explicit_path)
     if run_dir is not None:
-        # Single-link preparation owns one durable merged stdout/stderr journal at
-        # the workflow root. Discover it from the run itself so telemetry never
-        # depends on a runner-specific path hint surviving the failure callback.
         for name in _SINGLE_STAGE_LOGS:
             add(run_dir / name)
         for root in (run_dir / "diagnostics", run_dir.parent / "diagnostics"):
-            for name in _BATCH_STAGE_LOGS:
+            for name in _DEDICATED_STAGE_LOGS:
                 add(root / name)
 
     def mtime(path: Path) -> int:
@@ -215,62 +196,61 @@ def _discover_process_logs(
     return sorted(candidates, key=mtime)
 
 
-def _encoded_text_blob(text: str) -> dict[str, Any]:
+def _read_sanitized_log(path: Path) -> str:
+    try:
+        return _sanitize_text(path.read_bytes().decode("utf-8", errors="replace"))
+    except OSError:
+        return ""
+
+
+def _log_metadata(path: Path, text: str) -> dict[str, Any]:
     data = text.encode("utf-8")
     compressed = gzip.compress(data, compresslevel=6, mtime=0)
-    encoded = base64.b64encode(compressed).decode("ascii")
     return {
-        "encoding": "gzip+base64-chunks",
-        "chunks": [
-            encoded[index : index + _STAGE_LOG_CHUNK_CHARS]
-            for index in range(0, len(encoded), _STAGE_LOG_CHUNK_CHARS)
-        ],
+        "name": path.name,
+        "stage": path.stem,
+        "integrity_scope": "sanitized_utf8_content",
         "line_count": len(text.splitlines()),
         "byte_count": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
         "compressed_byte_count": len(compressed),
+        "encoding": "gzip+base64-chunks",
     }
 
 
-def _read_complete_stage_log(path: Path) -> tuple[dict[str, Any], str]:
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        return {}, ""
-    text = _sanitize_text(raw.decode("utf-8", errors="replace"))
-    return (
-        {
-            "name": path.name,
-            "stage": path.stem,
-            "integrity_scope": "sanitized_utf8_content",
-            **_encoded_text_blob(text),
-        },
-        text,
-    )
+def collect_workflow_log_chunks(
+    run_dir: str | Path | None,
+    *,
+    process_log_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return every sanitized durable log as independently uploadable chunks.
 
+    Raw log bytes never travel inside the compact task audit. Each returned record
+    is small enough for one telemetry request, so arbitrarily large logs cannot be
+    silently clipped by audit/list limits or one HTTP-body ceiling.
+    """
 
-def _select_stage_log(paths: list[Path]) -> tuple[Path | None, dict[str, Any], str]:
-    """Prefer the deepest dedicated stage journal over a later parent GUI log."""
-
-    dedicated = [
-        path
-        for path in paths
-        if path.name in _BATCH_STAGE_LOGS and path.parent.name == "diagnostics"
-    ]
-    fallback = [path for path in paths if path not in dedicated]
-    empty: tuple[Path | None, dict[str, Any], str] = (None, {}, "")
-
-    for group in (dedicated, fallback):
-        for path in reversed(group):
-            payload, text = _read_complete_stage_log(path)
-            if not payload:
-                continue
-            candidate = (path, payload, text)
-            if text:
-                return candidate
-            if empty[0] is None:
-                empty = candidate
-    return empty
+    path = Path(run_dir).expanduser() if str(run_dir or "").strip() else None
+    output: list[dict[str, Any]] = []
+    for log_path in _discover_process_logs(path, process_log_path):
+        text = _read_sanitized_log(log_path)
+        metadata = _log_metadata(log_path, text)
+        compressed = gzip.compress(text.encode("utf-8"), compresslevel=6, mtime=0)
+        encoded = base64.b64encode(compressed).decode("ascii")
+        chunks = [
+            encoded[index : index + _STAGE_LOG_CHUNK_CHARS]
+            for index in range(0, len(encoded), _STAGE_LOG_CHUNK_CHARS)
+        ] or [""]
+        for index, chunk in enumerate(chunks):
+            output.append(
+                {
+                    **metadata,
+                    "chunk_index": index,
+                    "chunk_count": len(chunks),
+                    "data": chunk,
+                }
+            )
+    return output
 
 
 def _exception_match(raw_line: str) -> re.Match[str] | None:
@@ -282,12 +262,10 @@ def _exception_match(raw_line: str) -> re.Match[str] | None:
         return None
     type_name = str(match.group("type") or "")
     leaf = type_name.rsplit(".", 1)[-1]
-    if leaf.endswith(("Error", "Exception")) or leaf in _EXCEPTION_TYPE_NAMES:
-        return match
-    return None
+    return match if leaf.endswith(("Error", "Exception")) or leaf in _EXCEPTION_TYPE_NAMES else None
 
 
-def _extract_all_exceptions(text: str) -> list[dict[str, Any]]:
+def _extract_all_exceptions(text: str, *, log_name: str = "") -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for line_number, raw in enumerate(text.splitlines(), start=1):
         match = _exception_match(raw)
@@ -295,6 +273,7 @@ def _extract_all_exceptions(text: str) -> list[dict[str, Any]]:
             continue
         output.append(
             {
+                "log_name": log_name,
                 "line_number": line_number,
                 "error_type": sanitize_telemetry_text(str(match.group("type") or ""), 240),
                 "message": sanitize_telemetry_text(str(match.group("message") or ""), _MAX_TEXT),
@@ -304,7 +283,7 @@ def _extract_all_exceptions(text: str) -> list[dict[str, Any]]:
     return output
 
 
-def _extract_all_tracebacks(text: str) -> list[dict[str, Any]]:
+def _extract_all_tracebacks(text: str, *, log_name: str = "") -> list[dict[str, Any]]:
     lines = text.splitlines()
     starts = [index for index, line in enumerate(lines) if _TRACEBACK_MARKER in line]
     output: list[dict[str, Any]] = []
@@ -324,14 +303,33 @@ def _extract_all_tracebacks(text: str) -> list[dict[str, Any]]:
         output.append(
             {
                 "index": position + 1,
+                "log_name": log_name,
                 "start_line": start + 1,
                 "end_line": end,
                 "exception_type": exception_type,
                 "exception_message": exception_message,
-                **_encoded_text_blob(block),
+                "preview": sanitize_telemetry_text(block, _MAX_TRACEBACK_ITEM),
             }
         )
     return output
+
+
+def _select_stage_log(paths: list[Path]) -> tuple[Path | None, dict[str, Any], str]:
+    """Prefer the deepest dedicated stage journal over a later parent GUI log."""
+
+    dedicated = [path for path in paths if path.name in _DEDICATED_STAGE_LOGS and path.parent.name == "diagnostics"]
+    fallback = [path for path in paths if path not in dedicated]
+    empty: tuple[Path | None, dict[str, Any], str] = (None, {}, "")
+    for group in (dedicated, fallback):
+        for path in reversed(group):
+            text = _read_sanitized_log(path)
+            metadata = _log_metadata(path, text)
+            candidate = (path, metadata, text)
+            if text:
+                return candidate
+            if empty[0] is None:
+                empty = candidate
+    return empty
 
 
 def _last_traceback_preview(text: str, tracebacks: list[dict[str, Any]]) -> str:
@@ -345,9 +343,7 @@ def _last_traceback_preview(text: str, tracebacks: list[dict[str, Any]]) -> str:
         return sanitize_telemetry_text(block, _MAX_TRACEBACK)
     keep = max(1, _MAX_TRACEBACK - len(_TRACEBACK_MARKER) - 48)
     return sanitize_telemetry_text(
-        _TRACEBACK_MARKER
-        + "\n…[preview truncated; full traceback is encoded above]…\n"
-        + block[-keep:],
+        _TRACEBACK_MARKER + "\n…[preview truncated; complete traceback is in task log chunks]…\n" + block[-keep:],
         _MAX_TRACEBACK,
     )
 
@@ -360,19 +356,7 @@ def _last_nonempty_line(text: str) -> str:
 
 
 def _compact_event(raw: dict[str, Any]) -> dict[str, Any]:
-    keys = (
-        "ts",
-        "event",
-        "stage",
-        "ui_phase",
-        "elapsed_s",
-        "detail",
-        "error",
-        "error_type",
-        "mode",
-        "active_stages",
-        "context",
-    )
+    keys = ("ts", "event", "stage", "ui_phase", "elapsed_s", "detail", "error", "error_type", "mode", "active_stages", "context")
     compact = {key: raw.get(key) for key in keys if key in raw}
     if raw.get("traceback"):
         compact["traceback"] = "[see failure_diagnostic.traceback]"
@@ -400,34 +384,15 @@ def _stage_summary(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "ui_phase": str(event.get("ui_phase") or ""),
             "detail": str(event.get("detail") or event.get("error") or ""),
         }
-    return [
-        sanitize_telemetry_value(stages[name], max_text=1_500, max_list=40)
-        for name in order[-_MAX_STAGE_SUMMARY:]
-    ]
+    return [sanitize_telemetry_value(stages[name], max_text=1_500, max_list=40) for name in order[-_MAX_STAGE_SUMMARY:]]
 
 
 def _compact_manifest(payload: dict[str, Any]) -> dict[str, Any]:
     keys = (
-        "run_id",
-        "mode",
-        "product_url",
-        "workflow_status",
-        "status",
-        "vertical",
-        "brand",
-        "makro_target_id",
-        "ownership_mode",
-        "error",
-        "error_type",
-        "failed_stage",
-        "started_at",
-        "completed_at",
+        "run_id", "mode", "product_url", "workflow_status", "status", "vertical", "brand",
+        "makro_target_id", "ownership_mode", "error", "error_type", "failed_stage", "started_at", "completed_at",
     )
-    return sanitize_telemetry_value(
-        {key: payload.get(key) for key in keys if key in payload},
-        max_text=4_000,
-        max_list=60,
-    )
+    return sanitize_telemetry_value({key: payload.get(key) for key in keys if key in payload}, max_text=4_000, max_list=60)
 
 
 def _latest_execution_report(roots: Iterable[str | Path]) -> tuple[Path | None, dict[str, Any]]:
@@ -450,21 +415,11 @@ def _latest_execution_report(roots: Iterable[str | Path]) -> tuple[Path | None, 
 
 
 def _section_name(payload: dict[str, Any]) -> str:
-    return str(
-        payload.get("section")
-        or payload.get("section_title")
-        or payload.get("title")
-        or "执行字段"
-    ).strip()
+    return str(payload.get("section") or payload.get("section_title") or payload.get("title") or "执行字段").strip()
 
 
 def _field_name(payload: dict[str, Any]) -> str:
-    return str(
-        payload.get("label")
-        or payload.get("question")
-        or payload.get("attribute_key")
-        or "unknown field"
-    ).strip()
+    return str(payload.get("label") or payload.get("question") or payload.get("attribute_key") or "unknown field").strip()
 
 
 def _verification_detail(payload: dict[str, Any]) -> str:
@@ -477,8 +432,6 @@ def _verification_detail(payload: dict[str, Any]) -> str:
 
 
 def execution_report_failure_summary(payload: dict[str, Any]) -> dict[str, Any]:
-    """Derive executor acceptance failure without treating GUI progress as evidence."""
-
     if not isinstance(payload, dict) or not payload:
         return {}
     sections = payload.get("section_reports")
@@ -494,23 +447,14 @@ def execution_report_failure_summary(payload: dict[str, Any]) -> dict[str, Any]:
                         continue
                     status = str(raw_result.get("execution_status") or "").strip()
                     error_type = _FIELD_FAILURE_STATUSES.get(status)
-                    if not error_type:
-                        continue
-                    field = _field_name(raw_result)
-                    detail = _verification_detail(raw_result)
-                    return sanitize_telemetry_value(
-                        {
-                            "source": "execution_report",
-                            "stage": f"{section} / {field}",
-                            "section": section,
-                            "field": field,
-                            "status": status,
-                            "error_type": error_type,
+                    if error_type:
+                        field = _field_name(raw_result)
+                        detail = _verification_detail(raw_result)
+                        return sanitize_telemetry_value({
+                            "source": "execution_report", "stage": f"{section} / {field}", "section": section,
+                            "field": field, "status": status, "error_type": error_type,
                             "error_message": detail or f"字段 {field} 执行状态={status}",
-                        },
-                        max_text=4_000,
-                        max_list=40,
-                    )
+                        }, max_text=4_000, max_list=40)
             persisted = raw_section.get("persisted_verifications")
             if isinstance(persisted, list):
                 for raw_verification in persisted:
@@ -520,103 +464,40 @@ def execution_report_failure_summary(payload: dict[str, Any]) -> dict[str, Any]:
                     if status in {"", "persisted_verified"}:
                         continue
                     field = _field_name(raw_verification)
-                    return sanitize_telemetry_value(
-                        {
-                            "source": "execution_report",
-                            "stage": f"{section} / {field}",
-                            "section": section,
-                            "field": field,
-                            "status": status,
-                            "error_type": "FieldPersistenceFailure",
-                            "error_message": str(raw_verification.get("detail") or f"字段 {field} Save 后验证状态={status}"),
-                        },
-                        max_text=4_000,
-                        max_list=40,
-                    )
+                    return sanitize_telemetry_value({
+                        "source": "execution_report", "stage": f"{section} / {field}", "section": section,
+                        "field": field, "status": status, "error_type": "FieldPersistenceFailure",
+                        "error_message": str(raw_verification.get("detail") or f"字段 {field} Save 后验证状态={status}"),
+                    }, max_text=4_000, max_list=40)
             section_status = str(raw_section.get("status") or "").strip()
-            section_error_type = _SECTION_FAILURE_STATUSES.get(section_status)
-            if section_error_type:
-                return sanitize_telemetry_value(
-                    {
-                        "source": "execution_report",
-                        "stage": section,
-                        "section": section,
-                        "field": "",
-                        "status": section_status,
-                        "error_type": section_error_type,
-                        "error_message": str(
-                            raw_section.get("save_error")
-                            or raw_section.get("detail")
-                            or raw_section.get("error")
-                            or f"section {section} 状态={section_status}"
-                        ),
-                    },
-                    max_text=4_000,
-                    max_list=40,
-                )
-
+            error_type = _SECTION_FAILURE_STATUSES.get(section_status)
+            if error_type:
+                return sanitize_telemetry_value({
+                    "source": "execution_report", "stage": section, "section": section, "field": "",
+                    "status": section_status, "error_type": error_type,
+                    "error_message": str(raw_section.get("save_error") or raw_section.get("detail") or raw_section.get("error") or f"section {section} 状态={section_status}"),
+                }, max_text=4_000, max_list=40)
     photos = payload.get("photo_upload")
     if isinstance(photos, dict):
         requested = int(photos.get("requested") or 0)
         status = str(photos.get("status") or "").strip()
         if requested > 0 and status not in _PHOTO_SUCCESS_STATUSES:
-            return sanitize_telemetry_value(
-                {
-                    "source": "execution_report",
-                    "stage": "Product Photos",
-                    "section": "Product Photos",
-                    "field": "",
-                    "status": status or "incomplete",
-                    "error_type": "PhotoPersistenceFailure",
-                    "error_message": str(photos.get("detail") or f"Product Photos 状态={status or 'incomplete'}"),
-                },
-                max_text=4_000,
-                max_list=40,
-            )
-
+            return sanitize_telemetry_value({
+                "source": "execution_report", "stage": "Product Photos", "section": "Product Photos", "field": "",
+                "status": status or "incomplete", "error_type": "PhotoPersistenceFailure",
+                "error_message": str(photos.get("detail") or f"Product Photos 状态={status or 'incomplete'}"),
+            }, max_text=4_000, max_list=40)
     completion = payload.get("completion")
     if isinstance(completion, dict):
         required_blocked = int(completion.get("required_blocked") or 0)
         if required_blocked:
-            return {
-                "source": "execution_report",
-                "stage": "执行验收 / required fields",
-                "section": "",
-                "field": "",
-                "status": "required_blocked",
-                "error_type": "RequiredFieldBlocked",
-                "error_message": f"required_blocked={required_blocked}",
-            }
+            return {"source": "execution_report", "stage": "执行验收 / required fields", "section": "", "field": "", "status": "required_blocked", "error_type": "RequiredFieldBlocked", "error_message": f"required_blocked={required_blocked}"}
         if not completion.get("required_field_cards_persisted", True):
-            return {
-                "source": "execution_report",
-                "stage": "执行验收 / required fields",
-                "section": "",
-                "field": "",
-                "status": "required_not_persisted",
-                "error_type": "RequiredFieldPersistenceFailure",
-                "error_message": "required sections not fully persisted",
-            }
+            return {"source": "execution_report", "stage": "执行验收 / required fields", "section": "", "field": "", "status": "required_not_persisted", "error_type": "RequiredFieldPersistenceFailure", "error_message": "required sections not fully persisted"}
         if not completion.get("photos_persisted", True):
-            return {
-                "source": "execution_report",
-                "stage": "Product Photos",
-                "section": "Product Photos",
-                "field": "",
-                "status": "photos_not_persisted",
-                "error_type": "PhotoPersistenceFailure",
-                "error_message": "Product Photos not persisted",
-            }
+            return {"source": "execution_report", "stage": "Product Photos", "section": "Product Photos", "field": "", "status": "photos_not_persisted", "error_type": "PhotoPersistenceFailure", "error_message": "Product Photos not persisted"}
         if not completion.get("draft_persisted_complete", True):
-            return {
-                "source": "execution_report",
-                "stage": "执行验收",
-                "section": "",
-                "field": "",
-                "status": "acceptance_incomplete",
-                "error_type": "ExecutionAcceptanceFailure",
-                "error_message": "Full Step 3 persisted acceptance 未完整通过",
-            }
+            return {"source": "execution_report", "stage": "执行验收", "section": "", "field": "", "status": "acceptance_incomplete", "error_type": "ExecutionAcceptanceFailure", "error_message": "Full Step 3 persisted acceptance 未完整通过"}
     return {}
 
 
@@ -624,29 +505,14 @@ def _compact_execution_report(payload: dict[str, Any]) -> dict[str, Any]:
     if not payload:
         return {}
     keys = (
-        "mode",
-        "page_url",
-        "makro_target_id",
-        "product_url",
-        "expected_vertical",
-        "plan_summary",
-        "blocked_reason_summary",
-        "field_totals",
-        "completion",
-        "section_save_attempted",
-        "section_saved",
-        "send_to_qc_clicked",
-        "browser_closed",
-        "final_screenshot",
+        "mode", "page_url", "makro_target_id", "product_url", "expected_vertical", "plan_summary",
+        "blocked_reason_summary", "field_totals", "completion", "section_save_attempted", "section_saved",
+        "send_to_qc_clicked", "browser_closed", "final_screenshot",
     )
     result = {key: payload.get(key) for key in keys if key in payload}
     sections = payload.get("section_reports")
     if isinstance(sections, list):
-        result["section_reports"] = [
-            sanitize_telemetry_value(item, max_text=2_000, max_list=60)
-            for item in sections[:12]
-            if isinstance(item, dict)
-        ]
+        result["section_reports"] = [sanitize_telemetry_value(item, max_text=2_000, max_list=60) for item in sections[:12] if isinstance(item, dict)]
     photos = payload.get("photo_upload")
     if isinstance(photos, dict):
         result["photo_upload"] = sanitize_telemetry_value(photos, max_text=2_000, max_list=60)
@@ -666,40 +532,41 @@ def collect_workflow_failure_diagnostic(
     process_log_path: str | Path | None = None,
     artifact_roots: Iterable[str | Path] = (),
 ) -> dict[str, Any]:
-    """Build one complete, redacted failure diagnostic.
-
-    A discovered stage log is the canonical failure truth. Its complete sanitized
-    UTF-8 content is encoded losslessly with line/byte/SHA-256 integrity metadata;
-    compact previews and execution reports are secondary views only. When no
-    stage log exists, the FAILED workflow event remains a valid fallback and its
-    traceback is preserved instead of being silently discarded.
-    """
+    """Build a compact failure index while raw complete logs travel separately."""
 
     path = Path(run_dir).expanduser() if str(run_dir or "").strip() else None
-    manifest: dict[str, Any] = {}
-    events: list[dict[str, Any]] = []
-    if path is not None:
-        manifest = _read_json_object(path / "run-manifest.json")
-        events = _read_diagnostic_events(path / "workflow-diagnostics.jsonl")
-
+    manifest = _read_json_object(path / "run-manifest.json") if path is not None else {}
+    events = _read_diagnostic_events(path / "workflow-diagnostics.jsonl") if path is not None else []
     process_paths = _discover_process_logs(path, process_log_path)
     stage_path, stage_log, stage_text = _select_stage_log(process_paths)
 
     failed_event: dict[str, Any] = {}
     for event in reversed(events):
-        if (
-            str(event.get("event") or "").upper() == "FAILED"
-            or event.get("traceback")
-            or event.get("error_type")
-        ):
+        if str(event.get("event") or "").upper() == "FAILED" or event.get("traceback") or event.get("error_type"):
             failed_event = event
             break
 
+    all_stage_logs: list[dict[str, Any]] = []
+    all_exceptions: list[dict[str, Any]] = []
+    all_tracebacks: list[dict[str, Any]] = []
+    selected_exceptions: list[dict[str, Any]] = []
+    selected_tracebacks: list[dict[str, Any]] = []
+    for candidate in process_paths:
+        text = _read_sanitized_log(candidate)
+        exceptions = _extract_all_exceptions(text, log_name=candidate.name)
+        tracebacks = _extract_all_tracebacks(text, log_name=candidate.name)
+        metadata = _log_metadata(candidate, text)
+        metadata["exception_count"] = len(exceptions)
+        metadata["traceback_count"] = len(tracebacks)
+        all_stage_logs.append(metadata)
+        all_exceptions.extend(exceptions)
+        all_tracebacks.extend(tracebacks)
+        if stage_path is not None and candidate == stage_path:
+            selected_exceptions = exceptions
+            selected_tracebacks = tracebacks
+
     event_traceback_text = _sanitize_text(str(failed_event.get("traceback") or ""))
-    evidence_text = stage_text or event_traceback_text
-    tracebacks = _extract_all_tracebacks(evidence_text) if evidence_text else []
-    exceptions = _extract_all_exceptions(evidence_text) if evidence_text else []
-    traceback_preview = _last_traceback_preview(evidence_text, tracebacks)
+    traceback_preview = _last_traceback_preview(stage_text, selected_tracebacks)
     if not traceback_preview and event_traceback_text:
         traceback_preview = sanitize_telemetry_text(event_traceback_text, _MAX_TRACEBACK)
 
@@ -707,86 +574,65 @@ def collect_workflow_failure_diagnostic(
     execution_failure = execution_report_failure_summary(report_payload)
     execution_report = _compact_execution_report(report_payload)
 
-    if stage_log:
-        if exceptions:
-            latest_exception = exceptions[-1]
-            raw_error_type = str(latest_exception.get("error_type") or "StageLogException")
-            raw_error_message = str(
-                latest_exception.get("message")
-                or latest_exception.get("line")
-                or _last_nonempty_line(stage_text)
-                or "stage log ended with an exception"
-            )
-        else:
-            raw_error_type = "StageLogFailure"
-            raw_error_message = _last_nonempty_line(stage_text) or "stage log captured without an explicit exception line"
-        raw_failed_stage = str(
-            failed_event.get("stage")
-            or fallback_stage
-            or stage_log.get("stage")
-            or (stage_path.stem if stage_path is not None else "stage")
-        )
+    if selected_exceptions:
+        latest_exception = selected_exceptions[-1]
+        raw_error_type = str(latest_exception.get("error_type") or "StageLogException")
+        raw_error_message = str(latest_exception.get("message") or latest_exception.get("line") or "stage log exception")
         truth_source = "stage_log"
     elif failed_event:
-        raw_error_message = str(
-            failed_event.get("error")
-            or failed_event.get("detail")
-            or fallback_error
-            or "任务失败"
-        )
-        raw_error_type = str(
-            failed_event.get("error_type")
-            or (exceptions[-1].get("error_type") if exceptions else "")
-            or fallback_error_type
-            or "TaskFailure"
-        )
-        raw_failed_stage = str(failed_event.get("stage") or fallback_stage or "unknown")
+        raw_error_type = str(failed_event.get("error_type") or fallback_error_type or "TaskFailure")
+        raw_error_message = str(failed_event.get("error") or failed_event.get("detail") or fallback_error or "任务失败")
         truth_source = "workflow_diagnostics_fallback"
     elif execution_failure:
-        raw_error_message = str(execution_failure.get("error_message") or fallback_error or "任务失败")
         raw_error_type = str(execution_failure.get("error_type") or fallback_error_type or "TaskFailure")
-        raw_failed_stage = str(execution_failure.get("stage") or fallback_stage or "unknown")
+        raw_error_message = str(execution_failure.get("error_message") or fallback_error or "任务失败")
         truth_source = "execution_report_fallback"
-    else:
-        raw_error_message = str(fallback_error or "任务失败")
+    elif fallback_error or fallback_error_type:
         raw_error_type = str(fallback_error_type or "TaskFailure")
-        raw_failed_stage = str(fallback_stage or "unknown")
+        raw_error_message = str(fallback_error or "任务失败")
+        truth_source = "caller_fallback"
+    elif stage_log:
+        raw_error_type = "StageLogFailure"
+        raw_error_message = _last_nonempty_line(stage_text) or "stage log captured without an explicit exception line"
+        truth_source = "stage_log"
+    else:
+        raw_error_type = "TaskFailure"
+        raw_error_message = "任务失败"
         truth_source = "caller_fallback"
 
+    raw_failed_stage = str(
+        failed_event.get("stage")
+        or fallback_stage
+        or execution_failure.get("stage")
+        or stage_log.get("stage")
+        or (stage_path.stem if stage_path is not None else "unknown")
+    )
     sources = {
         "stage_log": bool(stage_log),
-        "process_log": bool(stage_log),  # compatibility name for older telemetry consumers
+        "process_log": bool(stage_log),
         "workflow_diagnostics": bool(events),
         "execution_report": bool(execution_report),
     }
-    run_id = str(manifest.get("run_id") or "").strip()
-    if not run_id and path is not None:
-        run_id = path.name
-
+    run_id = str(manifest.get("run_id") or "").strip() or (path.name if path is not None else "")
     process_log_tail = sanitize_telemetry_text(stage_text[-_MAX_TRACEBACK:], _MAX_TRACEBACK) if stage_text else ""
     payload = {
-        "schema": 4,
+        "schema": 5,
         "truth_source": truth_source,
         "run_id": run_id,
-        "workflow_mode": sanitize_telemetry_text(
-            str(failed_event.get("mode") or manifest.get("mode") or workflow_mode or ""),
-            120,
-        ),
+        "workflow_mode": sanitize_telemetry_text(str(failed_event.get("mode") or manifest.get("mode") or workflow_mode or ""), 120),
         "failed_stage": sanitize_telemetry_text(raw_failed_stage, 500),
         "ui_phase": sanitize_telemetry_text(str(failed_event.get("ui_phase") or ""), 120),
         "error_type": sanitize_telemetry_text(raw_error_type, 240),
         "error_message": sanitize_telemetry_text(raw_error_message, _MAX_TEXT),
         "traceback": traceback_preview,
-        "tracebacks": tracebacks,
-        "exceptions": exceptions,
-        "traceback_count": len(tracebacks),
-        "exception_count": len(exceptions),
+        "tracebacks": all_tracebacks,
+        "exceptions": all_exceptions,
+        "traceback_count": len(all_tracebacks),
+        "exception_count": len(all_exceptions),
         "line_count": int(stage_log.get("line_count") or 0),
         "byte_count": int(stage_log.get("byte_count") or 0),
         "sha256": str(stage_log.get("sha256") or ""),
-        "active_stages": sanitize_telemetry_value(
-            failed_event.get("active_stages") or [], max_text=240, max_list=80
-        ),
+        "active_stages": sanitize_telemetry_value(failed_event.get("active_stages") or [], max_text=240, max_list=80),
         "elapsed_seconds": float(failed_event.get("elapsed_s") or 0.0),
         "diagnostic_source_available": any(sources.values()),
         "diagnostic_sources": sources,
@@ -797,10 +643,12 @@ def collect_workflow_failure_diagnostic(
         "manifest": _compact_manifest(manifest),
         "stage_log_name": stage_path.name if stage_path is not None else "",
         "stage_log": stage_log,
+        "stage_logs": all_stage_logs,
         "available_stage_logs": [candidate.name for candidate in process_paths],
         "process_log_name": stage_path.name if stage_path is not None else "",
         "process_log_files": [candidate.name for candidate in process_paths],
         "process_log_tail": process_log_tail,
+        "complete_logs_transport": "task_log_chunk",
         "execution_report_name": report_path.name if report_path is not None else "",
         "execution_report_run": report_path.parent.name if report_path is not None else "",
         "execution_report": execution_report,
@@ -815,6 +663,7 @@ def collect_workflow_failure_diagnostic(
 
 __all__ = [
     "collect_workflow_failure_diagnostic",
+    "collect_workflow_log_chunks",
     "execution_report_failure_summary",
     "sanitize_telemetry_text",
     "sanitize_telemetry_url",
