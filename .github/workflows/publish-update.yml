@@ -66,19 +66,25 @@ jobs:
             throw "Publish Update workflow drift detected between main dispatcher and selected source_ref. Synchronize the workflow before Stable packaging."
           }
 
-      - name: Require Stable code signing
+      - name: Validate optional Stable code signing
         shell: pwsh
         run: |
           $azure = [string]$env:VPK_AZURE_TRUSTED_SIGN_FILE
           $params = [string]$env:VPK_SIGN_PARAMS
-          if ([string]::IsNullOrWhiteSpace($azure) -and [string]::IsNullOrWhiteSpace($params)) {
-            throw "Stable publication requires code signing. Configure VPK_AZURE_TRUSTED_SIGN_FILE or VPK_SIGN_PARAMS as a repository secret. Development builds remain allowed to be unsigned."
-          }
           if (-not [string]::IsNullOrWhiteSpace($azure) -and -not [string]::IsNullOrWhiteSpace($params)) {
             throw "Configure exactly one Stable signing mode, not both."
           }
           if (-not [string]::IsNullOrWhiteSpace($azure) -and -not (Test-Path $azure -PathType Leaf)) {
             throw "Stable Azure signing metadata file is not present on the runner: $azure"
+          }
+          if ([string]::IsNullOrWhiteSpace($azure) -and [string]::IsNullOrWhiteSpace($params)) {
+            Write-Warning "Stable publication is unsigned. Direct Stable publication remains allowed; configure VPK_AZURE_TRUSTED_SIGN_FILE or VPK_SIGN_PARAMS when production code signing is available."
+          }
+          elseif (-not [string]::IsNullOrWhiteSpace($azure)) {
+            Write-Host "Stable code signing configured via Azure Artifact Signing metadata"
+          }
+          else {
+            Write-Host "Stable code signing configured via signtool parameters"
           }
 
       - name: Capture source commit
@@ -188,7 +194,7 @@ jobs:
           if ([string]$manifest.python -ne "3.11.9") { throw "Validated Test Python version mismatch" }
           if ([string]$manifest.dotnet -ne "8.0.424") { throw "Validated Test .NET SDK mismatch" }
           if ([string]$manifest.release_lock_sha256 -ne $lockSha) { throw "Validated Test dependency lock mismatch" }
-          if ([string]$manifest.pyinstaller_spec_sha256 -ne $specSha) { throw "Validated Test PyInstaller spec mismatch" }
+          if ([string]$manifest.pyinstaller_spec_sha256 -ne $specSha) { throw "Validated Test manifest spec mismatch" }
           if ([string]$manifest.build_windows_sha256 -ne $buildSha) { throw "Validated Test build script mismatch" }
 
           "VALIDATED_TEST_TAG=$tag" >> $env:GITHUB_ENV
