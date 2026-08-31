@@ -45,6 +45,13 @@ def test_single_step3_child_tracebacks_are_durable_and_all_append(tmp_path: Path
     assert "RuntimeError: cold resolver root cause" in text
     assert "ValueError: planner root cause" in text
 
+    # Parent workflow logging happens after the child dies and therefore normally
+    # has a newer mtime. It must never eclipse the deeper dedicated child journal.
+    (run_dir / "gui-workflow.log").write_text(
+        "RuntimeError: STEP 3 CURRENT RESOLVER · COLD failed with exit code 1\n",
+        encoding="utf-8",
+    )
+
     diagnostic = collect_workflow_failure_diagnostic(
         run_dir,
         fallback_error="STEP 3 CURRENT RESOLVER · COLD failed with exit code 1",
@@ -64,6 +71,7 @@ def test_single_step3_child_tracebacks_are_durable_and_all_append(tmp_path: Path
     assert diagnostic["exception_count"] >= 2
     assert diagnostic["traceback_count"] >= 2
     assert "prepare.log" in diagnostic["process_log_files"]
+    assert "gui-workflow.log" in diagnostic["process_log_files"]
 
 
 def test_single_step3_nonzero_child_exit_is_not_reduced_to_parent_exit_code(tmp_path: Path) -> None:
