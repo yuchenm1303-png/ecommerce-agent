@@ -11,6 +11,7 @@ from .cdp_automation_health import (
     probe_cdp_automation,
 )
 from .cdp_transport_lane import exclusive_cdp_transport_lane
+from .source_capture_acceptance import SourceCaptureAcceptance, assess_source_capture
 from .source_capture_cache import (
     SourceCachePublishResult,
     publish_source_capture_cache,
@@ -29,9 +30,21 @@ _detail_image_urls_from_text = _engine._detail_image_urls_from_text
 _source_cache_key = _engine._source_cache_key
 validate_source_url = _engine.validate_source_url
 
+_SOURCE_PARTIAL_RECOVERY_ATTEMPTS = 2
+_SOURCE_PARTIAL_CURRENT_PAGE_WAIT_MS = 2_600
+_SOURCE_PARTIAL_FRESH_NAV_WAIT_MS = 3_600
+_SOURCE_PARTIAL_SCROLL_WAIT_MS = 250
+
 
 def __getattr__(name: str):
     return getattr(_engine, name)
+
+
+def _acceptance(captured: CapturedProductSource) -> SourceCaptureAcceptance:
+    return assess_source_capture(
+        captured.snapshot,
+        product_image_count=len(captured.product_image_paths),
+    )
 
 
 def _cached_capture(
@@ -77,6 +90,130 @@ def _refresh_capture_cache(
     )
 
 
+def _browser_capture(
+    source_url: str,
+    *,
+    target_dir: Path,
+    profile_dir: str | Path,
+    cdp_port: int,
+    initial_wait_ms: int,
+    scroll_wait_ms: int,
+    max_scroll_steps: int,
+    max_visible_text_chars: int,
+    use_current_page: bool,
+) -> CapturedProductSource:
+    """Run one cache-blind browser acquisition attempt."""
+
+    return _engine.capture_product_source(
+        source_url,
+        output_dir=target_dir,
+        profile_dir=profile_dir,
+        cdp_port=cdp_port,
+        initial_wait_ms=initial_wait_ms,
+        scroll_wait_ms=scroll_wait_ms,
+        max_scroll_steps=max_scroll_steps,
+        max_visible_text_chars=max_visible_text_chars,
+        use_current_page=use_current_page,
+        cache_dir=None,
+        cache_ttl_seconds=0,
+        force_refresh=True,
+    )
+
+
+def _capture_until_accepted(
+    source_url: str,
+    *,
+    target_dir: Path,
+    profile_dir: str | Path,
+    cdp_port: int,
+    initial_wait_ms: int,
+    scroll_wait_ms: int,
+    max_scroll_steps: int,
+    max_visible_text_chars: int,
+    use_current_page: bool,
+) -> CapturedProductSource:
+    """Capture until source evidence is complete enough or fail as PARTIAL_SOURCE.
+
+    Height stability is only a scrolling heuristic inside the browser engine. This
+    wrapper owns the actual task-success contract. A suspicious SPA shell gets one
+    longer current-page settle pass and, for normal URL mode, one clean navigation
+    retry. Only an accepted capture may be cached or consumed downstream.
+    """
+
+    captured = _browser_capture(
+        source_url,
+        target_dir=target_dir,
+        profile_dir=profile_dir,
+        cdp_port=cdp_port,
+        initial_wait_ms=initial_wait_ms,
+        scroll_wait_ms=scroll_wait_ms,
+        max_scroll_steps=max_scroll_steps,
+        max_visible_text_chars=max_visible_text_chars,
+        use_current_page=use_current_page,
+    )
+    verdict = _acceptance(captured)
+    if verdict.ready:
+        print(f"SOURCE_CAPTURE READINESS ready attempt=initial {verdict.describe()}", flush=True)
+        return captured
+
+    print(
+        "SOURCE_CAPTURE PARTIAL_DETECTED "
+        f"attempt=initial {verdict.describe()} detail={verdict.reason}",
+        flush=True,
+    )
+
+    for attempt in range(1, _SOURCE_PARTIAL_RECOVERY_ATTEMPTS + 1):
+        fresh_navigation = bool(
+            not use_current_page and attempt == _SOURCE_PARTIAL_RECOVERY_ATTEMPTS
+        )
+        retry_use_current_page = not fresh_navigation
+        retry_wait_ms = max(
+            int(initial_wait_ms),
+            _SOURCE_PARTIAL_FRESH_NAV_WAIT_MS
+            if fresh_navigation
+            else _SOURCE_PARTIAL_CURRENT_PAGE_WAIT_MS,
+        )
+        retry_scroll_wait_ms = max(int(scroll_wait_ms), _SOURCE_PARTIAL_SCROLL_WAIT_MS)
+        mode = "fresh_navigation" if fresh_navigation else "current_page_settle"
+        print(
+            "SOURCE_CAPTURE PARTIAL_RETRY "
+            f"attempt={attempt}/{_SOURCE_PARTIAL_RECOVERY_ATTEMPTS} mode={mode} "
+            f"previous={verdict.describe()}",
+            flush=True,
+        )
+
+        captured = _browser_capture(
+            source_url,
+            target_dir=target_dir,
+            profile_dir=profile_dir,
+            cdp_port=cdp_port,
+            initial_wait_ms=retry_wait_ms,
+            scroll_wait_ms=retry_scroll_wait_ms,
+            max_scroll_steps=max_scroll_steps,
+            max_visible_text_chars=max_visible_text_chars,
+            use_current_page=retry_use_current_page,
+        )
+        verdict = _acceptance(captured)
+        if verdict.ready:
+            print(
+                f"SOURCE_CAPTURE READINESS ready attempt=recovery-{attempt} "
+                f"mode={mode} {verdict.describe()}",
+                flush=True,
+            )
+            return captured
+
+    print(
+        "SOURCE_CAPTURE PARTIAL_SOURCE "
+        f"retries={_SOURCE_PARTIAL_RECOVERY_ATTEMPTS} {verdict.describe()} "
+        f"detail={verdict.reason}",
+        flush=True,
+    )
+    raise _engine.SourceCaptureError(
+        "PARTIAL_SOURCE: supplier product page remained incomplete after bounded recovery; "
+        f"{verdict.describe()}. Downstream Resolver/photo selection was not started."
+    )
+
+
 def _capture_once(
     url: str,
     *,
@@ -96,7 +233,9 @@ def _capture_once(
 
     Browser acquisition produces the canonical task result. Cache read/write is an
     optional accelerator around it and is deliberately unable to turn a successful
-    capture into a failed job.
+    capture into a failed job. Cache entries are also subject to the same source
+    completeness contract as live captures, so an old partial shell can never be
+    replayed as canonical evidence.
     """
 
     source_url = validate_source_url(url)
@@ -111,13 +250,22 @@ def _capture_once(
             cache_ttl_seconds=int(cache_ttl_seconds),
         )
         if cached is not None:
-            return cached
+            cached_verdict = _acceptance(cached)
+            if cached_verdict.ready:
+                print(
+                    f"SOURCE_CACHE ACCEPTED {cached_verdict.describe()}",
+                    flush=True,
+                )
+                return cached
+            print(
+                "SOURCE_CACHE REJECTED_PARTIAL "
+                f"{cached_verdict.describe()} detail={cached_verdict.reason}",
+                flush=True,
+            )
 
-    # The browser engine is now cache-blind. This keeps page capture truth and
-    # optional filesystem caching as separate failure domains.
-    captured = _engine.capture_product_source(
+    captured = _capture_until_accepted(
         source_url,
-        output_dir=target_dir,
+        target_dir=target_dir,
         profile_dir=profile_dir,
         cdp_port=cdp_port,
         initial_wait_ms=initial_wait_ms,
@@ -125,9 +273,6 @@ def _capture_once(
         max_scroll_steps=max_scroll_steps,
         max_visible_text_chars=max_visible_text_chars,
         use_current_page=use_current_page,
-        cache_dir=None,
-        cache_ttl_seconds=0,
-        force_refresh=True,
     )
 
     if cache_root is not None:

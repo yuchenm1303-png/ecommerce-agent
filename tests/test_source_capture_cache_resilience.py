@@ -15,7 +15,7 @@ def _write_capture_tree(root: Path, source_url: str) -> Path:
             final_url=source_url,
             title="fixture product",
             captured_at="2026-08-31T00:00:00+00:00",
-            visible_text="fixture evidence",
+            visible_text="fixture evidence " * 220,
         ),
         root / "source-snapshot.json",
     )
