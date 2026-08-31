@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -7,6 +8,7 @@ TEST_WORKFLOW = (ROOT / ".github" / "workflows" / "publish-test-build.yml").read
 STABLE_WORKFLOW = (ROOT / ".github" / "workflows" / "publish-update.yml").read_text(encoding="utf-8")
 LOCK = (ROOT / "requirements-release.lock").read_text(encoding="utf-8")
 INSTALL = (ROOT / "scripts" / "install_release_environment.ps1").read_text(encoding="utf-8")
+DOTNET_CONTRACT = json.loads((ROOT / "global.json").read_text(encoding="utf-8"))
 
 
 def _require_in_both(fragment: str) -> None:
@@ -31,6 +33,17 @@ def test_test_and_stable_share_one_release_environment_contract() -> None:
     assert "python -m pip install -r requirements.txt" not in STABLE_WORKFLOW
     assert "pip install --upgrade pip" not in TEST_WORKFLOW
     assert "pip install --upgrade pip" not in STABLE_WORKFLOW
+
+
+def test_dotnet_sdk_is_repository_pinned_and_install_reads_that_single_contract() -> None:
+    sdk = DOTNET_CONTRACT["sdk"]
+    assert sdk["version"] == "8.0.424"
+    assert sdk["rollForward"] == "disable"
+    assert sdk["allowPrerelease"] is False
+    assert '$GlobalJson = Join-Path $Root "global.json"' in INSTALL
+    assert '$ExpectedDotNet = [string]$DotNetContract.sdk.version' in INSTALL
+    assert '$DotNetRollForward -ne "disable"' in INSTALL
+    assert 'global_json_sha256 = $GlobalJsonSha' in INSTALL
 
 
 def test_release_lock_is_exact_and_covers_packaged_top_level_dependencies() -> None:
