@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+import os
+from pathlib import Path
+import sys
+import traceback
+from typing import Any, Callable, Sequence
 
 from .providers.transient_retry import exception_text, is_retryable_ai_error
 
@@ -149,10 +154,140 @@ def is_provider_media_rejection(exc: BaseException) -> bool:
     return classify_provider_failure(exc, media_present=True).reason_code == "provider_media_rejected"
 
 
+def _cli_argument_value(argv: Sequence[str], name: str) -> str:
+    prefix = name + "="
+    for index, raw in enumerate(argv):
+        value = str(raw)
+        if value == name and index + 1 < len(argv):
+            return str(argv[index + 1]).strip()
+        if value.startswith(prefix):
+            return value[len(prefix) :].strip()
+    return ""
+
+
+def _single_workflow_root(output_dir: str | Path) -> Path | None:
+    """Resolve the owning single-GUI workflow from one nested child output dir."""
+
+    path = Path(output_dir).expanduser().resolve()
+    for candidate in (path, *path.parents):
+        if candidate.name.startswith("workflow-"):
+            return candidate
+    return None
+
+
+def _single_workflow_prepare_log(argv: Sequence[str]) -> Path | None:
+    output_dir = _cli_argument_value(argv, "--output-dir")
+    if not output_dir:
+        return None
+    workflow_root = _single_workflow_root(output_dir)
+    if workflow_root is None:
+        return None
+    return workflow_root / "diagnostics" / "prepare.log"
+
+
+def _append_single_workflow_child_failure(
+    *,
+    argv: Sequence[str],
+    stage: str,
+    error_type: str,
+    message: str,
+    traceback_text: str = "",
+) -> None:
+    """Synchronously persist the deepest single-workflow child failure.
+
+    The GUI process still owns its normal ``gui-workflow.log``.  This second,
+    synchronous source exists specifically so a child traceback can never be lost
+    merely because the outer QProcess/journal disappears before telemetry is built.
+    Every child failure appends to the canonical ``diagnostics/prepare.log`` that
+    ``task_failure_diagnostics`` already treats as a full stage-log truth source.
+    """
+
+    target = _single_workflow_prepare_log(argv)
+    if target is None:
+        return
+
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    header = (
+        "===== CHILD FAILURE "
+        f"stage={stage} ts={timestamp} pid={os.getpid()} ====="
+    )
+    body = str(traceback_text or "").rstrip()
+    if not body:
+        body = f"{error_type}: {message}"
+    elif f"{error_type}: {message}" not in body:
+        body += f"\n{error_type}: {message}"
+    payload = f"{header}\n{body}\n===== END CHILD FAILURE =====\n"
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception as journal_exc:
+        # Never replace or suppress the business exception. The outer process log
+        # still receives this explicit telemetry-journal failure marker.
+        print(
+            "TELEMETRY_FAILURE_JOURNAL_ERROR "
+            f"stage={stage} error={type(journal_exc).__name__}: {journal_exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def run_cli_with_failure_journal(
+    main: Callable[[], int],
+    *,
+    stage: str,
+    argv: Sequence[str] | None = None,
+) -> int:
+    """Run a Step-3 child CLI while durably preserving every fatal exit.
+
+    This wrapper does not classify, retry, reinterpret, or recover the task.  It
+    only makes the original child failure durable before process exit.  Ordinary
+    successful output remains untouched.
+    """
+
+    effective_argv = tuple(sys.argv[1:] if argv is None else argv)
+    try:
+        result = main()
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+        if int(code or 0) != 0:
+            _append_single_workflow_child_failure(
+                argv=effective_argv,
+                stage=stage,
+                error_type=type(exc).__name__,
+                message=str(exc),
+                traceback_text=traceback.format_exc(),
+            )
+        raise
+    except BaseException as exc:
+        _append_single_workflow_child_failure(
+            argv=effective_argv,
+            stage=stage,
+            error_type=type(exc).__name__,
+            message=str(exc),
+            traceback_text=traceback.format_exc(),
+        )
+        raise
+
+    status = int(result or 0)
+    if status != 0:
+        _append_single_workflow_child_failure(
+            argv=effective_argv,
+            stage=stage,
+            error_type="ChildProcessExitError",
+            message=f"{stage} returned exit code {status}",
+        )
+    return status
+
+
 __all__ = [
     "FailureIssue",
     "FailureScope",
     "FailureSeverity",
     "classify_provider_failure",
     "is_provider_media_rejection",
+    "run_cli_with_failure_journal",
 ]
