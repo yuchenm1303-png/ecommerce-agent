@@ -30,6 +30,32 @@ SUPPORTED_COMPAT_PROFILES = ("generic", "qwen-omni")
 _PROGRESS_INTERVAL_SECONDS = 15.0
 _PRODUCT_FACT_TASK = "resolve_compact_product_facts"
 _CANONICAL_JPEG_DATA_URI_PREFIX = "data:image/jpeg;base64,"
+_OPENAI_COMPAT_UNSUPPORTED_ARRAY_SCHEMA_KEYWORDS = frozenset(
+    {"uniqueItems", "contains", "minContains", "maxContains"}
+)
+
+
+def _transport_json_schema(value: Any) -> Any:
+    """Return the portable response-format schema for OpenAI-compatible APIs.
+
+    The application keeps the canonical JSON contract unchanged in the prompt and
+    validates business invariants after the response. The transport schema is only
+    a provider-side decoding aid, and OpenAI-compatible endpoints do not all expose
+    the same JSON Schema draft. In particular, DashScope rejects array schemas that
+    contain uniqueItems/contains/minContains/maxContains. Strip only those known
+    non-portable array keywords while preserving every other constraint.
+    """
+
+    if isinstance(value, list):
+        return [_transport_json_schema(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    output = {key: _transport_json_schema(item) for key, item in value.items()}
+    if str(output.get("type") or "").strip().casefold() == "array":
+        for key in _OPENAI_COMPAT_UNSUPPORTED_ARRAY_SCHEMA_KEYWORDS:
+            output.pop(key, None)
+    return output
 
 
 def _image_data_uri(path_value: str) -> str:
@@ -416,7 +442,7 @@ class OpenAICompatibleSemanticProvider:
                 "json_schema": {
                     "name": "semantic_task_result",
                     "strict": True,
-                    "schema": request_payload["json_contract"],
+                    "schema": _transport_json_schema(request_payload["json_contract"]),
                 },
             }
         elif self.structured_mode == "json_object":
