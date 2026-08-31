@@ -7,6 +7,7 @@ const DIAGNOSTIC_LIMIT = 100;
 const SYSTEM_WINDOW_HOURS = 24;
 const SYSTEM_BUCKET_MINUTES = 5;
 const DAILY_HEATMAP_DAYS = 365;
+const LOG_CHUNK_PAGE_SIZE = 1000;
 
 const TTL = {
   snapshot: 10_000,
@@ -266,6 +267,26 @@ async function loadTaskDetails(admin: ReturnType<typeof createClient>, userId: s
   });
 }
 
+async function loadTaskLogChunks(admin: ReturnType<typeof createClient>, auditId: string): Promise<JsonObject[]> {
+  const output: JsonObject[] = [];
+  let offset = 0;
+  while (true) {
+    const { data, error } = await admin.from("listing_task_log_chunks")
+      .select("audit_id,log_name,stage,log_sha256,encoding,chunk_index,chunk_count,line_count,byte_count,compressed_byte_count,chunk_data,created_at,updated_at")
+      .eq("audit_id", auditId)
+      .order("log_name", { ascending: true })
+      .order("log_sha256", { ascending: true })
+      .order("chunk_index", { ascending: true })
+      .range(offset, offset + LOG_CHUNK_PAGE_SIZE - 1);
+    if (error) throw new Error("task_log_chunks_failed");
+    const rows = Array.isArray(data) ? data.map(objectValue) : [];
+    output.push(...rows);
+    if (rows.length < LOG_CHUNK_PAGE_SIZE) break;
+    offset += LOG_CHUNK_PAGE_SIZE;
+  }
+  return output;
+}
+
 async function loadDiagnostics(admin: ReturnType<typeof createClient>, userId: string) {
   return await cached(`diagnostics:${userId}`, TTL.diagnostics, () =>
     dataOrThrow(
@@ -298,7 +319,7 @@ function basePayload(snapshot: unknown): JsonObject {
   const payload = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)
     ? { ...(snapshot as JsonObject) }
     : {};
-  payload.query_architecture = "usage_monitor_persistent_read_model_v3";
+  payload.query_architecture = "usage_monitor_persistent_read_model_v4";
   payload.system_window_hours = SYSTEM_WINDOW_HOURS;
   payload.system_bucket_minutes = SYSTEM_BUCKET_MINUTES;
   return payload;
@@ -341,14 +362,25 @@ Deno.serve(async (req: Request) => {
       const normalized = normalizeTaskAudits([row]);
       const logicalId = textValue(body.audit_id);
       const taskAudit = normalized.find((item) => textValue(item.id) === logicalId) ?? normalized[0] ?? row;
-      return json(req, { query_architecture: "usage_monitor_persistent_read_model_v3", task_audit: taskAudit });
+      let taskLogChunks: JsonObject[] = [];
+      try {
+        taskLogChunks = await loadTaskLogChunks(admin, sourceId);
+      } catch {
+        return json(req, { error: "task_log_chunks_failed" }, 503);
+      }
+      return json(req, {
+        query_architecture: "usage_monitor_persistent_read_model_v4",
+        task_audit: taskAudit,
+        task_log_chunks: taskLogChunks,
+        task_log_chunk_count: taskLogChunks.length,
+      });
     }
 
     if (scope === "heatmap") {
       try {
         const heatmap = await loadHeatmap(admin, user.id);
         return json(req, {
-          query_architecture: "usage_monitor_persistent_read_model_v3",
+          query_architecture: "usage_monitor_persistent_read_model_v4",
           daily_activity: heatmap.value,
           partial_errors: heatmap.stale ? [{ component: "daily_activity", code: "stale_cache" }] : [],
         });
@@ -395,7 +427,7 @@ Deno.serve(async (req: Request) => {
       payload.system_samples = systemResult.status === "fulfilled" ? systemResult.value.value : [];
       payload.task_audit_limit = TASK_AUDIT_LIMIT;
       payload.diagnostic_limit = DIAGNOSTIC_LIMIT;
-      payload.system_sample_basis = "persistent_5m_rollup_v3";
+      payload.system_sample_basis = "persistent_5m_rollup_v4";
       for (const [name, result] of [["task_audits", tasksResult], ["diagnostics", diagnosticsResult], ["system_health", systemResult]] as const) {
         if (result.status === "rejected") partialErrors.push({ component: name, code: "query_failed" });
         else if (result.value.stale) partialErrors.push({ component: name, code: "stale_cache" });
@@ -418,7 +450,7 @@ Deno.serve(async (req: Request) => {
       : { timezone: "Asia/Shanghai", window_days: DAILY_HEATMAP_DAYS, days: [] };
     payload.task_audit_limit = TASK_AUDIT_LIMIT;
     payload.diagnostic_limit = DIAGNOSTIC_LIMIT;
-    payload.system_sample_basis = "persistent_5m_rollup_v3";
+    payload.system_sample_basis = "persistent_5m_rollup_v4";
     payload.partial_errors = partialErrors;
     return json(req, payload);
   } catch {
