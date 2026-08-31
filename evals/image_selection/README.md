@@ -17,6 +17,8 @@ A case lives at:
 ```text
 evals/image_selection/cases/<case_id>/
   case.json
+  capture.json              # present for capture-case cases
+  capture_raw/              # raw production source capture, local only
   images/
     img_001.jpg
     img_002.jpg
@@ -64,6 +66,31 @@ Allowed ownership labels are exactly the production semantic classes:
 `auto_upload_allowed` must be true only for `EXACT_TARGET` and `TARGET_PACKAGING_OR_DETAIL`.
 
 `relevance_grade` is 0..3: 3 = strongest main image, 2 = useful support image, 1 = correct but weak/redundant, 0 = forbidden.
+
+## Capture a real product page without AI
+
+Use `capture-case` when there is no historical `listing-image-selection.json`. It calls the same production source collector used by the listing workflow, including the dedicated Source Edge, lazy-page loading and the production product-image candidate pool. It does not build a semantic provider, does not run Ownership/Gallery AI and does not perform any marketplace listing action.
+
+```powershell
+python -m tools.image_selection_lab capture-case `
+  --url "https://www.makro.co.za/example-product/p/example" `
+  --case-id B01_real_product
+```
+
+The capture is deliberately fresh (`force_refresh=True`, no source cache) so the benchmark records the real page state. Only exact duplicate image bytes are removed after production capture; semantic filtering is forbidden at acquisition time.
+
+Target identity is copied mechanically from JSON-LD Product fields, with the page title as a final name fallback. If the page does not expose enough exact identity, provide known human facts explicitly without AI:
+
+```powershell
+python -m tools.image_selection_lab capture-case `
+  --url "https://www.makro.co.za/example-product/p/example" `
+  --case-id B01_real_product `
+  --target-name "Exact product title" `
+  --target-brand "Exact brand" `
+  --target-model "Exact model"
+```
+
+Every captured candidate starts with `ground_truth: null`. Inspect the local images and label every candidate before any AI evaluation. If normal website verification appears, complete it manually in the dedicated Source Edge and rerun with `--use-current-page`; the tool never bypasses CAPTCHA or risk controls.
 
 ## Import a real failure
 
