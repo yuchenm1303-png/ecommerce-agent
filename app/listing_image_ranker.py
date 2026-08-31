@@ -12,7 +12,7 @@ from .providers.usage_telemetry import usage_request_context
 from .source_snapshot import source_snapshot_from_json
 
 
-LISTING_IMAGE_RANKING_VERSION = 4
+LISTING_IMAGE_RANKING_VERSION = 5
 MAX_AUTO_LISTING_IMAGES = 5
 
 
@@ -311,6 +311,30 @@ def build_listing_image_ranking_request(
     }
 
 
+def _build_zero_confirmation_request(request: dict[str, Any]) -> dict[str, Any]:
+    """Require a fresh multimodal adjudication before deleting the whole gallery."""
+
+    return {
+        **request,
+        "task": "confirm_empty_supplier_listing_gallery",
+        "prompt_instruction": (
+            "A previous pass proposed selecting zero supplier photos. Reinspect the actual pixels of every candidate "
+            "against the exact target-product context. Empty selection is destructive because it suppresses automatic "
+            "Product Photos. Return zero ONLY if every candidate is clearly unrelated, the wrong product/model/variant, "
+            "or non-product media. Imperfect composition, secondary views, packaging, weak backgrounds, or mild "
+            "redundancy are NOT reasons to reject every image. If any candidate genuinely depicts the exact target "
+            "product, select the best one to five and order them for upload."
+        ),
+        "rules": [
+            "This is an independent zero-selection confirmation; inspect every supplied image again.",
+            "If at least one candidate genuinely depicts the exact target product, selected_image_ids must not be empty.",
+            "Zero is allowed only when every candidate is clearly unusable for this exact listing because it is unrelated, wrong-product/wrong-variant, or non-product media.",
+            "Do not reject all candidates merely for imperfect image quality, packaging, secondary angle, background, or redundancy.",
+            "Return one decision for every candidate image_id. selected=true must match membership in selected_image_ids exactly.",
+        ],
+    }
+
+
 def _parse_ranking(raw: Any, candidates: list[_Candidate]) -> _ParsedRanking:
     if not isinstance(raw, dict):
         raise ListingImageRankingError("listing image AI returned no JSON object")
@@ -363,6 +387,20 @@ def _parse_ranking(raw: Any, candidates: list[_Candidate]) -> _ParsedRanking:
     )
 
 
+def _run_ranking_request(
+    provider: JSONTaskProvider,
+    request: dict[str, Any],
+    candidates: list[_Candidate],
+) -> _ParsedRanking:
+    with usage_request_context(
+        task=str(request.get("task") or ""),
+        provider=str(getattr(provider, "name", "")),
+        model=str(getattr(provider, "model", "")),
+    ):
+        raw = provider.extract_json(request)
+    return _parse_ranking(raw, candidates)
+
+
 def _selection_report(
     *,
     candidates: list[_Candidate],
@@ -372,7 +410,7 @@ def _selection_report(
     selected_ids = list(ranking.selected_ids) if ranking is not None else []
     selected_set = set(selected_ids)
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "policy": {
             "version": LISTING_IMAGE_RANKING_VERSION,
             "kind": "ai-owned-multimodal-listing-photo-selection",
@@ -381,6 +419,7 @@ def _selection_report(
             "semantic_owner": "multimodal_ai",
             "duplicate_owner": "multimodal_ai_except_exact_byte_duplicates",
             "ordering": "selected_image_ids_verbatim",
+            "empty_selection": "requires_second_independent_multimodal_confirmation",
         },
         "candidate_count": len(candidates),
         "transport_rejected": transport_rejected,
@@ -417,8 +456,10 @@ def finalize_supplier_listing_images(
     This stage intentionally has no Python-side image-role priority, importance
     score, white-background score, entropy score, visual similarity threshold or
     source-order preference. Pre-AI exclusions are limited to explicit customer
-    auxiliary ownership, technical failures and exact byte-identical copies. If the
-    AI call fails, the caller keeps the prior mechanical compatibility result.
+    auxiliary ownership, technical failures and exact byte-identical copies. A
+    destructive all-zero semantic result requires a second independent multimodal
+    confirmation. If either AI call fails, the caller keeps the prior mechanical
+    compatibility result because this function has not published a new manifest yet.
     """
 
     root = Path(run_dir).expanduser().resolve()
@@ -462,6 +503,11 @@ def finalize_supplier_listing_images(
             transport_rejected=transport_rejected,
             ranking=None,
         )
+        report["zero_selection_confirmation"] = {
+            "performed": False,
+            "confirmed_empty": True,
+            "reason": "no_transport_candidates",
+        }
         _write_json_atomic(selection_path, report)
         manifest["listing_image_ranking"] = {
             "version": LISTING_IMAGE_RANKING_VERSION,
@@ -487,13 +533,16 @@ def finalize_supplier_listing_images(
         product_context=_product_context(manifest),
         candidates=candidates,
     )
-    with usage_request_context(
-        task=str(request.get("task") or ""),
-        provider=str(getattr(provider, "name", "")),
-        model=str(getattr(provider, "model", "")),
-    ):
-        raw = provider.extract_json(request)
-    ranking = _parse_ranking(raw, candidates)
+    ranking = _run_ranking_request(provider, request, candidates)
+    model_calls = 1
+    zero_confirmation_performed = False
+    first_pass_summary = ranking.summary
+
+    if not ranking.selected_ids:
+        zero_confirmation_performed = True
+        confirmation_request = _build_zero_confirmation_request(request)
+        ranking = _run_ranking_request(provider, confirmation_request, candidates)
+        model_calls += 1
 
     by_id = {candidate.image_id: candidate for candidate in candidates}
     selected_candidates = [by_id[image_id] for image_id in ranking.selected_ids]
@@ -504,6 +553,12 @@ def finalize_supplier_listing_images(
         ranking=ranking,
     )
     report["selected"] = [str(candidate.path) for candidate in selected_candidates]
+    report["zero_selection_confirmation"] = {
+        "performed": zero_confirmation_performed,
+        "confirmed_empty": bool(zero_confirmation_performed and not selected_paths),
+        "first_pass_summary": first_pass_summary if zero_confirmation_performed else "",
+        "final_summary": ranking.summary,
+    }
     _write_json_atomic(selection_path, report)
 
     outputs["primary_source_listing_images"] = [str(path) for path in selected_paths]
@@ -521,8 +576,10 @@ def finalize_supplier_listing_images(
     manifest["listing_image_ranking"] = {
         "version": LISTING_IMAGE_RANKING_VERSION,
         "status": "ai_ranked",
-        "strategy": "multimodal_ai_owns_semantics_duplicates_and_order",
-        "model_calls": 1,
+        "strategy": "multimodal_ai_owns_semantics_duplicates_and_order_with_confirmed_empty_gallery",
+        "model_calls": model_calls,
+        "zero_selection_confirmation_performed": zero_confirmation_performed,
+        "zero_selection_confirmed": bool(zero_confirmation_performed and not selected_paths),
         "candidate_count": len(candidates),
         "transport_rejected_count": len(transport_rejected),
         "semantic_rejected_count": len(candidates) - len(selected_paths),
@@ -531,13 +588,13 @@ def finalize_supplier_listing_images(
         "selected_ids": list(ranking.selected_ids),
         "selection_report": str(selection_path),
     }
-    manifest["total_model_calls"] = int(manifest.get("total_model_calls") or 0) + 1
+    manifest["total_model_calls"] = int(manifest.get("total_model_calls") or 0) + model_calls
     _write_json_atomic(manifest_path, manifest)
 
     return ListingImageRankingResult(
         status="ai_ranked",
         selected=selected_paths,
-        model_calls=1,
+        model_calls=model_calls,
         mechanical_candidate_count=len(candidates),
         semantically_rejected_count=len(candidates) - len(selected_paths),
         selection_report=selection_path,
