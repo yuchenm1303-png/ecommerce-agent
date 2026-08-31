@@ -5,17 +5,30 @@ Set-StrictMode -Version Latest
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $LockFile = Join-Path $Root "requirements-release.lock"
+$GlobalJson = Join-Path $Root "global.json"
 $VenvRoot = Join-Path $Root ".release-venv"
 $VenvScripts = Join-Path $VenvRoot "Scripts"
 $VenvPython = Join-Path $VenvScripts "python.exe"
 $Artifacts = Join-Path $Root "artifacts"
 $ManifestPath = Join-Path $Artifacts "release-environment.json"
 $ExpectedPython = "3.11.9"
-$ExpectedDotNet = "8.0.424"
 $ExpectedPip = "26.2.1"
 
 if (-not (Test-Path $LockFile -PathType Leaf)) {
     throw "Release dependency lock missing: $LockFile"
+}
+if (-not (Test-Path $GlobalJson -PathType Leaf)) {
+    throw "Release .NET SDK contract missing: $GlobalJson"
+}
+
+$DotNetContract = Get-Content $GlobalJson -Raw -Encoding UTF8 | ConvertFrom-Json
+$ExpectedDotNet = [string]$DotNetContract.sdk.version
+$DotNetRollForward = [string]$DotNetContract.sdk.rollForward
+if ([string]::IsNullOrWhiteSpace($ExpectedDotNet)) {
+    throw "Release global.json must declare sdk.version"
+}
+if ($DotNetRollForward -ne "disable") {
+    throw "Release global.json must set sdk.rollForward=disable; actual=$DotNetRollForward"
 }
 
 $HostPython = (& python -c "import platform; print(platform.python_version())").Trim()
@@ -23,9 +36,15 @@ if ($LASTEXITCODE -ne 0 -or $HostPython -ne $ExpectedPython) {
     throw "Release build requires CPython $ExpectedPython; actual=$HostPython"
 }
 
-$DotNetVersion = (& dotnet --version).Trim()
-if ($LASTEXITCODE -ne 0 -or $DotNetVersion -ne $ExpectedDotNet) {
-    throw "Release build requires .NET SDK $ExpectedDotNet; actual=$DotNetVersion"
+Push-Location $Root
+try {
+    $DotNetVersion = (& dotnet --version).Trim()
+    if ($LASTEXITCODE -ne 0 -or $DotNetVersion -ne $ExpectedDotNet) {
+        throw "Release build requires .NET SDK $ExpectedDotNet from global.json; actual=$DotNetVersion"
+    }
+}
+finally {
+    Pop-Location
 }
 
 if (Test-Path $VenvRoot) {
@@ -67,6 +86,7 @@ try {
     if ([string]::IsNullOrWhiteSpace($PackageVersion)) { throw "packaging/VERSION is empty" }
 
     $LockSha = (Get-FileHash $LockFile -Algorithm SHA256).Hash.ToLowerInvariant()
+    $GlobalJsonSha = (Get-FileHash $GlobalJson -Algorithm SHA256).Hash.ToLowerInvariant()
     $SpecSha = (Get-FileHash (Join-Path $Root "packaging\EcommerceAgent.spec") -Algorithm SHA256).Hash.ToLowerInvariant()
     $BuildScriptSha = (Get-FileHash (Join-Path $Root "scripts\build_windows.ps1") -Algorithm SHA256).Hash.ToLowerInvariant()
     $DotNetToolsSha = (Get-FileHash (Join-Path $Root ".config\dotnet-tools.json") -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -84,6 +104,7 @@ try {
         dotnet = $DotNetVersion
         velopack_cli = $ToolVersion
         release_lock_sha256 = $LockSha
+        global_json_sha256 = $GlobalJsonSha
         pyinstaller_spec_sha256 = $SpecSha
         build_windows_sha256 = $BuildScriptSha
         dotnet_tools_sha256 = $DotNetToolsSha
