@@ -12,7 +12,7 @@ from pathlib import Path
 
 from app.failure_contract import run_cli_with_failure_journal
 from app.image_optimization_gate import image_optimization_enabled
-from app.listing_image_ranker import finalize_supplier_listing_images
+from app.listing_image_pipeline import run_supplier_listing_image_pipeline
 from app.providers.registry import (
     ProviderConfig,
     ProviderConfigurationError,
@@ -134,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--semantic-cache-dir",
         default="logs/semantic-cache",
-        help="本地字段 batch 和 Web Fill batch 的 content-addressed cache。",
+        help="本地字段 batch、Web Fill 和商品图片语义选择的 content-addressed cache。",
     )
     parser.add_argument("--no-semantic-cache", action="store_true")
     parser.add_argument("--output-dir", default="logs/ai-resolver")
@@ -191,13 +191,19 @@ def main() -> int:
     try:
         ranking_provider = build_semantic_provider(provider_config(args))
         set_progress(ranking_provider, "PHOTO-RANK")
-        result = finalize_supplier_listing_images(run_dir, ranking_provider)
+        semantic_cache_dir = None if args.no_semantic_cache else args.semantic_cache_dir
+        result = run_supplier_listing_image_pipeline(
+            run_dir,
+            ranking_provider,
+            cache_dir=semantic_cache_dir,
+        )
         selected = len(result.selected)
         print(
             f"listing_image_ranking={result.status.upper()} image_optimization=ON selected={selected} "
             f"candidates={result.mechanical_candidate_count} "
+            f"marketplace_rejected={result.mechanically_rejected_count} "
             f"semantic_rejected={result.semantically_rejected_count} "
-            f"calls={result.model_calls}",
+            f"calls={result.model_calls} cache_hits={result.cache_hits}/{result.request_count}",
             flush=True,
         )
     except Exception as exc:
