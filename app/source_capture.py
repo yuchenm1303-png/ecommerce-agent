@@ -11,6 +11,11 @@ from .cdp_automation_health import (
     probe_cdp_automation,
 )
 from .cdp_transport_lane import exclusive_cdp_transport_lane
+from .source_capture_cache import (
+    SourceCachePublishResult,
+    publish_source_capture_cache,
+    read_source_capture_cache,
+)
 from .update_browser_gate import close_managed_browser
 
 
@@ -29,6 +34,49 @@ def __getattr__(name: str):
     return getattr(_engine, name)
 
 
+def _cached_capture(
+    source_url: str,
+    *,
+    output_dir: Path,
+    cache_dir: Path | None,
+    cache_ttl_seconds: int,
+) -> CapturedProductSource | None:
+    """Read the optional source cache without letting cache I/O own task success."""
+
+    materialized = read_source_capture_cache(
+        source_url,
+        cache_key=_source_cache_key(source_url),
+        output_dir=Path(output_dir),
+        cache_dir=Path(cache_dir) if cache_dir is not None else None,
+        cache_ttl_seconds=int(cache_ttl_seconds),
+    )
+    if materialized is None:
+        return None
+    return CapturedProductSource(
+        snapshot_path=materialized.snapshot_path,
+        screenshot_path=materialized.screenshot_path,
+        snapshot=materialized.snapshot,
+        launched_now=False,
+        product_image_paths=materialized.product_image_paths,
+        cache_hit=True,
+    )
+
+
+def _refresh_capture_cache(
+    source_url: str,
+    source_dir: Path,
+    cache_dir: Path | None,
+) -> SourceCachePublishResult:
+    """Publish cache best-effort; a failed cache write is never a capture failure."""
+
+    return publish_source_capture_cache(
+        source_url,
+        cache_key=_source_cache_key(source_url),
+        source_dir=Path(source_dir),
+        cache_dir=Path(cache_dir) if cache_dir is not None else None,
+    )
+
+
 def _capture_once(
     url: str,
     *,
@@ -44,9 +92,32 @@ def _capture_once(
     cache_ttl_seconds: int,
     force_refresh: bool,
 ) -> CapturedProductSource:
-    return _engine.capture_product_source(
-        url,
-        output_dir=output_dir,
+    """Own cache lifecycle above the browser engine.
+
+    Browser acquisition produces the canonical task result. Cache read/write is an
+    optional accelerator around it and is deliberately unable to turn a successful
+    capture into a failed job.
+    """
+
+    source_url = validate_source_url(url)
+    target_dir = Path(output_dir)
+    cache_root = Path(cache_dir) if cache_dir is not None else None
+
+    if not force_refresh and not use_current_page:
+        cached = _cached_capture(
+            source_url,
+            output_dir=target_dir,
+            cache_dir=cache_root,
+            cache_ttl_seconds=int(cache_ttl_seconds),
+        )
+        if cached is not None:
+            return cached
+
+    # The browser engine is now cache-blind. This keeps page capture truth and
+    # optional filesystem caching as separate failure domains.
+    captured = _engine.capture_product_source(
+        source_url,
+        output_dir=target_dir,
         profile_dir=profile_dir,
         cdp_port=cdp_port,
         initial_wait_ms=initial_wait_ms,
@@ -54,10 +125,20 @@ def _capture_once(
         max_scroll_steps=max_scroll_steps,
         max_visible_text_chars=max_visible_text_chars,
         use_current_page=use_current_page,
-        cache_dir=cache_dir,
-        cache_ttl_seconds=cache_ttl_seconds,
-        force_refresh=force_refresh,
+        cache_dir=None,
+        cache_ttl_seconds=0,
+        force_refresh=True,
     )
+
+    if cache_root is not None:
+        cache_result = _refresh_capture_cache(source_url, target_dir, cache_root)
+        if not cache_result.published:
+            print(
+                "SOURCE_CACHE NON_FATAL "
+                f"key={_source_cache_key(source_url)} detail={cache_result.detail}",
+                flush=True,
+            )
+    return captured
 
 
 def capture_product_source(
@@ -181,9 +262,11 @@ __all__ = [
     "DEFAULT_SOURCE_CDP_PORT",
     "SourceAccessBlocked",
     "SOURCE_CAPTURE_CACHE_VERSION",
+    "_cached_capture",
     "_canonical_source_url",
     "_detail_document_urls",
     "_detail_image_urls_from_text",
+    "_refresh_capture_cache",
     "_source_cache_key",
     "capture_product_source",
     "validate_source_url",
