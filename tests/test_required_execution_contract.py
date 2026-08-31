@@ -77,30 +77,34 @@ def test_explicit_user_value_promotes_only_unresolved_required_field_to_ready():
     result = apply_required_overrides(
         plan,
         [live],
-        [{"field_id": field_id(live), "values": ["Orange"]}],
+        [{"field_id": field_id(live), "values": ["Orange"], "source_type": "user"}],
     )
 
     assert result["applied"] == 1
     assert item.action == READY
     assert item.resolution.answer_values == ["Orange"]
     assert item.resolution.source_type == "user"
-    assert item.resolution.source_reference == "user:required-field-input"
+    assert item.resolution.source_reference == "user:required-override"
     assert item.resolution.eligible_for_autofill is True
 
 
-def test_user_required_value_still_must_match_live_makro_option():
+def test_user_required_value_is_not_semantically_rejudged_by_python():
     live = _live_field()
-    plan = LiveFillPlan([_blocked_item()])
+    item = _blocked_item()
+    plan = LiveFillPlan([item])
 
-    with pytest.raises(RequiredOverrideError, match="Colour"):
-        apply_required_overrides(
-            plan,
-            [live],
-            [{"field_id": field_id(live), "values": ["Purple"]}],
-        )
+    result = apply_required_overrides(
+        plan,
+        [live],
+        [{"field_id": field_id(live), "values": ["Purple"], "source_type": "user"}],
+    )
+
+    assert result["applied"] == 1
+    assert item.action == READY
+    assert item.resolution.answer_values == ["Purple"]
 
 
-def test_user_override_cannot_replace_optional_or_already_resolved_decision():
+def test_user_override_cannot_promote_optional_unresolved_field():
     live = _live_field()
     optional = _blocked_item(required=False)
     plan = LiveFillPlan([optional])
@@ -108,7 +112,7 @@ def test_user_override_cannot_replace_optional_or_already_resolved_decision():
         apply_required_overrides(
             plan,
             [live],
-            [{"field_id": field_id(live), "values": ["Orange"]}],
+            [{"field_id": field_id(live), "values": ["Orange"], "source_type": "user"}],
         )
 
 
