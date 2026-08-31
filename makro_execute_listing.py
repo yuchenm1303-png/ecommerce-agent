@@ -53,6 +53,85 @@ from makro_preview_listing import (
 )
 
 
+_FATAL_SECTION_STATUSES = {
+    "section_error",
+    "section_execution_lost",
+    "save_failed",
+}
+
+
+def _execution_outcome(
+    section_reports: list[dict[str, Any]],
+    photo_report: dict[str, Any] | None,
+    completion: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Classify process health without letting one field poison sibling work.
+
+    Strict draft completeness and process execution health are different facts.
+    Field-local fill/readback/persistence failures remain visible in the report,
+    but they are a partial-success outcome when other fields were safely persisted.
+    Only structural section failures, or a run that produced no persisted success
+    at all, make the process itself fail.
+    """
+
+    structural_failures = [
+        {
+            "section": str(report.get("section") or ""),
+            "status": str(report.get("status") or ""),
+        }
+        for report in section_reports
+        if str(report.get("status") or "") in _FATAL_SECTION_STATUSES
+    ]
+    candidate_count = sum(int(report.get("candidate_count") or 0) for report in section_reports)
+    persisted_fields = sum(int(report.get("persisted_verified") or 0) for report in section_reports)
+    isolated_field_issues = sum(
+        int(report.get("validation_failed") or 0)
+        + int(report.get("fill_error") or 0)
+        + int(report.get("persisted_validation_failed") or 0)
+        + int(report.get("optional_prewrite_skipped") or 0)
+        for report in section_reports
+    )
+    photos_requested = bool(photo_report and int(photo_report.get("requested") or 0) > 0)
+    photos_persisted = bool(
+        photo_report
+        and photo_report.get("status") == "persisted_verified"
+        and int((photo_report.get("persistence") or {}).get("final_count") or 0) >= 1
+    )
+    photo_issue = photos_requested and not photos_persisted
+    strict_complete = bool(
+        completion
+        and completion.get("draft_persisted_complete")
+        and completion.get("autofill_safe_complete")
+    )
+    any_persisted_success = persisted_fields > 0 or photos_persisted
+
+    if structural_failures:
+        status = "failed"
+        reason = "structural_execution_failure"
+    elif (candidate_count > 0 or photos_requested) and not any_persisted_success:
+        status = "failed"
+        reason = "no_persisted_success"
+    elif strict_complete and isolated_field_issues == 0 and not photo_issue:
+        status = "success"
+        reason = "strict_acceptance_complete"
+    else:
+        status = "partial_success"
+        reason = "isolated_incomplete_items"
+
+    return {
+        "status": status,
+        "reason": reason,
+        "process_success": status != "failed",
+        "strict_acceptance_complete": strict_complete,
+        "persisted_fields": persisted_fields,
+        "candidate_fields": candidate_count,
+        "isolated_field_issues": isolated_field_issues,
+        "photos_requested": photos_requested,
+        "photos_persisted": photos_persisted,
+        "structural_failures": structural_failures,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -511,6 +590,26 @@ def main() -> int:
             if args.all_step3
             else None
         )
+        execution_outcome = (
+            _execution_outcome(section_reports, photo_report, completion)
+            if args.all_step3
+            else {
+                "status": "success",
+                "reason": "single_section_mode",
+                "process_success": True,
+                "strict_acceptance_complete": True,
+                "persisted_fields": totals["persisted_verified"],
+                "candidate_fields": totals["candidate_count"],
+                "isolated_field_issues": (
+                    totals["validation_failed"]
+                    + totals["fill_error"]
+                    + totals["persisted_validation_failed"]
+                ),
+                "photos_requested": bool(photo_report and int(photo_report.get("requested") or 0) > 0),
+                "photos_persisted": bool(photo_report and photo_report.get("status") == "persisted_verified"),
+                "structural_failures": [],
+            }
+        )
         final_screenshot = run_dir / "step3-final.png"
         final_screenshot_capture = _capture_optional_screenshot(page, final_screenshot)
 
@@ -549,6 +648,7 @@ def main() -> int:
             "field_totals": totals,
             "photo_upload": photo_report,
             "completion": completion,
+            "execution_outcome": execution_outcome,
             "grounded_source_count": len(grounding.sources),
             "decision_warnings": decision_packet.warnings,
             "section_save_attempted": sum(1 for item in section_reports if item.get("save_attempted"))
@@ -587,6 +687,10 @@ def main() -> int:
         if completion is not None:
             print(f"draft_persisted_complete={completion['draft_persisted_complete']}")
             print(f"autofill_safe_complete={completion['autofill_safe_complete']}")
+        print(
+            f"execution_outcome={execution_outcome['status']} "
+            f"isolated_field_issues={execution_outcome['isolated_field_issues']}"
+        )
         print("Send to QC=False。")
         print(f"报告：{report_path.resolve()}")
         if final_screenshot_capture.get("status") == "captured":
@@ -596,22 +700,18 @@ def main() -> int:
                 "最终截图：未生成；截图属于辅助诊断，不影响字段/图片持久化验收。"
             )
 
-        acceptance_ok = True
-        if args.all_step3 and completion is not None:
-            acceptance_ok = bool(completion.get("draft_persisted_complete")) and bool(
-                completion.get("autofill_safe_complete")
-            )
-        visual_success = acceptance_ok and not bool(
-            totals["fill_error"]
-            or totals["validation_failed"]
-            or totals["persisted_validation_failed"]
-        )
-        finish_visual_execution_hud(page, success=visual_success)
+        process_success = bool(execution_outcome.get("process_success"))
+        finish_visual_execution_hud(page, success=process_success)
         destroy_visual_execution_hud(page)
         harness.detach()
-        if not acceptance_ok:
-            print("Full Step 3 persisted acceptance 未完整通过；进程返回非零状态。")
+        if not process_success:
+            print("Step 3 存在结构性执行失败或没有任何持久化成功；进程返回非零状态。")
             return 2
+        if execution_outcome.get("status") == "partial_success":
+            print(
+                "Step 3 已完成；存在独立字段/图片问题，但已成功持久化的其他字段不受影响，"
+                "进程按部分成功返回 0。"
+            )
         return 0
 
 
