@@ -26,6 +26,7 @@ on:
       - "native/sakana-helper/**"
       - "packaging/**"
       - "scripts/build_windows.ps1"
+      - "scripts/velopack_cli.ps1"
       - "scripts/test_velopack_update_e2e.ps1"
       - "scripts/generate_app_icon.py"
       - ".config/dotnet-tools.json"
