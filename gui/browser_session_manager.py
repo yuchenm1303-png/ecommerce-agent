@@ -26,20 +26,21 @@ from app.update_browser_gate import close_managed_browser
 class ManagedMakroBrowser(QObject):
     """Own the formal GUI's one long-lived Makro browser generation.
 
-    Endpoint reachability, browser identity and Playwright automation health are
-    deliberately separate. The GUI probes automation only at idle lifecycle
-    boundaries; it never opens a health-probe transport while a task already owns
-    the browser. A poisoned generation is rotated only when idle, using the same
-    dedicated profile so login state survives while all old targetIds are invalidated.
+    All endpoint and Playwright health I/O runs on lifecycle worker threads. The
+    Qt presentation thread only consumes the cached browser-generation state, so
+    clicking Single/Batch never waits behind HTTP or connect_over_cdp probes.
 
-    Formal top-level workspaces are mutually exclusive. Batch owns its own
-    internal concurrency/transport lane; Single and Batch must never overlap and
-    accidentally create independent Playwright transports against the same Edge.
+    The actual business child process still owns the canonical task-time CDP
+    attach. Idle health monitoring exists to keep the managed browser warm and to
+    rotate poisoned generations before the next task, not to duplicate that attach
+    synchronously on every Start click.
     """
 
     status_changed = Signal(str, str)
+    endpoint_observed = Signal(str)
     _POLL_MS = 1500
     _PROBE_TIMEOUT_MS = 6_000
+    _HOT_STATES = {"READY", "LOGIN"}
 
     def __init__(self, window: Any, *, port: int = DEFAULT_CDP_PORT) -> None:
         super().__init__(window)
@@ -49,9 +50,11 @@ class ManagedMakroBrowser(QObject):
         self.profile_dir = self.project_root / "browser_profiles" / "makro-edge"
 
         self._state = "CHECKING"
-        self._detail = "正在检查 Makro 浏览器"
+        self._detail = "正在后台检查 Makro 浏览器"
         self._launch_lock = threading.Lock()
         self._launch_thread: threading.Thread | None = None
+        self._endpoint_thread: threading.Thread | None = None
+        self._poison_thread: threading.Thread | None = None
         self._instance_token = ""
         self._generation = 0
         self._single_prepared_generation: int | None = None
@@ -68,6 +71,7 @@ class ManagedMakroBrowser(QObject):
         self._batch_label: QLabel | None = None
         self._install_status_labels()
         self.status_changed.connect(self._apply_status)
+        self.endpoint_observed.connect(self._apply_endpoint_observation)
 
         window.runner.start = self._start_single
         window.execution_runner.start = self._start_real
@@ -82,18 +86,14 @@ class ManagedMakroBrowser(QObject):
             self._batch_controller.start_execution = self._start_batch_execute
             self._batch_controller.failed.connect(self._observe_failure)
 
-        token = self._cdp_instance_token()
-        if token:
-            self._instance_token = token
-            self._emit_status("CHECKING", "检测到 Makro Browser · 正在验证自动化控制")
-        else:
-            self._emit_status("STARTING", "Makro Browser 未运行 · 正在自动启动")
-
+        self._emit_status("CHECKING", "正在后台验证 Makro Browser 自动化控制")
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(self._POLL_MS)
         self._poll_timer.timeout.connect(self._poll)
         self._poll_timer.start()
-        QTimer.singleShot(250, self.ensure_async)
+        # No network call occurs in __init__. Let the first paint/event turn finish,
+        # then warm the browser entirely on the lifecycle worker.
+        QTimer.singleShot(0, self.ensure_async)
 
     @property
     def generation(self) -> int:
@@ -161,6 +161,8 @@ class ManagedMakroBrowser(QObject):
             self._batch_label.setStyleSheet(f"color: {color};")
 
     def _cdp_instance_token(self) -> str:
+        """Blocking endpoint I/O; callers must be lifecycle workers only."""
+
         return cdp_endpoint_token(self.port, timeout_s=0.45)
 
     def _observe_instance(self, token: str) -> None:
@@ -198,6 +200,25 @@ class ManagedMakroBrowser(QObject):
             return False
         return looks_like_cdp_transport_failure(message)
 
+    def _mark_poisoned_async(self, message: str) -> None:
+        if self._poison_thread is not None and self._poison_thread.is_alive():
+            return
+        cached_token = self._instance_token
+
+        def worker() -> None:
+            mark_cdp_poisoned(
+                self.port,
+                endpoint_token=cached_token,
+                reason=message,
+            )
+
+        self._poison_thread = threading.Thread(
+            target=worker,
+            name="managed-makro-edge-poison-record",
+            daemon=True,
+        )
+        self._poison_thread.start()
+
     def _observe_failure(self, message: str) -> None:
         if self._looks_like_login_failure(message):
             self._emit_status(
@@ -206,8 +227,9 @@ class ManagedMakroBrowser(QObject):
             )
             return
         if self._looks_like_makro_cdp_failure(message):
-            token = self._cdp_instance_token()
-            mark_cdp_poisoned(self.port, endpoint_token=token, reason=message)
+            # Recording a poison marker may need an endpoint lookup when no cached
+            # token exists, so even the error path keeps that I/O off the Qt thread.
+            self._mark_poisoned_async(message)
             self._emit_status(
                 "POISONED",
                 "浏览器自动化通道失效 · 当前任务会安全失败，空闲后自动恢复",
@@ -236,11 +258,14 @@ class ManagedMakroBrowser(QObject):
         return True, ""
 
     def wait_for_update_quiesce(self, timeout_s: float = 20.0) -> tuple[bool, str]:
-        thread = self._launch_thread
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=max(0.0, float(timeout_s)))
-        if thread is not None and thread.is_alive():
-            return False, "Makro Browser 后台启动线程仍在运行，无法安全进入安装阶段。"
+        timeout = max(0.0, float(timeout_s))
+        current = threading.current_thread()
+        threads = (self._launch_thread, self._endpoint_thread, self._poison_thread)
+        for thread in threads:
+            if thread is not None and thread.is_alive() and thread is not current:
+                thread.join(timeout=timeout)
+        if any(thread is not None and thread.is_alive() for thread in threads):
+            return False, "Makro Browser 后台生命周期线程仍在运行，无法安全进入安装阶段。"
         if not self._update_quiesced:
             return False, "更新冻结状态意外解除。"
         return True, ""
@@ -265,6 +290,24 @@ class ManagedMakroBrowser(QObject):
                 "已有 Single/真实填写/Batch 浏览器工作域正在运行。"
                 "为保证一个 Makro Edge 只存在一个正式自动化工作域，请等待当前任务结束后再启动。"
             )
+
+    def _assert_cached_browser_ready(self) -> None:
+        """O(1) task-start gate using the background lifecycle's cached state."""
+
+        token = self._instance_token
+        if (
+            token
+            and self._state in self._HOT_STATES
+            and not poison_matches_current_generation(self.port, token)
+        ):
+            return
+        # Never turn Start back into a network wait. Ask the lifecycle worker to
+        # recover/verify and fail immediately with a deterministic UI message.
+        self.ensure_async()
+        raise RuntimeError(
+            "Makro Browser 正在后台启动或验证自动化控制。"
+            "界面不会再为浏览器探针卡住；状态变为 READY 后请直接再次点击启动。"
+        )
 
     def _recover_poisoned_locked(self, reason: str, previous_token: str) -> bool:
         if self._is_busy():
@@ -309,6 +352,8 @@ class ManagedMakroBrowser(QObject):
         return True
 
     def ensure_ready(self, reason: str = "task") -> bool:
+        """Blocking lifecycle operation. It is never called by a Start click."""
+
         if self._update_quiesced:
             raise RuntimeError("Makro Browser 已进入更新冻结状态，不能在安装前重新启动。")
 
@@ -381,16 +426,16 @@ class ManagedMakroBrowser(QObject):
                 ) from exc
 
     def ensure_async(self) -> None:
+        """Schedule full readiness work without performing any caller-thread I/O."""
+
         if self._update_quiesced or self._is_busy():
             return
         if self._launch_thread is not None and self._launch_thread.is_alive():
             return
-
-        token = self._cdp_instance_token()
         if (
-            token
-            and self._state == "READY"
-            and not poison_matches_current_generation(self.port, token)
+            self._instance_token
+            and self._state in self._HOT_STATES
+            and not poison_matches_current_generation(self.port, self._instance_token)
         ):
             return
 
@@ -408,9 +453,28 @@ class ManagedMakroBrowser(QObject):
         self._launch_thread.start()
 
     def _poll(self) -> None:
+        """Launch one non-blocking endpoint observation for this timer tick."""
+
         if self._update_quiesced:
             return
-        token = self._cdp_instance_token()
+        if self._endpoint_thread is not None and self._endpoint_thread.is_alive():
+            return
+
+        def worker() -> None:
+            token = self._cdp_instance_token()
+            self.endpoint_observed.emit(token)
+
+        self._endpoint_thread = threading.Thread(
+            target=worker,
+            name="managed-makro-edge-endpoint-poll",
+            daemon=True,
+        )
+        self._endpoint_thread.start()
+
+    def _apply_endpoint_observation(self, token: str) -> None:
+        if self._update_quiesced:
+            return
+        token = str(token or "").strip()
         if token:
             previous_generation = self._generation
             self._observe_instance(token)
@@ -443,7 +507,7 @@ class ManagedMakroBrowser(QObject):
                 self.ensure_async()
                 return
 
-            if self._state not in {"READY", "LOGIN"}:
+            if self._state not in self._HOT_STATES:
                 if self._is_busy():
                     return
                 self._emit_status("CHECKING", "CDP 端点在线 · 正在验证 Playwright automation")
@@ -463,8 +527,8 @@ class ManagedMakroBrowser(QObject):
 
     def _start_single(self, config: Any, *, mode: str = "full") -> Any:
         self._assert_task_start_allowed()
+        self._assert_cached_browser_ready()
         self._single_prepared_generation = None
-        self.ensure_ready("Single preparation")
         return self._original_single_start(config, mode=mode)
 
     def _single_prepared(self, result: Any) -> None:
@@ -474,7 +538,7 @@ class ManagedMakroBrowser(QObject):
 
     def _start_real(self, config: Any) -> Any:
         self._assert_task_start_allowed()
-        self.ensure_ready("Real execution")
+        self._assert_cached_browser_ready()
         if (
             self._single_prepared_generation is not None
             and self._single_prepared_generation != self._generation
@@ -494,7 +558,7 @@ class ManagedMakroBrowser(QObject):
     ) -> Any:
         assert self._original_batch_prepare is not None
         self._assert_task_start_allowed()
-        self.ensure_ready("Batch preparation")
+        self._assert_cached_browser_ready()
         self._batch_prepare_generation = self._generation
         return self._original_batch_prepare(
             urls,
@@ -511,7 +575,7 @@ class ManagedMakroBrowser(QObject):
     ) -> Any:
         assert self._original_batch_execute is not None
         self._assert_task_start_allowed()
-        self.ensure_ready("Batch execution")
+        self._assert_cached_browser_ready()
         if (
             self._batch_prepare_generation is not None
             and self._batch_prepare_generation != self._generation
