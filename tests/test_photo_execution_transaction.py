@@ -15,13 +15,18 @@ class FakePage:
 
 
 class FakePhotoAdapter:
-    def __init__(self, *, staged: int, initial_count: int = 0, capacity: int = 5) -> None:
+    def __init__(
+        self,
+        *,
+        outcomes: list[str],
+        initial_count: int = 0,
+        capacity: int = 5,
+    ) -> None:
         self.page = FakePage()
         self.expanded = False
-        self.initial_count = initial_count
         self.persisted_count = initial_count
         self.capacity = capacity
-        self.staged_result = staged
+        self.outcomes = list(outcomes)
         self.upload_calls: list[list[str]] = []
         self.save_calls = 0
         self.cancel_calls = 0
@@ -46,30 +51,31 @@ class FakePhotoAdapter:
         }
 
     def upload_product_photos(self, paths: list[str], *, timeout_ms: int):
-        assert self.expanded
         assert timeout_ms > 0
+        assert len(paths) == 1
+        self.expanded = True
         self.upload_calls.append(list(paths))
-        staged = min(self.staged_result, len(paths))
-        items = [
-            {
-                "path": path,
-                "status": "staged" if index < staged else "upload_error",
-                "slot_id": f"thumbnail_{index}",
-            }
-            for index, path in enumerate(paths)
-        ]
+        outcome = self.outcomes[len(self.upload_calls) - 1]
+        staged = 1 if outcome == "staged" else 0
         return SimpleNamespace(
             as_dict=lambda: {
-                "status": "staged" if staged == len(paths) else "partial_staged",
-                "attempted": len(paths),
+                "status": outcome,
+                "attempted": 1,
                 "staged": staged,
-                "items": items,
-                "detail": f"{staged}/{len(paths)} exact slots confirmed",
+                "items": [
+                    {
+                        "path": paths[0],
+                        "status": "staged" if staged else outcome,
+                        "slot_id": f"thumbnail_{self.persisted_count}",
+                    }
+                ],
+                "detail": outcome,
             }
         )
 
     def save_section(self, title: str) -> None:
         assert title == PRODUCT_PHOTOS
+        assert self.expanded
         self.save_calls += 1
         self.expanded = False
 
@@ -94,9 +100,9 @@ def _image(tmp_path: Path, name: str) -> str:
     return str(path)
 
 
-def test_run_photos_delegates_all_staging_to_one_exact_slot_transaction(tmp_path: Path) -> None:
+def test_run_photos_persists_each_accepted_image_before_starting_the_next(tmp_path: Path) -> None:
     images = [_image(tmp_path, "a.jpg"), _image(tmp_path, "b.jpg")]
-    adapter = FakePhotoAdapter(staged=2)
+    adapter = FakePhotoAdapter(outcomes=["staged", "staged"])
 
     report = run_photos(
         adapter,
@@ -106,17 +112,18 @@ def test_run_photos_delegates_all_staging_to_one_exact_slot_transaction(tmp_path
         run_dir=tmp_path,
     )
 
-    assert adapter.upload_calls == [[str(Path(path).resolve()) for path in images]]
-    assert adapter.save_calls == 1
+    assert adapter.upload_calls == [[str(Path(path).resolve())] for path in images]
+    assert adapter.save_calls == 2
     assert report["status"] == "persisted_verified"
     assert report["staged"] == 2
     assert report["persisted_this_run"] == 2
-    assert report["save_count"] == 1
+    assert report["save_count"] == 2
+    assert report["final_count"] == 2
 
 
-def test_run_photos_never_saves_a_partial_exact_slot_transaction(tmp_path: Path) -> None:
+def test_later_uncertain_image_cannot_erase_an_earlier_persisted_image(tmp_path: Path) -> None:
     images = [_image(tmp_path, "a.jpg"), _image(tmp_path, "b.jpg")]
-    adapter = FakePhotoAdapter(staged=1)
+    adapter = FakePhotoAdapter(outcomes=["staged", "post_submit_uncertain"])
 
     report = run_photos(
         adapter,
@@ -126,17 +133,19 @@ def test_run_photos_never_saves_a_partial_exact_slot_transaction(tmp_path: Path)
         run_dir=tmp_path,
     )
 
-    assert len(adapter.upload_calls) == 1
-    assert adapter.save_calls == 0
-    assert adapter.cancel_calls == 1
-    assert report["staged"] == 1
-    assert report["saved"] is False
-    assert report["cancelled_unsaved_partial"] is True
+    assert adapter.upload_calls == [[str(Path(path).resolve())] for path in images]
+    assert adapter.save_calls == 1
+    assert report["status"] == "persisted_verified"
+    assert report["persisted_this_run"] == 1
+    assert report["final_count"] == 1
+    assert report["saved"] is True
+    assert report["request_complete"] is False
+    assert str(Path(images[1]).resolve()) in report["cancelled_image_transactions"]
 
 
-def test_run_photos_capacity_is_decided_before_exact_slot_transaction(tmp_path: Path) -> None:
+def test_capacity_omission_never_rolls_back_the_last_available_slot(tmp_path: Path) -> None:
     images = [_image(tmp_path, "a.jpg"), _image(tmp_path, "b.jpg")]
-    adapter = FakePhotoAdapter(staged=1, initial_count=4, capacity=5)
+    adapter = FakePhotoAdapter(outcomes=["staged"], initial_count=4, capacity=5)
 
     report = run_photos(
         adapter,
@@ -147,6 +156,7 @@ def test_run_photos_capacity_is_decided_before_exact_slot_transaction(tmp_path: 
     )
 
     assert adapter.upload_calls == [[str(Path(images[0]).resolve())]]
+    assert adapter.save_calls == 1
     assert report["capacity_limited"] is True
     assert report["omitted_count"] == 1
     assert report["status"] == "persisted_verified"
