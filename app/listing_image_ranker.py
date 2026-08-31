@@ -8,12 +8,25 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .image_media import has_decodable_image_pixels
+from .product_identity import ProductIdentity, infer_product_identity
 from .providers.usage_telemetry import usage_request_context
-from .source_snapshot import source_snapshot_from_json
+from .source_snapshot import SourceSnapshot, source_snapshot_from_json
 
 
-LISTING_IMAGE_RANKING_VERSION = 5
+LISTING_IMAGE_RANKING_VERSION = 6
 MAX_AUTO_LISTING_IMAGES = 5
+
+_IMAGE_OWNERSHIP_CLASSES = (
+    "EXACT_TARGET",
+    "TARGET_PACKAGING_OR_DETAIL",
+    "SAME_PRODUCT_OTHER_VARIANT",
+    "OTHER_PRODUCT",
+    "PAGE_ASSET",
+    "UNCERTAIN",
+)
+_AUTO_ELIGIBLE_OWNERSHIP_CLASSES = frozenset(
+    {"EXACT_TARGET", "TARGET_PACKAGING_OR_DETAIL"}
+)
 
 
 class ListingImageRankingError(RuntimeError):
@@ -34,7 +47,7 @@ class _Candidate:
     sha256: str
     source_index: int
 
-    def as_source(self) -> dict[str, str]:
+    def as_source(self) -> dict[str, Any]:
         return {
             "source_id": self.image_id,
             "source_type": "supplier_listing_image_candidate",
@@ -42,6 +55,28 @@ class _Candidate:
             "origin": str(self.path),
             "image_path": str(self.path),
             "sha256": self.sha256,
+            "source_index": self.source_index,
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class ImageOwnershipDecision:
+    image_id: str
+    classification: str
+    confidence: float
+    reason: str
+
+    @property
+    def auto_eligible(self) -> bool:
+        return self.classification in _AUTO_ELIGIBLE_OWNERSHIP_CLASSES
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "image_id": self.image_id,
+            "classification": self.classification,
+            "confidence": self.confidence,
+            "reason": self.reason,
+            "auto_eligible": self.auto_eligible,
         }
 
 
@@ -67,6 +102,20 @@ class ListingImageRankingResult:
     mechanical_candidate_count: int
     semantically_rejected_count: int
     selection_report: Path | None
+
+
+@dataclass(slots=True, frozen=True)
+class _ParsedOwnership:
+    decisions: dict[str, ImageOwnershipDecision]
+    summary: str
+
+    @property
+    def eligible_ids(self) -> tuple[str, ...]:
+        return tuple(
+            image_id
+            for image_id, decision in self.decisions.items()
+            if decision.auto_eligible
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -138,12 +187,12 @@ def _build_candidates(
     *,
     excluded_paths: set[Path] | None = None,
 ) -> tuple[list[_Candidate], list[dict[str, Any]]]:
-    """Build the AI candidate universe with transport and ownership checks only.
+    """Build a broad candidate universe using transport facts only.
 
-    Product meaning, importance, visual similarity, main-image quality and gallery
-    ordering deliberately do not exist in this layer. A supplier image only needs
-    to contain decodable pixels. Exact byte-identical copies are collapsed because
-    sending the exact same payload twice cannot add semantic information.
+    Product meaning never exists here. Any decodable supplier image may reach the
+    ownership AI. Exact byte-identical copies are collapsed because they add no
+    semantic information, and explicit customer auxiliary images stay outside the
+    automatic Product Photos intent boundary.
     """
 
     excluded = excluded_paths or set()
@@ -202,33 +251,171 @@ def _build_candidates(
     return candidates, rejected
 
 
-def _product_context(manifest: dict[str, Any]) -> dict[str, Any]:
+def _source_snapshot(manifest: dict[str, Any]) -> SourceSnapshot:
     outputs = manifest.get("outputs") or {}
-    snapshot_path = Path(str(outputs.get("primary_source_snapshot") or "")).expanduser()
-    context: dict[str, Any] = {
-        "product_url": str(manifest.get("primary_product_url") or "").strip(),
-        "page_title": "",
-        "specifications": [],
-        "page_text_excerpt": "",
-    }
+    if not isinstance(outputs, dict):
+        raise ListingImageRankingError("resolver manifest outputs must be an object")
+    snapshot_text = str(outputs.get("primary_source_snapshot") or "").strip()
+    if not snapshot_text:
+        raise ListingImageRankingError("primary_source_snapshot is required for safe image ownership")
+    snapshot_path = Path(snapshot_text).expanduser().resolve()
     if not snapshot_path.is_file():
-        return context
+        raise ListingImageRankingError(f"primary source snapshot not found: {snapshot_path}")
     try:
-        snapshot = source_snapshot_from_json(snapshot_path)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return context
-    context["product_url"] = snapshot.final_url or snapshot.requested_url or context["product_url"]
-    context["page_title"] = _compact_text(snapshot.title, 800)
-    context["specifications"] = [
-        {
-            "key": _compact_text(row.key, 100),
-            "value": _compact_text(row.value, 220),
-        }
-        for row in snapshot.table_rows[:40]
-        if row.key or row.value
-    ]
-    context["page_text_excerpt"] = _compact_text(snapshot.visible_text, 6000)
-    return context
+        return source_snapshot_from_json(snapshot_path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ListingImageRankingError(f"invalid primary source snapshot: {snapshot_path}") from exc
+
+
+def _infer_target_product(
+    provider: JSONTaskProvider,
+    snapshot: SourceSnapshot,
+) -> ProductIdentity:
+    """Create the image target from product-focused evidence, never page body text or candidate pixels."""
+
+    with usage_request_context(
+        task="infer_grounded_supplier_product_identity",
+        provider=str(getattr(provider, "name", "")),
+        model=str(getattr(provider, "model", "")),
+    ):
+        return infer_product_identity(provider, snapshot, image_paths=())
+
+
+def _ownership_schema(candidate_ids: list[str]) -> dict[str, Any]:
+    decision_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "classification": {
+                "type": "string",
+                "enum": list(_IMAGE_OWNERSHIP_CLASSES),
+            },
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "reason": {"type": "string", "minLength": 1},
+        },
+        "required": ["classification", "confidence", "reason"],
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "decisions": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {image_id: decision_schema for image_id in candidate_ids},
+                "required": candidate_ids,
+            },
+            "summary": {"type": "string"},
+        },
+        "required": ["decisions", "summary"],
+    }
+
+
+def build_listing_image_ownership_request(
+    *,
+    product_context: dict[str, Any],
+    candidates: list[_Candidate],
+) -> dict[str, Any]:
+    """Ask AI only whether each broad supplier image belongs to the exact sale unit."""
+
+    candidate_ids = [candidate.image_id for candidate in candidates]
+    return {
+        "task": "classify_supplier_listing_image_ownership",
+        "system_instruction": (
+            "You are the semantic ownership gate for ecommerce Product Photos. Inspect every candidate image "
+            "against one already-grounded target product identity. Classify what each image actually depicts. "
+            "Do not rank photos and do not try to fill a gallery quota. JSON only."
+        ),
+        "prompt_instruction": (
+            "Classify every image_id independently, while comparing the candidates together when useful. "
+            "Precision is more important than recall: when exact target ownership or exact variant cannot be "
+            "verified, use UNCERTAIN or SAME_PRODUCT_OTHER_VARIANT instead of promoting the image."
+        ),
+        "context": {
+            "target_product": product_context,
+            "candidate_image_ids": candidate_ids,
+            "auto_eligible_classifications": sorted(_AUTO_ELIGIBLE_OWNERSHIP_CLASSES),
+        },
+        "rules": [
+            "Inspect the actual pixels of every supplied candidate before classifying it.",
+            "EXACT_TARGET means the image depicts the exact sellable target product and exact supported variant/configuration.",
+            "TARGET_PACKAGING_OR_DETAIL means packaging, a close detail, dimensions, an in-use view, or an included component that clearly belongs to this exact target sale unit.",
+            "Use SAME_PRODUCT_OTHER_VARIANT for a different colour, size, model, count, flavour, configuration, bundle or other sellable variant even when the product family is the same.",
+            "Use OTHER_PRODUCT for recommendations, related products, accessories not included in the sale unit, or any different sellable product.",
+            "Use PAGE_ASSET for logos, banners, navigation graphics, seller decoration, advertisements or other non-product page media.",
+            "Use UNCERTAIN whenever pixels and target identity do not establish exact ownership strongly enough for an automatic marketplace upload.",
+            "For kits or bundles, a component is TARGET_PACKAGING_OR_DETAIL only when target_product explicitly supports that component as part of the offered sale unit.",
+            "Do not use candidate/source order as evidence that an image belongs to the target product.",
+            "A visually similar item is not enough: exact product/variant ownership is required for automatic upload eligibility.",
+            "Return one decision for every candidate_image_id and no others.",
+        ],
+        "target_fields": [],
+        "grounded_sources": [candidate.as_source() for candidate in candidates],
+        "json_contract": _ownership_schema(candidate_ids),
+        "strict_json_schema": True,
+    }
+
+
+def _parse_ownership(raw: Any, candidates: list[_Candidate]) -> _ParsedOwnership:
+    if not isinstance(raw, dict):
+        raise ListingImageRankingError("listing image ownership AI returned no JSON object")
+
+    expected = [candidate.image_id for candidate in candidates]
+    expected_set = set(expected)
+    raw_decisions = raw.get("decisions")
+    if not isinstance(raw_decisions, dict) or set(raw_decisions) != expected_set:
+        raise ListingImageRankingError(
+            "listing image ownership AI did not return the exact candidate decision partition"
+        )
+
+    decisions: dict[str, ImageOwnershipDecision] = {}
+    for image_id in expected:
+        item = raw_decisions.get(image_id)
+        if not isinstance(item, dict):
+            raise ListingImageRankingError(f"{image_id} ownership decision must be an object")
+        classification = _compact_text(item.get("classification"), 80).upper()
+        if classification not in _IMAGE_OWNERSHIP_CLASSES:
+            raise ListingImageRankingError(
+                f"{image_id}.classification is invalid: {classification!r}"
+            )
+        try:
+            confidence = float(item.get("confidence"))
+        except (TypeError, ValueError) as exc:
+            raise ListingImageRankingError(
+                f"{image_id}.confidence must be numeric"
+            ) from exc
+        if not 0.0 <= confidence <= 1.0:
+            raise ListingImageRankingError(
+                f"{image_id}.confidence must be within 0..1"
+            )
+        reason = _compact_text(item.get("reason"), 800)
+        if not reason:
+            raise ListingImageRankingError(f"{image_id}.reason is required")
+        decisions[image_id] = ImageOwnershipDecision(
+            image_id=image_id,
+            classification=classification,
+            confidence=confidence,
+            reason=reason,
+        )
+
+    return _ParsedOwnership(
+        decisions=decisions,
+        summary=_compact_text(raw.get("summary"), 1200),
+    )
+
+
+def _run_ownership_request(
+    provider: JSONTaskProvider,
+    request: dict[str, Any],
+    candidates: list[_Candidate],
+) -> _ParsedOwnership:
+    with usage_request_context(
+        task=str(request.get("task") or ""),
+        provider=str(getattr(provider, "name", "")),
+        model=str(getattr(provider, "model", "")),
+    ):
+        raw = provider.extract_json(request)
+    return _parse_ownership(raw, candidates)
 
 
 def _ranking_schema(candidate_ids: list[str]) -> dict[str, Any]:
@@ -267,42 +454,48 @@ def build_listing_image_ranking_request(
     *,
     product_context: dict[str, Any],
     candidates: list[_Candidate],
+    ownership: _ParsedOwnership | None = None,
 ) -> dict[str, Any]:
-    """Ask one multimodal model to make the complete photo decision.
-
-    The model sees every supplier candidate image together. `selected_image_ids` is
-    already the final upload order; Python never applies a second role table, score
-    formula, visual fingerprint, background heuristic or source-order ranking.
-    """
+    """Reinspect only ownership-approved images and produce the final upload order."""
 
     candidate_ids = [candidate.image_id for candidate in candidates]
+    ownership_context = {
+        candidate.image_id: (
+            ownership.decisions[candidate.image_id].as_dict()
+            if ownership is not None and candidate.image_id in ownership.decisions
+            else {}
+        )
+        for candidate in candidates
+    }
     return {
-        "task": "select_and_order_supplier_listing_images",
+        "task": "verify_and_order_exact_supplier_gallery",
         "system_instruction": (
-            "You are the sole semantic decision maker for ecommerce listing photos. "
-            "Inspect all supplied candidate images together with the exact target-product context. "
-            "Decide which images belong in the final listing, remove unrelated or redundant images, "
-            "and return the final upload order. The first selected image is the main product photo. JSON only."
+            "You are the final consistency verifier for ecommerce Product Photos. Every supplied image already "
+            "passed a separate ownership classification, but you must independently reinspect the pixels and may "
+            "reject any residual wrong product, wrong variant or misleading image. Return the exact final upload "
+            "order. JSON only."
         ),
         "prompt_instruction": (
-            "Return selected_image_ids in the exact order they should be uploaded. Choose up to five useful images. "
-            "Prefer a strong clear main-product image first, then the most useful non-redundant supporting views. "
-            "Do not return zero merely because images are imperfect; return zero only when none are genuinely useful "
-            "for the exact target product."
+            "Return selected_image_ids in the exact order they should be uploaded, with at most five images. "
+            "Choose fewer images whenever that is safer. One correct photo is better than five photos containing "
+            "one wrong product or wrong variant. Never fill a quota."
         ),
         "context": {
             "target_product": product_context,
+            "ownership_decisions": ownership_context,
             "candidate_image_ids": candidate_ids,
         },
         "rules": [
-            "Inspect the actual pixels of every supplied candidate before deciding.",
+            "Inspect the actual pixels of every supplied candidate again before deciding.",
             "selected_image_ids is the final gallery order and must contain no more than five image_ids.",
-            "Position 1 must be the best available main image of the exact sellable product.",
-            "Exclude unrelated products, recommendations, wrong models or variants, seller/page graphics and other images that do not help this exact listing.",
-            "Treat visual duplication and near-duplication as a semantic judgment: keep the better or more informative version instead of filling slots with repeated content.",
-            "Prefer useful variety such as another product view, detail, dimensions, included items, packaging or in-use context when it adds information.",
+            "Every selected image must remain consistent with the exact target product and exact supported variant/configuration.",
+            "Reject any residual unrelated product, recommendation, wrong variant, misleading accessory or page asset even if the ownership pass admitted it.",
+            "Position 1 should be the strongest clear main image of the exact sale unit when one exists.",
+            "Supporting images may show verified details, dimensions, packaging, included components or in-use context when they add useful non-redundant information.",
+            "Treat visual duplication and near-duplication as a semantic judgment and keep the better or more informative version.",
             "Do not use input/source order as evidence of importance.",
-            "Return one decision for every candidate image_id. selected=true must match membership in selected_image_ids exactly.",
+            "Empty selection is valid when no candidate remains safe enough for an automatic Product Photos upload; there is no minimum quota.",
+            "Return one decision for every candidate_image_id. selected=true must match membership in selected_image_ids exactly.",
         ],
         "target_fields": [],
         "grounded_sources": [candidate.as_source() for candidate in candidates],
@@ -311,33 +504,9 @@ def build_listing_image_ranking_request(
     }
 
 
-def _build_zero_confirmation_request(request: dict[str, Any]) -> dict[str, Any]:
-    """Require a fresh multimodal adjudication before deleting the whole gallery."""
-
-    return {
-        **request,
-        "task": "confirm_empty_supplier_listing_gallery",
-        "prompt_instruction": (
-            "A previous pass proposed selecting zero supplier photos. Reinspect the actual pixels of every candidate "
-            "against the exact target-product context. Empty selection is destructive because it suppresses automatic "
-            "Product Photos. Return zero ONLY if every candidate is clearly unrelated, the wrong product/model/variant, "
-            "or non-product media. Imperfect composition, secondary views, packaging, weak backgrounds, or mild "
-            "redundancy are NOT reasons to reject every image. If any candidate genuinely depicts the exact target "
-            "product, select the best one to five and order them for upload."
-        ),
-        "rules": [
-            "This is an independent zero-selection confirmation; inspect every supplied image again.",
-            "If at least one candidate genuinely depicts the exact target product, selected_image_ids must not be empty.",
-            "Zero is allowed only when every candidate is clearly unusable for this exact listing because it is unrelated, wrong-product/wrong-variant, or non-product media.",
-            "Do not reject all candidates merely for imperfect image quality, packaging, secondary angle, background, or redundancy.",
-            "Return one decision for every candidate image_id. selected=true must match membership in selected_image_ids exactly.",
-        ],
-    }
-
-
 def _parse_ranking(raw: Any, candidates: list[_Candidate]) -> _ParsedRanking:
     if not isinstance(raw, dict):
-        raise ListingImageRankingError("listing image AI returned no JSON object")
+        raise ListingImageRankingError("listing image gallery AI returned no JSON object")
 
     expected = [candidate.image_id for candidate in candidates]
     expected_set = set(expected)
@@ -356,16 +525,18 @@ def _parse_ranking(raw: Any, candidates: list[_Candidate]) -> _ParsedRanking:
 
     raw_decisions = raw.get("decisions")
     if not isinstance(raw_decisions, dict) or set(raw_decisions) != expected_set:
-        raise ListingImageRankingError("listing image AI did not return the exact candidate decision partition")
+        raise ListingImageRankingError(
+            "listing image gallery AI did not return the exact candidate decision partition"
+        )
 
     decisions: dict[str, RankedImageDecision] = {}
     selected_set = set(selected_ids)
     for image_id in expected:
         item = raw_decisions.get(image_id)
         if not isinstance(item, dict):
-            raise ListingImageRankingError(f"{image_id} decision must be an object")
+            raise ListingImageRankingError(f"{image_id} gallery decision must be an object")
         selected = item.get("selected")
-        reason = _compact_text(item.get("reason"), 600)
+        reason = _compact_text(item.get("reason"), 800)
         if type(selected) is not bool:
             raise ListingImageRankingError(f"{image_id}.selected must be boolean")
         if not reason:
@@ -405,61 +576,138 @@ def _selection_report(
     *,
     candidates: list[_Candidate],
     transport_rejected: list[dict[str, Any]],
+    identity: ProductIdentity | None,
+    ownership: _ParsedOwnership | None,
     ranking: _ParsedRanking | None,
+    status: str,
+    error: BaseException | None = None,
 ) -> dict[str, Any]:
+    by_id = {candidate.image_id: candidate for candidate in candidates}
     selected_ids = list(ranking.selected_ids) if ranking is not None else []
-    selected_set = set(selected_ids)
     return {
-        "schema_version": 6,
+        "schema_version": 7,
+        "status": status,
         "policy": {
             "version": LISTING_IMAGE_RANKING_VERSION,
-            "kind": "ai-owned-multimodal-listing-photo-selection",
+            "kind": "grounded-identity-two-stage-ai-listing-photo-selection",
             "max_auto_listing_images": MAX_AUTO_LISTING_IMAGES,
             "pre_ai_filter": "explicit-ownership-boundary-plus-decodable-image-and-exact-byte-duplicate-only",
-            "semantic_owner": "multimodal_ai",
-            "duplicate_owner": "multimodal_ai_except_exact_byte_duplicates",
+            "target_identity_source": "product-focused-structured-supplier-evidence-without-page-body-or-candidate-images",
+            "ownership_semantic_owner": "multimodal_ai",
+            "gallery_semantic_owner": "multimodal_ai",
+            "auto_eligible_ownership_classes": sorted(_AUTO_ELIGIBLE_OWNERSHIP_CLASSES),
+            "precision_policy": "fewer_correct_images_over_quota_fill",
             "ordering": "selected_image_ids_verbatim",
-            "empty_selection": "requires_second_independent_multimodal_confirmation",
+            "semantic_failure": "fail_closed_empty_automatic_gallery",
+            "program_semantic_fallback": "none",
         },
+        "target_product_identity": identity.as_dict() if identity is not None else None,
         "candidate_count": len(candidates),
         "transport_rejected": transport_rejected,
+        "ownership_summary": ownership.summary if ownership is not None else "",
+        "gallery_summary": ranking.summary if ranking is not None else "",
         "selected_ids": selected_ids,
-        "selected": [
-            str(candidate.path)
-            for candidate in candidates
-            if candidate.image_id in selected_set
-        ],
-        "summary": ranking.summary if ranking is not None else "",
-        "decisions": [
+        "selected": [str(by_id[image_id].path) for image_id in selected_ids if image_id in by_id],
+        "candidates": [
             {
                 "image_id": candidate.image_id,
                 "path": str(candidate.path),
                 "source_index": candidate.source_index,
                 "sha256": candidate.sha256,
-                **(
+                "ownership": (
+                    ownership.decisions[candidate.image_id].as_dict()
+                    if ownership is not None and candidate.image_id in ownership.decisions
+                    else None
+                ),
+                "gallery": (
                     ranking.decisions[candidate.image_id].as_dict()
-                    if ranking is not None
-                    else {"selected": False, "reason": "AI ranking not run"}
+                    if ranking is not None and candidate.image_id in ranking.decisions
+                    else None
                 ),
             }
             for candidate in candidates
         ],
+        "error": (
+            {
+                "type": type(error).__name__,
+                "message": _compact_text(error, 1600),
+            }
+            if error is not None
+            else None
+        ),
     }
+
+
+def _publish_manifest_state(
+    *,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    outputs: dict[str, Any],
+    selection_path: Path,
+    selected_paths: tuple[Path, ...],
+    status: str,
+    model_calls: int,
+    candidates: list[_Candidate],
+    transport_rejected: list[dict[str, Any]],
+    ownership: _ParsedOwnership | None,
+    ranking: _ParsedRanking | None,
+    error: BaseException | None = None,
+) -> None:
+    outputs["primary_source_listing_images"] = [str(path) for path in selected_paths]
+    outputs["primary_source_listing_image_selection"] = str(selection_path)
+    manifest["outputs"] = outputs
+
+    source_capture = manifest.get("source_capture") or {}
+    if isinstance(source_capture, dict):
+        source_capture["listing_image_policy_version"] = LISTING_IMAGE_RANKING_VERSION
+        source_capture["listing_images_selected"] = len(selected_paths)
+        source_capture["listing_images"] = [str(path) for path in selected_paths]
+        source_capture["listing_images_rejected"] = len(candidates) - len(selected_paths)
+        manifest["source_capture"] = source_capture
+
+    eligible_count = len(ownership.eligible_ids) if ownership is not None else 0
+    manifest["listing_image_ranking"] = {
+        "version": LISTING_IMAGE_RANKING_VERSION,
+        "status": status,
+        "strategy": "grounded_identity_then_ai_ownership_then_gallery_verification",
+        "precision_first": True,
+        "model_calls": model_calls,
+        "candidate_count": len(candidates),
+        "transport_rejected_count": len(transport_rejected),
+        "ownership_eligible_count": eligible_count,
+        "semantic_rejected_count": len(candidates) - len(selected_paths),
+        "selected_count": len(selected_paths),
+        "selected": [str(path) for path in selected_paths],
+        "selected_ids": list(ranking.selected_ids) if ranking is not None else [],
+        "selection_report": str(selection_path),
+        "error": (
+            {
+                "type": type(error).__name__,
+                "message": _compact_text(error, 1600),
+            }
+            if error is not None
+            else None
+        ),
+    }
+    manifest["total_model_calls"] = int(manifest.get("total_model_calls") or 0) + model_calls
+    _write_json_atomic(manifest_path, manifest)
 
 
 def finalize_supplier_listing_images(
     run_dir: str | Path,
     provider: JSONTaskProvider,
 ) -> ListingImageRankingResult:
-    """Let multimodal AI own supplier listing-photo relevance and final order.
+    """Select automatic Product Photos with two independent semantic AI stages.
 
-    This stage intentionally has no Python-side image-role priority, importance
-    score, white-background score, entropy score, visual similarity threshold or
-    source-order preference. Pre-AI exclusions are limited to explicit customer
-    auxiliary ownership, technical failures and exact byte-identical copies. A
-    destructive all-zero semantic result requires a second independent multimodal
-    confirmation. If either AI call fails, the caller keeps the prior mechanical
-    compatibility result because this function has not published a new manifest yet.
+    Acquisition remains intentionally broad and mechanical. The first AI stage
+    establishes exact image ownership against a clean target-product identity. The
+    second AI stage sees only ownership-approved candidates, independently verifies
+    consistency and emits the final 0..5 upload order. Python never re-ranks, fills
+    a quota, substitutes candidates or rescues an empty semantic result.
+
+    Any semantic/AI failure is fail-closed: the published automatic gallery becomes
+    empty before the exception returns to the caller, so an old mechanical candidate
+    list can never silently reach Makro Product Photos.
     """
 
     root = Path(run_dir).expanduser().resolve()
@@ -495,31 +743,28 @@ def finalize_supplier_listing_images(
     ).expanduser().resolve()
 
     if not candidates:
-        outputs["primary_source_listing_images"] = []
-        outputs["primary_source_listing_image_selection"] = str(selection_path)
-        manifest["outputs"] = outputs
         report = _selection_report(
             candidates=candidates,
             transport_rejected=transport_rejected,
+            identity=None,
+            ownership=None,
+            ranking=None,
+            status="no_transport_candidates",
+        )
+        _write_json_atomic(selection_path, report)
+        _publish_manifest_state(
+            manifest_path=manifest_path,
+            manifest=manifest,
+            outputs=outputs,
+            selection_path=selection_path,
+            selected_paths=(),
+            status="no_transport_candidates",
+            model_calls=0,
+            candidates=candidates,
+            transport_rejected=transport_rejected,
+            ownership=None,
             ranking=None,
         )
-        report["zero_selection_confirmation"] = {
-            "performed": False,
-            "confirmed_empty": True,
-            "reason": "no_transport_candidates",
-        }
-        _write_json_atomic(selection_path, report)
-        manifest["listing_image_ranking"] = {
-            "version": LISTING_IMAGE_RANKING_VERSION,
-            "status": "no_transport_candidates",
-            "strategy": "multimodal_ai_owns_semantics_and_order",
-            "model_calls": 0,
-            "candidate_count": 0,
-            "transport_rejected_count": len(transport_rejected),
-            "selected_count": 0,
-            "selection_report": str(selection_path),
-        }
-        _write_json_atomic(manifest_path, manifest)
         return ListingImageRankingResult(
             status="no_transport_candidates",
             selected=(),
@@ -529,70 +774,95 @@ def finalize_supplier_listing_images(
             selection_report=selection_path,
         )
 
-    request = build_listing_image_ranking_request(
-        product_context=_product_context(manifest),
-        candidates=candidates,
-    )
-    ranking = _run_ranking_request(provider, request, candidates)
-    model_calls = 1
-    zero_confirmation_performed = False
-    first_pass_summary = ranking.summary
+    model_calls = 0
+    identity: ProductIdentity | None = None
+    ownership: _ParsedOwnership | None = None
+    ranking: _ParsedRanking | None = None
 
-    if not ranking.selected_ids:
-        zero_confirmation_performed = True
-        confirmation_request = _build_zero_confirmation_request(request)
-        ranking = _run_ranking_request(provider, confirmation_request, candidates)
+    try:
+        snapshot = _source_snapshot(manifest)
         model_calls += 1
+        identity = _infer_target_product(provider, snapshot)
+        product_context = identity.as_dict()
 
-    by_id = {candidate.image_id: candidate for candidate in candidates}
-    selected_candidates = [by_id[image_id] for image_id in ranking.selected_ids]
-    selected_paths = tuple(candidate.path for candidate in selected_candidates)
-    report = _selection_report(
-        candidates=candidates,
-        transport_rejected=transport_rejected,
-        ranking=ranking,
-    )
-    report["selected"] = [str(candidate.path) for candidate in selected_candidates]
-    report["zero_selection_confirmation"] = {
-        "performed": zero_confirmation_performed,
-        "confirmed_empty": bool(zero_confirmation_performed and not selected_paths),
-        "first_pass_summary": first_pass_summary if zero_confirmation_performed else "",
-        "final_summary": ranking.summary,
-    }
-    _write_json_atomic(selection_path, report)
+        ownership_request = build_listing_image_ownership_request(
+            product_context=product_context,
+            candidates=candidates,
+        )
+        model_calls += 1
+        ownership = _run_ownership_request(provider, ownership_request, candidates)
 
-    outputs["primary_source_listing_images"] = [str(path) for path in selected_paths]
-    outputs["primary_source_listing_image_selection"] = str(selection_path)
-    manifest["outputs"] = outputs
+        eligible_set = set(ownership.eligible_ids)
+        eligible_candidates = [
+            candidate for candidate in candidates if candidate.image_id in eligible_set
+        ]
 
-    source_capture = manifest.get("source_capture") or {}
-    if isinstance(source_capture, dict):
-        source_capture["listing_image_policy_version"] = LISTING_IMAGE_RANKING_VERSION
-        source_capture["listing_images_selected"] = len(selected_paths)
-        source_capture["listing_images"] = [str(path) for path in selected_paths]
-        source_capture["listing_images_rejected"] = len(candidates) - len(selected_paths)
-        manifest["source_capture"] = source_capture
+        if eligible_candidates:
+            ranking_request = build_listing_image_ranking_request(
+                product_context=product_context,
+                candidates=eligible_candidates,
+                ownership=ownership,
+            )
+            model_calls += 1
+            ranking = _run_ranking_request(provider, ranking_request, eligible_candidates)
+            by_id = {candidate.image_id: candidate for candidate in eligible_candidates}
+            selected_paths = tuple(by_id[image_id].path for image_id in ranking.selected_ids)
+            status = "ai_ranked" if selected_paths else "ai_ranked_empty"
+        else:
+            selected_paths = ()
+            status = "ai_ownership_empty"
 
-    manifest["listing_image_ranking"] = {
-        "version": LISTING_IMAGE_RANKING_VERSION,
-        "status": "ai_ranked",
-        "strategy": "multimodal_ai_owns_semantics_duplicates_and_order_with_confirmed_empty_gallery",
-        "model_calls": model_calls,
-        "zero_selection_confirmation_performed": zero_confirmation_performed,
-        "zero_selection_confirmed": bool(zero_confirmation_performed and not selected_paths),
-        "candidate_count": len(candidates),
-        "transport_rejected_count": len(transport_rejected),
-        "semantic_rejected_count": len(candidates) - len(selected_paths),
-        "selected_count": len(selected_paths),
-        "selected": [str(path) for path in selected_paths],
-        "selected_ids": list(ranking.selected_ids),
-        "selection_report": str(selection_path),
-    }
-    manifest["total_model_calls"] = int(manifest.get("total_model_calls") or 0) + model_calls
-    _write_json_atomic(manifest_path, manifest)
+        report = _selection_report(
+            candidates=candidates,
+            transport_rejected=transport_rejected,
+            identity=identity,
+            ownership=ownership,
+            ranking=ranking,
+            status=status,
+        )
+        _write_json_atomic(selection_path, report)
+        _publish_manifest_state(
+            manifest_path=manifest_path,
+            manifest=manifest,
+            outputs=outputs,
+            selection_path=selection_path,
+            selected_paths=selected_paths,
+            status=status,
+            model_calls=model_calls,
+            candidates=candidates,
+            transport_rejected=transport_rejected,
+            ownership=ownership,
+            ranking=ranking,
+        )
+    except Exception as exc:
+        report = _selection_report(
+            candidates=candidates,
+            transport_rejected=transport_rejected,
+            identity=identity,
+            ownership=ownership,
+            ranking=ranking,
+            status="failed_closed",
+            error=exc,
+        )
+        _write_json_atomic(selection_path, report)
+        _publish_manifest_state(
+            manifest_path=manifest_path,
+            manifest=manifest,
+            outputs=outputs,
+            selection_path=selection_path,
+            selected_paths=(),
+            status="failed_closed",
+            model_calls=model_calls,
+            candidates=candidates,
+            transport_rejected=transport_rejected,
+            ownership=ownership,
+            ranking=ranking,
+            error=exc,
+        )
+        raise
 
     return ListingImageRankingResult(
-        status="ai_ranked",
+        status=status,
         selected=selected_paths,
         model_calls=model_calls,
         mechanical_candidate_count=len(candidates),
@@ -604,9 +874,11 @@ def finalize_supplier_listing_images(
 __all__ = [
     "LISTING_IMAGE_RANKING_VERSION",
     "MAX_AUTO_LISTING_IMAGES",
+    "ImageOwnershipDecision",
     "ListingImageRankingError",
     "ListingImageRankingResult",
     "RankedImageDecision",
+    "build_listing_image_ownership_request",
     "build_listing_image_ranking_request",
     "finalize_supplier_listing_images",
 ]
