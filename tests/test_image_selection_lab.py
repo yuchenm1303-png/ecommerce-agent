@@ -140,7 +140,7 @@ def test_cached_provider_replay_never_falls_through_to_network(tmp_path: Path) -
         replay.extract_json(changed)
 
 
-def test_cache_file_never_contains_local_image_path(tmp_path: Path) -> None:
+def test_cache_file_never_contains_local_image_path_and_image_sha_is_keyed(tmp_path: Path) -> None:
     fake = _FakeProvider()
     provider = CachedProvider(
         delegate=fake,
@@ -150,26 +150,36 @@ def test_cache_file_never_contains_local_image_path(tmp_path: Path) -> None:
         provider_identity={"provider": "fake", "model": "fake-model"},
     )
     private_path = "D:/customer/private/supplier.jpg"
-    provider.extract_json(
-        {
-            "task": "x",
-            "grounded_sources": [
-                {
-                    "source_id": "image_1",
-                    "source_type": "candidate",
-                    "kind": "image",
-                    "image_path": private_path,
-                    "origin": private_path,
-                    "sha256": "deadbeef",
-                    "source_index": 1,
-                }
-            ],
-        }
-    )
+    request = {
+        "task": "x",
+        "grounded_sources": [
+            {
+                "source_id": "image_1",
+                "source_type": "candidate",
+                "kind": "image",
+                "image_path": private_path,
+                "origin": private_path,
+                "sha256": "deadbeef",
+                "source_index": 1,
+            }
+        ],
+    }
 
-    cache_text = next(tmp_path.rglob("*.json")).read_text(encoding="utf-8")
+    provider.extract_json(request)
+
+    cache_files = sorted(tmp_path.rglob("*.json"))
+    assert len(cache_files) == 1
+    cache_text = cache_files[0].read_text(encoding="utf-8")
     assert private_path not in cache_text
-    assert "deadbeef" in cache_text
+    assert "deadbeef" not in cache_text
+    assert "request_fingerprint" in cache_text
+
+    changed_image = json.loads(json.dumps(request))
+    changed_image["grounded_sources"][0]["sha256"] = "feedface"
+    provider.extract_json(changed_image)
+
+    assert fake.calls == 2
+    assert len(list(tmp_path.rglob("*.json"))) == 2
 
 
 def test_import_case_never_promotes_previous_ai_prediction_to_ground_truth(tmp_path: Path) -> None:
