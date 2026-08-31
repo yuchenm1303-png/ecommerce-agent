@@ -14,6 +14,7 @@ RUNTIME_HOOK = (ROOT / "packaging" / "velopack_runtime_hook.py").read_text(encod
 BRANDING = (ROOT / "app" / "app_branding.py").read_text(encoding="utf-8")
 ICON_DATA = (ROOT / "app" / "app_icon_data.py").read_text(encoding="utf-8")
 ICON_GENERATOR = (ROOT / "scripts" / "generate_app_icon.py").read_text(encoding="utf-8")
+VELOPACK_CLI = (ROOT / "scripts" / "velopack_cli.ps1").read_text(encoding="utf-8")
 ROUTER = (ROOT / "gui" / "frozen_process_router.py").read_text(encoding="utf-8")
 WORKER = (ROOT / "run_packaged_worker.py").read_text(encoding="utf-8")
 OWNED_EXECUTOR = (ROOT / "makro_execute_owned.py").read_text(encoding="utf-8")
@@ -111,7 +112,9 @@ def test_velopack_toolchain_is_pinned_and_build_replaces_inno() -> None:
     manifest = json.loads((ROOT / ".config" / "dotnet-tools.json").read_text(encoding="utf-8"))
     assert manifest["tools"]["vpk"]["version"] == "1.2.0"
     assert "dotnet tool restore" in BUILD
-    assert "dotnet tool run vpk -- @PackArgs" in BUILD
+    assert '. (Join-Path $PSScriptRoot "velopack_cli.ps1")' in BUILD
+    assert "Invoke-RepositoryVelopack" in BUILD
+    assert "dotnet tool run vpk -- @PackArgs" not in BUILD
     assert '"pack"' in BUILD
     assert '"--packId", $PackId' in BUILD
     assert '"--mainExe", "EcommerceAgent.exe"' in BUILD
@@ -119,6 +122,18 @@ def test_velopack_toolchain_is_pinned_and_build_replaces_inno() -> None:
     assert "ISCC.exe" not in BUILD
     assert "Updater.spec" not in BUILD
     assert "Compress-Archive" not in BUILD
+
+
+def test_velopack_process_boundary_removes_only_blank_reserved_environment() -> None:
+    assert "System.Diagnostics.ProcessStartInfo" in VELOPACK_CLI
+    assert '"tool", "run", "vpk", "--"' in VELOPACK_CLI
+    assert '$StartInfo.Environment.Keys' in VELOPACK_CLI
+    assert '$_ -like "VPK_*"' in VELOPACK_CLI
+    assert "IsNullOrWhiteSpace" in VELOPACK_CLI
+    assert "$StartInfo.Environment.Remove($Name)" in VELOPACK_CLI
+    assert "RemainingBlank" in VELOPACK_CLI
+    assert "SetEnvironmentVariable" not in VELOPACK_CLI
+    assert "Remove-Item Env:" not in VELOPACK_CLI
 
 
 def test_windows_ci_smokes_canonical_velopack_layout_and_uninstall() -> None:
