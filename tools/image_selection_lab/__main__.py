@@ -15,6 +15,7 @@ from app.providers.registry import (
     validate_provider_config,
 )
 
+from .capture import DEFAULT_SOURCE_CDP_PORT, capture_case_from_url
 from .core import (
     ImageSelectionLabError,
     STRATEGIES,
@@ -209,10 +210,36 @@ def _cmd_import_case(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_capture_case(args: argparse.Namespace) -> int:
+    path = capture_case_from_url(
+        url=args.url,
+        cases_root=args.cases_root,
+        case_id=args.case_id,
+        profile_dir=args.profile_dir,
+        cdp_port=args.cdp_port,
+        initial_wait_ms=args.wait_ms,
+        scroll_wait_ms=args.scroll_wait_ms,
+        max_scroll_steps=args.max_scroll_steps,
+        max_visible_text_chars=args.max_visible_text_chars,
+        use_current_page=args.use_current_page,
+        target_name=args.target_name,
+        target_brand=args.target_brand,
+        target_model=args.target_model,
+        target_variant=args.target_variant,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    print(f"created={path}")
+    print(f"candidate_count={len(payload.get('candidates') or [])}")
+    print("ai_calls=0")
+    print("listing_actions=0")
+    print("ground_truth is intentionally blank; label every candidate before running AI evaluation")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m tools.image_selection_lab",
-        description="Offline/local benchmark harness for supplier Product Photos selection.",
+        description="Local benchmark harness for supplier Product Photos selection.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -230,6 +257,26 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser.add_argument("--case-id", required=True)
     import_parser.add_argument("--cases-root", default=str(DEFAULT_ROOT / "cases"))
     import_parser.set_defaults(handler=_cmd_import_case)
+
+    capture_parser = sub.add_parser(
+        "capture-case",
+        help="capture a real product page with the production source collector, without AI or listing actions",
+    )
+    capture_parser.add_argument("--url", required=True, help="real product-page URL")
+    capture_parser.add_argument("--case-id", required=True)
+    capture_parser.add_argument("--cases-root", default=str(DEFAULT_ROOT / "cases"))
+    capture_parser.add_argument("--profile-dir", default="browser_profiles/source-edge")
+    capture_parser.add_argument("--cdp-port", type=int, default=DEFAULT_SOURCE_CDP_PORT)
+    capture_parser.add_argument("--wait-ms", type=int, default=1800)
+    capture_parser.add_argument("--scroll-wait-ms", type=int, default=180)
+    capture_parser.add_argument("--max-scroll-steps", type=int, default=120)
+    capture_parser.add_argument("--max-visible-text-chars", type=int, default=120_000)
+    capture_parser.add_argument("--use-current-page", action="store_true")
+    capture_parser.add_argument("--target-name", default="", help="optional human-provided exact product name")
+    capture_parser.add_argument("--target-brand", default="", help="optional human-provided exact brand")
+    capture_parser.add_argument("--target-model", default="", help="optional human-provided exact model/SKU family")
+    capture_parser.add_argument("--target-variant", default="", help="optional human-provided exact variant")
+    capture_parser.set_defaults(handler=_cmd_capture_case)
     return parser
 
 
