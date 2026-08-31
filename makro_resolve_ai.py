@@ -173,10 +173,11 @@ def main() -> int:
     run_dir = _new_resolver_run(output_root, before)
     if run_dir is None:
         print(
-            "listing_image_ranking=SKIP detail=无法唯一定位本次 Resolver 输出目录；保留机械选图结果。",
+            "listing_image_ranking=FAIL_CLOSED detail=无法唯一定位本次 Resolver 输出目录；"
+            "无法安全发布自动 Product Photos，已停止本次 Resolver 链。",
             flush=True,
         )
-        return status
+        return 1
 
     try:
         ranking_provider = build_semantic_provider(provider_config(args))
@@ -191,11 +192,11 @@ def main() -> int:
             flush=True,
         )
     except Exception as exc:
-        # The existing mechanical gate remains a safe compatibility fallback if
-        # semantic ranking itself is temporarily unavailable. Field resolution is
-        # already complete, so a ranking outage must not corrupt that successful run.
+        # finalize_supplier_listing_images publishes an empty automatic gallery before
+        # surfacing semantic/AI failures. Keep successful field resolution available
+        # for manual Product Photos, but never restore the old mechanical image list.
         print(
-            f"listing_image_ranking=FALLBACK_MECHANICAL detail={exc}",
+            f"listing_image_ranking=FAIL_CLOSED automatic_product_photos=0 detail={exc}",
             flush=True,
         )
     return status
