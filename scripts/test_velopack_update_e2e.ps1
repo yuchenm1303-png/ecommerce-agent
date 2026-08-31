@@ -7,6 +7,8 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot "velopack_cli.ps1")
+
 function Get-SingleVelopackArtifact {
     param(
         [Parameter(Mandatory = $true)][string]$Directory,
@@ -75,18 +77,20 @@ if (-not (Test-Path $OldEmbeddedVersion)) {
 Set-Content -Path $OldEmbeddedVersion -Value $OldVersion -Encoding ascii -NoNewline
 
 function Invoke-E2EPack([string]$PackVersion, [string]$PackDirectory) {
-    & dotnet tool run vpk -- pack `
-        --outputDir $FeedDir `
-        --channel $Channel `
-        --runtime win-x64 `
-        --packId $PackId `
-        --packVersion $PackVersion `
-        --packDir $PackDirectory `
-        --packAuthors Smirel `
-        --packTitle "Listing Studio E2E" `
-        --icon $IconFile `
-        --mainExe EcommerceAgent.exe
-    if ($LASTEXITCODE -ne 0) { throw "Velopack E2E pack failed for $PackVersion" }
+    $ExitCode = Invoke-RepositoryVelopack -Arguments @(
+        "pack",
+        "--outputDir", $FeedDir,
+        "--channel", $Channel,
+        "--runtime", "win-x64",
+        "--packId", $PackId,
+        "--packVersion", $PackVersion,
+        "--packDir", $PackDirectory,
+        "--packAuthors", "Smirel",
+        "--packTitle", "Listing Studio E2E",
+        "--icon", $IconFile,
+        "--mainExe", "EcommerceAgent.exe"
+    )
+    if ($ExitCode -ne 0) { throw "Velopack E2E pack failed for $PackVersion" }
 }
 
 Write-Host "  [E2E 1/5] Pack and install old Velopack version $OldVersion"
