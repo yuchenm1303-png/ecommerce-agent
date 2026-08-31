@@ -170,8 +170,29 @@ No hardcoded model pricing is stored because provider pricing changes. To estima
 --input-price-per-million <CNY> --output-price-per-million <CNY>
 ```
 
-## Recommended first benchmark
+## Benchmark v1: frozen 12-case design
 
-Start with 12-15 cases, not hundreds. Prioritize hard negatives: same category/different brand, same brand/different line, same model/different colour, 50 ml vs 100 ml, one-pack vs two-pack, kit vs standalone item, included component detail, packaging, no-text visual-only cases, OCR-dependent SKU cases, and at least one case where all candidate images are wrong.
+The first benchmark is now defined in `evals/image_selection/benchmark_v1.json`. It is a test specification, not a set of committed product images. Real images stay under the gitignored `cases/` directory.
 
-Only after `current-v6` has a stable labelled baseline should `qwen-vl-rerank-v1` be implemented and compared on the exact same cases.
+The twelve required failure modes are:
+
+1. obvious unrelated page pollution;
+2. same category but different brand;
+3. same brand but different product line;
+4. exact model but wrong colour;
+5. exact family but wrong size/capacity;
+6. wrong pack count;
+7. bundle/kit versus standalone configuration;
+8. included-component detail versus unrelated accessory;
+9. packaging/detail images mixed with near-duplicates;
+10. visual-only images with little or no readable text;
+11. text-critical near-identical SKU variants;
+12. a 32-candidate all-negative stress case with zero valid target images.
+
+Use real supplier-page captures wherever possible. Do not clean the candidate pool to make the model look better, and do not use generated or stock images in the baseline suite. Each imported case must be labelled by a human; previous AI output is diagnostic history only.
+
+The hard suite gate is intentionally strict: zero wrong-product leaks, zero variant leaks, 100% safe galleries, and 100% empty output on all-negative cases. Quality targets such as main-image hit rate, recall and NDCG are secondary and cannot compensate for a safety regression.
+
+Execution order is fixed: run `current-v6` once on the frozen labelled cases, inspect/replay for free, then run the shuffled order-bias subset, and only after that implement `qwen-vl-rerank-v1` and compare both strategies on the exact same frozen cases.
+
+A new strategy may not replace production if it introduces any wrong-product, wrong-variant or all-negative failure that the current baseline did not have, even if it is cheaper or has better ranking metrics.
