@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from app.listing_image_ranker import (
     _Candidate,
     _parse_ownership,
     build_listing_image_ownership_request,
+    ListingImageRankingError,
 )
 
 
@@ -18,12 +21,13 @@ def _candidate(image_id: str = "image_01") -> _Candidate:
     )
 
 
-def test_ownership_contract_requires_pixel_facts_before_relationship_fields() -> None:
+def test_ownership_contract_requires_pixel_facts_and_positive_identity_proof_before_relationship() -> None:
     request = build_listing_image_ownership_request(
         product_context={
-            "name": "Dyson Airwrap HS05 Complete Long",
+            "name": "Dyson Airwrap i.d Multi-Styler and Dryer",
             "brand": "Dyson",
-            "model": "HS05",
+            "model": "Airwrap i.d",
+            "variant": "Ceramic Pink",
         },
         candidates=[_candidate()],
     )
@@ -32,38 +36,48 @@ def test_ownership_contract_requires_pixel_facts_before_relationship_fields() ->
         "image_01"
     ]
     required = decision_schema["required"]
-    assert required[:3] == [
+    assert required[:5] == [
         "visual_subject",
         "visible_identity",
         "visible_configuration",
+        "target_match_evidence",
+        "target_identity_gaps",
     ]
-    assert required[3:] == ["classification", "confidence", "reason"]
+    assert required[5:] == ["classification", "confidence", "reason"]
 
     assert request["context"]["decision_protocol"] == (
-        "pixel_visual_facts_then_target_relationship_v2"
+        "pixel_visual_facts_then_positive_identity_proof_v3"
     )
     prompt = request["prompt_instruction"].lower()
     rules = "\n".join(request["rules"]).lower()
-    assert "from pixels before assigning classification" in prompt
+    assert "from pixels" in prompt
+    assert "target_match_evidence and target_identity_gaps before assigning classification" in prompt
     assert "do not copy target fields" in prompt
-    assert "ocr/readable packaging text is one visual signal" in prompt
+    assert "ocr/readable" in prompt
+    assert "brand/category agreement" in prompt
+    assert "absence of a visible contradiction is never enough" in prompt
     assert "dom text" in rules
     assert "filenames or urls" in rules
-    assert "only after recording visual facts" in rules
+    assert "positive proof burden" in rules
+    assert "matching brand logo proves only the brand" in rules
+    assert "absence of conflict is not evidence of identity" in rules
+    assert "only brand or broad category is verified" in rules
 
 
-def test_parsed_ownership_preserves_compact_visual_evidence_for_gallery_and_report() -> None:
+def test_parsed_ownership_preserves_visual_evidence_and_identity_proof_for_gallery_and_report() -> None:
     candidate = _candidate()
     parsed = _parse_ownership(
         {
             "decisions": {
                 "image_01": {
                     "visual_subject": "pink hair styling wand with multiple curling attachments",
-                    "visible_identity": "Dyson; HS05 visible on packaging",
-                    "visible_configuration": "pink/rose-gold long-barrel kit with storage case",
+                    "visible_identity": "Dyson; Airwrap i.d visible on packaging",
+                    "visible_configuration": "ceramic-pink multi-styler kit with storage case",
+                    "target_match_evidence": "Airwrap i.d marking and ceramic-pink kit configuration visibly agree with the target.",
+                    "target_identity_gaps": "",
                     "classification": "EXACT_TARGET",
                     "confidence": 0.97,
-                    "reason": "Visible product identity and configuration agree with the target sale unit.",
+                    "reason": "Visible model identity and distinguishing configuration positively establish the target sale unit.",
                 }
             },
             "summary": "one exact target image",
@@ -74,10 +88,12 @@ def test_parsed_ownership_preserves_compact_visual_evidence_for_gallery_and_repo
     decision = parsed.decisions["image_01"]
     assert decision.auto_eligible is True
     assert decision.visual_subject.startswith("pink hair styling wand")
-    assert decision.visible_identity == "Dyson; HS05 visible on packaging"
+    assert decision.visible_identity == "Dyson; Airwrap i.d visible on packaging"
     assert "storage case" in decision.visible_configuration
+    assert "Airwrap i.d marking" in decision.target_match_evidence
+    assert decision.target_identity_gaps == ""
     assert decision.as_dict()["classification"] == "EXACT_TARGET"
-    assert decision.as_dict()["visual_subject"] == decision.visual_subject
+    assert decision.as_dict()["target_match_evidence"] == decision.target_match_evidence
 
 
 def test_program_eligibility_still_depends_only_on_relationship_classification() -> None:
@@ -87,11 +103,13 @@ def test_program_eligibility_still_depends_only_on_relationship_classification()
             "decisions": {
                 "image_01": {
                     "visual_subject": "hair styling tool",
-                    "visible_identity": "Dyson",
-                    "visible_configuration": "different visible colour/configuration",
+                    "visible_identity": "Dyson; HS05 visible on packaging",
+                    "visible_configuration": "rose-gold HS05 configuration",
+                    "target_match_evidence": "Dyson brand is visible, but the target model/variant are not established.",
+                    "target_identity_gaps": "Target Airwrap i.d model and Ceramic Pink variant are not established; visible HS05 conflicts.",
                     "classification": "SAME_PRODUCT_OTHER_VARIANT",
                     "confidence": 0.99,
-                    "reason": "The visible configuration conflicts with the exact target variant.",
+                    "reason": "The visible model/configuration conflicts with the exact target identity.",
                 }
             },
             "summary": "variant rejected",
@@ -104,3 +122,25 @@ def test_program_eligibility_still_depends_only_on_relationship_classification()
     assert decision.confidence == 0.99
     assert decision.auto_eligible is False
     assert parsed.eligible_ids == ()
+
+
+def test_parser_rejects_missing_positive_identity_proof_fields() -> None:
+    candidate = _candidate()
+    with pytest.raises(ListingImageRankingError, match="target_match_evidence"):
+        _parse_ownership(
+            {
+                "decisions": {
+                    "image_01": {
+                        "visual_subject": "hair styling tool",
+                        "visible_identity": "Dyson",
+                        "visible_configuration": "pink styling tool",
+                        "target_identity_gaps": "model and exact variant are unverified",
+                        "classification": "UNCERTAIN",
+                        "confidence": 0.6,
+                        "reason": "Exact target identity is not positively established.",
+                    }
+                },
+                "summary": "insufficient identity proof",
+            },
+            [candidate],
+        )
