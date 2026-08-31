@@ -439,24 +439,69 @@ class MakroDomainAdapter:
         section_path: str | None = None,
         recheck_wait_ms: int = 800,
     ) -> FillVerification:
+        """Write one approved field and converge across bounded React rerenders.
+
+        Makro controls may acknowledge a value immediately and then remount/reset
+        the controlled input on a later React commit. The low-level field engine
+        deliberately detects that rollback. This adapter owns live-schema rebinding,
+        so a detected rollback is resolved by rescanning the exact same semantic
+        field and reapplying the exact same approved answer. No new value is inferred
+        and a field that never converges remains a hard failure after three attempts.
+        """
+
         section = base_section_title(str(semantic_field.get("section_heading") or ""))
         label = str(semantic_field.get("label") or semantic_field.get("attribute_key") or "field").strip()
         safe_section = section.replace("\t", " ").replace("\n", " ")
         safe_label = label.replace("\t", " ").replace("\n", " ")
         print(f"GUI_EXEC_FIELD\tSTART\t{safe_section}\t{safe_label}", flush=True)
+
         constrained_answer = self._constrained_execution_answer(semantic_field, answer)
-        expanded = self._ensure_answer_value_slots(
-            semantic_field,
-            constrained_answer,
-            section_path,
-        )
-        verification = fill_resolved_field(
-            self.page,
-            expanded,
-            constrained_answer,
-            section_path=section_path,
-            recheck_wait_ms=recheck_wait_ms,
-        )
+        current_field = semantic_field
+        max_attempts = 3 if section_path else 1
+        verification: FillVerification | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            expanded = self._ensure_answer_value_slots(
+                current_field,
+                constrained_answer,
+                section_path,
+            )
+            verification = fill_resolved_field(
+                self.page,
+                expanded,
+                constrained_answer,
+                section_path=section_path,
+                recheck_wait_ms=recheck_wait_ms,
+            )
+            if verification.status == "validated":
+                break
+            if attempt >= max_attempts or verification.status not in {
+                "validation_failed",
+                "fill_error",
+            }:
+                break
+
+            settle_ms = max(150, min(400, max(1, int(recheck_wait_ms)) // 4))
+            print(
+                f"GUI_EXEC_FIELD\tRECONVERGE\t{safe_section}\t{safe_label}\t"
+                f"attempt={attempt + 1}\tprior={verification.status}",
+                flush=True,
+            )
+            self.page.wait_for_timeout(settle_ms)
+            try:
+                current_field = self._refresh_field(current_field, section_path)
+            except Exception as exc:
+                verification = FillVerification(
+                    attribute_key=str(semantic_field.get("attribute_key") or ""),
+                    label=label,
+                    status="fill_error",
+                    expected=list(getattr(constrained_answer, "answer_values", []) or []),
+                    detail=f"React 状态回滚后重新绑定 live field 失败：{exc}",
+                    execution_family=verification.execution_family,
+                )
+                break
+
+        assert verification is not None
         print(
             f"GUI_EXEC_FIELD\tCOMPLETE\t{safe_section}\t{safe_label}\t"
             f"{verification.status}\t{verification.execution_family or 'unknown'}",
