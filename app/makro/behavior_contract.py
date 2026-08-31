@@ -162,11 +162,15 @@ def _is_numeric(control: Mapping[str, Any]) -> bool:
     )
 
 
+def _is_radio_group(controls: Iterable[Mapping[str, Any]]) -> bool:
+    items = list(controls)
+    return bool(items) and all(_norm(control.get("field_kind")) in _RADIO_KINDS for control in items)
+
+
 def _base_family(primary: Mapping[str, Any] | None, controls: list[dict[str, Any]]) -> str:
     if primary is None:
         return "unsupported"
-    kinds = [_norm(control.get("field_kind")) for control in controls]
-    if kinds and all(kind in _RADIO_KINDS for kind in kinds):
+    if _is_radio_group(controls):
         return "selection"
     kind = _norm(primary.get("field_kind"))
     if _is_numeric(primary):
@@ -189,7 +193,15 @@ def signature_for_field(semantic_field: Mapping[str, Any]) -> BehaviorContractSi
     fixed_unit = fixed_rendered_unit(dict(semantic_field))
 
     has_add = bool(semantic_field.get("has_add_value_control"))
-    repeatable = bool(semantic_field.get("multi_value")) or has_add or len(controls) > 1
+    radio_group = _is_radio_group(controls)
+    # Multiple radio controls are one single-choice value domain, not a repeatable
+    # multi-value attribute.  Only indexed value slots / + semantics create
+    # repeatable cardinality.
+    repeatable = (
+        bool(semantic_field.get("multi_value"))
+        or has_add
+        or (len(controls) > 1 and not radio_group)
+    )
     cardinality = "repeatable" if repeatable else "single"
 
     if qualifiers:
@@ -199,28 +211,43 @@ def signature_for_field(semantic_field: Mapping[str, Any]) -> BehaviorContractSi
     else:
         qualifier_model = "none"
 
+    base_family = _base_family(primary, controls)
     if has_add:
         commit_model = "repeatable_add"
     elif repeatable:
         commit_model = "repeatable_slots"
-    elif _base_family(primary, controls) == "selection":
+    elif base_family == "selection":
         commit_model = "selection"
     else:
         commit_model = "direct"
 
     return BehaviorContractSignature(
-        base_family=_base_family(primary, controls),
+        base_family=base_family,
         primary_kind=_norm((primary or {}).get("field_kind")),
         primary_tag=_norm((primary or {}).get("tag")),
         input_type=_norm((primary or {}).get("type")),
         role=_norm((primary or {}).get("role")),
         inputmode=_norm((primary or {}).get("inputmode")),
-        control_kinds=tuple(sorted({_norm(c.get("field_kind")) for c in controls if _norm(c.get("field_kind"))})),
+        control_kinds=tuple(
+            sorted(
+                {
+                    _norm(control.get("field_kind"))
+                    for control in controls
+                    if _norm(control.get("field_kind"))
+                }
+            )
+        ),
         cardinality=cardinality,
         add_value_control=has_add,
         qualifier_model=qualifier_model,
         qualifier_kinds=tuple(
-            sorted({_norm(c.get("field_kind")) for c in qualifiers if _norm(c.get("field_kind"))})
+            sorted(
+                {
+                    _norm(control.get("field_kind"))
+                    for control in qualifiers
+                    if _norm(control.get("field_kind"))
+                }
+            )
         ),
         commit_model=commit_model,
     )
@@ -278,7 +305,11 @@ def verification_level(
 
 
 def _best_level(levels: Iterable[str]) -> str:
-    return max(levels, key=lambda level: _VERIFICATION_RANK.get(level, -1), default=UNVERIFIED)
+    return max(
+        levels,
+        key=lambda level: _VERIFICATION_RANK.get(level, -1),
+        default=UNVERIFIED,
+    )
 
 
 def build_run_contracts(
@@ -300,7 +331,10 @@ def build_run_contracts(
 
     contracts: dict[str, dict[str, Any]] = {}
     for observation in observed:
-        level, detail = verification_level(observation, result_index.get(observation.identity))
+        level, detail = verification_level(
+            observation,
+            result_index.get(observation.identity),
+        )
         entry = contracts.setdefault(
             observation.fingerprint,
             {
@@ -321,7 +355,9 @@ def build_run_contracts(
     for entry in contracts.values():
         best = _best_level(entry["verification_levels"])
         entry["best_verification"] = best
-        entry["verified_for_execution"] = _VERIFICATION_RANK.get(best, 0) >= _VERIFICATION_RANK[REACT_STABLE]
+        entry["verified_for_execution"] = (
+            _VERIFICATION_RANK.get(best, 0) >= _VERIFICATION_RANK[REACT_STABLE]
+        )
         entry["verification_levels"] = dict(
             sorted(
                 {
@@ -331,7 +367,9 @@ def build_run_contracts(
             )
         )
 
-    verified = sum(1 for entry in contracts.values() if entry["verified_for_execution"])
+    verified = sum(
+        1 for entry in contracts.values() if entry["verified_for_execution"]
+    )
     return {
         "contract_version": CONTRACT_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -362,8 +400,12 @@ def merge_contract_registry(
         "verticals": {},
     }
     if existing and int(existing.get("contract_version") or 0) == CONTRACT_VERSION:
-        registry["contracts"] = json.loads(json.dumps(existing.get("contracts") or {}))
-        registry["verticals"] = json.loads(json.dumps(existing.get("verticals") or {}))
+        registry["contracts"] = json.loads(
+            json.dumps(existing.get("contracts") or {})
+        )
+        registry["verticals"] = json.loads(
+            json.dumps(existing.get("verticals") or {})
+        )
 
     vertical = str(run_payload.get("vertical") or "")
     run_contracts = run_payload.get("contracts") or {}
@@ -402,11 +444,21 @@ def merge_contract_registry(
 
         examples = target.setdefault("field_examples", [])
         existing_keys = {
-            (item.get("section"), item.get("attribute_key"), item.get("label"), item.get("fixed_unit"))
+            (
+                item.get("section"),
+                item.get("attribute_key"),
+                item.get("label"),
+                item.get("fixed_unit"),
+            )
             for item in examples
         }
         for item in incoming.get("observations") or []:
-            key = (item.get("section"), item.get("attribute_key"), item.get("label"), item.get("fixed_unit"))
+            key = (
+                item.get("section"),
+                item.get("attribute_key"),
+                item.get("label"),
+                item.get("fixed_unit"),
+            )
             if key in existing_keys:
                 continue
             compact = {
@@ -422,20 +474,28 @@ def merge_contract_registry(
                 break
 
     vertical_verified = all(
-        bool(registry["contracts"].get(fingerprint, {}).get("verified_for_execution"))
+        bool(
+            registry["contracts"].get(fingerprint, {}).get(
+                "verified_for_execution"
+            )
+        )
         for fingerprint in observed_fingerprints
     )
     registry["verticals"][vertical] = {
         "last_audited_at": now,
         "source_url": str(run_payload.get("source_url") or ""),
-        "observed_field_count": int((run_payload.get("stats") or {}).get("observed_field_count") or 0),
+        "observed_field_count": int(
+            (run_payload.get("stats") or {}).get("observed_field_count") or 0
+        ),
         "observed_contracts": sorted(observed_fingerprints),
         "fully_verified": bool(observed_fingerprints) and vertical_verified,
     }
 
     total = len(registry["contracts"])
     verified = sum(
-        1 for item in registry["contracts"].values() if item.get("verified_for_execution")
+        1
+        for item in registry["contracts"].values()
+        if item.get("verified_for_execution")
     )
     registry["stats"] = {
         "audited_vertical_count": len(registry["verticals"]),
@@ -449,21 +509,31 @@ def merge_contract_registry(
 
 
 def marketplace_completeness(
-    schema_registry: Mapping[str, Any], behavior_registry: Mapping[str, Any]
+    schema_registry: Mapping[str, Any],
+    behavior_registry: Mapping[str, Any],
 ) -> dict[str, Any]:
-    expected = sorted((schema_registry.get("verticals") or {}).keys(), key=str.casefold)
+    expected = sorted(
+        (schema_registry.get("verticals") or {}).keys(),
+        key=str.casefold,
+    )
     audited_map = behavior_registry.get("verticals") or {}
     audited = sorted(audited_map.keys(), key=str.casefold)
+    expected_set = set(expected)
     missing = [vertical for vertical in expected if vertical not in audited_map]
     incomplete = [
         vertical
         for vertical in expected
-        if vertical in audited_map and not bool(audited_map[vertical].get("fully_verified"))
+        if vertical in audited_map
+        and not bool(audited_map[vertical].get("fully_verified"))
     ]
     return {
         "expected_vertical_count": len(expected),
-        "audited_vertical_count": len([v for v in expected if v in audited_map]),
-        "extra_audited_verticals": [v for v in audited if v not in set(expected)],
+        "audited_vertical_count": len(
+            [vertical for vertical in expected if vertical in audited_map]
+        ),
+        "extra_audited_verticals": [
+            vertical for vertical in audited if vertical not in expected_set
+        ],
         "missing_verticals": missing,
         "incomplete_verticals": incomplete,
         "marketplace_complete": bool(expected) and not missing and not incomplete,
