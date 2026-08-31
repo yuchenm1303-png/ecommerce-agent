@@ -250,16 +250,26 @@ def _read_complete_stage_log(path: Path) -> tuple[dict[str, Any], str]:
 
 
 def _select_stage_log(paths: list[Path]) -> tuple[Path | None, dict[str, Any], str]:
+    """Prefer the deepest dedicated stage journal over a later parent GUI log."""
+
+    dedicated = [
+        path
+        for path in paths
+        if path.name in _BATCH_STAGE_LOGS and path.parent.name == "diagnostics"
+    ]
+    fallback = [path for path in paths if path not in dedicated]
     empty: tuple[Path | None, dict[str, Any], str] = (None, {}, "")
-    for path in reversed(paths):
-        payload, text = _read_complete_stage_log(path)
-        if not payload:
-            continue
-        candidate = (path, payload, text)
-        if text:
-            return candidate
-        if empty[0] is None:
-            empty = candidate
+
+    for group in (dedicated, fallback):
+        for path in reversed(group):
+            payload, text = _read_complete_stage_log(path)
+            if not payload:
+                continue
+            candidate = (path, payload, text)
+            if text:
+                return candidate
+            if empty[0] is None:
+                empty = candidate
     return empty
 
 
