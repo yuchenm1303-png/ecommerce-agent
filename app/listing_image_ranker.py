@@ -28,7 +28,7 @@ _IMAGE_OWNERSHIP_CLASSES = (
 _AUTO_ELIGIBLE_OWNERSHIP_CLASSES = frozenset(
     {"EXACT_TARGET", "TARGET_PACKAGING_OR_DETAIL"}
 )
-_IMAGE_OWNERSHIP_PROTOCOL = "pixel_visual_facts_then_target_relationship_v2"
+_IMAGE_OWNERSHIP_PROTOCOL = "pixel_visual_facts_then_positive_identity_proof_v3"
 
 
 class ListingImageRankingError(RuntimeError):
@@ -70,6 +70,8 @@ class ImageOwnershipDecision:
     visual_subject: str = ""
     visible_identity: str = ""
     visible_configuration: str = ""
+    target_match_evidence: str = ""
+    target_identity_gaps: str = ""
 
     @property
     def auto_eligible(self) -> bool:
@@ -81,6 +83,8 @@ class ImageOwnershipDecision:
             "visual_subject": self.visual_subject,
             "visible_identity": self.visible_identity,
             "visible_configuration": self.visible_configuration,
+            "target_match_evidence": self.target_match_evidence,
+            "target_identity_gaps": self.target_identity_gaps,
             "classification": self.classification,
             "confidence": self.confidence,
             "reason": self.reason,
@@ -298,6 +302,8 @@ def _ownership_schema(candidate_ids: list[str]) -> dict[str, Any]:
             "visual_subject": {"type": "string", "minLength": 1},
             "visible_identity": {"type": "string"},
             "visible_configuration": {"type": "string"},
+            "target_match_evidence": {"type": "string"},
+            "target_identity_gaps": {"type": "string"},
             "classification": {
                 "type": "string",
                 "enum": list(_IMAGE_OWNERSHIP_CLASSES),
@@ -309,6 +315,8 @@ def _ownership_schema(candidate_ids: list[str]) -> dict[str, Any]:
             "visual_subject",
             "visible_identity",
             "visible_configuration",
+            "target_match_evidence",
+            "target_identity_gaps",
             "classification",
             "confidence",
             "reason",
@@ -335,23 +343,27 @@ def build_listing_image_ownership_request(
     product_context: dict[str, Any],
     candidates: list[_Candidate],
 ) -> dict[str, Any]:
-    """Ask AI for pixel-grounded visual facts first, then exact sale-unit ownership."""
+    """Ask AI for pixel facts, positive identity proof, then exact sale-unit ownership."""
 
     candidate_ids = [candidate.image_id for candidate in candidates]
     return {
         "task": "classify_supplier_listing_image_ownership",
         "system_instruction": (
             "You are the semantic ownership gate for ecommerce Product Photos. For every candidate, first record "
-            "concise facts that are actually visible in the image pixels, then compare those visual facts with the "
-            "already-grounded target product identity and classify the relationship. Do not rank photos and do not "
-            "try to fill a gallery quota. JSON only."
+            "concise facts actually visible in the image pixels, then explicitly state the positive visual evidence "
+            "that proves the candidate belongs to the already-grounded exact target identity and any target identity "
+            "facts that remain unverified or conflict. Only then classify the relationship. Do not rank photos and "
+            "do not try to fill a gallery quota. JSON only."
         ),
         "prompt_instruction": (
-            "For each image_id, complete visual_subject, visible_identity and visible_configuration from pixels "
-            "before assigning classification. OCR/readable packaging text is one visual signal, not the sole signal. "
-            "Do not copy target fields into visual facts unless they are genuinely visible in that image. Precision "
-            "is more important than recall: when exact target ownership or exact variant cannot be verified, use "
-            "UNCERTAIN or SAME_PRODUCT_OTHER_VARIANT instead of promoting the image."
+            "For each image_id, complete visual_subject, visible_identity and visible_configuration from pixels, "
+            "then complete target_match_evidence and target_identity_gaps before assigning classification. OCR/readable "
+            "packaging text is one visual signal, not the sole signal. Do not copy target fields into visual facts or "
+            "match evidence unless the pixels positively support them. Brand/category agreement or the absence of a "
+            "visible contradiction is never enough to prove exact ownership. Precision is more important than recall: "
+            "when the exact model/product line/variant/configuration is not positively established strongly enough to "
+            "distinguish the target from plausible alternatives, use UNCERTAIN or SAME_PRODUCT_OTHER_VARIANT instead "
+            "of promoting the image."
         ),
         "context": {
             "target_product": product_context,
@@ -365,16 +377,20 @@ def build_listing_image_ownership_request(
             "visible_identity must contain only brand/model/size/count/variant text or markings actually visible in the pixels; use an empty string when none is readable.",
             "visible_configuration must briefly record visible colour, form, package count, kit/bundle composition, attachments, packaging/detail context or other variant-relevant visual facts; use an empty string when not discernible.",
             "Visual facts are observations, not conclusions: never write 'matches target', 'same product', or silently copy target_product facts that are not visible in the candidate.",
-            "Only after recording visual facts, compare them with target_product to assign classification.",
-            "EXACT_TARGET means the image depicts the exact sellable target product and exact supported variant/configuration.",
-            "TARGET_PACKAGING_OR_DETAIL means packaging, a close detail, dimensions, an in-use view, or an included component that clearly belongs to this exact target sale unit.",
-            "Use SAME_PRODUCT_OTHER_VARIANT for a different colour, size, model, count, flavour, configuration, bundle or other sellable variant even when the product family is the same.",
+            "target_match_evidence must state only affirmative pixel-grounded evidence that links this candidate to the target's distinguishing identity; it may use visible design/form/configuration as well as readable markings, and must be empty when no such positive evidence exists.",
+            "target_identity_gaps must state every material target model/product-line/variant/configuration fact that the pixels do not positively establish, plus any visible conflict; use an empty string only when the exact relevant identity is genuinely established.",
+            "Only after recording visual facts and the positive-identity proof audit may you assign classification.",
+            "Automatic eligibility has a positive proof burden: evidence must be sufficient to distinguish the exact target sale unit from plausible same-brand or same-category products and variants.",
+            "A matching brand logo proves only the brand. Brand match, category match, general visual similarity, or absence of contradictory evidence must never be promoted into model, product-line, variant or configuration proof.",
+            "Absence of conflict is not evidence of identity. If distinguishing target facts remain unverified, do not infer them from the target context.",
+            "EXACT_TARGET means affirmative pixel evidence establishes the exact sellable target product and exact supported variant/configuration strongly enough to distinguish it from plausible alternatives, with no material identity gap or conflict.",
+            "TARGET_PACKAGING_OR_DETAIL means packaging, a close detail, dimensions, an in-use view, or an included component whose association with this exact target sale unit is itself positively established; generic same-brand packaging/accessories/details are not enough.",
+            "Use SAME_PRODUCT_OTHER_VARIANT when the pixels positively indicate a different colour, size, model, count, flavour, configuration, bundle or other sellable variant within the same product family.",
             "Use OTHER_PRODUCT for recommendations, related products, accessories not included in the sale unit, or any different sellable product.",
             "Use PAGE_ASSET for logos, banners, navigation graphics, seller decoration, advertisements or other non-product page media.",
-            "Use UNCERTAIN whenever pixels and target identity do not establish exact ownership strongly enough for an automatic marketplace upload.",
-            "For kits or bundles, a component is TARGET_PACKAGING_OR_DETAIL only when target_product explicitly supports that component as part of the offered sale unit.",
+            "Use UNCERTAIN whenever the pixels do not positively establish exact ownership strongly enough for an automatic marketplace upload, including when only brand or broad category is verified.",
+            "For kits or bundles, a component is TARGET_PACKAGING_OR_DETAIL only when target_product explicitly supports that component as part of the offered sale unit and the candidate provides positive visual evidence tying it to that exact sale unit.",
             "Do not use candidate/source order, DOM text, nearby page copy, filenames or URLs as semantic evidence of image ownership.",
-            "A visually similar item is not enough: exact product/variant ownership is required for automatic upload eligibility.",
             "Return one decision for every candidate_image_id and no others.",
         ],
         "target_fields": [],
@@ -401,6 +417,18 @@ def _parse_ownership(raw: Any, candidates: list[_Candidate]) -> _ParsedOwnership
         item = raw_decisions.get(image_id)
         if not isinstance(item, dict):
             raise ListingImageRankingError(f"{image_id} ownership decision must be an object")
+        for field in (
+            "visual_subject",
+            "visible_identity",
+            "visible_configuration",
+            "target_match_evidence",
+            "target_identity_gaps",
+        ):
+            if field not in item or not isinstance(item.get(field), str):
+                raise ListingImageRankingError(f"{image_id}.{field} must be a string")
+        visual_subject = _compact_text(item.get("visual_subject"), 240)
+        if not visual_subject:
+            raise ListingImageRankingError(f"{image_id}.visual_subject is required")
         classification = _compact_text(item.get("classification"), 80).upper()
         if classification not in _IMAGE_OWNERSHIP_CLASSES:
             raise ListingImageRankingError(
@@ -424,9 +452,11 @@ def _parse_ownership(raw: Any, candidates: list[_Candidate]) -> _ParsedOwnership
             classification=classification,
             confidence=confidence,
             reason=reason,
-            visual_subject=_compact_text(item.get("visual_subject"), 240),
+            visual_subject=visual_subject,
             visible_identity=_compact_text(item.get("visible_identity"), 240),
             visible_configuration=_compact_text(item.get("visible_configuration"), 320),
+            target_match_evidence=_compact_text(item.get("target_match_evidence"), 600),
+            target_identity_gaps=_compact_text(item.get("target_identity_gaps"), 600),
         )
 
     return _ParsedOwnership(
@@ -563,7 +593,9 @@ def build_listing_image_ranking_request(
         "prompt_instruction": (
             "Return selected_image_ids in the exact order they should be uploaded, with at most five images. "
             "Choose fewer images whenever that is safer. One correct photo is better than five photos containing "
-            "one wrong product or wrong variant. Never fill a quota."
+            "one wrong product or wrong variant. Never fill a quota. A selected image must have positive visual "
+            "evidence for the exact target identity; brand/category agreement or absence of visible contradiction "
+            "is not enough."
         ),
         "context": {
             "target_product": product_context,
@@ -573,7 +605,9 @@ def build_listing_image_ranking_request(
         "rules": [
             "Inspect the actual pixels of every supplied candidate again before deciding.",
             "selected_image_ids is the final gallery order, must contain no more than five image_ids, and must not contain duplicates.",
-            "Every selected image must remain consistent with the exact target product and exact supported variant/configuration.",
+            "Every selected image must remain consistent with and positively identifiable as the exact target product and exact supported variant/configuration.",
+            "Where target_product contains a distinguishing model, product line, variant or configuration, reject a candidate if those distinguishing facts remain unverified or visibly conflict; do not infer them merely because brand/category matches.",
+            "Absence of a visible conflict is not positive identity evidence.",
             "Reject any residual unrelated product, recommendation, wrong variant, misleading accessory or page asset even if the ownership pass admitted it.",
             "Position 1 should be the strongest clear main image of the exact sale unit when one exists.",
             "Supporting images may show verified details, dimensions, packaging, included components or in-use context when they add useful non-redundant information.",
@@ -682,6 +716,7 @@ def _selection_report(
             "ownership_semantic_owner": "multimodal_ai",
             "ownership_decision_protocol": _IMAGE_OWNERSHIP_PROTOCOL,
             "ownership_visual_facts_required_by_contract": True,
+            "ownership_positive_identity_proof_required": True,
             "gallery_semantic_owner": "multimodal_ai",
             "auto_eligible_ownership_classes": sorted(_AUTO_ELIGIBLE_OWNERSHIP_CLASSES),
             "precision_policy": "fewer_correct_images_over_quota_fill",
@@ -789,11 +824,12 @@ def finalize_supplier_listing_images(
     """Select automatic Product Photos with two independent semantic AI stages.
 
     Acquisition remains intentionally broad and mechanical. The first AI stage
-    records compact pixel-grounded visual facts for every candidate and only then
-    establishes exact image ownership against a clean target-product identity. The
-    second AI stage sees only ownership-approved candidates, independently verifies
-    consistency and emits the final 0..5 upload order. Python never re-ranks, fills
-    a quota, substitutes candidates or rescues an empty semantic result.
+    records compact pixel-grounded visual facts for every candidate, explicitly
+    audits positive evidence and identity gaps, and only then establishes exact image
+    ownership against a clean target-product identity. The second AI stage sees only
+    ownership-approved candidates, independently verifies consistency and emits the
+    final 0..5 upload order. Python never re-ranks, fills a quota, substitutes
+    candidates or rescues an empty semantic result.
 
     Any semantic/AI failure is fail-closed: the published automatic gallery becomes
     empty before the exception returns to the caller, so an old mechanical candidate
