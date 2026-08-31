@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QLineEdit, QMessageBox
 
 from app.required_overrides import (
     load_required_blocked_fields,
+    required_fallback_override,
     required_override_binding,
 )
 from .real_execution import FULL_STEP3
@@ -16,13 +17,17 @@ from .result_loader import RunResult, latest_fill_plan, latest_live_schema
 
 
 class RequiredInputSupport(QObject):
-    """Collect explicit user values for required fields the AI did not resolve.
+    """Cover required Makro gaps after the authoritative AI pass.
 
-    The Resolver is the only product-semantic decision maker.  The GUI therefore
-    never invents ``N/A``, ``1``, a first option, a unit conversion, or any other
-    deterministic fallback after the AI pass.  AI READY fields flow straight to
-    execution.  AI REVIEW/CONFLICT/MISSING required fields remain unresolved until
-    the user explicitly supplies or confirms a value.
+    AI READY fields are never changed here.  Only required fields that remain
+    BLOCKED after Resolver are exposed for optional manual input; if the user
+    leaves one empty, Full Step 3 generates the shared deterministic live-schema
+    fallback (first executable option, numeric ``1`` with live qualifier, or
+    free-text ``N/A``).
+
+    This is a final execution fallback, not a second product-decision layer and
+    not a second AI call.  The canonical executor still rebinds the current DOM
+    and validates fallback/user values mechanically before any browser write.
 
     Qt editors are presentation-only.  Authoritative manual values and bindings
     live in plain Python state so table rebuilds cannot alter business state.
@@ -67,6 +72,23 @@ class RequiredInputSupport(QObject):
                 return row
         return None
 
+    def _fallback_preview(self, field: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+        try:
+            fallback = required_fallback_override(field)
+        except Exception:
+            return None, "无法生成自动兜底"
+
+        values = [
+            str(value).strip()
+            for value in fallback.get("values") or []
+            if str(value).strip()
+        ]
+        display = " + ".join(values) or "N/A"
+        qualifier = str(fallback.get("qualifier") or "").strip()
+        if qualifier:
+            display = f"{display} {qualifier}".strip()
+        return fallback, display
+
     def _on_result(self, result: RunResult) -> None:
         previous_values = dict(self.values)
         self.inputs = {}
@@ -87,13 +109,24 @@ class RequiredInputSupport(QObject):
             if row is None:
                 continue
 
+            fallback, fallback_text = self._fallback_preview(field)
             editor = QLineEdit()
-            editor.setPlaceholderText("必填 · AI 未 READY，请明确填写或确认")
+            if fallback is None:
+                editor.setPlaceholderText("必填 · 当前 live 字段无法自动兜底")
+            else:
+                editor.setPlaceholderText(f"必填 · 留空将自动填 {fallback_text}")
             if self.values[identifier]:
                 editor.setText(self.values[identifier])
+
             options = missing.get("options") or []
             tooltip = missing.get("reason") or "AI 未将该必填字段判断为 READY。"
-            tooltip += "\n\n程序不会自动生成兜底值；需要明确用户输入后才能执行 Full Step 3。"
+            if fallback is None:
+                tooltip += "\n\n当前 live 字段无法生成合法自动兜底；可手动提供值后继续。"
+            else:
+                tooltip += (
+                    "\n\n无需再次运行 AI。"
+                    f"Full Step 3 开始前若仍留空，将自动填写：{fallback_text}。"
+                )
             if options:
                 tooltip += "\n\nMakro 当前可见选项：\n" + " | ".join(options)
             editor.setToolTip(tooltip)
@@ -105,11 +138,11 @@ class RequiredInputSupport(QObject):
 
         if required:
             self.window.fields_hint.setText(
-                f"READY={result.ready} · {len(required)} 个 Makro 必填项等待明确确认"
+                f"READY={result.ready} · {len(required)} 个 Makro 必填缺口可手动填写 / 自动兜底"
             )
             self.window.real_policy_hint.setText(
-                f"还有 {len(required)} 个 Makro 必填项不是 AI READY。程序不会代替 AI 猜值或机械兜底；"
-                "请明确填写/确认后再执行 Full Step 3。"
+                f"还有 {len(required)} 个 Makro 必填项未由 AI READY。可手动提供更准确值；"
+                "留空则在 Full Step 3 使用固定自动兜底，不再阻塞上架。"
             )
         self._sync_button()
 
@@ -162,9 +195,6 @@ class RequiredInputSupport(QObject):
             for identifier in self.fields
         )
 
-    def _all_required_confirmed(self) -> bool:
-        return self._manual_count() == len(self.fields)
-
     def _sync_button(self) -> None:
         result = getattr(self.window, "current_result", None)
         if result is None or not result.plan_summary:
@@ -178,22 +208,20 @@ class RequiredInputSupport(QObject):
 
         scope = self.window.real_scope_combo.currentData()
         if scope == FULL_STEP3 and self.fields:
-            confirmed = self._manual_count()
-            total = len(self.fields)
-            self.window.real_start_button.setEnabled(
-                result.ready > 0 and confirmed == total
-            )
+            self.window.real_start_button.setEnabled(result.ready > 0 or bool(self.fields))
+            manual = self._manual_count()
+            automatic = len(self.fields) - manual
             self.window.real_start_button.setToolTip(
-                f"AI 未 READY 的必填项已明确确认 {confirmed}/{total}；程序不会自动补值。"
+                f"可直接开始；{manual} 个使用用户值，其余 {automatic} 个未解决必填项自动兜底。"
             )
             return
 
         self.window.real_start_button.setEnabled(result.ready > 0)
         if result.ready <= 0:
-            self.window.real_start_button.setToolTip("当前 Fill Plan 没有 AI READY 字段。")
+            self.window.real_start_button.setToolTip("当前 Fill Plan 没有 READY 字段。")
 
     def _merged_overrides(self) -> list[dict[str, Any]]:
-        """Return explicit user decisions only; never synthesize fallback values."""
+        """User value wins; otherwise generate fallback for every blocked required field."""
 
         overrides: list[dict[str, Any]] = []
         for identifier, field in self.fields.items():
@@ -201,6 +229,7 @@ class RequiredInputSupport(QObject):
             if explicit is not None:
                 overrides.append(dict(explicit))
                 continue
+
             value = self.values.get(identifier, "").strip()
             if value:
                 overrides.append(
@@ -210,6 +239,8 @@ class RequiredInputSupport(QObject):
                         "source_type": "user",
                     }
                 )
+            else:
+                overrides.append(required_fallback_override(field))
         return overrides
 
     def _write_overrides(self) -> Path | None:
@@ -232,7 +263,7 @@ class RequiredInputSupport(QObject):
         return path
 
     def request_start(self, _checked: bool = False) -> None:
-        """Start execution only after every non-READY required field is explicit."""
+        """Run canonical preflight and automatically cover unresolved required gaps."""
 
         result = getattr(self.window, "current_result", None)
         if self.window.runner.is_running or self.window.execution_runner.is_running:
@@ -241,34 +272,29 @@ class RequiredInputSupport(QObject):
         if result is None or not result.plan_summary:
             QMessageBox.warning(self.window, "无法开始真实填写", "请先完成 Step 3 Resolver + Fill Plan。")
             return
-        if result.ready <= 0:
-            QMessageBox.warning(self.window, "没有可填写字段", "当前 Fill Plan 没有 AI READY 字段，真实填写保持锁定。")
+        if result.ready <= 0 and not self.fields:
+            QMessageBox.warning(self.window, "没有可填写字段", "当前 Fill Plan 没有 READY 或待兜底的必填字段，真实填写保持锁定。")
             return
 
         scope = self.window.real_scope_combo.currentData()
         try:
             if scope == FULL_STEP3:
-                if self.fields and not self._all_required_confirmed():
-                    QMessageBox.warning(
-                        self.window,
-                        "仍有未确认必填项",
-                        "AI 未 READY 的必填字段必须由你明确填写或确认；程序不会自动生成 N/A、1 或首个选项。",
-                    )
-                    return
                 path = self._write_overrides()
                 if self.fields:
                     manual = self._manual_count()
+                    automatic = len(self.fields) - manual
                     self.window.fields_hint.setText(
-                        f"必填预检完成 · 明确用户确认 {manual}/{len(self.fields)} · 自动兜底 0"
+                        f"必填预检完成 · 用户填写 {manual} · 自动兜底 {automatic}"
                     )
                     self.window.real_policy_hint.setText(
-                        "Full Step 3 只执行 AI READY 与明确用户确认值；Python 不再补值或重新解释商品语义。"
+                        "AI READY 仍然原样执行；只有 AI 未解决的必填项才使用自动兜底，"
+                        "并在当前 Makro DOM 上做机械校验后填写。"
                     )
                     append = getattr(self.window, "_append_log", None)
                     if callable(append):
                         append(
                             f"[required-preflight] overrides={path or 'none'} "
-                            f"user={manual} fallback_candidates=0 ai_calls=0"
+                            f"user={manual} fallback_candidates={automatic} ai_calls=0"
                         )
             else:
                 schema_path = latest_live_schema(result.run_dir)
@@ -277,7 +303,7 @@ class RequiredInputSupport(QObject):
                     if stale.exists():
                         stale.unlink()
         except Exception as exc:
-            QMessageBox.critical(self.window, "必填字段确认失败", str(exc))
+            QMessageBox.critical(self.window, "必填字段兜底失败", str(exc))
             return
 
         self._original_start()
