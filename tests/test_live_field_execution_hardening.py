@@ -10,8 +10,6 @@ from app.fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem
 from app.makro.marketplace_constraints import apply_makro_decision_constraints
 from app.makro_dryrun import _fill_control
 from app.required_overrides import (
-    FALLBACK_NUMERIC_VALUE,
-    FALLBACK_TEXT_VALUE,
     RequiredOverrideError,
     apply_required_overrides,
     required_fallback_override,
@@ -47,7 +45,7 @@ def _record(field: dict[str, object], *, resolved: bool = False) -> ResolutionRe
         answer_values=["already ready"] if resolved else [],
         qualifier=None,
         confidence=1.0 if resolved else 0.0,
-        source_type="fixture" if resolved else None,
+        source_type="ai_decision" if resolved else None,
         source_reference="fixture" if resolved else None,
         evidence="fixture" if resolved else None,
         detail="fixture",
@@ -76,88 +74,60 @@ def _item(field: dict[str, object], *, action: str = BLOCKED) -> LiveFillPlanIte
     [
         ("Pick Pack SLA", "shipping_days", {"name": "shipping_days", "type": "number", "field_kind": "input"}),
         ("Air Flow Level", "air_flow_level", {"name": "air_flow_level", "type": "number", "field_kind": "input"}),
-        ("Unfamiliar Metric", "mystery_metric", {"name": "mystery_metric", "role": "spinbutton", "field_kind": "input"}),
-        ("Another Metric", "another_metric", {"name": "another_metric", "inputmode": "decimal", "field_kind": "input"}),
+        ("Unfamiliar Text", "unfamiliar_text", {"name": "unfamiliar_text", "type": "text", "field_kind": "input"}),
     ],
 )
-def test_numeric_fallback_uses_live_control_type_not_field_name(label, key, control):
-    fallback = required_fallback_override(_field(label, key, controls=[control]))
-    assert fallback["values"] == [FALLBACK_NUMERIC_VALUE]
-    assert FALLBACK_NUMERIC_VALUE == "1"
+def test_required_fallback_is_disabled_for_every_control_family(label, key, control):
+    with pytest.raises(RequiredOverrideError, match="自动 N/A / 1 / 首选项兜底已禁用"):
+        required_fallback_override(_field(label, key, controls=[control]))
 
 
-def test_numeric_detection_prefers_control_whose_id_is_attribute_key():
-    field = _field(
-        "Unfamiliar Metric",
-        "mystery_metric",
-        controls=[
-            {"id": "decorative_helper", "name": "helper", "type": "text", "field_kind": "input"},
-            {"id": "mystery_metric", "name": "mystery_metric", "type": "number", "field_kind": "input"},
-        ],
-    )
-    assert required_fallback_override(field)["values"] == ["1"]
-
-
-def test_plain_text_control_still_uses_na_fallback():
-    fallback = required_fallback_override(
-        _field("Unfamiliar Text", "unfamiliar_text", controls=[{"name": "unfamiliar_text", "type": "text", "field_kind": "input"}])
-    )
-    assert fallback["values"] == [FALLBACK_TEXT_VALUE]
-    assert FALLBACK_TEXT_VALUE == "N/A"
-
-
-def test_stale_fallback_na_is_recomputed_from_current_number_control():
-    planned = _field("Air Flow Level", "air_flow_level")
+def test_explicit_user_value_is_preserved_without_python_semantic_rewrite():
     current = _field(
         "Air Flow Level",
         "air_flow_level",
         controls=[{"name": "air_flow_level", "type": "number", "field_kind": "input"}],
     )
-    stale = required_fallback_override(planned)
-    assert stale["values"] == ["N/A"]
-
     item = _item(current)
     result = apply_required_overrides(
         LiveFillPlan([item]),
         [current],
-        [stale],
-        planned_fields=[planned],
+        [{"field_id": field_id(current), "values": ["N/A"], "source_type": "user"}],
     )
 
-    assert result["fallback_recomputed_live"] == 1
+    assert result["applied"] == 1
     assert item.action == READY
-    assert item.resolution.answer_values == ["1"]
+    assert item.resolution.answer_values == ["N/A"]
+    assert item.resolution.source_type == "user"
 
 
-def test_explicit_user_text_is_not_silently_accepted_for_number_control():
-    current = _field(
-        "Air Flow Level",
-        "air_flow_level",
-        controls=[{"name": "air_flow_level", "type": "number", "field_kind": "input"}],
-    )
-    item = _item(current)
-    with pytest.raises(RequiredOverrideError, match="不是有限数字"):
-        apply_required_overrides(
-            LiveFillPlan([item]),
-            [current],
-            [{"field_id": field_id(current), "values": ["N/A"], "source_type": "user"}],
-        )
-
-
-def test_stale_override_does_not_replace_current_ready_decision():
+def test_explicit_override_does_not_replace_current_ai_ready_decision():
     current = _field("Air Flow Level", "air_flow_level")
     item = _item(current, action=READY)
     result = apply_required_overrides(
         LiveFillPlan([item]),
         [current],
-        [required_fallback_override(current)],
+        [{"field_id": field_id(current), "values": ["manual"], "source_type": "user"}],
     )
     assert result["applied"] == 0
     assert result["skipped_current_ready"] == 1
     assert item.resolution.answer_values == ["already ready"]
 
 
-def test_makro_model_name_constraint_removes_known_brand_without_inventing_value():
+def test_legacy_automatic_override_is_ignored():
+    current = _field("Air Flow Level", "air_flow_level")
+    item = _item(current)
+    result = apply_required_overrides(
+        LiveFillPlan([item]),
+        [current],
+        [{"field_id": field_id(current), "values": ["1"], "source_type": "fallback"}],
+    )
+    assert result["applied"] == 0
+    assert result["ignored_automatic"] == 1
+    assert item.action == BLOCKED
+
+
+def test_makro_constraint_layer_is_semantic_noop():
     field = _field("Model Name", "model_name")
     decision = FieldDecision(
         field_id=field_id(field),
@@ -173,12 +143,12 @@ def test_makro_model_name_constraint_removes_known_brand_without_inventing_value
 
     summary = apply_makro_decision_constraints(packet, [field])
 
-    assert summary["model_name_brand_removed"] == 1
+    assert summary == {"model_name_brand_removed": 0, "model_name_blocked": 0}
     assert decision.status == AI_READY
-    assert decision.values == ["Air Purifier"]
+    assert decision.values == ["Dexmary Air Purifier"]
 
 
-def test_makro_model_name_constraint_fails_closed_when_only_brand_remains():
+def test_makro_constraint_layer_never_downgrades_brand_only_ai_ready():
     field = _field("Model Name", "model_name")
     decision = FieldDecision(
         field_id=field_id(field),
@@ -194,9 +164,9 @@ def test_makro_model_name_constraint_fails_closed_when_only_brand_remains():
 
     summary = apply_makro_decision_constraints(packet, [field])
 
-    assert summary["model_name_blocked"] == 1
-    assert decision.status == MISSING
-    assert decision.values == []
+    assert summary["model_name_blocked"] == 0
+    assert decision.status == AI_READY
+    assert decision.values == ["Dexmary"]
 
 
 class _SelectLocator:
@@ -215,8 +185,6 @@ class _SelectLocator:
         assert state == "visible"
 
     def evaluate(self, _script):
-        # Production re-reads the native select's current DOM options immediately
-        # before mutation. The fixture must model that Playwright contract.
         return [
             {"text": "DRAFT", "value": "DRAFT", "disabled": False},
             {"text": "ACTIVE", "value": "ACTIVE", "disabled": False},
