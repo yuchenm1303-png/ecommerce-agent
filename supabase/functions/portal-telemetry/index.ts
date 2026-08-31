@@ -7,9 +7,11 @@ const SESSION_TABLE = "listing_usage_sessions";
 const EVENT_TABLE = "listing_usage_events";
 const DIAGNOSTIC_TABLE = "listing_diagnostic_reports";
 const AUDIT_TABLE = "listing_task_audits";
+const LOG_CHUNK_TABLE = "listing_task_log_chunks";
 const SYSTEM_SAMPLE_TABLE = "listing_system_samples";
 const DEVICE_RE = /^[0-9a-f]{32,128}$/i;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SHA256_RE = /^[0-9a-f]{64}$/i;
 const TOKEN_RE = /^[A-Za-z0-9_-]{32,256}$/;
 const EVENTS = new Set(["listing_prepare", "listing_execute", "batch_prepare", "batch_execute"]);
 const OUTCOMES = new Set(["started", "completed", "failed"]);
@@ -18,11 +20,15 @@ const AUDIT_STATUSES = new Set(["running", "completed", "failed", "cancelled", "
 const MAX_DIAGNOSTIC_BYTES = 80_000;
 const MAX_AUDIT_BYTES = 260_000;
 const MAX_SYSTEM_SAMPLE_BYTES = 32_000;
+const MAX_LOG_CHUNK_BYTES = 48_000;
+const MAX_LOG_CHUNK_DATA_CHARS = 24_000;
 const SECRET_KEY_RE = /(^|_)(api[_-]?key|token|secret|password|authorization|cookie|refresh[_-]?token|access[_-]?token)($|_)/i;
 const SECRET_QUERY_RE = /^(api[_-]?key|key|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|pwd|authorization|auth|signature|sig|sign|credential|session|sessionid)$/i;
 const URL_RE = /https?:\/\/[^\s"'<>]+/gi;
 const INLINE_QUERY_SECRET_RE = /([?&](?:api[_-]?key|key|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|pwd|authorization|auth|signature|sig|sign|credential|session|sessionid)=)([^&#\s"'<>]+)/gi;
 const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+\-/=]{8,}/gi;
+
+type JsonObject = Record<string, unknown>;
 
 function headers(): Record<string, string> {
   return {
@@ -84,8 +90,8 @@ function redactSecrets(value: unknown, depth = 0): unknown {
     if (typeof value === "string") return sanitizeText(value.slice(0, 32_000));
     return value;
   }
-  const source = value as Record<string, unknown>;
-  const output: Record<string, unknown> = {};
+  const source = value as JsonObject;
+  const output: JsonObject = {};
   for (const [key, item] of Object.entries(source).slice(0, 500)) {
     output[key.slice(0, 160)] = SECRET_KEY_RE.test(key) ? "[REDACTED]" : redactSecrets(item, depth + 1);
   }
@@ -99,11 +105,46 @@ function safeIso(value: unknown, fallback: string | null): string | null {
   return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : fallback;
 }
 
+function finiteInteger(value: unknown, fallback = 0): number {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : fallback;
+}
+
+async function resolveAudit(
+  admin: ReturnType<typeof createClient>,
+  userId: string,
+  deviceId: string,
+  auditId: string,
+  batchId: string,
+  jobId: string,
+): Promise<{ id: string; user_id: string; device_id: string } | null> {
+  if (batchId && jobId) {
+    const { data, error } = await admin.from(AUDIT_TABLE)
+      .select("id,user_id,device_id")
+      .eq("user_id", userId)
+      .eq("batch_id", batchId)
+      .eq("job_id", jobId)
+      .maybeSingle();
+    if (error) throw new Error("task_audit_logical_check_failed");
+    if (data) return data;
+  }
+  if (!UUID_RE.test(auditId)) return null;
+  const { data, error } = await admin.from(AUDIT_TABLE)
+    .select("id,user_id,device_id")
+    .eq("id", auditId)
+    .maybeSingle();
+  if (error) throw new Error("task_audit_check_failed");
+  if (data && (data.user_id !== userId || data.device_id !== deviceId)) {
+    throw new Error("task_audit_owner_mismatch");
+  }
+  return data;
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: headers() });
   if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
 
-  let body: Record<string, unknown> = {};
+  let body: JsonObject = {};
   try { body = await req.json(); } catch { return json({ error: "invalid_json" }, 400); }
 
   const action = String(body.action || "heartbeat").trim();
@@ -115,7 +156,7 @@ Deno.serve(async (req: Request) => {
   const eventType = String(body.event_type || "").trim();
   const outcome = String(body.outcome || "").trim();
 
-  if (!["session_start", "heartbeat", "event", "session_end", "diagnostic", "task_audit", "system_sample"].includes(action)) {
+  if (!["session_start", "heartbeat", "event", "session_end", "diagnostic", "task_audit", "task_log_chunk", "system_sample"].includes(action)) {
     return json({ error: "invalid_action" }, 400);
   }
   if (!UUID_RE.test(userId)) return json({ error: "invalid_identity" }, 400);
@@ -149,8 +190,7 @@ Deno.serve(async (req: Request) => {
     return json({ error: "invalid_telemetry_token" }, 401);
   }
 
-  const { error: deviceTouchError } = await admin
-    .from(DEVICE_TABLE)
+  const { error: deviceTouchError } = await admin.from(DEVICE_TABLE)
     .update({ last_seen_at: nowIso, app_version: appVersion, updated_at: nowIso })
     .eq("user_id", userId)
     .eq("device_id", deviceId);
@@ -161,7 +201,7 @@ Deno.serve(async (req: Request) => {
     if (!rawDiagnostic || typeof rawDiagnostic !== "object" || Array.isArray(rawDiagnostic)) {
       return json({ error: "invalid_diagnostic" }, 400);
     }
-    const diagnostic = redactSecrets(rawDiagnostic) as Record<string, unknown>;
+    const diagnostic = redactSecrets(rawDiagnostic) as JsonObject;
     const encoded = JSON.stringify(diagnostic);
     if (new TextEncoder().encode(encoded).byteLength > MAX_DIAGNOSTIC_BYTES) {
       return json({ error: "diagnostic_too_large" }, 413);
@@ -169,7 +209,6 @@ Deno.serve(async (req: Request) => {
     const crashId = String(diagnostic.crash_id || "").trim().slice(0, 160);
     const startupStage = String(diagnostic.last_stage || "").trim().slice(0, 160);
     if (crashId.length < 8) return json({ error: "invalid_crash_id" }, 400);
-
     const reportCode = diagnosticCode();
     const { error } = await admin.from(DIAGNOSTIC_TABLE).insert({
       report_code: reportCode,
@@ -185,8 +224,7 @@ Deno.serve(async (req: Request) => {
     return json({ accepted: true, action, report_code: reportCode, server_time: nowIso });
   }
 
-  const { data: existingSession, error: sessionError } = await admin
-    .from(SESSION_TABLE)
+  const { data: existingSession, error: sessionError } = await admin.from(SESSION_TABLE)
     .select("id, user_id, device_id")
     .eq("id", sessionId)
     .maybeSingle();
@@ -208,7 +246,7 @@ Deno.serve(async (req: Request) => {
     });
     if (error) return json({ error: "session_create_failed" }, 503);
   } else {
-    const patch: Record<string, unknown> = { last_seen_at: nowIso, app_version: appVersion };
+    const patch: JsonObject = { last_seen_at: nowIso, app_version: appVersion };
     if (action === "session_start") patch.ended_at = null;
     if (action === "session_end") patch.ended_at = nowIso;
     const { error } = await admin.from(SESSION_TABLE).update(patch).eq("id", sessionId).eq("user_id", userId);
@@ -234,7 +272,7 @@ Deno.serve(async (req: Request) => {
     if (!rawSample || typeof rawSample !== "object" || Array.isArray(rawSample)) {
       return json({ error: "invalid_system_sample" }, 400);
     }
-    const sample = redactSecrets(rawSample) as Record<string, unknown>;
+    const sample = redactSecrets(rawSample) as JsonObject;
     const encoded = JSON.stringify(sample);
     if (new TextEncoder().encode(encoded).byteLength > MAX_SYSTEM_SAMPLE_BYTES) {
       return json({ error: "system_sample_too_large" }, 413);
@@ -256,7 +294,7 @@ Deno.serve(async (req: Request) => {
     if (!rawAudit || typeof rawAudit !== "object" || Array.isArray(rawAudit)) {
       return json({ error: "invalid_task_audit" }, 400);
     }
-    const audit = redactSecrets(rawAudit) as Record<string, unknown>;
+    const audit = redactSecrets(rawAudit) as JsonObject;
     const encoded = JSON.stringify(audit);
     if (new TextEncoder().encode(encoded).byteLength > MAX_AUDIT_BYTES) {
       return json({ error: "task_audit_too_large" }, 413);
@@ -269,51 +307,33 @@ Deno.serve(async (req: Request) => {
     const productUrl = String(audit.product_url || "").trim().slice(0, 4096);
     const errorText = String(audit.error_text || "").trim().slice(0, 12_000);
     const inputData = audit.input_data && typeof audit.input_data === "object" && !Array.isArray(audit.input_data)
-      ? audit.input_data as Record<string, unknown>
-      : {};
+      ? audit.input_data as JsonObject : {};
     const resultData = audit.result_data && typeof audit.result_data === "object" && !Array.isArray(audit.result_data)
-      ? audit.result_data as Record<string, unknown>
-      : {};
+      ? audit.result_data as JsonObject : {};
     if (!UUID_RE.test(auditId) || !AUDIT_KINDS.has(taskKind) || !AUDIT_STATUSES.has(status)) {
       return json({ error: "invalid_task_audit_contract" }, 400);
     }
 
-    const batchId = taskKind === "batch"
-      ? String(inputData.batch_id || resultData.batch_id || "").trim().slice(0, 200)
-      : "";
-    const jobId = taskKind === "batch"
-      ? String(inputData.job_id || resultData.job_id || "").trim().slice(0, 160)
-      : "";
+    const batchId = taskKind === "batch" ? String(inputData.batch_id || resultData.batch_id || "").trim().slice(0, 200) : "";
+    const jobId = taskKind === "batch" ? String(inputData.job_id || resultData.job_id || "").trim().slice(0, 160) : "";
+    let existingAudit: { id: string; user_id: string; device_id: string; created_at?: string } | null = null;
 
-    let existingAudit: { id: string; user_id: string; device_id: string; created_at: string } | null = null;
-
-    // Batch audit identity belongs to the logical product job, not to whichever
-    // client-side telemetry controller happened to generate a UUID first.
     if (batchId && jobId) {
-      const { data: logicalAudit, error: logicalAuditError } = await admin
-        .from(AUDIT_TABLE)
-        .select("id, user_id, device_id, created_at")
-        .eq("user_id", userId)
-        .eq("batch_id", batchId)
-        .eq("job_id", jobId)
-        .maybeSingle();
-      if (logicalAuditError) return json({ error: "task_audit_logical_check_failed" }, 503);
-      if (logicalAudit) {
-        existingAudit = logicalAudit;
-        auditId = logicalAudit.id;
+      const { data, error } = await admin.from(AUDIT_TABLE)
+        .select("id,user_id,device_id,created_at")
+        .eq("user_id", userId).eq("batch_id", batchId).eq("job_id", jobId).maybeSingle();
+      if (error) return json({ error: "task_audit_logical_check_failed" }, 503);
+      if (data) {
+        existingAudit = data;
+        auditId = data.id;
       }
     }
-
     if (!existingAudit) {
-      const { data: idAudit, error: auditCheckError } = await admin
-        .from(AUDIT_TABLE)
-        .select("id, user_id, device_id, created_at")
-        .eq("id", auditId)
-        .maybeSingle();
-      if (auditCheckError) return json({ error: "task_audit_check_failed" }, 503);
-      existingAudit = idAudit;
+      const { data, error } = await admin.from(AUDIT_TABLE)
+        .select("id,user_id,device_id,created_at").eq("id", auditId).maybeSingle();
+      if (error) return json({ error: "task_audit_check_failed" }, 503);
+      existingAudit = data;
     }
-
     if (existingAudit && (existingAudit.user_id !== userId || existingAudit.device_id !== deviceId)) {
       return json({ error: "task_audit_owner_mismatch" }, 403);
     }
@@ -341,31 +361,95 @@ Deno.serve(async (req: Request) => {
     } else {
       const { error: createError } = await admin.from(AUDIT_TABLE).insert({ id: auditId, ...record, created_at: nowIso });
       if (createError) {
-        // Two legacy writers can race after both observe no row. The database
-        // logical-key constraint arbitrates that race; the loser then updates
-        // the row that won instead of creating another audit or returning 503.
         if (createError.code !== "23505" || !batchId || !jobId) {
           return json({ error: "task_audit_create_failed" }, 503);
         }
-        const { data: racedAudit, error: raceLookupError } = await admin
-          .from(AUDIT_TABLE)
-          .select("id, user_id, device_id")
-          .eq("user_id", userId)
-          .eq("batch_id", batchId)
-          .eq("job_id", jobId)
-          .maybeSingle();
+        const { data: racedAudit, error: raceLookupError } = await admin.from(AUDIT_TABLE)
+          .select("id,user_id,device_id")
+          .eq("user_id", userId).eq("batch_id", batchId).eq("job_id", jobId).maybeSingle();
         if (raceLookupError || !racedAudit) return json({ error: "task_audit_race_recovery_failed" }, 503);
         if (racedAudit.user_id !== userId || racedAudit.device_id !== deviceId) {
           return json({ error: "task_audit_owner_mismatch" }, 403);
         }
-        const { error: updateError } = await admin
-          .from(AUDIT_TABLE)
-          .update(record)
-          .eq("id", racedAudit.id)
-          .eq("user_id", userId);
+        auditId = racedAudit.id;
+        const { error: updateError } = await admin.from(AUDIT_TABLE)
+          .update(record).eq("id", auditId).eq("user_id", userId);
         if (updateError) return json({ error: "task_audit_update_failed" }, 503);
       }
     }
+    return json({ accepted: true, action, task_audit_id: auditId, server_time: nowIso });
+  }
+
+  if (action === "task_log_chunk") {
+    const rawChunk = body.log_chunk;
+    if (!rawChunk || typeof rawChunk !== "object" || Array.isArray(rawChunk)) {
+      return json({ error: "invalid_task_log_chunk" }, 400);
+    }
+    const chunk = rawChunk as JsonObject;
+    const auditId = String(chunk.audit_id || "").trim().toLowerCase();
+    const batchId = String(chunk.batch_id || "").trim().slice(0, 200);
+    const jobId = String(chunk.job_id || "").trim().slice(0, 160);
+    const logName = sanitizeText(String(chunk.name || chunk.log_name || "").trim()).slice(0, 240);
+    const stage = sanitizeText(String(chunk.stage || "").trim()).slice(0, 240);
+    const logSha256 = String(chunk.sha256 || "").trim().toLowerCase();
+    const encoding = String(chunk.encoding || "").trim();
+    const chunkIndex = finiteInteger(chunk.chunk_index, -1);
+    const chunkCount = finiteInteger(chunk.chunk_count, 0);
+    const lineCount = Math.max(0, finiteInteger(chunk.line_count, 0));
+    const byteCount = Math.max(0, finiteInteger(chunk.byte_count, 0));
+    const compressedByteCount = Math.max(0, finiteInteger(chunk.compressed_byte_count, 0));
+    const chunkData = String(chunk.data || "");
+
+    if (!logName || !SHA256_RE.test(logSha256) || encoding !== "gzip+base64-chunks") {
+      return json({ error: "invalid_task_log_contract" }, 400);
+    }
+    if (chunkIndex < 0 || chunkCount < 1 || chunkCount > 100_000 || chunkIndex >= chunkCount) {
+      return json({ error: "invalid_task_log_chunk_index" }, 400);
+    }
+    if (chunkData.length > MAX_LOG_CHUNK_DATA_CHARS) return json({ error: "task_log_chunk_too_large" }, 413);
+    if (new TextEncoder().encode(JSON.stringify(chunk)).byteLength > MAX_LOG_CHUNK_BYTES) {
+      return json({ error: "task_log_chunk_too_large" }, 413);
+    }
+
+    let resolved;
+    try {
+      resolved = await resolveAudit(admin, userId, deviceId, auditId, batchId, jobId);
+    } catch (error) {
+      const code = error instanceof Error ? error.message : "task_audit_check_failed";
+      if (code === "task_audit_owner_mismatch") return json({ error: code }, 403);
+      return json({ error: code }, 503);
+    }
+    if (!resolved) return json({ error: "task_audit_not_ready" }, 409);
+
+    const { error } = await admin.from(LOG_CHUNK_TABLE).upsert({
+      audit_id: resolved.id,
+      user_id: userId,
+      session_id: sessionId,
+      device_id: deviceId,
+      app_version: appVersion,
+      log_name: logName,
+      stage,
+      log_sha256: logSha256,
+      encoding,
+      chunk_index: chunkIndex,
+      chunk_count: chunkCount,
+      line_count: lineCount,
+      byte_count: byteCount,
+      compressed_byte_count: compressedByteCount,
+      chunk_data: chunkData,
+      updated_at: nowIso,
+    }, { onConflict: "audit_id,log_name,log_sha256,chunk_index" });
+    if (error) return json({ error: "task_log_chunk_write_failed" }, 503);
+    return json({
+      accepted: true,
+      action,
+      task_audit_id: resolved.id,
+      log_name: logName,
+      sha256: logSha256,
+      chunk_index: chunkIndex,
+      chunk_count: chunkCount,
+      server_time: nowIso,
+    });
   }
 
   return json({ accepted: true, action, server_time: nowIso });
