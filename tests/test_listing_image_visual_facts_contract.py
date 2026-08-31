@@ -8,6 +8,7 @@ from app.listing_image_ranker import (
     _Candidate,
     _parse_ownership,
     build_listing_image_ownership_request,
+    build_listing_image_ranking_request,
     ListingImageRankingError,
 )
 
@@ -21,7 +22,7 @@ def _candidate(image_id: str = "image_01") -> _Candidate:
     )
 
 
-def test_ownership_contract_requires_pixel_facts_and_positive_identity_proof_before_relationship() -> None:
+def test_ownership_contract_requires_pixel_facts_and_visual_fingerprint_proof_before_relationship() -> None:
     request = build_listing_image_ownership_request(
         product_context={
             "name": "Dyson Airwrap i.d Multi-Styler and Dryer",
@@ -46,22 +47,45 @@ def test_ownership_contract_requires_pixel_facts_and_positive_identity_proof_bef
     assert required[5:] == ["classification", "confidence", "reason"]
 
     assert request["context"]["decision_protocol"] == (
-        "pixel_visual_facts_then_positive_identity_proof_v3"
+        "pixel_visual_facts_then_visual_fingerprint_identity_proof_v4"
     )
     prompt = request["prompt_instruction"].lower()
     rules = "\n".join(request["rules"]).lower()
     assert "from pixels" in prompt
     assert "target_match_evidence and target_identity_gaps before assigning classification" in prompt
-    assert "do not copy target fields" in prompt
-    assert "ocr/readable" in prompt
-    assert "brand/category agreement" in prompt
-    assert "absence of a visible contradiction is never enough" in prompt
+    assert "not mandatory" in prompt
+    assert "missing or unreadable model label" in prompt
+    assert "colour alone" in prompt
+    assert "generic product-family resemblance" in prompt
     assert "dom text" in rules
     assert "filenames or urls" in rules
-    assert "positive proof burden" in rules
+    assert "visual fingerprint" in rules
+    assert "catalog code does not have to be literally printed" in rules
+    assert "empty visible_identity field does not by itself create an identity gap" in rules
+    assert "do not list an unreadable brand/model label as a gap" in rules
     assert "matching brand logo proves only the brand" in rules
     assert "absence of conflict is not evidence of identity" in rules
-    assert "only brand or broad category is verified" in rules
+    assert "do not use uncertain merely because a model code or logo is not readable" in rules
+
+
+def test_gallery_recheck_does_not_require_readable_model_text_when_visual_fingerprint_is_sufficient() -> None:
+    request = build_listing_image_ranking_request(
+        product_context={
+            "name": "Dyson Airwrap HS05",
+            "brand": "Dyson",
+            "model": "HS05",
+            "variant": "Nickel / Copper",
+        },
+        candidates=[_candidate()],
+    )
+
+    prompt = request["prompt_instruction"].lower()
+    rules = "\n".join(request["rules"]).lower()
+    assert "readable logo/model text is not mandatory" in prompt
+    assert "colour alone" in prompt
+    assert "readable logo or model code is not required" in rules
+    assert "do not reject a candidate merely because a textual model label is absent or unreadable" in rules
+    assert "meaningful visual ambiguity remains" in rules
 
 
 def test_parsed_ownership_preserves_visual_evidence_and_identity_proof_for_gallery_and_report() -> None:
@@ -134,7 +158,7 @@ def test_parser_rejects_missing_positive_identity_proof_fields() -> None:
                         "visual_subject": "hair styling tool",
                         "visible_identity": "Dyson",
                         "visible_configuration": "pink styling tool",
-                        "target_identity_gaps": "model and exact variant are unverified",
+                        "target_identity_gaps": "model and exact variant are visually ambiguous",
                         "classification": "UNCERTAIN",
                         "confidence": 0.6,
                         "reason": "Exact target identity is not positively established.",
