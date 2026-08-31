@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.ai_decisions import READY, FieldDecision
-from app.fill_plan import _fixed_qualifier_rendered, _hard_guard_values
+from app.fill_plan import _hard_guard_values
 from app.makro.semantic_normalize import coalesce_radio_semantic_fields
 
 
@@ -86,7 +86,7 @@ def _noise_field(context: str) -> dict:
     }
 
 
-def test_annotated_sound_unit_matches_bare_fixed_db_display():
+def test_ai_sound_unit_is_preserved_when_dom_renders_bare_db():
     field = _noise_field("Noise Level dB")
     decision = FieldDecision(
         field_id="noise",
@@ -98,19 +98,29 @@ def test_annotated_sound_unit_matches_bare_fixed_db_display():
 
     values, qualifier, error = _hard_guard_values(field, decision)
 
-    assert _fixed_qualifier_rendered(field, "dB(A)") is True
     assert values == ["36"]
-    assert qualifier == ""
+    assert qualifier == "dB(A)"
     assert error is None
 
 
-def test_annotated_sound_unit_matches_compact_dba_display():
+def test_ai_sound_unit_is_preserved_when_dom_renders_compact_dba():
     field = _noise_field("Noise Level dBA")
+    decision = FieldDecision(
+        field_id="noise",
+        status=READY,
+        values=["36"],
+        qualifier="dB(A)",
+        confidence=0.9,
+    )
 
-    assert _fixed_qualifier_rendered(field, "dB(A)") is True
+    values, qualifier, error = _hard_guard_values(field, decision)
+
+    assert values == ["36"]
+    assert qualifier == "dB(A)"
+    assert error is None
 
 
-def test_annotated_sound_unit_does_not_match_different_weighting():
+def test_dom_weighting_does_not_rejudge_ai_sound_unit():
     field = _noise_field("Noise Level dB(C)")
     decision = FieldDecision(
         field_id="noise",
@@ -122,7 +132,6 @@ def test_annotated_sound_unit_does_not_match_different_weighting():
 
     values, qualifier, error = _hard_guard_values(field, decision)
 
-    assert _fixed_qualifier_rendered(field, "dB(A)") is False
     assert values == ["36"]
     assert qualifier == "dB(A)"
-    assert error is not None
+    assert error is None
