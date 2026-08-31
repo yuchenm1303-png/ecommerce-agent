@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "case_id": "B02_dyson_hs05_variant_pressure",
+  "review_basis": "Human-reviewed 3x5 contact sheet from the 2026-08-31 Makro Dyson brand-page capture. Target is Dyson HS05 Hair Styler, Nickel/Copper. Visually similar Airwrap images in other colourways/configurations are intentionally labelled SAME_PRODUCT_OTHER_VARIANT.",
+  "expected_candidate_count": 15,
+  "expected_target": {
+    "name": "Dyson HS05 Hair Styler",
+    "brand": "Dyson",
+    "model": "HS05",
+    "variant": "Nickel, Copper"
+  },
+  "labels": {
+    "img_001": {"ownership": "PAGE_ASSET", "relevance_grade": 0, "main_image_allowed": false},
+    "img_002": {"ownership": "OTHER_PRODUCT", "relevance_grade": 0, "main_image_allowed": false},
+    "img_003": {"ownership": "SAME_PRODUCT_OTHER_VARIANT", "relevance_grade": 0, "main_image_allowed": false},
+    "img_004": {"ownership": "SAME_PRODUCT_OTHER_VARIANT", "relevance_grade": 0, "main_image_allowed": false},
+    "img_005": {"ownership": "OTHER_PRODUCT", "relevance_grade": 0, "main_image_allowed": false},
+    "img_006": {"ownership": "EXACT_TARGET", "relevance_grade": 3, "main_image_allowed": true},
+    "img_007": {"ownership": "OTHER_PRODUCT", "relevance_grade": 0, "main_image_allowed": false},
+    "img_008": {"ownership": "OTHER_PRODUCT", "relevance_grade": 0, "main_image_allowed": false},
+    "img_009": {"ownership": "OTHER_PRODUCT", "relevance_grade": 0, "main_image_allowed": false},
+    "img_010": {"ownership": "OTHER_PRODUCT", "relevance_grade": 0, "main_image_allowed": false},
+    "img_011": {"ownership": "OTHER_PRODUCT", "relevance_grade": 0, "main_image_allowed": false},
+    "img_012": {"ownership": "OTHER_PRODUCT", "relevance_grade": 0, "main_image_allowed": false},
+    "img_013": {"ownership": "SAME_PRODUCT_OTHER_VARIANT", "relevance_grade": 0, "main_image_allowed": false},
+    "img_014": {"ownership": "SAME_PRODUCT_OTHER_VARIANT", "relevance_grade": 0, "main_image_allowed": false},
+    "img_015": {"ownership": "SAME_PRODUCT_OTHER_VARIANT", "relevance_grade": 0, "main_image_allowed": false}
+  }
+}
