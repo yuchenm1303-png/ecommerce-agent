@@ -66,9 +66,9 @@ def test_release_environment_isolated_and_records_provenance() -> None:
     assert 'runner_image_version = [string]$env:ImageVersion' in INSTALL
 
 
-def test_stable_requires_the_same_source_and_release_contract_to_be_tested_first() -> None:
+def test_stable_can_optionally_validate_the_same_source_and_release_contract() -> None:
     assert "validated_test_tag:" in STABLE_WORKFLOW
-    assert "Verify validated Test candidate" in STABLE_WORKFLOW
+    assert "Verify optional Test candidate" in STABLE_WORKFLOW
     assert 'test-$version-$short-*' in STABLE_WORKFLOW
     assert 'release-environment.json' in STABLE_WORKFLOW
     assert 'release_lock_sha256' in STABLE_WORKFLOW
@@ -83,8 +83,11 @@ def test_test_workflow_matches_current_velopack_outputs_not_removed_msi_path() -
     assert "test_velopack_msi.ps1" not in TEST_WORKFLOW
 
 
-def test_stable_signing_remains_a_publish_only_gate() -> None:
-    assert "Require Stable code signing" in STABLE_WORKFLOW
+def test_stable_signing_is_optional_but_configuration_remains_validated() -> None:
+    assert "Validate optional Stable code signing" in STABLE_WORKFLOW
+    assert "Stable publication is unsigned" in STABLE_WORKFLOW
+    assert "Stable publication requires code signing" not in STABLE_WORKFLOW
+    assert "Configure exactly one Stable signing mode, not both." in STABLE_WORKFLOW
     assert "VPK_AZURE_TRUSTED_SIGN_FILE" in STABLE_WORKFLOW
     assert "VPK_SIGN_PARAMS" in STABLE_WORKFLOW
     assert "VPK_AZURE_TRUSTED_SIGN_FILE" not in TEST_WORKFLOW
