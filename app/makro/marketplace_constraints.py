@@ -17,6 +17,14 @@ from typing import Any, Iterable
 from ..ai_decisions import AIDecisionPacket
 
 
+def _is_model_name_field(field: dict[str, Any]) -> bool:
+    """Identify the historical Model Name field for adapter compatibility."""
+
+    key = str(field.get("attribute_key") or "").strip().casefold()
+    label = " ".join(str(field.get("label") or "").casefold().split())
+    return key == "model_name" or label == "model name"
+
+
 def _strip_known_brand(value: str, brand: str) -> str:
     """Return the AI-selected value unchanged.
 
