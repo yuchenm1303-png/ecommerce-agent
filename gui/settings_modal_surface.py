@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -24,15 +25,43 @@ from app.ai_service_settings import (
     resolved_ai_runtime,
     save_ai_service_settings,
 )
+from app.image_optimization_gate import (
+    image_optimization_enabled,
+    set_image_optimization_enabled,
+)
 
 
 _RUNTIME_KEY_ENV = "AI_API_KEY"
 _MASKED_KEY = "••••••••••••••••"
+_IMAGE_OPTIMIZATION_GUI_UNLOCKED = False
 
 _CONTENT_STYLE = r"""
 QWidget#aiSettingsContent { background: transparent; }
 QLabel#aiSettingsHint { color: rgba(255,255,255,196); font-size: 11px; }
 QLabel#aiSettingsProvider { color: rgba(255,255,255,238); font-size: 12px; font-weight: 720; }
+QLabel#imageOptimizationState { color: rgba(255,255,255,138); font-size: 11px; }
+QCheckBox#imageOptimizationSwitch {
+    color: rgba(255,255,255,226);
+    spacing: 9px;
+    font-size: 12px;
+    font-weight: 700;
+}
+QCheckBox#imageOptimizationSwitch:disabled { color: rgba(255,255,255,116); }
+QCheckBox#imageOptimizationSwitch::indicator {
+    width: 38px;
+    height: 20px;
+    border-radius: 10px;
+    border: 1px solid rgba(255,255,255,34);
+    background: rgba(255,255,255,32);
+}
+QCheckBox#imageOptimizationSwitch::indicator:checked {
+    border-color: rgba(157,243,239,90);
+    background: rgba(65,151,148,155);
+}
+QCheckBox#imageOptimizationSwitch::indicator:disabled {
+    border-color: rgba(255,255,255,20);
+    background: rgba(255,255,255,18);
+}
 QLineEdit#aiSettingsInput {
     min-height: 39px;
     padding: 0 12px;
@@ -100,6 +129,27 @@ class AISettingsContent(QWidget):
         self.api_key = self._input("输入你自己的 API Key")
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
 
+        self.image_optimization = QCheckBox("开启")
+        self.image_optimization.setObjectName("imageOptimizationSwitch")
+        self.image_optimization.setAccessibleName("图像优化")
+        self.image_optimization.setEnabled(_IMAGE_OPTIMIZATION_GUI_UNLOCKED)
+        self.image_optimization.setToolTip(
+            "高负载图像优化：启用后使用 Target Identity → Ownership → Gallery 多模态图片链。"
+            "当前版本暂未开放。"
+        )
+        self.image_optimization.toggled.connect(self._image_optimization_toggled)
+
+        self.image_optimization_state = QLabel("默认关闭 · 高负载 · 当前暂未开放")
+        self.image_optimization_state.setObjectName("imageOptimizationState")
+        self.image_optimization_state.setWordWrap(True)
+
+        optimization_row = QWidget()
+        optimization_layout = QHBoxLayout(optimization_row)
+        optimization_layout.setContentsMargins(0, 0, 0, 0)
+        optimization_layout.setSpacing(10)
+        optimization_layout.addWidget(self.image_optimization, 0, Qt.AlignmentFlag.AlignVCenter)
+        optimization_layout.addWidget(self.image_optimization_state, 1, Qt.AlignmentFlag.AlignVCenter)
+
         self.key_action = QPushButton("显示")
         self.key_action.setObjectName("modalPrimaryButton")
         self.key_action.setMaximumWidth(72)
@@ -116,6 +166,7 @@ class AISettingsContent(QWidget):
             ("主模型", self.model),
             ("事实模型", self.fact_model),
             ("Web 搜索模型", self.web_model),
+            ("图像优化", optimization_row),
         ]
         for row, (text, widget) in enumerate(rows):
             label = QLabel(text)
@@ -135,7 +186,8 @@ class AISettingsContent(QWidget):
         layout.addWidget(self.key_status)
 
         policy = QLabel(
-            "正式客户端只使用这里配置的用户密钥。以后如果提供平台内置 AI 额度，"
+            "正式客户端只使用这里配置的用户密钥。图像优化默认关闭时继续使用原有图片选择路径，"
+            "不会启动额外的 Ownership / Gallery 多模态调用。以后如果提供平台内置 AI 额度，"
             "由服务器端 Gateway 做鉴权、配额、限流和计费，不把平台上游 Key 放进客户端。"
         )
         policy.setObjectName("cardDetailText")
@@ -176,6 +228,32 @@ class AISettingsContent(QWidget):
         self.web_model.setText(settings.web_model)
         self._set_key_state(has_ai_service_key(settings))
         self._refresh_key_status(settings)
+        self._sync_image_optimization()
+
+    def _sync_image_optimization(self) -> None:
+        enabled = bool(_IMAGE_OPTIMIZATION_GUI_UNLOCKED and image_optimization_enabled())
+        blocked = self.image_optimization.blockSignals(True)
+        try:
+            self.image_optimization.setChecked(enabled)
+        finally:
+            self.image_optimization.blockSignals(blocked)
+        self.image_optimization.setEnabled(_IMAGE_OPTIMIZATION_GUI_UNLOCKED)
+        if _IMAGE_OPTIMIZATION_GUI_UNLOCKED:
+            self.image_optimization_state.setText(
+                "已开启 · 使用高负载 AI 图片链" if enabled else "已关闭 · 使用原有图片路径"
+            )
+        else:
+            self.image_optimization_state.setText("默认关闭 · 高负载 · 当前暂未开放")
+
+    def _image_optimization_toggled(self, checked: bool) -> None:
+        enabled = bool(checked and _IMAGE_OPTIMIZATION_GUI_UNLOCKED)
+        set_image_optimization_enabled(enabled)
+        if checked != enabled:
+            self._sync_image_optimization()
+            return
+        self.image_optimization_state.setText(
+            "已开启 · 使用高负载 AI 图片链" if enabled else "已关闭 · 使用原有图片路径"
+        )
 
     def _set_key_state(self, configured: bool) -> None:
         self._key_configured = bool(configured)
@@ -284,9 +362,13 @@ class AISettingsModalController:
 
     def __init__(self, window) -> None:
         self.window = window
+        # Every GUI launch starts on the legacy image path. The visible switch is
+        # intentionally locked for now; once unlocked, it owns this process gate
+        # and child Resolver processes inherit the state mechanically.
+        set_image_optimization_enabled(False)
         self.button = QPushButton("设置")
         self.button.setObjectName("quietButton")
-        self.button.setToolTip("AI 服务 / API Key")
+        self.button.setToolTip("AI 服务 / API Key / 图像优化")
         self.button.clicked.connect(self.open)
         self._panel: AISettingsContent | None = None
         self._runner_start: Callable[..., Any] | None = None
