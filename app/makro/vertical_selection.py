@@ -417,10 +417,6 @@ def _complete_exact_live_vertical(
 
 def _close_vertical_search(search, page: Page, *, wait_ms: int) -> None:
     try:
-        search.fill("")
-    except Exception as exc:
-        raise RuntimeError("Makro Step 1 Vertical Search input could not be cleared between query generations") from exc
-    try:
         search.press("Escape")
     except Exception:
         pass
@@ -432,6 +428,14 @@ def _close_vertical_search(search, page: Page, *, wait_ms: int) -> None:
         page.wait_for_timeout(min(max(int(wait_ms) // 5, 80), 180))
 
 
+def _reset_vertical_search(search, page: Page, *, wait_ms: int) -> None:
+    try:
+        search.fill("")
+    except Exception as exc:
+        raise RuntimeError("Makro Step 1 Vertical Search input could not be cleared between query generations") from exc
+    _close_vertical_search(search, page, wait_ms=wait_ms)
+
+
 def _run_vertical_search_query(
     page: Page,
     term: str,
@@ -441,7 +445,7 @@ def _run_vertical_search_query(
     """Run one query with a freshly reacquired search owner."""
 
     search = _vertical_search_input(page)
-    _close_vertical_search(search, page, wait_ms=wait_ms)
+    _reset_vertical_search(search, page, wait_ms=wait_ms)
     search = _vertical_search_input(page)
     generation = begin_search_query(search)
     if generation <= 0:
@@ -572,6 +576,7 @@ def _try_select_via_search(
                 "Makro Step 1 AI selected one current live Vertical, but that exact current row could "
                 f"not be clicked; selected={current_row!r}; query={term!r}"
             )
+        _close_vertical_search(search, page, wait_ms=wait_ms)
         return (
             _complete_exact_live_vertical(
                 page,
