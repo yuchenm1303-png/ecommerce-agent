@@ -435,7 +435,6 @@ def _ranking_schema(candidate_ids: list[str]) -> dict[str, Any]:
             "selected_image_ids": {
                 "type": "array",
                 "maxItems": MAX_AUTO_LISTING_IMAGES,
-                "uniqueItems": True,
                 "items": {"type": "string", "enum": candidate_ids},
             },
             "decisions": {
@@ -487,7 +486,7 @@ def build_listing_image_ranking_request(
         },
         "rules": [
             "Inspect the actual pixels of every supplied candidate again before deciding.",
-            "selected_image_ids is the final gallery order and must contain no more than five image_ids.",
+            "selected_image_ids is the final gallery order, must contain no more than five image_ids, and must not contain duplicates.",
             "Every selected image must remain consistent with the exact target product and exact supported variant/configuration.",
             "Reject any residual unrelated product, recommendation, wrong variant, misleading accessory or page asset even if the ownership pass admitted it.",
             "Position 1 should be the strongest clear main image of the exact sale unit when one exists.",
