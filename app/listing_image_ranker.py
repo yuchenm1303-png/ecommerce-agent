@@ -13,7 +13,7 @@ from .providers.usage_telemetry import usage_request_context
 from .source_snapshot import SourceSnapshot, source_snapshot_from_json
 
 
-LISTING_IMAGE_RANKING_VERSION = 6
+LISTING_IMAGE_RANKING_VERSION = 7
 MAX_AUTO_LISTING_IMAGES = 5
 OWNERSHIP_BATCH_SIZE = 6
 
@@ -28,7 +28,7 @@ _IMAGE_OWNERSHIP_CLASSES = (
 _AUTO_ELIGIBLE_OWNERSHIP_CLASSES = frozenset(
     {"EXACT_TARGET", "TARGET_PACKAGING_OR_DETAIL"}
 )
-_IMAGE_OWNERSHIP_PROTOCOL = "pixel_visual_facts_then_positive_identity_proof_v3"
+_IMAGE_OWNERSHIP_PROTOCOL = "pixel_visual_facts_then_visual_fingerprint_identity_proof_v4"
 
 
 class ListingImageRankingError(RuntimeError):
@@ -343,27 +343,28 @@ def build_listing_image_ownership_request(
     product_context: dict[str, Any],
     candidates: list[_Candidate],
 ) -> dict[str, Any]:
-    """Ask AI for pixel facts, positive identity proof, then exact sale-unit ownership."""
+    """Ask AI for pixel facts, visual-fingerprint proof, then exact sale-unit ownership."""
 
     candidate_ids = [candidate.image_id for candidate in candidates]
     return {
         "task": "classify_supplier_listing_image_ownership",
         "system_instruction": (
             "You are the semantic ownership gate for ecommerce Product Photos. For every candidate, first record "
-            "concise facts actually visible in the image pixels, then explicitly state the positive visual evidence "
-            "that proves the candidate belongs to the already-grounded exact target identity and any target identity "
-            "facts that remain unverified or conflict. Only then classify the relationship. Do not rank photos and "
-            "do not try to fill a gallery quota. JSON only."
+            "concise facts actually visible in the image pixels, then determine whether the combined pixel-visible "
+            "visual fingerprint positively establishes the already-grounded exact target identity and variant. A visual "
+            "fingerprint may be formed by product silhouette, industrial design, geometry, controls, attachment layout, "
+            "kit composition, materials, colourway, packaging structure and readable markings. Only then classify the "
+            "relationship. Do not rank photos and do not try to fill a gallery quota. JSON only."
         ),
         "prompt_instruction": (
-            "For each image_id, complete visual_subject, visible_identity and visible_configuration from pixels, "
-            "then complete target_match_evidence and target_identity_gaps before assigning classification. OCR/readable "
-            "packaging text is one visual signal, not the sole signal. Do not copy target fields into visual facts or "
-            "match evidence unless the pixels positively support them. Brand/category agreement or the absence of a "
-            "visible contradiction is never enough to prove exact ownership. Precision is more important than recall: "
-            "when the exact model/product line/variant/configuration is not positively established strongly enough to "
-            "distinguish the target from plausible alternatives, use UNCERTAIN or SAME_PRODUCT_OTHER_VARIANT instead "
-            "of promoting the image."
+            "For each image_id, complete visual_subject, visible_identity and visible_configuration from pixels, then "
+            "complete target_match_evidence and target_identity_gaps before assigning classification. Readable branding, "
+            "model text or packaging text is useful evidence but is NOT mandatory when a sufficiently discriminative "
+            "combination of non-text visual features establishes the represented product and exact supported variant. "
+            "Do not treat a missing or unreadable model label as an identity gap by itself. Conversely, brand/category "
+            "agreement, colour alone, generic product-family resemblance, or absence of contradiction is never enough. "
+            "Require a coherent combination of distinguishing visual features that separates the target from plausible "
+            "same-brand, same-family or same-category alternatives."
         ),
         "context": {
             "target_product": product_context,
@@ -375,20 +376,23 @@ def build_listing_image_ownership_request(
             "Inspect the actual pixels of every supplied candidate before classifying it.",
             "visual_subject must briefly state what product/object/media the pixels depict, without saying whether it matches the target.",
             "visible_identity must contain only brand/model/size/count/variant text or markings actually visible in the pixels; use an empty string when none is readable.",
-            "visible_configuration must briefly record visible colour, form, package count, kit/bundle composition, attachments, packaging/detail context or other variant-relevant visual facts; use an empty string when not discernible.",
-            "Visual facts are observations, not conclusions: never write 'matches target', 'same product', or silently copy target_product facts that are not visible in the candidate.",
-            "target_match_evidence must state only affirmative pixel-grounded evidence that links this candidate to the target's distinguishing identity; it may use visible design/form/configuration as well as readable markings, and must be empty when no such positive evidence exists.",
-            "target_identity_gaps must state every material target model/product-line/variant/configuration fact that the pixels do not positively establish, plus any visible conflict; use an empty string only when the exact relevant identity is genuinely established.",
-            "Only after recording visual facts and the positive-identity proof audit may you assign classification.",
-            "Automatic eligibility has a positive proof burden: evidence must be sufficient to distinguish the exact target sale unit from plausible same-brand or same-category products and variants.",
-            "A matching brand logo proves only the brand. Brand match, category match, general visual similarity, or absence of contradictory evidence must never be promoted into model, product-line, variant or configuration proof.",
-            "Absence of conflict is not evidence of identity. If distinguishing target facts remain unverified, do not infer them from the target context.",
-            "EXACT_TARGET means affirmative pixel evidence establishes the exact sellable target product and exact supported variant/configuration strongly enough to distinguish it from plausible alternatives, with no material identity gap or conflict.",
-            "TARGET_PACKAGING_OR_DETAIL means packaging, a close detail, dimensions, an in-use view, or an included component whose association with this exact target sale unit is itself positively established; generic same-brand packaging/accessories/details are not enough.",
+            "visible_configuration must briefly record visible colour, form, package count, kit/bundle composition, attachments, packaging/detail context, industrial-design features or other variant-relevant visual facts; use an empty string when not discernible.",
+            "Visual facts are observations, not conclusions: never write 'matches target', 'same product', or silently copy target_product facts that are not supported by the candidate pixels.",
+            "target_match_evidence must state the affirmative pixel-grounded visual fingerprint linking this candidate to the target's distinguishing identity. It may combine shape, industrial design, geometry, attachment arrangement, kit composition, materials, colourway, packaging structure and readable markings.",
+            "A target model name or catalog code does not have to be literally printed in the image. If the product represented by that identifier is strongly established by a distinctive visual fingerprint, the model identity may be considered positively established.",
+            "An empty visible_identity field does not by itself create an identity gap. Readable text is only one possible visual signal.",
+            "target_identity_gaps must record only material residual ambiguity or visible conflict AFTER considering the complete visual fingerprint. Do not list an unreadable brand/model label as a gap when the represented product and variant are otherwise visually established.",
+            "Only after recording visual facts and the visual-fingerprint identity audit may you assign classification.",
+            "Automatic eligibility has a positive proof burden: the combined evidence must distinguish the exact target sale unit from plausible same-brand, same-family or same-category alternatives.",
+            "A matching brand logo proves only the brand. Brand match, category match, colour alone, generic visual similarity, or absence of contradictory evidence must never be promoted into model, product-line, variant or configuration proof.",
+            "Absence of conflict is not evidence of identity. Positive proof must come from affirmative visual features, not from failing to notice a contradiction.",
+            "Do not demand a readable logo or model code when the exact product family/model and supported variant are sufficiently identifiable from the conjunction of distinctive pixel-visible design and configuration features.",
+            "EXACT_TARGET means the complete visual fingerprint positively establishes the exact sellable target product and exact supported variant/configuration strongly enough to distinguish it from plausible alternatives, with no material residual ambiguity or visible conflict.",
+            "TARGET_PACKAGING_OR_DETAIL means packaging, a close detail, dimensions, an in-use view, or an included component whose association with this exact target sale unit is itself positively established by readable markings or a sufficiently distinctive visual fingerprint; generic same-brand packaging/accessories/details are not enough.",
             "Use SAME_PRODUCT_OTHER_VARIANT when the pixels positively indicate a different colour, size, model, count, flavour, configuration, bundle or other sellable variant within the same product family.",
             "Use OTHER_PRODUCT for recommendations, related products, accessories not included in the sale unit, or any different sellable product.",
             "Use PAGE_ASSET for logos, banners, navigation graphics, seller decoration, advertisements or other non-product page media.",
-            "Use UNCERTAIN whenever the pixels do not positively establish exact ownership strongly enough for an automatic marketplace upload, including when only brand or broad category is verified.",
+            "Use UNCERTAIN when meaningful visual ambiguity remains between the target and plausible alternative products/variants after evaluating the full visual fingerprint. Do not use UNCERTAIN merely because a model code or logo is not readable.",
             "For kits or bundles, a component is TARGET_PACKAGING_OR_DETAIL only when target_product explicitly supports that component as part of the offered sale unit and the candidate provides positive visual evidence tying it to that exact sale unit.",
             "Do not use candidate/source order, DOM text, nearby page copy, filenames or URLs as semantic evidence of image ownership.",
             "Return one decision for every candidate_image_id and no others.",
@@ -591,11 +595,11 @@ def build_listing_image_ranking_request(
             "order. JSON only."
         ),
         "prompt_instruction": (
-            "Return selected_image_ids in the exact order they should be uploaded, with at most five images. "
-            "Choose fewer images whenever that is safer. One correct photo is better than five photos containing "
-            "one wrong product or wrong variant. Never fill a quota. A selected image must have positive visual "
-            "evidence for the exact target identity; brand/category agreement or absence of visible contradiction "
-            "is not enough."
+            "Return selected_image_ids in the exact order they should be uploaded, with at most five images. Choose "
+            "fewer images whenever that is safer. One correct photo is better than five photos containing one wrong "
+            "product or wrong variant. Never fill a quota. Positive identity evidence may be a sufficiently distinctive "
+            "combination of non-text visual features; readable logo/model text is not mandatory. Brand/category match, "
+            "colour alone, generic resemblance or absence of contradiction is not enough."
         ),
         "context": {
             "target_product": product_context,
@@ -605,9 +609,10 @@ def build_listing_image_ranking_request(
         "rules": [
             "Inspect the actual pixels of every supplied candidate again before deciding.",
             "selected_image_ids is the final gallery order, must contain no more than five image_ids, and must not contain duplicates.",
-            "Every selected image must remain consistent with and positively identifiable as the exact target product and exact supported variant/configuration.",
-            "Where target_product contains a distinguishing model, product line, variant or configuration, reject a candidate if those distinguishing facts remain unverified or visibly conflict; do not infer them merely because brand/category matches.",
-            "Absence of a visible conflict is not positive identity evidence.",
+            "Every selected image must remain positively identifiable as the exact target product and exact supported variant/configuration from a coherent visual fingerprint.",
+            "A readable logo or model code is not required when the represented target product/model and variant are sufficiently established by distinctive silhouette, industrial design, geometry, attachments, kit composition, materials, colourway or packaging structure.",
+            "Do not reject a candidate merely because a textual model label is absent or unreadable. Reject it when meaningful visual ambiguity remains between the target and plausible alternatives, or when visible features conflict with the target.",
+            "Brand/category agreement, colour alone, generic family resemblance or absence of visible conflict is not positive identity evidence.",
             "Reject any residual unrelated product, recommendation, wrong variant, misleading accessory or page asset even if the ownership pass admitted it.",
             "Position 1 should be the strongest clear main image of the exact sale unit when one exists.",
             "Supporting images may show verified details, dimensions, packaging, included components or in-use context when they add useful non-redundant information.",
@@ -717,6 +722,7 @@ def _selection_report(
             "ownership_decision_protocol": _IMAGE_OWNERSHIP_PROTOCOL,
             "ownership_visual_facts_required_by_contract": True,
             "ownership_positive_identity_proof_required": True,
+            "ownership_visual_fingerprint_allowed_without_readable_model_text": True,
             "gallery_semantic_owner": "multimodal_ai",
             "auto_eligible_ownership_classes": sorted(_AUTO_ELIGIBLE_OWNERSHIP_CLASSES),
             "precision_policy": "fewer_correct_images_over_quota_fill",
@@ -825,10 +831,10 @@ def finalize_supplier_listing_images(
 
     Acquisition remains intentionally broad and mechanical. The first AI stage
     records compact pixel-grounded visual facts for every candidate, explicitly
-    audits positive evidence and identity gaps, and only then establishes exact image
-    ownership against a clean target-product identity. The second AI stage sees only
-    ownership-approved candidates, independently verifies consistency and emits the
-    final 0..5 upload order. Python never re-ranks, fills a quota, substitutes
+    audits positive evidence and material residual ambiguity, and only then establishes
+    exact image ownership against a clean target-product identity. The second AI stage
+    sees only ownership-approved candidates, independently verifies consistency and
+    emits the final 0..5 upload order. Python never re-ranks, fills a quota, substitutes
     candidates or rescues an empty semantic result.
 
     Any semantic/AI failure is fail-closed: the published automatic gallery becomes
