@@ -8,6 +8,19 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+# Velopack binds VPK_* environment variables before command execution. GitHub
+# Actions materializes an unset secret as an existing empty environment variable;
+# typed options such as VPK_AZURE_TRUSTED_SIGN_FILE then fail while converting
+# "" to FileInfo. Optional signing configuration has one canonical meaning here:
+# blank means absent. Normalize that process environment once, before any vpk
+# command, while preserving every non-blank value unchanged.
+foreach ($OptionalVelopackEnv in @("VPK_AZURE_TRUSTED_SIGN_FILE", "VPK_SIGN_PARAMS")) {
+    $OptionalVelopackValue = [Environment]::GetEnvironmentVariable($OptionalVelopackEnv, "Process")
+    if ($null -ne $OptionalVelopackValue -and [string]::IsNullOrWhiteSpace($OptionalVelopackValue)) {
+        [Environment]::SetEnvironmentVariable($OptionalVelopackEnv, $null, "Process")
+    }
+}
+
 function Get-SingleVelopackArtifact {
     param(
         [Parameter(Mandatory = $true)][string]$Directory,
