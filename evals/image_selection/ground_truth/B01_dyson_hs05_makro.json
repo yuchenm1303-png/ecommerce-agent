@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "case_id": "B01_dyson_hs05_makro",
+  "review_basis": "Human-reviewed 5x5 contact sheet from the 2026-08-31 Makro Dyson HS05 real-page capture.",
+  "expected_candidate_count": 25,
+  "expected_target": {
+    "brand": "Dyson",
+    "model": "HS05",
+    "name": "Dyson air wrap HS05 complete long Wired Electric Hair Curler"
+  },
+  "labels": {
+    "img_001": {
+      "ownership": "EXACT_TARGET",
+      "relevance_grade": 2,
+      "main_image_allowed": true
+    },
+    "img_002": {
+      "ownership": "EXACT_TARGET",
+      "relevance_grade": 3,
+      "main_image_allowed": true
+    },
+    "img_003": {
+      "ownership": "EXACT_TARGET",
+      "relevance_grade": 3,
+      "main_image_allowed": true
+    },
+    "img_004": {
+      "ownership": "PAGE_ASSET",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_005": {
+      "ownership": "TARGET_PACKAGING_OR_DETAIL",
+      "relevance_grade": 2,
+      "main_image_allowed": false
+    },
+    "img_006": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_007": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_008": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_009": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_010": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_011": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_012": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_013": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_014": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_015": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_016": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_017": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_018": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_019": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_020": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_021": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_022": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_023": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_024": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    },
+    "img_025": {
+      "ownership": "OTHER_PRODUCT",
+      "relevance_grade": 0,
+      "main_image_allowed": false
+    }
+  }
+}
