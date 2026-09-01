@@ -19,8 +19,9 @@ Thumbs.db
 storage_state*.json
 *.cookie.json
 
-# Local authenticated browser state
+# Local authenticated browser/channel state
 browser_profiles/
+/channel_accounts/
 .auth/
 
 # Customer/private source material
