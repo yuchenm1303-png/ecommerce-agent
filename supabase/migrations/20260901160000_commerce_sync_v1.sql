@@ -52,9 +52,11 @@ declare
   v_existing_result jsonb;
   v_existing_product_id text;
   v_existing_variant_id text;
+  v_existing_account_channel text;
   v_existing_listing_id text;
   v_existing_listing_product_id text;
   v_existing_listing_variant_id text;
+  v_source_exists boolean := false;
   v_result jsonb;
 begin
   if p_workspace_id is null then
@@ -72,11 +74,17 @@ begin
   if v_product_id = '' or v_variant_id = '' or v_source_product_id = '' then
     return jsonb_build_object('accepted', false, 'error', 'product_identity_required');
   end if;
+  if btrim(coalesce(v_product ->> 'display_name', '')) = '' then
+    return jsonb_build_object('accepted', false, 'error', 'product_display_name_required');
+  end if;
   if v_request_identity = '' or v_supplier_url = '' then
     return jsonb_build_object('accepted', false, 'error', 'source_identity_required');
   end if;
   if v_channel = '' or v_channel_account_id = '' then
     return jsonb_build_object('accepted', false, 'error', 'channel_account_required');
+  end if;
+  if btrim(coalesce(v_account ->> 'label', '')) = '' then
+    return jsonb_build_object('accepted', false, 'error', 'channel_account_label_required');
   end if;
   if v_listing_id = '' or v_external_listing_id = '' then
     return jsonb_build_object('accepted', false, 'error', 'external_listing_id_required');
@@ -88,12 +96,9 @@ begin
     return jsonb_build_object('accepted', false, 'error', 'workspace_not_found');
   end if;
 
-  insert into public.commerce_workspaces (workspace_id)
-  values (p_workspace_id)
-  on conflict (workspace_id) do nothing;
-
-  -- Serialize retries and concurrent observations of the same supplier/listing
-  -- identity inside this database transaction. No desktop lock is trusted.
+  -- All identity conflicts are resolved before the first business write. Any
+  -- later SQL error aborts the RPC transaction, so callers can never observe a
+  -- half-created Product/Source/Account without its authoritative Listing fact.
   perform pg_advisory_xact_lock(
     hashtextextended(p_workspace_id::text || ':event:' || p_event_id, 0)
   );
@@ -108,7 +113,13 @@ begin
     )
   );
 
-  v_hash := encode(extensions.digest(convert_to(p_payload::text, 'UTF8'), 'sha256'), 'hex');
+  v_hash := encode(
+    extensions.digest(
+      convert_to(p_occurred_at::text || E'\n' || p_payload::text, 'UTF8'),
+      'sha256'
+    ),
+    'hex'
+  );
   select request_hash, result
     into v_existing_hash, v_existing_result
   from public.commerce_sync_events
@@ -124,8 +135,8 @@ begin
     );
   end if;
 
-  -- Exact source identity is the only automatic Product reuse rule here. The DB
-  -- never title-matches, fuzzy-matches or otherwise guesses product semantics.
+  -- Exact request_identity is the only automatic Product reuse rule. No title,
+  -- fuzzy, image, brand or cross-source semantic matching happens in PostgreSQL.
   select product_id, variant_id
     into v_existing_product_id, v_existing_variant_id
   from public.commerce_source_products
@@ -133,11 +144,43 @@ begin
     and extensions.digest(request_identity, 'sha256') = extensions.digest(v_request_identity, 'sha256')
     and request_identity = v_request_identity
   limit 1;
-
-  if found then
+  v_source_exists := found;
+  if v_source_exists then
     v_product_id := v_existing_product_id;
     v_variant_id := v_existing_variant_id;
-  else
+  end if;
+
+  select channel
+    into v_existing_account_channel
+  from public.commerce_channel_accounts
+  where workspace_id = p_workspace_id
+    and channel_account_id = v_channel_account_id
+  limit 1;
+  if found and v_existing_account_channel <> v_channel then
+    return jsonb_build_object('accepted', false, 'error', 'channel_account_conflict');
+  end if;
+
+  select listing_id, product_id, variant_id
+    into v_existing_listing_id, v_existing_listing_product_id, v_existing_listing_variant_id
+  from public.commerce_channel_listings
+  where workspace_id = p_workspace_id
+    and channel = v_channel
+    and channel_account_id = v_channel_account_id
+    and external_listing_id = v_external_listing_id
+  limit 1;
+  if found then
+    if v_existing_listing_product_id <> v_product_id
+       or v_existing_listing_variant_id <> v_variant_id then
+      return jsonb_build_object('accepted', false, 'error', 'listing_product_conflict');
+    end if;
+    v_listing_id := v_existing_listing_id;
+  end if;
+
+  insert into public.commerce_workspaces (workspace_id)
+  values (p_workspace_id)
+  on conflict (workspace_id) do nothing;
+
+  if not v_source_exists then
     insert into public.commerce_products (
       workspace_id, product_id, display_name, product_type_en, brand, status
     ) values (
@@ -199,26 +242,8 @@ begin
     'active'
   )
   on conflict (workspace_id, channel_account_id) do update set
-    channel = excluded.channel,
     label = excluded.label,
     status = 'active';
-
-  select listing_id, product_id, variant_id
-    into v_existing_listing_id, v_existing_listing_product_id, v_existing_listing_variant_id
-  from public.commerce_channel_listings
-  where workspace_id = p_workspace_id
-    and channel = v_channel
-    and channel_account_id = v_channel_account_id
-    and external_listing_id = v_external_listing_id
-  limit 1;
-
-  if found then
-    if v_existing_listing_product_id <> v_product_id
-       or v_existing_listing_variant_id <> v_variant_id then
-      return jsonb_build_object('accepted', false, 'error', 'listing_product_conflict');
-    end if;
-    v_listing_id := v_existing_listing_id;
-  end if;
 
   insert into public.commerce_channel_listings (
     workspace_id,

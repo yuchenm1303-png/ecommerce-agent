@@ -99,7 +99,13 @@ class DurableCommerceOutbox:
     def acknowledge(self, item: QueuedCommerceRequest, *, event_id: str) -> None:
         if str(event_id or "").strip() != item.event_id:
             raise ValueError("commerce acknowledgement event_id mismatch")
-        Path(item.path).unlink()
+        try:
+            Path(item.path).unlink(missing_ok=True)
+        except OSError:
+            # Server acceptance is already authoritative. If local deletion fails,
+            # retaining the file is safer than raising into the GUI; a later retry
+            # is idempotent at the server ledger.
+            pass
 
     def mark_failure(self, item: QueuedCommerceRequest, error: str) -> None:
         payload = {
