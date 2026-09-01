@@ -324,6 +324,7 @@ def _compact_executor_report(payload: dict[str, Any]) -> dict[str, Any]:
         "section_reports",
         "field_totals",
         "completion",
+        "execution_outcome",
         "section_save_attempted",
         "section_saved",
         "send_to_qc_clicked",
@@ -521,19 +522,19 @@ def _batch_terminal_semantics(
     batch_status = str(getattr(batch, "status", "") or "").upper()
     statuses = _batch_cohort_statuses(batch, job_ids)
     expected_batch_status = "PREPARED" if event_type == "batch_prepare" else "COMPLETE"
-    expected_job_status = "READY" if event_type == "batch_prepare" else "DONE"
+    success_statuses = {"READY"} if event_type == "batch_prepare" else {"DONE", "REVIEW"}
     audit_success = "ready" if event_type == "batch_prepare" else "completed"
 
     if batch_status == expected_batch_status and statuses and all(
-        status == expected_job_status for status in statuses
+        status in success_statuses for status in statuses
     ):
         if event_type == "batch_execute":
             all_statuses = [str(getattr(job, "status", "") or "").upper() for job in _batch_jobs(batch)]
-            if any(status in {"FAILED", "REVIEW", "STOPPED"} for status in all_statuses):
+            if any(status in {"FAILED", "STOPPED"} for status in all_statuses):
                 return "completed", "review"
         return "completed", audit_success
 
-    successful = sum(status == expected_job_status for status in statuses)
+    successful = sum(status in success_statuses for status in statuses)
     hard_failed = any(status in {"FAILED", "STOPPED"} for status in statuses)
     if successful > 0:
         return "failed", "review"
@@ -543,10 +544,8 @@ def _batch_terminal_semantics(
 def _batch_job_status(event_type: str, job_status: str) -> str:
     status = str(job_status or "").upper()
     if event_type == "batch_execute":
-        if status == "DONE":
+        if status in {"DONE", "REVIEW"}:
             return "completed"
-        if status == "REVIEW":
-            return "review"
         if status == "FAILED":
             return "failed"
         if status == "STOPPED":
@@ -891,7 +890,10 @@ class UsageTelemetryController(QObject):
     ) -> dict[str, Any]:
         job_id = _text(getattr(job, "job_id", ""), 160)
         job_status = _text(getattr(job, "status", ""), 120).upper()
-        job_error = _text(getattr(job, "error", ""), 12_000)
+        review_required = job_status == "REVIEW"
+        raw_issue = _text(getattr(job, "error", ""), 12_000)
+        review_is_success = event_type == "batch_execute" and review_required
+        job_error = "" if review_is_success else raw_issue
         batch_id = _text(getattr(batch, "batch_id", ""), 200)
         jobs = _batch_jobs(batch)
         index = next((i for i, candidate in enumerate(jobs) if _text(getattr(candidate, "job_id", ""), 160) == job_id), -1)
@@ -903,6 +905,8 @@ class UsageTelemetryController(QObject):
             "batch_index": index + 1 if index >= 0 else 0,
             "batch_size": len(jobs),
             "job_status": job_status,
+            "review_required": review_required,
+            "review_reason": raw_issue if review_required else "",
             "operation_phase": _text(getattr(job, "operation_phase", ""), 80),
             "product_url": _text(getattr(job, "product_url", ""), 4_096),
             "product_name": _text(getattr(job, "product_name", ""), 1_000),
@@ -928,7 +932,12 @@ class UsageTelemetryController(QObject):
         if execution_report:
             result["executor_report"] = _compact_executor_report(execution_report)
 
-        if include_failure_diagnostic and (job_status in {"FAILED", "REVIEW", "STOPPED"} or job_error):
+        include_review_failure = job_status == "REVIEW" and event_type != "batch_execute"
+        if include_failure_diagnostic and (
+            job_status in {"FAILED", "STOPPED"}
+            or include_review_failure
+            or job_error
+        ):
             job_root = Path(run_dir).parent if run_dir else None
             artifact_roots: tuple[str, ...] = ()
             if job_root is not None and event_type == "batch_execute":
@@ -973,7 +982,10 @@ class UsageTelemetryController(QObject):
                 status = "failed"
             include_diag = include_failure_diagnostics and (
                 status in {"failed", "review", "cancelled"}
-                or bool(_text(getattr(job, "error", ""), 12_000))
+                or (
+                    bool(_text(getattr(job, "error", ""), 12_000))
+                    and not (job_phase == "batch_execute" and job_status == "REVIEW")
+                )
             )
             result_data = self._batch_job_result(
                 batch,
@@ -981,7 +993,11 @@ class UsageTelemetryController(QObject):
                 job_phase,
                 include_failure_diagnostic=include_diag,
             )
-            error_text = _text(getattr(job, "error", ""), 12_000) or (forced_error if status == "failed" else "")
+            error_text = (
+                ""
+                if job_phase == "batch_execute" and job_status == "REVIEW"
+                else _text(getattr(job, "error", ""), 12_000)
+            ) or (forced_error if status == "failed" else "")
             input_data = self._batch_inputs.get(job_id, {})
             self._task_audit(
                 self._batch_audit_ids.get(job_id, ""),

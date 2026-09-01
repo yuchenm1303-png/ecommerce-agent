@@ -166,10 +166,8 @@ def _job_phase(batch_status: str, job_status: str) -> str:
 def _audit_status(phase: str, job_status: str) -> tuple[str, bool]:
     status = str(job_status or "").upper()
     if phase == "batch_execute":
-        if status == "DONE":
+        if status in {"DONE", "REVIEW"}:
             return "completed", True
-        if status == "REVIEW":
-            return "review", True
         if status == "FAILED":
             return "failed", True
         if status == "STOPPED":
@@ -374,6 +372,10 @@ class BatchLinkTelemetryController(QObject):
 
     def _job_result(self, job: Any, index: int, total: int, batch_id: str, *, include_failure: bool) -> dict[str, Any]:
         job_status = _text(getattr(job, "status", ""), 120).upper()
+        review_required = job_status == "REVIEW"
+        raw_issue = _text(getattr(job, "error", ""), 12_000)
+        review_reason = raw_issue if review_required else ""
+        job_error = "" if review_required else raw_issue
         run_dir = _text(getattr(job, "run_dir", ""), 8_000)
         execution_report_path = _text(getattr(job, "execution_report", ""), 8_000)
         failure_required = job_status == "FAILED" or include_failure
@@ -399,6 +401,8 @@ class BatchLinkTelemetryController(QObject):
             "batch_index": index,
             "batch_size": total,
             "job_status": job_status,
+            "review_required": review_required,
+            "review_reason": review_reason,
             "progress": int(getattr(job, "progress", 0) or 0),
             "product_url": _text(getattr(job, "product_url", ""), 4_096),
             "product_name": _text(getattr(job, "product_name", ""), 1_000),
@@ -412,7 +416,7 @@ class BatchLinkTelemetryController(QObject):
             "stage_detail": _text(getattr(job, "stage_detail", ""), 4_000),
             "failure_stage": _text(getattr(job, "failure_stage", ""), 4_000),
             "exit_code": getattr(job, "exit_code", None),
-            "error": _text(getattr(job, "error", ""), 12_000),
+            "error": job_error,
             "run_id": Path(run_dir).name if run_dir else "",
             "created_at": _text(getattr(job, "created_at", ""), 120),
             "updated_at": _text(getattr(job, "updated_at", ""), 120),
@@ -436,13 +440,15 @@ class BatchLinkTelemetryController(QObject):
                         "batch_index": index,
                         "batch_size": total,
                         "job_status": job_status,
+                        "review_required": review_required,
+                        "review_reason": review_reason,
                         "progress": int(getattr(job, "progress", 0) or 0),
                         "product_name": _text(getattr(job, "product_name", ""), 1_000),
                         "makro_target_id": _text(getattr(job, "makro_target_id", ""), 240),
                         "stage_detail": _text(getattr(job, "stage_detail", ""), 4_000),
                         "failure_stage": _text(getattr(job, "failure_stage", ""), 4_000),
                         "exit_code": getattr(job, "exit_code", None),
-                        "error": _text(getattr(job, "error", ""), 12_000),
+                        "error": job_error,
                         "required_blocked": int(getattr(job, "required_blocked", 0) or 0),
                         "product_images": int(getattr(job, "image_count", 0) or 0),
                         "run_id": Path(run_dir).name,
@@ -458,7 +464,7 @@ class BatchLinkTelemetryController(QObject):
         elif execution_report_path:
             result["execution_report_file"] = Path(execution_report_path).name
 
-        if failure_required and (job_status in {"REVIEW", "FAILED", "STOPPED"} or result.get("error")):
+        if failure_required and (job_status in {"FAILED", "STOPPED"} or result.get("error")):
             artifact_roots: tuple[str | Path, ...] = (execution_report_path,) if execution_report_path else ()
             result["failure_diagnostic"] = collect_workflow_failure_diagnostic(
                 run_dir or None,
@@ -514,7 +520,7 @@ class BatchLinkTelemetryController(QObject):
             job_status = _text(getattr(job, "status", ""), 120).upper()
             phase = _job_phase(batch_status, job_status)
             status, terminal = _audit_status(phase, job_status)
-            include_failure = terminal and status in {"review", "failed", "cancelled"}
+            include_failure = terminal and status in {"failed", "cancelled"}
             input_data = self._job_input(job, index, total, items, batch_id)
             result_data = self._job_result(job, index, total, batch_id, include_failure=include_failure)
             audit = {
@@ -525,7 +531,7 @@ class BatchLinkTelemetryController(QObject):
                 "product_url": _text(getattr(job, "product_url", ""), 4_096),
                 "input_data": input_data,
                 "result_data": result_data,
-                "error_text": _text(getattr(job, "error", ""), 12_000),
+                "error_text": "" if job_status == "REVIEW" else _text(getattr(job, "error", ""), 12_000),
                 "started_at": _text(getattr(job, "created_at", ""), 120) or _utc_now(),
                 "completed_at": _text(getattr(job, "updated_at", ""), 120) if terminal else "",
             }

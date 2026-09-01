@@ -281,13 +281,13 @@ Item {
                     height: jobCard.errorText.length > 0 ? 25 : 0
                     visible: height > 0
                     radius: 7
-                    color: Qt.rgba(180/255, 45/255, 72/255, 45/255)
+                    color: jobCard.statusBackground
                     Text {
                         anchors.fill: parent
                         anchors.leftMargin: 8
                         anchors.rightMargin: 8
                         text: jobCard.errorText
-                        color: "#ffc1cc"
+                        color: jobCard.statusForeground
                         font.family: "Microsoft YaHei UI"
                         font.pixelSize: 9
                         elide: Text.ElideRight
