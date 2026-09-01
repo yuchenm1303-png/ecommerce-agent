@@ -13,6 +13,7 @@ from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signa
 
 from app.listing_images import listing_images_from_resolver_outputs
 from app.required_overrides import write_required_fallback_overrides
+from app.source_interaction import SOURCE_INTERACTION_EXIT_CODE, SOURCE_OUTCOME_FILENAME
 from .async_run_journal import AsyncRunJournal
 from .batch_log_buffer import BATCH_LOG_FLUSH_LINES, BATCH_LOG_PENDING_LINES
 from .batch_model import (
@@ -48,15 +49,17 @@ _PHASE_UI = {
 
 _BATCH_LOG_PREVIEW_MS = 140
 _BATCH_STATE_PUBLISH_MS = 180
+_SOURCE_WAITING = "WAITING_SOURCE_INTERACTION"
 
 
 class BatchController(QObject):
     """Persistent batch scheduler around the canonical single-product engine.
 
-    Source Edge navigation is intentionally serialized. As soon as a job's exact
-    supplier bytes are cached, up to ``prepare_concurrency`` independent Makro
-    owned-tab jobs may run in parallel. Real execution uses the same owned tab
-    token and has a separate bounded concurrency.
+    Source Edge navigation is intentionally serialized. A recoverable supplier
+    login/human-verification page suspends that Source lane without holding a
+    worker, CDP session, or transport lock. Already-captured jobs remain free to
+    continue AI/Makro preparation while the shared Source page is preserved for
+    the user.
 
     Child-process stdout is durably journaled per job/stage while the control-tower
     surface receives a bounded, rate-limited preview. Complete stdout/stderr stays
@@ -79,6 +82,7 @@ class BatchController(QObject):
         self._source_queue: list[str] = []
         self._prepare_queue: list[str] = []
         self._execute_queue: list[str] = []
+        self._source_resume_pending: set[str] = set()
         self._processes: dict[QProcess, tuple[str, str]] = {}
         self._buffers: dict[QProcess, str] = {}
         self._journals: dict[QProcess, AsyncRunJournal] = {}
@@ -99,7 +103,16 @@ class BatchController(QObject):
 
     @property
     def is_running(self) -> bool:
-        return bool(self._processes or self._source_queue or self._prepare_queue or self._execute_queue)
+        return bool(
+            self._processes
+            or self._source_queue
+            or self._prepare_queue
+            or self._execute_queue
+            or self._source_interaction_waiting()
+        )
+
+    def _source_interaction_waiting(self) -> bool:
+        return any(str(job.status).upper() == _SOURCE_WAITING for job in self._jobs())
 
     def start_prepare(
         self,
@@ -125,6 +138,7 @@ class BatchController(QObject):
         self._source_queue = [job.job_id for job in self.batch.jobs]
         self._prepare_queue = []
         self._execute_queue = []
+        self._source_resume_pending.clear()
         self._persist_emit(immediate=True)
         self.running_changed.emit(True)
         self.state_changed.emit("批量准备中")
@@ -167,6 +181,7 @@ class BatchController(QObject):
         self._source_queue.clear()
         self._prepare_queue.clear()
         self._execute_queue.clear()
+        self._source_resume_pending.clear()
         for process in list(self._processes):
             if process.state() != QProcess.NotRunning:
                 process.terminate()
@@ -193,11 +208,49 @@ class BatchController(QObject):
     def _job_root(self, job: BatchJob) -> Path:
         return Path(job.run_dir).parent
 
+    def _source_outcome(self, job: BatchJob) -> dict[str, Any]:
+        path = self._job_root(job) / "source-prefetch" / SOURCE_OUTCOME_FILENAME
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def resume_source_interaction(self, job_id: str) -> None:
+        """Re-check one suspended Source job without restarting the whole product."""
+
+        if self.batch is None or self.config is None:
+            raise RuntimeError("Batch Source session is unavailable")
+        job = self._job(job_id)
+        if str(job.status).upper() != _SOURCE_WAITING:
+            raise ValueError(f"{job_id} 当前不是等待 Source 人工操作状态。")
+        source_active = any(stage == "source" for _, stage in self._processes.values())
+        if source_active:
+            raise RuntimeError("Source Edge 正在被另一条采集占用，请稍后再继续检测。")
+
+        while job_id in self._source_queue:
+            self._source_queue.remove(job_id)
+        self._source_resume_pending.add(job_id)
+        self._source_queue.insert(0, job_id)
+        job.status = "QUEUED"
+        job.stage_detail = "等待重新检测 Source Edge"
+        job.error = ""
+        job.failure_stage = ""
+        job.exit_code = None
+        job.progress = max(8, int(job.progress or 0))
+        job.touch()
+        self.batch.status = "PREPARING"
+        self._mode = "prepare"
+        self._stopping = False
+        self._persist_emit(immediate=True)
+        self.state_changed.emit(f"{job_id} · 正在重新检测 Source Edge")
+        self._pump_prepare()
+
     def _pump_prepare(self) -> None:
         if self.batch is None or self.config is None or self._mode != "prepare":
             return
         source_active = any(stage == "source" for _, stage in self._processes.values())
-        if self._source_queue and not source_active:
+        if self._source_queue and not source_active and not self._source_interaction_waiting():
             self._start_source(self._source_queue.pop(0))
 
         active_prepare = sum(stage == "prepare" for _, stage in self._processes.values())
@@ -205,7 +258,13 @@ class BatchController(QObject):
             self._start_prepare_job(self._prepare_queue.pop(0))
             active_prepare += 1
 
-        if not self._source_queue and not self._prepare_queue and not self._processes:
+        no_active_work = not self._source_queue and not self._prepare_queue and not self._processes
+        if no_active_work and self._source_interaction_waiting():
+            self.batch.status = "PREPARING"
+            self._persist_emit(immediate=True)
+            self.state_changed.emit("Source Edge 等待人工验证 · 已完成采集的商品继续运行")
+            return
+        if no_active_work:
             self.batch.status = "PREPARED"
             self._mode = "idle"
             self._persist_emit(immediate=True)
@@ -215,6 +274,8 @@ class BatchController(QObject):
     def _start_source(self, job_id: str) -> None:
         assert self.config is not None
         job = self._job(job_id)
+        resume_interaction = job_id in self._source_resume_pending
+        self._source_resume_pending.discard(job_id)
         job.operation_phase = "batch_prepare"
         root = self._job_root(job)
         cache = root / "_cache" / "source"
@@ -228,12 +289,16 @@ class BatchController(QObject):
             "--source-cache-dir", str(cache),
             "--output-dir", str(output),
         ]
+        if resume_interaction:
+            args.append("--resume-source-interaction")
         job.status = "CAPTURING"
-        job.stage_detail = "采集商品"
+        job.stage_detail = "重新检测 Source Edge" if resume_interaction else "采集商品"
         job.progress = 8
         job.error = ""
         job.failure_stage = ""
         job.exit_code = None
+        if not resume_interaction:
+            job.clear_interaction()
         job.touch()
         self._persist_emit()
         self._spawn(job_id, "source", args)
@@ -449,6 +514,29 @@ class BatchController(QObject):
         if journal is not None:
             journal.close()
 
+    def _apply_source_wait(self, job: BatchJob) -> None:
+        outcome = self._source_outcome(job)
+        kind = str(outcome.get("interaction_kind") or "HUMAN_CHALLENGE").strip().upper()
+        reason = str(outcome.get("interaction_reason") or "Source Edge 需要人工操作").strip()
+        labels = {
+            "HUMAN_CHALLENGE": "等待 1688 人机验证",
+            "LOGIN_REQUIRED": "等待供应商账号登录",
+        }
+        job.status = _SOURCE_WAITING
+        job.stage_detail = labels.get(kind, "等待 Source Edge 人工操作")
+        job.progress = 8
+        job.error = ""
+        job.failure_stage = ""
+        job.exit_code = None
+        job.interaction_kind = kind
+        job.interaction_reason = reason
+        job.interaction_url = str(outcome.get("observed_url") or "").strip()
+        job.interaction_title = str(outcome.get("observed_title") or "").strip()
+        job.touch()
+        if self.batch is not None:
+            self.batch.status = "PREPARING"
+        self.state_changed.emit(f"{job.job_id} · {job.stage_detail} · 完成后点击继续检测")
+
     def _finished(self, process: QProcess, exit_code: int) -> None:
         self._read_output(process)
         tail = self._buffers.pop(process, "")
@@ -471,18 +559,25 @@ class BatchController(QObject):
             return
 
         if stage == "source":
-            job.exit_code = exit_code
-            if exit_code == 0:
+            if exit_code == SOURCE_INTERACTION_EXIT_CODE:
+                self._apply_source_wait(job)
+            elif exit_code == 0:
+                job.exit_code = 0
                 job.failure_stage = ""
                 job.status = "QUEUED"
                 job.stage_detail = "source cached"
                 job.progress = 18
-                self._prepare_queue.append(job_id)
+                job.error = ""
+                job.clear_interaction()
+                if job_id not in self._prepare_queue:
+                    self._prepare_queue.append(job_id)
             else:
+                job.exit_code = exit_code
                 job.failure_stage = job.stage_detail or "采集商品"
                 job.status = "FAILED"
                 job.error = f"Source Capture exit code={exit_code}"
                 job.stage_detail = "采集失败"
+                job.clear_interaction()
             job.touch()
             self._persist_emit()
             self._pump_prepare()
@@ -585,6 +680,7 @@ class BatchController(QObject):
             return
         job_id, stage = self._processes.pop(process)
         self._buffers.pop(process, None)
+        self._source_resume_pending.discard(job_id)
         journal = self._journals.get(process)
         if journal is not None:
             journal.append("QProcess failed to start")
