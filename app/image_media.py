@@ -20,6 +20,7 @@ class ImageMediaType:
 
 
 _JPEG = ImageMediaType("image/jpeg", ".jpg", "JPEG")
+_DEFAULT_MIN_DIMENSION = 11
 _DEFAULT_MAX_LONG_EDGE = 2048
 _DEFAULT_MAX_PIXEL_AREA = 4_000_000
 _DEFAULT_MAX_BYTES = 4 * 1024 * 1024
@@ -27,12 +28,11 @@ _DEFAULT_JPEG_QUALITY = 88
 
 
 def has_decodable_image_pixels(path_value: str | Path) -> bool:
-    """Return whether a local artifact contains image pixels that can reach the AI.
+    """Return whether a local artifact contains pixels accepted by AI transport.
 
     This is a transport-boundary check only. It does not classify the image, rank it,
     inspect product meaning, or decide whether the image is useful evidence. Files
-    that cannot produce pixels cannot be represented to a vision model and are kept
-    out of multimodal requests before semantic reasoning begins.
+    that cannot produce a provider-valid raster cannot enter multimodal requests.
     """
 
     path = Path(path_value)
@@ -40,7 +40,10 @@ def has_decodable_image_pixels(path_value: str | Path) -> bool:
         return False
     try:
         with Image.open(path) as opened:
-            if int(opened.width) <= 0 or int(opened.height) <= 0:
+            if (
+                int(opened.width) < _DEFAULT_MIN_DIMENSION
+                or int(opened.height) < _DEFAULT_MIN_DIMENSION
+            ):
                 return False
             opened.load()
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
@@ -52,24 +55,31 @@ def normalize_image_media(
     data: bytes,
     *,
     source: str = "image payload",
+    min_dimension: int = _DEFAULT_MIN_DIMENSION,
     max_long_edge: int = _DEFAULT_MAX_LONG_EDGE,
     max_pixel_area: int = _DEFAULT_MAX_PIXEL_AREA,
     max_bytes: int = _DEFAULT_MAX_BYTES,
     jpeg_quality: int = _DEFAULT_JPEG_QUALITY,
 ) -> tuple[bytes, ImageMediaType]:
-    """Decode arbitrary raster bytes and emit one bounded JPEG transport payload.
+    """Decode arbitrary raster bytes and emit one bounded provider-valid JPEG.
 
     Filenames, URL suffixes, response Content-Type headers and handwritten magic-byte
     tables are not evidence about what a product image means. Pillow is used only as
-    the technical decoder. Any decodable raster is normalized to the one image format
-    sent to the multimodal provider; semantic usefulness remains entirely the model's
-    responsibility.
+    the technical decoder. Any technically valid raster is normalized to the one
+    image format sent to the multimodal provider; semantic usefulness remains
+    entirely the model's responsibility.
+
+    Provider transport has a mechanical minimum of 11 pixels on each edge. Images
+    below that boundary, or extreme aspect ratios that would fall below it after
+    bounded downscaling, are rejected here rather than being allowed to poison an
+    otherwise valid multimodal batch. We never upscale tiny evidence to manufacture
+    pixels that were not present in the supplier artifact.
     """
 
     payload = bytes(data or b"")
     if not payload:
         raise ImageMediaError(f"empty image payload: {source}")
-    if max_long_edge <= 0 or max_pixel_area <= 0 or max_bytes <= 0:
+    if min_dimension <= 0 or max_long_edge <= 0 or max_pixel_area <= 0 or max_bytes <= 0:
         raise ValueError("image transport bounds must be positive")
     if not 1 <= int(jpeg_quality) <= 95:
         raise ValueError("jpeg_quality must be in 1..95")
@@ -78,8 +88,11 @@ def normalize_image_media(
         with Image.open(BytesIO(payload)) as opened:
             frame = ImageOps.exif_transpose(opened)
             width, height = int(frame.width), int(frame.height)
-            if width <= 0 or height <= 0:
-                raise ImageMediaError(f"image has invalid dimensions: {source}")
+            if width < int(min_dimension) or height < int(min_dimension):
+                raise ImageMediaError(
+                    f"image dimensions {width}x{height} are below provider minimum "
+                    f"{int(min_dimension)}x{int(min_dimension)}: {source}"
+                )
             frame.load()
     except ImageMediaError:
         raise
@@ -95,6 +108,11 @@ def normalize_image_media(
         max(1, int(round(width * scale))),
         max(1, int(round(height * scale))),
     )
+    if min(target_size) < int(min_dimension):
+        raise ImageMediaError(
+            f"normalized image dimensions {target_size[0]}x{target_size[1]} would be below "
+            f"provider minimum {int(min_dimension)}x{int(min_dimension)}: {source}"
+        )
     if target_size != frame.size:
         resampling = getattr(Image, "Resampling", Image).LANCZOS
         frame = frame.resize(target_size, resampling)
@@ -123,6 +141,11 @@ def normalize_image_media(
             max(1, int(round(frame.width * 0.82))),
             max(1, int(round(frame.height * 0.82))),
         )
+        if min(next_size) < int(min_dimension):
+            raise ImageMediaError(
+                f"image cannot meet byte budget without dropping below provider minimum "
+                f"{int(min_dimension)}x{int(min_dimension)}: {source}"
+            )
         resampling = getattr(Image, "Resampling", Image).LANCZOS
         frame = frame.resize(next_size, resampling)
         quality = max(68, quality - 5)

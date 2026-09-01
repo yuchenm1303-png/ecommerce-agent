@@ -86,6 +86,10 @@ _PROVIDER_MEDIA_REJECTION_MARKERS = (
     "image url is invalid",
     "failed to process image",
     "failed to parse image",
+    "image length and width do not meet the model restrictions",
+    "image dimensions do not meet the model restrictions",
+    "image size does not meet the model restrictions",
+    "must be larger than 10",
     "content filter",
     "content_filter",
 )
@@ -99,12 +103,12 @@ def classify_provider_failure(
 ) -> FailureIssue:
     """Classify provider failures by blast radius, not exception ancestry.
 
-    Provider adapters intentionally wrap SDK exceptions.  The complete exception
-    chain is therefore inspected so an HTTP-400 media moderation/decoding rejection
-    can be isolated to the media item while account/auth/billing failures remain a
-    hard product-stage boundary.  Transient transport errors are retryable and are
-    not mistaken for bad media merely because the request happened to contain an
-    image.
+    Provider adapters intentionally wrap SDK exceptions. The complete exception
+    chain is therefore inspected so an HTTP-400 media moderation, decoding or
+    provider-dimension rejection can be isolated to the media item while
+    account/auth/billing failures remain a hard product-stage boundary. Transient
+    transport errors are retryable and are not mistaken for bad media merely because
+    the request happened to contain an image.
     """
 
     flattened = exception_text(exc)
@@ -195,7 +199,7 @@ def _append_single_workflow_child_failure(
 ) -> None:
     """Synchronously persist the deepest single-workflow child failure.
 
-    The GUI process still owns its normal ``gui-workflow.log``.  This second,
+    The GUI process still owns its normal ``gui-workflow.log``. This second,
     synchronous source exists specifically so a child traceback can never be lost
     merely because the outer QProcess/journal disappears before telemetry is built.
     Every child failure appends to the canonical ``diagnostics/prepare.log`` that
@@ -243,8 +247,8 @@ def run_cli_with_failure_journal(
 ) -> int:
     """Run a Step-3 child CLI while durably preserving every fatal exit.
 
-    This wrapper does not classify, retry, reinterpret, or recover the task.  It
-    only makes the original child failure durable before process exit.  Ordinary
+    This wrapper does not classify, retry, reinterpret, or recover the task. It
+    only makes the original child failure durable before process exit. Ordinary
     successful output remains untouched.
     """
 
