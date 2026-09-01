@@ -25,6 +25,7 @@ from .readonly_runner import RunnerConfig
 
 
 _TERMINAL = {"DONE", "REVIEW", "FAILED", "STOPPED"}
+_SOURCE_WAITING = "WAITING_SOURCE_INTERACTION"
 _JOB_ID_RE = re.compile(r"^JOB-(\d+)$")
 
 
@@ -45,13 +46,11 @@ class _CardControls:
 
 
 class BatchIndividualControls(QObject):
-    """Per-link start/stop/delete on top of the canonical BatchController.
+    """Per-link start/stop/delete/resume on the canonical BatchController.
 
-    One input row owns at most one current Job. Starting a row schedules only that
-    product; stopping terminates/removes only that Job's queues/process. Deletion
-    is a separate quiescent-state operation and is never combined with process
-    termination. Disk artifacts and Makro tabs are deliberately preserved. The
-    controller remains the sole subprocess owner.
+    Source human verification is a suspended Job, not a worker left sleeping. The
+    Continue action asks the controller to re-check the preserved Source Edge page;
+    if verification is still present the same Job returns to its waiting state.
     """
 
     def __init__(self, workspace: QWidget) -> None:
@@ -93,8 +92,6 @@ class BatchIndividualControls(QObject):
 
         def set_locked(_editor: Any, locked: bool) -> None:
             original_set_locked(bool(locked))
-            # Editing remains locked while Batch owns browser/process state, but
-            # independent Start/Stop/Delete remain available where safe.
             self._refresh_rows()
 
         self.editor.set_locked = MethodType(set_locked, self.editor)
@@ -110,7 +107,7 @@ class BatchIndividualControls(QObject):
         start = QPushButton("启动", row)
         start.setObjectName("batchRowStartButton")
         start.setFixedSize(48, 28)
-        start.setToolTip("只启动这一条：Source Capture → Step 1/2 → Resolver → Fill Plan。")
+        start.setToolTip("启动这一条；等待 Source 验证时用于继续检测。")
         stop = QPushButton("停止", row)
         stop.setObjectName("batchRowStopButton")
         stop.setFixedSize(48, 28)
@@ -191,6 +188,11 @@ class BatchIndividualControls(QObject):
     def start_row(self, row: Any) -> None:
         if row not in self.editor.rows or not bool(row.is_enabled()):
             return
+        current = self._row_job(row)
+        if current is not None and str(current.status) == _SOURCE_WAITING:
+            self.resume_source_interaction(str(current.job_id))
+            return
+
         url = str(row.url() or "").strip()
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -200,7 +202,6 @@ class BatchIndividualControls(QObject):
             QMessageBox.information(self.workspace, "Batch 正在停止", "请等待全局停止完成后再启动新商品。")
             return
 
-        current = self._row_job(row)
         if current is not None and self._job_busy_or_ready(current):
             QMessageBox.information(
                 self.workspace,
@@ -212,9 +213,6 @@ class BatchIndividualControls(QObject):
         config = self._runtime_config(url)
         try:
             if self.controller.batch is None:
-                # The first independent row still passes through the full installed
-                # start_prepare chain (AI runtime, offer intent, product files,
-                # photo ownership, browser ownership). Only one URL is supplied.
                 batch = self._original_start_prepare(
                     [url],
                     config,
@@ -242,8 +240,6 @@ class BatchIndividualControls(QObject):
             self.controller.config = config
         elif not self.controller.is_running:
             self.controller.config = config
-        # While other jobs are active, the new job joins the exact same resolved
-        # runtime config; ports/provider/key ownership must not mutate mid-flight.
 
         batch.prepare_concurrency = normalize_batch_concurrency(int(self.workspace.worker_count.value()))
         job_id = self._next_job_id()
@@ -299,6 +295,9 @@ class BatchIndividualControls(QObject):
         if job is None or str(job.status) in _TERMINAL:
             return
         self._remove_from_queues(job_id)
+        pending = getattr(self.controller, "_source_resume_pending", None)
+        if isinstance(pending, set):
+            pending.discard(job_id)
         process = self._process_for_job(job_id)
         job.status = "STOPPED"
         job.stage_detail = "正在停止 · 仅当前商品" if process is not None else "已停止 · 仅当前商品"
@@ -316,13 +315,26 @@ class BatchIndividualControls(QObject):
         QTimer.singleShot(2500, lambda p=process: self._kill_if_running(p))
         self.controller._persist_emit(immediate=True)
 
+    def resume_source_interaction(self, job_id: str) -> None:
+        job = self._job(job_id)
+        if job is None or str(job.status) != _SOURCE_WAITING:
+            return
+        try:
+            self.controller.resume_source_interaction(str(job_id))
+        except Exception as exc:
+            QMessageBox.information(
+                self.workspace,
+                "Source Edge 尚未恢复",
+                str(exc),
+            )
+
     def _require_quiescent_delete(self, job_id: str) -> bool:
         if not self._job_is_scheduled(job_id):
             return True
         QMessageBox.information(
             self.workspace,
             f"请先停止 {job_id}",
-            "任务仍在运行、排队或正在停止。\n\n"
+            "任务仍在运行、等待人工操作、排队或正在停止。\n\n"
             "请先点击“停止”，等待任务完全进入 STOPPED 后再删除。",
         )
         return False
@@ -380,8 +392,6 @@ class BatchIndividualControls(QObject):
         if self.controller.config is None or self._job_is_scheduled(job_id):
             return
 
-        # Rebind row-owned intent/files/photos at the last responsible moment so
-        # customer changes made after prepare are honored by this exact Job.
         row = self._row_for_job(job_id)
         if row is not None:
             self._bind_job_context(row, job)
@@ -445,7 +455,7 @@ class BatchIndividualControls(QObject):
         delete = QPushButton("删除")
         delete.setObjectName("dangerButton")
 
-        fill.clicked.connect(lambda _checked=False, jid=job_id: self.start_job_execution(jid))
+        fill.clicked.connect(lambda _checked=False, jid=job_id: self._primary_job_action(jid))
         stop.clicked.connect(lambda _checked=False, jid=job_id: self.stop_job(jid))
         delete.clicked.connect(lambda _checked=False, jid=job_id: self._confirm_delete_job(jid))
         row.addWidget(label)
@@ -458,6 +468,13 @@ class BatchIndividualControls(QObject):
         root.insertWidget(index if index >= 0 else root.count(), host)
         self._cards[job_id] = _CardControls(host, fill, stop, delete, hint)
         self._hide_legacy_remove(job_id)
+
+    def _primary_job_action(self, job_id: str) -> None:
+        job = self._job(job_id)
+        if job is not None and str(job.status) == _SOURCE_WAITING:
+            self.resume_source_interaction(job_id)
+            return
+        self.start_job_execution(job_id)
 
     def _confirm_delete_job(self, job_id: str) -> None:
         job = self._job(job_id)
@@ -505,8 +522,6 @@ class BatchIndividualControls(QObject):
         if not isinstance(file_map, dict):
             file_map = {}
             self.controller._supplemental_product_files_by_job_id = file_map
-        # Explicit empty tuple is meaningful for duplicate URLs: do not fall back
-        # to another occurrence's URL-scoped supplemental file selection.
         file_map[job_id] = files
 
         photos = getattr(self.window, "_listing_photo_ownership", None)
@@ -607,16 +622,17 @@ class BatchIndividualControls(QObject):
         scheduled = bool(job is not None and self._job_is_scheduled(str(job.job_id)))
         terminal = bool(job is not None and str(job.status) in _TERMINAL)
         ready = bool(job is not None and str(job.status) == "READY")
+        waiting_source = bool(job is not None and str(job.status) == _SOURCE_WAITING)
         valid = bool(str(row.url() or "").strip()) and bool(row.is_enabled())
 
-        controls.start.setEnabled(valid and (job is None or terminal))
+        controls.start.setEnabled(valid and (job is None or terminal or waiting_source))
         controls.stop.setEnabled(bool(job is not None and (scheduled or ready or not terminal)))
         controls.delete.setEnabled(
-            bool(str(row.url() or "").strip()) or job is not None
+            (bool(str(row.url() or "").strip()) or job is not None)
             and not scheduled
         )
         controls.start.setText(
-            "运行中" if scheduled else "重启" if terminal else "已准备" if ready else "启动"
+            "继续" if waiting_source else "运行中" if scheduled else "重启" if terminal else "已准备" if ready else "启动"
         )
 
     def _refresh_card(self, job: Any) -> None:
@@ -625,11 +641,15 @@ class BatchIndividualControls(QObject):
             return
         scheduled = self._job_is_scheduled(str(job.job_id))
         terminal = str(job.status) in _TERMINAL
-        controls.fill.setEnabled(str(job.status) == "READY" and not scheduled)
+        waiting_source = str(job.status) == _SOURCE_WAITING
+        controls.fill.setText("继续检测" if waiting_source else "单独填写")
+        controls.fill.setEnabled(waiting_source or (str(job.status) == "READY" and not scheduled))
         controls.stop.setEnabled(scheduled or (str(job.status) == "READY" and not terminal))
         controls.delete.setEnabled(not scheduled)
         controls.hint.setText(
-            "运行中 · 请先停止后删除"
+            "等待人工验证 · 完成后继续检测"
+            if waiting_source
+            else "运行中 · 请先停止后删除"
             if scheduled
             else "READY · 可单独真实填写"
             if str(job.status) == "READY"
@@ -651,7 +671,8 @@ class BatchIndividualControls(QObject):
         if batch is None or self.controller.config is None:
             return
         source_active = any(stage == "source" for _, stage in self.controller._processes.values())
-        if self.controller._source_queue and not source_active:
+        source_waiting = bool(getattr(self.controller, "_source_interaction_waiting", lambda: False)())
+        if self.controller._source_queue and not source_active and not source_waiting:
             self.controller._start_source(self.controller._source_queue.pop(0))
 
         active_prepare = sum(stage == "prepare" for _, stage in self.controller._processes.values())
@@ -695,8 +716,10 @@ class BatchIndividualControls(QObject):
         return None
 
     def _job_is_scheduled(self, job_id: str) -> bool:
+        job = self._job(job_id)
         return bool(
-            self._process_for_job(job_id) is not None
+            (job is not None and str(job.status) == _SOURCE_WAITING)
+            or self._process_for_job(job_id) is not None
             or job_id in self.controller._source_queue
             or job_id in self.controller._prepare_queue
             or job_id in self.controller._execute_queue
@@ -730,14 +753,17 @@ class BatchIndividualControls(QObject):
         if batch is None:
             return
         self._remove_from_queues(job_id)
+        pending = getattr(self.controller, "_source_resume_pending", None)
+        if isinstance(pending, set):
+            pending.discard(job_id)
         batch.jobs[:] = [job for job in batch.jobs if str(job.job_id) != str(job_id)]
         for name in ("_listing_offer_intent_by_job_id", "_supplemental_product_files_by_job_id"):
             mapping = getattr(self.controller, name, None)
             if isinstance(mapping, dict):
                 mapping.pop(job_id, None)
-        pending = getattr(self.workspace, "_pending_logs", None)
-        if isinstance(pending, dict):
-            pending.pop(job_id, None)
+        pending_logs = getattr(self.workspace, "_pending_logs", None)
+        if isinstance(pending_logs, dict):
+            pending_logs.pop(job_id, None)
         support = getattr(self.window, "_listing_offer_support", None)
         panels = getattr(support, "_batch_required_panels", None)
         if isinstance(panels, dict):
