@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,8 @@ import velopack
 GITHUB_REPOSITORY_URL = "https://github.com/yuchenm1303-png/ecommerce-agent"
 UPDATE_SOURCE_ENV = "ECOMMERCE_AGENT_UPDATE_SOURCE"
 _UPDATE_CHECK_SOURCE_ENV = "ECOMMERCE_AGENT_UPDATE_CHECK_SOURCE"
+_UPDATE_CHECK_RESULT_ENV = "ECOMMERCE_AGENT_UPDATE_CHECK_RESULT_PATH"
 _UPDATE_CHECK_WORKER_ARG = "--internal-velopack-check"
-_UPDATE_CHECK_RESULT_PREFIX = "LISTING_STUDIO_UPDATE_CHECK_RESULT:"
 _UPDATE_CHECK_TIMEOUT_SECONDS = 12.0
 _DOWNLOAD_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 _TRANSIENT_DOWNLOAD_MARKERS = (
@@ -196,19 +197,39 @@ def _update_check_command() -> list[str]:
     ]
 
 
-def run_update_check_worker() -> int:
-    """Run one Velopack discovery in an isolated process and emit a framed result."""
+def _write_update_check_result(result_path: Path, payload: dict[str, Any]) -> None:
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    temp = result_path.with_name(f".{result_path.name}.{os.getpid()}.tmp")
+    try:
+        temp.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temp, result_path)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
+
+def run_update_check_worker() -> int:
+    """Run one Velopack discovery in an isolated process and atomically publish its result."""
+
+    result_text = str(os.getenv(_UPDATE_CHECK_RESULT_ENV, "") or "").strip()
+    if not result_text:
+        return 2
+    result_path = Path(result_text)
     source = str(os.getenv(_UPDATE_CHECK_SOURCE_ENV, "") or "").strip() or None
     try:
         info = create_update_manager(source).check_for_updates()
         payload: dict[str, Any] = {"ok": True, "info": _update_info_to_payload(info)}
     except Exception as exc:
         payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    print(
-        _UPDATE_CHECK_RESULT_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-        flush=True,
-    )
+    try:
+        _write_update_check_result(result_path, payload)
+    except OSError:
+        return 3
     return 0 if payload.get("ok") else 1
 
 
@@ -220,45 +241,42 @@ def bounded_check_for_updates(
     """Discover an update in a killable child process with a true wall-clock deadline."""
 
     timeout = max(1.0, float(timeout_seconds))
-    env = os.environ.copy()
-    env[_UPDATE_CHECK_SOURCE_ENV] = str(source or "").strip()
-    creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0
-    process = subprocess.Popen(
-        _update_check_command(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-        creationflags=creationflags,
-    )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        process.kill()
-        process.communicate()
-        raise UpdateCheckTimeoutError(
-            f"Velopack update check timed out after {timeout:.0f}s"
-        ) from exc
+    with tempfile.TemporaryDirectory(prefix="listing-studio-update-check-") as temp_dir:
+        result_path = Path(temp_dir) / "result.json"
+        env = os.environ.copy()
+        env[_UPDATE_CHECK_SOURCE_ENV] = str(source or "").strip()
+        env[_UPDATE_CHECK_RESULT_ENV] = str(result_path)
+        creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0
+        process = subprocess.Popen(
+            _update_check_command(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            creationflags=creationflags,
+        )
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            process.wait()
+            raise UpdateCheckTimeoutError(
+                f"Velopack update check timed out after {timeout:.0f}s"
+            ) from exc
 
-    result_text = ""
-    for line in reversed(stdout.splitlines()):
-        if line.startswith(_UPDATE_CHECK_RESULT_PREFIX):
-            result_text = line[len(_UPDATE_CHECK_RESULT_PREFIX) :]
-            break
-    if not result_text:
-        detail = stderr.strip() or stdout.strip() or f"worker exit code {process.returncode}"
-        raise RuntimeError(f"Velopack update check worker failed: {detail}")
-    try:
-        payload = json.loads(result_text)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Velopack update check worker returned invalid JSON") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("Velopack update check worker returned invalid data")
-    if not payload.get("ok"):
-        raise RuntimeError(str(payload.get("error") or "Velopack update check failed"))
-    return _update_info_from_payload(payload.get("info"))
+        if not result_path.is_file():
+            raise RuntimeError(
+                f"Velopack update check worker exited without a result: code={process.returncode}"
+            )
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Velopack update check worker returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("Velopack update check worker returned invalid data")
+        if not payload.get("ok"):
+            raise RuntimeError(str(payload.get("error") or "Velopack update check failed"))
+        return _update_info_from_payload(payload.get("info"))
 
 
 def resolve_stable_update_source() -> tuple[str, str]:
