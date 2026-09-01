@@ -49,11 +49,18 @@ function auditMinute(value: unknown): number {
   return Number.isFinite(stamp) ? Math.floor(stamp / 60_000) : 0;
 }
 
+function executionPhase(value: unknown): boolean {
+  return textValue(value).toLowerCase().endsWith("_execute");
+}
+
+function executionReview(phase: unknown, status: unknown): boolean {
+  return executionPhase(phase) && textValue(status).toUpperCase() === "REVIEW";
+}
+
 function jobAuditStatus(phase: unknown, jobStatus: unknown, fallback: unknown): string {
   const status = textValue(jobStatus).toUpperCase();
   if (textValue(phase).toLowerCase() === "batch_execute") {
-    if (status === "DONE") return "completed";
-    if (status === "REVIEW") return "review";
+    if (status === "DONE" || status === "REVIEW") return "completed";
     if (status === "FAILED") return "failed";
     if (status === "STOPPED") return "cancelled";
     return textValue(fallback).toLowerCase() || "running";
@@ -63,6 +70,36 @@ function jobAuditStatus(phase: unknown, jobStatus: unknown, fallback: unknown): 
   if (status === "FAILED") return "failed";
   if (status === "STOPPED") return "cancelled";
   return textValue(fallback).toLowerCase() || "running";
+}
+
+function monitorAudit(auditValue: unknown): JsonObject {
+  const audit = objectValue(auditValue);
+  const result = objectValue(audit.result_data);
+  const storedStatus = textValue(audit.status).toLowerCase();
+  const jobStatus = textValue(result.job_status).toUpperCase();
+  const hardFailure = storedStatus === "failed" || storedStatus === "cancelled" ||
+    jobStatus === "FAILED" || jobStatus === "STOPPED";
+  const reviewRequired = executionPhase(audit.phase) && !hardFailure && (
+    storedStatus === "review" || jobStatus === "REVIEW" || result.review_required === true
+  );
+
+  if (!reviewRequired) return { ...audit };
+
+  const reviewReason = textValue(result.review_reason) || textValue(result.error) || textValue(audit.error_text);
+  const { failure_diagnostic: _ignoredFailureDiagnostic, ...safeResult } = result;
+  return {
+    ...audit,
+    status: "completed",
+    review_required: true,
+    review_reason: reviewReason,
+    error_text: "",
+    result_data: {
+      ...safeResult,
+      review_required: true,
+      review_reason: reviewReason,
+      error: "",
+    },
+  };
 }
 
 function nativeBatchLink(audit: JsonObject): boolean {
@@ -91,7 +128,7 @@ function explodeLegacyBatchAudit(audit: JsonObject): JsonObject[] {
   const items = Array.isArray(input.items) ? input.items.map(objectValue) : [];
   const jobs = Array.isArray(result.jobs) ? result.jobs.map(objectValue) : [];
   const count = Math.max(jobs.length, items.length, numberValue(input.item_count), numberValue(result.job_count));
-  if (!count) return [audit];
+  if (!count) return [monitorAudit(audit)];
 
   const diagnostics = Array.isArray(result.failure_diagnostics)
     ? result.failure_diagnostics.map(objectValue)
@@ -105,12 +142,20 @@ function explodeLegacyBatchAudit(audit: JsonObject): JsonObject[] {
     const jobId = textValue(job.job_id) || `JOB-${String(index + 1).padStart(3, "0")}`;
     const diagnostic = diagnostics.find((candidate) => textValue(candidate.job_id) === jobId);
     const productUrl = jobUrl || textValue(item.supplier_url);
+    const reviewRequired = textValue(job.status).toUpperCase() === "REVIEW";
+    const successfulReview = executionReview(audit.phase, job.status);
+    const reviewReason = reviewRequired
+      ? textValue(job.review_reason) || textValue(job.error) || textValue(audit.error_text)
+      : "";
+    const { failure_diagnostic: _ignoredFailureDiagnostic, ...jobWithoutFailureDiagnostic } = job;
 
     output.push({
       ...audit,
       id: `${textValue(audit.id) || "legacy-batch"}:${jobId}`,
       source_audit_id: textValue(audit.id),
       status: jobAuditStatus(audit.phase, job.status, audit.status),
+      review_required: reviewRequired,
+      review_reason: reviewReason,
       product_url: productUrl,
       input_data: {
         audit_scope: "batch_link_legacy",
@@ -124,17 +169,20 @@ function explodeLegacyBatchAudit(audit: JsonObject): JsonObject[] {
         model_config: objectValue(input.model_config),
       },
       result_data: {
-        ...job,
+        ...jobWithoutFailureDiagnostic,
         audit_scope: "batch_link_legacy",
         batch_id: textValue(result.batch_id) || textValue(input.batch_id) || textValue(audit.id),
         job_id: jobId,
         batch_index: index + 1,
         batch_size: count,
         job_status: textValue(job.status),
+        review_required: reviewRequired,
+        review_reason: reviewReason,
+        error: successfulReview ? "" : textValue(job.error),
         product_url: productUrl,
-        ...(diagnostic ? { failure_diagnostic: diagnostic } : {}),
+        ...(!successfulReview && diagnostic ? { failure_diagnostic: diagnostic } : {}),
       },
-      error_text: textValue(job.error) || textValue(audit.error_text),
+      error_text: successfulReview ? "" : textValue(job.error) || textValue(audit.error_text),
     });
   }
   return output;
@@ -147,7 +195,7 @@ function normalizeTaskAudits(rawValue: unknown): JsonObject[] {
 
   for (const audit of raw) {
     if (textValue(audit.task_kind) !== "batch" || nativeBatchLink(audit)) {
-      normalized.push({ ...audit, source_audit_id: textValue(audit.id) });
+      normalized.push(monitorAudit({ ...audit, source_audit_id: textValue(audit.id) }));
       continue;
     }
     for (const child of explodeLegacyBatchAudit(audit)) {
@@ -164,7 +212,7 @@ function normalizeTaskAudits(rawValue: unknown): JsonObject[] {
 }
 
 function taskSummary(rowValue: unknown): JsonObject {
-  const row = objectValue(rowValue);
+  const row = monitorAudit(rowValue);
   return {
     ...row,
     source_audit_id: textValue(row.id),
