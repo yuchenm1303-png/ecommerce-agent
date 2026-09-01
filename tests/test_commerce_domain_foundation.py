@@ -112,3 +112,11 @@ def test_unit_of_work_requires_explicit_commit() -> None:
     with uow:
         uow.commit()
     assert uow.calls == ["begin", "commit"]
+
+
+def test_manual_rollback_is_not_repeated_on_context_exit() -> None:
+    uow = _RecordingUnitOfWork()
+    with uow:
+        uow.rollback()
+
+    assert uow.calls == ["begin", "rollback"]

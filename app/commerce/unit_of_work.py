@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from enum import Enum
 
 from .catalog.repository import ProductRepository, SourceProductRepository
 from .events import CommerceEventSink
 from .listings.repository import ChannelListingRepository
+
+
+class _UnitOfWorkState(str, Enum):
+    IDLE = "idle"
+    ACTIVE = "active"
+    COMMITTED = "committed"
+    ROLLED_BACK = "rolled_back"
 
 
 class CommerceUnitOfWork(ABC):
@@ -21,39 +29,37 @@ class CommerceUnitOfWork(ABC):
     events: CommerceEventSink
 
     def __init__(self) -> None:
-        self._committed = False
-        self._entered = False
+        self._state = _UnitOfWorkState.IDLE
 
     def __enter__(self) -> "CommerceUnitOfWork":
-        if self._entered:
+        if self._state is not _UnitOfWorkState.IDLE:
             raise RuntimeError("commerce unit of work is already active")
-        self._entered = True
-        self._committed = False
         self._begin()
+        self._state = _UnitOfWorkState.ACTIVE
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         try:
-            if exc_type is not None or not self._committed:
+            if self._state is _UnitOfWorkState.ACTIVE:
                 self._rollback()
+                self._state = _UnitOfWorkState.ROLLED_BACK
         finally:
-            self._entered = False
+            self._state = _UnitOfWorkState.IDLE
         return False
 
     def commit(self) -> None:
-        if not self._entered:
-            raise RuntimeError("commerce unit of work is not active")
-        if self._committed:
-            raise RuntimeError("commerce unit of work has already committed")
+        self._require_active()
         self._commit()
-        self._committed = True
+        self._state = _UnitOfWorkState.COMMITTED
 
     def rollback(self) -> None:
-        if not self._entered:
+        self._require_active()
+        self._rollback()
+        self._state = _UnitOfWorkState.ROLLED_BACK
+
+    def _require_active(self) -> None:
+        if self._state is not _UnitOfWorkState.ACTIVE:
             raise RuntimeError("commerce unit of work is not active")
-        if not self._committed:
-            self._rollback()
-        self._committed = False
 
     @abstractmethod
     def _begin(self) -> None:
