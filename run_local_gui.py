@@ -58,6 +58,11 @@ def _complete_update_e2e_probe() -> bool:
 
 
 def main() -> int:
+    if "--internal-velopack-check" in sys.argv[1:]:
+        from app.velopack_runtime import run_update_check_worker
+
+        return run_update_check_worker()
+
     try:
         pending_crash = start_crash_diagnostics()
     except Exception:
