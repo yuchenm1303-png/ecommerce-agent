@@ -7,6 +7,7 @@ RUNTIME = (ROOT / "app" / "velopack_runtime.py").read_text(encoding="utf-8")
 UPDATER = (ROOT / "gui" / "app_updater.py").read_text(encoding="utf-8")
 RUN = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 BUILD = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
+SPEC = (ROOT / "packaging" / "EcommerceAgent.spec").read_text(encoding="utf-8")
 
 
 def test_client_retries_transient_velopack_disconnects_without_owning_update_semantics() -> None:
@@ -21,7 +22,7 @@ def test_client_retries_transient_velopack_disconnects_without_owning_update_sem
 def test_update_discovery_runs_in_a_killable_process_with_a_hard_deadline() -> None:
     assert '_UPDATE_CHECK_TIMEOUT_SECONDS = 12.0' in RUNTIME
     assert 'subprocess.Popen(' in RUNTIME
-    assert 'stdout, stderr = process.communicate(timeout=timeout)' in RUNTIME
+    assert 'process.wait(timeout=timeout)' in RUNTIME
     assert 'except subprocess.TimeoutExpired as exc:' in RUNTIME
     assert 'process.kill()' in RUNTIME
     assert 'raise UpdateCheckTimeoutError(' in RUNTIME
@@ -30,6 +31,16 @@ def test_update_discovery_runs_in_a_killable_process_with_a_hard_deadline() -> N
     assert 'manager.check_for_updates()' not in UPDATER
     assert 'if "--internal-velopack-check" in sys.argv[1:]:' in RUN
     assert 'return run_update_check_worker()' in RUN
+
+
+def test_frozen_update_checker_uses_file_ipc_instead_of_console_streams() -> None:
+    assert 'console=False' in SPEC
+    assert '_UPDATE_CHECK_RESULT_ENV = "ECOMMERCE_AGENT_UPDATE_CHECK_RESULT_PATH"' in RUNTIME
+    assert 'tempfile.TemporaryDirectory(prefix="listing-studio-update-check-")' in RUNTIME
+    assert 'env[_UPDATE_CHECK_RESULT_ENV] = str(result_path)' in RUNTIME
+    assert 'os.replace(temp, result_path)' in RUNTIME
+    assert 'stdout=subprocess.DEVNULL' in RUNTIME
+    assert 'stderr=subprocess.DEVNULL' in RUNTIME
 
 
 def test_manual_update_check_adopts_an_inflight_startup_check_instead_of_silently_returning() -> None:
