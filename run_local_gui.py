@@ -203,7 +203,7 @@ def main() -> int:
     from gui.batch_sku_spec_ui import install_batch_sku_spec_ui
     from gui.batch_url_editor import install_batch_url_editor
     from gui.batch_workspace_density import install_batch_workspace_density
-    from gui.browser_session_manager import install_managed_makro_browser
+    from gui.channel_account_browser import install_managed_makro_browser
     from gui.card_details_fast import install_card_details
     from gui.click_fireworks import install_click_fireworks
     from gui.console_summary_mode import install_console_summary_mode
