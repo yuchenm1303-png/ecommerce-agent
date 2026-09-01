@@ -82,6 +82,16 @@ def test_commerce_outbox_deduplicates_same_event_without_losing_data(tmp_path: P
         outbox.enqueue(changed)
 
 
+def test_commerce_sync_rejects_identity_conflicts_before_first_business_write() -> None:
+    sql = _MIGRATION.read_text(encoding="utf-8").casefold()
+    first_write = sql.index("insert into public.commerce_workspaces")
+
+    assert sql.index("event_payload_conflict") < first_write
+    assert sql.index("channel_account_conflict") < first_write
+    assert sql.index("listing_product_conflict") < first_write
+    assert sql.index("v_source_exists := found") < first_write
+
+
 def test_commerce_sync_is_one_trusted_rpc_and_direct_desktop_access_stays_denied() -> None:
     sql = _MIGRATION.read_text(encoding="utf-8").casefold()
     edge = _EDGE.read_text(encoding="utf-8")
