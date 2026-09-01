@@ -40,6 +40,8 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
             / "managed_makro_browser.json"
         )
         self._account_reconcile_lock = threading.Lock()
+        self._account_selection_lock = threading.Lock()
+        self._pending_channel_account: ChannelAccount | None = None
 
         super().__init__(window)
         # ManagedMakroBrowser schedules its first warm-up with QTimer.singleShot(0),
@@ -64,6 +66,80 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
                 "Listing Studio 登录账号已在本次运行中切换。为防止 Makro 店铺串号，"
                 "当前平台会话已停止使用；请重新启动程序，让新账号加载自己的 Makro 会话。"
             )
+
+    def list_channel_accounts(self) -> tuple[ChannelAccount, ...]:
+        self._assert_account_scope_stable()
+        return self.channel_accounts.list_accounts(self._CHANNEL)
+
+    def selected_channel_account(self) -> ChannelAccount:
+        with self._account_selection_lock:
+            return self._pending_channel_account or self.channel_account
+
+    def channel_browser_status(self) -> tuple[str, str]:
+        return self._state, self._detail
+
+    def _assert_account_change_allowed(self) -> None:
+        self._assert_account_scope_stable()
+        if self._update_quiesced:
+            raise RuntimeError("Listing Studio 正在准备更新，暂时不能切换 Makro 店铺。")
+        if self._is_busy():
+            raise RuntimeError(
+                "当前仍有 Single / Batch / 真实填写任务运行。为防止上架到错误店铺，"
+                "任务结束前不能切换 Makro 账号。"
+            )
+
+    def request_activate_channel_account(self, account_id: str) -> ChannelAccount:
+        """Persist an account selection and let the lifecycle worker rotate Edge.
+
+        This method is safe for the Qt presentation thread: it performs local
+        metadata I/O only and never probes CDP, closes Edge, or waits on a worker.
+        """
+
+        self._assert_account_change_allowed()
+        account = self.channel_accounts.set_active(self._CHANNEL, account_id)
+        with self._account_selection_lock:
+            if (
+                account.account_id == self.channel_account.account_id
+                and self._pending_channel_account is None
+            ):
+                self.ensure_async()
+                return account
+            self._pending_channel_account = account
+
+        # Any prepared browser-owned state belongs to the previous marketplace
+        # account and must never survive a store switch.
+        self._single_prepared_generation = None
+        self._batch_prepare_generation = None
+        self._emit_status(
+            "CHECKING",
+            f"已选择 {account.label} · 正在后台切换独立 Makro 登录会话",
+        )
+        self.ensure_async()
+        return account
+
+    def create_and_activate_channel_account(self, *, label: str = "") -> ChannelAccount:
+        self._assert_account_change_allowed()
+        account = self.channel_accounts.create_account(self._CHANNEL, label=label)
+        return self.request_activate_channel_account(account.account_id)
+
+    def _apply_pending_channel_account(self) -> bool:
+        with self._account_selection_lock:
+            account = self._pending_channel_account
+            self._pending_channel_account = None
+        if account is None or account.account_id == self.channel_account.account_id:
+            return False
+
+        self.channel_account = account
+        self._desired_profile_dir = self.channel_accounts.profile_dir(account)
+        self.profile_dir = self._desired_profile_dir
+        self._runtime_identity = self.channel_accounts.runtime_identity(account)
+        self._single_prepared_generation = None
+        self._batch_prepare_generation = None
+        return True
+
+    def _has_pending_channel_account(self) -> bool:
+        with self._account_selection_lock:
+            return self._pending_channel_account is not None
 
     def _read_runtime_identity(self) -> str:
         try:
@@ -157,14 +233,41 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
             self._clear_runtime_identity()
 
     def ensure_ready(self, reason: str = "task") -> bool:
-        self._assert_account_scope_stable()
-        self._reconcile_running_browser_account(reason)
-        launched = super().ensure_ready(reason)
-        self._write_runtime_identity()
-        return launched
+        """Resolve pending account changes on the lifecycle worker, never the UI."""
+
+        launched_any = False
+        while True:
+            self._assert_account_scope_stable()
+            self._apply_pending_channel_account()
+            self._reconcile_running_browser_account(reason)
+            launched_any = bool(super().ensure_ready(reason) or launched_any)
+            self._write_runtime_identity()
+            if not self._has_pending_channel_account():
+                return launched_any
+
+    def _apply_endpoint_observation(self, token: str) -> None:
+        # A selection can arrive during the tail of a lifecycle worker. Keep the
+        # poll path aware of it so a READY emitted by the old generation cannot
+        # strand the pending switch indefinitely.
+        if self._has_pending_channel_account() and not self._is_busy() and not self._update_quiesced:
+            selected = self.selected_channel_account()
+            if self._state in self._HOT_STATES:
+                self._emit_status(
+                    "CHECKING",
+                    f"已选择 {selected.label} · 正在后台切换独立 Makro 登录会话",
+                )
+            self.ensure_async()
+            return
+        super()._apply_endpoint_observation(token)
 
     def _assert_task_start_allowed(self) -> None:
         self._assert_account_scope_stable()
+        if self._has_pending_channel_account():
+            selected = self.selected_channel_account()
+            self.ensure_async()
+            raise RuntimeError(
+                f"Makro 店铺正在切换到 {selected.label}。状态变为 READY 后请重新开始任务。"
+            )
         super()._assert_task_start_allowed()
 
     def _apply_status(self, state: str, detail: str) -> None:
@@ -174,9 +277,24 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
         super()._apply_status(state, detail)
 
 
+def _install_channel_account_center_if_available(
+    window: Any,
+    manager: AccountBoundMakroBrowser,
+) -> None:
+    # CardDetails is installed before the managed browser in the formal GUI. Keep
+    # the browser subsystem usable in isolated tests/tools that do not construct
+    # presentation components.
+    if getattr(window, "_card_details", None) is None:
+        return
+    from .channel_account_surface import install_channel_account_center
+
+    install_channel_account_center(window, manager)
+
+
 def install_managed_makro_browser(window: Any) -> AccountBoundMakroBrowser:
     existing = getattr(window, "_managed_makro_browser", None)
     if isinstance(existing, AccountBoundMakroBrowser):
+        _install_channel_account_center_if_available(window, existing)
         return existing
     if isinstance(existing, ManagedMakroBrowser):
         raise RuntimeError("Makro Browser 已由非账号绑定的 manager 初始化，拒绝混用两套会话 owner。")
@@ -184,6 +302,7 @@ def install_managed_makro_browser(window: Any) -> AccountBoundMakroBrowser:
     manager = AccountBoundMakroBrowser(window)
     window._managed_makro_browser = manager
     window._channel_accounts = manager.channel_accounts
+    _install_channel_account_center_if_available(window, manager)
     return manager
 
 
