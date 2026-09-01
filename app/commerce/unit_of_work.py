@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from enum import Enum
 
 from .catalog.repository import ProductRepository, SourceProductRepository
+from .channels.repository import ChannelAccountRepository
 from .events import CommerceEventSink
 from .listings.repository import ChannelListingRepository
 
@@ -25,6 +26,7 @@ class CommerceUnitOfWork(ABC):
 
     products: ProductRepository
     source_products: SourceProductRepository
+    channels: ChannelAccountRepository
     listings: ChannelListingRepository
     events: CommerceEventSink
 
