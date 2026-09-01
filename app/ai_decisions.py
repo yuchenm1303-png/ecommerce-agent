@@ -146,15 +146,25 @@ def schema_digest(fields: Iterable[dict[str, Any]]) -> str:
 
 
 def source_manifest_digest(grounding: GroundingCatalog) -> str:
-    payload = [
-        {
-            "source_id": source.source_id,
-            "source_type": source.source_type,
-            "kind": source.kind,
-            "sha256": source.sha256,
-        }
-        for source in grounding.sources
-    ]
+    # Source ordering is transport/presentation detail, never product identity.
+    # Make the fingerprint content-addressed so equivalent source sets are stable.
+    payload = sorted(
+        (
+            {
+                "source_id": source.source_id,
+                "source_type": source.source_type,
+                "kind": source.kind,
+                "sha256": source.sha256,
+            }
+            for source in grounding.sources
+        ),
+        key=lambda item: (
+            item["source_id"],
+            item["source_type"],
+            item["kind"],
+            item["sha256"],
+        ),
+    )
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -371,7 +381,7 @@ def _validated_citations(
 
     The AI is responsible for deciding whether a cited source supports a claim.
     Python only verifies that the cited local source exists, or that a Web source
-    was actually persisted from the current search call.  Paraphrases are valid
+    was actually persisted from the current search call. Paraphrases are valid
     evidence text and are not required to be a literal substring of source text.
     """
 
@@ -380,7 +390,7 @@ def _validated_citations(
     for citation in citations:
         reference = citation.source_reference.strip()
         # Models often copy the visual ``[source-id]`` delimiter from compact
-        # evidence.  Brackets are presentation, not part of the provenance ID.
+        # evidence. Brackets are presentation, not part of the provenance ID.
         if reference.startswith("[") and reference.endswith("]"):
             reference = reference[1:-1].strip()
         valid = grounding.by_id(reference) is not None or reference in external_sources
@@ -420,12 +430,14 @@ def validate_ai_decision_packet(
     expected_identity: ProductIdentity = ProductIdentity(),
     external_sources: dict[str, str] | None = None,
 ) -> AIDecisionPacket:
-    """Validate only deterministic execution boundaries.
+    """Rebind AI output using only deterministic, field-local execution boundaries.
 
     Product identity interpretation, evidence sufficiency, negative claims,
-    dimensional axes, scope and all other product semantics belong to AI.
-    Python checks only schema/source identity, provenance addresses, business
-    locks and structural completeness.
+    dimensional axes, scope and every other product semantic belong to AI.
+    Schema/source digests are audit/cache fingerprints only: drift is recorded as
+    a warning and can never veto the whole product. Python validates concrete
+    field addresses, provenance addresses, business locks and packet structure;
+    any unbound field/citation is isolated to that field.
     """
 
     field_list = list(fields)
@@ -433,13 +445,20 @@ def validate_ai_decision_packet(
     expected_schema = schema_digest(field_list)
     expected_sources = source_manifest_digest(grounding)
     assert_identity_compatible(expected_identity, packet.identity)
+
+    warnings = list(packet.warnings)
     if packet.schema_sha256 and packet.schema_sha256 != expected_schema:
-        raise AIDecisionError("AI decision packet 的 live schema digest 与当前规划 schema 不一致。")
+        warnings.append(
+            "decision binding warning: live schema fingerprint changed; "
+            "rebound mechanically by field_id and isolated unmatched fields"
+        )
     if packet.source_manifest_sha256 and packet.source_manifest_sha256 != expected_sources:
-        raise AIDecisionError("AI decision packet 的 source manifest digest 与当前商品资料不一致。")
+        warnings.append(
+            "decision binding warning: source manifest fingerprint changed; "
+            "rebound mechanically by source_reference and isolated unverifiable citations"
+        )
 
     external = external_sources or {}
-    warnings = list(packet.warnings)
     observed: dict[str, FieldDecision] = {}
 
     for decision in packet.decisions:
