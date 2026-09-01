@@ -4,11 +4,11 @@ Makro Step 2 is not an autocomplete picker. The portal accepts one brand query,
 validates it with ``Check Brand`` and then exposes a confirmation/create-listing
 state for the validated brand.
 
-The current production policy pins Step 2 to ``KEAI``. The previous supplier /
-AI-derived brand path is intentionally retained behind ``BRAND_SELECTION_MODE``
-so it can be restored without rebuilding the brand-selection mechanics. A caller
-may provide one explicit diagnostic override; it still uses the same native Check
-Brand verification and never bypasses the portal contract.
+The current production policy uses the supplier / AI-derived brand path. The
+fixed ``KEAI`` policy is intentionally retained behind ``BRAND_SELECTION_MODE``
+so it can be re-enabled without rebuilding the brand-selection mechanics. A
+caller may provide one explicit diagnostic override; it still uses the same
+native Check Brand verification and never bypasses the portal contract.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from .listing_creation import (
 from .portal_interruptions import reconcile_portal_interruptions
 
 
-BRAND_SELECTION_MODE = "fixed"
+BRAND_SELECTION_MODE = "supplier"
 FIXED_BRAND = "KEAI"
 
 
