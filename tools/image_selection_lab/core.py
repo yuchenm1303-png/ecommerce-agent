@@ -18,8 +18,10 @@ from app.listing_image_ranker import (
     _Candidate,
     _run_ownership_request,
     _run_ranking_request,
+    _run_visual_facts_request,
     build_listing_image_ownership_request,
     build_listing_image_ranking_request,
+    build_listing_image_visual_facts_request,
 )
 from app.providers.usage_telemetry import USAGE_JOURNAL_ENV, summarize_usage_journal
 
@@ -399,7 +401,7 @@ class ImageSelectionStrategy(Protocol):
 
 
 class CurrentV6Strategy:
-    """Exact local parity adapter for the production v6 Ownership -> Gallery prompts/parsers."""
+    """Exact local parity adapter for the current production image-selection pipeline."""
 
     name = "current-v6"
 
@@ -458,17 +460,27 @@ class CurrentV6Strategy:
                 status="no_transport_candidates",
             )
 
+        visual_request = build_listing_image_visual_facts_request(candidates=candidates)
+        visual_facts = _run_visual_facts_request(provider, visual_request, candidates)
+
         ownership_request = build_listing_image_ownership_request(
             product_context=case.target_product,
             candidates=candidates,
+            visual_facts=visual_facts,
         )
-        ownership = _run_ownership_request(provider, ownership_request, candidates)
+        ownership = _run_ownership_request(
+            provider,
+            ownership_request,
+            candidates,
+            visual_facts,
+        )
         ownership_json = {
             image_id: decision.as_dict() for image_id, decision in ownership.decisions.items()
         }
         eligible = [
             candidate for candidate in candidates if candidate.image_id in set(ownership.eligible_ids)
         ]
+        calls = visual_facts.model_calls + 1
         if not eligible:
             return StrategyOutput(
                 strategy=self.name,
@@ -476,14 +488,14 @@ class CurrentV6Strategy:
                 ownership=ownership_json,
                 gallery={},
                 transport_rejected=tuple(transport_rejected),
-                semantic_calls=1,
+                semantic_calls=calls,
                 status="ai_ownership_empty",
             )
 
         ranking_request = build_listing_image_ranking_request(
-            product_context=case.target_product,
             candidates=eligible,
             ownership=ownership,
+            visual_facts=visual_facts,
         )
         ranking = _run_ranking_request(provider, ranking_request, eligible)
         gallery_json = {
@@ -495,7 +507,7 @@ class CurrentV6Strategy:
             ownership=ownership_json,
             gallery=gallery_json,
             transport_rejected=tuple(transport_rejected),
-            semantic_calls=2,
+            semantic_calls=calls + 1,
             status="ai_ranked" if ranking.selected_ids else "ai_ranked_empty",
         )
 
