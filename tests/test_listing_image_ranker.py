@@ -40,10 +40,7 @@ def _write_snapshot(path: Path) -> None:
                 "final_url": "https://supplier.example/item/1",
                 "title": "Acme Cordless Drill 18V Black",
                 "captured_at": "2026-08-30T00:00:00Z",
-                "visible_text": (
-                    "Acme Cordless Drill 18V Black with battery and charger. "
-                    "Customers also viewed Corn Flakes Full Cream Milk Vaseline Lotion."
-                ),
+                "visible_text": "Acme Cordless Drill 18V Black with battery and charger.",
                 "table_rows": [
                     {"key": "Brand", "value": "Acme", "table_index": 0, "row_index": 0},
                     {"key": "Voltage", "value": "18V", "table_index": 0, "row_index": 1},
@@ -98,21 +95,29 @@ def _identity_response() -> dict[str, object]:
     }
 
 
-def _gallery_selected(reason: str) -> dict[str, object]:
+def _blind_fact(
+    subject: str,
+    identity: str,
+    colour: str,
+    design: str,
+    guess: str,
+    quality: str,
+) -> dict[str, object]:
     return {
-        "target_conflicts": "",
-        "target_match_evidence": "Exact target drill identity and black 18V configuration are positively visible.",
-        "target_identity_gaps": "",
-        "selected": True,
-        "reason": reason,
+        "visual_subject": subject,
+        "readable_identity": identity,
+        "raw_colour_materials": colour,
+        "design_configuration": design,
+        "neutral_product_guess": guess,
+        "visual_uncertainty": "",
+        "presentation_quality": quality,
     }
 
 
-def test_ai_ownership_filters_unrelated_page_products_before_gallery_ranking(tmp_path: Path) -> None:
+def test_blind_perception_then_text_ownership_filters_unrelated_products(tmp_path: Path) -> None:
     unrelated = _write_image(tmp_path / "01-corn-flakes.jpg", (230, 230, 230))
     alternate = _write_image(tmp_path / "02-drill-side.jpg", (180, 180, 180))
     hero = _write_image(tmp_path / "03-drill-hero.jpg", (250, 250, 250))
-
     snapshot = tmp_path / "source-snapshot.json"
     _write_snapshot(snapshot)
     manifest_path = _write_manifest(tmp_path, [unrelated, alternate, hero], snapshot)
@@ -120,103 +125,124 @@ def test_ai_ownership_filters_unrelated_page_products_before_gallery_ranking(tmp
     provider = _FakeProvider(
         {
             "infer_grounded_supplier_product_identity": _identity_response(),
-            "classify_supplier_listing_image_ownership": {
+            "observe_supplier_listing_images_blind": {
+                "facts": {
+                    "image_01": _blind_fact(
+                        "box of breakfast cereal",
+                        "Corn Flakes",
+                        "yellow cereal box",
+                        "rectangular food carton",
+                        "breakfast cereal",
+                        "clear product view",
+                    ),
+                    "image_02": _blind_fact(
+                        "cordless drill shown from the side",
+                        "Acme; 18V",
+                        "black plastic and metal",
+                        "pistol-grip drill with battery",
+                        "Acme cordless drill",
+                        "clear alternate angle",
+                    ),
+                    "image_03": _blind_fact(
+                        "cordless drill with battery and charger",
+                        "Acme; 18V",
+                        "black plastic and metal",
+                        "pistol-grip drill with battery and charger kit",
+                        "Acme cordless drill kit",
+                        "strong complete hero view",
+                    ),
+                },
+                "summary": "target-blind observations",
+            },
+            "compare_blind_image_facts_to_target": {
                 "decisions": {
                     "image_01": {
-                        "visual_subject": "box of corn flakes",
-                        "visible_identity": "Corn Flakes",
-                        "visible_configuration": "boxed breakfast cereal",
-                        "target_conflicts": "Visible breakfast cereal product conflicts with target cordless drill.",
+                        "target_conflicts": "Frozen facts establish breakfast cereal, not a cordless drill.",
                         "target_match_evidence": "",
                         "target_identity_gaps": "",
                         "classification": "OTHER_PRODUCT",
                         "confidence": 0.99,
-                        "reason": "Corn flakes are a different sellable product.",
+                        "reason": "Different sellable product.",
                     },
                     "image_02": {
-                        "visual_subject": "black cordless drill shown from the side",
-                        "visible_identity": "Acme cordless drill",
-                        "visible_configuration": "black 18V drill with battery",
                         "target_conflicts": "",
-                        "target_match_evidence": "Visible Acme drill identity, 18V configuration and black tool form establish the target product.",
+                        "target_match_evidence": "Frozen Acme 18V black drill facts establish the target.",
                         "target_identity_gaps": "",
                         "classification": "EXACT_TARGET",
                         "confidence": 0.97,
-                        "reason": "The image positively establishes the exact black cordless drill.",
+                        "reason": "Exact target supported by frozen facts.",
                     },
                     "image_03": {
-                        "visual_subject": "black cordless drill hero image with kit",
-                        "visible_identity": "Acme cordless drill",
-                        "visible_configuration": "black 18V drill with battery and charger kit",
                         "target_conflicts": "",
-                        "target_match_evidence": "Visible Acme drill identity and complete 18V black battery/charger configuration establish the target sale unit.",
+                        "target_match_evidence": "Frozen Acme 18V black drill kit facts establish the full target sale unit.",
                         "target_identity_gaps": "",
                         "classification": "EXACT_TARGET",
                         "confidence": 0.99,
-                        "reason": "The image positively establishes the exact black cordless drill and kit.",
+                        "reason": "Exact target kit supported by frozen facts.",
                     },
                 },
-                "summary": "Only image_02 and image_03 belong to the target product.",
+                "summary": "two exact candidates",
             },
-            "verify_and_order_exact_supplier_gallery": {
+            "order_identity_approved_supplier_gallery": {
                 "selected_image_ids": ["image_03", "image_02"],
                 "decisions": {
-                    "image_02": _gallery_selected("Useful alternate view of the exact target."),
-                    "image_03": _gallery_selected("Strongest main image of the exact target."),
+                    "image_02": {"selected": True, "reason": "Useful alternate angle."},
+                    "image_03": {"selected": True, "reason": "Strongest complete hero."},
                 },
-                "summary": "Use the hero first, then the alternate view.",
+                "summary": "hero then alternate",
             },
         }
     )
 
     result = finalize_supplier_listing_images(tmp_path, provider)
 
-    assert provider.calls == 3
+    assert provider.calls == 4
     assert result.status == "ai_ranked"
     assert result.selected == (hero, alternate)
-    assert result.model_calls == 3
+    assert result.model_calls == 4
     assert [request["task"] for request in provider.requests] == [
         "infer_grounded_supplier_product_identity",
-        "classify_supplier_listing_image_ownership",
-        "verify_and_order_exact_supplier_gallery",
+        "observe_supplier_listing_images_blind",
+        "compare_blind_image_facts_to_target",
+        "order_identity_approved_supplier_gallery",
     ]
 
-    identity_sources = provider.requests[0]["grounded_sources"]
-    assert isinstance(identity_sources, list)
-    assert "Corn Flakes" not in json.dumps(identity_sources, ensure_ascii=False)
+    blind_context = provider.requests[1]["context"]
+    assert isinstance(blind_context, dict)
+    assert "target_product" not in blind_context
 
-    ownership_sources = provider.requests[1]["grounded_sources"]
-    assert isinstance(ownership_sources, list)
-    assert [item["source_id"] for item in ownership_sources] == [
-        "image_01",
-        "image_02",
-        "image_03",
-    ]
+    ownership_sources = provider.requests[2]["grounded_sources"]
+    assert ownership_sources == []
+    ownership_context = provider.requests[2]["context"]
+    assert isinstance(ownership_context, dict)
+    assert "target_product" in ownership_context
+    assert "blind_visual_facts" in ownership_context
 
-    gallery_sources = provider.requests[2]["grounded_sources"]
-    assert isinstance(gallery_sources, list)
-    assert [item["source_id"] for item in gallery_sources] == ["image_02", "image_03"]
+    gallery_context = provider.requests[3]["context"]
+    assert isinstance(gallery_context, dict)
+    assert "target_product" not in gallery_context
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["outputs"]["primary_source_listing_images"] == [str(hero), str(alternate)]
     assert manifest["listing_image_ranking"]["strategy"] == (
-        "grounded_identity_then_conflict_first_ownership_then_independent_gallery"
+        "target_blind_perception_then_frozen_facts_ownership_then_quality_gallery"
     )
     assert manifest["listing_image_ranking"]["ownership_eligible_count"] == 2
-    assert manifest["total_model_calls"] == 7
+    assert manifest["total_model_calls"] == 8
 
     report = json.loads((tmp_path / "listing-image-selection.json").read_text(encoding="utf-8"))
-    assert report["policy"]["ownership_semantic_owner"] == "multimodal_ai"
-    assert report["policy"]["ownership_positive_identity_proof_required"] is True
-    assert report["policy"]["material_visible_conflict_veto"] is True
-    assert report["policy"]["gallery_semantic_owner"] == "multimodal_ai_independent_reinspection"
-    assert report["policy"]["precision_policy"] == "fewer_correct_images_over_quota_fill"
+    assert report["policy"]["blind_visual_facts_target_visible"] is False
+    assert report["policy"]["ownership_candidate_pixels_visible"] is False
+    assert report["policy"]["gallery_target_identity_visible"] is False
     assert report["selected"] == [str(hero), str(alternate)]
+    assert report["candidates"][0]["blind_visual_facts"]["visual_subject"] == (
+        "box of breakfast cereal"
+    )
     assert report["candidates"][0]["ownership"]["classification"] == "OTHER_PRODUCT"
     assert report["candidates"][0]["gallery"] is None
 
 
-def test_ownership_ai_may_reject_all_candidates_without_forcing_gallery_fill(tmp_path: Path) -> None:
+def test_ownership_may_reject_all_without_running_gallery(tmp_path: Path) -> None:
     unrelated = _write_image(tmp_path / "milk.jpg", (100, 150, 200))
     snapshot = tmp_path / "source-snapshot.json"
     _write_snapshot(snapshot)
@@ -225,34 +251,45 @@ def test_ownership_ai_may_reject_all_candidates_without_forcing_gallery_fill(tmp
     provider = _FakeProvider(
         {
             "infer_grounded_supplier_product_identity": _identity_response(),
-            "classify_supplier_listing_image_ownership": {
+            "observe_supplier_listing_images_blind": {
+                "facts": {
+                    "image_01": _blind_fact(
+                        "milk carton",
+                        "Full Cream Milk",
+                        "white and blue carton",
+                        "rectangular beverage carton",
+                        "milk product",
+                        "clear product view",
+                    )
+                },
+                "summary": "blind milk observation",
+            },
+            "compare_blind_image_facts_to_target": {
                 "decisions": {
                     "image_01": {
-                        "visual_subject": "carton of milk",
-                        "visible_identity": "Full Cream Milk",
-                        "visible_configuration": "milk carton",
-                        "target_conflicts": "Visible milk product conflicts with target cordless drill.",
+                        "target_conflicts": "Frozen facts establish milk, not a drill.",
                         "target_match_evidence": "",
                         "target_identity_gaps": "",
                         "classification": "OTHER_PRODUCT",
                         "confidence": 0.99,
-                        "reason": "The image is milk, not the target cordless drill.",
+                        "reason": "Different product.",
                     }
                 },
-                "summary": "No candidate belongs to the target product.",
+                "summary": "no exact candidates",
             },
         }
     )
 
     result = finalize_supplier_listing_images(tmp_path, provider)
 
-    assert provider.calls == 2
+    assert provider.calls == 3
     assert result.status == "ai_ownership_empty"
     assert result.selected == ()
-    assert result.semantically_rejected_count == 1
+    assert result.model_calls == 3
     assert [request["task"] for request in provider.requests] == [
         "infer_grounded_supplier_product_identity",
-        "classify_supplier_listing_image_ownership",
+        "observe_supplier_listing_images_blind",
+        "compare_blind_image_facts_to_target",
     ]
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -260,7 +297,7 @@ def test_ownership_ai_may_reject_all_candidates_without_forcing_gallery_fill(tmp
     assert manifest["listing_image_ranking"]["selected_count"] == 0
 
 
-def test_customer_auxiliary_images_never_compete_for_auto_listing_slots(tmp_path: Path) -> None:
+def test_customer_auxiliary_images_never_enter_blind_perception(tmp_path: Path) -> None:
     supplier = _write_image(tmp_path / "supplier.jpg", (245, 245, 245))
     auxiliary = _write_image(tmp_path / "auxiliary.jpg", (120, 140, 160))
     snapshot = tmp_path / "source-snapshot.json"
@@ -269,12 +306,7 @@ def test_customer_auxiliary_images_never_compete_for_auto_listing_slots(tmp_path
 
     product_pack = tmp_path / "product-pack.json"
     product_pack.write_text(
-        json.dumps(
-            {
-                "evidence_images": [str(auxiliary)],
-                "listing_images": [str(auxiliary)],
-            }
-        ),
+        json.dumps({"evidence_images": [str(auxiliary)], "listing_images": [str(auxiliary)]}),
         encoding="utf-8",
     )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -284,28 +316,38 @@ def test_customer_auxiliary_images_never_compete_for_auto_listing_slots(tmp_path
     provider = _FakeProvider(
         {
             "infer_grounded_supplier_product_identity": _identity_response(),
-            "classify_supplier_listing_image_ownership": {
+            "observe_supplier_listing_images_blind": {
+                "facts": {
+                    "image_01": _blind_fact(
+                        "black cordless drill kit",
+                        "Acme; 18V",
+                        "black plastic and metal",
+                        "drill, battery and charger",
+                        "Acme cordless drill kit",
+                        "clear hero view",
+                    )
+                },
+                "summary": "supplier only",
+            },
+            "compare_blind_image_facts_to_target": {
                 "decisions": {
                     "image_01": {
-                        "visual_subject": "black cordless drill with battery and charger",
-                        "visible_identity": "Acme cordless drill",
-                        "visible_configuration": "black 18V drill kit",
                         "target_conflicts": "",
-                        "target_match_evidence": "Visible Acme drill identity and 18V black kit configuration establish the target sale unit.",
+                        "target_match_evidence": "Frozen Acme 18V drill kit facts establish target.",
                         "target_identity_gaps": "",
                         "classification": "EXACT_TARGET",
                         "confidence": 0.99,
-                        "reason": "The supplier image positively establishes the exact target drill.",
+                        "reason": "Exact target.",
                     }
                 },
-                "summary": "The supplier image belongs to the target product.",
+                "summary": "exact",
             },
-            "verify_and_order_exact_supplier_gallery": {
+            "order_identity_approved_supplier_gallery": {
                 "selected_image_ids": ["image_01"],
                 "decisions": {
-                    "image_01": _gallery_selected("Use the exact supplier product image.")
+                    "image_01": {"selected": True, "reason": "Use clear supplier hero."}
                 },
-                "summary": "One exact target image is available.",
+                "summary": "one image",
             },
         }
     )
@@ -313,10 +355,10 @@ def test_customer_auxiliary_images_never_compete_for_auto_listing_slots(tmp_path
     result = finalize_supplier_listing_images(tmp_path, provider)
 
     assert result.selected == (supplier,)
-    ownership_sources = provider.requests[1]["grounded_sources"]
-    assert isinstance(ownership_sources, list)
-    assert len(ownership_sources) == 1
-    assert Path(ownership_sources[0]["image_path"]) == supplier
+    blind_sources = provider.requests[1]["grounded_sources"]
+    assert isinstance(blind_sources, list)
+    assert len(blind_sources) == 1
+    assert Path(blind_sources[0]["image_path"]) == supplier
 
     report = json.loads((tmp_path / "listing-image-selection.json").read_text(encoding="utf-8"))
     assert report["transport_rejected"] == [
