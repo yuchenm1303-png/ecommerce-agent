@@ -17,6 +17,7 @@ from .source_capture_cache import (
     publish_source_capture_cache,
     read_source_capture_cache,
 )
+from .source_snapshot import SourceInteractionRequired
 from .update_browser_gate import close_managed_browser
 
 
@@ -131,15 +132,18 @@ def _capture_until_accepted(
     max_scroll_steps: int,
     max_visible_text_chars: int,
     use_current_page: bool,
+    resume_after_interaction: bool,
 ) -> CapturedProductSource:
     """Capture until source evidence is complete enough or fail as PARTIAL_SOURCE.
 
-    Height stability is only a scrolling heuristic inside the browser engine. This
-    wrapper owns the actual task-success contract. A suspicious SPA shell gets one
-    longer current-page settle pass and, for normal URL mode, one clean navigation
-    retry. Only an accepted capture may be cached or consumed downstream.
+    A user-interaction resume first observes the preserved Source Edge page instead
+    of navigating over it. If the challenge/login is still present,
+    ``SourceInteractionRequired`` escapes immediately and the transport lane is
+    released again. Once the page is clear, ordinary bounded recovery may use the
+    original supplier URL as its final fresh-navigation attempt.
     """
 
+    initial_use_current_page = bool(use_current_page or resume_after_interaction)
     captured = _browser_capture(
         source_url,
         target_dir=target_dir,
@@ -149,7 +153,7 @@ def _capture_until_accepted(
         scroll_wait_ms=scroll_wait_ms,
         max_scroll_steps=max_scroll_steps,
         max_visible_text_chars=max_visible_text_chars,
-        use_current_page=use_current_page,
+        use_current_page=initial_use_current_page,
     )
     verdict = _acceptance(captured)
     if verdict.ready:
@@ -228,21 +232,21 @@ def _capture_once(
     cache_dir: str | Path | None,
     cache_ttl_seconds: int,
     force_refresh: bool,
+    resume_after_interaction: bool,
 ) -> CapturedProductSource:
     """Own cache lifecycle above the browser engine.
 
     Browser acquisition produces the canonical task result. Cache read/write is an
     optional accelerator around it and is deliberately unable to turn a successful
-    capture into a failed job. Cache entries are also subject to the same source
-    completeness contract as live captures, so an old partial shell can never be
-    replayed as canonical evidence.
+    capture into a failed job. Interaction resumes bypass the cache because their
+    first responsibility is to verify the preserved live browser state.
     """
 
     source_url = validate_source_url(url)
     target_dir = Path(output_dir)
     cache_root = Path(cache_dir) if cache_dir is not None else None
 
-    if not force_refresh and not use_current_page:
+    if not force_refresh and not use_current_page and not resume_after_interaction:
         cached = _cached_capture(
             source_url,
             output_dir=target_dir,
@@ -273,6 +277,7 @@ def _capture_once(
         max_scroll_steps=max_scroll_steps,
         max_visible_text_chars=max_visible_text_chars,
         use_current_page=use_current_page,
+        resume_after_interaction=resume_after_interaction,
     )
 
     if cache_root is not None:
@@ -300,13 +305,14 @@ def capture_product_source(
     cache_dir: str | Path | None = None,
     cache_ttl_seconds: int = 900,
     force_refresh: bool = False,
+    resume_after_interaction: bool = False,
 ) -> CapturedProductSource:
     """Capture through one exclusive Source Edge transport generation.
 
-    The entire first attempt and any proven-CDP recovery are one 9333 transport
-    ownership transaction. Another process cannot attach to the same Source Edge
-    between a failed transport and its safe generation replacement. Ordinary page
-    navigation/rendering failures still never trigger a browser restart.
+    A recoverable login/challenge is represented by ``SourceInteractionRequired``.
+    It is deliberately not handled inside the transport transaction, so unwinding
+    releases both the Source CDP session and the exclusive 9333 lane while leaving
+    the long-lived browser/page intact for the user.
     """
 
     source_url = validate_source_url(url)
@@ -328,6 +334,7 @@ def capture_product_source(
                 cache_dir=cache_dir,
                 cache_ttl_seconds=cache_ttl_seconds,
                 force_refresh=force_refresh,
+                resume_after_interaction=resume_after_interaction,
             )
             if not captured.cache_hit:
                 clear_cdp_poison(port)
@@ -392,6 +399,7 @@ def capture_product_source(
                     cache_dir=cache_dir,
                     cache_ttl_seconds=cache_ttl_seconds,
                     force_refresh=force_refresh,
+                    resume_after_interaction=resume_after_interaction,
                 )
             except Exception as retry_exc:
                 if looks_like_cdp_transport_failure(retry_exc):
@@ -406,6 +414,7 @@ __all__ = [
     "CapturedProductSource",
     "DEFAULT_SOURCE_CDP_PORT",
     "SourceAccessBlocked",
+    "SourceInteractionRequired",
     "SOURCE_CAPTURE_CACHE_VERSION",
     "_cached_capture",
     "_canonical_source_url",
