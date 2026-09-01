@@ -73,12 +73,14 @@ function monitorAudit(auditValue: unknown): JsonObject {
   const hardFailure = storedStatus === "failed" || storedStatus === "cancelled" ||
     jobStatus === "FAILED" || jobStatus === "STOPPED";
   const reviewRequired = executionPhase(audit.phase) && !hardFailure && (
-    storedStatus === "review" || jobStatus === "REVIEW" || result.review_required === true
+    storedStatus === "review" || jobStatus === "REVIEW" ||
+    audit.review_required === true || result.review_required === true
   );
 
   if (!reviewRequired) return { ...audit };
 
-  const reviewReason = textValue(result.review_reason) || textValue(result.error) || textValue(audit.error_text);
+  const reviewReason = textValue(audit.review_reason) || textValue(result.review_reason) ||
+    textValue(result.error) || textValue(audit.error_text);
   const { failure_diagnostic: _ignoredFailureDiagnostic, ...safeResult } = result;
   return {
     ...audit,
@@ -293,7 +295,7 @@ async function loadTaskSummaries(admin: ReturnType<typeof createClient>, userId:
   return await cached(`task-summaries:${userId}`, TTL.taskSummaries, async () => {
     const rows = await dataOrThrow(
       admin.from("listing_task_audits")
-        .select("id,user_id,device_id,app_version,task_kind,phase,status,product_url,error_text,started_at,completed_at,updated_at,created_at")
+        .select("id,user_id,device_id,app_version,task_kind,phase,status,review_required,review_reason,product_url,error_text,started_at,completed_at,updated_at,created_at")
         .order("updated_at", { ascending: false })
         .limit(TASK_AUDIT_LIMIT),
       "task_summary_snapshot_failed",
@@ -306,7 +308,7 @@ async function loadTaskDetails(admin: ReturnType<typeof createClient>, userId: s
   return await cached(`task-details:${userId}`, TTL.taskDetails, async () => {
     const rows = await dataOrThrow(
       admin.from("listing_task_audits")
-        .select("id,user_id,device_id,app_version,task_kind,phase,status,product_url,input_data,result_data,error_text,started_at,completed_at,updated_at,created_at")
+        .select("id,user_id,device_id,app_version,task_kind,phase,status,review_required,review_reason,product_url,input_data,result_data,error_text,started_at,completed_at,updated_at,created_at")
         .order("updated_at", { ascending: false })
         .limit(TASK_AUDIT_LIMIT),
       "task_audit_snapshot_failed",
@@ -402,7 +404,7 @@ Deno.serve(async (req: Request) => {
       const sourceId = textValue(body.source_audit_id || body.audit_id).split(":")[0];
       if (!sourceId) return json(req, { error: "audit_id_required" }, 400);
       const { data: row, error } = await admin.from("listing_task_audits")
-        .select("id,user_id,device_id,app_version,task_kind,phase,status,product_url,input_data,result_data,error_text,started_at,completed_at,updated_at,created_at")
+        .select("id,user_id,device_id,app_version,task_kind,phase,status,review_required,review_reason,product_url,input_data,result_data,error_text,started_at,completed_at,updated_at,created_at")
         .eq("id", sourceId)
         .maybeSingle();
       if (error) return json(req, { error: "task_detail_failed" }, 503);
