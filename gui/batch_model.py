@@ -22,6 +22,7 @@ def normalize_batch_concurrency(value: int) -> int:
 BATCH_JOB_STATES = (
     "QUEUED",
     "CAPTURING",
+    "WAITING_SOURCE_INTERACTION",
     "UNDERSTANDING",
     "SELECTING_VERTICAL",
     "SELECTING_BRAND",
@@ -63,11 +64,21 @@ class BatchJob:
     failure_stage: str = ""
     exit_code: int | None = None
     operation_phase: str = ""
+    interaction_kind: str = ""
+    interaction_reason: str = ""
+    interaction_url: str = ""
+    interaction_title: str = ""
     created_at: str = field(default_factory=lambda: _now())
     updated_at: str = field(default_factory=lambda: _now())
 
     def touch(self) -> None:
         self.updated_at = _now()
+
+    def clear_interaction(self) -> None:
+        self.interaction_kind = ""
+        self.interaction_reason = ""
+        self.interaction_url = ""
+        self.interaction_title = ""
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -116,6 +127,7 @@ class BatchRun:
     def summary(self) -> dict[str, int]:
         processing = {
             "CAPTURING",
+            "WAITING_SOURCE_INTERACTION",
             "UNDERSTANDING",
             "SELECTING_VERTICAL",
             "SELECTING_BRAND",
