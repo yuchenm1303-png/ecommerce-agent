@@ -98,6 +98,16 @@ def _identity_response() -> dict[str, object]:
     }
 
 
+def _gallery_selected(reason: str) -> dict[str, object]:
+    return {
+        "target_conflicts": "",
+        "target_match_evidence": "Exact target drill identity and black 18V configuration are positively visible.",
+        "target_identity_gaps": "",
+        "selected": True,
+        "reason": reason,
+    }
+
+
 def test_ai_ownership_filters_unrelated_page_products_before_gallery_ranking(tmp_path: Path) -> None:
     unrelated = _write_image(tmp_path / "01-corn-flakes.jpg", (230, 230, 230))
     alternate = _write_image(tmp_path / "02-drill-side.jpg", (180, 180, 180))
@@ -116,8 +126,9 @@ def test_ai_ownership_filters_unrelated_page_products_before_gallery_ranking(tmp
                         "visual_subject": "box of corn flakes",
                         "visible_identity": "Corn Flakes",
                         "visible_configuration": "boxed breakfast cereal",
+                        "target_conflicts": "Visible breakfast cereal product conflicts with target cordless drill.",
                         "target_match_evidence": "",
-                        "target_identity_gaps": "Acme cordless drill identity and 18V black configuration are not present.",
+                        "target_identity_gaps": "",
                         "classification": "OTHER_PRODUCT",
                         "confidence": 0.99,
                         "reason": "Corn flakes are a different sellable product.",
@@ -126,6 +137,7 @@ def test_ai_ownership_filters_unrelated_page_products_before_gallery_ranking(tmp
                         "visual_subject": "black cordless drill shown from the side",
                         "visible_identity": "Acme cordless drill",
                         "visible_configuration": "black 18V drill with battery",
+                        "target_conflicts": "",
                         "target_match_evidence": "Visible Acme drill identity, 18V configuration and black tool form establish the target product.",
                         "target_identity_gaps": "",
                         "classification": "EXACT_TARGET",
@@ -136,6 +148,7 @@ def test_ai_ownership_filters_unrelated_page_products_before_gallery_ranking(tmp
                         "visual_subject": "black cordless drill hero image with kit",
                         "visible_identity": "Acme cordless drill",
                         "visible_configuration": "black 18V drill with battery and charger kit",
+                        "target_conflicts": "",
                         "target_match_evidence": "Visible Acme drill identity and complete 18V black battery/charger configuration establish the target sale unit.",
                         "target_identity_gaps": "",
                         "classification": "EXACT_TARGET",
@@ -148,14 +161,8 @@ def test_ai_ownership_filters_unrelated_page_products_before_gallery_ranking(tmp
             "verify_and_order_exact_supplier_gallery": {
                 "selected_image_ids": ["image_03", "image_02"],
                 "decisions": {
-                    "image_02": {
-                        "selected": True,
-                        "reason": "Useful alternate view of the exact target.",
-                    },
-                    "image_03": {
-                        "selected": True,
-                        "reason": "Strongest main image of the exact target.",
-                    },
+                    "image_02": _gallery_selected("Useful alternate view of the exact target."),
+                    "image_03": _gallery_selected("Strongest main image of the exact target."),
                 },
                 "summary": "Use the hero first, then the alternate view.",
             },
@@ -191,12 +198,9 @@ def test_ai_ownership_filters_unrelated_page_products_before_gallery_ranking(tmp
     assert [item["source_id"] for item in gallery_sources] == ["image_02", "image_03"]
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["outputs"]["primary_source_listing_images"] == [
-        str(hero),
-        str(alternate),
-    ]
+    assert manifest["outputs"]["primary_source_listing_images"] == [str(hero), str(alternate)]
     assert manifest["listing_image_ranking"]["strategy"] == (
-        "grounded_identity_then_ai_ownership_then_gallery_verification"
+        "grounded_identity_then_conflict_first_ownership_then_independent_gallery"
     )
     assert manifest["listing_image_ranking"]["ownership_eligible_count"] == 2
     assert manifest["total_model_calls"] == 7
@@ -204,7 +208,8 @@ def test_ai_ownership_filters_unrelated_page_products_before_gallery_ranking(tmp
     report = json.loads((tmp_path / "listing-image-selection.json").read_text(encoding="utf-8"))
     assert report["policy"]["ownership_semantic_owner"] == "multimodal_ai"
     assert report["policy"]["ownership_positive_identity_proof_required"] is True
-    assert report["policy"]["gallery_semantic_owner"] == "multimodal_ai"
+    assert report["policy"]["material_visible_conflict_veto"] is True
+    assert report["policy"]["gallery_semantic_owner"] == "multimodal_ai_independent_reinspection"
     assert report["policy"]["precision_policy"] == "fewer_correct_images_over_quota_fill"
     assert report["selected"] == [str(hero), str(alternate)]
     assert report["candidates"][0]["ownership"]["classification"] == "OTHER_PRODUCT"
@@ -226,8 +231,9 @@ def test_ownership_ai_may_reject_all_candidates_without_forcing_gallery_fill(tmp
                         "visual_subject": "carton of milk",
                         "visible_identity": "Full Cream Milk",
                         "visible_configuration": "milk carton",
+                        "target_conflicts": "Visible milk product conflicts with target cordless drill.",
                         "target_match_evidence": "",
-                        "target_identity_gaps": "Acme drill identity and exact configuration are not present.",
+                        "target_identity_gaps": "",
                         "classification": "OTHER_PRODUCT",
                         "confidence": 0.99,
                         "reason": "The image is milk, not the target cordless drill.",
@@ -284,6 +290,7 @@ def test_customer_auxiliary_images_never_compete_for_auto_listing_slots(tmp_path
                         "visual_subject": "black cordless drill with battery and charger",
                         "visible_identity": "Acme cordless drill",
                         "visible_configuration": "black 18V drill kit",
+                        "target_conflicts": "",
                         "target_match_evidence": "Visible Acme drill identity and 18V black kit configuration establish the target sale unit.",
                         "target_identity_gaps": "",
                         "classification": "EXACT_TARGET",
@@ -296,10 +303,7 @@ def test_customer_auxiliary_images_never_compete_for_auto_listing_slots(tmp_path
             "verify_and_order_exact_supplier_gallery": {
                 "selected_image_ids": ["image_01"],
                 "decisions": {
-                    "image_01": {
-                        "selected": True,
-                        "reason": "Use the exact supplier product image.",
-                    }
+                    "image_01": _gallery_selected("Use the exact supplier product image.")
                 },
                 "summary": "One exact target image is available.",
             },
