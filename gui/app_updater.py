@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QBoxLayout, QLabel, QMainWindow, QMessageBox, QPus
 
 from app.update_browser_gate import DEFAULT_CDP_PORT, close_managed_browser
 from app.velopack_runtime import (
+    bounded_check_for_updates,
     create_update_manager,
     installed_application_version,
     is_velopack_managed,
@@ -235,7 +236,17 @@ class ApplicationUpdater(QObject):
         self.check_for_updates(manual=True)
 
     def check_for_updates(self, *, manual: bool = False) -> None:
-        if not self.enabled() or self._checking or self._updating:
+        if not self.enabled() or self._updating:
+            return
+        if self._checking:
+            if manual:
+                self._manual_check = True
+                self._set_manual_check_busy(True)
+                token = self._check_token
+                QTimer.singleShot(
+                    _SLOW_CHECK_NOTICE_MS,
+                    lambda token=token: self._mark_check_slow(token),
+                )
             return
         self._checking = True
         self._manual_check = bool(manual)
@@ -258,8 +269,7 @@ class ApplicationUpdater(QObject):
                         "source_url": source_url,
                     }
                 else:
-                    manager = create_update_manager(source_url)
-                    info = manager.check_for_updates()
+                    info = bounded_check_for_updates(source_url)
                     summary = update_summary(info) if info else None
                     if summary is not None and advertised_version:
                         actual = str(summary.get("version") or "").strip().lstrip("v")
