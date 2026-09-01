@@ -41,8 +41,11 @@ def test_velopack_app_runs_before_normal_pyinstaller_entrypoint() -> None:
 
 
 def test_application_update_flow_delegates_transport_install_and_restart_to_velopack() -> None:
+    # GUI code owns product policy/presentation only. Release discovery is deliberately
+    # delegated to the bounded worker so a stuck Velopack/network call cannot pin the GUI.
+    assert "bounded_check_for_updates(source_url)" in UPDATER
+    assert "manager.check_for_updates()" not in UPDATER
     assert "create_update_manager(source_url)" in UPDATER
-    assert UPDATER.count("manager.check_for_updates()") == 1
     assert "manager.download_updates(info" in UPDATER
     assert "manager.get_update_pending_restart()" in UPDATER
     assert "manager.apply_updates_and_restart(pending)" in UPDATER
@@ -54,6 +57,29 @@ def test_application_update_flow_delegates_transport_install_and_restart_to_velo
     assert "prepare_standalone_updater" not in UPDATER
     assert "QNetworkAccessManager" not in UPDATER
     assert "subprocess" not in UPDATER
+
+
+def test_update_discovery_is_isolated_and_has_a_hard_wall_clock_deadline() -> None:
+    # Velopack remains the sole release-discovery authority, but the potentially
+    # blocking call lives only in a killable child process with an explicit deadline.
+    worker = RUNTIME.split("def run_update_check_worker() -> int:", 1)[1].split(
+        "def bounded_check_for_updates(", 1
+    )[0]
+    bounded = RUNTIME.split("def bounded_check_for_updates(", 1)[1].split(
+        "def resolve_stable_update_source", 1
+    )[0]
+
+    assert "_UPDATE_CHECK_TIMEOUT_SECONDS = 12.0" in RUNTIME
+    assert "create_update_manager(source).check_for_updates()" in worker
+    assert worker.count("check_for_updates()") == 1
+    assert "subprocess.Popen(" in bounded
+    assert "process.wait(timeout=timeout)" in bounded
+    assert "except subprocess.TimeoutExpired" in bounded
+    assert "process.kill()" in bounded
+    assert "process.wait()" in bounded
+    assert "raise UpdateCheckTimeoutError(" in bounded
+    assert "_UPDATE_CHECK_RESULT_ENV" in bounded
+    assert "_update_info_from_payload(payload.get(\"info\"))" in bounded
 
 
 def test_business_idle_and_browser_quiesce_remain_application_policy() -> None:
