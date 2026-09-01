@@ -16,15 +16,22 @@ class SourceAccessBlocked(SourceCaptureError):
     pass
 
 
-_BLOCK_PATTERNS = (
-    "captcha",
-    "verify you are human",
-    "security verification",
-    "安全验证",
-    "人机验证",
-    "滑块验证",
-    "请完成验证",
-)
+class SourceInteractionRequired(SourceCaptureError):
+    """Recoverable browser interaction that must be completed by the user."""
+
+    def __init__(
+        self,
+        kind: str,
+        reason: str,
+        *,
+        observed_url: str = "",
+        title: str = "",
+    ) -> None:
+        self.kind = str(kind or "HUMAN_CHALLENGE").strip().upper()
+        self.reason = str(reason or "source browser requires user interaction").strip()
+        self.observed_url = str(observed_url or "").strip()
+        self.title = " ".join(str(title or "").split())
+        super().__init__(self.reason)
 
 
 def _clean_text(value: object) -> str:
@@ -132,14 +139,6 @@ def write_source_snapshot(snapshot: SourceSnapshot, path: str | Path) -> Path:
     return target
 
 
-def _detect_access_block(text: str) -> str | None:
-    lowered = text.casefold()
-    for marker in _BLOCK_PATTERNS:
-        if marker.casefold() in lowered:
-            return marker
-    return None
-
-
 def _bounded_embedded_data(items: list[object], *, max_chars: int = 80_000) -> tuple[list[str], bool]:
     output: list[str] = []
     seen: set[str] = set()
@@ -167,12 +166,31 @@ def capture_page_snapshot(
     requested_url: str,
     max_visible_text_chars: int = 120_000,
 ) -> SourceSnapshot:
-    """Mechanically capture raw product-page evidence without interpreting it."""
+    """Mechanically capture raw product-page evidence without interpreting it.
+
+    Human verification/login is a recoverable browser lifecycle state, not a bad
+    product. A conservative benign-modal close is attempted first; security/login
+    dialogs are never clicked through or solved by automation.
+    """
+
+    from .source_interaction import (
+        ACCESS_DENIED,
+        RECOVERABLE_INTERACTIONS,
+        classify_source_page_state,
+        dismiss_ordinary_source_popup,
+    )
+
+    if dismiss_ordinary_source_popup(page):
+        try:
+            page.wait_for_timeout(180)
+        except Exception:
+            pass
 
     payload = page.evaluate(
         r"""() => {
           const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
           const visible = (el) => {
+            if (!el) return false;
             const style = getComputedStyle(el);
             const rect = el.getBoundingClientRect();
             return style.display !== 'none' && style.visibility !== 'hidden'
@@ -288,6 +306,33 @@ def capture_page_snapshot(
             pushImage(img.currentSrc || img.src || img.getAttribute('data-src') || img.getAttribute('data-lazy-src'));
           });
 
+          const visibleFrames = [...document.querySelectorAll('iframe')].filter(visible);
+          const challengePattern = /(captcha|nocaptcha|challenge|verify|verification|security|secdev|slider|滑块|验证)/i;
+          const loginPattern = /(login|signin|passport|登录)/i;
+          const challengeVisible = visibleFrames.some((frame) => challengePattern.test(
+            `${frame.src || ''} ${frame.id || ''} ${frame.name || ''} ${frame.className || ''}`
+          )) || [...document.querySelectorAll('[id],[class],[data-testid]')].filter(visible).slice(0, 1200).some((el) => {
+            const markerText = `${el.id || ''} ${el.className || ''} ${el.getAttribute('data-testid') || ''}`;
+            return challengePattern.test(markerText);
+          });
+          const passwordVisible = [...document.querySelectorAll('input[type="password"]')].some(visible);
+          const loginVisible = [...document.querySelectorAll('form,[role="dialog"],iframe')].filter(visible).some((el) => {
+            const markerText = `${el.id || ''} ${el.className || ''} ${el.getAttribute?.('name') || ''} ${el.getAttribute?.('src') || ''}`;
+            const text = clean(el.innerText || el.textContent || '');
+            return loginPattern.test(markerText) && /(登录|sign\s*in|log\s*in|password|密码)/i.test(text + ' ' + markerText);
+          });
+          const dialogs = [...document.querySelectorAll('[role="dialog"],[aria-modal="true"]')].filter(visible);
+          const ordinaryPopupVisible = dialogs.some((dialog) => {
+            const text = clean(dialog.innerText || dialog.textContent);
+            if (/(captcha|verify|安全验证|人机验证|滑块|验证码|请登录|登录后继续|sign\s*in|log\s*in)/i.test(text)) return false;
+            return [...dialog.querySelectorAll('button,[role="button"],[aria-label],[title]')].filter(visible).some((candidate) => {
+              const label = clean(candidate.getAttribute('aria-label') || candidate.getAttribute('title') || candidate.innerText || candidate.textContent);
+              return /^(×|x|close|关闭|稍后再说|not now)$/i.test(label);
+            });
+          });
+          const bodyText = String(document.body?.innerText || '');
+          const accessDeniedVisible = bodyText.length < 5000 && /(access denied|403 forbidden|访问被拒绝|无权访问|请求被拦截)/i.test(bodyText);
+
           const meta = {};
           for (const selector of [
             ['description', 'meta[name="description"]'],
@@ -301,22 +346,40 @@ def capture_page_snapshot(
           }
           return {
             title: clean(document.title),
-            visible_text: String(document.body?.innerText || ''),
+            visible_text: bodyText,
             table_rows: rows,
             json_ld: jsonLd,
             embedded_data: embedded,
             image_urls: imageUrls.slice(0, 24),
             meta,
+            interaction_hints: {
+              ready_state: document.readyState,
+              challenge_visible: challengeVisible,
+              password_visible: passwordVisible,
+              login_visible: loginVisible,
+              ordinary_popup_visible: ordinaryPopupVisible,
+              access_denied_visible: accessDeniedVisible,
+            },
           };
         }"""
     )
 
     visible_text = str(payload.get("visible_text") or "")
-    blocked = _detect_access_block(visible_text[:20_000])
-    if blocked:
-        raise SourceAccessBlocked(
-            f"来源页面出现安全/人机验证标记 {blocked!r}；已停止自动采集，请人工完成合法验证后再继续。"
+    page_state = classify_source_page_state(
+        url=str(page.url or ""),
+        title=payload.get("title"),
+        visible_text=visible_text,
+        hints=payload.get("interaction_hints") if isinstance(payload, dict) else {},
+    )
+    if page_state.state in RECOVERABLE_INTERACTIONS:
+        raise SourceInteractionRequired(
+            page_state.state,
+            page_state.reason,
+            observed_url=page_state.observed_url,
+            title=page_state.title,
         )
+    if page_state.state == ACCESS_DENIED:
+        raise SourceAccessBlocked(page_state.reason)
 
     warnings: list[str] = []
     if len(visible_text) > max_visible_text_chars:
