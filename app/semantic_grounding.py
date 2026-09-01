@@ -113,6 +113,64 @@ class GroundingCatalog:
             "warnings": list(self.warnings),
         }
 
+    @classmethod
+    def from_manifest(cls, payload: dict[str, object]) -> "GroundingCatalog":
+        """Restore the exact source universe that was visible to the Resolver.
+
+        A persisted Resolver manifest is an execution artifact, not a new product
+        interpretation. Replaying it preserves the original source ids and hashes
+        so downstream planning/execution never rebuilds an equivalent product into
+        a different identity merely because paths, ordering or optional artifacts
+        are observed again later.
+        """
+
+        if not isinstance(payload, dict):
+            raise ValueError("grounding manifest 顶层必须是 object。")
+        raw_sources = payload.get("sources")
+        raw_warnings = payload.get("warnings") or []
+        if not isinstance(raw_sources, list) or not isinstance(raw_warnings, list):
+            raise ValueError("grounding manifest 的 sources/warnings 格式无效。")
+
+        sources: list[GroundedSource] = []
+        for index, raw in enumerate(raw_sources, start=1):
+            if not isinstance(raw, dict):
+                raise ValueError(f"grounding manifest sources[{index}] 必须是 object。")
+            source = GroundedSource(
+                source_id=str(raw.get("source_id") or "").strip(),
+                source_type=str(raw.get("source_type") or "").strip(),
+                kind=str(raw.get("kind") or "").strip(),
+                origin=str(raw.get("origin") or "").strip(),
+                content=str(raw.get("content") or ""),
+                image_path=str(raw.get("image_path") or "").strip(),
+                sha256=str(raw.get("sha256") or "").strip(),
+            )
+            if source.kind == TEXT_KIND and source.sha256:
+                actual = _sha256_text(source.content)
+                if actual != source.sha256:
+                    raise ValueError(
+                        f"grounding manifest 文本 source {source.source_id} 内容 hash 不一致。"
+                    )
+            sources.append(source)
+
+        catalog = cls(
+            sources=sources,
+            warnings=[str(item) for item in raw_warnings],
+        )
+        declared_count = payload.get("source_count")
+        if declared_count is not None and int(declared_count) != len(catalog.sources):
+            raise ValueError(
+                "grounding manifest source_count 与实际 sources 数量不一致。"
+            )
+        return catalog
+
+
+def load_grounding_manifest(path: str | Path) -> GroundingCatalog:
+    """Load one Resolver-owned source-manifest.json without re-capturing product data."""
+
+    manifest_path = Path(path)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return GroundingCatalog.from_manifest(payload)
+
 
 _PRODUCT_DATA_ANCHOR = re.compile(
     r"\b(?:offerId|offerLoginId|skuId|sku2|skuMap|skuProps|specId|detailUrl)\b",
