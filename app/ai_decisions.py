@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 from .business_fields import is_business_question
 from .evidence_contract import ProductIdentity, assert_identity_compatible
-from .semantic_grounding import GroundingCatalog
+from .semantic_grounding import GroundingCatalog, load_grounding_manifest
 from .source_bundle import normalize_key
 
 
@@ -601,6 +601,36 @@ def _embedded_external_sources(payload: dict[str, Any]) -> dict[str, str]:
     return output
 
 
+def _resolver_grounding_for_packet(
+    packet_path: Path,
+    fallback: GroundingCatalog,
+) -> tuple[GroundingCatalog, str]:
+    """Prefer the exact Resolver source universe that produced the AI packet.
+
+    Resolver writes ``ai-decisions.json`` and ``source-manifest.json`` as one
+    artifact set. Downstream consumers must replay that immutable source address
+    space instead of rebuilding the product from snapshots/images. Missing or
+    damaged legacy manifests degrade to the caller's mechanical fallback and are
+    recorded; they never become a semantic reason to reject the whole product.
+    """
+
+    manifest_path = packet_path.resolve().with_name("source-manifest.json")
+    if not manifest_path.is_file():
+        return (
+            fallback,
+            "decision binding warning: canonical Resolver source manifest is unavailable; "
+            "using caller-provided mechanical grounding",
+        )
+    try:
+        return load_grounding_manifest(manifest_path), ""
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return (
+            fallback,
+            "decision binding warning: canonical Resolver source manifest could not be restored; "
+            f"using caller-provided mechanical grounding ({type(exc).__name__}: {exc})",
+        )
+
+
 def load_ai_decision_packet(
     path: str | Path,
     fields: Iterable[dict[str, Any]],
@@ -608,12 +638,19 @@ def load_ai_decision_packet(
     *,
     expected_identity: ProductIdentity = ProductIdentity(),
 ) -> AIDecisionPacket:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    packet_path = Path(path)
+    payload = json.loads(packet_path.read_text(encoding="utf-8"))
     packet = AIDecisionPacket.from_mapping(payload)
+    effective_grounding, binding_warning = _resolver_grounding_for_packet(
+        packet_path,
+        grounding,
+    )
+    if binding_warning:
+        packet.warnings.append(binding_warning)
     return validate_ai_decision_packet(
         packet,
         fields,
-        grounding,
+        effective_grounding,
         expected_identity=expected_identity,
         external_sources=_embedded_external_sources(payload),
     )
