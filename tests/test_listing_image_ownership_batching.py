@@ -37,6 +37,7 @@ class _BatchProvider:
                     "visual_subject": "product photo",
                     "visible_identity": "Brand Target",
                     "visible_configuration": "target configuration",
+                    "target_conflicts": "",
                     "target_match_evidence": "Synthetic pixels positively establish the target identity.",
                     "target_identity_gaps": "",
                     "classification": "EXACT_TARGET",
