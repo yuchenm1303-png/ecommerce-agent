@@ -30,9 +30,11 @@ from .batch_log_buffer import BATCH_LOG_PREVIEW_CHARS, display_log_line, log_buf
 
 _JOB_LOG_LINE = re.compile(r"^\[(JOB-\d+)(?:\s*·[^\]]+)?\]\s?(.*)$")
 _TERMINAL = {"DONE", "REVIEW", "FAILED", "STOPPED"}
+_SOURCE_WAITING = "WAITING_SOURCE_INTERACTION"
 _STATUS_LABELS = {
     "QUEUED": "排队",
     "CAPTURING": "采集商品",
+    _SOURCE_WAITING: "等待人工验证",
     "UNDERSTANDING": "识别商品",
     "SELECTING_VERTICAL": "选择类目",
     "SELECTING_BRAND": "选择品牌",
@@ -50,6 +52,7 @@ _STATUS_LABELS = {
 _STATUS_COLORS = {
     "READY": ("#b4f1cf", "#3d28696a"),
     "DONE": ("#b4f1cf", "#3d28696a"),
+    _SOURCE_WAITING: ("#ffe0a0", "#3dbe8425"),
     "REVIEW": ("#ffe0a0", "#3dbe8425"),
     "FAILED": ("#ffb2c0", "#40be3f57"),
     "STOPPED": ("#ffe0a0", "#38be8425"),
@@ -128,6 +131,7 @@ Item {
             required property bool canOpenUrl
             required property bool canOpenDir
             required property bool canFill
+            required property bool canResumeSource
             required property bool canStop
             required property bool canDelete
 
@@ -371,14 +375,22 @@ Item {
                     }
                     Text {
                         x: 88; width: Math.max(20, parent.width - 88 - 254); height: parent.height
-                        text: "独立任务控制"
+                        text: jobCard.canResumeSource ? "人工验证完成后继续当前商品" : "独立任务控制"
                         color: Qt.rgba(1,1,1,135/255)
                         font.family: "Microsoft YaHei UI"; font.pixelSize: 9
                         verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight
                     }
                     Button {
-                        x: parent.width - 246; y: 4; width: 82; height: 28; text: "单独填写"; enabled: jobCard.canFill; hoverEnabled: true
-                        onClicked: quickBatchList.startFill(jobCard.jobId)
+                        x: parent.width - 246; y: 4; width: 82; height: 28
+                        text: jobCard.canResumeSource ? "继续检测" : "单独填写"
+                        enabled: jobCard.canResumeSource || jobCard.canFill
+                        hoverEnabled: true
+                        onClicked: {
+                            if (jobCard.canResumeSource)
+                                quickBatchList.resumeSource(jobCard.jobId)
+                            else
+                                quickBatchList.startFill(jobCard.jobId)
+                        }
                         background: Rectangle { radius: 7; color: root.buttonFill("primary", parent.hovered, parent.down, parent.enabled); border.width: 1; border.color: Qt.rgba(1,1,1,24/255) }
                         contentItem: Text { text: parent.text; color: parent.enabled ? "white" : Qt.rgba(1,1,1,70/255); font.family: "Microsoft YaHei UI"; font.pixelSize: 10; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                     }
@@ -456,12 +468,7 @@ Item {
 
 
 class QuickBatchList(QAbstractListModel):
-    """Quick-owned Batch task list with one native ListView scroll transform.
-
-    BatchController remains the business-state owner. The legacy QWidget QScrollArea
-    is retained only as fallback; while Quick owns presentation it is detached from
-    the main window tree so StaticQmlBridge cannot mirror or scroll its descendants.
-    """
+    """Quick-owned Batch task list with one native ListView scroll transform."""
 
     _BASE = int(Qt.ItemDataRole.UserRole)
     _ROLE_NAMES = (
@@ -483,6 +490,7 @@ class QuickBatchList(QAbstractListModel):
         "canOpenUrl",
         "canOpenDir",
         "canFill",
+        "canResumeSource",
         "canStop",
         "canDelete",
     )
@@ -609,9 +617,13 @@ class QuickBatchList(QAbstractListModel):
 
     @staticmethod
     def _details_text(job: Any) -> str:
+        interaction = str(getattr(job, "interaction_reason", "") or "")
+        interaction_url = str(getattr(job, "interaction_url", "") or "")
         return "\n".join(
             (
                 f"Supplier URL: {getattr(job, 'product_url', '') or '—'}",
+                f"Source interaction: {interaction or '—'}",
+                f"Source page: {interaction_url or '—'}",
                 f"Makro targetId: {getattr(job, 'makro_target_id', '') or '—'}",
                 f"Run directory: {getattr(job, 'run_dir', '') or '—'}",
                 f"Execution report: {getattr(job, 'execution_report', '') or '—'}",
@@ -629,6 +641,8 @@ class QuickBatchList(QAbstractListModel):
         log_preview = logs[-1] if logs else ""
         expanded = job_id in self._expanded
         run_dir = str(getattr(job, "run_dir", "") or "")
+        waiting_source = status == _SOURCE_WAITING
+        interaction_reason = str(getattr(job, "interaction_reason", "") or "")
         return {
             "jobId": job_id,
             "productText": str(getattr(job, "product_name", "") or "等待商品信息"),
@@ -650,7 +664,7 @@ class QuickBatchList(QAbstractListModel):
                 f"{_STATUS_LABELS.get(status, status)}  ·  "
                 f"{str(getattr(job, 'stage_detail', '') or _STATUS_LABELS.get(status, status))}"
             ),
-            "errorText": str(getattr(job, "error", "") or ""),
+            "errorText": interaction_reason if waiting_source else str(getattr(job, "error", "") or ""),
             "logPreview": log_preview,
             "detailsText": self._details_text(job),
             "logText": (
@@ -662,6 +676,7 @@ class QuickBatchList(QAbstractListModel):
             "canOpenUrl": bool(str(getattr(job, "product_url", "") or "")),
             "canOpenDir": bool(run_dir),
             "canFill": status == "READY",
+            "canResumeSource": waiting_source,
             "canStop": status not in _TERMINAL and status != "READY",
             "canDelete": status in _TERMINAL or status == "READY",
         }
@@ -802,6 +817,12 @@ class QuickBatchList(QAbstractListModel):
     @Slot(str)
     def startFill(self, job_id: str) -> None:  # noqa: N802
         callback = getattr(self._individual_controls(), "start_job_execution", None)
+        if callable(callback):
+            callback(str(job_id))
+
+    @Slot(str)
+    def resumeSource(self, job_id: str) -> None:  # noqa: N802
+        callback = getattr(self._individual_controls(), "resume_source_interaction", None)
         if callable(callback):
             callback(str(job_id))
 
