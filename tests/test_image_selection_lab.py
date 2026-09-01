@@ -218,8 +218,10 @@ def test_import_case_never_promotes_previous_ai_prediction_to_ground_truth(tmp_p
         load_case(case_json)
 
 
-def test_current_v6_lab_reuses_production_prompt_and_parser_symbols() -> None:
+def test_current_v6_lab_reuses_full_production_blind_pipeline_symbols() -> None:
     source = Path("tools/image_selection_lab/core.py").read_text(encoding="utf-8")
+    assert "build_listing_image_visual_facts_request" in source
+    assert "_run_visual_facts_request" in source
     assert "build_listing_image_ownership_request" in source
     assert "build_listing_image_ranking_request" in source
     assert "_run_ownership_request" in source
