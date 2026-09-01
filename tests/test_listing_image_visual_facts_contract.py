@@ -5,12 +5,15 @@ from pathlib import Path
 import pytest
 
 from app.listing_image_ranker import (
+    ImageVisualFacts,
+    ListingImageRankingError,
     _Candidate,
+    _ParsedOwnership,
+    _ParsedVisualFacts,
     _parse_ownership,
-    _parse_ranking,
     build_listing_image_ownership_request,
     build_listing_image_ranking_request,
-    ListingImageRankingError,
+    build_listing_image_visual_facts_request,
 )
 
 
@@ -23,50 +26,51 @@ def _candidate(image_id: str = "image_01") -> _Candidate:
     )
 
 
-def test_ownership_contract_is_conflict_first_before_positive_proof_and_classification() -> None:
-    request = build_listing_image_ownership_request(
-        product_context={
-            "name": "Dyson Airwrap i.d Multi-Styler and Dryer",
-            "brand": "Dyson",
-            "model": "Airwrap i.d",
-            "variant": "Ceramic Pink",
+def _facts(
+    *,
+    colour: str = "silver/nickel body with metallic copper accents",
+    guess: str = "Dyson Airwrap-style multi-styler; exact catalog model uncertain",
+    uncertainty: str = "exact catalog model not readable",
+) -> _ParsedVisualFacts:
+    return _ParsedVisualFacts(
+        facts={
+            "image_01": ImageVisualFacts(
+                image_id="image_01",
+                visual_subject="multi-styler with cylindrical handle and attachments",
+                readable_identity="Dyson",
+                raw_colour_materials=colour,
+                design_configuration="cylindrical handle, airflow head and curling attachments",
+                neutral_product_guess=guess,
+                visual_uncertainty=uncertainty,
+                presentation_quality="clear complete hero-style product view",
+            )
         },
-        candidates=[_candidate()],
+        summary="blind facts",
     )
 
-    decision_schema = request["json_contract"]["properties"]["decisions"]["properties"][
-        "image_01"
-    ]
-    assert decision_schema["required"] == [
-        "visual_subject",
-        "visible_identity",
-        "visible_configuration",
-        "target_conflicts",
-        "target_match_evidence",
-        "target_identity_gaps",
-        "classification",
-        "confidence",
-        "reason",
-    ]
-    assert request["context"]["decision_protocol"] == (
-        "pixel_facts_conflict_audit_positive_proof_classification_v5"
-    )
+
+def test_blind_visual_perception_request_contains_no_target_identity() -> None:
+    request = build_listing_image_visual_facts_request(candidates=[_candidate()])
+
+    assert request["task"] == "observe_supplier_listing_images_blind"
+    assert request["context"]["decision_protocol"] == "target_blind_pixel_observation_v1"
+    assert "target_product" not in request["context"]
+    assert request["target_fields"] == []
+    assert len(request["grounded_sources"]) == 1
 
     prompt = request["prompt_instruction"].lower()
     rules = "\n".join(request["rules"]).lower()
-    assert "target_conflicts before target_match_evidence" in prompt
-    assert "can never be overridden" in prompt
-    assert "veto priority" in rules
-    assert "positive similarities must never cancel" in rules
-    assert "do not collapse distinct sellable colourways" in rules
-    assert "missing or unreadable logo/model text alone is not a gap" in rules
-    assert "absence of conflict is not evidence of identity" in rules
-    assert "dom text" in rules
-    assert "filenames or urls" in rules
+    assert "do not invent or normalize a marketing colourway/variant name" in prompt
+    assert "ceramic pink" in prompt
+    assert "only when that exact wording is readable" in prompt
+    assert "no target_product" in rules
+    assert "raw_colour_materials uses literal visual descriptors" in rules
+    assert "must not manufacture a variant name" in rules
 
 
-def test_gallery_is_an_independent_conflict_first_reinspection() -> None:
-    request = build_listing_image_ranking_request(
+def test_target_comparator_sees_only_frozen_blind_facts_not_candidate_pixels() -> None:
+    facts = _facts()
+    request = build_listing_image_ownership_request(
         product_context={
             "name": "Dyson Airwrap HS05",
             "brand": "Dyson",
@@ -74,125 +78,124 @@ def test_gallery_is_an_independent_conflict_first_reinspection() -> None:
             "variant": "Nickel / Copper",
         },
         candidates=[_candidate()],
+        visual_facts=facts,
     )
 
-    decision_schema = request["json_contract"]["properties"]["decisions"]["properties"][
-        "image_01"
-    ]
-    assert decision_schema["required"][:3] == [
-        "target_conflicts",
-        "target_match_evidence",
-        "target_identity_gaps",
-    ]
+    assert request["task"] == "compare_blind_image_facts_to_target"
     assert request["context"]["decision_protocol"] == (
-        "independent_conflict_first_gallery_verification_v1"
+        "frozen_blind_facts_target_comparison_v6"
     )
-    system = request["system_instruction"].lower()
-    prompt = request["prompt_instruction"].lower()
+    assert request["grounded_sources"] == []
+    assert request["context"]["blind_visual_facts"]["image_01"] == (
+        facts.facts["image_01"].as_dict()
+    )
+
     rules = "\n".join(request["rules"]).lower()
-    assert "ownership decisions are prior-stage context, not proof" in system
-    assert "target_conflicts first" in prompt
-    assert "material visible target conflict requires selected=false" in prompt
-    assert "never inherit the ownership conclusion as evidence" in rules
-    assert "different sellable variant/colourway/material finish/configuration" in rules
-    assert "different product line or product form" in rules
+    assert "cannot inspect pixels in this stage" in rules
+    assert "generic visual terms are not exact seller-variant proof" in rules
+    assert "cannot be silently renamed" in rules
+    assert "compare them as frozen observations" in rules
 
 
-def test_parsed_ownership_preserves_separate_conflict_proof_and_ambiguity_audit() -> None:
-    candidate = _candidate()
+def test_ownership_parser_attaches_frozen_blind_facts_without_rewriting_them() -> None:
+    facts = _facts()
     parsed = _parse_ownership(
         {
             "decisions": {
                 "image_01": {
-                    "visual_subject": "pink hair styling wand with multiple curling attachments",
-                    "visible_identity": "Dyson; Airwrap i.d visible on packaging",
-                    "visible_configuration": "ceramic-pink multi-styler kit with storage case",
                     "target_conflicts": "",
-                    "target_match_evidence": "Airwrap i.d marking and ceramic-pink kit configuration visibly establish the target.",
+                    "target_match_evidence": (
+                        "Frozen nickel/silver body, copper accents and distinctive multi-styler "
+                        "design jointly support the target."
+                    ),
                     "target_identity_gaps": "",
                     "classification": "EXACT_TARGET",
-                    "confidence": 0.97,
-                    "reason": "Exact target identity and configuration are positively established with no conflict.",
+                    "confidence": 0.94,
+                    "reason": "Exact target is sufficiently established from frozen facts.",
                 }
             },
-            "summary": "one exact target image",
+            "summary": "exact",
         },
-        [candidate],
+        [_candidate()],
+        facts,
     )
 
     decision = parsed.decisions["image_01"]
     assert decision.auto_eligible is True
+    assert decision.visible_identity == "Dyson"
+    assert "silver/nickel body with metallic copper accents" in decision.visible_configuration
     assert decision.target_conflicts == ""
-    assert "Airwrap i.d marking" in decision.target_match_evidence
-    assert decision.target_identity_gaps == ""
-    assert decision.as_dict()["target_conflicts"] == ""
 
 
-def test_ownership_parser_rejects_auto_eligible_decision_that_declares_visible_conflict() -> None:
-    candidate = _candidate()
+def test_ownership_parser_rejects_auto_eligible_decision_that_declares_conflict() -> None:
+    facts = _facts(colour="rose-gold-toned body with copper accents")
     with pytest.raises(ListingImageRankingError, match="target_conflicts"):
         _parse_ownership(
             {
                 "decisions": {
                     "image_01": {
-                        "visual_subject": "rose-gold hair styler",
-                        "visible_identity": "Dyson Airwrap family",
-                        "visible_configuration": "rose-gold/copper finish",
-                        "target_conflicts": "Visible rose-gold/copper finish conflicts with target Ceramic Pink variant.",
-                        "target_match_evidence": "Airwrap-family body form resembles the target family.",
+                        "target_conflicts": "Frozen rose-gold finish conflicts with target variant.",
+                        "target_match_evidence": "Same broad product family.",
                         "target_identity_gaps": "",
                         "classification": "EXACT_TARGET",
                         "confidence": 0.9,
-                        "reason": "synthetic inconsistent decision",
+                        "reason": "synthetic inconsistent output",
                     }
                 },
                 "summary": "inconsistent",
             },
-            [candidate],
+            [_candidate()],
+            facts,
         )
 
 
-def test_gallery_parser_rejects_selected_decision_that_declares_visible_conflict() -> None:
-    candidate = _candidate()
-    with pytest.raises(ListingImageRankingError, match="target_conflicts"):
-        _parse_ranking(
-            {
-                "selected_image_ids": ["image_01"],
-                "decisions": {
-                    "image_01": {
-                        "target_conflicts": "Visible product form is Airstrait, not the target Airwrap i.d.",
-                        "target_match_evidence": "Dyson brand and hair-tool category are visible.",
-                        "target_identity_gaps": "",
-                        "selected": True,
-                        "reason": "synthetic inconsistent decision",
-                    }
+def test_gallery_has_no_target_identity_and_only_ranks_identity_approved_candidates() -> None:
+    facts = _facts()
+    ownership = _ParsedOwnership(
+        decisions={
+            "image_01": _parse_ownership(
+                {
+                    "decisions": {
+                        "image_01": {
+                            "target_conflicts": "",
+                            "target_match_evidence": "Frozen facts establish exact target.",
+                            "target_identity_gaps": "",
+                            "classification": "EXACT_TARGET",
+                            "confidence": 0.95,
+                            "reason": "exact",
+                        }
+                    },
+                    "summary": "exact",
                 },
-                "summary": "inconsistent",
-            },
-            [candidate],
-        )
-
-
-def test_ownership_parser_keeps_non_text_visual_fingerprint_valid_when_no_conflict_or_gap() -> None:
-    candidate = _candidate()
-    parsed = _parse_ownership(
-        {
-            "decisions": {
-                "image_01": {
-                    "visual_subject": "multi-styler with curling barrels and dryer head",
-                    "visible_identity": "",
-                    "visible_configuration": "nickel body, copper accents, matching attachment layout",
-                    "target_conflicts": "",
-                    "target_match_evidence": "Distinctive multi-styler geometry, attachment set, nickel body and copper accents jointly establish the target visual fingerprint.",
-                    "target_identity_gaps": "",
-                    "classification": "EXACT_TARGET",
-                    "confidence": 0.92,
-                    "reason": "Non-text visual fingerprint is sufficiently discriminative.",
-                }
-            },
-            "summary": "exact without readable model text",
+                [_candidate()],
+                facts,
+            ).decisions["image_01"]
         },
-        [candidate],
+        summary="exact",
+    )
+    request = build_listing_image_ranking_request(
+        product_context={"name": "must not be exposed"},
+        candidates=[_candidate()],
+        ownership=ownership,
+        visual_facts=facts,
     )
 
-    assert parsed.eligible_ids == ("image_01",)
+    assert request["task"] == "order_identity_approved_supplier_gallery"
+    assert request["context"]["decision_protocol"] == "identity_frozen_quality_ordering_v2"
+    assert "target_product" not in request["context"]
+    assert len(request["grounded_sources"]) == 1
+    assert "not given target_product" in request["system_instruction"].lower()
+    rules = "\n".join(request["rules"]).lower()
+    assert "do not infer, verify or alter target identity" in rules
+    assert "photo quality" in rules
+
+
+def test_generic_colour_family_is_explicitly_insufficient_for_exact_variant_proof() -> None:
+    request = build_listing_image_ownership_request(
+        product_context={"variant": "Ceramic Pink"},
+        candidates=[_candidate()],
+        visual_facts=_facts(colour="pink body", uncertainty="exact seller colourway unresolved"),
+    )
+    rules = "\n".join(request["rules"]).lower()
+    assert "generic visual terms are not exact seller-variant proof" in rules
+    assert "broad colour family is insufficient" in request["prompt_instruction"].lower()
