@@ -304,7 +304,9 @@ class RecordChannelListingRepository(ChannelListingRepository):
     def find_for_variant_account(
         self,
         scope: CommerceScope,
+        *,
         variant_id: str,
+        channel: str,
         channel_account_id: str,
     ) -> tuple[ChannelListing, ...]:
         rows = self._gateway.get_many(
@@ -312,6 +314,7 @@ class RecordChannelListingRepository(ChannelListingRepository):
             {
                 "workspace_id": scope.workspace_id,
                 "variant_id": variant_id,
+                "channel": str(channel or "").strip().casefold(),
                 "channel_account_id": channel_account_id,
             },
         )

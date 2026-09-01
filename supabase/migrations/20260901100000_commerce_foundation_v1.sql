@@ -116,7 +116,7 @@ create table if not exists public.commerce_channel_listings (
     channel ~ '^[a-z0-9][a-z0-9_-]{0,31}$'
   ),
   channel_account_id text not null check (char_length(channel_account_id) between 1 and 200),
-  external_listing_id text not null default '' check (char_length(external_listing_id) <= 500),
+  external_listing_id text not null default '' check (char_length(external_listing_id) <= 300),
   status text not null default 'draft' check (status in ('draft', 'active', 'inactive', 'removed')),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -140,7 +140,7 @@ create unique index if not exists commerce_channel_listings_external_id_uq
   where btrim(external_listing_id) <> '';
 
 create index if not exists commerce_channel_listings_variant_account_idx
-  on public.commerce_channel_listings (workspace_id, variant_id, channel_account_id);
+  on public.commerce_channel_listings (workspace_id, variant_id, channel, channel_account_id);
 
 create or replace function public.set_commerce_updated_at()
 returns trigger

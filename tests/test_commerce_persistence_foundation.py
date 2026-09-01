@@ -134,8 +134,9 @@ def test_record_repositories_round_trip_commerce_aggregates() -> None:
     assert listings.get(scope, listing.listing_id) == listing
     assert listings.find_for_variant_account(
         scope,
-        size_variant.variant_id,
-        account.channel_account_id,
+        variant_id=size_variant.variant_id,
+        channel="makro",
+        channel_account_id=account.channel_account_id,
     ) == (listing,)
 
 
