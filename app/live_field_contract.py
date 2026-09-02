@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-import math
 import re
 from typing import Any, Iterable
 
 
-LIVE_FIELD_CONTRACT_VERSION = 1
+LIVE_FIELD_CONTRACT_VERSION = 2
 
 _TEXT_KINDS = {"input", "custom_textbox", "custom_searchbox"}
 _LONG_TEXT_KINDS = {"textarea", "contenteditable"}
 _SELECT_KINDS = {"select", "dropdown", "autocomplete", "listbox", "radio", "custom_radio"}
 _BOOLEAN_KINDS = {"checkbox", "custom_checkbox"}
 _NUMERIC_KINDS = {"custom_spinbutton", "custom_slider"}
+_RADIO_KINDS = {"radio", "custom_radio"}
 _QUALIFIER_NAME_RE = re.compile(r"_qualifier$")
 _FIXED_UNIT_SUFFIX_RE = re.compile(
     r"^\*+\s*(?P<unit>[A-Za-zµμ°%]+(?:[./-][A-Za-zµμ°%]+)*(?:\s+[A-Za-zµμ°%]+(?:[./-][A-Za-zµμ°%]+)*){0,2})\s*$"
@@ -93,7 +93,7 @@ def _family(field: dict[str, Any], controls: list[dict[str, Any]]) -> str:
     if primary is None:
         return "unsupported"
     kinds = [str(control.get("field_kind") or "").casefold() for control in controls]
-    if controls and all(kind in {"radio", "custom_radio"} for kind in kinds):
+    if controls and all(kind in _RADIO_KINDS for kind in kinds):
         return "selection"
     kind = str(primary.get("field_kind") or "").casefold()
     if kind in _BOOLEAN_KINDS:
@@ -125,7 +125,10 @@ def units_equivalent(left: object, right: object) -> bool:
 
 def _candidate_contexts(field: dict[str, Any]) -> list[str]:
     output: list[str] = []
-    for raw in [field.get("context_text"), *(c.get("context_text") for c in field.get("controls") or [] if isinstance(c, dict))]:
+    for raw in [
+        field.get("context_text"),
+        *(c.get("context_text") for c in field.get("controls") or [] if isinstance(c, dict)),
+    ]:
         text = " ".join(str(raw or "").split()).strip()
         if text and text not in output:
             output.append(text)
@@ -164,12 +167,21 @@ def _multi_value(field: dict[str, Any], controls: list[dict[str, Any]]) -> bool:
     return any(bool(c.get("repeatable") or c.get("has_add_value_control")) for c in controls)
 
 
+def _is_radio_group(controls: list[dict[str, Any]]) -> bool:
+    return bool(controls) and all(
+        str(control.get("field_kind") or "").casefold() in _RADIO_KINDS
+        for control in controls
+    )
+
+
 def _value_options(field: dict[str, Any], controls: list[dict[str, Any]]) -> list[str]:
     direct: list[str] = []
     for control in controls:
         direct.extend(_clean_options(control.get("options") or []))
     if direct:
         return list(dict.fromkeys(direct))
+    if _is_radio_group(controls):
+        return _clean_options(field.get("options") or [])
     if controls:
         return []
     return _clean_options(field.get("options") or [])
@@ -182,6 +194,17 @@ def _qualifier_options(field: dict[str, Any], controls: list[dict[str, Any]]) ->
     if direct:
         return list(dict.fromkeys(direct))
     return _clean_options(field.get("qualifier_options") or [])
+
+
+def _closed_domain(controls: list[dict[str, Any]], options: list[str]) -> bool:
+    if not controls:
+        return bool(options)
+    kinds = [str(control.get("field_kind") or "").casefold() for control in controls]
+    if all(kind in _RADIO_KINDS for kind in kinds):
+        return True
+    if all(kind == "select" for kind in kinds):
+        return True
+    return any(bool(control.get("options")) for control in controls)
 
 
 def _constraint_text(control: dict[str, Any] | None, key: str) -> str:
@@ -203,17 +226,27 @@ def _constraint_int(control: dict[str, Any] | None, key: str) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _safe_nonnegative_int(value: object) -> int:
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, parsed)
+
+
 def _normalize_persisted(raw: dict[str, Any]) -> dict[str, Any]:
     family = str(raw.get("family") or "unsupported").casefold()
     qualifier_mode = str(raw.get("qualifier_mode") or "none").casefold()
+    options = _clean_options(raw.get("options") or [])
     return {
         "version": LIVE_FIELD_CONTRACT_VERSION,
         "family": family if family in {"numeric", "text", "long_text", "selection", "boolean", "unsupported"} else "unsupported",
-        "value_control_count": max(0, int(raw.get("value_control_count") or 0)),
+        "value_control_count": _safe_nonnegative_int(raw.get("value_control_count")),
         "multi_value": bool(raw.get("multi_value")),
-        "qualifier_mode": qualifier_mode if qualifier_mode in {"none", "selectable", "fixed"} else "none",
+        "closed_domain": bool(raw.get("closed_domain")),
+        "qualifier_mode": qualifier_mode if qualifier_mode in {"none", "selectable", "fixed", "inline"} else "none",
         "fixed_unit": str(raw.get("fixed_unit") or "").strip(),
-        "options": _clean_options(raw.get("options") or []),
+        "options": options,
         "qualifier_options": _clean_options(raw.get("qualifier_options") or []),
         "min": str(raw.get("min") or "").strip(),
         "max": str(raw.get("max") or "").strip(),
@@ -225,11 +258,12 @@ def _normalize_persisted(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def execution_contract(field: dict[str, Any]) -> dict[str, Any]:
-    """Return the one canonical mechanical contract for a marketplace field.
+    """Return the canonical mechanical contract for one marketplace field.
 
-    Raw live controls win when present. Persisted schemas carry the normalized
-    contract verbatim, so Resolver, Fill Plan and executor can reason over the
-    same shape without serializing selectors, values or other transient DOM state.
+    Raw live controls win when present. Persisted schemas carry only this normalized
+    contract, never selectors/current values/transient DOM state. AI, planning,
+    required fallback, drift detection and execution preflight therefore consume
+    the same mechanical truth while remaining separate from product semantics.
     """
     controls = value_controls(field)
     qcontrols = qualifier_controls(field)
@@ -239,16 +273,26 @@ def execution_contract(field: dict[str, Any]) -> dict[str, Any]:
     family = _family(field, controls)
     primary = _primary_control(field, controls)
     fixed_unit = fixed_rendered_unit(field)
-    qualifier_mode = "selectable" if qcontrols else "fixed" if fixed_unit else "none"
+    options = _value_options(field, controls)
+    qualifier_mode = (
+        "selectable"
+        if qcontrols
+        else "fixed"
+        if fixed_unit
+        else "inline"
+        if family in {"text", "long_text"}
+        else "none"
+    )
     supported = family != "unsupported"
     return {
         "version": LIVE_FIELD_CONTRACT_VERSION,
         "family": family,
         "value_control_count": len(controls),
         "multi_value": _multi_value(field, controls),
+        "closed_domain": family == "selection" and _closed_domain(controls, options),
         "qualifier_mode": qualifier_mode,
         "fixed_unit": fixed_unit,
-        "options": _value_options(field, controls),
+        "options": options,
         "qualifier_options": _qualifier_options(field, qcontrols),
         "min": _constraint_text(primary, "min"),
         "max": _constraint_text(primary, "max"),
@@ -262,20 +306,21 @@ def execution_contract(field: dict[str, Any]) -> dict[str, Any]:
 def contract_signature(field: dict[str, Any]) -> tuple[object, ...]:
     contract = execution_contract(field)
     return (
-        contract["version"], contract["family"], contract["value_control_count"], contract["multi_value"],
-        contract["qualifier_mode"], normalize_unit(contract["fixed_unit"]),
+        contract["version"],
+        contract["family"],
+        contract["value_control_count"],
+        contract["multi_value"],
+        contract["closed_domain"],
+        contract["qualifier_mode"],
+        normalize_unit(contract["fixed_unit"]),
         tuple(sorted(_norm(v) for v in contract["options"])),
         tuple(sorted(_norm(v) for v in contract["qualifier_options"])),
-        contract["min"], contract["max"], contract["step"], contract["maxlength"], contract["supported"],
+        contract["min"],
+        contract["max"],
+        contract["step"],
+        contract["maxlength"],
+        contract["supported"],
     )
-
-
-def _finite(value: object) -> float | None:
-    try:
-        number = float(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
 
 
 def validate_qualifier(field: dict[str, Any], qualifier: object) -> str | None:
@@ -284,6 +329,8 @@ def validate_qualifier(field: dict[str, Any], qualifier: object) -> str | None:
         return None
     contract = execution_contract(field)
     mode = contract["qualifier_mode"]
+    if mode == "inline":
+        return None
     if mode == "none":
         return "答案包含 qualifier，但当前 live field 既没有 qualifier control，也没有可确认的固定单位；未执行写入。"
     if mode == "fixed":
@@ -298,7 +345,14 @@ def validate_qualifier(field: dict[str, Any], qualifier: object) -> str | None:
 
 
 __all__ = [
-    "LIVE_FIELD_CONTRACT_VERSION", "contract_signature", "execution_contract", "fixed_rendered_unit",
-    "is_numeric_control", "normalize_unit", "qualifier_controls", "units_equivalent",
-    "validate_qualifier", "value_controls",
+    "LIVE_FIELD_CONTRACT_VERSION",
+    "contract_signature",
+    "execution_contract",
+    "fixed_rendered_unit",
+    "is_numeric_control",
+    "normalize_unit",
+    "qualifier_controls",
+    "units_equivalent",
+    "validate_qualifier",
+    "value_controls",
 ]
