@@ -6,7 +6,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
-from .live_field_contract import contract_signature, execution_contract
+from .live_field_contract import LIVE_FIELD_CONTRACT_VERSION, contract_signature, execution_contract
 from .makro.listing_draft_identity import (
     DRAFT_IDENTITY_FIELD,
     assert_same_listing_draft,
@@ -170,8 +170,17 @@ def load_live_schema(path: str | Path) -> list[dict[str, Any]]:
         if not isinstance(raw, dict):
             continue
         item = dict(raw)
-        if not isinstance(item.get("execution_contract"), dict):
+        contract = item.get("execution_contract")
+        if not isinstance(contract, dict):
             raise ValueError("live schema field 缺少 execution_contract；请重新扫描当前 Makro 页面。")
+        try:
+            contract_version = int(contract.get("version"))
+        except (TypeError, ValueError):
+            contract_version = -1
+        if contract_version != LIVE_FIELD_CONTRACT_VERSION:
+            raise ValueError(
+                "live schema execution_contract 版本已过期；请重新扫描当前 Makro 页面，禁止沿用旧机械合同。"
+            )
         if identity is not None:
             item[DRAFT_IDENTITY_FIELD] = dict(identity)
         output.append(item)
