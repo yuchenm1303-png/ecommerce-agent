@@ -468,7 +468,7 @@ def _cancel_open_photo_transaction(adapter: MakroDomainAdapter) -> bool:
     live = adapter.find_section(PRODUCT_PHOTOS)
     if live is None or live.get("has_edit"):
         return False
-    adapter.cancel_section(PRODUCT_PHOTOS)
+    adapter.cancel_product_photos()
     return True
 
 
@@ -523,6 +523,8 @@ def _photo_base_report(
         "save_attempted": False,
         "save_count": 0,
         "saved": False,
+        "recovery_attempts": [],
+        "recovered_commits": 0,
         "persistence": {
             "status": "persisted_verified" if initial_count >= 0 else "unknown",
             "initial_count": initial_count,
@@ -532,28 +534,112 @@ def _photo_base_report(
     }
 
 
-def _cancel_failed_photo_transaction(
+def _classify_photo_recovery_count(
+    *,
+    baseline_count: int,
+    observed_count: int,
+    allow_late_commit: bool,
+) -> str:
+    """Classify recovery from authoritative persisted Product Photos count only."""
+
+    if observed_count == baseline_count:
+        return "clean_no_commit"
+    if allow_late_commit and observed_count == baseline_count + 1:
+        return "late_commit"
+    return "ambiguous"
+
+
+def _reconcile_failed_photo_transaction(
     adapter: MakroDomainAdapter,
     report: dict[str, Any],
     *,
     image: Path,
-) -> bool:
-    """Discard only the current image's unsaved slot transaction.
+    baseline_count: int,
+    allow_late_commit: bool,
+) -> dict[str, Any]:
+    """Restore a deterministic Product Photos boundary after one failed image.
 
-    Production persists every accepted image before the next image starts, so a
-    Cancel here cannot erase a previously successful sibling image.
+    Cancel is only a transport action, not proof of recovery. The transaction is
+    safe to continue only after the section is collapsed again and the live
+    persisted completion counter proves either no commit, or one exact late commit
+    after a Save boundary. Any other state remains ambiguous and stops execution.
     """
 
+    recovery: dict[str, Any] = {
+        "path": str(image),
+        "baseline_count": int(baseline_count),
+        "allow_late_commit": bool(allow_late_commit),
+        "status": "ambiguous",
+    }
     try:
-        cancelled = _cancel_open_photo_transaction(adapter)
-        if cancelled:
-            report.setdefault("cancelled_image_transactions", []).append(str(image))
-        return True
-    except Exception as exc:
-        report.setdefault("photo_transaction_cleanup_errors", []).append(
-            {"path": str(image), "error": str(exc)}
+        live = adapter.find_section(PRODUCT_PHOTOS)
+        if live is None:
+            recovery["detail"] = "恢复图片事务时找不到 Product Photos section。"
+            report["recovery_attempts"].append(recovery)
+            return recovery
+
+        if not live.get("has_edit"):
+            adapter.cancel_product_photos()
+            recovery["cancelled_open_transaction"] = True
+
+        restored = adapter.find_section(PRODUCT_PHOTOS)
+        if restored is None or not restored.get("has_edit"):
+            recovery["detail"] = "Cancel 后 Product Photos 未恢复为折叠 EDIT 状态。"
+            report["recovery_attempts"].append(recovery)
+            return recovery
+
+        state = adapter.inspect_product_photos()
+        raw_count = state.get("completion_count")
+        if raw_count is None:
+            recovery["detail"] = "恢复后无法读取 Product Photos 持久化完成计数。"
+            report["recovery_attempts"].append(recovery)
+            return recovery
+
+        observed_count = int(raw_count)
+        recovery["observed_count"] = observed_count
+        recovery["status"] = _classify_photo_recovery_count(
+            baseline_count=int(baseline_count),
+            observed_count=observed_count,
+            allow_late_commit=allow_late_commit,
         )
-        return False
+        if recovery["status"] == "clean_no_commit":
+            recovery["detail"] = "恢复后持久化计数未变化；当前失败图片未提交，可安全继续下一张。"
+        elif recovery["status"] == "late_commit":
+            recovery["detail"] = "恢复后持久化计数恰好增加 1；确认当前图片发生延迟提交。"
+        else:
+            recovery["detail"] = (
+                "恢复后的持久化计数与单图片事务边界不一致；"
+                "拒绝猜测当前图片状态。"
+            )
+    except Exception as exc:
+        recovery["error"] = str(exc)
+        recovery["detail"] = "恢复 Product Photos 事务时发生异常；状态仍不确定。"
+
+    report["recovery_attempts"].append(recovery)
+    return recovery
+
+
+def _record_recovered_photo_commit(
+    report: dict[str, Any],
+    *,
+    image: Path,
+    stage_items: list[dict[str, Any]],
+    recovery: dict[str, Any],
+) -> int:
+    observed_count = int(recovery["observed_count"])
+    report["persisted_this_run"] += 1
+    report["persisted"] = observed_count
+    report["final_count"] = observed_count
+    report["saved"] = True
+    report["recovered_commits"] += 1
+    for item in stage_items:
+        item["status"] = "persisted_verified_recovered"
+        item["recovery"] = dict(recovery)
+    report["items"].extend(stage_items)
+    report.setdefault("recovered_commit_items", []).append(
+        {"path": str(image), **dict(recovery)}
+    )
+    return observed_count
 
 
 def run_photos(
@@ -566,12 +652,10 @@ def run_photos(
 ) -> dict[str, Any]:
     """Execute Product Photos with one persistence transaction per image.
 
-    The old gallery-wide transaction coupled unrelated images: if image N became
-    post-submit uncertain, Cancel discarded images 0..N-1 even when their exact
-    slots had already been accepted. Production now uses a strict image-owned
-    transaction boundary: stage one image, Save it, verify the completion counter,
-    then move to the next image. A failed image may Cancel only its own unsaved
-    transaction, so later failures can never erase earlier persisted successes.
+    Each accepted image has its own Save/persistence boundary. A failed image is
+    reconciled from Makro's authoritative completion counter before any sibling is
+    attempted. Clean no-commit recovery continues; an exact post-Save +1 is treated
+    as a delayed commit; any ambiguous state stops rather than guessing ownership.
     """
 
     resolved: list[Path] = []
@@ -746,6 +830,7 @@ def run_photos(
             omitted.extend(resolved[index:])
             break
 
+        stage_items: list[dict[str, Any]] = []
         try:
             staged_result = adapter.upload_product_photos(
                 [str(image)],
@@ -753,17 +838,25 @@ def run_photos(
             )
             payload = staged_result.as_dict()
         except Exception as exc:
-            failed_transactions += 1
             report["attempted"] += 1
+            recovery = _reconcile_failed_photo_transaction(
+                adapter,
+                report,
+                image=image,
+                baseline_count=current_count,
+                allow_late_commit=False,
+            )
+            failed_transactions += 1
             report["items"].append(
                 {
                     "path": str(image),
                     "status": "transaction_error",
                     "detail": str(exc),
+                    "recovery": dict(recovery),
                     "failure_scope": "image_transaction",
                 }
             )
-            if not _cancel_failed_photo_transaction(adapter, report, image=image):
+            if recovery.get("status") != "clean_no_commit":
                 operational_stop = True
                 break
             continue
@@ -777,7 +870,16 @@ def run_photos(
         staged_count = int(payload.get("staged") or 0)
         stage_status = str(payload.get("status") or "")
         if stage_status != "staged" or staged_count != 1:
+            recovery = _reconcile_failed_photo_transaction(
+                adapter,
+                report,
+                image=image,
+                baseline_count=current_count,
+                allow_late_commit=False,
+            )
             failed_transactions += 1
+            for item in stage_items:
+                item["recovery"] = dict(recovery)
             report["items"].extend(stage_items)
             if not stage_items:
                 report["items"].append(
@@ -785,10 +887,11 @@ def run_photos(
                         "path": str(image),
                         "status": stage_status or "staging_unconfirmed",
                         "detail": str(payload.get("detail") or ""),
+                        "recovery": dict(recovery),
                         "failure_scope": "image_transaction",
                     }
                 )
-            if not _cancel_failed_photo_transaction(adapter, report, image=image):
+            if recovery.get("status") != "clean_no_commit":
                 operational_stop = True
                 break
             continue
@@ -799,19 +902,40 @@ def run_photos(
             adapter.save_section(PRODUCT_PHOTOS)
             report["save_count"] += 1
         except Exception as exc:
+            recovery = _reconcile_failed_photo_transaction(
+                adapter,
+                report,
+                image=image,
+                baseline_count=current_count,
+                allow_late_commit=True,
+            )
+            if recovery.get("status") == "late_commit":
+                current_count = _record_recovered_photo_commit(
+                    report,
+                    image=image,
+                    stage_items=stage_items,
+                    recovery=recovery,
+                )
+                report.setdefault("save_warnings", []).append(
+                    {"path": str(image), "error": str(exc), "recovery": dict(recovery)}
+                )
+                continue
+
             failed_transactions += 1
             for item in stage_items:
                 item["status"] = "save_failed"
                 item["save_error"] = str(exc)
+                item["recovery"] = dict(recovery)
             report["items"].extend(stage_items)
             report.setdefault("save_failures", []).append(
                 {
                     "path": str(image),
                     "error": str(exc),
+                    "recovery": dict(recovery),
                     "diagnostics": _collect_save_failure_diagnostics(adapter, PRODUCT_PHOTOS),
                 }
             )
-            if not _cancel_failed_photo_transaction(adapter, report, image=image):
+            if recovery.get("status") != "clean_no_commit":
                 operational_stop = True
                 break
             continue
@@ -821,22 +945,38 @@ def run_photos(
             expected_added=1,
         )
         if persistence.get("status") != "persisted_verified":
+            recovery = _reconcile_failed_photo_transaction(
+                adapter,
+                report,
+                image=image,
+                baseline_count=current_count,
+                allow_late_commit=True,
+            )
+            if recovery.get("status") == "late_commit":
+                current_count = _record_recovered_photo_commit(
+                    report,
+                    image=image,
+                    stage_items=stage_items,
+                    recovery=recovery,
+                )
+                report.setdefault("persistence_recoveries", []).append(
+                    {"path": str(image), **dict(recovery)}
+                )
+                continue
+
             failed_transactions += 1
             for item in stage_items:
                 item["status"] = "persistence_failed"
                 item["persistence"] = dict(persistence)
+                item["recovery"] = dict(recovery)
             report["items"].extend(stage_items)
             report.setdefault("persistence_failures", []).append(
-                {"path": str(image), **dict(persistence)}
+                {"path": str(image), **dict(persistence), "recovery": dict(recovery)}
             )
-            raw_final = persistence.get("final_count")
-            if raw_final is not None and int(raw_final) > current_count:
-                current_count = int(raw_final)
-            if not _cancel_failed_photo_transaction(adapter, report, image=image):
+            if recovery.get("status") != "clean_no_commit":
                 operational_stop = True
-            else:
-                operational_stop = True
-            break
+                break
+            continue
 
         current_count = int(persistence.get("final_count") or (current_count + 1))
         report["persisted_this_run"] += 1
@@ -885,8 +1025,8 @@ def run_photos(
             f"failed_transactions={failed_transactions}, omitted_capacity={len(omitted)}, final={current_count}."
         )
         report["detail"] = (
-            "至少一张图片已可靠持久化；失败图片只回滚自己的未保存事务，"
-            "不会再撤销先前成功图片。"
+            "至少一张图片已可靠持久化；失败图片只有在恢复出确定的持久化计数后才会继续，"
+            "不会让一个不确定图片事务污染后续图片。"
         )
     else:
         report["request_status"] = "incomplete_upload"

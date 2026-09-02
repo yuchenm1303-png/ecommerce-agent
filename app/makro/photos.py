@@ -601,31 +601,26 @@ def _wait_for_target_slot_completion(
 
         signal, new_sources = _target_slot_acceptance_signal(before_state, latest, slot_id)
         latest_new_sources = set(new_sources)
-        strong_signal = signal in {
-            "target_slot_check",
-            "target_slot_consumed",
-            "completion_counter_growth",
-        }
-        if strong_signal:
-            latest["uploading_seen"] = uploading_seen or bool(latest.get("uploading"))
-            latest["acceptance_signal"] = signal
-            latest["new_target_sources"] = sorted(new_sources)
-            latest["target_slot_before"] = _slot_diagnostic_payload(before_state, slot_id)
-            latest["target_slot_after"] = _slot_diagnostic_payload(latest, slot_id)
-            return latest
 
-        if signal == "target_slot_new_preview":
+        if signal:
             key = (signal, tuple(sorted(new_sources)))
             if key != candidate_key:
                 candidate_key = key
+                candidate_since = None
+
+            if bool(latest.get("uploading")):
+                candidate_since = None
+            elif candidate_since is None:
                 candidate_since = now
+
             stable_ms = 0.0 if candidate_since is None else (now - candidate_since) * 1000.0
-            if not bool(latest.get("uploading")) and stable_ms >= accepted_stability_ms:
+            if stable_ms >= accepted_stability_ms:
                 latest["uploading_seen"] = uploading_seen
                 latest["acceptance_signal"] = signal
                 latest["new_target_sources"] = sorted(new_sources)
                 latest["target_slot_before"] = _slot_diagnostic_payload(before_state, slot_id)
                 latest["target_slot_after"] = _slot_diagnostic_payload(latest, slot_id)
+                latest["accepted_stability_ms"] = stable_ms
                 return latest
         else:
             candidate_key = None
