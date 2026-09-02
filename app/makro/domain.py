@@ -28,6 +28,7 @@ from .listing_draft_identity import DRAFT_IDENTITY_FIELD, listing_draft_identity
 from .locators import click_add_value_for_control, selector_for_control
 from .marketplace_constraints import _is_model_name_field, _strip_known_brand
 from .photos import (
+    PRODUCT_PHOTOS_SECTION,
     PhotoUploadResult,
     inspect_product_photos,
     upload_product_photos,
@@ -205,6 +206,17 @@ class MakroDomainAdapter:
 
     def cancel_section(self, section_title: str, *, wait_ms: int = 450) -> None:
         cancel_section(self.page, section_title, wait_ms=wait_ms)
+
+    def cancel_product_photos(self, *, wait_ms: int = 450) -> None:
+        """Cancel only the open Product Photos transaction.
+
+        Photo orchestration owns an image-level transaction boundary and must not
+        address that boundary through an arbitrary section title. Keep the DOM
+        mechanics in the canonical section primitive while exposing an explicit
+        domain operation for Product Photos recovery.
+        """
+
+        cancel_section(self.page, PRODUCT_PHOTOS_SECTION, wait_ms=wait_ms)
 
     def save_section(
         self,
