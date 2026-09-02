@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from ..image_media import ImageMediaError, read_image_media
 from .errors import JSONTaskProviderError, JSONTaskResponseError, JSONTaskTransportError
+from .json_contract import JSONContractValidationError, validate_json_contract
 from .transient_retry import run_with_transient_retry
 from .usage_telemetry import instrument_openai_client, usage_request_context
 
@@ -30,6 +31,7 @@ SUPPORTED_COMPAT_PROFILES = ("generic", "qwen-omni")
 _PROGRESS_INTERVAL_SECONDS = 15.0
 _PRODUCT_FACT_TASK = "resolve_compact_product_facts"
 _CANONICAL_JPEG_DATA_URI_PREFIX = "data:image/jpeg;base64,"
+_MAX_STRUCTURAL_ATTEMPTS = 2
 _OPENAI_COMPAT_UNSUPPORTED_ARRAY_SCHEMA_KEYWORDS = frozenset(
     {"uniqueItems", "contains", "minContains", "maxContains"}
 )
@@ -415,10 +417,12 @@ class OpenAICompatibleSemanticProvider:
                 f"OpenAI-compatible JSON task 调用失败：{value}"
             ) from value
 
-    def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
-        if not request_payload.get("json_contract"):
-            raise OpenAICompatibleProviderError("JSON task 缺少 json_contract。")
-
+    def _request_kwargs(
+        self,
+        request_payload: dict[str, Any],
+        *,
+        streaming: bool,
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": [
@@ -451,26 +455,59 @@ class OpenAICompatibleSemanticProvider:
             kwargs["max_tokens"] = self.max_output_tokens
         if self.enable_thinking is not None:
             kwargs["extra_body"] = {"enable_thinking": self.enable_thinking}
-
-        streaming = self.compat_profile == "qwen-omni"
         if streaming:
             kwargs["stream"] = True
             kwargs["stream_options"] = {"include_usage": True}
             kwargs["modalities"] = ["text"]
+        return kwargs
 
-        def attempt() -> dict[str, Any]:
-            output_text = self._network_text(kwargs, streaming=streaming)
-            return _parse_json_object(output_text)
+    def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
+        contract = request_payload.get("json_contract")
+        if not contract:
+            raise OpenAICompatibleProviderError("JSON task 缺少 json_contract。")
+
+        streaming = self.compat_profile == "qwen-omni"
+        base_request = dict(request_payload)
+        correction_error = str(base_request.get("validation_error") or "").strip()
 
         with usage_request_context(
             task=str(request_payload.get("task") or ""),
             provider=self.name,
             model=self.model,
         ):
-            payload = run_with_transient_retry(
-                attempt,
-                progress=self._progress,
-                label="AI JSON task",
-            )
-        payload["extractor"] = self.name
-        return payload
+            for structural_attempt in range(1, _MAX_STRUCTURAL_ATTEMPTS + 1):
+                current_request = dict(base_request)
+                if correction_error:
+                    current_request["validation_error"] = correction_error
+                else:
+                    current_request.pop("validation_error", None)
+                kwargs = self._request_kwargs(current_request, streaming=streaming)
+
+                def attempt() -> dict[str, Any]:
+                    output_text = self._network_text(kwargs, streaming=streaming)
+                    return _parse_json_object(output_text)
+
+                payload = run_with_transient_retry(
+                    attempt,
+                    progress=self._progress,
+                    label="AI JSON task",
+                )
+                try:
+                    validate_json_contract(payload, contract)
+                except JSONContractValidationError as exc:
+                    correction_error = str(exc)
+                    if structural_attempt >= _MAX_STRUCTURAL_ATTEMPTS:
+                        raise OpenAICompatibleResponseError(
+                            "OpenAI-compatible API 返回 JSON 未满足 json_contract："
+                            + correction_error
+                        ) from exc
+                    self._progress(
+                        "AI JSON structural contract rejected; correction retry "
+                        f"{structural_attempt + 1}/{_MAX_STRUCTURAL_ATTEMPTS}: {correction_error}"
+                    )
+                    continue
+
+                payload["extractor"] = self.name
+                return payload
+
+        raise OpenAICompatibleResponseError("OpenAI-compatible API 未形成有效 JSON 结果。")

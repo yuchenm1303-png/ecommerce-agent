@@ -7,12 +7,17 @@ import pytest
 
 from app.listing_image_ranker import ListingImageRankingError, _Candidate, _parse_ranking
 from app.providers.openai_compatible import (
+    OpenAICompatibleResponseError,
     OpenAICompatibleSemanticProvider,
     _transport_json_schema,
 )
 
 
-def _provider_without_network(captured: dict[str, object]) -> OpenAICompatibleSemanticProvider:
+def _provider_without_network(
+    captured: dict[str, object],
+    *,
+    outputs: list[str] | None = None,
+) -> OpenAICompatibleSemanticProvider:
     provider = object.__new__(OpenAICompatibleSemanticProvider)
     provider.model = "qwen3.7-plus"
     provider.image_detail = "auto"
@@ -22,11 +27,15 @@ def _provider_without_network(captured: dict[str, object]) -> OpenAICompatibleSe
     provider.request_timeout_seconds = 120.0
     provider.enable_thinking = None
     provider.progress_callback = None
+    responses = iter(outputs or ['{"ids":[]}'])
 
     def fake_network_text(kwargs: dict[str, object], *, streaming: bool) -> str:
         captured["kwargs"] = kwargs
         captured["streaming"] = streaming
-        return '{"ok":true}'
+        calls = captured.setdefault("calls", [])
+        assert isinstance(calls, list)
+        calls.append(kwargs)
+        return next(responses)
 
     provider._network_text = fake_network_text  # type: ignore[method-assign]
     return provider
@@ -89,7 +98,7 @@ def test_strict_response_format_uses_portable_schema_but_prompt_keeps_canonical_
         }
     )
 
-    assert result["ok"] is True
+    assert result["ids"] == []
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
     response_schema = kwargs["response_format"]["json_schema"]["schema"]
@@ -100,6 +109,66 @@ def test_strict_response_format_uses_portable_schema_but_prompt_keeps_canonical_
     assert isinstance(user_content, list)
     prompt_text = user_content[0]["text"]
     assert '"uniqueItems":true' in prompt_text
+
+
+def _entity_kind_contract() -> dict[str, object]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "entity_kind": {
+                "type": "string",
+                "enum": ["physical_product", "service_or_platform", "unknown"],
+            }
+        },
+        "required": ["entity_kind"],
+    }
+
+
+def test_provider_corrects_missing_required_entity_kind_once() -> None:
+    captured: dict[str, object] = {}
+    provider = _provider_without_network(
+        captured,
+        outputs=['{}', '{"entity_kind":"physical_product"}'],
+    )
+
+    result = provider.extract_json(
+        {
+            "task": "infer_grounded_supplier_product_identity",
+            "json_contract": _entity_kind_contract(),
+            "strict_json_schema": True,
+            "grounded_sources": [],
+        }
+    )
+
+    assert result["entity_kind"] == "physical_product"
+    calls = captured["calls"]
+    assert isinstance(calls, list)
+    assert len(calls) == 2
+    correction_content = calls[1]["messages"][1]["content"]
+    correction_prompt = correction_content[0]["text"]
+    assert "CORRECTION REQUIRED" in correction_prompt
+    assert "$.entity_kind: required property is missing" in correction_prompt
+    assert calls[1]["response_format"]["type"] == "json_schema"
+
+
+def test_provider_fails_closed_when_entity_kind_is_still_missing_after_correction() -> None:
+    captured: dict[str, object] = {}
+    provider = _provider_without_network(captured, outputs=['{}', '{}'])
+
+    with pytest.raises(OpenAICompatibleResponseError, match=r"\$\.entity_kind"):
+        provider.extract_json(
+            {
+                "task": "infer_grounded_supplier_product_identity",
+                "json_contract": _entity_kind_contract(),
+                "strict_json_schema": True,
+                "grounded_sources": [],
+            }
+        )
+
+    calls = captured["calls"]
+    assert isinstance(calls, list)
+    assert len(calls) == 2
 
 
 def test_gallery_parser_still_rejects_duplicate_selected_ids() -> None:
