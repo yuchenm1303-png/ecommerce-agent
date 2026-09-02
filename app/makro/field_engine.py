@@ -5,8 +5,9 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from ..live_field_contract import execution_contract as canonical_execution_contract
+from ..live_field_contract import is_numeric_control
 from .locators import scoped_selector_for_control
-from .unit_contract import qualifier_controls
 
 
 _TEXT_KINDS = {
@@ -19,7 +20,6 @@ _TEXT_KINDS = {
 _SELECT_KINDS = {"select", "dropdown", "autocomplete", "listbox"}
 _BOOLEAN_KINDS = {"checkbox", "custom_checkbox"}
 _RADIO_KINDS = {"radio", "custom_radio"}
-_NUMERIC_KINDS = {"custom_spinbutton", "custom_slider"}
 
 _TRUE_VALUES = {"1", "true", "yes", "y", "是", "有", "checked", "on"}
 _FALSE_VALUES = {"0", "false", "no", "n", "否", "无", "unchecked", "off"}
@@ -27,7 +27,7 @@ _FALSE_VALUES = {"0", "false", "no", "n", "否", "无", "unchecked", "off"}
 
 @dataclass(slots=True, frozen=True)
 class FieldExecutionContract:
-    """Pure mechanical execution contract derived from the current live field."""
+    """Legacy execution view backed exclusively by the canonical live contract."""
 
     live_family: str
     schema_family: str
@@ -53,19 +53,6 @@ def _norm(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
 
 
-def is_numeric_control(control: dict[str, Any]) -> bool:
-    field_kind = str(control.get("field_kind") or "").casefold()
-    input_type = str(control.get("type") or "").casefold()
-    role = str(control.get("role") or "").casefold()
-    inputmode = str(control.get("inputmode") or "").casefold()
-    return (
-        field_kind in _NUMERIC_KINDS
-        or input_type in {"number", "range"}
-        or role in {"spinbutton", "slider"}
-        or inputmode in {"numeric", "decimal"}
-    )
-
-
 def is_radio_control(control: dict[str, Any]) -> bool:
     return str(control.get("field_kind") or "").casefold() in _RADIO_KINDS
 
@@ -75,81 +62,35 @@ def is_radio_group(controls: Iterable[dict[str, Any]]) -> bool:
     return bool(items) and all(is_radio_control(control) for control in items)
 
 
-def _value_controls(semantic_field: dict[str, Any]) -> list[dict[str, Any]]:
-    output: list[dict[str, Any]] = []
-    for control in semantic_field.get("controls") or []:
-        if str(control.get("name") or "").endswith("_qualifier"):
-            continue
-        if control.get("field_kind") == "option":
-            continue
-        output.append(control)
-    return output
-
-
-def _primary_control(
-    semantic_field: dict[str, Any],
-    controls: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    key = str(semantic_field.get("attribute_key") or "")
-    for control in controls:
-        if key and str(control.get("id") or "") == key:
-            return control
-    return controls[0] if controls else None
-
-
-def _live_base_family(
-    control: dict[str, Any] | None,
-    controls: list[dict[str, Any]],
-) -> str:
-    if not control:
-        return "unsupported"
-    if is_radio_group(controls):
-        return "selection"
-    kind = str(control.get("field_kind") or "").casefold()
-    if kind in _BOOLEAN_KINDS:
-        return "boolean"
-    if is_numeric_control(control):
-        return "numeric"
-    if kind in _SELECT_KINDS:
-        return "selection"
-    if kind in {"textarea", "contenteditable"}:
-        return "long_text"
-    if kind in _TEXT_KINDS:
-        return "text"
-    return "unsupported"
-
-
 def execution_contract(
     semantic_field: dict[str, Any],
     answer: Any | None = None,
 ) -> FieldExecutionContract:
-    controls = _value_controls(semantic_field)
-    primary = _primary_control(semantic_field, controls)
-    base = _live_base_family(primary, controls)
+    """Expose the historical engine shape without re-deriving field mechanics."""
+    canonical = canonical_execution_contract(semantic_field)
     values = list(getattr(answer, "answer_values", None) or []) if answer is not None else []
-    multi = bool(semantic_field.get("multi_value")) or len(values) > 1
-    qualifier = bool(qualifier_controls(semantic_field))
+    multi = bool(canonical["multi_value"]) or len(values) > 1
+    qualifier = canonical["qualifier_mode"] == "selectable"
     suffixes: list[str] = []
     if multi:
         suffixes.append("multi")
     if qualifier:
         suffixes.append("qualified")
+    base = str(canonical["family"])
     live_family = "_".join([base, *suffixes]) if suffixes else base
     schema_family = str(
         semantic_field.get("schema_execution_family")
         or semantic_field.get("execution_family")
         or ""
     )
-    supported = base != "unsupported"
-    reason = "" if supported else "live semantic field has no supported writable control family"
     return FieldExecutionContract(
         live_family=live_family,
         schema_family=schema_family,
-        value_control_count=len(controls),
+        value_control_count=int(canonical["value_control_count"]),
         multi_value=multi,
         qualifier=qualifier,
-        supported=supported,
-        reason=reason,
+        supported=bool(canonical["supported"]),
+        reason=str(canonical["reason"] or ""),
     )
 
 
@@ -209,8 +150,6 @@ def _boolean_target(value: object) -> bool:
 
 
 def _commit_value(locator: Any, *, dispatch_value_events: bool) -> None:
-    """Finish one live-control mutation using Makro's browser event contract."""
-
     if dispatch_value_events:
         dispatch = getattr(locator, "dispatch_event", None)
         if callable(dispatch):
@@ -262,14 +201,7 @@ def _custom_live_options(
     page: Any,
     fallback: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Read the currently visible popup domain after opening a custom select.
-
-    Makro rebuilds dependent dropdowns when a qualifier changes. Scan-time option
-    metadata can therefore be stale even after the control itself has been rebound.
-    The final mutation boundary must authorize the value against the popup that is
-    actually visible now, exactly as native ``select`` already does.
-    """
-
+    """Read the currently visible popup domain after opening a custom select."""
     evaluate = getattr(page, "evaluate", None)
     if not callable(evaluate):
         return [dict(item) for item in (fallback or [])]
