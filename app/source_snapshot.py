@@ -165,26 +165,53 @@ def capture_page_snapshot(
     *,
     requested_url: str,
     max_visible_text_chars: int = 120_000,
+    page_state_provider: Any | None = None,
+    page_state_screenshot_path: str | Path | None = None,
 ) -> SourceSnapshot:
-    """Mechanically capture raw product-page evidence without interpreting it.
+    """Mechanically capture product evidence after AI judges the current UI state.
 
-    Human verification/login is a recoverable browser lifecycle state, not a bad
-    product. A conservative benign-modal close is attempted first; security/login
-    dialogs are never clicked through or solved by automation.
+    Python collects a bounded fresh browser observation and validates the AI JSON
+    contract. It does not infer captcha/login/access state from URL/text/class-name
+    keywords and it never attempts to solve a human verification challenge.
     """
 
     from .source_interaction import (
         ACCESS_DENIED,
-        RECOVERABLE_INTERACTIONS,
+        LOADING,
+        PARTIAL_UNKNOWN,
         classify_source_page_state,
-        dismiss_ordinary_source_popup,
     )
 
-    if dismiss_ordinary_source_popup(page):
+    state_screenshot = Path(page_state_screenshot_path) if page_state_screenshot_path else None
+    if state_screenshot is not None:
         try:
-            page.wait_for_timeout(180)
+            state_screenshot.parent.mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(state_screenshot), full_page=False)
         except Exception:
-            pass
+            try:
+                if state_screenshot.exists():
+                    state_screenshot.unlink()
+            except OSError:
+                pass
+
+    page_state = classify_source_page_state(
+        page,
+        provider=page_state_provider,
+        screenshot_path=state_screenshot,
+    )
+    if page_state.requires_user:
+        raise SourceInteractionRequired(
+            page_state.state,
+            page_state.reason,
+            observed_url=page_state.observed_url,
+            title=page_state.title,
+        )
+    if page_state.state == ACCESS_DENIED:
+        raise SourceAccessBlocked(page_state.reason)
+    if page_state.state in {LOADING, PARTIAL_UNKNOWN}:
+        raise SourceCaptureError(
+            f"supplier page state is not capture-ready ({page_state.state}): {page_state.reason}"
+        )
 
     payload = page.evaluate(
         r"""() => {
@@ -306,33 +333,7 @@ def capture_page_snapshot(
             pushImage(img.currentSrc || img.src || img.getAttribute('data-src') || img.getAttribute('data-lazy-src'));
           });
 
-          const visibleFrames = [...document.querySelectorAll('iframe')].filter(visible);
-          const challengePattern = /(captcha|nocaptcha|challenge|verify|verification|security|secdev|slider|滑块|验证)/i;
-          const loginPattern = /(login|signin|passport|登录)/i;
-          const challengeVisible = visibleFrames.some((frame) => challengePattern.test(
-            `${frame.src || ''} ${frame.id || ''} ${frame.name || ''} ${frame.className || ''}`
-          )) || [...document.querySelectorAll('[id],[class],[data-testid]')].filter(visible).slice(0, 1200).some((el) => {
-            const markerText = `${el.id || ''} ${el.className || ''} ${el.getAttribute('data-testid') || ''}`;
-            return challengePattern.test(markerText);
-          });
-          const passwordVisible = [...document.querySelectorAll('input[type="password"]')].some(visible);
-          const loginVisible = [...document.querySelectorAll('form,[role="dialog"],iframe')].filter(visible).some((el) => {
-            const markerText = `${el.id || ''} ${el.className || ''} ${el.getAttribute?.('name') || ''} ${el.getAttribute?.('src') || ''}`;
-            const text = clean(el.innerText || el.textContent || '');
-            return loginPattern.test(markerText) && /(登录|sign\s*in|log\s*in|password|密码)/i.test(text + ' ' + markerText);
-          });
-          const dialogs = [...document.querySelectorAll('[role="dialog"],[aria-modal="true"]')].filter(visible);
-          const ordinaryPopupVisible = dialogs.some((dialog) => {
-            const text = clean(dialog.innerText || dialog.textContent);
-            if (/(captcha|verify|安全验证|人机验证|滑块|验证码|请登录|登录后继续|sign\s*in|log\s*in)/i.test(text)) return false;
-            return [...dialog.querySelectorAll('button,[role="button"],[aria-label],[title]')].filter(visible).some((candidate) => {
-              const label = clean(candidate.getAttribute('aria-label') || candidate.getAttribute('title') || candidate.innerText || candidate.textContent);
-              return /^(×|x|close|关闭|稍后再说|not now)$/i.test(label);
-            });
-          });
           const bodyText = String(document.body?.innerText || '');
-          const accessDeniedVisible = bodyText.length < 5000 && /(access denied|403 forbidden|访问被拒绝|无权访问|请求被拦截)/i.test(bodyText);
-
           const meta = {};
           for (const selector of [
             ['description', 'meta[name="description"]'],
@@ -352,35 +353,11 @@ def capture_page_snapshot(
             embedded_data: embedded,
             image_urls: imageUrls.slice(0, 24),
             meta,
-            interaction_hints: {
-              ready_state: document.readyState,
-              challenge_visible: challengeVisible,
-              password_visible: passwordVisible,
-              login_visible: loginVisible,
-              ordinary_popup_visible: ordinaryPopupVisible,
-              access_denied_visible: accessDeniedVisible,
-            },
           };
         }"""
     )
 
     visible_text = str(payload.get("visible_text") or "")
-    page_state = classify_source_page_state(
-        url=str(page.url or ""),
-        title=payload.get("title"),
-        visible_text=visible_text,
-        hints=payload.get("interaction_hints") if isinstance(payload, dict) else {},
-    )
-    if page_state.state in RECOVERABLE_INTERACTIONS:
-        raise SourceInteractionRequired(
-            page_state.state,
-            page_state.reason,
-            observed_url=page_state.observed_url,
-            title=page_state.title,
-        )
-    if page_state.state == ACCESS_DENIED:
-        raise SourceAccessBlocked(page_state.reason)
-
     warnings: list[str] = []
     if len(visible_text) > max_visible_text_chars:
         warnings.append(
@@ -401,6 +378,11 @@ def capture_page_snapshot(
             seen_urls.add(value)
             image_urls.append(value)
 
+    meta = {str(k): _clean_text(v) for k, v in (payload.get("meta") or {}).items()}
+    meta["page_state"] = page_state.state
+    meta["page_state_confidence"] = f"{page_state.confidence:.4f}"
+    meta["page_state_reason"] = _clean_text(page_state.reason)[:1200]
+
     return SourceSnapshot(
         requested_url=requested_url,
         final_url=str(page.url),
@@ -411,6 +393,6 @@ def capture_page_snapshot(
         json_ld=list(payload.get("json_ld") or []),
         embedded_data=embedded_data,
         image_urls=image_urls[:24],
-        meta={str(k): _clean_text(v) for k, v in (payload.get("meta") or {}).items()},
+        meta=meta,
         warnings=warnings,
     )
