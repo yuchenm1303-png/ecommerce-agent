@@ -15,7 +15,7 @@ from typing import Any, Callable
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import QBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QWidget
 
-from app.update_browser_gate import DEFAULT_CDP_PORT, close_managed_browser
+from app.update_browser_gate import close_managed_browser
 from app.velopack_runtime import (
     check_update_route,
     create_update_manager,
@@ -483,6 +483,23 @@ class ApplicationUpdater(QObject):
                 )
                 return
 
+        browser_port = 0
+        if browser_manager is not None:
+            try:
+                browser_port = int(getattr(browser_manager, "port", 0) or 0)
+            except (TypeError, ValueError):
+                browser_port = 0
+            if not 1 <= browser_port <= 65535:
+                self._resume_browser_manager()
+                self._last_prompted_version = None
+                self._schedule_check_retry()
+                self._show_message(
+                    QMessageBox.Icon.Warning,
+                    "无法确认当前 Makro Browser 的实例端口。",
+                    informative="为避免关闭另一个 Listing Studio 实例的浏览器，本次更新已取消。",
+                )
+                return
+
         summary = update_summary(info)
         actual = str(summary.get("version") or "").strip().lstrip("v")
         if actual != target_version:
@@ -528,13 +545,14 @@ class ApplicationUpdater(QObject):
                     if not ready:
                         raise RuntimeError(str(reason or "Makro Browser 更新冻结没有完成。"))
 
-                self._update_stage.emit("正在关闭 Makro Browser，释放更新文件…", True)
-                closed = close_managed_browser(
-                    port=DEFAULT_CDP_PORT,
-                    progress=lambda text: self._update_stage.emit(str(text), True),
-                )
-                if not closed.ok:
-                    raise RuntimeError(closed.detail or "无法安全关闭 Makro Browser。")
+                if browser_manager is not None:
+                    self._update_stage.emit("正在关闭 Makro Browser，释放更新文件…", True)
+                    closed = close_managed_browser(
+                        port=browser_port,
+                        progress=lambda text: self._update_stage.emit(str(text), True),
+                    )
+                    if not closed.ok:
+                        raise RuntimeError(closed.detail or "无法安全关闭 Makro Browser。")
 
                 self._update_stage.emit("后台任务已经停止。正在准备切换到新版本…", True)
                 self._update_finished.emit({"ok": True, "version": target_version})

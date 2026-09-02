@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from app.browser_instance import managed_makro_cdp_port
 from app.cdp_automation_health import clear_cdp_poison
 from app.channel_accounts import ChannelAccount, ChannelAccountStore
 from app.update_browser_gate import close_managed_browser
@@ -15,27 +16,30 @@ from .browser_session_manager import ManagedMakroBrowser
 
 
 class AccountBoundMakroBrowser(ManagedMakroBrowser):
-    """Bind the one managed Makro Edge generation to an explicit channel account.
+    """Bind one managed Makro Edge generation to one runtime/account namespace.
 
     The existing Single/Batch CDP architecture remains the execution owner. This
-    class only selects which persisted Edge profile that architecture is allowed
-    to use and prevents a signed-in Listing Studio account from silently reusing
-    another account's marketplace session.
+    class selects both the runtime-root-specific CDP transport and the persisted
+    account profile, preventing two Listing Studio copies from recovering/closing
+    the same browser generation and preventing marketplace-session cross-account
+    reuse inside one copy.
     """
 
     _CHANNEL = "makro"
 
     def __init__(self, window: Any) -> None:
+        project_root = Path(window.project_root).resolve()
+        managed_port = managed_makro_cdp_port(project_root)
         self._account_scope_id = self._current_scope_id(window)
         self.channel_accounts = ChannelAccountStore(
-            Path(window.project_root),
+            project_root,
             scope_id=self._account_scope_id,
         )
         self.channel_account = self.channel_accounts.active_account(self._CHANNEL)
         self._desired_profile_dir = self.channel_accounts.profile_dir(self.channel_account)
         self._runtime_identity = self.channel_accounts.runtime_identity(self.channel_account)
         self._runtime_marker = (
-            Path(window.project_root).resolve()
+            project_root
             / "channel_accounts"
             / "managed_makro_browser.json"
         )
@@ -43,10 +47,24 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
         self._account_selection_lock = threading.Lock()
         self._pending_channel_account: ChannelAccount | None = None
 
-        super().__init__(window)
+        self._sync_managed_port_controls(window, managed_port)
+        super().__init__(window, port=managed_port)
         # ManagedMakroBrowser schedules its first warm-up with QTimer.singleShot(0),
         # so the account-bound profile is committed before lifecycle I/O can run.
         self.profile_dir = self._desired_profile_dir
+
+    @staticmethod
+    def _sync_managed_port_controls(window: Any, port: int) -> None:
+        """Make every GUI task producer use this manager's isolated CDP port."""
+
+        single_port = getattr(window, "makro_port", None)
+        if single_port is not None and callable(getattr(single_port, "setValue", None)):
+            single_port.setValue(int(port))
+
+        batch_workspace = getattr(window, "batch_workspace", None)
+        batch_port = getattr(batch_workspace, "makro_port", None)
+        if batch_port is not None and callable(getattr(batch_port, "setValue", None)):
+            batch_port.setValue(int(port))
 
     @staticmethod
     def _current_scope_id(window: Any) -> str:
@@ -152,10 +170,11 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
 
     def _write_runtime_identity(self) -> None:
         payload = {
-            "version": 1,
+            "version": 2,
             "identity": self._runtime_identity,
             "channel": self.channel_account.channel,
             "account_id": self.channel_account.account_id,
+            "cdp_port": self.port,
         }
         self._runtime_marker.parent.mkdir(parents=True, exist_ok=True)
         temp = self._runtime_marker.with_name(
