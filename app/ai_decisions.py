@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 from .business_fields import is_business_question
 from .evidence_contract import ProductIdentity, assert_identity_compatible
+from .live_field_contract import execution_contract
 from .semantic_grounding import GroundingCatalog, load_grounding_manifest
 from .source_bundle import normalize_key
 
@@ -47,29 +48,10 @@ def _clean_options(items: Iterable[object]) -> list[str]:
 
 
 def field_options(field: dict[str, Any]) -> list[str]:
-    """Return only executable value options, never qualifier/unit options.
-
-    Raw Makro semantic fields keep a convenience aggregate ``field.options``.
-    For numeric+unit controls that aggregate can contain only the qualifier
-    selector (cm/kg/...), which is not a legal value option. Prefer options from
-    non-qualifier controls. If live controls prove this is a value input plus a
-    qualifier control and the value input has no options, return no value options
-    instead of falling back to the polluted aggregate list.
-
-    This deliberately mirrors the live-schema contract so planning, field ids,
-    required fallbacks and production hard guards all interpret the same field
-    shape.
-    """
-
-    controls = [
-        control
-        for control in field.get("controls") or []
-        if isinstance(control, dict)
-    ]
+    controls = [control for control in field.get("controls") or [] if isinstance(control, dict)]
     output: list[str] = []
     seen: set[str] = set()
     has_qualifier_control = False
-
     for control in controls:
         if str(control.get("name") or "").endswith("_qualifier"):
             has_qualifier_control = True
@@ -79,7 +61,6 @@ def field_options(field: dict[str, Any]) -> list[str]:
             if key not in seen:
                 seen.add(key)
                 output.append(value)
-
     if output:
         return output
     if controls and has_qualifier_control:
@@ -112,14 +93,16 @@ def field_contract(field: dict[str, Any]) -> dict[str, Any]:
         "qualifier_options": field_qualifier_options(field),
         "help_text": str(field.get("help_text") or "").strip(),
         "context_text": str(field.get("context_text") or "").strip(),
+        "execution_contract": execution_contract(field),
     }
 
 
 def field_id(field: dict[str, Any]) -> str:
-    # Context text is useful to the AI (for fixed units and nearby UI wording),
-    # but it is presentation context rather than the stable field address.
+    # Field id is a stable address. Mechanical execution shape belongs to schema
+    # binding/drift, not to the address itself, so control changes never rename a field.
     payload = field_contract(field)
     payload.pop("context_text", None)
+    payload.pop("execution_contract", None)
     payload["section_heading"] = _stable_section(payload["section_heading"])
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return "mf_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
@@ -146,8 +129,6 @@ def schema_digest(fields: Iterable[dict[str, Any]]) -> str:
 
 
 def source_manifest_digest(grounding: GroundingCatalog) -> str:
-    # Source ordering is transport/presentation detail, never product identity.
-    # Make the fingerprint content-addressed so equivalent source sets are stable.
     payload = sorted(
         (
             {
@@ -246,10 +227,7 @@ class FieldDecision:
         raw_citations = payload.get("citations") or []
         raw_alternatives = payload.get("alternatives") or []
         raw_queries = payload.get("search_queries") or []
-        if not all(
-            isinstance(item, list)
-            for item in (raw_values, raw_citations, raw_alternatives, raw_queries)
-        ):
+        if not all(isinstance(item, list) for item in (raw_values, raw_citations, raw_alternatives, raw_queries)):
             raise AIDecisionError(
                 f"decisions[{index}] 的 values/citations/alternatives/search_queries 必须是数组。"
             )
@@ -277,18 +255,12 @@ class FieldDecision:
             qualifier=str(payload.get("qualifier") or "").strip(),
             confidence=confidence,
             citations=[
-                DecisionCitation.from_mapping(
-                    item,
-                    where=f"decisions[{index}].citations[{citation_index}]",
-                )
+                DecisionCitation.from_mapping(item, where=f"decisions[{index}].citations[{citation_index}]")
                 for citation_index, item in enumerate(raw_citations, start=1)
                 if isinstance(item, dict)
             ],
             alternatives=[
-                DecisionAlternative.from_mapping(
-                    item,
-                    where=f"decisions[{index}].alternatives[{alt_index}]",
-                )
+                DecisionAlternative.from_mapping(item, where=f"decisions[{index}].alternatives[{alt_index}]")
                 for alt_index, item in enumerate(raw_alternatives, start=1)
                 if isinstance(item, dict)
             ],
@@ -377,38 +349,21 @@ def _validated_citations(
     warnings: list[str],
     field_identifier: str,
 ) -> list[DecisionCitation]:
-    """Validate provenance addresses only; never re-judge AI semantics in Python.
-
-    The AI is responsible for deciding whether a cited source supports a claim.
-    Python only verifies that the cited local source exists, or that a Web source
-    was actually persisted from the current search call. Paraphrases are valid
-    evidence text and are not required to be a literal substring of source text.
-    """
-
     output: list[DecisionCitation] = []
     seen: set[tuple[str, str]] = set()
     for citation in citations:
         reference = citation.source_reference.strip()
-        # Models often copy the visual ``[source-id]`` delimiter from compact
-        # evidence. Brackets are presentation, not part of the provenance ID.
         if reference.startswith("[") and reference.endswith("]"):
             reference = reference[1:-1].strip()
         valid = grounding.by_id(reference) is not None or reference in external_sources
         if not valid:
-            warnings.append(
-                f"{field_identifier}: unknown citation source_reference {reference!r} dropped"
-            )
+            warnings.append(f"{field_identifier}: unknown citation source_reference {reference!r} dropped")
             continue
         fingerprint = (reference, _normalize_ws(citation.evidence_text))
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
-        output.append(
-            DecisionCitation(
-                source_reference=reference,
-                evidence_text=citation.evidence_text,
-            )
-        )
+        output.append(DecisionCitation(source_reference=reference, evidence_text=citation.evidence_text))
     return output
 
 
@@ -430,16 +385,6 @@ def validate_ai_decision_packet(
     expected_identity: ProductIdentity = ProductIdentity(),
     external_sources: dict[str, str] | None = None,
 ) -> AIDecisionPacket:
-    """Rebind AI output using only deterministic, field-local execution boundaries.
-
-    Product identity interpretation, evidence sufficiency, negative claims,
-    dimensional axes, scope and every other product semantic belong to AI.
-    Schema/source digests are audit/cache fingerprints only: drift is recorded as
-    a warning and can never veto the whole product. Python validates concrete
-    field addresses, provenance addresses, business locks and packet structure;
-    any unbound field/citation is isolated to that field.
-    """
-
     field_list = list(fields)
     by_id = indexed_fields(field_list)
     expected_schema = schema_digest(field_list)
@@ -469,9 +414,9 @@ def validate_ai_decision_packet(
             raise AIDecisionError(f"AI decision field_id 重复：{decision.field_id}")
 
         target = by_id[decision.field_id]
-        locked = is_business_question(
-            str(target.get("attribute_key") or "")
-        ) or is_business_question(str(target.get("label") or ""))
+        locked = is_business_question(str(target.get("attribute_key") or "")) or is_business_question(
+            str(target.get("label") or "")
+        )
         if locked:
             decision.status = BUSINESS_LOCKED
             decision.values = []
@@ -479,10 +424,7 @@ def validate_ai_decision_packet(
             decision.citations = []
             decision.alternatives = []
             decision.search_queries = []
-            decision.reason = (
-                decision.reason
-                or "seller-operated field; requires explicit business data"
-            )
+            decision.reason = decision.reason or "seller-operated field; requires explicit business data"
             observed[decision.field_id] = decision
             continue
 
@@ -515,8 +457,7 @@ def validate_ai_decision_packet(
 
         if decision.status == READY:
             meaningful_values = bool(decision.values) and all(
-                re.search(r"[\w\d]", value, flags=re.UNICODE)
-                for value in decision.values
+                re.search(r"[\w\d]", value, flags=re.UNICODE) for value in decision.values
             )
             if not meaningful_values or not decision.citations:
                 warnings.append(
@@ -525,14 +466,9 @@ def validate_ai_decision_packet(
                 _set_missing(decision, decision.reason or "READY lacked executable value/provenance")
         elif decision.status == CONFLICT:
             usable = [alt for alt in decision.alternatives if alt.values and alt.citations]
-            distinct = {
-                tuple(normalize_key(value) for value in alternative.values)
-                for alternative in usable
-            }
+            distinct = {tuple(normalize_key(value) for value in alternative.values) for alternative in usable}
             if len(distinct) < 2:
-                warnings.append(
-                    f"{decision.field_id}: malformed CONFLICT converted to MISSING"
-                )
+                warnings.append(f"{decision.field_id}: malformed CONFLICT converted to MISSING")
                 _set_missing(decision, decision.reason or "CONFLICT lacked two grounded alternatives")
         elif decision.status == REVIEW:
             if not decision.values or not decision.citations:
@@ -548,18 +484,16 @@ def validate_ai_decision_packet(
     for identifier, target in by_id.items():
         if identifier in observed:
             continue
-        locked = is_business_question(
-            str(target.get("attribute_key") or "")
-        ) or is_business_question(str(target.get("label") or ""))
+        locked = is_business_question(str(target.get("attribute_key") or "")) or is_business_question(
+            str(target.get("label") or "")
+        )
         status = BUSINESS_LOCKED if locked else MISSING
         observed[identifier] = FieldDecision(
             field_id=identifier,
             status=status,
             reason="seller-operated field" if locked else "AI stage omitted this target field",
         )
-        warnings.append(
-            f"AI stage omitted field_id={identifier}; synthesized status={status}"
-        )
+        warnings.append(f"AI stage omitted field_id={identifier}; synthesized status={status}")
 
     return AIDecisionPacket(
         identity=packet.identity,
@@ -575,10 +509,7 @@ def validate_ai_decision_packet(
 def write_ai_decision_packet(packet: AIDecisionPacket, path: str | Path) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(packet.as_dict(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    target.write_text(json.dumps(packet.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
     return target
 
 
@@ -605,15 +536,6 @@ def _resolver_grounding_for_packet(
     packet_path: Path,
     fallback: GroundingCatalog,
 ) -> tuple[GroundingCatalog, str]:
-    """Prefer the exact Resolver source universe that produced the AI packet.
-
-    Resolver writes ``ai-decisions.json`` and ``source-manifest.json`` as one
-    artifact set. Downstream consumers must replay that immutable source address
-    space instead of rebuilding the product from snapshots/images. Missing or
-    damaged legacy manifests degrade to the caller's mechanical fallback and are
-    recorded; they never become a semantic reason to reject the whole product.
-    """
-
     manifest_path = packet_path.resolve().with_name("source-manifest.json")
     if not manifest_path.is_file():
         return (
@@ -641,10 +563,7 @@ def load_ai_decision_packet(
     packet_path = Path(path)
     payload = json.loads(packet_path.read_text(encoding="utf-8"))
     packet = AIDecisionPacket.from_mapping(payload)
-    effective_grounding, binding_warning = _resolver_grounding_for_packet(
-        packet_path,
-        grounding,
-    )
+    effective_grounding, binding_warning = _resolver_grounding_for_packet(packet_path, grounding)
     if binding_warning:
         packet.warnings.append(binding_warning)
     return validate_ai_decision_packet(
