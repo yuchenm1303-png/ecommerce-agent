@@ -314,37 +314,51 @@ def classify_source_page_state(
 ) -> SourcePageState:
     """Classify the fresh current page with AI; Python only captures and validates."""
 
-    observation = _mechanical_page_observation(page)
     effective_provider = provider or current_source_page_state_provider()
-    if effective_provider is None:
-        return SourcePageState(
-            state=PRODUCT_READY,
-            reason="page-state AI provider not configured; semantic blocker classification skipped",
-            observed_url=_clean(observation.get("url"), limit=4000),
-            title=_clean(observation.get("title"), limit=1000),
-            confidence=0.0,
-            evidence_refs=("page-observation",),
-        )
-
-    screenshot_source: str | Path | None = screenshot_path
-    if screenshot_source is None:
-        screenshot_source = _viewport_jpeg_data_uri(page)
-    request = build_source_page_state_request(
-        observation,
-        screenshot_path=screenshot_source,
-    )
-    allowed_refs = {
-        str(item.get("source_id") or "")
-        for item in request.get("grounded_sources") or []
-        if str(item.get("source_id") or "")
-    }
     try:
-        raw = effective_provider.extract_json(request)
-    except Exception as exc:
-        raise SourcePageStateDecisionError(
-            f"page-state AI decision failed: {type(exc).__name__}: {exc}"
-        ) from exc
-    return _parse_page_state(raw, observation=observation, allowed_refs=allowed_refs)
+        from .browser_visual_hud import set_browser_visual_hud_capture_safe
+
+        set_browser_visual_hud_capture_safe(page, True)
+    except Exception:
+        set_browser_visual_hud_capture_safe = None  # type: ignore[assignment]
+
+    try:
+        observation = _mechanical_page_observation(page)
+        if effective_provider is None:
+            return SourcePageState(
+                state=PRODUCT_READY,
+                reason="page-state AI provider not configured; semantic blocker classification skipped",
+                observed_url=_clean(observation.get("url"), limit=4000),
+                title=_clean(observation.get("title"), limit=1000),
+                confidence=0.0,
+                evidence_refs=("page-observation",),
+            )
+
+        screenshot_source: str | Path | None = screenshot_path
+        if screenshot_source is None:
+            screenshot_source = _viewport_jpeg_data_uri(page)
+        request = build_source_page_state_request(
+            observation,
+            screenshot_path=screenshot_source,
+        )
+        allowed_refs = {
+            str(item.get("source_id") or "")
+            for item in request.get("grounded_sources") or []
+            if str(item.get("source_id") or "")
+        }
+        try:
+            raw = effective_provider.extract_json(request)
+        except Exception as exc:
+            raise SourcePageStateDecisionError(
+                f"page-state AI decision failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        return _parse_page_state(raw, observation=observation, allowed_refs=allowed_refs)
+    finally:
+        if set_browser_visual_hud_capture_safe is not None:
+            try:
+                set_browser_visual_hud_capture_safe(page, False)
+            except Exception:
+                pass
 
 
 __all__ = [
