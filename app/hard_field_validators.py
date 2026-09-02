@@ -93,6 +93,11 @@ def _numeric_validation(contract: dict[str, Any], answer: ResolvedAnswer) -> Fie
         return FieldValidationResult(True)
     minimum = _float(contract["min"]) if contract["min"] else None
     maximum = _float(contract["max"]) if contract["max"] else None
+    step_text = str(contract["step"] or "").strip().casefold()
+    step = None if step_text in {"", "any"} else _float(step_text)
+    if step_text not in {"", "any"} and (step is None or step <= 0):
+        return FieldValidationResult(False, f"当前 numeric live contract 的 step={contract['step']!r} 无效。")
+
     for raw in answer.answer_values:
         number = _float(raw)
         if number is None:
@@ -101,6 +106,14 @@ def _numeric_validation(contract: dict[str, Any], answer: ResolvedAnswer) -> Fie
             return FieldValidationResult(False, f"数值 {number:g} 小于字段最小值 {minimum:g}。")
         if maximum is not None and number > maximum:
             return FieldValidationResult(False, f"数值 {number:g} 大于字段最大值 {maximum:g}。")
+        if step is not None:
+            base = minimum if minimum is not None else 0.0
+            ratio = (number - base) / step
+            if not math.isclose(ratio, round(ratio), rel_tol=1e-9, abs_tol=1e-9):
+                return FieldValidationResult(
+                    False,
+                    f"数值 {number:g} 不符合字段 step={step:g}（base={base:g}）。",
+                )
     return FieldValidationResult(True)
 
 
