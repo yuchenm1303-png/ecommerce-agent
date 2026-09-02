@@ -4,7 +4,7 @@ import re
 from typing import Any, Iterable
 
 
-LIVE_FIELD_CONTRACT_VERSION = 2
+LIVE_FIELD_CONTRACT_VERSION = 3
 
 _TEXT_KINDS = {"input", "custom_textbox", "custom_searchbox"}
 _LONG_TEXT_KINDS = {"textarea", "contenteditable"}
@@ -196,17 +196,6 @@ def _qualifier_options(field: dict[str, Any], controls: list[dict[str, Any]]) ->
     return _clean_options(field.get("qualifier_options") or [])
 
 
-def _closed_domain(controls: list[dict[str, Any]], options: list[str]) -> bool:
-    if not controls:
-        return bool(options)
-    kinds = [str(control.get("field_kind") or "").casefold() for control in controls]
-    if all(kind in _RADIO_KINDS for kind in kinds):
-        return True
-    if all(kind == "select" for kind in kinds):
-        return True
-    return any(bool(control.get("options")) for control in controls)
-
-
 def _constraint_text(control: dict[str, Any] | None, key: str) -> str:
     if control is None or control.get(key) in (None, ""):
         return ""
@@ -237,7 +226,6 @@ def _safe_nonnegative_int(value: object) -> int:
 def _normalize_persisted(raw: dict[str, Any]) -> dict[str, Any]:
     family = str(raw.get("family") or "unsupported").casefold()
     qualifier_mode = str(raw.get("qualifier_mode") or "none").casefold()
-    options = _clean_options(raw.get("options") or [])
     return {
         "version": LIVE_FIELD_CONTRACT_VERSION,
         "family": family if family in {"numeric", "text", "long_text", "selection", "boolean", "unsupported"} else "unsupported",
@@ -246,7 +234,7 @@ def _normalize_persisted(raw: dict[str, Any]) -> dict[str, Any]:
         "closed_domain": bool(raw.get("closed_domain")),
         "qualifier_mode": qualifier_mode if qualifier_mode in {"none", "selectable", "fixed", "inline"} else "none",
         "fixed_unit": str(raw.get("fixed_unit") or "").strip(),
-        "options": options,
+        "options": _clean_options(raw.get("options") or []),
         "qualifier_options": _clean_options(raw.get("qualifier_options") or []),
         "min": str(raw.get("min") or "").strip(),
         "max": str(raw.get("max") or "").strip(),
@@ -284,12 +272,20 @@ def execution_contract(field: dict[str, Any]) -> dict[str, Any]:
         else "none"
     )
     supported = family != "unsupported"
+    if family == "selection" and not options:
+        supported = False
+        reason = "selection field has no captured enabled executable options"
+    elif qualifier_mode == "selectable" and not _qualifier_options(field, qcontrols):
+        supported = False
+        reason = "qualifier control has no captured enabled executable options"
+    else:
+        reason = "" if supported else "live field has no supported writable control family"
     return {
         "version": LIVE_FIELD_CONTRACT_VERSION,
         "family": family,
         "value_control_count": len(controls),
         "multi_value": _multi_value(field, controls),
-        "closed_domain": family == "selection" and _closed_domain(controls, options),
+        "closed_domain": family == "selection",
         "qualifier_mode": qualifier_mode,
         "fixed_unit": fixed_unit,
         "options": options,
@@ -299,7 +295,7 @@ def execution_contract(field: dict[str, Any]) -> dict[str, Any]:
         "step": _constraint_text(primary, "step"),
         "maxlength": _constraint_int(primary, "maxlength"),
         "supported": supported,
-        "reason": "" if supported else "live field has no supported writable control family",
+        "reason": reason,
     }
 
 
@@ -325,10 +321,19 @@ def contract_signature(field: dict[str, Any]) -> tuple[object, ...]:
 
 def validate_qualifier(field: dict[str, Any], qualifier: object) -> str | None:
     expected = str(qualifier or "").strip()
-    if not expected:
-        return None
     contract = execution_contract(field)
     mode = contract["qualifier_mode"]
+    if mode == "selectable":
+        options = contract["qualifier_options"]
+        if not options:
+            return "当前 qualifier control 没有 captured enabled executable option；未执行写入。"
+        if not expected:
+            return "当前 live field 需要显式 qualifier，但答案没有 qualifier；未执行写入。"
+        if _norm(expected) not in {_norm(value) for value in options}:
+            return f"qualifier {expected!r} 不属于当前 enabled live qualifier options。"
+        return None
+    if not expected:
+        return None
     if mode == "inline":
         return None
     if mode == "none":
@@ -338,10 +343,7 @@ def validate_qualifier(field: dict[str, Any], qualifier: object) -> str | None:
         if not units_equivalent(expected, fixed):
             return f"答案单位与页面固定单位冲突；未执行写入：answer_qualifier={expected!r}, fixed_unit={fixed!r}。"
         return None
-    options = contract["qualifier_options"]
-    if options and _norm(expected) not in {_norm(value) for value in options}:
-        return f"qualifier {expected!r} 不属于当前 enabled live qualifier options。"
-    return None
+    return "未知 qualifier execution contract；未执行写入。"
 
 
 __all__ = [
