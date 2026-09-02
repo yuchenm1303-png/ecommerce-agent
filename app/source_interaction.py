@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import contextvars
 import json
 import re
 from dataclasses import dataclass
@@ -27,6 +29,7 @@ PAGE_STATES = {
 RECOVERABLE_INTERACTIONS = {HUMAN_CHALLENGE, LOGIN_REQUIRED, ORDINARY_POPUP}
 SOURCE_INTERACTION_EXIT_CODE = 75
 SOURCE_OUTCOME_FILENAME = "source-outcome.json"
+_CANONICAL_JPEG_DATA_URI_PREFIX = "data:image/jpeg;base64,"
 
 
 class JSONTaskProvider(Protocol):
@@ -34,6 +37,12 @@ class JSONTaskProvider(Protocol):
 
     def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
         ...
+
+
+_PAGE_STATE_PROVIDER: contextvars.ContextVar[JSONTaskProvider | None] = contextvars.ContextVar(
+    "source_page_state_provider",
+    default=None,
+)
 
 
 class SourcePageStateDecisionError(RuntimeError):
@@ -54,6 +63,16 @@ class SourcePageState:
     @property
     def requires_user(self) -> bool:
         return self.state in RECOVERABLE_INTERACTIONS
+
+
+def configure_source_page_state_provider(provider: JSONTaskProvider | None) -> None:
+    """Bind the semantic observer for the current worker/process context."""
+
+    _PAGE_STATE_PROVIDER.set(provider)
+
+
+def current_source_page_state_provider() -> JSONTaskProvider | None:
+    return _PAGE_STATE_PROVIDER.get()
 
 
 def _clean(value: object, *, limit: int = 4000) -> str:
@@ -146,6 +165,16 @@ def _mechanical_page_observation(page: Any) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _viewport_jpeg_data_uri(page: Any) -> str:
+    try:
+        body = page.screenshot(type="jpeg", quality=72, full_page=False)
+    except Exception:
+        return ""
+    if not isinstance(body, (bytes, bytearray)) or not body:
+        return ""
+    return _CANONICAL_JPEG_DATA_URI_PREFIX + base64.b64encode(bytes(body)).decode("ascii")
+
+
 def build_source_page_state_request(
     observation: dict[str, Any],
     *,
@@ -169,14 +198,15 @@ def build_source_page_state_request(
             )[:52000],
         }
     ]
-    image = Path(screenshot_path) if screenshot_path else None
-    if image is not None and image.is_file():
+    screenshot_value = str(screenshot_path or "").strip()
+    image = None if screenshot_value.startswith(_CANONICAL_JPEG_DATA_URI_PREFIX) else Path(screenshot_value) if screenshot_value else None
+    if screenshot_value.startswith(_CANONICAL_JPEG_DATA_URI_PREFIX) or (image is not None and image.is_file()):
         sources.append(
             {
                 "source_id": "page-screenshot",
                 "source_type": "current_browser_viewport",
                 "kind": "image",
-                "image_path": str(image),
+                "image_path": screenshot_value,
             }
         )
     allowed_refs = [str(item["source_id"]) for item in sources]
@@ -279,13 +309,14 @@ def _parse_page_state(
 def classify_source_page_state(
     page: Any,
     *,
-    provider: JSONTaskProvider | None,
+    provider: JSONTaskProvider | None = None,
     screenshot_path: str | Path | None = None,
 ) -> SourcePageState:
     """Classify the fresh current page with AI; Python only captures and validates."""
 
     observation = _mechanical_page_observation(page)
-    if provider is None:
+    effective_provider = provider or current_source_page_state_provider()
+    if effective_provider is None:
         return SourcePageState(
             state=PRODUCT_READY,
             reason="page-state AI provider not configured; semantic blocker classification skipped",
@@ -295,9 +326,12 @@ def classify_source_page_state(
             evidence_refs=("page-observation",),
         )
 
+    screenshot_source: str | Path | None = screenshot_path
+    if screenshot_source is None:
+        screenshot_source = _viewport_jpeg_data_uri(page)
     request = build_source_page_state_request(
         observation,
-        screenshot_path=screenshot_path,
+        screenshot_path=screenshot_source,
     )
     allowed_refs = {
         str(item.get("source_id") or "")
@@ -305,7 +339,7 @@ def classify_source_page_state(
         if str(item.get("source_id") or "")
     }
     try:
-        raw = provider.extract_json(request)
+        raw = effective_provider.extract_json(request)
     except Exception as exc:
         raise SourcePageStateDecisionError(
             f"page-state AI decision failed: {type(exc).__name__}: {exc}"
@@ -329,4 +363,6 @@ __all__ = [
     "SourcePageStateDecisionError",
     "build_source_page_state_request",
     "classify_source_page_state",
+    "configure_source_page_state_provider",
+    "current_source_page_state_provider",
 ]
