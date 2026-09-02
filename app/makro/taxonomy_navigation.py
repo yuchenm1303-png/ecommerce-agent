@@ -116,23 +116,44 @@ def _wait_for_branch_outcome(
     poll_ms: int,
     max_polls: int,
 ) -> str:
-    """Wait for a selected-node leaf or a stable, genuinely changed child.
+    """Wait for the clicked node to become a confirmed leaf or a stable child.
 
-    The leaf probe is selected-node aware. This prevents a rejected leaf's stale
-    confirmation state from being mistaken for the next sibling during backtracking.
-    Comparing the next-column signature separately prevents stale child columns from
-    being mistaken for the newly selected sibling's children while Makro repaints.
+    Makro can commit a Vertical and render the Select Brand confirmation while the
+    old taxonomy DOM is simultaneously being replaced. During that short transition
+    a structural column observer may legitimately see several provisional groups or
+    lose an owner entirely. Those observation failures are not allowed to defeat a
+    subsequently verified leaf. We therefore keep polling the authoritative
+    selected-node leaf state first, remember the latest transient column-observation
+    error, and only re-raise it when the transition never settles to either a leaf
+    or a successfully observed child.
+
+    This does not hide real mechanical failures: an observation error that persists
+    through the full bounded transition window remains a hard failure.
     """
 
     required = _required_stable_polls(max_polls)
     candidate_signature: tuple[str, ...] = ()
     confirmations = 0
+    last_observation_error: Exception | None = None
 
     for _ in range(max(1, int(max_polls))):
         if leaf_ready_fn(selected):
             return "leaf"
 
-        child = _column_signature(_child_column(columns_fn(), level))
+        try:
+            child = _column_signature(_child_column(columns_fn(), level))
+        except Exception as exc:
+            last_observation_error = exc
+            candidate_signature = ()
+            confirmations = 0
+            if leaf_ready_fn(selected):
+                return "leaf"
+            page.wait_for_timeout(max(1, int(poll_ms)))
+            continue
+
+        # A successful structural read proves the observer recovered from any
+        # earlier provisional DOM state, so an old error must not leak forward.
+        last_observation_error = None
         if child and child != previous_child:
             if child == candidate_signature:
                 confirmations += 1
@@ -149,6 +170,8 @@ def _wait_for_branch_outcome(
 
     if leaf_ready_fn(selected):
         return "leaf"
+    if last_observation_error is not None:
+        raise last_observation_error
     return "dead"
 
 
@@ -176,8 +199,10 @@ def navigate_live_taxonomy(
     ``leaf_ready_fn`` receives the node that was just clicked and must only report
     a leaf when the current confirmation belongs to that exact node.
 
-    Exceptions from callbacks remain hard failures because they indicate an invalid
-    response or a mechanical/verification problem rather than an unsuitable branch.
+    Callback failures are hard failures except for structural column observations
+    made inside the bounded post-click transition window. Those are retried only
+    long enough to let an authoritative selected-leaf confirmation win; if no leaf
+    or stable child appears, the latest observation failure is re-raised.
     When all bounded tree paths are exhausted this function returns ``""``.
     """
 
