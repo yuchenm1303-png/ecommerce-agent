@@ -49,6 +49,18 @@ def test_package_mirror_has_a_recoverable_cross_instance_lock() -> None:
     assert "await releaseMirrorLock(admin, stable.version)" in PORTAL_RELEASE
 
 
+def test_package_warmup_continues_automatically_but_is_hard_bounded() -> None:
+    assert "const MAX_AUTOMATIC_WARM_PASSES = 12" in PORTAL_RELEASE
+    assert 'const WARM_PASS_QUERY = "warm_pass"' in PORTAL_RELEASE
+    assert "function requiredWarmPasses(stable: StableRelease): number" in PORTAL_RELEASE
+    assert "Math.ceil(chunkPlan(asset).length / MAX_CHUNKS_PER_WARM)" in PORTAL_RELEASE
+    assert "Math.min(required, MAX_AUTOMATIC_WARM_PASSES)" in PORTAL_RELEASE
+    assert "if (!completed || await packageMirrorReady(admin, stable)) return" in PORTAL_RELEASE
+    assert "nextPass >= requiredPasses || nextPass >= MAX_AUTOMATIC_WARM_PASSES" in PORTAL_RELEASE
+    assert "nextUrl.searchParams.set(WARM_PASS_QUERY, String(nextPass))" in PORTAL_RELEASE
+    assert "EdgeRuntime.waitUntil(warmAndContinue(req, admin, stable, warmPass))" in PORTAL_RELEASE
+
+
 def test_storage_bucket_limit_matches_free_plan_chunk_transport_boundary() -> None:
     assert "file_size_limit = 52428800" in CHUNK_LIMIT_MIGRATION
     assert "public = true" in CHUNK_LIMIT_MIGRATION
