@@ -145,6 +145,20 @@ def _candidate_labels(field: dict[str, Any]) -> list[str]:
 
 
 def fixed_rendered_unit(field: dict[str, Any]) -> str:
+    """Return the fixed unit from the authoritative contract when one is frozen.
+
+    Raw DOM context is consulted only while the field contract is first derived.
+    Once an execution_contract snapshot exists, transient React text (validation
+    errors, helper messages, loading state) is never allowed to reinterpret the
+    field's unit contract.
+    """
+    frozen = field.get("execution_contract")
+    if isinstance(frozen, dict):
+        contract = _normalize_persisted(frozen)
+        if contract["qualifier_mode"] == "fixed":
+            return str(contract["fixed_unit"] or "").strip()
+        return ""
+
     if qualifier_controls(field):
         return ""
     labels = _candidate_labels(field)
@@ -248,16 +262,18 @@ def _normalize_persisted(raw: dict[str, Any]) -> dict[str, Any]:
 def execution_contract(field: dict[str, Any]) -> dict[str, Any]:
     """Return the canonical mechanical contract for one marketplace field.
 
-    Raw live controls win when present. Persisted schemas carry only this normalized
-    contract, never selectors/current values/transient DOM state. AI, planning,
-    required fallback, drift detection and execution preflight therefore consume
-    the same mechanical truth while remaining separate from product semantics.
+    A frozen execution_contract is authoritative even when fresh DOM controls are
+    attached to the same semantic field. Raw controls are interpreted only when
+    no snapshot exists, i.e. at the field's first contract-capture boundary.
+    This preserves one mechanical judgment while still letting later layers use
+    fresh controls for locator, write and readback operations.
     """
+    frozen = field.get("execution_contract")
+    if isinstance(frozen, dict):
+        return _normalize_persisted(frozen)
+
     controls = value_controls(field)
     qcontrols = qualifier_controls(field)
-    if not controls and isinstance(field.get("execution_contract"), dict):
-        return _normalize_persisted(field["execution_contract"])
-
     family = _family(field, controls)
     primary = _primary_control(field, controls)
     fixed_unit = fixed_rendered_unit(field)
