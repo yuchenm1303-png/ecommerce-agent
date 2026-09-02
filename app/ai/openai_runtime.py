@@ -45,6 +45,22 @@ def _message_payload(message: AIMessage) -> dict[str, Any]:
         payload["name"] = message.name
     if message.tool_call_id:
         payload["tool_call_id"] = message.tool_call_id
+    if message.tool_calls:
+        payload["tool_calls"] = [
+            {
+                "id": call.call_id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(
+                        call.arguments,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                },
+            }
+            for call in message.tool_calls
+        ]
     return payload
 
 

@@ -63,15 +63,40 @@ MessageContent = str | tuple[ContentPart, ...]
 
 
 @dataclass(frozen=True, slots=True)
+class ToolCall:
+    call_id: str
+    name: str
+    arguments: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        call_id = str(self.call_id or "").strip()
+        name = str(self.name or "").strip()
+        if not call_id:
+            raise ValueError("tool call id must not be empty")
+        if not name:
+            raise ValueError("tool call name must not be empty")
+        if not isinstance(self.arguments, dict):
+            raise TypeError("tool call arguments must be a JSON object")
+        object.__setattr__(self, "call_id", call_id)
+        object.__setattr__(self, "name", name)
+
+
+@dataclass(frozen=True, slots=True)
 class AIMessage:
     role: MessageRole
     content: MessageContent
     name: str = ""
     tool_call_id: str = ""
+    tool_calls: tuple[ToolCall, ...] = ()
 
     def __post_init__(self) -> None:
         role = MessageRole(self.role)
         content = self.content
+        tool_calls = tuple(self.tool_calls)
+        if any(not isinstance(call, ToolCall) for call in tool_calls):
+            raise TypeError("message tool_calls must contain ToolCall values")
+        if len({call.call_id for call in tool_calls}) != len(tool_calls):
+            raise ValueError("message tool call ids must be unique")
         if isinstance(content, str):
             if not content and role is not MessageRole.ASSISTANT:
                 raise ValueError("message content must not be empty")
@@ -85,10 +110,15 @@ class AIMessage:
         tool_call_id = str(self.tool_call_id or "").strip()
         if role is MessageRole.TOOL and not tool_call_id:
             raise ValueError("tool messages require tool_call_id")
+        if tool_calls and role is not MessageRole.ASSISTANT:
+            raise ValueError("only assistant messages may contain tool_calls")
+        if role is MessageRole.TOOL and tool_calls:
+            raise ValueError("tool messages cannot contain tool_calls")
         object.__setattr__(self, "role", role)
         object.__setattr__(self, "content", content)
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "tool_call_id", tool_call_id)
+        object.__setattr__(self, "tool_calls", tool_calls)
 
     @property
     def uses_vision(self) -> bool:
@@ -170,13 +200,6 @@ class StructuredRequest:
             raise ValueError("schema_name must not be empty")
         object.__setattr__(self, "schema_name", schema_name)
         object.__setattr__(self, "mode", StructuredOutputMode(self.mode))
-
-
-@dataclass(frozen=True, slots=True)
-class ToolCall:
-    call_id: str
-    name: str
-    arguments: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
