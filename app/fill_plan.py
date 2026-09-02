@@ -20,11 +20,13 @@ from .business_fields import (
     BUSINESS_ATTRIBUTE_ALIASES,
     is_business_question,
 )
+from .hard_field_validators import validate_resolved_answer
 from .resolution_types import (
     CONFLICT as RESOLVER_CONFLICT,
     MISSING as RESOLVER_MISSING,
     NEEDS_REVIEW,
     RESOLVED,
+    ResolvedAnswer,
     ResolutionRecord,
 )
 from .source_bundle import ProductSourceBundle, SourceEvidence, normalize_key
@@ -133,16 +135,12 @@ def _hard_guard_values(
     live_field: dict[str, Any],
     decision: FieldDecision,
 ) -> tuple[list[str], str, str | None]:
-    """Compatibility helper that preserves a decision exactly.
+    """Compatibility helper that preserves semantic content exactly.
 
-    Historically this function compared AI values with live options, rewrote
-    qualifiers, inlined units and converted measurements.  That made Python a
-    second product-decision engine and allowed a later DOM scan to turn an AI
-    READY into BLOCKED.  Product semantics now have one owner: the Resolver.
-
-    The live field is intentionally ignored here.  Mechanical compatibility is
-    tested only while the browser actually binds/writes/reads the control, where
-    failures are execution failures and never semantic re-decisions.
+    Product semantics have one owner: the Resolver.  This helper therefore never
+    rewrites values, qualifiers or units.  Mechanical compatibility is enforced
+    separately by the single live execution contract before a value becomes an
+    executable Fill Plan item.
     """
 
     del live_field
@@ -358,6 +356,52 @@ def _business_record(
     )
 
 
+def _apply_live_execution_contract(
+    live_field: dict[str, Any],
+    resolution: ResolutionRecord,
+) -> str | None:
+    """Fail closed when an exact resolved value cannot satisfy the live control.
+
+    This is a mechanical boundary only.  It never changes the value into another
+    product answer; the original answer/evidence remain attached for review.
+    """
+
+    if not resolution.eligible_for_autofill:
+        return None
+
+    validation = validate_resolved_answer(
+        live_field,
+        ResolvedAnswer(
+            attribute_key=resolution.attribute_key,
+            label=resolution.label,
+            status=resolution.status,
+            answer=resolution.answer,
+            answer_values=list(resolution.answer_values),
+            qualifier=resolution.qualifier,
+            confidence=resolution.confidence,
+            source_type=resolution.source_type,
+            source_reference=resolution.source_reference,
+            evidence=resolution.evidence,
+            detail=resolution.detail,
+        ),
+    )
+    if validation.valid:
+        return None
+
+    contract_detail = f"live execution contract: {validation.detail}"
+    semantic_detail = str(resolution.detail or "").strip()
+    resolution.status = NEEDS_REVIEW
+    resolution.eligible_for_autofill = False
+    resolution.preview_eligible = False
+    resolution.gate_reason = GATE_HARD_FIELD_CONSTRAINT
+    resolution.detail = (
+        f"{semantic_detail} | {contract_detail}"
+        if semantic_detail
+        else contract_detail
+    )
+    return contract_detail
+
+
 def _decimal_answer(item: LiveFillPlanItem) -> Decimal | None:
     if not item.resolution.answer_values:
         return None
@@ -412,13 +456,13 @@ def build_live_fill_plan(
     semantic_fields: Iterable[dict[str, Any]],
     business_bundle: ProductSourceBundle,
 ) -> LiveFillPlan:
-    """Bind authoritative AI decisions to live field identities.
+    """Bind semantic decisions, then admit only mechanically executable values.
 
-    This layer does not solve product meaning, compare AI values with marketplace
-    options, normalize units, rewrite text or downgrade READY.  Its only product
-    job is identity binding.  AI READY therefore remains READY from planning
-    through real execution unless the browser mechanically fails to perform the
-    write.
+    This layer never solves product meaning, rewrites text, substitutes values or
+    converts units.  The Resolver remains the semantic owner.  Before any exact
+    resolved value becomes READY, the observed live field contract must admit it;
+    otherwise the original semantic answer stays intact but the item is BLOCKED
+    for review instead of being deferred to a browser fill error.
     """
 
     fields = list(semantic_fields)
@@ -453,11 +497,16 @@ def build_live_fill_plan(
             resolution = _decision_record(live_field, decision)
             action = READY if resolution.eligible_for_autofill else BLOCKED
             if action == READY:
-                reason = "AI READY authoritative; executor only performs mechanical write/readback/persistence checks."
+                reason = "AI READY semantic answer bound to current live field."
             elif resolution.preview_eligible:
                 reason = "AI status=REVIEW；只允许显式人工 review，不由 Python 改判。"
             else:
                 reason = resolution.detail or "AI decision is not READY."
+
+        contract_failure = _apply_live_execution_contract(live_field, resolution)
+        if contract_failure:
+            action = BLOCKED
+            reason = contract_failure
 
         items.append(
             LiveFillPlanItem(
