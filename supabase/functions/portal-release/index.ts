@@ -13,6 +13,9 @@ const LEGACY_MANIFEST_ASSET = "update.json";
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const SHA256_DIGEST_RE = /^sha256:([0-9a-f]{64})$/i;
 const HISTORY_LIMIT = 12;
+const STANDARD_UPLOAD_LIMIT = 6 * 1024 * 1024;
+const TUS_CHUNK_SIZE = 6 * 1024 * 1024;
+const MIRROR_LOCK_MAX_AGE_MS = 15 * 60 * 1000;
 const ALLOWED_ORIGINS = new Set([
   "https://smirel.com",
   "https://www.smirel.com",
@@ -100,7 +103,10 @@ function storageConfig() {
   const supabaseUrl = String(Deno.env.get("SUPABASE_URL") || "").trim().replace(/\/$/, "");
   const serverKey = getServerSecretKey();
   if (!supabaseUrl || !serverKey) throw new Error("server_storage_config_missing");
-  return { supabaseUrl, serverKey };
+  const projectId = new URL(supabaseUrl).hostname.split(".")[0];
+  if (!projectId) throw new Error("server_storage_project_missing");
+  const directStorageUrl = `https://${projectId}.storage.supabase.co`;
+  return { supabaseUrl, serverKey, directStorageUrl };
 }
 
 function createAdminClient() {
@@ -307,7 +313,27 @@ function encodedObjectPath(path: string): string {
   return path.split("/").map((part) => encodeURIComponent(part)).join("/");
 }
 
-async function streamAssetToStorage(version: string, asset: MirrorAsset): Promise<void> {
+function base64Metadata(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+async function retry<T>(label: string, action: () => Promise<T>, attempts = 3): Promise<T> {
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await action();
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+    }
+  }
+  throw new Error(`${label}:${String((lastError as any)?.message || lastError || "failed")}`);
+}
+
+async function standardStreamAssetToStorage(version: string, asset: MirrorAsset): Promise<void> {
   const source = await fetch(asset.sourceUrl, {
     headers: { "User-Agent": "Listing-Studio-Update-Mirror" },
     cache: "no-store",
@@ -343,6 +369,122 @@ async function streamAssetToStorage(version: string, asset: MirrorAsset): Promis
   }
 }
 
+async function createTusUpload(version: string, asset: MirrorAsset): Promise<string> {
+  const { directStorageUrl, serverKey } = storageConfig();
+  const endpoint = `${directStorageUrl}/storage/v1/upload/resumable`;
+  const objectName = `${mirrorFolder(version)}/${asset.name}`;
+  const metadata = [
+    ["bucketName", UPDATE_BUCKET],
+    ["objectName", objectName],
+    ["contentType", asset.contentType],
+    ["cacheControl", "31536000"],
+  ].map(([key, value]) => `${key} ${base64Metadata(value)}`).join(",");
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${serverKey}`,
+      "apikey": serverKey,
+      "Tus-Resumable": "1.0.0",
+      "Upload-Length": String(asset.size),
+      "Upload-Metadata": metadata,
+      "x-upsert": "true",
+    },
+  });
+  if (response.status !== 201) {
+    throw new Error(`tus_create_${response.status}:${(await response.text()).slice(0, 500)}`);
+  }
+  const location = String(response.headers.get("location") || "").trim();
+  if (!location) throw new Error("tus_create_missing_location");
+  return new URL(location, endpoint).toString();
+}
+
+async function readTusOffset(uploadUrl: string): Promise<number> {
+  const { serverKey } = storageConfig();
+  const response = await fetch(uploadUrl, {
+    method: "HEAD",
+    headers: {
+      "Authorization": `Bearer ${serverKey}`,
+      "apikey": serverKey,
+      "Tus-Resumable": "1.0.0",
+    },
+  });
+  if (!response.ok) throw new Error(`tus_head_${response.status}`);
+  const offset = Number(response.headers.get("upload-offset") || -1);
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("tus_head_invalid_offset");
+  return offset;
+}
+
+async function fetchSourceChunk(asset: MirrorAsset, offset: number): Promise<Uint8Array> {
+  const end = Math.min(asset.size - 1, offset + TUS_CHUNK_SIZE - 1);
+  const expected = end - offset + 1;
+  return await retry(`source_range_${offset}`, async () => {
+    const response = await fetch(asset.sourceUrl, {
+      headers: {
+        "User-Agent": "Listing-Studio-Update-Mirror",
+        "Range": `bytes=${offset}-${end}`,
+      },
+      cache: "no-store",
+      redirect: "follow",
+    });
+    if (response.status !== 206) {
+      throw new Error(`status_${response.status}`);
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength !== expected) {
+      throw new Error(`size_${bytes.byteLength}_expected_${expected}`);
+    }
+    return bytes;
+  });
+}
+
+async function patchTusChunk(uploadUrl: string, offset: number, bytes: Uint8Array): Promise<number> {
+  const { serverKey } = storageConfig();
+  return await retry(`tus_patch_${offset}`, async () => {
+    const current = await readTusOffset(uploadUrl);
+    if (current !== offset) return current;
+    const response = await fetch(uploadUrl, {
+      method: "PATCH",
+      headers: {
+        "Authorization": `Bearer ${serverKey}`,
+        "apikey": serverKey,
+        "Tus-Resumable": "1.0.0",
+        "Upload-Offset": String(offset),
+        "Content-Type": "application/offset+octet-stream",
+      },
+      body: bytes,
+    });
+    if (response.status !== 204) {
+      throw new Error(`status_${response.status}:${(await response.text()).slice(0, 500)}`);
+    }
+    const next = Number(response.headers.get("upload-offset") || -1);
+    if (!Number.isSafeInteger(next) || next < offset || next > offset + bytes.byteLength) {
+      throw new Error(`invalid_offset_${next}`);
+    }
+    return next;
+  });
+}
+
+async function resumableAssetToStorage(version: string, asset: MirrorAsset): Promise<void> {
+  const uploadUrl = await retry("tus_create", () => createTusUpload(version, asset));
+  let offset = await readTusOffset(uploadUrl);
+  while (offset < asset.size) {
+    const bytes = await fetchSourceChunk(asset, offset);
+    const next = await patchTusChunk(uploadUrl, offset, bytes);
+    if (next === offset) throw new Error(`tus_upload_stalled_at_${offset}`);
+    offset = next;
+  }
+  if (offset !== asset.size) throw new Error(`tus_upload_size_mismatch:${offset}:${asset.size}`);
+}
+
+async function streamAssetToStorage(version: string, asset: MirrorAsset): Promise<void> {
+  if (asset.size <= STANDARD_UPLOAD_LIMIT) {
+    await standardStreamAssetToStorage(version, asset);
+    return;
+  }
+  await resumableAssetToStorage(version, asset);
+}
+
 async function ensureMirrorAsset(
   admin: ReturnType<typeof createAdminClient>,
   stable: StableRelease,
@@ -357,13 +499,53 @@ async function ensureMirrorAsset(
   return true;
 }
 
+function mirrorLockPath(version: string): string {
+  return `${mirrorFolder(version)}/.package-mirror.lock`;
+}
+
+async function claimMirrorLock(admin: ReturnType<typeof createAdminClient>, version: string): Promise<boolean> {
+  const folder = mirrorFolder(version);
+  const lockName = ".package-mirror.lock";
+  const { data, error } = await admin.storage.from(UPDATE_BUCKET).list(folder, {
+    limit: 20,
+    search: lockName,
+  });
+  if (error) throw error;
+  const existing = data?.find((item: any) => item?.name === lockName);
+  if (existing) {
+    const createdAt = Date.parse(String(existing.created_at || existing.updated_at || ""));
+    if (Number.isFinite(createdAt) && Date.now() - createdAt < MIRROR_LOCK_MAX_AGE_MS) return false;
+    await admin.storage.from(UPDATE_BUCKET).remove([mirrorLockPath(version)]);
+  }
+
+  const { error: lockError } = await admin.storage.from(UPDATE_BUCKET).upload(
+    mirrorLockPath(version),
+    new Blob([String(Date.now())], { type: "application/json" }),
+    { contentType: "application/json", cacheControl: "60", upsert: false },
+  );
+  if (!lockError) return true;
+  if (/already exists|duplicate/i.test(String(lockError.message || ""))) return false;
+  throw lockError;
+}
+
+async function releaseMirrorLock(admin: ReturnType<typeof createAdminClient>, version: string) {
+  const { error } = await admin.storage.from(UPDATE_BUCKET).remove([mirrorLockPath(version)]);
+  if (error) console.error("update mirror lock cleanup failed", error);
+}
+
 async function warmUpdatePackages(admin: ReturnType<typeof createAdminClient>, stable: StableRelease) {
-  for (const asset of stable.packageAssets) {
-    try {
-      await ensureMirrorAsset(admin, stable, asset);
-    } catch (error) {
-      console.error("update package mirror warmup failed", asset.name, error);
+  if (!(await claimMirrorLock(admin, stable.version))) return;
+  try {
+    for (const asset of stable.packageAssets) {
+      try {
+        await ensureMirrorAsset(admin, stable, asset);
+      } catch (error) {
+        console.error("update package mirror warmup failed", asset.name, error);
+        throw error;
+      }
     }
+  } finally {
+    await releaseMirrorLock(admin, stable.version);
   }
 }
 
