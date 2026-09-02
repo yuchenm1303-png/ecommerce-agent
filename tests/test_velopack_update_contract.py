@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import py_compile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,6 +76,25 @@ def test_update_discovery_and_download_are_isolated_from_the_qt_process() -> Non
     assert '_update_info_from_payload(payload.get("info"))' in RUNTIME
     assert "_UPDATE_DOWNLOAD_IDLE_TIMEOUT_SECONDS = 45.0" in RUNTIME
     assert "update download made no progress" in RUNTIME
+
+
+def test_chunked_update_transport_compiles_and_disables_implicit_windows_proxy(monkeypatch) -> None:
+    module_path = ROOT / "app" / "chunked_update_transport.py"
+    py_compile.compile(str(module_path), doraise=True)
+    from app import chunked_update_transport as transport
+
+    for name in (
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    handler = transport._configured_proxy_handler()
+    assert getattr(handler, "proxies", {}) == {}
+    assert transport._RETRY_DELAYS_SECONDS == (1.0, 3.0, 7.0)
 
 
 def test_business_idle_and_browser_quiesce_remain_application_policy() -> None:
