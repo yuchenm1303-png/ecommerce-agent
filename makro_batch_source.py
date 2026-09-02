@@ -5,10 +5,12 @@ Source Edge contract remains deterministic. Later batch job workers consume the
 exact cached bytes and can run Makro/AI work in parallel without competing for
 the Source Edge's current tab.
 
-Recoverable supplier login/human-verification pages are not failures. The worker
-persists a waiting checkpoint and exits with the dedicated interaction code so the
-GUI can release every browser/process resource while keeping Source Edge itself
-and the current page intact for the user.
+Recoverable supplier login/human-verification/modal pages are not failures. The
+worker persists a waiting checkpoint and exits with the dedicated interaction
+code so the GUI can release every browser/process resource while keeping Source
+Edge itself and the current page intact for the user. Current page-state semantics
+are decided from a fresh AI observation; Python only captures the page and owns
+the pause/resume lifecycle.
 """
 
 from __future__ import annotations
@@ -19,13 +21,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.providers.registry import (
+    ProviderConfig,
+    ProviderConfigurationError,
+    SUPPORTED_PROVIDERS,
+    build_semantic_provider,
+    default_api_key_env,
+)
 from app.source_capture import (
     DEFAULT_SOURCE_CDP_PORT,
     SourceInteractionRequired,
     capture_product_source,
 )
-from app.source_interaction import SOURCE_INTERACTION_EXIT_CODE, SOURCE_OUTCOME_FILENAME
+from app.source_interaction import (
+    SOURCE_INTERACTION_EXIT_CODE,
+    SOURCE_OUTCOME_FILENAME,
+    configure_source_page_state_provider,
+)
 from app.workflow_diagnostics import configure_diagnostics, diag_event
+
+
+_DEFAULT_PAGE_STATE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+_DEFAULT_PAGE_STATE_MODEL = "qwen3.7-plus"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,11 +57,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-cache-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
+        "--page-state-provider",
+        choices=SUPPORTED_PROVIDERS,
+        default="openai-compatible",
+        help="AI provider used only to judge the current Source Edge UI state.",
+    )
+    parser.add_argument("--page-state-model", default=_DEFAULT_PAGE_STATE_MODEL)
+    parser.add_argument("--page-state-api-key-env", default="AI_API_KEY")
+    parser.add_argument("--page-state-base-url", default=_DEFAULT_PAGE_STATE_BASE_URL)
+    parser.add_argument("--page-state-request-timeout-seconds", type=float, default=120.0)
+    parser.add_argument(
         "--resume-source-interaction",
         action="store_true",
         help=(
-            "Resume one suspended Source job. The preserved current Source Edge page is observed "
-            "before any fresh navigation; unresolved login/human verification stays suspended."
+            "Resume one suspended Source job. The preserved current Source Edge page is freshly "
+            "observed by AI before any fresh navigation; only a blocker that exists now stays suspended."
         ),
     )
     return parser
@@ -63,6 +90,21 @@ def _write_source_outcome(output_dir: Path, payload: dict[str, Any]) -> Path:
     return target
 
 
+def _build_page_state_provider(args: argparse.Namespace):
+    provider_name = str(args.page_state_provider or "").strip().casefold()
+    api_key_env = str(args.page_state_api_key_env or "").strip() or default_api_key_env(provider_name)
+    config = ProviderConfig(
+        provider=provider_name,
+        model=str(args.page_state_model or "").strip(),
+        api_key_env=api_key_env,
+        base_url=str(args.page_state_base_url or "").strip(),
+        structured_mode="json_object",
+        request_timeout_seconds=float(args.page_state_request_timeout_seconds),
+        enable_thinking=False if provider_name == "openai-compatible" else None,
+    )
+    return build_semantic_provider(config)
+
+
 def main() -> int:
     args = build_parser().parse_args()
     output_dir = Path(args.output_dir).resolve()
@@ -75,6 +117,12 @@ def main() -> int:
         product_url=args.product_url,
         source_cdp_port=args.source_cdp_port,
     )
+
+    try:
+        page_state_provider = _build_page_state_provider(args)
+    except ProviderConfigurationError as exc:
+        raise SystemExit(str(exc)) from exc
+    configure_source_page_state_provider(page_state_provider)
 
     print("BATCH_SOURCE START", flush=True)
     diag_event(
@@ -90,6 +138,8 @@ def main() -> int:
         max_scroll_steps=args.source_max_scroll_steps,
         max_visible_text_chars=args.source_max_visible_text_chars,
         resume_after_interaction=bool(args.resume_source_interaction),
+        page_state_provider=str(args.page_state_provider),
+        page_state_model=str(args.page_state_model),
     )
     try:
         captured = capture_product_source(
@@ -153,6 +203,8 @@ def main() -> int:
         table_rows=len(captured.snapshot.table_rows),
         json_ld_items=len(captured.snapshot.json_ld),
         embedded_data_items=len(captured.snapshot.embedded_data),
+        page_state=captured.snapshot.meta.get("page_state", ""),
+        page_state_confidence=captured.snapshot.meta.get("page_state_confidence", ""),
         warnings=list(captured.snapshot.warnings),
     )
     payload = {
