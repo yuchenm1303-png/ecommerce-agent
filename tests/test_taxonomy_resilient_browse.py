@@ -35,6 +35,7 @@ class _FakeOwnedTaxonomy:
         ["Aquarium Accessories", "Pet Gear"],
         ["Pet Grooming", "Pet Toys"],
     ]
+    ARTS_CHUNKS = [["Painting Supplies", "Craft Kits"]]
     STALE = [
         ("card-hair", ["Hair Combs"]),
         ("card-gym", ["Home Gym Combo"]),
@@ -44,7 +45,7 @@ class _FakeOwnedTaxonomy:
 
     def __init__(self, _page: object, *, stuck_root: bool = False) -> None:
         self.state = "root"
-        self.positions = {"root": 0, "pet": 0}
+        self.positions = {"root": 0, "pet": 0, "arts": 0}
         self.clicked: list[tuple[str, str]] = []
         self.last_diagnostic = ""
         self.stuck_root = bool(stuck_root)
@@ -93,6 +94,10 @@ class _FakeOwnedTaxonomy:
             # proving the wrapper cannot trust a raw numeric column index.
             child = self._descriptor("pet", self.PET_CHUNKS, dom_order=3)
             output.insert(3, child)
+        elif self.state == "arts":
+            child = self._descriptor("arts", self.ARTS_CHUNKS, dom_order=3)
+            output.insert(3, child)
+        if self.state in {"pet", "arts"}:
             # Keep deterministic DOM-order values after insertion.
             for index, entry in enumerate(output):
                 entry["dom_order"] = index
@@ -101,7 +106,15 @@ class _FakeOwnedTaxonomy:
     def scroll_owned_column(self, owner_id: str, action: str) -> dict[str, object]:
         if owner_id in {group_id for group_id, _ in self.STALE}:
             return {"found": True, "moved": False, "at_end": True, "scroll_top": 0.0, "max_scroll": 0.0}
-        chunks = self.ROOT_CHUNKS if owner_id == "root" else self.PET_CHUNKS if owner_id == "pet" else None
+        chunks = (
+            self.ROOT_CHUNKS
+            if owner_id == "root"
+            else self.PET_CHUNKS
+            if owner_id == "pet"
+            else self.ARTS_CHUNKS
+            if owner_id == "arts"
+            else None
+        )
         if chunks is None:
             raise RuntimeError(f"unknown owner {owner_id}")
         before = self.positions[owner_id]
@@ -141,7 +154,13 @@ class _FakeOwnedTaxonomy:
             self.state = "pet"
             self.positions["pet"] = 0
             return True
+        if group_id == "root" and text == "Arts & Crafts" and self.positions["root"] == 0:
+            self.state = "arts"
+            self.positions["arts"] = 0
+            return True
         if group_id == "pet" and text == "Pet Toys" and self.positions["pet"] == 1:
+            return True
+        if group_id == "arts" and text == "Craft Kits" and self.positions["arts"] == 0:
             return True
         return False
 
@@ -185,6 +204,38 @@ def test_generated_child_is_rebound_structurally_and_fully_scrolled(monkeypatch)
     ]
     assert browser.click_node(1, "Pet Toys") is True
     assert owned.clicked == [("root", "Pet Supplies"), ("pet", "Pet Toys")]
+
+
+def test_shallow_sibling_click_invalidates_deeper_branch_state(monkeypatch) -> None:
+    browser, owned, _search = _browser(monkeypatch)
+
+    assert browser.click_node(0, "Pet Supplies") is True
+    assert browser.click_node(1, "Pet Toys") is True
+    assert browser._clicked_depth == 1
+    assert set(browser._stale_after_parent) == {1, 2}
+
+    assert browser.click_node(0, "Arts & Crafts") is True
+
+    assert browser._clicked_depth == 0
+    assert set(browser._stale_after_parent) == {1}
+    assert browser.columns() == [
+        [
+            "Your Verticals",
+            "Agricultural Products",
+            "Arts & Crafts",
+            "Automobile",
+            "Pet Supplies",
+            "Software",
+        ],
+        ["Painting Supplies", "Craft Kits"],
+    ]
+    assert browser.click_node(1, "Craft Kits") is True
+    assert owned.clicked == [
+        ("root", "Pet Supplies"),
+        ("pet", "Pet Toys"),
+        ("root", "Arts & Crafts"),
+        ("arts", "Craft Kits"),
+    ]
 
 
 def test_partial_scroll_can_never_masquerade_as_complete_taxonomy(monkeypatch) -> None:
