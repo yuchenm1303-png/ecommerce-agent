@@ -125,6 +125,22 @@ def _with_vertical_diagnostics(provider: Any) -> Any:
     return _VerticalDiagnosticProvider(provider)
 
 
+def _bind_source_page_state_provider(provider: Any) -> Any:
+    """Make the process's configured semantic provider the Source-page observer too.
+
+    Every production workflow already establishes one semantic provider before it
+    interprets supplier/product evidence. Reuse that exact provider for current
+    browser page-state semantics so Single/GUI/Batch do not silently diverge into a
+    separate heuristic path. The binding is process/context local and introduces no
+    browser behavior by itself.
+    """
+
+    from ..source_interaction import configure_source_page_state_provider
+
+    configure_source_page_state_provider(provider)
+    return provider
+
+
 def _validated_base_url(value: str) -> str:
     url = value.strip().rstrip("/")
     if not url:
@@ -336,7 +352,7 @@ def build_semantic_provider(
             request_timeout_seconds=normalized.request_timeout_seconds,
             enable_thinking=normalized.enable_thinking,
         )
-        return _with_vertical_diagnostics(provider)
+        return _bind_source_page_state_provider(_with_vertical_diagnostics(provider))
 
     if client is None:
         try:
@@ -357,4 +373,4 @@ def build_semantic_provider(
         max_output_tokens=normalized.max_output_tokens,
         request_timeout_seconds=normalized.request_timeout_seconds,
     )
-    return _with_vertical_diagnostics(provider)
+    return _bind_source_page_state_provider(_with_vertical_diagnostics(provider))
