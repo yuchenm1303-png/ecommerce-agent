@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +18,15 @@ _HTTP_TIMEOUT_SECONDS = 15.0
 _STREAM_READ_BYTES = 1024 * 1024
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _MANIFEST_SCHEMA = 1
+_RETRY_DELAYS_SECONDS = (1.0, 3.0, 7.0)
+_PROXY_ENV_NAMES = (
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+)
 
 
 class ChunkMirrorUnavailable(RuntimeError):
@@ -46,26 +57,62 @@ def _source_url(source: str, *parts: str) -> str:
     return f"{base}/{encoded}"
 
 
+def _configured_proxy_handler() -> urllib.request.ProxyHandler:
+    """Honor only proxy state explicitly inherited by the isolated update worker.
+
+    The parent runtime materializes Windows system-proxy settings into HTTP(S)_PROXY
+    for proxy attempts and removes them for direct attempts. Building an explicit
+    ProxyHandler here prevents urllib from silently re-reading the Windows registry
+    during a direct fallback attempt.
+    """
+
+    proxies: dict[str, str] = {}
+    all_proxy = str(os.getenv("ALL_PROXY") or os.getenv("all_proxy") or "").strip()
+    https_proxy = str(os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or all_proxy).strip()
+    http_proxy = str(os.getenv("HTTP_PROXY") or os.getenv("http_proxy") or all_proxy).strip()
+    if https_proxy:
+        proxies["https"] = https_proxy
+    if http_proxy:
+        proxies["http"] = http_proxy
+    return urllib.request.ProxyHandler(proxies)
+
+
+def _opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(_configured_proxy_handler())
+
+
 def _open(url: str) -> Any:
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "ListingStudio-Chunked-Update/1"},
         method="GET",
     )
-    return urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT_SECONDS)
+    return _opener().open(request, timeout=_HTTP_TIMEOUT_SECONDS)
+
+
+def _retry_delay(attempt: int) -> None:
+    if attempt < len(_RETRY_DELAYS_SECONDS):
+        time.sleep(_RETRY_DELAYS_SECONDS[attempt])
 
 
 def _read_manifest(source: str, file_name: str) -> dict[str, Any]:
     url = _source_url(source, "chunks", file_name, "manifest.json")
-    try:
-        with _open(url) as response:
-            raw = response.read(_MAX_MANIFEST_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        if int(exc.code or 0) == 404:
-            raise ChunkMirrorUnavailable("chunk mirror is not ready for this package") from exc
-        raise
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise ChunkMirrorUnavailable(f"chunk mirror manifest unavailable: {exc}") from exc
+    last_error: BaseException | None = None
+    for attempt in range(len(_RETRY_DELAYS_SECONDS) + 1):
+        try:
+            with _open(url) as response:
+                raw = response.read(_MAX_MANIFEST_BYTES + 1)
+            break
+        except urllib.error.HTTPError as exc:
+            if int(exc.code or 0) == 404:
+                raise ChunkMirrorUnavailable("chunk mirror is not ready for this package") from exc
+            last_error = exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+        _retry_delay(attempt)
+    else:
+        raise ChunkMirrorUnavailable(f"chunk mirror manifest unavailable: {last_error}") from last_error
+
     if len(raw) > _MAX_MANIFEST_BYTES:
         raise ChunkMirrorIntegrityError("chunk mirror manifest is unexpectedly large")
     try:
@@ -143,25 +190,124 @@ def _copy_response(
     return written
 
 
+def _download_exact_object(
+    url: str,
+    destination: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str = "",
+    on_bytes: Callable[[int], None] | None = None,
+) -> None:
+    last_error: BaseException | None = None
+    attempts = len(_RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(attempts):
+        destination.unlink(missing_ok=True)
+        digest = hashlib.sha256()
+        try:
+            with _open(url) as response, destination.open("wb") as output:
+                _copy_response(
+                    response,
+                    output,
+                    expected_size=expected_size,
+                    on_bytes=on_bytes,
+                    digest=digest,
+                )
+            if expected_sha256 and digest.hexdigest().lower() != expected_sha256:
+                raise ChunkMirrorIntegrityError("mirrored object SHA256 mismatch")
+            return
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            ChunkMirrorIntegrityError,
+        ) as exc:
+            last_error = exc
+            destination.unlink(missing_ok=True)
+            _retry_delay(attempt)
+    if isinstance(last_error, ChunkMirrorIntegrityError):
+        raise last_error
+    raise ChunkMirrorUnavailable(f"mirrored object unavailable after {attempts} attempts: {last_error}") from last_error
+
+
 def _download_direct_asset(source: str, asset: Any, destination: Path) -> None:
     file_name = _asset_name(asset)
     expected_size = _asset_size(asset)
     if not file_name or expected_size <= 0:
         raise ChunkMirrorIntegrityError("Velopack asset metadata is incomplete")
-    digest = hashlib.sha256()
-    with _open(_source_url(source, file_name)) as response, destination.open("wb") as output:
-        _copy_response(response, output, expected_size=expected_size, digest=digest)
-    expected_sha = _asset_sha256(asset)
-    if expected_sha and digest.hexdigest().lower() != expected_sha:
-        destination.unlink(missing_ok=True)
-        raise ChunkMirrorIntegrityError(f"mirrored asset SHA256 mismatch: {file_name}")
+    try:
+        _download_exact_object(
+            _source_url(source, file_name),
+            destination,
+            expected_size=expected_size,
+            expected_sha256=_asset_sha256(asset),
+        )
+    except ChunkMirrorIntegrityError as exc:
+        raise ChunkMirrorIntegrityError(f"mirrored asset integrity failed: {file_name}: {exc}") from exc
 
 
 def _download_feed(source: str, destination: Path) -> None:
-    with _open(_source_url(source, VELOPACK_FEED_NAME)) as response, destination.open("wb") as output:
-        shutil.copyfileobj(response, output, length=_STREAM_READ_BYTES)
-    if destination.stat().st_size <= 0:
-        raise ChunkMirrorIntegrityError("mirrored Velopack feed is empty")
+    url = _source_url(source, VELOPACK_FEED_NAME)
+    last_error: BaseException | None = None
+    for attempt in range(len(_RETRY_DELAYS_SECONDS) + 1):
+        destination.unlink(missing_ok=True)
+        try:
+            with _open(url) as response, destination.open("wb") as output:
+                shutil.copyfileobj(response, output, length=_STREAM_READ_BYTES)
+            if destination.stat().st_size <= 0:
+                raise ChunkMirrorIntegrityError("mirrored Velopack feed is empty")
+            return
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            ChunkMirrorIntegrityError,
+        ) as exc:
+            last_error = exc
+            destination.unlink(missing_ok=True)
+            _retry_delay(attempt)
+    raise ChunkMirrorUnavailable(f"mirrored Velopack feed unavailable: {last_error}") from last_error
+
+
+def _append_verified_chunk(
+    source: str,
+    file_name: str,
+    part: dict[str, int | str],
+    output: Any,
+    digest: Any,
+    scratch_dir: Path,
+    on_bytes: Callable[[int], None] | None,
+) -> None:
+    name = str(part["name"])
+    expected_size = int(part["size"])
+    scratch = scratch_dir / f".{name}.download"
+    attempt_bytes = 0
+    highest_reported = 0
+
+    def _advanced(amount: int) -> None:
+        nonlocal attempt_bytes, highest_reported
+        attempt_bytes += amount
+        if on_bytes is not None and attempt_bytes > highest_reported:
+            on_bytes(attempt_bytes - highest_reported)
+            highest_reported = attempt_bytes
+
+    try:
+        _download_exact_object(
+            _source_url(source, "chunks", file_name, name),
+            scratch,
+            expected_size=expected_size,
+            on_bytes=_advanced,
+        )
+        with scratch.open("rb") as chunk:
+            while True:
+                block = chunk.read(_STREAM_READ_BYTES)
+                if not block:
+                    break
+                output.write(block)
+                digest.update(block)
+    finally:
+        scratch.unlink(missing_ok=True)
 
 
 def _reassemble_full_package(
@@ -173,29 +319,35 @@ def _reassemble_full_package(
 ) -> None:
     parts = _validated_parts(manifest, target)
     total_size = _asset_size(target)
-    copied = 0
+    reported_bytes = 0
     digest = hashlib.sha256()
 
     def _advanced(amount: int) -> None:
-        nonlocal copied
-        copied += amount
+        nonlocal reported_bytes
+        reported_bytes = min(total_size, reported_bytes + max(0, amount))
         if progress is not None:
-            progress(max(0, min(100, int(copied * 100 / total_size))))
+            progress(max(0, min(100, int(reported_bytes * 100 / total_size))))
 
     file_name = _asset_name(target)
-    with destination.open("wb") as output:
-        for part in parts:
-            name = str(part["name"])
-            expected_size = int(part["size"])
-            url = _source_url(source, "chunks", file_name, name)
-            with _open(url) as response:
-                _copy_response(
-                    response,
-                    output,
-                    expected_size=expected_size,
-                    on_bytes=_advanced,
-                    digest=digest,
-                )
+    destination.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(prefix="listing-studio-chunks-") as scratch_text:
+        scratch_dir = Path(scratch_text)
+        try:
+            with destination.open("wb") as output:
+                for part in parts:
+                    _append_verified_chunk(
+                        source,
+                        file_name,
+                        part,
+                        output,
+                        digest,
+                        scratch_dir,
+                        _advanced,
+                    )
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+
     if destination.stat().st_size != total_size:
         destination.unlink(missing_ok=True)
         raise ChunkMirrorIntegrityError("reassembled package size does not match Velopack")
