@@ -4,18 +4,20 @@ Makro Step 2 is not an autocomplete picker. The portal accepts one brand query,
 validates it with ``Check Brand`` and then exposes a confirmation/create-listing
 state for the validated brand.
 
-The current production policy uses the supplier / AI-derived brand path. The
-fixed ``KEAI`` policy is intentionally retained behind ``BRAND_SELECTION_MODE``
-so it can be re-enabled without rebuilding the brand-selection mechanics. A
-caller may provide one explicit diagnostic override; it still uses the same
-native Check Brand verification and never bypasses the portal contract.
+Production keeps supplier / AI brand identity authoritative. Step 2 applies only
+marketplace-output policy: explicit Chinese brand text is deterministically
+romanized to pinyin, an explicitly unknown brand uses the seller's KEAI fallback,
+and explicit unbranded evidence keeps the existing Makro unbranded candidates.
+Every resulting query still passes through Makro's native Check Brand verification.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any, Protocol
 
 from playwright.sync_api import Page
+from pypinyin import lazy_pinyin
 
 from .listing_creation import (
     _advance_brand_confirmation,
@@ -34,6 +36,7 @@ from .portal_interruptions import reconcile_portal_interruptions
 
 BRAND_SELECTION_MODE = "supplier"
 FIXED_BRAND = "KEAI"
+_HAN_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 
 
 class JSONTaskProvider(Protocol):
@@ -48,6 +51,43 @@ class BrandHints(Protocol):
     brand_status: str
 
 
+def _romanize_chinese_brand(value: str) -> str:
+    """Convert only Han-script spans to joined tone-free pinyin.
+
+    This is an output-format transform, not a new brand inference: Latin text,
+    digits and punctuation already present in the grounded brand are preserved.
+    """
+
+    brand = " ".join(str(value or "").split()).strip()
+    if not brand or not _HAN_TEXT_RE.search(brand):
+        return brand
+
+    def replace(match: re.Match[str]) -> str:
+        return "".join(lazy_pinyin(match.group(0), errors="default"))
+
+    return _HAN_TEXT_RE.sub(replace, brand).strip()
+
+
+def _supplier_brand_terms(hints: BrandHints) -> tuple[str, ...]:
+    """Map the already-decided brand status into marketplace query text."""
+
+    status = str(hints.brand_status or "").strip().casefold()
+    if status == "unknown":
+        fallback = str(FIXED_BRAND or "").strip()
+        return (fallback,) if fallback else ()
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for raw in _brand_search_terms(hints):
+        term = _romanize_chinese_brand(raw)
+        key = term.casefold()
+        if not term or key in seen:
+            continue
+        seen.add(key)
+        terms.append(term)
+    return tuple(terms)
+
+
 def _brand_terms(hints: BrandHints, *, diagnostic_override: str = "") -> tuple[str, ...]:
     """Return one active Step 2 query policy without weakening live verification."""
 
@@ -58,7 +98,7 @@ def _brand_terms(hints: BrandHints, *, diagnostic_override: str = "") -> tuple[s
         brand = str(FIXED_BRAND or "").strip()
         return (brand,) if brand else ()
     if BRAND_SELECTION_MODE == "supplier":
-        return tuple(_brand_search_terms(hints))
+        return _supplier_brand_terms(hints)
     raise RuntimeError(f"Unsupported BRAND_SELECTION_MODE={BRAND_SELECTION_MODE!r}")
 
 
@@ -136,7 +176,8 @@ def select_brand(
         "Makro Step 2 did not confirm the configured brand through Check Brand. "
         f"mode={BRAND_SELECTION_MODE!r}, fixed_brand={FIXED_BRAND!r}, "
         f"diagnostic_override={str(diagnostic_override or '').strip()!r}, "
-        f"supplier_brand={str(hints.brand or '').strip()!r}, queries={attempted!r}"
+        f"supplier_brand={str(hints.brand or '').strip()!r}, "
+        f"supplier_brand_status={str(hints.brand_status or '').strip()!r}, queries={attempted!r}"
     )
 
 
