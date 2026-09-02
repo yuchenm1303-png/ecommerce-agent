@@ -28,12 +28,13 @@ from .listing_content_policy import (
     allow_best_effort_inference,
     field_content_policy,
 )
+from .live_field_contract import execution_contract
 from .semantic_grounding import GroundingCatalog
 from .web_enrichment import PersistedWebSource, WebEvidence
 
 
-INFERENCE_CONTRACT_VERSION = 6
-INFERENCE_CACHE_VERSION = 6
+INFERENCE_CONTRACT_VERSION = 7
+INFERENCE_CACHE_VERSION = 7
 INFERENCE_REFERENCE = "model-inference:category-knowledge"
 INFERENCE_URL = "model-inference://category-knowledge"
 INFERENCE_CONTENT = (
@@ -83,6 +84,7 @@ def _target(field: dict[str, Any]) -> dict[str, Any]:
             else "A"
         ),
         "multi_value": contract["multi_value"],
+        "execution_contract": execution_contract(field),
     }
     if contract["options"]:
         output["options"] = contract["options"]
@@ -148,15 +150,6 @@ def _policy_handoff_from_web(
     packet: AIDecisionPacket,
     fields: Iterable[dict[str, Any]],
 ) -> AIDecisionPacket:
-    """Route policy-sensitive Web answers through the policy-aware final stage.
-
-    Product-fact READY values grounded in the supplier remain frozen. Web remains
-    useful evidence, but Web-written copy is regenerated with the seller content
-    policy. Exact-only fields are downgraded to MISSING so they cannot inherit a
-    comparable-product identifier/compliance/package answer and are also excluded
-    from best-effort inference by ``allow_best_effort_inference``.
-    """
-
     by_id = {field_id(field): field for field in fields}
     decisions: list[FieldDecision] = []
     rerouted: list[str] = []
@@ -261,7 +254,7 @@ def build_best_effort_inference_request(
         "prompt_instruction": (
             "Return exactly one decision per target. Prefer a useful READY answer only when the available context "
             "and target content_policy can responsibly support it; otherwise return MISSING. Use lower confidence "
-            "for inference. Preserve physical scope and obey each target's multi_value/options/qualifier/content_policy contract exactly."
+            "for inference. Preserve physical scope and obey each target's execution_contract and content_policy exactly."
         ),
         "evidence_policy": "best_effort",
         "content_policy_version": CONTENT_POLICY_VERSION,
@@ -279,10 +272,10 @@ def build_best_effort_inference_request(
             "Keep packaging/product body/mount dimensions and front/cabin/rear scopes separate. Packaging dimensions may fill only section S logistics fields, never product-body Width/Height/Depth or mount dimensions.",
             "For scoped dimensions, map keys literally without rotating axes: length->length, breadth->breadth, height->height, weight->weight.",
             "An unscoped viewing angle must not be assigned to Exterior or Interior Field of View.",
+            "Obey execution_contract exactly: family=numeric requires a bare finite number; qualifier_mode=none requires qualifier=''; qualifier_mode=selectable permits only qualifier_options; qualifier_mode=fixed permits only fixed_unit when qualifier is returned.",
             "If multi_value=false, return exactly one value string. If several compatible facets belong in a free-text field, combine them into one concise readable string rather than returning several values.",
-            "For options, return one exact allowed value. For qualifier_options, qualifier must be one exact allowed qualifier. If qualifier_options are absent, qualifier must be empty unless context_text explicitly renders a fixed physical unit.",
+            "For family=numeric, never embed the unit token inside values; keep any allowed unit only in qualifier.",
             "qualifier is only a marketplace unit/qualifier, never explanation, scope commentary, confidence text or field description.",
-            "For numeric targets with a qualifier option or fixed unit in context_text, return a bare finite number in values and the unit in qualifier; never embed the unit token inside the numeric value.",
             "Never invent exact identifiers, certifications/compliance claims, exact package contents, legal entities, seller policies or seller-operated facts. If a target policy requires exact evidence, it will not be present in this best-effort target set.",
             *GLOBAL_CONTENT_RULES,
         ],
