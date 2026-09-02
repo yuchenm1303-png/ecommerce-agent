@@ -15,18 +15,20 @@ PUBLISH = (ROOT / ".github" / "workflows" / "publish-update.yml").read_text(enco
 TEST_PUBLISH = (ROOT / ".github" / "workflows" / "publish-test-build.yml").read_text(encoding="utf-8")
 PORTAL_DOWNLOAD = (ROOT / "supabase" / "functions" / "portal-download" / "index.ts").read_text(encoding="utf-8")
 PORTAL_RELEASE = (ROOT / "supabase" / "functions" / "portal-release" / "index.ts").read_text(encoding="utf-8")
+UPDATE_MIRROR_MIGRATION = (
+    ROOT / "supabase" / "migrations" / "20260902052000_resilient_update_mirror.sql"
+).read_text(encoding="utf-8")
 
 
-def test_runtime_uses_official_velopack_manager_as_the_single_release_authority() -> None:
+def test_github_remains_release_authority_while_control_plane_routes_identical_velopack_feeds() -> None:
     assert "import velopack" in RUNTIME
     assert "velopack.GithubSource" in RUNTIME
     assert "velopack.UpdateManager" in RUNTIME
-    assert "resolve_stable_update_source" in RUNTIME
-    assert 'return "", GITHUB_REPOSITORY_URL' in RUNTIME
+    assert "class StableUpdateRoute" in RUNTIME
+    assert "PORTAL_RELEASE_URL" in RUNTIME
+    assert 'if GITHUB_REPOSITORY_URL not in sources:' in RUNTIME
+    assert "actual != route.advertised_version" in RUNTIME
     assert "override != GITHUB_REPOSITORY_URL" in RUNTIME
-    assert "PORTAL_RELEASE_URL" not in RUNTIME
-    assert "urllib.request" not in RUNTIME
-    assert "urllib.error" not in RUNTIME
     assert "get_current_version()" in RUNTIME
     assert "Update.exe" in RUNTIME
     assert 'current.name.casefold() != "current"' in RUNTIME
@@ -40,17 +42,14 @@ def test_velopack_app_runs_before_normal_pyinstaller_entrypoint() -> None:
     assert "ECOMMERCE_AGENT_UPDATE_E2E_MARKER" in RUNTIME_HOOK
 
 
-def test_application_update_flow_delegates_transport_install_and_restart_to_velopack() -> None:
-    # GUI code owns product policy/presentation only. Release discovery is deliberately
-    # delegated to the bounded worker so a stuck Velopack/network call cannot pin the GUI.
-    assert "bounded_check_for_updates(source_url)" in UPDATER
+def test_application_update_flow_delegates_package_semantics_install_and_restart_to_velopack() -> None:
+    assert "resolve_stable_update_route()" in UPDATER
+    assert "check_update_route(route, self.current_version)" in UPDATER
     assert "manager.check_for_updates()" not in UPDATER
-    assert "create_update_manager(source_url)" in UPDATER
-    assert "manager.download_updates(info" in UPDATER
+    assert "download_update_with_failover(" in UPDATER
     assert "manager.get_update_pending_restart()" in UPDATER
     assert "manager.apply_updates_and_restart(pending)" in UPDATER
     assert "wait_exit_then_apply_updates" not in UPDATER
-    assert "已从 Stable 通道撤回" not in UPDATER
     assert "QTimer.singleShot(180, QApplication.quit)" not in UPDATER
     assert "installer_sha256" not in UPDATER
     assert "UpdaterJob" not in UPDATER
@@ -59,27 +58,20 @@ def test_application_update_flow_delegates_transport_install_and_restart_to_velo
     assert "subprocess" not in UPDATER
 
 
-def test_update_discovery_is_isolated_and_has_a_hard_wall_clock_deadline() -> None:
-    # Velopack remains the sole release-discovery authority, but the potentially
-    # blocking call lives only in a killable child process with an explicit deadline.
-    worker = RUNTIME.split("def run_update_check_worker() -> int:", 1)[1].split(
-        "def bounded_check_for_updates(", 1
-    )[0]
-    bounded = RUNTIME.split("def bounded_check_for_updates(", 1)[1].split(
-        "def resolve_stable_update_source", 1
-    )[0]
-
+def test_update_discovery_and_download_are_isolated_from_the_qt_process() -> None:
     assert "_UPDATE_CHECK_TIMEOUT_SECONDS = 12.0" in RUNTIME
-    assert "create_update_manager(source).check_for_updates()" in worker
-    assert worker.count("check_for_updates()") == 1
-    assert "subprocess.Popen(" in bounded
-    assert "process.wait(timeout=timeout)" in bounded
-    assert "except subprocess.TimeoutExpired" in bounded
-    assert "process.kill()" in bounded
-    assert "process.wait()" in bounded
-    assert "raise UpdateCheckTimeoutError(" in bounded
-    assert "_UPDATE_CHECK_RESULT_ENV" in bounded
-    assert "_update_info_from_payload(payload.get(\"info\"))" in bounded
+    assert "def _run_check_worker() -> int:" in RUNTIME
+    assert "def _run_download_worker() -> int:" in RUNTIME
+    assert "create_update_manager(source).check_for_updates()" in RUNTIME
+    assert "subprocess.Popen(" in RUNTIME
+    assert "process.wait(timeout=timeout)" in RUNTIME
+    assert "except subprocess.TimeoutExpired" in RUNTIME
+    assert "process.kill()" in RUNTIME
+    assert "raise UpdateCheckTimeoutError(" in RUNTIME
+    assert "_UPDATE_CHECK_RESULT_ENV" in RUNTIME
+    assert '_update_info_from_payload(payload.get("info"))' in RUNTIME
+    assert "_UPDATE_DOWNLOAD_IDLE_TIMEOUT_SECONDS = 45.0" in RUNTIME
+    assert "update download made no progress" in RUNTIME
 
 
 def test_business_idle_and_browser_quiesce_remain_application_policy() -> None:
@@ -179,14 +171,30 @@ def test_portal_download_resolves_authorized_stable_version_without_legacy_manif
     assert 'error: "version_not_found"' in PORTAL_DOWNLOAD
 
 
-def test_public_release_metadata_accepts_velopack_release_and_only_uses_legacy_manifest_optionally() -> None:
-    assert 'const UPDATE_BASE_URL = `https://github.com/${REPOSITORY}`' in PORTAL_RELEASE
-    assert "updateBaseUrl: UPDATE_BASE_URL" in PORTAL_RELEASE
+def test_public_release_metadata_is_a_cached_github_projection_with_cdn_failover() -> None:
+    assert 'const GITHUB_UPDATE_SOURCE = `https://github.com/${REPOSITORY}`' in PORTAL_RELEASE
+    assert 'const UPDATE_BUCKET = "listing-studio-updates"' in PORTAL_RELEASE
+    assert 'const UPDATE_FEED_NAME = `releases.${UPDATE_CHANNEL}.json`' in PORTAL_RELEASE
+    assert 'const STABLE_CACHE_PATH = "stable/latest.json"' in PORTAL_RELEASE
     assert 'const LEGACY_MANIFEST_ASSET = "update.json"' in PORTAL_RELEASE
     assert "legacyManifestAsset?.browser_download_url" in PORTAL_RELEASE
     assert 'String(release.tag_name || "") !== `v${version}`' in PORTAL_RELEASE
     assert 'throw new Error("invalid_latest_release")' in PORTAL_RELEASE
     assert "installerAsset?.digest" in PORTAL_RELEASE
     assert 'const installerName = `EcommerceAgent-Setup-${version}.exe`' in PORTAL_RELEASE
+    assert "loadStableCache(admin)" in PORTAL_RELEASE
+    assert "updateSources" in PORTAL_RELEASE
+    assert "mirrorReady: mirrorFeedReady" in PORTAL_RELEASE
+    assert "source.body" in PORTAL_RELEASE
+    assert '"Content-Length": String(asset.size)' in PORTAL_RELEASE
+    assert 'duplex: "half"' in PORTAL_RELEASE
     assert "RELEASE_HISTORY_API" in PORTAL_RELEASE
-    assert "stable_manifest_missing" not in PORTAL_RELEASE
+    assert "warmPrivateMirror" not in PORTAL_RELEASE
+
+
+def test_update_mirror_bucket_is_public_only_for_already_public_velopack_assets() -> None:
+    assert "'listing-studio-updates'" in UPDATE_MIRROR_MIGRATION
+    assert "true" in UPDATE_MIRROR_MIGRATION
+    assert "536870912" in UPDATE_MIRROR_MIGRATION
+    assert "application/json" in UPDATE_MIRROR_MIGRATION
+    assert "application/octet-stream" in UPDATE_MIRROR_MIGRATION

@@ -2,10 +2,13 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
 const REPOSITORY = "yuchenm1303-png/ecommerce-agent";
-const UPDATE_BASE_URL = `https://github.com/${REPOSITORY}`;
+const GITHUB_UPDATE_SOURCE = `https://github.com/${REPOSITORY}`;
 const LATEST_RELEASE_API = `https://api.github.com/repos/${REPOSITORY}/releases/latest`;
 const RELEASE_HISTORY_API = `https://api.github.com/repos/${REPOSITORY}/releases?per_page=20`;
-const RELEASE_BUCKET = "listing-studio-releases";
+const UPDATE_BUCKET = "listing-studio-updates";
+const UPDATE_CHANNEL = "win-x64-stable";
+const UPDATE_FEED_NAME = `releases.${UPDATE_CHANNEL}.json`;
+const STABLE_CACHE_PATH = "stable/latest.json";
 const LEGACY_MANIFEST_ASSET = "update.json";
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const SHA256_DIGEST_RE = /^sha256:([0-9a-f]{64})$/i;
@@ -14,6 +17,29 @@ const ALLOWED_ORIGINS = new Set([
   "https://smirel.com",
   "https://www.smirel.com",
 ]);
+
+type MirrorAsset = {
+  name: string;
+  sourceUrl: string;
+  size: number;
+  contentType: string;
+};
+
+type StableRelease = {
+  version: string;
+  title: string;
+  notes: string;
+  publishedAt: string;
+  required: boolean;
+  minSupportedVersion: string;
+  installerName: string;
+  installerUrl: string;
+  installerSha256: string;
+  installerSize: number;
+  fileSize: string;
+  feedAsset: MirrorAsset;
+  packageAssets: MirrorAsset[];
+};
 
 function corsHeaders(req: Request): Record<string, string> {
   const origin = req.headers.get("origin") || "";
@@ -70,16 +96,35 @@ function getServerSecretKey(): string {
   return String(Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "").trim();
 }
 
-function createAdminClient() {
-  const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
+function storageConfig() {
+  const supabaseUrl = String(Deno.env.get("SUPABASE_URL") || "").trim().replace(/\/$/, "");
   const serverKey = getServerSecretKey();
   if (!supabaseUrl || !serverKey) throw new Error("server_storage_config_missing");
+  return { supabaseUrl, serverKey };
+}
+
+function createAdminClient() {
+  const { supabaseUrl, serverKey } = storageConfig();
   return createClient(supabaseUrl, serverKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 }
 
-function parseStableRelease(release: any) {
+function assetForRelease(release: any, version: string, name: string, contentType: string): MirrorAsset | null {
+  const asset = release.assets.find((candidate: any) => candidate?.name === name);
+  const size = Number(asset?.size || 0);
+  const expectedUrl = `https://github.com/${REPOSITORY}/releases/download/v${version}/${name}`;
+  if (
+    String(asset?.browser_download_url || "") !== expectedUrl ||
+    !Number.isSafeInteger(size) ||
+    size <= 0
+  ) {
+    return null;
+  }
+  return { name, sourceUrl: expectedUrl, size, contentType };
+}
+
+function parseStableRelease(release: any): StableRelease | null {
   if (!release || release.draft || release.prerelease || !Array.isArray(release.assets)) {
     return null;
   }
@@ -94,15 +139,22 @@ function parseStableRelease(release: any) {
   const installerSize = Number(installerAsset?.size || 0);
   const digest = String(installerAsset?.digest || "").trim().toLowerCase();
   const digestMatch = digest.match(SHA256_DIGEST_RE);
-  const expectedUrl = `https://github.com/${REPOSITORY}/releases/download/v${version}/${installerName}`;
+  const installerUrl = `https://github.com/${REPOSITORY}/releases/download/v${version}/${installerName}`;
   if (
-    String(installerAsset?.browser_download_url || "") !== expectedUrl ||
+    String(installerAsset?.browser_download_url || "") !== installerUrl ||
     !Number.isSafeInteger(installerSize) ||
     installerSize <= 0 ||
     !digestMatch
   ) {
     return null;
   }
+
+  const feedAsset = assetForRelease(release, version, UPDATE_FEED_NAME, "application/json");
+  const fullName = `Smirel.ListingStudio-${version}-${UPDATE_CHANNEL}-full.nupkg`;
+  const deltaName = `Smirel.ListingStudio-${version}-${UPDATE_CHANNEL}-delta.nupkg`;
+  const fullAsset = assetForRelease(release, version, fullName, "application/octet-stream");
+  const deltaAsset = assetForRelease(release, version, deltaName, "application/octet-stream");
+  if (!feedAsset || !fullAsset) return null;
 
   return {
     version,
@@ -112,14 +164,16 @@ function parseStableRelease(release: any) {
     required: false,
     minSupportedVersion: "",
     installerName,
-    installerUrl: expectedUrl,
+    installerUrl,
     installerSha256: digestMatch[1].toLowerCase(),
     installerSize,
     fileSize: formatBytes(installerSize),
+    feedAsset,
+    packageAssets: deltaAsset ? [deltaAsset, fullAsset] : [fullAsset],
   };
 }
 
-async function applyLegacyMetadata(stable: NonNullable<ReturnType<typeof parseStableRelease>>, release: any) {
+async function applyLegacyMetadata(stable: StableRelease, release: any): Promise<StableRelease> {
   const legacyManifestAsset = release.assets.find((asset: any) => asset?.name === LEGACY_MANIFEST_ASSET);
   if (!legacyManifestAsset?.browser_download_url) return stable;
 
@@ -154,7 +208,7 @@ async function applyLegacyMetadata(stable: NonNullable<ReturnType<typeof parseSt
   }
 }
 
-async function resolveStableRelease() {
+async function resolveStableReleaseFromGitHub(): Promise<StableRelease> {
   const releaseResponse = await fetch(LATEST_RELEASE_API, {
     headers: githubHeaders("Listing-Studio-Release-Metadata"),
     cache: "no-store",
@@ -165,6 +219,36 @@ async function resolveStableRelease() {
   const parsed = parseStableRelease(release);
   if (!parsed) throw new Error("invalid_latest_release");
   return await applyLegacyMetadata(parsed, release);
+}
+
+async function persistStableCache(admin: ReturnType<typeof createAdminClient>, stable: StableRelease) {
+  const blob = new Blob([JSON.stringify(stable)], { type: "application/json" });
+  const { error } = await admin.storage.from(UPDATE_BUCKET).upload(STABLE_CACHE_PATH, blob, {
+    contentType: "application/json",
+    cacheControl: "30",
+    upsert: true,
+  });
+  if (error) throw error;
+}
+
+async function loadStableCache(admin: ReturnType<typeof createAdminClient>): Promise<StableRelease> {
+  const { data, error } = await admin.storage.from(UPDATE_BUCKET).download(STABLE_CACHE_PATH);
+  if (error || !data) throw error || new Error("stable_cache_missing");
+  const parsed = JSON.parse(await data.text());
+  if (!parsed || !VERSION_RE.test(String(parsed.version || ""))) throw new Error("stable_cache_invalid");
+  if (!parsed.feedAsset || !Array.isArray(parsed.packageAssets)) throw new Error("stable_cache_invalid_assets");
+  return parsed as StableRelease;
+}
+
+async function resolveStableRelease(admin: ReturnType<typeof createAdminClient>): Promise<StableRelease> {
+  try {
+    const stable = await resolveStableReleaseFromGitHub();
+    await persistStableCache(admin, stable).catch((error) => console.error("stable cache persist failed", error));
+    return stable;
+  } catch (githubError) {
+    console.error("GitHub Stable control-plane lookup failed; using last validated cache", githubError);
+    return await loadStableCache(admin);
+  }
 }
 
 async function resolveStableHistory(currentVersion: string) {
@@ -179,7 +263,7 @@ async function resolveStableHistory(currentVersion: string) {
 
   return releases
     .map(parseStableRelease)
-    .filter((item): item is NonNullable<ReturnType<typeof parseStableRelease>> => Boolean(item))
+    .filter((item): item is StableRelease => Boolean(item))
     .filter((item) => item.version !== currentVersion)
     .sort((a, b) => Date.parse(b.publishedAt || "") - Date.parse(a.publishedAt || ""))
     .slice(0, HISTORY_LIMIT)
@@ -194,52 +278,92 @@ async function resolveStableHistory(currentVersion: string) {
     }));
 }
 
-async function privateInstallerExists(
-  admin: ReturnType<typeof createAdminClient>,
-  stable: Awaited<ReturnType<typeof resolveStableRelease>>,
-) {
-  const folder = `stable/v${stable.version}`;
-  const { data, error } = await admin.storage.from(RELEASE_BUCKET).list(folder, {
-    limit: 100,
-    search: stable.installerName,
-  });
-  if (error) throw error;
-  const hit = data?.find((item: any) => item?.name === stable.installerName);
-  if (!hit) return false;
-  const size = Number(hit?.metadata?.size ?? hit?.metadata?.contentLength ?? 0);
-  return size <= 0 || size === stable.installerSize;
+function mirrorFolder(version: string): string {
+  return `stable/v${version}`;
 }
 
-async function warmPrivateMirror(stable: Awaited<ReturnType<typeof resolveStableRelease>>) {
-  try {
-    const admin = createAdminClient();
-    if (await privateInstallerExists(admin, stable)) return;
+function mirrorBaseUrl(version: string): string {
+  const { supabaseUrl } = storageConfig();
+  return `${supabaseUrl}/storage/v1/object/public/${UPDATE_BUCKET}/${mirrorFolder(version)}`;
+}
 
-    const source = await fetch(stable.installerUrl, {
-      headers: { "User-Agent": "Listing-Studio-Release-Mirror" },
-      cache: "no-store",
-      redirect: "follow",
-    });
-    if (!source.ok || !source.body) throw new Error(`installer_source_fetch_${source.status}`);
+async function mirrorAssetExists(
+  admin: ReturnType<typeof createAdminClient>,
+  version: string,
+  asset: MirrorAsset,
+): Promise<boolean> {
+  const { data, error } = await admin.storage.from(UPDATE_BUCKET).list(mirrorFolder(version), {
+    limit: 100,
+    search: asset.name,
+  });
+  if (error) throw error;
+  const hit = data?.find((item: any) => item?.name === asset.name);
+  if (!hit) return false;
+  const size = Number(hit?.metadata?.size ?? hit?.metadata?.contentLength ?? 0);
+  return size === asset.size;
+}
 
-    const contentLength = Number(source.headers.get("content-length") || 0);
-    if (contentLength > 0 && contentLength !== stable.installerSize) {
-      try { await source.body.cancel(); } catch {}
-      throw new Error("installer_source_size_mismatch");
+function encodedObjectPath(path: string): string {
+  return path.split("/").map((part) => encodeURIComponent(part)).join("/");
+}
+
+async function streamAssetToStorage(version: string, asset: MirrorAsset): Promise<void> {
+  const source = await fetch(asset.sourceUrl, {
+    headers: { "User-Agent": "Listing-Studio-Update-Mirror" },
+    cache: "no-store",
+    redirect: "follow",
+  });
+  if (!source.ok || !source.body) throw new Error(`update_asset_fetch_${source.status}:${asset.name}`);
+  const sourceLength = Number(source.headers.get("content-length") || 0);
+  if (sourceLength > 0 && sourceLength !== asset.size) {
+    try { await source.body.cancel(); } catch {}
+    throw new Error(`update_asset_source_size_mismatch:${asset.name}`);
+  }
+
+  const { supabaseUrl, serverKey } = storageConfig();
+  const path = `${mirrorFolder(version)}/${asset.name}`;
+  const uploadUrl = `${supabaseUrl}/storage/v1/object/${UPDATE_BUCKET}/${encodedObjectPath(path)}`;
+  const init = {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${serverKey}`,
+      "apikey": serverKey,
+      "Content-Type": asset.contentType,
+      "Content-Length": String(asset.size),
+      "Cache-Control": "max-age=31536000, immutable",
+      "x-upsert": "true",
+    },
+    body: source.body,
+    duplex: "half",
+  } as RequestInit & { duplex: "half" };
+  const upload = await fetch(uploadUrl, init);
+  if (!upload.ok) {
+    const detail = (await upload.text()).slice(0, 800);
+    throw new Error(`update_asset_upload_${upload.status}:${asset.name}:${detail}`);
+  }
+}
+
+async function ensureMirrorAsset(
+  admin: ReturnType<typeof createAdminClient>,
+  stable: StableRelease,
+  asset: MirrorAsset,
+): Promise<boolean> {
+  if (await mirrorAssetExists(admin, stable.version, asset)) return true;
+  await streamAssetToStorage(stable.version, asset);
+  if (!(await mirrorAssetExists(admin, stable.version, asset))) {
+    throw new Error(`update_asset_verify_failed:${asset.name}`);
+  }
+  console.log(`update mirror ready: ${mirrorFolder(stable.version)}/${asset.name}`);
+  return true;
+}
+
+async function warmUpdatePackages(admin: ReturnType<typeof createAdminClient>, stable: StableRelease) {
+  for (const asset of stable.packageAssets) {
+    try {
+      await ensureMirrorAsset(admin, stable, asset);
+    } catch (error) {
+      console.error("update package mirror warmup failed", asset.name, error);
     }
-
-    const path = `stable/v${stable.version}/${stable.installerName}`;
-    const { error } = await admin.storage.from(RELEASE_BUCKET).upload(path, source.body, {
-      contentType: "application/octet-stream",
-      cacheControl: "31536000",
-      upsert: false,
-    });
-    if (error && !/already exists|duplicate/i.test(String(error.message || ""))) throw error;
-
-    if (!(await privateInstallerExists(admin, stable))) throw new Error("private_release_verify_failed");
-    console.log(`private release mirror ready: ${path}`);
-  } catch (error) {
-    console.error("private release warmup failed", error);
   }
 }
 
@@ -252,17 +376,33 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const stable = await resolveStableRelease();
+    const admin = createAdminClient();
+    const stable = await resolveStableRelease(admin);
     const history = await resolveStableHistory(stable.version).catch((error) => {
       console.error("release history resolution failed", error);
       return [];
     });
-    EdgeRuntime.waitUntil(warmPrivateMirror(stable));
+
+    let mirrorFeedReady = false;
+    try {
+      mirrorFeedReady = await ensureMirrorAsset(admin, stable, stable.feedAsset);
+    } catch (error) {
+      console.error("update feed mirror warmup failed", error);
+    }
+    if (mirrorFeedReady) {
+      EdgeRuntime.waitUntil(warmUpdatePackages(admin, stable));
+    }
+
+    const updateSources = mirrorFeedReady
+      ? [mirrorBaseUrl(stable.version), GITHUB_UPDATE_SOURCE]
+      : [GITHUB_UPDATE_SOURCE];
 
     return json(req, {
       channel: "stable",
       version: `v${stable.version}`,
-      updateBaseUrl: UPDATE_BASE_URL,
+      updateBaseUrl: updateSources[0],
+      updateSources,
+      mirrorReady: mirrorFeedReady,
       title: stable.title,
       notes: stable.notes,
       publishedAt: stable.publishedAt,

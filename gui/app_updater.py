@@ -1,9 +1,9 @@
-"""Velopack-backed Stable update presentation for Listing Studio.
+"""Resilient Stable update presentation for Listing Studio.
 
-Listing Studio owns only product policy and presentation: when to offer an update,
-whether listing work is idle, closing its dedicated Makro browser, and showing the
-branded progress surface. Velopack owns release discovery, package download,
-process handoff, replacement, rollback and restart.
+The application owns update policy and presentation. The control plane exposes a
+validated Stable version and redundant transport routes; Velopack still owns the
+release feed semantics, package verification, installation, rollback and restart.
+Network work is isolated from the Qt process so a bad route can never pin the UI.
 """
 from __future__ import annotations
 
@@ -17,11 +17,12 @@ from PySide6.QtWidgets import QBoxLayout, QLabel, QMainWindow, QMessageBox, QPus
 
 from app.update_browser_gate import DEFAULT_CDP_PORT, close_managed_browser
 from app.velopack_runtime import (
-    bounded_check_for_updates,
+    check_update_route,
     create_update_manager,
+    download_update_with_failover,
     installed_application_version,
     is_velopack_managed,
-    resolve_stable_update_source,
+    resolve_stable_update_route,
     update_summary,
 )
 from gui.update_panel import UpdateMessageDialog, UpdateOfferDialog, UpdateProgressDialog
@@ -29,6 +30,8 @@ from gui.update_runtime import shutdown_owned_qprocesses
 
 _CHECK_DELAY_MS = 1800
 _AUTO_CHECK_INTERVAL_MS = 60 * 60 * 1000
+_AUTO_RETRY_DELAYS_MS = (30_000, 120_000, 600_000, 1_800_000)
+_BUSY_RETRY_MS = 120_000
 _SLOW_CHECK_NOTICE_MS = 6000
 
 
@@ -43,27 +46,20 @@ def _format_size(size: int) -> str:
     return f"{value} B"
 
 
-def _version_key(value: str) -> tuple[int, int, int] | None:
-    parts = str(value or "").strip().lstrip("v").split(".")
-    if len(parts) != 3 or any(not part.isdigit() for part in parts):
-        return None
-    return int(parts[0]), int(parts[1]), int(parts[2])
-
-
 def _friendly_update_error(error: str) -> str:
     raw = str(error or "").strip()
     lowered = raw.lower()
-    if "update_service_unreachable" in lowered or "timed out" in lowered or "timeout" in lowered:
-        return "暂时无法连接更新服务，请检查网络后稍后重试。当前版本可以继续正常使用。"
-    if "update_service_http_429" in lowered or "rate limit" in lowered:
-        return "更新服务当前请求较多，请稍后重试。当前版本可以继续正常使用。"
-    if "update_service_http_" in lowered or "http" in lowered or "network" in lowered:
-        return "更新服务器暂时不可用，请稍后重试。当前版本可以继续正常使用。"
-    return raw or "更新服务暂时不可用，请稍后重试。"
+    if "timed out" in lowered or "timeout" in lowered or "all stable update routes failed" in lowered:
+        return "当前网络没有完成更新连接，程序会自动切换线路并继续重试。当前版本可以正常使用。"
+    if "429" in lowered or "rate limit" in lowered:
+        return "更新服务当前请求较多，程序会稍后自动重试。当前版本可以正常使用。"
+    if "http" in lowered or "network" in lowered or "connection" in lowered or "dns" in lowered:
+        return "更新线路暂时不可用，程序会自动切换备用线路并继续重试。当前版本可以正常使用。"
+    return raw or "更新服务暂时不可用，程序会自动重试。"
 
 
 class ApplicationUpdater(QObject):
-    """Thin branded Qt presentation over Velopack's standard lifecycle."""
+    """Qt presentation over a redundant, bounded Velopack update lifecycle."""
 
     _check_finished = Signal(object)
     _download_progress = Signal(int)
@@ -79,6 +75,7 @@ class ApplicationUpdater(QObject):
         self._checking = False
         self._updating = False
         self._check_token = 0
+        self._retry_index = 0
         self._last_prompted_version: str | None = None
         self._active_source_url = ""
         self._progress: UpdateProgressDialog | None = None
@@ -94,6 +91,9 @@ class ApplicationUpdater(QObject):
         self._auto_timer = QTimer(self)
         self._auto_timer.setInterval(_AUTO_CHECK_INTERVAL_MS)
         self._auto_timer.timeout.connect(self.check_for_updates)
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.timeout.connect(self.check_for_updates)
         self._install_header_controls()
 
     @staticmethod
@@ -213,6 +213,19 @@ class ApplicationUpdater(QObject):
         except RuntimeError:
             pass
 
+    def _reset_retry_backoff(self) -> None:
+        self._retry_index = 0
+        self._retry_timer.stop()
+
+    def _schedule_check_retry(self, delay_ms: int | None = None) -> None:
+        if not self.enabled() or self._updating:
+            return
+        if delay_ms is None:
+            index = min(self._retry_index, len(_AUTO_RETRY_DELAYS_MS) - 1)
+            delay_ms = _AUTO_RETRY_DELAYS_MS[index]
+            self._retry_index = min(self._retry_index + 1, len(_AUTO_RETRY_DELAYS_MS) - 1)
+        self._retry_timer.start(max(1_000, int(delay_ms)))
+
     def schedule_startup_check(self) -> None:
         if not self.enabled():
             return
@@ -248,6 +261,7 @@ class ApplicationUpdater(QObject):
                     lambda token=token: self._mark_check_slow(token),
                 )
             return
+
         self._checking = True
         self._manual_check = bool(manual)
         self._check_token += 1
@@ -258,31 +272,18 @@ class ApplicationUpdater(QObject):
 
         def _worker() -> None:
             try:
-                advertised_version, source_url = resolve_stable_update_source()
-                advertised_key = _version_key(advertised_version)
-                current_key = _version_key(self.current_version)
-                if advertised_key is not None and current_key is not None and advertised_key <= current_key:
-                    payload = {
-                        "ok": True,
-                        "summary": None,
-                        "info": None,
-                        "source_url": source_url,
-                    }
-                else:
-                    info = bounded_check_for_updates(source_url)
-                    summary = update_summary(info) if info else None
-                    if summary is not None and advertised_version:
-                        actual = str(summary.get("version") or "").strip().lstrip("v")
-                        if actual != advertised_version:
-                            raise RuntimeError(
-                                "更新服务元数据与 Velopack feed 不一致，请稍后重试。"
-                            )
-                    payload = {
-                        "ok": True,
-                        "summary": summary,
-                        "info": info,
-                        "source_url": source_url,
-                    }
+                route = resolve_stable_update_route()
+                info, source_url = check_update_route(route, self.current_version)
+                summary = update_summary(info) if info else None
+                payload = {
+                    "ok": True,
+                    "summary": summary,
+                    "info": info,
+                    "source_url": source_url,
+                    "sources": list(route.sources),
+                    "prefer_system_proxy": route.prefer_system_proxy,
+                    "control_plane_error": route.control_plane_error,
+                }
             except Exception as exc:
                 payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             self._check_finished.emit(payload)
@@ -296,6 +297,7 @@ class ApplicationUpdater(QObject):
         self._set_manual_check_busy(False)
         payload = dict(payload_obj) if isinstance(payload_obj, dict) else {}
         if not payload.get("ok"):
+            self._schedule_check_retry()
             if manual:
                 raw_error = str(payload.get("error") or "Velopack update check failed")
                 friendly = _friendly_update_error(raw_error)
@@ -307,9 +309,16 @@ class ApplicationUpdater(QObject):
                 )
             return
 
+        self._reset_retry_backoff()
         summary = payload.get("summary")
         info = payload.get("info")
         source_url = str(payload.get("source_url") or "").strip()
+        sources = tuple(
+            str(value or "").strip()
+            for value in payload.get("sources", [])
+            if str(value or "").strip()
+        )
+        prefer_system_proxy = bool(payload.get("prefer_system_proxy", True))
         if not isinstance(summary, dict) or info is None:
             if manual:
                 self._show_message(
@@ -325,24 +334,43 @@ class ApplicationUpdater(QObject):
         if not manual and latest == self._last_prompted_version:
             return
         self._last_prompted_version = latest
-        self._prompt_for_update(summary, info, source_url)
+        self._prompt_for_update(
+            summary,
+            info,
+            source_url,
+            sources or (source_url,),
+            prefer_system_proxy=prefer_system_proxy,
+            manual=manual,
+        )
 
     def _browser_manager(self) -> Any | None:
         return getattr(self.window, "_managed_makro_browser", None)
 
-    def _prompt_for_update(self, summary: dict[str, Any], info: Any, source_url: str) -> None:
+    def _prompt_for_update(
+        self,
+        summary: dict[str, Any],
+        info: Any,
+        source_url: str,
+        sources: tuple[str, ...],
+        *,
+        prefer_system_proxy: bool,
+        manual: bool,
+    ) -> None:
         manager = self._browser_manager()
         if manager is not None and hasattr(manager, "is_busy"):
             try:
-                if bool(manager.is_busy()):
-                    self._last_prompted_version = None
+                busy = bool(manager.is_busy())
+            except Exception:
+                busy = True
+            if busy:
+                self._last_prompted_version = None
+                self._schedule_check_retry(_BUSY_RETRY_MS)
+                if manual:
                     self._show_message(
                         QMessageBox.Icon.Information,
                         "当前有上架任务正在运行，暂不开始更新。",
-                        informative="请等待 Single / Real Execution / Batch 任务结束后再次检查更新。",
+                        informative="任务结束后程序会自动再次检查，不需要反复点击。",
                     )
-                    return
-            except Exception:
                 return
 
         latest = str(summary.get("version") or "").strip().lstrip("v")
@@ -357,7 +385,13 @@ class ApplicationUpdater(QObject):
         )
         QTimer.singleShot(0, lambda: self._bring_to_front(dialog))
         if dialog.exec() == UpdateOfferDialog.DialogCode.Accepted:
-            self._begin_update(latest, info, source_url)
+            self._begin_update(
+                latest,
+                info,
+                source_url,
+                sources,
+                prefer_system_proxy=prefer_system_proxy,
+            )
 
     def _open_progress(self, target_version: str) -> None:
         progress = UpdateProgressDialog(self.window, target_version=target_version)
@@ -413,6 +447,7 @@ class ApplicationUpdater(QObject):
         self._resume_browser_manager()
         self._last_prompted_version = None
         self._close_progress()
+        self._schedule_check_retry()
         friendly = _friendly_update_error(error)
         self._show_message(
             QMessageBox.Icon.Critical,
@@ -421,7 +456,15 @@ class ApplicationUpdater(QObject):
             details=error if friendly != error else "",
         )
 
-    def _begin_update(self, target_version: str, info: Any, source_url: str) -> None:
+    def _begin_update(
+        self,
+        target_version: str,
+        info: Any,
+        source_url: str,
+        sources: tuple[str, ...],
+        *,
+        prefer_system_proxy: bool,
+    ) -> None:
         if self._updating:
             return
         browser_manager = self._browser_manager()
@@ -432,10 +475,11 @@ class ApplicationUpdater(QObject):
                 ready, reason = False, str(exc)
             if not ready:
                 self._last_prompted_version = None
+                self._schedule_check_retry(_BUSY_RETRY_MS)
                 self._show_message(
                     QMessageBox.Icon.Information,
                     "当前状态不适合进入更新。",
-                    informative=str(reason or "请等待当前任务结束后重试。"),
+                    informative=str(reason or "请等待当前任务结束，程序会自动重试。"),
                 )
                 return
 
@@ -443,30 +487,38 @@ class ApplicationUpdater(QObject):
         actual = str(summary.get("version") or "").strip().lstrip("v")
         if actual != target_version:
             self._last_prompted_version = None
+            self._schedule_check_retry()
             self._show_message(
                 QMessageBox.Icon.Warning,
                 "更新目标已经发生变化。",
-                informative="请重新检查更新后再继续。",
+                informative="程序会重新检查 Stable 通道，不会安装不一致的版本。",
             )
             return
 
         self._updating = True
         self._active_source_url = source_url
+        self._retry_timer.stop()
         self._set_manual_check_busy(False)
         self._open_progress(target_version)
 
         def _worker() -> None:
             try:
-                manager = create_update_manager(source_url)
+                def _progress(value: int) -> None:
+                    self._download_progress.emit(max(0, min(100, int(value))))
 
-                def _progress(value: Any) -> None:
-                    try:
-                        percent = max(0, min(100, int(value)))
-                    except (TypeError, ValueError):
-                        percent = 0
-                    self._download_progress.emit(percent)
+                def _status(text: str) -> None:
+                    self._update_stage.emit(str(text), True)
 
-                manager.download_updates(info, _progress)
+                used_source = download_update_with_failover(
+                    target_version,
+                    sources,
+                    preferred_source=source_url,
+                    prefer_system_proxy=prefer_system_proxy,
+                    progress=_progress,
+                    status=_status,
+                )
+                self._active_source_url = used_source
+                manager = create_update_manager(used_source)
                 if manager.get_update_pending_restart() is None:
                     raise RuntimeError("Velopack 下载完成但没有生成可应用的更新包。")
 

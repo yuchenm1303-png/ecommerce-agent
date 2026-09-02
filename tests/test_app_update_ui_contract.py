@@ -29,11 +29,26 @@ def test_installed_app_checks_stable_updates_at_startup_and_while_running() -> N
     assert 'self._auto_timer.start()' in UPDATER
 
 
+def test_failed_automatic_checks_retry_quickly_instead_of_going_silent_for_an_hour() -> None:
+    assert '_AUTO_RETRY_DELAYS_MS = (30_000, 120_000, 600_000, 1_800_000)' in UPDATER
+    assert 'self._retry_timer.setSingleShot(True)' in UPDATER
+    assert 'self._retry_timer.timeout.connect(self.check_for_updates)' in UPDATER
+    assert 'self._schedule_check_retry()' in UPDATER
+    assert 'self._reset_retry_backoff()' in UPDATER
+
+
 def test_periodic_check_does_not_repeat_the_same_update_prompt() -> None:
     assert 'self._last_prompted_version' in UPDATER
     assert 'latest == self._last_prompted_version' in UPDATER
     assert 'manual = self._manual_check' in UPDATER
     assert 'if not manual and latest == self._last_prompted_version' in UPDATER
+
+
+def test_busy_listing_work_defers_update_and_rechecks_without_auto_modal_spam() -> None:
+    assert '_BUSY_RETRY_MS = 120_000' in UPDATER
+    assert 'self._schedule_check_retry(_BUSY_RETRY_MS)' in UPDATER
+    assert 'if manual:' in UPDATER
+    assert '任务结束后程序会自动再次检查' in UPDATER
 
 
 def test_updater_uses_premium_foreground_panels_and_download_progress() -> None:
