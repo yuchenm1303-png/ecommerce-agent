@@ -22,13 +22,14 @@ from .ai_decisions import (
 )
 from .compact_evidence import CompactEvidence
 from .business_fields import is_business_question
+from .live_field_contract import execution_contract
 from .providers.dashscope_web_search import WebSearchJSONResult, WebSearchSource
 from .semantic_grounding import GroundingCatalog, TEXT_KIND
 from .source_bundle import normalize_key
 
 
-WEB_SEARCH_CONTRACT_VERSION = 19
-WEB_SEARCH_CACHE_VERSION = 19
+WEB_SEARCH_CONTRACT_VERSION = 20
+WEB_SEARCH_CACHE_VERSION = 20
 WEB_FILLABLE_STATUSES = {MISSING, REVIEW}
 STRONG_IDENTITY_BASES = {
     "canonical_offer_or_url",
@@ -180,8 +181,7 @@ def _prior_payload(decision: FieldDecision) -> dict[str, Any]:
 
 
 def _web_field_contract(field: dict[str, Any]) -> dict[str, Any]:
-    """Keep only field metadata that changes Web research or answer shape."""
-
+    """Keep exactly the semantic address plus canonical mechanical answer shape."""
     contract = field_contract(field)
     section = contract["section_heading"].casefold()
     payload: dict[str, Any] = {
@@ -194,9 +194,9 @@ def _web_field_contract(field: dict[str, Any]) -> dict[str, Any]:
             if "product description" in section
             else "A"
         ),
+        "multi_value": contract["multi_value"],
+        "execution_contract": execution_contract(field),
     }
-    if contract["multi_value"]:
-        payload["multi_value"] = True
     if contract["options"]:
         payload["options"] = contract["options"]
     if contract["qualifier_options"]:
@@ -244,9 +244,6 @@ def _fingerprint_lines(text: str, *, budget: int) -> list[str]:
             line = line.split("] ", 1)[1]
         if not line:
             continue
-        # Long rendered-text lines often begin with the supplier/manufacturer
-        # identity and then continue into page chrome. Keep that useful prefix
-        # instead of dropping the entire line from the compact fingerprint.
         line = line[:280]
         key = normalize_key(line)
         if not key or key in seen:
@@ -270,7 +267,6 @@ def build_product_fingerprint(
     max_chars: int = 2_000,
 ) -> str:
     """Build a small search identity, never a second copy of all product evidence."""
-
     lines: list[str] = []
     if compact_evidence is not None:
         lines.extend(_fingerprint_lines(compact_evidence.web_text, budget=1_200))
@@ -315,10 +311,7 @@ def _research_prompt(
             "source_product_url": product_url.strip(),
             "fingerprint": product_fingerprint,
         },
-        "target_fields": [
-            _web_target_payload(field, decision)
-            for field, decision in targets
-        ],
+        "target_fields": [_web_target_payload(field, decision) for field, decision in targets],
         "workflow": [
             "Actually invoke the built-in Web search tool now. Perform 3 to 5 distinct product-level queries covering exact product identity, manufacturer/model, manuals/specification pages, and genuinely comparable products.",
             "Inspect multiple non-duplicate real pages when available. Read their specification tables and manuals instead of relying only on search-result titles or snippets.",
@@ -334,7 +327,8 @@ def _research_prompt(
             "A URL merely present in canonical_product or the prompt is identity context, not a returned Web source. Never copy it into source_url unless the search tool actually returned it.",
             "Use READY for direct comparable-product evidence, REVIEW for material uncertainty, and CONFLICT for direct disagreement.",
             "Do not rotate dimension axes or mix packaging/body/mount, cabin/rear, documentation/device-interface language, product/vehicle compatibility, display resolution/recording resolution, or other neighboring field scopes.",
-            "If multi_value=false return one value. If qualifier_options exist, use an exact allowed qualifier; if qualifier_options are empty, qualifier must be empty.",
+            "Obey each target execution_contract exactly. family=numeric requires bare finite values. qualifier_mode=none requires qualifier empty; selectable allows only qualifier_options; fixed allows only fixed_unit; inline may carry a grounded unit that the text control will serialize inline.",
+            "If multi_value=false return one value. For closed_domain selections use only exact options.",
             "Never research seller-operated price, stock, MOQ, fulfilment, shipping policy or listing-status fields.",
             "Return decisions only for fields found in real returned pages. Omit everything else; the separate inference stage will handle it.",
             "Return one JSON object only.",
@@ -435,10 +429,7 @@ def _search_cache_key(
         "source_manifest_sha256": initial.source_manifest_sha256,
         "product_url": product_url.strip(),
         "product_fingerprint": product_fingerprint,
-        "targets": [
-            _web_target_payload(field, decision)
-            for field, decision in targets
-        ],
+        "targets": [_web_target_payload(field, decision) for field, decision in targets],
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -747,7 +738,6 @@ def run_web_enrichment(
     compact_evidence: CompactEvidence | None = None,
 ) -> WebEnrichmentResult:
     """Run one product-level Web research session, then fill only MISSING fields."""
-
     if int(batch_size) < 1:
         raise ValueError("web batch_size 必须 >= 1。")
     if int(concurrency) < 1:
