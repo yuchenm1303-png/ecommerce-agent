@@ -12,11 +12,8 @@ CATALOG_PROBE_STEP1_URL = (
     "https://seller.makro.co.za/index.html#dashboard/addListings/single"
 )
 
-# Exact, observed Step-1 content headings.  The first entry is the current live
-# Makro heading confirmed in the Windows portal.  Older Browse Verticals labels
-# are retained only as compatible surface aliases; generic progress-step text
-# such as "SELECT VERTICAL" is deliberately not accepted because it can appear
-# outside the taxonomy content surface.
+# Public compatibility metadata only.  Taxonomy ownership no longer depends on
+# heading text, language, CSS classes, screen coordinates, or fixed dimensions.
 STEP1_SURFACE_MARKERS = (
     "Select The Vertical For Your Product",
     "Browse Verticals",
@@ -26,227 +23,260 @@ STEP1_SURFACE_MARKERS = (
     "浏览垂直领域",
 )
 
+_REGISTRY_KEY = "__listingStudioMakroTaxonomyRegistryV3"
 
-_SURFACE_JS = r"""({anchor, markers, limit, click}) => {
-  const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-  const visible = (el) => {
-    if (!el || !(el instanceof Element)) return false;
-    const s = getComputedStyle(el);
-    if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity || 1) === 0) return false;
-    const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0 && r.right > 0 && r.bottom > 0
-      && r.left < innerWidth && r.top < innerHeight;
-  };
 
-  const markerKeys = new Set((markers || []).map((v) => clean(v).toLocaleLowerCase()));
-  const ax = Number(anchor.x || 0);
-  const ay = Number(anchor.y || 0);
-  const aw = Number(anchor.width || 0);
-  const ah = Number(anchor.height || 0);
-  const anchorLeft = ax;
-  const anchorRight = ax + aw;
-  const anchorTop = ay;
-  const anchorBottom = ay + ah;
+class TaxonomySurfaceError(RuntimeError):
+    """The live Step-1 taxonomy surface could not be mechanically owned."""
 
-  // Verify the exact Step-1 content surface near the vertical search control.
-  // This is intentionally independent from sidebar/progress navigation text.
-  const markerCandidates = [];
-  for (const el of document.querySelectorAll('body *')) {
-    if (!visible(el)) continue;
+
+_STRUCTURAL_SURFACE_JS = rf"""(anchor, payload) => {{
+  const REGISTRY_KEY = { _REGISTRY_KEY!r };
+  const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const key = (value) => clean(value).toLocaleLowerCase();
+  const rendered = (el) => {{
+    if (!el || !(el instanceof Element) || !el.isConnected) return false;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) === 0) return false;
+    const rect = el.getBoundingClientRect();
+    // Deliberately do not require viewport intersection. Rows clipped by an
+    // internal taxonomy scroller are still real DOM evidence.
+    return rect.width > 0 && rect.height > 0;
+  }};
+  const leafText = (el) => {{
     const text = clean(el.innerText || el.textContent || '');
-    if (!markerKeys.has(text.toLocaleLowerCase())) continue;
-    const r = el.getBoundingClientRect();
-    if (r.right < anchorLeft - 48) continue;
-    if (r.left > anchorRight + 520) continue;
-    if (r.bottom < anchorTop - 280) continue;
-    if (r.top > anchorBottom + 180) continue;
-    const childEcho = [...(el.children || [])].some((child) =>
-      markerKeys.has(clean(child.innerText || child.textContent || '').toLocaleLowerCase())
-    );
-    if (childEcho) continue;
-    markerCandidates.push({el, r, text, area: r.width * r.height});
-  }
-  markerCandidates.sort((a, b) => {
-    const da = Math.abs(a.r.left - anchorLeft) + Math.abs(a.r.bottom - anchorTop);
-    const db = Math.abs(b.r.left - anchorLeft) + Math.abs(b.r.bottom - anchorTop);
-    return da - db || a.area - b.area;
-  });
-  if (!markerCandidates.length) {
-    return {
-      marker_found: false,
-      columns: [],
-      diagnostic: 'Select Vertical content heading not found beside the Step-1 search surface',
-    };
-  }
-
-  const marker = markerCandidates[0];
-  const mr = marker.r;
-  const surfaceLeft = Math.max(0, anchorLeft - 40);
-  const surfaceTop = Math.max(anchorBottom - 12, mr.bottom - 8);
-
-  const leafText = (el) => {
-    const text = clean(el.innerText || el.textContent || '');
-    if (!text || text.length < 2 || text.length > 90) return '';
-    for (const child of el.children || []) {
+    if (!text || text.length < 2 || text.length > 120) return '';
+    for (const child of el.children || []) {{
       if (clean(child.innerText || child.textContent || '') === text) return '';
-    }
+    }}
     return text;
-  };
-
-  const itemElements = (container) => {
-    const cr = container.getBoundingClientRect();
+  }};
+  const isActionable = (el) => {{
+    if (!el || !(el instanceof Element)) return false;
+    const tag = String(el.tagName || '').toLocaleLowerCase();
+    const role = key(el.getAttribute && el.getAttribute('role'));
+    if (tag === 'button' || tag === 'a' || ['button','option','menuitem','treeitem'].includes(role)) return true;
+    if (typeof el.onclick === 'function') return true;
+    try {{ return getComputedStyle(el).cursor === 'pointer'; }} catch (_) {{ return false; }}
+  }};
+  const actionTarget = (source, stop) => {{
+    let node = source;
+    for (let depth = 0; depth < 10 && node && node instanceof Element && node !== stop; depth++, node = node.parentElement) {{
+      if (isActionable(node)) return node;
+    }}
+    return null;
+  }};
+  const isExplicitList = (el) => {{
+    if (!el || !(el instanceof Element)) return false;
+    const tag = String(el.tagName || '').toLocaleLowerCase();
+    const role = key(el.getAttribute && el.getAttribute('role'));
+    return tag === 'ul' || tag === 'ol' || ['list','listbox','menu','tree'].includes(role);
+  }};
+  const isScrollOwner = (el) => {{
+    if (!el || !(el instanceof Element) || el === document.body || el === document.documentElement) return false;
+    const style = getComputedStyle(el);
+    const overflowY = key(style.overflowY);
+    return overflowY === 'auto' || overflowY === 'scroll' || el.scrollHeight > el.clientHeight + 4;
+  }};
+  const directBranchCount = (container) => {{
+    let count = 0;
+    for (const child of container.children || []) {{
+      if (!rendered(child)) continue;
+      let actionable = false;
+      if (isActionable(child)) actionable = true;
+      if (!actionable) {{
+        const descendants = child.querySelectorAll('button,a,[role="button"],[role="option"],[role="menuitem"],[role="treeitem"]');
+        actionable = [...descendants].some(rendered);
+      }}
+      if (actionable) count += 1;
+      if (count >= 2) return count;
+    }}
+    return count;
+  }};
+  const groupOwner = (target, scope) => {{
+    // Prefer an actual scroll/list owner. This is the strongest structural
+    // contract and survives text/language/layout changes.
+    let node = target.parentElement;
+    for (let depth = 0; depth < 12 && node && node instanceof Element && node !== scope; depth++, node = node.parentElement) {{
+      if (node.contains(anchor)) continue;
+      if (isScrollOwner(node) || isExplicitList(node)) return node;
+    }}
+    // Some Makro generations render short columns as plain repeated sibling
+    // containers. Bind the smallest repeated owner instead of guessing by pixels.
+    node = target.parentElement;
+    for (let depth = 0; depth < 8 && node && node instanceof Element && node !== scope; depth++, node = node.parentElement) {{
+      if (node.contains(anchor)) continue;
+      if (directBranchCount(node) >= 2) return node;
+    }}
+    return null;
+  }};
+  const followsAnchor = (el) => {{
+    if (!el || el.contains(anchor)) return false;
+    const position = anchor.compareDocumentPosition(el);
+    return !!(position & Node.DOCUMENT_POSITION_FOLLOWING);
+  }};
+  const registry = (() => {{
+    let current = window[REGISTRY_KEY];
+    if (!current || current.version !== 3) {{
+      current = {{version: 3, nextId: 1, ids: new WeakMap(), nodes: new Map(), rootId: '', scopeId: ''}};
+      window[REGISTRY_KEY] = current;
+    }}
+    for (const [id, node] of [...current.nodes.entries()]) {{
+      if (!node || !node.isConnected) current.nodes.delete(id);
+    }}
+    return current;
+  }})();
+  const idOf = (el) => {{
+    let id = registry.ids.get(el);
+    if (!id) {{
+      id = `taxonomy-v3-${{registry.nextId++}}`;
+      registry.ids.set(el, id);
+    }}
+    registry.nodes.set(id, el);
+    return id;
+  }};
+  const nodeFor = (id) => {{
+    const node = registry.nodes.get(String(id || ''));
+    return node && node.isConnected ? node : null;
+  }};
+  const currentItems = (owner, scope, limit) => {{
     const out = [];
     const seen = new Set();
-    for (const el of container.querySelectorAll('*')) {
-      if (!visible(el)) continue;
+    for (const el of owner.querySelectorAll('*')) {{
+      if (!rendered(el)) continue;
       const text = leafText(el);
       if (!text) continue;
-      const r = el.getBoundingClientRect();
-      if (r.width < 20 || r.height < 8 || r.height > 100) continue;
-      if (r.left < cr.left - 6 || r.right > cr.right + 6) continue;
-      const role = el.getAttribute && el.getAttribute('role');
-      const style = getComputedStyle(el);
-      const clickable = !!el.closest('button,a,[role="button"],[role="option"],[role="menuitem"],li')
-        || style.cursor === 'pointer'
-        || typeof el.onclick === 'function';
-      const rowish = r.width >= Math.min(48, Math.max(28, cr.width * 0.25));
-      if (!clickable && !rowish) continue;
-      const key = text.toLocaleLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({el, text, clickable});
+      const target = actionTarget(el, owner);
+      if (!target) continue;
+      const actualOwner = groupOwner(target, scope);
+      if (actualOwner !== owner) continue;
+      const normalized = key(text);
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      out.push({{text, source: el, target}});
       if (out.length >= limit) break;
-    }
+    }}
     return out;
-  };
+  }};
+  const discoverGroups = (scope, limit) => {{
+    const owners = new Map();
+    for (const el of scope.querySelectorAll('*')) {{
+      if (!rendered(el)) continue;
+      const text = leafText(el);
+      if (!text) continue;
+      const target = actionTarget(el, scope);
+      if (!target) continue;
+      const owner = groupOwner(target, scope);
+      if (!owner || !rendered(owner) || owner.contains(anchor) || !followsAnchor(owner)) continue;
+      if (!owners.has(owner)) owners.set(owner, []);
+    }}
+    const descriptors = [];
+    let domOrder = 0;
+    for (const owner of scope.querySelectorAll('*')) {{
+      if (!owners.has(owner)) continue;
+      const items = currentItems(owner, scope, limit);
+      if (items.length < 1) continue;
+      const ownerId = idOf(owner);
+      const maxScroll = Math.max(0, Number(owner.scrollHeight || 0) - Number(owner.clientHeight || 0));
+      descriptors.push({{
+        group_id: ownerId,
+        owner_id: ownerId,
+        items: items.map((item) => item.text),
+        scrollable: isScrollOwner(owner),
+        scroll_top: Number(owner.scrollTop || 0),
+        max_scroll: maxScroll,
+        client_height: Number(owner.clientHeight || 0),
+        dom_order: domOrder++,
+        is_root: false,
+      }});
+    }}
+    return descriptors;
+  }};
+  const chooseScope = (limit) => {{
+    let fallback = null;
+    let node = anchor.parentElement;
+    for (let depth = 0; depth < 10 && node && node instanceof Element; depth++, node = node.parentElement) {{
+      const groups = discoverGroups(node, limit);
+      if (!groups.length) continue;
+      fallback = {{scope: node, groups}};
+      // The smallest ancestor containing the search plus at least one repeated
+      // group is the structural Step-1 owner. A single-item transient group is
+      // not strong enough to establish ownership.
+      if (groups.some((group) => group.items.length >= 2)) return fallback;
+    }}
+    return fallback;
+  }};
 
-  const pools = [];
-  for (const el of document.querySelectorAll('body *')) {
-    if (!visible(el)) continue;
-    const r = el.getBoundingClientRect();
-    // Hard ownership boundary: only the central Step-1 content below the search
-    // control is eligible. Dashboard/Orders navigation is left of this region.
-    if (r.left < surfaceLeft || r.top < surfaceTop) continue;
-    if (r.right > innerWidth - 4) continue;
-    if (r.width < 48 || r.width > 420 || r.height < 24 || r.height > innerHeight * 0.88) continue;
-    const items = itemElements(el);
-    if (!items.length) continue;
-    const clickableCount = items.filter((item) => item.clickable).length;
-    if (clickableCount < 1) continue;
-    pools.push({
-      el,
-      x: r.left,
-      y: r.top,
-      width: r.width,
-      height: r.height,
-      items,
-    });
-  }
+  const action = String(payload && payload.action || 'inspect');
+  const limit = Math.max(8, Number(payload && payload.limit || 400));
 
-  const itemKey = (pool) => pool.items.map((item) => item.text).join('\u0001').toLocaleLowerCase();
-  const dedupe = (input) => {
-    const sorted = [...input].sort((a, b) =>
-      a.x - b.x || a.y - b.y || b.items.length - a.items.length || b.height - a.height
-    );
-    const kept = [];
-    for (const candidate of sorted) {
-      let duplicate = false;
-      for (const existing of kept) {
-        const sameX = Math.abs(existing.x - candidate.x) < 14;
-        const sameWidth = Math.abs(existing.width - candidate.width) < 32;
-        const a = itemKey(existing);
-        const b = itemKey(candidate);
-        if (sameX && sameWidth && (a === b || a.includes(b) || b.includes(a))) {
-          duplicate = true;
-          if (candidate.items.length > existing.items.length
-              || (candidate.items.length === existing.items.length && candidate.height > existing.height)) {
-            Object.assign(existing, candidate);
-          }
-          break;
-        }
-      }
-      if (!duplicate) kept.push(candidate);
-    }
-    return kept;
-  };
+  if (action === 'scroll') {{
+    const owner = nodeFor(payload.owner_id);
+    if (!owner) return {{ok: false, reason: 'owned_column_missing'}};
+    const maxTop = Math.max(0, Number(owner.scrollHeight || 0) - Number(owner.clientHeight || 0));
+    const before = Number(owner.scrollTop || 0);
+    let target = before;
+    const direction = String(payload.direction || '');
+    if (direction === 'top') target = 0;
+    else if (direction === 'next') {{
+      const step = Math.max(1, Math.floor(Math.max(1, Number(owner.clientHeight || 1)) * 0.82));
+      target = Math.min(maxTop, before + step);
+    }} else return {{ok: false, reason: 'invalid_scroll_action'}};
+    owner.scrollTop = target;
+    try {{ owner.dispatchEvent(new Event('scroll', {{bubbles: true}})); }} catch (_) {{}}
+    const after = Number(owner.scrollTop || 0);
+    return {{
+      ok: true,
+      found: true,
+      moved: Math.abs(after - before) > 0.5,
+      at_end: after >= maxTop - 1,
+      scroll_top: after,
+      max_scroll: maxTop,
+    }};
+  }}
 
-  const available = dedupe(pools);
-  const rootCandidates = available.filter((pool) => {
-    if (pool.items.length < 2) return false;
-    if (pool.x < surfaceLeft) return false;
-    if (pool.x > anchorLeft + 300) return false;
-    if (pool.y > anchorBottom + 620) return false;
-    return true;
-  });
-  rootCandidates.sort((a, b) => {
-    const scoreA = Math.abs(a.x - anchorLeft) * 4
-      + Math.abs(a.y - anchorBottom) - Math.min(a.items.length, 80) * 2;
-    const scoreB = Math.abs(b.x - anchorLeft) * 4
-      + Math.abs(b.y - anchorBottom) - Math.min(b.items.length, 80) * 2;
-    return scoreA - scoreB;
-  });
-  if (!rootCandidates.length) {
-    return {
-      marker_found: true,
-      marker_text: marker.text,
-      columns: [],
-      diagnostic: 'Select Vertical heading found but no taxonomy root column exists in its owned Step-1 surface',
-    };
-  }
+  const chosen = chooseScope(limit);
+  if (!chosen || !chosen.scope || !chosen.groups.length) {{
+    return {{ok: false, reason: 'taxonomy_structure_not_found', diagnostic: 'no structural taxonomy group follows the live Vertical search input'}};
+  }}
+  const scope = chosen.scope;
+  let groups = chosen.groups;
+  registry.scopeId = idOf(scope);
 
-  const kept = [rootCandidates[0]];
-  for (let depth = 0; depth < 7; depth++) {
-    const rightmost = kept[kept.length - 1];
-    const candidates = available.filter((pool) => {
-      if (kept.includes(pool)) return false;
-      if (pool.x <= rightmost.x + 24 || pool.x > rightmost.x + 440) return false;
-      if (Math.abs(pool.y - rightmost.y) > 210 && Math.abs(pool.y - anchorBottom) > 320) return false;
-      return !kept.some((existing) => Math.abs(existing.x - pool.x) < 16);
-    });
-    if (!candidates.length) break;
-    const minX = Math.min(...candidates.map((pool) => pool.x));
-    const sameColumn = candidates.filter((pool) => Math.abs(pool.x - minX) < 20);
-    sameColumn.sort((a, b) => b.items.length - a.items.length || b.height - a.height || a.y - b.y);
-    kept.push(sameColumn[0]);
-  }
+  const liveIds = new Set(groups.map((group) => group.group_id));
+  if (!registry.rootId || !liveIds.has(registry.rootId)) {{
+    const strong = groups.filter((group) => group.items.length >= 2);
+    if (!strong.length) {{
+      return {{ok: false, reason: 'taxonomy_root_not_stable', diagnostic: 'taxonomy groups exist but no repeated root group is stable'}};
+    }}
+    const scrollable = strong.filter((group) => group.scrollable);
+    registry.rootId = (scrollable[0] || strong[0]).group_id;
+  }}
+  groups = groups.map((group) => ({{...group, is_root: group.group_id === registry.rootId}}));
+  groups.sort((a, b) => Number(b.is_root) - Number(a.is_root) || a.dom_order - b.dom_order);
 
-  const columns = kept.map((pool) => pool.items.map((item) => item.text));
-  if (!click) {
-    return {
-      marker_found: true,
-      marker_text: marker.text,
-      columns,
-      diagnostic: '',
-    };
-  }
+  if (action === 'click') {{
+    const groupId = String(payload.group_id || '');
+    const owner = nodeFor(groupId);
+    if (!owner) return {{ok: false, reason: 'owned_column_missing', groups}};
+    const wanted = clean(payload.wanted);
+    const matches = currentItems(owner, scope, limit).filter((item) => clean(item.text) === wanted);
+    if (matches.length !== 1) return {{ok: false, reason: 'node_not_unique_in_owned_column', groups}};
+    const item = matches[0];
+    try {{ item.source.scrollIntoView({{block: 'nearest', inline: 'nearest'}}); }} catch (_) {{}}
+    item.target.click();
+    return {{ok: true, reason: '', groups}};
+  }}
 
-  const level = Number(click.level);
-  const wanted = clean(click.wanted);
-  if (!Number.isInteger(level) || level < 0 || level >= kept.length) {
-    return {ok: false, reason: 'level_missing', marker_found: true, columns};
-  }
-  const column = kept[level];
-  const matches = column.items.filter((item) => clean(item.text) === wanted);
-  if (matches.length !== 1) {
-    return {ok: false, reason: 'node_not_unique', marker_found: true, columns};
-  }
-
-  const source = matches[0].el;
-  source.scrollIntoView({block: 'center', inline: 'nearest'});
-  let target = source;
-  for (let i = 0; i < 7 && target && target !== column.el; i++, target = target.parentElement) {
-    const role = target.getAttribute && target.getAttribute('role');
-    const style = target instanceof Element ? getComputedStyle(target) : null;
-    if (target.tagName === 'BUTTON' || target.tagName === 'A'
-        || role === 'button' || role === 'option' || role === 'menuitem'
-        || target.onclick || (style && style.cursor === 'pointer')) {
-      target.click();
-      return {ok: true, reason: '', marker_found: true, columns};
-    }
-  }
-  source.click();
-  return {ok: true, reason: '', marker_found: true, columns};
-}"""
+  return {{
+    ok: true,
+    reason: '',
+    root_group_id: registry.rootId,
+    scope_id: registry.scopeId,
+    groups,
+    diagnostic: '',
+  }};
+}}"""
 
 
 def parse_catalog_route(url: str) -> MakroListingTarget | None:
@@ -292,102 +322,182 @@ def assert_catalog_probe_route(page: Page, *, allow_vertical: bool) -> MakroList
     return target
 
 
+def _clean(value: object) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
 class CatalogTaxonomyBrowser:
-    """Read/click taxonomy only inside the owned Step-1 Select Vertical surface."""
+    """Own the live Step-1 taxonomy structurally from the exact search control."""
 
     def __init__(self, page: Page) -> None:
         self.page = page
         self.last_diagnostic = ""
 
-    def _search_anchor(self) -> dict[str, float]:
+    def _search(self):
         search = _vertical_search_input(self.page)
         try:
             if not search.is_visible():
-                raise RuntimeError("Makro Step 1 vertical search input is not visible")
+                raise TaxonomySurfaceError("Makro Step 1 Vertical Search input is not visible")
+        except TaxonomySurfaceError:
+            raise
         except Exception as exc:
-            raise RuntimeError("Makro Step 1 vertical search input is not visibly operable") from exc
-        box = search.bounding_box()
-        if not box or float(box.get("width") or 0) < 120 or float(box.get("height") or 0) < 16:
-            raise RuntimeError("Makro Step 1 vertical search input has no stable layout box")
-        return {
-            "x": float(box["x"]),
-            "y": float(box["y"]),
-            "width": float(box["width"]),
-            "height": float(box["height"]),
-        }
+            raise TaxonomySurfaceError("Makro Step 1 Vertical Search input is not visibly operable") from exc
+        return search
 
-    def _surface(
-        self,
-        *,
-        max_items_per_level: int,
-        click: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        assert_catalog_probe_route(self.page, allow_vertical=False)
-        anchor = self._search_anchor()
+    def _evaluate(self, payload: dict[str, Any], *, allow_vertical: bool) -> dict[str, Any]:
+        assert_catalog_probe_route(self.page, allow_vertical=allow_vertical)
+        search = self._search()
         try:
-            raw = self.page.evaluate(
-                _SURFACE_JS,
-                {
-                    "anchor": anchor,
-                    "markers": list(STEP1_SURFACE_MARKERS),
-                    "limit": int(max_items_per_level),
-                    "click": click,
-                },
-            )
+            raw = search.evaluate(_STRUCTURAL_SURFACE_JS, payload)
         except Exception as exc:
-            raise RuntimeError("failed to inspect Makro Select Vertical taxonomy surface") from exc
+            raise TaxonomySurfaceError("failed to inspect the structural Makro taxonomy owner") from exc
         if not isinstance(raw, dict):
-            raise RuntimeError("Makro Select Vertical surface probe returned an invalid payload")
+            raise TaxonomySurfaceError("Makro taxonomy structural probe returned an invalid payload")
         self.last_diagnostic = str(raw.get("diagnostic") or raw.get("reason") or "")
+        if not raw.get("ok"):
+            raise TaxonomySurfaceError(
+                "Makro taxonomy structural ownership failed: "
+                + (self.last_diagnostic or "unknown structural failure")
+            )
         return raw
 
-    def surface_snapshot(self, *, max_items_per_level: int = 200) -> dict[str, Any]:
-        return self._surface(max_items_per_level=max_items_per_level)
-
-    def columns(self, *, max_items_per_level: int = 200) -> list[list[str]]:
-        snapshot = self.surface_snapshot(max_items_per_level=max_items_per_level)
-        output: list[list[str]] = []
-        for raw_column in snapshot.get("columns") or []:
-            if not isinstance(raw_column, list):
+    def column_descriptors(self, *, max_items_per_level: int = 400) -> list[dict[str, Any]]:
+        raw = self._evaluate(
+            {"action": "inspect", "limit": max(8, int(max_items_per_level))},
+            allow_vertical=True,
+        )
+        output: list[dict[str, Any]] = []
+        for entry in raw.get("groups") or []:
+            if not isinstance(entry, dict):
                 continue
             values: list[str] = []
             seen: set[str] = set()
-            for raw in raw_column:
-                value = " ".join(str(raw or "").split()).strip()
-                key = value.casefold()
-                if not value or key in seen:
+            for item in entry.get("items") or []:
+                value = _clean(item)
+                normalized = value.casefold()
+                if not value or normalized in seen:
                     continue
-                seen.add(key)
+                seen.add(normalized)
                 values.append(value)
-            if values:
-                output.append(values)
+            group_id = _clean(entry.get("group_id"))
+            owner_id = _clean(entry.get("owner_id")) or group_id
+            if not group_id or not owner_id or not values:
+                continue
+            output.append(
+                {
+                    "group_id": group_id,
+                    "owner_id": owner_id,
+                    "items": values,
+                    "scrollable": bool(entry.get("scrollable")),
+                    "scroll_top": float(entry.get("scroll_top") or 0.0),
+                    "max_scroll": float(entry.get("max_scroll") or 0.0),
+                    "client_height": float(entry.get("client_height") or 0.0),
+                    "dom_order": int(entry.get("dom_order") or 0),
+                    "is_root": bool(entry.get("is_root")),
+                }
+            )
+        if not output:
+            raise TaxonomySurfaceError("Makro taxonomy owner is present but exposes no live category groups")
+        roots = [entry for entry in output if entry["is_root"]]
+        if len(roots) != 1:
+            raise TaxonomySurfaceError(
+                f"Makro taxonomy structural probe exposed {len(roots)} root groups; expected exactly one"
+            )
         return output
 
-    def ready(self, *, max_items_per_level: int = 200) -> bool:
+    def scroll_owned_column(self, owner_id: str, action: str) -> dict[str, Any]:
+        direction = str(action or "").strip().casefold()
+        if direction not in {"top", "next"}:
+            raise ValueError("taxonomy scroll action must be top or next")
+        raw = self._evaluate(
+            {
+                "action": "scroll",
+                "owner_id": _clean(owner_id),
+                "direction": direction,
+                "limit": 8,
+            },
+            allow_vertical=True,
+        )
+        return {
+            "found": bool(raw.get("found", True)),
+            "moved": bool(raw.get("moved")),
+            "at_end": bool(raw.get("at_end")),
+            "scroll_top": float(raw.get("scroll_top") or 0.0),
+            "max_scroll": float(raw.get("max_scroll") or 0.0),
+        }
+
+    def click_owned_node(
+        self,
+        group_id: str,
+        text: str,
+        *,
+        max_items_per_level: int = 400,
+    ) -> bool:
+        wanted = _clean(text)
+        if not group_id or not wanted:
+            return False
+        try:
+            raw = self._evaluate(
+                {
+                    "action": "click",
+                    "group_id": _clean(group_id),
+                    "wanted": wanted,
+                    "limit": max(8, int(max_items_per_level)),
+                },
+                allow_vertical=False,
+            )
+        except TaxonomySurfaceError:
+            return False
+        return bool(raw.get("ok"))
+
+    def surface_snapshot(self, *, max_items_per_level: int = 400) -> dict[str, Any]:
+        descriptors = self.column_descriptors(max_items_per_level=max_items_per_level)
+        return {
+            "marker_found": True,
+            "marker_text": "",
+            "root_group_id": next(entry["group_id"] for entry in descriptors if entry["is_root"]),
+            "columns": [list(entry["items"]) for entry in descriptors],
+            "descriptors": descriptors,
+            "diagnostic": self.last_diagnostic,
+        }
+
+    def columns(self, *, max_items_per_level: int = 400) -> list[list[str]]:
+        return [
+            list(entry["items"])
+            for entry in self.column_descriptors(max_items_per_level=max_items_per_level)
+        ]
+
+    def ready(self, *, max_items_per_level: int = 400) -> bool:
         if not is_fresh_catalog_step1_url(str(getattr(self.page, "url", "") or "")):
             return False
         try:
-            snapshot = self.surface_snapshot(max_items_per_level=max_items_per_level)
+            return bool(self.column_descriptors(max_items_per_level=max_items_per_level))
         except Exception:
             return False
-        columns = snapshot.get("columns") or []
-        return bool(snapshot.get("marker_found") and columns and columns[0])
 
-    def click_node(self, level: int, text: str, *, max_items_per_level: int = 200) -> bool:
-        wanted = " ".join(str(text or "").split()).strip()
-        if level < 0 or not wanted:
+    def click_node(self, level: int, text: str, *, max_items_per_level: int = 400) -> bool:
+        wanted = _clean(text)
+        if int(level) < 0 or not wanted:
             return False
-        result = self._surface(
+        try:
+            descriptors = self.column_descriptors(max_items_per_level=max_items_per_level)
+        except TaxonomySurfaceError:
+            return False
+        index = int(level)
+        if index >= len(descriptors):
+            return False
+        return self.click_owned_node(
+            str(descriptors[index]["group_id"]),
+            wanted,
             max_items_per_level=max_items_per_level,
-            click={"level": int(level), "wanted": wanted},
         )
-        return bool(result.get("ok"))
 
 
 __all__ = [
     "CATALOG_PROBE_STEP1_URL",
     "STEP1_SURFACE_MARKERS",
     "CatalogTaxonomyBrowser",
+    "TaxonomySurfaceError",
     "assert_catalog_probe_route",
     "is_fresh_catalog_step1_url",
     "parse_catalog_route",

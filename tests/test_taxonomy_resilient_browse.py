@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.makro import taxonomy_resilient as taxonomy_module
 
 
@@ -18,9 +20,6 @@ class _FakeSearch:
     def evaluate(self, _script: str) -> None:
         return None
 
-    def bounding_box(self) -> dict[str, float]:
-        return {"x": 40.0, "y": 260.0, "width": 840.0, "height": 44.0}
-
 
 class _FakePage:
     def wait_for_timeout(self, _milliseconds: int) -> None:
@@ -28,86 +27,168 @@ class _FakePage:
 
 
 class _FakeOwnedTaxonomy:
-    ROOT = [
+    ROOT_CHUNKS = [
+        ["Your Verticals", "Agricultural Products", "Arts & Crafts"],
+        ["Automobile", "Pet Supplies", "Software"],
+    ]
+    PET_CHUNKS = [
+        ["Aquarium Accessories", "Pet Gear"],
+        ["Pet Grooming", "Pet Toys"],
+    ]
+    STALE = [
+        ("card-hair", ["Hair Combs"]),
+        ("card-gym", ["Home Gym Combo"]),
+        ("card-resistance", ["Resistance Tubes"]),
+        ("card-mobile", ["Car Mobile Holder"]),
+    ]
+
+    def __init__(self, _page: object, *, stuck_root: bool = False) -> None:
+        self.state = "root"
+        self.positions = {"root": 0, "pet": 0}
+        self.clicked: list[tuple[str, str]] = []
+        self.last_diagnostic = ""
+        self.stuck_root = bool(stuck_root)
+
+    def _descriptor(
+        self,
+        group_id: str,
+        chunks: list[list[str]],
+        *,
+        dom_order: int,
+        is_root: bool = False,
+    ) -> dict[str, object]:
+        position = self.positions.get(group_id, 0)
+        position = min(position, len(chunks) - 1)
+        return {
+            "group_id": group_id,
+            "owner_id": group_id,
+            "items": list(chunks[position]),
+            "scrollable": len(chunks) > 1,
+            "scroll_top": float(position * 100),
+            "max_scroll": float((len(chunks) - 1) * 100),
+            "client_height": 100.0,
+            "dom_order": dom_order,
+            "is_root": is_root,
+        }
+
+    def column_descriptors(self, *, max_items_per_level: int = 400) -> list[dict[str, object]]:
+        del max_items_per_level
+        output = [self._descriptor("root", self.ROOT_CHUNKS, dom_order=0, is_root=True)]
+        for offset, (group_id, values) in enumerate(self.STALE, start=1):
+            output.append(
+                {
+                    "group_id": group_id,
+                    "owner_id": group_id,
+                    "items": list(values),
+                    "scrollable": False,
+                    "scroll_top": 0.0,
+                    "max_scroll": 0.0,
+                    "client_height": 100.0,
+                    "dom_order": offset,
+                    "is_root": False,
+                }
+            )
+        if self.state == "pet":
+            # The true generated child appears structurally after two stale cards,
+            # proving the wrapper cannot trust a raw numeric column index.
+            child = self._descriptor("pet", self.PET_CHUNKS, dom_order=3)
+            output.insert(3, child)
+            # Keep deterministic DOM-order values after insertion.
+            for index, entry in enumerate(output):
+                entry["dom_order"] = index
+        return output
+
+    def scroll_owned_column(self, owner_id: str, action: str) -> dict[str, object]:
+        if owner_id in {group_id for group_id, _ in self.STALE}:
+            return {"found": True, "moved": False, "at_end": True, "scroll_top": 0.0, "max_scroll": 0.0}
+        chunks = self.ROOT_CHUNKS if owner_id == "root" else self.PET_CHUNKS if owner_id == "pet" else None
+        if chunks is None:
+            raise RuntimeError(f"unknown owner {owner_id}")
+        before = self.positions[owner_id]
+        if action == "top":
+            self.positions[owner_id] = 0
+        elif action == "next":
+            if owner_id == "root" and self.stuck_root and before < len(chunks) - 1:
+                return {
+                    "found": True,
+                    "moved": False,
+                    "at_end": False,
+                    "scroll_top": float(before * 100),
+                    "max_scroll": float((len(chunks) - 1) * 100),
+                }
+            self.positions[owner_id] = min(len(chunks) - 1, before + 1)
+        else:
+            raise RuntimeError(f"bad action {action}")
+        after = self.positions[owner_id]
+        return {
+            "found": True,
+            "moved": after != before,
+            "at_end": after >= len(chunks) - 1,
+            "scroll_top": float(after * 100),
+            "max_scroll": float((len(chunks) - 1) * 100),
+        }
+
+    def click_owned_node(
+        self,
+        group_id: str,
+        text: str,
+        *,
+        max_items_per_level: int = 400,
+    ) -> bool:
+        del max_items_per_level
+        self.clicked.append((group_id, text))
+        if group_id == "root" and text == "Pet Supplies" and self.positions["root"] == 1:
+            self.state = "pet"
+            self.positions["pet"] = 0
+            return True
+        if group_id == "pet" and text == "Pet Toys" and self.positions["pet"] == 1:
+            return True
+        return False
+
+
+def _browser(monkeypatch, *, stuck_root: bool = False):
+    search = _FakeSearch()
+    owned = _FakeOwnedTaxonomy(None, stuck_root=stuck_root)
+    monkeypatch.setattr(taxonomy_module, "_vertical_search_input", lambda _page: search)
+    monkeypatch.setattr(taxonomy_module, "CatalogTaxonomyBrowser", lambda _page: owned)
+    return taxonomy_module.ResilientMakroTaxonomyBrowser(_FakePage()), owned, search
+
+
+def test_browse_fallback_harvests_offscreen_root_and_resets_search(monkeypatch) -> None:
+    browser, _owned, search = _browser(monkeypatch)
+
+    assert browser.columns() == [[
         "Your Verticals",
         "Agricultural Products",
         "Arts & Crafts",
         "Automobile",
         "Pet Supplies",
         "Software",
-    ]
-    STALE = [
-        ["Hair Combs"],
-        ["Home Gym Combo"],
-        ["Resistance Tubes"],
-        ["Car Mobile Holder"],
-    ]
-    PET_CHILD = ["Aquarium Accessories", "Pet Gear", "Pet Grooming", "Pet Toys"]
-
-    def __init__(self, _page: object) -> None:
-        self.state = "root"
-        self.clicked: list[tuple[int, str]] = []
-        self.last_diagnostic = ""
-
-    def columns(self, *, max_items_per_level: int = 160) -> list[list[str]]:
-        del max_items_per_level
-        if self.state == "root":
-            return [list(self.ROOT), *[list(item) for item in self.STALE]]
-        if self.state == "pet":
-            # The real taxonomy child is deliberately inserted after two stale
-            # Step-1 presentation columns. The resilient wrapper must bind the
-            # newly-created child rather than trusting raw DOM column position.
-            return [
-                list(self.ROOT),
-                list(self.STALE[0]),
-                list(self.STALE[1]),
-                list(self.PET_CHILD),
-                list(self.STALE[2]),
-                list(self.STALE[3]),
-            ]
-        return []
-
-    def click_node(self, level: int, text: str, *, max_items_per_level: int = 160) -> bool:
-        del max_items_per_level
-        self.clicked.append((int(level), str(text)))
-        if self.state == "root" and level == 0 and text == "Pet Supplies":
-            self.state = "pet"
-            return True
-        if self.state == "pet" and level == 3 and text == "Pet Toys":
-            return True
-        return False
-
-
-def _browser(monkeypatch):
-    search = _FakeSearch()
-    owned = _FakeOwnedTaxonomy(None)
-    monkeypatch.setattr(taxonomy_module, "_vertical_search_input", lambda _page: search)
-    monkeypatch.setattr(taxonomy_module, "CatalogTaxonomyBrowser", lambda _page: owned)
-    monkeypatch.setattr(
-        taxonomy_module.ResilientMakroTaxonomyBrowser,
-        "_harvest_physical_column",
-        lambda self, raw_index, seed_values, *, max_items_per_level: list(seed_values),
-    )
-    monkeypatch.setattr(
-        taxonomy_module.ResilientMakroTaxonomyBrowser,
-        "_reveal_exact",
-        lambda self, raw_index, wanted, *, max_items_per_level: True,
-    )
-    return taxonomy_module.ResilientMakroTaxonomyBrowser(_FakePage()), owned, search
-
-
-def test_browse_fallback_resets_search_and_hides_preexisting_presentation_columns(monkeypatch) -> None:
-    browser, _owned, search = _browser(monkeypatch)
-
-    assert browser.columns() == [_FakeOwnedTaxonomy.ROOT]
+    ]]
     assert search.fills == [""]
 
 
-def test_new_taxonomy_child_is_rebound_after_parent_click_without_trusting_raw_column_index(monkeypatch) -> None:
+def test_generated_child_is_rebound_structurally_and_fully_scrolled(monkeypatch) -> None:
     browser, owned, _search = _browser(monkeypatch)
 
     assert browser.click_node(0, "Pet Supplies") is True
-    assert browser.columns() == [_FakeOwnedTaxonomy.ROOT, _FakeOwnedTaxonomy.PET_CHILD]
-
+    assert browser.columns() == [
+        [
+            "Your Verticals",
+            "Agricultural Products",
+            "Arts & Crafts",
+            "Automobile",
+            "Pet Supplies",
+            "Software",
+        ],
+        ["Aquarium Accessories", "Pet Gear", "Pet Grooming", "Pet Toys"],
+    ]
     assert browser.click_node(1, "Pet Toys") is True
-    assert owned.clicked == [(0, "Pet Supplies"), (3, "Pet Toys")]
+    assert owned.clicked == [("root", "Pet Supplies"), ("pet", "Pet Toys")]
+
+
+def test_partial_scroll_can_never_masquerade_as_complete_taxonomy(monkeypatch) -> None:
+    browser, _owned, _search = _browser(monkeypatch, stuck_root=True)
+
+    with pytest.raises(taxonomy_module.TaxonomyMechanicalError, match="could not advance"):
+        browser.columns()
