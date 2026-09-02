@@ -18,6 +18,9 @@ PORTAL_RELEASE = (ROOT / "supabase" / "functions" / "portal-release" / "index.ts
 UPDATE_MIRROR_MIGRATION = (
     ROOT / "supabase" / "migrations" / "20260902052000_resilient_update_mirror.sql"
 ).read_text(encoding="utf-8")
+UPDATE_MIRROR_CHUNK_LIMIT_MIGRATION = (
+    ROOT / "supabase" / "migrations" / "20260902054500_chunked_update_mirror_limit.sql"
+).read_text(encoding="utf-8")
 
 
 def test_github_remains_release_authority_while_control_plane_routes_identical_velopack_feeds() -> None:
@@ -185,16 +188,20 @@ def test_public_release_metadata_is_a_cached_github_projection_with_cdn_failover
     assert "loadStableCache(admin)" in PORTAL_RELEASE
     assert "updateSources" in PORTAL_RELEASE
     assert "mirrorReady: mirrorFeedReady" in PORTAL_RELEASE
-    assert "source.body" in PORTAL_RELEASE
-    assert '"Content-Length": String(asset.size)' in PORTAL_RELEASE
-    assert 'duplex: "half"' in PORTAL_RELEASE
+    assert "packageMirrorReady: packagesReady" in PORTAL_RELEASE
+    assert "const MIRROR_CHUNK_BYTES = 32 * 1024 * 1024" in PORTAL_RELEASE
+    assert "function chunkPlan(asset: MirrorAsset): ChunkPart[]" in PORTAL_RELEASE
+    assert '"Range": `bytes=${part.offset}-${end}`' in PORTAL_RELEASE
+    assert "writeChunkManifest(admin, stable, asset)" in PORTAL_RELEASE
     assert "RELEASE_HISTORY_API" in PORTAL_RELEASE
     assert "warmPrivateMirror" not in PORTAL_RELEASE
+    assert '"Tus-Resumable"' not in PORTAL_RELEASE
 
 
-def test_update_mirror_bucket_is_public_only_for_already_public_velopack_assets() -> None:
+def test_update_mirror_bucket_is_public_and_effectively_chunk_limited() -> None:
     assert "'listing-studio-updates'" in UPDATE_MIRROR_MIGRATION
     assert "true" in UPDATE_MIRROR_MIGRATION
-    assert "536870912" in UPDATE_MIRROR_MIGRATION
     assert "application/json" in UPDATE_MIRROR_MIGRATION
     assert "application/octet-stream" in UPDATE_MIRROR_MIGRATION
+    assert "file_size_limit = 52428800" in UPDATE_MIRROR_CHUNK_LIMIT_MIGRATION
+    assert "public = true" in UPDATE_MIRROR_CHUNK_LIMIT_MIGRATION
