@@ -13,6 +13,7 @@ from typing import Any, Iterable
 
 from playwright.sync_api import Page
 
+from ..live_field_contract import execution_contract as canonical_execution_contract
 from ..makro_dryrun import FillVerification, fill_resolved_field, verify_resolved_field
 from .field_engine import execution_contract, fill_control as fill_live_control
 from .fields import build_semantic_fields, scroll_and_capture
@@ -119,11 +120,48 @@ def _same_semantic_field(
     )
 
 
+def _execution_contract_key(field: dict[str, Any]) -> tuple[str, str, str]:
+    """Stable semantic address for one Makro field within one adapter session."""
+    return (
+        str(field.get("attribute_key") or ""),
+        str(field.get("label") or ""),
+        base_section_title(str(field.get("section_heading") or "")),
+    )
+
+
 class MakroDomainAdapter:
     """Skill layer for the Makro Add a Single Listing page."""
 
     def __init__(self, page: Page) -> None:
         self.page = page
+        self._execution_contracts: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    def _bind_execution_contracts(
+        self,
+        fields: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Freeze each field's mechanical contract on first observation.
+
+        Later scans still return fresh DOM controls/selectors/current values, but
+        the mechanical meaning of the field is rebound from this adapter-local
+        snapshot. React validation text, rerenders and Save/reopen state therefore
+        cannot reinterpret numeric/text/selection/unit semantics mid-run.
+        """
+        seen: set[tuple[str, str, str]] = set()
+        for field in fields:
+            key = _execution_contract_key(field)
+            if key in seen:
+                raise RuntimeError(
+                    "当前 Makro 扫描出现无法唯一寻址的重复 semantic field；"
+                    f"拒绝共享 execution contract：{key!r}"
+                )
+            seen.add(key)
+            frozen = self._execution_contracts.get(key)
+            if frozen is None:
+                frozen = dict(canonical_execution_contract(field))
+                self._execution_contracts[key] = frozen
+            field["execution_contract"] = dict(frozen)
+        return fields
 
     def is_listing_page(self) -> bool:
         return is_makro_listing_page(self.page)
@@ -268,10 +306,11 @@ class MakroDomainAdapter:
         try:
             identity = listing_draft_identity_from_url(self.page.url)
         except (ValueError, RuntimeError):
-            return fields
-        for field in fields:
-            field[DRAFT_IDENTITY_FIELD] = dict(identity)
-        return fields
+            identity = None
+        if identity is not None:
+            for field in fields:
+                field[DRAFT_IDENTITY_FIELD] = dict(identity)
+        return self._bind_execution_contracts(fields)
 
     def selector_for(self, control: dict[str, Any]) -> str:
         return selector_for_control(control)
