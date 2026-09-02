@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
+from ..ai.listing import listing_semantic_profile
+from ..ai.platform import AIPlatform
 from .openai_compatible import (
     SUPPORTED_COMPAT_PROFILES,
     OpenAICompatibleSemanticProvider,
@@ -42,12 +44,24 @@ def _vertical_diag(event: str, payload: dict[str, Any]) -> None:
 class _VerticalDiagnosticProvider:
     """Transparent provider proxy that traces only Makro Vertical AI decisions."""
 
-    def __init__(self, delegate: Any) -> None:
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        structured_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        model_profile: Any = None,
+    ) -> None:
         self._delegate = delegate
+        self._structured_executor = structured_executor or delegate.extract_json
+        self.model_profile = model_profile
 
     @property
     def name(self) -> str:
         return str(getattr(self._delegate, "name", "semantic-provider"))
+
+    @property
+    def ai_profile_id(self) -> str:
+        return str(getattr(self.model_profile, "profile_id", ""))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._delegate, name)
@@ -78,7 +92,7 @@ class _VerticalDiagnosticProvider:
             )
 
         try:
-            result = self._delegate.extract_json(request_payload)
+            result = self._structured_executor(request_payload)
         except Exception as exc:
             if task in {_VERTICAL_PLAN_TASK, _VERTICAL_CHOICE_TASK}:
                 _vertical_diag(
@@ -119,10 +133,19 @@ class _VerticalDiagnosticProvider:
         return result
 
 
-def _with_vertical_diagnostics(provider: Any) -> Any:
+def _with_vertical_diagnostics(
+    provider: Any,
+    *,
+    structured_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    model_profile: Any = None,
+) -> Any:
     if isinstance(provider, _VerticalDiagnosticProvider):
         return provider
-    return _VerticalDiagnosticProvider(provider)
+    return _VerticalDiagnosticProvider(
+        provider,
+        structured_executor=structured_executor,
+        model_profile=model_profile,
+    )
 
 
 def _bind_source_page_state_provider(provider: Any) -> Any:
@@ -330,17 +353,16 @@ def validate_provider_config(config: ProviderConfig) -> ProviderConfig:
     )
 
 
-def build_semantic_provider(
-    config: ProviderConfig,
+def _build_semantic_backend(
+    normalized: ProviderConfig,
     *,
-    environ: dict[str, str] | None = None,
-    client: Any | None = None,
-):
-    normalized = validate_provider_config(config)
-    api_key = resolve_api_key(normalized, environ=environ)
+    api_key: str,
+    client: Any | None,
+) -> Any:
+    """Construct the existing vendor adapter without changing its semantics."""
 
     if normalized.provider == "openai-compatible":
-        provider = OpenAICompatibleSemanticProvider(
+        return OpenAICompatibleSemanticProvider(
             model=normalized.model,
             api_key=api_key,
             base_url=normalized.base_url,
@@ -352,7 +374,6 @@ def build_semantic_provider(
             request_timeout_seconds=normalized.request_timeout_seconds,
             enable_thinking=normalized.enable_thinking,
         )
-        return _bind_source_page_state_provider(_with_vertical_diagnostics(provider))
 
     if client is None:
         try:
@@ -366,11 +387,44 @@ def build_semantic_provider(
             timeout=normalized.request_timeout_seconds,
             max_retries=0,
         )
-    provider = OpenAISemanticProvider(
+    return OpenAISemanticProvider(
         model=normalized.model,
         client=client,
         image_detail=normalized.image_detail,
         max_output_tokens=normalized.max_output_tokens,
         request_timeout_seconds=normalized.request_timeout_seconds,
     )
-    return _bind_source_page_state_provider(_with_vertical_diagnostics(provider))
+
+
+def build_semantic_provider(
+    config: ProviderConfig,
+    *,
+    environ: dict[str, str] | None = None,
+    client: Any | None = None,
+):
+    """Build the pinned Listing semantic profile on the generic AI Platform.
+
+    Existing callers still receive the same semantic-provider surface and the
+    same underlying OpenAI/OpenAI-compatible delegate. Only model selection and
+    capability ownership move behind a stable application profile.
+    """
+
+    normalized = validate_provider_config(config)
+    api_key = resolve_api_key(normalized, environ=environ)
+    backend = _build_semantic_backend(normalized, api_key=api_key, client=client)
+
+    profile = listing_semantic_profile(
+        provider=normalized.provider,
+        model=normalized.model,
+    )
+    platform = AIPlatform()
+    platform.register(profile, backend)
+    provider = _with_vertical_diagnostics(
+        backend,
+        structured_executor=lambda payload: platform.execute_structured(
+            profile.profile_id,
+            payload,
+        ),
+        model_profile=profile,
+    )
+    return _bind_source_page_state_provider(provider)
