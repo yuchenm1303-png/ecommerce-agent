@@ -15,6 +15,8 @@ const SHA256_DIGEST_RE = /^sha256:([0-9a-f]{64})$/i;
 const HISTORY_LIMIT = 12;
 const MIRROR_CHUNK_BYTES = 32 * 1024 * 1024;
 const MAX_CHUNKS_PER_WARM = 3;
+const MAX_AUTOMATIC_WARM_PASSES = 12;
+const WARM_PASS_QUERY = "warm_pass";
 const MIRROR_LOCK_MAX_AGE_MS = 15 * 60 * 1000;
 const CHUNK_MANIFEST_SCHEMA = 1;
 const ALLOWED_ORIGINS = new Set([
@@ -358,6 +360,21 @@ function chunkPlan(asset: MirrorAsset): ChunkPart[] {
   return parts;
 }
 
+function requestedWarmPass(req: Request): number {
+  const raw = Number(new URL(req.url).searchParams.get(WARM_PASS_QUERY) || 0);
+  if (!Number.isSafeInteger(raw) || raw < 0) return 0;
+  return Math.min(raw, MAX_AUTOMATIC_WARM_PASSES - 1);
+}
+
+function requiredWarmPasses(stable: StableRelease): number {
+  let required = 1;
+  for (const asset of stable.packageAssets) {
+    if (asset.size <= MIRROR_CHUNK_BYTES) continue;
+    required = Math.max(required, Math.ceil(chunkPlan(asset).length / MAX_CHUNKS_PER_WARM));
+  }
+  return Math.min(required, MAX_AUTOMATIC_WARM_PASSES);
+}
+
 async function fetchRange(asset: MirrorAsset, part: ChunkPart): Promise<Uint8Array> {
   const end = part.offset + part.size - 1;
   const response = await fetch(asset.sourceUrl, {
@@ -481,8 +498,12 @@ async function packageMirrorReady(admin: ReturnType<typeof createAdminClient>, s
   return true;
 }
 
-async function warmUpdatePackages(admin: ReturnType<typeof createAdminClient>, stable: StableRelease) {
-  if (!(await claimMirrorLock(admin, stable.version))) return;
+async function warmUpdatePackages(
+  admin: ReturnType<typeof createAdminClient>,
+  stable: StableRelease,
+): Promise<boolean> {
+  if (!(await claimMirrorLock(admin, stable.version))) return false;
+  let completed = false;
   try {
     for (const asset of stable.packageAssets) {
       if (asset.size <= MIRROR_CHUNK_BYTES) {
@@ -491,10 +512,42 @@ async function warmUpdatePackages(admin: ReturnType<typeof createAdminClient>, s
         await ensureChunkedAsset(admin, stable, asset);
       }
     }
+    completed = true;
   } catch (error) {
     console.error("update package mirror warmup failed", error);
   } finally {
     await releaseMirrorLock(admin, stable.version);
+  }
+  return completed;
+}
+
+async function warmAndContinue(
+  req: Request,
+  admin: ReturnType<typeof createAdminClient>,
+  stable: StableRelease,
+  warmPass: number,
+) {
+  const completed = await warmUpdatePackages(admin, stable);
+  if (!completed || await packageMirrorReady(admin, stable)) return;
+
+  const nextPass = warmPass + 1;
+  const requiredPasses = requiredWarmPasses(stable);
+  if (nextPass >= requiredPasses || nextPass >= MAX_AUTOMATIC_WARM_PASSES) return;
+
+  const nextUrl = new URL(req.url);
+  nextUrl.searchParams.set(WARM_PASS_QUERY, String(nextPass));
+  try {
+    const response = await fetch(nextUrl, {
+      method: "GET",
+      headers: { "User-Agent": "Listing-Studio-Mirror-Warmup" },
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      console.error(`update mirror continuation failed: pass=${nextPass} status=${response.status}`);
+    }
+    try { await response.body?.cancel(); } catch {}
+  } catch (error) {
+    console.error(`update mirror continuation request failed: pass=${nextPass}`, error);
   }
 }
 
@@ -519,7 +572,10 @@ Deno.serve(async (req: Request) => {
     const packagesReady = mirrorFeedReady
       ? await packageMirrorReady(admin, stable).catch(() => false)
       : false;
-    if (mirrorFeedReady && !packagesReady) EdgeRuntime.waitUntil(warmUpdatePackages(admin, stable));
+    if (mirrorFeedReady && !packagesReady) {
+      const warmPass = requestedWarmPass(req);
+      EdgeRuntime.waitUntil(warmAndContinue(req, admin, stable, warmPass));
+    }
 
     const updateSources = mirrorFeedReady
       ? [mirrorBaseUrl(stable.version), GITHUB_UPDATE_SOURCE]
