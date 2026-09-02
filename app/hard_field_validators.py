@@ -10,6 +10,10 @@ from .resolution_types import RESOLVED, ResolvedAnswer
 from .source_bundle import normalize_key
 
 
+_TRUE_VALUES = {"1", "true", "yes", "y", "是", "有", "checked", "on"}
+_FALSE_VALUES = {"0", "false", "no", "n", "否", "无", "unchecked", "off"}
+
+
 @dataclass(slots=True, frozen=True)
 class FieldValidationResult:
     valid: bool
@@ -50,7 +54,7 @@ def is_selection_semantic_field(semantic_field: dict[str, Any]) -> bool:
 
 def is_closed_selection_semantic_field(semantic_field: dict[str, Any]) -> bool:
     contract = execution_contract(semantic_field)
-    return contract["family"] == "selection" and bool(contract["options"])
+    return contract["family"] == "selection" and bool(contract["closed_domain"])
 
 
 def executable_value_options(semantic_field: dict[str, Any]) -> list[str]:
@@ -72,11 +76,11 @@ def _cardinality_validation(contract: dict[str, Any], answer: ResolvedAnswer) ->
 
 
 def _closed_domain_validation(contract: dict[str, Any], answer: ResolvedAnswer) -> FieldValidationResult:
-    if contract["family"] != "selection":
+    if contract["family"] != "selection" or not contract["closed_domain"]:
         return FieldValidationResult(True)
     options = list(contract["options"])
     if not options:
-        return FieldValidationResult(False, "当前 live selection 控件没有 enabled executable option。")
+        return FieldValidationResult(False, "当前 closed-domain live selection 没有 enabled executable option。")
     allowed = {_norm(value) for value in options if _norm(value)}
     for value in answer.answer_values:
         if _norm(value) not in allowed:
@@ -97,6 +101,20 @@ def _numeric_validation(contract: dict[str, Any], answer: ResolvedAnswer) -> Fie
             return FieldValidationResult(False, f"数值 {number:g} 小于字段最小值 {minimum:g}。")
         if maximum is not None and number > maximum:
             return FieldValidationResult(False, f"数值 {number:g} 大于字段最大值 {maximum:g}。")
+    return FieldValidationResult(True)
+
+
+def _boolean_validation(contract: dict[str, Any], answer: ResolvedAnswer) -> FieldValidationResult:
+    if contract["family"] != "boolean":
+        return FieldValidationResult(True)
+    if len(answer.answer_values) != 1:
+        return FieldValidationResult(False, "boolean 控件要求恰好一个明确值。")
+    value = _norm(answer.answer_values[0])
+    if value not in _TRUE_VALUES | _FALSE_VALUES:
+        return FieldValidationResult(
+            False,
+            f"布尔控件无法机械解释值 {answer.answer_values[0]!r}；仅接受明确 true/false/yes/no/1/0。",
+        )
     return FieldValidationResult(True)
 
 
@@ -144,7 +162,13 @@ def validate_resolved_answer(
             if not is_valid_gtin(value):
                 return FieldValidationResult(False, f"GTIN/EAN 校验失败：{value!r} 不是有效的 GTIN-8/12/13/14。")
 
-    for validator in (_cardinality_validation, _closed_domain_validation, _numeric_validation, _length_validation):
+    for validator in (
+        _cardinality_validation,
+        _closed_domain_validation,
+        _numeric_validation,
+        _boolean_validation,
+        _length_validation,
+    ):
         result = validator(contract, answer)
         if not result.valid:
             return result
