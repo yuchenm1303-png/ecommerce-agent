@@ -13,6 +13,11 @@ from .contracts import ToolEffect
 
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
 ToolHandler = Callable[["ToolContext", dict[str, Any]], "ToolResult"]
+CancelCheck = Callable[[], bool]
+
+
+def _never_cancelled() -> bool:
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +25,15 @@ class ToolContext:
     session_id: str
     turn_id: str
     workspace: Path
+    is_cancelled: CancelCheck = _never_cancelled
+
+    @property
+    def cancelled(self) -> bool:
+        return bool(self.is_cancelled())
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancelled:
+            raise RuntimeError("agent turn cancellation requested")
 
     def resolve_workspace_path(self, relative_path: str) -> Path:
         value = str(relative_path or "").strip()
@@ -200,6 +214,7 @@ def _validate_value(schema: dict[str, Any], value: Any, *, path: str, root: bool
 
 __all__ = [
     "AgentTool",
+    "CancelCheck",
     "ToolContext",
     "ToolHandler",
     "ToolPolicy",

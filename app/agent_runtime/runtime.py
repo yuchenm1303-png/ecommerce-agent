@@ -159,29 +159,34 @@ class AgentRuntime:
             session.status = AgentStatus.RUNNING
             session.pending_approval = None
             call = session.pending_tool_calls.pop(0)
-            if approved:
-                self._record(
-                    session,
-                    AgentEventKind.TOOL_APPROVED,
-                    data={"call_id": call.call_id, "tool": call.name},
-                )
-                if not self._consume_tool_call(session, call, approval_granted=True):
-                    return self._result(session)
-            else:
-                self._record(
-                    session,
-                    AgentEventKind.TOOL_DENIED,
-                    data={"call_id": call.call_id, "tool": call.name},
-                )
-                self._append_tool_result(
-                    session,
-                    call,
-                    ToolResult(ok=False, content="Tool call denied by the user."),
-                    failed=True,
-                )
-
             token = self._activate(session.session_id)
             try:
+                if approved:
+                    self._record(
+                        session,
+                        AgentEventKind.TOOL_APPROVED,
+                        data={"call_id": call.call_id, "tool": call.name},
+                    )
+                    if not self._consume_tool_call(
+                        session,
+                        call,
+                        token=token,
+                        approval_granted=True,
+                    ):
+                        return self._result(session)
+                else:
+                    self._record(
+                        session,
+                        AgentEventKind.TOOL_DENIED,
+                        data={"call_id": call.call_id, "tool": call.name},
+                    )
+                    self._append_tool_result(
+                        session,
+                        call,
+                        ToolResult(ok=False, content="Tool call denied by the user."),
+                        failed=True,
+                    )
+
                 if not self._process_pending_tools(session, token):
                     return self._result(session)
                 return self._drive(session, token)
@@ -203,6 +208,7 @@ class AgentRuntime:
                 session.status = AgentStatus.CANCELLED
                 session.pending_approval = None
                 session.pending_tool_calls.clear()
+                session.error = "cancelled by user"
                 self._record(session, AgentEventKind.TURN_CANCELLED, data={})
             return self._result(session)
 
@@ -254,6 +260,8 @@ class AgentRuntime:
                 )
                 if not isinstance(response, ModelResponse):
                     raise TypeError("agent model platform must return ModelResponse")
+                if not response.text and not response.tool_calls:
+                    raise RuntimeError("agent model response contained neither text nor tool calls")
                 if self._cancel_if_requested(session, token):
                     return self._result(session)
 
@@ -360,7 +368,12 @@ class AgentRuntime:
                 return False
 
             session.pending_tool_calls.pop(0)
-            if not self._consume_tool_call(session, call, approval_granted=False):
+            if not self._consume_tool_call(
+                session,
+                call,
+                token=token,
+                approval_granted=False,
+            ):
                 return False
         return True
 
@@ -369,8 +382,11 @@ class AgentRuntime:
         session: AgentSession,
         call: ToolCall,
         *,
+        token: CancellationToken,
         approval_granted: bool,
     ) -> bool:
+        if self._cancel_if_requested(session, token):
+            return False
         tool = self.tools.get(call.name)
         if tool is None:
             self._append_tool_result(
@@ -402,6 +418,7 @@ class AgentRuntime:
             session_id=session.session_id,
             turn_id=session.current_turn_id,
             workspace=Path(session.workspace_dir),
+            is_cancelled=lambda: token.cancelled,
         )
         try:
             result = tool.handler(context, call.arguments)
@@ -410,6 +427,8 @@ class AgentRuntime:
         except Exception as exc:
             result = ToolResult(ok=False, content=f"{type(exc).__name__}: {exc}")
         self._append_tool_result(session, call, result, failed=not result.ok)
+        if self._cancel_if_requested(session, token):
+            return False
         return True
 
     def _append_tool_result(
@@ -452,6 +471,8 @@ class AgentRuntime:
     def _cancel_if_requested(self, session: AgentSession, token: CancellationToken) -> bool:
         if not token.cancelled:
             return False
+        if session.status is AgentStatus.CANCELLED:
+            return True
         session.status = AgentStatus.CANCELLED
         session.pending_approval = None
         session.pending_tool_calls.clear()
