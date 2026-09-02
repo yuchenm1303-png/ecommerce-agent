@@ -124,12 +124,7 @@ def _controls_prove_closed_domain(controls: list[dict[str, Any]]) -> bool:
 
 
 def is_closed_selection_semantic_field(semantic_field: dict[str, Any]) -> bool:
-    """Return True only when the current live DOM proves a finite option domain.
-
-    These helpers remain available for non-AI inputs and diagnostics.  Validated
-    AI decisions bypass this semantic gate entirely; the browser executor is the
-    only authority on whether an exact value can mechanically be written.
-    """
+    """Return True only when the current live DOM proves a finite option domain."""
 
     controls = _value_controls(semantic_field)
     if controls:
@@ -268,30 +263,23 @@ def validate_resolved_answer(
     semantic_field: dict[str, Any],
     answer: ResolvedAnswer,
 ) -> FieldValidationResult:
-    """Validate non-AI inputs without re-deciding validated AI product semantics.
+    """Validate one resolved value against the observed live execution contract.
 
-    A ``source_type == 'ai_decision'`` answer is authoritative.  This function
-    must never turn it from READY into BLOCKED because a later DOM scan renders a
-    different input type, option list, unit control, min/max, maxlength, or other
-    presentation contract.  The executor still performs exact field binding,
-    control interaction, readback, Save and persistence verification; an
-    impossible browser operation is reported as an execution failure, not as a
-    competing product decision.
-
-    Non-AI inputs (for example explicit seller/business configuration) retain the
-    deterministic validation helpers below.
+    Semantic ownership and mechanical executability are separate concerns.  AI,
+    user input and deterministic business/fallback sources may decide *what* the
+    value means, but none of them may bypass the current live control contract.
+    This validator never invents, rewrites or substitutes product semantics; it
+    only answers whether the exact resolved value can be executed as observed.
     """
 
     if answer.status != RESOLVED:
-        return FieldValidationResult(True)
-    if str(answer.source_type or "").casefold() == "ai_decision":
         return FieldValidationResult(True)
     if not answer.answer_values:
         return FieldValidationResult(False, "resolved 答案没有 answer_values。")
     if answer.qualifier and not has_live_value_control(semantic_field):
         return FieldValidationResult(
             False,
-            "带 qualifier 的非 AI 答案没有当前 live value control。",
+            "带 qualifier 的 resolved 答案没有当前 live value control。",
         )
 
     key_names = {
