@@ -14,6 +14,8 @@ from typing import Any, Callable
 
 import velopack
 
+from app.chunked_update_transport import ChunkMirrorUnavailable, materialize_chunked_velopack_source
+
 GITHUB_REPOSITORY_URL = "https://github.com/yuchenm1303-png/ecommerce-agent"
 PORTAL_RELEASE_URL = "https://nfzkphjbelyltrzgkdwt.supabase.co/functions/v1/portal-release"
 UPDATE_SOURCE_ENV = "ECOMMERCE_AGENT_UPDATE_SOURCE"
@@ -400,6 +402,53 @@ def _run_check_worker() -> int:
     return 0 if payload.get("ok") else 1
 
 
+def _download_with_chunked_fallback(
+    manager: Any,
+    info: Any,
+    source: str | None,
+    progress: Callable[[int], None],
+) -> Any:
+    """Keep normal Velopack transport first, then recover from a mirrored full package.
+
+    The chunk path is transport-only: bytes are reassembled and strictly checked,
+    then handed back to an ordinary Velopack local-directory source. Velopack still
+    owns release selection, delta/full semantics, staging and install validation.
+    """
+
+    try:
+        manager.download_updates(info, progress)
+        return manager
+    except Exception as primary_error:
+        candidate = str(source or "").strip().rstrip("/")
+        if not candidate.startswith("https://") or candidate == GITHUB_REPOSITORY_URL:
+            raise
+        try:
+            with materialize_chunked_velopack_source(
+                candidate,
+                info,
+                progress=lambda value: progress(max(0, min(85, int(value) * 85 // 100))),
+            ) as local_source:
+                local_manager = create_update_manager(str(local_source))
+                local_info = local_manager.check_for_updates()
+                if local_info is None:
+                    raise RuntimeError("chunked local source did not expose the expected update")
+                expected = str(info.TargetFullRelease.Version or "").strip().lstrip("v")
+                actual = str(local_info.TargetFullRelease.Version or "").strip().lstrip("v")
+                if actual != expected:
+                    raise RuntimeError(
+                        f"chunked local source target mismatch: expected={expected} actual={actual}"
+                    )
+                local_manager.download_updates(
+                    local_info,
+                    lambda value: progress(85 + max(0, min(15, int(value) * 15 // 100))),
+                )
+                if local_manager.get_update_pending_restart() is None:
+                    raise RuntimeError("chunked Velopack download completed without a pending update")
+                return local_manager
+        except ChunkMirrorUnavailable:
+            raise primary_error
+
+
 def _run_download_worker() -> int:
     result_text = str(os.getenv(_UPDATE_CHECK_RESULT_ENV, "") or "").strip()
     progress_text = str(os.getenv(_UPDATE_DOWNLOAD_PROGRESS_ENV, "") or "").strip()
@@ -430,7 +479,7 @@ def _run_download_worker() -> int:
                 percent = 0
             _write_json_atomic(progress_path, {"stage": "downloading", "progress": percent})
 
-        manager.download_updates(info, _progress)
+        manager = _download_with_chunked_fallback(manager, info, source, _progress)
         if manager.get_update_pending_restart() is None:
             raise RuntimeError("Velopack download completed without a pending update")
         payload: dict[str, Any] = {"ok": True, "source": str(source or "")}
