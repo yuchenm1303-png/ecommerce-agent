@@ -41,6 +41,16 @@ def test_chunk_client_reassembles_only_validated_velopack_bytes() -> None:
     assert "local_manager.download_updates(" in RUNTIME
 
 
+def test_slow_chunk_activity_keeps_worker_alive_without_fake_progress() -> None:
+    assert "on_activity: Callable[[], None] | None = None" in CHUNK_TRANSPORT
+    assert "if on_activity is not None:" in CHUNK_TRANSPORT
+    assert "on_activity()" in CHUNK_TRANSPORT
+    assert "def _heartbeat() -> None:" in CHUNK_TRANSPORT
+    assert "legitimately slow 32 MB transfer" in CHUNK_TRANSPORT
+    assert "copied += _append_verified_chunk(" in CHUNK_TRANSPORT
+    assert "int(copied * 100 / total_size)" in CHUNK_TRANSPORT
+
+
 def test_package_mirror_has_a_recoverable_cross_instance_lock() -> None:
     assert "const MIRROR_LOCK_MAX_AGE_MS = 15 * 60 * 1000" in PORTAL_RELEASE
     assert 'return `${mirrorFolder(version)}/.package-mirror.lock`' in PORTAL_RELEASE
