@@ -26,12 +26,13 @@ from .business_fields import is_business_question
 from .compact_evidence import CompactEvidence
 from .evidence_contract import ProductIdentity
 from .listing_content_policy import CONTENT_POLICY_VERSION, GLOBAL_CONTENT_RULES, field_content_policy
+from .live_field_contract import execution_contract
 from .semantic_grounding import GroundingCatalog
 from .source_bundle import normalize_key
 
 
-PRODUCT_FACT_CONTRACT_VERSION = 4
-PRODUCT_FACT_CACHE_VERSION = 7
+PRODUCT_FACT_CONTRACT_VERSION = 5
+PRODUCT_FACT_CACHE_VERSION = 8
 
 
 class JSONTaskProvider(Protocol):
@@ -51,9 +52,10 @@ RULES = [
     "A field may appear at most once. Omit unsupported fields; omission means MISSING.",
     "READY requires an explicit value, exact attribute meaning and matching physical scope.",
     "Two incompatible direct values for the same target and scope require CONFLICT.",
+    "Obey each target execution_contract exactly. family=numeric requires bare finite numeric values. qualifier_mode=none requires an empty qualifier. qualifier_mode=selectable permits only an exact qualifier_options value. qualifier_mode=fixed permits only the fixed_unit when a qualifier is returned.",
     "If multi_value=false, READY must contain exactly one value string. When several compatible facets belong in a free-text field, combine them into one concise string; incompatible alternatives require CONFLICT instead of multiple READY values.",
-    "qualifier is only the marketplace unit/qualifier, never explanation, scope commentary, confidence text or field description. If qualifier_options exist, use one exact allowed qualifier. If qualifier_options are absent, qualifier must be empty unless context_text explicitly renders a fixed physical unit for the value input.",
-    "For a numeric target with a qualifier option or fixed unit rendered in context_text, return the bare finite number in values and the unit in qualifier; never embed the unit token inside the numeric value.",
+    "qualifier is only the marketplace unit/qualifier, never explanation, scope commentary, confidence text or field description.",
+    "For family=numeric, never embed a unit token inside the numeric value; keep any allowed unit only in qualifier.",
     "Do not infer negative values, compatibility, contents, quantity, identity or seller details from absence or convention.",
     "Keep packaging, product body, mount and lens scopes separate; keep physical axes separate.",
     "Keep front, cabin and rear cameras separate; keep documentation language and device capability separate.",
@@ -131,6 +133,7 @@ def _target(field: dict[str, Any]) -> dict[str, Any]:
         "section_heading": contract["section_heading"],
         "required": contract["required"],
         "multi_value": contract["multi_value"],
+        "execution_contract": execution_contract(field),
     }
     for key in ("options", "qualifier_options", "help_text", "context_text"):
         if contract.get(key):
@@ -160,7 +163,7 @@ def build_product_fact_request(
             "Return only fields with direct evidence. For READY, values and citations must be non-empty and "
             "alternatives empty. For CONFLICT, values and citations must be empty and alternatives must contain "
             "at least two distinct grounded values. Check every source for disagreement before READY. "
-            "Follow the target field's multi_value/options/qualifier contract and content_policy exactly."
+            "Follow the target field's execution_contract, multi_value/options/qualifier contract and content_policy exactly."
         ),
         "product_identity": {"source_product_url": product_url.strip()},
         "target_fields": [_target(field) for field in targets],
@@ -348,11 +351,7 @@ def _packet_from_response(
 ) -> AIDecisionPacket:
     if not isinstance(raw, dict) or not isinstance(raw.get("facts"), list):
         raise ValueError("product fact response requires a facts array")
-    _expand_aliases(
-        raw,
-        compact_evidence.citation_aliases,
-        _compact_line_index(compact_evidence),
-    )
+    _expand_aliases(raw, compact_evidence.citation_aliases, _compact_line_index(compact_evidence))
     allowed = {field_id(field) for field in fields if not _is_business(field)}
     packaging_targets = {
         field_contract(field)["attribute_key"]: field_id(field)
@@ -367,13 +366,11 @@ def _packet_from_response(
             match.group(1).casefold()
             for citation in item.get("citations") or []
             if isinstance(citation, dict)
-            for match in [
-                re.match(
-                    r"\s*(length|breadth|height|weight)\s*=",
-                    str(citation.get("evidence_text") or ""),
-                    flags=re.IGNORECASE,
-                )
-            ]
+            for match in [re.match(
+                r"\s*(length|breadth|height|weight)\s*=",
+                str(citation.get("evidence_text") or ""),
+                flags=re.IGNORECASE,
+            )]
             if match is not None
         }
         if len(cited_keys) == 1:
@@ -413,9 +410,7 @@ def _packet_from_response(
             decisions_by_id[identifier] = candidate
             continue
         decisions_by_id[identifier] = _merge_duplicate_decisions(existing, candidate)
-        warnings.append(
-            f"duplicate fact field_id={identifier} isolated and reconciled without discarding the batch"
-        )
+        warnings.append(f"duplicate fact field_id={identifier} isolated and reconciled without discarding the batch")
 
     packet = AIDecisionPacket(
         identity=ProductIdentity(),
@@ -499,14 +494,7 @@ def _run_batch(
     cache_dir: Path | None,
     cache_namespace: str,
 ) -> _BatchResult:
-    key = _cache_key(
-        provider,
-        fields,
-        grounding,
-        compact_evidence,
-        product_url,
-        cache_namespace,
-    )
+    key = _cache_key(provider, fields, grounding, compact_evidence, product_url, cache_namespace)
     cache_path = cache_dir / f"product-facts-batch-{key}.json" if cache_dir is not None else None
     if cache_path is not None and cache_path.is_file():
         try:
@@ -517,9 +505,7 @@ def _run_batch(
             pass
 
     try:
-        raw = provider.extract_json(
-            build_product_fact_request(fields, compact_evidence, product_url=product_url)
-        )
+        raw = provider.extract_json(build_product_fact_request(fields, compact_evidence, product_url=product_url))
         packet = _packet_from_response(raw, fields, grounding, compact_evidence, provider.name)
     except Exception as exc:
         return _BatchResult(index, None, 1, False, str(exc))
@@ -551,10 +537,7 @@ def run_product_facts(
     if int(concurrency) < 1:
         raise ValueError("product fact concurrency must be >= 1")
     target_fields = [field for field in field_list if not _is_business(field)]
-    batches = [
-        target_fields[start : start + int(batch_size)]
-        for start in range(0, len(target_fields), int(batch_size))
-    ]
+    batches = [target_fields[start : start + int(batch_size)] for start in range(0, len(target_fields), int(batch_size))]
     cache_root = Path(cache_dir) if cache_dir is not None else None
     results: list[_BatchResult] = []
     if batches:
@@ -582,14 +565,9 @@ def run_product_facts(
         if result.packet is None:
             warnings.append(f"product fact batch {result.index + 1} failed: {result.warning}")
             continue
-        resolved.extend(
-            decision
-            for decision in result.packet.decisions
-            if decision.status in {READY, CONFLICT}
-        )
+        resolved.extend(decision for decision in result.packet.decisions if decision.status in {READY, CONFLICT})
         warnings.extend(
-            warning
-            for warning in result.packet.warnings
+            warning for warning in result.packet.warnings
             if not warning.startswith("AI stage omitted field_id=")
         )
     combined = AIDecisionPacket(
