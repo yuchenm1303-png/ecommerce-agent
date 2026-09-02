@@ -281,9 +281,10 @@ class ResilientMakroTaxonomyBrowser:
         depth: int,
         parent_group_id: str,
         parent_dom_order: int,
+        used_group_ids: list[str],
     ) -> dict[str, Any] | None:
         stale = self._stale_after_parent.get(int(depth), {})
-        used = set(self._logical_group_ids[:depth])
+        used = {str(group_id or "") for group_id in used_group_ids if str(group_id or "")}
         candidates = [
             entry
             for entry in descriptors
@@ -359,6 +360,7 @@ class ResilientMakroTaxonomyBrowser:
                 depth=depth + 1,
                 parent_group_id=group_id,
                 parent_dom_order=dom_order,
+                used_group_ids=group_ids,
             )
             if child is None:
                 break
@@ -419,6 +421,36 @@ class ResilientMakroTaxonomyBrowser:
             f"Makro taxonomy exact-node reveal exhausted its scroll budget: {wanted!r}"
         )
 
+    def _commit_click_state(
+        self,
+        logical_level: int,
+        stale: dict[str, tuple[str, ...]],
+    ) -> None:
+        """Commit one click as the sole active branch and invalidate deeper history."""
+
+        keep = int(logical_level) + 1
+        discarded_depths = sorted(
+            int(depth)
+            for depth in self._stale_after_parent
+            if int(depth) > int(logical_level)
+        )
+        self._clicked_depth = int(logical_level)
+        self._logical_group_ids = self._logical_group_ids[:keep]
+        self._logical_owner_ids = self._logical_owner_ids[:keep]
+        self._logical_dom_orders = self._logical_dom_orders[:keep]
+        self._stale_after_parent = {
+            int(depth): snapshot
+            for depth, snapshot in self._stale_after_parent.items()
+            if int(depth) <= int(logical_level)
+        }
+        self._stale_after_parent[int(logical_level) + 1] = dict(stale)
+        _diag(
+            "branch_state_committed",
+            level=int(logical_level),
+            active_group_ids=list(self._logical_group_ids),
+            discarded_deeper_depths=discarded_depths,
+        )
+
     def click_node(self, level: int, text: str, *, max_items_per_level: int = 400) -> bool:
         wanted = _clean(text)
         logical_level = int(level)
@@ -476,8 +508,7 @@ class ResilientMakroTaxonomyBrowser:
                 f"Makro taxonomy exact owned node could not be clicked: level={logical_level} node={wanted!r}"
             )
 
-        self._clicked_depth = max(self._clicked_depth, logical_level)
-        self._stale_after_parent[logical_level + 1] = stale
+        self._commit_click_state(logical_level, stale)
         self._wait(140)
         _diag(
             "node_clicked",
