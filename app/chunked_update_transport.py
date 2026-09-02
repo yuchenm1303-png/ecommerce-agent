@@ -153,6 +153,7 @@ def _copy_response(
     *,
     expected_size: int,
     digest: Any = None,
+    on_activity: Callable[[], None] | None = None,
 ) -> int:
     written = 0
     while True:
@@ -165,6 +166,8 @@ def _copy_response(
             raise ChunkMirrorIntegrityError("mirrored object exceeded its declared size")
         if digest is not None:
             digest.update(block)
+        if on_activity is not None:
+            on_activity()
     if written != expected_size:
         raise ChunkMirrorIntegrityError(
             f"mirrored object size mismatch: expected={expected_size} actual={written}"
@@ -178,6 +181,7 @@ def _download_exact_object(
     *,
     expected_size: int,
     expected_sha256: str = "",
+    on_activity: Callable[[], None] | None = None,
 ) -> None:
     last_error: BaseException | None = None
     attempts = len(_RETRY_DELAYS_SECONDS) + 1
@@ -191,6 +195,7 @@ def _download_exact_object(
                     output,
                     expected_size=expected_size,
                     digest=digest,
+                    on_activity=on_activity,
                 )
             if expected_sha256 and digest.hexdigest().lower() != expected_sha256:
                 raise ChunkMirrorIntegrityError("mirrored object SHA256 mismatch")
@@ -257,6 +262,7 @@ def _append_verified_chunk(
     output: Any,
     digest: Any,
     scratch_dir: Path,
+    on_activity: Callable[[], None] | None,
 ) -> int:
     name = str(part["name"])
     expected_size = int(part["size"])
@@ -266,6 +272,7 @@ def _append_verified_chunk(
             _source_url(source, "chunks", file_name, name),
             scratch,
             expected_size=expected_size,
+            on_activity=on_activity,
         )
         with scratch.open("rb") as chunk:
             while True:
@@ -293,6 +300,13 @@ def _reassemble_full_package(
     file_name = _asset_name(target)
     destination.unlink(missing_ok=True)
 
+    def _heartbeat() -> None:
+        # Re-write the current committed percentage so the parent can distinguish
+        # a legitimately slow 32 MB transfer from a dead network worker. Progress
+        # only advances after the entire chunk has been downloaded successfully.
+        if progress is not None:
+            progress(max(0, min(100, int(copied * 100 / total_size))))
+
     with tempfile.TemporaryDirectory(prefix="listing-studio-chunks-") as scratch_text:
         scratch_dir = Path(scratch_text)
         try:
@@ -305,6 +319,7 @@ def _reassemble_full_package(
                         output,
                         digest,
                         scratch_dir,
+                        _heartbeat,
                     )
                     if progress is not None:
                         progress(max(0, min(100, int(copied * 100 / total_size))))
