@@ -23,6 +23,14 @@ from .listing import (
 )
 from .platform import AIPlatform, StructuredModelBackend
 from .profiles import ModelProfile, ModelRegistry
+from .provider_catalog import (
+    BaseUrlPolicy,
+    ProviderAdapter,
+    ProviderCatalog,
+    ProviderConnection,
+    ProviderDescriptor,
+    provider_descriptor,
+)
 from .roles import ModelRole
 
 __all__ = [
@@ -33,6 +41,7 @@ __all__ = [
     "AGENT_VISION_PROFILE_ID",
     "AGENT_VISION_ROLE",
     "AIPlatform",
+    "BaseUrlPolicy",
     "CredentialRef",
     "CredentialSource",
     "LISTING_ATTRIBUTES_PROFILE_ID",
@@ -49,6 +58,11 @@ __all__ = [
     "ModelProfile",
     "ModelRegistry",
     "ModelRole",
+    "ProviderAdapter",
+    "ProviderCatalog",
+    "ProviderConnection",
+    "ProviderDescriptor",
     "StructuredModelBackend",
     "listing_semantic_profile",
+    "provider_descriptor",
 ]
