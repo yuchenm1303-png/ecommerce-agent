@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -12,8 +13,6 @@ from app.ai import (
     ModelRegistry,
     listing_semantic_profile,
 )
-from app.providers.openai_compatible import OpenAICompatibleSemanticProvider
-from app.providers.registry import ProviderConfig, build_semantic_provider
 
 
 class _StructuredBackend:
@@ -25,18 +24,6 @@ class _StructuredBackend:
     def extract_json(self, request_payload: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(request_payload)
         return {"ok": True}
-
-
-class _DummyCreate:
-    def __call__(self, **_kwargs: Any) -> None:
-        return None
-
-
-class _DummyClient:
-    def __init__(self) -> None:
-        from types import SimpleNamespace
-
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=_DummyCreate()))
 
 
 def test_model_profile_is_provider_neutral_and_contains_no_credentials() -> None:
@@ -94,22 +81,11 @@ def test_ai_platform_delegates_exact_structured_task_without_mutation() -> None:
     assert backend.calls[0] is request
 
 
-def test_listing_provider_registry_is_now_bound_to_pinned_ai_profile() -> None:
-    provider = build_semantic_provider(
-        ProviderConfig(
-            provider="openai-compatible",
-            model="vision-model",
-            api_key_env="VENDOR_KEY",
-            base_url="https://api.vendor.test/v1",
-        ),
-        environ={"VENDOR_KEY": "secret"},
-        client=_DummyClient(),
-    )
+def test_ai_platform_remains_detached_from_current_listing_production_path() -> None:
+    registry_source = (
+        Path(__file__).resolve().parents[1] / "app" / "providers" / "registry.py"
+    ).read_text(encoding="utf-8")
 
-    assert provider.ai_profile_id == LISTING_SEMANTIC_PROFILE_ID
-    assert provider.model_profile.allow_fallback is False
-    assert provider.model_profile.provider == "openai-compatible"
-    assert provider.model_profile.model == "vision-model"
-    # Preserve the existing compatibility surface used by current diagnostics/tests.
-    assert isinstance(provider._delegate, OpenAICompatibleSemanticProvider)
-    assert provider.model == "vision-model"
+    assert "AIPlatform" not in registry_source
+    assert "listing_semantic_profile" not in registry_source
+    assert "..ai" not in registry_source
