@@ -1,20 +1,14 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any, Iterable
 
 from .ai_decisions import field_id
 from .fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem, _apply_business_relations
-from .hard_field_validators import (
-    executable_qualifier_options,
-    executable_value_options,
-    is_numeric_semantic_field,
-    is_selection_semantic_field,
-    validate_resolved_answer,
-)
+from .hard_field_validators import validate_resolved_answer
 from .listing_content_policy import allow_required_fallback
+from .live_field_contract import execution_contract
 from .live_schema import load_live_schema, schema_field_signature
 from .resolution_types import RESOLVED, ResolvedAnswer
 
@@ -32,16 +26,6 @@ _OPTION_PLACEHOLDERS = {
     "please select",
     "-- select --",
 }
-_NUMERIC_NAME_HINT = re.compile(
-    r"(?:^|\b)(?:price|cost|qty|quantity|stock|weight|length|width|height|depth|volume|capacity|"
-    r"size|moq|minimum order|warranty|power|voltage|current|frequency|diameter|thickness|"
-    r"count|number of|pack size)(?:\b|$)",
-    re.IGNORECASE,
-)
-_NUMERIC_UNIT_HINT = re.compile(
-    r"(?:^|\s)(?:kg|g|mg|cm|mm|ml|l|m|w|v|hz|mah|wh|gb|mb|tb)(?:\s|$)",
-    re.IGNORECASE,
-)
 
 
 class RequiredOverrideError(ValueError):
@@ -68,39 +52,25 @@ def _field_identity(field: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def _jsonable_signature(value: object) -> object:
+    if isinstance(value, tuple):
+        return [_jsonable_signature(item) for item in value]
+    if isinstance(value, list):
+        return [_jsonable_signature(item) for item in value]
+    return value
+
+
 def _schema_signature_payload(field: dict[str, Any]) -> list[Any]:
-    signature = schema_field_signature(field)
-    return [
-        str(signature[0]),
-        str(signature[1]),
-        str(signature[2]),
-        bool(signature[3]),
-        bool(signature[4]),
-        list(signature[5]),
-        list(signature[6]),
-    ]
+    return list(_jsonable_signature(schema_field_signature(field)))
 
 
 def _schema_signature_key(payload: object) -> str | None:
-    if not isinstance(payload, list) or len(payload) != 7:
+    if not isinstance(payload, list):
         return None
-    if not isinstance(payload[5], list) or not isinstance(payload[6], list):
-        return None
-    normalized = [
-        str(payload[0]),
-        str(payload[1]),
-        str(payload[2]),
-        bool(payload[3]),
-        bool(payload[4]),
-        [str(value) for value in payload[5]],
-        [str(value) for value in payload[6]],
-    ]
-    return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def required_override_binding(field: dict[str, Any]) -> dict[str, Any]:
-    """Persist both display-era field id and stable schema identity."""
-
     return {
         "field_id": field_id(field),
         "schema_signature": _schema_signature_payload(field),
@@ -115,63 +85,31 @@ def _usable_option(values: Iterable[str]) -> str:
     return cleaned[0] if cleaned else ""
 
 
-def _has_typed_live_value_control(field: dict[str, Any]) -> bool:
-    for control in field.get("controls") or []:
-        if not isinstance(control, dict):
-            continue
-        if str(control.get("name") or "").endswith("_qualifier"):
-            continue
-        if any(
-            str(control.get(key) or "").strip()
-            for key in ("field_kind", "type", "role", "inputmode")
-        ):
-            return True
-    return False
-
-
-def _looks_numeric(field: dict[str, Any]) -> bool:
-    if is_numeric_semantic_field(field):
-        return True
-    if _has_typed_live_value_control(field):
-        return False
-
-    identity_text = " | ".join(
-        re.sub(r"[_-]+", " ", str(field.get(key) or ""))
-        for key in ("attribute_key", "label")
-    )
-    if _NUMERIC_NAME_HINT.search(identity_text):
-        return True
-
-    unit_text = " | ".join(
-        str(field.get(key) or "") for key in ("help_text", "context_text")
-    )
-    return bool(_NUMERIC_UNIT_HINT.search(unit_text))
-
-
 def required_fallback_override(field: dict[str, Any]) -> dict[str, Any]:
-    """Build the final deterministic fallback for one unresolved required field.
+    """Build a deterministic fallback exclusively from the observed live contract.
 
-    This function is deliberately downstream of the Resolver.  It never touches
-    an AI READY field and never competes with an AI product decision.  It exists
-    only so a required Makro field that the AI could not resolve does not block
-    the listing forever.
-
-    The fallback is derived from the current live field contract:
-    - selection -> first enabled executable option;
-    - numeric/unit field -> ``1`` plus the first executable qualifier when needed;
-    - remaining free text -> ``N/A``.
-
-    A selection/qualifier control with no executable option fails closed rather
-    than inventing a value the browser cannot write.
+    No label/key/unit heuristics are allowed here. Python may choose a mechanical
+    placeholder only when the current contract proves how that exact DOM control
+    can be written; unsupported/ambiguous families fail closed.
     """
-
     if not allow_required_fallback(field):
         label = str(field.get("label") or field.get("attribute_key") or "required field")
         raise RequiredOverrideError(f"{label} 当前策略不允许自动必填兜底。")
 
+    label = str(field.get("label") or field.get("attribute_key") or "required field")
     binding = required_override_binding(field)
-    option = _usable_option(executable_value_options(field))
-    if option:
+    contract = execution_contract(field)
+    family = str(contract["family"])
+
+    if not contract["supported"]:
+        raise RequiredOverrideError(f"{label} 当前 live execution contract 不受支持；无法自动兜底。")
+
+    if family == "selection":
+        option = _usable_option(contract["options"])
+        if not option:
+            raise RequiredOverrideError(
+                f"{label} 当前是 selection 控件，但没有可执行的 enabled live option；无法自动兜底。"
+            )
         return {
             **binding,
             "values": [option],
@@ -179,48 +117,45 @@ def required_fallback_override(field: dict[str, Any]) -> dict[str, Any]:
             "reason": "deterministic first enabled live Makro option for unresolved required field",
         }
 
-    if is_selection_semantic_field(field):
-        label = str(field.get("label") or field.get("attribute_key") or "required field")
-        raise RequiredOverrideError(
-            f"{label} 当前是 selection 控件，但没有可执行的 enabled live option；无法自动兜底。"
-        )
-
-    qualifier_controls = [
-        control
-        for control in field.get("controls") or []
-        if isinstance(control, dict)
-        and str(control.get("name") or "").endswith("_qualifier")
-    ]
-    qualifier = _usable_option(executable_qualifier_options(field))
-    if qualifier:
-        return {
+    if family == "numeric":
+        payload: dict[str, Any] = {
             **binding,
             "values": [FALLBACK_NUMERIC_VALUE],
-            "qualifier": qualifier,
             "source_type": "fallback",
-            "reason": "deterministic numeric placeholder with first enabled live Makro qualifier",
+            "reason": "deterministic numeric placeholder from canonical live execution contract",
         }
-    if qualifier_controls:
-        label = str(field.get("label") or field.get("attribute_key") or "required field")
-        raise RequiredOverrideError(
-            f"{label} 当前 qualifier 控件没有可执行的 enabled live option；无法自动兜底。"
-        )
+        mode = str(contract["qualifier_mode"])
+        if mode == "selectable":
+            qualifier = _usable_option(contract["qualifier_options"])
+            if not qualifier:
+                raise RequiredOverrideError(
+                    f"{label} 当前 qualifier control 没有可执行的 enabled option；无法自动兜底。"
+                )
+            payload["qualifier"] = qualifier
+        elif mode == "fixed":
+            fixed = str(contract["fixed_unit"] or "").strip()
+            if not fixed:
+                raise RequiredOverrideError(f"{label} 的 fixed qualifier contract 缺少单位；无法自动兜底。")
+            payload["qualifier"] = fixed
+        return payload
 
-    value = FALLBACK_NUMERIC_VALUE if _looks_numeric(field) else FALLBACK_TEXT_VALUE
-    return {
-        **binding,
-        "values": [value],
-        "source_type": "fallback",
-        "reason": "deterministic placeholder for unresolved required field",
-    }
+    if family in {"text", "long_text"}:
+        return {
+            **binding,
+            "values": [FALLBACK_TEXT_VALUE],
+            "source_type": "fallback",
+            "reason": "deterministic text placeholder from canonical live execution contract",
+        }
+
+    raise RequiredOverrideError(
+        f"{label} 当前 live family={family!r} 没有无语义猜测的自动兜底策略。"
+    )
 
 
 def _bind_plan_items_to_fields(
     plan: LiveFillPlan,
     semantic_fields: Iterable[dict[str, Any]],
 ) -> dict[str, LiveFillPlanItem]:
-    """Bind repeated live fields occurrence-by-occurrence without guessing."""
-
     item_buckets: dict[tuple[str, str, str], list[LiveFillPlanItem]] = {}
     for item in plan.items:
         item_buckets.setdefault(_item_identity(item), []).append(item)
@@ -257,8 +192,6 @@ def load_required_blocked_fields(
     fill_plan_path: str | Path,
     live_schema_path: str | Path,
 ) -> list[dict[str, Any]]:
-    """Return unresolved required fields with occurrence-aware schema binding."""
-
     payload = json.loads(Path(fill_plan_path).read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
         raise RequiredOverrideError("fill-plan.json 缺少 items 数组。")
@@ -331,8 +264,6 @@ def build_required_fallback_overrides(
     fill_plan_path: str | Path,
     live_schema_path: str | Path,
 ) -> list[dict[str, Any]]:
-    """Generate fallbacks only for required fields still BLOCKED after AI."""
-
     return [
         required_fallback_override(item["field"])
         for item in load_required_blocked_fields(fill_plan_path, live_schema_path)
@@ -346,14 +277,8 @@ def write_required_fallback_overrides(
     *,
     output_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Persist deterministic required fallbacks for Batch execution."""
-
     schema_path = Path(live_schema_path).resolve()
-    target = (
-        Path(output_path).resolve()
-        if output_path is not None
-        else schema_path.with_name(REQUIRED_OVERRIDES_FILENAME)
-    )
+    target = Path(output_path).resolve() if output_path is not None else schema_path.with_name(REQUIRED_OVERRIDES_FILENAME)
     overrides = build_required_fallback_overrides(fill_plan_path, schema_path)
     if not overrides:
         if target.exists():
@@ -361,10 +286,7 @@ def write_required_fallback_overrides(
         return {"path": "", "count": 0, "field_ids": []}
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps({"overrides": overrides}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    target.write_text(json.dumps({"overrides": overrides}, ensure_ascii=False, indent=2), encoding="utf-8")
     return {
         "path": str(target),
         "count": len(overrides),
@@ -395,9 +317,7 @@ def _target_from_override(
                 f"required override field_id={identifier} 在 planned live schema 中不唯一。"
             )
         if len(planned_matches) == 1:
-            signature_key = _schema_signature_key(
-                _schema_signature_payload(planned_matches[0])
-            )
+            signature_key = _schema_signature_key(_schema_signature_payload(planned_matches[0]))
 
     if signature_key is None:
         raise RequiredOverrideError(
@@ -405,8 +325,7 @@ def _target_from_override(
         )
 
     rebound = [
-        field
-        for field in fields
+        field for field in fields
         if _schema_signature_key(_schema_signature_payload(field)) == signature_key
     ]
     if len(rebound) != 1:
@@ -441,17 +360,7 @@ def apply_required_overrides(
     *,
     planned_fields: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Resolve only still-BLOCKED required fields from user input or fallback.
-
-    Existing READY items are never replaced.  Therefore the Resolver remains the
-    sole owner whenever it produced a decision; deterministic fallback activates
-    only after AI has left a required field unresolved.
-
-    Persisted fallback values are treated as instructions, not trusted product
-    data: every fallback is recomputed from the current live field before use and
-    then passes the non-AI mechanical validator.
-    """
-
+    """Resolve only still-BLOCKED required fields through the same live contract."""
     fields = list(semantic_fields)
     planned = list(planned_fields or [])
     items_by_field_id = _bind_plan_items_to_fields(plan, fields)
@@ -472,9 +381,7 @@ def apply_required_overrides(
         current_identifier = field_id(live_field)
         item = items_by_field_id.get(current_identifier)
         if item is None:
-            raise RequiredOverrideError(
-                f"override[{index}] 无法绑定当前 Fill Plan：{current_identifier}"
-            )
+            raise RequiredOverrideError(f"override[{index}] 无法绑定当前 Fill Plan：{current_identifier}")
         if not item.required:
             raise RequiredOverrideError(f"{item.label} 不是 required 字段，拒绝 required override。")
         if item.action == READY:
