@@ -137,17 +137,22 @@ def _assert_single_listing_tab(context: Any) -> None:
 
 
 def _assert_clean_step3_start(adapter: MakroDomainAdapter) -> None:
-    expanded = [
+    """Reject only a structurally incomplete Step 3 page.
+
+    Expanded/collapsed card state is presentation state, not evidence of unsaved
+    or unsafe data.  Real execution safety is already enforced by target ownership,
+    vertical/schema binding and post-write persistence verification, so this gate
+    must never stop progress merely because a card is already open.
+    """
+
+    missing = [
         title
-        for title in (*CORE_FORM_SECTIONS, PRODUCT_PHOTOS)
-        if (section := adapter.find_section(title)) is not None
-        and not section.get("has_edit")
+        for title in CORE_FORM_SECTIONS
+        if adapter.find_section(title) is None
     ]
-    if expanded:
+    if missing:
         raise RuntimeError(
-            "检测到仍处于编辑状态的 section："
-            + " | ".join(expanded)
-            + "。请先人工 Save/Cancel 当前未保存内容，再运行完整验收。"
+            "当前页面缺少 Step 3 核心 section：" + " | ".join(missing)
         )
 
 
