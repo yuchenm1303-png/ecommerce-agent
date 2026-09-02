@@ -19,14 +19,6 @@ _STREAM_READ_BYTES = 1024 * 1024
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _MANIFEST_SCHEMA = 1
 _RETRY_DELAYS_SECONDS = (1.0, 3.0, 7.0)
-_PROXY_ENV_NAMES = (
-    "ALL_PROXY",
-    "all_proxy",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "HTTP_PROXY",
-    "http_proxy",
-)
 
 
 class ChunkMirrorUnavailable(RuntimeError):
@@ -58,13 +50,7 @@ def _source_url(source: str, *parts: str) -> str:
 
 
 def _configured_proxy_handler() -> urllib.request.ProxyHandler:
-    """Honor only proxy state explicitly inherited by the isolated update worker.
-
-    The parent runtime materializes Windows system-proxy settings into HTTP(S)_PROXY
-    for proxy attempts and removes them for direct attempts. Building an explicit
-    ProxyHandler here prevents urllib from silently re-reading the Windows registry
-    during a direct fallback attempt.
-    """
+    """Use only proxy state explicitly inherited by the isolated update worker."""
 
     proxies: dict[str, str] = {}
     all_proxy = str(os.getenv("ALL_PROXY") or os.getenv("all_proxy") or "").strip()
@@ -74,11 +60,9 @@ def _configured_proxy_handler() -> urllib.request.ProxyHandler:
         proxies["https"] = https_proxy
     if http_proxy:
         proxies["http"] = http_proxy
+    # An explicit empty ProxyHandler is intentional. It prevents urllib from
+    # silently re-reading the Windows registry during a direct worker attempt.
     return urllib.request.ProxyHandler(proxies)
-
-
-def _opener() -> urllib.request.OpenerDirector:
-    return urllib.request.build_opener(_configured_proxy_handler())
 
 
 def _open(url: str) -> Any:
@@ -87,7 +71,8 @@ def _open(url: str) -> Any:
         headers={"User-Agent": "ListingStudio-Chunked-Update/1"},
         method="GET",
     )
-    return _opener().open(request, timeout=_HTTP_TIMEOUT_SECONDS)
+    opener = urllib.request.build_opener(_configured_proxy_handler())
+    return opener.open(request, timeout=_HTTP_TIMEOUT_SECONDS)
 
 
 def _retry_delay(attempt: int) -> None:
@@ -167,7 +152,6 @@ def _copy_response(
     destination: Any,
     *,
     expected_size: int,
-    on_bytes: Callable[[int], None] | None = None,
     digest: Any = None,
 ) -> int:
     written = 0
@@ -181,8 +165,6 @@ def _copy_response(
             raise ChunkMirrorIntegrityError("mirrored object exceeded its declared size")
         if digest is not None:
             digest.update(block)
-        if on_bytes is not None:
-            on_bytes(len(block))
     if written != expected_size:
         raise ChunkMirrorIntegrityError(
             f"mirrored object size mismatch: expected={expected_size} actual={written}"
@@ -196,7 +178,6 @@ def _download_exact_object(
     *,
     expected_size: int,
     expected_sha256: str = "",
-    on_bytes: Callable[[int], None] | None = None,
 ) -> None:
     last_error: BaseException | None = None
     attempts = len(_RETRY_DELAYS_SECONDS) + 1
@@ -209,7 +190,6 @@ def _download_exact_object(
                     response,
                     output,
                     expected_size=expected_size,
-                    on_bytes=on_bytes,
                     digest=digest,
                 )
             if expected_sha256 and digest.hexdigest().lower() != expected_sha256:
@@ -277,27 +257,15 @@ def _append_verified_chunk(
     output: Any,
     digest: Any,
     scratch_dir: Path,
-    on_bytes: Callable[[int], None] | None,
-) -> None:
+) -> int:
     name = str(part["name"])
     expected_size = int(part["size"])
     scratch = scratch_dir / f".{name}.download"
-    attempt_bytes = 0
-    highest_reported = 0
-
-    def _advanced(amount: int) -> None:
-        nonlocal attempt_bytes, highest_reported
-        attempt_bytes += amount
-        if on_bytes is not None and attempt_bytes > highest_reported:
-            on_bytes(attempt_bytes - highest_reported)
-            highest_reported = attempt_bytes
-
     try:
         _download_exact_object(
             _source_url(source, "chunks", file_name, name),
             scratch,
             expected_size=expected_size,
-            on_bytes=_advanced,
         )
         with scratch.open("rb") as chunk:
             while True:
@@ -306,6 +274,7 @@ def _append_verified_chunk(
                     break
                 output.write(block)
                 digest.update(block)
+        return expected_size
     finally:
         scratch.unlink(missing_ok=True)
 
@@ -319,31 +288,26 @@ def _reassemble_full_package(
 ) -> None:
     parts = _validated_parts(manifest, target)
     total_size = _asset_size(target)
-    reported_bytes = 0
+    copied = 0
     digest = hashlib.sha256()
-
-    def _advanced(amount: int) -> None:
-        nonlocal reported_bytes
-        reported_bytes = min(total_size, reported_bytes + max(0, amount))
-        if progress is not None:
-            progress(max(0, min(100, int(reported_bytes * 100 / total_size))))
-
     file_name = _asset_name(target)
     destination.unlink(missing_ok=True)
+
     with tempfile.TemporaryDirectory(prefix="listing-studio-chunks-") as scratch_text:
         scratch_dir = Path(scratch_text)
         try:
             with destination.open("wb") as output:
                 for part in parts:
-                    _append_verified_chunk(
+                    copied += _append_verified_chunk(
                         source,
                         file_name,
                         part,
                         output,
                         digest,
                         scratch_dir,
-                        _advanced,
                     )
+                    if progress is not None:
+                        progress(max(0, min(100, int(copied * 100 / total_size))))
         except Exception:
             destination.unlink(missing_ok=True)
             raise
