@@ -30,8 +30,8 @@ class TaxonomySurfaceError(RuntimeError):
     """The live Step-1 taxonomy surface could not be mechanically owned."""
 
 
-_STRUCTURAL_SURFACE_JS = rf"""(anchor, payload) => {{
-  const REGISTRY_KEY = { _REGISTRY_KEY!r };
+_STRUCTURAL_SURFACE_JS = r"""(anchor, payload) => {{
+  const REGISTRY_KEY = __REGISTRY_KEY_LITERAL__;
   const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
   const key = (value) => clean(value).toLocaleLowerCase();
   const rendered = (el) => {{
@@ -276,7 +276,7 @@ _STRUCTURAL_SURFACE_JS = rf"""(anchor, payload) => {{
     groups,
     diagnostic: '',
   }};
-}}"""
+}}""".replace("__REGISTRY_KEY_LITERAL__", repr(_REGISTRY_KEY)).replace("{{", "{").replace("}}", "}")
 
 
 def parse_catalog_route(url: str) -> MakroListingTarget | None:
