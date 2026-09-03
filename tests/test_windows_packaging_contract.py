@@ -112,9 +112,10 @@ def test_pyinstaller_is_onedir_and_embeds_velopack_runtime_hook() -> None:
 def test_worker_freeze_contract_covers_complete_makro_runtime_package() -> None:
     assert 'WORKER_RUNTIME_PACKAGE = "app.makro"' in SPEC
     assert 'WORKER_RUNTIME_ROOT = ROOT / "app" / "makro"' in SPEC
-    assert "collect_submodules(WORKER_RUNTIME_PACKAGE)" in SPEC
-    assert "hiddenimports=worker_hiddenimports" in SPEC
+    assert "collect_submodules" not in SPEC
     assert "expected_worker_runtime_modules = _source_modules(" in SPEC
+    assert "set(playwright_hiddenimports).union(expected_worker_runtime_modules)" in SPEC
+    assert "hiddenimports=worker_hiddenimports" in SPEC
     assert "expected_worker_runtime_modules - worker_pure_modules" in SPEC
     assert "PyInstaller Worker analysis omitted Makro runtime modules" in SPEC
 
