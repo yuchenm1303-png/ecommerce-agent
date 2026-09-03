@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST_WORKFLOW = (ROOT / ".github" / "workflows" / "publish-test-build.yml").read_text(encoding="utf-8")
 STABLE_WORKFLOW = (ROOT / ".github" / "workflows" / "publish-update.yml").read_text(encoding="utf-8")
+TOP_LEVEL_REQUIREMENTS = (ROOT / "requirements.txt").read_text(encoding="utf-8")
 LOCK = (ROOT / "requirements-release.lock").read_text(encoding="utf-8")
 INSTALL = (ROOT / "scripts" / "install_release_environment.ps1").read_text(encoding="utf-8")
 DOTNET_CONTRACT = json.loads((ROOT / "global.json").read_text(encoding="utf-8"))
@@ -14,6 +16,15 @@ DOTNET_CONTRACT = json.loads((ROOT / "global.json").read_text(encoding="utf-8"))
 def _require_in_both(fragment: str) -> None:
     assert fragment in TEST_WORKFLOW
     assert fragment in STABLE_WORKFLOW
+
+
+def _requirement_name(line: str) -> str:
+    text = line.strip()
+    if not text or text.startswith("#"):
+        return ""
+    match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)", text)
+    assert match is not None, f"unsupported requirement line: {line!r}"
+    return match.group(1).casefold().replace("_", "-").replace(".", "-")
 
 
 def test_test_and_stable_share_one_release_environment_contract() -> None:
@@ -55,12 +66,30 @@ def test_release_lock_is_exact_and_covers_packaged_top_level_dependencies() -> N
     assert requirements
     assert all("==" in line for line in requirements)
     assert all(not any(operator in line for operator in (">=", "<=", "~=", "!=", "<", ">")) for line in requirements)
+
+    top_level_names = {
+        name
+        for line in TOP_LEVEL_REQUIREMENTS.splitlines()
+        if (name := _requirement_name(line))
+    }
+    locked_names = {
+        name
+        for line in requirements
+        if (name := _requirement_name(line))
+    }
+    missing = sorted(top_level_names - locked_names)
+    assert not missing, (
+        "requirements-release.lock is missing top-level dependencies required by "
+        f"requirements.txt: {missing}"
+    )
+
     for expected in (
         "playwright==1.62.0",
         "openai==2.54.0",
         "Pillow==12.3.0",
         "PySide6==6.11.2",
         "PyInstaller==6.22.2",
+        "pypinyin==0.55.0",
         "velopack==1.2.0",
     ):
         assert expected in requirements
@@ -104,4 +133,4 @@ def test_stable_signing_is_optional_but_configuration_remains_validated() -> Non
     assert "VPK_AZURE_TRUSTED_SIGN_FILE" in STABLE_WORKFLOW
     assert "VPK_SIGN_PARAMS" in STABLE_WORKFLOW
     assert "VPK_AZURE_TRUSTED_SIGN_FILE" not in TEST_WORKFLOW
-    assert "VPK_SIGN_PARAMS" not in TEST_WORKFLOW
+    assert "VPK_SIGN_PARAMS" not in STABLE_WORKFLOW
