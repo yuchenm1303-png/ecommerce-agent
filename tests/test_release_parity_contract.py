@@ -133,4 +133,4 @@ def test_stable_signing_is_optional_but_configuration_remains_validated() -> Non
     assert "VPK_AZURE_TRUSTED_SIGN_FILE" in STABLE_WORKFLOW
     assert "VPK_SIGN_PARAMS" in STABLE_WORKFLOW
     assert "VPK_AZURE_TRUSTED_SIGN_FILE" not in TEST_WORKFLOW
-    assert "VPK_SIGN_PARAMS" not in STABLE_WORKFLOW
+    assert "VPK_SIGN_PARAMS" not in TEST_WORKFLOW
