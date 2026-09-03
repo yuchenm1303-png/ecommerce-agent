@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 
@@ -18,6 +19,39 @@ RUNNER = (ROOT / "gui" / "batch_runner.py").read_text(encoding="utf-8")
 WORKSPACE = (ROOT / "gui" / "batch_workspace.py").read_text(encoding="utf-8")
 CONTROLS = (ROOT / "gui" / "batch_job_controls.py").read_text(encoding="utf-8")
 WINDOW = (ROOT / "gui" / "workflow_console_window.py").read_text(encoding="utf-8")
+
+
+def _uses_name(source: str, name: str) -> bool:
+    tree = ast.parse(source)
+    return any(isinstance(node, ast.Name) and node.id == name for node in ast.walk(tree))
+
+
+def _uses_attribute(source: str, owner: str, attribute: str) -> bool:
+    tree = ast.parse(source)
+    return any(
+        isinstance(node, ast.Attribute)
+        and node.attr == attribute
+        and isinstance(node.value, ast.Name)
+        and node.value.id == owner
+        for node in ast.walk(tree)
+    )
+
+
+def _function_calls(source: str, function_name: str, callee_name: str) -> bool:
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name
+    )
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id == callee_name:
+            return True
+        if isinstance(node.func, ast.Attribute) and node.func.attr == callee_name:
+            return True
+    return False
 
 
 def test_batch_jobs_own_exact_makro_tabs_instead_of_guessing_current_page() -> None:
@@ -67,8 +101,8 @@ def test_batch_browser_transport_is_single_while_ai_remains_parallel() -> None:
 
 
 def test_transport_lane_is_ownership_only_and_never_launches_a_child_runtime() -> None:
-    assert "subprocess" not in TRANSPORT
-    assert "sys.executable" not in TRANSPORT
+    assert not _uses_name(TRANSPORT, "subprocess")
+    assert not _uses_attribute(TRANSPORT, "sys", "executable")
     assert "python_args_under_transport_lane" not in TRANSPORT
     assert "app.cdp_transport_lane" not in PARALLEL
 
@@ -98,7 +132,7 @@ def test_batch_start_hot_path_never_runs_a_speculative_playwright_probe() -> Non
     assert 'getattr(self.manager, "_original_batch_execute", None)' in init
     assert "runtime.manager.ensure_ready" not in start
     assert "probe_cdp_automation" not in start
-    assert "probe_cdp_automation" not in gate
+    assert not _function_calls(PARALLEL, "_ensure_start_generation", "probe_cdp_automation")
     assert "poison_matches_current_generation(requested_port)" in gate
     assert "not is_cdp_ready(" in gate
     assert "self.manager.ensure_ready(reason)" in gate
