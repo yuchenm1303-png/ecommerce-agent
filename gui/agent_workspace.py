@@ -10,7 +10,7 @@ from PySide6.QtCore import QEvent, QObject, QPoint, Property, QTimer, Qt, QUrl, 
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtQml import QQmlComponent
 from PySide6.QtQuick import QQuickItem, QQuickWindow
-from PySide6.QtWidgets import QHBoxLayout, QMainWindow, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QMainWindow, QPushButton, QVBoxLayout, QWidget
 
 from app.agent_runtime import (
     AgentEvent,
@@ -36,6 +36,7 @@ from app.ai import (
     ProviderConnection,
     build_ai_platform,
 )
+from app.runtime_paths import runtime_root as application_runtime_root
 
 
 _DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -73,10 +74,10 @@ class AgentWorkspaceController(QObject):
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
         self.window = window
-        self.runtime_root = Path(getattr(window, "project_root", Path.cwd())).resolve()
+        self.runtime_root = application_runtime_root().resolve()
         # Formal Agent sessions are isolated from the standalone Agent Lab while
         # using the same durable Harness storage contract.
-        self.store = FileAgentSessionStore(self.runtime_root / ".agent_workspace")
+        self.store = FileAgentSessionStore(self.runtime_root / "agent_workspace")
         self.runtime: AgentRuntime | None = None
         self._open = False
         self._configured = False
@@ -228,7 +229,7 @@ class AgentWorkspaceController(QObject):
         status = component.status()
         if status in {QQmlComponent.Status.Null, QQmlComponent.Status.Loading}:
             return
-        if status is QQmlComponent.Status.Error:
+        if status == QQmlComponent.Status.Error:
             detail = "\n".join(error.toString() for error in component.errors())
             raise RuntimeError(f"AgentWorkspace.qml failed to load:\n{detail}")
         created = component.create(static_view.engine.rootContext())
@@ -322,11 +323,10 @@ class AgentWorkspaceController(QObject):
 
     @Slot()
     def openWorkspaceView(self) -> None:
-        if not self._ensure_runtime():
-            # Open the surface anyway so the missing-credential state is visible.
-            pass
+        self._ensure_runtime()
         self._open = True
         self._sync_header_route()
+        self._sync_phase_badge()
         self.openChanged.emit()
 
     @Slot()
@@ -410,23 +410,25 @@ class AgentWorkspaceController(QObject):
             self._set_error(f"读取 Agent Session 失败：{type(exc).__name__}: {exc}")
             return
         if session.status is AgentStatus.RUNNING and self.runtime is not None:
-            session = self.runtime.recover_interrupted(session_id)
+            self.runtime.recover_interrupted(session_id)
+            session = self.store.load(session_id)
+            events = self.store.events(session_id)
         self._session_id = session.session_id
         self._workspace_path = session.workspace_dir
         self._input_tokens = session.usage.input_tokens
         self._output_tokens = session.usage.output_tokens
         self._total_tokens = session.usage.total_tokens
+        self._rebuild_from_events(events)
         self._waiting_approval = session.status is AgentStatus.WAITING_APPROVAL and session.pending_approval is not None
-        if session.pending_approval is not None:
+        if session.pending_approval is not None and self._waiting_approval:
             pending = session.pending_approval
             self._approval_call_id = pending.call_id
-            self._approval_title = f"{pending.tool_name} 需要你的批准"
+            self._approval_title = f"{self._friendly_tool(pending.tool_name)}需要你的批准"
             self._approval_detail = json.dumps(pending.arguments, ensure_ascii=False, indent=2)
         else:
             self._approval_call_id = ""
             self._approval_title = ""
             self._approval_detail = ""
-        self._rebuild_from_events(events)
         self._refresh_files()
         self.sessionChanged.emit()
         self.usageChanged.emit()
@@ -453,7 +455,7 @@ class AgentWorkspaceController(QObject):
         self._activity = []
         self._tool_rows = {}
         for event in events:
-            self._apply_event_models(event, emit=False)
+            self._apply_event_models(event, emit=False, live_state=False)
         self.conversationChanged.emit()
         self.activityChanged.emit()
 
@@ -566,9 +568,9 @@ class AgentWorkspaceController(QObject):
     def _apply_event(self, event_obj: object) -> None:
         if not isinstance(event_obj, AgentEvent) or event_obj.session_id != self._session_id:
             return
-        self._apply_event_models(event_obj, emit=True)
+        self._apply_event_models(event_obj, emit=True, live_state=True)
 
-    def _apply_event_models(self, event: AgentEvent, *, emit: bool) -> None:
+    def _apply_event_models(self, event: AgentEvent, *, emit: bool, live_state: bool) -> None:
         data = event.data
         kind = event.kind
         clock = str(event.created_at or "")[11:19]
@@ -599,8 +601,9 @@ class AgentWorkspaceController(QObject):
             self._update_tool(str(data.get("call_id") or ""), state=state, body=body or ("完成" if state == "done" else "执行失败"))
         elif kind is AgentEventKind.TOOL_APPROVAL_REQUIRED:
             self._update_tool(str(data.get("call_id") or ""), state="approval", body="等待你的批准")
-            arguments = json.dumps(data.get("arguments") or {}, ensure_ascii=False, indent=2)
-            self._set_approval(True, str(data.get("call_id") or ""), f"{self._friendly_tool(str(data.get('tool') or ''))}需要你的批准", arguments)
+            if live_state:
+                arguments = json.dumps(data.get("arguments") or {}, ensure_ascii=False, indent=2)
+                self._set_approval(True, str(data.get("call_id") or ""), f"{self._friendly_tool(str(data.get('tool') or ''))}需要你的批准", arguments)
         elif kind is AgentEventKind.TOOL_APPROVED:
             self._update_tool(str(data.get("call_id") or ""), state="approved", body="已批准，正在继续")
         elif kind is AgentEventKind.TOOL_DENIED:
@@ -724,13 +727,17 @@ class AgentWorkspaceController(QObject):
             return
         self._status = value
         self.statusChanged.emit()
-        if self._open:
-            badge = getattr(self.window, "phase_badge", None)
-            if badge is not None:
-                try:
-                    badge.setText(f"AGENT · {value}")
-                except RuntimeError:
-                    pass
+        self._sync_phase_badge()
+
+    def _sync_phase_badge(self) -> None:
+        if not self._open:
+            return
+        badge = getattr(self.window, "phase_badge", None)
+        if badge is not None:
+            try:
+                badge.setText(f"AGENT · {self._status}")
+            except RuntimeError:
+                pass
 
     def _set_error(self, value: str) -> None:
         value = str(value or "")
@@ -751,8 +758,7 @@ class AgentWorkspaceController(QObject):
             policy.setRetainSizeWhenHidden(True)
             toggle.setSizePolicy(policy)
             toggle.setVisible(not self._open)
-        if self._open:
-            self._set_status(self._status)
+        self._sync_phase_badge()
         static_view = self._static_view
         bridge = getattr(static_view, "bridge", None) if static_view is not None else None
         schedule = getattr(bridge, "schedule_structure_refresh", None)
