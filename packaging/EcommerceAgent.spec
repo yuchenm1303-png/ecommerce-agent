@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from PyInstaller.building.datastruct import TOC
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all
 
 ROOT = Path(SPECPATH).resolve().parent
 APP_ICON = ROOT / "packaging" / "app_icon.ico"
@@ -46,13 +46,12 @@ def _source_modules(package_root: Path, package_name: str) -> set[str]:
 
 playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all("playwright")
 velopack_datas, velopack_binaries, velopack_hiddenimports = collect_all("velopack")
-worker_runtime_hiddenimports = collect_submodules(WORKER_RUNTIME_PACKAGE)
-worker_hiddenimports = sorted(
-    set(playwright_hiddenimports).union(worker_runtime_hiddenimports)
-)
 expected_worker_runtime_modules = _source_modules(
     WORKER_RUNTIME_ROOT,
     WORKER_RUNTIME_PACKAGE,
+)
+worker_hiddenimports = sorted(
+    set(playwright_hiddenimports).union(expected_worker_runtime_modules)
 )
 
 gui_datas = [
