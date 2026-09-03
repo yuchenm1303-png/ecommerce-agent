@@ -30,6 +30,7 @@ def test_packaging_python_sources_compile() -> None:
         (ROOT / "app" / "runtime_paths.py", RUNTIME),
         (ROOT / "app" / "velopack_runtime.py", VELOPACK_RUNTIME),
         (ROOT / "packaging" / "velopack_runtime_hook.py", RUNTIME_HOOK),
+        (ROOT / "packaging" / "EcommerceAgent.spec", SPEC),
         (ROOT / "makro_execute_owned.py", OWNED_EXECUTOR),
         (ROOT / "run_local_gui.py", RUN),
         (ROOT / "gui" / "quick_batch_list.py", QUICK_BATCH),
@@ -106,6 +107,16 @@ def test_pyinstaller_is_onedir_and_embeds_velopack_runtime_hook() -> None:
     assert 'runtime_hooks=[str(VELOPACK_RUNTIME_HOOK)]' in SPEC
     assert 'name="EcommerceAgent"' in SPEC[SPEC.index("coll = COLLECT"):]
     assert "onefile" not in SPEC.lower()
+
+
+def test_worker_freeze_contract_covers_complete_makro_runtime_package() -> None:
+    assert 'WORKER_RUNTIME_PACKAGE = "app.makro"' in SPEC
+    assert 'WORKER_RUNTIME_ROOT = ROOT / "app" / "makro"' in SPEC
+    assert "collect_submodules(WORKER_RUNTIME_PACKAGE)" in SPEC
+    assert "hiddenimports=worker_hiddenimports" in SPEC
+    assert "expected_worker_runtime_modules = _source_modules(" in SPEC
+    assert "expected_worker_runtime_modules - worker_pure_modules" in SPEC
+    assert "PyInstaller Worker analysis omitted Makro runtime modules" in SPEC
 
 
 def test_velopack_toolchain_is_pinned_and_build_replaces_inno() -> None:
