@@ -14,6 +14,18 @@ def test_agent_lab_is_a_separate_development_entry() -> None:
     assert 'gui" / "qml" / "AgentLab.qml"' in lab_entry
 
 
+def test_agent_lab_autoconfigures_existing_dashscope_runtime_key() -> None:
+    root = Path(__file__).resolve().parents[1]
+    lab_entry = (root / "run_agent_lab.py").read_text(encoding="utf-8")
+
+    assert 'os.environ.get("AI_API_KEY")' in lab_entry
+    assert 'os.environ.get("DASHSCOPE_API_KEY")' in lab_entry
+    assert 'os.environ.get("AGENT_LAB_MODEL")' in lab_entry
+    assert '"qwen-plus"' in lab_entry
+    assert 'configure("openai-compatible", base_url, model, api_key)' in lab_entry
+    assert "print(api_key" not in lab_entry
+
+
 def test_agent_lab_uses_runtime_only_credentials_and_safe_tools() -> None:
     root = Path(__file__).resolve().parents[1]
     source = (root / "gui" / "agent_lab_controller.py").read_text(encoding="utf-8")
