@@ -54,6 +54,14 @@ def _function_calls(source: str, function_name: str, callee_name: str) -> bool:
     return False
 
 
+def test_makro_runtime_source_tree_is_syntax_valid() -> None:
+    runtime_root = ROOT / "app" / "makro"
+    sources = sorted(runtime_root.rglob("*.py"))
+    assert sources, "Makro runtime source tree is empty"
+    for path in sources:
+        compile(path.read_text(encoding="utf-8"), str(path), "exec")
+
+
 def test_batch_jobs_own_exact_makro_tabs_instead_of_guessing_current_page() -> None:
     assert "Target.getTargetInfo" in OWNER
     assert "context.new_page()" in JOB
