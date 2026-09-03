@@ -109,15 +109,20 @@ def test_pyinstaller_is_onedir_and_embeds_velopack_runtime_hook() -> None:
     assert "onefile" not in SPEC.lower()
 
 
-def test_worker_freeze_contract_covers_complete_makro_runtime_package() -> None:
+def test_worker_freeze_contract_reconciles_complete_makro_runtime_into_pyz() -> None:
     assert 'WORKER_RUNTIME_PACKAGE = "app.makro"' in SPEC
     assert 'WORKER_RUNTIME_ROOT = ROOT / "app" / "makro"' in SPEC
     assert "collect_submodules" not in SPEC
-    assert "expected_worker_runtime_modules = _source_modules(" in SPEC
+    assert "worker_runtime_sources = _source_module_map(" in SPEC
+    assert "expected_worker_runtime_modules = set(worker_runtime_sources)" in SPEC
+    assert 'compile(source_text, str(module_source), "exec")' in SPEC
     assert "set(playwright_hiddenimports).union(expected_worker_runtime_modules)" in SPEC
     assert "hiddenimports=worker_hiddenimports" in SPEC
+    assert "omitted_worker_runtime_modules" in SPEC
+    assert 'worker_a.pure.append((module_name, str(module_source), "PYMODULE"))' in SPEC
+    assert "PYINSTALLER_WORKER_RECONCILE" in SPEC
     assert "expected_worker_runtime_modules - worker_pure_modules" in SPEC
-    assert "PyInstaller Worker analysis omitted Makro runtime modules" in SPEC
+    assert "PyInstaller Worker freeze reconciliation failed" in SPEC
 
 
 def test_velopack_toolchain_is_pinned_and_build_replaces_inno() -> None:
