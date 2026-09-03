@@ -140,4 +140,4 @@ out.write_text(json.dumps({{'returncode': child.returncode, 'stderr': child.stde
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["returncode"] != 0
-    assert "禁止嵌套" in payload["stderr"]
+    assert "CDP transport lane" in payload["stderr"]
