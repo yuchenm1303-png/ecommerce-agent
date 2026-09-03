@@ -4,19 +4,23 @@ import os
 from pathlib import Path
 
 from PyInstaller.building.datastruct import TOC
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 ROOT = Path(SPECPATH).resolve().parent
 APP_ICON = ROOT / "packaging" / "app_icon.ico"
 APP_ACCESS_SOURCE = ROOT / "gui" / "app_access.py"
 APP_ACCESS_MODULE = "gui.app_access"
 VELOPACK_RUNTIME_HOOK = ROOT / "packaging" / "velopack_runtime_hook.py"
+WORKER_RUNTIME_PACKAGE = "app.makro"
+WORKER_RUNTIME_ROOT = ROOT / "app" / "makro"
 if not APP_ICON.is_file():
     raise RuntimeError(f"Application icon was not generated: {APP_ICON}")
 if not APP_ACCESS_SOURCE.is_file():
     raise RuntimeError(f"Application access source missing: {APP_ACCESS_SOURCE}")
 if not VELOPACK_RUNTIME_HOOK.is_file():
     raise RuntimeError(f"Velopack runtime hook missing: {VELOPACK_RUNTIME_HOOK}")
+if not WORKER_RUNTIME_ROOT.is_dir():
+    raise RuntimeError(f"Worker runtime package missing: {WORKER_RUNTIME_ROOT}")
 
 BUILD_VERSION = os.environ.get("ECOMMERCE_AGENT_BUILD_VERSION", "").strip()
 if not BUILD_VERSION:
@@ -25,8 +29,31 @@ BUILD_METADATA = ROOT / "build" / "package_metadata"
 BUILD_METADATA.mkdir(parents=True, exist_ok=True)
 (BUILD_METADATA / "VERSION").write_text(BUILD_VERSION + "\n", encoding="utf-8")
 
+
+def _source_modules(package_root: Path, package_name: str) -> set[str]:
+    """Return every source module that belongs to one frozen runtime package."""
+
+    modules: set[str] = set()
+    for source in package_root.rglob("*.py"):
+        relative = source.relative_to(package_root).with_suffix("")
+        parts = list(relative.parts)
+        if parts and parts[-1] == "__init__":
+            parts.pop()
+        suffix = ".".join(parts)
+        modules.add(package_name if not suffix else f"{package_name}.{suffix}")
+    return modules
+
+
 playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all("playwright")
 velopack_datas, velopack_binaries, velopack_hiddenimports = collect_all("velopack")
+worker_runtime_hiddenimports = collect_submodules(WORKER_RUNTIME_PACKAGE)
+worker_hiddenimports = sorted(
+    set(playwright_hiddenimports).union(worker_runtime_hiddenimports)
+)
+expected_worker_runtime_modules = _source_modules(
+    WORKER_RUNTIME_ROOT,
+    WORKER_RUNTIME_PACKAGE,
+)
 
 gui_datas = [
     (str(ROOT / "gui" / "assets"), "gui/assets"),
@@ -63,7 +90,7 @@ worker_a = Analysis(
     pathex=[str(ROOT)],
     binaries=playwright_binaries,
     datas=playwright_datas,
-    hiddenimports=playwright_hiddenimports,
+    hiddenimports=worker_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -71,6 +98,16 @@ worker_a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+worker_pure_modules = {entry[0] for entry in worker_a.pure}
+missing_worker_runtime_modules = sorted(
+    expected_worker_runtime_modules - worker_pure_modules
+)
+if missing_worker_runtime_modules:
+    raise RuntimeError(
+        "PyInstaller Worker analysis omitted Makro runtime modules: "
+        + ", ".join(missing_worker_runtime_modules)
+    )
 
 utf8_options = [("X utf8", None, "OPTION")]
 worker_options = [("X utf8", None, "OPTION"), ("u", None, "OPTION")]
