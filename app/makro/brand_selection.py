@@ -6,9 +6,9 @@ state for the validated brand.
 
 Production keeps supplier / AI brand identity authoritative. Step 2 applies only
 marketplace-output policy: explicit Chinese brand text is deterministically
-romanized to pinyin, an explicitly unknown brand uses the seller's KEAI fallback,
-and explicit unbranded evidence keeps the existing Makro unbranded candidates.
-Every resulting query still passes through Makro's native Check Brand verification.
+romanized to pinyin, while unknown and explicitly unbranded identities use the
+seller's VINCIE fallback. Every resulting query still passes through Makro's
+native Check Brand verification.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from .portal_interruptions import reconcile_portal_interruptions
 
 
 BRAND_SELECTION_MODE = "supplier"
-FIXED_BRAND = "KEAI"
+FIXED_BRAND = "VINCIE"
 _HAN_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 
 
@@ -72,7 +72,7 @@ def _supplier_brand_terms(hints: BrandHints) -> tuple[str, ...]:
     """Map the already-decided brand status into marketplace query text."""
 
     status = str(hints.brand_status or "").strip().casefold()
-    if status == "unknown":
+    if status in {"unknown", "unbranded"}:
         fallback = str(FIXED_BRAND or "").strip()
         return (fallback,) if fallback else ()
 
