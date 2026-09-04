@@ -14,12 +14,14 @@ nodes to AI.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from playwright.sync_api import Page
 
 from .catalog_taxonomy import CatalogTaxonomyBrowser, TaxonomySurfaceError
 from .listing_creation import _vertical_search_input
+from .search_surface import read_search_rows
 
 
 class TaxonomyMechanicalError(RuntimeError):
@@ -36,6 +38,39 @@ def _key(value: object) -> str:
 
 def _signature(values: list[str] | tuple[str, ...]) -> tuple[str, ...]:
     return tuple(_key(value) for value in values if _key(value))
+
+
+def _root_surface_signature(
+    descriptors: list[dict[str, Any]],
+) -> tuple[str, str, tuple[str, ...]] | None:
+    """Describe exactly one structurally owned taxonomy root without semantics."""
+
+    roots = [entry for entry in descriptors if bool(entry.get("is_root"))]
+    if len(roots) != 1:
+        return None
+    root = roots[0]
+    group_id = str(root.get("group_id") or "")
+    owner_id = str(root.get("owner_id") or group_id)
+    items = _signature(list(root.get("items") or []))
+    if not group_id or not owner_id or not items:
+        return None
+    return group_id, owner_id, items
+
+
+def _browse_transition_ready(
+    prior_query_rows: tuple[str, ...],
+    current_query_rows: tuple[str, ...],
+    current_root: tuple[str, str, tuple[str, ...]] | None,
+) -> bool:
+    """Prove that a query-owned result surface cannot be reused as Browse root."""
+
+    if current_root is None:
+        return False
+    if not prior_query_rows:
+        return True
+    query_surface_retired = current_query_rows != prior_query_rows
+    root_is_not_prior_query = current_root[2] != prior_query_rows
+    return bool(query_surface_retired and root_is_not_prior_query)
 
 
 def _diag(event: str, **payload: object) -> None:
@@ -85,10 +120,139 @@ class ResilientMakroTaxonomyBrowser:
         except Exception:
             pass
 
+    def _probe_root_surface(self, *, max_items_per_level: int = 400) -> tuple[str, str, tuple[str, ...]] | None:
+        """Best-effort structural root probe used only while a UI transition settles."""
+
+        try:
+            descriptors = self._owned.column_descriptors(
+                max_items_per_level=max(8, int(max_items_per_level))
+            )
+        except Exception:
+            return None
+        return _root_surface_signature(descriptors)
+
+    @staticmethod
+    def _search_value(search: Any) -> str:
+        try:
+            return _clean(search.input_value())
+        except Exception:
+            try:
+                return _clean(search.get_attribute("value"))
+            except Exception:
+                return ""
+
+    def _wait_for_verified_browse_transition(
+        self,
+        search: Any,
+        prior_query_rows: tuple[str, ...],
+        *,
+        timeout_s: float = 6.0,
+    ) -> tuple[str, str, tuple[str, ...]] | None:
+        """Wait for the query surface to retire and a stable Browse root to own Step 1."""
+
+        deadline = time.monotonic() + max(1.0, float(timeout_s))
+        stable_root: tuple[str, str, tuple[str, ...]] | None = None
+        stable_samples = 0
+        last_query_rows = prior_query_rows
+        last_root: tuple[str, str, tuple[str, ...]] | None = None
+
+        while time.monotonic() < deadline:
+            last_query_rows = _signature(read_search_rows(search))
+            last_root = self._probe_root_surface()
+            ready = (
+                not self._search_value(search)
+                and _browse_transition_ready(prior_query_rows, last_query_rows, last_root)
+            )
+            if ready:
+                if last_root == stable_root:
+                    stable_samples += 1
+                else:
+                    stable_root = last_root
+                    stable_samples = 1
+                if stable_samples >= 2:
+                    _diag(
+                        "browse_transition_verified",
+                        prior_query_row_count=len(prior_query_rows),
+                        current_query_row_count=len(last_query_rows),
+                        root_group_id=stable_root[0] if stable_root else "",
+                        root_owner_id=stable_root[1] if stable_root else "",
+                        root_item_count=len(stable_root[2]) if stable_root else 0,
+                    )
+                    return stable_root
+            else:
+                stable_root = None
+                stable_samples = 0
+            self._wait(160)
+
+        _diag(
+            "browse_transition_unverified",
+            prior_query_rows=list(prior_query_rows)[:12],
+            current_query_rows=list(last_query_rows)[:12],
+            current_root_group_id=last_root[0] if last_root else "",
+            current_root_items=list(last_root[2])[:12] if last_root else [],
+        )
+        return None
+
+    def _reload_clean_browse_surface(self, *, timeout_s: float = 12.0) -> tuple[str, str, tuple[str, ...]]:
+        """Rebuild the current uncommitted Step-1 DOM when SPA search state will not retire."""
+
+        current_url = str(getattr(self.page, "url", "") or "")
+        try:
+            self.page.reload(wait_until="domcontentloaded", timeout=15_000)
+        except Exception as exc:
+            raise TaxonomyMechanicalError(
+                "Makro Step 1 Search->Browse transition stayed stale and the current Step-1 page could not be reloaded"
+            ) from exc
+
+        deadline = time.monotonic() + max(2.0, float(timeout_s))
+        stable_root: tuple[str, str, tuple[str, ...]] | None = None
+        stable_samples = 0
+        while time.monotonic() < deadline:
+            try:
+                search = _vertical_search_input(self.page)
+            except Exception:
+                self._wait(180)
+                continue
+            if self._search_value(search):
+                try:
+                    search.fill("")
+                except Exception:
+                    self._wait(180)
+                    continue
+            root = self._probe_root_surface()
+            if root is not None:
+                if root == stable_root:
+                    stable_samples += 1
+                else:
+                    stable_root = root
+                    stable_samples = 1
+                if stable_samples >= 2:
+                    _diag(
+                        "browse_surface_reloaded",
+                        previous_url=current_url,
+                        current_url=str(getattr(self.page, "url", "") or ""),
+                        root_group_id=root[0],
+                        root_owner_id=root[1],
+                        root_item_count=len(root[2]),
+                    )
+                    return root
+            else:
+                stable_root = None
+                stable_samples = 0
+            self._wait(180)
+
+        raise TaxonomyMechanicalError(
+            "Makro Step 1 could not establish a stable Browse taxonomy root after rebuilding the current Step-1 page"
+        )
+
     def _prepare_browse(self) -> None:
         if self._browse_prepared:
             return
         search = _vertical_search_input(self.page)
+        prior_query_rows = _signature(read_search_rows(search))
+        prior_search_value = self._search_value(search)
+        transition_required = bool(prior_search_value or prior_query_rows)
+
         try:
             search.fill("")
         except Exception as exc:
@@ -103,9 +267,27 @@ class ResilientMakroTaxonomyBrowser:
             search.evaluate("el => el.blur()")
         except Exception:
             pass
-        self._wait(180)
+
+        root: tuple[str, str, tuple[str, ...]] | None = None
+        recovery = "none"
+        if transition_required:
+            root = self._wait_for_verified_browse_transition(search, prior_query_rows)
+            if root is None:
+                recovery = "reload_current_step1"
+                root = self._reload_clean_browse_surface()
+        else:
+            self._wait(120)
+
         self._browse_prepared = True
-        _diag("browse_prepared", search_cleared=True)
+        _diag(
+            "browse_prepared",
+            search_cleared=True,
+            transition_required=transition_required,
+            transition_verified=bool(root) if transition_required else True,
+            recovery=recovery,
+            prior_query_row_count=len(prior_query_rows),
+            root_group_id=root[0] if root else "",
+        )
 
     def _descriptors(self, *, max_items_per_level: int) -> list[dict[str, Any]]:
         try:
@@ -250,7 +432,6 @@ class ResilientMakroTaxonomyBrowser:
                 self._scroll(owner_id, "top", group_id=group_id)
                 self._wait(60)
             except Exception:
-                # Preserve the original mechanical failure if one already exists.
                 pass
 
         _diag(
