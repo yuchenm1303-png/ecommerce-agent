@@ -519,8 +519,33 @@ class ResilientMakroTaxonomyBrowser:
         parent_dom_order: int,
         used_group_ids: list[str],
     ) -> dict[str, Any] | None:
-        stale = self._stale_after_parent.get(int(depth), {})
         used = {str(group_id or "") for group_id in used_group_ids if str(group_id or "")}
+
+        # A previously committed logical level remains authoritative while that exact
+        # structural owner is still live under the same parent. Makro keeps parent
+        # columns mounted when a deeper child opens, so treating every mounted group
+        # after the parent as a new candidate confuses the current level with its child.
+        if 0 <= int(depth) < len(self._logical_group_ids) and int(depth) < len(self._logical_owner_ids):
+            committed_group_id = str(self._logical_group_ids[int(depth)] or "")
+            committed_owner_id = str(self._logical_owner_ids[int(depth)] or committed_group_id)
+            committed = self._by_group(descriptors, committed_group_id)
+            if (
+                committed is not None
+                and committed_group_id not in used
+                and committed_group_id != parent_group_id
+                and not bool(committed.get("is_root"))
+                and str(committed.get("owner_id") or committed_group_id) == committed_owner_id
+                and int(committed.get("dom_order") or 0) > int(parent_dom_order)
+            ):
+                _diag(
+                    "logical_group_reused",
+                    depth=int(depth),
+                    group_id=committed_group_id,
+                    owner_id=committed_owner_id,
+                )
+                return committed
+
+        stale = self._stale_after_parent.get(int(depth), {})
         candidates = [
             entry
             for entry in descriptors
