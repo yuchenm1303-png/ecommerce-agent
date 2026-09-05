@@ -1,20 +1,23 @@
 """Scroll-complete structural traversal for the live Makro Step-1 taxonomy.
 
 The raw catalog sensor owns real taxonomy containers from the exact Vertical
-search control.  This layer adds lifecycle mechanics only: Search->Browse reset,
-complete internal scrolling, exact-node reveal, and child-column rebinding after
-our own clicks.  Product/category meaning remains entirely in the AI chooser.
+search control. This layer adds lifecycle mechanics only: verified Search->Browse
+transition, complete internal scrolling, exact-node reveal, and child-column
+rebinding after our own clicks. Product/category meaning remains entirely in the
+AI chooser.
 
-A known-partial category list is never returned.  If a scroll owner cannot be
-proved complete or a generated child cannot be uniquely rebound, traversal fails
-with an explicit mechanical error instead of silently presenting incomplete live
-nodes to AI.
+A category owner is fully harvested once and that proven-complete snapshot is
+reused while the same DOM owner remains structurally valid. A click invalidates
+only descendant/repaint candidates that can actually change. This preserves the
+bounded stability polling contract without repeatedly scrolling unchanged parent
+columns from top to bottom on every poll.
 """
 
 from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from playwright.sync_api import Page
@@ -26,6 +29,13 @@ from .search_surface import read_search_rows
 
 class TaxonomyMechanicalError(RuntimeError):
     """A live taxonomy operation could not be mechanically completed or proven."""
+
+
+@dataclass(frozen=True, slots=True)
+class _CompleteColumnSnapshot:
+    owner_id: str
+    capacity: int
+    values: tuple[str, ...]
 
 
 def _clean(value: object) -> str:
@@ -109,6 +119,7 @@ class ResilientMakroTaxonomyBrowser:
         self._logical_owner_ids: list[str] = []
         self._logical_dom_orders: list[int] = []
         self._stale_after_parent: dict[int, dict[str, tuple[str, ...]]] = {}
+        self._complete_columns: dict[str, _CompleteColumnSnapshot] = {}
 
     @property
     def last_diagnostic(self) -> str:
@@ -120,7 +131,11 @@ class ResilientMakroTaxonomyBrowser:
         except Exception:
             pass
 
-    def _probe_root_surface(self, *, max_items_per_level: int = 400) -> tuple[str, str, tuple[str, ...]] | None:
+    def _probe_root_surface(
+        self,
+        *,
+        max_items_per_level: int = 400,
+    ) -> tuple[str, str, tuple[str, ...]] | None:
         """Best-effort structural root probe used only while a UI transition settles."""
 
         try:
@@ -193,10 +208,15 @@ class ResilientMakroTaxonomyBrowser:
         )
         return None
 
-    def _reload_clean_browse_surface(self, *, timeout_s: float = 12.0) -> tuple[str, str, tuple[str, ...]]:
+    def _reload_clean_browse_surface(
+        self,
+        *,
+        timeout_s: float = 12.0,
+    ) -> tuple[str, str, tuple[str, ...]]:
         """Rebuild the current uncommitted Step-1 DOM when SPA search state will not retire."""
 
         current_url = str(getattr(self.page, "url", "") or "")
+        self._complete_columns.clear()
         try:
             self.page.reload(wait_until="domcontentloaded", timeout=15_000)
         except Exception as exc:
@@ -444,8 +464,43 @@ class ResilientMakroTaxonomyBrowser:
         )
         return output
 
-    def _root_descriptor(
+    def _complete_owned_column(
         self,
+        descriptor: dict[str, Any],
+        *,
+        max_items_per_level: int,
+    ) -> list[str]:
+        """Return one structurally proven complete column, harvesting it at most once per owner generation."""
+
+        limit = max(8, int(max_items_per_level))
+        group_id = str(descriptor.get("group_id") or "")
+        owner_id = str(descriptor.get("owner_id") or group_id)
+        if not group_id or not owner_id:
+            raise TaxonomyMechanicalError("Makro taxonomy descriptor has no stable structural owner id")
+
+        cached = self._complete_columns.get(group_id)
+        if cached is not None and cached.owner_id == owner_id and cached.capacity >= limit:
+            return list(cached.values)
+
+        values = self._harvest_owned_column(
+            descriptor,
+            max_items_per_level=limit,
+        )
+        self._complete_columns[group_id] = _CompleteColumnSnapshot(
+            owner_id=owner_id,
+            capacity=limit,
+            values=tuple(values),
+        )
+        return values
+
+    def _invalidate_complete_columns(self, group_ids: set[str] | list[str] | tuple[str, ...]) -> None:
+        for raw_group_id in group_ids:
+            group_id = str(raw_group_id or "")
+            if group_id:
+                self._complete_columns.pop(group_id, None)
+
+    @staticmethod
+    def _root_descriptor(
         descriptors: list[dict[str, Any]],
     ) -> dict[str, Any]:
         roots = [entry for entry in descriptors if bool(entry.get("is_root"))]
@@ -505,7 +560,7 @@ class ResilientMakroTaxonomyBrowser:
         return None
 
     def columns(self, *, max_items_per_level: int = 400) -> list[list[str]]:
-        """Return complete logical taxonomy levels only after proving each list end."""
+        """Return complete logical taxonomy levels, reusing proven unchanged owners across stability polls."""
 
         limit = max(8, int(max_items_per_level))
         self._prepare_browse()
@@ -520,7 +575,10 @@ class ResilientMakroTaxonomyBrowser:
         current = root
 
         for depth in range(max_depth + 1):
-            values = self._harvest_owned_column(current, max_items_per_level=limit)
+            values = self._complete_owned_column(
+                current,
+                max_items_per_level=limit,
+            )
             if not values:
                 raise TaxonomyMechanicalError(
                     f"Makro taxonomy logical level {depth} completed with no live nodes"
@@ -607,14 +665,17 @@ class ResilientMakroTaxonomyBrowser:
         logical_level: int,
         stale: dict[str, tuple[str, ...]],
     ) -> None:
-        """Commit one click as the sole active branch and invalidate deeper history."""
+        """Commit one click as the sole active branch and invalidate only structurally mutable descendants."""
 
         keep = int(logical_level) + 1
+        discarded_group_ids = list(self._logical_group_ids[keep:])
         discarded_depths = sorted(
             int(depth)
             for depth in self._stale_after_parent
             if int(depth) > int(logical_level)
         )
+        self._invalidate_complete_columns(set(discarded_group_ids).union(stale))
+
         self._clicked_depth = int(logical_level)
         self._logical_group_ids = self._logical_group_ids[:keep]
         self._logical_owner_ids = self._logical_owner_ids[:keep]
@@ -629,6 +690,7 @@ class ResilientMakroTaxonomyBrowser:
             "branch_state_committed",
             level=int(logical_level),
             active_group_ids=list(self._logical_group_ids),
+            invalidated_group_ids=sorted(set(discarded_group_ids).union(stale)),
             discarded_deeper_depths=discarded_depths,
         )
 
