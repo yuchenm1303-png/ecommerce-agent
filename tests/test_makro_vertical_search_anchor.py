@@ -21,9 +21,9 @@ class _Provider:
             ],
             "broader_queries": [
                 "skincare treatment",
-                "serum",
+                "skincare serum",
             ],
-            "head_noun_query": "skincare serum",
+            "head_noun_query": "serum",
         }
 
 
@@ -51,8 +51,8 @@ def test_planner_explicitly_requests_short_core_class_anchor() -> None:
     rules = " ".join(request["rules"]).casefold()
 
     assert "single common noun" in rules
-    assert "high-recall marketplace retrieval" in rules
-    assert "retrieval probe" in rules
+    assert "authorized retrieval probe" in rules
+    assert "must not semantically reject or rewrite" in rules
     assert "complete makro breadcrumb" in rules
 
 
@@ -60,11 +60,18 @@ def test_single_word_core_anchor_survives_budget_and_executes_first() -> None:
     hints = _serum_hints()
     planned = plan_vertical_search_terms(_Provider(), hints)
 
-    assert "serum" in planned
-    assert planned[-1] == "niacinamide skincare serum"
+    assert planned == (
+        "niacinamide discoloration correcting serum",
+        "brightening face serum",
+        "dark spot serum",
+        "facial treatment serum",
+        "skincare treatment",
+        "skincare serum",
+        "serum",
+    )
 
     execution = _broad_first_search_execution_terms(hints, planned)
 
     assert execution[0] == "serum"
-    assert execution[-1] == "niacinamide skincare serum"
-    assert len(execution) <= 7
+    assert execution[-1] == "niacinamide discoloration correcting serum"
+    assert len(execution) == 7
