@@ -1,9 +1,10 @@
 """Makro Step 1 Vertical resolution.
 
 One production decision boundary owns Step 1: Makro supplies the selectable
-Verticals, AI plans a bounded retrieval ladder, and AI decides directly from the
-rows that are live in each current search generation. When AI chooses one current
-live row, that exact row is clicked immediately; the workflow never re-runs an old
+Verticals, AI plans a bounded retrieval ladder, and execution probes that ladder
+from broad recall to specific precision while AI decides directly from the rows
+that are live in each current search generation. When AI chooses one current live
+row, that exact row is clicked immediately; the workflow never re-runs an old
 query to re-judge or re-bind an already chosen category. Query-local DOM failures
 stay inside that retrieval attempt, and the existing taxonomy fallback remains for
 runs where AI selects none from every live search generation.
@@ -497,6 +498,31 @@ def _search_attempt_is_locally_recoverable(page: Page) -> bool:
     return True
 
 
+def _broad_first_search_execution_terms(
+    hints: ListingBootstrapHints,
+    planner_terms: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Reverse the retrieval gradient while keeping canonical identity as final precision fallback."""
+
+    terms = tuple(str(term or "").strip() for term in planner_terms if str(term or "").strip())
+    if len(terms) <= 1:
+        return terms
+
+    identity = dict(hints.product_identity or {})
+    canonical = str(identity.get("product_type_en") or "").strip()
+    if not canonical and hints.vertical_search_terms:
+        canonical = str(hints.vertical_search_terms[0] or "").strip()
+    canonical_key = normalize_label(canonical)
+
+    reversed_terms = list(reversed(terms))
+    if not canonical_key:
+        return tuple(reversed_terms)
+
+    broad_first = [term for term in reversed_terms if normalize_label(term) != canonical_key]
+    canonical_terms = [term for term in terms if normalize_label(term) == canonical_key]
+    return tuple([*broad_first, *canonical_terms])
+
+
 def _try_select_via_search(
     page: Page,
     provider: JSONTaskProvider,
@@ -506,12 +532,21 @@ def _try_select_via_search(
 ) -> tuple[str, list[str], tuple[str, ...]]:
     """Let AI decide from each current live generation and click immediately."""
 
-    planned_terms = plan_vertical_search_terms(provider, hints)
+    planner_terms = plan_vertical_search_terms(provider, hints)
+    execution_terms = _broad_first_search_execution_terms(hints, planner_terms)
+    _vertical_diag(
+        "search_execution_order",
+        {
+            "policy": "broad_to_specific",
+            "planner_terms": list(planner_terms),
+            "execution_terms": list(execution_terms),
+        },
+    )
     observed: list[str] = []
     observed_keys: set[str] = set()
     last_search = None
 
-    for query_index, term in enumerate(planned_terms, start=1):
+    for query_index, term in enumerate(execution_terms, start=1):
         try:
             rows, search = _run_vertical_search_query(page, term, wait_ms=wait_ms)
         except Exception as exc:
@@ -521,7 +556,7 @@ def _try_select_via_search(
                 "query_failed",
                 {
                     "query_index": query_index,
-                    "query_count": len(planned_terms),
+                    "query_count": len(execution_terms),
                     "query": term,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
@@ -549,7 +584,7 @@ def _try_select_via_search(
             "query_decision",
             {
                 "query_index": query_index,
-                "query_count": len(planned_terms),
+                "query_count": len(execution_terms),
                 "query": term,
                 "fresh_row_count": len(rows),
                 "candidate_count": len(current_candidates),
@@ -585,7 +620,7 @@ def _try_select_via_search(
                 verification_label=_search_result_leaf(current_row),
             ),
             observed,
-            planned_terms,
+            execution_terms,
         )
 
     if last_search is not None:
@@ -593,7 +628,7 @@ def _try_select_via_search(
             _close_vertical_search(last_search, page, wait_ms=wait_ms)
         except Exception:
             pass
-    return "", observed, planned_terms
+    return "", observed, execution_terms
 
 
 def _select_via_search_with_context(
