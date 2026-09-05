@@ -1,11 +1,12 @@
 """Semantic policy for Makro taxonomy fallback.
 
 Makro's live taxonomy is sometimes sparse or commercially coarse. Navigation
-therefore prefers genuine taxonomy ancestry but may traverse the most plausible
-retail branch when no exact ancestry exists. Product Identity is only the initial
-interpretation: the exact supplier snippets cited by that identity and any customer
-listing intent remain independent evidence so taxonomy fallback cannot reinforce an
-early AI misunderstanding. The final leaf still has to be a real live Makro class.
+prefers genuine taxonomy ancestry and only permits a speculative best-available
+branch after the AI has compared the complete live generation and established that
+no same-type, genuine ancestor, or genuine merchandise superclass is present.
+Product Identity is only the initial interpretation: exact supplier evidence and
+customer intent remain independent channels so fallback cannot reinforce an early
+AI misunderstanding. The final leaf still has to be a real live Makro class.
 """
 
 from __future__ import annotations
@@ -24,9 +25,9 @@ _BEST_AVAILABLE_FIT = "best_available_fit"
 _NO_VALID_CLASS = "none"
 _SELECTABLE_PATH_RELATIONS = (
     _ANCESTOR_BRANCH,
-    _BEST_AVAILABLE_BRANCH,
     _SAME_PRODUCT_TYPE,
     _BROADER_VALID_CLASS,
+    _BEST_AVAILABLE_BRANCH,
 )
 _LEAF_RELATIONS = {
     _SAME_PRODUCT_TYPE,
@@ -124,15 +125,19 @@ def build_taxonomy_path_choice_request(
     return {
         "task": "choose_safe_makro_taxonomy_node",
         "system_instruction": (
-            "Choose at most one exact live Makro taxonomy node for a physical product. Makro taxonomy "
-            "may be sparse. The initial Product Identity is an AI interpretation, not immutable truth; "
-            "reconcile it against cited raw supplier evidence and customer intent before choosing. JSON only."
+            "Choose at most one exact live Makro taxonomy node for a physical product. Compare the complete "
+            "live generation before choosing. Genuine same-type, ancestor, and merchandise-superclass relations "
+            "strictly outrank speculative best-available exploration. The initial Product Identity is an AI "
+            "interpretation, not immutable truth; reconcile it against cited raw supplier evidence and customer "
+            "intent before choosing. JSON only."
         ),
         "prompt_instruction": (
-            "Evaluate context.current_path + each live node as a marketplace breadcrumb. Prefer strict "
-            "taxonomy ancestry; otherwise choose the branch a marketplace operator would most reasonably "
-            "explore for a best-fit listing category. If independent evidence exposes an initial identity "
-            "mistake, correct the hypothesis rather than repeatedly following it. Return one atomic selection_key."
+            "Evaluate context.current_path + every live node as a marketplace breadcrumb. First determine whether "
+            "any node is the same product type, a genuine taxonomy ancestor, or a genuine merchandise superclass. "
+            "If one exists, choose the best such node and do not use best_available_branch. Only if none exists may "
+            "you consider one conventional retail branch that is genuinely likely to contain a usable closest-fit "
+            "leaf. If all remaining routes are speculative neighboring departments, return none. If independent "
+            "evidence exposes an initial identity mistake, correct the hypothesis. Return one atomic selection_key."
         ),
         "context": {
             "product_summary": hints.product_summary,
@@ -147,15 +152,19 @@ def build_taxonomy_path_choice_request(
             "Treat initial_product_identity as a hypothesis. Grounded supplier evidence is independent factual evidence.",
             "Customer listing intent may reveal a plausible misunderstanding but must never override supplier evidence that plainly describes a different physical item.",
             "Separate core sold product class from incidental material, personalization, colour, size and marketing attributes.",
-            "Use ancestor_branch for a genuine marketplace department/product-family ancestor.",
+            "Compare all live nodes in the current generation before selecting; do not stop at the first superficially plausible label.",
             "Use same_product_type when the node already names the same physical product class.",
-            "Use broader_valid_class when the node is a genuine semantic superclass.",
-            "When no strict ancestor exists, use best_available_branch for the live branch most likely to contain the closest commercially reasonable leaf.",
-            "For best_available_branch, judge retail context, buyer expectation and defining function; do not choose a branch merely because one vague word overlaps.",
-            "Physical containment alone is not evidence: a product fitting inside a container, case, bag, vehicle or room does not make that object a good category branch.",
+            "Use ancestor_branch for a genuine marketplace department or product-family ancestor that would conventionally contain the sold item.",
+            "Use broader_valid_class when the node is a genuine semantic merchandise superclass of the sold item.",
+            "Priority is strict: if any live node qualifies as same_product_type, ancestor_branch, or broader_valid_class, best_available_branch is not permitted.",
+            "Use best_available_branch only after establishing that no live node is the same type, genuine ancestor, or genuine merchandise superclass.",
+            "A best_available_branch must still be a conventional retail merchandising route for the sold item based on defining function, buyer expectation, and normal department placement.",
+            "Do not use best_available_branch merely because the product can be stored in, attached to, used with, powered by, displayed on, connected to, placed inside, or operated near something named by that branch.",
+            "Do not choose a neighboring department from vague word overlap, shared context, or physical association when it does not conventionally merchandise the sold product itself.",
             "Accessories, consumables and spare parts should not be preferred when a branch representing the sold product itself is materially closer.",
+            "At the taxonomy root, prefer the department or product family that normally sells the item; a speculative detour is worse than returning none.",
             "Judge the complete breadcrumb, not an isolated word.",
-            "Return none only when no current live branch is even a reasonable route to a usable best-fit category after reconciling all independent evidence.",
+            "Return none when every current live branch would be a speculative or misleading route; none is safer than inventing ancestry to keep traversal moving.",
         ],
         "json_contract": {
             "type": "object",
@@ -256,12 +265,13 @@ def build_taxonomy_leaf_validation_request(
             "Distinguish the core product class from incidental material, personalization, colour, size and marketing attributes.",
             "Use same_product_type for the same physical product class.",
             "Use broader_valid_class for a genuine merchandise superclass.",
-            "Use best_available_fit when the leaf is not a strict superclass but is the most commercially reasonable live Makro category available for this product.",
+            "Use best_available_fit only when this breadcrumb is a conventional retail location for the sold item and Makro has no same-type or genuine broader leaf available in the explored route.",
             "A best_available_fit may differ in form, use-case or specificity when Makro has no exact class; describe those tradeoffs in unsupported_defining_constraints and reason instead of automatically rejecting it.",
+            "Physical association is not semantic fit: being stored in, attached to, used with, connected to, placed inside, or operated near another product class does not make that class a valid best fit.",
             "Prefer shared defining function, normal retail context and buyer expectation over literal word overlap.",
             "Do not use best_available_fit for a plainly unrelated class when a meaningfully closer live category exists.",
             "unsupported_defining_constraints is diagnostic: list meaningful mismatches so logs show the compromise.",
-            "Use none only when this leaf would severely misrepresent the sold product even after reconciling all independent evidence.",
+            "Use none when this breadcrumb would materially misrepresent where the sold product is conventionally merchandised.",
         ],
         "json_contract": {
             "type": "object",
