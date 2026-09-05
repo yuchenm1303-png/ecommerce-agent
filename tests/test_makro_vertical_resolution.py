@@ -4,7 +4,6 @@ import inspect
 
 import pytest
 
-import app.makro.vertical_resolution as vertical_resolution
 import app.makro.vertical_selection as vertical_selection
 from app.makro.listing_creation import ListingBootstrapHints
 from app.makro.vertical_resolution import (
@@ -94,7 +93,7 @@ def _protective_glasses_hints() -> ListingBootstrapHints:
     )
 
 
-def test_search_plan_contract_has_specific_alternate_broader_and_discriminative_head_roles() -> None:
+def test_search_plan_contract_has_specific_alternate_broader_and_head_roles() -> None:
     request = build_vertical_search_plan_request(_bag_sealer_hints())
     properties = request["json_contract"]["properties"]
 
@@ -114,8 +113,9 @@ def test_search_plan_contract_has_specific_alternate_broader_and_discriminative_
         "head_noun_query",
     ]
     rules = " ".join(request["rules"]).casefold()
-    assert "core product class -> alternate retail vocabulary -> broader family -> discriminative head phrase" in rules
-    assert "do not collapse" in rules
+    assert "shortest useful class anchor" in rules
+    assert "authorized retrieval probe" in rules
+    assert "must not semantically reject or rewrite" in rules
     assert "initial_product_identity as a hypothesis" in rules
 
 
@@ -191,7 +191,7 @@ def test_search_planner_does_not_duplicate_canonical_when_ai_already_planned_it(
     assert terms.count("rechargeable bag sealer") == 1
 
 
-def test_search_planner_fallback_keeps_discriminating_two_word_head() -> None:
+def test_search_planner_fallback_keeps_head_without_semantic_veto() -> None:
     provider = FakeProvider(
         {"plan_makro_vertical_search_intents": RuntimeError("temporary provider failure")}
     )
@@ -199,10 +199,11 @@ def test_search_planner_fallback_keeps_discriminating_two_word_head() -> None:
     assert plan_vertical_search_terms(provider, _bag_sealer_hints()) == (
         "rechargeable bag sealer",
         "bag sealer",
+        "sealer",
     )
 
 
-def test_invalid_generic_head_does_not_destroy_other_valid_planner_queries() -> None:
+def test_ai_authorized_generic_head_is_not_rejected_by_python() -> None:
     provider = FakeProvider(
         {
             "plan_makro_vertical_search_intents": {
@@ -216,11 +217,12 @@ def test_invalid_generic_head_does_not_destroy_other_valid_planner_queries() -> 
 
     assert plan_vertical_search_terms(provider, _bag_sealer_hints()) == (
         "bag sealer",
+        "machine",
         "rechargeable bag sealer",
     )
 
 
-def test_multiword_ultrasonic_cleaner_never_degrades_to_bare_cleaner() -> None:
+def test_multiword_product_keeps_ai_authorized_one_word_head() -> None:
     provider = FakeProvider(
         {
             "plan_makro_vertical_search_intents": {
@@ -242,20 +244,48 @@ def test_multiword_ultrasonic_cleaner_never_degrades_to_bare_cleaner() -> None:
         "ultrasonic cleaning machine",
         "jewelry cleaning machine",
         "ultrasonic cleaner",
+        "cleaner",
     )
-    assert "cleaner" not in terms
-    assert vertical_resolution._usable_head_query_for_product(
-        _ultrasonic_cleaner_hints(), "cleaner"
-    ) is False
 
 
-def test_search_query_guard_rejects_platform_pollution_without_blocking_real_product_names() -> None:
-    assert vertical_resolution._usable_query("Makro bag sealer") is False
-    assert vertical_resolution._usable_query("seller category") is False
-    assert vertical_resolution._usable_query("vertical") is False
-    assert vertical_resolution._usable_query("category") is False
-    assert vertical_resolution._usable_query("vertical blinds") is True
-    assert vertical_resolution._usable_query("category 6 cable") is True
+def test_python_does_not_semantically_filter_ai_planned_queries() -> None:
+    provider = FakeProvider(
+        {
+            "plan_makro_vertical_search_intents": {
+                "specific_queries": ["Makro bag sealer", "seller category"],
+                "alternate_queries": ["vertical", "category"],
+                "broader_queries": ["设备", "product"],
+                "head_noun_query": "machine",
+            }
+        }
+    )
+
+    assert plan_vertical_search_terms(provider, _bag_sealer_hints()) == (
+        "Makro bag sealer",
+        "seller category",
+        "vertical",
+        "category",
+        "设备",
+        "product",
+        "machine",
+    )
+
+
+def test_full_ai_budget_is_not_evicted_for_python_canonical_fallback() -> None:
+    provider = FakeProvider(
+        {
+            "plan_makro_vertical_search_intents": {
+                "specific_queries": ["q1", "q2"],
+                "alternate_queries": ["q3", "q4"],
+                "broader_queries": ["q5", "q6"],
+                "head_noun_query": "q7",
+            }
+        }
+    )
+
+    assert plan_vertical_search_terms(provider, _bag_sealer_hints()) == (
+        "q1", "q2", "q3", "q4", "q5", "q6", "q7"
+    )
 
 
 def test_live_candidate_evidence_builder_deduplicates_rows() -> None:
