@@ -125,13 +125,5 @@ jobs:
           }
           if (Test-Path $installDir) { throw "Velopack uninstall left installation root behind: $installDir" }
 
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: EcommerceAgent-Windows-${{ github.sha }}
-          path: |
-            artifacts/EcommerceAgent-Setup-*.exe
-            artifacts/EcommerceAgent-*-portable.zip
-            artifacts/velopack/*
-          if-no-files-found: error
-          retention-days: 14
+      # Routine CI validates the package in-place and then lets the runner discard it.
+      # Distribution artifacts belong to verified GitHub Releases, not Actions storage.
