@@ -5,6 +5,8 @@ const REPOSITORY = "yuchenm1303-png/ecommerce-agent";
 const ACCESS_TABLE = "download_portal_users";
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const SHA256_DIGEST_RE = /^sha256:([0-9a-f]{64})$/i;
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/i;
+const PORTAL_RELEASE_TIMEOUT_MS = 5_000;
 const ALLOWED_ORIGINS = new Set([
   "https://smirel.com",
   "https://www.smirel.com",
@@ -35,6 +37,11 @@ function json(req: Request, body: unknown, status = 200): Response {
 function normalizeVersion(value: unknown): string {
   const raw = String(value ?? "").trim();
   return raw.startsWith("v") ? raw.slice(1) : raw;
+}
+
+function installerUrl(version: string): string {
+  const name = `EcommerceAgent-Setup-${version}.exe`;
+  return `https://github.com/${REPOSITORY}/releases/download/v${version}/${name}`;
 }
 
 async function getAuthorizedUser(req: Request) {
@@ -80,6 +87,44 @@ async function getAuthorizedUser(req: Request) {
   return { user, status: 200 } as const;
 }
 
+async function resolveLatestStable() {
+  const supabaseUrl = String(Deno.env.get("SUPABASE_URL") || "").trim().replace(/\/$/, "");
+  if (!supabaseUrl) throw new Error("server_config");
+
+  const response = await fetch(`${supabaseUrl}/functions/v1/portal-release`, {
+    method: "GET",
+    headers: {
+      "Accept": "application/json",
+      "User-Agent": "Listing-Studio-Authorized-Download",
+    },
+    cache: "no-store",
+    signal: AbortSignal.timeout(PORTAL_RELEASE_TIMEOUT_MS),
+  });
+  if (!response.ok) throw new Error(`portal_release_${response.status}`);
+
+  const release = await response.json();
+  const version = normalizeVersion(release?.version);
+  const sha256 = String(release?.installerSha256 || "").trim().toLowerCase();
+  const size = Number(release?.fileSizeBytes || 0);
+  if (
+    release?.channel !== "stable" ||
+    !VERSION_RE.test(version) ||
+    !SHA256_HEX_RE.test(sha256) ||
+    !Number.isSafeInteger(size) ||
+    size <= 0
+  ) {
+    throw new Error("invalid_portal_stable_release");
+  }
+
+  return {
+    version,
+    url: installerUrl(version),
+    sha256,
+    size,
+    publishedAt: String(release?.publishedAt || ""),
+  } as const;
+}
+
 async function resolveStableVersion(requestedVersion: string) {
   const releaseApi = `https://api.github.com/repos/${REPOSITORY}/releases/tags/v${requestedVersion}`;
   const githubHeaders = {
@@ -109,7 +154,7 @@ async function resolveStableVersion(requestedVersion: string) {
 
   const installerName = `EcommerceAgent-Setup-${requestedVersion}.exe`;
   const installerAsset = release.assets.find((asset: any) => asset?.name === installerName);
-  const expectedInstallerUrl = `https://github.com/${REPOSITORY}/releases/download/v${requestedVersion}/${installerName}`;
+  const expectedInstallerUrl = installerUrl(requestedVersion);
   if (String(installerAsset?.browser_download_url || "") !== expectedInstallerUrl) {
     throw new Error("installer_url_mismatch");
   }
@@ -127,6 +172,22 @@ async function resolveStableVersion(requestedVersion: string) {
     sha256: digestMatch[1].toLowerCase(),
     size: installerSize,
     publishedAt: String(release.published_at || release.created_at || ""),
+  } as const;
+}
+
+async function resolveLegacyDownload(version: string) {
+  if (VERSION_RE.test(version)) {
+    const exact = await resolveStableVersion(version);
+    if (!("error" in exact)) return { stable: exact, source: "github_release_stable_version" } as const;
+    if (exact.error !== "version_not_found") return exact;
+  }
+
+  // Old cached portal JS used a packaged fallback version for the "latest" button.
+  // If that stale tag no longer exists, recover by asking the server-owned Stable
+  // control plane instead of returning a false 404 to the user.
+  return {
+    stable: await resolveLatestStable(),
+    source: "portal_release_stable_latest_legacy_recovery",
   } as const;
 }
 
@@ -150,30 +211,52 @@ Deno.serve(async (req: Request) => {
     return json(req, { error: "invalid_json" }, 400);
   }
 
-  if (String(body.action || "download") !== "download") {
-    return json(req, { error: "invalid_action" }, 400);
-  }
-
+  const action = String(body.action || "download").trim();
   const version = normalizeVersion(body.version);
-  if (!VERSION_RE.test(version)) {
-    return json(req, { error: "invalid_version" }, 400);
-  }
 
   try {
-    const stable = await resolveStableVersion(version);
-    if ("error" in stable) {
-      return json(req, { error: stable.error }, stable.status);
+    let resolved:
+      | { stable: Awaited<ReturnType<typeof resolveLatestStable>>; source: string }
+      | { error: string; status: number };
+
+    if (action === "download_latest") {
+      resolved = {
+        stable: await resolveLatestStable(),
+        source: "portal_release_stable_latest",
+      };
+    } else if (action === "download_version") {
+      if (!VERSION_RE.test(version)) {
+        return json(req, { error: "invalid_version" }, 400);
+      }
+      const exact = await resolveStableVersion(version);
+      if ("error" in exact) {
+        resolved = exact;
+      } else {
+        resolved = { stable: exact, source: "github_release_stable_version" };
+      }
+    } else if (action === "download") {
+      // Backward compatibility for already-cached portal JS. New clients must use
+      // one of the explicit actions above so intent is never inferred from a version.
+      resolved = await resolveLegacyDownload(version);
+    } else {
+      return json(req, { error: "invalid_action" }, 400);
     }
+
+    if ("error" in resolved) {
+      return json(req, { error: resolved.error }, resolved.status);
+    }
+
+    const stable = resolved.stable;
     return json(req, {
       url: stable.url,
       version: `v${stable.version}`,
       sha256: stable.sha256,
       size: stable.size,
       publishedAt: stable.publishedAt,
-      source: "github_release_stable_version",
+      source: resolved.source,
     });
   } catch (error) {
-    console.error("authorized stable version download resolution failed", error);
+    console.error("authorized stable download resolution failed", error);
     return json(req, { error: "stable_release_unavailable" }, 503);
   }
 });
