@@ -98,6 +98,23 @@ QProgressBar#updateProgress::chunk {
 """
 
 
+class _WindowDragHandle(QWidget):
+    """Native title-region drag handle for the frameless update dialogs."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802, ANN001
+        if event.button() == Qt.MouseButton.LeftButton:
+            window_handle = self.window().windowHandle()
+            if window_handle is not None:
+                window_handle.startSystemMove()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+
 class _UpdatePanelBase(QDialog):
     def __init__(self, parent: QWidget | None, *, title: str, subtitle: str) -> None:
         super().__init__(parent)
@@ -123,10 +140,13 @@ class _UpdatePanelBase(QDialog):
         self.card_layout.setContentsMargins(30, 28, 30, 28)
         self.card_layout.setSpacing(18)
 
-        header = QHBoxLayout()
+        self.drag_handle = _WindowDragHandle(self.card)
+        header = QHBoxLayout(self.drag_handle)
+        header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(16)
-        icon_label = QLabel(self.card)
+        icon_label = QLabel(self.drag_handle)
         icon_label.setFixedSize(58, 58)
+        icon_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         app = QApplication.instance()
         icon = app.windowIcon() if app is not None else self.windowIcon()
         if not icon.isNull():
@@ -135,18 +155,21 @@ class _UpdatePanelBase(QDialog):
 
         heading = QVBoxLayout()
         heading.setSpacing(3)
-        eyebrow = QLabel("LISTING STUDIO · SECURE UPDATE", self.card)
+        eyebrow = QLabel("LISTING STUDIO · SECURE UPDATE", self.drag_handle)
         eyebrow.setObjectName("updateEyebrow")
+        eyebrow.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         heading.addWidget(eyebrow)
-        self.title_label = QLabel(title, self.card)
+        self.title_label = QLabel(title, self.drag_handle)
         self.title_label.setObjectName("updateTitle")
+        self.title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         heading.addWidget(self.title_label)
-        self.subtitle_label = QLabel(subtitle, self.card)
+        self.subtitle_label = QLabel(subtitle, self.drag_handle)
         self.subtitle_label.setObjectName("updateSubtitle")
         self.subtitle_label.setWordWrap(True)
+        self.subtitle_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         heading.addWidget(self.subtitle_label)
         header.addLayout(heading, 1)
-        self.card_layout.addLayout(header)
+        self.card_layout.addWidget(self.drag_handle)
 
     def _center_over_parent(self) -> None:
         parent = self.parentWidget()
