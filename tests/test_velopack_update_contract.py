@@ -16,6 +16,9 @@ PUBLISH = (ROOT / ".github" / "workflows" / "publish-update.yml").read_text(enco
 TEST_PUBLISH = (ROOT / ".github" / "workflows" / "publish-test-build.yml").read_text(encoding="utf-8")
 PORTAL_DOWNLOAD = (ROOT / "supabase" / "functions" / "portal-download" / "index.ts").read_text(encoding="utf-8")
 PORTAL_RELEASE = (ROOT / "supabase" / "functions" / "portal-release" / "index.ts").read_text(encoding="utf-8")
+PORTAL_RELEASE_WARM = (
+    ROOT / "supabase" / "functions" / "portal-release-warm" / "index.ts"
+).read_text(encoding="utf-8")
 UPDATE_MIRROR_MIGRATION = (
     ROOT / "supabase" / "migrations" / "20260902052000_resilient_update_mirror.sql"
 ).read_text(encoding="utf-8")
@@ -185,37 +188,58 @@ def test_release_publication_is_transactional_and_checks_portal_installer_digest
     assert "Select-Object -Skip 3" in TEST_PUBLISH
 
 
-def test_portal_download_resolves_authorized_stable_version_without_legacy_manifest() -> None:
+def test_portal_download_serves_authorized_mirrored_stable_chunks_without_github_resolution() -> None:
     assert 'const MANIFEST_ASSET = "update.json"' not in PORTAL_DOWNLOAD
-    assert "SHA256_DIGEST_RE" in PORTAL_DOWNLOAD
-    assert "installerAsset?.digest" in PORTAL_DOWNLOAD
-    assert 'const installerName = `EcommerceAgent-Setup-${requestedVersion}.exe`' in PORTAL_DOWNLOAD
-    assert 'source: "github_release_stable_version"' in PORTAL_DOWNLOAD
-    assert 'error: "version_not_found"' in PORTAL_DOWNLOAD
+    assert 'const DOWNLOAD_BUCKET = "listing-studio-downloads"' in PORTAL_DOWNLOAD
+    assert "SHA256_HEX_RE" in PORTAL_DOWNLOAD
+    assert "resolveLatestStable()" in PORTAL_DOWNLOAD
+    assert "loadInstallerManifest(version)" in PORTAL_DOWNLOAD
+    assert ".createSignedUrls(paths, SIGNED_CHUNK_TTL_SECONDS)" in PORTAL_DOWNLOAD
+    assert 'error: "version_not_mirrored"' in PORTAL_DOWNLOAD
+    assert 'throw new Error("latest_installer_mirror_mismatch")' in PORTAL_DOWNLOAD
+    assert 'action === "download_latest"' in PORTAL_DOWNLOAD
+    assert 'action === "download_version"' in PORTAL_DOWNLOAD
+    assert "https://api.github.com/" not in PORTAL_DOWNLOAD
+    assert "browser_download_url" not in PORTAL_DOWNLOAD
+    assert "installerAsset?.digest" not in PORTAL_DOWNLOAD
 
 
-def test_public_release_metadata_is_a_cached_github_projection_with_cdn_failover() -> None:
-    assert 'const GITHUB_UPDATE_SOURCE = `https://github.com/${REPOSITORY}`' in PORTAL_RELEASE
+def test_public_release_metadata_is_mirror_only_and_never_falls_back_to_private_github() -> None:
     assert 'const UPDATE_BUCKET = "listing-studio-updates"' in PORTAL_RELEASE
-    assert 'const UPDATE_FEED_NAME = `releases.${UPDATE_CHANNEL}.json`' in PORTAL_RELEASE
     assert 'const STABLE_CACHE_PATH = "stable/latest.json"' in PORTAL_RELEASE
-    assert 'const LEGACY_MANIFEST_ASSET = "update.json"' in PORTAL_RELEASE
-    assert "legacyManifestAsset?.browser_download_url" in PORTAL_RELEASE
-    assert 'String(release.tag_name || "") !== `v${version}`' in PORTAL_RELEASE
-    assert 'throw new Error("invalid_latest_release")' in PORTAL_RELEASE
-    assert "installerAsset?.digest" in PORTAL_RELEASE
-    assert 'const installerName = `EcommerceAgent-Setup-${version}.exe`' in PORTAL_RELEASE
+    assert "SHA256_HEX_RE" in PORTAL_RELEASE
     assert "loadStableCache(admin)" in PORTAL_RELEASE
-    assert "updateSources" in PORTAL_RELEASE
-    assert "mirrorReady: mirrorFeedReady" in PORTAL_RELEASE
-    assert "packageMirrorReady: packagesReady" in PORTAL_RELEASE
+    assert "releaseMirrorReady(admin, stable)" in PORTAL_RELEASE
+    assert "chunkManifestReady(" in PORTAL_RELEASE
+    assert "objectReady(" in PORTAL_RELEASE
     assert "const MIRROR_CHUNK_BYTES = 32 * 1024 * 1024" in PORTAL_RELEASE
-    assert "function chunkPlan(asset: MirrorAsset): ChunkPart[]" in PORTAL_RELEASE
-    assert '"Range": `bytes=${part.offset}-${end}`' in PORTAL_RELEASE
-    assert "writeChunkManifest(admin, stable, asset)" in PORTAL_RELEASE
-    assert "RELEASE_HISTORY_API" in PORTAL_RELEASE
-    assert "warmPrivateMirror" not in PORTAL_RELEASE
-    assert '"Tus-Resumable"' not in PORTAL_RELEASE
+    assert "updateSources: [baseUrl]" in PORTAL_RELEASE
+    assert "mirrorReady: true" in PORTAL_RELEASE
+    assert "packageMirrorReady: true" in PORTAL_RELEASE
+    assert "stable_mirror_incomplete" in PORTAL_RELEASE
+    assert "GITHUB_UPDATE_SOURCE" not in PORTAL_RELEASE
+    assert "LEGACY_MANIFEST_ASSET" not in PORTAL_RELEASE
+    assert "browser_download_url" not in PORTAL_RELEASE
+    assert "https://api.github.com/" not in PORTAL_RELEASE
+    assert '"Range"' not in PORTAL_RELEASE
+
+
+def test_private_release_warmer_owns_github_validation_and_transactional_mirroring() -> None:
+    assert 'const REPOSITORY = "yuchenm1303-png/ecommerce-agent"' in PORTAL_RELEASE_WARM
+    assert 'const UPDATE_BUCKET = "listing-studio-updates"' in PORTAL_RELEASE_WARM
+    assert 'const DOWNLOAD_BUCKET = "listing-studio-downloads"' in PORTAL_RELEASE_WARM
+    assert "SHA256_DIGEST_RE" in PORTAL_RELEASE_WARM
+    assert "githubHeaders(token" in PORTAL_RELEASE_WARM
+    assert "getRelease(token, tag)" in PORTAL_RELEASE_WARM
+    assert "parseAsset(release, version" in PORTAL_RELEASE_WARM
+    assert "https://api.github.com/repos/${REPOSITORY}/releases/assets/${asset.id}" in PORTAL_RELEASE_WARM
+    assert 'Range: `bytes=${part.offset}-${end}`' in PORTAL_RELEASE_WARM
+    assert "ensureChunkedAsset(" in PORTAL_RELEASE_WARM
+    assert "const ready = fullReady && installerReady" in PORTAL_RELEASE_WARM
+    assert "if (ready)" in PORTAL_RELEASE_WARM
+    assert "buildStableCache(release, version, installer, feed, packages)" in PORTAL_RELEASE_WARM
+    assert "persistJson(admin, UPDATE_BUCKET, STABLE_CACHE_PATH" in PORTAL_RELEASE_WARM
+    assert "github_token_cannot_read_release" in PORTAL_RELEASE_WARM
 
 
 def test_update_mirror_bucket_is_public_and_effectively_chunk_limited() -> None:
