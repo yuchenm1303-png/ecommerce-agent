@@ -273,15 +273,5 @@ jobs:
             Write-Warning "Test release $tag is already public; automatic cleanup intentionally refused"
           }
 
-      - name: Upload test build files to workflow run
-        if: ${{ success() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: EcommerceAgent-Test-${{ steps.build.outputs.tag }}
-          path: |
-            artifacts/EcommerceAgent-Setup-${{ steps.build.outputs.version }}.exe
-            artifacts/EcommerceAgent-${{ steps.build.outputs.version }}-portable.zip
-            artifacts/release-environment.json
-            artifacts/velopack/*
-          if-no-files-found: error
-          retention-days: 7
+      # Test binaries are persisted and pruned as GitHub prereleases. Do not
+      # duplicate the same hundreds of MB in Actions artifact storage.
