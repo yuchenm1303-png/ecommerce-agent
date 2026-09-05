@@ -147,6 +147,10 @@ def _append_unique_query(output: list[str], seen: set[str], raw: object) -> None
     output.append(value)
 
 
+def _is_single_word_query(value: object) -> bool:
+    return len(_query_key(value).split()) == 1
+
+
 def _fallback_search_ladder(hints: ListingBootstrapHints) -> tuple[str, ...]:
     output: list[str] = []
     seen: set[str] = set()
@@ -183,7 +187,9 @@ def build_vertical_search_plan_request(hints: ListingBootstrapHints) -> dict[str
             "Create a specific-to-broad retrieval ladder by reconciling the initial identity with the "
             "grounded supplier snippets and customer intent. Preserve the core sold product class while "
             "preventing incidental material, personalization, colour or marketing attributes from trapping "
-            "all queries in one mistaken interpretation. Include conventional retail vocabulary variants."
+            "all queries in one mistaken interpretation. Include conventional retail vocabulary variants. "
+            "The executor probes broad recall first, so deliberately include the shortest genuine marketplace "
+            "class anchor when one exists instead of keeping every query modifier-heavy."
         ),
         "context": {
             "product_type_en": product_type,
@@ -196,7 +202,9 @@ def build_vertical_search_plan_request(hints: ListingBootstrapHints) -> dict[str
             "specific_queries: return 1 or 2 concise phrases for the core sold physical product class; omit incidental material/personalization/style modifiers unless they define a genuinely different class.",
             "alternate_queries: return 0 to 2 conventional retail synonyms or function/form paraphrases that could recover the same item when marketplace vocabulary differs.",
             "When customer intent or grounded evidence supports a materially different but plausible class wording from the initial identity, reserve an alternate query for that supported wording instead of repeating the initial hypothesis.",
-            "broader_queries: return 0 to 2 progressively broader product-family phrases by removing qualifiers, not by switching to unrelated products.",
+            "broader_queries: return 0 to 2 progressively broader product-family names by removing qualifiers, not by switching to unrelated products.",
+            "When a single common noun still genuinely names the sold product class, make it the broadest broader_queries entry for high-recall marketplace retrieval; examples include serum, toy, headphones, or backpack. Do not use generic placeholders such as product, item, device, equipment, tool, or machine.",
+            "A one-word core class anchor is only a retrieval probe. The later live-candidate AI chooser still has to validate the complete Makro breadcrumb against the full product evidence before anything is clicked.",
             "head_noun_query: return the shortest useful common class phrase for broad marketplace recall.",
             "The final ladder must behave like core product class -> alternate retail vocabulary -> broader family -> discriminative head phrase.",
             "If the product type has multiple meaningful words, do not collapse head_noun_query to one bare functional/form noun; keep at least one differentiating modifier.",
@@ -224,12 +232,14 @@ def _planned_search_ladder(raw: dict[str, Any], hints: ListingBootstrapHints) ->
     specific = _normalize_search_terms(raw.get("specific_queries") or (), limit=2)
     alternate = _normalize_search_terms(raw.get("alternate_queries") or (), limit=2)
     broader = _normalize_search_terms(raw.get("broader_queries") or (), limit=2)
+    broad_phrases = tuple(term for term in broader if not _is_single_word_query(term))
+    broad_anchors = tuple(term for term in broader if _is_single_word_query(term))
     head = _clean(raw.get("head_noun_query"))
     if not specific:
         return ()
     output: list[str] = []
     seen: set[str] = set()
-    for term in (*specific, *alternate, *broader):
+    for term in (*specific, *alternate, *broad_phrases):
         if len(output) >= _MAX_SEARCH_TERMS - 1:
             break
         _append_unique_query(output, seen, term)
@@ -239,6 +249,17 @@ def _planned_search_ladder(raw: dict[str, Any], hints: ListingBootstrapHints) ->
             output = [term for term in output if _query_key(term) != head_key]
             seen = {_query_key(term) for term in output}
         _append_unique_query(output, seen, head)
+    for term in broad_anchors:
+        key = _query_key(term)
+        if not key:
+            continue
+        if key in seen:
+            output = [existing for existing in output if _query_key(existing) != key]
+            seen = {_query_key(existing) for existing in output}
+        while len(output) >= _MAX_SEARCH_TERMS:
+            removed = output.pop(0)
+            seen.discard(_query_key(removed))
+        _append_unique_query(output, seen, term)
     return tuple(output[:_MAX_SEARCH_TERMS])
 
 
@@ -251,8 +272,8 @@ def _with_canonical_product_type_fallback(
     output = list(terms)
     seen = {_query_key(term) for term in output if _query_key(term)}
     if product_key and product_key not in seen and _usable_query(product_type):
-        if len(output) >= _MAX_SEARCH_TERMS:
-            output = output[: _MAX_SEARCH_TERMS - 1]
+        while len(output) >= _MAX_SEARCH_TERMS:
+            output.pop(0)
         output.append(product_type)
     return tuple(output[:_MAX_SEARCH_TERMS])
 
