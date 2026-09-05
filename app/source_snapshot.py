@@ -8,12 +8,27 @@ from pathlib import Path
 from typing import Any
 
 
+_SOURCE_READINESS_ATTEMPTS = 4
+_SOURCE_READINESS_WAIT_MS = 2_000
+
+
 class SourceCaptureError(RuntimeError):
     pass
 
 
 class SourceAccessBlocked(SourceCaptureError):
     pass
+
+
+class SourcePageNotReady(SourceCaptureError):
+    """Bounded transient supplier-page state that never became capture-ready."""
+
+    def __init__(self, state: str, reason: str) -> None:
+        self.state = str(state or "PARTIAL_UNKNOWN").strip().upper()
+        self.reason = str(reason or "page is not yet capture-ready").strip()
+        super().__init__(
+            f"supplier page state is not capture-ready ({self.state}): {self.reason}"
+        )
 
 
 class SourceInteractionRequired(SourceCaptureError):
@@ -160,6 +175,77 @@ def _bounded_embedded_data(items: list[object], *, max_chars: int = 80_000) -> t
     return output, truncated
 
 
+def _classify_capture_ready_page_state(
+    page: Any,
+    *,
+    provider: Any | None,
+    screenshot_path: str | Path | None,
+    attempts: int = _SOURCE_READINESS_ATTEMPTS,
+    wait_ms: int = _SOURCE_READINESS_WAIT_MS,
+):
+    """Converge transient AI page states on the same live page within a hard bound.
+
+    AI remains the semantic authority for every observation. Python only retries
+    states that the AI contract explicitly marks as transient; it never inspects
+    site identity, spinner text, DOM semantics, or product content to overrule AI.
+    """
+
+    from .source_interaction import (
+        ACCESS_DENIED,
+        LOADING,
+        PARTIAL_UNKNOWN,
+        classify_source_page_state,
+    )
+
+    total_attempts = max(1, int(attempts))
+    retry_wait_ms = max(0, int(wait_ms))
+    state_screenshot = Path(screenshot_path) if screenshot_path else None
+
+    for attempt_index in range(total_attempts):
+        if state_screenshot is not None:
+            try:
+                state_screenshot.parent.mkdir(parents=True, exist_ok=True)
+                page.screenshot(path=str(state_screenshot), full_page=False)
+            except Exception:
+                try:
+                    if state_screenshot.exists():
+                        state_screenshot.unlink()
+                except OSError:
+                    pass
+
+        page_state = classify_source_page_state(
+            page,
+            provider=provider,
+            screenshot_path=state_screenshot,
+        )
+        if page_state.requires_user:
+            raise SourceInteractionRequired(
+                page_state.state,
+                page_state.reason,
+                observed_url=page_state.observed_url,
+                title=page_state.title,
+            )
+        if page_state.state == ACCESS_DENIED:
+            raise SourceAccessBlocked(page_state.reason)
+        if page_state.state not in {LOADING, PARTIAL_UNKNOWN}:
+            return page_state
+
+        if attempt_index + 1 >= total_attempts:
+            raise SourcePageNotReady(page_state.state, page_state.reason)
+
+        print(
+            "SOURCE_CAPTURE READINESS_RETRY "
+            f"state={page_state.state} "
+            f"attempt={attempt_index + 2}/{total_attempts} "
+            f"wait_ms={retry_wait_ms}",
+            flush=True,
+        )
+        if retry_wait_ms:
+            page.wait_for_timeout(retry_wait_ms)
+
+    raise RuntimeError("unreachable source readiness state")
+
+
 def capture_page_snapshot(
     page: Any,
     *,
@@ -173,45 +259,15 @@ def capture_page_snapshot(
     Python collects a bounded fresh browser observation and validates the AI JSON
     contract. It does not infer captcha/login/access state from URL/text/class-name
     keywords and it never attempts to solve a human verification challenge.
+    Transient AI states are re-observed on the same page within a strict bound so
+    SPA hydration is not mistaken for a terminal supplier failure.
     """
 
-    from .source_interaction import (
-        ACCESS_DENIED,
-        LOADING,
-        PARTIAL_UNKNOWN,
-        classify_source_page_state,
-    )
-
-    state_screenshot = Path(page_state_screenshot_path) if page_state_screenshot_path else None
-    if state_screenshot is not None:
-        try:
-            state_screenshot.parent.mkdir(parents=True, exist_ok=True)
-            page.screenshot(path=str(state_screenshot), full_page=False)
-        except Exception:
-            try:
-                if state_screenshot.exists():
-                    state_screenshot.unlink()
-            except OSError:
-                pass
-
-    page_state = classify_source_page_state(
+    page_state = _classify_capture_ready_page_state(
         page,
         provider=page_state_provider,
-        screenshot_path=state_screenshot,
+        screenshot_path=page_state_screenshot_path,
     )
-    if page_state.requires_user:
-        raise SourceInteractionRequired(
-            page_state.state,
-            page_state.reason,
-            observed_url=page_state.observed_url,
-            title=page_state.title,
-        )
-    if page_state.state == ACCESS_DENIED:
-        raise SourceAccessBlocked(page_state.reason)
-    if page_state.state in {LOADING, PARTIAL_UNKNOWN}:
-        raise SourceCaptureError(
-            f"supplier page state is not capture-ready ({page_state.state}): {page_state.reason}"
-        )
 
     payload = page.evaluate(
         r"""() => {
