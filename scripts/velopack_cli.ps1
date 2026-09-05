@@ -8,9 +8,9 @@ function Invoke-RepositoryVelopack {
     # before command execution. GitHub Actions can materialize an unset secret as
     # an empty environment entry, and typed options (for example FileInfo) then
     # fail during configuration binding. Own the process boundary explicitly:
-    # every Velopack invocation gets the current environment minus blank VPK_*
-    # entries, while every non-blank value (including VPK_TOKEN/signing config)
-    # is preserved byte-for-byte.
+    # every Velopack invocation gets a sanitized child environment. Explicit
+    # VPK_TOKEN/signing values remain authoritative; when VPK_TOKEN is absent,
+    # the standard GitHub Actions token is adapted only inside the child process.
     $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $StartInfo.FileName = "dotnet"
     $StartInfo.UseShellExecute = $false
@@ -21,6 +21,23 @@ function Invoke-RepositoryVelopack {
             throw "Velopack argument list contains null."
         }
         $StartInfo.ArgumentList.Add([string]$Argument)
+    }
+
+    # GitHub Actions exposes repository credentials as GH_TOKEN, while Velopack's
+    # GitHub source reads VPK_TOKEN. Bridge that naming mismatch at the child
+    # process boundary so private release discovery/download is authenticated.
+    # Never put the credential on the command line, mutate the parent environment,
+    # or print the token value.
+    $ExplicitVelopackToken = [string]$StartInfo.Environment["VPK_TOKEN"]
+    if ([string]::IsNullOrWhiteSpace($ExplicitVelopackToken)) {
+        foreach ($GitHubTokenName in @("GH_TOKEN", "GITHUB_TOKEN")) {
+            $GitHubToken = [string]$StartInfo.Environment[$GitHubTokenName]
+            if (-not [string]::IsNullOrWhiteSpace($GitHubToken)) {
+                $StartInfo.Environment["VPK_TOKEN"] = $GitHubToken
+                Write-Host "Velopack child environment mapped $GitHubTokenName to VPK_TOKEN for authenticated GitHub access."
+                break
+            }
+        }
     }
 
     $BlankVelopackNames = @(
