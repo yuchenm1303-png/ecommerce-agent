@@ -499,15 +499,5 @@ jobs:
             Write-Warning "Release $tag is already public; automatic cleanup intentionally refused"
           }
 
-      - name: Upload published files to workflow run
-        if: ${{ success() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: EcommerceAgent-Stable-${{ steps.version.outputs.version }}
-          path: |
-            artifacts/EcommerceAgent-Setup-${{ steps.version.outputs.version }}.exe
-            artifacts/EcommerceAgent-${{ steps.version.outputs.version }}-portable.zip
-            artifacts/release-environment.json
-            artifacts/velopack/*
-          if-no-files-found: error
-          retention-days: 30
+      # Stable binaries are already persisted and verified as GitHub Release assets.
+      # Do not duplicate them in Actions artifact storage.
