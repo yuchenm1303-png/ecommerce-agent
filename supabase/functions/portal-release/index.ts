@@ -1,23 +1,13 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
-const REPOSITORY = "yuchenm1303-png/ecommerce-agent";
-const GITHUB_UPDATE_SOURCE = `https://github.com/${REPOSITORY}`;
-const LATEST_RELEASE_API = `https://api.github.com/repos/${REPOSITORY}/releases/latest`;
-const RELEASE_HISTORY_API = `https://api.github.com/repos/${REPOSITORY}/releases?per_page=20`;
 const UPDATE_BUCKET = "listing-studio-updates";
 const UPDATE_CHANNEL = "win-x64-stable";
-const UPDATE_FEED_NAME = `releases.${UPDATE_CHANNEL}.json`;
 const STABLE_CACHE_PATH = "stable/latest.json";
-const LEGACY_MANIFEST_ASSET = "update.json";
+const HISTORY_CACHE_PATH = "stable/history.json";
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
-const SHA256_DIGEST_RE = /^sha256:([0-9a-f]{64})$/i;
-const HISTORY_LIMIT = 12;
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/i;
 const MIRROR_CHUNK_BYTES = 32 * 1024 * 1024;
-const MAX_CHUNKS_PER_WARM = 3;
-const MAX_AUTOMATIC_WARM_PASSES = 12;
-const WARM_PASS_QUERY = "warm_pass";
-const MIRROR_LOCK_MAX_AGE_MS = 15 * 60 * 1000;
 const CHUNK_MANIFEST_SCHEMA = 1;
 const ALLOWED_ORIGINS = new Set([
   "https://smirel.com",
@@ -48,10 +38,14 @@ type StableRelease = {
   packageAssets: MirrorAsset[];
 };
 
-type ChunkPart = {
-  name: string;
-  offset: number;
-  size: number;
+type HistoryItem = {
+  version: string;
+  title: string;
+  notes: string;
+  publishedAt: string;
+  fileSize: string;
+  fileSizeBytes: number;
+  installerSha256: string;
 };
 
 function corsHeaders(req: Request): Record<string, string> {
@@ -76,35 +70,14 @@ function json(req: Request, body: unknown, status = 200): Response {
   });
 }
 
-function githubHeaders(userAgent: string): Record<string, string> {
-  return {
-    "Accept": "application/vnd.github+json",
-    "User-Agent": userAgent,
-    "X-GitHub-Api-Version": "2022-11-28",
-  };
-}
-
-function normalizeVersion(value: unknown): string {
-  const raw = String(value ?? "").trim();
-  return raw.startsWith("v") ? raw.slice(1) : raw;
-}
-
-function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "—";
-  const mib = bytes / 1024 / 1024;
-  return `${mib >= 100 ? mib.toFixed(0) : mib.toFixed(1)} MB`;
-}
-
 function getServerSecretKey(): string {
-  const secretBundle = Deno.env.get("SUPABASE_SECRET_KEYS") || "";
-  if (secretBundle) {
+  const bundle = Deno.env.get("SUPABASE_SECRET_KEYS") || "";
+  if (bundle) {
     try {
-      const parsed = JSON.parse(secretBundle);
+      const parsed = JSON.parse(bundle);
       const value = String(parsed?.default || "").trim();
       if (value) return value;
-    } catch (error) {
-      console.error("failed to parse SUPABASE_SECRET_KEYS", error);
-    }
+    } catch {}
   }
   return String(Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "").trim();
 }
@@ -123,167 +96,6 @@ function createAdminClient() {
   });
 }
 
-function assetForRelease(release: any, version: string, name: string, contentType: string): MirrorAsset | null {
-  const asset = release.assets.find((candidate: any) => candidate?.name === name);
-  const size = Number(asset?.size || 0);
-  const expectedUrl = `https://github.com/${REPOSITORY}/releases/download/v${version}/${name}`;
-  const digest = String(asset?.digest || "").trim().toLowerCase();
-  const digestMatch = digest.match(SHA256_DIGEST_RE);
-  if (
-    String(asset?.browser_download_url || "") !== expectedUrl ||
-    !Number.isSafeInteger(size) ||
-    size <= 0
-  ) {
-    return null;
-  }
-  return {
-    name,
-    sourceUrl: expectedUrl,
-    size,
-    contentType,
-    sha256: digestMatch?.[1]?.toLowerCase() || "",
-  };
-}
-
-function parseStableRelease(release: any): StableRelease | null {
-  if (!release || release.draft || release.prerelease || !Array.isArray(release.assets)) return null;
-
-  const version = normalizeVersion(release.tag_name);
-  if (!VERSION_RE.test(version) || String(release.tag_name || "") !== `v${version}`) return null;
-
-  const installerName = `EcommerceAgent-Setup-${version}.exe`;
-  const installerAsset = release.assets.find((asset: any) => asset?.name === installerName);
-  const installerSize = Number(installerAsset?.size || 0);
-  const digest = String(installerAsset?.digest || "").trim().toLowerCase();
-  const digestMatch = digest.match(SHA256_DIGEST_RE);
-  const installerUrl = `https://github.com/${REPOSITORY}/releases/download/v${version}/${installerName}`;
-  if (
-    String(installerAsset?.browser_download_url || "") !== installerUrl ||
-    !Number.isSafeInteger(installerSize) ||
-    installerSize <= 0 ||
-    !digestMatch
-  ) return null;
-
-  const feedAsset = assetForRelease(release, version, UPDATE_FEED_NAME, "application/json");
-  const fullName = `Smirel.ListingStudio-${version}-${UPDATE_CHANNEL}-full.nupkg`;
-  const deltaName = `Smirel.ListingStudio-${version}-${UPDATE_CHANNEL}-delta.nupkg`;
-  const fullAsset = assetForRelease(release, version, fullName, "application/octet-stream");
-  const deltaAsset = assetForRelease(release, version, deltaName, "application/octet-stream");
-  if (!feedAsset || !fullAsset) return null;
-
-  return {
-    version,
-    title: String(release.name || `Listing Studio ${version}`).trim() || `Listing Studio ${version}`,
-    notes: String(release.body || "").trim(),
-    publishedAt: String(release.published_at || release.created_at || "").trim(),
-    required: false,
-    minSupportedVersion: "",
-    installerName,
-    installerUrl,
-    installerSha256: digestMatch[1].toLowerCase(),
-    installerSize,
-    fileSize: formatBytes(installerSize),
-    feedAsset,
-    packageAssets: deltaAsset ? [deltaAsset, fullAsset] : [fullAsset],
-  };
-}
-
-async function applyLegacyMetadata(stable: StableRelease, release: any): Promise<StableRelease> {
-  const legacyManifestAsset = release.assets.find((asset: any) => asset?.name === LEGACY_MANIFEST_ASSET);
-  if (!legacyManifestAsset?.browser_download_url) return stable;
-  try {
-    const response = await fetch(String(legacyManifestAsset.browser_download_url), {
-      headers: { "User-Agent": "Listing-Studio-Release-Metadata" },
-      cache: "no-store",
-      redirect: "follow",
-    });
-    if (!response.ok) return stable;
-    const manifest = await response.json();
-    if (
-      manifest?.schema_version !== 1 ||
-      manifest?.channel !== "stable" ||
-      normalizeVersion(manifest?.version) !== stable.version
-    ) return stable;
-    return {
-      ...stable,
-      title: String(manifest?.title || stable.title).trim() || stable.title,
-      notes: String(manifest?.notes || stable.notes).trim(),
-      publishedAt: String(manifest?.published_at || stable.publishedAt).trim(),
-      required: Boolean(manifest?.required),
-      minSupportedVersion: String(manifest?.min_supported_version || "").trim(),
-    };
-  } catch (error) {
-    console.error("legacy release metadata ignored", error);
-    return stable;
-  }
-}
-
-async function resolveStableReleaseFromGitHub(): Promise<StableRelease> {
-  const response = await fetch(LATEST_RELEASE_API, {
-    headers: githubHeaders("Listing-Studio-Release-Metadata"),
-    cache: "no-store",
-  });
-  if (!response.ok) throw new Error(`release_api_${response.status}`);
-  const release = await response.json();
-  const parsed = parseStableRelease(release);
-  if (!parsed) throw new Error("invalid_latest_release");
-  return await applyLegacyMetadata(parsed, release);
-}
-
-async function persistStableCache(admin: ReturnType<typeof createAdminClient>, stable: StableRelease) {
-  const { error } = await admin.storage.from(UPDATE_BUCKET).upload(
-    STABLE_CACHE_PATH,
-    new Blob([JSON.stringify(stable)], { type: "application/json" }),
-    { contentType: "application/json", cacheControl: "30", upsert: true },
-  );
-  if (error) throw error;
-}
-
-async function loadStableCache(admin: ReturnType<typeof createAdminClient>): Promise<StableRelease> {
-  const { data, error } = await admin.storage.from(UPDATE_BUCKET).download(STABLE_CACHE_PATH);
-  if (error || !data) throw error || new Error("stable_cache_missing");
-  const parsed = JSON.parse(await data.text());
-  if (!parsed || !VERSION_RE.test(String(parsed.version || ""))) throw new Error("stable_cache_invalid");
-  if (!parsed.feedAsset || !Array.isArray(parsed.packageAssets)) throw new Error("stable_cache_invalid_assets");
-  return parsed as StableRelease;
-}
-
-async function resolveStableRelease(admin: ReturnType<typeof createAdminClient>): Promise<StableRelease> {
-  try {
-    const stable = await resolveStableReleaseFromGitHub();
-    await persistStableCache(admin, stable).catch((error) => console.error("stable cache persist failed", error));
-    return stable;
-  } catch (error) {
-    console.error("GitHub Stable control-plane lookup failed; using last validated cache", error);
-    return await loadStableCache(admin);
-  }
-}
-
-async function resolveStableHistory(currentVersion: string) {
-  const response = await fetch(RELEASE_HISTORY_API, {
-    headers: githubHeaders("Listing-Studio-Release-History"),
-    cache: "no-store",
-  });
-  if (!response.ok) throw new Error(`release_history_api_${response.status}`);
-  const releases = await response.json();
-  if (!Array.isArray(releases)) throw new Error("invalid_release_history");
-  return releases
-    .map(parseStableRelease)
-    .filter((item): item is StableRelease => Boolean(item))
-    .filter((item) => item.version !== currentVersion)
-    .sort((a, b) => Date.parse(b.publishedAt || "") - Date.parse(a.publishedAt || ""))
-    .slice(0, HISTORY_LIMIT)
-    .map((item) => ({
-      version: `v${item.version}`,
-      title: item.title,
-      notes: item.notes,
-      publishedAt: item.publishedAt,
-      fileSize: item.fileSize,
-      fileSizeBytes: item.installerSize,
-      installerSha256: item.installerSha256,
-    }));
-}
-
 function mirrorFolder(version: string): string {
   return `stable/v${version}`;
 }
@@ -293,7 +105,102 @@ function mirrorBaseUrl(version: string): string {
   return `${supabaseUrl}/storage/v1/object/public/${UPDATE_BUCKET}/${mirrorFolder(version)}`;
 }
 
-async function objectExists(
+function validateAsset(value: any): MirrorAsset | null {
+  const name = String(value?.name || "").trim();
+  const sourceUrl = String(value?.sourceUrl || "").trim();
+  const size = Number(value?.size || 0);
+  const contentType = String(value?.contentType || "application/octet-stream").trim();
+  const sha256 = String(value?.sha256 || "").trim().toLowerCase();
+  if (
+    !name || name !== name.split(/[\\/]/).pop() ||
+    !Number.isSafeInteger(size) || size <= 0 ||
+    (sha256 && !SHA256_HEX_RE.test(sha256))
+  ) return null;
+  return { name, sourceUrl, size, contentType, sha256 };
+}
+
+function validateStableCache(value: any): StableRelease {
+  const version = String(value?.version || "").trim();
+  const installerName = String(value?.installerName || "").trim();
+  const installerSha256 = String(value?.installerSha256 || "").trim().toLowerCase();
+  const installerSize = Number(value?.installerSize || 0);
+  const feedAsset = validateAsset(value?.feedAsset);
+  const packageAssets = Array.isArray(value?.packageAssets)
+    ? value.packageAssets.map(validateAsset).filter(Boolean) as MirrorAsset[]
+    : [];
+
+  if (
+    !VERSION_RE.test(version) ||
+    installerName !== `EcommerceAgent-Setup-${version}.exe` ||
+    !SHA256_HEX_RE.test(installerSha256) ||
+    !Number.isSafeInteger(installerSize) || installerSize <= 0 ||
+    !feedAsset || feedAsset.name !== `releases.${UPDATE_CHANNEL}.json` ||
+    packageAssets.length === 0
+  ) {
+    throw new Error("stable_cache_invalid");
+  }
+
+  return {
+    version,
+    title: String(value?.title || `Listing Studio ${version}`).trim() || `Listing Studio ${version}`,
+    notes: String(value?.notes || "").trim(),
+    publishedAt: String(value?.publishedAt || "").trim(),
+    required: Boolean(value?.required),
+    minSupportedVersion: String(value?.minSupportedVersion || "").trim(),
+    installerName,
+    installerUrl: String(value?.installerUrl || "").trim(),
+    installerSha256,
+    installerSize,
+    fileSize: String(value?.fileSize || "—").trim() || "—",
+    feedAsset,
+    packageAssets,
+  };
+}
+
+async function loadJson(admin: ReturnType<typeof createAdminClient>, path: string) {
+  const { data, error } = await admin.storage.from(UPDATE_BUCKET).download(path);
+  if (error || !data) throw error || new Error(`storage_object_missing:${path}`);
+  return JSON.parse(await data.text());
+}
+
+async function loadStableCache(admin: ReturnType<typeof createAdminClient>): Promise<StableRelease> {
+  return validateStableCache(await loadJson(admin, STABLE_CACHE_PATH));
+}
+
+async function loadHistoryCache(
+  admin: ReturnType<typeof createAdminClient>,
+  currentVersion: string,
+): Promise<HistoryItem[]> {
+  try {
+    const raw = await loadJson(admin, HISTORY_CACHE_PATH);
+    if (!Array.isArray(raw)) return [];
+    return raw.flatMap((item: any) => {
+      const version = String(item?.version || "").trim();
+      const bare = version.startsWith("v") ? version.slice(1) : version;
+      const fileSizeBytes = Number(item?.fileSizeBytes || 0);
+      const sha256 = String(item?.installerSha256 || "").trim().toLowerCase();
+      if (
+        !VERSION_RE.test(bare) || bare === currentVersion ||
+        !Number.isSafeInteger(fileSizeBytes) || fileSizeBytes <= 0 ||
+        !SHA256_HEX_RE.test(sha256)
+      ) return [];
+      return [{
+        version: `v${bare}`,
+        title: String(item?.title || `Listing Studio ${bare}`).trim() || `Listing Studio ${bare}`,
+        notes: String(item?.notes || "").trim(),
+        publishedAt: String(item?.publishedAt || "").trim(),
+        fileSize: String(item?.fileSize || "—").trim() || "—",
+        fileSizeBytes,
+        installerSha256: sha256,
+      }];
+    }).slice(0, 12);
+  } catch (error) {
+    console.error("Stable history cache unavailable", error);
+    return [];
+  }
+}
+
+async function objectReady(
   admin: ReturnType<typeof createAdminClient>,
   folder: string,
   name: string,
@@ -307,91 +214,15 @@ async function objectExists(
   return size === expectedSize;
 }
 
-async function directAssetExists(admin: ReturnType<typeof createAdminClient>, version: string, asset: MirrorAsset) {
-  return await objectExists(admin, mirrorFolder(version), asset.name, asset.size);
-}
-
-async function uploadBytes(
-  admin: ReturnType<typeof createAdminClient>,
-  path: string,
-  bytes: Uint8Array,
-  contentType: string,
-) {
-  const { error } = await admin.storage.from(UPDATE_BUCKET).upload(path, bytes, {
-    contentType,
-    cacheControl: "31536000",
-    upsert: false,
-  });
-  if (error && !/already exists|duplicate/i.test(String(error.message || ""))) throw error;
-}
-
-async function fetchWholeAsset(asset: MirrorAsset): Promise<Uint8Array> {
-  const response = await fetch(asset.sourceUrl, {
-    headers: { "User-Agent": "Listing-Studio-Update-Mirror" },
-    cache: "no-store",
-    redirect: "follow",
-  });
-  if (!response.ok) throw new Error(`update_asset_fetch_${response.status}:${asset.name}`);
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength !== asset.size) throw new Error(`update_asset_size:${asset.name}:${bytes.byteLength}:${asset.size}`);
-  return bytes;
-}
-
-async function ensureDirectAsset(admin: ReturnType<typeof createAdminClient>, stable: StableRelease, asset: MirrorAsset) {
-  if (await directAssetExists(admin, stable.version, asset)) return true;
-  const bytes = await fetchWholeAsset(asset);
-  await uploadBytes(admin, `${mirrorFolder(stable.version)}/${asset.name}`, bytes, asset.contentType);
-  if (!(await directAssetExists(admin, stable.version, asset))) throw new Error(`update_asset_verify_failed:${asset.name}`);
-  console.log(`update mirror ready: ${mirrorFolder(stable.version)}/${asset.name}`);
-  return true;
-}
-
 function chunkFolder(version: string, asset: MirrorAsset): string {
   return `${mirrorFolder(version)}/chunks/${asset.name}`;
 }
 
-function chunkPlan(asset: MirrorAsset): ChunkPart[] {
-  const parts: ChunkPart[] = [];
-  for (let offset = 0, index = 0; offset < asset.size; index += 1) {
-    const size = Math.min(MIRROR_CHUNK_BYTES, asset.size - offset);
-    parts.push({ name: `part-${String(index).padStart(3, "0")}`, offset, size });
-    offset += size;
-  }
-  return parts;
-}
-
-function requestedWarmPass(req: Request): number {
-  const raw = Number(new URL(req.url).searchParams.get(WARM_PASS_QUERY) || 0);
-  if (!Number.isSafeInteger(raw) || raw < 0) return 0;
-  return Math.min(raw, MAX_AUTOMATIC_WARM_PASSES - 1);
-}
-
-function requiredWarmPasses(stable: StableRelease): number {
-  let required = 1;
-  for (const asset of stable.packageAssets) {
-    if (asset.size <= MIRROR_CHUNK_BYTES) continue;
-    required = Math.max(required, Math.ceil(chunkPlan(asset).length / MAX_CHUNKS_PER_WARM));
-  }
-  return Math.min(required, MAX_AUTOMATIC_WARM_PASSES);
-}
-
-async function fetchRange(asset: MirrorAsset, part: ChunkPart): Promise<Uint8Array> {
-  const end = part.offset + part.size - 1;
-  const response = await fetch(asset.sourceUrl, {
-    headers: {
-      "User-Agent": "Listing-Studio-Update-Mirror",
-      "Range": `bytes=${part.offset}-${end}`,
-    },
-    cache: "no-store",
-    redirect: "follow",
-  });
-  if (response.status !== 206) throw new Error(`update_asset_range_${response.status}:${asset.name}:${part.name}`);
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength !== part.size) throw new Error(`update_chunk_size:${asset.name}:${part.name}:${bytes.byteLength}:${part.size}`);
-  return bytes;
-}
-
-async function chunkManifestReady(admin: ReturnType<typeof createAdminClient>, stable: StableRelease, asset: MirrorAsset) {
+async function chunkManifestReady(
+  admin: ReturnType<typeof createAdminClient>,
+  stable: StableRelease,
+  asset: MirrorAsset,
+): Promise<boolean> {
   const folder = chunkFolder(stable.version, asset);
   const { data, error } = await admin.storage.from(UPDATE_BUCKET).download(`${folder}/manifest.json`);
   if (error || !data) return false;
@@ -401,154 +232,49 @@ async function chunkManifestReady(admin: ReturnType<typeof createAdminClient>, s
       manifest?.schema_version !== CHUNK_MANIFEST_SCHEMA ||
       manifest?.file_name !== asset.name ||
       Number(manifest?.size || 0) !== asset.size ||
-      !Array.isArray(manifest?.chunks)
+      String(manifest?.sha256 || "").trim().toLowerCase() !== asset.sha256 ||
+      !Array.isArray(manifest?.chunks) || manifest.chunks.length === 0
     ) return false;
-    const planned = chunkPlan(asset);
-    if (manifest.chunks.length !== planned.length) return false;
-    for (let i = 0; i < planned.length; i += 1) {
-      const actual = manifest.chunks[i];
-      const expected = planned[i];
-      if (actual?.name !== expected.name || Number(actual?.offset) !== expected.offset || Number(actual?.size) !== expected.size) return false;
+
+    let expectedOffset = 0;
+    for (let index = 0; index < manifest.chunks.length; index += 1) {
+      const part = manifest.chunks[index];
+      const name = String(part?.name || "");
+      const offset = Number(part?.offset);
+      const size = Number(part?.size);
+      if (
+        name !== `part-${String(index).padStart(3, "0")}` ||
+        !Number.isSafeInteger(offset) || offset !== expectedOffset ||
+        !Number.isSafeInteger(size) || size <= 0 ||
+        !(await objectReady(admin, folder, name, size))
+      ) return false;
+      expectedOffset += size;
     }
-    return true;
+    return expectedOffset === asset.size;
   } catch {
     return false;
   }
 }
 
-async function writeChunkManifest(admin: ReturnType<typeof createAdminClient>, stable: StableRelease, asset: MirrorAsset) {
-  const manifest = {
-    schema_version: CHUNK_MANIFEST_SCHEMA,
-    file_name: asset.name,
-    size: asset.size,
-    sha256: asset.sha256,
-    chunk_size: MIRROR_CHUNK_BYTES,
-    chunks: chunkPlan(asset),
-  };
-  const path = `${chunkFolder(stable.version, asset)}/manifest.json`;
-  const { error } = await admin.storage.from(UPDATE_BUCKET).upload(
-    path,
-    new Blob([JSON.stringify(manifest)], { type: "application/json" }),
-    { contentType: "application/json", cacheControl: "31536000", upsert: true },
-  );
-  if (error) throw error;
-}
-
-async function ensureChunkedAsset(admin: ReturnType<typeof createAdminClient>, stable: StableRelease, asset: MirrorAsset) {
-  if (await chunkManifestReady(admin, stable, asset)) return true;
-  const folder = chunkFolder(stable.version, asset);
-  const plan = chunkPlan(asset);
-  let uploaded = 0;
-  for (const part of plan) {
-    if (await objectExists(admin, folder, part.name, part.size)) continue;
-    if (uploaded >= MAX_CHUNKS_PER_WARM) return false;
-    const bytes = await fetchRange(asset, part);
-    await uploadBytes(admin, `${folder}/${part.name}`, bytes, "application/octet-stream");
-    if (!(await objectExists(admin, folder, part.name, part.size))) throw new Error(`update_chunk_verify_failed:${asset.name}:${part.name}`);
-    uploaded += 1;
+async function assetReady(
+  admin: ReturnType<typeof createAdminClient>,
+  stable: StableRelease,
+  asset: MirrorAsset,
+): Promise<boolean> {
+  if (asset.size <= MIRROR_CHUNK_BYTES) {
+    return await objectReady(admin, mirrorFolder(stable.version), asset.name, asset.size);
   }
-  for (const part of plan) {
-    if (!(await objectExists(admin, folder, part.name, part.size))) return false;
-  }
-  await writeChunkManifest(admin, stable, asset);
-  if (!(await chunkManifestReady(admin, stable, asset))) throw new Error(`update_chunk_manifest_verify_failed:${asset.name}`);
-  console.log(`chunked update mirror ready: ${asset.name} (${plan.length} parts)`);
-  return true;
-}
-
-function mirrorLockPath(version: string): string {
-  return `${mirrorFolder(version)}/.package-mirror.lock`;
-}
-
-async function claimMirrorLock(admin: ReturnType<typeof createAdminClient>, version: string): Promise<boolean> {
-  const folder = mirrorFolder(version);
-  const lockName = ".package-mirror.lock";
-  const { data, error } = await admin.storage.from(UPDATE_BUCKET).list(folder, { limit: 20, search: lockName });
-  if (error) throw error;
-  const existing = data?.find((item: any) => item?.name === lockName);
-  if (existing) {
-    const createdAt = Date.parse(String(existing.created_at || existing.updated_at || ""));
-    if (Number.isFinite(createdAt) && Date.now() - createdAt < MIRROR_LOCK_MAX_AGE_MS) return false;
-    await admin.storage.from(UPDATE_BUCKET).remove([mirrorLockPath(version)]);
-  }
-  const { error: lockError } = await admin.storage.from(UPDATE_BUCKET).upload(
-    mirrorLockPath(version),
-    new Blob([String(Date.now())], { type: "application/json" }),
-    { contentType: "application/json", cacheControl: "60", upsert: false },
-  );
-  if (!lockError) return true;
-  if (/already exists|duplicate/i.test(String(lockError.message || ""))) return false;
-  throw lockError;
-}
-
-async function releaseMirrorLock(admin: ReturnType<typeof createAdminClient>, version: string) {
-  const { error } = await admin.storage.from(UPDATE_BUCKET).remove([mirrorLockPath(version)]);
-  if (error) console.error("update mirror lock cleanup failed", error);
-}
-
-async function packageAssetReady(admin: ReturnType<typeof createAdminClient>, stable: StableRelease, asset: MirrorAsset) {
-  if (asset.size <= MIRROR_CHUNK_BYTES) return await directAssetExists(admin, stable.version, asset);
   return await chunkManifestReady(admin, stable, asset);
 }
 
-async function packageMirrorReady(admin: ReturnType<typeof createAdminClient>, stable: StableRelease) {
+async function releaseMirrorReady(admin: ReturnType<typeof createAdminClient>, stable: StableRelease) {
+  if (!(await objectReady(admin, mirrorFolder(stable.version), stable.feedAsset.name, stable.feedAsset.size))) {
+    return false;
+  }
   for (const asset of stable.packageAssets) {
-    if (!(await packageAssetReady(admin, stable, asset))) return false;
+    if (!(await assetReady(admin, stable, asset))) return false;
   }
   return true;
-}
-
-async function warmUpdatePackages(
-  admin: ReturnType<typeof createAdminClient>,
-  stable: StableRelease,
-): Promise<boolean> {
-  if (!(await claimMirrorLock(admin, stable.version))) return false;
-  let completed = false;
-  try {
-    for (const asset of stable.packageAssets) {
-      if (asset.size <= MIRROR_CHUNK_BYTES) {
-        await ensureDirectAsset(admin, stable, asset);
-      } else {
-        await ensureChunkedAsset(admin, stable, asset);
-      }
-    }
-    completed = true;
-  } catch (error) {
-    console.error("update package mirror warmup failed", error);
-  } finally {
-    await releaseMirrorLock(admin, stable.version);
-  }
-  return completed;
-}
-
-async function warmAndContinue(
-  req: Request,
-  admin: ReturnType<typeof createAdminClient>,
-  stable: StableRelease,
-  warmPass: number,
-) {
-  const completed = await warmUpdatePackages(admin, stable);
-  if (!completed || await packageMirrorReady(admin, stable)) return;
-
-  const nextPass = warmPass + 1;
-  const requiredPasses = requiredWarmPasses(stable);
-  if (nextPass >= requiredPasses || nextPass >= MAX_AUTOMATIC_WARM_PASSES) return;
-
-  const nextUrl = new URL(req.url);
-  nextUrl.searchParams.set(WARM_PASS_QUERY, String(nextPass));
-  try {
-    const response = await fetch(nextUrl, {
-      method: "GET",
-      headers: { "User-Agent": "Listing-Studio-Mirror-Warmup" },
-      cache: "no-store",
-    });
-    if (!response.ok) {
-      console.error(`update mirror continuation failed: pass=${nextPass} status=${response.status}`);
-    }
-    try { await response.body?.cancel(); } catch {}
-  } catch (error) {
-    console.error(`update mirror continuation request failed: pass=${nextPass}`, error);
-  }
 }
 
 Deno.serve(async (req: Request) => {
@@ -557,37 +283,21 @@ Deno.serve(async (req: Request) => {
 
   try {
     const admin = createAdminClient();
-    const stable = await resolveStableRelease(admin);
-    const history = await resolveStableHistory(stable.version).catch((error) => {
-      console.error("release history resolution failed", error);
-      return [];
-    });
-
-    let mirrorFeedReady = false;
-    try {
-      mirrorFeedReady = await ensureDirectAsset(admin, stable, stable.feedAsset);
-    } catch (error) {
-      console.error("update feed mirror warmup failed", error);
-    }
-    const packagesReady = mirrorFeedReady
-      ? await packageMirrorReady(admin, stable).catch(() => false)
-      : false;
-    if (mirrorFeedReady && !packagesReady) {
-      const warmPass = requestedWarmPass(req);
-      EdgeRuntime.waitUntil(warmAndContinue(req, admin, stable, warmPass));
+    const stable = await loadStableCache(admin);
+    if (!(await releaseMirrorReady(admin, stable))) {
+      throw new Error(`stable_mirror_incomplete:v${stable.version}`);
     }
 
-    const updateSources = mirrorFeedReady
-      ? [mirrorBaseUrl(stable.version), GITHUB_UPDATE_SOURCE]
-      : [GITHUB_UPDATE_SOURCE];
+    const history = await loadHistoryCache(admin, stable.version);
+    const baseUrl = mirrorBaseUrl(stable.version);
 
     return json(req, {
       channel: "stable",
       version: `v${stable.version}`,
-      updateBaseUrl: updateSources[0],
-      updateSources,
-      mirrorReady: mirrorFeedReady,
-      packageMirrorReady: packagesReady,
+      updateBaseUrl: baseUrl,
+      updateSources: [baseUrl],
+      mirrorReady: true,
+      packageMirrorReady: true,
       chunkBytes: MIRROR_CHUNK_BYTES,
       title: stable.title,
       notes: stable.notes,
@@ -600,7 +310,7 @@ Deno.serve(async (req: Request) => {
       history,
     });
   } catch (error) {
-    console.error("public release metadata resolution failed", error);
+    console.error("mirrored Stable metadata unavailable", error);
     return json(req, { error: "stable_release_unavailable" }, 503);
   }
 });
