@@ -25,9 +25,6 @@ from .requested_vertical import (
 
 _MAX_SEARCH_TERMS = 7
 _MAX_LIVE_CANDIDATES = 120
-_QUERY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 '&/()+.,-]*$")
-_FORBIDDEN_PLATFORM_WORDS = {"makro", "marketplace", "seller", "listing"}
-_GENERIC_ONLY_QUERY_WORDS = {"vertical", "category", "product"}
 _SAME_PRODUCT_TYPE = "same_product_type"
 _BROADER_VALID_CLASS = "broader_valid_class"
 _BEST_AVAILABLE_FIT = "best_available_fit"
@@ -52,29 +49,9 @@ def _clean(value: object) -> str:
 
 
 def _query_key(value: object) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", _clean(value).casefold()).strip()
+    """Mechanical identity only; never reinterpret or semantically veto an AI query."""
 
-
-def _usable_query(value: object) -> bool:
-    text = _clean(value)
-    if len(text) < 2 or len(text) > 72 or not text.isascii() or not _QUERY_RE.fullmatch(text):
-        return False
-    key = _query_key(text)
-    if not key or not re.search(r"[a-z]", key):
-        return False
-    words = set(key.split())
-    if words & _FORBIDDEN_PLATFORM_WORDS:
-        return False
-    return not bool(words and words <= _GENERIC_ONLY_QUERY_WORDS)
-
-
-def _usable_head_query(value: object) -> bool:
-    if not _usable_query(value):
-        return False
-    words = _query_key(value).split()
-    if not 1 <= len(words) <= 2:
-        return False
-    return not (len(words) == 1 and words[0] in _GENERIC_CLASS_NOUNS)
+    return _clean(value).casefold()
 
 
 def _identity(hints: ListingBootstrapHints) -> dict[str, Any]:
@@ -99,37 +76,19 @@ def _canonical_product_type(hints: ListingBootstrapHints) -> str:
     return _clean(hints.vertical_search_terms[0] if hints.vertical_search_terms else "")
 
 
-def _product_type_query_words(hints: ListingBootstrapHints) -> list[str]:
-    return [
-        word
-        for word in _query_key(_canonical_product_type(hints)).split()
-        if word and word not in _TOKEN_STOPWORDS
-    ]
-
-
-def _usable_head_query_for_product(hints: ListingBootstrapHints, value: object) -> bool:
-    """Reject lossy one-word heads for an already multi-word product identity."""
-
-    if not _usable_head_query(value):
-        return False
-    head_words = _query_key(value).split()
-    product_words = _product_type_query_words(hints)
-    if len(product_words) >= 2 and len(head_words) < 2:
-        return False
-    return True
-
-
 def _normalize_search_terms(
     values: Iterable[object],
     *,
     limit: int = _MAX_SEARCH_TERMS,
 ) -> tuple[str, ...]:
+    """Preserve AI-authorized query semantics; only clean, deduplicate and bound count."""
+
     output: list[str] = []
     seen: set[str] = set()
     for raw in values:
         value = _clean(raw)
         key = _query_key(value)
-        if not _usable_query(value) or not key or key in seen:
+        if not value or not key or key in seen:
             continue
         seen.add(key)
         output.append(value)
@@ -141,17 +100,15 @@ def _normalize_search_terms(
 def _append_unique_query(output: list[str], seen: set[str], raw: object) -> None:
     value = _clean(raw)
     key = _query_key(value)
-    if not _usable_query(value) or not key or key in seen:
+    if not value or not key or key in seen:
         return
     seen.add(key)
     output.append(value)
 
 
-def _is_single_word_query(value: object) -> bool:
-    return len(_query_key(value).split()) == 1
-
-
 def _fallback_search_ladder(hints: ListingBootstrapHints) -> tuple[str, ...]:
+    """Mechanical emergency ladder used only when the AI planner itself is unavailable."""
+
     output: list[str] = []
     seen: set[str] = set()
     for raw in hints.vertical_search_terms:
@@ -162,13 +119,11 @@ def _fallback_search_ladder(hints: ListingBootstrapHints) -> tuple[str, ...]:
     product_type = _canonical_product_type(hints)
     _append_unique_query(output, seen, product_type)
 
-    words = re.findall(r"[A-Za-z0-9]+", product_type)
+    words = _clean(product_type).split()
     if len(words) >= 3:
         _append_unique_query(output, seen, " ".join(words[-2:]))
     if words:
-        head = words[-1]
-        if _usable_head_query_for_product(hints, head):
-            _append_unique_query(output, seen, head)
+        _append_unique_query(output, seen, words[-1])
     return tuple(output[:_MAX_SEARCH_TERMS])
 
 
@@ -203,13 +158,12 @@ def build_vertical_search_plan_request(hints: ListingBootstrapHints) -> dict[str
             "alternate_queries: return 0 to 2 conventional retail synonyms or function/form paraphrases that could recover the same item when marketplace vocabulary differs.",
             "When customer intent or grounded evidence supports a materially different but plausible class wording from the initial identity, reserve an alternate query for that supported wording instead of repeating the initial hypothesis.",
             "broader_queries: return 0 to 2 progressively broader product-family names by removing qualifiers, not by switching to unrelated products.",
-            "When a single common noun still genuinely names the sold product class, make it the broadest broader_queries entry for high-recall marketplace retrieval; examples include serum, toy, headphones, or backpack. Do not use generic placeholders such as product, item, device, equipment, tool, or machine.",
-            "A one-word core class anchor is only a retrieval probe. The later live-candidate AI chooser still has to validate the complete Makro breadcrumb against the full product evidence before anything is clicked.",
-            "head_noun_query: return the shortest useful common class phrase for broad marketplace recall.",
-            "The final ladder must behave like core product class -> alternate retail vocabulary -> broader family -> discriminative head phrase.",
-            "If the product type has multiple meaningful words, do not collapse head_noun_query to one bare functional/form noun; keep at least one differentiating modifier.",
+            "When a single common noun genuinely names the sold product class, it may be the broadest retrieval query; examples include serum, toy, headphones, or backpack.",
+            "head_noun_query: return the shortest useful common class phrase for broad marketplace recall, including one word when you judge that one word to be the useful class anchor.",
+            "Every non-empty query you return is an authorized retrieval probe. The executor may only normalize whitespace, deduplicate identical strings, enforce the bounded query count, and reorder the ladder broad-first; it must not semantically reject or rewrite your query.",
+            "A broad retrieval probe never authorizes a category click by itself. The later live-candidate AI chooser must validate the complete Makro breadcrumb against the full product evidence before anything is clicked.",
+            "The final ladder must behave like core product class -> alternate retail vocabulary -> broader family -> shortest useful class anchor.",
             "Drop model numbers, brand, colour, size, material, engraving/personalization, power source and marketing adjectives unless they define a genuinely different product class.",
-            "Do not use Makro, marketplace, seller, listing, vertical or category as retrieval metadata.",
             "Do not deliberately broaden into accessories or spare parts unless the supplied product itself is one.",
             "Alternate queries must remain plausible names for the same sold physical item, not an accessory, consumable or neighboring product.",
         ],
@@ -217,10 +171,10 @@ def build_vertical_search_plan_request(hints: ListingBootstrapHints) -> dict[str
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "specific_queries": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "string", "minLength": 2}},
-                "alternate_queries": {"type": "array", "minItems": 0, "maxItems": 2, "items": {"type": "string", "minLength": 2}},
-                "broader_queries": {"type": "array", "minItems": 0, "maxItems": 2, "items": {"type": "string", "minLength": 2}},
-                "head_noun_query": {"type": "string", "minLength": 2},
+                "specific_queries": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "string", "minLength": 1}},
+                "alternate_queries": {"type": "array", "minItems": 0, "maxItems": 2, "items": {"type": "string", "minLength": 1}},
+                "broader_queries": {"type": "array", "minItems": 0, "maxItems": 2, "items": {"type": "string", "minLength": 1}},
+                "head_noun_query": {"type": "string", "minLength": 1},
             },
             "required": ["specific_queries", "alternate_queries", "broader_queries", "head_noun_query"],
         },
@@ -229,37 +183,27 @@ def build_vertical_search_plan_request(hints: ListingBootstrapHints) -> dict[str
 
 
 def _planned_search_ladder(raw: dict[str, Any], hints: ListingBootstrapHints) -> tuple[str, ...]:
+    """Honor the AI plan verbatim apart from mechanical cleanup, dedupe and count bound."""
+
     specific = _normalize_search_terms(raw.get("specific_queries") or (), limit=2)
     alternate = _normalize_search_terms(raw.get("alternate_queries") or (), limit=2)
     broader = _normalize_search_terms(raw.get("broader_queries") or (), limit=2)
-    broad_phrases = tuple(term for term in broader if not _is_single_word_query(term))
-    broad_anchors = tuple(term for term in broader if _is_single_word_query(term))
     head = _clean(raw.get("head_noun_query"))
     if not specific:
         return ()
+
     output: list[str] = []
     seen: set[str] = set()
-    for term in (*specific, *alternate, *broad_phrases):
-        if len(output) >= _MAX_SEARCH_TERMS - 1:
-            break
+    for term in (*specific, *alternate, *broader):
         _append_unique_query(output, seen, term)
-    if _usable_head_query_for_product(hints, head):
+
+    if head:
         head_key = _query_key(head)
         if head_key in seen:
             output = [term for term in output if _query_key(term) != head_key]
             seen = {_query_key(term) for term in output}
         _append_unique_query(output, seen, head)
-    for term in broad_anchors:
-        key = _query_key(term)
-        if not key:
-            continue
-        if key in seen:
-            output = [existing for existing in output if _query_key(existing) != key]
-            seen = {_query_key(existing) for existing in output}
-        while len(output) >= _MAX_SEARCH_TERMS:
-            removed = output.pop(0)
-            seen.discard(_query_key(removed))
-        _append_unique_query(output, seen, term)
+
     return tuple(output[:_MAX_SEARCH_TERMS])
 
 
@@ -267,13 +211,18 @@ def _with_canonical_product_type_fallback(
     hints: ListingBootstrapHints,
     terms: tuple[str, ...],
 ) -> tuple[str, ...]:
+    """Supplement spare capacity only; never evict an AI-authorized retrieval probe."""
+
     product_type = _canonical_product_type(hints)
     product_key = _query_key(product_type)
     output = list(terms)
     seen = {_query_key(term) for term in output if _query_key(term)}
-    if product_key and product_key not in seen and _usable_query(product_type):
-        while len(output) >= _MAX_SEARCH_TERMS:
-            output.pop(0)
+    if (
+        product_type
+        and product_key
+        and product_key not in seen
+        and len(output) < _MAX_SEARCH_TERMS
+    ):
         output.append(product_type)
     return tuple(output[:_MAX_SEARCH_TERMS])
 
@@ -281,10 +230,10 @@ def _with_canonical_product_type_fallback(
 def plan_vertical_search_terms(provider: JSONTaskProvider, hints: ListingBootstrapHints) -> tuple[str, ...]:
     requested = current_requested_vertical()
     if requested:
-        query = requested_vertical_query(requested)
-        if not _usable_query(query):
+        query = _clean(requested_vertical_query(requested))
+        if not query:
             raise ValueError(
-                f"手动指定类目无法转换成可用的 Makro Vertical 搜索词：{requested!r}"
+                f"手动指定类目无法转换成非空 Makro Vertical 搜索词：{requested!r}"
             )
         return (query,)
 
@@ -299,7 +248,7 @@ def plan_vertical_search_terms(provider: JSONTaskProvider, hints: ListingBootstr
     fallback = _fallback_search_ladder(hints)
     if fallback:
         return _with_canonical_product_type_fallback(hints, fallback)
-    raise ValueError("Product evidence produced no safe Makro Vertical retrieval intent")
+    raise ValueError("Product evidence produced no non-empty Makro Vertical retrieval intent")
 
 
 @dataclass(frozen=True, slots=True)
