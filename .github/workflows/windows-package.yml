@@ -24,6 +24,7 @@ on:
       - "run_packaged_worker.py"
       - "run_local_gui.py"
       - "native/sakana-helper/**"
+      - "native/installer-bootstrapper/**"
       - "packaging/**"
       - "scripts/build_windows.ps1"
       - "scripts/velopack_cli.ps1"
@@ -35,6 +36,7 @@ on:
       - "requirements-build.txt"
       - "tests/test_batch_architecture_contract.py"
       - "tests/test_cdp_transport_lane.py"
+      - "tests/test_customer_installer_contract.py"
       - "tests/test_execute_owned_worker.py"
       - "tests/test_windows_packaging_contract.py"
       - "tests/test_velopack_update_contract.py"
@@ -77,6 +79,7 @@ jobs:
             tests/test_velopack_update_contract.py `
             tests/test_app_update_ui_contract.py `
             tests/test_updater_browser_shutdown_contract.py `
+            tests/test_customer_installer_contract.py `
             tests/test_batch_architecture_contract.py `
             tests/test_cdp_transport_lane.py `
             tests/test_execute_owned_worker.py
@@ -85,19 +88,31 @@ jobs:
         shell: pwsh
         run: .\scripts\build_windows.ps1
 
-      - name: Silent Velopack install and uninstall smoke test
+      - name: Silent customer install recovery and uninstall smoke test
         shell: pwsh
         run: |
           $setups = @(Get-ChildItem artifacts\EcommerceAgent-Setup-*.exe -File)
-          if ($setups.Count -ne 1) { throw "Expected exactly one friendly Velopack installer artifact, found $($setups.Count)" }
+          if ($setups.Count -ne 1) { throw "Expected exactly one customer installer artifact, found $($setups.Count)" }
           $setup = $setups[0]
           $expectedVersion = (Get-Content packaging\VERSION -Raw).Trim()
           $installDir = Join-Path $env:RUNNER_TEMP "ListingStudioVelopackInstalled"
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
+
+          # Reproduce the customer failure mode: the app is gone but the old
+          # Velopack root still contains debris. The customer installer must
+          # self-heal this state before invoking native Velopack.
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+          Set-Content (Join-Path $installDir "orphaned-velopack-state.txt") "stale" -Encoding ascii
+
           $install = Start-Process -FilePath $setup.FullName -ArgumentList @(
             "--silent", "--installto", $installDir
           ) -Wait -PassThru
-          if ($install.ExitCode -ne 0) { throw "Velopack install failed: $($install.ExitCode)" }
+          if ($install.ExitCode -ne 0) { throw "Customer installer failed: $($install.ExitCode)" }
+
+          $staleBackups = @(Get-ChildItem $env:RUNNER_TEMP -Directory -Filter "ListingStudioVelopackInstalled.stale-*" -ErrorAction SilentlyContinue)
+          if ($staleBackups.Count -ne 0) {
+            throw "Customer installer left stale rollback directories behind: $($staleBackups.FullName -join ', ')"
+          }
 
           $stub = Join-Path $installDir "EcommerceAgent.exe"
           $update = Join-Path $installDir "Update.exe"
