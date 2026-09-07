@@ -93,6 +93,54 @@ function Resolve-VelopackDeltaPackage {
     return $Package
 }
 
+function Resolve-WindowsSignTool {
+    $KitsRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
+    if (-not (Test-Path $KitsRoot)) {
+        throw "Windows SDK signtool root missing: $KitsRoot"
+    }
+    $Candidates = @(Get-ChildItem $KitsRoot -Filter signtool.exe -File -Recurse -ErrorAction Stop | Where-Object {
+        $_.FullName -match '[\\/]x64[\\/]signtool\.exe$'
+    } | Sort-Object FullName -Descending)
+    if ($Candidates.Count -lt 1) {
+        throw "Windows SDK x64 signtool.exe was not found"
+    }
+    return $Candidates[0].FullName
+}
+
+function Invoke-CustomerInstallerSigning {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string]$AzureTrustedSignFile,
+        [string]$SignParams
+    )
+
+    if ([string]::IsNullOrWhiteSpace($AzureTrustedSignFile) -and [string]::IsNullOrWhiteSpace($SignParams)) {
+        return
+    }
+
+    $SignTool = Resolve-WindowsSignTool
+    if (-not [string]::IsNullOrWhiteSpace($AzureTrustedSignFile)) {
+        $NugetRoot = Join-Path $env:USERPROFILE ".nuget\packages"
+        $Dlib = @(Get-ChildItem $NugetRoot -Filter Azure.CodeSigning.Dlib.dll -File -Recurse -ErrorAction Stop | Select-Object -First 1)
+        if ($Dlib.Count -ne 1) {
+            throw "Azure Trusted Signing DLib was not found after Velopack restore"
+        }
+        & $SignTool sign `
+            /fd SHA256 `
+            /tr http://timestamp.acs.microsoft.com `
+            /td SHA256 `
+            /dlib $Dlib[0].FullName `
+            /dmdf $AzureTrustedSignFile `
+            $FilePath
+        if ($LASTEXITCODE -ne 0) { throw "Customer installer Azure signing failed: $LASTEXITCODE" }
+        return
+    }
+
+    $Command = "`"$SignTool`" sign $SignParams `"$FilePath`""
+    & $env:ComSpec /D /S /C $Command
+    if ($LASTEXITCODE -ne 0) { throw "Customer installer signing failed: $LASTEXITCODE" }
+}
+
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = (Get-Content (Join-Path $Root "packaging\VERSION") -Raw).Trim()
@@ -120,8 +168,12 @@ $PortableAlias = Join-Path $ArtifactDir "EcommerceAgent-$Version-portable.zip"
 $IconFile = Join-Path $Root "packaging\app_icon.ico"
 $SakanaProject = Join-Path $Root "native\sakana-helper\EcommerceAgentSakana.vcxproj"
 $SakanaPublishDir = Join-Path $Root "build\sakana-helper"
+$InstallerProject = Join-Path $Root "native\installer-bootstrapper\EcommerceAgentInstaller.vcxproj"
+$InstallerBuildDir = Join-Path $Root "build\installer-bootstrapper"
+$InstallerResourceFile = Join-Path $InstallerBuildDir "payload.rc"
+$InstallerWrapperExe = Join-Path $InstallerBuildDir "EcommerceAgentInstaller.exe"
 
-foreach ($Path in @($AppDir, $WorkDir, $SakanaPublishDir, $VelopackDir, $SetupAlias, $PortableAlias, $IconFile)) {
+foreach ($Path in @($AppDir, $WorkDir, $SakanaPublishDir, $InstallerBuildDir, $VelopackDir, $SetupAlias, $PortableAlias, $IconFile)) {
     if (Test-Path $Path) { Remove-Item $Path -Recurse -Force }
 }
 New-Item -ItemType Directory -Force -Path $DistRoot, $WorkDir, $ArtifactDir, $VelopackDir | Out-Null
@@ -283,7 +335,31 @@ if ($PreviousReleaseDownloaded) {
         -PackageVersion $Version
 }
 
-Copy-Item $NativeSetup.FullName $SetupAlias -Force
+# Customer-facing setup owns stale-install recovery. The native Velopack setup is
+# embedded unchanged and still owns installation, repair, updates and rollback.
+New-Item -ItemType Directory -Force -Path $InstallerBuildDir | Out-Null
+$NativeSetupRcPath = $NativeSetup.FullName.Replace("\", "/")
+$IconRcPath = $IconFile.Replace("\", "/")
+@(
+    "#include <windows.h>",
+    "1 ICON `"$IconRcPath`"",
+    "101 RCDATA `"$NativeSetupRcPath`""
+) | Set-Content $InstallerResourceFile -Encoding ascii
+
+& $MsBuild $InstallerProject `
+    /restore /m `
+    /p:Configuration=Release `
+    /p:Platform=x64 `
+    "/p:PayloadResourceFile=$InstallerResourceFile" `
+    "/p:OutDir=$InstallerBuildDir\"
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $InstallerWrapperExe -PathType Leaf)) {
+    throw "Customer installer bootstrapper build failed: $LASTEXITCODE"
+}
+Copy-Item $InstallerWrapperExe $SetupAlias -Force
+Invoke-CustomerInstallerSigning `
+    -FilePath $SetupAlias `
+    -AzureTrustedSignFile $AzureTrustedSignFile `
+    -SignParams $SignParams
 Copy-Item $NativePortable.FullName $PortableAlias -Force
 
 if ($ShouldRunUpdateE2E) {
