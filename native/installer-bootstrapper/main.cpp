@@ -15,6 +15,13 @@ namespace {
 constexpr int kSetupResourceId = 101;
 constexpr wchar_t kDefaultInstallDir[] = L"Smirel.ListingStudio";
 constexpr wchar_t kMainExe[] = L"EcommerceAgent.exe";
+constexpr wchar_t kUninstallRegistryKey[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Smirel.ListingStudio";
+
+struct InstallTarget {
+    fs::path root;
+    bool owns_default_root = false;
+};
 
 std::wstring quote_arg(const std::wstring& value) {
     if (value.empty()) return L"\"\"";
@@ -61,31 +68,75 @@ fs::path default_install_root() {
     return root / kDefaultInstallDir;
 }
 
-fs::path requested_install_root(int argc, wchar_t** argv) {
+InstallTarget requested_install_target(int argc, wchar_t** argv) {
     for (int i = 1; i < argc; ++i) {
         std::wstring arg(argv[i]);
         if (_wcsicmp(arg.c_str(), L"--installto") == 0 && i + 1 < argc) {
-            return fs::path(argv[i + 1]);
+            return {fs::path(argv[i + 1]), false};
         }
         constexpr wchar_t prefix[] = L"--installto=";
         if (arg.size() > std::size(prefix) - 1 && _wcsnicmp(arg.c_str(), prefix, std::size(prefix) - 1) == 0) {
-            return fs::path(arg.substr(std::size(prefix) - 1));
+            return {fs::path(arg.substr(std::size(prefix) - 1)), false};
         }
     }
-    return default_install_root();
+    return {default_install_root(), true};
 }
 
-bool directory_has_entries(const fs::path& root) {
+bool install_root_has_state(const fs::path& root) {
     std::error_code ec;
-    if (!fs::is_directory(root, ec)) return false;
+    if (!fs::exists(root, ec)) return false;
+    if (!fs::is_directory(root, ec)) return true;
     return fs::directory_iterator(root, ec) != fs::directory_iterator();
+}
+
+bool paths_equal_case_insensitive(const fs::path& left, const fs::path& right) {
+    try {
+        const std::wstring lhs = fs::absolute(left).lexically_normal().wstring();
+        const std::wstring rhs = fs::absolute(right).lexically_normal().wstring();
+        return _wcsicmp(lhs.c_str(), rhs.c_str()) == 0;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool uninstall_registration_matches(const fs::path& root) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kUninstallRegistryKey, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    DWORD bytes = 0;
+    DWORD type = 0;
+    LONG status = RegGetValueW(key, nullptr, L"InstallLocation", RRF_RT_REG_SZ, &type, nullptr, &bytes);
+    if (status != ERROR_SUCCESS || bytes < sizeof(wchar_t)) {
+        RegCloseKey(key);
+        return false;
+    }
+
+    std::vector<wchar_t> buffer((bytes / sizeof(wchar_t)) + 1, L'\0');
+    status = RegGetValueW(
+        key,
+        nullptr,
+        L"InstallLocation",
+        RRF_RT_REG_SZ,
+        &type,
+        buffer.data(),
+        &bytes);
+    RegCloseKey(key);
+    if (status != ERROR_SUCCESS || buffer.front() == L'\0') {
+        return false;
+    }
+
+    return paths_equal_case_insensitive(fs::path(buffer.data()), root);
 }
 
 bool is_complete_install(const fs::path& root) {
     std::error_code ec;
     return fs::is_regular_file(root / L"Update.exe", ec)
         && fs::is_regular_file(root / kMainExe, ec)
-        && fs::is_regular_file(root / L"current" / kMainExe, ec);
+        && fs::is_regular_file(root / L"current" / kMainExe, ec)
+        && fs::is_regular_file(root / L"current" / L"sq.version", ec)
+        && uninstall_registration_matches(root);
 }
 
 fs::path stale_backup_path(const fs::path& root) {
@@ -171,16 +222,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         return ERROR_INVALID_PARAMETER;
     }
 
-    fs::path install_root;
+    InstallTarget target;
     fs::path stale_backup;
     fs::path temp_dir;
     try {
-        install_root = requested_install_root(argc, argv);
-        const bool stale = directory_has_entries(install_root) && !is_complete_install(install_root);
+        target = requested_install_target(argc, argv);
+        const bool stale = target.owns_default_root
+            && install_root_has_state(target.root)
+            && !is_complete_install(target.root);
         if (stale) {
-            stale_backup = stale_backup_path(install_root);
+            stale_backup = stale_backup_path(target.root);
             std::error_code ec;
-            fs::rename(install_root, stale_backup, ec);
+            fs::rename(target.root, stale_backup, ec);
             if (ec) {
                 LocalFree(argv);
                 show_error(L"检测到旧安装残留，但无法自动整理。请关闭 Listing Studio 后重新双击安装包。");
@@ -198,13 +251,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         if (exit_code == ERROR_SUCCESS) {
             remove_tree_noexcept(stale_backup);
         } else {
-            restore_stale_install(install_root, stale_backup);
+            restore_stale_install(target.root, stale_backup);
         }
         remove_tree_noexcept(temp_dir);
         return static_cast<int>(exit_code);
     } catch (...) {
         if (argv) LocalFree(argv);
-        restore_stale_install(install_root, stale_backup);
+        restore_stale_install(target.root, stale_backup);
         remove_tree_noexcept(temp_dir);
         show_error(L"安装程序无法准备安装环境，请重新下载后重试。");
         return ERROR_INSTALL_FAILURE;
