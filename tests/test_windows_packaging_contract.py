@@ -156,7 +156,9 @@ def test_velopack_process_boundary_removes_only_blank_reserved_environment() -> 
 def test_windows_ci_smokes_canonical_velopack_layout_and_uninstall() -> None:
     assert "actions/setup-dotnet@v4" in WINDOWS
     assert "dotnet tool restore" in WINDOWS
-    assert '"--silent", "--installto", $installDir' in WINDOWS
+    assert 'Join-Path $env:LOCALAPPDATA "Smirel.ListingStudio"' in WINDOWS
+    assert 'ArgumentList @("--silent")' in WINDOWS
+    assert '"--installto", $installDir' not in WINDOWS
     assert 'Join-Path $installDir "Update.exe"' in WINDOWS
     assert 'Join-Path $installDir "current\\EcommerceAgent.exe"' in WINDOWS
     assert '& $worker makro_execute_owned.py --help' in WINDOWS
