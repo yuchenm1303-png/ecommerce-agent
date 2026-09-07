@@ -95,21 +95,19 @@ jobs:
           if ($setups.Count -ne 1) { throw "Expected exactly one customer installer artifact, found $($setups.Count)" }
           $setup = $setups[0]
           $expectedVersion = (Get-Content packaging\VERSION -Raw).Trim()
-          $installDir = Join-Path $env:RUNNER_TEMP "ListingStudioVelopackInstalled"
+          $installDir = Join-Path $env:LOCALAPPDATA "Smirel.ListingStudio"
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
 
-          # Reproduce the customer failure mode: the app is gone but the old
-          # Velopack root still contains debris. The customer installer must
-          # self-heal this state before invoking native Velopack.
+          # Reproduce the customer's real double-click failure mode at the
+          # canonical per-user location: the old app is gone but stale files
+          # keep Velopack in overwrite/repair mode.
           New-Item -ItemType Directory -Force -Path $installDir | Out-Null
           Set-Content (Join-Path $installDir "orphaned-velopack-state.txt") "stale" -Encoding ascii
 
-          $install = Start-Process -FilePath $setup.FullName -ArgumentList @(
-            "--silent", "--installto", $installDir
-          ) -Wait -PassThru
+          $install = Start-Process -FilePath $setup.FullName -ArgumentList @("--silent") -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "Customer installer failed: $($install.ExitCode)" }
 
-          $staleBackups = @(Get-ChildItem $env:RUNNER_TEMP -Directory -Filter "ListingStudioVelopackInstalled.stale-*" -ErrorAction SilentlyContinue)
+          $staleBackups = @(Get-ChildItem $env:LOCALAPPDATA -Directory -Filter "Smirel.ListingStudio.stale-*" -ErrorAction SilentlyContinue)
           if ($staleBackups.Count -ne 0) {
             throw "Customer installer left stale rollback directories behind: $($staleBackups.FullName -join ', ')"
           }
