@@ -432,16 +432,23 @@ def main() -> int:
             )
 
         summary = plan.summary()
-        if args.all_step3 and int(summary.get("required_blocked") or 0) > 0:
-            missing_required = [
-                item.label
-                for item in plan.items
-                if item.required and item.action == BLOCKED
-            ]
-            raise RuntimeError(
-                "Full Step 3 仍有 Makro 必填项没有可靠答案；已在任何字段写入前停止。"
-                "请在 GUI 的必填输入框补齐后再执行："
-                + " | ".join(missing_required)
+        missing_required = [
+            item.label
+            for item in plan.items
+            if item.required and item.action == BLOCKED
+        ]
+        if missing_required:
+            print(
+                "FIELD_ISOLATION\tREQUIRED_BLOCKED_CONTINUE\t"
+                f"count={len(missing_required)}\tfields={' | '.join(missing_required)}",
+                flush=True,
+            )
+        for failure in override_summary.get("isolated_failures") or []:
+            print(
+                "FIELD_ISOLATION\tREQUIRED_OVERRIDE_SKIPPED\t"
+                f"field={failure.get('label') or failure.get('field_id') or ''}\t"
+                f"reason={failure.get('reason') or ''}",
+                flush=True,
             )
 
         if args.all_step3:
@@ -610,6 +617,11 @@ def main() -> int:
                 "structural_failures": [],
             }
         )
+        if args.all_step3:
+            execution_outcome["isolated_field_issues"] = (
+                int(execution_outcome.get("isolated_field_issues") or 0)
+                + int(summary.get("required_blocked") or 0)
+            )
         final_screenshot = run_dir / "step3-final.png"
         final_screenshot_capture = _capture_optional_screenshot(page, final_screenshot)
 
