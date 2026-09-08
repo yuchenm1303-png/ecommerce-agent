@@ -311,7 +311,27 @@ def open_section_for_edit(page: Page, section: dict[str, Any]) -> None:
         raise RuntimeError(f"section {title!r} EDIT 后未进入展开态{suffix}")
 
 
-def visible_section_errors(page: Page, section_path: str) -> list[str]:
+_CMS_RULE_CATEGORY_SOURCE_MISSING = "failed to get source defined for the category"
+
+
+def is_nonblocking_category_schema_error(text: str) -> bool:
+    """Return True only for Makro CMS metadata failures, not field validation failures.
+
+    Makro can render ``Error encountered when running cms rule / Failed to get
+    source defined for the category`` beside otherwise valid fields. This is a
+    marketplace category-schema/source defect: the value can be written, saved,
+    reopened and read back unchanged. Treating it as a field validation failure
+    incorrectly downgrades a successfully persisted section.
+    """
+
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().casefold()
+    return (
+        "error encountered when running cms rule" in normalized
+        and _CMS_RULE_CATEGORY_SOURCE_MISSING in normalized
+    )
+
+
+def _visible_section_validation_messages(page: Page, section_path: str) -> list[str]:
     card = page.locator(section_path)
     texts: list[str] = []
     selectors = ".form-error, [role='alert'], [class*='FormError'], [class*='error' i]"
@@ -323,6 +343,26 @@ def visible_section_errors(page: Page, section_path: str) -> list[str]:
     except Exception:
         pass
     return texts[:30]
+
+
+def visible_section_errors(page: Page, section_path: str) -> list[str]:
+    """Return only actionable field validation failures for a section."""
+
+    return [
+        text
+        for text in _visible_section_validation_messages(page, section_path)
+        if not is_nonblocking_category_schema_error(text)
+    ]
+
+
+def visible_section_advisories(page: Page, section_path: str) -> list[str]:
+    """Return non-blocking marketplace category-schema notices for diagnostics."""
+
+    return [
+        text
+        for text in _visible_section_validation_messages(page, section_path)
+        if is_nonblocking_category_schema_error(text)
+    ]
 
 
 def collapsed_error_badges(page: Page, section_title: str) -> list[str]:
