@@ -353,6 +353,91 @@ def _source_metadata(source_type: str) -> tuple[str, str, float, str]:
     raise RequiredOverrideError(f"required override source_type={source_type!r} 不受支持。")
 
 
+def _apply_one_required_override(
+    item: LiveFillPlanItem,
+    live_field: dict[str, Any],
+    raw: dict[str, Any],
+) -> tuple[str, bool]:
+    if not item.required:
+        raise RequiredOverrideError(f"{item.label} 不是 required 字段，拒绝 required override。")
+    if item.action == READY:
+        return "", False
+    if item.action != BLOCKED:
+        raise RequiredOverrideError(
+            f"{item.label} 当前 action={item.action!r}，不是可补齐的 BLOCKED required 字段。"
+        )
+
+    requested_source = str(raw.get("source_type") or "user").strip().casefold()
+    source_type, source_reference, confidence, evidence = _source_metadata(requested_source)
+    effective = raw
+    fallback_recomputed = False
+    if source_type == "fallback":
+        effective = required_fallback_override(live_field)
+        fallback_recomputed = True
+
+    raw_values = effective.get("values")
+    if raw_values is None:
+        raw_values = [effective.get("value")]
+    if not isinstance(raw_values, list):
+        raise RequiredOverrideError(f"{item.label} 的 values 必须是数组。")
+    values = [str(value).strip() for value in raw_values if str(value or "").strip()]
+    if not values:
+        raise RequiredOverrideError(f"{item.label} 的补充值为空。")
+    qualifier = str(effective.get("qualifier") or "").strip()
+
+    hard_validation = validate_resolved_answer(
+        live_field,
+        ResolvedAnswer(
+            attribute_key=item.attribute_key,
+            label=item.label,
+            status=RESOLVED,
+            answer=" + ".join(values),
+            answer_values=list(values),
+            qualifier=qualifier or None,
+            confidence=confidence,
+            source_type=source_type,
+            source_reference=source_reference,
+            evidence=evidence,
+            detail=str(effective.get("reason") or "").strip(),
+        ),
+    )
+    if not hard_validation.valid:
+        raise RequiredOverrideError(f"{item.label}: {hard_validation.detail}")
+
+    record = item.resolution
+    record.status = RESOLVED
+    record.answer = " + ".join(values)
+    record.answer_values = list(values)
+    record.qualifier = qualifier or None
+    record.confidence = confidence
+    record.source_type = source_type
+    record.source_reference = source_reference
+    record.evidence = evidence
+    record.detail = (
+        "deterministic required-field fallback"
+        if source_type == "fallback"
+        else str(raw.get("reason") or "explicit user decision").strip()
+    )
+    record.eligible_for_autofill = True
+    record.preview_eligible = False
+    record.gate_reason = ""
+    record.provenance = [
+        {
+            "source_reference": source_reference,
+            "evidence_text": evidence,
+            "source_type": source_type,
+            "confidence": confidence,
+        }
+    ]
+    item.action = READY
+    item.reason = (
+        "AI 未解决的 Makro 必填项已使用固定自动兜底。"
+        if source_type == "fallback"
+        else "用户补充了 AI 未解决的 Makro 必填值。"
+    )
+    return source_type, fallback_recomputed
+
+
 def apply_required_overrides(
     plan: LiveFillPlan,
     semantic_fields: Iterable[dict[str, Any]],
@@ -360,12 +445,18 @@ def apply_required_overrides(
     *,
     planned_fields: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Resolve only still-BLOCKED required fields through the same live contract."""
+    """Apply required overrides with a field-local failure boundary.
+
+    Whole-plan/live-schema binding remains fail-closed. Once that structural
+    invariant is proven, a malformed value/qualifier/option belongs only to its
+    target field: keep that field BLOCKED, record the reason, and continue.
+    """
     fields = list(semantic_fields)
     planned = list(planned_fields or [])
     items_by_field_id = _bind_plan_items_to_fields(plan, fields)
 
     applied: list[str] = []
+    isolated_failures: list[dict[str, Any]] = []
     source_counts = {"user": 0, "fallback": 0}
     rebound_by_schema_signature = 0
     skipped_current_ready = 0
@@ -375,92 +466,42 @@ def apply_required_overrides(
         if not isinstance(raw, dict):
             continue
 
-        live_field, rebound = _target_from_override(raw, fields, planned)
-        if rebound:
-            rebound_by_schema_signature += 1
-        current_identifier = field_id(live_field)
-        item = items_by_field_id.get(current_identifier)
-        if item is None:
-            raise RequiredOverrideError(f"override[{index}] 无法绑定当前 Fill Plan：{current_identifier}")
-        if not item.required:
-            raise RequiredOverrideError(f"{item.label} 不是 required 字段，拒绝 required override。")
-        if item.action == READY:
-            skipped_current_ready += 1
-            continue
-        if item.action != BLOCKED:
-            raise RequiredOverrideError(
-                f"{item.label} 当前 action={item.action!r}，不是可补齐的 BLOCKED required 字段。"
+        requested_identifier = str(raw.get("field_id") or "").strip()
+        current_identifier = requested_identifier
+        label = requested_identifier or f"override[{index}]"
+        try:
+            live_field, rebound = _target_from_override(raw, fields, planned)
+            if rebound:
+                rebound_by_schema_signature += 1
+            current_identifier = field_id(live_field)
+            item = items_by_field_id.get(current_identifier)
+            if item is None:
+                raise RequiredOverrideError(
+                    f"override[{index}] 无法绑定当前 Fill Plan：{current_identifier}"
+                )
+            label = item.label
+            if item.action == READY:
+                skipped_current_ready += 1
+                continue
+
+            source_type, fallback_recomputed = _apply_one_required_override(
+                item,
+                live_field,
+                raw,
             )
-
-        requested_source = str(raw.get("source_type") or "user").strip().casefold()
-        source_type, source_reference, confidence, evidence = _source_metadata(requested_source)
-        effective = raw
-        if source_type == "fallback":
-            effective = required_fallback_override(live_field)
-            fallback_recomputed_live += 1
-
-        raw_values = effective.get("values")
-        if raw_values is None:
-            raw_values = [effective.get("value")]
-        if not isinstance(raw_values, list):
-            raise RequiredOverrideError(f"{item.label} 的 values 必须是数组。")
-        values = [str(value).strip() for value in raw_values if str(value or "").strip()]
-        if not values:
-            raise RequiredOverrideError(f"{item.label} 的补充值为空。")
-        qualifier = str(effective.get("qualifier") or "").strip()
-
-        hard_validation = validate_resolved_answer(
-            live_field,
-            ResolvedAnswer(
-                attribute_key=item.attribute_key,
-                label=item.label,
-                status=RESOLVED,
-                answer=" + ".join(values),
-                answer_values=list(values),
-                qualifier=qualifier or None,
-                confidence=confidence,
-                source_type=source_type,
-                source_reference=source_reference,
-                evidence=evidence,
-                detail=str(effective.get("reason") or "").strip(),
-            ),
-        )
-        if not hard_validation.valid:
-            raise RequiredOverrideError(f"{item.label}: {hard_validation.detail}")
-
-        record = item.resolution
-        record.status = RESOLVED
-        record.answer = " + ".join(values)
-        record.answer_values = list(values)
-        record.qualifier = qualifier or None
-        record.confidence = confidence
-        record.source_type = source_type
-        record.source_reference = source_reference
-        record.evidence = evidence
-        record.detail = (
-            "deterministic required-field fallback"
-            if source_type == "fallback"
-            else str(raw.get("reason") or "explicit user decision").strip()
-        )
-        record.eligible_for_autofill = True
-        record.preview_eligible = False
-        record.gate_reason = ""
-        record.provenance = [
-            {
-                "source_reference": source_reference,
-                "evidence_text": evidence,
-                "source_type": source_type,
-                "confidence": confidence,
-            }
-        ]
-        item.action = READY
-        item.reason = (
-            "AI 未解决的 Makro 必填项已使用固定自动兜底。"
-            if source_type == "fallback"
-            else "用户补充了 AI 未解决的 Makro 必填值。"
-        )
-        applied.append(current_identifier)
-        source_counts[source_type] += 1
+            if fallback_recomputed:
+                fallback_recomputed_live += 1
+            applied.append(current_identifier)
+            source_counts[source_type] += 1
+        except RequiredOverrideError as exc:
+            isolated_failures.append(
+                {
+                    "index": index,
+                    "field_id": current_identifier,
+                    "label": label,
+                    "reason": str(exc),
+                }
+            )
 
     _apply_business_relations(plan.items)
     return {
@@ -470,5 +511,7 @@ def apply_required_overrides(
         "rebound_by_schema_signature": rebound_by_schema_signature,
         "skipped_current_ready": skipped_current_ready,
         "fallback_recomputed_live": fallback_recomputed_live,
+        "isolated_failed": len(isolated_failures),
+        "isolated_failures": isolated_failures,
         "automatic_fallback_enabled": True,
     }
