@@ -2,11 +2,11 @@ name: Warm Stable Mirrors
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/5 * * * *"
-  push:
-    paths:
-      - ".github/workflows/release-mirror-warm.yml"
+  workflow_run:
+    workflows:
+      - "Publish Update"
+    types:
+      - completed
 
 permissions:
   contents: read
@@ -17,6 +17,7 @@ concurrency:
 
 jobs:
   warm-stable-mirrors:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
