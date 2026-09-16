@@ -32,7 +32,8 @@ from app.live_schema import assert_live_schema_matches, load_live_schema
 from app.makro import MAKRO_HOME_URL, base_section_title
 from app.makro.direct_visual_hold import is_listing_attribute_field
 from app.makro.domain import MakroDomainAdapter
-from app.makro.execution import PRODUCT_PHOTOS, fill_one_section as _fill_one_section, run_photos as _run_photos
+from app.makro.execution import PRODUCT_PHOTOS, run_photos as _run_photos
+from app.makro.fast_execution import fill_one_section as _fill_one_section
 from app.makro.listing_preflight import CORE_FORM_SECTIONS
 from app.makro.marketplace_constraints import apply_makro_decision_constraints
 from app.makro.visual_execution_hud import (
