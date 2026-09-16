@@ -67,3 +67,9 @@ def test_certifications_and_ingredients_are_explicit_leave_blank_policy() -> Non
 def test_policy_matching_tolerates_live_key_formatting() -> None:
     item = SimpleNamespace(attribute_key="product_ingredients", label="Ingredients")
     assert _policy_blank_reason(item) == "seller_policy_leave_blank"
+
+
+def test_production_executor_is_wired_to_fast_section_policy() -> None:
+    import makro_execute_listing
+
+    assert makro_execute_listing._fill_one_section.__module__ == "app.makro.fast_execution"
