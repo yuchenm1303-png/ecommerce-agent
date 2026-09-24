@@ -36,6 +36,7 @@ from .portal_interruptions import reconcile_portal_interruptions
 
 BRAND_SELECTION_MODE = "fixed"
 FIXED_BRAND = "Non branded"
+SUPPLIER_FALLBACK_BRAND = "VINCIE"
 _HAN_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 
 
@@ -73,7 +74,7 @@ def _supplier_brand_terms(hints: BrandHints) -> tuple[str, ...]:
 
     status = str(hints.brand_status or "").strip().casefold()
     if status in {"unknown", "unbranded"}:
-        fallback = str(FIXED_BRAND or "").strip()
+        fallback = str(SUPPLIER_FALLBACK_BRAND or "").strip()
         return (fallback,) if fallback else ()
 
     terms: list[str] = []
@@ -184,5 +185,6 @@ def select_brand(
 __all__ = [
     "BRAND_SELECTION_MODE",
     "FIXED_BRAND",
+    "SUPPLIER_FALLBACK_BRAND",
     "select_brand",
 ]
