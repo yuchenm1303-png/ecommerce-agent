@@ -36,7 +36,7 @@ def _hints(*, brand="Qigreesol", status="explicit"):
     return SimpleNamespace(brand=brand, brand_status=status)
 
 
-def _install_common(monkeypatch, page, brand_input, *, actual_brand="KEAI"):
+def _install_common(monkeypatch, page, brand_input, *, actual_brand="Non branded"):
     monkeypatch.setattr(brand_selection, "is_brand_step", lambda current: current.phase == "brand")
     monkeypatch.setattr(brand_selection, "is_product_info_step", lambda current: current.phase == "product")
     monkeypatch.setattr(brand_selection, "_brand_input", lambda _page: brand_input)
@@ -63,16 +63,16 @@ def _install_common(monkeypatch, page, brand_input, *, actual_brand="KEAI"):
     )
 
 
-def test_fixed_policy_always_uses_keai_without_ai(monkeypatch):
+def test_fixed_policy_always_uses_non_branded_without_ai(monkeypatch):
     page = FakePage()
     brand_input = FakeInput()
     _install_common(monkeypatch, page, brand_input)
 
     def check_brand(_page):
-        page.ready_brand = "KEAI"
+        page.ready_brand = "Non branded"
 
     def advance(_page, selected):
-        assert selected == "KEAI"
+        assert selected == "Non branded"
         page.phase = "product"
 
     monkeypatch.setattr(brand_selection, "_click_check_brand", check_brand)
@@ -85,11 +85,11 @@ def test_fixed_policy_always_uses_keai_without_ai(monkeypatch):
         wait_ms=0,
     )
 
-    assert selected == "KEAI"
-    assert brand_input.values == ["", "KEAI"]
+    assert selected == "Non branded"
+    assert brand_input.values == ["", "Non branded"]
 
 
-def test_fixed_brand_confirmation_must_match_keai(monkeypatch):
+def test_fixed_brand_confirmation_must_match_non_branded(monkeypatch):
     page = FakePage()
     brand_input = FakeInput()
     _install_common(monkeypatch, page, brand_input)
@@ -157,7 +157,7 @@ def test_brand_production_path_is_not_autocomplete_based() -> None:
     source = inspect.getsource(brand_selection.select_brand)
     module_source = inspect.getsource(brand_selection)
     assert 'BRAND_SELECTION_MODE = "fixed"' in module_source
-    assert 'FIXED_BRAND = "KEAI"' in module_source
+    assert 'FIXED_BRAND = "Non branded"' in module_source
     assert "_brand_search_terms(hints)" in module_source
     assert "_click_check_brand(page)" in source
     assert "_wait_for_brand_check_outcome" in source
