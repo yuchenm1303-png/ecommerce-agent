@@ -130,25 +130,31 @@ def test_supplier_brand_path_is_retained_for_future_restore(monkeypatch):
     assert brand_input.values == ["", "Qigreesol"]
 
 
-def test_unknown_supplier_brand_still_fails_closed_when_legacy_mode_restored(monkeypatch):
+def test_unknown_supplier_brand_keeps_original_vincie_fallback_when_restored(monkeypatch):
     page = FakePage()
     brand_input = FakeInput()
-    _install_common(monkeypatch, page, brand_input)
+    _install_common(monkeypatch, page, brand_input, actual_brand="VINCIE")
     monkeypatch.setattr(brand_selection, "BRAND_SELECTION_MODE", "supplier")
-    monkeypatch.setattr(brand_selection, "_brand_search_terms", lambda _hints: ())
-    monkeypatch.setattr(
-        brand_selection,
-        "_click_check_brand",
-        lambda _page: pytest.fail("unknown supplier brand must not be queried"),
+
+    def check_brand(_page):
+        page.ready_brand = "VINCIE"
+
+    def advance(_page, selected):
+        assert selected == "VINCIE"
+        page.phase = "product"
+
+    monkeypatch.setattr(brand_selection, "_click_check_brand", check_brand)
+    monkeypatch.setattr(brand_selection, "_advance_brand_confirmation", advance)
+
+    selected = brand_selection.select_brand(
+        page,
+        FakeProvider(),
+        _hints(brand="", status="unknown"),
+        wait_ms=0,
     )
 
-    with pytest.raises(RuntimeError, match="produced no brand query"):
-        brand_selection.select_brand(
-            page,
-            FakeProvider(),
-            _hints(brand="", status="unknown"),
-            wait_ms=0,
-        )
+    assert selected == "VINCIE"
+    assert brand_input.values == ["", "VINCIE"]
 
 
 def test_brand_production_path_is_not_autocomplete_based() -> None:
@@ -158,6 +164,7 @@ def test_brand_production_path_is_not_autocomplete_based() -> None:
     module_source = inspect.getsource(brand_selection)
     assert 'BRAND_SELECTION_MODE = "fixed"' in module_source
     assert 'FIXED_BRAND = "Non branded"' in module_source
+    assert 'SUPPLIER_FALLBACK_BRAND = "VINCIE"' in module_source
     assert "_brand_search_terms(hints)" in module_source
     assert "_click_check_brand(page)" in source
     assert "_wait_for_brand_check_outcome" in source
