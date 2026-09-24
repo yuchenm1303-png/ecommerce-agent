@@ -25,7 +25,6 @@ from playwright.sync_api import sync_playwright
 from app.ai_decisions import load_ai_decision_packet
 from app.browser_page_owner import find_page_by_target_id
 from app.browser_session import DEFAULT_CDP_PORT, EdgeHarness, is_cdp_ready
-from app.business_decisions import is_user_decision_business_field
 from app.business_fields import generate_listing_sku, generated_business_bundle
 from app.evidence_contract import ProductIdentity
 from app.fill_plan import BLOCKED, build_live_fill_plan
@@ -42,10 +41,6 @@ from app.makro.visual_execution_hud import (
     finish_visual_execution_hud,
     install_visual_execution_hud,
     set_visual_execution_hud_capture_safe,
-)
-from app.makro.user_decisions import (
-    collect_runtime_user_decisions,
-    pending_user_decision_items,
 )
 from app.required_overrides import apply_required_overrides, load_required_overrides
 from app.semantic_grounding import build_grounding_catalog
@@ -188,12 +183,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-scroll-steps", type=int, default=200)
     parser.add_argument("--recheck-wait-ms", type=int, default=800)
     parser.add_argument("--upload-timeout-ms", type=int, default=8_000)
-    parser.add_argument(
-        "--seller-decision-timeout-ms",
-        type=int,
-        default=900_000,
-        help="等待用户在 Makro live price 字段中确认经营决策的最长时间；默认 15 分钟。",
-    )
     parser.add_argument("--max-text-chars", type=int, default=5000)
     parser.add_argument("--overlap-chars", type=int, default=250)
     parser.add_argument("--output-dir", default="logs/makro-direct-execution")
@@ -207,8 +196,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if args.upload_timeout_ms <= 0:
         raise SystemExit("--upload-timeout-ms 必须大于 0")
-    if args.seller_decision_timeout_ms <= 0:
-        raise SystemExit("--seller-decision-timeout-ms 必须大于 0")
     if args.max_text_chars < 500:
         raise SystemExit("--max-text-chars 不能小于 500")
     if args.overlap_chars < 0 or args.overlap_chars >= args.max_text_chars:
@@ -445,56 +432,6 @@ def main() -> int:
                 planned_fields=planned_live_fields,
             )
 
-        runtime_decision_summary: dict[str, Any] = {
-            "applied": 0,
-            "field_ids": [],
-            "sources": {"user": 0, "fallback": 0},
-        }
-        runtime_section = None if args.all_step3 else base_section_title(str(args.section or ""))
-        pending_decisions = pending_user_decision_items(
-            plan,
-            section=runtime_section or None,
-        )
-
-        if args.all_step3:
-            hard_missing_required = [
-                item.label
-                for item in plan.items
-                if item.required
-                and item.action == BLOCKED
-                and not is_user_decision_business_field(
-                    {"attribute_key": item.attribute_key, "label": item.label}
-                )
-            ]
-            if hard_missing_required:
-                raise RuntimeError(
-                    "Full Step 3 仍有非经营决策的 Makro 必填项没有可靠答案；"
-                    "已在任何字段写入前停止："
-                    + " | ".join(hard_missing_required)
-                )
-
-        visual_hud_installed = False
-        if pending_decisions:
-            visual_hud_installed = install_visual_execution_hud(page)
-            try:
-                runtime_overrides = collect_runtime_user_decisions(
-                    adapter,
-                    plan,
-                    section=runtime_section or None,
-                    wait_ms=args.scroll_wait_ms,
-                    max_scroll_steps=args.max_scroll_steps,
-                    timeout_ms=args.seller_decision_timeout_ms,
-                )
-                runtime_decision_summary = apply_required_overrides(
-                    plan,
-                    semantic_fields,
-                    runtime_overrides,
-                    planned_fields=planned_live_fields,
-                )
-            except Exception:
-                finish_visual_execution_hud(page, success=False)
-                raise
-
         summary = plan.summary()
         if args.all_step3 and int(summary.get("required_blocked") or 0) > 0:
             missing_required = [
@@ -503,10 +440,12 @@ def main() -> int:
                 if item.required and item.action == BLOCKED
             ]
             raise RuntimeError(
-                "Full Step 3 的人工经营决策完成后仍有 Makro 必填项未解决；"
-                "已在正式字段写入前停止："
+                "Full Step 3 仍有 Makro 必填项没有可靠答案；已在任何字段写入前停止。"
+                "请先补齐必填项或让正常 fallback 生成合法值："
                 + " | ".join(missing_required)
             )
+
+        visual_hud_installed = False
 
         if args.all_step3:
             banner = "===== MAKRO STEP 3 DIRECT ACCEPTANCE ====="
@@ -521,7 +460,6 @@ def main() -> int:
         print(f"product_url={args.product_url}")
         print(f"generated_listing_sku={generated_sku}")
         print(f"user_required_overrides={override_summary['applied']}")
-        print(f"runtime_user_decisions={runtime_decision_summary['applied']}")
         print(f"makro_constraints={makro_constraint_summary}")
         print(
             f"live_fields={summary['live_field_count']}, ready={summary['ready']}, "
@@ -697,7 +635,6 @@ def main() -> int:
             "live_schema": str(Path(args.live_schema).resolve()),
             "required_override_file": str(override_path) if override_path.is_file() else "",
             "required_overrides": override_summary,
-            "runtime_user_decisions": runtime_decision_summary,
             "makro_constraints": makro_constraint_summary,
             "source_snapshots": [str(Path(path).resolve()) for path in args.supplier_snapshot],
             "evidence_images": [str(Path(path).resolve()) for path in args.image],
