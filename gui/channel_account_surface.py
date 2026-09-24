@@ -32,7 +32,7 @@ class ChannelAccountCenterPanel(QWidget):
         layout.setSpacing(12)
 
         intro = QLabel(
-            "Makro 店铺与 Listing Studio 账号分开管理。每个店铺使用独立 Browser Profile；"
+            "Makro 店铺与 Listing Studio 账号分开管理。每个店铺使用独立 Browser Profile + CDP lane；"
             "程序不保存 Makro 密码、Cookie 或登录 Token。"
         )
         intro.setObjectName("cardDetailText")
@@ -89,8 +89,8 @@ class ChannelAccountCenterPanel(QWidget):
         connect_layout.addWidget(connect_title)
 
         connect_hint = QLabel(
-            "创建后程序会切换到一个全新的独立 Profile，并打开 Makro 官方登录页。"
-            "完成一次正常登录后，Single / Batch 会持续复用该店铺会话。"
+            "创建后程序会为这个店铺分配一个全新的独立 Profile 和固定 Browser lane，并打开 Makro 官方登录页。"
+            "完成一次正常登录后，该店铺会持续复用自己的会话，切换其他店铺不会覆盖它。"
         )
         connect_hint.setObjectName("cardDetailText")
         connect_hint.setWordWrap(True)
@@ -109,8 +109,8 @@ class ChannelAccountCenterPanel(QWidget):
         layout.addWidget(connect_card)
 
         policy = QLabel(
-            "切换店铺时，当前商品准备产生的 owned tab / Step 3 现场会失效，必须在新店铺下重新准备。"
-            "任务运行期间禁止切换，避免商品被上架到错误店铺。"
+            "Single 的 Step 3 准备现场在切换店铺后会失效，避免把旧店铺页面用于新账号。"
+            "Batch 会永久记录所属 Makro 店铺，切回原店铺后可以继续；当前版本任务运行期间仍禁止手动切换店铺。"
         )
         policy.setObjectName("cardDetailText")
         policy.setWordWrap(True)
@@ -125,6 +125,10 @@ class ChannelAccountCenterPanel(QWidget):
         self.manager.status_changed.connect(self._browser_status_changed)
         self.reload()
 
+    def _account_port(self, account: Any) -> int:
+        getter = getattr(self.manager, "channel_browser_port", None)
+        return int(getter(account)) if callable(getter) else 0
+
     def reload(self) -> None:
         accounts = tuple(self.manager.list_channel_accounts())
         selected = self.manager.selected_channel_account()
@@ -134,7 +138,9 @@ class ChannelAccountCenterPanel(QWidget):
             self.account_combo.clear()
             selected_index = -1
             for index, account in enumerate(accounts):
-                self.account_combo.addItem(account.label, account.account_id)
+                port = self._account_port(account)
+                suffix = f" · CDP {port}" if port else ""
+                self.account_combo.addItem(f"{account.label}{suffix}", account.account_id)
                 if account.account_id == selected.account_id:
                     selected_index = index
             if selected_index >= 0:
@@ -143,11 +149,14 @@ class ChannelAccountCenterPanel(QWidget):
             self.account_combo.blockSignals(blocked)
 
         current = self.manager.channel_account
+        current_port = self._account_port(current)
         if selected.account_id == current.account_id:
-            self.active_label.setText(f"上架会话 · {current.label}")
+            self.active_label.setText(f"上架会话 · {current.label} · CDP {current_port}")
         else:
+            selected_port = self._account_port(selected)
             self.active_label.setText(
-                f"目标店铺 · {selected.label} · 正在从 {current.label} 安全切换"
+                f"目标店铺 · {selected.label} · CDP {selected_port} · "
+                f"正在从 {current.label} 切换控制面"
             )
 
         state, detail = self.manager.channel_browser_status()
@@ -185,7 +194,8 @@ class ChannelAccountCenterPanel(QWidget):
             self.reload()
             return
         self._set_action(
-            f"已选择 {account.label}。Makro Browser 正在后台安全切换；完成后状态会变为 READY。"
+            f"已选择 {account.label}。程序正在后台接管该店铺自己的 Makro Browser lane；"
+            "完成后状态会变为 READY。其他店铺会话不会被覆盖。"
         )
         self.reload()
 
@@ -198,8 +208,10 @@ class ChannelAccountCenterPanel(QWidget):
             self.reload()
             return
         self.new_label.clear()
+        port = self._account_port(account)
         self._set_action(
-            f"已创建 {account.label}。独立 Makro Profile 正在打开；首次请在官方 Seller Centre 完成登录。"
+            f"已创建 {account.label} · CDP {port}。独立 Makro Profile 正在打开；"
+            "首次请在官方 Seller Centre 完成登录。"
         )
         self.reload()
 
@@ -212,7 +224,7 @@ class ChannelAccountCenterController:
         self.manager = manager
         self.button = QPushButton("平台账号")
         self.button.setObjectName("quietButton")
-        self.button.setToolTip("Makro 店铺连接 / 切换 / 登录会话")
+        self.button.setToolTip("Makro 店铺连接 / 切换 / 独立 Browser lane")
         self.button.clicked.connect(self.open)
         self._panel: ChannelAccountCenterPanel | None = None
         self._install_header_button()
