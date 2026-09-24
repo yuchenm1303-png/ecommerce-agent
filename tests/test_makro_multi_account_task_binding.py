@@ -195,8 +195,9 @@ def test_account_center_exposes_per_account_batch_slot_overview() -> None:
 
     assert "def account_slot_snapshot" in runtime_source
     assert "\"has_batch\": False" in runtime_source
-    assert "账号任务概览" in surface_source
-    assert "snapshot_getter(account.account_id)" in surface_source
+    assert "Makro 店铺工作台" in surface_source
+    assert "def _account_snapshot" in surface_source
+    assert "channelAccountCard" in surface_source
     assert "暂无 Batch" in surface_source
 
 
