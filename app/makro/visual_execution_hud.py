@@ -219,7 +219,8 @@ _INSTALL_SCRIPT = r"""
       if(!nodes) return false;
       this.currentTarget=target;
       this.lastActionAt=Date.now();
-      this.adviceUntil=Date.now()+7000;
+      const holdMs=Math.max(1000,Math.min(1800000,Number(payload.hold_ms)||7000));
+      this.adviceUntil=Date.now()+holdMs;
       const rect=target.getBoundingClientRect();
       const x=Math.max(0,Math.min(window.innerWidth,rect.left+rect.width*.5));
       const y=Math.max(0,Math.min(window.innerHeight,rect.top+rect.height*.5));
