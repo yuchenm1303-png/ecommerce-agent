@@ -69,6 +69,15 @@ _ADVICE_SCRIPT = r"""
 }
 """
 
+_REFERENCE_SCRIPT = r"""
+(el, payload) => {
+  const api = window[payload.key];
+  if (!api || typeof api.pinReference !== 'function') return false;
+  api.pinReference(el, payload);
+  return true;
+}
+"""
+
 
 def _visual_renderer():
     """Resolve the single existing renderer only when a HUD operation runs."""
@@ -281,6 +290,43 @@ def browser_visual_hud_advice(
         print(f"GUI_BROWSER_HUD\tADVICE_ERROR\t{type(exc).__name__}: {exc}", flush=True)
 
 
+def browser_visual_hud_reference(
+    locator: Any,
+    advisory: dict[str, Any],
+) -> None:
+    """Pin a persistent, display-only reference card beside a live DOM field.
+
+    The reference layer is independent from the moving execution bubble and
+    never changes focus, clicks, fills, validation, Save or execution timing.
+    """
+
+    if not advisory:
+        return
+    try:
+        key = _hud_api_key()
+        payload = {
+            "key": key,
+            "id": str(advisory.get("key") or advisory.get("kind") or "reference"),
+            "kind": str(advisory.get("kind") or "reference"),
+            "eyebrow": str(advisory.get("eyebrow") or "参考"),
+            "title": str(advisory.get("title") or "参考信息"),
+            "thought": str(advisory.get("thought") or ""),
+            "source": str(advisory.get("source") or "Listing Studio"),
+            "warning": str(advisory.get("warning") or ""),
+            "rows": [
+                {
+                    "label": str(row.get("label") or ""),
+                    "value": str(row.get("value") or ""),
+                }
+                for row in advisory.get("rows") or []
+                if isinstance(row, dict)
+            ][:8],
+        }
+        locator.evaluate(_REFERENCE_SCRIPT, payload)
+    except Exception as exc:
+        print(f"GUI_BROWSER_HUD\tREFERENCE_ERROR\t{type(exc).__name__}: {exc}", flush=True)
+
+
 def set_browser_visual_hud_capture_safe(page: Any, active: bool) -> None:
     try:
         _visual_renderer().set_visual_execution_hud_capture_safe(page, bool(active))
@@ -322,6 +368,7 @@ def finish_browser_visual_hud(
 __all__ = [
     "arm_browser_visual_hud",
     "browser_visual_hud_advice",
+    "browser_visual_hud_reference",
     "browser_visual_hud_status",
     "browser_visual_hud_target",
     "finish_browser_visual_hud",
