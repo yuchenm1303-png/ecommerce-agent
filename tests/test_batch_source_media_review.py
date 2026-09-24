@@ -1,4 +1,4 @@
-from gui.batch_source_outcome import source_media_review
+from app.batch_source_outcome import source_media_review
 
 
 def test_exhausted_source_media_routes_to_review():

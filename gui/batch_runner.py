@@ -21,7 +21,7 @@ from .batch_account_lanes import (
     LaneProcessMap,
 )
 from .batch_log_buffer import BATCH_LOG_FLUSH_LINES, BATCH_LOG_PENDING_LINES
-from .batch_source_outcome import source_media_review
+from app.batch_source_outcome import source_media_review
 from .batch_model import (
     BATCH_WORKER_DEFAULT,
     BatchJob,
