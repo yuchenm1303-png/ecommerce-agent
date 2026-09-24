@@ -54,7 +54,7 @@ _TARGET_SCRIPT = r"""
 (el, payload) => {
   const api = window[payload.key];
   if (!api || typeof api.update !== 'function') return false;
-  api.update(el, payload.phase, payload.verb, payload.detail);
+  api.update(el, payload.phase, payload.verb, payload.detail, true);
   if (payload.pulse && typeof api.pulse === 'function') api.pulse();
   return true;
 }
