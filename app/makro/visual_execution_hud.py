@@ -42,6 +42,8 @@ html,body{margin:0;width:100%;height:100%;min-height:0;background:transparent;co
 .app{position:relative;width:100%;height:100%;overflow:hidden;background:transparent}
 .hud{position:absolute;inset:0;z-index:20;pointer-events:none;overflow:hidden;opacity:1;visibility:visible;transition:opacity .22s ease,visibility .22s ease}
 .app.hud-hidden .hud{opacity:0;visibility:hidden}
+.hud.review-mode .edge-aurora,.hud.review-mode .cursor-wrap,.hud.review-mode .info-bubble,.hud.review-mode .bottom-timeline{opacity:0;visibility:hidden}
+.hud.review-mode .reference-layer{opacity:1;visibility:visible}
 @property --edge-angle{syntax:"<angle>";inherits:false;initial-value:0deg}
 .edge-aurora{position:absolute;inset:0;pointer-events:none;overflow:hidden;contain:layout paint style;isolation:isolate}
 .edge-aurora-layer{position:absolute;inset:var(--edge-inset);border-radius:var(--edge-radius);pointer-events:none;background:conic-gradient(from var(--edge-angle) at 50% 50%,#62f3ff 0deg,#58c7ff 34deg,#7779ff 72deg,#ba62ff 112deg,#ff4ab8 156deg,#ff4979 198deg,#ff9e4d 234deg,#ffe55a 268deg,#abf15f 302deg,#48eacb 336deg,#62f3ff 360deg);animation:edgeColorOrbit var(--edge-flow-speed) linear infinite,edgeLayerBreath var(--edge-breath-speed) ease-in-out infinite;will-change:opacity,filter}
@@ -165,6 +167,7 @@ _INSTALL_SCRIPT = r"""
         d,
         root:d.documentElement,
         app:d.getElementById('app'),
+        hud:d.querySelector('.hud'),
         cursor:d.getElementById('cursor'),
         bubble:d.getElementById('bubble'),
         title:d.getElementById('bubbleTitle'),
@@ -175,7 +178,7 @@ _INSTALL_SCRIPT = r"""
         thought:d.getElementById('thought'),
         phases:Array.from(d.querySelectorAll('.phase'))
       };
-      if(!nodes.root || !nodes.app || !nodes.bubble || !nodes.title || !nodes.confidence || !nodes.coords || !nodes.source || !nodes.referenceLayer || !nodes.thought) return null;
+      if(!nodes.root || !nodes.app || !nodes.hud || !nodes.bubble || !nodes.title || !nodes.confidence || !nodes.coords || !nodes.source || !nodes.referenceLayer || !nodes.thought) return null;
       return nodes;
     },
     interactive(node){
@@ -275,16 +278,64 @@ _INSTALL_SCRIPT = r"""
         const card=nodes.d.createElement('div');
         card.className='reference-card';
         nodes.referenceLayer.appendChild(card);
-        item={id,target,card,payload};
+        item={
+          id,
+          target,
+          card,
+          payload,
+          targetName:String(target.getAttribute('name') || ''),
+          targetId:String(target.getAttribute('id') || ''),
+          targetTag:String(target.tagName || '').toLowerCase()
+        };
         this.references.set(id,item);
       }else{
         item.target=target;
         item.payload=payload;
+        item.targetName=String(target.getAttribute('name') || item.targetName || '');
+        item.targetId=String(target.getAttribute('id') || item.targetId || '');
+        item.targetTag=String(target.tagName || item.targetTag || '').toLowerCase();
       }
       this.renderReference(item,nodes);
       this.scheduleReferenceLayout();
       nodes.app.classList.remove('hud-hidden');
       this.lastActionAt=Date.now();
+      return true;
+    },
+    rebindReference(item){
+      if(item.target instanceof Element && item.target.isConnected) return item.target;
+      let candidates=[];
+      if(item.targetName){
+        try { candidates=Array.from(document.getElementsByName(item.targetName)); } catch (_) {}
+      }
+      if(!candidates.length && item.targetId){
+        try {
+          const byId=document.getElementById(item.targetId);
+          if(byId) candidates=[byId];
+        } catch (_) {}
+      }
+      const wantedTag=String(item.targetTag || '').toLowerCase();
+      const rebound=candidates.find(node => {
+        if(!(node instanceof Element)) return false;
+        if(wantedTag && String(node.tagName || '').toLowerCase()!==wantedTag) return false;
+        return this.visible(node);
+      }) || candidates.find(node => node instanceof Element && (!wantedTag || String(node.tagName || '').toLowerCase()===wantedTag));
+      if(rebound) item.target=rebound;
+      return rebound || null;
+    },
+    enterReviewMode(){
+      const nodes=this.nodes();
+      if(!nodes) return false;
+      nodes.hud.classList.add('review-mode');
+      this.currentTarget=null;
+      this.lastActionAt=Date.now();
+      this.scheduleReferenceLayout();
+      nodes.app.classList.remove('hud-hidden');
+      return true;
+    },
+    leaveReviewMode(){
+      const nodes=this.nodes();
+      if(!nodes) return false;
+      nodes.hud.classList.remove('review-mode');
       return true;
     },
     scheduleReferenceLayout(){
@@ -301,7 +352,11 @@ _INSTALL_SCRIPT = r"""
       const vw=Math.max(1,window.innerWidth), vh=Math.max(1,window.innerHeight);
       const placed=[];
       this.references.forEach(item => {
-        const target=item.target, card=item.card;
+        const card=item.card;
+        let target=item.target;
+        if(!(target instanceof Element) || !target.isConnected){
+          target=this.rebindReference(item);
+        }
         if(!this.visible(target)){
           card.style.opacity='0';
           return;
@@ -357,6 +412,7 @@ _INSTALL_SCRIPT = r"""
       if(this.destroyed || !this.visible(target)) return;
       const nodes=this.nodes();
       if(!nodes) return;
+      this.leaveReviewMode();
       this.currentTarget=target;
       this.lastActionAt=Date.now();
       const rect=target.getBoundingClientRect();
@@ -384,6 +440,7 @@ _INSTALL_SCRIPT = r"""
     status(title,thought,phase=1){
       const nodes=this.nodes();
       if(!nodes) return false;
+      this.leaveReviewMode();
       nodes.title.textContent=String(title || '正在执行真实填写');
       nodes.thought.textContent=String(thought || '等待真实页面操作。');
       nodes.confidence.textContent='LIVE DOM';
@@ -456,7 +513,12 @@ _INSTALL_SCRIPT = r"""
   }
   api.watchdog=setInterval(() => {
     if(api.destroyed) return;
-    if(Date.now()-api.lastActionAt > 75000) api.destroy();
+    if(Date.now()-api.lastActionAt <= 75000) return;
+    if(api.references.size){
+      api.enterReviewMode();
+      return;
+    }
+    api.destroy();
   },5000);
 
   window[apiKey]=api;
@@ -506,11 +568,13 @@ def set_visual_execution_hud_capture_safe(page: Any, active: bool) -> None:
 
 
 def finish_visual_execution_hud(page: Any, *, success: bool) -> None:
+    """End execution chrome but keep pinned field references for manual review."""
+
     title = "真实填写完成" if success else "真实填写未完整通过"
     thought = (
-        "当前执行已完成，Listing Studio 正在整理最终报告。"
+        "自动填写已结束；字段参考卡将继续保留，方便人工复核和补充。"
         if success
-        else "当前执行已停止在未完整通过状态，请回到 Listing Studio 查看执行结果。"
+        else "自动填写已停止；已生成的字段参考卡继续保留，方便人工检查和修改。"
     )
     _safe_evaluate(
         page,
@@ -521,6 +585,11 @@ def finish_visual_execution_hud(page: Any, *, success: bool) -> None:
         page.wait_for_timeout(420)
     except Exception:
         pass
+    _safe_evaluate(
+        page,
+        "key => { const api=window[key]; if(api && typeof api.enterReviewMode === 'function') api.enterReviewMode(); }",
+        HUD_API_KEY,
+    )
 
 
 def destroy_visual_execution_hud(page: Any) -> None:
