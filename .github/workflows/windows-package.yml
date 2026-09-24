@@ -1,0 +1,137 @@
+name: Windows Package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/local-test-gui
+    tags:
+      - "v*"
+    paths:
+      - "app/runtime_paths.py"
+      - "app/velopack_runtime.py"
+      - "app/update_browser_gate.py"
+      - "app/browser_session.py"
+      - "app/cdp_transport_lane.py"
+      - "gui/app_updater.py"
+      - "gui/browser_session_manager.py"
+      - "gui/resilient_app_updater.py"
+      - "gui/update_runtime.py"
+      - "gui/frozen_process_router.py"
+      - "gui/batch_parallel_runtime.py"
+      - "makro_execute_listing.py"
+      - "makro_execute_owned.py"
+      - "run_packaged_worker.py"
+      - "run_local_gui.py"
+      - "native/sakana-helper/**"
+      - "packaging/**"
+      - "scripts/build_windows.ps1"
+      - "scripts/velopack_cli.ps1"
+      - "scripts/test_velopack_update_e2e.ps1"
+      - "scripts/generate_app_icon.py"
+      - ".config/dotnet-tools.json"
+      - "requirements.txt"
+      - "requirements-gui.txt"
+      - "requirements-build.txt"
+      - "tests/test_batch_architecture_contract.py"
+      - "tests/test_cdp_transport_lane.py"
+      - "tests/test_execute_owned_worker.py"
+      - "tests/test_windows_packaging_contract.py"
+      - "tests/test_velopack_update_contract.py"
+      - "tests/test_app_update_ui_contract.py"
+      - "tests/test_updater_browser_shutdown_contract.py"
+      - ".github/workflows/windows-package.yml"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-gui.txt -r requirements-build.txt
+          dotnet tool restore
+
+      - name: Velopack packaging contracts
+        shell: pwsh
+        run: |
+          python -m pytest -q `
+            tests/test_windows_packaging_contract.py `
+            tests/test_velopack_update_contract.py `
+            tests/test_app_update_ui_contract.py `
+            tests/test_updater_browser_shutdown_contract.py `
+            tests/test_batch_architecture_contract.py `
+            tests/test_cdp_transport_lane.py `
+            tests/test_execute_owned_worker.py
+
+      - name: Build Velopack installer and portable package
+        shell: pwsh
+        run: .\scripts\build_windows.ps1
+
+      - name: Silent Velopack install and uninstall smoke test
+        shell: pwsh
+        run: |
+          $setups = @(Get-ChildItem artifacts\EcommerceAgent-Setup-*.exe -File)
+          if ($setups.Count -ne 1) { throw "Expected exactly one friendly Velopack installer artifact, found $($setups.Count)" }
+          $setup = $setups[0]
+          $expectedVersion = (Get-Content packaging\VERSION -Raw).Trim()
+          $installDir = Join-Path $env:RUNNER_TEMP "ListingStudioVelopackInstalled"
+          if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
+          $install = Start-Process -FilePath $setup.FullName -ArgumentList @(
+            "--silent", "--installto", $installDir
+          ) -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Velopack install failed: $($install.ExitCode)" }
+
+          $stub = Join-Path $installDir "EcommerceAgent.exe"
+          $update = Join-Path $installDir "Update.exe"
+          $gui = Join-Path $installDir "current\EcommerceAgent.exe"
+          $worker = Join-Path $installDir "current\EcommerceAgentWorker.exe"
+          $sakana = Join-Path $installDir "current\_internal\native\sakana\helper\EcommerceAgentSakana.exe"
+          $versionFile = Join-Path $installDir "current\_internal\packaging\VERSION"
+          foreach ($required in @($stub, $update, $gui, $worker, $sakana, $versionFile)) {
+            if (-not (Test-Path $required)) { throw "Velopack installed component missing: $required" }
+          }
+          $installedVersion = (Get-Content $versionFile -Raw).Trim()
+          if ($installedVersion -ne $expectedVersion) {
+            throw "Installed VERSION mismatch: expected=$expectedVersion actual=$installedVersion"
+          }
+          & $worker --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Installed worker self-test failed: $LASTEXITCODE" }
+          & $worker makro_execute_owned.py --help
+          if ($LASTEXITCODE -ne 0) { throw "Installed owned-execute worker dispatch failed: $LASTEXITCODE" }
+
+          $uninstall = Start-Process -FilePath $update -ArgumentList @("--silent", "uninstall") -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Velopack uninstall failed: $($uninstall.ExitCode)" }
+          $deadline = (Get-Date).AddSeconds(15)
+          while ((Test-Path $installDir) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 100
+          }
+          if (Test-Path $installDir) { throw "Velopack uninstall left installation root behind: $installDir" }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: EcommerceAgent-Windows-${{ github.sha }}
+          path: |
+            artifacts/EcommerceAgent-Setup-*.exe
+            artifacts/EcommerceAgent-*-portable.zip
+            artifacts/velopack/*
+          if-no-files-found: error
+          retention-days: 14

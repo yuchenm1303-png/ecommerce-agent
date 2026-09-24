@@ -1,0 +1,4 @@
+# Real supplier images, imported cases, model responses and reports stay local.
+cases/
+cache/
+runs/

@@ -1,254 +1,169 @@
 # ecommerce-agent
 
-电商卖家后台批量信息采集、匹配、填写与校验自动化原型。
+Makro Marketplace Seller Center 的商品资料采集、AI 字段补全、只读规划与浏览器持久化验收工具。
 
-项目已经从本地 `mock_site` 进入真实平台适配阶段：**Makro Marketplace Seller Center**。
+当前唯一生产链：
 
-核心目标：
+**Makro live schema → 一个 1688/供应商商品链接 → 自动采集原始页面证据 → Local AI 直接填字段 → Web 只补 MISSING → Thin Hard Guards → Fill Plan → Browser → Save/reopen verify → Product Photos persistence**
 
-**读取商品资料 → 打开 Add Listing → 动态抓取页面问题 → 从证据中解析可靠答案 → 自动填写 → 二次校验 → 人工/规则安全门 → 保存 → 记录日志**
+`Send to QC` 始终禁止自动点击。
 
-## 当前进度
+## 核心原则
 
-### V0.1：本地闭环
+1. 新商品的人工产品输入只有商品链接；不要求人工 SKU、旧 QA 答案、旧 snapshot 或半成品资料。
+2. Python 机械采集页面，不解释商品：结构化参数、rendered text、variant/SKU 原始数据、整页截图和页面暴露的大图。
+3. Local AI 直接读取这些原始证据并输出 `READY / CONFLICT / MISSING`。
+4. `READY / CONFLICT` 冻结；只有 `MISSING` 进入 Web。
+5. Web 同时获得 exact URL、原始供应商页面证据和 Local 已知字段，避免只凭 `M8` 这类通用型号串商品。
+6. Python citation guard 只验证引用的 source address 是否真实存在，不逐字匹配 evidence_text，也不在 AI 后面重新判断商品语义。
+7. 不存在 Product Profile、Final Resolve、Python 商品语义复核或循环复核。
+8. Makro SKU 是 seller-controlled identifier，根据商品 URL 稳定生成，不参与 AI 商品理解。
 
-- 支持读取 `.csv`、`.xlsx`、`.xlsm` 商品表格。
-- 按 SKU 批量处理多个商品。
-- 使用 Playwright 控制 Chromium 浏览器。
-- 从普通 HTML `<label>` 与输入控件关系中抓取页面问题。
-- 对字段进行保守匹配：只接受精确匹配或明确配置的同义字段。
-- 支持文本框、下拉框、复选框的基础填写。
-- 每个字段填写后重新读取页面值进行校验。
-- 必填字段找不到可靠答案、商品身份不一致或校验失败时阻止保存。
-- 支持 `--dry-run`。
-- 每个商品的执行结果写入 `logs/*.jsonl`。
-- GitHub Actions 执行单元测试和 mock 浏览器 E2E。
+## Stage 0 — Source Capture
 
-### V0.2：Makro 动态页面探测
+`makro_resolve_ai.py --product-url <URL>` 使用独立 source Edge（默认 CDP `9333`），与 Makro seller Edge 分离。
 
-- 新增 `app/platforms/makro.py`，校验 Makro Add a Single Listing hash route。
-- 不依赖 `requestId` 作为长期稳定标识，因为该参数由平台动态生成。
-- 新增 `makro_probe.py`：在用户自己的电脑上登录后，采集真实页面控件的 DOM 元数据。
-- 使用本地持久化 Playwright Edge profile，账号密码不写入代码、不上传 GitHub。
-- 可展开所有带 EDIT 的 section，识别真实 label、mandatory-star、下拉选项、内部滚动容器。
-- Semantic Field Grouping 把多个 DOM control 聚合成真实 Makro attribute，多值字段不会被误算成多道问题。
-- 已用真实产物验证不同 vertical 的动态字段变化：页面字段数量和控件数量变化时，semantic field 仍可稳定还原。
-- Probe 不记录 Cookie/token/sessionStorage/Authorization，不点击 `Save` / `Send to QC`。
+机械采集：
 
-### V0.3：证据驱动 Answer Resolver + 真实 Dry-Run Fill
+- title / meta；
+- table / dl / 明确 key-value 参数行；
+- rendered visible text；
+- JSON-LD；
+- 页面 DOM / inline script 中 bounded SKU、variant、spec、offer、length/width/height/weight 原始片段；
+- full-page screenshot；
+- 页面已经暴露的大尺寸商品/详情图片 URL，并自动下载可用图片作为独立视觉证据。
 
-- 新增 `app/source_bundle.py`：统一商品证据模型 `ProductSourceBundle` / `SourceEvidence`。
-- 支持两种明确资料：标准“每行一个商品”的 CSV/XLSX/XLSM，以及客户当前使用的 Question/Answer 工作簿。
-- 新增 `app/answer_resolver.py`：输入当前页面动态 `semantic_fields`，按 `attribute_key + label` 从明确证据解析答案，不依赖固定类目字段表。
-- 来源冲突返回 `conflict`；没有证据返回 `missing`；下拉选项无法唯一精确匹配返回 `needs_review`。
-- SKU、Listing Status、价格、MOQ、shipping 等经营字段只接受明确结构化数据/config/rule，不允许 AI 或非结构化来源猜测。
-- 支持 multi-value 数组，以及 value + qualifier（例如数值 + Hours/Minutes）解析。
-- 新增 `app/makro_dryrun.py`：只填写 `resolved` 字段，填后立即 readback 验证。
-- 新增 `makro_fill.py`：真实 Makro dry-run CLI，动态扫描 → 解析 → 填写 → 回读，**绝不点击 Save / Send to QC**。
-- 当前 no-save 阶段一次只填写一个 section，并停在该 section 的 Save 前供人工检查；其他 section 会完成解析但不写入，避免跨 section 时依赖保存未验证的数据。
+采集器不点击 SKU、不选择款式、不解释字段、不绕过 CAPTCHA/风控。
 
-## 项目结构
+### Hot source cache
 
-```text
-ecommerce-agent/
-├─ app/
-│  ├─ data_loader.py
-│  ├─ source_bundle.py       # 商品证据统一模型 / table + QA 文件加载
-│  ├─ answer_resolver.py     # 动态 semantic field → 证据答案
-│  ├─ makro_dryrun.py        # 真实 Makro 安全填写 + readback
-│  ├─ extractor.py
-│  ├─ matcher.py
-│  ├─ filler.py
-│  ├─ validator.py
-│  ├─ logger.py
-│  ├─ runner.py
-│  └─ platforms/
-│     ├─ base.py
-│     ├─ mock.py
-│     └─ makro.py
-├─ data/
-│  └─ products.csv
-├─ mock_site/
-│  └─ index.html
-├─ tests/
-├─ logs/
-├─ makro_probe.py            # 登录后动态采集真实 Makro DOM
-├─ makro_fill.py             # 证据驱动真实 dry-run fill
-├─ main.py
-└─ requirements.txt
-```
+Resolver 默认把同一商品 URL 的原始 snapshot / screenshot / product-image bytes 短期缓存 15 分钟。紧接着的 hot rerun 复用完全相同的 source bytes，使 Local/Web semantic cache 可以真正命中。
 
-## Windows 本地安装
+需要重新读取最新网页时显式使用：
 
-建议 Python 3.11+。
+`--refresh-source`
 
-```powershell
-git clone https://github.com/yuchenm1303-png/ecommerce-agent.git
-cd ecommerce-agent
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-playwright install chromium
-```
+source cache 只是网页字节复用，不是商品事实层。
 
-默认真实 Makro 使用本机 Microsoft Edge `channel="msedge"`，Chromium 主要用于测试。
+## Stage 1 — Local Fill
 
-## 本地 mock
+默认模型：`qwen3.7-plus`。
 
-终端 1：
+`app/field_mapping.py` 将原始页面 evidence + 当前小批 Makro live fields 直接交给 AI。AI负责跨语言理解、variant、scope、dimension axes、视觉/文字冲突和字段映射。
 
-```powershell
-python -m http.server 8000 --directory mock_site
-```
+输出只有：
 
-终端 2：
+- `READY`：证据明确支持；
+- `CONFLICT`：同一字段存在真实冲突；
+- `MISSING`：不能确定。
 
-```powershell
-python main.py --dry-run
-```
+结构化来源中的 `length / width / height` 标签保持原样给 AI；Makro field 的附近 `context_text` 也会保留，用于识别页面固定单位。Python 不交换尺寸轴、不补单位、不判断语义。
 
-## Makro 动态页面 Probe
+## Stage 2 — Web Fill
 
-不要把 Makro 邮箱、密码写进代码或发到仓库。
+默认模型：`qwen3.7-max`。
+
+Web 只接收 Local 的 `MISSING` 字段。每个 Web batch 同时看到：
+
+- exact `source_product_url`；
+- 原始 primary supplier evidence；
+- Local `READY / CONFLICT` 商品指纹；
+- 当前待补字段。
+
+Web prompt 明确规定：只有同一个通用型号名不构成同款证据；其他 URL 必须与当前原始商品证据中的多个具体锚点一致，否则返回 `MISSING`。Python 不替 AI 做“是不是同款”的语义判断，只检查引用 URL 是否确实来自本次 Web search sources。
+
+没有后续 Final Resolve。
+
+## Makro SKU / Business fields
+
+`app/business_fields.py` 根据 exact product URL 生成稳定 12 位数字 SKU；query/tracking 参数变化不改变结果。
+
+SKU 不进入商品搜索或 AI 身份判断。
+
+价格、库存、MOQ、Fulfilment、Shipping SLA、Listing Status 等其他经营字段只能来自明确 seller data；缺失保持 blocked，AI/Web 不猜。
+
+## Thin Hard Guards
+
+Python 仅保留机械执行边界：
+
+- live schema / source strict rebind；
+- citation source address provenance；
+- seller business lock；
+- single/multi-value shape；
+- Makro option / qualifier 控件；
+- GTIN、numeric min/max、maxlength；
+- Selling Price <= Base Price/MRP、MinOQ <= MaxOQ；
+- DOM 唯一定位、React readback；
+- Save/reopen persistence；
+- Product Photos persistence；
+- 禁止 Send to QC。
+
+Python 不判断 cabin/rear、manual/UI language、包装/机身尺寸、商品同款、功能缺失等商品语义。
+
+## 只读验收顺序
+
+每轮真实商品验收先重新扫描当前 Makro live schema：
 
 ```powershell
-python makro_probe.py --keep-open --scan-sections
+python makro_plan_listing.py `
+  --scan-live-schema `
+  --expected-vertical vehicle_camera_system
 ```
 
-流程：
-
-1. 程序复用 `browser_profiles/makro-edge/`；登录仍有效则直接使用，失效时手动登录一次；
-2. 从 Makro UI 正常进入 `Add a Single Listing`；
-3. 回终端按 Enter；
-4. 程序展开并扫描当前页面所有 listing section；
-5. `--keep-open` 可在同一个 Edge 会话里继续扫描下一商品/类目。
-
-### Probe 采集能力
-
-- 识别 `input` / `textarea` / `select` / combobox / dropdown / checkbox / radio / autocomplete；
-- 遍历页面与内部滚动容器，等待懒加载；
-- 从 Makro `.styles__AttributeItemLabelName...` 提取真实 label；
-- 从 `sup.mandatory-star__MandatoryStarContainer` 判断 required；
-- 采集下拉 options、section/subsection、context、稳定 selector 候选；
-- 统一展开 Price/Stock、Product Description、Additional Description、Product Photos 等带 EDIT 的 section；
-- Semantic Field Grouping：优先稳定 id，其次去除 name 中 `_0_value` / `_1_value` / qualifier 索引，把多值控件还原成一个真实属性；
-- 不记录认证数据，不上传图片，不点击 Save / Send to QC。
-
-### Probe 输出
-
-```text
-logs/makro-probe/
-├─ makro-fields-时间.json
-├─ makro-page-时间.png
-└─ makro-dom-时间.html
-```
-
-真实探测产物与 browser profile 都已经被 `.gitignore` 排除。
-
-## Answer Resolver
-
-Resolver 的输入不是固定类目模板，而是**当前页面实时得到的 semantic fields**。
-
-每个解析结果包含：
-
-```text
-attribute_key
-label
-status: resolved / needs_review / missing / conflict
-answer / answer_values
-qualifier
-source_type / source_reference
-evidence / confidence
-option_match
-detail
-```
-
-当前来源规则：
-
-1. 标准商品表里的明确结构化值；
-2. 客户 Question/Answer 文件里的明确答案；
-3. 后续可以接入图片识别、知识库、供应商/官方页面提取器；
-4. LLM 只能在已有证据基础上归纳，不能凭常识生成产品参数。
-
-来源冲突不自动裁决；下拉框只做规范化后的唯一精确匹配，不做危险的模糊猜测。
-
-### 标准商品表
+然后只给商品链接运行 cold Resolver：
 
 ```powershell
-python makro_fill.py --product private_data/products.xlsx --sku ABC123 --dry-run
+python makro_resolve_ai.py `
+  --provider openai-compatible `
+  --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 `
+  --model qwen3.7-plus `
+  --web-search-model qwen3.7-max `
+  --api-key-env DASHSCOPE_API_KEY `
+  --live-schema <live-schema.json> `
+  --product-url <1688-or-supplier-product-url> `
+  --disable-thinking `
+  --web-enrich auto
 ```
 
-标准商品表要求存在 SKU 列，每一行代表一个商品，其他表头直接作为证据字段。
+立即用完全相同命令运行 hot Resolver。正常情况下 `source_capture.source_cache_hit=true`，成功缓存的 Local/Web batches 不应再次调用模型。
 
-### 客户 Question/Answer 文件
+主要输出：
 
-支持类似：
+- `primary-source/source-snapshot.json`
+- `primary-source/source-page.png`
+- `primary-source/product-images/*`
+- `ai-decisions.local.json`
+- `search-requests.json`
+- `web-evidence.json`
+- `web-search-sources.json`
+- `ai-decisions.json`
+- `source-manifest.json`
+- `run-manifest.json`
 
-```text
-Question | Explanation | Answer
-Model Number | ... | L11
-Ports | ... | USB-C
-Colour | ... | Black
-```
+最终只读 Fill Plan 必须使用 Resolver 的**同一套 source bytes** strict rebind：同一 snapshot、full-page screenshot，以及 `run-manifest.json` 中列出的每一张 `primary_source_product_images`（通过重复 `--image` 传入）。
 
-运行：
+只有 read-only acceptance 通过后才进入 `makro_execute_listing.py`。真实执行同样必须 strict rebind 完整 source set；永不自动 `Send to QC`。
 
-```powershell
-python makro_fill.py --product private_data/product-qa.xlsx --source-format qa --dry-run
-```
+## 关键文件
 
-也支持中文 `问题/属性/字段 + 答案/值` 等常见表头。
+- `app/source_capture.py`：supplier page 采集、页面大图下载、短期 source byte cache
+- `app/source_snapshot.py`：原始页面结构化 snapshot
+- `app/semantic_grounding.py`：保持结构的原始 evidence / citation manifest
+- `app/field_mapping.py`：原始 evidence → Local Fill
+- `app/web_enrichment.py`：primary evidence 绑定的 MISSING-only Web Fill
+- `app/ai_decisions.py`：结构/来源地址校验，不做商品语义复核
+- `app/business_fields.py`：seller business policy + generated SKU
+- `app/fill_plan.py`：decisions → executable plan
+- `makro_resolve_ai.py`：单商品链接 Resolver
+- `makro_plan_listing.py`：live schema / read-only Fill Plan
+- `makro_execute_listing.py`：生产 browser persistence runner
 
-## 真实 Makro Dry-Run Fill
+## 验收门槛
 
-```powershell
-python makro_fill.py --product private_data/product-qa.xlsx --source-format qa --dry-run
-```
+代码修改至少要求 GitHub Actions 的 unit tests、mock-e2e、browser automation dry-run、browser probe 全部通过。
 
-或标准商品表：
+真实商品固定顺序：
 
-```powershell
-python makro_fill.py --product private_data/products.xlsx --sku ABC123 --dry-run
-```
+**fresh live schema → cold Resolver → hot Resolver → read-only Fill Plan**
 
-程序会：
-
-1. 打开/复用自动化 Edge；
-2. 让用户进入真实 Add a Single Listing；
-3. 动态扫描当前所有 semantic fields；
-4. 从 `ProductSourceBundle` 解析全部字段；
-5. 找到一个存在 `resolved` 答案的 section；
-6. 只填写该 section 的可靠答案；
-7. 每个字段立即 readback；
-8. 停在 Save 前供人工检查；
-9. 写入 `logs/makro-fill/makro-fill-*.json`；
-10. **绝不点击 Save / Send to QC**。
-
-可以用 `--section "Product Description"` 指定本次要测试的 section。
-
-`--image`、`--product-url`、`--supplemental-text` 已进入统一 source bundle 接口，但当前版本不会自动从它们推断参数；图片识别/网页证据提取会作为下一层 provider 接入，避免在证据提取器尚未验证前偷偷猜值。
-
-## 测试
-
-```powershell
-pytest -q
-pytest -q -m probe
-```
-
-GitHub Actions：`tests` job 跑全部单元测试；`mock-e2e` job 跑原有 mock browser dry-run 并执行 probe 浏览器测试。
-
-## 安全原则
-
-项目默认采取“宁可漏填，不要错填”的策略：
-
-- 不保存账号密码；
-- 不绕过验证码或平台风控；
-- 不把客户资料、Cookie、Token 提交 GitHub；
-- 未验证字段不提交；
-- 来源冲突进入人工复核；
-- 下拉选项无法唯一精确匹配时不自动选择；
-- 经营字段禁止 AI 猜测；
-- 当前真实 Makro 仍只有 probe / no-save dry-run；
-- `makro_fill.py` 代码路径中没有 Save / Send to QC 动作。
-
-正式放入客户资料前，建议将仓库改为 **Private**。
+在 read-only 结果通过前，不真实写 Makro。

@@ -1,0 +1,631 @@
+"""Language-tolerant Makro Step 1/2 portal adapter.
+
+This module is deliberately narrow: it recognizes the current Add Listing stage,
+locates the small set of pre-Step-3 controls, reads live candidate labels and
+performs exact UI clicks. Product semantics stay in ``listing_creation`` and
+Step 3 field execution stays in the existing domain/executor layers.
+
+Recognition order is structural first (route/query + form shape), then stable
+control attributes, then localized text as a conservative fallback. Display
+language is therefore not a workflow invariant.
+"""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from enum import Enum
+from typing import Any
+from urllib.parse import urlparse
+
+from playwright.sync_api import Page
+
+from .listing import parse_makro_listing_url
+from .ui_transition import PostconditionAction
+
+
+class ListingStage(str, Enum):
+    VERTICAL = "step1"
+    BRAND = "step2"
+    PRODUCT_INFO = "step3"
+    UNKNOWN = "unknown"
+
+
+_VERTICAL_TOKENS = (
+    "vertical",
+    "category",
+    "categories",
+    "垂直",
+    "类别",
+    "分类",
+    "类目",
+    "品类",
+)
+_BRAND_TOKENS = ("brand", "品牌")
+_PRODUCT_INFO_MARKERS = (
+    "add product info",
+    "please fill all mandatory attributes",
+    "product photos",
+    "price stock and shipping information",
+    "product description",
+    "additional description",
+    "添加产品信息",
+    "请填写所有必填属性",
+    "产品照片",
+    "价格 库存和配送信息",
+    "产品描述",
+    "附加描述",
+)
+_ACTION_TOKENS: dict[str, tuple[str, ...]] = {
+    "check_brand": (
+        "check brand",
+        "brand check",
+        "检查品牌",
+        "核验品牌",
+        "查看品牌",
+    ),
+    "select_brand": (
+        "select brand",
+        "choose brand",
+        "选择品牌",
+        "选取品牌",
+    ),
+    "confirm_brand": (
+        "confirm brand",
+        "use brand",
+        "select brand",
+        "确认品牌",
+        "使用品牌",
+        "选择品牌",
+    ),
+    "create_listing": (
+        "create new listing",
+        "create listing",
+        "new listing",
+        "创建新商品",
+        "创建新上架",
+        "创建新刊登",
+        "新建商品",
+        "新建刊登",
+    ),
+}
+
+
+def normalize_ui_text(value: object) -> str:
+    """Unicode-safe normalization for labels shown by the portal.
+
+    Unlike the old ASCII-only normalizer, this preserves letters/numbers from
+    every script, so Chinese or browser-translated labels do not disappear.
+    """
+
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    chars = [ch if (ch.isalnum() or ch.isspace()) else " " for ch in text]
+    return re.sub(r"\s+", " ", "".join(chars)).strip()
+
+
+def _first_visible(locator):
+    try:
+        count = locator.count()
+    except Exception:
+        return None
+    for index in range(count):
+        item = locator.nth(index)
+        try:
+            if item.is_visible():
+                return item
+        except Exception:
+            continue
+    return None
+
+
+def _visible_items(locator, *, editable: bool = False) -> list[Any]:
+    output: list[Any] = []
+    try:
+        count = locator.count()
+    except Exception:
+        return output
+    for index in range(count):
+        item = locator.nth(index)
+        try:
+            if not item.is_visible():
+                continue
+            if editable and not item.is_editable():
+                continue
+            output.append(item)
+        except Exception:
+            continue
+    return output
+
+
+def _attribute_blob(locator) -> str:
+    values: list[str] = []
+    for name in (
+        "placeholder",
+        "name",
+        "id",
+        "aria-label",
+        "title",
+        "data-testid",
+        "data-test",
+        "data-action",
+        "class",
+    ):
+        try:
+            value = locator.get_attribute(name)
+        except Exception:
+            value = None
+        if value:
+            values.append(str(value))
+    try:
+        text = locator.inner_text(timeout=500)
+    except Exception:
+        text = ""
+    if text:
+        values.append(text)
+    return normalize_ui_text(" ".join(values))
+
+
+def _contains_any(value: str, tokens: tuple[str, ...]) -> bool:
+    normalized = normalize_ui_text(value)
+    return any(normalize_ui_text(token) in normalized for token in tokens)
+
+
+class MakroPortalAdapter:
+    """Small, conservative adapter for Makro pre-Step-3 portal mechanics."""
+
+    def __init__(self, page: Page) -> None:
+        self.page = page
+
+    def body_text(self) -> str:
+        try:
+            return self.page.locator("body").inner_text(timeout=3000)
+        except Exception:
+            return ""
+
+    def target(self):
+        try:
+            return parse_makro_listing_url(self.page.url)
+        except (ValueError, AttributeError):
+            return None
+
+    def _is_makro_host(self) -> bool:
+        try:
+            return urlparse(str(getattr(self.page, "url", "") or "")).hostname == "seller.makro.co.za"
+        except ValueError:
+            return False
+
+    def _has_password(self) -> bool:
+        try:
+            return _first_visible(self.page.locator('input[type="password"]')) is not None
+        except Exception:
+            return False
+
+    def _text_inputs(self) -> list[Any]:
+        selector = (
+            'input:not([type]), input[type="text"], input[type="search"], '
+            'textarea'
+        )
+        return _visible_items(self.page.locator(selector), editable=True)
+
+    def _form_control_count(self) -> int:
+        try:
+            value = self.page.evaluate(
+                r"""() => {
+                  const visible = (el) => {
+                    const style = getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden'
+                      && rect.width > 2 && rect.height > 2;
+                  };
+                  const selector = [
+                    'input:not([type="hidden"]):not([type="password"])',
+                    'textarea', 'select', '[role="combobox"]', '[contenteditable="true"]'
+                  ].join(',');
+                  return [...document.querySelectorAll(selector)].filter(visible).length;
+                }"""
+            )
+            return int(value or 0)
+        except Exception:
+            return 0
+
+    def _product_info_structure_visible(self) -> bool:
+        """Recognize the collapsed Step 3 shell before any section is opened.
+
+        Step 3 initially renders mostly section summaries and EDIT actions, so a
+        visible-input-count gate is not reliable immediately after Create New
+        Listing. Read the rendered shell directly and require multiple stable
+        Step 3 section markers. This check is host-bound and read-only.
+        """
+
+        if not self._is_makro_host():
+            return False
+        try:
+            raw = self.page.evaluate(
+                r"""() => {
+                  const visible = (el) => {
+                    const s = getComputedStyle(el), r = el.getBoundingClientRect();
+                    return s.display !== 'none' && s.visibility !== 'hidden'
+                      && Number(s.opacity || 1) !== 0 && r.width > 2 && r.height > 2;
+                  };
+                  const body = document.body;
+                  const text = body ? (body.innerText || body.textContent || '') : '';
+                  let editActions = 0;
+                  for (const el of document.querySelectorAll('button,a,[role="button"]')) {
+                    if (!visible(el)) continue;
+                    const value = String(el.innerText || el.textContent || '').trim().toLocaleLowerCase();
+                    if (value === 'edit' || value === '编辑') editActions += 1;
+                  }
+                  return {text, editActions};
+                }"""
+            )
+        except Exception:
+            return False
+        if not isinstance(raw, dict):
+            return False
+        text = normalize_ui_text(raw.get("text") or "")
+        marker_hits = sum(
+            normalize_ui_text(marker) in text
+            for marker in _PRODUCT_INFO_MARKERS
+        )
+        if marker_hits >= 2:
+            return True
+        try:
+            edit_actions = int(raw.get("editActions") or 0)
+        except (TypeError, ValueError):
+            edit_actions = 0
+        mandatory = any(
+            normalize_ui_text(marker) in text
+            for marker in (
+                "please fill all mandatory attributes",
+                "preview title",
+                "请填写所有必填属性",
+                "预览标题",
+            )
+        )
+        return edit_actions >= 2 and mandatory
+
+    def _text_stage_fallback(self) -> ListingStage:
+        text = normalize_ui_text(self.body_text())
+        vertical_markers = (
+            "select the vertical for your product",
+            "browse verticals",
+            "选择待产品的垂直领域",
+            "浏览垂直栏目",
+            "进入垂直类别",
+        )
+        brand_markers = (
+            "check for the brand you want to sell",
+            "enter brand name",
+            "检查您要销售的品牌",
+            "输入品牌名称",
+        )
+        if sum(normalize_ui_text(marker) in text for marker in _PRODUCT_INFO_MARKERS) >= 2:
+            return ListingStage.PRODUCT_INFO
+        if any(normalize_ui_text(marker) in text for marker in brand_markers):
+            return ListingStage.BRAND
+        if any(normalize_ui_text(marker) in text for marker in vertical_markers):
+            return ListingStage.VERTICAL
+        return ListingStage.UNKNOWN
+
+    def detect_stage(self) -> ListingStage:
+        """Detect Step 1/2/3 without making display language the primary signal."""
+
+        if self._has_password():
+            return ListingStage.UNKNOWN
+
+        if self._product_info_structure_visible():
+            return ListingStage.PRODUCT_INFO
+
+        target = self.target()
+        if target is None:
+            return ListingStage.UNKNOWN
+
+        controls = self._form_control_count()
+        inputs = self._text_inputs()
+        vertical = str(target.vertical or "").strip()
+        brand = str(target.brand or "").strip()
+
+        if (target.request_id or target.vid or (vertical and brand)) and controls >= 5:
+            return ListingStage.PRODUCT_INFO
+
+        fallback = self._text_stage_fallback()
+
+        if not vertical and inputs:
+            return ListingStage.VERTICAL
+
+        if vertical and not brand and inputs:
+            blobs = [_attribute_blob(item) for item in inputs]
+            if any(_contains_any(blob, _VERTICAL_TOKENS) for blob in blobs):
+                return ListingStage.VERTICAL
+            if any(_contains_any(blob, _BRAND_TOKENS) for blob in blobs):
+                return ListingStage.BRAND
+            if fallback in {ListingStage.VERTICAL, ListingStage.BRAND}:
+                return fallback
+            return ListingStage.BRAND
+
+        if fallback is not ListingStage.UNKNOWN:
+            return fallback
+        return ListingStage.UNKNOWN
+
+    def find_search_input(self, kind: str):
+        """Find the Step 1/2 search box using stable attributes, then form shape."""
+
+        if kind not in {"vertical", "brand"}:
+            raise ValueError(f"unsupported Makro search input kind={kind!r}")
+        tokens = _VERTICAL_TOKENS if kind == "vertical" else _BRAND_TOKENS
+        inputs = self._text_inputs()
+        if not inputs:
+            raise RuntimeError(f"Makro {kind} search input not found")
+
+        scored: list[tuple[int, Any]] = []
+        for item in inputs:
+            blob = _attribute_blob(item)
+            score = 0
+            if any(normalize_ui_text(token) in blob for token in tokens):
+                score += 100
+            try:
+                if item.evaluate(
+                    "(el) => !!el.closest('main,[role=main],[class*=listing i],[class*=content i]')"
+                ):
+                    score += 10
+            except Exception:
+                pass
+            scored.append((score, item))
+
+        best = max(score for score, _ in scored)
+        winners = [item for score, item in scored if score == best]
+        if best > 0 and len(winners) == 1:
+            return winners[0]
+        if len(inputs) == 1:
+            return inputs[0]
+
+        in_main: list[Any] = []
+        for item in inputs:
+            try:
+                if item.evaluate("(el) => !!el.closest('main,[role=main]')"):
+                    in_main.append(item)
+            except Exception:
+                continue
+        if len(in_main) == 1:
+            return in_main[0]
+        raise RuntimeError(
+            f"Makro {kind} search input is ambiguous: {len(inputs)} editable text controls are visible"
+        )
+
+    def _button_candidates(self, root=None) -> list[Any]:
+        scope = root if root is not None else self.page
+        try:
+            locator = scope.locator('button, [role="button"]')
+        except Exception:
+            return []
+        output: list[Any] = []
+        for item in _visible_items(locator):
+            try:
+                if not item.is_enabled():
+                    continue
+            except Exception:
+                pass
+            output.append(item)
+        return output
+
+    def _nearby_buttons(self, related_input) -> list[Any]:
+        if related_input is None:
+            return []
+        xpaths = (
+            "xpath=ancestor::form[1]",
+            "xpath=ancestor::*[@role='dialog'][1]",
+            "xpath=ancestor::section[1]",
+            "xpath=ancestor::div[1]",
+        )
+        for xpath in xpaths:
+            try:
+                scope = related_input.locator(xpath)
+                if scope.count() < 1:
+                    continue
+                buttons = self._button_candidates(scope.first)
+                if buttons:
+                    return buttons
+            except Exception:
+                continue
+        return []
+
+    def _exact_text_action_candidates(self, tokens: tuple[str, ...]) -> list[Any]:
+        """Resolve exact visible action text to its real clickable DOM owner.
+
+        Some Makro builds style primary actions as ordinary ``div``/``span``
+        nodes rather than semantic ``button`` elements. We therefore bind the
+        exact localized action label first and then walk only that node's own
+        ancestor chain for a genuine clickable owner. Unrelated global buttons
+        (tour close buttons, floating HUD controls, etc.) are never candidates.
+        """
+
+        output: list[Any] = []
+        seen: set[str] = set()
+        for token in tokens:
+            pattern = re.compile(r"^\s*" + re.escape(str(token)) + r"\s*$", re.IGNORECASE)
+            try:
+                text_nodes = _visible_items(self.page.get_by_text(pattern, exact=True))
+            except Exception:
+                text_nodes = []
+            for node in text_nodes:
+                current = node
+                chosen = None
+                for _ in range(6):
+                    try:
+                        actionable = bool(
+                            current.evaluate(
+                                r"""el => {
+                                  const tag = String(el.tagName || '').toUpperCase();
+                                  const role = String(el.getAttribute && el.getAttribute('role') || '').toLowerCase();
+                                  const style = getComputedStyle(el);
+                                  const disabled = !!el.disabled || el.getAttribute?.('aria-disabled') === 'true';
+                                  return !disabled && (
+                                    tag === 'BUTTON' || tag === 'A' || role === 'button' ||
+                                    typeof el.onclick === 'function' || style.cursor === 'pointer'
+                                  );
+                                }"""
+                            )
+                        )
+                    except Exception:
+                        actionable = False
+                    if actionable:
+                        chosen = current
+                        break
+                    try:
+                        parent = current.locator("xpath=..")
+                        if parent.count() != 1:
+                            break
+                        current = parent
+                    except Exception:
+                        break
+                if chosen is None:
+                    continue
+                try:
+                    key = str(chosen.evaluate("el => el.outerHTML"))
+                except Exception:
+                    key = str(id(chosen))
+                if key in seen:
+                    continue
+                seen.add(key)
+                output.append(chosen)
+        return output
+
+    def find_action_button(self, action: str, *, related_input=None):
+        """Find one semantic action and return a postcondition-owned trigger.
+
+        The caller already owns the business transition check (Step 2 appears,
+        Step 3 appears, brand confirmation appears, etc.).  The returned facade
+        therefore treats a Playwright timeout as an indeterminate trigger result
+        and lets the caller's postcondition decide success.  Non-timeout click
+        failures are never swallowed.
+        """
+
+        tokens = _ACTION_TOKENS.get(action)
+        if tokens is None:
+            raise ValueError(f"unsupported Makro action={action!r}")
+
+        buttons = self._button_candidates()
+        scored: list[tuple[int, Any]] = []
+        for item in buttons:
+            blob = _attribute_blob(item)
+            score = 0
+            for token in tokens:
+                normalized = normalize_ui_text(token)
+                if blob == normalized:
+                    score = max(score, 200)
+                elif normalized and normalized in blob:
+                    score = max(score, 100)
+            if score:
+                scored.append((score, item))
+        if scored:
+            best = max(score for score, _ in scored)
+            winners = [item for score, item in scored if score == best]
+            if len(winners) == 1:
+                return PostconditionAction(winners[0])
+
+        text_actions = self._exact_text_action_candidates(tokens)
+        if len(text_actions) == 1:
+            return PostconditionAction(text_actions[0])
+        if len(text_actions) > 1:
+            return None
+
+        nearby = self._nearby_buttons(related_input)
+        if related_input is not None and len(nearby) == 1:
+            return PostconditionAction(nearby[0])
+
+        return None
+
+    def visible_text_candidates(self, *, limit: int = 160) -> list[str]:
+        raw = self.page.evaluate(
+            r"""(limit) => {
+              const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+              const visible = (el) => {
+                const style = getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden'
+                  && rect.width > 2 && rect.height > 2;
+              };
+              const out = [];
+              const seen = new Set();
+              for (const el of document.querySelectorAll('body *')) {
+                if (out.length >= limit) break;
+                if (!visible(el)) continue;
+                const text = clean(el.innerText || el.textContent || '');
+                if (!text || text.length < 2 || text.length > 90 || text.includes('\\n')) continue;
+                let sameChild = false;
+                for (const child of el.children || []) {
+                  if (clean(child.innerText || child.textContent || '') === text) {
+                    sameChild = true;
+                    break;
+                  }
+                }
+                if (sameChild) continue;
+                const key = text.toLocaleLowerCase();
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push(text);
+              }
+              return out;
+            }""",
+            int(limit),
+        )
+        return [re.sub(r"\s+", " ", str(item or "")).strip() for item in raw or [] if str(item or "").strip()]
+
+    def click_exact_visible_text(self, text: str) -> bool:
+        try:
+            item = _first_visible(self.page.get_by_text(text, exact=True))
+        except Exception:
+            item = None
+        if item is not None:
+            try:
+                item.click(timeout=5000)
+                return True
+            except Exception:
+                pass
+        try:
+            return bool(
+                self.page.evaluate(
+                    r"""(wanted) => {
+                      const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+                      const visible = (el) => {
+                        const s = getComputedStyle(el), r = el.getBoundingClientRect();
+                        return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 2 && r.height > 2;
+                      };
+                      for (const el of document.querySelectorAll('body *')) {
+                        if (!visible(el) || clean(el.innerText || el.textContent || '') !== wanted) continue;
+                        let target = el;
+                        for (let i = 0; i < 5 && target; i++, target = target.parentElement) {
+                          const role = target.getAttribute && target.getAttribute('role');
+                          const style = target instanceof Element ? getComputedStyle(target) : null;
+                          if (target.tagName === 'BUTTON' || target.tagName === 'A' || role === 'button'
+                              || target.onclick || (style && style.cursor === 'pointer')) {
+                            target.click();
+                            return true;
+                          }
+                        }
+                        el.click();
+                        return true;
+                      }
+                      return false;
+                    }""",
+                    text,
+                )
+            )
+        except Exception:
+            return False
+
+    def diagnostics(self) -> dict[str, Any]:
+        target = self.target()
+        return {
+            "stage": self.detect_stage().value,
+            "url": str(getattr(self.page, "url", "") or ""),
+            "vertical": str(getattr(target, "vertical", "") or "") if target else "",
+            "brand": str(getattr(target, "brand", "") or "") if target else "",
+            "request_id": str(getattr(target, "request_id", "") or "") if target else "",
+            "vid": str(getattr(target, "vid", "") or "") if target else "",
+            "editable_text_inputs": len(self._text_inputs()),
+            "form_controls": self._form_control_count(),
+        }
+
+
+__all__ = ["ListingStage", "MakroPortalAdapter", "normalize_ui_text"]

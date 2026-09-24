@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+.release-venv/
 
 # IDE / OS
 .vscode/
@@ -18,8 +19,9 @@ Thumbs.db
 storage_state*.json
 *.cookie.json
 
-# Local authenticated browser state
+# Local authenticated browser/channel state
 browser_profiles/
+/channel_accounts/
 .auth/
 
 # Customer/private source material
@@ -27,12 +29,19 @@ private_data/
 *.rar
 *.zip
 
-# Runtime output
-logs/*.jsonl
-logs/*.log
-logs/makro-probe/
-logs/makro-fill/
+# Runtime output may contain customer evidence, source manifests, screenshots,
+# resolver packets, semantic cache entries, local paths or listing state.
+# Keep none of it in git; only retain the empty directory marker.
+logs/*
 !logs/.gitkeep
+
+# Agent Harness runtime state contains user prompts, tool observations, workspace
+# files and durable session/event snapshots. It is always local runtime data.
+/agent_runtime/
+/agent_workspace/
+
+# Local performance benchmark output
+/perf_results/
 
 # Generated local spreadsheets
 # Keep the CSV fixture in git; generated Excel files stay local.
@@ -41,3 +50,17 @@ data/*.xlsx
 # Playwright
 playwright-report/
 test-results/
+
+# Windows packaging output
+/build/
+/dist/
+/artifacts/
+/packaging/app_icon.ico
+# PyInstaller auto-generates a root spec when packaging the E2E parent probe
+/EcommerceAgent.spec
+
+# Native Sakana helper build output. Source assets and the vendored WebView2
+# compile-time SDK remain tracked; generated binaries are produced by MSBuild.
+/native/sakana-helper/bin/
+/native/sakana-helper/obj-native/
+/native/sakana-helper/obj-managed-stale/

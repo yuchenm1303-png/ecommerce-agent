@@ -1,88 +1,43 @@
+"""Guarded first adapter for Makro Marketplace.
+
+The real-platform milestone is DOM discovery and dry-run filling. Final
+save/submission stays disabled until selectors and success signals have been
+captured from the authenticated site on the user's own computer.
+
+Makro-specific recognition/parsing lives in ``app.makro.listing``; this
+adapter only re-exports those helpers and keeps the legacy PlatformAdapter
+interface for the mock/runner flow.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import Page
 
+from app.makro.listing import (
+    MAKRO_HOST,
+    MAKRO_SINGLE_LISTING_ROUTE,
+    MakroListingTarget,
+    is_makro_listing_page,
+    parse_makro_listing_url,
+)
 from app.models import ProductRecord
 from app.platforms.base import PlatformAdapter
 
-
-MAKRO_HOST = "seller.makro.co.za"
-MAKRO_SINGLE_LISTING_ROUTE = "dashboard/addListings/single"
-
-
-@dataclass(frozen=True)
-class MakroListingTarget:
-    url: str
-    brand: str | None
-    vertical: str | None
-    request_id: str | None
-    vid: str | None
-
-
-def parse_makro_listing_url(url: str) -> MakroListingTarget:
-    """Validate and parse a Makro Marketplace single-listing hash URL.
-
-    Makro uses a hash-routed SPA. Parameters such as requestId can be short-lived,
-    so callers must not treat them as stable product identifiers.
-    """
-
-    parsed = urlparse(url.strip())
-    if parsed.scheme not in {"http", "https"}:
-        raise ValueError("Makro listing URL must use http/https")
-    if parsed.hostname != MAKRO_HOST:
-        raise ValueError(f"Expected host {MAKRO_HOST!r}, got {parsed.hostname!r}")
-
-    route, separator, query_string = parsed.fragment.partition("?")
-    if route.rstrip("/") != MAKRO_SINGLE_LISTING_ROUTE:
-        raise ValueError(
-            "URL is not a Makro Add a Single Listing page: "
-            f"expected #{MAKRO_SINGLE_LISTING_ROUTE}"
-        )
-
-    params = parse_qs(query_string if separator else "", keep_blank_values=True)
-
-    def first(name: str) -> str | None:
-        values = params.get(name)
-        return values[0] if values else None
-
-    return MakroListingTarget(
-        url=url.strip(),
-        brand=first("brand"),
-        vertical=first("vertical"),
-        request_id=first("requestId"),
-        vid=first("vid"),
-    )
-
-
-def is_makro_listing_page(page: Page) -> bool:
-    """Return True only when the authenticated single-listing UI is visible."""
-
-    parsed = urlparse(page.url)
-    if parsed.hostname != MAKRO_HOST:
-        return False
-
-    # Never probe or fill a login form.
-    if page.locator('input[type="password"]').count() > 0:
-        return False
-
-    markers = (
-        "Add a Single Listing",
-        "ADD PRODUCT INFO",
-        "Please fill all mandatory attributes",
-    )
-    return any(page.get_by_text(marker, exact=False).count() > 0 for marker in markers)
+# Legacy names kept importable from here (see tests/test_makro.py).
+__all__ = [
+    "MAKRO_HOST",
+    "MAKRO_SINGLE_LISTING_ROUTE",
+    "MakroListingTarget",
+    "is_makro_listing_page",
+    "parse_makro_listing_url",
+    "MakroPlatformAdapter",
+]
 
 
 class MakroPlatformAdapter(PlatformAdapter):
-    """Guarded first adapter for Makro Marketplace.
-
-    The first real-platform milestone is DOM discovery and dry-run filling. Final
-    save/submission stays disabled until selectors and success signals have been
-    captured from the authenticated site on the user's own computer.
-    """
+    """Guard adapter for Makro Marketplace (legacy interface)."""
 
     def __init__(self, listing_url: str) -> None:
         self.target = parse_makro_listing_url(listing_url)

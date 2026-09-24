@@ -1,0 +1,420 @@
+"""Makro listing section discovery, scanning and persistence primitives.
+
+This module owns the section lifecycle for every Step 3 card:
+
+- discover a card and normalize its title;
+- open only that card's EDIT control;
+- scan fields inside that card;
+- Cancel only that card when the caller explicitly wants to discard edits;
+- Save only that card and prove Makro accepted persistence by observing collapse
+  back to EDIT; residual validation badges are completion state, not persistence
+  failure, and are verified separately by the execution layer.
+
+It never clicks Send to QC and contains no product/category-specific field list.
+"""
+
+from __future__ import annotations
+
+import re
+import time
+from collections.abc import Callable
+from typing import Any
+
+from playwright.sync_api import Page
+
+from .fields import (
+    _JS_HELPERS,
+    build_semantic_fields,
+    capture_controls,
+    find_scroll_containers,
+    merge_scans,
+    scroll_container,
+    scroll_window,
+)
+from .ui_transition import trigger_transition
+
+_FIND_SECTIONS_SCRIPT = (
+    "() => {\n"
+    + _JS_HELPERS
+    + r"""
+  const cards = [];
+  document.querySelectorAll('[class*="styles__Card-"], [class*="Card-sc-"], [data-testid*="card" i]').forEach((card) => {
+    if (!isVisible(card)) return;
+    const titleEl = card.querySelector('[class*="styles__Title-"], [class*="Title-ef7o31"], [class*="Title-"]');
+    const title = titleEl ? clean(titleEl.innerText || titleEl.textContent) : "";
+    if (!title) return;
+    const buttons = Array.from(card.querySelectorAll("button"));
+    const links = Array.from(card.querySelectorAll("a"));
+    const editBtn = buttons.find((b) => clean(b.innerText).toUpperCase() === "EDIT");
+    const saveBtn = buttons.find((b) => clean(b.innerText).toUpperCase() === "SAVE");
+    const cancelEl = [...links, ...buttons].find((b) => clean(b.innerText).toUpperCase() === "CANCEL");
+    const hasFields = card.querySelectorAll('input, textarea, select, [role="combobox"], [contenteditable="true"]').length > 0;
+    const imageCount = card.querySelectorAll('img').length;
+    cards.push({
+      path: pathOf(card),
+      title,
+      expanded: !editBtn,
+      has_edit: Boolean(editBtn),
+      has_cancel: Boolean(cancelEl),
+      has_save: Boolean(saveBtn),
+      has_fields: hasFields,
+      image_count: imageCount,
+    });
+  });
+  return cards;
+"""
+    + "\n}"
+)
+
+
+def find_sections(page: Page) -> list[dict[str, Any]]:
+    """List all listing section cards with title and expanded state."""
+    return page.evaluate(_FIND_SECTIONS_SCRIPT)
+
+
+def _await_section_cards(
+    page: Page, *, wait_ms: int = 500, timeout_s: float = 30.0
+) -> list[dict[str, Any]]:
+    sections = find_sections(page)
+    deadline = time.monotonic() + timeout_s
+    while not sections and time.monotonic() < deadline:
+        page.wait_for_timeout(int(wait_ms))
+        sections = find_sections(page)
+    return sections
+
+
+def scan_section_fields(
+    page: Page,
+    section_path: str,
+    *,
+    include_values: bool = False,
+    wait_ms: int = 350,
+    max_scroll_steps: int = 200,
+) -> list[dict[str, Any]]:
+    """Scroll the window plus the section's own containers and scan its fields."""
+
+    scans: list[list[dict[str, Any]]] = [
+        capture_controls(page, include_values=include_values)
+    ]
+    for _ in range(max_scroll_steps):
+        state = scroll_window(page)
+        if not state.get("moved"):
+            break
+        page.wait_for_timeout(wait_ms)
+        scans.append(capture_controls(page, include_values=include_values))
+
+    for container in find_scroll_containers(page):
+        container_path = container.get("path", "")
+        if not container_path.startswith(section_path + " > "):
+            continue
+        for _ in range(max_scroll_steps):
+            state = scroll_container(page, container_path)
+            if not state.get("moved"):
+                break
+            page.wait_for_timeout(wait_ms)
+            scans.append(capture_controls(page, include_values=include_values))
+
+    merged = merge_scans(scans)
+    prefix = section_path + " > "
+    return [item for item in merged if item.get("path", "").startswith(prefix)]
+
+
+def _page_is_closed(page: Page) -> bool:
+    try:
+        return bool(page.is_closed())
+    except Exception:
+        return True
+
+
+def scan_sections(
+    page: Page,
+    *,
+    include_values: bool = False,
+    wait_ms: int = 350,
+    max_scroll_steps: int = 200,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Scan each Step 3 card as an independent read-only transaction.
+
+    A card-local render/EDIT/scan/cleanup failure is returned in ``section_failures``
+    so the caller can apply the business minimum (core card vs optional card).
+    Browser/page loss is never downgraded. This keeps discovery mechanical and
+    prevents one optional React card from erasing a valid schema from unrelated
+    cards while preserving fail-closed ownership semantics.
+    """
+
+    sections = _await_section_cards(page)
+    stats: dict[str, Any] = {
+        "sections_found": len(sections),
+        "sections_expanded_by_scan": 0,
+        "sections_cancelled": 0,
+        "section_failures": [],
+    }
+    section_results: list[dict[str, Any]] = []
+    flat_scans: list[list[dict[str, Any]]] = []
+
+    for section in sections:
+        title = str(section.get("title") or "")
+        was_collapsed = False
+        opened_by_scan = False
+        try:
+            current_section = find_section(page, title) or section
+            section_path = str(current_section.get("path") or "")
+            if not section_path:
+                raise RuntimeError("section has no stable DOM path")
+
+            was_collapsed = bool(current_section.get("has_edit"))
+            expanded = not was_collapsed
+            if was_collapsed:
+                open_section_for_edit(page, current_section)
+                opened_by_scan = True
+                stats["sections_expanded_by_scan"] += 1
+                expanded = True
+
+            ready_section = _wait_for_section_fields(
+                page, title, wait_ms=wait_ms, timeout_s=10.0
+            )
+            current_section = ready_section or find_section(page, title) or current_section
+            section_path = str(current_section.get("path") or "")
+            if not section_path:
+                raise RuntimeError("expanded section lost its stable DOM path")
+            if ready_section is None and bool(current_section.get("has_fields")) is False:
+                raise RuntimeError("section fields did not become ready within the render window")
+
+            controls = scan_section_fields(
+                page,
+                section_path,
+                include_values=include_values,
+                wait_ms=wait_ms,
+                max_scroll_steps=max_scroll_steps,
+            )
+            for item in controls:
+                if not item.get("section_heading"):
+                    item["section_heading"] = title
+
+            semantic_fields = build_semantic_fields(controls)
+            section_results.append(
+                {
+                    "title": title,
+                    "expanded": expanded,
+                    "image_count": section.get("image_count"),
+                    "field_count": sum(
+                        1 for item in controls if item.get("field_kind") != "option"
+                    ),
+                    "semantic_field_count": len(semantic_fields),
+                    "semantic_fields": semantic_fields,
+                    "controls": controls,
+                }
+            )
+            flat_scans.append(controls)
+        except Exception as exc:
+            if _page_is_closed(page):
+                raise
+            stats["section_failures"].append(
+                {
+                    "section": title,
+                    "stage": "scan",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+        finally:
+            if opened_by_scan and not _page_is_closed(page):
+                try:
+                    current = find_section(page, title)
+                    if current is not None and not current.get("has_edit"):
+                        cancel_section(page, title, wait_ms=wait_ms)
+                        stats["sections_cancelled"] += 1
+                except Exception as cleanup_exc:
+                    stats["section_failures"].append(
+                        {
+                            "section": title,
+                            "stage": "cleanup",
+                            "error_type": type(cleanup_exc).__name__,
+                            "error": str(cleanup_exc),
+                        }
+                    )
+
+    flat_controls = merge_scans(flat_scans)
+    return section_results, flat_controls, stats
+
+
+def _wait_for_section_fields(
+    page: Page, section_title: str, *, wait_ms: int, timeout_s: float
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        section = find_section(page, section_title)
+        if section and section.get("has_fields"):
+            return section
+        page.wait_for_timeout(int(wait_ms))
+    return None
+
+
+def base_section_title(title: str) -> str:
+    normalized = re.sub(r"\s*\(\d+\s*/\s*\d+\)\s*$", "", title).strip()
+    normalized = re.sub(
+        r"\s*\(\s*optional\s*\)\s*$", "", normalized, flags=re.IGNORECASE
+    ).strip()
+    return normalized
+
+
+def find_section(page: Page, wanted: str) -> dict[str, Any] | None:
+    wanted_base = base_section_title(wanted).casefold()
+    for section in find_sections(page):
+        if base_section_title(str(section.get("title") or "")).casefold() == wanted_base:
+            return section
+    return None
+
+
+def _wait_for_section_state(
+    page: Page,
+    section_title: str,
+    predicate: Callable[[dict[str, Any]], bool],
+    *,
+    timeout_s: float = 5.0,
+    poll_ms: int = 150,
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + max(0.1, float(timeout_s))
+    latest: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        latest = find_section(page, section_title)
+        if latest is not None and predicate(latest):
+            return latest
+        page.wait_for_timeout(max(50, int(poll_ms)))
+    latest = find_section(page, section_title)
+    if latest is not None and predicate(latest):
+        return latest
+    return None
+
+
+def open_section_for_edit(page: Page, section: dict[str, Any]) -> None:
+    if not section.get("has_edit"):
+        return
+    title = str(section.get("title") or "").strip()
+    path = str(section.get("path") or "")
+    if not title:
+        raise RuntimeError("section 缺少 title，无法验证 EDIT 后置状态。")
+    if not path:
+        raise RuntimeError("section 缺少 DOM path，无法安全打开。")
+    card = page.locator(path).first
+    button = card.get_by_text("EDIT", exact=True).first
+    button.scroll_into_view_if_needed()
+    trigger = trigger_transition(lambda: button.click())
+    expanded = _wait_for_section_state(
+        page,
+        title,
+        lambda current: not bool(current.get("has_edit")),
+        timeout_s=5.0,
+    )
+    if expanded is None:
+        suffix = f"；click timeout={trigger.timeout_detail}" if trigger.timed_out else ""
+        raise RuntimeError(f"section {title!r} EDIT 后未进入展开态{suffix}")
+
+
+def visible_section_errors(page: Page, section_path: str) -> list[str]:
+    card = page.locator(section_path)
+    texts: list[str] = []
+    selectors = ".form-error, [role='alert'], [class*='FormError'], [class*='error' i]"
+    try:
+        for text in card.locator(selectors).all_inner_texts():
+            clean = re.sub(r"\s+", " ", text).strip()
+            if clean and clean not in texts:
+                texts.append(clean)
+    except Exception:
+        pass
+    return texts[:30]
+
+
+def collapsed_error_badges(page: Page, section_title: str) -> list[str]:
+    section = find_section(page, section_title)
+    if section is None or not section.get("path"):
+        return []
+    try:
+        text = page.locator(str(section["path"])).inner_text(timeout=3_000)
+    except Exception:
+        return []
+    return list(dict.fromkeys(re.findall(r"\b\d+\s+Errors?\b", text, flags=re.I)))
+
+
+def cancel_section(page: Page, section_title: str, *, wait_ms: int = 450) -> None:
+    section = find_section(page, section_title)
+    if section is None:
+        raise RuntimeError(f"Cancel 前找不到 section：{section_title}")
+    if section.get("has_edit") and not section.get("has_cancel"):
+        return
+    path = str(section.get("path") or "")
+    if not path:
+        raise RuntimeError(f"section {section_title!r} 缺少稳定 DOM path。")
+    card = page.locator(path)
+    cancel = card.get_by_text("Cancel", exact=True)
+    if cancel.count() != 1 or not cancel.first.is_visible():
+        raise RuntimeError(
+            f"section {section_title!r} 没有唯一可见 Cancel；拒绝猜测其它按钮。"
+        )
+    cancel.first.scroll_into_view_if_needed()
+    trigger = trigger_transition(lambda: cancel.first.click())
+    collapsed = _wait_for_section_state(
+        page,
+        section_title,
+        lambda current: bool(current.get("has_edit")),
+        timeout_s=max(5.0, max(0, int(wait_ms)) / 1000.0),
+    )
+    if collapsed is None:
+        suffix = f"；click timeout={trigger.timeout_detail}" if trigger.timed_out else ""
+        raise RuntimeError(f"section {section_title!r} Cancel 后未恢复折叠态{suffix}")
+
+
+def save_section(page: Page, section_title: str, *, timeout_s: float = 45.0) -> None:
+    """Trigger one Step 3 Save and prove the section crossed its persistence boundary.
+
+    Makro may collapse a saved card back to EDIT while still displaying a red
+    validation badge (for example 15/16 mandatory attributes). Collapse means the
+    section transaction was accepted and persisted; the badge describes listing
+    completeness and must not be reclassified as a failed Save. Field-level
+    verification and completion accounting happen after this primitive returns.
+    """
+
+    section = find_section(page, section_title)
+    if section is None:
+        raise RuntimeError(f"Save 前找不到 section：{section_title}")
+    if section.get("has_edit"):
+        raise RuntimeError(f"Save 前 section 已折叠：{section_title}")
+    path = str(section.get("path") or "")
+    if not path:
+        raise RuntimeError(f"Save 前 section 缺少 DOM path：{section_title}")
+
+    card = page.locator(path)
+    save = card.locator("button").filter(has_text=re.compile(r"^\s*Save\s*$", re.I))
+    if save.count() != 1 or not save.first.is_visible():
+        raise RuntimeError(f"{section_title} 没有唯一可见 Save 按钮。")
+    save.first.scroll_into_view_if_needed()
+    trigger = trigger_transition(lambda: save.first.click())
+
+    deadline = time.monotonic() + timeout_s
+    collapsed_samples = 0
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(250)
+        live = find_section(page, section_title)
+        if live is None or not live.get("has_edit"):
+            collapsed_samples = 0
+            continue
+
+        collapsed_samples += 1
+        if collapsed_samples >= 2:
+            return
+
+    live = find_section(page, section_title)
+    if live is not None and live.get("has_edit"):
+        return
+
+    live_path = str((live or {}).get("path") or path)
+    errors = visible_section_errors(page, live_path)
+    detail = " | ".join(errors) if errors else "未读取到可见 validation error"
+    trigger_detail = (
+        f"；Save click timeout={trigger.timeout_detail}"
+        if trigger.timed_out
+        else ""
+    )
+    raise RuntimeError(
+        f"{section_title} 点击 Save 后 {timeout_s:.0f}s 内未恢复 EDIT：{detail}{trigger_detail}"
+    )

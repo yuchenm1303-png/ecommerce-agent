@@ -1,0 +1,524 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
+from typing import Any, Iterable
+
+from .ai_decisions import (
+    CONFLICT,
+    MISSING,
+    READY as AI_READY,
+    REVIEW,
+    AIDecisionPacket,
+    FieldDecision,
+    field_id,
+    field_options,
+    field_qualifier_options,
+)
+from .business_fields import (
+    BUSINESS_ALLOWED_SOURCE_TYPES,
+    BUSINESS_ATTRIBUTE_ALIASES,
+    is_business_question,
+)
+from .hard_field_validators import validate_resolved_answer
+from .resolution_types import (
+    CONFLICT as RESOLVER_CONFLICT,
+    MISSING as RESOLVER_MISSING,
+    NEEDS_REVIEW,
+    RESOLVED,
+    ResolvedAnswer,
+    ResolutionRecord,
+)
+from .source_bundle import ProductSourceBundle, SourceEvidence, normalize_key
+
+
+READY = "ready"
+BLOCKED = "blocked"
+GATE_AI_REVIEW = "ai_review"
+GATE_AI_CONFLICT = "ai_conflict"
+GATE_AI_MISSING = "ai_missing"
+GATE_BUSINESS_LOCKED = "business_locked"
+GATE_HARD_FIELD_CONSTRAINT = "hard_field_constraint"
+GATE_CROSS_FIELD_RULE = "cross_field_business_rule"
+GATE_BUSINESS_CONFLICT = "business_conflict"
+
+
+@dataclass(slots=True)
+class LiveFillPlanItem:
+    attribute_key: str
+    label: str
+    section_heading: str
+    required: bool
+    action: str
+    reason: str
+    resolution: ResolutionRecord
+
+    @property
+    def question_number(self) -> str:
+        return ""
+
+    @property
+    def question(self) -> str:
+        return self.label
+
+    @property
+    def match_basis(self) -> str:
+        return "ai-field-id"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "attribute_key": self.attribute_key,
+            "label": self.label,
+            "section_heading": self.section_heading,
+            "required": self.required,
+            "action": self.action,
+            "reason": self.reason,
+            "resolution": self.resolution.as_dict(),
+        }
+
+
+@dataclass(slots=True)
+class LiveFillPlan:
+    items: list[LiveFillPlanItem]
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def ready_count(self) -> int:
+        return sum(item.action == READY for item in self.items)
+
+    @property
+    def blocked_count(self) -> int:
+        return sum(item.action == BLOCKED for item in self.items)
+
+    @property
+    def preview_eligible_count(self) -> int:
+        return sum(item.resolution.preview_eligible for item in self.items)
+
+    @property
+    def required_blocked_count(self) -> int:
+        return sum(item.required and item.action == BLOCKED for item in self.items)
+
+    @property
+    def required_ready_count(self) -> int:
+        return sum(item.required and item.action == READY for item in self.items)
+
+    @property
+    def required_preview_eligible_count(self) -> int:
+        return sum(item.required and item.resolution.preview_eligible for item in self.items)
+
+    def summary(self) -> dict[str, Any]:
+        gate_counts: dict[str, int] = {}
+        for item in self.items:
+            gate = item.resolution.gate_reason or "ready"
+            gate_counts[gate] = gate_counts.get(gate, 0) + 1
+        return {
+            "live_field_count": len(self.items),
+            "ready": self.ready_count,
+            "blocked": self.blocked_count,
+            "preview_eligible": self.preview_eligible_count,
+            "required_ready": self.required_ready_count,
+            "required_blocked": self.required_blocked_count,
+            "required_preview_eligible": self.required_preview_eligible_count,
+            "safe_to_autofill_required_fields": self.required_blocked_count == 0,
+            "gate_counts": gate_counts,
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "summary": self.summary(),
+            "items": [item.as_dict() for item in self.items],
+            "warnings": list(self.warnings),
+        }
+
+
+def _hard_guard_values(
+    live_field: dict[str, Any],
+    decision: FieldDecision,
+) -> tuple[list[str], str, str | None]:
+    """Compatibility helper that preserves semantic content exactly.
+
+    Product semantics have one owner: the Resolver.  This helper therefore never
+    rewrites values, qualifiers or units.  Mechanical compatibility is enforced
+    separately by the single live execution contract before a value becomes an
+    executable Fill Plan item.
+    """
+
+    del live_field
+    return list(decision.values), str(decision.qualifier or "").strip(), None
+
+
+def _provenance(decision: FieldDecision) -> list[dict[str, Any]]:
+    return [
+        {
+            "source_reference": citation.source_reference,
+            "evidence_text": citation.evidence_text,
+            "source_type": "grounded_source",
+            "confidence": decision.confidence,
+        }
+        for citation in decision.citations
+    ]
+
+
+def _record_base(live_field: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "attribute_key": str(live_field.get("attribute_key") or ""),
+        "label": str(live_field.get("label") or live_field.get("attribute_key") or ""),
+        "question_category": str(live_field.get("section_heading") or ""),
+        "question_unit": " | ".join(field_qualifier_options(live_field)),
+        "question_options": field_options(live_field),
+    }
+
+
+def _decision_record(live_field: dict[str, Any], decision: FieldDecision) -> ResolutionRecord:
+    """Map the AI status into execution state without changing AI content."""
+
+    values = list(decision.values)
+    qualifier = str(decision.qualifier or "").strip()
+    base = _record_base(live_field)
+    source_reference = decision.citations[0].source_reference if decision.citations else None
+    evidence = " | ".join(citation.evidence_text for citation in decision.citations)
+
+    if decision.status == AI_READY:
+        status = RESOLVED
+        eligible = True
+        preview = False
+        gate = ""
+    elif decision.status == REVIEW:
+        status = NEEDS_REVIEW
+        eligible = False
+        preview = bool(values) and bool(decision.citations)
+        gate = GATE_AI_REVIEW
+    elif decision.status == CONFLICT:
+        status = RESOLVER_CONFLICT
+        eligible = False
+        preview = False
+        gate = GATE_AI_CONFLICT
+    else:
+        status = RESOLVER_MISSING
+        eligible = False
+        preview = False
+        gate = GATE_AI_MISSING
+
+    return ResolutionRecord(
+        **base,
+        status=status,
+        answer=" + ".join(values) if values else None,
+        answer_values=values,
+        qualifier=qualifier or None,
+        confidence=decision.confidence,
+        source_type="ai_decision",
+        source_reference=source_reference,
+        evidence=evidence or None,
+        detail=decision.reason,
+        eligible_for_autofill=eligible,
+        preview_eligible=preview,
+        gate_reason=gate,
+        provenance=_provenance(decision),
+    )
+
+
+def _is_business_field(live_field: dict[str, Any]) -> bool:
+    return is_business_question(str(live_field.get("attribute_key") or "")) or is_business_question(
+        str(live_field.get("label") or "")
+    )
+
+
+def _business_values(candidate: SourceEvidence) -> list[str]:
+    if isinstance(candidate.value, tuple):
+        return [str(value).strip() for value in candidate.value if str(value).strip()]
+    value = str(candidate.value).strip()
+    return [value] if value else []
+
+
+def _business_record(
+    live_field: dict[str, Any],
+    business_bundle: ProductSourceBundle,
+) -> ResolutionRecord:
+    """Resolve seller-owned business fields from explicit seller/config evidence.
+
+    These values are not product-semantic AI claims.  They remain deterministic so
+    SKU, stock, price and order-policy data come only from seller-owned inputs.
+    """
+
+    base = _record_base(live_field)
+    attribute_key = base["attribute_key"]
+    label = base["label"]
+    keys = [attribute_key, label, *BUSINESS_ATTRIBUTE_ALIASES.get(attribute_key, ())]
+    candidates = [
+        candidate
+        for candidate in business_bundle.candidates(keys)
+        if candidate.source_type in BUSINESS_ALLOWED_SOURCE_TYPES
+    ]
+    if not candidates:
+        return ResolutionRecord(
+            **base,
+            status=RESOLVER_MISSING,
+            answer=None,
+            answer_values=[],
+            qualifier=None,
+            confidence=0.0,
+            source_type=None,
+            source_reference=None,
+            evidence=None,
+            detail="经营字段没有 structured/business/config/rule 明确输入。",
+            eligible_for_autofill=False,
+            preview_eligible=False,
+            gate_reason=GATE_BUSINESS_LOCKED,
+        )
+
+    grouped: dict[tuple[str, ...], list[SourceEvidence]] = {}
+    for candidate in candidates:
+        values = _business_values(candidate)
+        fingerprint = tuple(normalize_key(value) for value in values)
+        if fingerprint:
+            grouped.setdefault(fingerprint, []).append(candidate)
+
+    if not grouped:
+        return ResolutionRecord(
+            **base,
+            status=RESOLVER_MISSING,
+            answer=None,
+            answer_values=[],
+            qualifier=None,
+            confidence=0.0,
+            source_type=None,
+            source_reference=None,
+            evidence=None,
+            detail="经营字段显式输入为空。",
+            eligible_for_autofill=False,
+            preview_eligible=False,
+            gate_reason=GATE_BUSINESS_LOCKED,
+        )
+
+    if len(grouped) > 1:
+        return ResolutionRecord(
+            **base,
+            status=RESOLVER_CONFLICT,
+            answer=None,
+            answer_values=[],
+            qualifier=None,
+            confidence=max(candidate.confidence for candidate in candidates),
+            source_type=None,
+            source_reference=None,
+            evidence=None,
+            detail="多个显式 seller/business 输入互相冲突；禁止自动选择。",
+            eligible_for_autofill=False,
+            preview_eligible=False,
+            gate_reason=GATE_BUSINESS_CONFLICT,
+            provenance=[
+                {
+                    "key": candidate.key,
+                    "value": _business_values(candidate),
+                    "source_type": candidate.source_type,
+                    "source_reference": candidate.source_reference,
+                    "confidence": candidate.confidence,
+                    "evidence_text": candidate.evidence_text,
+                }
+                for candidate in candidates
+            ],
+        )
+
+    agreeing = next(iter(grouped.values()))
+    selected = sorted(
+        agreeing,
+        key=lambda candidate: (
+            candidate.priority,
+            -candidate.confidence,
+            candidate.source_reference,
+        ),
+    )[0]
+    values = _business_values(selected)
+    return ResolutionRecord(
+        **base,
+        status=RESOLVED,
+        answer=" + ".join(values) if values else None,
+        answer_values=values,
+        qualifier=None,
+        confidence=selected.confidence,
+        source_type=selected.source_type,
+        source_reference=selected.source_reference,
+        evidence=selected.evidence_text or None,
+        detail="explicit seller/business input",
+        eligible_for_autofill=True,
+        preview_eligible=False,
+        gate_reason="",
+        provenance=[
+            {
+                "key": candidate.key,
+                "value": _business_values(candidate),
+                "source_type": candidate.source_type,
+                "source_reference": candidate.source_reference,
+                "confidence": candidate.confidence,
+                "evidence_text": candidate.evidence_text,
+            }
+            for candidate in agreeing
+        ],
+    )
+
+
+def _apply_live_execution_contract(
+    live_field: dict[str, Any],
+    resolution: ResolutionRecord,
+) -> str | None:
+    """Fail closed when an exact resolved value cannot satisfy the live control.
+
+    This is a mechanical boundary only.  It never changes the value into another
+    product answer; the original answer/evidence remain attached for review.
+    """
+
+    if not resolution.eligible_for_autofill:
+        return None
+
+    validation = validate_resolved_answer(
+        live_field,
+        ResolvedAnswer(
+            attribute_key=resolution.attribute_key,
+            label=resolution.label,
+            status=resolution.status,
+            answer=resolution.answer,
+            answer_values=list(resolution.answer_values),
+            qualifier=resolution.qualifier,
+            confidence=resolution.confidence,
+            source_type=resolution.source_type,
+            source_reference=resolution.source_reference,
+            evidence=resolution.evidence,
+            detail=resolution.detail,
+        ),
+    )
+    if validation.valid:
+        return None
+
+    contract_detail = f"live execution contract: {validation.detail}"
+    semantic_detail = str(resolution.detail or "").strip()
+    resolution.status = NEEDS_REVIEW
+    resolution.eligible_for_autofill = False
+    resolution.preview_eligible = False
+    resolution.gate_reason = GATE_HARD_FIELD_CONSTRAINT
+    resolution.detail = (
+        f"{semantic_detail} | {contract_detail}"
+        if semantic_detail
+        else contract_detail
+    )
+    return contract_detail
+
+
+def _decimal_answer(item: LiveFillPlanItem) -> Decimal | None:
+    if not item.resolution.answer_values:
+        return None
+    try:
+        return Decimal(item.resolution.answer_values[0].strip())
+    except (InvalidOperation, AttributeError):
+        return None
+
+
+def _block(items: list[LiveFillPlanItem], keys: tuple[str, ...], detail: str) -> None:
+    for item in items:
+        if item.attribute_key not in keys:
+            continue
+        item.action = BLOCKED
+        item.reason = detail
+        item.resolution.status = NEEDS_REVIEW
+        item.resolution.eligible_for_autofill = False
+        item.resolution.preview_eligible = False
+        item.resolution.gate_reason = GATE_CROSS_FIELD_RULE
+        item.resolution.detail = detail
+
+
+def _apply_business_relations(items: list[LiveFillPlanItem]) -> None:
+    """Apply relations only to seller/business fields, never AI product fields."""
+
+    by_key = {item.attribute_key: item for item in items}
+    mrp = by_key.get("mrp")
+    selling = by_key.get("flipkart_selling_price")
+    if mrp and selling and mrp.action == READY and selling.action == READY:
+        mrp_value, selling_value = _decimal_answer(mrp), _decimal_answer(selling)
+        if mrp_value is not None and selling_value is not None and selling_value > mrp_value:
+            _block(
+                items,
+                ("mrp", "flipkart_selling_price"),
+                f"价格关系无效：Selling Price={selling_value} 高于 Base Price/MRP={mrp_value}。",
+            )
+
+    minimum = by_key.get("minimum_order_quantity")
+    maximum = by_key.get("max_order_quantity_allowed")
+    if minimum and maximum and minimum.action == READY and maximum.action == READY:
+        min_value, max_value = _decimal_answer(minimum), _decimal_answer(maximum)
+        if min_value is not None and max_value is not None and min_value > max_value:
+            _block(
+                items,
+                ("minimum_order_quantity", "max_order_quantity_allowed"),
+                f"MOQ 关系无效：MinOQ={min_value} 高于 MaxOQ={max_value}。",
+            )
+
+
+def build_live_fill_plan(
+    decision_packet: AIDecisionPacket,
+    semantic_fields: Iterable[dict[str, Any]],
+    business_bundle: ProductSourceBundle,
+) -> LiveFillPlan:
+    """Bind semantic decisions, then admit only mechanically executable values.
+
+    This layer never solves product meaning, rewrites text, substitutes values or
+    converts units.  The Resolver remains the semantic owner.  Before any exact
+    resolved value becomes READY, the observed live field contract must admit it;
+    otherwise the original semantic answer stays intact but the item is BLOCKED
+    for review instead of being deferred to a browser fill error.
+    """
+
+    fields = list(semantic_fields)
+    decisions = {decision.field_id: decision for decision in decision_packet.decisions}
+    warnings = list(decision_packet.warnings)
+    items: list[LiveFillPlanItem] = []
+
+    for live_field in fields:
+        identifier = field_id(live_field)
+        label = str(live_field.get("label") or live_field.get("attribute_key") or "")
+        attribute_key = str(live_field.get("attribute_key") or "")
+        section = str(live_field.get("section_heading") or "")
+        required = bool(live_field.get("required"))
+
+        if _is_business_field(live_field):
+            resolution = _business_record(live_field, business_bundle)
+            action = READY if resolution.eligible_for_autofill else BLOCKED
+            reason = (
+                "显式 seller/business 数据已绑定。"
+                if action == READY
+                else resolution.detail
+            )
+        else:
+            decision = decisions.get(identifier)
+            if decision is None:
+                decision = FieldDecision(
+                    field_id=identifier,
+                    status=MISSING,
+                    reason="decision packet 缺少该 live field",
+                )
+                warnings.append(f"missing decision for field_id={identifier}")
+            resolution = _decision_record(live_field, decision)
+            action = READY if resolution.eligible_for_autofill else BLOCKED
+            if action == READY:
+                reason = "AI READY semantic answer bound to current live field."
+            elif resolution.preview_eligible:
+                reason = "AI status=REVIEW；只允许显式人工 review，不由 Python 改判。"
+            else:
+                reason = resolution.detail or "AI decision is not READY."
+
+        contract_failure = _apply_live_execution_contract(live_field, resolution)
+        if contract_failure:
+            action = BLOCKED
+            reason = contract_failure
+
+        items.append(
+            LiveFillPlanItem(
+                attribute_key=attribute_key,
+                label=label,
+                section_heading=section,
+                required=required,
+                action=action,
+                reason=reason,
+                resolution=resolution,
+            )
+        )
+
+    _apply_business_relations(items)
+    return LiveFillPlan(items=items, warnings=warnings)

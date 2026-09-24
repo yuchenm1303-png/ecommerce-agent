@@ -1,0 +1,676 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable
+
+from .source_snapshot import SourceSnapshot, source_snapshot_from_json
+
+
+TEXT_KIND = "text"
+IMAGE_KIND = "image"
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_text(text: str) -> str:
+    return _sha256_bytes(text.encode("utf-8"))
+
+
+@dataclass(slots=True, frozen=True)
+class GroundedSource:
+    """One exact source unit the AI may cite."""
+
+    source_id: str
+    source_type: str
+    kind: str
+    origin: str
+    content: str = ""
+    image_path: str = ""
+    sha256: str = ""
+
+    @property
+    def logical_source_id(self) -> str:
+        marker = ":text:"
+        if self.kind == TEXT_KIND and marker in self.source_id:
+            return self.source_id.split(marker, 1)[0]
+        return self.source_id
+
+    def as_request_dict(self) -> dict[str, str]:
+        payload = {
+            "source_id": self.source_id,
+            "source_type": self.source_type,
+            "kind": self.kind,
+            "origin": self.origin,
+            "sha256": self.sha256,
+        }
+        if self.kind == TEXT_KIND:
+            payload["content"] = self.content
+        elif self.kind == IMAGE_KIND:
+            payload["image_path"] = self.image_path
+        return payload
+
+    def as_manifest_dict(self) -> dict[str, str]:
+        return {
+            "source_id": self.source_id,
+            "logical_source_id": self.logical_source_id,
+            "source_type": self.source_type,
+            "kind": self.kind,
+            "origin": self.origin,
+            "sha256": self.sha256,
+            "image_path": self.image_path,
+            "content": self.content,
+        }
+
+
+@dataclass(slots=True)
+class GroundingCatalog:
+    sources: list[GroundedSource] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        seen: set[str] = set()
+        for source in self.sources:
+            if not source.source_id:
+                raise ValueError("grounded source 缺少 source_id。")
+            if source.source_id in seen:
+                raise ValueError(f"grounded source_id 重复：{source.source_id}")
+            seen.add(source.source_id)
+            if source.kind not in {TEXT_KIND, IMAGE_KIND}:
+                raise ValueError(f"不支持的 grounded source kind：{source.kind!r}")
+            if source.kind == TEXT_KIND and not source.content.strip():
+                raise ValueError(f"文本 source {source.source_id} 内容为空。")
+            if source.kind == IMAGE_KIND and not source.image_path.strip():
+                raise ValueError(f"图片 source {source.source_id} 缺少 image_path。")
+            if source.sha256 and not re.fullmatch(r"[0-9a-f]{64}", source.sha256):
+                raise ValueError(f"source {source.source_id} 的 sha256 格式无效。")
+
+    def by_id(self, source_id: str) -> GroundedSource | None:
+        wanted = source_id.strip()
+        for source in self.sources:
+            if source.source_id == wanted:
+                return source
+        return None
+
+    @property
+    def logical_source_count(self) -> int:
+        return len({source.logical_source_id for source in self.sources})
+
+    def as_request_list(self) -> list[dict[str, str]]:
+        return [source.as_request_dict() for source in self.sources]
+
+    def as_manifest(self) -> dict[str, object]:
+        return {
+            "schema_version": 3,
+            "source_count": len(self.sources),
+            "logical_source_count": self.logical_source_count,
+            "sources": [source.as_manifest_dict() for source in self.sources],
+            "warnings": list(self.warnings),
+        }
+
+    @classmethod
+    def from_manifest(cls, payload: dict[str, object]) -> "GroundingCatalog":
+        """Restore the exact source universe that was visible to the Resolver.
+
+        A persisted Resolver manifest is an execution artifact, not a new product
+        interpretation. Replaying it preserves the original source ids and hashes
+        so downstream planning/execution never rebuilds an equivalent product into
+        a different identity merely because paths, ordering or optional artifacts
+        are observed again later.
+        """
+
+        if not isinstance(payload, dict):
+            raise ValueError("grounding manifest 顶层必须是 object。")
+        raw_sources = payload.get("sources")
+        raw_warnings = payload.get("warnings") or []
+        if not isinstance(raw_sources, list) or not isinstance(raw_warnings, list):
+            raise ValueError("grounding manifest 的 sources/warnings 格式无效。")
+
+        sources: list[GroundedSource] = []
+        for index, raw in enumerate(raw_sources, start=1):
+            if not isinstance(raw, dict):
+                raise ValueError(f"grounding manifest sources[{index}] 必须是 object。")
+            source = GroundedSource(
+                source_id=str(raw.get("source_id") or "").strip(),
+                source_type=str(raw.get("source_type") or "").strip(),
+                kind=str(raw.get("kind") or "").strip(),
+                origin=str(raw.get("origin") or "").strip(),
+                content=str(raw.get("content") or ""),
+                image_path=str(raw.get("image_path") or "").strip(),
+                sha256=str(raw.get("sha256") or "").strip(),
+            )
+            if source.kind == TEXT_KIND and source.sha256:
+                actual = _sha256_text(source.content)
+                if actual != source.sha256:
+                    raise ValueError(
+                        f"grounding manifest 文本 source {source.source_id} 内容 hash 不一致。"
+                    )
+            sources.append(source)
+
+        catalog = cls(
+            sources=sources,
+            warnings=[str(item) for item in raw_warnings],
+        )
+        declared_count = payload.get("source_count")
+        if declared_count is not None and int(declared_count) != len(catalog.sources):
+            raise ValueError(
+                "grounding manifest source_count 与实际 sources 数量不一致。"
+            )
+        return catalog
+
+
+def load_grounding_manifest(path: str | Path) -> GroundingCatalog:
+    """Load one Resolver-owned source-manifest.json without re-capturing product data."""
+
+    manifest_path = Path(path)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return GroundingCatalog.from_manifest(payload)
+
+
+_PRODUCT_DATA_ANCHOR = re.compile(
+    r"\b(?:offerId|offerLoginId|skuId|sku2|skuMap|skuProps|specId|detailUrl)\b",
+    re.IGNORECASE,
+)
+
+
+def _structured_assignments(value: str) -> list[str]:
+    """Extract exact scalar/object assignments for known supplier transport keys."""
+
+    output: list[str] = []
+    for match in re.finditer(
+        r'''(?P<key>["']?(?:offerId|offerLoginId|skuId|sku2|skuMap|skuProps|specId|detailUrl)["']?)\s*[:=]\s*''',
+        value,
+        flags=re.IGNORECASE,
+    ):
+        start = match.start("key")
+        cursor = match.end()
+        if cursor >= len(value):
+            continue
+        opening = value[cursor]
+        end = cursor
+        if opening in {'"', "'"}:
+            quote = opening
+            end += 1
+            escaped = False
+            while end < len(value):
+                char = value[end]
+                end += 1
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    break
+            else:
+                continue
+        elif opening in "[{":
+            pairs = {"[": "]", "{": "}"}
+            stack = [pairs[opening]]
+            end += 1
+            quote = ""
+            escaped = False
+            while end < len(value) and stack:
+                char = value[end]
+                end += 1
+                if quote:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == quote:
+                        quote = ""
+                    continue
+                if char in {'"', "'"}:
+                    quote = char
+                elif char in pairs:
+                    stack.append(pairs[char])
+                elif char == stack[-1]:
+                    stack.pop()
+            if stack:
+                continue
+        else:
+            token = re.match(r"[^,;\s)}\]]+", value[cursor:])
+            if token is None:
+                continue
+            end = cursor + token.end()
+        exact = value[start:end].strip()
+        if exact:
+            output.append(exact)
+    return output
+
+
+def _compact_embedded_data(items: Iterable[str]) -> list[str]:
+    """Keep exact product/variant records while discarding generic page scripts."""
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        value = re.sub(r"\s+", " ", str(raw or "")).strip()
+        if not value:
+            continue
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = None
+        is_dom_record = bool(
+            isinstance(parsed, dict)
+            and set(parsed).issubset({"tag", "text", "attrs"})
+            and (str(parsed.get("text") or "").strip() or parsed.get("attrs"))
+        )
+        extracted = [value] if is_dom_record else _structured_assignments(value)
+        for exact in extracted:
+            fingerprint = exact.casefold()
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            candidates.append(exact)
+
+    kept: list[str] = []
+    kept_folded: list[str] = []
+    for value in sorted(candidates, key=len, reverse=True):
+        folded = value.casefold()
+        if any(folded in existing for existing in kept_folded):
+            continue
+        kept.append(value)
+        kept_folded.append(folded)
+    kept.reverse()
+    return kept
+
+
+def _compact_visible_text(value: str) -> str:
+    """Remove session-only storefront chrome from otherwise citable page text."""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"(?m)(^|\n)送至\s*\n[^\n]*(?=\n预计)", r"\1送至\n预计", text)
+    for marker in ("【平台活动下价格】", "【非平台活动下价格】"):
+        index = text.find(marker)
+        if index >= 0:
+            text = text[:index].rstrip()
+            break
+    return text
+
+
+def _snapshot_non_row_parts(snapshot: SourceSnapshot) -> list[tuple[str, str]]:
+    """Build a compact citable view while the full snapshot stays unchanged."""
+
+    parts: list[tuple[str, str]] = []
+    identity: list[str] = []
+    if snapshot.title:
+        identity.append(f"Title: {snapshot.title}")
+    for key, value in snapshot.meta.items():
+        if value:
+            identity.append(f"Meta {key}: {value}")
+    if identity:
+        parts.append(("identity", "Page identity/meta:\n" + "\n".join(identity)))
+
+    if snapshot.json_ld:
+        parts.append(
+            (
+                "json-ld",
+                "Page JSON-LD:\n"
+                + json.dumps(snapshot.json_ld, ensure_ascii=False, separators=(",", ":")),
+            )
+        )
+    embedded = _compact_embedded_data(snapshot.embedded_data)
+    if embedded:
+        parts.append(("embedded", "Embedded page/variant data:\n" + "\n".join(embedded)))
+    visible_text = _compact_visible_text(snapshot.visible_text)
+    if visible_text:
+        parts.append(("visible-text", "Rendered page text:\n" + visible_text))
+    return [(kind, part) for kind, part in parts if part.strip()]
+
+
+def chunk_text(
+    text: str,
+    *,
+    max_chars: int = 3000,
+    overlap_chars: int = 250,
+) -> list[str]:
+    """Split long captured text for citation precision, not model batching."""
+
+    if max_chars < 500:
+        raise ValueError("max_chars 不能小于 500。")
+    if overlap_chars < 0 or overlap_chars >= max_chars:
+        raise ValueError("overlap_chars 必须满足 0 <= overlap_chars < max_chars。")
+
+    value = text.strip()
+    if not value:
+        return []
+    if len(value) <= max_chars:
+        return [value]
+
+    chunks: list[str] = []
+    start = 0
+    length = len(value)
+    while start < length:
+        tentative_end = min(length, start + max_chars)
+        end = tentative_end
+        if tentative_end < length:
+            lower_bound = start + max_chars // 2
+            whitespace = max(
+                value.rfind("\n", lower_bound, tentative_end),
+                value.rfind(" ", lower_bound, tentative_end),
+            )
+            if whitespace > start:
+                end = whitespace
+        chunk = value[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= length:
+            break
+        start = max(start + 1, end - overlap_chars)
+    return chunks
+
+
+def _text_source(
+    *,
+    prefix: str,
+    source_type: str,
+    ordinal: int,
+    chunk_index: int,
+    origin: str,
+    content: str,
+) -> GroundedSource:
+    digest = _sha256_text(content)
+    return GroundedSource(
+        source_id=f"{prefix}:{ordinal:03d}:text:{chunk_index:04d}:{digest[:12]}",
+        source_type=source_type,
+        kind=TEXT_KIND,
+        origin=origin,
+        content=content,
+        sha256=digest,
+    )
+
+
+def _row_source(
+    *,
+    prefix: str,
+    source_type: str,
+    ordinal: int,
+    row_ordinal: int,
+    origin: str,
+    key: str,
+    value: str,
+    table_index: int,
+    row_index: int,
+) -> GroundedSource:
+    content = (
+        "Structured page row; preserve key/value meaning exactly: "
+        + json.dumps(
+            {
+                "key": key,
+                "value": value,
+                "table_index": table_index,
+                "row_index": row_index,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+    digest = _sha256_text(content)
+    return GroundedSource(
+        source_id=f"{prefix}:{ordinal:03d}:text:row-{row_ordinal:04d}:{digest[:12]}",
+        source_type=source_type,
+        kind=TEXT_KIND,
+        origin=f"{origin}#table={table_index}&row={row_index}",
+        content=content,
+        sha256=digest,
+    )
+
+
+def _sources_from_snapshot(
+    snapshot_path: str | Path,
+    *,
+    prefix: str,
+    source_type: str,
+    ordinal: int,
+    max_chars: int,
+    overlap_chars: int,
+) -> list[GroundedSource]:
+    path = Path(snapshot_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"source snapshot 不存在：{path}")
+    snapshot = source_snapshot_from_json(path)
+    origin = snapshot.final_url or snapshot.requested_url or str(path.resolve())
+
+    sources: list[GroundedSource] = []
+    chunk_index = 1
+
+    non_row_parts = _snapshot_non_row_parts(snapshot)
+    if non_row_parts:
+        part_kind, first = non_row_parts.pop(0)
+        for chunk in chunk_text(first, max_chars=max_chars, overlap_chars=overlap_chars):
+            sources.append(
+                _text_source(
+                    prefix=prefix,
+                    source_type=source_type,
+                    ordinal=ordinal,
+                    chunk_index=chunk_index,
+                    origin=f"{origin}#evidence={part_kind}",
+                    content=chunk,
+                )
+            )
+            chunk_index += 1
+
+    for row_ordinal, row in enumerate(snapshot.table_rows, start=1):
+        if not row.key or not row.value:
+            continue
+        sources.append(
+            _row_source(
+                prefix=prefix,
+                source_type=source_type,
+                ordinal=ordinal,
+                row_ordinal=row_ordinal,
+                origin=origin,
+                key=row.key,
+                value=row.value,
+                table_index=row.table_index,
+                row_index=row.row_index,
+            )
+        )
+
+    for part_kind, part in non_row_parts:
+        for chunk in chunk_text(part, max_chars=max_chars, overlap_chars=overlap_chars):
+            sources.append(
+                _text_source(
+                    prefix=prefix,
+                    source_type=source_type,
+                    ordinal=ordinal,
+                    chunk_index=chunk_index,
+                    origin=f"{origin}#evidence={part_kind}",
+                    content=chunk,
+                )
+            )
+            chunk_index += 1
+    return sources
+
+
+def _product_pack_customer_snapshots(snapshot_path: str | Path) -> tuple[Path, ...] | None:
+    """Expand a Product Pack bootstrap snapshot back to its exact file snapshots."""
+
+    path = Path(snapshot_path)
+    if not path.is_file():
+        return None
+    try:
+        snapshot = source_snapshot_from_json(path)
+    except Exception:
+        return None
+    if str(snapshot.meta.get("input_mode") or "").strip().casefold() != "customer_product_pack":
+        return None
+
+    manifest_path = path.parent / "product-pack.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Product Pack bootstrap 缺少同目录 product-pack.json：{manifest_path}"
+        )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    values = payload.get("customer_snapshots") or []
+    if not isinstance(values, list):
+        raise ValueError("Product Pack customer_snapshots 必须是数组。")
+    return tuple(Path(str(value)).resolve() for value in values if str(value).strip())
+
+
+def _append_optional_snapshot(
+    sources: list[GroundedSource],
+    warnings: list[str],
+    path: str | Path,
+    *,
+    prefix: str,
+    source_type: str,
+    ordinal: int,
+    max_chars: int,
+    overlap_chars: int,
+) -> None:
+    try:
+        sources.extend(
+            _sources_from_snapshot(
+                path,
+                prefix=prefix,
+                source_type=source_type,
+                ordinal=ordinal,
+                max_chars=max_chars,
+                overlap_chars=overlap_chars,
+            )
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        warnings.append(f"optional {source_type} artifact skipped: {path}: {exc}")
+
+
+def build_grounding_catalog(
+    *,
+    image_paths: Iterable[str] = (),
+    supplier_snapshots: Iterable[str] = (),
+    customer_snapshots: Iterable[str] = (),
+    official_snapshots: Iterable[str] = (),
+    supplemental_text: str = "",
+    max_text_chars: int = 3000,
+    overlap_chars: int = 250,
+) -> GroundingCatalog:
+    """Create the exact raw source universe visible to the field-filling AI.
+
+    Supplier snapshots are the canonical minimum and remain fail-closed. Optional
+    images, customer attachments and official enrichment snapshots each own their
+    own failure domain: a missing/corrupt optional artifact is recorded as a warning
+    and does not invalidate unrelated evidence. Product Pack bootstrap snapshots are
+    expanded to their normalized customer snapshots, with missing members degraded
+    individually as long as the bootstrap itself remains valid.
+    """
+
+    sources: list[GroundedSource] = []
+    warnings: list[str] = []
+
+    for index, raw_path in enumerate(image_paths, start=1):
+        path = Path(raw_path)
+        if not path.is_file():
+            warnings.append(f"optional product image skipped: {path}: file missing")
+            continue
+        try:
+            digest = _sha256_bytes(path.read_bytes())
+        except OSError as exc:
+            warnings.append(f"optional product image skipped: {path}: {exc}")
+            continue
+        sources.append(
+            GroundedSource(
+                source_id=f"image:{index:03d}:{digest[:12]}",
+                source_type="product_image",
+                kind=IMAGE_KIND,
+                origin=str(path.resolve()),
+                image_path=str(path),
+                sha256=digest,
+            )
+        )
+
+    supplier_index = 0
+    customer_index = 0
+    supplier_seen = False
+    for path in supplier_snapshots:
+        supplier_seen = True
+        expanded = _product_pack_customer_snapshots(path)
+        if expanded is not None:
+            for customer_path in expanded:
+                customer_index += 1
+                _append_optional_snapshot(
+                    sources,
+                    warnings,
+                    customer_path,
+                    prefix="customer-file",
+                    source_type="customer_file",
+                    ordinal=customer_index,
+                    max_chars=max_text_chars,
+                    overlap_chars=overlap_chars,
+                )
+            continue
+
+        supplier_index += 1
+        sources.extend(
+            _sources_from_snapshot(
+                path,
+                prefix="supplier",
+                source_type="supplier_web",
+                ordinal=supplier_index,
+                max_chars=max_text_chars,
+                overlap_chars=overlap_chars,
+            )
+        )
+
+    for path in customer_snapshots:
+        customer_index += 1
+        _append_optional_snapshot(
+            sources,
+            warnings,
+            path,
+            prefix="customer-file",
+            source_type="customer_file",
+            ordinal=customer_index,
+            max_chars=max_text_chars,
+            overlap_chars=overlap_chars,
+        )
+
+    for index, path in enumerate(official_snapshots, start=1):
+        _append_optional_snapshot(
+            sources,
+            warnings,
+            path,
+            prefix="official",
+            source_type="official_web",
+            ordinal=index,
+            max_chars=max_text_chars,
+            overlap_chars=overlap_chars,
+        )
+
+    if supplemental_text.strip():
+        for index, chunk in enumerate(
+            chunk_text(
+                supplemental_text,
+                max_chars=max_text_chars,
+                overlap_chars=overlap_chars,
+            ),
+            start=1,
+        ):
+            digest = _sha256_text(chunk)
+            sources.append(
+                GroundedSource(
+                    source_id=f"customer-text:001:text:{index:04d}:{digest[:12]}",
+                    source_type="customer_file",
+                    kind=TEXT_KIND,
+                    origin="supplemental_text",
+                    content=chunk,
+                    sha256=digest,
+                )
+            )
+
+    if supplier_seen and not any(
+        source.source_type in {"supplier_web", "customer_file"}
+        and source.kind == TEXT_KIND
+        for source in sources
+    ) and not any(source.kind == IMAGE_KIND for source in sources):
+        raise ValueError("canonical supplier/product-pack evidence produced no usable grounded source")
+
+    return GroundingCatalog(sources=sources, warnings=warnings)

@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "incident": "2026-08-26-ultrasonic-cleaner-current-generation-binding",
+  "purpose": "Regression for browser-state ownership only. The historical selected category is not endorsed as the semantically correct category.",
+  "product_type": "ultrasonic jewelry cleaner",
+  "planned_terms": [
+    "ultrasonic jewelry cleaner",
+    "digital ultrasonic cleaner 650ml",
+    "ultrasonic glasses cleaner",
+    "denture and retainer cleaner machine",
+    "ultrasonic cleaning machine",
+    "small parts ultrasonic cleaner",
+    "ultrasonic cleaner"
+  ],
+  "observations": {
+    "ultrasonic jewelry cleaner": [
+      "Home Decor / Festival Supplies / Rice Lights",
+      "Home Decor / Spiritual & Festive Decor / Christmas Tree",
+      "Home Decor / Spiritual & Festive Decor / Christmas Tree Decoration",
+      "Food & Nutrition / Staples / Rice",
+      "Home & Kitchen Accessories / Cuttlery and Dinning Sets / Tea Urn",
+      "Sports & Fitness / Fitness Equipment / Cross Fit Trainer",
+      "Home & Kitchen Accessories / Bar & Glassware / Ice Bucket"
+    ],
+    "digital ultrasonic cleaner 650ml": [
+      "Health & Beauty / Health Care Devices / Digital Thermometers",
+      "Cameras and Accessories / Camera Accessories / Digital Photo Frame",
+      "Measuring & Layout Tools / Measuring Instruments / Laser Distance Meter",
+      "Automotive Spares / Bike Spare Parts / Vehicle Brake Disc",
+      "Automotive Spares / Bike Spare Parts / Vehicle Disc Pad",
+      "Automotive Spares / Car Spare Parts / Vehicle Brake Disc",
+      "Automotive Spares / Car Spare Parts / Vehicle Disc Pad"
+    ],
+    "ultrasonic glasses cleaner": [
+      "Home Improvement Tools / Gardening Tools / Plant Straightener",
+      "Health & Beauty / Hair Care / Hair Straighteners",
+      "Sports & Fitness / Other Sports / Laser Range Finder",
+      "Home & Kitchen Accessories / Cuttlery and Dinning Sets / Tea Urn",
+      "Cameras and Accessories / Camera Accessories / Camera Rig",
+      "Storage and Peripherals / Networking and Cables / LAN Adapter",
+      "Storage and Peripherals / Networking and Cables / Network Nic"
+    ],
+    "denture and retainer cleaner machine": [
+      "Health & Beauty / Oral Care / Denture Rinse",
+      "Health & Beauty / Oral Care / Dental Floss Sticks",
+      "Home and Office Furniture / Living Room Furniture / TV Entertainment Unit",
+      "Industrial & Scientific Supplies / Lab & Scientific Products / Three D Printer",
+      "Industrial & Scientific Supplies / Lab & Scientific Products / Three D Printer Accessories",
+      "Household Care & Supplies / Home Care / Detergent Pod",
+      "Household Care & Supplies / Home Care / Dish Washing Detergent"
+    ],
+    "ultrasonic cleaning machine": [
+      "Home Decor / Festival Supplies / Rice Lights",
+      "Food & Nutrition / Staples / Rice",
+      "Home & Kitchen Accessories / Cuttlery and Dinning Sets / Tea Urn",
+      "Home Medical Supplies / Health Monitors / Anti Snoring Device",
+      "Home & Kitchen Accessories / Bar & Glassware / Ice Bucket",
+      "Home Improvement Tools / Building & Construction Supplies / Cable Tie",
+      "Household Care & Supplies / Home Organizers & Storage / Ice Bucket"
+    ],
+    "small parts ultrasonic cleaner": [
+      "Smart Devices / Automation & Robotics / Smart Door Lock",
+      "Smart Devices / Automation & Robotics / Smart Lighting",
+      "Wearable Smart Devices / Smart Devices / Smart Glass",
+      "Wearable Smart Devices / Smart Devices / Smart Tracker",
+      "Smart Devices / Automation & Robotics / Smart Switch Plug",
+      "Wearable Smart Devices / Smart Devices / Smart Watch Band Strap",
+      "Health & Beauty / Bath and Spa / Bath Salts"
+    ],
+    "ultrasonic cleaner": [
+      "Home Improvement Tools / Gardening Tools / Plant Straightener",
+      "Health & Beauty / Hair Care / Hair Straighteners",
+      "Home & Kitchen Accessories / Appliance Accessories / Vacuum Cleaner Bags",
+      "Home & Kitchen Accessories / Appliance Accessories / Vacuum Cleaner Filters",
+      "Home & Kitchen Accessories / Appliance Accessories / Vacuum Cleaner Nozzles",
+      "Pet Supplies / Aquarium Accessories / Aquarium Cleaner",
+      "Cameras and Accessories / Camera Accessories / Lens Cleaners"
+    ]
+  },
+  "historical_selected_vertical": "Cameras and Accessories / Camera Accessories / Lens Cleaners",
+  "expected_owner_query": "ultrasonic cleaner",
+  "expected_binding_mode": "current_generation",
+  "forbidden_extra_query_after_global_choice": "ultrasonic cleaner"
+}

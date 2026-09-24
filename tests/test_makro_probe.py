@@ -283,7 +283,11 @@ def test_scroll_and_capture_discovers_lazy_fields(headless_page) -> None:
     controls, stats = scroll_and_capture(
         headless_page,
         include_values=False,
-        wait_ms=30,
+        # The fixture depends on an async browser scroll event. Windows
+        # headless Chromium can deliver it >1s later under load, so 30ms made
+        # this regression test flaky. This tolerance is test-only; production
+        # scroll_and_capture still defaults to 350ms.
+        wait_ms=2000,
         max_scroll_steps=50,
     )
     paths = " ".join(item["path"] for item in controls)

@@ -6,6 +6,27 @@ on:
   pull_request:
 
 jobs:
+  makro-multi-account-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify Makro account isolation and task ownership
+        run: |
+          pytest -q \
+            tests/test_channel_accounts.py \
+            tests/test_makro_multi_account_task_binding.py
+
   tests:
     runs-on: ubuntu-latest
     steps:
@@ -24,9 +45,35 @@ jobs:
       - name: Run unit tests
         run: pytest -q
 
-  mock-e2e:
+  production-contract:
     runs-on: ubuntu-latest
     needs: tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run production architecture contracts
+        run: |
+          pytest -q \
+            tests/test_production_entry_contract.py \
+            tests/test_ai_first_architecture.py \
+            tests/test_batch_architecture_contract.py
+
+      - name: Verify packaged production worker routing
+        run: python run_packaged_worker.py --self-test
+
+  legacy-mock-e2e:
+    runs-on: ubuntu-latest
+    needs: production-contract
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,12 +89,12 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Start mock seller site
+      - name: Start legacy mock seller site
         run: |
           python -m http.server 8000 --directory mock_site >/tmp/mock-site.log 2>&1 &
           sleep 1
 
-      - name: Run browser automation dry-run
+      - name: Run legacy browser automation dry-run
         run: python main.py --headless --dry-run
 
       - name: Run browser probe tests
