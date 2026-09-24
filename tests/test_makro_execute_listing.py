@@ -83,3 +83,6 @@ def test_direct_executor_rebinds_before_any_fill_and_has_no_semantic_context():
     assert "pending_user_decision_items(" not in source
     assert "is_user_decision_business_field(" not in source
     assert source.index("generated_business_bundle(") < source.index("_fill_one_section(")
+    assert "finish_visual_execution_hud(page, success=process_success)" in source
+    assert "destroy_visual_execution_hud(page)" not in source
+    assert "harness.detach()" in source
