@@ -4,7 +4,6 @@ import hashlib
 import os
 from typing import Any
 
-from .business_decisions import is_user_decision_business_field
 from .source_bundle import normalize_key
 
 
@@ -391,16 +390,13 @@ def allow_best_effort_inference(field: dict[str, Any]) -> bool:
 
 
 def allow_required_fallback(field: dict[str, Any]) -> bool:
-    """Allow mechanical completion except for explicit seller decisions.
+    """Keep the established deterministic fallback behavior for required fields.
 
-    Price fields are intentionally human-owned business decisions. They must
-    never fall through to the generic numeric placeholder or any other
-    deterministic fallback. Product/content fields keep the existing fallback
-    behavior here; their stricter presentation policy remains independent.
+    Reference/advisory HUDs are observability only. They must never change
+    whether the canonical executor fills a field or waits for a user.
     """
 
-    if is_user_decision_business_field(field):
-        return False
+    del field
     return True
 
 

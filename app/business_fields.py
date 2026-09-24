@@ -41,12 +41,12 @@ FIXED_ORDER_QUANTITY_ACCOUNT_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("importer_details", "LILI", "account-default:importer-details"),
 )
 
-# Current seller policy. Mechanical account policy may bypass AI/product
-# inference, but price is intentionally excluded: Base Price / Selling Price are
-# seller decisions and must be explicitly confirmed for each listing. The old
-# temporary 6000/5000 values were only workflow placeholders and must never be
-# treated as trusted production evidence.
+# Current seller policy. Keep the established automatic price placeholders
+# exactly as before; the runtime HUD may explain/reference them, but it must not
+# turn them into a blocking human-input gate.
 FIXED_COMMERCIAL_ACCOUNT_DEFAULTS: tuple[tuple[str, str, str], ...] = (
+    ("mrp", "6000", "account-default:base-price"),
+    ("flipkart_selling_price", "5000", "account-default:selling-price"),
     ("minimum_order_quantity", "1", "account-default:min-order-quantity"),
     ("max_order_quantity_allowed", "99", "account-default:max-order-quantity"),
     ("service_profile", "FBS", "account-default:fulfilment-by"),

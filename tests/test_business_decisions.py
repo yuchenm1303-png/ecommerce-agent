@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import pytest
-
 from app.business_decisions import (
+    PRICE_REFERENCE_DEFAULTS,
     is_user_decision_business_field,
     price_decision_advisory,
+    price_reference_advisory,
     user_decision_business_key,
 )
-from app.required_overrides import RequiredOverrideError, required_fallback_override
 
 
 def _field(key: str, label: str) -> dict:
@@ -21,46 +20,57 @@ def _field(key: str, label: str) -> dict:
     }
 
 
-def test_price_aliases_are_explicit_seller_decisions() -> None:
+def test_price_aliases_map_to_price_reference_keys() -> None:
     assert user_decision_business_key("Base Price") == "mrp"
     assert user_decision_business_key("Your selling price") == "flipkart_selling_price"
     assert is_user_decision_business_field(_field("mrp", "Base Price")) is True
     assert is_user_decision_business_field(_field("colour", "Colour")) is False
 
 
-def test_price_decision_advisory_never_invents_market_reference() -> None:
-    advisory = price_decision_advisory(
+def test_price_reference_card_explains_existing_automatic_values() -> None:
+    advisory = price_reference_advisory(
         _field("flipkart_selling_price", "Your selling price"),
-        confirmed_value="1499",
-        counterpart_value="1699",
+        confirmed_value="5000",
+        counterpart_value="6000",
     )
 
-    assert advisory["kind"] == "price_decision"
-    assert advisory["auto_write_without_user"] is False
+    assert advisory["kind"] == "price_reference"
+    assert advisory["auto_write_without_user"] is True
+    assert advisory["persistent"] is True
     rows = {row["label"]: row["value"] for row in advisory["rows"]}
-    assert rows["当前确认"] == "R 1,499"
-    assert rows["Base Price / MRP"] == "R 1,699"
-    assert rows["自动占位"] == "已禁用"
-    assert rows["价差"].startswith("R 200")
-    assert "不会凭空生成市场价" in advisory["thought"]
+    assert rows["参考填写"] == "R 5,000"
+    assert rows["Base Price / MRP 参考"] == "R 6,000"
+    assert "16.7%" in rows["价格结构"]
+    assert "不会暂停等待" in advisory["thought"]
+    assert "不是实时市场报价" in advisory["thought"]
 
 
-def test_price_decision_advisory_warns_on_invalid_relation() -> None:
-    advisory = price_decision_advisory(
+def test_price_reference_uses_established_defaults_when_values_are_omitted() -> None:
+    assert PRICE_REFERENCE_DEFAULTS == {
+        "mrp": "6000",
+        "flipkart_selling_price": "5000",
+    }
+    advisory = price_reference_advisory("Base Price")
+    rows = {row["label"]: row["value"] for row in advisory["rows"]}
+    assert rows["参考填写"] == "R 6,000"
+    assert rows["Selling Price 参考"] == "R 5,000"
+
+
+def test_price_reference_warns_on_invalid_relation_but_never_blocks_write() -> None:
+    advisory = price_reference_advisory(
         "selling price",
         confirmed_value="1800",
         counterpart_value="1600",
     )
     assert "高于 Base Price" in advisory["warning"]
+    assert advisory["auto_write_without_user"] is True
 
 
-@pytest.mark.parametrize(
-    ("key", "label"),
-    (
-        ("mrp", "Base Price"),
-        ("flipkart_selling_price", "Your selling price"),
-    ),
-)
-def test_price_fields_can_never_use_required_placeholder(key: str, label: str) -> None:
-    with pytest.raises(RequiredOverrideError, match="不允许自动必填兜底"):
-        required_fallback_override(_field(key, label))
+def test_legacy_advisory_name_is_non_blocking_alias() -> None:
+    advisory = price_decision_advisory(
+        "selling price",
+        confirmed_value="5000",
+        counterpart_value="6000",
+    )
+    assert advisory["kind"] == "price_reference"
+    assert advisory["auto_write_without_user"] is True

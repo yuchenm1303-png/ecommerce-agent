@@ -60,11 +60,11 @@ _TARGET_SCRIPT = r"""
 }
 """
 
-_ADVICE_SCRIPT = r"""
+_REFERENCE_SCRIPT = r"""
 (el, payload) => {
   const api = window[payload.key];
-  if (!api || typeof api.advice !== 'function') return false;
-  api.advice(el, payload);
+  if (!api || typeof api.pinReference !== 'function') return false;
+  api.pinReference(el, payload);
   return true;
 }
 """
@@ -248,10 +248,20 @@ def browser_visual_hud_advice(
     *,
     phase: int = 2,
 ) -> None:
-    """Show structured decision guidance beside one real live DOM control.
+    """Backward-compatible alias to the light, non-blocking reference card."""
 
-    Advice is display-only. The iframe remains pointer-events:none and this
-    helper never writes, clicks or changes the target field.
+    del phase
+    browser_visual_hud_reference(locator, advisory)
+
+
+def browser_visual_hud_reference(
+    locator: Any,
+    advisory: dict[str, Any],
+) -> None:
+    """Pin a persistent, display-only reference card beside a live DOM field.
+
+    The reference layer is independent from the moving execution bubble and
+    never changes focus, clicks, fills, validation, Save or execution timing.
     """
 
     if not advisory:
@@ -260,13 +270,13 @@ def browser_visual_hud_advice(
         key = _hud_api_key()
         payload = {
             "key": key,
-            "phase": max(0, min(4, int(phase))),
-            "title": str(advisory.get("title") or "需要你决定"),
+            "id": str(advisory.get("key") or advisory.get("kind") or "reference"),
+            "kind": str(advisory.get("kind") or "reference"),
+            "eyebrow": str(advisory.get("eyebrow") or "参考"),
+            "title": str(advisory.get("title") or "参考信息"),
             "thought": str(advisory.get("thought") or ""),
             "source": str(advisory.get("source") or "Listing Studio"),
             "warning": str(advisory.get("warning") or ""),
-            "kind": str(advisory.get("kind") or "decision"),
-            "hold_ms": max(1_000, min(1_800_000, int(advisory.get("hold_ms") or 7_000))),
             "rows": [
                 {
                     "label": str(row.get("label") or ""),
@@ -276,9 +286,9 @@ def browser_visual_hud_advice(
                 if isinstance(row, dict)
             ][:8],
         }
-        locator.evaluate(_ADVICE_SCRIPT, payload)
+        locator.evaluate(_REFERENCE_SCRIPT, payload)
     except Exception as exc:
-        print(f"GUI_BROWSER_HUD\tADVICE_ERROR\t{type(exc).__name__}: {exc}", flush=True)
+        print(f"GUI_BROWSER_HUD\tREFERENCE_ERROR\t{type(exc).__name__}: {exc}", flush=True)
 
 
 def set_browser_visual_hud_capture_safe(page: Any, active: bool) -> None:
@@ -322,6 +332,7 @@ def finish_browser_visual_hud(
 __all__ = [
     "arm_browser_visual_hud",
     "browser_visual_hud_advice",
+    "browser_visual_hud_reference",
     "browser_visual_hud_status",
     "browser_visual_hud_target",
     "finish_browser_visual_hud",

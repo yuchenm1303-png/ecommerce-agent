@@ -7,6 +7,10 @@ from .source_bundle import normalize_key
 
 
 PRICE_DECISION_KEYS = frozenset({"mrp", "flipkart_selling_price"})
+PRICE_REFERENCE_DEFAULTS = {
+    "mrp": "6000",
+    "flipkart_selling_price": "5000",
+}
 
 _PRICE_ALIASES: dict[str, tuple[str, ...]] = {
     "mrp": (
@@ -33,7 +37,7 @@ _NORMALIZED_PRICE_ALIASES = {
 
 
 def user_decision_business_key(field_or_key: object) -> str:
-    """Return the canonical seller-decision key without product inference."""
+    """Compatibility name: return the canonical price-business key."""
 
     if isinstance(field_or_key, dict):
         candidates = (
@@ -51,7 +55,7 @@ def user_decision_business_key(field_or_key: object) -> str:
 
 
 def is_user_decision_business_field(field_or_key: object) -> bool:
-    """Price fields require an explicit seller choice and never use placeholders."""
+    """Compatibility helper retained for callers/tests; price remains auto-filled."""
 
     return user_decision_business_key(field_or_key) in PRICE_DECISION_KEYS
 
@@ -70,9 +74,81 @@ def _decimal(value: object) -> Decimal | None:
 def _money(value: object, *, currency: str = "R") -> str:
     parsed = _decimal(value)
     if parsed is None:
-        return str(value or "").strip() or "未确认"
+        return str(value or "").strip() or "—"
     rendered = f"{parsed:,.2f}".rstrip("0").rstrip(".")
     return f"{currency} {rendered}".strip()
+
+
+def price_reference_advisory(
+    field_or_key: object,
+    *,
+    confirmed_value: object = "",
+    counterpart_value: object = "",
+    currency: str = "R",
+) -> dict[str, Any]:
+    """Build a display-only reference card for the established auto-filled prices.
+
+    This function never changes Fill Plan readiness, browser writes, Save policy,
+    or execution flow. The 6000/5000 values are the existing seller operating
+    defaults; the card explains them instead of turning them into a human gate.
+    """
+
+    key = user_decision_business_key(field_or_key)
+    if key not in PRICE_DECISION_KEYS:
+        return {}
+
+    current_raw = confirmed_value or PRICE_REFERENCE_DEFAULTS[key]
+    counterpart_key = "flipkart_selling_price" if key == "mrp" else "mrp"
+    counterpart_raw = counterpart_value or PRICE_REFERENCE_DEFAULTS[counterpart_key]
+    current = _decimal(current_raw)
+    counterpart = _decimal(counterpart_raw)
+
+    if key == "mrp":
+        title = "Base Price · 价格参考"
+        paired_label = "Selling Price 参考"
+        relation = "Base Price / MRP 不低于 Selling Price"
+    else:
+        title = "Selling Price · 价格参考"
+        paired_label = "Base Price / MRP 参考"
+        relation = "Selling Price 不高于 Base Price / MRP"
+
+    rows: list[dict[str, str]] = [
+        {"label": "参考填写", "value": _money(current_raw, currency=currency)},
+        {"label": paired_label, "value": _money(counterpart_raw, currency=currency)},
+    ]
+
+    mrp = current if key == "mrp" else counterpart
+    selling = counterpart if key == "mrp" else current
+    warning = ""
+    if mrp is not None and selling is not None and mrp > 0:
+        spread = mrp - selling
+        discount = (spread / mrp) * Decimal("100")
+        rows.append(
+            {
+                "label": "价格结构",
+                "value": f"价差 {_money(spread, currency=currency)} · {discount:.1f}% 折扣",
+            }
+        )
+        if selling > mrp:
+            warning = "当前 Selling Price 高于 Base Price / MRP，建议调整价格关系。"
+
+    rows.append({"label": "关系参考", "value": relation})
+
+    return {
+        "kind": "price_reference",
+        "key": key,
+        "title": title,
+        "eyebrow": "经营参考",
+        "thought": (
+            f"系统会继续按原流程自动填写 {_money(current_raw, currency=currency)}，不会暂停等待。"
+            " 这是当前经营参考值，不是实时市场报价；可按实际成本、平台费用和销售策略修改。"
+        ),
+        "rows": rows,
+        "source": "Listing Studio · 当前经营参数",
+        "warning": warning,
+        "auto_write_without_user": True,
+        "persistent": True,
+    }
 
 
 def price_decision_advisory(
@@ -82,89 +158,21 @@ def price_decision_advisory(
     counterpart_value: object = "",
     currency: str = "R",
 ) -> dict[str, Any]:
-    """Build display-only guidance for a seller-controlled price field.
+    """Backward-compatible alias for the non-blocking price reference card."""
 
-    The payload is deliberately advisory. It never chooses a price and contains
-    no guessed market data. Callers may add evidence-backed reference rows later
-    without changing the HUD contract.
-    """
-
-    key = user_decision_business_key(field_or_key)
-    if key not in PRICE_DECISION_KEYS:
-        return {}
-
-    value = _decimal(confirmed_value)
-    counterpart = _decimal(counterpart_value)
-    rows: list[dict[str, str]] = []
-
-    if confirmed_value not in (None, ""):
-        rows.append({"label": "当前确认", "value": _money(confirmed_value, currency=currency)})
-    else:
-        rows.append({"label": "当前确认", "value": "等待你决定"})
-
-    if key == "mrp":
-        title = "Base Price · 需要你决定"
-        relation = "Base Price / MRP 应不低于 Selling Price"
-        thought = (
-            "这是卖家经营决策，不属于商品事实。程序不会再使用临时占位价；"
-            "请结合采购成本、平台费用、目标毛利和你掌握的市场价格决定最终值。"
-        )
-        if counterpart_value not in (None, ""):
-            rows.append(
-                {
-                    "label": "Selling Price",
-                    "value": _money(counterpart_value, currency=currency),
-                }
-            )
-    else:
-        title = "Selling Price · 需要你决定"
-        relation = "Selling Price 应不高于 Base Price / MRP"
-        thought = (
-            "这是最终成交价的卖家经营决策。程序只会写入你明确确认的值；"
-            "建议同时检查采购成本、平台费用、目标毛利与市场参考，不会凭空生成市场价。"
-        )
-        if counterpart_value not in (None, ""):
-            rows.append(
-                {
-                    "label": "Base Price / MRP",
-                    "value": _money(counterpart_value, currency=currency),
-                }
-            )
-
-    rows.append({"label": "关系约束", "value": relation})
-    rows.append({"label": "自动占位", "value": "已禁用"})
-
-    warning = ""
-    if value is not None and counterpart is not None:
-        selling = value if key == "flipkart_selling_price" else counterpart
-        mrp = counterpart if key == "flipkart_selling_price" else value
-        if mrp > 0:
-            spread = mrp - selling
-            discount = (spread / mrp) * Decimal("100")
-            rows.append(
-                {
-                    "label": "价差",
-                    "value": f"{_money(spread, currency=currency)} · {discount:.1f}%",
-                }
-            )
-        if selling > mrp:
-            warning = "当前 Selling Price 高于 Base Price / MRP，保存前必须调整。"
-
-    return {
-        "kind": "price_decision",
-        "key": key,
-        "title": title,
-        "thought": thought,
-        "rows": rows,
-        "source": "用户决策 + Makro 经营约束",
-        "warning": warning,
-        "auto_write_without_user": False,
-    }
+    return price_reference_advisory(
+        field_or_key,
+        confirmed_value=confirmed_value,
+        counterpart_value=counterpart_value,
+        currency=currency,
+    )
 
 
 __all__ = [
     "PRICE_DECISION_KEYS",
+    "PRICE_REFERENCE_DEFAULTS",
     "is_user_decision_business_field",
     "price_decision_advisory",
+    "price_reference_advisory",
     "user_decision_business_key",
 ]

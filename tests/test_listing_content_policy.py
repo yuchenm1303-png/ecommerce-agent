@@ -196,11 +196,11 @@ def test_ordinary_required_field_keeps_existing_deterministic_fallback() -> None
     assert allow_required_fallback(target) is True
 
 
-def test_price_business_fields_require_explicit_user_decision() -> None:
-    assert allow_required_fallback(_field("mrp", "Base Price", required=True)) is False
+def test_price_reference_ui_does_not_change_required_fallback_policy() -> None:
+    assert allow_required_fallback(_field("mrp", "Base Price", required=True)) is True
     assert allow_required_fallback(
         _field("flipkart_selling_price", "Your selling price", required=True)
-    ) is False
+    ) is True
 
 
 def test_local_product_fact_request_carries_policy_but_excludes_warranty_business_fields() -> None:
