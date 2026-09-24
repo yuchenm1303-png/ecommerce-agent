@@ -34,6 +34,7 @@ def test_direct_executor_cli_has_no_old_product_inputs():
     assert "--expected-brand" not in options
     assert "--product-table" not in options
     assert "--facts-json" not in options
+    assert "--seller-decision-timeout-ms" in options
 
 
 def test_direct_executor_requires_canonical_resolver_source_snapshot():
@@ -78,3 +79,6 @@ def test_direct_executor_rebinds_before_any_fill_and_has_no_semantic_context():
     assert "ResolutionInputSpec" not in source
     assert "load_question_catalog" not in source
     assert source.index("load_ai_decision_packet(") < source.index("_fill_one_section(")
+    assert "collect_runtime_user_decisions(" in source
+    assert source.index("collect_runtime_user_decisions(") < source.index("_fill_one_section(")
+    assert "is_user_decision_business_field(" in source
