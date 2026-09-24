@@ -7,6 +7,11 @@ from typing import Any
 from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QLineEdit, QMessageBox
 
+from app.business_decisions import (
+    is_user_decision_business_field,
+    price_decision_advisory,
+)
+from app.listing_content_policy import allow_required_fallback
 from app.required_overrides import (
     load_required_blocked_fields,
     required_fallback_override,
@@ -110,8 +115,12 @@ class RequiredInputSupport(QObject):
                 continue
 
             fallback, fallback_text = self._fallback_preview(field)
+            advisory = price_decision_advisory(field)
             editor = QLineEdit()
-            if fallback is None:
+            if advisory:
+                editor.setPlaceholderText("经营决策 · 请手动确认（不会使用占位价格）")
+                editor.setProperty("sellerDecisionKind", advisory.get("kind", "user_decision"))
+            elif fallback is None:
                 editor.setPlaceholderText("必填 · 当前 live 字段无法自动兜底")
             else:
                 editor.setPlaceholderText(f"必填 · 留空将自动填 {fallback_text}")
@@ -120,7 +129,17 @@ class RequiredInputSupport(QObject):
 
             options = missing.get("options") or []
             tooltip = missing.get("reason") or "AI 未将该必填字段判断为 READY。"
-            if fallback is None:
+            if advisory:
+                rows = "\n".join(
+                    f"{row.get('label', '')}: {row.get('value', '')}"
+                    for row in advisory.get("rows") or []
+                )
+                tooltip += (
+                    "\n\n这是卖家经营决策，程序不会替你决定，也不会恢复旧的临时占位价。"
+                    f"\n{rows}"
+                    f"\n\n{advisory.get('thought', '')}"
+                )
+            elif fallback is None:
                 tooltip += "\n\n当前 live 字段无法生成合法自动兜底；可手动提供值后继续。"
             else:
                 tooltip += (
@@ -137,12 +156,21 @@ class RequiredInputSupport(QObject):
             self.inputs[identifier] = editor
 
         if required:
+            decisions = sum(
+                1 for item in required if is_user_decision_business_field(item["field"])
+            )
+            fallback_count = len(required) - decisions
             self.window.fields_hint.setText(
-                f"READY={result.ready} · {len(required)} 个 Makro 必填缺口可手动填写 / 自动兜底"
+                f"READY={result.ready} · {decisions} 个经营决策待确认"
+                + (f" · {fallback_count} 个普通必填可兜底" if fallback_count else "")
             )
             self.window.real_policy_hint.setText(
-                f"还有 {len(required)} 个 Makro 必填项未由 AI READY。可手动提供更准确值；"
-                "留空则在 Full Step 3 使用固定自动兜底，不再阻塞上架。"
+                "价格等经营决策必须由你明确确认，程序不会使用临时占位价；"
+                + (
+                    f"其余 {fallback_count} 个普通 required 字段仍保留现有机械兜底。"
+                    if fallback_count
+                    else "当前没有需要机械兜底的普通 required 字段。"
+                )
             )
         self._sync_button()
 
@@ -195,6 +223,15 @@ class RequiredInputSupport(QObject):
             for identifier in self.fields
         )
 
+    def _missing_user_decisions(self) -> list[str]:
+        return [
+            self.labels.get(identifier, identifier)
+            for identifier, field in self.fields.items()
+            if is_user_decision_business_field(field)
+            and not bool(self.explicit_overrides.get(identifier))
+            and not bool(self.values.get(identifier, "").strip())
+        ]
+
     def _sync_button(self) -> None:
         result = getattr(self.window, "current_result", None)
         if result is None or not result.plan_summary:
@@ -207,6 +244,14 @@ class RequiredInputSupport(QObject):
             return
 
         scope = self.window.real_scope_combo.currentData()
+        if scope == FULL_STEP3:
+            missing_decisions = self._missing_user_decisions()
+            if missing_decisions:
+                self.window.real_start_button.setEnabled(False)
+                self.window.real_start_button.setToolTip(
+                    "请先确认经营决策字段：" + "、".join(missing_decisions)
+                )
+                return
         if scope == FULL_STEP3 and self.fields:
             self.window.real_start_button.setEnabled(result.ready > 0 or bool(self.fields))
             manual = self._manual_count()
@@ -240,6 +285,11 @@ class RequiredInputSupport(QObject):
                     }
                 )
             else:
+                if not allow_required_fallback(field):
+                    label = self.labels.get(identifier, identifier)
+                    raise RuntimeError(
+                        f"{label} 是卖家经营决策，必须由用户明确确认；不会自动使用占位值。"
+                    )
                 overrides.append(required_fallback_override(field))
         return overrides
 
