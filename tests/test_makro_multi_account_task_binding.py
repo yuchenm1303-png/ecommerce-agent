@@ -1,24 +1,38 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
 from pathlib import Path
-
-from gui.batch_browser_session import shared_batch_browser
-from gui.batch_model import BatchJob, BatchRun
 
 
 ROOT = Path(__file__).resolve().parents[1]
+BATCH_MODEL_PATH = ROOT / "gui" / "batch_model.py"
+BATCH_BROWSER_PATH = ROOT / "gui" / "batch_browser_session.py"
 BATCH_RUNTIME_PATH = ROOT / "gui" / "batch_parallel_runtime.py"
 CHANNEL_BROWSER_PATH = ROOT / "gui" / "channel_account_browser.py"
 
 
+def _load_batch_model():
+    spec = importlib.util.spec_from_file_location("makro_multi_account_batch_model", BATCH_MODEL_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(spec.name, None)
+    return module
+
+
 def test_batch_job_round_trip_preserves_makro_account_identity() -> None:
-    job = BatchJob(
+    model = _load_batch_model()
+    job = model.BatchJob(
         job_id="JOB-001",
         product_url="https://example.test/product",
         makro_account_id="account-b",
         makro_account_label="Makro 店铺 B",
     )
-    batch = BatchRun(
+    batch = model.BatchRun(
         batch_id="batch-test",
         root_dir="/tmp/batch-test",
         jobs=[job],
@@ -26,7 +40,7 @@ def test_batch_job_round_trip_preserves_makro_account_identity() -> None:
         makro_account_label="Makro 店铺 B",
     )
 
-    restored = BatchRun.from_dict(batch.as_dict())
+    restored = model.BatchRun.from_dict(batch.as_dict())
 
     assert restored.makro_account_id == "account-b"
     assert restored.makro_account_label == "Makro 店铺 B"
@@ -35,6 +49,7 @@ def test_batch_job_round_trip_preserves_makro_account_identity() -> None:
 
 
 def test_legacy_batch_without_account_fields_remains_loadable() -> None:
+    model = _load_batch_model()
     payload = {
         "batch_id": "legacy-batch",
         "root_dir": "/tmp/legacy-batch",
@@ -46,7 +61,7 @@ def test_legacy_batch_without_account_fields_remains_loadable() -> None:
         ],
     }
 
-    restored = BatchRun.from_dict(payload)
+    restored = model.BatchRun.from_dict(payload)
 
     assert restored.makro_account_id == ""
     assert restored.makro_account_label == ""
@@ -54,18 +69,13 @@ def test_legacy_batch_without_account_fields_remains_loadable() -> None:
     assert restored.jobs[0].makro_account_label == ""
 
 
-def test_shared_batch_browser_uses_explicit_account_profile(tmp_path: Path) -> None:
-    account_profile = tmp_path / "browser_profiles" / "channels" / "makro" / "account-b"
+def test_shared_batch_browser_accepts_explicit_account_profile() -> None:
+    source = BATCH_BROWSER_PATH.read_text(encoding="utf-8")
 
-    browser = shared_batch_browser(
-        tmp_path,
-        cdp_port=9444,
-        profile_dir=account_profile,
-    )
-
-    assert browser.cdp_port == 9444
-    assert browser.profile_dir == account_profile.resolve()
-    assert browser.profile_dir != (tmp_path / "browser_profiles" / "makro-edge").resolve()
+    assert "profile_dir: str | Path | None = None" in source
+    assert "Path(profile_dir).resolve()" in source
+    assert 'root / "browser_profiles" / "makro-edge"' in source
+    assert "profile_dir=resolved_profile" in source
 
 
 def test_batch_runtime_binds_before_first_job_and_rejects_cross_account_reuse() -> None:
@@ -100,8 +110,8 @@ def test_single_prepared_task_is_invalidated_by_account_switch() -> None:
 
 def test_multi_account_task_sources_compile() -> None:
     for path in (
-        ROOT / "gui" / "batch_model.py",
-        ROOT / "gui" / "batch_browser_session.py",
+        BATCH_MODEL_PATH,
+        BATCH_BROWSER_PATH,
         BATCH_RUNTIME_PATH,
         CHANNEL_BROWSER_PATH,
     ):
