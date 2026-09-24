@@ -19,9 +19,11 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt -r requirements-gui.txt
 
       - name: Run unit tests
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: pytest -q
 
   production-contract:
@@ -38,9 +40,11 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt -r requirements-gui.txt
 
       - name: Run production architecture contracts
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: |
           pytest -q \
             tests/test_production_entry_contract.py \
