@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.business_decisions import is_user_decision_business_field
 from app.listing_content_policy import (
     LISTING_INTENT_ENV,
     allow_required_fallback,
@@ -89,6 +90,7 @@ def _protected_required(run_dir: Path) -> list[dict[str, Any]]:
         item
         for item in load_required_blocked_fields(plan_path, schema_path)
         if not allow_required_fallback(item["field"])
+        and not is_user_decision_business_field(item["field"])
     ]
 
 
@@ -399,6 +401,11 @@ class ListingOfferSupport(QObject):
                             "source_type": "user",
                         }
                     )
+                elif is_user_decision_business_field(field):
+                    # Price is intentionally deferred to the exact Makro live
+                    # field. The canonical executor will pause there, show the
+                    # display-only HUD, and capture a trusted human input event.
+                    continue
                 elif allow_required_fallback(field):
                     overrides.append(required_fallback_override(field))
                 else:
@@ -422,6 +429,7 @@ class ListingOfferSupport(QObject):
                 if not editor.text().strip()
                 and identifier in _support.fields
                 and not allow_required_fallback(_support.fields[identifier])
+                and not is_user_decision_business_field(_support.fields[identifier])
             ]
             if missing:
                 _support.window.real_start_button.setEnabled(False)
@@ -437,6 +445,11 @@ class ListingOfferSupport(QObject):
             for identifier, editor in support.inputs.items():
                 field = support.fields.get(identifier)
                 if field is None:
+                    continue
+                if is_user_decision_business_field(field):
+                    # RequiredInputSupport owns the price-specific copy. Do not
+                    # relabel it as a generic protected fact: blank means the
+                    # runtime HUD will ask at the live Makro field.
                     continue
                 if allow_required_fallback(field):
                     ordinary += 1
