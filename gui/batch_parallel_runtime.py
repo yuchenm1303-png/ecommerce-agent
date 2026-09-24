@@ -101,23 +101,27 @@ class BatchParallelRuntime:
             )
 
     def _task_account(self) -> tuple[Any, Path]:
-        """Return the committed Makro account/profile for a new browser task."""
+        """Return the account only after its browser runtime identity is committed."""
 
-        current = getattr(self.manager, "channel_account", None)
-        if current is None:
-            # Compatibility for tests/tools that still construct the base manager.
-            return None, Path(self.manager.profile_dir).resolve()
+        task_account_gate = getattr(self.manager, "task_channel_account", None)
+        if callable(task_account_gate):
+            current = task_account_gate()
+        else:
+            current = getattr(self.manager, "channel_account", None)
+            if current is None:
+                # Compatibility for tests/tools that still construct the base manager.
+                return None, Path(self.manager.profile_dir).resolve()
 
-        selected_getter = getattr(self.manager, "selected_channel_account", None)
-        selected = selected_getter() if callable(selected_getter) else current
-        if selected.account_id != current.account_id:
-            ensure_async = getattr(self.manager, "ensure_async", None)
-            if callable(ensure_async):
-                ensure_async()
-            raise RuntimeError(
-                f"Makro 店铺正在切换到 {selected.label}。状态变为 READY 后再启动 Batch，"
-                "避免任务绑定到旧账号。"
-            )
+            selected_getter = getattr(self.manager, "selected_channel_account", None)
+            selected = selected_getter() if callable(selected_getter) else current
+            if selected.account_id != current.account_id:
+                ensure_async = getattr(self.manager, "ensure_async", None)
+                if callable(ensure_async):
+                    ensure_async()
+                raise RuntimeError(
+                    f"Makro 店铺正在切换到 {selected.label}。状态变为 READY 后再启动 Batch，"
+                    "避免任务绑定到旧账号。"
+                )
 
         profile_dir = Path(self.manager.profile_dir).resolve()
         store = getattr(self.manager, "channel_accounts", None)
