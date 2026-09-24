@@ -4,6 +4,7 @@ import hashlib
 import os
 from typing import Any
 
+from .business_decisions import is_user_decision_business_field
 from .source_bundle import normalize_key
 
 
@@ -390,17 +391,16 @@ def allow_best_effort_inference(field: dict[str, Any]) -> bool:
 
 
 def allow_required_fallback(field: dict[str, Any]) -> bool:
-    """Keep final deterministic completion available for every required field.
+    """Allow mechanical completion except for explicit seller decisions.
 
-    ``required_fallback=manual_only`` remains useful metadata for the Resolver: it
-    tells AI/search stages not to invent a product fact or use a placeholder as a
-    normal answer. It must not become an execution lock. Only after the normal
-    evidence + synthesis pipeline has finished unresolved does the shared
-    required-field layer apply its deterministic live-schema fallback so Single
-    and Batch can continue through the canonical executor.
+    Price fields are intentionally human-owned business decisions. They must
+    never fall through to the generic numeric placeholder or any other
+    deterministic fallback. Product/content fields keep the existing fallback
+    behavior here; their stricter presentation policy remains independent.
     """
 
-    del field
+    if is_user_decision_business_field(field):
+        return False
     return True
 
 
