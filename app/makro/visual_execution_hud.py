@@ -156,6 +156,7 @@ _INSTALL_SCRIPT = r"""
     lastPulseAt:0,
     references:new Map(),
     referenceLayoutPending:false,
+    executionActive:true,
     destroyed:false,
     doc(){
       try { return frame.contentDocument; } catch (_) { return null; }
@@ -325,6 +326,7 @@ _INSTALL_SCRIPT = r"""
     enterReviewMode(){
       const nodes=this.nodes();
       if(!nodes) return false;
+      this.executionActive=false;
       nodes.hud.classList.add('review-mode');
       this.currentTarget=null;
       this.lastActionAt=Date.now();
@@ -337,6 +339,10 @@ _INSTALL_SCRIPT = r"""
       if(!nodes) return false;
       nodes.hud.classList.remove('review-mode');
       return true;
+    },
+    resumeExecution(){
+      this.executionActive=true;
+      this.leaveReviewMode();
     },
     scheduleReferenceLayout(){
       if(this.referenceLayoutPending || this.destroyed) return;
@@ -408,11 +414,15 @@ _INSTALL_SCRIPT = r"""
       nodes.root.style.setProperty('--bubble-x',`${bx}px`);
       nodes.root.style.setProperty('--bubble-y',`${by}px`);
     },
-    update(target,phase,verb,detail){
+    update(target,phase,verb,detail,resume=false){
       if(this.destroyed || !this.visible(target)) return;
       const nodes=this.nodes();
       if(!nodes) return;
-      this.leaveReviewMode();
+      if(resume) this.resumeExecution();
+      if(!this.executionActive){
+        this.scheduleReferenceLayout();
+        return;
+      }
       this.currentTarget=target;
       this.lastActionAt=Date.now();
       const rect=target.getBoundingClientRect();
@@ -440,7 +450,7 @@ _INSTALL_SCRIPT = r"""
     status(title,thought,phase=1){
       const nodes=this.nodes();
       if(!nodes) return false;
-      this.leaveReviewMode();
+      this.resumeExecution();
       nodes.title.textContent=String(title || '正在执行真实填写');
       nodes.thought.textContent=String(thought || '等待真实页面操作。');
       nodes.confidence.textContent='LIVE DOM';
