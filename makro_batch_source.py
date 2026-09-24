@@ -203,7 +203,7 @@ def main() -> int:
         outcome = _write_source_outcome(
             output_dir,
             {
-                "outcome": "failed",
+                "outcome": "review",
                 "checkpoint": "source_capture",
                 "product_url": args.product_url,
                 "failure_kind": "LISTING_MEDIA_UNAVAILABLE",

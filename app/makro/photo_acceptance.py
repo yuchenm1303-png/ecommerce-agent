@@ -3,36 +3,52 @@ from __future__ import annotations
 from typing import Any, Callable
 
 
+def _positive_int(value: object, *, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    return parsed if parsed >= 0 else int(default)
+
+
 def photo_requirement_satisfied(photo_report: dict[str, Any] | None) -> bool:
     """Return the canonical Makro Product Photos acceptance state.
 
-    The upload transaction itself already records the authoritative
-    ``listing_photo_requirement_satisfied`` flag. Older reports may not contain
-    that field, so the compatibility fallback uses observed persisted gallery
-    counts. Crucially, "no upload was requested" is never treated as success.
+    Observed final gallery count wins whenever it is present. That prevents a stale
+    or contradictory boolean from turning a real 0/N gallery into success. Older
+    reports may not contain final_count, so compatibility falls back to the lower
+    uploader flag and then persisted/initial counts. "No upload was requested" is
+    never treated as success by itself.
     """
 
     if not photo_report:
         return False
 
+    persistence = photo_report.get("persistence") or {}
+    if not isinstance(persistence, dict):
+        persistence = {}
+    required_min = 1
+    for raw_required in (photo_report.get("required_min"), persistence.get("required_min")):
+        parsed_required = _positive_int(raw_required)
+        if parsed_required >= 1:
+            required_min = parsed_required
+            break
+
+    for owner in (photo_report, persistence):
+        if "final_count" in owner:
+            return _positive_int(owner.get("final_count")) >= required_min
+
     explicit = photo_report.get("listing_photo_requirement_satisfied")
     if isinstance(explicit, bool):
         return explicit
 
-    persistence = photo_report.get("persistence") or {}
     counts = (
-        photo_report.get("final_count"),
         photo_report.get("persisted"),
-        persistence.get("final_count") if isinstance(persistence, dict) else None,
+        persistence.get("persisted"),
         photo_report.get("initial_count"),
+        persistence.get("initial_count"),
     )
-    for raw in counts:
-        try:
-            if int(raw or 0) >= 1:
-                return True
-        except (TypeError, ValueError):
-            continue
-    return False
+    return any(_positive_int(raw) >= required_min for raw in counts)
 
 
 def harden_completion_result(

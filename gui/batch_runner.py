@@ -21,6 +21,7 @@ from .batch_account_lanes import (
     LaneProcessMap,
 )
 from .batch_log_buffer import BATCH_LOG_FLUSH_LINES, BATCH_LOG_PENDING_LINES
+from .batch_source_outcome import source_media_review
 from .batch_model import (
     BATCH_WORKER_DEFAULT,
     BatchJob,
@@ -871,10 +872,18 @@ class BatchController(QObject):
                     self._prepare_queue.append(job_id)
             else:
                 job.exit_code = exit_code
-                job.failure_stage = job.stage_detail or "采集商品"
-                job.status = "FAILED"
-                job.error = f"Source Capture exit code={exit_code}"
-                job.stage_detail = "采集失败"
+                media_review = source_media_review(self._source_outcome(job))
+                if media_review is not None:
+                    failure_stage, error, stage_detail = media_review
+                    job.failure_stage = failure_stage
+                    job.status = "REVIEW"
+                    job.error = error
+                    job.stage_detail = stage_detail
+                else:
+                    job.failure_stage = job.stage_detail or "采集商品"
+                    job.status = "FAILED"
+                    job.error = f"Source Capture exit code={exit_code}"
+                    job.stage_detail = "采集失败"
                 job.clear_interaction()
             job.touch()
             self._persist_emit()

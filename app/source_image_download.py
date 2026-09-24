@@ -4,7 +4,7 @@ import hashlib
 import json
 from collections import Counter
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from .image_media import ImageMediaError
 from .public_resource_fetch import PublicResourceFetchError
@@ -15,6 +15,28 @@ def _host(value: str) -> str:
         return str(urlsplit(str(value or "")).hostname or "").casefold()
     except ValueError:
         return ""
+
+
+def _safe_url(value: str) -> str:
+    """Keep host/path diagnostics while stripping query, fragment and user info."""
+
+    try:
+        parsed = urlsplit(str(value or ""))
+    except ValueError:
+        return ""
+    scheme = parsed.scheme.casefold()
+    if scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port:
+        host = f"{host}:{port}"
+    return urlunsplit((scheme, host, parsed.path or "/", "", ""))
 
 
 def _supplier_referer(context) -> str:
@@ -56,8 +78,9 @@ def install_source_image_downloader(engine_module) -> None:
 
     The underlying public-resource transport stays SSRF-bounded. The only request
     behaviour change is sending the current supplier page as Referer, which many
-    image CDNs require. Failures are aggregated by host/reason instead of being
-    silently discarded; URLs, cookies and query strings are never logged.
+    image CDNs require. Failures remain aggregated by host/reason, while a bounded
+    list of rejected candidates records sanitized URL paths plus rejection reasons.
+    Cookies, query strings and fragments are never logged.
     """
 
     if bool(getattr(engine_module, "_source_image_downloader_hardened", False)):
@@ -80,7 +103,19 @@ def install_source_image_downloader(engine_module) -> None:
         attempted = 0
         failures: Counter[str] = Counter()
         failure_hosts: Counter[str] = Counter()
+        rejected_candidates: list[dict[str, str]] = []
         referer = _supplier_referer(context)
+
+        def reject(url: str, reason: str) -> None:
+            if len(rejected_candidates) >= 16:
+                return
+            safe = _safe_url(url)
+            rejected_candidates.append(
+                {
+                    "url": safe or "<invalid-or-redacted>",
+                    "reason": str(reason or "unknown")[:80],
+                }
+            )
 
         for raw_url in image_urls:
             if len(saved) >= limit or total_source_bytes >= engine_module._PRODUCT_IMAGES_TOTAL_MAX_BYTES:
@@ -100,6 +135,7 @@ def install_source_image_downloader(engine_module) -> None:
                 body = response.body
                 if total_source_bytes + len(body) > engine_module._PRODUCT_IMAGES_TOTAL_MAX_BYTES:
                     failures["total_size_limit"] += 1
+                    reject(url, "total_size_limit")
                     break
                 normalized, media = engine_module.normalize_image_media(
                     body,
@@ -107,6 +143,7 @@ def install_source_image_downloader(engine_module) -> None:
                 )
                 digest = hashlib.sha256(normalized).hexdigest()
                 if digest in seen_hashes:
+                    reject(url, "duplicate_content")
                     continue
                 seen_hashes.add(digest)
                 path = output_dir / f"source-image-{len(saved) + 1:02d}-{digest[:10]}{media.extension}"
@@ -116,6 +153,7 @@ def install_source_image_downloader(engine_module) -> None:
             except Exception as exc:
                 reason = _classify_error(exc)
                 failures[reason] += 1
+                reject(url, reason)
                 host = _host(url)
                 if host:
                     failure_hosts[host] += 1
@@ -125,6 +163,7 @@ def install_source_image_downloader(engine_module) -> None:
             "saved": len(saved),
             "failures": dict(sorted(failures.items())),
             "failure_hosts": dict(failure_hosts.most_common(8)),
+            "rejected_candidates": rejected_candidates,
             "referer_host": _host(referer),
         }
         print(

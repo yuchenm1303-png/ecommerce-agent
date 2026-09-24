@@ -74,3 +74,19 @@ def test_old_success_outcome_is_downgraded_when_photos_are_missing():
     assert hardened["reason"] == "mandatory_product_photo_missing"
     assert hardened["strict_acceptance_complete"] is False
     assert hardened["photo_requirement_satisfied"] is False
+
+
+def test_observed_zero_final_count_overrides_stale_true_flag():
+    report = {
+        "requested": 0,
+        "initial_count": 0,
+        "final_count": 0,
+        "required_min": 1,
+        "listing_photo_requirement_satisfied": True,
+    }
+    assert photo_requirement_satisfied(report) is False
+
+
+def test_required_min_uses_observed_final_count():
+    assert photo_requirement_satisfied({"final_count": 1, "required_min": 2}) is False
+    assert photo_requirement_satisfied({"final_count": 2, "required_min": 2}) is True

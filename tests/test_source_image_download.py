@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -69,3 +70,7 @@ def test_fetch_failure_diagnostic_does_not_log_query_or_cookie_secret(tmp_path: 
     assert "do-not-log" not in output
     assert "secret-value" not in output
     assert "cookie-secret" not in output
+    payload = json.loads(output.split("SOURCE_IMAGE_DOWNLOAD ", 1)[1])
+    assert payload["rejected_candidates"] == [
+        {"url": "https://images.example.com/product.jpg", "reason": "http_403"}
+    ]
