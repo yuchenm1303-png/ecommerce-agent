@@ -110,7 +110,8 @@ def test_formal_gui_routes_managed_makro_browser_through_channel_account_owner()
     assert "class AccountBoundMakroBrowser(ManagedMakroBrowser)" in ACCOUNT_BROWSER
     assert "ChannelAccountStore(" in ACCOUNT_BROWSER
     assert "close_managed_browser(" in ACCOUNT_BROWSER
-    assert "为防止上架到错误店铺" in ACCOUNT_BROWSER
+    assert "def channel_account_change_blocked" in ACCOUNT_BROWSER
+    assert "独立 Batch 不受此限制" in ACCOUNT_BROWSER
 
 
 def test_channel_account_sources_compile() -> None:

@@ -161,7 +161,8 @@ def test_batch_runtime_keeps_independent_account_slots() -> None:
     assert "def activate_account_slot" in runtime_source
     assert "self._remember_current_slot()" in runtime_source
     assert "activate_account_lane" in runtime_source
-    assert "已恢复 Batch" in runtime_source
+    assert "install_account_lane" in runtime_source
+    assert "account_lane_snapshot" in runtime_source
     assert "activate_account_slot" in browser_source
 
 
