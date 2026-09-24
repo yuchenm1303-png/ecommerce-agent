@@ -641,12 +641,8 @@ class UsageTelemetryController(QObject):
         self._single_input: dict[str, Any] = {}
         self._single_result: dict[str, Any] = {}
 
-        self._batch_id = ""
-        self._batch_event_type = ""
-        self._batch_job_ids: tuple[str, ...] = ()
-        self._batch_audit_ids: dict[str, str] = {}
-        self._batch_started_at: dict[str, str] = {}
-        self._batch_inputs: dict[str, dict[str, Any]] = {}
+        self._batch_lane_states: dict[str, dict[str, Any]] = {}
+        self._batch_dirty_lanes: set[str] = set()
         self._batch_flush = QTimer(self)
         self._batch_flush.setSingleShot(True)
         self._batch_flush.setInterval(_AUDIT_FLUSH_MS)
@@ -660,6 +656,76 @@ class UsageTelemetryController(QObject):
         QApplication.instance().aboutToQuit.connect(self._session_end)
         self._bind_single()
         self._bind_batch()
+
+    def _batch_lane_key(self) -> str:
+        workspace = getattr(self.window, "batch_workspace", None)
+        controller = getattr(workspace, "controller", None)
+        getter = getattr(controller, "current_account_lane", None)
+        lane = str(getter() if callable(getter) else "").strip()
+        return lane or "__legacy__"
+
+    def _batch_lane_state(self) -> dict[str, Any]:
+        lane = self._batch_lane_key()
+        state = self._batch_lane_states.get(lane)
+        if state is None:
+            state = {
+                "batch_id": "",
+                "event_type": "",
+                "job_ids": (),
+                "audit_ids": {},
+                "started_at": {},
+                "inputs": {},
+            }
+            self._batch_lane_states[lane] = state
+        return state
+
+    @property
+    def _batch_id(self) -> str:
+        return str(self._batch_lane_state()["batch_id"])
+
+    @_batch_id.setter
+    def _batch_id(self, value: str) -> None:
+        self._batch_lane_state()["batch_id"] = str(value or "")
+
+    @property
+    def _batch_event_type(self) -> str:
+        return str(self._batch_lane_state()["event_type"])
+
+    @_batch_event_type.setter
+    def _batch_event_type(self, value: str) -> None:
+        self._batch_lane_state()["event_type"] = str(value or "")
+
+    @property
+    def _batch_job_ids(self) -> tuple[str, ...]:
+        return tuple(self._batch_lane_state()["job_ids"])
+
+    @_batch_job_ids.setter
+    def _batch_job_ids(self, value: tuple[str, ...]) -> None:
+        self._batch_lane_state()["job_ids"] = tuple(value)
+
+    @property
+    def _batch_audit_ids(self) -> dict[str, str]:
+        return self._batch_lane_state()["audit_ids"]
+
+    @_batch_audit_ids.setter
+    def _batch_audit_ids(self, value: dict[str, str]) -> None:
+        self._batch_lane_state()["audit_ids"] = dict(value)
+
+    @property
+    def _batch_started_at(self) -> dict[str, str]:
+        return self._batch_lane_state()["started_at"]
+
+    @_batch_started_at.setter
+    def _batch_started_at(self, value: dict[str, str]) -> None:
+        self._batch_lane_state()["started_at"] = dict(value)
+
+    @property
+    def _batch_inputs(self) -> dict[str, dict[str, Any]]:
+        return self._batch_lane_state()["inputs"]
+
+    @_batch_inputs.setter
+    def _batch_inputs(self, value: dict[str, dict[str, Any]]) -> None:
+        self._batch_lane_state()["inputs"] = dict(value)
 
     def _enabled(self) -> bool:
         session = self.access.session
@@ -844,6 +910,8 @@ class UsageTelemetryController(QObject):
             "audit_scope": "batch_link",
             "batch_id": _text(getattr(batch, "batch_id", ""), 200),
             "job_id": _text(getattr(job, "job_id", ""), 160),
+            "makro_account_id": _text(getattr(job, "makro_account_id", ""), 200),
+            "makro_account_label": _text(getattr(job, "makro_account_label", ""), 500),
             "batch_index": index + 1,
             "batch_size": len(jobs),
             "supplier_url": product_url,
@@ -917,6 +985,9 @@ class UsageTelemetryController(QObject):
             "blocked": int(getattr(job, "blocked", 0) or 0),
             "required_blocked": int(getattr(job, "required_blocked", 0) or 0),
             "product_images": int(getattr(job, "image_count", 0) or 0),
+            "makro_account_id": _text(getattr(job, "makro_account_id", ""), 200),
+            "makro_account_label": _text(getattr(job, "makro_account_label", ""), 500),
+            "makro_cdp_port": int(getattr(job, "makro_cdp_port", 0) or 0),
             "makro_target_id": _text(getattr(job, "makro_target_id", ""), 240),
             "stage_detail": _text(getattr(job, "stage_detail", ""), 2_000),
             "failure_stage": _text(getattr(job, "failure_stage", ""), 500),
@@ -1030,11 +1101,19 @@ class UsageTelemetryController(QObject):
         controller = getattr(workspace, "controller", None)
         if controller is None:
             return
-        controller.running_changed.connect(self._on_batch_running)
+        lane_running = getattr(controller, "lane_running_changed", None)
+        if lane_running is not None:
+            lane_running.connect(self._on_batch_lane_running)
+        else:
+            controller.running_changed.connect(self._on_batch_running)
         controller.failed.connect(self._on_batch_failed)
-        jobs_changed = getattr(controller, "jobs_changed", None)
-        if jobs_changed is not None:
-            jobs_changed.connect(self._on_batch_jobs_changed)
+        lane_state = getattr(controller, "lane_state_changed", None)
+        if lane_state is not None:
+            lane_state.connect(self._on_batch_lane_state_changed)
+        else:
+            jobs_changed = getattr(controller, "jobs_changed", None)
+            if jobs_changed is not None:
+                jobs_changed.connect(self._on_batch_jobs_changed)
 
     def _on_prepare_running(self, running: bool) -> None:
         if running and not self._prepare_active:
@@ -1184,6 +1263,24 @@ class UsageTelemetryController(QObject):
                 completed_at=_utc_now(),
             )
 
+    def _on_batch_lane_running(self, account_id: str, running: bool) -> None:
+        workspace = getattr(self.window, "batch_workspace", None)
+        controller = getattr(workspace, "controller", None)
+        lane_context = getattr(controller, "account_lane", None)
+        if callable(lane_context):
+            with lane_context(str(account_id)):
+                self._on_batch_running(bool(running))
+            return
+        self._on_batch_running(bool(running))
+
+    def _on_batch_lane_state_changed(
+        self,
+        account_id: str,
+        _snapshot: Any,
+    ) -> None:
+        self._batch_dirty_lanes.add(str(account_id))
+        self._batch_flush.start()
+
     def _on_batch_running(self, running: bool) -> None:
         workspace = getattr(self.window, "batch_workspace", None)
         controller = getattr(workspace, "controller", None)
@@ -1236,14 +1333,29 @@ class UsageTelemetryController(QObject):
             self._batch_inputs = {}
 
     def _on_batch_jobs_changed(self, *_args: Any) -> None:
-        if self._batch_event_type and self._batch_job_ids:
-            self._batch_flush.start()
+        self._batch_dirty_lanes.add(self._batch_lane_key())
+        self._batch_flush.start()
 
     def _flush_batch_audits(self) -> None:
-        if not self._batch_event_type or not self._batch_job_ids:
-            return
         workspace = getattr(self.window, "batch_workspace", None)
         controller = getattr(workspace, "controller", None)
+        if controller is None:
+            return
+        lanes = tuple(self._batch_dirty_lanes)
+        self._batch_dirty_lanes.clear()
+        if not lanes:
+            lanes = (self._batch_lane_key(),)
+        lane_context = getattr(controller, "account_lane", None)
+        for lane in lanes:
+            if callable(lane_context):
+                with lane_context(lane):
+                    self._flush_current_batch_audit(controller)
+            else:
+                self._flush_current_batch_audit(controller)
+
+    def _flush_current_batch_audit(self, controller: Any) -> None:
+        if not self._batch_event_type or not self._batch_job_ids:
+            return
         batch = getattr(controller, "batch", None)
         if batch is None:
             return

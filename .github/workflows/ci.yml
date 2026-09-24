@@ -26,7 +26,10 @@ jobs:
           pytest -q \
             tests/test_channel_accounts.py \
             tests/test_batch_account_lanes.py \
-            tests/test_makro_multi_account_task_binding.py
+            tests/test_makro_multi_account_task_binding.py \
+            tests/test_batch_individual_controls_contract.py \
+            tests/test_listing_photo_ownership_contract.py \
+            tests/test_listing_offer_support_contract.py
 
   tests:
     runs-on: ubuntu-latest
