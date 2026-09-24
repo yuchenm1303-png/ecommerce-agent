@@ -72,7 +72,7 @@ class BatchParallelRuntime:
 
         self._owners: dict[str, BatchSharedBrowserOwner] = {}
         self._parallelism_by_account: dict[str, int] = {}
-        self._starting_accountss: dict[str, Any] = {}
+        self._starting_accounts: dict[str, Any] = {}
         self._account_slots: dict[str, tuple[Any, Any]] = {}
         scope_token = str(getattr(self.manager.channel_accounts, "scope_token", "") or "")
         self._slot_store = BatchAccountSlotStore(

@@ -145,7 +145,8 @@ def test_batch_controller_has_account_lane_process_context() -> None:
 def test_batch_runtime_binds_before_first_job_and_rejects_cross_account_reuse() -> None:
     source = BATCH_RUNTIME_PATH.read_text(encoding="utf-8")
 
-    assert "self._starting_accounts" in source
+    assert "self._starting_accounts: dict[str, Any]" in source
+    assert "_starting_accountss" not in source
     assert "self._stamp_batch_account(batch, account)" in source
     assert "这个 Batch 属于" in source
     assert "程序不会跨店铺复用已准备任务" in source
