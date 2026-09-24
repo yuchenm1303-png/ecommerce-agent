@@ -20,9 +20,8 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
     Every Makro account owns both a dedicated Browser Profile and a persisted CDP
     port. Switching the UI account changes which lane this lifecycle manager is
     observing; it no longer destroys another account's healthy Edge merely to open
-    the selected one. This is the browser-process foundation required for true
-    cross-account Batch concurrency, while current Single/Batch start guards still
-    fail closed until the selected lane is fully committed.
+    the selected one. Batch presentation/runtime state follows the same account
+    switch through BatchParallelRuntime's independent account slots.
     """
 
     _CHANNEL = "makro"
@@ -47,8 +46,6 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
 
         self._sync_managed_port_controls(window, managed_port)
         super().__init__(window, port=managed_port)
-        # ManagedMakroBrowser schedules its first warm-up with QTimer.singleShot(0),
-        # so the account-bound profile is committed before lifecycle I/O can run.
         self.profile_dir = self._desired_profile_dir
 
     @staticmethod
@@ -157,8 +154,6 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
         if account is None:
             raise KeyError(f"unknown {self._CHANNEL} channel account: {wanted}")
 
-        # Materialize and validate the lane before committing active=B. If this
-        # fails, the persisted active account remains unchanged.
         self.channel_accounts.cdp_port(account)
         account = self.channel_accounts.set_active(self._CHANNEL, account.account_id)
         with self._account_selection_lock:
@@ -170,8 +165,6 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
                 return account
             self._pending_channel_account = account
 
-        # Any prepared browser-owned state belongs to the previous marketplace
-        # account and must never survive a store switch.
         self._single_prepared_generation = None
         self._batch_prepare_generation = None
         if self._single_prepared_account_id is not None:
@@ -206,6 +199,11 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
         self._generation += 1
         self._single_prepared_generation = None
         self._batch_prepare_generation = None
+
+        batch_runtime = getattr(self.window, "_batch_parallel_runtime", None)
+        activate_slot = getattr(batch_runtime, "activate_account_slot", None)
+        if callable(activate_slot):
+            activate_slot(account)
         return True
 
     def _has_pending_channel_account(self) -> bool:
@@ -259,12 +257,7 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
         return self.profile_dir.resolve() == legacy
 
     def _reconcile_running_browser_account(self, reason: str) -> None:
-        """Verify the selected account lane without touching other account lanes.
-
-        A healthy browser on another account's dedicated port is intentionally
-        invisible here. If the *selected account's* port is occupied by a browser
-        whose marker does not match, only that conflicting port is recovered.
-        """
+        """Verify the selected account lane without touching other account lanes."""
 
         with self._account_reconcile_lock:
             token = self._cdp_instance_token()
@@ -275,8 +268,6 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
             if observed_identity == self._runtime_identity:
                 return
 
-            # Upgrade compatibility: the first account that legitimately claimed
-            # the old global profile may reuse its already-running legacy Edge.
             if not observed_identity and self._legacy_profile_is_desired():
                 self._write_runtime_identity()
                 return
@@ -322,9 +313,6 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
                 return launched_any
 
     def _apply_endpoint_observation(self, token: str) -> None:
-        # A selection can arrive during the tail of a lifecycle worker. Keep the
-        # poll path aware of it so READY from the previous lane cannot strand the
-        # pending switch indefinitely.
         if self._has_pending_channel_account() and not self._is_busy() and not self._update_quiesced:
             selected = self.selected_channel_account()
             if self._state in self._HOT_STATES:
@@ -382,9 +370,6 @@ def _install_channel_account_center_if_available(
     window: Any,
     manager: AccountBoundMakroBrowser,
 ) -> None:
-    # CardDetails is installed before the managed browser in the formal GUI. Keep
-    # the browser subsystem usable in isolated tests/tools that do not construct
-    # presentation components.
     if getattr(window, "_card_details", None) is None:
         return
     from .channel_account_surface import install_channel_account_center
