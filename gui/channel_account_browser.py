@@ -98,6 +98,41 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
     def channel_browser_status(self) -> tuple[str, str]:
         return self._state, self._detail
 
+    def task_channel_account(self) -> ChannelAccount:
+        """Return the account only after the live browser owner is committed to it.
+
+        Account selection is asynchronous: the lifecycle thread first applies the
+        requested metadata, then rotates Edge/Profile, verifies automation and only
+        finally writes the runtime identity marker. Task producers must use this
+        gate instead of reading ``channel_account`` directly, otherwise they can
+        observe the brief middle state where account B is selected while account
+        A's Edge is still the live CDP endpoint.
+        """
+
+        self._assert_account_scope_stable()
+        if self._has_pending_channel_account():
+            selected = self.selected_channel_account()
+            self.ensure_async()
+            raise RuntimeError(
+                f"Makro 店铺正在切换到 {selected.label}。状态变为 READY 后再启动任务。"
+            )
+
+        expected_profile = self.channel_accounts.profile_dir(self.channel_account).resolve()
+        if Path(self.profile_dir).resolve() != expected_profile:
+            self.ensure_async()
+            raise RuntimeError(
+                "当前 Makro Browser Profile 尚未切换到已选择店铺；为防止串号，已拒绝启动任务。"
+            )
+
+        expected_identity = self.channel_accounts.runtime_identity(self.channel_account)
+        if self._read_runtime_identity() != expected_identity:
+            self.ensure_async()
+            raise RuntimeError(
+                f"{self.channel_account.label} 的 Makro Browser 会话仍在切换或验证中。"
+                "运行时身份确认完成后再启动任务。"
+            )
+        return self.channel_account
+
     def _assert_account_change_allowed(self) -> None:
         self._assert_account_scope_stable()
         if self._update_quiesced:
