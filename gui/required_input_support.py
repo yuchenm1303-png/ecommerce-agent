@@ -7,6 +7,12 @@ from typing import Any
 from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QLineEdit, QMessageBox
 
+from app.business_decisions import (
+    is_user_decision_business_field,
+    price_decision_advisory,
+    user_decision_business_key,
+)
+from app.listing_content_policy import allow_required_fallback
 from app.required_overrides import (
     load_required_blocked_fields,
     required_fallback_override,
@@ -110,8 +116,12 @@ class RequiredInputSupport(QObject):
                 continue
 
             fallback, fallback_text = self._fallback_preview(field)
+            advisory = price_decision_advisory(field)
             editor = QLineEdit()
-            if fallback is None:
+            if advisory:
+                editor.setPlaceholderText("经营决策 · 可提前填写；留空将在 Makro HUD 中确认")
+                editor.setProperty("sellerDecisionKind", advisory.get("kind", "user_decision"))
+            elif fallback is None:
                 editor.setPlaceholderText("必填 · 当前 live 字段无法自动兜底")
             else:
                 editor.setPlaceholderText(f"必填 · 留空将自动填 {fallback_text}")
@@ -120,7 +130,19 @@ class RequiredInputSupport(QObject):
 
             options = missing.get("options") or []
             tooltip = missing.get("reason") or "AI 未将该必填字段判断为 READY。"
-            if fallback is None:
+            if advisory:
+                rows = "\n".join(
+                    f"{row.get('label', '')}: {row.get('value', '')}"
+                    for row in advisory.get("rows") or []
+                )
+                tooltip += (
+                    "\n\n这是卖家经营决策，程序不会替你决定，也不会恢复旧的临时占位价。"
+                    "\n你可以现在提前填写；若留空，Full Step 3 运行到对应 Makro 字段时"
+                    "会暂停并在字段旁展开 HUD，等待你直接在 Makro 中输入。"
+                    f"\n{rows}"
+                    f"\n\n{advisory.get('thought', '')}"
+                )
+            elif fallback is None:
                 tooltip += "\n\n当前 live 字段无法生成合法自动兜底；可手动提供值后继续。"
             else:
                 tooltip += (
@@ -137,12 +159,22 @@ class RequiredInputSupport(QObject):
             self.inputs[identifier] = editor
 
         if required:
+            decisions = sum(
+                1 for item in required if is_user_decision_business_field(item["field"])
+            )
+            fallback_count = len(required) - decisions
             self.window.fields_hint.setText(
-                f"READY={result.ready} · {len(required)} 个 Makro 必填缺口可手动填写 / 自动兜底"
+                f"READY={result.ready} · {decisions} 个经营决策待确认"
+                + (f" · {fallback_count} 个普通必填可兜底" if fallback_count else "")
             )
             self.window.real_policy_hint.setText(
-                f"还有 {len(required)} 个 Makro 必填项未由 AI READY。可手动提供更准确值；"
-                "留空则在 Full Step 3 使用固定自动兜底，不再阻塞上架。"
+                "价格等经营决策必须由你明确确认：可在这里提前填，也可留空，"
+                "让真实执行到 Makro 字段时用 HUD 等待你现场输入；程序不会使用临时占位价。"
+                + (
+                    f"其余 {fallback_count} 个普通 required 字段仍保留现有机械兜底。"
+                    if fallback_count
+                    else ""
+                )
             )
         self._sync_button()
 
@@ -195,6 +227,39 @@ class RequiredInputSupport(QObject):
             for identifier in self.fields
         )
 
+    def _missing_user_decisions(self) -> list[str]:
+        return [
+            self.labels.get(identifier, identifier)
+            for identifier, field in self.fields.items()
+            if is_user_decision_business_field(field)
+            and not bool(self.explicit_overrides.get(identifier))
+            and not bool(self.values.get(identifier, "").strip())
+        ]
+
+    def _price_relation_warning(self) -> str:
+        values: dict[str, str] = {}
+        for identifier, field in self.fields.items():
+            key = user_decision_business_key(field)
+            if not key:
+                continue
+            explicit = self.explicit_overrides.get(identifier)
+            if explicit is not None:
+                raw = explicit.get("values") or []
+                value = str(raw[0]).strip() if raw else ""
+            else:
+                value = self.values.get(identifier, "").strip()
+            if value:
+                values[key] = value
+
+        if "mrp" not in values or "flipkart_selling_price" not in values:
+            return ""
+        advisory = price_decision_advisory(
+            "flipkart_selling_price",
+            confirmed_value=values["flipkart_selling_price"],
+            counterpart_value=values["mrp"],
+        )
+        return str(advisory.get("warning") or "").strip()
+
     def _sync_button(self) -> None:
         result = getattr(self.window, "current_result", None)
         if result is None or not result.plan_summary:
@@ -207,13 +272,23 @@ class RequiredInputSupport(QObject):
             return
 
         scope = self.window.real_scope_combo.currentData()
+        if scope == FULL_STEP3:
+            price_warning = self._price_relation_warning()
+            if price_warning:
+                self.window.real_start_button.setEnabled(False)
+                self.window.real_start_button.setToolTip(price_warning)
+                return
         if scope == FULL_STEP3 and self.fields:
             self.window.real_start_button.setEnabled(result.ready > 0 or bool(self.fields))
             manual = self._manual_count()
-            automatic = len(self.fields) - manual
-            self.window.real_start_button.setToolTip(
-                f"可直接开始；{manual} 个使用用户值，其余 {automatic} 个未解决必填项自动兜底。"
-            )
+            runtime_decisions = len(self._missing_user_decisions())
+            automatic = max(0, len(self.fields) - manual - runtime_decisions)
+            detail = f"可直接开始；{manual} 个使用预先确认值"
+            if runtime_decisions:
+                detail += f" · {runtime_decisions} 个经营决策将在 Makro HUD 中等待你输入"
+            if automatic:
+                detail += f" · {automatic} 个普通必填项自动兜底"
+            self.window.real_start_button.setToolTip(detail)
             return
 
         self.window.real_start_button.setEnabled(result.ready > 0)
@@ -240,6 +315,16 @@ class RequiredInputSupport(QObject):
                     }
                 )
             else:
+                if is_user_decision_business_field(field):
+                    # Deliberately omit it from the preflight override file.
+                    # The canonical executor will pause at the exact live Makro
+                    # field and collect a trusted human input/change event.
+                    continue
+                if not allow_required_fallback(field):
+                    label = self.labels.get(identifier, identifier)
+                    raise RuntimeError(
+                        f"{label} 当前策略要求用户明确确认，且不支持运行时 HUD 决策。"
+                    )
                 overrides.append(required_fallback_override(field))
         return overrides
 
@@ -282,19 +367,23 @@ class RequiredInputSupport(QObject):
                 path = self._write_overrides()
                 if self.fields:
                     manual = self._manual_count()
-                    automatic = len(self.fields) - manual
+                    runtime_decisions = len(self._missing_user_decisions())
+                    automatic = max(0, len(self.fields) - manual - runtime_decisions)
                     self.window.fields_hint.setText(
-                        f"必填预检完成 · 用户填写 {manual} · 自动兜底 {automatic}"
+                        f"必填预检完成 · 预先确认 {manual}"
+                        + (f" · HUD 待确认 {runtime_decisions}" if runtime_decisions else "")
+                        + (f" · 自动兜底 {automatic}" if automatic else "")
                     )
                     self.window.real_policy_hint.setText(
-                        "AI READY 仍然原样执行；只有 AI 未解决的必填项才使用自动兜底，"
-                        "并在当前 Makro DOM 上做机械校验后填写。"
+                        "AI READY 仍然原样执行；经营决策若留空，会在对应 Makro live 字段"
+                        "通过 HUD 等待你的真实输入；普通 unresolved required 才使用机械兜底。"
                     )
                     append = getattr(self.window, "_append_log", None)
                     if callable(append):
                         append(
                             f"[required-preflight] overrides={path or 'none'} "
-                            f"user={manual} fallback_candidates={automatic} ai_calls=0"
+                            f"user={manual} runtime_decisions={runtime_decisions} "
+                            f"fallback_candidates={automatic} ai_calls=0"
                         )
             else:
                 schema_path = latest_live_schema(result.run_dir)

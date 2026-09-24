@@ -1,14 +1,121 @@
+from .agent import (
+    AGENT_FAST_PROFILE_ID,
+    AGENT_FAST_ROLE,
+    AGENT_REASONING_PROFILE_ID,
+    AGENT_REASONING_ROLE,
+    AGENT_VISION_PROFILE_ID,
+    AGENT_VISION_ROLE,
+)
 from .capabilities import ModelCapability
-from .listing import LISTING_SEMANTIC_PROFILE_ID, listing_semantic_profile
-from .platform import AIPlatform, StructuredModelBackend
+from .configuration import AIConfiguration, ModelBinding
+from .contracts import (
+    AIMessage,
+    ChatRequest,
+    ImagePart,
+    MessageRole,
+    ModelResponse,
+    ModelUsage,
+    StreamEvent,
+    StreamEventKind,
+    StructuredOutputMode,
+    StructuredRequest,
+    TextPart,
+    ToolCall,
+    ToolChoice,
+    ToolDefinition,
+)
+from .credential_resolver import CredentialResolver
+from .credentials import CredentialRef, CredentialSource
+from .errors import (
+    AIConfigurationError,
+    AICredentialError,
+    AIPlatformError,
+    AIResponseError,
+    AITransportError,
+)
+from .listing import (
+    LISTING_ATTRIBUTES_PROFILE_ID,
+    LISTING_ATTRIBUTES_ROLE,
+    LISTING_IDENTITY_PROFILE_ID,
+    LISTING_IDENTITY_ROLE,
+    LISTING_SEMANTIC_PROFILE_ID,
+    LISTING_SEMANTIC_ROLE,
+    LISTING_VISION_PROFILE_ID,
+    LISTING_VISION_ROLE,
+    LISTING_WEB_RESEARCH_PROFILE_ID,
+    LISTING_WEB_RESEARCH_ROLE,
+    listing_semantic_profile,
+)
+from .openai_runtime import OpenAIChatBackend
+from .platform import AIPlatform, ChatModelBackend, StructuredModelBackend
 from .profiles import ModelProfile, ModelRegistry
+from .provider_catalog import (
+    BaseUrlPolicy,
+    ProviderAdapter,
+    ProviderCatalog,
+    ProviderConnection,
+    ProviderDescriptor,
+    provider_descriptor,
+)
+from .roles import ModelRole
+from .runtime import ClientFactory, build_ai_platform
 
 __all__ = [
+    "AGENT_FAST_PROFILE_ID",
+    "AGENT_FAST_ROLE",
+    "AGENT_REASONING_PROFILE_ID",
+    "AGENT_REASONING_ROLE",
+    "AGENT_VISION_PROFILE_ID",
+    "AGENT_VISION_ROLE",
+    "AIConfiguration",
+    "AIConfigurationError",
+    "AICredentialError",
+    "AIMessage",
     "AIPlatform",
+    "AIPlatformError",
+    "AIResponseError",
+    "AITransportError",
+    "BaseUrlPolicy",
+    "ChatModelBackend",
+    "ChatRequest",
+    "ClientFactory",
+    "CredentialRef",
+    "CredentialResolver",
+    "CredentialSource",
+    "ImagePart",
+    "LISTING_ATTRIBUTES_PROFILE_ID",
+    "LISTING_ATTRIBUTES_ROLE",
+    "LISTING_IDENTITY_PROFILE_ID",
+    "LISTING_IDENTITY_ROLE",
     "LISTING_SEMANTIC_PROFILE_ID",
+    "LISTING_SEMANTIC_ROLE",
+    "LISTING_VISION_PROFILE_ID",
+    "LISTING_VISION_ROLE",
+    "LISTING_WEB_RESEARCH_PROFILE_ID",
+    "LISTING_WEB_RESEARCH_ROLE",
+    "MessageRole",
+    "ModelBinding",
     "ModelCapability",
     "ModelProfile",
     "ModelRegistry",
+    "ModelResponse",
+    "ModelRole",
+    "ModelUsage",
+    "OpenAIChatBackend",
+    "ProviderAdapter",
+    "ProviderCatalog",
+    "ProviderConnection",
+    "ProviderDescriptor",
+    "StreamEvent",
+    "StreamEventKind",
     "StructuredModelBackend",
+    "StructuredOutputMode",
+    "StructuredRequest",
+    "TextPart",
+    "ToolCall",
+    "ToolChoice",
+    "ToolDefinition",
+    "build_ai_platform",
     "listing_semantic_profile",
+    "provider_descriptor",
 ]

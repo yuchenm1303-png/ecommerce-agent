@@ -747,7 +747,16 @@ class StaticQmlBridge(QObject):
                 if data is None:
                     return None
                 text = widget.text()
-                kind = "badge" if widget.objectName() in {"phaseBadge", "appVersionBadge"} else "label"
+                kind = (
+                    "badge"
+                    if widget.objectName() in {
+                        "phaseBadge",
+                        "appVersionBadge",
+                        "channelAccountStatusBadge",
+                        "batchAccountStatusBadge",
+                    }
+                    else "label"
+                )
                 data.update(
                     kind=kind,
                     text=text,
@@ -765,6 +774,8 @@ class StaticQmlBridge(QObject):
                 "batchJobCard",
                 "batchJobDetails",
                 "cardDetailSection",
+                "channelAccountCard",
+                "batchAccountContext",
                 "consolePhaseUnit",
             }:
                 data = self._base(widget, origin)

@@ -69,6 +69,8 @@ Makro SKU ID 是 seller-controlled identifier，不是 supplier SKU、不是 lis
 
 其他 business fields（价格、库存、MOQ、Fulfilment、Shipping SLA、Listing Status、Selling Region 等）只能来自明确 seller/business/config/rule 输入；缺失就 blocked，不允许 AI/Web 猜。
 
+**Base Price / MRP 与 Selling Price 是显式 seller decision，不是 account fixed default。** 禁止恢复测试期的固定 6000 / 5000，也禁止落入通用 numeric `1` required fallback。Single 中用户可以在 GUI 提前确认；也可以留空进入真实执行：canonical executor 必须在任何正式字段写入前打开精确 Makro live section，用现有 Visual HUD 在目标价格控件旁展示只读参考/关系约束，并等待该控件的 trusted human `input/change`。HUD 永远 `pointer-events:none`，不得替用户点击或定价。采集到值后先 Cancel 临时 section 事务，再把该值作为 `source_type=user` required override 走现有 hard validation、价格关系校验、正式写入、Save/reopen verification。Selling Price > Base Price/MRP 必须 fail closed。Batch 也复用同一 executor/runtime decision gate，不允许另建默认价格旁路。
+
 当前 live schema 已明确知道哪些字段 `required=true`。正常 Resolver/Web/content policy 跑完后：关键 protected required 字段必须由用户显式确认；普通 required 字段可以继续走现有 deterministic non-AI fallback。所有用户值/兜底值都只经过当前 Makro option/unit/field hard guards，不得触发第二轮 AI/Web 搜索。
 
 ## Python 只能守机械边界

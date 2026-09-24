@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from . import source_capture_engine as _engine
@@ -17,7 +18,8 @@ from .source_capture_cache import (
     publish_source_capture_cache,
     read_source_capture_cache,
 )
-from .source_snapshot import SourceInteractionRequired
+from .source_image_recovery import recover_rendered_product_images
+from .source_snapshot import SourceInteractionRequired, write_source_snapshot
 from .update_browser_gate import close_managed_browser
 
 
@@ -91,6 +93,66 @@ def _refresh_capture_cache(
     )
 
 
+def _recover_missing_product_media(
+    captured: CapturedProductSource,
+    *,
+    target_dir: Path,
+    cdp_port: int,
+) -> CapturedProductSource:
+    """Use already-rendered Source Edge pixels when secondary image HTTP failed.
+
+    The source engine deliberately keeps its independent SSRF-bounded HTTP fetcher
+    as the primary path. If that transport returns zero product files while Edge
+    visibly rendered supplier images, recover only the exact image URLs already
+    observed in the canonical snapshot. This keeps product semantics untouched and
+    avoids turning arbitrary URLs into browser fetches.
+    """
+
+    if captured.product_image_paths:
+        return captured
+
+    recovery = recover_rendered_product_images(
+        captured.snapshot,
+        output_dir=target_dir,
+        cdp_port=int(cdp_port),
+    )
+    snapshot = captured.snapshot
+    snapshot.meta["product_image_browser_recovery_attempted"] = "true"
+    snapshot.meta["product_image_browser_recovery_saved"] = str(len(recovery.saved))
+    snapshot.meta["product_image_browser_recovery_failures"] = str(len(recovery.failures))
+    snapshot.meta["listing_media_ready"] = "true" if recovery.saved else "false"
+    if recovery.failures:
+        snapshot.meta["product_image_browser_recovery_diagnostics"] = json.dumps(
+            recovery.summary(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )[:8_000]
+
+    if recovery.saved:
+        snapshot.meta["product_images_downloaded"] = str(len(recovery.saved))
+        snapshot.meta["visual_evidence_available"] = "true"
+        snapshot.warnings.append(
+            "secondary image HTTP returned no usable product files; recovered rendered supplier images from Source Edge"
+        )
+    else:
+        warning = (
+            "no local product images captured after bounded browser-pixel recovery; "
+            "semantic source evidence may remain usable but Makro Product Photos is not yet satisfiable"
+        )
+        if warning not in snapshot.warnings:
+            snapshot.warnings.append(warning)
+
+    write_source_snapshot(snapshot, captured.snapshot_path)
+    return CapturedProductSource(
+        snapshot_path=captured.snapshot_path,
+        screenshot_path=captured.screenshot_path,
+        snapshot=snapshot,
+        launched_now=captured.launched_now,
+        product_image_paths=tuple(recovery.saved),
+        cache_hit=captured.cache_hit,
+    )
+
+
 def _browser_capture(
     source_url: str,
     *,
@@ -103,9 +165,9 @@ def _browser_capture(
     max_visible_text_chars: int,
     use_current_page: bool,
 ) -> CapturedProductSource:
-    """Run one cache-blind browser acquisition attempt."""
+    """Run one cache-blind browser acquisition attempt with bounded media recovery."""
 
-    return _engine.capture_product_source(
+    captured = _engine.capture_product_source(
         source_url,
         output_dir=target_dir,
         profile_dir=profile_dir,
@@ -118,6 +180,11 @@ def _browser_capture(
         cache_dir=None,
         cache_ttl_seconds=0,
         force_refresh=True,
+    )
+    return _recover_missing_product_media(
+        captured,
+        target_dir=target_dir,
+        cdp_port=cdp_port,
     )
 
 
@@ -134,13 +201,15 @@ def _capture_until_accepted(
     use_current_page: bool,
     resume_after_interaction: bool,
 ) -> CapturedProductSource:
-    """Capture until source evidence is complete enough or fail as PARTIAL_SOURCE.
+    """Capture until semantic evidence and, when possible, listing media stabilize.
 
-    A user-interaction resume first observes the preserved Source Edge page instead
-    of navigating over it. If the challenge/login is still present,
-    ``SourceInteractionRequired`` escapes immediately and the transport lane is
-    released again. Once the page is clear, ordinary bounded recovery may use the
-    original supplier URL as its final fresh-navigation attempt.
+    Semantic readiness and listing-media readiness are intentionally separate. A
+    supplier page with rich text but no local product image receives the same two
+    bounded recovery attempts instead of being accepted immediately. If semantic
+    evidence is sound but media still cannot be recovered, the capture is returned
+    with an explicit media-degraded marker so customer-supplied listing images can
+    still rescue the job; downstream persisted acceptance must not call it complete
+    until Product Photos is actually satisfied.
     """
 
     initial_use_current_page = bool(use_current_page or resume_after_interaction)
@@ -156,13 +225,15 @@ def _capture_until_accepted(
         use_current_page=initial_use_current_page,
     )
     verdict = _acceptance(captured)
-    if verdict.ready:
+    if verdict.ready and verdict.listing_media_ready:
         print(f"SOURCE_CAPTURE READINESS ready attempt=initial {verdict.describe()}", flush=True)
         return captured
 
+    issue = "media_missing" if verdict.ready else "partial_source"
     print(
-        "SOURCE_CAPTURE PARTIAL_DETECTED "
-        f"attempt=initial {verdict.describe()} detail={verdict.reason}",
+        "SOURCE_CAPTURE RECOVERY_NEEDED "
+        f"attempt=initial issue={issue} {verdict.describe()} "
+        f"detail={verdict.media_reason if verdict.ready else verdict.reason}",
         flush=True,
     )
 
@@ -180,7 +251,7 @@ def _capture_until_accepted(
         retry_scroll_wait_ms = max(int(scroll_wait_ms), _SOURCE_PARTIAL_SCROLL_WAIT_MS)
         mode = "fresh_navigation" if fresh_navigation else "current_page_settle"
         print(
-            "SOURCE_CAPTURE PARTIAL_RETRY "
+            "SOURCE_CAPTURE RETRY "
             f"attempt={attempt}/{_SOURCE_PARTIAL_RECOVERY_ATTEMPTS} mode={mode} "
             f"previous={verdict.describe()}",
             flush=True,
@@ -198,13 +269,22 @@ def _capture_until_accepted(
             use_current_page=retry_use_current_page,
         )
         verdict = _acceptance(captured)
-        if verdict.ready:
+        if verdict.ready and verdict.listing_media_ready:
             print(
                 f"SOURCE_CAPTURE READINESS ready attempt=recovery-{attempt} "
                 f"mode={mode} {verdict.describe()}",
                 flush=True,
             )
             return captured
+
+    if verdict.ready:
+        print(
+            "SOURCE_CAPTURE MEDIA_DEGRADED "
+            f"retries={_SOURCE_PARTIAL_RECOVERY_ATTEMPTS} {verdict.describe()} "
+            f"detail={verdict.media_reason}",
+            flush=True,
+        )
+        return captured
 
     print(
         "SOURCE_CAPTURE PARTIAL_SOURCE "
@@ -237,9 +317,10 @@ def _capture_once(
     """Own cache lifecycle above the browser engine.
 
     Browser acquisition produces the canonical task result. Cache read/write is an
-    optional accelerator around it and is deliberately unable to turn a successful
-    capture into a failed job. Interaction resumes bypass the cache because their
-    first responsibility is to verify the preserved live browser state.
+    optional accelerator around it. A semantically valid cache entry with zero
+    product images is no longer accepted as fully reusable: it triggers a fresh
+    browser capture so transient CDN/network failures cannot be frozen for the
+    entire cache TTL.
     """
 
     source_url = validate_source_url(url)
@@ -255,17 +336,24 @@ def _capture_once(
         )
         if cached is not None:
             cached_verdict = _acceptance(cached)
-            if cached_verdict.ready:
+            if cached_verdict.ready and cached_verdict.listing_media_ready:
                 print(
                     f"SOURCE_CACHE ACCEPTED {cached_verdict.describe()}",
                     flush=True,
                 )
                 return cached
-            print(
-                "SOURCE_CACHE REJECTED_PARTIAL "
-                f"{cached_verdict.describe()} detail={cached_verdict.reason}",
-                flush=True,
-            )
+            if cached_verdict.ready:
+                print(
+                    "SOURCE_CACHE REJECTED_MEDIA_MISSING "
+                    f"{cached_verdict.describe()} detail={cached_verdict.media_reason}",
+                    flush=True,
+                )
+            else:
+                print(
+                    "SOURCE_CACHE REJECTED_PARTIAL "
+                    f"{cached_verdict.describe()} detail={cached_verdict.reason}",
+                    flush=True,
+                )
 
     captured = _capture_until_accepted(
         source_url,

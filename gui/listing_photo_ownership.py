@@ -148,7 +148,7 @@ class ListingPhotoOwnership:
         if self.editor is None:
             raise RuntimeError("Listing photo ownership requires Batch URL editor")
 
-        self._manual_images_by_job_id: dict[str, tuple[Path, ...]] = {}
+        self._manual_images_by_job_key: dict[str, tuple[Path, ...]] = {}
         self.single_photo_button: QPushButton | None = None
 
         self._install_single_surface()
@@ -554,16 +554,24 @@ class ListingPhotoOwnership:
 
         self.controller._spawn = MethodType(spawn, self.controller)
 
+    @staticmethod
+    def _job_image_key(job: Any) -> str:
+        run_dir = str(getattr(job, "run_dir", "") or "").strip()
+        if run_dir:
+            return str(Path(run_dir).resolve())
+        account_id = str(getattr(job, "makro_account_id", "") or "").strip()
+        return f"{account_id}:{str(getattr(job, 'job_id', '') or '')}"
+
     def _set_job_images(self, job: Any, images: tuple[Path, ...]) -> None:
         row = self._row_for_job(job)
         normalized = self._row_listing_images(row) if row is not None else _normalized_manual_images(images)
-        self._manual_images_by_job_id[str(job.job_id)] = normalized
+        self._manual_images_by_job_key[self._job_image_key(job)] = normalized
         self._write_sidecar(job, normalized)
 
     def _job_images(self, job: Any) -> tuple[Path, ...]:
-        key = str(job.job_id)
-        if key in self._manual_images_by_job_id:
-            return self._manual_images_by_job_id[key]
+        key = self._job_image_key(job)
+        if key in self._manual_images_by_job_key:
+            return self._manual_images_by_job_key[key]
         sidecar = Path(job.run_dir).parent / _MANUAL_PHOTO_SIDECAR
         if not sidecar.is_file():
             return ()

@@ -35,6 +35,11 @@ private_data/
 logs/*
 !logs/.gitkeep
 
+# Agent Harness runtime state contains user prompts, tool observations, workspace
+# files and durable session/event snapshots. It is always local runtime data.
+/agent_runtime/
+/agent_workspace/
+
 # Local performance benchmark output
 /perf_results/
 

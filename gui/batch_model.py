@@ -53,7 +53,10 @@ class BatchJob:
     blocked: int = 0
     required_blocked: int = 0
     product_name: str = ""
+    makro_account_id: str = ""
+    makro_account_label: str = ""
     makro_target_id: str = ""
+    makro_browser_instance_token: str = ""
     browser_lane: int = 0
     makro_cdp_port: int = 0
     makro_profile_dir: str = ""
@@ -95,6 +98,9 @@ class BatchRun:
     root_dir: str
     jobs: list[BatchJob]
     status: str = "IDLE"
+    makro_account_id: str = ""
+    makro_account_label: str = ""
+    makro_browser_instance_token: str = ""
     prepare_concurrency: int = BATCH_WORKER_DEFAULT
     execute_concurrency: int = BATCH_WORKER_DEFAULT
     save_authorized: bool = False

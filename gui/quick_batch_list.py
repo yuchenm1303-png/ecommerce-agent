@@ -114,6 +114,7 @@ Item {
         delegate: Rectangle {
             id: jobCard
             required property string jobId
+            required property string accountLabel
             required property string productText
             required property string urlText
             required property int progressValue
@@ -162,7 +163,7 @@ Item {
                         Text {
                             width: parent.width
                             height: 13
-                            text: jobCard.jobId + " · OWNED PRODUCT TASK"
+                            text: jobCard.jobId + " · " + (jobCard.accountLabel.length > 0 ? jobCard.accountLabel + " · " : "") + "OWNED PRODUCT TASK"
                             color: Qt.rgba(218/255, 232/255, 250/255, 150/255)
                             font.family: "Microsoft YaHei UI"
                             font.pixelSize: 9
@@ -473,6 +474,7 @@ class QuickBatchList(QAbstractListModel):
     _BASE = int(Qt.ItemDataRole.UserRole)
     _ROLE_NAMES = (
         "jobId",
+        "accountLabel",
         "productText",
         "urlText",
         "progressValue",
@@ -518,6 +520,7 @@ class QuickBatchList(QAbstractListModel):
         self._component_failed = False
 
         self._rows: list[dict[str, Any]] = []
+        self._scope_key = self._selected_scope()
         self._expanded: set[str] = set()
         self._logs: dict[str, deque[str]] = {}
         self._dirty_log_text: set[str] = set()
@@ -592,6 +595,30 @@ class QuickBatchList(QAbstractListModel):
             return None
         return None
 
+    def _selected_scope(self) -> str:
+        getter = getattr(self.controller, "selected_account_lane", None)
+        if callable(getter):
+            return str(getter() or "").strip() or "__default__"
+        return "__default__"
+
+    def _scope_for_jobs(self, jobs: object) -> str:
+        if isinstance(jobs, (list, tuple)):
+            for job in jobs:
+                account_id = str(getattr(job, "makro_account_id", "") or "").strip()
+                if account_id:
+                    return account_id
+        return self._selected_scope()
+
+    def _log_key(self, job_id: str) -> str:
+        return f"{self._scope_key}:{str(job_id)}"
+
+    def _is_background_lane_event(self) -> bool:
+        current_getter = getattr(self.controller, "current_account_lane", None)
+        selected_getter = getattr(self.controller, "selected_account_lane", None)
+        if not callable(current_getter) or not callable(selected_getter):
+            return False
+        return str(current_getter() or "") != str(selected_getter() or "")
+
     def _load_existing_logs(self) -> None:
         cards = getattr(self.workspace, "_job_cards", None)
         if not isinstance(cards, dict):
@@ -605,7 +632,7 @@ class QuickBatchList(QAbstractListModel):
             except RuntimeError:
                 continue
             if lines:
-                self._logs[str(job_id)] = log_buffer(lines)
+                self._logs[self._log_key(str(job_id))] = log_buffer(lines)
 
     @staticmethod
     def _phase_text(progress: int) -> str:
@@ -624,6 +651,9 @@ class QuickBatchList(QAbstractListModel):
                 f"Supplier URL: {getattr(job, 'product_url', '') or '—'}",
                 f"Source interaction: {interaction or '—'}",
                 f"Source page: {interaction_url or '—'}",
+                f"Makro account: {getattr(job, 'makro_account_label', '') or getattr(job, 'makro_account_id', '') or '—'}",
+                f"Makro account ID: {getattr(job, 'makro_account_id', '') or '—'}",
+                f"Makro CDP lane: {getattr(job, 'makro_cdp_port', '') or '—'}",
                 f"Makro targetId: {getattr(job, 'makro_target_id', '') or '—'}",
                 f"Run directory: {getattr(job, 'run_dir', '') or '—'}",
                 f"Execution report: {getattr(job, 'execution_report', '') or '—'}",
@@ -637,14 +667,16 @@ class QuickBatchList(QAbstractListModel):
         status = str(getattr(job, "status", "QUEUED") or "QUEUED")
         progress = max(0, min(100, int(getattr(job, "progress", 0) or 0)))
         foreground, background = _STATUS_COLORS.get(status, ("#ccecff", "#386997c9"))
-        logs = self._logs.get(job_id)
+        log_key = self._log_key(job_id)
+        logs = self._logs.get(log_key)
         log_preview = logs[-1] if logs else ""
-        expanded = job_id in self._expanded
+        expanded = log_key in self._expanded
         run_dir = str(getattr(job, "run_dir", "") or "")
         waiting_source = status == _SOURCE_WAITING
         interaction_reason = str(getattr(job, "interaction_reason", "") or "")
         return {
             "jobId": job_id,
+            "accountLabel": str(getattr(job, "makro_account_label", "") or ""),
             "productText": str(getattr(job, "product_name", "") or "等待商品信息"),
             "urlText": str(getattr(job, "product_url", "") or "—"),
             "progressValue": progress,
@@ -685,10 +717,21 @@ class QuickBatchList(QAbstractListModel):
     def sync_jobs(self, jobs: object) -> None:
         if not isinstance(jobs, (list, tuple)):
             return
+        next_scope = self._scope_for_jobs(jobs)
+        scope_changed = next_scope != self._scope_key
+        if scope_changed:
+            self._scope_key = next_scope
+            self._dirty_log_text.clear()
+            self._log_text_timer.stop()
         next_rows = [self._snapshot_job(job) for job in jobs]
         same_topology = (
-            len(next_rows) == len(self._rows)
-            and all(old.get("jobId") == new.get("jobId") for old, new in zip(self._rows, next_rows))
+            not scope_changed
+            and len(next_rows) == len(self._rows)
+            and all(
+                old.get("jobId") == new.get("jobId")
+                and old.get("accountLabel") == new.get("accountLabel")
+                for old, new in zip(self._rows, next_rows)
+            )
         )
         if not same_topology:
             next_rows = [self._snapshot_job(job, refresh_log_text=True) for job in jobs]
@@ -711,6 +754,8 @@ class QuickBatchList(QAbstractListModel):
 
     @Slot(str)
     def append_log(self, line: str) -> None:
+        if self._is_background_lane_event():
+            return
         clean = display_log_line(line)
         if not clean:
             return
@@ -719,7 +764,7 @@ class QuickBatchList(QAbstractListModel):
             return
         job_id = match.group(1)
         message = match.group(2).strip() or clean
-        logs = self._logs.setdefault(job_id, log_buffer())
+        logs = self._logs.setdefault(self._log_key(job_id), log_buffer())
         logs.append(message)
         row_index = self._row_index(job_id)
         if row_index < 0:
@@ -752,7 +797,7 @@ class QuickBatchList(QAbstractListModel):
             row = self._rows[row_index]
             if not row.get("expanded"):
                 continue
-            row["logText"] = "\n".join(self._logs.get(job_id, ()))
+            row["logText"] = "\n".join(self._logs.get(self._log_key(job_id), ()))
             index = self.index(row_index, 0)
             self.dataChanged.emit(index, index, [self._ROLES["logText"]])
 
@@ -771,10 +816,11 @@ class QuickBatchList(QAbstractListModel):
     @Slot(str)
     def toggleExpanded(self, job_id: str) -> None:  # noqa: N802
         job_id = str(job_id)
-        if job_id in self._expanded:
-            self._expanded.remove(job_id)
+        expansion_key = self._log_key(job_id)
+        if expansion_key in self._expanded:
+            self._expanded.remove(expansion_key)
         else:
-            self._expanded.add(job_id)
+            self._expanded.add(expansion_key)
         row_index = self._row_index(job_id)
         job = self._job(job_id)
         if row_index < 0 or job is None:

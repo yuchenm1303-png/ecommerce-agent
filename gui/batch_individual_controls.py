@@ -64,7 +64,7 @@ class BatchIndividualControls(QObject):
 
         self._rows: dict[int, _RowControls] = {}
         self._cards: dict[str, _CardControls] = {}
-        self._stop_requested: set[str] = set()
+        self._stop_requested: set[tuple[str, str]] = set()
         self._batch_id = ""
 
         self._install_job_owned_product_files()
@@ -146,6 +146,11 @@ class BatchIndividualControls(QObject):
         self._rows[id(row)] = _RowControls(start, stop, remove)
         self._refresh_row(row)
 
+    def _lane_job_key(self, job_id: str) -> tuple[str, str]:
+        getter = getattr(self.controller, "current_account_lane", None)
+        lane = str(getter() if callable(getter) else "")
+        return (lane, str(job_id))
+
     # --------------------------------------------------------- controller hooks
     def _install_controller_hooks(self) -> None:
         self._original_start_prepare = self.controller.start_prepare
@@ -164,10 +169,11 @@ class BatchIndividualControls(QObject):
 
         def finished(_controller: Any, process: Any, exit_code: int) -> None:
             job_id, stage = _controller._processes.get(process, ("", ""))
+            stop_key = self._lane_job_key(job_id)
             self._original_finished(process, exit_code)
 
-            if job_id in self._stop_requested:
-                self._stop_requested.discard(job_id)
+            if stop_key in self._stop_requested:
+                self._stop_requested.discard(stop_key)
                 self._remove_from_queues(job_id)
                 job = self._job(job_id)
                 if job is not None:
@@ -225,7 +231,7 @@ class BatchIndividualControls(QObject):
 
             self._bind_row_job(row, job)
             self.workspace.open_batch_button.setEnabled(True)
-            self.controller.state_changed.emit(f"{job.job_id} · 单独启动 · 其他商品不受影响")
+            self.controller._emit_state_changed(f"{job.job_id} · 单独启动 · 其他商品不受影响")
             self.controller._persist_emit(immediate=True)
             self._pump_lanes()
         except Exception as exc:
@@ -256,7 +262,7 @@ class BatchIndividualControls(QObject):
         self.controller._source_queue.append(job_id)
         if self.controller._mode == "idle":
             self.controller._mode = "prepare"
-            self.controller.running_changed.emit(True)
+            self.controller._emit_running_changed(True)
         return job
 
     def _next_job_id(self) -> str:
@@ -310,7 +316,7 @@ class BatchIndividualControls(QObject):
             self._settle_if_idle("")
             return
 
-        self._stop_requested.add(job_id)
+        self._stop_requested.add(self._lane_job_key(job_id))
         process.terminate()
         QTimer.singleShot(2500, lambda p=process: self._kill_if_running(p))
         self.controller._persist_emit(immediate=True)
@@ -425,8 +431,8 @@ class BatchIndividualControls(QObject):
             self.controller._mode = "execute"
         self.controller._execute_queue.append(job_id)
         if not was_running:
-            self.controller.running_changed.emit(True)
-        self.controller.state_changed.emit(f"{job_id} · 单独真实填写 · 其他商品继续")
+            self.controller._emit_running_changed(True)
+        self.controller._emit_state_changed(f"{job_id} · 单独真实填写 · 其他商品继续")
         self.controller._persist_emit(immediate=True)
         self._pump_lanes()
 
@@ -569,9 +575,9 @@ class BatchIndividualControls(QObject):
         batch_id = str(batch.batch_id) if batch is not None else ""
         if batch_id != self._batch_id:
             self._batch_id = batch_id
-            if not batch_id:
-                for row in list(self.editor.rows):
-                    row._individual_job_id = ""
+            self._cards.clear()
+            for row in list(self.editor.rows):
+                row._individual_job_id = ""
 
         by_id = {str(job.job_id): job for job in jobs}
         claimed = {
@@ -698,8 +704,8 @@ class BatchIndividualControls(QObject):
             else:
                 batch.status = "IDLE"
         self.controller._persist_emit(immediate=True)
-        self.controller.running_changed.emit(False)
-        self.controller.state_changed.emit("Batch 空闲 · 可继续单独启动商品")
+        self.controller._emit_running_changed(False)
+        self.controller._emit_state_changed("Batch 空闲 · 可继续单独启动商品")
 
     def _remove_from_queues(self, job_id: str) -> None:
         for name in ("_source_queue", "_prepare_queue", "_execute_queue"):

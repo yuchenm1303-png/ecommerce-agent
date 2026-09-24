@@ -185,10 +185,14 @@ Item {
         id: badgeComponent
         Rectangle {
             property var d
-            radius: 7
-            color: Qt.rgba(0, 0, 0, 72/255)
+            radius: d && d.name === "channelAccountStatusBadge" ? 9 : 7
+            color: d && d.name === "channelAccountStatusBadge"
+                ? Qt.rgba(1, 1, 1, 18/255)
+                : Qt.rgba(0, 0, 0, 72/255)
             border.width: 1
-            border.color: Qt.rgba(1, 1, 1, 20/255)
+            border.color: d && d.name === "channelAccountStatusBadge"
+                ? Qt.rgba(1, 1, 1, 30/255)
+                : Qt.rgba(1, 1, 1, 20/255)
             Text {
                 anchors.fill: parent
                 anchors.leftMargin: 12
@@ -208,10 +212,17 @@ Item {
         id: panelComponent
         Rectangle {
             property var d
-            radius: d && d.name === "cardDetailSection" ? 10 : 8
-            color: d && d.name === "cardDetailSection" ? Qt.rgba(1,1,1,16/255) : (d && d.fill ? d.fill : "transparent")
-            border.width: d && d.name === "cardDetailSection" ? 1 : 0
-            border.color: Qt.rgba(1,1,1,20/255)
+            readonly property bool accountCard: d && d.name === "channelAccountCard"
+            radius: accountCard ? 12 : d && d.name === "cardDetailSection" ? 10 : 8
+            color: accountCard
+                ? Qt.rgba(1, 1, 1, 18/255)
+                : d && d.name === "cardDetailSection"
+                ? Qt.rgba(1,1,1,16/255)
+                : (d && d.fill ? d.fill : "transparent")
+            border.width: accountCard || (d && d.name === "cardDetailSection") ? 1 : 0
+            border.color: accountCard
+                ? Qt.rgba(1,1,1,30/255)
+                : Qt.rgba(1,1,1,20/255)
         }
     }
 

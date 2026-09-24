@@ -85,3 +85,10 @@ def test_offer_intent_does_not_replace_makro_seller_sku_or_qc_lock(monkeypatch) 
     assert "makro_execute_listing.py" not in gui  # reuse controller/executor instead of a second engine
     assert "Send to QC" not in gui
     assert "install_listing_offer_support" in launcher
+
+
+def test_required_confirmation_panel_key_is_unique_across_account_batches() -> None:
+    source = _source("gui/listing_offer_support.py")
+    assert "def _batch_panel_key" in source
+    assert "Path(run_dir).resolve()" in source
+    assert "active_panel_keys" in source

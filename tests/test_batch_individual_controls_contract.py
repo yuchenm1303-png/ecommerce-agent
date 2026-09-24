@@ -49,3 +49,10 @@ def test_formal_gui_installs_individual_batch_controls_not_batch_pause_controls(
     assert "install_batch_individual_controls(window.batch_workspace)" in ENTRY
     assert "install_cooperative_batch_job_controls(window.batch_workspace)" not in ENTRY
     assert "from gui.cooperative_pause import install_cooperative_pause" in ENTRY
+
+
+def test_individual_stop_state_is_scoped_by_account_lane() -> None:
+    assert "set[tuple[str, str]]" in CONTROLS
+    assert "def _lane_job_key" in CONTROLS
+    assert "stop_key = self._lane_job_key(job_id)" in CONTROLS
+    assert "self._cards.clear()" in CONTROLS

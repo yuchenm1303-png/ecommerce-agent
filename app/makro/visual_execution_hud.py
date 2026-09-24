@@ -67,6 +67,14 @@ html,body{margin:0;width:100%;height:100%;min-height:0;background:transparent;co
 .bubble-line span,.bubble-line b,.bubble-title,.bubble-thought{transform:none!important;filter:none!important}
 .bubble-line b{color:#e7f8ff;font-weight:600;text-align:right;overflow-wrap:anywhere}
 .bubble-thought{margin-top:9px;padding-top:9px;border-top:1px solid rgba(255,255,255,.07);min-height:29px;font-size:12px;color:#c3d7e4;line-height:1.65;overflow-wrap:anywhere}
+.info-bubble.advice-mode{--info-bubble-width:352px}
+.advice-panel{display:none;margin-top:9px;padding-top:9px;border-top:1px solid rgba(102,217,255,.13)}
+.info-bubble.advice-mode .advice-panel{display:block}
+.advice-row{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:2px 0;font-size:11.8px;line-height:1.55}
+.advice-row span{color:#91a7b9;flex:0 0 auto}
+.advice-row b{color:#eefaff;font-weight:650;text-align:right;overflow-wrap:anywhere}
+.advice-warning{display:none;margin-top:7px;padding:7px 9px;border-radius:10px;background:rgba(245,184,92,.09);border:1px solid rgba(245,184,92,.18);color:#f4cf94;font-size:11.5px;line-height:1.55}
+.advice-warning.visible{display:block}
 .bottom-timeline{position:absolute;left:50%;bottom:92px;transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:9px 13px;border-radius:999px;background:rgba(8,17,27,.86);border:1px solid rgba(255,255,255,.08);pointer-events:none}
 .phase{display:flex;align-items:center;gap:8px;color:#7f91a2;font-size:12px;white-space:nowrap}.phase::after{content:"";width:18px;height:1px;background:rgba(255,255,255,.13)}.phase:last-child::after{display:none}.phase.active{color:#dff8ff}.phase.done{color:var(--success)}.phase i{width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 10px currentColor}
 @media(max-width:720px){:root{--info-bubble-width:260px}.bottom-timeline{bottom:34px;gap:4px;padding:7px 9px}.phase{gap:4px;font-size:11px}.phase::after{width:8px}.phase i{width:4.5px;height:4.5px}}
@@ -96,7 +104,7 @@ html,body{margin:0;width:100%;height:100%;min-height:0;background:transparent;co
     </svg>
     <div class="cursor-hotspot"></div><div class="click-wave"></div>
   </div>
-  <div class="info-bubble" id="bubble"><div class="bubble-title" id="bubbleTitle">正在开始真实填写</div><div class="bubble-line"><span>目标状态</span><b id="confidence">LIVE DOM</b></div><div class="bubble-line"><span>执行坐标</span><b id="coords">—</b></div><div class="bubble-line"><span>动作来源</span><b id="actionSource">Playwright + Live DOM</b></div><div class="bubble-thought" id="thought">正在等待第一个真实页面操作。</div></div>
+  <div class="info-bubble" id="bubble"><div class="bubble-title" id="bubbleTitle">正在开始真实填写</div><div class="bubble-line"><span>目标状态</span><b id="confidence">LIVE DOM</b></div><div class="bubble-line"><span>执行坐标</span><b id="coords">—</b></div><div class="bubble-line"><span>动作来源</span><b id="actionSource">Playwright + Live DOM</b></div><div class="advice-panel" id="advicePanel"><div id="adviceRows"></div><div class="advice-warning" id="adviceWarning"></div></div><div class="bubble-thought" id="thought">正在等待第一个真实页面操作。</div></div>
   <div class="bottom-timeline" id="timeline"><div class="phase done"><i></i>观察</div><div class="phase active"><i></i>分析</div><div class="phase"><i></i>移动</div><div class="phase"><i></i>点击</div><div class="phase"><i></i>验证</div></div>
 </section>
 </div>
@@ -134,6 +142,7 @@ _INSTALL_SCRIPT = r"""
     currentTarget:null,
     lastActionAt:Date.now(),
     lastPulseAt:0,
+    adviceUntil:0,
     destroyed:false,
     doc(){
       try { return frame.contentDocument; } catch (_) { return null; }
@@ -151,10 +160,13 @@ _INSTALL_SCRIPT = r"""
         confidence:d.getElementById('confidence'),
         coords:d.getElementById('coords'),
         source:d.getElementById('actionSource'),
+        advicePanel:d.getElementById('advicePanel'),
+        adviceRows:d.getElementById('adviceRows'),
+        adviceWarning:d.getElementById('adviceWarning'),
         thought:d.getElementById('thought'),
         phases:Array.from(d.querySelectorAll('.phase'))
       };
-      if(!nodes.root || !nodes.app || !nodes.bubble || !nodes.title || !nodes.confidence || !nodes.coords || !nodes.source || !nodes.thought) return null;
+      if(!nodes.root || !nodes.app || !nodes.bubble || !nodes.title || !nodes.confidence || !nodes.coords || !nodes.source || !nodes.advicePanel || !nodes.adviceRows || !nodes.adviceWarning || !nodes.thought) return null;
       return nodes;
     },
     interactive(node){
@@ -193,6 +205,52 @@ _INSTALL_SCRIPT = r"""
         phase.classList.toggle('active', i === index);
       });
     },
+    clearAdvice(nodes){
+      if(!nodes) return;
+      this.adviceUntil=0;
+      nodes.bubble.classList.remove('advice-mode');
+      nodes.adviceRows.replaceChildren();
+      nodes.adviceWarning.textContent='';
+      nodes.adviceWarning.classList.remove('visible');
+    },
+    advice(target,payload){
+      if(this.destroyed || !this.visible(target)) return false;
+      const nodes=this.nodes();
+      if(!nodes) return false;
+      this.currentTarget=target;
+      this.lastActionAt=Date.now();
+      const holdMs=Math.max(1000,Math.min(1800000,Number(payload.hold_ms)||7000));
+      this.adviceUntil=Date.now()+holdMs;
+      const rect=target.getBoundingClientRect();
+      const x=Math.max(0,Math.min(window.innerWidth,rect.left+rect.width*.5));
+      const y=Math.max(0,Math.min(window.innerHeight,rect.top+rect.height*.5));
+      nodes.root.style.setProperty('--cursor-x',`${x}px`);
+      nodes.root.style.setProperty('--cursor-y',`${y}px`);
+      nodes.coords.textContent=`${Math.round(x)}, ${Math.round(y)}`;
+      nodes.title.textContent=String(payload.title || '需要你决定');
+      nodes.confidence.textContent='USER DECISION';
+      nodes.source.textContent=String(payload.source || 'Listing Studio');
+      nodes.adviceRows.replaceChildren();
+      (Array.isArray(payload.rows) ? payload.rows : []).slice(0,8).forEach(row => {
+        const line=nodes.d.createElement('div');
+        line.className='advice-row';
+        const label=nodes.d.createElement('span');
+        const value=nodes.d.createElement('b');
+        label.textContent=String(row && row.label || '');
+        value.textContent=String(row && row.value || '');
+        line.append(label,value);
+        nodes.adviceRows.appendChild(line);
+      });
+      const warning=String(payload.warning || '').trim();
+      nodes.adviceWarning.textContent=warning;
+      nodes.adviceWarning.classList.toggle('visible',Boolean(warning));
+      nodes.thought.textContent=String(payload.thought || '');
+      nodes.bubble.classList.add('advice-mode');
+      this.placeBubble(nodes,x,y);
+      this.setPhase(Math.max(0,Math.min(4,Number(payload.phase)||2)));
+      nodes.app.classList.remove('hud-hidden');
+      return true;
+    },
     placeBubble(nodes,x,y){
       const vw=Math.max(1,window.innerWidth), vh=Math.max(1,window.innerHeight);
       const rect=nodes.bubble.getBoundingClientRect();
@@ -211,6 +269,16 @@ _INSTALL_SCRIPT = r"""
       if(this.destroyed || !this.visible(target)) return;
       const nodes=this.nodes();
       if(!nodes) return;
+      const keepAdvice=target===this.currentTarget
+        && Date.now()<this.adviceUntil
+        && nodes.bubble.classList.contains('advice-mode');
+      if(keepAdvice){
+        this.lastActionAt=Date.now();
+        this.setPhase(phase);
+        nodes.app.classList.remove('hud-hidden');
+        return;
+      }
+      this.clearAdvice(nodes);
       this.currentTarget=target;
       this.lastActionAt=Date.now();
       const rect=target.getBoundingClientRect();
@@ -238,6 +306,7 @@ _INSTALL_SCRIPT = r"""
     status(title,thought,phase=1){
       const nodes=this.nodes();
       if(!nodes) return false;
+      this.clearAdvice(nodes);
       nodes.title.textContent=String(title || '正在执行真实填写');
       nodes.thought.textContent=String(thought || '等待真实页面操作。');
       nodes.confidence.textContent='LIVE DOM';

@@ -31,6 +31,25 @@ def _install_application_access_extensions_hook() -> None:
             install_batch_link_telemetry(window, controller)
         except Exception as exc:  # Telemetry must never block the core workspace.
             print(f"[batch-link-telemetry] install skipped: {exc}", file=sys.stderr)
+
+        # Agent is a detached workspace extension. Defer installation until the
+        # first Qt event-loop turn so run_local_gui.py can finish constructing the
+        # existing Single/Batch workspace and its authoritative QQuickWindow first.
+        # No Agent model/provider is initialized until the user actually opens it.
+        try:
+            from PySide6.QtCore import QTimer
+
+            def install_agent_workspace_extension() -> None:
+                try:
+                    from .agent_workspace import install_agent_workspace
+
+                    install_agent_workspace(window)
+                except Exception as exc:  # Agent must never block Listing startup.
+                    print(f"[agent-workspace] install skipped: {exc}", file=sys.stderr)
+
+            QTimer.singleShot(0, install_agent_workspace_extension)
+        except Exception as exc:  # Keep Listing fully independent from Agent UI.
+            print(f"[agent-workspace] deferred install unavailable: {exc}", file=sys.stderr)
         return controller
 
     _app_access.install_application_access = install_with_extensions

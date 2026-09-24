@@ -6,6 +6,32 @@ on:
   pull_request:
 
 jobs:
+  makro-multi-account-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify Makro account isolation and task ownership
+        run: |
+          pytest -q \
+            tests/test_channel_accounts.py \
+            tests/test_batch_account_lanes.py \
+            tests/test_makro_multi_account_task_binding.py \
+            tests/test_batch_individual_controls_contract.py \
+            tests/test_listing_photo_ownership_contract.py \
+            tests/test_listing_offer_support_contract.py \
+            tests/test_makro_multi_account_ui_contract.py
+
   tests:
     runs-on: ubuntu-latest
     steps:

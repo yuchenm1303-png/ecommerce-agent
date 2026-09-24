@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from .capabilities import ModelCapability
+from .credentials import CredentialRef
 
 
 _PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9._-]{0,127}$")
@@ -12,11 +13,11 @@ _PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9._-]{0,127}$")
 
 @dataclass(frozen=True, slots=True)
 class ModelProfile:
-    """Stable application role bound to one provider/model configuration.
+    """One provider/model assignment for a stable application AI role.
 
-    Profiles deliberately contain no API key, token or credential material.
-    Listing workflows can therefore depend on a stable role such as
-    ``listing.semantic`` without depending on Qwen/OpenAI vendor names.
+    A profile contains only non-secret model metadata plus an optional
+    ``CredentialRef``. The reference names where a secret can be resolved; the
+    secret value itself never belongs in this object.
     """
 
     profile_id: str
@@ -24,6 +25,7 @@ class ModelProfile:
     model: str
     capabilities: frozenset[ModelCapability]
     allow_fallback: bool = False
+    credential_ref: CredentialRef | None = None
 
     def __post_init__(self) -> None:
         profile_id = str(self.profile_id or "").strip().casefold()
@@ -38,6 +40,9 @@ class ModelProfile:
         capabilities = frozenset(ModelCapability(value) for value in self.capabilities)
         if not capabilities:
             raise ValueError("model profile must declare at least one capability")
+        credential_ref = self.credential_ref
+        if credential_ref is not None and not isinstance(credential_ref, CredentialRef):
+            raise TypeError("credential_ref must be CredentialRef or None")
         object.__setattr__(self, "profile_id", profile_id)
         object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "model", model)
@@ -45,6 +50,18 @@ class ModelProfile:
 
     def supports(self, *required: ModelCapability) -> bool:
         return all(ModelCapability(value) in self.capabilities for value in required)
+
+    def as_safe_dict(self) -> dict[str, object]:
+        return {
+            "profile_id": self.profile_id,
+            "provider": self.provider,
+            "model": self.model,
+            "capabilities": sorted(value.value for value in self.capabilities),
+            "allow_fallback": self.allow_fallback,
+            "credential_ref": (
+                self.credential_ref.as_safe_dict() if self.credential_ref is not None else None
+            ),
+        }
 
 
 class ModelRegistry:

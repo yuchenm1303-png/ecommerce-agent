@@ -32,7 +32,15 @@ from app.makro.listing_draft_identity import (
     listing_draft_identity_from_url,
     normalized_listing_draft_identity,
 )
-from makro_execute_listing import main as execute_main
+from app.makro.photo_acceptance import install_executor_photo_guards
+import makro_execute_listing as _executor
+
+
+# Makro Product Photos is mandatory for a persistable listing. Install the
+# canonical gate before any execution entrypoint can classify a zero-photo draft
+# as strict success. The guard is idempotent and preserves already-persisted
+# gallery images when no new upload is required.
+install_executor_photo_guards(_executor)
 
 
 _OWNED_HISTORY_SETTLE_MS = 8_000
@@ -197,7 +205,7 @@ def main() -> int:
                 "and that exact draft could not be restored from the same tab history; "
                 "refusing to navigate another tab or replay a stale listing URL."
             )
-        return int(execute_main())
+        return int(_executor.main())
 
 
 if __name__ == "__main__":

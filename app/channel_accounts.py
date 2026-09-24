@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .browser_instance import (
+    managed_makro_account_cdp_port_candidates,
+    managed_makro_cdp_port,
+)
+
 
 _STATE_VERSION = 1
 _CHANNEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -37,8 +42,10 @@ class ChannelAccount:
 class ChannelAccountStore:
     """Local channel-account metadata scoped to the signed-in application account.
 
-    This store contains identity and selection metadata only. It never stores a
-    marketplace password, cookie, access token, API key, or OAuth secret.
+    This store contains identity/selection/browser-lane metadata only. It never
+    stores a marketplace password, cookie, access token, API key, or OAuth secret.
+    Each Makro account receives a persisted CDP port in addition to its isolated
+    Browser Profile so separate account sessions can remain alive concurrently.
     """
 
     def __init__(self, runtime_root: Path, *, scope_id: str) -> None:
@@ -115,6 +122,14 @@ class ChannelAccountStore:
             created_at=float(row.get("created_at") or 0.0),
         )
 
+    @staticmethod
+    def _valid_port(value: Any) -> int:
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return port if 1 <= port <= 65535 else 0
+
     def list_accounts(self, channel: str) -> tuple[ChannelAccount, ...]:
         normalized = self._normalize_channel(channel)
         return tuple(
@@ -171,18 +186,21 @@ class ChannelAccountStore:
         account_id = self._default_account_id(channel)
         profile_key = account_id
         label = f"{channel.title()} 默认账号"
-        if channel == "makro":
-            label = _DEFAULT_MAKRO_LABEL
-            if self._claim_legacy_makro_profile(account_id):
-                profile_key = _LEGACY_MAKRO_PROFILE_KEY
-
-        row = {
+        row: dict[str, Any] = {
             "account_id": account_id,
             "channel": channel,
             "label": label,
             "profile_key": profile_key,
             "created_at": time.time(),
         }
+        if channel == "makro":
+            row["label"] = _DEFAULT_MAKRO_LABEL
+            # The first/default account deliberately keeps the historical managed
+            # port so existing installations do not lose their live Edge endpoint.
+            row["cdp_port"] = managed_makro_cdp_port(self.runtime_root)
+            if self._claim_legacy_makro_profile(account_id):
+                row["profile_key"] = _LEGACY_MAKRO_PROFILE_KEY
+
         self._state["accounts"].append(row)
         self._state["active"][channel] = account_id
         self._save()
@@ -208,7 +226,7 @@ class ChannelAccountStore:
         normalized = self._normalize_channel(channel)
         account_id = uuid.uuid4().hex
         fallback = f"{normalized.title()} 账号 {len(self.list_accounts(normalized)) + 1}"
-        row = {
+        row: dict[str, Any] = {
             "account_id": account_id,
             "channel": normalized,
             "label": self._normalize_label(label, fallback=fallback),
@@ -217,7 +235,12 @@ class ChannelAccountStore:
         }
         self._state["accounts"].append(row)
         self._save()
-        return self._from_row(row)
+        account = self._from_row(row)
+        if normalized == "makro":
+            # Allocate now rather than at first task start so the account center can
+            # expose a stable lane immediately and restarts never reshuffle ports.
+            self.cdp_port(account)
+        return account
 
     def set_active(self, channel: str, account_id: str) -> ChannelAccount:
         normalized = self._normalize_channel(channel)
@@ -228,6 +251,68 @@ class ChannelAccountStore:
                 self._save()
                 return account
         raise KeyError(f"unknown {normalized} channel account: {wanted}")
+
+    def _row_for(self, account: ChannelAccount) -> dict[str, Any]:
+        for row in self._rows():
+            if (
+                str(row.get("channel") or "") == account.channel
+                and str(row.get("account_id") or "") == account.account_id
+            ):
+                return row
+        raise KeyError(f"unknown {account.channel} channel account: {account.account_id}")
+
+    def cdp_port(self, account: ChannelAccount) -> int:
+        """Return/persist the dedicated managed CDP port for one Makro account."""
+
+        if account.channel != "makro":
+            raise ValueError(f"CDP browser lane is not defined for channel {account.channel!r}")
+        row = self._row_for(account)
+        existing = self._valid_port(row.get("cdp_port"))
+        if existing:
+            return existing
+
+        occupied = {
+            port
+            for other in self._rows()
+            if str(other.get("channel") or "") == "makro"
+            for port in (self._valid_port(other.get("cdp_port")),)
+            if port
+        }
+        legacy_port = managed_makro_cdp_port(self.runtime_root)
+        is_default = account.account_id == self._default_account_id("makro")
+        # Older state files did not persist cdp_port. Preserve the historical lane
+        # for the deterministic default account as well as the legacy-profile owner.
+        if account.profile_key == _LEGACY_MAKRO_PROFILE_KEY or is_default:
+            if legacy_port in occupied:
+                owner = next(
+                    (
+                        other
+                        for other in self._rows()
+                        if self._valid_port(other.get("cdp_port")) == legacy_port
+                    ),
+                    None,
+                )
+                if owner is not None and str(owner.get("account_id") or "") != account.account_id:
+                    raise RuntimeError(
+                        "默认 Makro Browser 端口已被另一个平台账号占用；为防止串号，已停止分配。"
+                    )
+            row["cdp_port"] = legacy_port
+            self._save()
+            return legacy_port
+
+        # Keep the historical/default lane reserved even if an older state file has
+        # not yet materialized its cdp_port field.
+        occupied.add(legacy_port)
+        for candidate in managed_makro_account_cdp_port_candidates(
+            self.runtime_root,
+            account.account_id,
+        ):
+            if candidate in occupied:
+                continue
+            row["cdp_port"] = candidate
+            self._save()
+            return candidate
+        raise RuntimeError("没有可用的 Makro Browser CDP 端口，无法创建独立账号会话。")
 
     def profile_dir(self, account: ChannelAccount) -> Path:
         if account.channel == "makro" and account.profile_key == _LEGACY_MAKRO_PROFILE_KEY:
