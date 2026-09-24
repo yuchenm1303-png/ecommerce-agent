@@ -145,7 +145,7 @@ def test_batch_controller_has_account_lane_process_context() -> None:
 def test_batch_runtime_binds_before_first_job_and_rejects_cross_account_reuse() -> None:
     source = BATCH_RUNTIME_PATH.read_text(encoding="utf-8")
 
-    assert "self._starting_account" in source
+    assert "self._starting_accounts" in source
     assert "self._stamp_batch_account(batch, account)" in source
     assert "这个 Batch 属于" in source
     assert "程序不会跨店铺复用已准备任务" in source
@@ -159,9 +159,32 @@ def test_batch_runtime_keeps_independent_account_slots() -> None:
     assert "self._account_slots" in runtime_source
     assert "def activate_account_slot" in runtime_source
     assert "self._remember_current_slot()" in runtime_source
-    assert "self.controller.batch = batch" in runtime_source
+    assert "activate_account_lane" in runtime_source
     assert "已恢复 Batch" in runtime_source
     assert "activate_account_slot" in browser_source
+
+
+def test_multiple_accounts_can_keep_independent_batch_lanes_running() -> None:
+    runtime_source = BATCH_RUNTIME_PATH.read_text(encoding="utf-8")
+    browser_source = CHANNEL_BROWSER_PATH.read_text(encoding="utf-8")
+    runner_source = (ROOT / "gui" / "batch_runner.py").read_text(encoding="utf-8")
+
+    assert "self._owners: dict[str, BatchSharedBrowserOwner]" in runtime_source
+    assert "_parallelism_by_account" in runtime_source
+    assert "def _current_lane_id" in runtime_source
+    assert "def account_lane_running" in runner_source
+    assert "def any_account_lane_running" in runner_source
+    assert "def channel_account_change_blocked" in browser_source
+    assert "独立 Batch 不受此限制" in browser_source
+
+
+def test_shared_supplier_source_remains_serialized_across_accounts() -> None:
+    source = (ROOT / "gui" / "batch_runner.py").read_text(encoding="utf-8")
+
+    assert "def _source_process_active_any_lane" in source
+    assert "def _source_interaction_waiting_any_lane" in source
+    assert "def _pump_waiting_source_lanes" in source
+    assert "self._source_process_active_any_lane()" in source
 
 
 def test_account_center_exposes_per_account_batch_slot_overview() -> None:

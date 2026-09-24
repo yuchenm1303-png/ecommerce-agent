@@ -125,8 +125,8 @@ class ChannelAccountCenterPanel(QWidget):
 
         policy = QLabel(
             "Single 的 Step 3 准备现场在切换店铺后会失效，避免把旧店铺页面用于新账号。"
-            "每个 Makro 账号都保留自己的 Browser Profile、CDP lane 和 Batch 槽位，切回原店铺后可以继续。"
-            "当前版本同一桌面进程一次只调度一个账号的 Batch；其他账号的浏览器登录会话会保持独立，不会被覆盖。"
+            "每个 Makro 账号都保留自己的 Browser Profile、CDP lane 和 Batch scheduler lane。"
+            "账号之间可以同时准备/真实填写；共享的供应商 Source Edge 会自动串行，避免页面互相抢占。"
         )
         policy.setObjectName("cardDetailText")
         policy.setWordWrap(True)
@@ -139,11 +139,49 @@ class ChannelAccountCenterPanel(QWidget):
         layout.addStretch(1)
 
         self.manager.status_changed.connect(self._browser_status_changed)
+        controller = getattr(getattr(self.manager.window, "batch_workspace", None), "controller", None)
+        lane_state = getattr(controller, "lane_state_changed", None)
+        if lane_state is not None:
+            lane_state.connect(lambda _account_id, _snapshot: self._refresh_account_overview())
         self.reload()
 
     def _account_port(self, account: Any) -> int:
         getter = getattr(self.manager, "channel_browser_port", None)
         return int(getter(account)) if callable(getter) else 0
+
+    def _refresh_account_overview(
+        self,
+        accounts: tuple[Any, ...] | None = None,
+        current: Any | None = None,
+    ) -> None:
+        accounts = accounts or tuple(self.manager.list_channel_accounts())
+        current = current or self.manager.channel_account
+        runtime = getattr(self.manager.window, "_batch_parallel_runtime", None)
+        snapshot_getter = getattr(runtime, "account_slot_snapshot", None)
+        overview_lines: list[str] = []
+        for account in accounts:
+            port = self._account_port(account)
+            marker = "●" if account.account_id == current.account_id else "○"
+            batch_text = "暂无 Batch"
+            if callable(snapshot_getter):
+                try:
+                    snapshot = snapshot_getter(account.account_id)
+                except Exception as exc:
+                    batch_text = f"Batch 状态不可用 · {exc}"
+                else:
+                    if bool(snapshot.get("has_batch")):
+                        summary = snapshot.get("summary") or {}
+                        status = "RUNNING" if bool(snapshot.get("running")) else str(
+                            snapshot.get("status") or "IDLE"
+                        )
+                        batch_text = (
+                            f"{status} · {int(summary.get('total') or 0)} tasks · "
+                            f"{int(summary.get('ready') or 0)} ready · "
+                            f"{int(summary.get('processing') or 0)} processing · "
+                            f"{int(summary.get('done') or 0)} done"
+                        )
+            overview_lines.append(f"{marker} {account.label} · CDP {port} · {batch_text}")
+        self.account_overview.setText("\n".join(overview_lines) or "暂无 Makro 账号")
 
     def reload(self) -> None:
         accounts = tuple(self.manager.list_channel_accounts())
@@ -175,40 +213,14 @@ class ChannelAccountCenterPanel(QWidget):
                 f"正在从 {current.label} 切换控制面"
             )
 
-        runtime = getattr(self.manager.window, "_batch_parallel_runtime", None)
-        snapshot_getter = getattr(runtime, "account_slot_snapshot", None)
-        overview_lines: list[str] = []
-        for account in accounts:
-            port = self._account_port(account)
-            marker = "●" if account.account_id == current.account_id else "○"
-            batch_text = "暂无 Batch"
-            if callable(snapshot_getter):
-                try:
-                    snapshot = snapshot_getter(account.account_id)
-                except Exception as exc:
-                    batch_text = f"Batch 状态不可用 · {exc}"
-                else:
-                    if bool(snapshot.get("has_batch")):
-                        summary = snapshot.get("summary") or {}
-                        status = "RUNNING" if bool(snapshot.get("running")) else str(
-                            snapshot.get("status") or "IDLE"
-                        )
-                        batch_text = (
-                            f"{status} · {int(summary.get('total') or 0)} tasks · "
-                            f"{int(summary.get('ready') or 0)} ready · "
-                            f"{int(summary.get('processing') or 0)} processing · "
-                            f"{int(summary.get('done') or 0)} done"
-                        )
-            overview_lines.append(
-                f"{marker} {account.label} · CDP {port} · {batch_text}"
-            )
-        self.account_overview.setText("\n".join(overview_lines) or "暂无 Makro 账号")
+        self._refresh_account_overview(accounts, current)
 
         state, detail = self.manager.channel_browser_status()
         self._browser_status_changed(state, detail)
-        busy = bool(self.manager.is_busy())
-        self.switch_button.setEnabled(not busy and bool(accounts))
-        self.connect_button.setEnabled(not busy)
+        change_blocked = getattr(self.manager, "channel_account_change_blocked", None)
+        blocked = bool(change_blocked()) if callable(change_blocked) else bool(self.manager.is_busy())
+        self.switch_button.setEnabled(not blocked and bool(accounts))
+        self.connect_button.setEnabled(not blocked)
 
     def _browser_status_changed(self, state: str, detail: str) -> None:
         self.browser_status.setText(f"Browser · {str(state).upper()} · {detail}")

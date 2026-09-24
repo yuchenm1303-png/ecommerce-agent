@@ -104,6 +104,34 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
     def channel_browser_status(self) -> tuple[str, str]:
         return self._state, self._detail
 
+    def _single_domain_busy(self) -> bool:
+        return bool(
+            self.window.runner.is_running
+            or self.window.execution_runner.is_running
+        )
+
+    def channel_account_change_blocked(self) -> bool:
+        return bool(self._update_quiesced or self._single_domain_busy())
+
+    def _is_busy(self) -> bool:
+        if self._single_domain_busy():
+            return True
+        workspace = getattr(self.window, "batch_workspace", None)
+        controller = getattr(workspace, "controller", None)
+        lane_running = getattr(controller, "account_lane_running", None)
+        if callable(lane_running):
+            target = self.selected_channel_account()
+            return bool(lane_running(target.account_id))
+        return bool(workspace is not None and workspace.is_running)
+
+    def begin_update_quiesce(self) -> tuple[bool, str]:
+        workspace = getattr(self.window, "batch_workspace", None)
+        controller = getattr(workspace, "controller", None)
+        any_running = getattr(controller, "any_account_lane_running", None)
+        if callable(any_running) and any_running():
+            return False, "仍有 Makro 账号的独立 Batch 在运行。请等待所有账号任务结束后再更新。"
+        return super().begin_update_quiesce()
+
     def task_channel_account(self) -> ChannelAccount:
         """Return the account only after the selected browser lane is committed."""
 
@@ -136,10 +164,10 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
         self._assert_account_scope_stable()
         if self._update_quiesced:
             raise RuntimeError("Listing Studio 正在准备更新，暂时不能切换 Makro 店铺。")
-        if self._is_busy():
+        if self._single_domain_busy():
             raise RuntimeError(
-                "当前仍有 Single / Batch / 真实填写任务运行。为防止上架到错误店铺，"
-                "任务结束前不能切换 Makro 账号。"
+                "当前 Single / 真实填写任务仍在运行。该现场仍属于当前 Makro 店铺，"
+                "任务结束前不能切换账号；独立 Batch 不受此限制。"
             )
 
     def request_activate_channel_account(self, account_id: str) -> ChannelAccount:
@@ -307,13 +335,50 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
             self._assert_account_scope_stable()
             self._apply_pending_channel_account()
             self._reconcile_running_browser_account(reason)
-            launched_any = bool(super().ensure_ready(reason) or launched_any)
+
+            if self._is_busy() and not self._single_domain_busy():
+                token = self._cdp_instance_token()
+                if not token or self._read_runtime_identity() != self._runtime_identity:
+                    raise RuntimeError(
+                        f"{self.channel_account.label} 的独立 Browser lane 正在运行任务，"
+                        "但无法验证其运行时身份；为防止串号，已拒绝切入。"
+                    )
+                self._observe_instance(token)
+                self._emit_status(
+                    "READY",
+                    f"{self.channel_account.label} 专属 Browser lane 正在执行独立 Batch",
+                )
+            else:
+                launched_any = bool(super().ensure_ready(reason) or launched_any)
+
             self._write_runtime_identity()
             if not self._has_pending_channel_account():
                 return launched_any
 
+    def ensure_async(self) -> None:
+        if not self._has_pending_channel_account():
+            super().ensure_async()
+            return
+        if self._update_quiesced or self._single_domain_busy():
+            return
+        if self._launch_thread is not None and self._launch_thread.is_alive():
+            return
+
+        def worker() -> None:
+            try:
+                self.ensure_ready("Makro account lane switch")
+            except Exception:
+                pass
+
+        self._launch_thread = threading.Thread(
+            target=worker,
+            name="managed-makro-account-lane-switch",
+            daemon=True,
+        )
+        self._launch_thread.start()
+
     def _apply_endpoint_observation(self, token: str) -> None:
-        if self._has_pending_channel_account() and not self._is_busy() and not self._update_quiesced:
+        if self._has_pending_channel_account() and not self._update_quiesced:
             selected = self.selected_channel_account()
             if self._state in self._HOT_STATES:
                 self._emit_status(

@@ -50,10 +50,11 @@ class BatchParallelRuntime:
     browser-instance token that created its owned targetIds; a restored Batch may
     reuse those tabs only if the same account/profile/port/generation is alive.
 
-    Current UI scheduling remains one active Batch controller at a time. Separate
-    per-account CDP/Profile lanes are already in place, but simultaneous execution
-    across accounts is intentionally a later scheduler step rather than sharing a
-    controller or transport owner unsafely.
+    One BatchController now carries independent account lanes. The selected lane
+    owns the visible workspace while QProcess callbacks re-enter their originating
+    account lane, so shop A can keep preparing/executing after the user switches to
+    shop B. Each account also keeps its own CDP lease/transport owner; only the
+    shared supplier Source Edge remains globally serialized.
     """
 
     def __init__(self, window: Any) -> None:
@@ -69,9 +70,9 @@ class BatchParallelRuntime:
         if self._original_start_prepare is None or self._original_start_execution is None:
             raise RuntimeError("Batch parallel runtime requires canonical BatchController starts")
 
-        self._owner: BatchSharedBrowserOwner | None = None
-        self._parallelism = 0
-        self._starting_account: Any | None = None
+        self._owners: dict[str, BatchSharedBrowserOwner] = {}
+        self._parallelism_by_account: dict[str, int] = {}
+        self._starting_accountss: dict[str, Any] = {}
         self._account_slots: dict[str, tuple[Any, Any]] = {}
         scope_token = str(getattr(self.manager.channel_accounts, "scope_token", "") or "")
         self._slot_store = BatchAccountSlotStore(
@@ -84,8 +85,20 @@ class BatchParallelRuntime:
         self._install_controller_routing()
         self.controller._batch_parallel_runtime = self
         self.manager.status_changed.connect(self._decorate_batch_status)
-        self.controller.running_changed.connect(lambda _running: self._release_if_safe())
-        self.controller.jobs_changed.connect(lambda _jobs: self._release_if_safe())
+        lane_running = getattr(self.controller, "lane_running_changed", None)
+        lane_state = getattr(self.controller, "lane_state_changed", None)
+        if lane_running is not None:
+            lane_running.connect(
+                lambda account_id, _running: self._release_if_safe(str(account_id))
+            )
+        else:
+            self.controller.running_changed.connect(lambda _running: self._release_if_safe())
+        if lane_state is not None:
+            lane_state.connect(
+                lambda account_id, _snapshot: self._release_if_safe(str(account_id))
+            )
+        else:
+            self.controller.jobs_changed.connect(lambda _jobs: self._release_if_safe())
         self.window.destroyed.connect(lambda *_args: self._release_owner())
         self._restore_persisted_slots()
 
@@ -101,11 +114,14 @@ class BatchParallelRuntime:
         }
 
     def account_slot_snapshot(self, account_id: str) -> dict[str, Any]:
-        """Return presentation-safe state for one account's independent Batch slot."""
+        """Return presentation-safe state for one account's independent Batch lane."""
 
         account_key = str(account_id or "").strip()
         if not account_key:
             raise ValueError("Makro account_id must not be empty")
+        snapshot_getter = getattr(self.controller, "account_lane_snapshot", None)
+        if callable(snapshot_getter):
+            return dict(snapshot_getter(account_key))
 
         slot = self._account_slots.get(account_key)
         if slot is None:
@@ -117,28 +133,14 @@ class BatchParallelRuntime:
                 "running": False,
                 "summary": self._empty_summary(),
             }
-
         batch, _config = slot
-        owner_id = str(getattr(batch, "makro_account_id", "") or "").strip()
-        if owner_id and owner_id != account_key:
-            raise RuntimeError(
-                "Makro Batch 槽位账号归属损坏；为防止串号，已拒绝展示该槽位。"
-            )
-
-        summary = batch.summary() if callable(getattr(batch, "summary", None)) else self._empty_summary()
-        current = getattr(self.manager, "channel_account", None)
-        running = bool(
-            current is not None
-            and str(getattr(current, "account_id", "") or "") == account_key
-            and self.controller.is_running
-        )
         return {
             "account_id": account_key,
             "has_batch": True,
             "batch_id": str(getattr(batch, "batch_id", "") or ""),
             "status": str(getattr(batch, "status", "") or "IDLE").upper(),
-            "running": running,
-            "summary": dict(summary),
+            "running": False,
+            "summary": batch.summary(),
         }
 
     def _controller_log(self, message: str) -> None:
@@ -192,7 +194,11 @@ class BatchParallelRuntime:
                 continue
             if self._normalize_recovered_batch(batch):
                 save_batch_run(batch)
-            self._account_slots[str(account.account_id)] = (batch, None)
+            account_id = str(account.account_id)
+            self._account_slots[account_id] = (batch, None)
+            install_lane = getattr(self.controller, "install_account_lane", None)
+            if callable(install_lane):
+                install_lane(account_id, batch=batch, config=None)
 
         self.activate_account_slot(self.manager.channel_account)
 
@@ -205,7 +211,8 @@ class BatchParallelRuntime:
             return
         self._account_slots[account_id] = (batch, self.controller.config)
         self._slot_store.remember(account_id, batch.root_dir)
-        save_batch_run(batch)
+        if not self.controller.is_running:
+            save_batch_run(batch)
 
     def _ensure_controller_config(self) -> RunnerConfig:
         config = self.controller.config
@@ -233,48 +240,36 @@ class BatchParallelRuntime:
         return config
 
     def activate_account_slot(self, account: Any) -> None:
-        """Swap the visible Batch controller state to one Makro account's slot."""
-
-        if self.controller.is_running:
-            raise RuntimeError("Batch 仍在运行，不能切换独立 Makro 任务槽位。")
+        """Select one account lane without stopping work owned by other accounts."""
 
         self._remember_current_slot()
-        self._release_owner()
-
         account_id = str(getattr(account, "account_id", "") or "").strip()
         if not account_id:
             raise RuntimeError("目标 Makro 账号缺少 account_id，不能恢复任务槽位。")
-        slot = self._account_slots.get(account_id)
-        if slot is None:
-            batch = None
-            config = None
-        else:
-            batch, config = slot
-            stored_id = str(getattr(batch, "makro_account_id", "") or "").strip()
-            if stored_id != account_id:
-                raise RuntimeError("Makro Batch 槽位账号归属损坏；为防止串号，已拒绝恢复。")
 
+        slot = self._account_slots.get(account_id)
+        install_lane = getattr(self.controller, "install_account_lane", None)
+        snapshot_getter = getattr(self.controller, "account_lane_snapshot", None)
+        if slot is not None and callable(install_lane) and callable(snapshot_getter):
+            snapshot = snapshot_getter(account_id)
+            if not bool(snapshot.get("has_batch")):
+                batch, config = slot
+                stored_id = str(getattr(batch, "makro_account_id", "") or "").strip()
+                if stored_id != account_id:
+                    raise RuntimeError("Makro Batch 槽位账号归属损坏；为防止串号，已拒绝恢复。")
+                install_lane(account_id, batch=batch, config=config)
+
+        activate_lane = getattr(self.controller, "activate_account_lane", None)
+        if callable(activate_lane):
+            activate_lane(account_id)
+            self._parallelism_by_account.setdefault(account_id, 0)
+            return
+
+        if self.controller.is_running:
+            raise RuntimeError("Batch 仍在运行，旧控制器不能切换 Makro 任务槽位。")
+        batch, config = slot if slot is not None else (None, None)
         self.controller.batch = batch
         self.controller.config = config
-        self.controller._mode = "idle"
-        self.controller._source_queue.clear()
-        self.controller._prepare_queue.clear()
-        self.controller._execute_queue.clear()
-        self.controller._source_resume_pending.clear()
-        self.controller._stopping = False
-        self._parallelism = 0
-
-        jobs = list(batch.jobs) if batch is not None else []
-        summary = batch.summary() if batch is not None else self._empty_summary()
-        self.controller.jobs_changed.emit(jobs)
-        self.controller.summary_changed.emit(summary)
-        self.controller.running_changed.emit(False)
-        if batch is None:
-            self.controller.state_changed.emit(f"{account.label} · 暂无 Batch")
-        else:
-            self.controller.state_changed.emit(
-                f"{account.label} · 已恢复 Batch {batch.batch_id} · {batch.status}"
-            )
 
     def _assert_top_level_idle(self) -> None:
         if self.manager.update_quiesced:
@@ -285,39 +280,55 @@ class BatchParallelRuntime:
                 "Batch 不会在另一个正式工作域持有 Makro Browser 时等待或抢占 session lease。"
             )
 
+    def _current_lane_id(self) -> str:
+        getter = getattr(self.controller, "current_account_lane", None)
+        if callable(getter):
+            return str(getter() or "").strip()
+        current = getattr(self.manager, "channel_account", None)
+        return str(getattr(current, "account_id", "") or "").strip()
+
+    def _account_for_lane(self, account_id: str) -> Any:
+        wanted = str(account_id or "").strip()
+        for account in self.manager.list_channel_accounts():
+            if str(account.account_id) == wanted:
+                return account
+        raise RuntimeError(f"Makro account lane 不存在：{wanted}")
+
     def _task_account(self) -> tuple[Any, Path]:
-        """Return the account only after its browser runtime identity is committed."""
+        """Resolve the account owned by the current scheduler callback lane."""
 
-        task_account_gate = getattr(self.manager, "task_channel_account", None)
-        if callable(task_account_gate):
-            current = task_account_gate()
-        else:
-            current = getattr(self.manager, "channel_account", None)
-            if current is None:
-                return None, Path(self.manager.profile_dir).resolve()
+        lane_id = self._current_lane_id()
+        current_manager = getattr(self.manager, "channel_account", None)
+        if not lane_id and current_manager is not None:
+            lane_id = str(current_manager.account_id)
 
-            selected_getter = getattr(self.manager, "selected_channel_account", None)
-            selected = selected_getter() if callable(selected_getter) else current
-            if selected.account_id != current.account_id:
-                ensure_async = getattr(self.manager, "ensure_async", None)
-                if callable(ensure_async):
-                    ensure_async()
-                raise RuntimeError(
-                    f"Makro 店铺正在切换到 {selected.label}。状态变为 READY 后再启动 Batch，"
-                    "避免任务绑定到旧账号。"
-                )
+        account = self._account_for_lane(lane_id)
+        manager_id = str(getattr(current_manager, "account_id", "") or "")
+        selected_getter = getattr(self.manager, "selected_channel_account", None)
+        selected = selected_getter() if callable(selected_getter) else current_manager
+        selected_id = str(getattr(selected, "account_id", "") or "")
 
-        profile_dir = Path(self.manager.profile_dir).resolve()
-        store = getattr(self.manager, "channel_accounts", None)
-        if store is not None:
-            expected = Path(store.profile_dir(current)).resolve()
-            expected_port = int(store.cdp_port(current))
-            if profile_dir != expected or int(self.manager.port) != expected_port:
+        if lane_id == manager_id == selected_id:
+            gate = getattr(self.manager, "task_channel_account", None)
+            if callable(gate):
+                account = gate()
+
+        store = self.manager.channel_accounts
+        profile_dir = Path(store.profile_dir(account)).resolve()
+        expected_port = int(store.cdp_port(account))
+        config = self.controller.config
+        if config is not None and int(config.makro_cdp_port) != expected_port:
+            raise RuntimeError(
+                f"{account.label} 的 Batch 配置 CDP {config.makro_cdp_port} 与账号专属端口 "
+                f"{expected_port} 不一致；为防止串号，已拒绝继续。"
+            )
+        if lane_id == manager_id:
+            if Path(self.manager.profile_dir).resolve() != profile_dir or int(self.manager.port) != expected_port:
                 raise RuntimeError(
                     "当前 Makro Browser Profile/CDP lane 与已选择平台账号不一致；"
                     "为防止串号，已拒绝创建 Batch。"
                 )
-        return current, profile_dir
+        return account, profile_dir
 
     def _stamp_batch_account(self, batch: Any, account: Any) -> None:
         if account is None:
@@ -341,8 +352,9 @@ class BatchParallelRuntime:
 
         expected_id = str(getattr(batch, "makro_account_id", "") or "").strip()
         current_id = str(account.account_id)
-        if not expected_id and self._starting_account is not None:
-            starting_id = str(getattr(self._starting_account, "account_id", "") or "")
+        starting_account = self._starting_accounts.get(self._current_lane_id())
+        if not expected_id and starting_account is not None:
+            starting_id = str(getattr(starting_account, "account_id", "") or "")
             if starting_id != current_id:
                 raise RuntimeError(
                     "Batch 启动期间 Makro 店铺发生变化；为防止第一条任务串号，已停止启动。"
@@ -389,14 +401,21 @@ class BatchParallelRuntime:
 
     def _ensure_start_generation(self, reason: str, port: int) -> None:
         requested_port = int(port)
-        if requested_port != int(self.manager.port):
+        account, _profile_dir = self._task_account()
+        expected_port = int(self.manager.channel_accounts.cdp_port(account))
+        if requested_port != expected_port:
             raise RuntimeError(
-                f"Batch Makro CDP {requested_port} 与当前店铺专属端口 {self.manager.port} 不一致。"
+                f"Batch Makro CDP {requested_port} 与 {account.label} 专属端口 "
+                f"{expected_port} 不一致。"
             )
         if poison_matches_current_generation(requested_port) or not is_cdp_ready(
             requested_port,
             timeout_s=0.25,
         ):
+            if str(account.account_id) != str(self.manager.channel_account.account_id):
+                raise RuntimeError(
+                    f"{account.label} 的后台 Browser lane 已离线；为保护其他账号任务，不会跨账号重启。"
+                )
             self.manager.ensure_ready(reason)
 
     def _install_controller_routing(self) -> None:
@@ -412,11 +431,14 @@ class BatchParallelRuntime:
             runtime._assert_top_level_idle()
             account, profile_dir = runtime._task_account()
             requested = normalize_batch_concurrency(prepare_concurrency)
-            runtime._parallelism = min(requested, max(1, len(urls)))
+            runtime._parallelism_by_account[str(account.account_id)] = min(
+                requested,
+                max(1, len(urls)),
+            )
             port = int(config.makro_cdp_port)
             runtime._ensure_start_generation("Batch preparation", port)
             runtime._ensure_owner(port, profile_dir=profile_dir)
-            runtime._starting_account = account
+            runtime._starting_accounts[runtime._current_lane_id()] = account
             try:
                 batch = runtime._original_start_prepare(
                     urls,
@@ -424,13 +446,15 @@ class BatchParallelRuntime:
                     prepare_concurrency=requested,
                 )
             finally:
-                runtime._starting_account = None
+                runtime._starting_accounts.pop(runtime._current_lane_id(), None)
             runtime._stamp_batch_account(batch, account)
-            assert runtime._owner is not None
+            owner = runtime._owners.get(str(account.account_id))
+            if owner is None:
+                raise RuntimeError("Makro account transport owner was not acquired")
             bind_batch_shared_browser(
                 batch,
-                runtime._owner.browser,
-                instance_token=runtime._owner.instance_token,
+                owner.browser,
+                instance_token=owner.instance_token,
             )
             runtime._account_slots[str(account.account_id)] = (batch, _controller.config)
             _controller._persist_emit(immediate=True)
@@ -450,7 +474,9 @@ class BatchParallelRuntime:
             runtime._ensure_start_generation("Batch execution", int(config.makro_cdp_port))
             runtime._ensure_owner(int(config.makro_cdp_port), profile_dir=profile_dir)
             runtime._assert_prepared_browser_alive()
-            runtime._parallelism = normalize_batch_concurrency(execute_concurrency)
+            runtime._parallelism_by_account[str(_account.account_id)] = normalize_batch_concurrency(
+                execute_concurrency
+            )
             runtime._original_start_execution(
                 allow_save=allow_save,
                 upload_images=upload_images,
@@ -496,11 +522,13 @@ class BatchParallelRuntime:
         self.controller._start_source = MethodType(start_source, self.controller)
 
     def _ensure_owner(self, port: int, *, profile_dir: str | Path | None = None) -> None:
+        account, account_profile = self._task_account()
+        account_id = str(account.account_id)
         requested_port = int(port)
         requested_profile = Path(
-            profile_dir if profile_dir is not None else self.manager.profile_dir
+            profile_dir if profile_dir is not None else account_profile
         ).resolve()
-        owner = self._owner
+        owner = self._owners.get(account_id)
         if (
             owner is not None
             and int(owner.browser.cdp_port) == requested_port
@@ -517,10 +545,11 @@ class BatchParallelRuntime:
             )
             if has_owned_tabs:
                 raise RuntimeError(
-                    "当前 Batch 已绑定 Makro targetId，不能中途切换账号 Profile/CDP 端口；"
-                    "请先切换任务槽位，再接管对应店铺的 Browser lane。"
+                    f"{account.label} 的 Batch 已绑定 Makro targetId，不能中途更换自己的 "
+                    "Profile/CDP lane；请重新批量准备。"
                 )
             owner.release()
+            self._owners.pop(account_id, None)
 
         browser = shared_batch_browser(
             self.project_root,
@@ -529,7 +558,7 @@ class BatchParallelRuntime:
         )
         owner = BatchSharedBrowserOwner(browser)
         owner.acquire()
-        self._owner = owner
+        self._owners[account_id] = owner
 
     def _ensure_job_binding(self, job: Any) -> None:
         config = self.controller.config
@@ -537,9 +566,12 @@ class BatchParallelRuntime:
             raise RuntimeError("Batch browser binding requires runtime config")
         _account, profile_dir = self._assert_batch_account_matches_current()
         self._ensure_owner(int(config.makro_cdp_port), profile_dir=profile_dir)
-        assert self._owner is not None
-        browser = self._owner.browser
-        current_token = self._owner.instance_token
+        account, _ = self._assert_batch_account_matches_current()
+        owner = self._owners.get(str(account.account_id))
+        if owner is None:
+            raise RuntimeError("Batch browser binding requires account transport owner")
+        browser = owner.browser
+        current_token = owner.instance_token
 
         target = str(getattr(job, "makro_target_id", "") or "")
         stored_token = str(getattr(job, "makro_browser_instance_token", "") or "")
@@ -566,17 +598,18 @@ class BatchParallelRuntime:
         batch = self.controller.batch
         if batch is None:
             return
-        self._assert_batch_account_matches_current()
-        if self._owner is None or not self._owner.acquired:
+        account, _profile_dir = self._assert_batch_account_matches_current()
+        owner = self._owners.get(str(account.account_id))
+        if owner is None or not owner.acquired:
             if any(str(job.makro_target_id or "") for job in batch.jobs):
                 raise RuntimeError(
-                    "这个 Batch 没有当前 GUI 持有的账号绑定 browser session owner；请重新批量准备。"
+                    "这个 Batch 没有自己账号的 browser session owner；请重新批量准备。"
                 )
             return
 
-        self._owner.assert_alive()
-        browser = self._owner.browser
-        current_token = self._owner.instance_token
+        owner.assert_alive()
+        browser = owner.browser
+        current_token = owner.instance_token
         expected_profile = browser.profile_dir.resolve()
         owned_jobs = [job for job in batch.jobs if str(job.makro_target_id or "")]
         batch_token = str(getattr(batch, "makro_browser_instance_token", "") or "")
@@ -606,29 +639,49 @@ class BatchParallelRuntime:
                 f"请重新批量准备。jobs={incompatible}"
             )
 
-    def _release_if_safe(self) -> None:
+    def _release_if_safe(self, account_id: str | None = None) -> None:
+        lane = str(account_id or self._current_lane_id()).strip()
+        if not lane:
+            return
+        lane_context = getattr(self.controller, "account_lane", None)
+        if callable(lane_context):
+            with lane_context(lane):
+                if self.controller.is_running:
+                    return
+                batch = self.controller.batch
+                if batch is None or not batch.jobs:
+                    self._release_owner(lane)
+                    return
+                if str(batch.status) in {"COMPLETE", "STOPPED"}:
+                    self._release_owner(lane)
+            return
+
         if self.controller.is_running:
             return
         batch = self.controller.batch
-        if batch is None or not batch.jobs:
-            self._release_owner()
-            return
-        if str(batch.status) in {"COMPLETE", "STOPPED"}:
-            self._release_owner()
+        if batch is None or not batch.jobs or str(batch.status) in {"COMPLETE", "STOPPED"}:
+            self._release_owner(lane)
 
-    def _release_owner(self) -> None:
-        owner = self._owner
-        self._owner = None
+    def _release_owner(self, account_id: str | None = None) -> None:
+        if account_id is None:
+            owners = tuple(self._owners.values())
+            self._owners.clear()
+            for owner in owners:
+                owner.release()
+            return
+        owner = self._owners.pop(str(account_id), None)
         if owner is not None:
             owner.release()
 
     def _decorate_batch_status(self, state: str, detail: str) -> None:
         label = getattr(self.manager, "_batch_label", None)
-        if label is None or self._owner is None:
-            return
-        port = int(self._owner.browser.cdp_port)
-        parallelism = max(1, int(self._parallelism or 1))
         account = getattr(self.manager, "channel_account", None)
+        account_id = str(getattr(account, "account_id", "") or "")
+        owner = self._owners.get(account_id)
+        if label is None or owner is None:
+            return
+        port = int(owner.browser.cdp_port)
+        parallelism = max(1, int(self._parallelism_by_account.get(account_id) or 1))
         account_label = str(getattr(account, "label", "") or "当前店铺")
         label.setText(
             f"Makro Browser · {state} · {account_label} · {detail} · "
@@ -636,7 +689,8 @@ class BatchParallelRuntime:
         )
         label.setToolTip(
             "当前 Batch 永久绑定创建时的 Makro 店铺、Browser Profile、CDP lane 与 Edge generation。"
-            "切换店铺不会覆盖其他账号的 Batch；重启后也会恢复各账号最后一个 Batch。"
+            "不同 Makro 账号拥有独立 scheduler lane / Browser owner，可以同时运行；"
+            "共享的供应商 Source Edge 仍按顺序串行采集。重启后会恢复各账号最后一个 Batch。"
             "只有原 Edge generation 仍存活时才会复用 owned targetId。"
         )
 
