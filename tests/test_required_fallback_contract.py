@@ -226,7 +226,7 @@ def test_gui_required_preflight_has_no_second_ai_but_has_fallback():
     assert "ai_calls=0" in GUI_SOURCE
 
 
-def test_gui_manual_value_is_optional_and_price_can_defer_to_runtime_hud():
+def test_gui_manual_value_is_optional_and_reference_hud_never_gates_fill():
     support = __import__(
         "gui.required_input_support",
         fromlist=["RequiredInputSupport"],
@@ -237,8 +237,9 @@ def test_gui_manual_value_is_optional_and_price_can_defer_to_runtime_hud():
 
     assert "self.values" in GUI_SOURCE
     assert "required_fallback_override(field)" in merged
-    assert "is_user_decision_business_field(field)" in merged
-    assert "runtime_decisions = len(self._missing_user_decisions())" in sync
-    assert "runtime_decisions = len(self._missing_user_decisions())" in request
+    assert "is_user_decision_business_field" not in merged
+    assert "runtime_decisions" not in sync
+    assert "runtime_decisions" not in request
+    assert "HUD 待确认" not in request
     assert "not self._all_required_confirmed()" not in request
     assert ".text()" not in merged
