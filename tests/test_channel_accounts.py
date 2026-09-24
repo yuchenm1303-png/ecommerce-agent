@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
+from app.browser_instance import managed_makro_cdp_port
 from app.channel_accounts import ChannelAccountStore
 
 
@@ -52,6 +54,48 @@ def test_store_supports_multiple_accounts_without_sharing_profiles(tmp_path: Pat
     assert len(store.list_accounts("makro")) == 2
 
 
+def test_makro_accounts_receive_distinct_persisted_browser_ports(tmp_path: Path) -> None:
+    store = ChannelAccountStore(tmp_path, scope_id="user-a")
+    original = store.active_account("makro")
+    second = store.create_account("makro", label="Makro 店铺 B")
+    third = store.create_account("makro", label="Makro 店铺 C")
+
+    original_port = store.cdp_port(original)
+    second_port = store.cdp_port(second)
+    third_port = store.cdp_port(third)
+
+    assert original_port == managed_makro_cdp_port(tmp_path)
+    assert len({original_port, second_port, third_port}) == 3
+
+    reloaded = ChannelAccountStore(tmp_path, scope_id="user-a")
+    accounts = {account.label: account for account in reloaded.list_accounts("makro")}
+    assert reloaded.cdp_port(accounts[second.label]) == second_port
+    assert reloaded.cdp_port(accounts[third.label]) == third_port
+
+    payload = json.loads(store.state_path.read_text(encoding="utf-8"))
+    ports = [int(row["cdp_port"]) for row in payload["accounts"] if row["channel"] == "makro"]
+    assert len(ports) == len(set(ports))
+
+
+def test_legacy_state_without_cdp_ports_is_migrated_lazily(tmp_path: Path) -> None:
+    store = ChannelAccountStore(tmp_path, scope_id="user-a")
+    original = store.active_account("makro")
+    second = store.create_account("makro", label="Makro 店铺 B")
+
+    payload = json.loads(store.state_path.read_text(encoding="utf-8"))
+    for row in payload["accounts"]:
+        row.pop("cdp_port", None)
+    store.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    reloaded = ChannelAccountStore(tmp_path, scope_id="user-a")
+    accounts = {account.account_id: account for account in reloaded.list_accounts("makro")}
+    original_port = reloaded.cdp_port(accounts[original.account_id])
+    second_port = reloaded.cdp_port(accounts[second.account_id])
+
+    assert original_port != second_port
+    assert original_port == managed_makro_cdp_port(tmp_path)
+
+
 def test_unknown_account_cannot_be_selected(tmp_path: Path) -> None:
     store = ChannelAccountStore(tmp_path, scope_id="user-a")
     store.active_account("makro")
@@ -71,5 +115,7 @@ def test_formal_gui_routes_managed_makro_browser_through_channel_account_owner()
 
 def test_channel_account_sources_compile() -> None:
     account_store = (ROOT / "app" / "channel_accounts.py").read_text(encoding="utf-8")
+    browser_instance = (ROOT / "app" / "browser_instance.py").read_text(encoding="utf-8")
     compile(account_store, str(ROOT / "app" / "channel_accounts.py"), "exec")
+    compile(browser_instance, str(ROOT / "app" / "browser_instance.py"), "exec")
     compile(ACCOUNT_BROWSER, str(ROOT / "gui" / "channel_account_browser.py"), "exec")
