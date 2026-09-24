@@ -161,7 +161,6 @@ def _clear_trusted_event(page: Any, token: str) -> None:
               if (!root) return;
               const state = root[payload.token];
               if (state && typeof state.mark === 'function') {
-                try { document.removeEventListener; } catch (_) {}
                 const target = state.target;
                 if (target) {
                   try { target.removeEventListener('input', state.mark, true); } catch (_) {}
