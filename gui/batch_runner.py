@@ -333,7 +333,7 @@ class BatchController(QObject):
         self._lanes.state().last_state = str(text)
         self.lane_state_changed.emit(key, self.account_lane_snapshot(key))
         if key == self.selected_account_lane():
-            self._emit_state_changed(str(text))
+            self.state_changed.emit(str(text))
 
     @property
     def is_running(self) -> bool:

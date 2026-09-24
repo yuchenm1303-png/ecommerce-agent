@@ -28,6 +28,7 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
 
     def __init__(self, window: Any) -> None:
         project_root = Path(window.project_root).resolve()
+        self.project_root = project_root
         self._account_scope_id = self._current_scope_id(window)
         self.channel_accounts = ChannelAccountStore(
             project_root,
