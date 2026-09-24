@@ -60,15 +60,6 @@ _TARGET_SCRIPT = r"""
 }
 """
 
-_ADVICE_SCRIPT = r"""
-(el, payload) => {
-  const api = window[payload.key];
-  if (!api || typeof api.advice !== 'function') return false;
-  api.advice(el, payload);
-  return true;
-}
-"""
-
 _REFERENCE_SCRIPT = r"""
 (el, payload) => {
   const api = window[payload.key];
@@ -257,37 +248,10 @@ def browser_visual_hud_advice(
     *,
     phase: int = 2,
 ) -> None:
-    """Show structured decision guidance beside one real live DOM control.
+    """Backward-compatible alias to the light, non-blocking reference card."""
 
-    Advice is display-only. The iframe remains pointer-events:none and this
-    helper never writes, clicks or changes the target field.
-    """
-
-    if not advisory:
-        return
-    try:
-        key = _hud_api_key()
-        payload = {
-            "key": key,
-            "phase": max(0, min(4, int(phase))),
-            "title": str(advisory.get("title") or "需要你决定"),
-            "thought": str(advisory.get("thought") or ""),
-            "source": str(advisory.get("source") or "Listing Studio"),
-            "warning": str(advisory.get("warning") or ""),
-            "kind": str(advisory.get("kind") or "decision"),
-            "hold_ms": max(1_000, min(1_800_000, int(advisory.get("hold_ms") or 7_000))),
-            "rows": [
-                {
-                    "label": str(row.get("label") or ""),
-                    "value": str(row.get("value") or ""),
-                }
-                for row in advisory.get("rows") or []
-                if isinstance(row, dict)
-            ][:8],
-        }
-        locator.evaluate(_ADVICE_SCRIPT, payload)
-    except Exception as exc:
-        print(f"GUI_BROWSER_HUD\tADVICE_ERROR\t{type(exc).__name__}: {exc}", flush=True)
+    del phase
+    browser_visual_hud_reference(locator, advisory)
 
 
 def browser_visual_hud_reference(
