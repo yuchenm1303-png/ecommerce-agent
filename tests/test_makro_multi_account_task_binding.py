@@ -78,6 +78,17 @@ def test_batch_runtime_binds_before_first_job_and_rejects_cross_account_reuse() 
     assert "profile_dir=requested_profile" in source
 
 
+def test_batch_start_requires_committed_account_browser_identity() -> None:
+    runtime_source = BATCH_RUNTIME_PATH.read_text(encoding="utf-8")
+    browser_source = CHANNEL_BROWSER_PATH.read_text(encoding="utf-8")
+
+    assert "task_channel_account" in runtime_source
+    assert "def task_channel_account" in browser_source
+    assert "runtime_identity(self.channel_account)" in browser_source
+    assert "self._read_runtime_identity() != expected_identity" in browser_source
+    assert "运行时身份确认完成后再启动任务" in browser_source
+
+
 def test_single_prepared_task_is_invalidated_by_account_switch() -> None:
     source = CHANNEL_BROWSER_PATH.read_text(encoding="utf-8")
 
