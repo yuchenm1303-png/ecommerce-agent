@@ -146,18 +146,21 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
             )
 
     def request_activate_channel_account(self, account_id: str) -> ChannelAccount:
-        """Persist an account selection and let the lifecycle worker select its lane.
-
-        The method performs metadata I/O only. Existing healthy browser processes
-        belonging to other Makro accounts are deliberately left alive on their own
-        ports/profiles so later scheduler work can use them independently.
-        """
+        """Validate one account lane, then persist selection and hand it to lifecycle."""
 
         self._assert_account_change_allowed()
-        account = self.channel_accounts.set_active(self._CHANNEL, account_id)
-        # Materialize the lane before publishing the selection. This makes port
-        # collisions fail here, before any task can observe the target account.
+        wanted = str(account_id or "").strip()
+        account = next(
+            (item for item in self.channel_accounts.list_accounts(self._CHANNEL) if item.account_id == wanted),
+            None,
+        )
+        if account is None:
+            raise KeyError(f"unknown {self._CHANNEL} channel account: {wanted}")
+
+        # Materialize and validate the lane before committing active=B. If this
+        # fails, the persisted active account remains unchanged.
         self.channel_accounts.cdp_port(account)
+        account = self.channel_accounts.set_active(self._CHANNEL, account.account_id)
         with self._account_selection_lock:
             if (
                 account.account_id == self.channel_account.account_id
