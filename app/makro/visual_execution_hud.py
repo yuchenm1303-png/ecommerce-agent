@@ -75,6 +75,24 @@ html,body{margin:0;width:100%;height:100%;min-height:0;background:transparent;co
 .advice-row b{color:#eefaff;font-weight:650;text-align:right;overflow-wrap:anywhere}
 .advice-warning{display:none;margin-top:7px;padding:7px 9px;border-radius:10px;background:rgba(245,184,92,.09);border:1px solid rgba(245,184,92,.18);color:#f4cf94;font-size:11.5px;line-height:1.55}
 .advice-warning.visible{display:block}
+
+/* Persistent field references are intentionally separate from the dark moving
+   execution bubble. They are soft light glass cards and never take input. */
+.reference-layer{position:absolute;inset:0;z-index:26;pointer-events:none;overflow:hidden}
+.reference-card{position:absolute;left:0;top:0;width:min(314px,calc(100vw - 24px));padding:12px 13px 11px;border-radius:15px;background:linear-gradient(145deg,rgba(255,255,255,.96),rgba(247,246,255,.94));border:1px solid rgba(121,102,226,.20);box-shadow:0 14px 34px rgba(45,40,84,.16),0 3px 10px rgba(71,106,166,.08);color:#25324a;backdrop-filter:blur(18px) saturate(1.18);-webkit-backdrop-filter:blur(18px) saturate(1.18);opacity:0;transform:translate3d(-1000px,-1000px,0);transition:transform .22s cubic-bezier(.18,.78,.18,1),opacity .18s ease;contain:layout style;pointer-events:none}
+.reference-card::before{content:"";position:absolute;left:0;top:16px;bottom:16px;width:3px;border-radius:0 99px 99px 0;background:linear-gradient(180deg,#7e7cff,#9f7cff 48%,#69b9ff);opacity:.78}
+.reference-head{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.reference-eyebrow{display:inline-flex;align-items:center;min-height:21px;padding:3px 8px;border-radius:999px;background:rgba(126,124,255,.10);border:1px solid rgba(126,124,255,.13);color:#6661c9;font-size:10.5px;font-weight:720;letter-spacing:.02em;white-space:nowrap}
+.reference-title{min-width:0;color:#202c43;font-size:12.7px;font-weight:760;line-height:1.35;overflow-wrap:anywhere}
+.reference-rows{display:grid;gap:4px;padding-top:7px;border-top:1px solid rgba(100,109,150,.10)}
+.reference-row{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;font-size:11.6px;line-height:1.5}
+.reference-row span{color:#7d879a;flex:0 0 auto}
+.reference-row b{color:#263550;font-weight:680;text-align:right;overflow-wrap:anywhere}
+.reference-note{margin-top:8px;padding-top:7px;border-top:1px solid rgba(100,109,150,.10);color:#657087;font-size:11.1px;line-height:1.55;overflow-wrap:anywhere}
+.reference-source{margin-top:6px;color:#989fb0;font-size:10.4px;line-height:1.35}
+.reference-warning{display:none;margin-top:7px;padding:6px 8px;border-radius:9px;background:rgba(255,184,76,.11);border:1px solid rgba(222,145,24,.18);color:#9a620b;font-size:10.9px;line-height:1.45}
+.reference-warning.visible{display:block}
+@media(max-width:720px){.reference-card{width:min(284px,calc(100vw - 20px));padding:11px 12px}.reference-row{font-size:11.3px}.reference-note{font-size:10.9px}}
 .bottom-timeline{position:absolute;left:50%;bottom:92px;transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:9px 13px;border-radius:999px;background:rgba(8,17,27,.86);border:1px solid rgba(255,255,255,.08);pointer-events:none}
 .phase{display:flex;align-items:center;gap:8px;color:#7f91a2;font-size:12px;white-space:nowrap}.phase::after{content:"";width:18px;height:1px;background:rgba(255,255,255,.13)}.phase:last-child::after{display:none}.phase.active{color:#dff8ff}.phase.done{color:var(--success)}.phase i{width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 10px currentColor}
 @media(max-width:720px){:root{--info-bubble-width:260px}.bottom-timeline{bottom:34px;gap:4px;padding:7px 9px}.phase{gap:4px;font-size:11px}.phase::after{width:8px}.phase i{width:4.5px;height:4.5px}}
@@ -105,6 +123,7 @@ html,body{margin:0;width:100%;height:100%;min-height:0;background:transparent;co
     <div class="cursor-hotspot"></div><div class="click-wave"></div>
   </div>
   <div class="info-bubble" id="bubble"><div class="bubble-title" id="bubbleTitle">正在开始真实填写</div><div class="bubble-line"><span>目标状态</span><b id="confidence">LIVE DOM</b></div><div class="bubble-line"><span>执行坐标</span><b id="coords">—</b></div><div class="bubble-line"><span>动作来源</span><b id="actionSource">Playwright + Live DOM</b></div><div class="advice-panel" id="advicePanel"><div id="adviceRows"></div><div class="advice-warning" id="adviceWarning"></div></div><div class="bubble-thought" id="thought">正在等待第一个真实页面操作。</div></div>
+  <div class="reference-layer" id="referenceLayer"></div>
   <div class="bottom-timeline" id="timeline"><div class="phase done"><i></i>观察</div><div class="phase active"><i></i>分析</div><div class="phase"><i></i>移动</div><div class="phase"><i></i>点击</div><div class="phase"><i></i>验证</div></div>
 </section>
 </div>
@@ -143,6 +162,8 @@ _INSTALL_SCRIPT = r"""
     lastActionAt:Date.now(),
     lastPulseAt:0,
     adviceUntil:0,
+    references:new Map(),
+    referenceLayoutPending:false,
     destroyed:false,
     doc(){
       try { return frame.contentDocument; } catch (_) { return null; }
@@ -163,10 +184,11 @@ _INSTALL_SCRIPT = r"""
         advicePanel:d.getElementById('advicePanel'),
         adviceRows:d.getElementById('adviceRows'),
         adviceWarning:d.getElementById('adviceWarning'),
+        referenceLayer:d.getElementById('referenceLayer'),
         thought:d.getElementById('thought'),
         phases:Array.from(d.querySelectorAll('.phase'))
       };
-      if(!nodes.root || !nodes.app || !nodes.bubble || !nodes.title || !nodes.confidence || !nodes.coords || !nodes.source || !nodes.advicePanel || !nodes.adviceRows || !nodes.adviceWarning || !nodes.thought) return null;
+      if(!nodes.root || !nodes.app || !nodes.bubble || !nodes.title || !nodes.confidence || !nodes.coords || !nodes.source || !nodes.advicePanel || !nodes.adviceRows || !nodes.adviceWarning || !nodes.referenceLayer || !nodes.thought) return null;
       return nodes;
     },
     interactive(node){
@@ -203,6 +225,131 @@ _INSTALL_SCRIPT = r"""
       nodes.phases.forEach((phase,i) => {
         phase.classList.toggle('done', i < index);
         phase.classList.toggle('active', i === index);
+      });
+    },
+    renderReference(item,nodes){
+      const payload=item.payload || {};
+      const card=item.card;
+      card.replaceChildren();
+
+      const head=nodes.d.createElement('div');
+      head.className='reference-head';
+      const eyebrow=nodes.d.createElement('span');
+      eyebrow.className='reference-eyebrow';
+      eyebrow.textContent=String(payload.eyebrow || '参考');
+      const title=nodes.d.createElement('div');
+      title.className='reference-title';
+      title.textContent=String(payload.title || '参考信息');
+      head.append(eyebrow,title);
+      card.appendChild(head);
+
+      const rows=nodes.d.createElement('div');
+      rows.className='reference-rows';
+      (Array.isArray(payload.rows) ? payload.rows : []).slice(0,8).forEach(row => {
+        const line=nodes.d.createElement('div');
+        line.className='reference-row';
+        const label=nodes.d.createElement('span');
+        const value=nodes.d.createElement('b');
+        label.textContent=String(row && row.label || '');
+        value.textContent=String(row && row.value || '');
+        line.append(label,value);
+        rows.appendChild(line);
+      });
+      card.appendChild(rows);
+
+      const warningText=String(payload.warning || '').trim();
+      const warning=nodes.d.createElement('div');
+      warning.className='reference-warning'+(warningText?' visible':'');
+      warning.textContent=warningText;
+      card.appendChild(warning);
+
+      const thought=String(payload.thought || '').trim();
+      if(thought){
+        const note=nodes.d.createElement('div');
+        note.className='reference-note';
+        note.textContent=thought;
+        card.appendChild(note);
+      }
+      const sourceText=String(payload.source || '').trim();
+      if(sourceText){
+        const source=nodes.d.createElement('div');
+        source.className='reference-source';
+        source.textContent=sourceText;
+        card.appendChild(source);
+      }
+    },
+    pinReference(target,payload){
+      if(this.destroyed || !(target instanceof Element)) return false;
+      const nodes=this.nodes();
+      if(!nodes) return false;
+      const id=String(payload.id || payload.kind || this.label(target) || 'reference');
+      let item=this.references.get(id);
+      if(!item){
+        const card=nodes.d.createElement('div');
+        card.className='reference-card';
+        nodes.referenceLayer.appendChild(card);
+        item={id,target,card,payload};
+        this.references.set(id,item);
+      }else{
+        item.target=target;
+        item.payload=payload;
+      }
+      this.renderReference(item,nodes);
+      this.scheduleReferenceLayout();
+      nodes.app.classList.remove('hud-hidden');
+      this.lastActionAt=Date.now();
+      return true;
+    },
+    scheduleReferenceLayout(){
+      if(this.referenceLayoutPending || this.destroyed) return;
+      this.referenceLayoutPending=true;
+      requestAnimationFrame(() => {
+        this.referenceLayoutPending=false;
+        this.layoutReferences();
+      });
+    },
+    layoutReferences(){
+      const nodes=this.nodes();
+      if(!nodes) return;
+      const vw=Math.max(1,window.innerWidth), vh=Math.max(1,window.innerHeight);
+      const placed=[];
+      this.references.forEach(item => {
+        const target=item.target, card=item.card;
+        if(!this.visible(target)){
+          card.style.opacity='0';
+          return;
+        }
+        card.style.opacity='1';
+        const tr=target.getBoundingClientRect();
+        const cr=card.getBoundingClientRect();
+        const w=Math.max(1,Math.ceil(cr.width || card.offsetWidth || 314));
+        const h=Math.max(1,Math.ceil(cr.height || card.offsetHeight || 140));
+        const gap=14;
+        let x=tr.left-gap-w;
+        let side='left';
+        if(x<12){
+          x=tr.right+gap;
+          side='right';
+        }
+        if(x+w>vw-12){
+          x=Math.max(12,Math.min(vw-w-12,tr.left-gap-w));
+          side='left';
+        }
+        let y=tr.top+(tr.height*.5)-(h*.5);
+        y=Math.max(12,Math.min(Math.max(12,vh-h-12),y));
+
+        // Keep multiple price cards readable without covering each other.
+        for(const prior of placed){
+          const overlapX=x < prior.x+prior.w+6 && x+w+6 > prior.x;
+          const overlapY=y < prior.y+prior.h+6 && y+h+6 > prior.y;
+          if(overlapX && overlapY){
+            const down=prior.y+prior.h+8;
+            y=down+h <= vh-12 ? down : Math.max(12,prior.y-h-8);
+          }
+        }
+        card.dataset.side=side;
+        card.style.transform=`translate3d(${Math.round(x)}px,${Math.round(y)}px,0)`;
+        placed.push({x,y,w,h});
       });
     },
     clearAdvice(nodes){
@@ -326,6 +473,7 @@ _INSTALL_SCRIPT = r"""
       listeners.splice(0).forEach(off => { try { off(); } catch (_) {} });
       try { this.observer && this.observer.disconnect(); } catch (_) {}
       try { this.watchdog && clearInterval(this.watchdog); } catch (_) {}
+      try { this.references.clear(); } catch (_) {}
       try { frame.remove(); } catch (_) {}
       if(window[apiKey]===this) delete window[apiKey];
     }
@@ -356,6 +504,7 @@ _INSTALL_SCRIPT = r"""
     if(target) api.update(target,4,'正在验证','控件已收到真实 change 事件，等待执行器确认最终值。');
   };
   const reposition=() => {
+    api.scheduleReferenceLayout();
     const target=api.currentTarget;
     if(target && api.visible(target)) api.update(target,2,'正在跟随','页面位置已变化，光标正在跟随当前真实目标。');
   };
@@ -369,7 +518,10 @@ _INSTALL_SCRIPT = r"""
   listen(window,'scroll',reposition,{passive:true,capture:true});
 
   if(window.MutationObserver){
-    api.observer=new MutationObserver(() => { api.lastActionAt=Date.now(); });
+    api.observer=new MutationObserver(() => {
+      api.lastActionAt=Date.now();
+      api.scheduleReferenceLayout();
+    });
     api.observer.observe(document.documentElement,{subtree:true,childList:true,attributes:false});
   }
   api.watchdog=setInterval(() => {
