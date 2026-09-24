@@ -4,11 +4,11 @@ Makro Step 2 is not an autocomplete picker. The portal accepts one brand query,
 validates it with ``Check Brand`` and then exposes a confirmation/create-listing
 state for the validated brand.
 
-Production keeps supplier / AI brand identity authoritative. Step 2 applies only
-marketplace-output policy: explicit Chinese brand text is deterministically
-romanized to pinyin, while unknown and explicitly unbranded identities use the
-seller's VINCIE fallback. Every resulting query still passes through Makro's
-native Check Brand verification.
+Production is currently pinned to the marketplace brand ``Non branded``. The
+supplier / AI brand path, including Chinese-brand romanization and the prior
+fallback behavior, is intentionally retained behind ``BRAND_SELECTION_MODE`` so
+it can be restored without rebuilding Step 2. Every active query still passes
+through Makro's native Check Brand verification.
 """
 
 from __future__ import annotations
@@ -34,8 +34,8 @@ from .listing_creation import (
 from .portal_interruptions import reconcile_portal_interruptions
 
 
-BRAND_SELECTION_MODE = "supplier"
-FIXED_BRAND = "VINCIE"
+BRAND_SELECTION_MODE = "fixed"
+FIXED_BRAND = "Non branded"
 _HAN_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 
 
