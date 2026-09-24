@@ -6,13 +6,14 @@ from typing import Any
 
 from app.browser_session import is_cdp_ready
 from app.cdp_automation_health import poison_matches_current_generation
+from .batch_account_slot_store import BatchAccountSlotStore
 from .batch_browser_session import (
     BatchSharedBrowserOwner,
     bind_batch_shared_browser,
     bind_job_shared_browser,
     shared_batch_browser,
 )
-from .batch_model import normalize_batch_concurrency, save_batch_run
+from .batch_model import load_batch_run, normalize_batch_concurrency, save_batch_run
 
 
 def _set_cli_option(args: list[str], name: str, value: str) -> None:
@@ -43,11 +44,10 @@ class BatchParallelRuntime:
     """Run Batch work on an account-bound Makro browser lane.
 
     Every Batch is permanently owned by the Makro account that created it. The
-    runtime keeps one independent in-memory Batch slot per account, so switching
-    from shop A to B no longer overwrites A's prepared queue. Each slot persists
-    the Edge browser-instance token that created its owned targetIds; a restored
-    Batch may reuse those tabs only if the same account/profile/port/generation is
-    still alive.
+    runtime keeps one independent Batch slot per account and persists the latest
+    slot pointer across application restarts. Each Batch also records the Edge
+    browser-instance token that created its owned targetIds; a restored Batch may
+    reuse those tabs only if the same account/profile/port/generation is alive.
 
     Current UI scheduling remains one active Batch controller at a time. Separate
     per-account CDP/Profile lanes are already in place, but simultaneous execution
@@ -72,6 +72,11 @@ class BatchParallelRuntime:
         self._parallelism = 0
         self._starting_account: Any | None = None
         self._account_slots: dict[str, tuple[Any, Any]] = {}
+        scope_token = str(getattr(self.manager.channel_accounts, "scope_token", "") or "")
+        self._slot_store = BatchAccountSlotStore(
+            self.project_root,
+            scope_token=scope_token,
+        )
         self._original_spawn = self.controller._spawn
         self._original_start_source = self.controller._start_source
 
@@ -81,6 +86,7 @@ class BatchParallelRuntime:
         self.controller.running_changed.connect(lambda _running: self._release_if_safe())
         self.controller.jobs_changed.connect(lambda _jobs: self._release_if_safe())
         self.window.destroyed.connect(lambda *_args: self._release_owner())
+        self._restore_persisted_slots()
 
     @staticmethod
     def _empty_summary() -> dict[str, int]:
@@ -93,6 +99,63 @@ class BatchParallelRuntime:
             "failed": 0,
         }
 
+    def _controller_log(self, message: str) -> None:
+        emit = getattr(self.controller, "_emit_log_now", None)
+        if callable(emit):
+            emit(message)
+
+    def _normalize_recovered_batch(self, batch: Any) -> bool:
+        """Turn interrupted process state into explicit STOPPED state on restart."""
+
+        safe_batch_states = {"PREPARED", "COMPLETE", "STOPPED"}
+        if str(getattr(batch, "status", "") or "").upper() in safe_batch_states:
+            return False
+
+        changed = False
+        safe_job_states = {"READY", "DONE", "REVIEW", "FAILED", "STOPPED"}
+        for job in batch.jobs:
+            if str(job.status or "").upper() in safe_job_states:
+                continue
+            job.failure_stage = job.failure_stage or job.stage_detail or "application restart"
+            job.exit_code = None
+            job.status = "STOPPED"
+            job.stage_detail = "应用重启，原运行任务已停止"
+            job.touch()
+            changed = True
+        batch.status = "STOPPED"
+        return True or changed
+
+    def _restore_persisted_slots(self) -> None:
+        for account in self.manager.list_channel_accounts():
+            try:
+                path = self._slot_store.batch_path(account.account_id)
+            except Exception as exc:
+                self._controller_log(
+                    f"[makro-account-slot] {account.label} 槽位索引无效，已跳过恢复：{exc}"
+                )
+                continue
+            if path is None:
+                continue
+            try:
+                batch = load_batch_run(path)
+            except Exception as exc:
+                self._controller_log(
+                    f"[makro-account-slot] {account.label} Batch 无法读取，已跳过恢复：{exc}"
+                )
+                continue
+
+            owner_id = str(getattr(batch, "makro_account_id", "") or "").strip()
+            if owner_id != str(account.account_id):
+                self._controller_log(
+                    f"[makro-account-slot] {account.label} Batch 账号归属不匹配，已拒绝恢复。"
+                )
+                continue
+            if self._normalize_recovered_batch(batch):
+                save_batch_run(batch)
+            self._account_slots[str(account.account_id)] = (batch, None)
+
+        self.activate_account_slot(self.manager.channel_account)
+
     def _remember_current_slot(self) -> None:
         batch = self.controller.batch
         if batch is None:
@@ -101,17 +164,31 @@ class BatchParallelRuntime:
         if not account_id:
             return
         self._account_slots[account_id] = (batch, self.controller.config)
+        self._slot_store.remember(account_id, batch.root_dir)
         save_batch_run(batch)
 
-    def activate_account_slot(self, account: Any) -> None:
-        """Swap the visible Batch controller state to one Makro account's slot.
+    def _ensure_controller_config(self) -> Any:
+        config = self.controller.config
+        if config is not None:
+            return config
+        builder = getattr(self.window.batch_workspace, "_config", None)
+        if not callable(builder):
+            raise RuntimeError("恢复的 Batch 缺少运行配置，且无法从当前工作区重建。")
+        config = builder()
+        if int(config.makro_cdp_port) != int(self.manager.port):
+            raise RuntimeError(
+                "恢复 Batch 时当前工作区 Makro CDP 端口与账号专属 lane 不一致；已拒绝执行。"
+            )
+        self.controller.config = config
+        batch = self.controller.batch
+        if batch is not None:
+            account_id = str(getattr(batch, "makro_account_id", "") or "").strip()
+            if account_id:
+                self._account_slots[account_id] = (batch, config)
+        return config
 
-        Account switching is allowed only while the canonical controller is idle,
-        so queues/processes must already be empty. The old account's CDP lease is
-        released but its Edge process is deliberately left alive on its dedicated
-        port. Re-entering the slot later reacquires that account lane and validates
-        the persisted browser generation before any owned targetId is reused.
-        """
+    def activate_account_slot(self, account: Any) -> None:
+        """Swap the visible Batch controller state to one Makro account's slot."""
 
         if self.controller.is_running:
             raise RuntimeError("Batch 仍在运行，不能切换独立 Makro 任务槽位。")
@@ -132,8 +209,6 @@ class BatchParallelRuntime:
             if stored_id != account_id:
                 raise RuntimeError("Makro Batch 槽位账号归属损坏；为防止串号，已拒绝恢复。")
 
-        # The guard above proves there are no child processes. Clear only scheduler
-        # queues/state; the restored Batch object remains the durable presentation.
         self.controller.batch = batch
         self.controller.config = config
         self.controller._mode = "idle"
@@ -208,7 +283,9 @@ class BatchParallelRuntime:
             job.makro_account_id = str(account.account_id)
             job.makro_account_label = str(account.label)
             job.touch()
-        self._account_slots[str(account.account_id)] = (batch, self.controller.config)
+        account_id = str(account.account_id)
+        self._account_slots[account_id] = (batch, self.controller.config)
+        self._slot_store.remember(account_id, batch.root_dir)
         save_batch_run(batch)
 
     def _assert_batch_account_matches_current(self) -> tuple[Any, Path]:
@@ -324,9 +401,7 @@ class BatchParallelRuntime:
         ) -> None:
             runtime._assert_top_level_idle()
             _account, profile_dir = runtime._assert_batch_account_matches_current()
-            config = _controller.config
-            if config is None:
-                raise RuntimeError("Batch execution requires runtime config")
+            config = runtime._ensure_controller_config()
             runtime._ensure_start_generation("Batch execution", int(config.makro_cdp_port))
             runtime._ensure_owner(int(config.makro_cdp_port), profile_dir=profile_dir)
             runtime._assert_prepared_browser_alive()
@@ -359,6 +434,8 @@ class BatchParallelRuntime:
             runtime._original_spawn(job_id, stage, routed)
 
         def start_source(_controller: Any, job_id: str) -> None:
+            if _controller.config is None:
+                runtime._ensure_controller_config()
             if _controller.config is not None:
                 _account, profile_dir = runtime._assert_batch_account_matches_current()
                 runtime._ensure_owner(
@@ -514,7 +591,8 @@ class BatchParallelRuntime:
         )
         label.setToolTip(
             "当前 Batch 永久绑定创建时的 Makro 店铺、Browser Profile、CDP lane 与 Edge generation。"
-            "切换店铺不会覆盖其他账号的 Batch；切回后只有原 Edge generation 仍存活时才复用 owned targetId。"
+            "切换店铺不会覆盖其他账号的 Batch；重启后也会恢复各账号最后一个 Batch。"
+            "只有原 Edge generation 仍存活时才会复用 owned targetId。"
         )
 
 
