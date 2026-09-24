@@ -15,6 +15,11 @@ from app.listing_images import listing_images_from_resolver_outputs
 from app.required_overrides import write_required_fallback_overrides
 from app.source_interaction import SOURCE_INTERACTION_EXIT_CODE, SOURCE_OUTCOME_FILENAME
 from .async_run_journal import AsyncRunJournal
+from .batch_account_lanes import (
+    BatchAccountLaneRegistry,
+    LaneProcessDataMap,
+    LaneProcessMap,
+)
 from .batch_log_buffer import BATCH_LOG_FLUSH_LINES, BATCH_LOG_PENDING_LINES
 from .batch_model import (
     BATCH_WORKER_DEFAULT,
@@ -72,24 +77,20 @@ class BatchController(QObject):
     running_changed = Signal(bool)
     log = Signal(str)
     failed = Signal(str)
+    lane_state_changed = Signal(str, object)
+    lane_running_changed = Signal(str, bool)
 
     def __init__(self, project_root: Path, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.project_root = project_root.resolve()
-        self.batch: BatchRun | None = None
-        self.config: RunnerConfig | None = None
-        self._mode = "idle"
-        self._source_queue: list[str] = []
-        self._prepare_queue: list[str] = []
-        self._execute_queue: list[str] = []
-        self._source_resume_pending: set[str] = set()
-        self._processes: dict[QProcess, tuple[str, str]] = {}
-        self._buffers: dict[QProcess, str] = {}
+        self._lanes = BatchAccountLaneRegistry()
+        self._processes = LaneProcessMap(self._lanes.current_key)
+        self._buffers = LaneProcessDataMap(self._processes, self._lanes.current_key)
         self._journals: dict[QProcess, AsyncRunJournal] = {}
-        self._stopping = False
-        self._execution_images = False
-        self._pending_log_preview: deque[str] = deque(maxlen=BATCH_LOG_PENDING_LINES)
-        self._state_dirty = False
+        self._pending_log_preview: deque[tuple[str, str]] = deque(
+            maxlen=BATCH_LOG_PENDING_LINES
+        )
+        self._dirty_lanes: set[str] = set()
 
         self._log_preview_timer = QTimer(self)
         self._log_preview_timer.setSingleShot(True)
@@ -100,6 +101,238 @@ class BatchController(QObject):
         self._state_publish_timer.setSingleShot(True)
         self._state_publish_timer.setInterval(_BATCH_STATE_PUBLISH_MS)
         self._state_publish_timer.timeout.connect(self._flush_persist_emit)
+
+    @property
+    def batch(self) -> BatchRun | None:
+        return self._lanes.state().batch
+
+    @batch.setter
+    def batch(self, value: BatchRun | None) -> None:
+        self._lanes.state().batch = value
+
+    @property
+    def config(self) -> RunnerConfig | None:
+        return self._lanes.state().config
+
+    @config.setter
+    def config(self, value: RunnerConfig | None) -> None:
+        self._lanes.state().config = value
+
+    @property
+    def _mode(self) -> str:
+        return self._lanes.state().mode
+
+    @_mode.setter
+    def _mode(self, value: str) -> None:
+        self._lanes.state().mode = str(value or "idle")
+
+    @property
+    def _source_queue(self) -> list[str]:
+        return self._lanes.state().source_queue
+
+    @_source_queue.setter
+    def _source_queue(self, value: list[str]) -> None:
+        self._lanes.state().source_queue = list(value)
+
+    @property
+    def _prepare_queue(self) -> list[str]:
+        return self._lanes.state().prepare_queue
+
+    @_prepare_queue.setter
+    def _prepare_queue(self, value: list[str]) -> None:
+        self._lanes.state().prepare_queue = list(value)
+
+    @property
+    def _execute_queue(self) -> list[str]:
+        return self._lanes.state().execute_queue
+
+    @_execute_queue.setter
+    def _execute_queue(self, value: list[str]) -> None:
+        self._lanes.state().execute_queue = list(value)
+
+    @property
+    def _source_resume_pending(self) -> set[str]:
+        return self._lanes.state().source_resume_pending
+
+    @_source_resume_pending.setter
+    def _source_resume_pending(self, value: set[str]) -> None:
+        self._lanes.state().source_resume_pending = set(value)
+
+    @property
+    def _stopping(self) -> bool:
+        return bool(self._lanes.state().stopping)
+
+    @_stopping.setter
+    def _stopping(self, value: bool) -> None:
+        self._lanes.state().stopping = bool(value)
+
+    @property
+    def _execution_images(self) -> bool:
+        return bool(self._lanes.state().execution_images)
+
+    @_execution_images.setter
+    def _execution_images(self, value: bool) -> None:
+        self._lanes.state().execution_images = bool(value)
+
+    def _lane_extra(self, name: str, factory: Any) -> Any:
+        extras = self._lanes.state().extras
+        if name not in extras:
+            extras[name] = factory()
+        return extras[name]
+
+    def _set_lane_extra(self, name: str, value: Any) -> None:
+        self._lanes.state().extras[name] = value
+
+    @property
+    def _listing_offer_intent_by_job_id(self) -> dict[str, Any]:
+        return self._lane_extra("listing_offer_intent_by_job_id", dict)
+
+    @_listing_offer_intent_by_job_id.setter
+    def _listing_offer_intent_by_job_id(self, value: dict[str, Any]) -> None:
+        self._set_lane_extra("listing_offer_intent_by_job_id", value)
+
+    @property
+    def _listing_offer_intent_by_url(self) -> dict[str, Any]:
+        return self._lane_extra("listing_offer_intent_by_url", dict)
+
+    @_listing_offer_intent_by_url.setter
+    def _listing_offer_intent_by_url(self, value: dict[str, Any]) -> None:
+        self._set_lane_extra("listing_offer_intent_by_url", value)
+
+    @property
+    def _listing_offer_pending_intents(self) -> list[Any]:
+        return self._lane_extra("listing_offer_pending_intents", list)
+
+    @_listing_offer_pending_intents.setter
+    def _listing_offer_pending_intents(self, value: list[Any]) -> None:
+        self._set_lane_extra("listing_offer_pending_intents", value)
+
+    @property
+    def _supplemental_product_files_by_job_id(self) -> dict[str, Any]:
+        return self._lane_extra("supplemental_product_files_by_job_id", dict)
+
+    @_supplemental_product_files_by_job_id.setter
+    def _supplemental_product_files_by_job_id(self, value: dict[str, Any]) -> None:
+        self._set_lane_extra("supplemental_product_files_by_job_id", value)
+
+    @property
+    def _supplemental_product_files_by_url(self) -> dict[str, Any]:
+        return self._lane_extra("supplemental_product_files_by_url", dict)
+
+    @_supplemental_product_files_by_url.setter
+    def _supplemental_product_files_by_url(self, value: dict[str, Any]) -> None:
+        self._set_lane_extra("supplemental_product_files_by_url", value)
+
+    def current_account_lane(self) -> str:
+        return self._lanes.current_key()
+
+    def selected_account_lane(self) -> str:
+        return self._lanes.selected_key()
+
+    def account_lane(self, account_id: str):
+        return self._lanes.use(account_id)
+
+    def install_account_lane(
+        self,
+        account_id: str,
+        *,
+        batch: BatchRun | None = None,
+        config: RunnerConfig | None = None,
+    ) -> None:
+        with self._lanes.use(account_id):
+            state = self._lanes.state()
+            state.batch = batch
+            state.config = config
+            state.mode = "idle"
+            state.source_queue.clear()
+            state.prepare_queue.clear()
+            state.execute_queue.clear()
+            state.source_resume_pending.clear()
+            state.stopping = False
+            state.execution_images = False
+            if batch is None:
+                state.last_state = "Idle · 等待批量链接"
+            else:
+                state.last_state = f"已恢复 Batch {batch.batch_id} · {batch.status}"
+
+    def activate_account_lane(self, account_id: str) -> None:
+        key = str(account_id or "").strip()
+        if not key:
+            raise ValueError("Makro account lane requires account_id")
+        self._lanes.select(key)
+        with self._lanes.use(key):
+            batch = self.batch
+            jobs = list(batch.jobs) if batch is not None else []
+            summary = (
+                batch.summary()
+                if batch is not None
+                else {
+                    "total": 0,
+                    "processing": 0,
+                    "ready": 0,
+                    "done": 0,
+                    "review": 0,
+                    "failed": 0,
+                }
+            )
+            self.jobs_changed.emit(jobs)
+            self.summary_changed.emit(summary)
+            self.running_changed.emit(self.is_running)
+            self._emit_state_changed(self._lanes.state().last_state)
+            self.lane_state_changed.emit(key, self.account_lane_snapshot(key))
+
+    def account_lane_running(self, account_id: str) -> bool:
+        with self._lanes.use(account_id):
+            return self.is_running
+
+    def any_account_lane_running(self) -> bool:
+        for key in self._lanes.keys():
+            with self._lanes.use(key):
+                if self.is_running:
+                    return True
+        return False
+
+    def account_lane_snapshot(self, account_id: str) -> dict[str, Any]:
+        key = str(account_id or "").strip()
+        if not key:
+            raise ValueError("Makro account lane requires account_id")
+        with self._lanes.use(key):
+            batch = self.batch
+            summary = (
+                batch.summary()
+                if batch is not None
+                else {
+                    "total": 0,
+                    "processing": 0,
+                    "ready": 0,
+                    "done": 0,
+                    "review": 0,
+                    "failed": 0,
+                }
+            )
+            return {
+                "account_id": key,
+                "has_batch": batch is not None,
+                "batch_id": str(getattr(batch, "batch_id", "") or ""),
+                "status": str(getattr(batch, "status", "") or "IDLE").upper(),
+                "running": self.is_running,
+                "summary": summary,
+                "state": self._lanes.state().last_state,
+            }
+
+    def _emit_running_changed(self, running: bool) -> None:
+        key = self.current_account_lane()
+        self.lane_running_changed.emit(key, bool(running))
+        self.lane_state_changed.emit(key, self.account_lane_snapshot(key))
+        if key == self.selected_account_lane():
+            self.running_changed.emit(bool(running))
+
+    def _emit_state_changed(self, text: str) -> None:
+        key = self.current_account_lane()
+        self._lanes.state().last_state = str(text)
+        self.lane_state_changed.emit(key, self.account_lane_snapshot(key))
+        if key == self.selected_account_lane():
+            self._emit_state_changed(str(text))
 
     @property
     def is_running(self) -> bool:
@@ -113,6 +346,31 @@ class BatchController(QObject):
 
     def _source_interaction_waiting(self) -> bool:
         return any(str(job.status).upper() == _SOURCE_WAITING for job in self._jobs())
+
+    def _source_process_active_any_lane(self) -> bool:
+        return any(
+            stage == "source"
+            for _process, (_job_id, stage) in self._processes.all_items()
+        )
+
+    def _source_interaction_waiting_any_lane(self) -> bool:
+        for key in self._lanes.keys():
+            with self._lanes.use(key):
+                if self._source_interaction_waiting():
+                    return True
+        return False
+
+    def _pump_waiting_source_lanes(self) -> None:
+        if self._source_process_active_any_lane() or self._source_interaction_waiting_any_lane():
+            return
+        selected = self.selected_account_lane()
+        ordered = (selected,) + tuple(key for key in self._lanes.keys() if key != selected)
+        for key in ordered:
+            with self._lanes.use(key):
+                if self._mode == "prepare" and self._source_queue:
+                    self._pump_prepare()
+                    if self._source_process_active_any_lane():
+                        return
 
     def start_prepare(
         self,
@@ -140,8 +398,8 @@ class BatchController(QObject):
         self._execute_queue = []
         self._source_resume_pending.clear()
         self._persist_emit(immediate=True)
-        self.running_changed.emit(True)
-        self.state_changed.emit("批量准备中")
+        self._emit_running_changed(True)
+        self._emit_state_changed("批量准备中")
         self._pump_prepare()
         return self.batch
 
@@ -171,8 +429,8 @@ class BatchController(QObject):
         self._stopping = False
         self._execution_images = bool(upload_images)
         self._execute_queue = [job.job_id for job in ready]
-        self.running_changed.emit(True)
-        self.state_changed.emit("批量真实填写中")
+        self._emit_running_changed(True)
+        self._emit_state_changed("批量真实填写中")
         self._persist_emit(immediate=True)
         self._pump_execute()
 
@@ -224,7 +482,7 @@ class BatchController(QObject):
         job = self._job(job_id)
         if str(job.status).upper() != _SOURCE_WAITING:
             raise ValueError(f"{job_id} 当前不是等待 Source 人工操作状态。")
-        source_active = any(stage == "source" for _, stage in self._processes.values())
+        source_active = self._source_process_active_any_lane()
         if source_active:
             raise RuntimeError("Source Edge 正在被另一条采集占用，请稍后再继续检测。")
 
@@ -243,14 +501,18 @@ class BatchController(QObject):
         self._mode = "prepare"
         self._stopping = False
         self._persist_emit(immediate=True)
-        self.state_changed.emit(f"{job_id} · 正在重新检测 Source Edge")
+        self._emit_state_changed(f"{job_id} · 正在重新检测 Source Edge")
         self._pump_prepare()
 
     def _pump_prepare(self) -> None:
         if self.batch is None or self.config is None or self._mode != "prepare":
             return
-        source_active = any(stage == "source" for _, stage in self._processes.values())
-        if self._source_queue and not source_active and not self._source_interaction_waiting():
+        source_active = self._source_process_active_any_lane()
+        if (
+            self._source_queue
+            and not source_active
+            and not self._source_interaction_waiting_any_lane()
+        ):
             self._start_source(self._source_queue.pop(0))
 
         active_prepare = sum(stage == "prepare" for _, stage in self._processes.values())
@@ -262,18 +524,22 @@ class BatchController(QObject):
         if no_active_work and self._source_interaction_waiting():
             self.batch.status = "PREPARING"
             self._persist_emit(immediate=True)
-            self.state_changed.emit("Source Edge 等待人工验证 · 已完成采集的商品继续运行")
+            self._emit_state_changed("Source Edge 等待人工验证 · 已完成采集的商品继续运行")
             return
         if no_active_work:
             self.batch.status = "PREPARED"
             self._mode = "idle"
             self._persist_emit(immediate=True)
-            self.running_changed.emit(False)
-            self.state_changed.emit("批量准备完成")
+            self._emit_running_changed(False)
+            self._emit_state_changed("批量准备完成")
 
     def _start_source(self, job_id: str) -> None:
         assert self.config is not None
         job = self._job(job_id)
+        if self._source_process_active_any_lane() or self._source_interaction_waiting_any_lane():
+            if job_id not in self._source_queue:
+                self._source_queue.insert(0, job_id)
+            return
         resume_interaction = job_id in self._source_resume_pending
         self._source_resume_pending.discard(job_id)
         job.operation_phase = "batch_prepare"
@@ -351,8 +617,8 @@ class BatchController(QObject):
             self.batch.status = "COMPLETE"
             self._mode = "idle"
             self._persist_emit(immediate=True)
-            self.running_changed.emit(False)
-            self.state_changed.emit("Batch 执行完成")
+            self._emit_running_changed(False)
+            self._emit_state_changed("Batch 执行完成")
 
     def _start_execute_job(self, job_id: str) -> None:
         assert self.config is not None
@@ -440,17 +706,49 @@ class BatchController(QObject):
         journal = AsyncRunJournal(log_path)
         self._journals[process] = journal
 
-        process.readyReadStandardOutput.connect(lambda p=process: self._read_output(p))
-        process.finished.connect(
-            lambda exit_code, exit_status, p=process: self._finished(p, int(exit_code))
+        process.readyReadStandardOutput.connect(
+            lambda p=process: self._dispatch_read_output(p)
         )
-        process.errorOccurred.connect(lambda error, p=process: self._process_error(p, error))
+        process.finished.connect(
+            lambda exit_code, exit_status, p=process: self._dispatch_finished(
+                p,
+                int(exit_code),
+            )
+        )
+        process.errorOccurred.connect(
+            lambda error, p=process: self._dispatch_process_error(p, error)
+        )
         command = subprocess.list2cmdline([sys.executable, *args])
         journal.append(f"stage={stage}")
         journal.append(f"cwd={self.project_root}")
         journal.append("$ " + command)
         self._emit_log_now(f"[{job_id} · {stage}] $ {command}")
         process.start(sys.executable, args)
+
+    def _dispatch_read_output(self, process: QProcess) -> None:
+        lane = self._processes.owner_for(process)
+        if lane is None:
+            return
+        with self._lanes.use(lane):
+            self._read_output(process)
+
+    def _dispatch_finished(self, process: QProcess, exit_code: int) -> None:
+        lane = self._processes.owner_for(process)
+        if lane is None:
+            return
+        with self._lanes.use(lane):
+            self._finished(process, exit_code)
+
+    def _dispatch_process_error(
+        self,
+        process: QProcess,
+        error: QProcess.ProcessError,
+    ) -> None:
+        lane = self._processes.owner_for(process)
+        if lane is None:
+            return
+        with self._lanes.use(lane):
+            self._process_error(process, error)
 
     def _read_output(self, process: QProcess) -> None:
         raw = bytes(process.readAllStandardOutput())
@@ -535,7 +833,7 @@ class BatchController(QObject):
         job.touch()
         if self.batch is not None:
             self.batch.status = "PREPARING"
-        self.state_changed.emit(f"{job.job_id} · {job.stage_detail} · 完成后点击继续检测")
+        self._emit_state_changed(f"{job.job_id} · {job.stage_detail} · 完成后点击继续检测")
 
     def _finished(self, process: QProcess, exit_code: int) -> None:
         self._read_output(process)
@@ -581,6 +879,7 @@ class BatchController(QObject):
             job.touch()
             self._persist_emit()
             self._pump_prepare()
+            self._pump_waiting_source_lanes()
             return
 
         if stage == "prepare":
@@ -678,8 +977,9 @@ class BatchController(QObject):
     def _process_error(self, process: QProcess, error: QProcess.ProcessError) -> None:
         if error != QProcess.FailedToStart or process not in self._processes:
             return
-        job_id, stage = self._processes.pop(process)
-        self._buffers.pop(process, None)
+        job_id, stage = self._processes.get(process)
+        self._buffers.discard(process)
+        self._processes.pop(process)
         self._source_resume_pending.discard(job_id)
         journal = self._journals.get(process)
         if journal is not None:
@@ -695,6 +995,8 @@ class BatchController(QObject):
         self._persist_emit()
         if stage in {"source", "prepare"}:
             self._pump_prepare()
+            if stage == "source":
+                self._pump_waiting_source_lanes()
         elif stage == "execute":
             self._pump_execute()
 
@@ -733,15 +1035,16 @@ class BatchController(QObject):
         self._flush_persist_emit()
         self._flush_log_preview()
         self._mode = "idle"
-        self.running_changed.emit(False)
-        self.state_changed.emit("Batch 已停止")
+        self._emit_running_changed(False)
+        self._emit_state_changed("Batch 已停止")
+        self._pump_waiting_source_lanes()
 
     def _emit_log_now(self, text: str) -> None:
         self.log.emit(text)
 
     def _queue_log_preview(self, job_id: str, text: str) -> None:
         del job_id
-        self._pending_log_preview.append(text)
+        self._pending_log_preview.append((self.current_account_lane(), text))
         if not self._log_preview_timer.isActive():
             self._log_preview_timer.start()
 
@@ -751,7 +1054,9 @@ class BatchController(QObject):
         self._log_preview_timer.stop()
         emitted = 0
         while self._pending_log_preview and emitted < BATCH_LOG_FLUSH_LINES:
-            self.log.emit(self._pending_log_preview.popleft())
+            lane, text = self._pending_log_preview.popleft()
+            with self._lanes.use(lane):
+                self.log.emit(text)
             emitted += 1
         if self._pending_log_preview:
             self._log_preview_timer.start()
@@ -759,20 +1064,30 @@ class BatchController(QObject):
     def _persist_emit(self, *, immediate: bool = False) -> None:
         if self.batch is None:
             return
-        self._state_dirty = True
+        self._dirty_lanes.add(self.current_account_lane())
         if immediate:
             self._flush_persist_emit()
         elif not self._state_publish_timer.isActive():
             self._state_publish_timer.start()
 
     def _flush_persist_emit(self) -> None:
-        if not self._state_dirty or self.batch is None:
+        if not self._dirty_lanes:
             return
         self._state_publish_timer.stop()
-        self._state_dirty = False
-        save_batch_run(self.batch)
-        self.jobs_changed.emit(list(self.batch.jobs))
-        self.summary_changed.emit(self.batch.summary())
+        dirty = tuple(self._dirty_lanes)
+        self._dirty_lanes.clear()
+        selected = self.selected_account_lane()
+        for lane in dirty:
+            with self._lanes.use(lane):
+                batch = self.batch
+                if batch is None:
+                    continue
+                save_batch_run(batch)
+                snapshot = self.account_lane_snapshot(lane)
+                self.lane_state_changed.emit(lane, snapshot)
+                if lane == selected:
+                    self.jobs_changed.emit(list(batch.jobs))
+                    self.summary_changed.emit(batch.summary())
 
 
 __all__ = ["BatchController"]

@@ -225,7 +225,7 @@ class BatchIndividualControls(QObject):
 
             self._bind_row_job(row, job)
             self.workspace.open_batch_button.setEnabled(True)
-            self.controller.state_changed.emit(f"{job.job_id} · 单独启动 · 其他商品不受影响")
+            self.controller._emit_state_changed(f"{job.job_id} · 单独启动 · 其他商品不受影响")
             self.controller._persist_emit(immediate=True)
             self._pump_lanes()
         except Exception as exc:
@@ -256,7 +256,7 @@ class BatchIndividualControls(QObject):
         self.controller._source_queue.append(job_id)
         if self.controller._mode == "idle":
             self.controller._mode = "prepare"
-            self.controller.running_changed.emit(True)
+            self.controller._emit_running_changed(True)
         return job
 
     def _next_job_id(self) -> str:
@@ -425,8 +425,8 @@ class BatchIndividualControls(QObject):
             self.controller._mode = "execute"
         self.controller._execute_queue.append(job_id)
         if not was_running:
-            self.controller.running_changed.emit(True)
-        self.controller.state_changed.emit(f"{job_id} · 单独真实填写 · 其他商品继续")
+            self.controller._emit_running_changed(True)
+        self.controller._emit_state_changed(f"{job_id} · 单独真实填写 · 其他商品继续")
         self.controller._persist_emit(immediate=True)
         self._pump_lanes()
 
@@ -698,8 +698,8 @@ class BatchIndividualControls(QObject):
             else:
                 batch.status = "IDLE"
         self.controller._persist_emit(immediate=True)
-        self.controller.running_changed.emit(False)
-        self.controller.state_changed.emit("Batch 空闲 · 可继续单独启动商品")
+        self.controller._emit_running_changed(False)
+        self.controller._emit_state_changed("Batch 空闲 · 可继续单独启动商品")
 
     def _remove_from_queues(self, job_id: str) -> None:
         for name in ("_source_queue", "_prepare_queue", "_execute_queue"):

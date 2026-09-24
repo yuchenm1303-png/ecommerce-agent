@@ -25,6 +25,7 @@ jobs:
         run: |
           pytest -q \
             tests/test_channel_accounts.py \
+            tests/test_batch_account_lanes.py \
             tests/test_makro_multi_account_task_binding.py
 
   tests:

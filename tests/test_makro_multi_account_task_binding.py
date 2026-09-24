@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BATCH_MODEL_PATH = ROOT / "gui" / "batch_model.py"
+BATCH_LANES_PATH = ROOT / "gui" / "batch_account_lanes.py"
 BATCH_BROWSER_PATH = ROOT / "gui" / "batch_browser_session.py"
 BATCH_RUNTIME_PATH = ROOT / "gui" / "batch_parallel_runtime.py"
 BATCH_SLOT_STORE_PATH = ROOT / "gui" / "batch_account_slot_store.py"
@@ -130,6 +131,17 @@ def test_shared_batch_browser_accepts_explicit_account_profile_and_generation() 
     assert "job.makro_browser_instance_token" in source
 
 
+def test_batch_controller_has_account_lane_process_context() -> None:
+    source = (ROOT / "gui" / "batch_runner.py").read_text(encoding="utf-8")
+
+    assert "BatchAccountLaneRegistry" in source
+    assert "def activate_account_lane" in source
+    assert "def account_lane_snapshot" in source
+    assert "def _dispatch_finished" in source
+    assert "lane_state_changed = Signal" in source
+    assert "_source_process_active_any_lane" in source
+
+
 def test_batch_runtime_binds_before_first_job_and_rejects_cross_account_reuse() -> None:
     source = BATCH_RUNTIME_PATH.read_text(encoding="utf-8")
 
@@ -216,6 +228,7 @@ def test_single_prepared_task_is_invalidated_by_account_switch() -> None:
 def test_multi_account_task_sources_compile() -> None:
     for path in (
         BATCH_MODEL_PATH,
+        BATCH_LANES_PATH,
         BATCH_BROWSER_PATH,
         BATCH_RUNTIME_PATH,
         BATCH_SLOT_STORE_PATH,
