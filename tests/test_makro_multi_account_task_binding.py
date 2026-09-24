@@ -11,7 +11,9 @@ BATCH_MODEL_PATH = ROOT / "gui" / "batch_model.py"
 BATCH_BROWSER_PATH = ROOT / "gui" / "batch_browser_session.py"
 BATCH_RUNTIME_PATH = ROOT / "gui" / "batch_parallel_runtime.py"
 BATCH_SLOT_STORE_PATH = ROOT / "gui" / "batch_account_slot_store.py"
+BATCH_WORKSPACE_PATH = ROOT / "gui" / "batch_workspace.py"
 CHANNEL_BROWSER_PATH = ROOT / "gui" / "channel_account_browser.py"
+CHANNEL_SURFACE_PATH = ROOT / "gui" / "channel_account_surface.py"
 
 
 def _load_module(name: str, path: Path):
@@ -150,6 +152,26 @@ def test_batch_runtime_keeps_independent_account_slots() -> None:
     assert "activate_account_slot" in browser_source
 
 
+def test_account_center_exposes_per_account_batch_slot_overview() -> None:
+    runtime_source = BATCH_RUNTIME_PATH.read_text(encoding="utf-8")
+    surface_source = CHANNEL_SURFACE_PATH.read_text(encoding="utf-8")
+
+    assert "def account_slot_snapshot" in runtime_source
+    assert "\"has_batch\": False" in runtime_source
+    assert "账号任务概览" in surface_source
+    assert "snapshot_getter(account.account_id)" in surface_source
+    assert "暂无 Batch" in surface_source
+
+
+def test_batch_cards_show_makro_account_ownership() -> None:
+    source = BATCH_WORKSPACE_PATH.read_text(encoding="utf-8")
+
+    assert "job.makro_account_label" in source
+    assert "Makro account ID:" in source
+    assert "Makro CDP lane:" in source
+    assert "Makro profile:" in source
+
+
 def test_batch_runtime_restores_latest_account_slots_across_restart() -> None:
     source = BATCH_RUNTIME_PATH.read_text(encoding="utf-8")
 
@@ -197,7 +219,9 @@ def test_multi_account_task_sources_compile() -> None:
         BATCH_BROWSER_PATH,
         BATCH_RUNTIME_PATH,
         BATCH_SLOT_STORE_PATH,
+        BATCH_WORKSPACE_PATH,
         CHANNEL_BROWSER_PATH,
+        CHANNEL_SURFACE_PATH,
     ):
         source = path.read_text(encoding="utf-8")
         compile(source, str(path), "exec")

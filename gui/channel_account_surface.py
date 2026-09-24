@@ -78,6 +78,21 @@ class ChannelAccountCenterPanel(QWidget):
         current_layout.addWidget(self.browser_status)
         layout.addWidget(current_card)
 
+        overview_card = QFrame()
+        overview_card.setObjectName("cardDetailSection")
+        overview_layout = QVBoxLayout(overview_card)
+        overview_layout.setContentsMargins(15, 14, 15, 15)
+        overview_layout.setSpacing(8)
+        overview_title = QLabel("账号任务概览")
+        overview_title.setObjectName("modalFieldLabel")
+        overview_layout.addWidget(overview_title)
+        self.account_overview = QLabel()
+        self.account_overview.setObjectName("cardDetailText")
+        self.account_overview.setWordWrap(True)
+        self.account_overview.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        overview_layout.addWidget(self.account_overview)
+        layout.addWidget(overview_card)
+
         connect_card = QFrame()
         connect_card.setObjectName("cardDetailSection")
         connect_layout = QVBoxLayout(connect_card)
@@ -110,7 +125,8 @@ class ChannelAccountCenterPanel(QWidget):
 
         policy = QLabel(
             "Single 的 Step 3 准备现场在切换店铺后会失效，避免把旧店铺页面用于新账号。"
-            "Batch 会永久记录所属 Makro 店铺，切回原店铺后可以继续；当前版本任务运行期间仍禁止手动切换店铺。"
+            "每个 Makro 账号都保留自己的 Browser Profile、CDP lane 和 Batch 槽位，切回原店铺后可以继续。"
+            "当前版本同一桌面进程一次只调度一个账号的 Batch；其他账号的浏览器登录会话会保持独立，不会被覆盖。"
         )
         policy.setObjectName("cardDetailText")
         policy.setWordWrap(True)
@@ -158,6 +174,35 @@ class ChannelAccountCenterPanel(QWidget):
                 f"目标店铺 · {selected.label} · CDP {selected_port} · "
                 f"正在从 {current.label} 切换控制面"
             )
+
+        runtime = getattr(self.manager.window, "_batch_parallel_runtime", None)
+        snapshot_getter = getattr(runtime, "account_slot_snapshot", None)
+        overview_lines: list[str] = []
+        for account in accounts:
+            port = self._account_port(account)
+            marker = "●" if account.account_id == current.account_id else "○"
+            batch_text = "暂无 Batch"
+            if callable(snapshot_getter):
+                try:
+                    snapshot = snapshot_getter(account.account_id)
+                except Exception as exc:
+                    batch_text = f"Batch 状态不可用 · {exc}"
+                else:
+                    if bool(snapshot.get("has_batch")):
+                        summary = snapshot.get("summary") or {}
+                        status = "RUNNING" if bool(snapshot.get("running")) else str(
+                            snapshot.get("status") or "IDLE"
+                        )
+                        batch_text = (
+                            f"{status} · {int(summary.get('total') or 0)} tasks · "
+                            f"{int(summary.get('ready') or 0)} ready · "
+                            f"{int(summary.get('processing') or 0)} processing · "
+                            f"{int(summary.get('done') or 0)} done"
+                        )
+            overview_lines.append(
+                f"{marker} {account.label} · CDP {port} · {batch_text}"
+            )
+        self.account_overview.setText("\n".join(overview_lines) or "暂无 Makro 账号")
 
         state, detail = self.manager.channel_browser_status()
         self._browser_status_changed(state, detail)

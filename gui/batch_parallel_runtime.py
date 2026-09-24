@@ -100,6 +100,47 @@ class BatchParallelRuntime:
             "failed": 0,
         }
 
+    def account_slot_snapshot(self, account_id: str) -> dict[str, Any]:
+        """Return presentation-safe state for one account's independent Batch slot."""
+
+        account_key = str(account_id or "").strip()
+        if not account_key:
+            raise ValueError("Makro account_id must not be empty")
+
+        slot = self._account_slots.get(account_key)
+        if slot is None:
+            return {
+                "account_id": account_key,
+                "has_batch": False,
+                "batch_id": "",
+                "status": "IDLE",
+                "running": False,
+                "summary": self._empty_summary(),
+            }
+
+        batch, _config = slot
+        owner_id = str(getattr(batch, "makro_account_id", "") or "").strip()
+        if owner_id and owner_id != account_key:
+            raise RuntimeError(
+                "Makro Batch 槽位账号归属损坏；为防止串号，已拒绝展示该槽位。"
+            )
+
+        summary = batch.summary() if callable(getattr(batch, "summary", None)) else self._empty_summary()
+        current = getattr(self.manager, "channel_account", None)
+        running = bool(
+            current is not None
+            and str(getattr(current, "account_id", "") or "") == account_key
+            and self.controller.is_running
+        )
+        return {
+            "account_id": account_key,
+            "has_batch": True,
+            "batch_id": str(getattr(batch, "batch_id", "") or ""),
+            "status": str(getattr(batch, "status", "") or "IDLE").upper(),
+            "running": running,
+            "summary": dict(summary),
+        }
+
     def _controller_log(self, message: str) -> None:
         emit = getattr(self.controller, "_emit_log_now", None)
         if callable(emit):

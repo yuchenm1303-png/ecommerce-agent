@@ -249,7 +249,9 @@ class BatchJobCard(QFrame):
         self._job = job
         progress = max(0, min(100, int(job.progress)))
         product = job.product_name or _product_label(job.product_url)
-        self.job_label.setText(f"{job.job_id} · OWNED PRODUCT TASK")
+        account_label = str(job.makro_account_label or "").strip()
+        owner = f" · {account_label}" if account_label else ""
+        self.job_label.setText(f"{job.job_id}{owner} · OWNED PRODUCT TASK")
         self.product_label.setText(product)
         self.product_label.setToolTip(job.product_name or job.product_url)
         self.url_label.setText(job.product_url)
@@ -329,6 +331,10 @@ class BatchJobCard(QFrame):
             "\n".join(
                 (
                     f"Supplier URL: {job.product_url}",
+                    f"Makro account: {job.makro_account_label or job.makro_account_id or '—'}",
+                    f"Makro account ID: {job.makro_account_id or '—'}",
+                    f"Makro CDP lane: {job.makro_cdp_port or '—'}",
+                    f"Makro profile: {job.makro_profile_dir or '—'}",
                     f"Makro targetId: {job.makro_target_id or '—'}",
                     f"Run directory: {job.run_dir or '—'}",
                     f"Execution report: {job.execution_report or '—'}",
