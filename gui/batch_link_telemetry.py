@@ -203,6 +203,7 @@ class BatchLinkTelemetryController(QObject):
         self._result_cache: dict[str, tuple[str, dict[str, Any]]] = {}
         self._batch_positions: dict[str, dict[str, int]] = {}
         self._batch_sizes: dict[str, int] = {}
+        self._pending_account_lanes: set[str] = set()
         self._bound_controller: Any = None
         self._flush = QTimer(self)
         self._flush.setSingleShot(True)
@@ -232,13 +233,38 @@ class BatchLinkTelemetryController(QObject):
         if controller is None:
             return
         self._bound_controller = controller
-        controller.jobs_changed.connect(self._on_jobs_changed)
-        controller.running_changed.connect(self._on_running_changed)
+        lane_state = getattr(controller, "lane_state_changed", None)
+        lane_running = getattr(controller, "lane_running_changed", None)
+        if lane_state is not None and lane_running is not None:
+            lane_state.connect(self._on_lane_state_changed)
+            lane_running.connect(self._on_lane_running_changed)
+        else:
+            controller.jobs_changed.connect(self._on_jobs_changed)
+            controller.running_changed.connect(self._on_running_changed)
         controller.failed.connect(self._on_controller_failed)
         self._bind_retry.stop()
         self._schedule_publish()
 
+    def _current_account_lane(self) -> str:
+        getter = getattr(self._bound_controller, "current_account_lane", None)
+        lane = str(getter() if callable(getter) else "").strip()
+        return lane or "__legacy__"
+
+    def _on_lane_state_changed(self, account_id: str, _snapshot: Any) -> None:
+        self._pending_account_lanes.add(str(account_id))
+        self._schedule_publish()
+
+    def _on_lane_running_changed(self, account_id: str, running: bool) -> None:
+        lane = str(account_id)
+        if running:
+            self._pending_account_lanes.add(lane)
+            self._schedule_publish()
+            return
+        self._flush.stop()
+        self._publish_lane(lane, force_terminal=True)
+
     def _on_jobs_changed(self, *_args: Any) -> None:
+        self._pending_account_lanes.add(self._current_account_lane())
         self._schedule_publish()
 
     def _on_running_changed(self, running: bool) -> None:
@@ -250,7 +276,7 @@ class BatchLinkTelemetryController(QObject):
 
     def _on_controller_failed(self, *_args: Any) -> None:
         self._flush.stop()
-        self._publish_all(force_terminal=True)
+        self._publish_lane(self._current_account_lane(), force_terminal=True)
 
     def _schedule_publish(self) -> None:
         if self._enabled():
@@ -356,16 +382,37 @@ class BatchLinkTelemetryController(QObject):
         if item is None and 0 <= index - 1 < len(items):
             item = items[index - 1]
         item = dict(item or {})
+        job_id = _text(getattr(job, "job_id", ""), 160)
+        listing_intent = _text(getattr(job, "listing_intent", ""), 8_000) or _text(
+            item.get("listing_intent"),
+            8_000,
+        )
+        file_map = getattr(self._bound_controller, "_supplemental_product_files_by_job_id", None)
+        owned_files = tuple(file_map.get(job_id, ())) if isinstance(file_map, dict) else ()
+        customer_files = (
+            [
+                {
+                    "name": Path(path).name,
+                    "extension": Path(path).suffix.casefold(),
+                    "size_bytes": int(Path(path).stat().st_size) if Path(path).is_file() else 0,
+                }
+                for path in owned_files[:100]
+            ]
+            if owned_files
+            else item.get("customer_files") or []
+        )
         return _safe(
             {
                 "audit_scope": "batch_link",
                 "batch_id": batch_id,
-                "job_id": _text(getattr(job, "job_id", ""), 160),
+                "job_id": job_id,
+                "makro_account_id": _text(getattr(job, "makro_account_id", ""), 200),
+                "makro_account_label": _text(getattr(job, "makro_account_label", ""), 500),
                 "batch_index": index,
                 "batch_size": total,
                 "supplier_url": product_url,
-                "listing_intent": item.get("listing_intent") or "",
-                "customer_files": item.get("customer_files") or [],
+                "listing_intent": listing_intent,
+                "customer_files": customer_files,
                 "model_config": self._model_config(),
             }
         )
@@ -412,6 +459,9 @@ class BatchLinkTelemetryController(QObject):
             "blocked": int(getattr(job, "blocked", 0) or 0),
             "required_blocked": int(getattr(job, "required_blocked", 0) or 0),
             "product_images": int(getattr(job, "image_count", 0) or 0),
+            "makro_account_id": _text(getattr(job, "makro_account_id", ""), 200),
+            "makro_account_label": _text(getattr(job, "makro_account_label", ""), 500),
+            "makro_cdp_port": int(getattr(job, "makro_cdp_port", 0) or 0),
             "makro_target_id": _text(getattr(job, "makro_target_id", ""), 240),
             "stage_detail": _text(getattr(job, "stage_detail", ""), 4_000),
             "failure_stage": _text(getattr(job, "failure_stage", ""), 4_000),
@@ -499,6 +549,21 @@ class BatchLinkTelemetryController(QObject):
     def _signature(self, audit: dict[str, Any]) -> str:
         return json.dumps(_audit_payload(audit), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
+    def _publish_lane(self, account_id: str, *, force_terminal: bool = False) -> None:
+        if not self._enabled():
+            return
+        session_id = self._usage_session_id()
+        if not session_id:
+            self._pending_account_lanes.add(str(account_id))
+            self._schedule_publish()
+            return
+        lane_context = getattr(self._bound_controller, "account_lane", None)
+        if callable(lane_context):
+            with lane_context(str(account_id)):
+                self._publish_current_lane(session_id, force_terminal=force_terminal)
+            return
+        self._publish_current_lane(session_id, force_terminal=force_terminal)
+
     def _publish_all(self, force_terminal: bool = False) -> None:
         if not self._enabled():
             return
@@ -506,13 +571,33 @@ class BatchLinkTelemetryController(QObject):
         if not session_id:
             self._schedule_publish()
             return
+        lanes = tuple(self._pending_account_lanes)
+        self._pending_account_lanes.clear()
+        if not lanes:
+            lanes = (self._current_account_lane(),)
+        lane_context = getattr(self._bound_controller, "account_lane", None)
+        for lane in lanes:
+            if callable(lane_context):
+                with lane_context(lane):
+                    self._publish_current_lane(session_id, force_terminal=force_terminal)
+            else:
+                self._publish_current_lane(session_id, force_terminal=force_terminal)
+
+    def _publish_current_lane(
+        self,
+        session_id: str,
+        *,
+        force_terminal: bool = False,
+    ) -> None:
         batch = self._batch()
         jobs = list(getattr(batch, "jobs", ()) or ()) if batch is not None else []
         if not jobs:
             return
         batch_id = _text(getattr(batch, "batch_id", ""), 240)
         batch_status = _text(getattr(batch, "status", ""), 120).upper()
-        items = self._input_items()
+        selected_getter = getattr(self._bound_controller, "selected_account_lane", None)
+        selected_lane = str(selected_getter() if callable(selected_getter) else "")
+        items = self._input_items() if self._current_account_lane() == selected_lane else []
         positions, total = self._stable_batch_coordinates(batch_id, jobs)
         for fallback_index, job in enumerate(jobs, start=1):
             job_id = _text(getattr(job, "job_id", ""), 160)
@@ -541,6 +626,7 @@ class BatchLinkTelemetryController(QObject):
                 continue
             self._last_signatures[audit_id] = signature
             self._post_audit(audit, session_id=session_id)
+
 
     def _post_audit(self, audit: dict[str, Any], *, session_id: str) -> None:
         session = self.access.session

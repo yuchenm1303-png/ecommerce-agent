@@ -250,6 +250,18 @@ def test_single_prepared_task_is_invalidated_by_account_switch() -> None:
     assert "程序不会把旧店铺的准备结果用于当前账号" in source
 
 
+def test_batch_link_telemetry_publishes_background_account_lanes() -> None:
+    source = (ROOT / "gui" / "batch_link_telemetry.py").read_text(encoding="utf-8")
+
+    assert "_pending_account_lanes" in source
+    assert "lane_state_changed" in source
+    assert "lane_running_changed" in source
+    assert "def _publish_lane" in source
+    assert "def _publish_current_lane" in source
+    assert '"makro_account_id"' in source
+    assert "_supplemental_product_files_by_job_id" in source
+
+
 def test_usage_telemetry_is_scoped_per_account_lane() -> None:
     source = (ROOT / "gui" / "usage_telemetry.py").read_text(encoding="utf-8")
 
