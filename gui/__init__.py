@@ -20,6 +20,12 @@ def _install_application_access_extensions_hook() -> None:
     def install_with_extensions(window, session):
         controller = original_install(window, session)
         try:
+            from .static_label_stability import install_static_label_stability
+
+            install_static_label_stability()
+        except Exception as exc:  # Presentation stability must never block the core workspace.
+            print(f"[static-label-stability] install skipped: {exc}", file=sys.stderr)
+        try:
             from .account_controls import install_application_account_controls
 
             install_application_account_controls(window, controller)
