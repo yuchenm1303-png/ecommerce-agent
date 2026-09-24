@@ -164,6 +164,21 @@ def _trusted_event(page: Any, token: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {"touched": False, "value": "", "at": 0}
 
 
+def trusted_input_ready(
+    state: dict[str, Any],
+    *,
+    stable_ms: int = USER_INPUT_STABLE_MS,
+) -> bool:
+    """Accept a human value only after commit-like event or input quiescence."""
+
+    if not bool(state.get("touched")):
+        return False
+    event_type = str(state.get("event_type") or "")
+    if event_type in {"change", "blur"}:
+        return True
+    return int(state.get("stable_for_ms") or 0) >= max(0, int(stable_ms))
+
+
 def _clear_trusted_event(page: Any, token: str) -> None:
     try:
         page.evaluate(
@@ -210,19 +225,15 @@ def _wait_for_user_value(
     try:
         while time.monotonic() < deadline:
             state = _trusted_event(adapter.page, token)
-            if bool(state.get("touched")):
-                event_type = str(state.get("event_type") or "")
-                stable_for_ms = int(state.get("stable_for_ms") or 0)
-                confirmed = event_type in {"change", "blur"} or stable_for_ms >= USER_INPUT_STABLE_MS
-                if confirmed:
-                    current = read_control(
-                        adapter.page,
-                        control,
-                        section_path=section_path,
-                        timeout_ms=3_000,
-                    ).strip()
-                    if current:
-                        return current
+            if trusted_input_ready(state):
+                current = read_control(
+                    adapter.page,
+                    control,
+                    section_path=section_path,
+                    timeout_ms=3_000,
+                ).strip()
+                if current:
+                    return current
             adapter.page.wait_for_timeout(max(50, int(poll_ms)))
     finally:
         _clear_trusted_event(adapter.page, token)
@@ -351,4 +362,5 @@ __all__ = [
     "USER_INPUT_STABLE_MS",
     "collect_runtime_user_decisions",
     "pending_user_decision_items",
+    "trusted_input_ready",
 ]
