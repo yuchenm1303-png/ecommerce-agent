@@ -16,18 +16,19 @@ from .coverage import (
     PASS,
     SKIPPED_EXISTING,
     CoverageResult,
-    _equivalent,
     _match_field,
-    _read_control,
-    _unique_visible_locator,
     _value_controls,
-    _write_control,
     exercise_live_field,
     field_shape,
     semantic_field_is_empty,
     summarize_results,
 )
 from .direct_visual_hold import _listing_fields, _open_section
+from .field_engine import (
+    fill_control as _engine_fill_control,
+    read_control as _engine_read_control,
+    values_equivalent as _engine_values_equivalent,
+)
 from .listing_preflight import CORE_FORM_SECTIONS
 from .sections import cancel_section, save_section, visible_section_errors
 from .visual_hold import _verify_final_hold
@@ -107,7 +108,12 @@ def _apply_save_safe_overrides(
     run_token: str,
     recheck_wait_ms: int,
 ) -> None:
-    """Normalize synthetic values that have format/cross-field constraints."""
+    """Normalize synthetic values that have format/cross-field constraints.
+
+    Save-safe replacements must use the same production Field Engine as normal
+    execution.  This keeps synthetic inspection from owning a second mutation
+    path after ``coverage`` was migrated onto the shared engine.
+    """
 
     result_by_key = {
         item.attribute_key: item for item in results if item.status == PASS
@@ -123,7 +129,6 @@ def _apply_save_safe_overrides(
         if not values:
             continue
         control = values[0]
-        locator, selector = _unique_visible_locator(adapter.page, section_path, control)
 
         if str(control.get("field_kind") or "") == "select":
             options = [
@@ -134,14 +139,28 @@ def _apply_save_safe_overrides(
             if candidate not in options:
                 continue
 
-        _write_control(adapter.page, locator, control, candidate)
-        immediate = _read_control(locator, control)
+        selector = _engine_fill_control(
+            adapter.page,
+            control,
+            candidate,
+            section_path,
+        )
+        immediate = _engine_read_control(
+            adapter.page,
+            control,
+            section_path,
+            timeout_ms=3_000,
+        )
         adapter.page.wait_for_timeout(recheck_wait_ms)
-        locator2, _ = _unique_visible_locator(adapter.page, section_path, control)
-        settled = _read_control(locator2, control)
+        settled = _engine_read_control(
+            adapter.page,
+            control,
+            section_path,
+            timeout_ms=3_000,
+        )
         if not (
-            _equivalent(candidate, immediate, control)
-            and _equivalent(candidate, settled, control)
+            _engine_values_equivalent(control, candidate, immediate)
+            and _engine_values_equivalent(control, candidate, settled)
         ):
             raise RuntimeError(
                 f"save-safe override 回读失败：{key} expected={candidate!r}, "
@@ -161,7 +180,7 @@ def _apply_save_safe_overrides(
             result.settled.append(settled)
         if selector not in result.selectors:
             result.selectors.append(selector)
-        result.detail = "已替换为 save-safe synthetic 值并完成稳定回读。"
+        result.detail = "已通过生产 Field Engine 替换为 save-safe synthetic 值并完成稳定回读。"
 
 
 def _verify_saved_section(

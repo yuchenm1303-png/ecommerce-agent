@@ -15,7 +15,15 @@ from collections.abc import Sequence
 from app.browser_session import DEFAULT_CDP_PORT
 from app.cdp_automation_health import poison_matches_current_generation
 from app.cdp_transport_lane import exclusive_cdp_transport_lane
-from makro_execute_listing import main as execute_main
+from app.makro.photo_acceptance import install_executor_photo_guards
+import makro_execute_listing as _executor
+
+
+# Makro Product Photos is mandatory for a persistable listing. Install the
+# canonical gate before any execution entrypoint can classify a zero-photo draft
+# as strict success. The guard is idempotent and preserves already-persisted
+# gallery images when no new upload is required.
+install_executor_photo_guards(_executor)
 
 
 def _cdp_port(argv: Sequence[str]) -> int:
@@ -33,7 +41,7 @@ def main() -> int:
                 "Makro Browser automation generation 已标记失效；"
                 "真实执行不会继续 attach，等待 GUI 在空闲边界安全恢复。"
             )
-        return int(execute_main())
+        return int(_executor.main())
 
 
 if __name__ == "__main__":

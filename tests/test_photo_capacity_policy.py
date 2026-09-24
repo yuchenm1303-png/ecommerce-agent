@@ -1,6 +1,4 @@
-from pathlib import Path
-
-from app.makro.execution import _persisted_gallery_report, _photo_upload_budget
+from app.makro.execution import _photo_upload_budget
 from makro_preview_listing import _completion_summary
 
 
@@ -30,25 +28,17 @@ def test_photo_upload_budget_falls_back_to_visible_slots_without_counter() -> No
     assert budget["omitted_count"] == 3
 
 
-def test_full_gallery_is_persisted_but_request_is_explicitly_capacity_limited() -> None:
-    omitted = [Path(f"image-{index}.jpg") for index in range(5)]
-    report = _persisted_gallery_report(
+def test_full_gallery_budget_is_explicitly_capacity_limited() -> None:
+    budget = _photo_upload_budget(
         requested=5,
         initial_count=5,
         capacity=5,
-        available_slots=0,
-        omitted_paths=omitted,
-        request_status="skipped_no_capacity",
-        detail="existing gallery is already full",
+        visible_empty_slots=0,
     )
 
-    assert report["status"] == "persisted_verified"
-    assert report["request_status"] == "skipped_no_capacity"
-    assert report["request_complete"] is False
-    assert report["capacity_limited"] is True
-    assert report["omitted_count"] == 5
-    assert report["listing_photo_requirement_satisfied"] is True
-    assert report["persistence"]["final_count"] == 5
+    assert budget["available_slots"] == 0
+    assert budget["upload_count"] == 0
+    assert budget["omitted_count"] == 5
 
 
 def test_completion_does_not_fail_only_because_gallery_is_full() -> None:
@@ -76,6 +66,7 @@ def test_completion_does_not_fail_only_because_gallery_is_full() -> None:
         "capacity_limited": True,
         "requested": 5,
         "omitted_count": 5,
+        "listing_photo_requirement_satisfied": True,
         "persistence": {
             "status": "persisted_verified",
             "initial_count": 5,

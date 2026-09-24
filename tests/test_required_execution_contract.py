@@ -8,7 +8,6 @@ from app.ai_decisions import field_id
 from app.fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem
 from app.makro.execution import fill_one_section, run_photos
 from app.makro.photos import (
-    PHOTO_SLOT_IDS,
     _DynamicPhotoFileTarget,
     _next_empty_photo_slot,
     _open_photo_slot_upload_panel,
@@ -156,22 +155,17 @@ def test_production_photo_path_stages_one_transaction_then_saves_once():
     assert "expected_added=1" not in source
 
 
-def test_product_photos_uses_real_thumbnail_ids_and_shared_input_surface():
+def test_product_photos_uses_live_thumbnail_ids_in_numeric_order():
     surface_source = inspect.getsource(_photo_surface)
     next_slot_source = inspect.getsource(_next_empty_photo_slot)
     select_source = inspect.getsource(_select_file_input)
 
-    assert PHOTO_SLOT_IDS == (
-        "thumbnail_0",
-        "thumbnail_1",
-        "thumbnail_2",
-        "thumbnail_3",
-        "thumbnail_4",
-    )
     assert '[id^="thumbnail_"]' in surface_source
-    assert 'input[type="file"]' in surface_source
-    assert "PHOTO_SLOT_IDS" in next_slot_source
+    assert "slot_count > 0" in surface_source
+    assert "sorted(" in next_slot_source
+    assert 'slot.get("index")' in next_slot_source
     assert 'snapshot.get("is_empty")' in next_slot_source
+    assert "PHOTO_SLOT_IDS" not in next_slot_source
     assert "_next_empty_photo_slot" in select_source
     assert "_DynamicPhotoFileTarget" in select_source
     assert "AddProductImage" not in next_slot_source

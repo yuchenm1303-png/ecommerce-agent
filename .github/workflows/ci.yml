@@ -18,10 +18,17 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      - name: Install Qt runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0
+
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt -r requirements-gui.txt
 
       - name: Run unit tests
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: pytest -q
 
   production-contract:
@@ -37,10 +44,17 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      - name: Install Qt runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0
+
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt -r requirements-gui.txt
 
       - name: Run production architecture contracts
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: |
           pytest -q \
             tests/test_production_entry_contract.py \
