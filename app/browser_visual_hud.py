@@ -266,6 +266,7 @@ def browser_visual_hud_advice(
             "source": str(advisory.get("source") or "Listing Studio"),
             "warning": str(advisory.get("warning") or ""),
             "kind": str(advisory.get("kind") or "decision"),
+            "hold_ms": max(1_000, min(1_800_000, int(advisory.get("hold_ms") or 7_000))),
             "rows": [
                 {
                     "label": str(row.get("label") or ""),
