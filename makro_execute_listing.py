@@ -37,7 +37,6 @@ from app.makro.fast_execution import fill_one_section as _fill_one_section
 from app.makro.listing_preflight import CORE_FORM_SECTIONS
 from app.makro.marketplace_constraints import apply_makro_decision_constraints
 from app.makro.visual_execution_hud import (
-    destroy_visual_execution_hud,
     finish_visual_execution_hud,
     install_visual_execution_hud,
     set_visual_execution_hud_capture_safe,
@@ -718,7 +717,9 @@ def main() -> int:
 
         process_success = bool(execution_outcome.get("process_success"))
         finish_visual_execution_hud(page, success=process_success)
-        destroy_visual_execution_hud(page)
+        # Keep the injected reference layer alive after Playwright detaches so
+        # the seller can review/edit the Makro form with guidance still visible.
+        # Full page navigation/reload naturally clears the injected DOM.
         harness.detach()
         if not process_success:
             print("Step 3 存在结构性执行失败或没有任何持久化成功；进程返回非零状态。")
