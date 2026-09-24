@@ -14,6 +14,7 @@ from .batch_browser_session import (
     shared_batch_browser,
 )
 from .batch_model import load_batch_run, normalize_batch_concurrency, save_batch_run
+from .readonly_runner import RunnerConfig
 
 
 def _set_cli_option(args: list[str], name: str, value: str) -> None:
@@ -111,7 +112,6 @@ class BatchParallelRuntime:
         if str(getattr(batch, "status", "") or "").upper() in safe_batch_states:
             return False
 
-        changed = False
         safe_job_states = {"READY", "DONE", "REVIEW", "FAILED", "STOPPED"}
         for job in batch.jobs:
             if str(job.status or "").upper() in safe_job_states:
@@ -121,9 +121,8 @@ class BatchParallelRuntime:
             job.status = "STOPPED"
             job.stage_detail = "应用重启，原运行任务已停止"
             job.touch()
-            changed = True
         batch.status = "STOPPED"
-        return True or changed
+        return True
 
     def _restore_persisted_slots(self) -> None:
         for account in self.manager.list_channel_accounts():
@@ -167,24 +166,29 @@ class BatchParallelRuntime:
         self._slot_store.remember(account_id, batch.root_dir)
         save_batch_run(batch)
 
-    def _ensure_controller_config(self) -> Any:
+    def _ensure_controller_config(self) -> RunnerConfig:
         config = self.controller.config
         if config is not None:
             return config
-        builder = getattr(self.window.batch_workspace, "_config", None)
-        if not callable(builder):
-            raise RuntimeError("恢复的 Batch 缺少运行配置，且无法从当前工作区重建。")
-        config = builder()
+
+        batch = self.controller.batch
+        if batch is None or not batch.jobs:
+            raise RuntimeError("恢复的 Batch 没有商品任务，无法重建运行配置。")
+        workspace = self.window.batch_workspace
+        config = RunnerConfig(
+            product_url=str(batch.jobs[0].product_url),
+            makro_cdp_port=int(workspace.makro_port.value()),
+            source_cdp_port=int(workspace.source_port.value()),
+            source_use_current_page=False,
+        )
         if int(config.makro_cdp_port) != int(self.manager.port):
             raise RuntimeError(
                 "恢复 Batch 时当前工作区 Makro CDP 端口与账号专属 lane 不一致；已拒绝执行。"
             )
         self.controller.config = config
-        batch = self.controller.batch
-        if batch is not None:
-            account_id = str(getattr(batch, "makro_account_id", "") or "").strip()
-            if account_id:
-                self._account_slots[account_id] = (batch, config)
+        account_id = str(getattr(batch, "makro_account_id", "") or "").strip()
+        if account_id:
+            self._account_slots[account_id] = (batch, config)
         return config
 
     def activate_account_slot(self, account: Any) -> None:
