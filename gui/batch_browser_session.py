@@ -48,18 +48,32 @@ def shared_batch_browser(
     )
 
 
-def bind_job_shared_browser(job: BatchJob, browser: SharedBatchBrowser) -> None:
-    """Persist that one Job belongs to the shared Edge, while targetId owns its tab."""
+def bind_job_shared_browser(
+    job: BatchJob,
+    browser: SharedBatchBrowser,
+    *,
+    instance_token: str = "",
+) -> None:
+    """Persist the account lane and browser generation that owns one Job tab."""
 
     job.browser_lane = 0
     job.makro_cdp_port = int(browser.cdp_port)
     job.makro_profile_dir = str(browser.profile_dir.resolve())
+    if instance_token:
+        job.makro_browser_instance_token = str(instance_token)
     job.touch()
 
 
-def bind_batch_shared_browser(batch: BatchRun, browser: SharedBatchBrowser) -> None:
+def bind_batch_shared_browser(
+    batch: BatchRun,
+    browser: SharedBatchBrowser,
+    *,
+    instance_token: str = "",
+) -> None:
+    if instance_token:
+        batch.makro_browser_instance_token = str(instance_token)
     for job in batch.jobs:
-        bind_job_shared_browser(job, browser)
+        bind_job_shared_browser(job, browser, instance_token=instance_token)
 
 
 def browser_instance_token(port: int) -> str:
