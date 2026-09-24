@@ -8,10 +8,21 @@ from urllib.parse import urlsplit, urlunsplit
 
 from playwright.sync_api import sync_playwright
 
+from . import source_capture_engine as _source_engine
 from .browser_session import _connect_browser_resilient, acquire_cdp_session_lease
 from .image_media import ImageMediaError, normalize_image_media
+from .source_image_download import install_source_image_downloader
 from .source_snapshot import SourceSnapshot
 
+
+# v10 invalidates zero-image cache generations created before the hardened image
+# transport/recovery contract. _source_cache_key reads this module global from the
+# engine at call time, so the existing helper remains the single cache-key owner.
+_source_engine.SOURCE_CAPTURE_CACHE_VERSION = max(
+    int(_source_engine.SOURCE_CAPTURE_CACHE_VERSION),
+    10,
+)
+install_source_image_downloader(_source_engine)
 
 _RECOVERY_MAX_IMAGES = 8
 _RECOVERY_MIN_NATURAL_EDGE = 280
