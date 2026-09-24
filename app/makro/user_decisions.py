@@ -22,6 +22,7 @@ from makro_preview_listing import _item_identity, _open_and_index_section
 
 
 _USER_EVENT_STATE = "__listingStudioUserDecisionEvents"
+USER_INPUT_STABLE_MS = 900
 
 
 def _value_controls(field: dict[str, Any]) -> list[dict[str, Any]]:
@@ -122,18 +123,22 @@ def _arm_trusted_input(locator: Any, token: str) -> None:
           const key = payload.key;
           const token = payload.token;
           const root = window[key] || (window[key] = Object.create(null));
-          const state = {touched:false, value:'', at:0, mark:null, target:el};
+          const state = {
+            touched:false, value:'', at:0, eventType:'', mark:null, target:el
+          };
           const mark = event => {
             if (!event.isTrusted) return;
             const value = ('value' in el) ? String(el.value || '') : String(el.textContent || '');
             state.touched=true;
             state.value=value.trim();
             state.at=Date.now();
+            state.eventType=String(event.type || '');
           };
           state.mark=mark;
           root[token]=state;
           el.addEventListener('input', mark, true);
           el.addEventListener('change', mark, true);
+          el.addEventListener('blur', mark, true);
         }""",
         {"key": _USER_EVENT_STATE, "token": token},
     )
@@ -145,8 +150,14 @@ def _trusted_event(page: Any, token: str) -> dict[str, Any]:
           const root = window[payload.key] || {};
           const state = root[payload.token];
           return state
-            ? {touched:Boolean(state.touched), value:String(state.value || ''), at:Number(state.at)||0}
-            : {touched:false, value:'', at:0};
+            ? {
+                touched:Boolean(state.touched),
+                value:String(state.value || ''),
+                at:Number(state.at)||0,
+                event_type:String(state.eventType || ''),
+                stable_for_ms:Math.max(0,Date.now()-(Number(state.at)||Date.now()))
+              }
+            : {touched:false, value:'', at:0, event_type:'', stable_for_ms:0};
         }""",
         {"key": _USER_EVENT_STATE, "token": token},
     )
@@ -165,6 +176,7 @@ def _clear_trusted_event(page: Any, token: str) -> None:
                 if (target) {
                   try { target.removeEventListener('input', state.mark, true); } catch (_) {}
                   try { target.removeEventListener('change', state.mark, true); } catch (_) {}
+                  try { target.removeEventListener('blur', state.mark, true); } catch (_) {}
                 }
               }
               delete root[payload.token];
@@ -199,14 +211,18 @@ def _wait_for_user_value(
         while time.monotonic() < deadline:
             state = _trusted_event(adapter.page, token)
             if bool(state.get("touched")):
-                current = read_control(
-                    adapter.page,
-                    control,
-                    section_path=section_path,
-                    timeout_ms=3_000,
-                ).strip()
-                if current:
-                    return current
+                event_type = str(state.get("event_type") or "")
+                stable_for_ms = int(state.get("stable_for_ms") or 0)
+                confirmed = event_type in {"change", "blur"} or stable_for_ms >= USER_INPUT_STABLE_MS
+                if confirmed:
+                    current = read_control(
+                        adapter.page,
+                        control,
+                        section_path=section_path,
+                        timeout_ms=3_000,
+                    ).strip()
+                    if current:
+                        return current
             adapter.page.wait_for_timeout(max(50, int(poll_ms)))
     finally:
         _clear_trusted_event(adapter.page, token)
@@ -332,6 +348,7 @@ def collect_runtime_user_decisions(
 
 
 __all__ = [
+    "USER_INPUT_STABLE_MS",
     "collect_runtime_user_decisions",
     "pending_user_decision_items",
 ]
