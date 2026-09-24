@@ -7,7 +7,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from app.browser_instance import managed_makro_cdp_port
 from app.cdp_automation_health import clear_cdp_poison
 from app.channel_accounts import ChannelAccount, ChannelAccountStore
 from app.update_browser_gate import close_managed_browser
@@ -16,33 +15,30 @@ from .browser_session_manager import ManagedMakroBrowser
 
 
 class AccountBoundMakroBrowser(ManagedMakroBrowser):
-    """Bind one managed Makro Edge generation to one runtime/account namespace.
+    """Bind one managed Makro Edge lane to one selected marketplace account.
 
-    The existing Single/Batch CDP architecture remains the execution owner. This
-    class selects both the runtime-root-specific CDP transport and the persisted
-    account profile, preventing two Listing Studio copies from recovering/closing
-    the same browser generation and preventing marketplace-session cross-account
-    reuse inside one copy.
+    Every Makro account owns both a dedicated Browser Profile and a persisted CDP
+    port. Switching the UI account changes which lane this lifecycle manager is
+    observing; it no longer destroys another account's healthy Edge merely to open
+    the selected one. This is the browser-process foundation required for true
+    cross-account Batch concurrency, while current Single/Batch start guards still
+    fail closed until the selected lane is fully committed.
     """
 
     _CHANNEL = "makro"
 
     def __init__(self, window: Any) -> None:
         project_root = Path(window.project_root).resolve()
-        managed_port = managed_makro_cdp_port(project_root)
         self._account_scope_id = self._current_scope_id(window)
         self.channel_accounts = ChannelAccountStore(
             project_root,
             scope_id=self._account_scope_id,
         )
         self.channel_account = self.channel_accounts.active_account(self._CHANNEL)
+        managed_port = self.channel_accounts.cdp_port(self.channel_account)
         self._desired_profile_dir = self.channel_accounts.profile_dir(self.channel_account)
         self._runtime_identity = self.channel_accounts.runtime_identity(self.channel_account)
-        self._runtime_marker = (
-            project_root
-            / "channel_accounts"
-            / "managed_makro_browser.json"
-        )
+        self._runtime_marker = self._runtime_marker_for(self.channel_account)
         self._account_reconcile_lock = threading.Lock()
         self._account_selection_lock = threading.Lock()
         self._pending_channel_account: ChannelAccount | None = None
@@ -57,7 +53,7 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
 
     @staticmethod
     def _sync_managed_port_controls(window: Any, port: int) -> None:
-        """Make every GUI task producer use this manager's isolated CDP port."""
+        """Make every GUI task producer use the currently selected account lane."""
 
         single_port = getattr(window, "makro_port", None)
         if single_port is not None and callable(getattr(single_port, "setValue", None)):
@@ -79,6 +75,19 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
             raise RuntimeError("当前应用账号缺少 user_id，不能安全绑定 Makro 平台账号。")
         return user_id
 
+    def _runtime_marker_for(self, account: ChannelAccount) -> Path:
+        return (
+            self.project_root
+            / "channel_accounts"
+            / "managed_makro_browsers"
+            / self.channel_accounts.scope_token
+            / f"{account.account_id}.json"
+        )
+
+    def channel_browser_port(self, account: ChannelAccount | None = None) -> int:
+        target = account or self.channel_account
+        return self.channel_accounts.cdp_port(target)
+
     def _assert_account_scope_stable(self) -> None:
         current = self._current_scope_id(self.window)
         if current != self._account_scope_id:
@@ -99,15 +108,7 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
         return self._state, self._detail
 
     def task_channel_account(self) -> ChannelAccount:
-        """Return the account only after the live browser owner is committed to it.
-
-        Account selection is asynchronous: the lifecycle thread first applies the
-        requested metadata, then rotates Edge/Profile, verifies automation and only
-        finally writes the runtime identity marker. Task producers must use this
-        gate instead of reading ``channel_account`` directly, otherwise they can
-        observe the brief middle state where account B is selected while account
-        A's Edge is still the live CDP endpoint.
-        """
+        """Return the account only after the selected browser lane is committed."""
 
         self._assert_account_scope_stable()
         if self._has_pending_channel_account():
@@ -118,10 +119,11 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
             )
 
         expected_profile = self.channel_accounts.profile_dir(self.channel_account).resolve()
-        if Path(self.profile_dir).resolve() != expected_profile:
+        expected_port = self.channel_accounts.cdp_port(self.channel_account)
+        if Path(self.profile_dir).resolve() != expected_profile or int(self.port) != expected_port:
             self.ensure_async()
             raise RuntimeError(
-                "当前 Makro Browser Profile 尚未切换到已选择店铺；为防止串号，已拒绝启动任务。"
+                "当前 Makro Browser lane 尚未切换到已选择店铺；为防止串号，已拒绝启动任务。"
             )
 
         expected_identity = self.channel_accounts.runtime_identity(self.channel_account)
@@ -144,14 +146,18 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
             )
 
     def request_activate_channel_account(self, account_id: str) -> ChannelAccount:
-        """Persist an account selection and let the lifecycle worker rotate Edge.
+        """Persist an account selection and let the lifecycle worker select its lane.
 
-        This method is safe for the Qt presentation thread: it performs local
-        metadata I/O only and never probes CDP, closes Edge, or waits on a worker.
+        The method performs metadata I/O only. Existing healthy browser processes
+        belonging to other Makro accounts are deliberately left alive on their own
+        ports/profiles so later scheduler work can use them independently.
         """
 
         self._assert_account_change_allowed()
         account = self.channel_accounts.set_active(self._CHANNEL, account_id)
+        # Materialize the lane before publishing the selection. This makes port
+        # collisions fail here, before any task can observe the target account.
+        self.channel_accounts.cdp_port(account)
         with self._account_selection_lock:
             if (
                 account.account_id == self.channel_account.account_id
@@ -169,7 +175,7 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
             self._single_prepared_invalidated_by_account_switch = True
         self._emit_status(
             "CHECKING",
-            f"已选择 {account.label} · 正在后台切换独立 Makro 登录会话",
+            f"已选择 {account.label} · 正在后台连接独立 Makro Browser lane",
         )
         self.ensure_async()
         return account
@@ -189,7 +195,12 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
         self.channel_account = account
         self._desired_profile_dir = self.channel_accounts.profile_dir(account)
         self.profile_dir = self._desired_profile_dir
+        self.port = self.channel_accounts.cdp_port(account)
+        self._sync_managed_port_controls(self.window, self.port)
         self._runtime_identity = self.channel_accounts.runtime_identity(account)
+        self._runtime_marker = self._runtime_marker_for(account)
+        self._instance_token = ""
+        self._generation += 1
         self._single_prepared_generation = None
         self._batch_prepare_generation = None
         return True
@@ -205,15 +216,18 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
             return ""
         if not isinstance(payload, dict):
             return ""
+        if int(payload.get("cdp_port") or 0) != int(self.port):
+            return ""
         return str(payload.get("identity") or "").strip()
 
     def _write_runtime_identity(self) -> None:
         payload = {
-            "version": 2,
+            "version": 3,
             "identity": self._runtime_identity,
             "channel": self.channel_account.channel,
             "account_id": self.channel_account.account_id,
             "cdp_port": self.port,
+            "profile_dir": str(Path(self.profile_dir).resolve()),
         }
         self._runtime_marker.parent.mkdir(parents=True, exist_ok=True)
         temp = self._runtime_marker.with_name(
@@ -242,10 +256,11 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
         return self.profile_dir.resolve() == legacy
 
     def _reconcile_running_browser_account(self, reason: str) -> None:
-        """Rotate a live managed Edge only when its recorded account is different.
+        """Verify the selected account lane without touching other account lanes.
 
-        This function performs endpoint/process I/O and is called only from the
-        inherited lifecycle worker path, never from a Start-click UI path.
+        A healthy browser on another account's dedicated port is intentionally
+        invisible here. If the *selected account's* port is occupied by a browser
+        whose marker does not match, only that conflicting port is recovered.
         """
 
         with self._account_reconcile_lock:
@@ -258,29 +273,29 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
                 return
 
             # Upgrade compatibility: the first account that legitimately claimed
-            # the old global profile may reuse the already-running legacy Edge.
+            # the old global profile may reuse its already-running legacy Edge.
             if not observed_identity and self._legacy_profile_is_desired():
                 self._write_runtime_identity()
                 return
 
             if self._is_busy():
                 raise RuntimeError(
-                    "检测到当前 Makro Browser 属于另一个平台账号，但任务仍在运行；"
+                    "检测到当前账号专属 Makro Browser 端口属于未知会话，但任务仍在运行；"
                     "为防止串号，程序不会中途替换浏览器。"
                 )
 
             self._emit_status(
                 "RECOVERING",
-                f"{reason} · 正在切换到 {self.channel_account.label} 的独立登录会话",
+                f"{reason} · 正在恢复 {self.channel_account.label} 的专属 Browser lane",
             )
             closed = close_managed_browser(port=self.port, deadline_s=6.0)
             if not closed.ok:
                 self._emit_status(
                     "ERROR",
-                    f"平台账号隔离失败：无法安全关闭其他账号的 Makro Browser · {closed.detail}",
+                    f"平台账号隔离失败：无法安全关闭冲突 Makro Browser · {closed.detail}",
                 )
                 raise RuntimeError(
-                    "无法证明并安全关闭当前 Makro Browser；为防止上架到错误店铺，已停止继续。"
+                    "无法证明并安全关闭当前账号端口上的 Browser；为防止串号，已停止继续。"
                 )
 
             self._instance_token = ""
@@ -291,7 +306,7 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
             self._clear_runtime_identity()
 
     def ensure_ready(self, reason: str = "task") -> bool:
-        """Resolve pending account changes on the lifecycle worker, never the UI."""
+        """Resolve pending account lane changes on the lifecycle worker."""
 
         launched_any = False
         while True:
@@ -305,14 +320,14 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
 
     def _apply_endpoint_observation(self, token: str) -> None:
         # A selection can arrive during the tail of a lifecycle worker. Keep the
-        # poll path aware of it so a READY emitted by the old generation cannot
-        # strand the pending switch indefinitely.
+        # poll path aware of it so READY from the previous lane cannot strand the
+        # pending switch indefinitely.
         if self._has_pending_channel_account() and not self._is_busy() and not self._update_quiesced:
             selected = self.selected_channel_account()
             if self._state in self._HOT_STATES:
                 self._emit_status(
                     "CHECKING",
-                    f"已选择 {selected.label} · 正在后台切换独立 Makro 登录会话",
+                    f"已选择 {selected.label} · 正在后台连接专属 Makro Browser lane",
                 )
             self.ensure_async()
             return
@@ -356,7 +371,7 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
     def _apply_status(self, state: str, detail: str) -> None:
         account: ChannelAccount | None = getattr(self, "channel_account", None)
         if account is not None:
-            detail = f"{account.label} · {detail}"
+            detail = f"{account.label} · CDP {self.port} · {detail}"
         super()._apply_status(state, detail)
 
 
