@@ -20,6 +20,13 @@ def test_visual_hud_contains_noninteractive_light_reference_layer() -> None:
     assert "pinReference" in _INSTALL_SCRIPT
     assert "references:new Map()" in _INSTALL_SCRIPT
     assert "USER DECISION" not in _INSTALL_SCRIPT
+    assert "enterReviewMode" in _INSTALL_SCRIPT
+    assert "executionActive:true" in _INSTALL_SCRIPT
+    assert "if(api.references.size)" in _INSTALL_SCRIPT
+    assert "api.destroy();" in _INSTALL_SCRIPT
+    assert "if(api.references.size){\n      api.enterReviewMode();" in _INSTALL_SCRIPT
+    assert "rebindReference(item)" in _INSTALL_SCRIPT
+    assert "document.getElementsByName(item.targetName)" in _INSTALL_SCRIPT
 
 
 def test_browser_reference_card_passes_structured_rows_without_page_actions() -> None:
