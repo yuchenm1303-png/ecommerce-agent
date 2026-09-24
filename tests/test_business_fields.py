@@ -76,8 +76,6 @@ def test_current_profile_uses_fixed_commercial_account_policy():
     assert MAKRO_ACCOUNT_FIXED_DEFAULTS is FIXED_COMMERCIAL_ACCOUNT_DEFAULTS
     assert MAKRO_ACCOUNT_FIXED_DEFAULTS is not FIXED_ORDER_QUANTITY_ACCOUNT_DEFAULTS
     expected = {
-        "mrp": "6000",
-        "flipkart_selling_price": "5000",
         "minimum_order_quantity": "1",
         "max_order_quantity_allowed": "99",
         "service_profile": "FBS",
@@ -98,6 +96,13 @@ def test_current_profile_uses_fixed_commercial_account_policy():
         assert items[0].source_type == "config"
         assert items[0].source_reference.startswith("account-default:")
         assert items[0].confidence == 1.0
+
+    # Price is intentionally absent from generated seller defaults. It must be
+    # supplied as an explicit user decision for each listing.
+    assert bundle.candidates(("mrp", *BUSINESS_ATTRIBUTE_ALIASES["mrp"])) == []
+    assert bundle.candidates(
+        ("flipkart_selling_price", *BUSINESS_ATTRIBUTE_ALIASES["flipkart_selling_price"])
+    ) == []
 
 
 def test_account_fixed_labels_are_business_fields_and_skip_product_reasoning():
