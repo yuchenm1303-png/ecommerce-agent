@@ -12,13 +12,13 @@ ENTRY = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 def test_batch_manual_photos_are_job_owned_and_override_supplier_fallback() -> None:
     assert '"listing-photo-intent.json"' in PHOTO_OWNERSHIP
     assert '"manual_listing_images"' in PHOTO_OWNERSHIP
-    assert "_manual_images_by_job_id" in PHOTO_OWNERSHIP
+    assert "_manual_images_by_job_key" in PHOTO_OWNERSHIP
     assert "_match_rows_to_urls" in PHOTO_OWNERSHIP
     assert "defaultdict, deque" in PHOTO_OWNERSHIP
     assert "_replace_upload_image_args" in PHOTO_OWNERSHIP
     # Current UI copy is not an execution contract. Lock the actual override path:
     # explicit manual images are bound by job id and replace only --upload-image args.
-    assert "self._manual_images_by_job_id" in PHOTO_OWNERSHIP
+    assert "self._manual_images_by_job_key" in PHOTO_OWNERSHIP
     assert "--upload-image" in PHOTO_OWNERSHIP
     assert "_supplier_listing_images" in PHOTO_OWNERSHIP
 
@@ -52,3 +52,10 @@ def test_single_auto_fallback_never_becomes_persistent_manual_state() -> None:
     assert "finally:" in WORKFLOW
     assert "if temporary_auto:" in WORKFLOW
     assert "self._selected_upload_images = manual_images" in WORKFLOW
+
+
+def test_batch_manual_photo_cache_key_cannot_collide_across_accounts() -> None:
+    assert "def _job_image_key" in PHOTO_OWNERSHIP
+    assert "Path(run_dir).resolve()" in PHOTO_OWNERSHIP
+    assert "makro_account_id" in PHOTO_OWNERSHIP
+    assert "_manual_images_by_job_id" not in PHOTO_OWNERSHIP

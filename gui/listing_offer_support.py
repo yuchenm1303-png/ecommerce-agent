@@ -362,7 +362,19 @@ class ListingOfferSupport(QObject):
 
         self.controller.jobs_changed.connect(self._annotate_batch_cards)
 
+    @staticmethod
+    def _batch_panel_key(job: Any) -> str:
+        run_dir = str(getattr(job, "run_dir", "") or "").strip()
+        if run_dir:
+            return str(Path(run_dir).resolve())
+        account_id = str(getattr(job, "makro_account_id", "") or "").strip()
+        return f"{account_id}:{str(getattr(job, 'job_id', '') or '')}"
+
     def _annotate_batch_cards(self, jobs: list[Any]) -> None:
+        active_panel_keys = {self._batch_panel_key(job) for job in jobs}
+        for key in tuple(self._batch_required_panels):
+            if key not in active_panel_keys:
+                self._batch_required_panels.pop(key, None)
         for job in jobs:
             card = getattr(self.batch, "_job_cards", {}).get(str(job.job_id))
             if card is None:
@@ -554,14 +566,15 @@ class ListingOfferSupport(QObject):
             missing = _protected_missing_user(Path(job.run_dir))
         except Exception:
             missing = []
-        existing = self._batch_required_panels.get(job_id)
+        panel_key = self._batch_panel_key(job)
+        existing = self._batch_required_panels.get(panel_key)
         if not missing:
             if existing is not None:
                 existing.host.hide()
             return
         if existing is None:
             existing = self._create_batch_required_panel(card, job_id)
-            self._batch_required_panels[job_id] = existing
+            self._batch_required_panels[panel_key] = existing
         self._populate_batch_required_panel(existing, missing, job_id)
         existing.host.show()
 
@@ -645,7 +658,7 @@ class ListingOfferSupport(QObject):
             missing = _protected_missing_user(Path(job.run_dir))
         except Exception:
             return
-        panel = self._batch_required_panels.get(job_id)
+        panel = self._batch_required_panels.get(self._batch_panel_key(job))
         if panel is None:
             return
         values = {

@@ -64,7 +64,7 @@ class BatchIndividualControls(QObject):
 
         self._rows: dict[int, _RowControls] = {}
         self._cards: dict[str, _CardControls] = {}
-        self._stop_requested: set[str] = set()
+        self._stop_requested: set[tuple[str, str]] = set()
         self._batch_id = ""
 
         self._install_job_owned_product_files()
@@ -146,6 +146,11 @@ class BatchIndividualControls(QObject):
         self._rows[id(row)] = _RowControls(start, stop, remove)
         self._refresh_row(row)
 
+    def _lane_job_key(self, job_id: str) -> tuple[str, str]:
+        getter = getattr(self.controller, "current_account_lane", None)
+        lane = str(getter() if callable(getter) else "")
+        return (lane, str(job_id))
+
     # --------------------------------------------------------- controller hooks
     def _install_controller_hooks(self) -> None:
         self._original_start_prepare = self.controller.start_prepare
@@ -164,10 +169,11 @@ class BatchIndividualControls(QObject):
 
         def finished(_controller: Any, process: Any, exit_code: int) -> None:
             job_id, stage = _controller._processes.get(process, ("", ""))
+            stop_key = self._lane_job_key(job_id)
             self._original_finished(process, exit_code)
 
-            if job_id in self._stop_requested:
-                self._stop_requested.discard(job_id)
+            if stop_key in self._stop_requested:
+                self._stop_requested.discard(stop_key)
                 self._remove_from_queues(job_id)
                 job = self._job(job_id)
                 if job is not None:
@@ -310,7 +316,7 @@ class BatchIndividualControls(QObject):
             self._settle_if_idle("")
             return
 
-        self._stop_requested.add(job_id)
+        self._stop_requested.add(self._lane_job_key(job_id))
         process.terminate()
         QTimer.singleShot(2500, lambda p=process: self._kill_if_running(p))
         self.controller._persist_emit(immediate=True)
@@ -569,9 +575,9 @@ class BatchIndividualControls(QObject):
         batch_id = str(batch.batch_id) if batch is not None else ""
         if batch_id != self._batch_id:
             self._batch_id = batch_id
-            if not batch_id:
-                for row in list(self.editor.rows):
-                    row._individual_job_id = ""
+            self._cards.clear()
+            for row in list(self.editor.rows):
+                row._individual_job_id = ""
 
         by_id = {str(job.job_id): job for job in jobs}
         claimed = {
