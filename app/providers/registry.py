@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from .input_rejection_fallback import with_product_identity_input_fallback
 from .openai_compatible import (
     SUPPORTED_COMPAT_PROFILES,
     OpenAICompatibleSemanticProvider,
@@ -352,6 +353,7 @@ def build_semantic_provider(
             request_timeout_seconds=normalized.request_timeout_seconds,
             enable_thinking=normalized.enable_thinking,
         )
+        provider = with_product_identity_input_fallback(provider)
         return _bind_source_page_state_provider(_with_vertical_diagnostics(provider))
 
     if client is None:
