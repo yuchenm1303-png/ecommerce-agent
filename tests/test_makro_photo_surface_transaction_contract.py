@@ -3,7 +3,6 @@ from __future__ import annotations
 import inspect
 
 from app.makro.photos import (
-    PHOTO_SLOT_IDS,
     _DynamicPhotoFileTarget,
     _photo_surface_is_ready,
     _select_file_input,
@@ -20,39 +19,46 @@ class FakeWaitPage:
         self.waits.append(ms)
 
 
-def _state(slot_ids: list[str]) -> dict:
+def _slot_ids(count: int) -> list[str]:
+    return [f"thumbnail_{index}" for index in range(count)]
+
+
+def _state(slot_ids: list[str], *, capacity: int | None = None) -> dict:
     return {
         "found": True,
         "slots": [
             {
                 "id": slot_id,
+                "index": index,
                 "has_plus": True,
                 "has_check": False,
                 "image_sources": [],
             }
-            for slot_id in slot_ids
+            for index, slot_id in enumerate(slot_ids)
         ],
         "slot_count": len(slot_ids),
         "completion_count": 0,
-        "capacity": 5 if len(slot_ids) == 5 else None,
+        "capacity": capacity,
         "empty_slot_ids": list(slot_ids),
         "file_inputs": [],
         "uploading": False,
     }
 
 
-def test_photo_surface_requires_all_five_fixed_roles():
-    assert not _photo_surface_is_ready(_state(list(PHOTO_SLOT_IDS[:4])))
-    assert _photo_surface_is_ready(_state(list(PHOTO_SLOT_IDS)))
+def test_photo_surface_uses_declared_live_capacity_instead_of_fixed_five_roles():
+    assert not _photo_surface_is_ready(_state(_slot_ids(4), capacity=5))
+    assert _photo_surface_is_ready(_state(_slot_ids(4), capacity=4))
+    assert _photo_surface_is_ready(_state(_slot_ids(5), capacity=5))
+    assert _photo_surface_is_ready(_state(_slot_ids(3), capacity=None))
 
 
 def test_photo_surface_waits_for_two_complete_stable_snapshots(monkeypatch):
     page = FakeWaitPage()
     states = iter(
         [
-            _state(list(PHOTO_SLOT_IDS[:2])),
-            _state(list(PHOTO_SLOT_IDS)),
-            _state(list(PHOTO_SLOT_IDS)),
+            _state(_slot_ids(2), capacity=5),
+            _state(_slot_ids(5), capacity=5),
+            _state(_slot_ids(5), capacity=5),
         ]
     )
     monkeypatch.setattr(
@@ -71,7 +77,7 @@ def test_photo_surface_waits_for_two_complete_stable_snapshots(monkeypatch):
 
 def test_expanded_inspection_uses_surface_readiness_gate(monkeypatch):
     page = FakeWaitPage()
-    ready = _state(list(PHOTO_SLOT_IDS))
+    ready = _state(_slot_ids(5), capacity=5)
     ready["surface_ready"] = True
     calls: list[tuple[str, int]] = []
 
