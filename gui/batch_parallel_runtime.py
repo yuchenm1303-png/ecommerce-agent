@@ -80,6 +80,7 @@ class BatchParallelRuntime:
 
         self._owner: BatchSharedBrowserOwner | None = None
         self._parallelism = 0
+        self._starting_account: Any | None = None
         self._original_spawn = self.controller._spawn
         self._original_start_source = self.controller._start_source
 
@@ -148,6 +149,18 @@ class BatchParallelRuntime:
 
         expected_id = str(getattr(batch, "makro_account_id", "") or "").strip()
         current_id = str(account.account_id)
+        if not expected_id and self._starting_account is not None:
+            starting_id = str(getattr(self._starting_account, "account_id", "") or "")
+            if starting_id != current_id:
+                raise RuntimeError(
+                    "Batch 启动期间 Makro 店铺发生变化；为防止第一条任务串号，已停止启动。"
+                )
+            # BatchController pumps the first Source job before start_prepare()
+            # returns. Commit the account here on that first pump so no job ever
+            # exists in an unbound marketplace state.
+            self._stamp_batch_account(batch, account)
+            expected_id = current_id
+
         if not expected_id:
             accounts_getter = getattr(self.manager, "list_channel_accounts", None)
             accounts = tuple(accounts_getter()) if callable(accounts_getter) else (account,)
@@ -167,19 +180,22 @@ class BatchParallelRuntime:
                 "程序不会跨店铺复用已准备任务；请切换回原店铺后再执行，或在当前店铺重新准备。"
             )
 
+        changed = False
         for job in batch.jobs:
             job_account_id = str(getattr(job, "makro_account_id", "") or "").strip()
             if not job_account_id:
                 job.makro_account_id = current_id
                 job.makro_account_label = str(account.label)
                 job.touch()
+                changed = True
                 continue
             if job_account_id != current_id:
                 raise RuntimeError(
                     f"{job.job_id} 的 Makro 账号归属与 Batch 不一致；"
                     "为防止商品上架到错误店铺，已停止执行，请重新准备该 Batch。"
                 )
-        save_batch_run(batch)
+        if changed:
+            save_batch_run(batch)
         return account, profile_dir
 
     def _ensure_start_generation(self, reason: str, port: int) -> None:
@@ -221,11 +237,15 @@ class BatchParallelRuntime:
             port = int(config.makro_cdp_port)
             runtime._ensure_start_generation("Batch preparation", port)
             runtime._ensure_owner(port, profile_dir=profile_dir)
-            batch = runtime._original_start_prepare(
-                urls,
-                config,
-                prepare_concurrency=requested,
-            )
+            runtime._starting_account = account
+            try:
+                batch = runtime._original_start_prepare(
+                    urls,
+                    config,
+                    prepare_concurrency=requested,
+                )
+            finally:
+                runtime._starting_account = None
             runtime._stamp_batch_account(batch, account)
             assert runtime._owner is not None
             bind_batch_shared_browser(batch, runtime._owner.browser)
