@@ -191,6 +191,47 @@ def main() -> int:
         print(f"source_outcome={outcome}", flush=True)
         return SOURCE_INTERACTION_EXIT_CODE
 
+    # Batch execution has no safe reason to advance into Makro Step 3 when the
+    # supplier prefetch produced zero local product images. Source capture already
+    # performed bounded fresh/re-render recovery. Stop here so a field-rich page
+    # can never become a false DONE listing with Product Photos 0/N.
+    if not captured.product_image_paths:
+        detail = (
+            "supplier source is semantically readable but no local product image remained "
+            "after bounded image recovery; batch execution was stopped before Makro writes"
+        )
+        outcome = _write_source_outcome(
+            output_dir,
+            {
+                "outcome": "failed",
+                "checkpoint": "source_capture",
+                "product_url": args.product_url,
+                "failure_kind": "LISTING_MEDIA_UNAVAILABLE",
+                "failure_reason": detail,
+                "observed_url": captured.snapshot.final_url,
+                "observed_title": captured.snapshot.title,
+                "resume_after_interaction": bool(args.resume_source_interaction),
+                "browser_closed": False,
+            },
+        )
+        diag_event(
+            "batch_source_capture",
+            "FAILED",
+            product_url=args.product_url,
+            error_type="ListingMediaUnavailable",
+            detail=detail,
+            source_outcome=str(outcome.resolve()),
+            product_images=0,
+            warnings=list(captured.snapshot.warnings),
+        )
+        print(
+            "BATCH_SOURCE FAILED kind=LISTING_MEDIA_UNAVAILABLE images=0 "
+            "detail=source image recovery exhausted; Makro execution not started",
+            flush=True,
+        )
+        print(f"source_outcome={outcome}", flush=True)
+        return 1
+
     diag_event(
         "batch_source_capture",
         "COMPLETE",
