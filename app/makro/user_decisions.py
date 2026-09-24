@@ -122,12 +122,16 @@ def _arm_trusted_input(locator: Any, token: str) -> None:
           const key = payload.key;
           const token = payload.token;
           const root = window[key] || (window[key] = Object.create(null));
-          root[token] = {touched:false, value:'', at:0};
+          const state = {touched:false, value:'', at:0, mark:null, target:el};
           const mark = event => {
             if (!event.isTrusted) return;
             const value = ('value' in el) ? String(el.value || '') : String(el.textContent || '');
-            root[token] = {touched:true, value:value.trim(), at:Date.now()};
+            state.touched=true;
+            state.value=value.trim();
+            state.at=Date.now();
           };
+          state.mark=mark;
+          root[token]=state;
           el.addEventListener('input', mark, true);
           el.addEventListener('change', mark, true);
         }""",
@@ -139,7 +143,10 @@ def _trusted_event(page: Any, token: str) -> dict[str, Any]:
     value = page.evaluate(
         """payload => {
           const root = window[payload.key] || {};
-          return root[payload.token] || {touched:false, value:'', at:0};
+          const state = root[payload.token];
+          return state
+            ? {touched:Boolean(state.touched), value:String(state.value || ''), at:Number(state.at)||0}
+            : {touched:false, value:'', at:0};
         }""",
         {"key": _USER_EVENT_STATE, "token": token},
     )
@@ -151,7 +158,17 @@ def _clear_trusted_event(page: Any, token: str) -> None:
         page.evaluate(
             """payload => {
               const root = window[payload.key];
-              if (root) delete root[payload.token];
+              if (!root) return;
+              const state = root[payload.token];
+              if (state && typeof state.mark === 'function') {
+                try { document.removeEventListener; } catch (_) {}
+                const target = state.target;
+                if (target) {
+                  try { target.removeEventListener('input', state.mark, true); } catch (_) {}
+                  try { target.removeEventListener('change', state.mark, true); } catch (_) {}
+                }
+              }
+              delete root[payload.token];
             }""",
             {"key": _USER_EVENT_STATE, "token": token},
         )
