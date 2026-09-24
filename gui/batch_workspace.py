@@ -432,6 +432,8 @@ class BatchWorkspace(QWidget):
         top.addWidget(hint, 1, Qt.AlignBottom)
         layout.addLayout(top)
 
+        layout.addWidget(self._build_account_context())
+
         self.url_input = QPlainTextEdit()
         self.url_input.setPlaceholderText(
             "https://detail.1688.com/offer/AAA.html\n"
@@ -476,6 +478,80 @@ class BatchWorkspace(QWidget):
         row.addWidget(self.prepare_button)
         layout.addLayout(row)
         return card
+
+    def _build_account_context(self) -> QFrame:
+        frame = QFrame()
+        frame.setObjectName("batchAccountContext")
+        frame.setMaximumHeight(54)
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(11, 7, 11, 7)
+        row.setSpacing(9)
+
+        identity = QVBoxLayout()
+        identity.setSpacing(0)
+        self.account_context_name = QLabel("Makro 店铺 · 等待绑定")
+        self.account_context_name.setObjectName("batchAccountLabel")
+        self.account_context_name.setStyleSheet("font-weight: 740;")
+        self.account_context_meta = QLabel("独立 Profile / CDP / scheduler lane")
+        self.account_context_meta.setObjectName("cardHint")
+        identity.addWidget(self.account_context_name)
+        identity.addWidget(self.account_context_meta)
+        row.addLayout(identity, 1)
+
+        self.account_context_background = QLabel("无后台店铺任务")
+        self.account_context_background.setObjectName("cardHint")
+        self.account_context_background.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        row.addWidget(self.account_context_background, 0, Qt.AlignVCenter)
+
+        self.account_context_status = QLabel("● IDLE")
+        self.account_context_status.setObjectName("batchAccountStatusBadge")
+        self.account_context_status.setAlignment(Qt.AlignCenter)
+        self.account_context_status.setMinimumWidth(96)
+        row.addWidget(self.account_context_status, 0, Qt.AlignVCenter)
+
+        frame.setToolTip(
+            "当前 Batch 控制面所属 Makro 店铺。切换店铺不会停止其他账号的独立 Batch。"
+        )
+        return frame
+
+    def set_account_context(
+        self,
+        *,
+        label: str,
+        cdp_port: int,
+        status: str,
+        running_others: int,
+        total_accounts: int,
+    ) -> None:
+        state = str(status or "IDLE").upper()
+        self.account_context_name.setText(f"当前店铺 · {label or 'Makro'}")
+        self.account_context_meta.setText(
+            f"CDP {int(cdp_port)} · 独立 Profile / scheduler lane · {int(total_accounts)} 个已绑定店铺"
+        )
+        self.account_context_status.setText(f"● {state}")
+        if state == "RUNNING":
+            color = "#9fe2bd"
+        elif state in {"READY", "PREPARED", "COMPLETE"}:
+            color = "#b9d9f2"
+        elif state in {"FAILED", "ERROR", "POISONED"}:
+            color = "#f18da0"
+        elif state in {"REVIEW", "STOPPED"}:
+            color = "#f4cb7a"
+        else:
+            color = "#aeb9c7"
+        self.account_context_status.setStyleSheet(
+            f"color: {color}; font-weight: 760;"
+        )
+        if int(running_others) > 0:
+            self.account_context_background.setText(
+                f"后台 {int(running_others)} 个店铺仍在运行"
+            )
+            self.account_context_background.setStyleSheet(
+                "color: #9fe2bd; font-weight: 650;"
+            )
+        else:
+            self.account_context_background.setText("无后台店铺任务")
+            self.account_context_background.setStyleSheet("")
 
     def _build_summary_row(self) -> QHBoxLayout:
         row = QHBoxLayout()

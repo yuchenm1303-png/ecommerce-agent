@@ -26,6 +26,7 @@ class ChannelAccountCenterPanel(QWidget):
         super().__init__(parent)
         self.manager = manager
         self.setObjectName("channelAccountCenterContent")
+        self._account_cards: dict[str, dict[str, Any]] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -54,18 +55,32 @@ class ChannelAccountCenterPanel(QWidget):
         platform_row.addWidget(platform_value, 1)
         current_layout.addLayout(platform_row)
 
-        account_row = QHBoxLayout()
-        account_label = QLabel("当前店铺")
-        account_label.setObjectName("modalFieldLabel")
-        self.account_combo = QComboBox()
-        self.account_combo.setObjectName("modalCombo")
-        self.switch_button = QPushButton("切换到此店铺")
+        current_row = QHBoxLayout()
+        current_identity = QVBoxLayout()
+        current_identity.setSpacing(2)
+        self.current_store_name = QLabel("等待 Makro 店铺")
+        self.current_store_name.setObjectName("cardTitle")
+        self.current_store_meta = QLabel("独立 Browser Profile · 独立 CDP lane")
+        self.current_store_meta.setObjectName("modalMetaLabel")
+        current_identity.addWidget(self.current_store_name)
+        current_identity.addWidget(self.current_store_meta)
+        current_row.addLayout(current_identity, 1)
+
+        self.fleet_badge = QLabel("全部空闲")
+        self.fleet_badge.setObjectName("channelAccountStatusBadge")
+        self.fleet_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.fleet_badge.setMinimumWidth(112)
+        current_row.addWidget(self.fleet_badge, 0, Qt.AlignmentFlag.AlignVCenter)
+        current_layout.addLayout(current_row)
+
+        # Legacy control owners stay alive for compatibility, but the visible
+        # interaction is the account-card workspace below.
+        self.account_combo = QComboBox(self)
+        self.account_combo.hide()
+        self.switch_button = QPushButton("切换到此店铺", self)
         self.switch_button.setObjectName("modalPrimaryButton")
         self.switch_button.clicked.connect(self._switch_selected)
-        account_row.addWidget(account_label)
-        account_row.addWidget(self.account_combo, 1)
-        account_row.addWidget(self.switch_button)
-        current_layout.addLayout(account_row)
+        self.switch_button.hide()
 
         self.active_label = QLabel()
         self.active_label.setObjectName("modalMetaLabel")
@@ -83,14 +98,29 @@ class ChannelAccountCenterPanel(QWidget):
         overview_layout = QVBoxLayout(overview_card)
         overview_layout.setContentsMargins(15, 14, 15, 15)
         overview_layout.setSpacing(8)
-        overview_title = QLabel("账号任务概览")
+        overview_title = QLabel("Makro 店铺工作台")
         overview_title.setObjectName("modalFieldLabel")
         overview_layout.addWidget(overview_title)
+
+        overview_hint = QLabel(
+            "每个店铺都是独立任务域。正在后台运行的店铺会继续执行，"
+            "切换只改变当前查看和新任务的目标店铺。"
+        )
+        overview_hint.setObjectName("cardDetailText")
+        overview_hint.setWordWrap(True)
+        overview_layout.addWidget(overview_hint)
+
+        self.accounts_host = QWidget(overview_card)
+        self.accounts_layout = QVBoxLayout(self.accounts_host)
+        self.accounts_layout.setContentsMargins(0, 2, 0, 0)
+        self.accounts_layout.setSpacing(8)
+        overview_layout.addWidget(self.accounts_host)
+
+        # Hidden compatibility summary for older contracts / diagnostics.
         self.account_overview = QLabel()
-        self.account_overview.setObjectName("cardDetailText")
-        self.account_overview.setWordWrap(True)
-        self.account_overview.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.account_overview.hide()
         overview_layout.addWidget(self.account_overview)
+        layout.addWidget(overview_card)
         layout.addWidget(overview_card)
 
         connect_card = QFrame()
@@ -142,46 +172,212 @@ class ChannelAccountCenterPanel(QWidget):
         controller = getattr(getattr(self.manager.window, "batch_workspace", None), "controller", None)
         lane_state = getattr(controller, "lane_state_changed", None)
         if lane_state is not None:
-            lane_state.connect(lambda _account_id, _snapshot: self._refresh_account_overview())
+            lane_state.connect(self._on_lane_state_changed)
         self.reload()
 
     def _account_port(self, account: Any) -> int:
         getter = getattr(self.manager, "channel_browser_port", None)
         return int(getter(account)) if callable(getter) else 0
 
-    def _refresh_account_overview(
-        self,
-        accounts: tuple[Any, ...] | None = None,
-        current: Any | None = None,
-    ) -> None:
-        accounts = accounts or tuple(self.manager.list_channel_accounts())
-        current = current or self.manager.channel_account
+    @staticmethod
+    def _status_color(status: str) -> str:
+        name = str(status or "IDLE").upper()
+        if name == "RUNNING":
+            return "#9fe2bd"
+        if name in {"READY", "PREPARED", "COMPLETE"}:
+            return "#b9d9f2"
+        if name in {"FAILED", "ERROR", "POISONED"}:
+            return "#f18da0"
+        if name in {"REVIEW", "STOPPED"}:
+            return "#f4cb7a"
+        return "#aeb9c7"
+
+    def _account_snapshot(self, account: Any) -> dict[str, Any]:
         runtime = getattr(self.manager.window, "_batch_parallel_runtime", None)
-        snapshot_getter = getattr(runtime, "account_slot_snapshot", None)
-        overview_lines: list[str] = []
+        getter = getattr(runtime, "account_slot_snapshot", None)
+        if not callable(getter):
+            return {
+                "has_batch": False,
+                "status": "IDLE",
+                "running": False,
+                "summary": {},
+            }
+        try:
+            return dict(getter(str(account.account_id)))
+        except Exception as exc:
+            return {
+                "has_batch": False,
+                "status": "ERROR",
+                "running": False,
+                "summary": {},
+                "error": str(exc),
+            }
+
+    def _clear_account_cards(self) -> None:
+        while self.accounts_layout.count():
+            item = self.accounts_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
+        self._account_cards.clear()
+
+    def _ensure_account_cards(self, accounts: tuple[Any, ...]) -> None:
+        wanted = tuple(str(account.account_id) for account in accounts)
+        if tuple(self._account_cards) == wanted:
+            return
+        self._clear_account_cards()
+
         for account in accounts:
+            account_id = str(account.account_id)
+            frame = QFrame(self.accounts_host)
+            frame.setObjectName("channelAccountCard")
+            box = QVBoxLayout(frame)
+            box.setContentsMargins(13, 11, 13, 11)
+            box.setSpacing(7)
+
+            header = QHBoxLayout()
+            identity = QVBoxLayout()
+            identity.setSpacing(1)
+            name = QLabel(str(account.label))
+            name.setObjectName("modalFieldLabel")
+            meta = QLabel()
+            meta.setObjectName("modalMetaLabel")
+            identity.addWidget(name)
+            identity.addWidget(meta)
+            header.addLayout(identity, 1)
+
+            badge = QLabel("● IDLE")
+            badge.setObjectName("channelAccountStatusBadge")
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setMinimumWidth(92)
+            header.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
+            box.addLayout(header)
+
+            summary = QLabel()
+            summary.setObjectName("cardDetailText")
+            summary.setWordWrap(True)
+            box.addWidget(summary)
+
+            footer = QHBoxLayout()
+            lane = QLabel()
+            lane.setObjectName("modalMetaLabel")
+            footer.addWidget(lane, 1)
+            action = QPushButton("切换查看")
+            action.setObjectName("quietButton")
+            action.clicked.connect(
+                lambda _checked=False, target=account_id: self._switch_account(target)
+            )
+            footer.addWidget(action)
+            box.addLayout(footer)
+
+            self.accounts_layout.addWidget(frame)
+            self._account_cards[account_id] = {
+                "frame": frame,
+                "name": name,
+                "meta": meta,
+                "badge": badge,
+                "summary": summary,
+                "lane": lane,
+                "action": action,
+            }
+
+    def _refresh_account_cards(self) -> None:
+        accounts = tuple(self.manager.list_channel_accounts())
+        if not accounts:
+            self._clear_account_cards()
+            self.account_overview.setText("暂无 Makro 账号")
+            self.current_store_name.setText("等待 Makro 店铺")
+            self.current_store_meta.setText("连接一个店铺后即可创建独立任务域")
+            self.fleet_badge.setText("无账号")
+            return
+
+        self._ensure_account_cards(accounts)
+        current = self.manager.channel_account
+        selected = self.manager.selected_channel_account()
+        change_blocked = getattr(self.manager, "channel_account_change_blocked", None)
+        blocked = bool(change_blocked()) if callable(change_blocked) else bool(self.manager.is_busy())
+
+        running_count = 0
+        compatibility_lines: list[str] = []
+        for account in accounts:
+            account_id = str(account.account_id)
+            widgets = self._account_cards[account_id]
+            snapshot = self._account_snapshot(account)
+            summary = snapshot.get("summary") or {}
+            running = bool(snapshot.get("running"))
+            running_count += int(running)
+            has_batch = bool(snapshot.get("has_batch"))
+            status = "RUNNING" if running else (
+                str(snapshot.get("status") or "IDLE").upper() if has_batch else "IDLE"
+            )
             port = self._account_port(account)
-            marker = "●" if account.account_id == current.account_id else "○"
-            batch_text = "暂无 Batch"
-            if callable(snapshot_getter):
-                try:
-                    snapshot = snapshot_getter(account.account_id)
-                except Exception as exc:
-                    batch_text = f"Batch 状态不可用 · {exc}"
-                else:
-                    if bool(snapshot.get("has_batch")):
-                        summary = snapshot.get("summary") or {}
-                        status = "RUNNING" if bool(snapshot.get("running")) else str(
-                            snapshot.get("status") or "IDLE"
-                        )
-                        batch_text = (
-                            f"{status} · {int(summary.get('total') or 0)} tasks · "
-                            f"{int(summary.get('ready') or 0)} ready · "
-                            f"{int(summary.get('processing') or 0)} processing · "
-                            f"{int(summary.get('done') or 0)} done"
-                        )
-            overview_lines.append(f"{marker} {account.label} · CDP {port} · {batch_text}")
-        self.account_overview.setText("\n".join(overview_lines) or "暂无 Makro 账号")
+            is_current = account_id == str(current.account_id)
+            is_selected = account_id == str(selected.account_id)
+
+            role = "当前查看" if is_current else "准备切换" if is_selected else "独立任务域"
+            if running and not is_current:
+                role = "后台运行"
+            widgets["name"].setText(str(account.label))
+            widgets["meta"].setText(f"{role} · CDP {port}")
+            widgets["badge"].setText(f"● {status}")
+            widgets["badge"].setStyleSheet(
+                f"color: {self._status_color(status)}; font-weight: 760;"
+            )
+
+            if has_batch:
+                widgets["summary"].setText(
+                    f"{int(summary.get('total') or 0)} TASKS   ·   "
+                    f"{int(summary.get('processing') or 0)} PROCESSING   ·   "
+                    f"{int(summary.get('ready') or 0)} READY   ·   "
+                    f"{int(summary.get('done') or 0)} DONE"
+                )
+            else:
+                widgets["summary"].setText("暂无 Batch · 可在这个店铺独立创建任务")
+
+            failed = int(summary.get("failed") or 0)
+            review = int(summary.get("review") or 0)
+            tail: list[str] = []
+            if failed:
+                tail.append(f"{failed} FAILED")
+            if review:
+                tail.append(f"{review} REVIEW")
+            widgets["lane"].setText(
+                "独立 Profile / Browser owner"
+                + ((" · " + " · ".join(tail)) if tail else "")
+            )
+
+            action = widgets["action"]
+            if is_current:
+                action.setText("当前店铺")
+                action.setEnabled(False)
+            elif is_selected:
+                action.setText("切换中…")
+                action.setEnabled(False)
+            else:
+                action.setText("切换查看")
+                action.setEnabled(not blocked)
+
+            compatibility_lines.append(
+                f"{'●' if is_current else '○'} {account.label} · CDP {port} · {status}"
+            )
+
+        self.account_overview.setText("\n".join(compatibility_lines))
+        current_port = self._account_port(current)
+        self.current_store_name.setText(str(current.label))
+        self.current_store_meta.setText(
+            f"当前控制面 · CDP {current_port} · 独立 Profile / scheduler lane"
+        )
+        if running_count:
+            self.fleet_badge.setText(f"{running_count} 店运行中")
+            self.fleet_badge.setStyleSheet("color: #9fe2bd; font-weight: 760;")
+        else:
+            self.fleet_badge.setText("全部空闲")
+            self.fleet_badge.setStyleSheet("color: #aeb9c7; font-weight: 720;")
+
+    def _on_lane_state_changed(self, _account_id: str, _snapshot: object) -> None:
+        self._refresh_account_cards()
 
     def reload(self) -> None:
         accounts = tuple(self.manager.list_channel_accounts())
@@ -213,7 +409,7 @@ class ChannelAccountCenterPanel(QWidget):
                 f"正在从 {current.label} 切换控制面"
             )
 
-        self._refresh_account_overview(accounts, current)
+        self._refresh_account_cards()
 
         state, detail = self.manager.channel_browser_status()
         self._browser_status_changed(state, detail)
@@ -231,6 +427,7 @@ class ChannelAccountCenterPanel(QWidget):
             self.browser_status.setStyleSheet("color: #f18da0; font-weight: 650;")
         else:
             self.browser_status.setStyleSheet("color: #f4cb7a; font-weight: 650;")
+        self._refresh_account_cards()
 
     def _set_action(self, text: str, *, error: bool = False) -> None:
         self.action_status.setText(text)
@@ -240,8 +437,8 @@ class ChannelAccountCenterPanel(QWidget):
             else "color: #b9d9f2; font-weight: 650;"
         )
 
-    def _switch_selected(self) -> None:
-        account_id = str(self.account_combo.currentData() or "").strip()
+    def _switch_account(self, account_id: str) -> None:
+        account_id = str(account_id or "").strip()
         if not account_id:
             return
         try:
@@ -251,10 +448,13 @@ class ChannelAccountCenterPanel(QWidget):
             self.reload()
             return
         self._set_action(
-            f"已选择 {account.label}。程序正在后台接管该店铺自己的 Makro Browser lane；"
-            "完成后状态会变为 READY。其他店铺会话不会被覆盖。"
+            f"正在切换到 {account.label}。该店铺自己的 Browser / Batch lane 会成为当前控制面；"
+            "其他正在运行的店铺继续在后台执行。"
         )
         self.reload()
+
+    def _switch_selected(self) -> None:
+        self._switch_account(str(self.account_combo.currentData() or ""))
 
     def _connect_new(self) -> None:
         label = self.new_label.text().strip()
@@ -279,12 +479,23 @@ class ChannelAccountCenterController:
     def __init__(self, window: QWidget, manager: Any) -> None:
         self.window = window
         self.manager = manager
-        self.button = QPushButton("平台账号")
+        self.button = QPushButton("Makro")
         self.button.setObjectName("quietButton")
-        self.button.setToolTip("Makro 店铺连接 / 切换 / 独立 Browser lane")
+        self.button.setToolTip("Makro 多店铺工作台 · 独立任务 / Browser lane / 后台状态")
         self.button.clicked.connect(self.open)
         self._panel: ChannelAccountCenterPanel | None = None
         self._install_header_button()
+        self._refresh_button_label()
+        self.manager.status_changed.connect(self._refresh_button_label)
+
+    def _refresh_button_label(self, *_args: object) -> None:
+        account = getattr(self.manager, "channel_account", None)
+        label = str(getattr(account, "label", "") or "店铺").strip()
+        compact = label if len(label) <= 14 else label[:13] + "…"
+        self.button.setText(f"Makro · {compact}")
+        self.button.setToolTip(
+            f"当前店铺：{label}\n打开多店铺工作台，查看并切换独立任务 / Browser lane。"
+        )
 
     def _install_header_button(self) -> None:
         root = self.window.centralWidget()

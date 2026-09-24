@@ -141,10 +141,14 @@ Item {
         id: badgeComponent
         Rectangle {
             property var d
-            radius: 7
-            color: Qt.rgba(0, 0, 0, 72/255)
+            readonly property bool accountBadge: d && (
+                d.name === "channelAccountStatusBadge"
+                || d.name === "batchAccountStatusBadge"
+            )
+            radius: accountBadge ? 9 : 7
+            color: accountBadge ? Qt.rgba(1, 1, 1, 18/255) : Qt.rgba(0, 0, 0, 72/255)
             border.width: 1
-            border.color: Qt.rgba(1, 1, 1, 20/255)
+            border.color: accountBadge ? Qt.rgba(1, 1, 1, 30/255) : Qt.rgba(1, 1, 1, 20/255)
             Text {
                 anchors.fill: parent
                 anchors.leftMargin: 12
@@ -165,9 +169,19 @@ Item {
         id: panelComponent
         Rectangle {
             property var d
-            color: d && d.fill ? d.fill : "transparent"
-            border.width: 0
-            radius: 8
+            readonly property bool accountContext: d && d.name === "batchAccountContext"
+            color: accountContext
+                ? Qt.rgba(1, 1, 1, 15/255)
+                : d && d.fill ? d.fill : "transparent"
+            border.width: accountContext ? 1 : 0
+            border.color: Qt.rgba(1, 1, 1, 22/255)
+            radius: accountContext ? 10 : 8
+            Behavior on color {
+                ColorAnimation {
+                    duration: 220
+                    easing.type: Easing.OutCubic
+                }
+            }
         }
     }
 

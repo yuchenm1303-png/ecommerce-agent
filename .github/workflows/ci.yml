@@ -29,7 +29,8 @@ jobs:
             tests/test_makro_multi_account_task_binding.py \
             tests/test_batch_individual_controls_contract.py \
             tests/test_listing_photo_ownership_contract.py \
-            tests/test_listing_offer_support_contract.py
+            tests/test_listing_offer_support_contract.py \
+            tests/test_makro_multi_account_ui_contract.py
 
   tests:
     runs-on: ubuntu-latest

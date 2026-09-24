@@ -85,22 +85,80 @@ class BatchParallelRuntime:
         self._install_controller_routing()
         self.controller._batch_parallel_runtime = self
         self.manager.status_changed.connect(self._decorate_batch_status)
+        self.manager.status_changed.connect(self._refresh_workspace_account_context)
         lane_running = getattr(self.controller, "lane_running_changed", None)
         lane_state = getattr(self.controller, "lane_state_changed", None)
         if lane_running is not None:
-            lane_running.connect(
-                lambda account_id, _running: self._release_if_safe(str(account_id))
-            )
+            lane_running.connect(self._on_lane_runtime_changed)
         else:
-            self.controller.running_changed.connect(lambda _running: self._release_if_safe())
+            self.controller.running_changed.connect(
+                lambda _running: self._on_lane_runtime_changed(self._current_lane_id())
+            )
         if lane_state is not None:
-            lane_state.connect(
-                lambda account_id, _snapshot: self._release_if_safe(str(account_id))
-            )
+            lane_state.connect(self._on_lane_state_changed)
         else:
-            self.controller.jobs_changed.connect(lambda _jobs: self._release_if_safe())
+            self.controller.jobs_changed.connect(
+                lambda _jobs: self._on_lane_state_changed(self._current_lane_id(), {})
+            )
         self.window.destroyed.connect(lambda *_args: self._release_owner())
         self._restore_persisted_slots()
+        self._refresh_workspace_account_context()
+
+    def _on_lane_runtime_changed(self, account_id: str, *_args: object) -> None:
+        self._release_if_safe(str(account_id))
+        self._refresh_workspace_account_context()
+
+    def _on_lane_state_changed(
+        self,
+        account_id: str,
+        _snapshot: object,
+    ) -> None:
+        self._release_if_safe(str(account_id))
+        self._refresh_workspace_account_context()
+
+    def _refresh_workspace_account_context(self, *_args: object) -> None:
+        workspace = getattr(self.window, "batch_workspace", None)
+        setter = getattr(workspace, "set_account_context", None)
+        if not callable(setter):
+            return
+
+        accounts = tuple(self.manager.list_channel_accounts())
+        if not accounts:
+            return
+        current = self.manager.channel_account
+        current_id = str(getattr(current, "account_id", "") or "")
+        running_others = 0
+        current_snapshot: dict[str, Any] | None = None
+        for account in accounts:
+            snapshot = self.account_slot_snapshot(str(account.account_id))
+            if str(account.account_id) == current_id:
+                current_snapshot = snapshot
+            elif bool(snapshot.get("running")):
+                running_others += 1
+
+        snapshot = current_snapshot or {
+            "has_batch": False,
+            "status": "IDLE",
+            "running": False,
+        }
+        status = "RUNNING" if bool(snapshot.get("running")) else (
+            str(snapshot.get("status") or "IDLE").upper()
+            if bool(snapshot.get("has_batch"))
+            else "IDLE"
+        )
+        port_getter = getattr(self.manager, "channel_browser_port", None)
+        port = (
+            int(port_getter(current))
+            if callable(port_getter)
+            else int(self.manager.channel_accounts.cdp_port(current))
+        )
+        setter(
+            label=str(getattr(current, "label", "") or "Makro"),
+            cdp_port=port,
+            status=status,
+            running_others=running_others,
+            total_accounts=len(accounts),
+        )
 
     @staticmethod
     def _empty_summary() -> dict[str, int]:
@@ -263,6 +321,7 @@ class BatchParallelRuntime:
         if callable(activate_lane):
             activate_lane(account_id)
             self._parallelism_by_account.setdefault(account_id, 0)
+            self._refresh_workspace_account_context()
             return
 
         if self.controller.is_running:
@@ -270,6 +329,7 @@ class BatchParallelRuntime:
         batch, config = slot if slot is not None else (None, None)
         self.controller.batch = batch
         self.controller.config = config
+        self._refresh_workspace_account_context()
 
     def _assert_top_level_idle(self) -> None:
         if self.manager.update_quiesced:
