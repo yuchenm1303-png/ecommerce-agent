@@ -24,13 +24,14 @@ def _load_batch_model():
     return module
 
 
-def test_batch_job_round_trip_preserves_makro_account_identity() -> None:
+def test_batch_job_round_trip_preserves_makro_account_and_browser_identity() -> None:
     model = _load_batch_model()
     job = model.BatchJob(
         job_id="JOB-001",
         product_url="https://example.test/product",
         makro_account_id="account-b",
         makro_account_label="Makro 店铺 B",
+        makro_browser_instance_token="ws://edge-b/devtools/browser/generation-1",
     )
     batch = model.BatchRun(
         batch_id="batch-test",
@@ -38,14 +39,17 @@ def test_batch_job_round_trip_preserves_makro_account_identity() -> None:
         jobs=[job],
         makro_account_id="account-b",
         makro_account_label="Makro 店铺 B",
+        makro_browser_instance_token="ws://edge-b/devtools/browser/generation-1",
     )
 
     restored = model.BatchRun.from_dict(batch.as_dict())
 
     assert restored.makro_account_id == "account-b"
     assert restored.makro_account_label == "Makro 店铺 B"
+    assert restored.makro_browser_instance_token.endswith("generation-1")
     assert restored.jobs[0].makro_account_id == "account-b"
     assert restored.jobs[0].makro_account_label == "Makro 店铺 B"
+    assert restored.jobs[0].makro_browser_instance_token.endswith("generation-1")
 
 
 def test_legacy_batch_without_account_fields_remains_loadable() -> None:
@@ -65,17 +69,21 @@ def test_legacy_batch_without_account_fields_remains_loadable() -> None:
 
     assert restored.makro_account_id == ""
     assert restored.makro_account_label == ""
+    assert restored.makro_browser_instance_token == ""
     assert restored.jobs[0].makro_account_id == ""
     assert restored.jobs[0].makro_account_label == ""
+    assert restored.jobs[0].makro_browser_instance_token == ""
 
 
-def test_shared_batch_browser_accepts_explicit_account_profile() -> None:
+def test_shared_batch_browser_accepts_explicit_account_profile_and_generation() -> None:
     source = BATCH_BROWSER_PATH.read_text(encoding="utf-8")
 
     assert "profile_dir: str | Path | None = None" in source
     assert "Path(profile_dir).resolve()" in source
     assert 'root / "browser_profiles" / "makro-edge"' in source
     assert "profile_dir=resolved_profile" in source
+    assert "batch.makro_browser_instance_token" in source
+    assert "job.makro_browser_instance_token" in source
 
 
 def test_batch_runtime_binds_before_first_job_and_rejects_cross_account_reuse() -> None:
@@ -86,6 +94,28 @@ def test_batch_runtime_binds_before_first_job_and_rejects_cross_account_reuse() 
     assert "这个 Batch 属于" in source
     assert "程序不会跨店铺复用已准备任务" in source
     assert "profile_dir=requested_profile" in source
+
+
+def test_batch_runtime_keeps_independent_account_slots() -> None:
+    runtime_source = BATCH_RUNTIME_PATH.read_text(encoding="utf-8")
+    browser_source = CHANNEL_BROWSER_PATH.read_text(encoding="utf-8")
+
+    assert "self._account_slots" in runtime_source
+    assert "def activate_account_slot" in runtime_source
+    assert "self._remember_current_slot()" in runtime_source
+    assert "self.controller.batch = batch" in runtime_source
+    assert "已恢复 Batch" in runtime_source
+    assert "activate_account_slot" in browser_source
+
+
+def test_restored_batch_rejects_stale_browser_generation() -> None:
+    source = BATCH_RUNTIME_PATH.read_text(encoding="utf-8")
+
+    assert "makro_browser_instance_token" in source
+    assert "stored_token != current_token" in source
+    assert "batch_token != current_token" in source
+    assert "旧 targetId 已失效" in source
+    assert "旧 owned targetId 全部失效" in source
 
 
 def test_batch_start_requires_committed_account_browser_identity() -> None:
