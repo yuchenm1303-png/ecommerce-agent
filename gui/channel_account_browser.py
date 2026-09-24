@@ -46,6 +46,8 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
         self._account_reconcile_lock = threading.Lock()
         self._account_selection_lock = threading.Lock()
         self._pending_channel_account: ChannelAccount | None = None
+        self._single_prepared_account_id: str | None = None
+        self._single_prepared_invalidated_by_account_switch = False
 
         self._sync_managed_port_controls(window, managed_port)
         super().__init__(window, port=managed_port)
@@ -128,6 +130,8 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
         # account and must never survive a store switch.
         self._single_prepared_generation = None
         self._batch_prepare_generation = None
+        if self._single_prepared_account_id is not None:
+            self._single_prepared_invalidated_by_account_switch = True
         self._emit_status(
             "CHECKING",
             f"已选择 {account.label} · 正在后台切换独立 Makro 登录会话",
@@ -288,6 +292,31 @@ class AccountBoundMakroBrowser(ManagedMakroBrowser):
                 f"Makro 店铺正在切换到 {selected.label}。状态变为 READY 后请重新开始任务。"
             )
         super()._assert_task_start_allowed()
+
+    def _start_single(self, config: Any, *, mode: str = "full") -> Any:
+        self._single_prepared_account_id = None
+        self._single_prepared_invalidated_by_account_switch = False
+        return super()._start_single(config, mode=mode)
+
+    def _single_prepared(self, result: Any) -> None:
+        super()._single_prepared(result)
+        if getattr(result, "plan_summary", None):
+            self._single_prepared_account_id = self.channel_account.account_id
+            self._single_prepared_invalidated_by_account_switch = False
+
+    def _start_real(self, config: Any) -> Any:
+        if self._single_prepared_invalidated_by_account_switch:
+            raise RuntimeError(
+                "这个 Single 任务是在另一个 Makro 店铺下准备的，且之后发生过账号切换。"
+                "旧 Step 3 页面归属已经失效；请在当前店铺重新执行“完整流程准备”后再真实填写。"
+            )
+        prepared_account_id = str(self._single_prepared_account_id or "")
+        if prepared_account_id and prepared_account_id != self.channel_account.account_id:
+            raise RuntimeError(
+                "当前 Single 准备结果属于另一个 Makro 店铺。"
+                "程序不会把旧店铺的准备结果用于当前账号；请重新执行“完整流程准备”。"
+            )
+        return super()._start_real(config)
 
     def _apply_status(self, state: str, detail: str) -> None:
         account: ChannelAccount | None = getattr(self, "channel_account", None)
