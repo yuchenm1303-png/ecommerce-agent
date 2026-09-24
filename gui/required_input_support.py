@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QLineEdit, QMessageBox
 from app.business_decisions import (
     is_user_decision_business_field,
     price_decision_advisory,
+    user_decision_business_key,
 )
 from app.listing_content_policy import allow_required_fallback
 from app.required_overrides import (
@@ -232,6 +233,30 @@ class RequiredInputSupport(QObject):
             and not bool(self.values.get(identifier, "").strip())
         ]
 
+    def _price_relation_warning(self) -> str:
+        values: dict[str, str] = {}
+        for identifier, field in self.fields.items():
+            key = user_decision_business_key(field)
+            if not key:
+                continue
+            explicit = self.explicit_overrides.get(identifier)
+            if explicit is not None:
+                raw = explicit.get("values") or []
+                value = str(raw[0]).strip() if raw else ""
+            else:
+                value = self.values.get(identifier, "").strip()
+            if value:
+                values[key] = value
+
+        if "mrp" not in values or "flipkart_selling_price" not in values:
+            return ""
+        advisory = price_decision_advisory(
+            "flipkart_selling_price",
+            confirmed_value=values["flipkart_selling_price"],
+            counterpart_value=values["mrp"],
+        )
+        return str(advisory.get("warning") or "").strip()
+
     def _sync_button(self) -> None:
         result = getattr(self.window, "current_result", None)
         if result is None or not result.plan_summary:
@@ -251,6 +276,11 @@ class RequiredInputSupport(QObject):
                 self.window.real_start_button.setToolTip(
                     "请先确认经营决策字段：" + "、".join(missing_decisions)
                 )
+                return
+            price_warning = self._price_relation_warning()
+            if price_warning:
+                self.window.real_start_button.setEnabled(False)
+                self.window.real_start_button.setToolTip(price_warning)
                 return
         if scope == FULL_STEP3 and self.fields:
             self.window.real_start_button.setEnabled(result.ready > 0 or bool(self.fields))
