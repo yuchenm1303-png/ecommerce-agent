@@ -19,13 +19,14 @@ _RICH_PRODUCT_JSONLD_SCORE = 4
 class SourceCaptureAcceptance:
     """Mechanical completeness verdict for one captured supplier product state.
 
-    This gate does not judge product semantics. It only prevents a transient SPA
-    shell from becoming canonical source truth. A capture must expose more than one
-    independent evidence surface, or one clearly strong surface, before downstream
-    Resolver/photo selection may consume it.
+    ``ready`` describes semantic source completeness only. ``listing_media_ready``
+    is deliberately separate because a text-rich supplier page can be perfectly
+    usable for Resolver grounding while still having zero local product images,
+    which can never satisfy Makro's mandatory Product Photos requirement.
     """
 
     ready: bool
+    listing_media_ready: bool
     visible_text_chars: int
     table_rows: int
     embedded_data_items: int
@@ -35,13 +36,15 @@ class SourceCaptureAcceptance:
     signal_count: int
     strong_signal: bool
     reason: str
+    media_reason: str
 
     def describe(self) -> str:
         return (
             f"text={self.visible_text_chars} rows={self.table_rows} "
             f"embedded={self.embedded_data_items} images={self.product_images} "
             f"jsonld={self.json_ld_items} rich_product_jsonld={int(self.rich_product_jsonld)} "
-            f"signals={self.signal_count} strong={int(self.strong_signal)}"
+            f"signals={self.signal_count} strong={int(self.strong_signal)} "
+            f"media_ready={int(self.listing_media_ready)}"
         )
 
 
@@ -109,12 +112,12 @@ def assess_source_capture(
     *,
     product_image_count: int,
 ) -> SourceCaptureAcceptance:
-    """Decide whether a supplier capture is complete enough to become canonical.
+    """Decide semantic completeness and listing-media readiness independently.
 
-    The policy is intentionally domain-agnostic. A short shell with no specs,
-    embedded product state and only one or two images is never accepted merely
-    because JSON-LD exists. Rich JSON-LD can support one independent live signal,
-    but cannot by itself turn a visibly partial SPA state into a successful capture.
+    A transient SPA shell must not become canonical source truth. Rich text/table
+    evidence may make the source semantically ready even when media acquisition is
+    degraded. That degraded-media state is now explicit so callers cannot mistake
+    semantic readiness for readiness to satisfy Makro Product Photos.
     """
 
     visible_text_chars = len(str(snapshot.visible_text or "").strip())
@@ -144,6 +147,7 @@ def assess_source_capture(
         or signal_count >= 2
         or (rich_product_jsonld and signal_count >= 1)
     )
+    listing_media_ready = product_images >= 1
 
     passed_names = [name for name, passed in live_signals.items() if passed]
     if ready:
@@ -157,8 +161,15 @@ def assess_source_capture(
             f"surfaces ({signal_count}/4 live signals)"
         )
 
+    media_reason = (
+        f"{product_images} local product image(s) are available for listing media"
+        if listing_media_ready
+        else "no local product image was captured; Makro Product Photos requirement is not satisfiable from supplier media"
+    )
+
     return SourceCaptureAcceptance(
         ready=ready,
+        listing_media_ready=listing_media_ready,
         visible_text_chars=visible_text_chars,
         table_rows=table_rows,
         embedded_data_items=embedded_data_items,
@@ -168,6 +179,7 @@ def assess_source_capture(
         signal_count=signal_count,
         strong_signal=strong_signal,
         reason=reason,
+        media_reason=media_reason,
     )
 
 
