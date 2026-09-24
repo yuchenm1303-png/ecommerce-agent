@@ -5,6 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.browser_visual_hud import browser_visual_hud_advice
+from app.business_decisions import (
+    is_user_decision_business_field,
+    price_decision_advisory,
+    user_decision_business_key,
+)
 from app.fill_plan import LiveFillPlan
 from app.hard_field_validators import validate_resolved_answer
 from app.makro.domain import MakroDomainAdapter
@@ -104,6 +110,62 @@ def _answer_values(answer: Any) -> list[str]:
         return values
     scalar = str(getattr(answer, "answer", "") or "").strip()
     return [scalar] if scalar else []
+
+
+def _price_decision_values(plan: LiveFillPlan) -> dict[str, str]:
+    """Collect only explicit user-confirmed price values for HUD context."""
+
+    output: dict[str, str] = {}
+    for item in plan.items:
+        key = user_decision_business_key(getattr(item, "attribute_key", ""))
+        if not key:
+            continue
+        resolution = getattr(item, "resolution", None)
+        if str(getattr(resolution, "source_type", "") or "").casefold() != "user":
+            continue
+        values = _answer_values(resolution)
+        if values:
+            output[key] = values[0]
+    return output
+
+
+def _show_user_decision_advice(
+    adapter: MakroDomainAdapter,
+    prepared: _PreparedCandidate,
+    decision_values: dict[str, str] | None,
+) -> None:
+    """Best-effort HUD guidance; never changes execution outcome."""
+
+    if not is_user_decision_business_field(prepared.live_field):
+        return
+    if str(getattr(prepared.answer, "source_type", "") or "").casefold() != "user":
+        return
+
+    controls = _value_controls(prepared.live_field)
+    if not controls:
+        return
+    path = str(controls[0].get("path") or "").strip()
+    if not path:
+        return
+
+    key = user_decision_business_key(prepared.live_field)
+    counterpart_key = (
+        "flipkart_selling_price" if key == "mrp" else "mrp"
+    )
+    current_values = _answer_values(prepared.answer)
+    advisory = price_decision_advisory(
+        prepared.live_field,
+        confirmed_value=current_values[0] if current_values else "",
+        counterpart_value=(decision_values or {}).get(counterpart_key, ""),
+    )
+    if not advisory:
+        return
+    try:
+        locator = adapter.page.locator(path).first
+        browser_visual_hud_advice(locator, advisory, phase=2)
+    except Exception:
+        # Visual guidance is deliberately non-authoritative.
+        return
 
 
 def _fast_batch_eligible(live_field: dict[str, Any], answer: Any) -> bool:
@@ -460,11 +522,13 @@ def _run_safe_prepared(
     count_write: bool = True,
     result_entry: dict[str, Any] | None = None,
     safe_fallback: bool = False,
+    decision_values: dict[str, str] | None = None,
 ) -> None:
     if count_write:
         report["writes_attempted"] += 1
         if prepared.mode == "review":
             report["review_candidates_attempted"] += 1
+    _show_user_decision_advice(adapter, prepared, decision_values)
     try:
         verification = adapter.fill_resolved_field(
             prepared.live_field,
@@ -686,6 +750,8 @@ def fill_one_section(
         report["status"] = "no_candidates"
         return report
 
+    decision_values = _price_decision_values(plan)
+
     try:
         _open_and_index_section(
             adapter,
@@ -862,6 +928,7 @@ def fill_one_section(
             report=report,
             validated_identities=validated_identities,
             executed_candidates=executed_candidates,
+            decision_values=decision_values,
         )
 
     if not structural_failure and pending:
