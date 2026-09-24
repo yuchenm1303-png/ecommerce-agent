@@ -142,6 +142,7 @@ _INSTALL_SCRIPT = r"""
     currentTarget:null,
     lastActionAt:Date.now(),
     lastPulseAt:0,
+    adviceUntil:0,
     destroyed:false,
     doc(){
       try { return frame.contentDocument; } catch (_) { return null; }
@@ -206,6 +207,7 @@ _INSTALL_SCRIPT = r"""
     },
     clearAdvice(nodes){
       if(!nodes) return;
+      this.adviceUntil=0;
       nodes.bubble.classList.remove('advice-mode');
       nodes.adviceRows.replaceChildren();
       nodes.adviceWarning.textContent='';
@@ -217,6 +219,7 @@ _INSTALL_SCRIPT = r"""
       if(!nodes) return false;
       this.currentTarget=target;
       this.lastActionAt=Date.now();
+      this.adviceUntil=Date.now()+7000;
       const rect=target.getBoundingClientRect();
       const x=Math.max(0,Math.min(window.innerWidth,rect.left+rect.width*.5));
       const y=Math.max(0,Math.min(window.innerHeight,rect.top+rect.height*.5));
@@ -265,6 +268,15 @@ _INSTALL_SCRIPT = r"""
       if(this.destroyed || !this.visible(target)) return;
       const nodes=this.nodes();
       if(!nodes) return;
+      const keepAdvice=target===this.currentTarget
+        && Date.now()<this.adviceUntil
+        && nodes.bubble.classList.contains('advice-mode');
+      if(keepAdvice){
+        this.lastActionAt=Date.now();
+        this.setPhase(phase);
+        nodes.app.classList.remove('hud-hidden');
+        return;
+      }
       this.clearAdvice(nodes);
       this.currentTarget=target;
       this.lastActionAt=Date.now();
