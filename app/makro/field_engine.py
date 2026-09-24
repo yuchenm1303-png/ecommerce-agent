@@ -113,6 +113,16 @@ def _single_locator(
     return locator, selector
 
 
+def control_locator(
+    page: Any,
+    control: dict[str, Any],
+    section_path: str | None = None,
+) -> tuple[Any, str]:
+    """Return the same unique, visible locator used by write/read execution."""
+
+    return _single_locator(page, control, section_path)
+
+
 def _ensure_writable(locator: Any, control: dict[str, Any], selector: str) -> None:
     if control.get("disabled"):
         raise RuntimeError(f"控件 {selector} 当前 disabled，拒绝写入。")
@@ -506,6 +516,7 @@ def radio_group_values_equivalent(
 
 __all__ = [
     "FieldExecutionContract",
+    "control_locator",
     "execution_contract",
     "fill_control",
     "fill_radio_group",
