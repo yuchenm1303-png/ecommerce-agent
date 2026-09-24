@@ -279,9 +279,10 @@ class ChannelAccountStore:
             if port
         }
         legacy_port = managed_makro_cdp_port(self.runtime_root)
-        # Preserve the original managed port for the account that owns the legacy
-        # profile. Older state files did not yet persist cdp_port.
-        if account.profile_key == _LEGACY_MAKRO_PROFILE_KEY:
+        is_default = account.account_id == self._default_account_id("makro")
+        # Older state files did not persist cdp_port. Preserve the historical lane
+        # for the deterministic default account as well as the legacy-profile owner.
+        if account.profile_key == _LEGACY_MAKRO_PROFILE_KEY or is_default:
             if legacy_port in occupied:
                 owner = next(
                     (
