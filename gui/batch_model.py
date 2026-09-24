@@ -56,6 +56,7 @@ class BatchJob:
     makro_account_id: str = ""
     makro_account_label: str = ""
     makro_target_id: str = ""
+    makro_browser_instance_token: str = ""
     browser_lane: int = 0
     makro_cdp_port: int = 0
     makro_profile_dir: str = ""
@@ -99,6 +100,7 @@ class BatchRun:
     status: str = "IDLE"
     makro_account_id: str = ""
     makro_account_label: str = ""
+    makro_browser_instance_token: str = ""
     prepare_concurrency: int = BATCH_WORKER_DEFAULT
     execute_concurrency: int = BATCH_WORKER_DEFAULT
     save_authorized: bool = False
