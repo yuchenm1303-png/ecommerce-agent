@@ -34,6 +34,8 @@ def test_account_center_is_a_card_workspace_not_only_a_text_summary() -> None:
     assert '"切换查看"' in ACCOUNT_SURFACE
     assert '"后台运行"' in ACCOUNT_SURFACE
     assert "def _refresh_account_cards" in ACCOUNT_SURFACE
+    assert "def _queue_quick_refresh" in ACCOUNT_SURFACE
+    assert "_queue_controls_refresh" in ACCOUNT_SURFACE
     assert "def _switch_account" in ACCOUNT_SURFACE
 
 

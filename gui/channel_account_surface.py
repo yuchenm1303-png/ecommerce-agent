@@ -375,8 +375,15 @@ class ChannelAccountCenterPanel(QWidget):
             self.fleet_badge.setText("全部空闲")
             self.fleet_badge.setStyleSheet("color: #aeb9c7; font-weight: 720;")
 
+    def _queue_quick_refresh(self) -> None:
+        layer = getattr(self.manager.window, "_quick_modal_layer", None)
+        refresh = getattr(layer, "_queue_controls_refresh", None)
+        if callable(refresh):
+            refresh()
+
     def _on_lane_state_changed(self, _account_id: str, _snapshot: object) -> None:
         self._refresh_account_cards()
+        self._queue_quick_refresh()
 
     def reload(self) -> None:
         accounts = tuple(self.manager.list_channel_accounts())
@@ -427,6 +434,7 @@ class ChannelAccountCenterPanel(QWidget):
         else:
             self.browser_status.setStyleSheet("color: #f4cb7a; font-weight: 650;")
         self._refresh_account_cards()
+        self._queue_quick_refresh()
 
     def _set_action(self, text: str, *, error: bool = False) -> None:
         self.action_status.setText(text)
