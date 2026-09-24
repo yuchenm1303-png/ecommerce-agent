@@ -121,7 +121,6 @@ class ChannelAccountCenterPanel(QWidget):
         self.account_overview.hide()
         overview_layout.addWidget(self.account_overview)
         layout.addWidget(overview_card)
-        layout.addWidget(overview_card)
 
         connect_card = QFrame()
         connect_card.setObjectName("cardDetailSection")
