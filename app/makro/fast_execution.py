@@ -20,6 +20,7 @@ from app.makro.execution import (
     _collect_save_failure_diagnostics,
 )
 from app.makro.field_engine import (
+    control_locator,
     execution_contract,
     fill_control,
     read_control,
@@ -142,10 +143,7 @@ def _show_user_decision_advice(
         return
 
     controls = _value_controls(prepared.live_field)
-    if not controls:
-        return
-    path = str(controls[0].get("path") or "").strip()
-    if not path:
+    if len(controls) != 1:
         return
 
     key = user_decision_business_key(prepared.live_field)
@@ -161,7 +159,11 @@ def _show_user_decision_advice(
     if not advisory:
         return
     try:
-        locator = adapter.page.locator(path).first
+        locator, _selector = control_locator(
+            adapter.page,
+            controls[0],
+            prepared.section_path,
+        )
         browser_visual_hud_advice(locator, advisory, phase=2)
     except Exception:
         # Visual guidance is deliberately non-authoritative.
