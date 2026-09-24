@@ -23,11 +23,28 @@ class SharedBatchBrowser:
     profile_dir: Path
 
 
-def shared_batch_browser(project_root: str | Path, *, cdp_port: int) -> SharedBatchBrowser:
+def shared_batch_browser(
+    project_root: str | Path,
+    *,
+    cdp_port: int,
+    profile_dir: str | Path | None = None,
+) -> SharedBatchBrowser:
+    """Describe the already-managed Makro browser used by one Batch.
+
+    ``profile_dir`` is explicit for account-bound sessions. The legacy default is
+    retained only for older callers/tests that predate multi-account Makro
+    profiles. New GUI Batch work always passes the selected account profile.
+    """
+
     root = Path(project_root).resolve()
+    resolved_profile = (
+        Path(profile_dir).resolve()
+        if profile_dir is not None
+        else (root / "browser_profiles" / "makro-edge").resolve()
+    )
     return SharedBatchBrowser(
         cdp_port=int(cdp_port),
-        profile_dir=root / "browser_profiles" / "makro-edge",
+        profile_dir=resolved_profile,
     )
 
 
