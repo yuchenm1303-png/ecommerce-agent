@@ -8,10 +8,16 @@ that PID's exact ``msedge.exe`` image identity.
 
 from __future__ import annotations
 
+import base64
 import csv
+import json
 import os
+import socket
+import struct
 import subprocess
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,6 +124,112 @@ def _pid_image_name(pid: int) -> str:
     return ""
 
 
+def _browser_websocket_url(port: int) -> str:
+    """Return the browser-level CDP WebSocket URL, or "" when unreachable."""
+
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{int(port)}/json/version",
+            timeout=5,
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("webSocketDebuggerUrl") or "").strip()
+
+
+def _ws_text_frame(payload: str) -> bytes:
+    """Encode one masked client text frame (RFC 6455 §5.2/§5.3)."""
+
+    data = payload.encode("utf-8")
+    mask = os.urandom(4)
+    header = bytearray([0x81])
+    length = len(data)
+    if length < 126:
+        header.append(0x80 | length)
+    elif length < (1 << 16):
+        header.append(0x80 | 126)
+        header.extend(struct.pack("!H", length))
+    else:
+        header.append(0x80 | 127)
+        header.extend(struct.pack("!Q", length))
+    header.extend(mask)
+    header.extend(bytes(byte ^ mask[index % 4] for index, byte in enumerate(data)))
+    return bytes(header)
+
+
+def _send_cdp_browser_close(websocket_url: str) -> bool:
+    """Send ``Browser.close`` over CDP; True once the command is on the wire.
+
+    Deliberately a minimal RFC 6455 client on the standard library: this module
+    ships inside the packaged app and must not grow a WebSocket dependency for
+    one frame.
+    """
+
+    parsed = urllib.parse.urlsplit(str(websocket_url or "").strip())
+    host = parsed.hostname or ""
+    if not host:
+        return False
+    port = int(parsed.port or 80)
+    resource = parsed.path or "/"
+    if parsed.query:
+        resource = f"{resource}?{parsed.query}"
+
+    handshake = (
+        f"GET {resource} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {base64.b64encode(os.urandom(16)).decode('ascii')}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    try:
+        with socket.create_connection((host, port), timeout=5) as connection:
+            connection.settimeout(5)
+            connection.sendall(handshake.encode("ascii"))
+            header = b""
+            while b"\r\n\r\n" not in header:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    return False
+                header += chunk
+                if len(header) > 65536:
+                    return False
+            if b" 101" not in header.split(b"\r\n", 1)[0]:
+                return False
+            connection.sendall(_ws_text_frame('{"id":1,"method":"Browser.close"}'))
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def _request_graceful_exit(port: int, log_path: str | Path | None = None) -> bool:
+    """Ask the managed Edge to shut itself down, instead of killing it.
+
+    Chromium only persists its profile on a clean exit. A forced kill leaves
+    ``profile.exit_type`` at ``Crashed`` and silently drops the non-persistent
+    session cookies that keep a marketplace seller signed in, so the next launch
+    lands on a logged-out page.
+
+    ``Browser.close`` is sent through the browser's own CDP endpoint rather than
+    by signalling the listener PID: in the Edge process model the CDP listener is
+    a *child* of the window-owning browser process, so a close signal aimed at the
+    listener PID never reaches the window and the browser survives it.
+    """
+
+    websocket_url = _browser_websocket_url(port)
+    if not websocket_url:
+        _log(log_path, f"browser gate could not resolve CDP endpoint on port {port}")
+        return False
+    if not _send_cdp_browser_close(websocket_url):
+        _log(log_path, f"browser gate could not send Browser.close on port {port}")
+        return False
+    _log(log_path, f"browser gate requested graceful Edge exit on cdp_port={port}")
+    return True
+
+
 def _wait_listener_closed(port: int, deadline_s: float) -> bool:
     deadline = time.monotonic() + max(0.0, float(deadline_s))
     while time.monotonic() < deadline:
@@ -131,6 +243,7 @@ def close_managed_browser(
     *,
     port: int = DEFAULT_CDP_PORT,
     deadline_s: float = 6.0,
+    graceful_deadline_s: float = 8.0,
     log_path: str | Path | None = None,
     progress: ProgressCallback | None = None,
 ) -> BrowserCloseResult:
@@ -139,6 +252,11 @@ def close_managed_browser(
     No listener means there is nothing to close. If another image owns the CDP
     port, fail closed and leave it untouched. This keeps normal user Edge windows
     out of updater process management.
+
+    The browser is asked to close itself over CDP first so Chromium can flush the
+    profile (marketplace logins live in non-persistent session cookies that a
+    forced kill drops). ``taskkill /F`` remains the fallback once the graceful
+    budget expires, so a hung browser can never block an update.
     """
 
     pid = listener_pid(port)
@@ -161,6 +279,20 @@ def close_managed_browser(
         except Exception:
             pass
     _log(log_path, f"browser gate closing managed Edge pid={pid} cdp_port={port}")
+    # A refused Browser.close means the endpoint is already unusable, so waiting
+    # out the graceful budget would only delay the update it cannot influence.
+    if _request_graceful_exit(port, log_path) and _wait_listener_closed(port, graceful_deadline_s):
+        _log(
+            log_path,
+            f"browser gate closed managed Edge pid={pid} gracefully cdp_port={port}",
+        )
+        return BrowserCloseResult(True, pid=pid)
+
+    _log(
+        log_path,
+        f"browser gate forcing managed Edge pid={pid} cdp_port={port} "
+        f"after {float(graceful_deadline_s):.1f}s graceful budget",
+    )
     try:
         probe = subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"],
