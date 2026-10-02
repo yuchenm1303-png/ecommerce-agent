@@ -30,10 +30,14 @@ def test_photo_upload_rejects_missing_file_before_touching_page(tmp_path: Path):
 
     result = upload_product_photos(object(), [missing])
 
-    assert result.status == "invalid_input"
+    # Each unusable file is rejected individually before browser submission;
+    # when nothing usable remains the whole request is no_usable_input.
+    assert result.status == "no_usable_input"
     assert result.attempted == 0
     assert result.staged == 0
-    assert str(missing) in result.detail
+    assert [item["status"] for item in result.items] == ["rejected_pre_submit"]
+    assert result.items[0]["path"] == str(missing.resolve())
+    assert str(missing.resolve()) in result.items[0]["detail"]
 
 
 def test_photo_upload_with_no_explicit_files_is_a_noop():

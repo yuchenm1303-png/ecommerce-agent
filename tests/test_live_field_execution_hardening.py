@@ -10,7 +10,8 @@ from app.fill_plan import BLOCKED, READY, LiveFillPlan, LiveFillPlanItem
 from app.makro.marketplace_constraints import apply_makro_decision_constraints
 from app.makro_dryrun import _fill_control
 from app.required_overrides import (
-    RequiredOverrideError,
+    FALLBACK_NUMERIC_VALUE,
+    FALLBACK_TEXT_VALUE,
     apply_required_overrides,
     required_fallback_override,
 )
@@ -69,24 +70,34 @@ def _item(field: dict[str, object], *, action: str = BLOCKED) -> LiveFillPlanIte
     )
 
 
+_NUMBER = {"type": "number", "field_kind": "input"}
+_TEXT = {"type": "text", "field_kind": "input"}
+
+
 @pytest.mark.parametrize(
-    ("label", "key", "control"),
+    ("label", "key", "control", "expected"),
     [
-        ("Pick Pack SLA", "shipping_days", {"name": "shipping_days", "type": "number", "field_kind": "input"}),
-        ("Air Flow Level", "air_flow_level", {"name": "air_flow_level", "type": "number", "field_kind": "input"}),
-        ("Unfamiliar Text", "unfamiliar_text", {"name": "unfamiliar_text", "type": "text", "field_kind": "input"}),
+        ("Pick Pack SLA", "shipping_days", {"name": "shipping_days", **_NUMBER}, FALLBACK_NUMERIC_VALUE),
+        ("Air Flow Level", "air_flow_level", {"name": "air_flow_level", **_NUMBER}, FALLBACK_NUMERIC_VALUE),
+        ("Unfamiliar Text", "unfamiliar_text", {"name": "unfamiliar_text", **_TEXT}, FALLBACK_TEXT_VALUE),
     ],
 )
-def test_required_fallback_is_disabled_for_every_control_family(label, key, control):
-    with pytest.raises(RequiredOverrideError, match="自动 N/A / 1 / 首选项兜底已禁用"):
-        required_fallback_override(_field(label, key, controls=[control]))
+def test_required_fallback_follows_live_control_family(label, key, control, expected):
+    # Deterministic required fallback is derived from the live control family,
+    # never from the field name.
+    fallback = required_fallback_override(_field(label, key, controls=[control]))
+
+    assert fallback["values"] == [expected]
+    assert fallback["source_type"] == "fallback"
+    assert FALLBACK_NUMERIC_VALUE == "1"
+    assert FALLBACK_TEXT_VALUE == "N/A"
 
 
 def test_explicit_user_value_is_preserved_without_python_semantic_rewrite():
     current = _field(
         "Air Flow Level",
         "air_flow_level",
-        controls=[{"name": "air_flow_level", "type": "number", "field_kind": "input"}],
+        controls=[{"name": "air_flow_level", **_TEXT}],
     )
     item = _item(current)
     result = apply_required_overrides(
@@ -99,6 +110,28 @@ def test_explicit_user_value_is_preserved_without_python_semantic_rewrite():
     assert item.action == READY
     assert item.resolution.answer_values == ["N/A"]
     assert item.resolution.source_type == "user"
+
+
+def test_explicit_user_text_is_not_silently_accepted_for_number_control():
+    current = _field(
+        "Air Flow Level",
+        "air_flow_level",
+        controls=[{"name": "air_flow_level", **_NUMBER}],
+    )
+    item = _item(current)
+    result = apply_required_overrides(
+        LiveFillPlan([item]),
+        [current],
+        [{"field_id": field_id(current), "values": ["N/A"], "source_type": "user"}],
+    )
+
+    # The numeric hard guard rejects the value without rewriting it; the failure
+    # stays local to this field instead of aborting the whole override batch.
+    assert result["applied"] == 0
+    assert result["isolated_failed"] == 1
+    assert "不是有限数字" in result["isolated_failures"][0]["reason"]
+    assert item.action == BLOCKED
+    assert item.resolution.answer_values == []
 
 
 def test_explicit_override_does_not_replace_current_ai_ready_decision():
@@ -114,17 +147,25 @@ def test_explicit_override_does_not_replace_current_ai_ready_decision():
     assert item.resolution.answer_values == ["already ready"]
 
 
-def test_legacy_automatic_override_is_ignored():
-    current = _field("Air Flow Level", "air_flow_level")
+def test_stale_persisted_fallback_is_recomputed_from_current_number_control():
+    current = _field(
+        "Air Flow Level",
+        "air_flow_level",
+        controls=[{"name": "air_flow_level", **_NUMBER}],
+    )
     item = _item(current)
+    # A persisted fallback is an instruction, not trusted data: the stale text
+    # placeholder is recomputed from the current numeric live control.
     result = apply_required_overrides(
         LiveFillPlan([item]),
         [current],
-        [{"field_id": field_id(current), "values": ["1"], "source_type": "fallback"}],
+        [{"field_id": field_id(current), "values": ["N/A"], "source_type": "fallback"}],
     )
-    assert result["applied"] == 0
-    assert result["ignored_automatic"] == 1
-    assert item.action == BLOCKED
+    assert result["applied"] == 1
+    assert result["fallback_recomputed_live"] == 1
+    assert item.action == READY
+    assert item.resolution.answer_values == ["1"]
+    assert item.resolution.source_type == "fallback"
 
 
 def test_makro_constraint_layer_is_semantic_noop():

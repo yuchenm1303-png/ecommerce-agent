@@ -80,7 +80,9 @@ def test_save_accepts_late_async_collapse(monkeypatch) -> None:
     assert clock.now >= 20.0
 
 
-def test_save_tolerates_transient_collapsed_error_badge(monkeypatch) -> None:
+def test_save_returns_on_stable_collapse_without_waiting_for_badges(monkeypatch) -> None:
+    # Collapse back to EDIT is the persistence boundary. A red badge describes
+    # listing completeness and is verified afterwards by reopen verification.
     clock = _Clock()
     page = _Page(clock)
 
@@ -96,21 +98,22 @@ def test_save_tolerates_transient_collapsed_error_badge(monkeypatch) -> None:
     monkeypatch.setattr(
         sections,
         "collapsed_error_badges",
-        lambda *_args: ["1 Error"] if clock.now < 2.0 else [],
+        lambda *_args: pytest.fail("Save persistence must not be decided by completeness badges"),
     )
     monkeypatch.setattr(
         sections,
         "open_section_for_edit",
-        lambda *_args: pytest.fail("transient badge must not reopen the section"),
+        lambda *_args: pytest.fail("a collapsed save must not reopen the section"),
     )
 
     sections.save_section(page, "Price, Stock and Shipping Information", timeout_s=5.0)
 
     assert page.save_clicked is True
-    assert clock.now >= 2.0
+    # Two stable collapsed samples (250 ms polls) after collapse at 0.5 s.
+    assert 0.5 <= clock.now < 1.0
 
 
-def test_save_keeps_persistent_validation_fail_closed(monkeypatch) -> None:
+def test_save_that_never_collapses_fails_closed_with_visible_errors(monkeypatch) -> None:
     clock = _Clock()
     page = _Page(clock)
 
@@ -118,11 +121,14 @@ def test_save_keeps_persistent_validation_fail_closed(monkeypatch) -> None:
     monkeypatch.setattr(
         sections,
         "find_section",
-        lambda *_args: {"path": "card", "has_edit": bool(page.save_clicked)},
+        lambda *_args: {"path": "card", "has_edit": False},
     )
-    monkeypatch.setattr(sections, "collapsed_error_badges", lambda *_args: ["1 Error"])
-    monkeypatch.setattr(sections, "open_section_for_edit", lambda *_args: None)
+    monkeypatch.setattr(
+        sections,
+        "open_section_for_edit",
+        lambda *_args: pytest.fail("an open card is diagnosed in place"),
+    )
     monkeypatch.setattr(sections, "visible_section_errors", lambda *_args: ["SKU already used"])
 
-    with pytest.raises(RuntimeError, match="validation error"):
+    with pytest.raises(RuntimeError, match="未恢复 EDIT：SKU already used"):
         sections.save_section(page, "Price, Stock and Shipping Information", timeout_s=1.0)

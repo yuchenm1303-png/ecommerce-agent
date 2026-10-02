@@ -28,7 +28,15 @@ def _field(**updates):
         "qualifier_options": [],
         "help_text": "planning help text",
         "context_text": "",
-        "controls": [],
+        # Fallbacks derive only from the observed live execution contract.
+        "controls": [
+            {
+                "id": "required_note",
+                "name": "required_note_0_value",
+                "type": "text",
+                "field_kind": "input",
+            }
+        ],
     }
     field.update(updates)
     return field
@@ -100,7 +108,15 @@ def test_new_fallback_persists_stable_schema_signature():
 
     assert fallback["field_id"] == binding["field_id"]
     assert fallback["schema_signature"] == binding["schema_signature"]
-    assert len(fallback["schema_signature"]) == 7
+    # The persisted signature is the full production drift signature: stable
+    # address plus the canonical mechanical execution contract.
+    assert len(fallback["schema_signature"]) == len(schema_field_signature(field))
+    assert fallback["schema_signature"][:4] == [
+        "requirednote",
+        "requirednote",
+        "productdescription",
+        True,
+    ]
 
 
 def test_duplicate_current_field_identity_fails_closed_before_override_rebind():

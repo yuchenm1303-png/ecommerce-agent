@@ -37,7 +37,7 @@ def test_live_schema_drift_fails_before_browser_write():
     planned = live_schema_payload([_field("package_length", "Length")])["fields"]
     current = [_field("package_length", "Length", required=False)]
 
-    with pytest.raises(RuntimeError, match="live schema 与当前 Makro 页面不一致"):
+    with pytest.raises(RuntimeError, match="live schema 与当前 Makro 页面执行合同不一致"):
         assert_live_schema_matches(planned, current)
 
 
@@ -76,6 +76,8 @@ def test_live_schema_preserves_nearby_context_for_fixed_unit_inputs():
             {
                 "id": "length",
                 "name": "length_0_value",
+                "type": "number",
+                "field_kind": "input",
                 "context_text": "Length * cm",
             }
         ],
@@ -83,7 +85,18 @@ def test_live_schema_preserves_nearby_context_for_fixed_unit_inputs():
     planned = live_schema_payload([field])["fields"]
     assert planned[0]["context_text"] == "Length * cm"
     assert planned[0]["qualifier_options"] == []
+    assert planned[0]["execution_contract"]["qualifier_mode"] == "fixed"
+    assert planned[0]["execution_contract"]["fixed_unit"] == "cm"
 
-    # Context is useful AI input but not stable browser schema identity.
-    current = [{**field, "controls": [{**field["controls"][0], "context_text": "Length cm"}]}]
-    assert_live_schema_matches(planned, current)
+    # Context wording is AI input, not schema identity: churn that leaves the
+    # mechanical contract unchanged is not drift.
+    unchanged = [
+        {**field, "controls": [{**field["controls"][0], "context_text": "Length *cm | Enter a value"}]}
+    ]
+    assert_live_schema_matches(planned, unchanged)
+
+    # The rendered fixed unit is part of the write contract, so losing it is drift
+    # and must fail closed before any browser write.
+    unit_lost = [{**field, "controls": [{**field["controls"][0], "context_text": "Length cm"}]}]
+    with pytest.raises(RuntimeError, match="执行合同不一致"):
+        assert_live_schema_matches(planned, unit_lost)

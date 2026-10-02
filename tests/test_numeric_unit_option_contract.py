@@ -4,8 +4,10 @@ import pytest
 
 from app.ai_decisions import FieldDecision, READY as AI_READY, field_options, field_qualifier_options
 from app.fill_plan import _hard_guard_values
+from app.hard_field_validators import validate_resolved_answer
 from app.live_schema import live_schema_payload
 from app.required_overrides import RequiredOverrideError, required_fallback_override
+from app.resolution_types import RESOLVED, ResolvedAnswer
 
 
 def _depth_field() -> dict[str, object]:
@@ -37,8 +39,46 @@ def test_schema_still_separates_value_options_from_qualifier_options():
     assert schema_field["qualifier_options"] == ["cm"]
 
 
-def test_required_placeholder_generation_is_disabled():
-    with pytest.raises(RequiredOverrideError, match="自动 N/A / 1 / 首选项兜底已禁用"):
+def _live_depth_field() -> dict[str, object]:
+    return {
+        **_depth_field(),
+        "controls": [
+            {"id": "depth", "name": "depth", "type": "number", "field_kind": "input", "options": []},
+            {
+                "name": "depth_qualifier",
+                "field_kind": "select",
+                "options": [{"text": "cm", "value": "cm", "disabled": False}],
+            },
+        ],
+    }
+
+
+def test_required_depth_fallback_passes_the_same_production_hard_guard():
+    field = _live_depth_field()
+    fallback = required_fallback_override(field)
+
+    assert fallback["values"] == ["1"]
+    assert fallback["qualifier"] == "cm"
+
+    validation = validate_resolved_answer(
+        field,
+        ResolvedAnswer(
+            attribute_key="depth",
+            label="Depth",
+            status=RESOLVED,
+            answer="1",
+            answer_values=list(fallback["values"]),
+            qualifier=str(fallback["qualifier"]),
+            source_type="fallback",
+        ),
+    )
+    assert validation.valid, validation.detail
+
+
+def test_required_fallback_fails_closed_without_an_executable_value_control():
+    # The raw value control above has no writable family, so no placeholder may
+    # be invented for it.
+    with pytest.raises(RequiredOverrideError, match="live execution contract 不受支持"):
         required_fallback_override(_depth_field())
 
 

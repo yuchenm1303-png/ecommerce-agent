@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 
@@ -75,7 +76,14 @@ def test_batch_jobs_own_exact_makro_tabs_instead_of_guessing_current_page() -> N
 def test_batch_source_navigation_is_prefetched_before_parallel_prepare() -> None:
     assert "capture_product_source" in SOURCE
     assert "self._source_queue" in RUNNER
-    assert 'source_active = any(stage == "source"' in RUNNER
+    # Source activity is lane-aware since account lanes were introduced: one
+    # source process in any account lane still holds the shared Source Edge.
+    assert "source_active = self._source_process_active_any_lane()" in RUNNER
+    lane_check = RUNNER.split("    def _source_process_active_any_lane(self)", 1)[1].split(
+        "    def ", 1
+    )[0]
+    assert 'stage == "source"' in lane_check
+    assert "self._processes.all_items()" in lane_check
     assert "Batch source cache miss" in JOB
     assert "acquired.source_cache_hit" in JOB
 
@@ -90,7 +98,9 @@ def test_batch_reuses_canonical_business_pipeline_and_executor() -> None:
     assert "_run_resolver_pair" in STEP3
     assert "_resolver_pair_for_pack" in STEP3
     assert '"makro_execute_listing.py"' in RUNNER
-    assert "from makro_execute_listing import main as execute_main" in OWNED_EXECUTOR
+    assert "import makro_execute_listing as _executor" in OWNED_EXECUTOR
+    assert "install_executor_photo_guards(_executor)" in OWNED_EXECUTOR
+    assert "return int(_executor.main())" in OWNED_EXECUTOR
     assert '"--all-step3"' in RUNNER
     assert '"--allow-section-save"' in RUNNER
     assert '"--upload-image"' in RUNNER
@@ -198,7 +208,7 @@ def test_batch_job_surface_keeps_bounded_ui_logs_and_owned_tab_metadata() -> Non
     assert "self._logs: deque[str] = log_buffer()" in WORKSPACE
     assert "setMaximumBlockCount(" in WORKSPACE
     assert "AsyncRunJournal(log_path)" in RUNNER
-    assert "deque(maxlen=BATCH_LOG_PENDING_LINES)" in RUNNER
+    assert re.search(r"deque\(\s*maxlen=BATCH_LOG_PENDING_LINES\s*\)", RUNNER)
     assert "Makro targetId" in WORKSPACE
     assert "Execution report" in WORKSPACE
     assert "READY  {job.ready}" in WORKSPACE

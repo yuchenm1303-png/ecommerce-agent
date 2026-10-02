@@ -11,7 +11,9 @@ HEALTH = (ROOT / "app" / "cdp_automation_health.py").read_text(encoding="utf-8")
 
 def test_endpoint_reachability_is_not_treated_as_automation_health() -> None:
     assert "probe_cdp_automation(" in MANAGER
-    assert '"CHECKING", "检测到 Makro Browser · 正在验证自动化控制"' in MANAGER
+    # A reachable CDP endpoint only moves the session to CHECKING; READY still
+    # requires the Playwright automation probe.
+    assert '"CHECKING", "CDP 端点在线 · 正在验证 Playwright automation"' in MANAGER
     assert "connect_over_cdp(" in HEALTH
     assert "AUTOMATION_READY" in HEALTH
     assert "POISONED" in HEALTH
@@ -41,6 +43,10 @@ def test_source_edge_has_separate_bounded_recovery_path() -> None:
     assert "looks_like_cdp_transport_failure" in SOURCE
     assert "close_managed_browser(port=port" in SOURCE
     assert "launch_detached_edge(" in SOURCE
-    assert "probe_cdp_automation(port, timeout_ms=8_000)" in SOURCE
+    probe = SOURCE.split("probe = probe_cdp_automation(", 1)[1].split(")", 1)[0]
+    assert "port," in probe
+    assert "timeout_ms=8_000" in probe
+    # The recovery probe reuses the exclusive Source transport lane it already holds.
+    assert "transport_lane_owned=True" in probe
     assert "SOURCE_CDP RECOVERED" in SOURCE
     assert "if not looks_like_cdp_transport_failure(exc):" in SOURCE

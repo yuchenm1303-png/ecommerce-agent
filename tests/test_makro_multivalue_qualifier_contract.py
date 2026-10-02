@@ -7,13 +7,23 @@ from app.makro_dryrun import (
 from app.resolution_types import ResolvedAnswer
 
 
+_UNIT_OPTIONS = [
+    {"text": "cm", "value": "cm", "disabled": False},
+    {"text": "mm", "value": "mm", "disabled": False},
+]
+
+
 def _control(name: str, *, kind: str = "input") -> dict[str, object]:
-    return {
+    control: dict[str, object] = {
         "name": name,
         "field_kind": kind,
         "path": f"body > input[name='{name}']",
         "selector_candidates": [],
     }
+    if name.endswith("_qualifier"):
+        # Selectable qualifiers are executable only with captured enabled options.
+        control["options"] = list(_UNIT_OPTIONS)
+    return control
 
 
 def _answer(values: list[str], qualifier: str = "cm") -> ResolvedAnswer:

@@ -306,7 +306,12 @@ def test_resilient_dom_reader_reuses_the_owned_step1_surface() -> None:
     assert "CatalogTaxonomyBrowser" in resilient
     assert "document.querySelectorAll('body *')" not in resilient
     assert "STEP1_SURFACE_MARKERS" in owned
-    assert "Hard ownership boundary" in owned
+    # Ownership is structural (anchored on the live search control), not a
+    # coordinate/pixel boundary.
+    assert "_STRUCTURAL_SURFACE_JS" in owned
+    assert "class TaxonomySurfaceError(RuntimeError)" in owned
+    assert "surfaceLeft" not in owned
+    assert "surfaceTop" not in owned
     assert "sidebar_navigation_eligible" in (ROOT / "app" / "makro" / "vertical_catalog.py").read_text(encoding="utf-8")
 
 

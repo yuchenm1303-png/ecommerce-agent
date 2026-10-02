@@ -142,6 +142,7 @@ def test_live_capture_result_survives_cache_publication_failure(tmp_path, monkey
         cache_dir=tmp_path / "cache",
         cache_ttl_seconds=900,
         force_refresh=True,
+        resume_after_interaction=False,
     )
 
     assert result is captured

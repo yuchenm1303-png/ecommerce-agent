@@ -88,16 +88,24 @@ def test_query_reset_never_requires_old_dom_to_disappear() -> None:
     page = FakePage()
     search = FakeSearch()
 
-    assert vertical_selection._close_vertical_search(search, page, wait_ms=800) is None
+    # Between query generations the input is cleared, then the popup is closed.
+    assert vertical_selection._reset_vertical_search(search, page, wait_ms=800) is None
     assert search.events[:3] == [
         ("fill", ""),
         ("press", "Escape"),
         ("evaluate", "el => el.blur()"),
     ]
     assert page.waits
-    source = inspect.getsource(vertical_selection._close_vertical_search)
-    assert "query_quiescence" not in source
-    assert "remaining_rows" not in source
+
+    # Closing alone (e.g. before the Brand transition) keeps the selected value.
+    closed = FakeSearch()
+    assert vertical_selection._close_vertical_search(closed, FakePage(), wait_ms=800) is None
+    assert closed.events == [("press", "Escape"), ("evaluate", "el => el.blur()")]
+
+    for helper in (vertical_selection._reset_vertical_search, vertical_selection._close_vertical_search):
+        source = inspect.getsource(helper)
+        assert "query_quiescence" not in source
+        assert "remaining_rows" not in source
 
 
 def test_each_discovery_query_reacquires_search_and_starts_fresh_generation(monkeypatch) -> None:
@@ -108,7 +116,7 @@ def test_each_discovery_query_reacquires_search_and_starts_fresh_generation(monk
     monkeypatch.setattr(vertical_selection, "_vertical_search_input", lambda _page: search)
     monkeypatch.setattr(
         vertical_selection,
-        "_close_vertical_search",
+        "_reset_vertical_search",
         lambda *_args, **_kwargs: order.append("reset"),
     )
     monkeypatch.setattr(
@@ -152,7 +160,11 @@ def test_generation_creation_failure_stops_before_query_write(monkeypatch) -> No
 def test_ai_rejects_one_generation_then_selects_and_clicks_next_generation(monkeypatch) -> None:
     selected = "Home Improvement Tools / Bathroom Fittings & Sanitary / Shower Head"
     distractor = "Home & Kitchen / Bathroom Accessories / Soap Dishes"
-    planned = ("bathroom fixture", "rain showerhead", "unused later query")
+    # The planner ladder is specific -> broad; execution probes broad -> specific
+    # and keeps the canonical product type ("rain showerhead") as the final query.
+    planned = ("rain showerhead", "shower head", "bathroom fixture")
+    executed = ("bathroom fixture", "shower head", "rain showerhead")
+    assert vertical_selection._broad_first_search_execution_terms(_hints(), planned) == executed
     search = FakeSearch()
     calls: list[str] = []
     decisions: list[tuple[str, list[str]]] = []
@@ -163,12 +175,12 @@ def test_ai_rejects_one_generation_then_selects_and_clicks_next_generation(monke
     def run_query(_page, term, *, wait_ms):
         _ = wait_ms
         calls.append(term)
-        rows = [distractor] if term == planned[0] else [selected]
+        rows = [distractor] if term == executed[0] else [selected]
         return rows, search
 
     def choose(_provider, _hints, terms, candidates):
         decisions.append((terms[0], [item.label for item in candidates]))
-        return selected if terms == (planned[1],) else ""
+        return selected if terms == (executed[1],) else ""
 
     monkeypatch.setattr(vertical_selection, "_run_vertical_search_query", run_query)
     monkeypatch.setattr(vertical_selection, "choose_vertical_candidate_pool", choose)
@@ -186,11 +198,11 @@ def test_ai_rejects_one_generation_then_selects_and_clicks_next_generation(monke
     )
 
     assert resolved == "shower_head"
-    assert terms == planned
-    assert calls == [planned[0], planned[1]]
+    assert terms == executed
+    assert calls == [executed[0], executed[1]]
     assert decisions == [
-        (planned[0], [distractor]),
-        (planned[1], [selected]),
+        (executed[0], [distractor]),
+        (executed[1], [selected]),
     ]
     assert observed == [distractor, selected]
     assert clicks == [(selected, False)]
@@ -217,12 +229,15 @@ def test_ai_selection_stops_ladder_immediately_without_any_requery(monkeypatch) 
     monkeypatch.setattr(vertical_selection, "click_search_row", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(vertical_selection, "_complete_exact_live_vertical", lambda *_args, **_kwargs: "electric_hair_curler")
 
-    resolved, _observed, _terms = vertical_selection._try_select_via_search(
+    resolved, _observed, terms = vertical_selection._try_select_via_search(
         FakePage(), FakeProvider(), _hints(), wait_ms=80
     )
 
     assert resolved == "electric_hair_curler"
-    assert calls == ["electric hair curler"]
+    # Broad recall runs first; the AI selected from that generation, so the
+    # remaining, more specific query never runs.
+    assert terms == ("hair curler", "electric hair curler")
+    assert calls == ["hair curler"]
 
 
 def test_selected_current_row_click_failure_is_execution_failure_not_new_search(monkeypatch) -> None:
@@ -246,7 +261,8 @@ def test_selected_current_row_click_failure_is_execution_failure_not_new_search(
     with pytest.raises(RuntimeError, match="exact current row could not be clicked"):
         vertical_selection._try_select_via_search(FakePage(), FakeProvider(), _hints(), wait_ms=80)
 
-    assert calls == [planned[0]]
+    # Only the first executed (broadest) generation ran; no new search follows.
+    assert calls == ["shower head"]
 
 
 def test_duplicate_selected_rows_fail_at_current_execution_boundary(monkeypatch) -> None:
@@ -316,7 +332,7 @@ def test_all_ai_none_closes_last_search_and_falls_back_without_click(monkeypatch
         FakePage(), FakeProvider(), _hints(), wait_ms=80
     )
     assert resolved == ""
-    assert terms == planned
+    assert terms == ("showerhead", "rain showerhead")
     assert closed == [True]
 
 

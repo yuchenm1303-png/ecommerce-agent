@@ -17,6 +17,14 @@ def _unique_port() -> int:
     return 47000 + ((os.getpid() * 131 + time.time_ns()) % 12000)
 
 
+def _utf8_env() -> dict[str, str]:
+    # Lane errors contain non-ASCII text. Pin child stdio to UTF-8 (decoded with
+    # encoding="utf-8" below) so results never depend on the console code page:
+    # otherwise e.g. PYTHONIOENCODING=utf-8 + a cp936 parent makes Windows
+    # subprocess return stderr=None.
+    return {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
 def _wait(path: Path, timeout: float = 4.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -57,8 +65,9 @@ out.write_text(json.dumps({{'acquired': acquired, 'release_started': released}})
     holder = subprocess.Popen(
         [sys.executable, "-c", holder_code],
         cwd=ROOT,
-        env=dict(os.environ),
-        text=True,
+        env=_utf8_env(),
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -79,8 +88,9 @@ out.write_text(json.dumps({{'started': started, 'acquired': acquired}}), encodin
         waiter = subprocess.Popen(
             [sys.executable, "-c", waiter_code],
             cwd=ROOT,
-            env=dict(os.environ),
-            text=True,
+            env=_utf8_env(),
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -122,7 +132,8 @@ out=Path({str(output)!r})
 with exclusive_cdp_transport_lane(port):
     child=subprocess.run(
         [sys.executable, '-c', 'from app.cdp_transport_lane import exclusive_cdp_transport_lane;\\nwith exclusive_cdp_transport_lane({port}):\\n    pass'],
-        text=True,
+        encoding='utf-8',
+        errors='replace',
         capture_output=True,
         check=False,
     )
@@ -131,8 +142,9 @@ out.write_text(json.dumps({{'returncode': child.returncode, 'stderr': child.stde
     result = subprocess.run(
         [sys.executable, "-c", code],
         cwd=ROOT,
-        env=dict(os.environ),
-        text=True,
+        env=_utf8_env(),
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         timeout=8.0,
         check=False,

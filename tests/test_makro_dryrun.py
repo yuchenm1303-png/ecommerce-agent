@@ -184,7 +184,11 @@ def test_more_values_than_slots_fails_before_any_partial_write():
 
 
 def test_qualifier_answer_fails_before_value_write_if_qualifier_control_missing():
-    c = control("battery_life_0_value")
+    # Numeric controls have no inline unit channel: without a live qualifier
+    # control or a rendered fixed unit, the qualifier cannot be written. (Plain
+    # text controls are different: the domain adapter serializes the approved
+    # qualifier into the value before this primitive runs.)
+    c = {**control("battery_life_0_value"), "type": "number"}
     locator = FakeLocator()
     page = FakePage({'[name="battery_life_0_value"]': locator})
     result = fill_resolved_field(

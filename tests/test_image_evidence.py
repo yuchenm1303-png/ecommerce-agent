@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -239,8 +241,14 @@ def test_opaque_valid_supplier_image_is_canonicalized_before_provider_transport(
     request_source = provider.requests[0]["grounded_sources"][0]
     assert request_source["source_id"] == source.source_id
     assert request_source["sha256"] == source.sha256
-    assert Path(request_source["image_path"]).suffix == ".jpg"
-    assert request_source["image_path"] != source.image_path
+    # Single-pass transport: the verified canonical JPEG bytes travel inline as
+    # a data URI; the opaque supplier artifact is never handed to the provider.
+    transport = request_source["image_path"]
+    assert transport != source.image_path
+    assert transport.startswith("data:image/jpeg;base64,")
+    canonical = base64.b64decode(transport.split(",", 1)[1])
+    with Image.open(BytesIO(canonical)) as decoded:
+        assert decoded.format == "JPEG"
 
 
 def test_corrupt_supplier_image_isolated_before_model_call_when_other_evidence_exists(tmp_path):

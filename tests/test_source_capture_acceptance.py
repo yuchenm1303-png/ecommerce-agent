@@ -133,6 +133,7 @@ def test_partial_capture_retries_current_page_then_recovers(tmp_path, monkeypatc
         cache_dir=None,
         cache_ttl_seconds=900,
         force_refresh=True,
+        resume_after_interaction=False,
     )
 
     assert result is recovered
@@ -170,6 +171,7 @@ def test_persistently_partial_capture_fails_before_downstream(tmp_path, monkeypa
             cache_dir=None,
             cache_ttl_seconds=900,
             force_refresh=True,
+            resume_after_interaction=False,
         )
 
     assert len(calls) == 3

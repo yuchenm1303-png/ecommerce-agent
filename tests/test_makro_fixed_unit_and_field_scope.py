@@ -99,6 +99,12 @@ def test_section_executor_no_longer_rolls_back_whole_card_on_one_field_failure()
     assert "transaction_failed" not in source
     assert "execution_incomplete" not in source
     assert 'report["status"] = "execution_failed_unsaved"' not in source
-    assert 'report["unsaved_values_preserved"] = True' in source
+    # A rejected Save keeps diagnostics only; the executor never Cancels the card
+    # and so never discards sibling values that were already entered.
+    save_failure = source.split('report["status"] = "save_failed"', 1)[1].split(
+        "return report", 1
+    )[0]
+    assert "cancel_section" not in save_failure
+    assert "只保留现场诊断" in save_failure
     assert 'report["status"] = "persisted_partial"' in source
     assert "仅该字段失败，继续处理同 section 的其他字段" in source

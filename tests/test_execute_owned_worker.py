@@ -29,7 +29,9 @@ def test_owned_execute_calls_business_executor_inside_same_transport_lane(monkey
         events.append(("execute", 9222))
         return 0
 
-    monkeypatch.setattr(owned, "execute_main", execute)
+    # The canonical host calls the photo-guarded business executor module in
+    # process (``_executor.main``), not a separately imported ``main`` alias.
+    monkeypatch.setattr(owned._executor, "main", execute)
     monkeypatch.setattr(owned.sys, "argv", ["makro_execute_owned.py", "--cdp-port", "9222"])
 
     assert owned.main() == 0
@@ -45,8 +47,8 @@ def test_owned_execute_never_calls_executor_for_poisoned_generation(monkeypatch)
     )
     monkeypatch.setattr(owned, "poison_matches_current_generation", lambda _port: True)
     monkeypatch.setattr(
-        owned,
-        "execute_main",
+        owned._executor,
+        "main",
         lambda: (_ for _ in ()).throw(AssertionError("executor must not run")),
     )
     monkeypatch.setattr(owned.sys, "argv", ["makro_execute_owned.py", "--cdp-port", "9333"])

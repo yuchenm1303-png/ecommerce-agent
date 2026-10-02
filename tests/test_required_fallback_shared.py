@@ -25,9 +25,11 @@ def _field(*, help_text: str) -> dict:
         "required": True,
         "multi_value": False,
         "options": [],
-        "qualifier_options": ["cm"],
+        "qualifier_options": [],
         "help_text": help_text,
         "context_text": "",
+        # A unit qualifier only exists as a live qualifier control; the fallback
+        # copies its first enabled option, never a schema-level guess.
         "controls": [
             {
                 "id": "length",
@@ -35,7 +37,12 @@ def _field(*, help_text: str) -> dict:
                 "type": "number",
                 "inputmode": "decimal",
                 "field_kind": "input",
-            }
+            },
+            {
+                "name": "length_qualifier",
+                "field_kind": "select",
+                "options": [{"text": "cm", "value": "cm", "disabled": False}],
+            },
         ],
     }
 

@@ -65,8 +65,11 @@ def test_pool_contract_allows_practical_best_available_fit() -> None:
     rules = " ".join(request["rules"]).casefold()
     system = request["system_instruction"].casefold()
     assert "best_available_fit" in rules
-    assert "closest practical category" in system
-    assert "marketplace operator would most reasonably use" in rules
+    assert "closest practical class for the sold product" in rules
+    # The current live candidate set is authoritative; the AI may return none so
+    # the caller continues the retrieval ladder instead of forcing a fit.
+    assert "current live candidate set is authoritative" in system
+    assert "never invent a vertical" in system
     assert "same_product_type -> broader_valid_class -> best_available_fit -> none" in rules
 
 

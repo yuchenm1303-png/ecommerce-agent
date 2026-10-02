@@ -168,7 +168,17 @@ def test_execution_contract_uses_live_dom_but_preserves_registry_family_metadata
         execution_family="numeric_qualified",
     )
     answer = resolved("depth", ["12.5"], qualifier="cm")
-    field["controls"].append(control("depth_0_qualifier", kind="select"))
+    # A selectable qualifier is executable only with captured enabled options.
+    field["controls"].append(
+        control(
+            "depth_0_qualifier",
+            kind="select",
+            options=[
+                {"text": "cm", "value": "cm", "disabled": False},
+                {"text": "mm", "value": "mm", "disabled": False},
+            ],
+        )
+    )
     contract = execution_contract(field, answer)
     assert contract.live_family == "numeric_qualified"
     assert contract.schema_family == "numeric_qualified"
@@ -227,7 +237,13 @@ def test_native_select_rejects_stale_metadata_before_select_option():
 
 
 def test_custom_dropdown_refuses_ambiguous_visible_exact_option_instead_of_clicking_last():
-    c = control("colour_0_value", kind="dropdown")
+    # The value belongs to the captured option domain; the ambiguity is purely in
+    # the rendered popup, which must not be resolved by clicking the last match.
+    c = control(
+        "colour_0_value",
+        kind="dropdown",
+        options=[{"text": "Black", "value": "Black", "disabled": False}],
+    )
     trigger = Locator()
     first = Locator(text="Black")
     second = Locator(text="Black")

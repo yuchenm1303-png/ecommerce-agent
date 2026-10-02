@@ -52,5 +52,6 @@ def test_full_gallery_rerun_is_already_persisted(monkeypatch, tmp_path: Path) ->
     assert report["staged"] == 0
     assert report["save_attempted"] is False
     assert report["saved"] is False
-    assert report["restored_collapsed_state"] is True
+    assert report["restored_collapsed_state_after_inspection"] is True
+    assert report["request_status"] == "skipped_no_capacity"
     assert adapter.cancelled is True

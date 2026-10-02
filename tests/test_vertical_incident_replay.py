@@ -41,19 +41,34 @@ def test_dyson_incident_selects_current_live_row_and_never_replays_owner_query(m
     )
 
     monkeypatch.setattr(vertical_selection, "plan_vertical_search_terms", lambda *_args: planned)
+    # Execution probes broad -> specific and keeps the canonical product type
+    # ("electric hair curler") as the final, most precise query.
+    executed = (
+        "hair curler",
+        "Dyson Airwrap",
+        "Dyson curling iron set",
+        "Dyson hot air styler",
+        "Dyson Airwrap multi-styler long",
+        "Dyson Airwrap HS05 Complete Long",
+        "electric hair curler",
+    )
+    selection_made: list[str] = []
 
     def run_query(_page, term, *, wait_ms):
         _ = wait_ms
+        if selection_made:
+            raise AssertionError("no query may run after the AI selected a current live row")
         calls.append(term)
-        if term == "hair curler":
-            raise AssertionError("the query after the AI selection must never run")
         rows = [selected, unrelated] if term == "electric hair curler" else [unrelated]
         return rows, search
 
     def choose(_provider, _hints, terms, _candidates):
         term = terms[0]
         decisions.append(term)
-        return selected if term == "electric hair curler" else ""
+        if term == "electric hair curler":
+            selection_made.append(term)
+            return selected
+        return ""
 
     monkeypatch.setattr(vertical_selection, "_run_vertical_search_query", run_query)
     monkeypatch.setattr(vertical_selection, "choose_vertical_candidate_pool", choose)
@@ -79,10 +94,11 @@ def test_dyson_incident_selects_current_live_row_and_never_replays_owner_query(m
     )
 
     assert resolved == "electric_hair_curler"
-    assert terms == planned
-    assert calls == list(planned[:6])
-    assert decisions == list(planned[:6])
+    assert terms == executed
+    assert calls == list(executed)
+    assert decisions == list(executed)
+    # The owner query that produced the selection runs exactly once and is never
+    # replayed to re-judge or re-bind the chosen row.
     assert calls.count("electric hair curler") == 1
-    assert "hair curler" not in calls
     assert selected in observed
     assert clicked == [selected]

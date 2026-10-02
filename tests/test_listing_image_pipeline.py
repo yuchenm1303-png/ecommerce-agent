@@ -27,6 +27,7 @@ class _Provider:
 
 
 def _image(path: Path, size: tuple[int, int], colour: tuple[int, int, int]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", size, colour).save(path)
     return path.resolve()
 
@@ -89,22 +90,37 @@ def _responses() -> dict[str, dict[str, object]]:
             "confidence": 0.99,
             "evidence_refs": ["identity:page-title"],
         },
-        "classify_supplier_listing_image_ownership": {
-            "decisions": {
+        # Stage 2: target-blind perception of candidate pixels.
+        "observe_supplier_listing_images_blind": {
+            "facts": {
                 "image_01": {
                     "visual_subject": "bag of garden fertilizer",
-                    "visible_identity": "Acme",
-                    "visible_configuration": "20 kg fertilizer bag",
-                    "target_match_evidence": "Acme fertilizer bag and 20 kg configuration",
+                    "readable_identity": "Acme; 20 kg",
+                    "raw_colour_materials": "printed plastic sack",
+                    "design_configuration": "single sealed 20 kg fertilizer bag",
+                    "neutral_product_guess": "Acme garden fertilizer",
+                    "visual_uncertainty": "",
+                    "presentation_quality": "clear front product view",
+                }
+            },
+            "summary": "target-blind observations",
+        },
+        # Stage 3: compare the frozen blind facts with the grounded target.
+        "compare_blind_image_facts_to_target": {
+            "decisions": {
+                "image_01": {
+                    "target_conflicts": "",
+                    "target_match_evidence": "Frozen Acme 20 kg fertilizer bag facts establish the exact target sale unit.",
                     "target_identity_gaps": "",
                     "classification": "EXACT_TARGET",
                     "confidence": 0.99,
-                    "reason": "The pixels establish the exact target sale unit.",
+                    "reason": "Exact target supported by frozen facts.",
                 }
             },
             "summary": "One exact target image.",
         },
-        "verify_and_order_exact_supplier_gallery": {
+        # Stage 4: order the identity-approved gallery.
+        "order_identity_approved_supplier_gallery": {
             "selected_image_ids": ["image_01"],
             "decisions": {
                 "image_01": {
@@ -133,10 +149,12 @@ def test_undersized_supplier_image_is_removed_before_semantic_ranking(tmp_path: 
 
     assert result.selected == (good,)
     assert result.mechanically_rejected_count == 1
-    assert result.model_calls == 3
-    assert provider.calls == 3
-    ownership_sources = provider.requests[1]["grounded_sources"]
-    assert [Path(item["image_path"]) for item in ownership_sources] == [good]
+    assert result.model_calls == 4
+    assert provider.calls == 4
+    # Only the mechanically eligible image reaches the pixel-reading (blind) stage.
+    assert provider.requests[1]["task"] == "observe_supplier_listing_images_blind"
+    perception_sources = provider.requests[1]["grounded_sources"]
+    assert [Path(item["image_path"]) for item in perception_sources] == [good]
 
     report = json.loads((run_dir / "listing-image-selection.json").read_text(encoding="utf-8"))
     rejected = report["marketplace_mechanical_rejected"]
@@ -162,7 +180,7 @@ def test_hot_run_reuses_exact_cold_image_semantics_across_different_paths(tmp_pa
         cold_provider,
         cache_dir=cache_dir,
     )
-    assert cold_result.model_calls == 3
+    assert cold_result.model_calls == 4
 
     hot_provider = _Provider()
     hot_result = run_supplier_listing_image_pipeline(
@@ -173,10 +191,10 @@ def test_hot_run_reuses_exact_cold_image_semantics_across_different_paths(tmp_pa
 
     assert hot_provider.calls == 0
     assert hot_result.model_calls == 0
-    assert hot_result.cache_hits == 3
-    assert hot_result.request_count == 3
+    assert hot_result.cache_hits == 4
+    assert hot_result.request_count == 4
     assert hot_result.selected == (hot_image,)
     manifest = json.loads((hot / "run-manifest.json").read_text(encoding="utf-8"))
     assert manifest["listing_image_ranking"]["model_calls"] == 0
-    assert manifest["listing_image_ranking"]["cache_hits"] == 3
+    assert manifest["listing_image_ranking"]["cache_hits"] == 4
     assert manifest["total_model_calls"] == 5

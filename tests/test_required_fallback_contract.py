@@ -22,7 +22,22 @@ ROOT = Path(__file__).resolve().parents[1]
 GUI_SOURCE = (ROOT / "gui" / "required_input_support.py").read_text(encoding="utf-8")
 
 
+def _text_control(key: str) -> dict:
+    return {"id": key, "name": f"{key}_0_value", "type": "text", "field_kind": "input"}
+
+
+def _select_control(key: str, options: list[str]) -> dict:
+    return {
+        "id": key,
+        "name": f"{key}_0_value",
+        "field_kind": "select",
+        "options": [{"text": item, "value": item, "disabled": False} for item in options],
+    }
+
+
 def _field(**updates):
+    # Required fallback is derived only from the observed live execution
+    # contract, so every fixture carries the live control a DOM scan produces.
     field = {
         "attribute_key": "required_note",
         "label": "Required Note",
@@ -33,10 +48,19 @@ def _field(**updates):
         "qualifier_options": [],
         "help_text": "",
         "context_text": "",
-        "controls": [],
+        "controls": [_text_control("required_note")],
     }
     field.update(updates)
     return field
+
+
+def _colour_field() -> dict:
+    return _field(
+        attribute_key="colour",
+        label="Colour",
+        options=["Orange", "Black"],
+        controls=[_select_control("colour", ["Orange", "Black"])],
+    )
 
 
 def _blocked_item(field):
@@ -81,7 +105,22 @@ def test_numeric_or_unit_required_gap_uses_one():
         _field(
             attribute_key="package_weight",
             label="Package Weight",
-            qualifier_options=["kg", "g"],
+            controls=[
+                {
+                    "id": "package_weight",
+                    "name": "package_weight_0_value",
+                    "type": "number",
+                    "field_kind": "input",
+                },
+                {
+                    "name": "package_weight_0_qualifier",
+                    "field_kind": "select",
+                    "options": [
+                        {"text": "kg", "value": "kg", "disabled": False},
+                        {"text": "g", "value": "g", "disabled": False},
+                    ],
+                },
+            ],
         )
     )
 
@@ -96,6 +135,7 @@ def test_select_required_gap_uses_first_real_live_option():
             attribute_key="colour",
             label="Colour",
             options=["Select One", "Orange", "Black"],
+            controls=[_select_control("colour", ["Select One", "Orange", "Black"])],
         )
     )
 
@@ -140,12 +180,14 @@ def test_selection_without_executable_option_fails_closed():
         ],
     )
 
-    with pytest.raises(RequiredOverrideError, match="selection 控件"):
+    # A selection contract without any enabled option is unsupported, so the
+    # fallback fails closed before choosing anything.
+    with pytest.raises(RequiredOverrideError, match="live execution contract 不受支持"):
         required_fallback_override(field)
 
 
 def test_fallback_promotes_only_ai_missing_required_field():
-    live = _field(attribute_key="colour", label="Colour", options=["Orange", "Black"])
+    live = _colour_field()
     item = _blocked_item(live)
     plan = LiveFillPlan([item])
 
@@ -160,7 +202,7 @@ def test_fallback_promotes_only_ai_missing_required_field():
 
 
 def test_ai_ready_is_never_replaced_by_fallback():
-    live = _field(attribute_key="colour", label="Colour", options=["Orange", "Black"])
+    live = _colour_field()
     item = _blocked_item(live)
     item.action = READY
     item.reason = "AI READY authoritative"
@@ -182,7 +224,7 @@ def test_ai_ready_is_never_replaced_by_fallback():
 
 
 def test_explicit_user_value_still_wins_for_ai_missing_required_field():
-    live = _field(attribute_key="colour", label="Colour", options=["Orange", "Black"])
+    live = _colour_field()
     item = _blocked_item(live)
     plan = LiveFillPlan([item])
 
@@ -201,7 +243,14 @@ def test_explicit_user_value_still_wins_for_ai_missing_required_field():
 
 
 def test_persisted_fallback_is_recomputed_from_current_live_field():
-    live = _field(attribute_key="model_name", label="Model Name")
+    # NOTE: AGENTS.md lists Model Name as a protected required field (no generic
+    # N/A fallback), but allow_required_fallback() currently admits every required
+    # field. This pins the current runtime behaviour until that policy is settled.
+    live = _field(
+        attribute_key="model_name",
+        label="Model Name",
+        controls=[_text_control("model_name")],
+    )
     item = _blocked_item(live)
     plan = LiveFillPlan([item])
     persisted = {

@@ -72,16 +72,18 @@ def test_taxonomy_path_contract_is_one_atomic_selection_key() -> None:
     assert schema["required"] == ["selection_key"]
     assert set(schema["properties"]) == {"selection_key"}
     choices = schema["properties"]["selection_key"]["enum"]
+    # Speculative best_available_branch is the lowest-priority relation: genuine
+    # same-type/ancestor/superclass relations strictly outrank it.
     assert choices == [
         "none",
         "ancestor_branch:node_0",
         "ancestor_branch:node_1",
-        "best_available_branch:node_0",
-        "best_available_branch:node_1",
         "same_product_type:node_0",
         "same_product_type:node_1",
         "broader_valid_class:node_0",
         "broader_valid_class:node_1",
+        "best_available_branch:node_0",
+        "best_available_branch:node_1",
     ]
     assert all(not choice.startswith("none:") for choice in choices)
     assert request["context"]["live_node_options"] == [
@@ -91,7 +93,10 @@ def test_taxonomy_path_contract_is_one_atomic_selection_key() -> None:
     rules = " ".join(request["rules"]).casefold()
     assert "atomic" in rules
     assert "best_available_branch" in rules
-    assert "physical containment alone" in rules
+    assert "best_available_branch is not permitted" in rules
+    # Physical association (stored in / placed inside / used with ...) is not
+    # evidence for a category branch.
+    assert "placed inside" in rules
 
 
 def test_taxonomy_reconciliation_preserves_independent_evidence_without_splitting_atomic_decision() -> None:

@@ -39,7 +39,8 @@ class _SaveRejectingPhotoAdapter:
         }
 
     def upload_product_photos(self, paths: list[str], *, timeout_ms: int):
-        assert self.expanded
+        # Like the real uploader, each image transaction opens the section itself.
+        self.expanded = True
         assert timeout_ms > 0
         return SimpleNamespace(
             as_dict=lambda: {
@@ -64,6 +65,9 @@ class _SaveRejectingPhotoAdapter:
         self.cancel_calls += 1
         self.expanded = False
 
+    def cancel_product_photos(self) -> None:
+        self.cancel_section(PRODUCT_PHOTOS)
+
 
 def test_photo_save_failure_discards_the_open_unsaved_transaction(tmp_path: Path) -> None:
     image = tmp_path / "photo.jpg"
@@ -78,8 +82,18 @@ def test_photo_save_failure_discards_the_open_unsaved_transaction(tmp_path: Path
         run_dir=tmp_path,
     )
 
-    assert report["status"] == "save_failed"
+    # Image-owned transactions: the rejected Save is reconciled from Makro's
+    # persisted counter; the open unsaved transaction is discarded and nothing
+    # is reported as persisted.
+    assert report["status"] == "incomplete_upload"
     assert report["saved"] is False
-    assert report["cancelled_unsaved_after_failure"] is True
-    assert adapter.cancel_calls == 1
+    assert report["persisted_this_run"] == 0
+    failure = report["save_failures"][0]
+    assert failure["error"] == "Makro rejected photo Save"
+    assert failure["recovery"]["cancelled_open_transaction"] is True
+    assert failure["recovery"]["status"] == "clean_no_commit"
+    assert [item["status"] for item in report["items"]] == ["save_failed"]
+    # One Cancel restores the collapsed state after inspection, one discards the
+    # rejected image transaction.
+    assert adapter.cancel_calls == 2
     assert adapter.expanded is False

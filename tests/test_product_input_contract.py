@@ -10,7 +10,8 @@ from app.product_input import validate_product_input
 
 def _manifest(tmp_path: Path, reference: str) -> Path:
     bootstrap = tmp_path / "bootstrap-source.json"
-    bootstrap.write_text("{}", encoding="utf-8")
+    # A product pack must retain at least some usable text or image evidence.
+    bootstrap.write_text(json.dumps({"visible_text": "M8 dash camera"}), encoding="utf-8")
     path = tmp_path / "product-pack.json"
     path.write_text(
         json.dumps(

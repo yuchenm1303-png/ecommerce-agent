@@ -4,9 +4,16 @@ from app.ai_decisions import AIDecisionPacket, FieldDecision, MISSING, READY, fi
 from app.best_effort_inference import build_best_effort_inference_request
 from app.compact_evidence import CompactEvidence
 from app.evidence_contract import ProductIdentity
-from app.fill_plan import GATE_HARD_FIELD_CONSTRAINT, _decision_record, _hard_guard_values
+from app.fill_plan import (
+    BLOCKED,
+    GATE_HARD_FIELD_CONSTRAINT,
+    _decision_record,
+    _hard_guard_values,
+    build_live_fill_plan,
+)
 from app.live_schema import live_schema_payload
 from app.product_facts import build_product_fact_request
+from app.source_bundle import ProductSourceBundle
 
 
 def _numeric_unit_field() -> dict:
@@ -95,10 +102,26 @@ def test_numeric_hard_guard_still_blocks_composite_text() -> None:
         confidence=1.0,
     )
 
-    record = _decision_record(field, decision)
+    # The decision record preserves the AI answer exactly; the mechanical numeric
+    # guard is the live execution contract applied when the Fill Plan is built.
+    assert _decision_record(field, decision).answer_values == ["5V/2A"]
+    plan = build_live_fill_plan(
+        AIDecisionPacket(
+            identity=ProductIdentity(),
+            schema_sha256="",
+            source_manifest_sha256="",
+            decisions=[decision],
+        ),
+        [field],
+        ProductSourceBundle(),
+    )
+    item = plan.items[0]
+    record = item.resolution
 
+    assert item.action == BLOCKED
     assert record.gate_reason == GATE_HARD_FIELD_CONSTRAINT
     assert record.eligible_for_autofill is False
+    assert record.answer_values == ["5V/2A"]
     assert "不是有限数字" in record.detail
 
 
@@ -124,7 +147,7 @@ def test_direct_product_fact_contract_requires_single_value_and_real_qualifiers(
     assert "multi_value=false" in rules
     assert "exactly one value string" in rules
     assert "qualifier is only the marketplace unit/qualifier" in rules
-    assert "bare finite number" in rules
+    assert "family=numeric requires bare finite numeric values" in rules
 
 
 def test_best_effort_contract_exposes_false_multi_value_and_numeric_unit_shape() -> None:

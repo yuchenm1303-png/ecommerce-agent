@@ -39,20 +39,37 @@ def _identity() -> dict[str, object]:
     }
 
 
-def _ownership(classification: str = "EXACT_TARGET") -> dict[str, object]:
+def _blind_facts() -> dict[str, object]:
+    def fact(view: str) -> dict[str, str]:
+        return {
+            "visual_subject": "cordless drill kit",
+            "readable_identity": "18V",
+            "raw_colour_materials": "grey plastic body",
+            "design_configuration": "pistol-grip drill with battery",
+            "neutral_product_guess": "18V cordless drill kit",
+            "visual_uncertainty": "",
+            "presentation_quality": view,
+        }
+
     return {
-        "decisions": {
-            "image_01": {
-                "classification": classification,
-                "confidence": 0.98,
-                "reason": "ownership decision for image 1",
-            },
-            "image_02": {
-                "classification": classification,
-                "confidence": 0.97,
-                "reason": "ownership decision for image 2",
-            },
-        },
+        "facts": {"image_01": fact("hero view"), "image_02": fact("alternate angle")},
+        "summary": "target-blind observations",
+    }
+
+
+def _ownership(classification: str = "EXACT_TARGET") -> dict[str, object]:
+    def decision(index: int, confidence: float) -> dict[str, object]:
+        return {
+            "target_conflicts": "",
+            "target_match_evidence": f"Frozen facts for image {index} establish the 18V drill kit.",
+            "target_identity_gaps": "",
+            "classification": classification,
+            "confidence": confidence,
+            "reason": f"ownership decision for image {index}",
+        }
+
+    return {
+        "decisions": {"image_01": decision(1, 0.98), "image_02": decision(2, 0.97)},
         "summary": "ownership pass complete",
     }
 
@@ -115,6 +132,7 @@ def test_final_gallery_may_be_empty_without_a_recall_biased_rescue_pass(tmp_path
     provider = _SequenceProvider(
         [
             _identity(),
+            _blind_facts(),
             _ownership(),
             _ranking([], reason="No candidate is safe enough for automatic upload."),
         ]
@@ -124,11 +142,12 @@ def test_final_gallery_may_be_empty_without_a_recall_biased_rescue_pass(tmp_path
 
     assert result.selected == ()
     assert result.status == "ai_ranked_empty"
-    assert result.model_calls == 3
+    assert result.model_calls == 4
     assert [request["task"] for request in provider.requests] == [
         "infer_grounded_supplier_product_identity",
-        "classify_supplier_listing_image_ownership",
-        "verify_and_order_exact_supplier_gallery",
+        "observe_supplier_listing_images_blind",
+        "compare_blind_image_facts_to_target",
+        "order_identity_approved_supplier_gallery",
     ]
     assert all(request["task"] != "confirm_empty_supplier_listing_gallery" for request in provider.requests)
 
@@ -136,7 +155,7 @@ def test_final_gallery_may_be_empty_without_a_recall_biased_rescue_pass(tmp_path
     assert manifest["outputs"]["primary_source_listing_images"] == []
     assert manifest["listing_image_ranking"]["status"] == "ai_ranked_empty"
     assert manifest["listing_image_ranking"]["precision_first"] is True
-    assert manifest["total_model_calls"] == 3
+    assert manifest["total_model_calls"] == 4
 
 
 def test_semantic_ai_failure_clears_old_mechanical_gallery_before_raising(tmp_path: Path) -> None:

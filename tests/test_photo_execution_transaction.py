@@ -93,6 +93,11 @@ class FakePhotoAdapter:
         self.cancel_calls += 1
         self.expanded = False
 
+    def cancel_product_photos(self) -> None:
+        # Mirrors MakroDomainAdapter: the explicit Product Photos Cancel used for
+        # image-transaction recovery delegates to the canonical section Cancel.
+        self.cancel_section(PRODUCT_PHOTOS)
+
 
 def _image(tmp_path: Path, name: str) -> str:
     path = tmp_path / name
@@ -140,7 +145,15 @@ def test_later_uncertain_image_cannot_erase_an_earlier_persisted_image(tmp_path:
     assert report["final_count"] == 1
     assert report["saved"] is True
     assert report["request_complete"] is False
-    assert str(Path(images[1]).resolve()) in report["cancelled_image_transactions"]
+    # The failed image cancelled only its own open transaction, and Makro's
+    # persisted counter proved it committed nothing.
+    recovery = report["recovery_attempts"][-1]
+    assert recovery["path"] == str(Path(images[1]).resolve())
+    assert recovery["cancelled_open_transaction"] is True
+    assert recovery["baseline_count"] == 1
+    assert recovery["observed_count"] == 1
+    assert recovery["status"] == "clean_no_commit"
+    assert adapter.expanded is False
 
 
 def test_capacity_omission_never_rolls_back_the_last_available_slot(tmp_path: Path) -> None:

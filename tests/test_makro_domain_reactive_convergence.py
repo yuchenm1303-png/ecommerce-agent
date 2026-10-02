@@ -16,11 +16,20 @@ class _Page:
 
 
 def _field(marker: str) -> dict[str, object]:
+    # Numeric value + live unit qualifier (numeric_qualified): the adapter keeps
+    # the approved qualifier separate instead of serializing it into the value.
     return {
         "attribute_key": "breadth",
         "label": "Breadth",
         "section_heading": "Price, Stock and Shipping Information",
-        "controls": [{"name": f"breadth_{marker}_value", "field_kind": "input"}],
+        "controls": [
+            {"name": f"breadth_{marker}_value", "field_kind": "input", "type": "number"},
+            {
+                "name": f"breadth_{marker}_qualifier",
+                "field_kind": "select",
+                "options": [{"text": "cm", "value": "cm", "disabled": False}],
+            },
+        ],
     }
 
 

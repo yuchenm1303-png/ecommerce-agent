@@ -26,7 +26,15 @@ def test_field_telemetry_is_observability_only_not_a_second_decision_gate() -> N
         "    def verify_resolved_field(", 1
     )[0]
     assert "_ensure_answer_value_slots(" in block
-    assert "if verification.status" not in block
+    # The only status branches are the bounded React-rerender reconvergence loop:
+    # it re-applies the exact same approved answer and never changes the plan.
+    assert "max_attempts = 3 if section_path else 1" in block
+    assert 'if verification.status == "validated":' in block
+    assert "if attempt >= max_attempts or verification.status not in {" in block
+    assert block.count("constrained_answer = self._constrained_execution_answer(") == 1
+    assert block.index("constrained_answer = self._constrained_execution_answer(") < block.index(
+        "for attempt in range(1, max_attempts + 1):"
+    )
     assert "skip" not in block.casefold()
     assert "READY" not in block
     assert "BLOCKED" not in block

@@ -87,7 +87,17 @@ def test_strict_complete_run_without_field_issues_is_success():
         }
     ]
 
-    outcome = _execution_outcome(reports, None, _completion(complete=True))
+    # Product Photos are mandatory for a persistable listing: the canonical
+    # execution host (makro_execute_owned) installs a photo guard on this
+    # executor, so a strict success also carries a persisted gallery.
+    photo_report = {
+        "requested": 1,
+        "status": "persisted_verified",
+        "final_count": 1,
+        "persistence": {"status": "persisted_verified", "final_count": 1},
+    }
+
+    outcome = _execution_outcome(reports, photo_report, _completion(complete=True))
 
     assert outcome["status"] == "success"
     assert outcome["process_success"] is True

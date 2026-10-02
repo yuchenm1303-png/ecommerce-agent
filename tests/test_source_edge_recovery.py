@@ -5,14 +5,41 @@ from types import SimpleNamespace
 import pytest
 
 import app.source_capture as source_capture
+from app.source_snapshot import SnapshotTableRow, SourceSnapshot
 
 
 PRODUCT_URL = "https://detail.1688.com/offer/123456789.html"
 
 
+def _accepted_capture(tmp_path) -> source_capture.CapturedProductSource:
+    """A complete supplier capture: semantic evidence and listing media are ready,
+    so the post-capture acceptance/media-recovery steps never touch a browser."""
+
+    snapshot = SourceSnapshot(
+        requested_url=PRODUCT_URL,
+        final_url=PRODUCT_URL,
+        title="fixture product",
+        captured_at="2026-09-23T00:00:00+00:00",
+        visible_text="x" * 4_878,
+        table_rows=[
+            SnapshotTableRow(key=f"k{index}", value=f"v{index}", table_index=1, row_index=index + 1)
+            for index in range(22)
+        ],
+        embedded_data=["embedded-0"],
+    )
+    return source_capture.CapturedProductSource(
+        snapshot_path=tmp_path / "source-snapshot.json",
+        screenshot_path=tmp_path / "source-page.png",
+        snapshot=snapshot,
+        launched_now=False,
+        product_image_paths=(tmp_path / "source-image-01.jpg",),
+        cache_hit=False,
+    )
+
+
 def test_source_edge_rotates_once_only_for_cdp_transport_failure(monkeypatch, tmp_path) -> None:
     calls: list[str] = []
-    captured = SimpleNamespace(cache_hit=False)
+    captured = _accepted_capture(tmp_path)
 
     def capture_once(*_args, **_kwargs):
         calls.append("capture")

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sys
 
+from PIL import Image
+
 import makro_resolve_ai
 import app.resolver_pipeline as resolver_pipeline
 from app.live_schema import write_live_schema
@@ -61,7 +63,9 @@ def _fake_capture(tmp_path):
     screenshot_path.write_bytes(b"fake-page-image")
     detail = capture_dir / "product-images" / "source-image-01.jpg"
     detail.parent.mkdir(parents=True, exist_ok=True)
-    detail.write_bytes(b"fake-detail-image")
+    # Undecodable bytes are now isolated before any model call, so the evidence
+    # image must be a real raster for the image-evidence request to happen.
+    Image.new("RGB", (64, 64), (200, 200, 200)).save(detail, format="JPEG")
     return AcquiredProductInput(
         mode="supplier_url",
         product_reference_url=PRODUCT_URL,

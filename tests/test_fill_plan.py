@@ -17,9 +17,11 @@ from app.fill_plan import (
     GATE_AI_MISSING,
     GATE_AI_REVIEW,
     GATE_BUSINESS_LOCKED,
+    GATE_HARD_FIELD_CONSTRAINT,
     READY,
     build_live_fill_plan,
 )
+from app.live_schema import live_schema_payload
 from app.source_bundle import ProductSourceBundle
 
 
@@ -45,6 +47,32 @@ def field(
         "qualifier_options": list(qualifier_options),
         "context_text": context_text,
         "controls": list(controls),
+    }
+
+
+# A value becomes READY only when the observed live execution contract admits it,
+# so executable fixtures carry the live controls a real Makro DOM scan produces.
+def select_control(key: str, options: tuple[str, ...]) -> dict:
+    return {
+        "id": key,
+        "name": f"{key}_0_value",
+        "field_kind": "select",
+        "options": [{"text": item, "value": item, "disabled": False} for item in options],
+    }
+
+
+def text_control(key: str) -> dict:
+    return {"id": key, "name": f"{key}_0_value", "type": "text", "field_kind": "input"}
+
+
+def number_control(key: str, **extra) -> dict:
+    return {
+        "id": key,
+        "name": f"{key}_0_value",
+        "type": "number",
+        "inputmode": "decimal",
+        "field_kind": "input",
+        **extra,
     }
 
 
@@ -92,7 +120,12 @@ def add_structured(bundle: ProductSourceBundle, key: str, value: str):
 
 
 def test_ai_ready_is_authoritative_and_flows_directly_to_fill_plan():
-    colour = field("colour", "Colour", options=("Black", "White"))
+    colour = field(
+        "colour",
+        "Colour",
+        options=("Black", "White"),
+        controls=(select_control("colour", ("Black", "White")),),
+    )
     plan = build_live_fill_plan(
         packet([colour], [decision(colour, AI_READY, ("Black",))]),
         [colour],
@@ -106,7 +139,9 @@ def test_ai_ready_is_authoritative_and_flows_directly_to_fill_plan():
     assert item.resolution.eligible_for_autofill is True
 
 
-def test_ai_ready_is_not_overruled_by_later_live_option_domain():
+def test_ai_ready_outside_live_option_domain_is_blocked_without_rewrite():
+    # The live option domain is a mechanical hard guard: Python never maps the
+    # AI answer onto a "close" option, it keeps the answer and blocks the write.
     colour = field(
         "colour",
         "Colour",
@@ -128,61 +163,86 @@ def test_ai_ready_is_not_overruled_by_later_live_option_domain():
         ProductSourceBundle(),
     )
 
-    assert plan.items[0].action == READY
-    assert plan.items[0].resolution.answer_values == ["Dark"]
-    assert plan.items[0].resolution.gate_reason == ""
+    item = plan.items[0]
+    assert item.action == BLOCKED
+    assert item.resolution.gate_reason == GATE_HARD_FIELD_CONSTRAINT
+    assert item.resolution.eligible_for_autofill is False
+    assert item.resolution.answer_values == ["Dark"]
+    assert "live execution contract" in item.reason
 
 
-def test_ai_ready_preserves_multiple_values_without_python_semantic_veto():
-    feature = field("feature", "Feature", multi_value=False)
+def test_single_value_field_blocks_multiple_ai_values_without_rewrite():
+    feature = field(
+        "feature",
+        "Feature",
+        multi_value=False,
+        controls=(text_control("feature"),),
+    )
     plan = build_live_fill_plan(
         packet([feature], [decision(feature, AI_READY, ("A", "B"))]),
         [feature],
         ProductSourceBundle(),
     )
 
-    assert plan.items[0].action == READY
-    assert plan.items[0].resolution.answer_values == ["A", "B"]
+    item = plan.items[0]
+    assert item.action == BLOCKED
+    assert item.resolution.gate_reason == GATE_HARD_FIELD_CONSTRAINT
+    assert item.resolution.answer_values == ["A", "B"]
 
 
-def test_ai_ready_preserves_qualifier_exactly_without_unit_conversion():
+def test_ai_qualifier_is_never_unit_converted_to_fit_a_fixed_unit():
     weight = field(
         "weight",
         "Weight",
         context_text="Weight *KG",
         controls=({"type": "number", "inputmode": "decimal", "context_text": "Weight *KG"},),
     )
-    plan = build_live_fill_plan(
+    converted_unit = build_live_fill_plan(
         packet([weight], [decision(weight, AI_READY, ("285",), qualifier="g")]),
         [weight],
         ProductSourceBundle(),
     )
 
-    item = plan.items[0]
-    assert item.action == READY
-    assert item.resolution.answer_values == ["285"]
-    assert item.resolution.qualifier == "g"
+    blocked = converted_unit.items[0]
+    assert blocked.action == BLOCKED
+    assert blocked.resolution.gate_reason == GATE_HARD_FIELD_CONSTRAINT
+    assert blocked.resolution.answer_values == ["285"]
+    assert blocked.resolution.qualifier == "g"
+
+    same_unit = build_live_fill_plan(
+        packet([weight], [decision(weight, AI_READY, ("0.285",), qualifier="kg")]),
+        [weight],
+        ProductSourceBundle(),
+    )
+
+    ready = same_unit.items[0]
+    assert ready.action == READY
+    assert ready.resolution.answer_values == ["0.285"]
+    assert ready.resolution.qualifier == "kg"
 
 
 def test_ai_ready_survives_schema_only_to_full_dom_rebind_unchanged():
-    planned = field("bluetooth_range", "Bluetooth Range")
-    resolved = decision(planned, AI_READY, ("33",), qualifier="Feet")
-    first = build_live_fill_plan(packet([planned], [resolved]), [planned], ProductSourceBundle())
-
-    current = {
-        **planned,
-        "controls": [
+    current = field(
+        "bluetooth_range",
+        "Bluetooth Range",
+        controls=(
+            number_control("bluetooth_range", min="0", max="1000"),
             {
-                "id": "bluetooth_range",
-                "name": "bluetooth_range_0_value",
-                "type": "number",
-                "inputmode": "decimal",
-                "field_kind": "input",
-                "min": "0",
-                "max": "1000",
-            }
-        ],
-    }
+                "name": "bluetooth_range_0_qualifier",
+                "field_kind": "select",
+                "options": [
+                    {"text": "Feet", "value": "Feet", "disabled": False},
+                    {"text": "Meter", "value": "Meter", "disabled": False},
+                ],
+            },
+        ),
+    )
+    # The planner-side schema field carries only the frozen execution contract.
+    planned = live_schema_payload([current])["fields"][0]
+    assert "controls" not in planned
+    resolved = decision(planned, AI_READY, ("33",), qualifier="Feet")
+
+    first = build_live_fill_plan(packet([planned], [resolved]), [planned], ProductSourceBundle())
     second = build_live_fill_plan(packet([current], [resolved]), [current], ProductSourceBundle())
 
     assert first.items[0].action == READY
@@ -230,6 +290,7 @@ def test_business_field_still_requires_explicit_seller_data():
         "flipkart_selling_price",
         "Your selling price",
         section="Price, Stock and Shipping Information",
+        controls=(number_control("flipkart_selling_price"),),
     )
     guessed = decision(selling, AI_READY, ("899",))
 
@@ -253,11 +314,17 @@ def test_business_field_still_requires_explicit_seller_data():
 
 
 def test_selling_price_above_mrp_blocks_only_explicit_business_fields():
-    mrp = field("mrp", "Base Price", section="Price, Stock and Shipping Information")
+    mrp = field(
+        "mrp",
+        "Base Price",
+        section="Price, Stock and Shipping Information",
+        controls=(number_control("mrp"),),
+    )
     selling = field(
         "flipkart_selling_price",
         "Your selling price",
         section="Price, Stock and Shipping Information",
+        controls=(number_control("flipkart_selling_price"),),
     )
     bundle = ProductSourceBundle()
     add_structured(bundle, "Base Price", "800")
