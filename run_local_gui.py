@@ -74,9 +74,7 @@ def main() -> int:
         from PySide6.QtQuick import QQuickWindow
         from PySide6.QtWidgets import (
             QApplication,
-            QAbstractScrollArea,
             QLabel,
-            QSizePolicy,
             QVBoxLayout,
             QWidget,
         )
@@ -206,7 +204,6 @@ def main() -> int:
     from gui.channel_account_browser import install_managed_makro_browser
     from gui.card_details_fast import install_card_details
     from gui.click_fireworks import install_click_fireworks
-    from gui.console_summary_mode import install_console_summary_mode
     from gui.crash_diagnostics_ui import offer_pending_crash_report
     from gui.field_table_transfer import install_field_table_transfer
     from gui.frozen_process_router import install_frozen_process_router
@@ -219,7 +216,6 @@ def main() -> int:
     from gui.native_window_shell import install_native_window_shell
     from gui.nekro_card_fx import install_nekro_card_fx
     from gui.nekro_effects import install_nekro_effects
-    from gui.page_scroll_layout import install_page_scroll_layout
     from gui.preparation_progress import install_detailed_preparation_progress
     from gui.presentation_clock import install_presentation_clock
     from gui.product_copy import install_product_copy
@@ -231,7 +227,6 @@ def main() -> int:
     from gui.runtime_assistant import install_runtime_assistant
     from gui.sakana_toy import install_sakana_toy
     from gui.single_ai_guidance import install_single_ai_guidance
-    from gui.single_top_compact import install_single_top_compact
     from gui.smooth_scroll import SmoothWheelFilter
     from gui.startup_entrance import install_startup_entrance
     from gui.startup_entrance_stability import install_startup_entrance_stability
@@ -243,6 +238,7 @@ def main() -> int:
     from gui.update_runtime import install_update_runtime
     from gui.usage_telemetry import install_usage_telemetry
     from gui.wallpaper_cache import install_preblur_cache
+    from gui.workspace_composer import install_workspace_composer
     from gui.workspace_layout_commit import install_workspace_layout_commit
     from gui.workspace_transition import install_workspace_transition
     from gui.workspace_transition_tuning import apply_workspace_transition_tuning
@@ -265,32 +261,8 @@ def main() -> int:
     mark_startup_stage("main_ui_install")
     install_ui_polish(window)
 
-    side_tabs = getattr(window, "side_detail_tabs", None)
-    if side_tabs is not None:
-        side_tabs.setFixedHeight(300)
-        side_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        side_host = side_tabs.parentWidget()
-        side_layout = side_host.layout() if side_host is not None else None
-        if side_layout is not None:
-            side_layout.setStretchFactor(side_tabs, 0)
-            side_layout.setAlignment(side_tabs, Qt.AlignmentFlag.AlignTop)
-            side_layout.addStretch(1)
-
-        ancestor = side_host
-        while ancestor is not None:
-            if isinstance(ancestor, QAbstractScrollArea):
-                ancestor.verticalScrollBar().setValue(0)
-                ancestor.horizontalScrollBar().setValue(0)
-                ancestor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-                ancestor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-                break
-            ancestor = ancestor.parentWidget()
-
     details = install_card_details(window)
-    mature = install_mature_ui(window)
-    details.attach_mature(mature)
-    install_page_scroll_layout(window, visual)
-    install_console_summary_mode(window)
+    install_mature_ui(window)
     install_field_table_transfer(window)
 
     window.install_mode_workspace()
@@ -311,11 +283,13 @@ def main() -> int:
     install_listing_offer_hardening(window)
     install_listing_photo_ownership(window)
     install_batch_individual_controls(window.batch_workspace)
-    install_single_top_compact(window)
     install_cooperative_pause(window)
     install_activity_presence(window)
     install_detailed_preparation_progress(window)
     install_workspace_layout_commit(window)
+    # One layout owner composes Single, Batch and the header from the widgets
+    # installed above; nothing below may move business widgets between cards.
+    install_workspace_composer(window)
     visual.refresh_glass_frames()
 
     # Low-frequency table/log work is optimized separately from rendering. It no

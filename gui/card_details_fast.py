@@ -224,22 +224,6 @@ class FastCardDetailController(CardDetailController):
 
         self._install_real_settings_action()
 
-    def attach_mature(self, mature: QObject) -> None:
-        self._reclaim_expand_lane()
-        timer = getattr(mature, "_timer", None)
-        if isinstance(timer, QTimer):
-            timer.timeout.connect(self._reclaim_expand_lane)
-
-    def _reclaim_expand_lane(self) -> None:
-        for frame in self._expandable_cards:
-            layout = frame.layout()
-            if layout is None:
-                continue
-            margins = layout.contentsMargins()
-            if margins.right() >= 38:
-                right = margins.left() if margins.left() > 0 else 10
-                layout.setContentsMargins(margins.left(), margins.top(), right, margins.bottom())
-
     @staticmethod
     def _blur_pixmap(source: QPixmap) -> QPixmap:
         if source.isNull():

@@ -3,7 +3,7 @@ from __future__ import annotations
 from PySide6.QtCore import QEvent, QObject, QTimer, Qt
 from PySide6.QtWidgets import QLayout, QMainWindow, QStackedWidget, QWidget
 
-from .page_scroll_layout import refresh_single_source_layout
+from .workspace_composer import refresh_workspace_layout
 
 
 _MAX_LAYOUT_PASSES = 3
@@ -65,13 +65,10 @@ class WorkspaceLayoutCommitter(QObject):
         self.prepare_page(int(self.stack.currentIndex()))
 
     def _commit_single_fixed(self) -> None:
-        summary = getattr(self.window, "_console_summary_mode", None)
-        apply = getattr(summary, "apply", None)
-        if callable(apply):
-            try:
-                apply()
-            except RuntimeError:
-                pass
+        try:
+            refresh_workspace_layout(self.window)
+        except RuntimeError:
+            pass
 
     def _commit_batch_responsive(self) -> None:
         workspace = getattr(self.window, "batch_workspace", None)
@@ -119,7 +116,7 @@ class WorkspaceLayoutCommitter(QObject):
             page.setGeometry(target_rect)
 
         if int(index) == 0:
-            refresh_single_source_layout(self.window)
+            self._commit_single_fixed()
 
         for _pass in range(_MAX_LAYOUT_PASSES):
             changed = _activate_layout_tree(page)

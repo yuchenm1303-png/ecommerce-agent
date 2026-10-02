@@ -5,13 +5,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DETAIL = (ROOT / "gui" / "listing_intent_detail.py").read_text(encoding="utf-8")
-TOP = (ROOT / "gui" / "single_top_compact.py").read_text(encoding="utf-8")
+COMPOSER = (ROOT / "gui" / "workspace_composer.py").read_text(encoding="utf-8")
 OFFER = (ROOT / "gui" / "listing_offer_support.py").read_text(encoding="utf-8")
 
 
 def test_listing_intent_detail_sources_compile() -> None:
     compile(DETAIL, str(ROOT / "gui" / "listing_intent_detail.py"), "exec")
-    compile(TOP, str(ROOT / "gui" / "single_top_compact.py"), "exec")
+    compile(COMPOSER, str(ROOT / "gui" / "workspace_composer.py"), "exec")
 
 
 def test_detail_editor_reuses_the_existing_intent_contract() -> None:
@@ -32,10 +32,11 @@ def test_detail_editor_is_explicitly_expandable_and_collapsible() -> None:
     assert "QPlainTextEdit" in DETAIL
 
 
-def test_single_top_geometry_expands_only_on_demand() -> None:
-    assert "_INTENT_DETAIL_EXTRA = 112" in TOP
-    assert "def set_single_top_detail_expanded" in TOP
-    assert "_TOP_CARD_MIN + extra" in TOP
-    assert "_TOP_CARD_MAX + extra" in TOP
-    assert "install_listing_intent_detail" in TOP
-    assert "on_expanded=lambda expanded: set_single_top_detail_expanded(window, expanded)" in TOP
+def test_detail_editor_expands_inside_the_composed_product_card() -> None:
+    # The composer installs the editor before re-laying out the product card and
+    # places its host directly beneath the intent row; expanding it only re-commits
+    # glass geometry, the card itself absorbs the height through its stretch.
+    assert "install_listing_intent_detail(self.window, on_expanded=self._intent_detail_toggled)" in COMPOSER
+    assert "def _intent_detail_toggled" in COMPOSER
+    assert "layout.addWidget(detail_host)" in COMPOSER
+    assert "host_layout.setContentsMargins(0, 0, 0, 0)" in COMPOSER

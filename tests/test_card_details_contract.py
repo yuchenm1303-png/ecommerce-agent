@@ -9,15 +9,17 @@ FAST_DETAILS = (ROOT / "gui" / "card_details_fast.py").read_text(encoding="utf-8
 RUNNER = (ROOT / "run_local_gui.py").read_text(encoding="utf-8")
 
 
-def test_card_details_are_installed_after_polish_and_reconciled_after_mature_layout() -> None:
+def test_card_details_are_installed_after_polish_and_before_page_composition() -> None:
     assert "from gui.card_details_fast import install_card_details" in RUNNER
     assert "install_ui_polish(window)" in RUNNER
     assert "details = install_card_details(window)" in RUNNER
-    assert "mature = install_mature_ui(window)" in RUNNER
-    assert "details.attach_mature(mature)" in RUNNER
+    assert "install_mature_ui(window)" in RUNNER
+    # The legacy expand lane no longer exists, so nothing reconciles card margins.
+    assert "attach_mature" not in RUNNER
     assert RUNNER.index("install_ui_polish(window)") < RUNNER.index("details = install_card_details(window)")
-    assert RUNNER.index("details = install_card_details(window)") < RUNNER.index("mature = install_mature_ui(window)")
-    assert RUNNER.index("details.attach_mature(mature)") < RUNNER.index("shell.show()")
+    assert RUNNER.index("details = install_card_details(window)") < RUNNER.index("install_mature_ui(window)")
+    assert RUNNER.index("install_mature_ui(window)") < RUNNER.index("install_workspace_composer(window)")
+    assert RUNNER.index("install_workspace_composer(window)") < RUNNER.index("shell.show()")
 
 
 def test_every_presentation_card_family_is_discovered_for_details() -> None:
@@ -114,11 +116,9 @@ def test_console_detail_uses_the_same_modal_and_clones_all_tabs_read_only() -> N
     assert "clone.setReadOnly(True)" in FAST_DETAILS
 
 
-def test_legacy_expand_lane_is_reclaimed_after_mature_responsive_pass() -> None:
-    assert "def attach_mature" in FAST_DETAILS
-    assert "timer.timeout.connect(self._reclaim_expand_lane)" in FAST_DETAILS
-    assert "if margins.right() >= 38" in FAST_DETAILS
-    assert "layout.setContentsMargins" in FAST_DETAILS
+def test_no_legacy_expand_lane_reclaim_remains() -> None:
+    assert "def attach_mature" not in FAST_DETAILS
+    assert "_reclaim_expand_lane" not in FAST_DETAILS
 
 
 def test_detail_geometry_notifications_are_coalesced() -> None:

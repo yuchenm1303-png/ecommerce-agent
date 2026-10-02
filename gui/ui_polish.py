@@ -720,7 +720,7 @@ def install_ui_polish(window: QMainWindow) -> None:
             outer.removeWidget(workspace)
             outer.removeWidget(console_widget)
 
-            # Structural only. page_scroll_layout.py owns every vertical size.
+            # Structural only. workspace_composer.py later recomposes the page.
             body = QSplitter(Qt.Orientation.Vertical, root)
             body.setObjectName("bodySplitter")
             body.setChildrenCollapsible(False)
