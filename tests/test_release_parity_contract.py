@@ -57,6 +57,13 @@ def test_dotnet_sdk_is_repository_pinned_and_install_reads_that_single_contract(
     assert 'global_json_sha256 = $GlobalJsonSha' in INSTALL
 
 
+def test_routine_windows_package_installs_the_pinned_sdk() -> None:
+    # global.json disables roll-forward, so a floating "8.0.x" breaks as soon as
+    # the runner image ships a newer patch than the pinned SDK.
+    package = (ROOT / ".github" / "workflows" / "windows-package.yml").read_text(encoding="utf-8")
+    assert f'dotnet-version: "{DOTNET_CONTRACT["sdk"]["version"]}"' in package
+
+
 def test_release_lock_is_exact_and_covers_packaged_top_level_dependencies() -> None:
     requirements = [
         line.strip()

@@ -62,7 +62,7 @@ jobs:
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "8.0.x"
+          dotnet-version: "8.0.424"
 
       - name: Install build dependencies
         shell: pwsh
