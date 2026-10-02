@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TEST_WORKFLOW = (ROOT / ".github" / "workflows" / "publish-test-build.yml").read_text(encoding="utf-8")
 STABLE_WORKFLOW = (ROOT / ".github" / "workflows" / "publish-update.yml").read_text(encoding="utf-8")
+PACKAGE_WORKFLOW = (ROOT / ".github" / "workflows" / "windows-package.yml").read_text(encoding="utf-8")
 TOP_LEVEL_REQUIREMENTS = (ROOT / "requirements.txt").read_text(encoding="utf-8")
 LOCK = (ROOT / "requirements-release.lock").read_text(encoding="utf-8")
 INSTALL = (ROOT / "scripts" / "install_release_environment.ps1").read_text(encoding="utf-8")
@@ -60,8 +61,21 @@ def test_dotnet_sdk_is_repository_pinned_and_install_reads_that_single_contract(
 def test_routine_windows_package_installs_the_pinned_sdk() -> None:
     # global.json disables roll-forward, so a floating "8.0.x" breaks as soon as
     # the runner image ships a newer patch than the pinned SDK.
-    package = (ROOT / ".github" / "workflows" / "windows-package.yml").read_text(encoding="utf-8")
-    assert f'dotnet-version: "{DOTNET_CONTRACT["sdk"]["version"]}"' in package
+    assert f'dotnet-version: "{DOTNET_CONTRACT["sdk"]["version"]}"' in PACKAGE_WORKFLOW
+
+
+def test_routine_windows_package_packs_above_the_latest_stable_release() -> None:
+    # The build hydrates the latest public Stable for delta generation, and
+    # Velopack refuses to pack a version at or below it.
+    resolve = PACKAGE_WORKFLOW.index("name: Resolve routine package version")
+    build = PACKAGE_WORKFLOW.index("name: Build Velopack installer and portable package")
+    smoke = PACKAGE_WORKFLOW.index("$expectedVersion = (Get-Content packaging\\VERSION -Raw).Trim()")
+    step = PACKAGE_WORKFLOW[resolve:build]
+
+    assert resolve < build < smoke
+    assert 'gh api "repos/$env:GITHUB_REPOSITORY/releases/latest"' in step
+    assert "$latest.Build + 1" in step
+    assert 'Set-Content "packaging\\VERSION" $version' in step
 
 
 def test_release_lock_is_exact_and_covers_packaged_top_level_dependencies() -> None:
