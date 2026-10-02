@@ -39,7 +39,7 @@ def test_ai_guidance_is_context_not_evidence(monkeypatch):
     )
 
 
-def test_single_gui_installs_both_guidance_inputs_before_compact_layout():
+def test_single_gui_installs_both_guidance_inputs_before_page_composition():
     source = Path("gui/single_ai_guidance.py").read_text(encoding="utf-8")
     startup = Path("run_local_gui.py").read_text(encoding="utf-8")
 
@@ -47,5 +47,5 @@ def test_single_gui_installs_both_guidance_inputs_before_compact_layout():
     assert "window.model_name_keywords_input = keywords" in source
     assert "layout.insertLayout(3, row)" in source
     assert startup.index("install_single_ai_guidance(window)") < startup.index(
-        "install_single_top_compact(window)"
+        "install_workspace_composer(window)"
     )

@@ -46,20 +46,20 @@ GUI_SOURCES = [
     PROJECT_ROOT / "gui" / "native_window_shell.py",
     PROJECT_ROOT / "gui" / "ui_polish.py",
     PROJECT_ROOT / "gui" / "ui_maturity.py",
-    PROJECT_ROOT / "gui" / "page_scroll_layout.py",
+    PROJECT_ROOT / "gui" / "workspace_composer.py",
+    PROJECT_ROOT / "gui" / "workspace_layout_commit.py",
     PROJECT_ROOT / "gui" / "startup_entrance.py",
     PROJECT_ROOT / "gui" / "startup_entrance_stability.py",
     PROJECT_ROOT / "gui" / "ui_data_optimizations.py",
-    PROJECT_ROOT / "gui" / "restore_snapshot.py",
     PROJECT_ROOT / "gui" / "workspace_transition.py",
     PROJECT_ROOT / "gui" / "card_details.py",
     PROJECT_ROOT / "gui" / "card_details_fast.py",
     PROJECT_ROOT / "gui" / "static_modal_interaction.py",
-    PROJECT_ROOT / "gui" / "console_summary_mode.py",
     PROJECT_ROOT / "gui" / "nekro_card_fx.py",
     PROJECT_ROOT / "gui" / "nekro_effects.py",
     PROJECT_ROOT / "gui" / "smooth_scroll.py",
     PROJECT_ROOT / "gui" / "log_presenter.py",
+    PROJECT_ROOT / "tools" / "gui_layout_probe.py",
 ]
 
 
