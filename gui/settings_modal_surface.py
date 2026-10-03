@@ -14,7 +14,7 @@ import os
 from app.ai_profile_store import AI_SOURCE_RELAY, load_active_ai_source
 from app.ai_relay_pool import load_relay_connection_key, load_relay_pool
 from app.ai_service_settings import RUNTIME_WEB_BASE_URL_ENV, RUNTIME_WEB_KEY_ENV
-from .ai_settings_pool_surface import (
+from .ai_settings_polished_surface import (
     AISettingsContent,
     AISettingsModalController as _BaseAISettingsModalController,
 )
