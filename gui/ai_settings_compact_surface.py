@@ -50,7 +50,6 @@ from app.ai_service_settings import (
     RUNTIME_WEB_BASE_URL_ENV,
     RUNTIME_WEB_KEY_ENV,
     has_ai_service_key,
-    load_ai_service_key,
     load_ai_service_settings,
     save_ai_service_key,
 )
@@ -101,6 +100,7 @@ class AISettingsContent(QWidget):
         self.setStyleSheet(_STYLE)
 
         self._busy = False
+        self._loading = False
         self._qwen_key_editing = False
         self._relay_key_editing = False
         self._qwen_key_configured = False
@@ -202,7 +202,7 @@ class AISettingsContent(QWidget):
         title = QLabel("官方 Qwen · 原有稳定配置")
         title.setObjectName("aiProfileTitle")
         form.addWidget(title, 0, 0, 1, 2)
-        note = QLabel("这套配置沿用你原来已经跑通的 DashScope/Qwen，不会被中转站测试覆盖。")
+        note = QLabel("沿用原来已经跑通的 DashScope/Qwen；中转站探测、保存、切换都不会写入这里。")
         note.setObjectName("aiHint")
         note.setWordWrap(True)
         form.addWidget(note, 1, 0, 1, 2)
@@ -238,7 +238,8 @@ class AISettingsContent(QWidget):
         title.setObjectName("aiProfileTitle")
         layout.addWidget(title)
         hint = QLabel(
-            "流程：填 Base URL + Key → 探测可用模型 → 为三个角色选择模型 → 测试能力 → 保存并切换。"
+            "首次配置：填 Base URL + Key → 探测可用模型 → 为三个角色选择模型 → 测试能力 → 保存。"
+            "保存成功后，以后在 Qwen / 中转站之间切换不需要重复测试；只有配置变化才重新验证。"
         )
         hint.setObjectName("aiHint")
         hint.setWordWrap(True)
@@ -253,8 +254,10 @@ class AISettingsContent(QWidget):
         form.setColumnStretch(1, 1)
 
         self.relay_base = self._input("https://your-relay.example/v1")
+        self.relay_base.textChanged.connect(self._relay_connection_changed)
         self.relay_key = self._input("中转站 API Key")
         self.relay_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.relay_key.textChanged.connect(self._relay_connection_changed)
         self.relay_key_action = QPushButton("显示")
         self.relay_key_action.setObjectName("modalPrimaryButton")
         self.relay_key_action.setMaximumWidth(72)
@@ -283,9 +286,9 @@ class AISettingsContent(QWidget):
         for row, role in enumerate(("semantic", "fact", "web")):
             combo = QComboBox()
             combo.setObjectName("modalCombo")
-            combo.currentIndexChanged.connect(self._relay_changed)
+            combo.currentIndexChanged.connect(self._relay_model_changed)
             manual = self._input("当中转站不提供 /models 时手动填写模型 ID")
-            manual.textChanged.connect(self._relay_changed)
+            manual.textChanged.connect(self._relay_model_changed)
             manual.hide()
             self.relay_models[role] = combo
             self.relay_manual[role] = manual
@@ -296,7 +299,6 @@ class AISettingsContent(QWidget):
             manual_label.hide()
             role_form.addWidget(manual_label, row * 2 + 1, 0)
             role_form.addWidget(manual, row * 2 + 1, 1)
-
         layout.addWidget(roles)
 
         capability = QFrame()
@@ -319,80 +321,79 @@ class AISettingsContent(QWidget):
         self.verify_button.clicked.connect(self._start_probe)
         cap_form.addWidget(self.verify_button, 3, 1)
         layout.addWidget(capability)
-
         return card
 
     # --------------------------------------------------------------- reload
     def reload(self) -> None:
+        self._loading = True
         try:
-            qwen, _ = load_qwen_profile()
+            try:
+                qwen, _ = load_qwen_profile()
+                self._qwen_key_configured = has_ai_service_key(qwen)
+            except Exception:
+                qwen = load_ai_service_settings()
+                self._qwen_key_configured = has_ai_service_key(qwen)
             self.qwen_base.setText(qwen.base_url)
             self.qwen_semantic.setText(qwen.model)
             self.qwen_fact.setText(qwen.fact_model)
             self.qwen_web.setText(qwen.web_model)
-            self._qwen_key_configured = has_ai_service_key(qwen)
-        except Exception:
-            qwen = load_ai_service_settings()
-            self.qwen_base.setText(qwen.base_url)
-            self.qwen_semantic.setText(qwen.model)
-            self.qwen_fact.setText(qwen.fact_model)
-            self.qwen_web.setText(qwen.web_model)
-            self._qwen_key_configured = has_ai_service_key(qwen)
 
-        self._qwen_key_editing = not self._qwen_key_configured
-        if self._qwen_key_configured:
-            self.qwen_key.setReadOnly(True)
-            self.qwen_key.setText(_MASKED_KEY)
-            self.qwen_key_action.setText("更改")
-            self.qwen_status.setText("✓ 原有 Qwen Key 已安全保存。")
-            self.qwen_status.setObjectName("aiPass")
-        else:
-            self.qwen_key.setReadOnly(False)
-            self.qwen_key.clear()
-            self.qwen_key_action.setText("显示")
-            self.qwen_status.setText("尚未配置官方 Qwen Key。")
-            self.qwen_status.setObjectName("aiWarn")
+            self._qwen_key_editing = not self._qwen_key_configured
+            if self._qwen_key_configured:
+                self.qwen_key.setReadOnly(True)
+                self.qwen_key.setText(_MASKED_KEY)
+                self.qwen_key_action.setText("更改")
+                self.qwen_status.setText("✓ 原有 Qwen Key 已安全保存。")
+                self.qwen_status.setObjectName("aiPass")
+            else:
+                self.qwen_key.setReadOnly(False)
+                self.qwen_key.clear()
+                self.qwen_key_action.setText("显示")
+                self.qwen_status.setText("尚未配置官方 Qwen Key。")
+                self.qwen_status.setObjectName("aiWarn")
 
-        self._loaded_relay = load_relay_profile()
-        self._relay_key_configured = has_relay_key()
-        self._relay_key_editing = not self._relay_key_configured
-        if self._loaded_relay is not None:
-            self.relay_base.setText(self._loaded_relay.base_url)
-            for role, value in (
-                ("semantic", self._loaded_relay.model),
-                ("fact", self._loaded_relay.fact_model),
-                ("web", self._loaded_relay.web_model),
-            ):
-                combo = self.relay_models[role]
-                combo.blockSignals(True)
-                combo.clear()
-                combo.addItem(value)
-                combo.setCurrentIndex(0)
-                combo.blockSignals(False)
-        else:
-            self.relay_base.clear()
-            for combo in self.relay_models.values():
-                combo.clear()
+            self._loaded_relay = load_relay_profile()
+            self._relay_key_configured = has_relay_key()
+            self._relay_key_editing = not self._relay_key_configured
+            if self._loaded_relay is not None:
+                self.relay_base.setText(self._loaded_relay.base_url)
+                for role, value in (
+                    ("semantic", self._loaded_relay.model),
+                    ("fact", self._loaded_relay.fact_model),
+                    ("web", self._loaded_relay.web_model),
+                ):
+                    combo = self.relay_models[role]
+                    combo.blockSignals(True)
+                    combo.clear()
+                    combo.addItem(value)
+                    combo.setCurrentIndex(0)
+                    combo.blockSignals(False)
+            else:
+                self.relay_base.clear()
+                for combo in self.relay_models.values():
+                    combo.clear()
 
-        if self._relay_key_configured:
-            self.relay_key.setReadOnly(True)
-            self.relay_key.setText(_MASKED_KEY)
-            self.relay_key_action.setText("更改")
-        else:
-            self.relay_key.setReadOnly(False)
-            self.relay_key.clear()
-            self.relay_key_action.setText("显示")
+            if self._relay_key_configured:
+                self.relay_key.setReadOnly(True)
+                self.relay_key.setText(_MASKED_KEY)
+                self.relay_key_action.setText("更改")
+            else:
+                self.relay_key.setReadOnly(False)
+                self.relay_key.clear()
+                self.relay_key_action.setText("显示")
 
-        self._relay_catalog_available = None
-        self._relay_catalog = None
-        self.catalog_status.setText("尚未探测模型。")
-        self._load_relay_verification()
+            self._relay_catalog_available = None
+            self._relay_catalog = None
+            self.catalog_status.setText("已保存配置可直接切换；修改连接后请重新探测模型。" if self._loaded_relay else "尚未探测模型。")
+            self._load_relay_verification()
 
-        active = load_active_ai_source()
-        index = self.source.findData(active)
-        self.source.blockSignals(True)
-        self.source.setCurrentIndex(index if index >= 0 else 0)
-        self.source.blockSignals(False)
+            active = load_active_ai_source()
+            index = self.source.findData(active)
+            self.source.blockSignals(True)
+            self.source.setCurrentIndex(index if index >= 0 else 0)
+            self.source.blockSignals(False)
+        finally:
+            self._loading = False
         self._source_changed()
 
     def _load_relay_verification(self) -> None:
@@ -438,9 +439,7 @@ class AISettingsContent(QWidget):
         source = self.source.currentData()
         self.qwen_card.setVisible(source == AI_SOURCE_QWEN)
         self.relay_card.setVisible(source == AI_SOURCE_RELAY)
-        self.save_button.setText(
-            "保存并使用官方 Qwen" if source == AI_SOURCE_QWEN else "保存并使用中转站"
-        )
+        self.save_button.setText("使用官方 Qwen" if source == AI_SOURCE_QWEN else "保存并使用中转站")
 
     # ---------------------------------------------------------------- keys
     def _qwen_key_action(self) -> None:
@@ -462,7 +461,7 @@ class AISettingsContent(QWidget):
             self.relay_key.clear()
             self.relay_key.setPlaceholderText("输入新的中转站 API Key")
             self.relay_key_action.setText("显示")
-            self._relay_changed()
+            self._relay_connection_changed()
             return
         visible = self.relay_key.echoMode() == QLineEdit.EchoMode.Password
         self.relay_key.setEchoMode(QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password)
@@ -563,7 +562,7 @@ class AISettingsContent(QWidget):
 
     def _relay_bindings(self, *, require_catalog: bool) -> tuple[RoleBinding, RoleBinding, RoleBinding]:
         if require_catalog and self._relay_catalog_available is None:
-            raise CapabilityProbeError("请先点击“探测连接并读取可用模型”。")
+            raise CapabilityProbeError("连接或模型已修改，请先点击“探测连接并读取可用模型”。")
         key = self._effective_relay_key()
         if not key:
             raise CapabilityProbeError("中转站 API Key 为空。")
@@ -581,14 +580,18 @@ class AISettingsContent(QWidget):
                     )
         return bindings  # type: ignore[return-value]
 
-    def _relay_changed(self, *_args: object) -> None:
-        if self._busy:
+    def _relay_connection_changed(self, *_args: object) -> None:
+        if self._loading or self._busy:
             return
-        self._relay_catalog_available = None if self.sender() in {self.relay_base, self.relay_key} else self._relay_catalog_available
-        if self.sender() in {self.relay_base, self.relay_key}:
-            self._relay_catalog = None
-            self.catalog_status.setText("连接已变化，请重新探测模型。")
-        self._invalidate_relay_verification("中转站连接或模型已变化")
+        self._relay_catalog_available = None
+        self._relay_catalog = None
+        self.catalog_status.setText("连接已变化，请重新探测模型。")
+        self._invalidate_relay_verification("中转站 URL 或 Key 已变化")
+
+    def _relay_model_changed(self, *_args: object) -> None:
+        if self._loading or self._busy:
+            return
+        self._invalidate_relay_verification("模型选择已变化")
 
     # --------------------------------------------------------------- probes
     def _start_probe(self) -> None:
@@ -693,19 +696,34 @@ class AISettingsContent(QWidget):
         self.reload()
         QMessageBox.information(self, "已切换", "已使用原来的官方 Qwen 配置；中转站配置保持不变。")
 
+    def _saved_relay_is_verified(self, bindings: tuple[RoleBinding, RoleBinding, RoleBinding]) -> bool:
+        signatures = {item.role: binding_signature(item) for item in bindings}
+        return (
+            self._relay_signatures == signatures
+            and len(self._relay_reports) == 3
+            and all(report.passed for report in self._relay_reports.values())
+        )
+
     def _save_relay_source(self) -> None:
+        # A previously saved and still-matching relay profile can be selected instantly.
+        # Discovery + probing is required only after URL/key/model changes.
         try:
-            bindings = self._relay_bindings(require_catalog=True)
+            bindings = self._relay_bindings(require_catalog=False)
         except Exception as exc:
             QMessageBox.warning(self, "中转站配置不完整", str(exc))
             return
-        signatures = {item.role: binding_signature(item) for item in bindings}
-        if self._relay_signatures != signatures or len(self._relay_reports) != 3 or not all(
-            report.passed for report in self._relay_reports.values()
-        ):
-            QMessageBox.warning(self, "请先测试模型能力", "中转站连接或模型尚未通过完整能力测试，不能切换为当前来源。")
-            return
 
+        if not self._saved_relay_is_verified(bindings):
+            try:
+                bindings = self._relay_bindings(require_catalog=True)
+            except Exception as exc:
+                QMessageBox.warning(self, "请先探测中转站模型", str(exc))
+                return
+            if not self._saved_relay_is_verified(bindings):
+                QMessageBox.warning(self, "请先测试模型能力", "连接或模型已经变化，请重新探测并通过完整能力测试后再保存。")
+                return
+
+        signatures = {item.role: binding_signature(item) for item in bindings}
         models = self._relay_selected_models()
         profile = RelayAIProfile(
             base_url=self.relay_base.text().strip(),
@@ -728,7 +746,7 @@ class AISettingsContent(QWidget):
                 )
             )
             if {item.role: binding_signature(item) for item in final_bindings} != signatures:
-                raise CapabilityProbeError("保存后的中转站配置与刚才通过验证的配置不一致，请重新测试。")
+                raise CapabilityProbeError("保存后的中转站配置与刚才验证的配置不一致，请重新测试。")
             save_verification_snapshot(
                 config_dir=relay_verification_directory(),
                 bindings=final_bindings,
@@ -739,7 +757,7 @@ class AISettingsContent(QWidget):
             QMessageBox.critical(self, "中转站配置保存失败", str(exc))
             return
         self.reload()
-        QMessageBox.information(self, "已切换", "已保存并使用中转站；原来的官方 Qwen 配置未被修改。")
+        QMessageBox.information(self, "已切换", "已使用中转站；原来的官方 Qwen 配置完全保持不变。")
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
@@ -805,10 +823,7 @@ class AISettingsModalController(_BaseAISettingsModalController):
             RoleBinding("fact", profile.base_url, profile.fact_model, key).normalized(),
             RoleBinding("web", profile.base_url, profile.web_model, key).normalized(),
         )
-        managed = assert_verified_if_managed(
-            config_dir=relay_verification_directory(),
-            bindings=bindings,
-        )
+        managed = assert_verified_if_managed(config_dir=relay_verification_directory(), bindings=bindings)
         if not managed:
             raise CapabilityProbeError("中转站配置缺少能力验证记录，请先在 AI 服务设置中测试并保存。")
         config.provider = "openai-compatible"
