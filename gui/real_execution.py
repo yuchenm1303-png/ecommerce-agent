@@ -187,12 +187,15 @@ class RealExecutionRunner(QObject):
         process.start(sys.executable, args)
 
     def stop(self) -> None:
-        if self.process is None or self.process.state() == QProcess.NotRunning:
+        process = self.process
+        if process is None or process.state() == QProcess.NotRunning:
             return
         self._emit_log("Stop requested. Terminating real execution subprocess...")
-        self.process.terminate()
-        if not self.process.waitForFinished(2500):
-            self.process.kill()
+        process.terminate()
+        def kill_if_pending() -> None:
+            if self.process is process and process.state() != QProcess.NotRunning:
+                process.kill()
+        QTimer.singleShot(2500, self, kill_if_pending)
 
     def _validate_config(self, config: RealExecutionConfig) -> None:
         root = config.read_only_run_dir.resolve()

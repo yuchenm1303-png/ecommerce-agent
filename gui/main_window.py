@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QUrl
+from PySide6.QtCore import QPointF, QRectF, Qt, QUrl, QTimer
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -844,7 +844,10 @@ class MainWindow(QMainWindow):
             )
 
     def _run_failed(self, message: str) -> None:
-        QMessageBox.warning(self, "只读测试未完成", message)
+        if message.startswith("测试已由用户停止"):
+            self.phase_badge.setText("已停止 · 浏览器现场保留")
+            return
+        QTimer.singleShot(0, self, lambda: QMessageBox.warning(self, "只读测试未完成", message))
 
     def _open_run_dir(self) -> None:
         run_dir = self.runner.run_dir

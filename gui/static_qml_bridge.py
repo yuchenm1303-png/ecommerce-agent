@@ -1125,6 +1125,11 @@ class StaticQmlBridge(QObject):
     @Slot(str)
     def click(self, key: str) -> None:
         target = self._target(key)
+        # Return from the QML signal handler before native actions can open a
+        # nested event loop or rebuild the delegate that delivered this click.
+        QTimer.singleShot(0, self, lambda: self._dispatch_click(target))
+
+    def _dispatch_click(self, target: QWidget | None) -> None:
         try:
             if isinstance(target, QAbstractButton) and target.isEnabled():
                 target.click()

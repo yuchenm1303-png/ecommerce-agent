@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
 
 from app.product_pack import SUPPORTED_PRODUCT_PACK_SUFFIXES
 from .async_run_journal import AsyncRunJournal
@@ -171,13 +171,16 @@ class ReadOnlyRunner(QObject):
         self._start_process(args)
 
     def stop(self) -> None:
-        if self.process is None or self.process.state() == QProcess.NotRunning:
+        process = self.process
+        if self._stopping or process is None or process.state() == QProcess.NotRunning:
             return
         self._stopping = True
         self._emit_log("Stop requested. Terminating current workflow subprocess...")
-        self.process.terminate()
-        if not self.process.waitForFinished(2500):
-            self.process.kill()
+        process.terminate()
+        def kill_if_pending() -> None:
+            if self.process is process and process.state() != QProcess.NotRunning:
+                process.kill()
+        QTimer.singleShot(2500, self, kill_if_pending)
 
     def _validate_config(self, config: RunnerConfig, *, mode: str) -> None:
         url = config.product_url.strip()
