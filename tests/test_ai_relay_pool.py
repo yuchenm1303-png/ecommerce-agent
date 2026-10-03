@@ -9,8 +9,10 @@ from app.ai_relay_pool import (
     RelayConnection,
     RelayPoolProfile,
     RelayRoleBinding,
+    load_relay_connection_key,
     load_relay_pool,
     relay_pool_path,
+    save_relay_connection_key,
     save_relay_pool,
 )
 from app.providers.registry import ProviderConfigurationError
@@ -85,3 +87,18 @@ def test_invalid_connection_url_is_rejected(monkeypatch, tmp_path: Path) -> None
     )
     with pytest.raises(ProviderConfigurationError, match="Base URL"):
         save_relay_pool(profile)
+
+
+def test_connection_keys_are_independent(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("ECOMMERCE_AGENT_CONFIG_DIR", str(tmp_path))
+    # Source-development persistence is environment-backed on non-Windows;
+    # each connection must still use an isolated credential slot.
+    monkeypatch.delenv("ECOMMERCE_AGENT_AI_RELAY_API_KEY", raising=False)
+    monkeypatch.delenv("ECOMMERCE_AGENT_AI_RELAY_2_API_KEY", raising=False)
+    monkeypatch.delenv("ECOMMERCE_AGENT_AI_RELAY_3_API_KEY", raising=False)
+    save_relay_connection_key("relay-1", "key-a")
+    save_relay_connection_key("relay-2", "key-b")
+    save_relay_connection_key("relay-3", "key-c")
+    assert load_relay_connection_key("relay-1") == "key-a"
+    assert load_relay_connection_key("relay-2") == "key-b"
+    assert load_relay_connection_key("relay-3") == "key-c"
