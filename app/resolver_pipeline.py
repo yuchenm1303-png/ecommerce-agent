@@ -17,6 +17,12 @@ from .ai_decisions import (
     field_id,
     write_ai_decision_packet,
 )
+from .ai_service_settings import (
+    RUNTIME_FACT_BASE_URL_ENV,
+    RUNTIME_FACT_KEY_ENV,
+    RUNTIME_WEB_BASE_URL_ENV,
+    RUNTIME_WEB_KEY_ENV,
+)
 from .best_effort_inference import run_best_effort_inference
 from .business_fields import generate_listing_sku
 from .compact_evidence import build_compact_evidence, write_compact_evidence
@@ -74,6 +80,25 @@ def provider_config(args: Any) -> ProviderConfig:
     )
 
 
+def fact_provider_config(args: Any, config: ProviderConfig) -> ProviderConfig:
+    """Resolve the Fact provider without changing the legacy default path.
+
+    The role-specific environment is intentionally opt-in. If the GUI did not
+    enable a Fact override, this returns the historical ``replace(model=...)``
+    configuration byte-for-byte in meaning: same base URL and same key env.
+    """
+
+    override_base_url = str(os.getenv(RUNTIME_FACT_BASE_URL_ENV, "") or "").strip()
+    return validate_provider_config(
+        replace(
+            config,
+            model=args.fact_model or config.model,
+            base_url=override_base_url or config.base_url,
+            api_key_env=RUNTIME_FACT_KEY_ENV if override_base_url else config.api_key_env,
+        )
+    )
+
+
 def cache_namespace(config: ProviderConfig) -> str:
     safe = config.as_safe_dict()
     safe.pop("request_timeout_seconds", None)
@@ -115,18 +140,32 @@ def dashscope_web_provider(
 ) -> tuple[DashScopeWebSearchProvider | None, str]:
     if args.web_enrich == "off":
         return None, "disabled"
-    if config.provider != "openai-compatible":
-        return None, "current provider is not DashScope OpenAI-compatible"
-    if "dashscope.aliyuncs.com" not in config.base_url.casefold():
-        return None, "current compatible endpoint is not dashscope.aliyuncs.com"
-    api_key = os.getenv(config.api_key_env, "").strip()
+
+    override_base_url = str(os.getenv(RUNTIME_WEB_BASE_URL_ENV, "") or "").strip()
+    if override_base_url:
+        # An explicit Web override is an assertion that this endpoint implements
+        # DashScope Responses web_search semantics. We keep using the dedicated
+        # provider below; there is intentionally no generic chat-completions fallback.
+        api_key_env = RUNTIME_WEB_KEY_ENV
+        base_url = override_base_url
+    else:
+        # Preserve the historical safety gate exactly when no explicit role
+        # override is enabled.
+        if config.provider != "openai-compatible":
+            return None, "current provider is not DashScope OpenAI-compatible"
+        if "dashscope.aliyuncs.com" not in config.base_url.casefold():
+            return None, "current compatible endpoint is not dashscope.aliyuncs.com"
+        api_key_env = config.api_key_env
+        base_url = args.web_base_url.strip() or config.base_url
+
+    api_key = os.getenv(api_key_env, "").strip()
     if not api_key:
-        return None, f"missing API key env {config.api_key_env}"
+        return None, f"missing API key env {api_key_env}"
     return (
         DashScopeWebSearchProvider(
             model=args.web_search_model.strip(),
             api_key=api_key,
-            base_url=args.web_base_url.strip() or config.base_url,
+            base_url=base_url,
             request_timeout_seconds=args.request_timeout_seconds,
         ),
         "available",
@@ -335,12 +374,8 @@ def run_resolver(args: Any) -> int:
     try:
         main_provider_config = provider_config(args)
         provider = build_semantic_provider(main_provider_config)
-        fact_provider_config = replace(
-            main_provider_config,
-            model=args.fact_model or main_provider_config.model,
-        )
-        validate_provider_config(fact_provider_config)
-        fact_provider = build_semantic_provider(fact_provider_config)
+        fact_config = fact_provider_config(args, main_provider_config)
+        fact_provider = build_semantic_provider(fact_config)
     except ProviderConfigurationError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -351,7 +386,7 @@ def run_resolver(args: Any) -> int:
     )
     cache_dir = None if args.no_semantic_cache else Path(args.semantic_cache_dir)
     namespace = cache_namespace(main_provider_config)
-    fact_namespace = cache_namespace(fact_provider_config)
+    fact_namespace = cache_namespace(fact_config)
     execution_model = (
         SUPPLIER_EXECUTION_MODEL
         if acquired.mode == "supplier_url"
@@ -362,7 +397,7 @@ def run_resolver(args: Any) -> int:
     print("===== DIRECT PRODUCT RESOLUTION =====", flush=True)
     print(
         f"provider={main_provider_config.provider}, model={main_provider_config.model}, "
-        f"fact_model={fact_provider_config.model}, "
+        f"fact_model={fact_config.model}, "
         f"live_fields={len(live_fields)}, citation_sources={len(grounding.sources)}",
         flush=True,
     )
@@ -539,7 +574,7 @@ def run_resolver(args: Any) -> int:
                 "live_field_count": len(live_fields),
                 "provider_adapter": provider.name,
                 "provider_config": main_provider_config.as_safe_dict(),
-                "fact_provider_config": fact_provider_config.as_safe_dict(),
+                "fact_provider_config": fact_config.as_safe_dict(),
                 "web_search_model": args.web_search_model,
                 "primary_product_url": product_reference_url,
                 "generated_listing_sku": generated_sku,
@@ -674,6 +709,7 @@ __all__ = [
     "dashscope_web_provider",
     "decision_summary",
     "empty_web_result",
+    "fact_provider_config",
     "provider_config",
     "run_resolver",
     "search_requests",
