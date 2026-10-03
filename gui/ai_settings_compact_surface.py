@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLabel, QPushButton, QFrame, QGridLayout, QHBoxLayout, QWidget
+from PySide6.QtWidgets import QLabel, QPushButton, QFrame, QGridLayout, QWidget
 
+from app.ai_connection_probe import CapabilityProbeError
 from .ai_settings_surface import (
     AISettingsContent as _BaseAISettingsContent,
     AISettingsModalController as _BaseAISettingsModalController,
@@ -12,13 +13,13 @@ from .ai_settings_surface import (
 class AISettingsContent(_BaseAISettingsContent):
     """Compact connection-first presentation over the verified AI settings core.
 
-    The common path intentionally exposes only one connection:
+    Normal setup is deliberately one path:
       Base URL + API Key -> discover /models -> choose role models -> capability probe.
 
-    Manual model IDs are fallback-only when a provider does not expose /models.
-    Fact/Web connection overrides remain available behind one explicit advanced toggle.
-    The underlying persistence, capability probes and runtime admission gates are inherited
-    unchanged from ``ai_settings_surface``.
+    Manual model IDs appear only when a provider does not expose /models. Fact/Web
+    connection overrides remain available behind one explicit advanced toggle. The
+    persistence, capability probes and runtime admission gates stay in the verified
+    base implementation and are not duplicated here.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -41,7 +42,6 @@ class AISettingsContent(_BaseAISettingsContent):
         if root_layout is None:
             return
 
-        # Make the workflow explicit instead of exposing implementation details first.
         for label in self.findChildren(QLabel):
             text = label.text()
             if text.startswith("先配置连接，再读取该 Key"):
@@ -58,7 +58,7 @@ class AISettingsContent(_BaseAISettingsContent):
         self.main_catalog_button.setText("探测连接并读取可用模型")
         self.verify_button.setText("测试所选模型能力")
 
-        # The default connection card does not need to advertise the transport type.
+        # Hide transport implementation detail on the common path.
         default_card = self.base_url.parentWidget()
         default_layout = default_card.layout() if default_card is not None else None
         if isinstance(default_layout, QGridLayout):
@@ -70,7 +70,7 @@ class AISettingsContent(_BaseAISettingsContent):
             if value is not None:
                 value.hide()
 
-        # Manual IDs are fallback-only. Hide all three duplicate rows on the normal path.
+        # Manual model IDs are fallback-only and stay invisible when /models works.
         role_card = self.model.parentWidget()
         role_layout = role_card.layout() if role_card is not None else None
         if isinstance(role_layout, QGridLayout):
@@ -81,7 +81,7 @@ class AISettingsContent(_BaseAISettingsContent):
                     label.hide()
                 self._role_manual(role).hide()
 
-        # Fact/Web independent credentials are an escape hatch, not the main workflow.
+        # Fact/Web independent credentials are an escape hatch, not the main UI.
         advanced = self.fact_override.parentWidget()
         if isinstance(advanced, QFrame):
             self._compact_advanced = advanced
@@ -98,6 +98,11 @@ class AISettingsContent(_BaseAISettingsContent):
             button.setChecked(enabled)
             self._set_advanced_visible(enabled)
 
+        # The feature is locked in this build; do not occupy the connection workflow.
+        optimization_card = self.image_optimization.parentWidget()
+        if isinstance(optimization_card, QFrame):
+            optimization_card.hide()
+
         self._sync_manual_fallback_visibility()
 
     def _set_advanced_visible(self, visible: bool) -> None:
@@ -111,7 +116,6 @@ class AISettingsContent(_BaseAISettingsContent):
     def _sync_manual_fallback_visibility(self) -> None:
         for role in ("semantic", "fact", "web"):
             connection = self._connection_for_role(role)
-            # Manual input is only justified when /models is explicitly unavailable.
             visible = self._catalog_available.get(connection) is False
             manual = self._role_manual(role)
             manual.setVisible(visible)
@@ -121,9 +125,37 @@ class AISettingsContent(_BaseAISettingsContent):
 
     def _apply_catalog_to_role(self, role: str) -> None:
         super()._apply_catalog_to_role(role)
-        # During base __init__ these compact fields do not exist yet.
         if hasattr(self, "_compact_role_manual_labels"):
             self._sync_manual_fallback_visibility()
+
+    def _start_capability_probe(self) -> None:
+        # New/edited managed configurations must discover each active connection first.
+        # A provider that explicitly rejects /models is still supported through the
+        # manual-ID fallback because its catalog state becomes False rather than None.
+        active_connections = {"main"}
+        if self.fact_override.isChecked():
+            active_connections.add("fact")
+        if self.web_override.isChecked():
+            active_connections.add("web")
+        pending = [name for name in active_connections if self._catalog_available.get(name) is None]
+        if pending:
+            from PySide6.QtWidgets import QMessageBox
+
+            names = {"main": "默认连接", "fact": "Fact 独立连接", "web": "Web 独立连接"}
+            QMessageBox.warning(
+                self,
+                "请先探测可用模型",
+                "能力测试前必须先读取当前连接的模型目录："
+                + "、".join(names[name] for name in sorted(pending))
+                + "。如果服务不支持 /models，探测会自动切换到手动模型 ID 回退。",
+            )
+            return
+        try:
+            super()._start_capability_probe()
+        except CapabilityProbeError as exc:
+            from PySide6.QtWidgets import QMessageBox
+
+            QMessageBox.warning(self, "无法开始能力测试", str(exc))
 
 
 class AISettingsModalController(_BaseAISettingsModalController):
