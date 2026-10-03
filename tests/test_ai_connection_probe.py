@@ -52,15 +52,23 @@ class _ChatCompletions:
 
 
 class _Responses:
-    def __init__(self, output):
-        self.output = output
+    def __init__(self, outputs):
+        if isinstance(outputs, tuple):
+            self.outputs = list(outputs)
+        else:
+            self.outputs = [outputs]
         self.calls = []
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        if isinstance(self.output, BaseException):
-            raise self.output
-        return SimpleNamespace(output=self.output)
+        if not self.outputs:
+            raise AssertionError("unexpected extra Responses call")
+        output = self.outputs.pop(0)
+        if isinstance(output, BaseException):
+            raise output
+        if hasattr(output, "output"):
+            return output
+        return SimpleNamespace(output=output)
 
 
 class _Client:
@@ -70,8 +78,22 @@ class _Client:
         self.responses = _Responses(web_output)
 
 
-def _binding(role: str, model: str = "model-a", key: str = "secret-key") -> RoleBinding:
-    return RoleBinding(role, "https://relay.example/v1", model, key)
+def _binding(
+    role: str,
+    model: str = "model-a",
+    key: str = "secret-key",
+    base_url: str = "https://relay.example/v1",
+) -> RoleBinding:
+    return RoleBinding(role, base_url, model, key)
+
+
+def _web_call_with_sources(url: str = "https://openai.com/"):
+    return [
+        SimpleNamespace(
+            type="web_search_call",
+            action=SimpleNamespace(sources=[SimpleNamespace(url=url)]),
+        )
+    ]
 
 
 def test_discover_models_returns_sorted_unique_catalog() -> None:
@@ -144,22 +166,79 @@ def test_semantic_fails_when_endpoint_ignores_image() -> None:
     assert vision.passed is False
 
 
-def test_web_requires_actual_web_search_call_and_source_url() -> None:
-    output = [
-        SimpleNamespace(
-            type="web_search_call",
-            action=SimpleNamespace(
-                sources=[SimpleNamespace(url="https://openai.com/")]
-            ),
-        )
-    ]
-    client = _Client(web_output=output)
+def test_web_relay_prefers_standard_responses_without_dashscope_fields() -> None:
+    client = _Client(web_output=_web_call_with_sources())
     report = probe_role(_binding("web"), client_factory=_Factory(client))
     assert report.passed is True
     call = client.responses.calls[0]
     assert call["tools"] == [{"type": "web_search"}]
-    assert call["tool_choice"] == "required"
+    assert "extra_body" not in call
+    assert "tool_choice" not in call
+    names = {item.name for item in report.checks if item.passed}
+    assert "web_protocol_openai_responses" in names
+
+
+def test_web_accepts_standard_url_citation_sources() -> None:
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(type="web_search_call", action=SimpleNamespace(sources=[])),
+            SimpleNamespace(
+                type="message",
+                content=[
+                    SimpleNamespace(
+                        type="output_text",
+                        text="OpenAI",
+                        annotations=[
+                            SimpleNamespace(
+                                type="url_citation",
+                                url="https://openai.com/",
+                                title="OpenAI",
+                            )
+                        ],
+                    )
+                ],
+            ),
+        ]
+    )
+    client = _Client(web_output=response)
+    report = probe_role(_binding("web"), client_factory=_Factory(client))
+    assert report.passed is True
+    names = {item.name for item in report.checks if item.passed}
+    assert "web_sources" in names
+
+
+def test_web_falls_back_to_dashscope_extensions_after_standard_rejection() -> None:
+    client = _Client(
+        web_output=(
+            RuntimeError("standard minimal rejected"),
+            RuntimeError("standard required rejected"),
+            _web_call_with_sources(),
+        )
+    )
+    report = probe_role(_binding("web"), client_factory=_Factory(client))
+    assert report.passed is True
+    assert len(client.responses.calls) == 3
+    dashscope_call = client.responses.calls[2]
+    assert dashscope_call["tool_choice"] == "required"
+    assert dashscope_call["extra_body"]["search_options"]["forced_search"] is True
+    names = {item.name for item in report.checks if item.passed}
+    assert "web_protocol_dashscope_responses" in names
+
+
+def test_official_dashscope_endpoint_keeps_dashscope_protocol_first() -> None:
+    client = _Client(web_output=_web_call_with_sources())
+    report = probe_role(
+        _binding(
+            "web",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ),
+        client_factory=_Factory(client),
+    )
+    assert report.passed is True
+    call = client.responses.calls[0]
     assert call["extra_body"]["search_options"]["forced_search"] is True
+    names = {item.name for item in report.checks if item.passed}
+    assert "web_protocol_dashscope_responses" in names
 
 
 @pytest.mark.parametrize(
@@ -170,7 +249,8 @@ def test_web_requires_actual_web_search_call_and_source_url() -> None:
     ],
 )
 def test_web_rejects_fake_or_sourceless_search(output) -> None:
-    client = _Client(web_output=output)
+    # Every protocol attempt receives the same unusable response.
+    client = _Client(web_output=(output, output, output))
     report = probe_role(_binding("web"), client_factory=_Factory(client))
     assert report.passed is False
 
@@ -202,18 +282,7 @@ def test_verification_snapshot_contains_no_plaintext_key_and_guards_binding_chan
         ),
         probe_role(
             bindings[2],
-            client_factory=_Factory(
-                _Client(
-                    web_output=[
-                        SimpleNamespace(
-                            type="web_search_call",
-                            action=SimpleNamespace(
-                                sources=[SimpleNamespace(url="https://example.com/source")]
-                            ),
-                        )
-                    ]
-                )
-            ),
+            client_factory=_Factory(_Client(web_output=_web_call_with_sources("https://example.com/source"))),
         ),
     )
     save_verification_snapshot(config_dir=tmp_path, bindings=bindings, reports=reports)
