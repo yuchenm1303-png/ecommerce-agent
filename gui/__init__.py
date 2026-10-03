@@ -38,10 +38,10 @@ def _install_application_access_extensions_hook() -> None:
         except Exception as exc:  # Telemetry must never block the core workspace.
             print(f"[batch-link-telemetry] install skipped: {exc}", file=sys.stderr)
 
-        # Agent is a detached workspace extension. Defer installation until the
-        # first Qt event-loop turn so run_local_gui.py can finish constructing the
-        # existing Single/Batch workspace and its authoritative QQuickWindow first.
-        # No Agent model/provider is initialized until the user actually opens it.
+        # Agent and Batch auto-execute are detached workspace extensions. Defer
+        # installation until the first Qt event-loop turn so run_local_gui.py can
+        # finish constructing the existing Single/Batch workspace and its
+        # authoritative QQuickWindow first.
         try:
             from PySide6.QtCore import QTimer
 
@@ -53,9 +53,29 @@ def _install_application_access_extensions_hook() -> None:
                 except Exception as exc:  # Agent must never block Listing startup.
                     print(f"[agent-workspace] install skipped: {exc}", file=sys.stderr)
 
+            def install_batch_auto_execute_extension() -> None:
+                try:
+                    from .batch_auto_execute import install_batch_auto_execute
+
+                    workspace = getattr(window, "batch_workspace", None)
+                    if workspace is None:
+                        raise RuntimeError("Batch workspace is unavailable")
+                    install_batch_auto_execute(workspace)
+
+                    # Static Quick may already have cached the QWidget topology.
+                    # Tell it about the newly inserted checkbox immediately.
+                    static_view = getattr(window, "_static_qml_view_controller", None)
+                    bridge = getattr(static_view, "bridge", None)
+                    refresh = getattr(bridge, "schedule_structure_refresh", None)
+                    if callable(refresh):
+                        refresh()
+                except Exception as exc:  # Batch extension must never block Listing startup.
+                    print(f"[batch-auto-execute] install skipped: {exc}", file=sys.stderr)
+
             QTimer.singleShot(0, install_agent_workspace_extension)
-        except Exception as exc:  # Keep Listing fully independent from Agent UI.
-            print(f"[agent-workspace] deferred install unavailable: {exc}", file=sys.stderr)
+            QTimer.singleShot(0, install_batch_auto_execute_extension)
+        except Exception as exc:  # Keep Listing fully independent from detached UI extensions.
+            print(f"[workspace-extensions] deferred install unavailable: {exc}", file=sys.stderr)
         return controller
 
     _app_access.install_application_access = install_with_extensions
