@@ -751,14 +751,16 @@ class AISettingsContent(QWidget):
     def _stage_progress(self, role: str, stage: str) -> None:
         self._active_role = role
         self._active_stage = {"client_init": "连接中", "strict_json_schema": "验证结构化输出",
-                              "vision": "验证图片识别", "web_search": "验证联网搜索与来源"}.get(stage, stage)
+                              "vision": "验证图片识别", "web_search": "验证联网搜索与来源",
+                              "vision_retry": "图片返回格式异常，正在纠正重试",
+                              "strict_json_schema_retry": "返回格式异常，正在纠正重试"}.get(stage, stage)
         self._stage_started = time.monotonic()
         self._activity_tick()
 
     def _role_finished(self, report: RoleCapabilityReport) -> None:
         self._active_role = ""
+        self._completed_roles += 1
         if report.passed:
-            self._completed_roles += 1
             self._set_capability(report.role, "pass", "✓ 测试通过")
         else:
             self._set_capability(report.role, "fail", "✕ 测试失败 · " + report.error)
@@ -789,8 +791,6 @@ class AISettingsContent(QWidget):
                                     progress_callback=lambda stage, role=binding.role: self.probe_progress.emit(role, stage))
                 reports.append(report)
                 self.probe_role_finished.emit(report)
-                if not report.passed:
-                    break
             self.probe_finished.emit((signatures, tuple(reports)))
         threading.Thread(target=worker, name="relay-pool-capability", daemon=True).start()
 

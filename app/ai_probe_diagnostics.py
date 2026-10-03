@@ -83,12 +83,25 @@ class ProbeDiagnostics:
                        status_code=getattr(exc, "status_code", None),
                        request_id=self.clean(getattr(exc, "request_id", None) or headers.get("x-request-id", "")))
             raise
+        choices = getattr(result, "choices", ()) or ()
+        message = getattr(choices[0], "message", None) if choices else None
+        content = getattr(message, "content", None)
         self.write("request_succeeded", endpoint=endpoint,
+                   choice_count=len(choices),
+                   finish_reason=getattr(choices[0], "finish_reason", None) if choices else None,
+                   content_type=type(content).__name__,
+                   content_length=len(content) if isinstance(content, (str, list)) else 0,
+                   refusal_present=bool(getattr(message, "refusal", None)),
                    elapsed_seconds=round(time.monotonic() - started, 3),
                    request_id=self.clean(getattr(result, "_request_id", "") or ""))
         return result
 
     def wrap(self, client):
+        def validation_retry():
+            self.write("validation_retry", reason="invalid_json", attempt=2)
+            callback = getattr(self, "progress_callback", None)
+            if callback is not None:
+                callback(self.stage + "_retry")
         def endpoint(path, method):
             return lambda **kwargs: self.call(path, method, **kwargs)
         # Resolve SDK resources lazily so test doubles and partial clients work.
@@ -103,6 +116,7 @@ class ProbeDiagnostics:
         return SimpleNamespace(
             chat=SimpleNamespace(completions=Resource(self, "chat.completions")),
             responses=Resource(self, "responses"),
+            validation_retry=validation_retry,
         )
 
     def finish(self, report):

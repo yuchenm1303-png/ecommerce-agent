@@ -490,3 +490,56 @@ def test_activity_shows_elapsed_stage_and_completed_roles_then_stops():
     widget.close()
     widget.deleteLater()
     application.processEvents()
+
+
+def test_malformed_vision_output_gets_one_format_correction(tmp_path):
+    client = _Client(chat_payloads=({"probe": "ok"}, "not JSON", {"colors": ["red", "green", "blue"]}))
+    stages = []
+    report = probe_role(_binding("semantic"), client_factory=_Factory(client), diagnostic_dir=tmp_path,
+                        vision_sequence=("red", "green", "blue"), progress_callback=stages.append)
+    assert report.passed
+    assert "vision_retry" in stages
+    assert len(client.chat.completions.calls) == 3
+    assert client.chat.completions.calls[-1]["response_format"] == client.chat.completions.calls[-2]["response_format"]
+    assert "validation_retry" in Path(report.log_path).read_text(encoding="utf-8")
+
+
+def test_repeated_invalid_vision_format_still_fails(tmp_path):
+    client = _Client(chat_payloads=({"probe": "ok"}, "not JSON", "still not JSON"))
+    report = probe_role(_binding("semantic"), client_factory=_Factory(client), diagnostic_dir=tmp_path,
+                        vision_sequence=("red", "green", "blue"))
+    assert not report.passed
+    assert report.failed_stage == "vision"
+    assert "连续两次" in report.error
+    assert len(client.chat.completions.calls) == 3
+
+
+def test_gui_tests_other_roles_after_semantic_failure(monkeypatch, tmp_path):
+    from PySide6.QtWidgets import QApplication
+    from gui import ai_settings_pool_surface as surface
+    application = QApplication.instance() or QApplication([])
+    widget = surface.AISettingsContent()
+    bindings = tuple(_binding(role) for role in ("semantic", "fact", "web"))
+    monkeypatch.setattr(widget, "_bindings_from_ui", lambda **kwargs: bindings)
+    called = []
+    def fake_transport(binding, **kwargs):
+        called.append(binding.role)
+        payloads = (RuntimeError("semantic unavailable"),) if binding.role == "semantic" else ({"probe": "ok"},)
+        return probe_role(binding, **kwargs, diagnostic_dir=tmp_path,
+                          client_factory=_Factory(_Client(chat_payloads=payloads, web_output=_web_call_with_sources())))
+    class InlineThread:
+        def __init__(self, *, target, **kwargs):
+            self.target = target
+        def start(self):
+            self.target()
+    monkeypatch.setattr(surface, "probe_role", fake_transport)
+    monkeypatch.setattr(surface.threading, "Thread", InlineThread)
+    widget._start_probe()
+    assert called == ["semantic", "fact", "web"]
+    assert widget._completed_roles == 3
+    assert widget._verified_reports["fact"].passed
+    assert widget._verified_reports["web"].passed
+    assert not widget._verified_signatures
+    widget.close()
+    widget.deleteLater()
+    application.processEvents()

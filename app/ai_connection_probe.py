@@ -255,6 +255,26 @@ def _discover_models(binding, *, timeout, client_factory, diagnostics):
         )
 
 
+def _structured_probe(client: Any, **request: Any) -> dict[str, Any]:
+    """Allow one format correction without relaxing schema or image validation."""
+    for attempt in range(2):
+        response = client.chat.completions.create(**request)
+        text = _message_text(response)
+        try:
+            return _parse_json(text)
+        except CapabilityProbeError as exc:
+            if attempt:
+                choices = getattr(response, "choices", ()) or ()
+                finish = getattr(choices[0], "finish_reason", "unknown") if choices else "missing_choices"
+                raise CapabilityProbeError(f"连续两次未返回有效 JSON；文本长度={len(text)}，结束原因={finish}。") from exc
+            notify = getattr(client, "validation_retry", None)
+            if callable(notify):
+                notify()
+            request = dict(request)
+            request["messages"] = [*request["messages"], {"role": "user", "content": "The response was not valid JSON. Return only one JSON object matching the supplied schema. No prose or markdown. Inspect the supplied image if present; do not guess."}]
+    raise AssertionError("unreachable")
+
+
 def _strict_json_probe(client: Any, *, model: str, timeout: float) -> None:
     schema = {
         "type": "object",
@@ -262,7 +282,7 @@ def _strict_json_probe(client: Any, *, model: str, timeout: float) -> None:
         "required": ["probe"],
         "additionalProperties": False,
     }
-    response = client.chat.completions.create(
+    payload = _structured_probe(client,
         model=model,
         messages=[
             {"role": "system", "content": "Return only the requested structured result."},
@@ -275,7 +295,6 @@ def _strict_json_probe(client: Any, *, model: str, timeout: float) -> None:
         timeout=timeout,
         extra_body={"enable_thinking": False},
     )
-    payload = _parse_json(_message_text(response))
     if payload != {"probe": "ok"}:
         raise CapabilityProbeError(f"Strict JSON Schema 返回内容不符合约定：{payload!r}")
 
@@ -318,7 +337,7 @@ def _vision_probe(
         "required": ["colors"],
         "additionalProperties": False,
     }
-    response = client.chat.completions.create(
+    payload = _structured_probe(client,
         model=model,
         messages=[
             {
@@ -334,7 +353,7 @@ def _vision_probe(
                             "The image contains three solid vertical color blocks. "
                             "Return their colors from left to right using only one of: "
                             + ", ".join(allowed)
-                            + "."
+                            + '. Return only a JSON object with the field "colors" containing exactly three color names. No other text.'
                         ),
                     },
                     {"type": "image_url", "image_url": {"url": _vision_image(sequence)}},
@@ -348,7 +367,6 @@ def _vision_probe(
         timeout=timeout,
         extra_body={"enable_thinking": False},
     )
-    payload = _parse_json(_message_text(response))
     actual = tuple(str(item).casefold() for item in payload.get("colors") or [])
     expected = tuple(item.casefold() for item in sequence)
     if actual != expected:
