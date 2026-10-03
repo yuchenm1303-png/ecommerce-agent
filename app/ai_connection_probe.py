@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 
 from PIL import Image, ImageDraw
 
+from .providers.dashscope_web_search import negotiate_responses_web_search
+
 
 _VERIFICATION_FILENAME = "ai-capability-verification.json"
 _ROLE_REQUIREMENTS = {
@@ -335,60 +337,20 @@ def _vision_probe(
         )
 
 
-def _source_url(source: Any) -> str:
-    if isinstance(source, dict):
-        return str(source.get("url") or "").strip()
-    return str(getattr(source, "url", "") or "").strip()
-
-
-def _web_probe(client: Any, *, model: str, timeout: float) -> None:
-    response = client.responses.create(
-        model=model,
-        input=[
-            {
-                "role": "system",
-                "content": (
-                    "Use web search. Return a concise answer. The test is valid only if the transport "
-                    "actually emits a web_search_call with source URLs."
-                ),
-            },
-            {
-                "role": "user",
-                "content": "Search the web for the official OpenAI homepage and report its domain.",
-            },
-        ],
-        tools=[{"type": "web_search"}],
-        tool_choice="required",
-        timeout=timeout,
-        extra_body={
-            "enable_thinking": False,
-            "search_options": {"forced_search": True},
-        },
+def _web_probe(client: Any, *, model: str, base_url: str) -> str:
+    prompt = (
+        "You MUST use the web-search tool for this capability test. "
+        "Search the web for the official OpenAI homepage and report its domain. "
+        "The test is valid only when the Responses transport emits a real web_search_call "
+        "and exposes at least one HTTP(S) source URL."
     )
-    calls = [
-        item
-        for item in list(getattr(response, "output", []) or [])
-        if str(getattr(item, "type", "") or (item.get("type") if isinstance(item, dict) else ""))
-        == "web_search_call"
-    ]
-    if not calls:
-        raise CapabilityProbeError("Responses API 可调用，但没有产生真实的 web_search_call。")
-    urls: list[str] = []
-    for call in calls:
-        action = call.get("action") if isinstance(call, dict) else getattr(call, "action", None)
-        sources = (
-            action.get("sources", [])
-            if isinstance(action, dict)
-            else getattr(action, "sources", [])
-            if action is not None
-            else []
-        )
-        for source in sources or []:
-            url = _source_url(source)
-            if url.startswith(("http://", "https://")):
-                urls.append(url)
-    if not urls:
-        raise CapabilityProbeError("web_search_call 没有返回任何 HTTP(S) 来源 URL。")
+    _response, protocol = negotiate_responses_web_search(
+        client,
+        model=model,
+        prompt=prompt,
+        base_url=base_url,
+    )
+    return protocol
 
 
 def probe_role(
@@ -453,12 +415,21 @@ def probe_role(
 
         if normalized.role == "web":
             try:
-                _web_probe(client, model=normalized.model, timeout=timeout)
+                protocol = _web_probe(
+                    client,
+                    model=normalized.model,
+                    base_url=normalized.base_url,
+                )
                 checks.extend(
                     (
                         CapabilityCheck("responses_api", True, "Responses API 可调用"),
                         CapabilityCheck("web_search", True, "产生真实 web_search_call"),
                         CapabilityCheck("web_sources", True, "搜索结果包含来源 URL"),
+                        CapabilityCheck(
+                            "web_protocol_" + protocol.replace("-", "_"),
+                            True,
+                            f"自动协商命中协议：{protocol}",
+                        ),
                     )
                 )
             except Exception as exc:
