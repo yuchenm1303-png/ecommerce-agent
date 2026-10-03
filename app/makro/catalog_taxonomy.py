@@ -34,6 +34,28 @@ _STRUCTURAL_SURFACE_JS = r"""(anchor, payload) => {{
   const REGISTRY_KEY = __REGISTRY_KEY_LITERAL__;
   const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
   const key = (value) => clean(value).toLocaleLowerCase();
+  const scrollEndTolerance = (owner) => {{
+    // CSS scroll geometry is not guaranteed to share one precision domain:
+    // scrollHeight/clientHeight are commonly integer-like while reachable
+    // scrollTop can be fractional. Keep the acceptance band deliberately tiny
+    // relative to the viewport, but large enough to absorb that quantization.
+    const clientHeight = Math.max(0, Number(owner && owner.clientHeight || 0));
+    const proportional = clientHeight > 0 ? clientHeight * 0.005 : 0;
+    return Math.max(2, Math.min(4, proportional || 2));
+  }};
+  const scrollState = (owner) => {{
+    const maxScroll = Math.max(0, Number(owner && owner.scrollHeight || 0) - Number(owner && owner.clientHeight || 0));
+    const scrollTop = Math.max(0, Number(owner && owner.scrollTop || 0));
+    const endTolerance = scrollEndTolerance(owner);
+    const remainingScroll = Math.max(0, maxScroll - scrollTop);
+    return {{
+      scrollTop,
+      maxScroll,
+      remainingScroll,
+      endTolerance,
+      atEnd: remainingScroll <= endTolerance,
+    }};
+  }};
   const rendered = (el) => {{
     if (!el || !(el instanceof Element) || !el.isConnected) return false;
     const style = getComputedStyle(el);
@@ -177,14 +199,17 @@ _STRUCTURAL_SURFACE_JS = r"""(anchor, payload) => {{
       const items = currentItems(owner, scope, limit);
       if (items.length < 1) continue;
       const ownerId = idOf(owner);
-      const maxScroll = Math.max(0, Number(owner.scrollHeight || 0) - Number(owner.clientHeight || 0));
+      const scroll = scrollState(owner);
       descriptors.push({{
         group_id: ownerId,
         owner_id: ownerId,
         items: items.map((item) => item.text),
         scrollable: isScrollOwner(owner),
-        scroll_top: Number(owner.scrollTop || 0),
-        max_scroll: maxScroll,
+        scroll_top: scroll.scrollTop,
+        max_scroll: scroll.maxScroll,
+        remaining_scroll: scroll.remainingScroll,
+        end_tolerance: scroll.endTolerance,
+        at_end: scroll.atEnd,
         client_height: Number(owner.clientHeight || 0),
         dom_order: domOrder++,
         is_root: false,
@@ -213,25 +238,32 @@ _STRUCTURAL_SURFACE_JS = r"""(anchor, payload) => {{
   if (action === 'scroll') {{
     const owner = nodeFor(payload.owner_id);
     if (!owner) return {{ok: false, reason: 'owned_column_missing'}};
-    const maxTop = Math.max(0, Number(owner.scrollHeight || 0) - Number(owner.clientHeight || 0));
-    const before = Number(owner.scrollTop || 0);
+    const beforeState = scrollState(owner);
+    const before = beforeState.scrollTop;
     let target = before;
     const direction = String(payload.direction || '');
     if (direction === 'top') target = 0;
     else if (direction === 'next') {{
       const step = Math.max(1, Math.floor(Math.max(1, Number(owner.clientHeight || 1)) * 0.82));
-      target = Math.min(maxTop, before + step);
+      target = Math.min(beforeState.maxScroll, before + step);
     }} else return {{ok: false, reason: 'invalid_scroll_action'}};
     owner.scrollTop = target;
     try {{ owner.dispatchEvent(new Event('scroll', {{bubbles: true}})); }} catch (_) {{}}
-    const after = Number(owner.scrollTop || 0);
+    const afterState = scrollState(owner);
+    const moved = Math.abs(afterState.scrollTop - before) > 0.25;
     return {{
       ok: true,
       found: true,
-      moved: Math.abs(after - before) > 0.5,
-      at_end: after >= maxTop - 1,
-      scroll_top: after,
-      max_scroll: maxTop,
+      moved,
+      at_end: afterState.atEnd,
+      saturated: direction === 'next' && !moved && afterState.atEnd,
+      scroll_top: afterState.scrollTop,
+      max_scroll: afterState.maxScroll,
+      remaining_scroll: afterState.remainingScroll,
+      end_tolerance: afterState.endTolerance,
+      client_height: Number(owner.clientHeight || 0),
+      target_scroll: target,
+      requested_delta: Math.max(0, target - before),
     }};
   }}
 
@@ -391,6 +423,9 @@ class CatalogTaxonomyBrowser:
                     "scrollable": bool(entry.get("scrollable")),
                     "scroll_top": float(entry.get("scroll_top") or 0.0),
                     "max_scroll": float(entry.get("max_scroll") or 0.0),
+                    "remaining_scroll": float(entry.get("remaining_scroll") or 0.0),
+                    "end_tolerance": float(entry.get("end_tolerance") or 0.0),
+                    "at_end": bool(entry.get("at_end")),
                     "client_height": float(entry.get("client_height") or 0.0),
                     "dom_order": int(entry.get("dom_order") or 0),
                     "is_root": bool(entry.get("is_root")),
@@ -422,8 +457,14 @@ class CatalogTaxonomyBrowser:
             "found": bool(raw.get("found", True)),
             "moved": bool(raw.get("moved")),
             "at_end": bool(raw.get("at_end")),
+            "saturated": bool(raw.get("saturated")),
             "scroll_top": float(raw.get("scroll_top") or 0.0),
             "max_scroll": float(raw.get("max_scroll") or 0.0),
+            "remaining_scroll": float(raw.get("remaining_scroll") or 0.0),
+            "end_tolerance": float(raw.get("end_tolerance") or 0.0),
+            "client_height": float(raw.get("client_height") or 0.0),
+            "target_scroll": float(raw.get("target_scroll") or 0.0),
+            "requested_delta": float(raw.get("requested_delta") or 0.0),
         }
 
     def click_owned_node(

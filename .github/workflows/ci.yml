@@ -32,6 +32,30 @@ jobs:
             tests/test_listing_offer_support_contract.py \
             tests/test_makro_multi_account_ui_contract.py
 
+  taxonomy-scroll-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile taxonomy modules
+        run: |
+          python -m py_compile \
+            app/makro/catalog_taxonomy.py \
+            app/makro/taxonomy_resilient.py
+
+      - name: Verify fractional-end and real-stall taxonomy behavior
+        run: pytest -q tests/test_taxonomy_resilient_browse.py
+
   tests:
     runs-on: ubuntu-latest
     steps:

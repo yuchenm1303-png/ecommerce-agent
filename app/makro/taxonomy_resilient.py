@@ -11,6 +11,14 @@ reused while the same DOM owner remains structurally valid. A click invalidates
 only descendant/repaint candidates that can actually change. This preserves the
 bounded stability polling contract without repeatedly scrolling unchanged parent
 columns from top to bottom on every poll.
+
+Scroll completion is intentionally tolerant of browser geometry quantization.
+Chromium can expose an integer-like ``scrollHeight - clientHeight`` while the
+reachable ``scrollTop`` is fractional and stops a little below that number.  The
+wrapper therefore normalizes every scroll observation through one shared terminal
+contract and gives a materially stalled owner a short settle/retry window before
+failing closed.  A sub-pixel/few-pixel tail can never turn into a workflow-fatal
+false stall, while a column that is genuinely stuck far from its end still fails.
 """
 
 from __future__ import annotations
@@ -18,7 +26,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from playwright.sync_api import Page
 
@@ -38,6 +46,23 @@ class _CompleteColumnSnapshot:
     values: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _ScrollGeometry:
+    scroll_top: float
+    max_scroll: float
+    remaining_scroll: float
+    end_tolerance: float
+    at_end: bool
+    terminal_reason: str
+
+
+_SCROLL_MIN_END_TOLERANCE = 2.0
+_SCROLL_MAX_END_TOLERANCE = 4.0
+_SCROLL_END_TOLERANCE_RATIO = 0.005
+_SCROLL_PROGRESS_EPSILON = 0.25
+_SCROLL_SETTLE_RETRIES = 2
+
+
 def _clean(value: object) -> str:
     return " ".join(str(value or "").split()).strip()
 
@@ -48,6 +73,73 @@ def _key(value: object) -> str:
 
 def _signature(values: list[str] | tuple[str, ...]) -> tuple[str, ...]:
     return tuple(_key(value) for value in values if _key(value))
+
+
+def _number(state: Mapping[str, Any], key: str) -> float:
+    try:
+        return float(state.get(key) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _scroll_end_tolerance(state: Mapping[str, Any]) -> float:
+    """Return one bounded CSS-pixel end tolerance shared by all Python checks.
+
+    New catalog sensors publish the tolerance they used in-page.  Older/fake
+    sensors are normalized here from client height so rollout remains backwards
+    compatible and tests can exercise the Python safety net independently.
+    """
+
+    explicit = _number(state, "end_tolerance")
+    if explicit > 0:
+        return max(0.5, min(8.0, explicit))
+    client_height = max(0.0, _number(state, "client_height"))
+    derived = client_height * _SCROLL_END_TOLERANCE_RATIO if client_height else 0.0
+    return max(
+        _SCROLL_MIN_END_TOLERANCE,
+        min(_SCROLL_MAX_END_TOLERANCE, derived or _SCROLL_MIN_END_TOLERANCE),
+    )
+
+
+def _scroll_geometry(state: Mapping[str, Any]) -> _ScrollGeometry:
+    """Normalize mixed integer/fractional browser scroll geometry.
+
+    ``at_end=True`` from the DOM owner is authoritative.  Otherwise a remaining
+    tail no larger than the bounded tolerance is also terminal.  This specifically
+    covers Chromium layouts where ``max_scroll`` is integer-like but the physically
+    reachable ``scrollTop`` is fractional (for example 345.9047546 vs 347.0).
+    """
+
+    scroll_top = max(0.0, _number(state, "scroll_top"))
+    max_scroll = max(0.0, _number(state, "max_scroll"))
+    remaining = max(0.0, max_scroll - scroll_top)
+    tolerance = _scroll_end_tolerance(state)
+    reported_end = bool(state.get("at_end"))
+    geometry_end = remaining <= tolerance
+    at_end = bool(reported_end or geometry_end)
+    terminal_reason = "reported_end" if reported_end else "geometry_tolerance" if geometry_end else ""
+    return _ScrollGeometry(
+        scroll_top=scroll_top,
+        max_scroll=max_scroll,
+        remaining_scroll=remaining,
+        end_tolerance=tolerance,
+        at_end=at_end,
+        terminal_reason=terminal_reason,
+    )
+
+
+def _normalize_scroll_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    geometry = _scroll_geometry(state)
+    normalized = dict(state)
+    normalized.update(
+        scroll_top=geometry.scroll_top,
+        max_scroll=geometry.max_scroll,
+        remaining_scroll=geometry.remaining_scroll,
+        end_tolerance=geometry.end_tolerance,
+        at_end=geometry.at_end,
+        terminal_reason=geometry.terminal_reason,
+    )
+    return normalized
 
 
 def _root_surface_signature(
@@ -356,7 +448,7 @@ class ResilientMakroTaxonomyBrowser:
         group_id: str,
     ) -> dict[str, Any]:
         try:
-            state = self._owned.scroll_owned_column(owner_id, action)
+            raw_state = self._owned.scroll_owned_column(owner_id, action)
         except Exception as exc:
             _diag(
                 "mechanical_failure",
@@ -369,11 +461,128 @@ class ResilientMakroTaxonomyBrowser:
             raise TaxonomyMechanicalError(
                 f"Makro taxonomy owned column could not scroll ({action}): {type(exc).__name__}: {exc}"
             ) from exc
-        if not state.get("found", True):
+        if not raw_state.get("found", True):
             raise TaxonomyMechanicalError(
                 f"Makro taxonomy owned column disappeared while scrolling: group={group_id!r} owner={owner_id!r}"
             )
+        state = _normalize_scroll_state(raw_state)
+        _diag(
+            "scroll_state",
+            action=action,
+            group_id=group_id,
+            owner_id=owner_id,
+            moved=bool(state.get("moved")),
+            at_end=bool(state.get("at_end")),
+            terminal_reason=state.get("terminal_reason", ""),
+            scroll_top=state.get("scroll_top"),
+            max_scroll=state.get("max_scroll"),
+            remaining_scroll=state.get("remaining_scroll"),
+            end_tolerance=state.get("end_tolerance"),
+        )
         return state
+
+    def _advance_owned_scroll(
+        self,
+        owner_id: str,
+        *,
+        group_id: str,
+        max_items_per_level: int,
+        operation: str,
+    ) -> dict[str, Any]:
+        """Advance one owned scroller with bounded async-settle recovery.
+
+        A no-move response near the normalized end is terminal, not an error.
+        A no-move response materially before the end gets two bounded settle/retry
+        opportunities so React/virtual-list paint latency cannot become a false hard
+        failure. Persistent material stalls remain fail-closed to prevent truncated
+        category candidate sets.
+        """
+
+        limit = max(8, int(max_items_per_level))
+        current_owner_id = str(owner_id or group_id)
+        state = self._scroll(current_owner_id, "next", group_id=group_id)
+        if bool(state.get("moved")) or bool(state.get("at_end")):
+            return state
+
+        baseline = _scroll_geometry(state).scroll_top
+        last_state = state
+        for retry in range(1, _SCROLL_SETTLE_RETRIES + 1):
+            self._wait(100 + retry * 50)
+            descriptors = self._descriptors(max_items_per_level=limit)
+            live = self._by_group(descriptors, group_id)
+            if live is None:
+                raise TaxonomyMechanicalError(
+                    "Makro taxonomy owned group disappeared while recovering a stalled scroll; "
+                    f"operation={operation!r} group={group_id!r}"
+                )
+
+            settled = _normalize_scroll_state(live)
+            settled_geometry = _scroll_geometry(settled)
+            rebound_owner_id = str(live.get("owner_id") or group_id)
+            if settled_geometry.at_end:
+                _diag(
+                    "scroll_stall_recovered",
+                    operation=operation,
+                    resolution="settled_at_end",
+                    retry=retry,
+                    group_id=group_id,
+                    owner_id=rebound_owner_id,
+                    scroll_top=settled_geometry.scroll_top,
+                    max_scroll=settled_geometry.max_scroll,
+                    remaining_scroll=settled_geometry.remaining_scroll,
+                    end_tolerance=settled_geometry.end_tolerance,
+                )
+                settled.update(found=True, moved=False)
+                return settled
+            if settled_geometry.scroll_top > baseline + _SCROLL_PROGRESS_EPSILON:
+                _diag(
+                    "scroll_stall_recovered",
+                    operation=operation,
+                    resolution="async_progress",
+                    retry=retry,
+                    group_id=group_id,
+                    owner_id=rebound_owner_id,
+                    scroll_top=settled_geometry.scroll_top,
+                    max_scroll=settled_geometry.max_scroll,
+                )
+                settled.update(found=True, moved=True)
+                return settled
+
+            if rebound_owner_id != current_owner_id:
+                _diag(
+                    "scroll_owner_rebound",
+                    operation=operation,
+                    group_id=group_id,
+                    previous_owner_id=current_owner_id,
+                    owner_id=rebound_owner_id,
+                    retry=retry,
+                )
+                current_owner_id = rebound_owner_id
+
+            last_state = self._scroll(current_owner_id, "next", group_id=group_id)
+            if bool(last_state.get("moved")) or bool(last_state.get("at_end")):
+                _diag(
+                    "scroll_stall_recovered",
+                    operation=operation,
+                    resolution="retry_progress" if last_state.get("moved") else "retry_at_end",
+                    retry=retry,
+                    group_id=group_id,
+                    owner_id=current_owner_id,
+                    scroll_top=last_state.get("scroll_top"),
+                    max_scroll=last_state.get("max_scroll"),
+                    remaining_scroll=last_state.get("remaining_scroll"),
+                    end_tolerance=last_state.get("end_tolerance"),
+                )
+                return last_state
+            baseline = max(baseline, _scroll_geometry(last_state).scroll_top)
+
+        geometry = _scroll_geometry(last_state)
+        raise TaxonomyMechanicalError(
+            "Makro taxonomy scroll owner could not advance after bounded settle/retry while materially before its real end; "
+            f"operation={operation!r} group={group_id!r} scroll_top={geometry.scroll_top} "
+            f"max_scroll={geometry.max_scroll} remaining={geometry.remaining_scroll} "
+            f"tolerance={geometry.end_tolerance}"
+        )
 
     def _harvest_owned_column(
         self,
@@ -416,9 +625,7 @@ class ResilientMakroTaxonomyBrowser:
                         f"group={group_id!r} count>{limit}. Refusing to truncate live nodes."
                     )
 
-                scroll_top = float(live.get("scroll_top") or 0.0)
-                max_scroll = float(live.get("max_scroll") or 0.0)
-                at_end = scroll_top >= max_scroll - 1.0
+                geometry = _scroll_geometry(live)
                 _diag(
                     "harvest_progress",
                     group_id=group_id,
@@ -426,20 +633,23 @@ class ResilientMakroTaxonomyBrowser:
                     iteration=iterations,
                     unique_count=len(output),
                     chunk_count=len(chunk),
-                    scroll_top=scroll_top,
-                    max_scroll=max_scroll,
-                    at_end=at_end,
+                    scroll_top=geometry.scroll_top,
+                    max_scroll=geometry.max_scroll,
+                    remaining_scroll=geometry.remaining_scroll,
+                    end_tolerance=geometry.end_tolerance,
+                    at_end=geometry.at_end,
+                    terminal_reason=geometry.terminal_reason,
                 )
-                if at_end:
+                if geometry.at_end:
                     completed = True
                     break
 
-                moved = self._scroll(owner_id, "next", group_id=group_id)
-                if not moved.get("moved") and not moved.get("at_end"):
-                    raise TaxonomyMechanicalError(
-                        "Makro taxonomy scroll owner could not advance before its real end; "
-                        f"group={group_id!r} scroll_top={moved.get('scroll_top')} max_scroll={moved.get('max_scroll')}"
-                    )
+                self._advance_owned_scroll(
+                    owner_id,
+                    group_id=group_id,
+                    max_items_per_level=limit,
+                    operation="harvest",
+                )
                 self._wait(90)
 
             if not completed:
@@ -671,15 +881,15 @@ class ResilientMakroTaxonomyBrowser:
                 raise TaxonomyMechanicalError(
                     f"Makro taxonomy exact node is duplicated inside one owned group: {wanted!r}"
                 )
-            scroll_top = float(live.get("scroll_top") or 0.0)
-            max_scroll = float(live.get("max_scroll") or 0.0)
-            if scroll_top >= max_scroll - 1.0:
+            geometry = _scroll_geometry(live)
+            if geometry.at_end:
                 return False
-            state = self._scroll(owner_id, "next", group_id=group_id)
-            if not state.get("moved") and not state.get("at_end"):
-                raise TaxonomyMechanicalError(
-                    f"Makro taxonomy could not reveal exact node before scroll end: {wanted!r}"
-                )
+            self._advance_owned_scroll(
+                owner_id,
+                group_id=group_id,
+                max_items_per_level=limit,
+                operation="reveal_exact",
+            )
             self._wait(90)
         raise TaxonomyMechanicalError(
             f"Makro taxonomy exact-node reveal exhausted its scroll budget: {wanted!r}"
