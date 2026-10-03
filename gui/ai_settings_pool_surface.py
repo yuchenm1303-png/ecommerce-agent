@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtCore import Signal, Qt, QUrl, QTimer
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -107,6 +110,9 @@ class AISettingsContent(QWidget):
 
     catalog_finished = Signal(object)
     probe_finished = Signal(object)
+    probe_progress = Signal(str, str)
+    probe_role_finished = Signal(object)
+    activity_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -127,6 +133,16 @@ class AISettingsContent(QWidget):
 
         self.catalog_finished.connect(self._catalog_done)
         self.probe_finished.connect(self._probe_done)
+        self.probe_progress.connect(self._stage_progress)
+        self.probe_role_finished.connect(self._role_finished)
+        self._activity_kind = ""
+        self._activity_frame = 0
+        self._completed_roles = 0
+        self._active_role = ""
+        self._active_stage = ""
+        self._activity_timer = QTimer(self)
+        self._activity_timer.setInterval(250)
+        self._activity_timer.timeout.connect(self._activity_tick)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -341,6 +357,14 @@ class AISettingsContent(QWidget):
         self.verify_button.setObjectName("modalPrimaryButton")
         self.verify_button.clicked.connect(self._start_probe)
         cap_form.addWidget(self.verify_button, 3, 1)
+        self.probe_summary = self._status("")
+        cap_form.addWidget(self.probe_summary, 4, 1)
+        self.probe_log_button = QPushButton("打开诊断日志")
+        self.probe_log_button.setObjectName("modalSecondaryButton")
+        self.probe_log_button.setEnabled(False)
+        self.probe_log_button.clicked.connect(self._open_probe_logs)
+        cap_form.addWidget(self.probe_log_button, 5, 1)
+        self._probe_log_path = ""
         layout.addWidget(capability)
         return card
 
@@ -581,7 +605,7 @@ class AISettingsContent(QWidget):
             QMessageBox.warning(self, "连接无效", str(exc))
             return
         self._set_busy(True)
-        self.catalog_status.setText("正在读取 /v1/models …")
+        self._begin_activity("catalog")
         expected = base.rstrip("/")
         def worker() -> None:
             result = discover_models(base_url=base, api_key=key)
@@ -605,6 +629,10 @@ class AISettingsContent(QWidget):
             text = "连接成功，但 /models 没有返回模型。"
         else:
             text = "该连接不提供 /models；绑定到它的角色可手动填写模型 ID。\n" + result.error
+        text += f" · 耗时 {getattr(result, 'elapsed_seconds', 0):.1f} 秒"
+        if getattr(result, "log_path", ""):
+            self._probe_log_path = result.log_path
+            self.probe_log_button.setEnabled(True)
         self._catalog_status[cid] = text
         if cid == self._current_connection_id():
             self.catalog_status.setText(text)
@@ -691,6 +719,55 @@ class AISettingsContent(QWidget):
         return tuple(result)  # type: ignore[return-value]
 
     # ------------------------------------------------------------- capability
+    def _begin_activity(self, kind: str) -> None:
+        self._activity_kind = kind
+        self._activity_started = time.monotonic()
+        self._stage_started = self._activity_started
+        self._activity_frame = 0
+        self._completed_roles = 0
+        self._active_role = ""
+        self._active_stage = "准备连接"
+        self._activity_timer.start()
+        self._activity_tick()
+
+    def _activity_tick(self) -> None:
+        if not self._busy or not self._activity_kind:
+            return
+        spinner = ("◐", "◓", "◑", "◒")[self._activity_frame % 4]
+        self._activity_frame += 1
+        elapsed = int(time.monotonic() - self._activity_started)
+        if self._activity_kind == "catalog":
+            self.catalog_button.setText(f"{spinner} 正在探测 · {elapsed} 秒")
+            self.catalog_status.setText(f"正在获取模型列表 · 已等待 {elapsed} 秒")
+        else:
+            self.verify_button.setText(f"{spinner} 测试中 · 已完成 {self._completed_roles}/3 个角色")
+            stage_elapsed = int(time.monotonic() - self._stage_started)
+            self.probe_summary.setText(f"已用 {elapsed} 秒 · 已完成 {self._completed_roles}/3 个角色 · 每次请求最多等待 120 秒")
+            if self._active_role:
+                self.capability_status[self._active_role].setText(
+                    f"{spinner} {self._active_stage} · 已等待 {stage_elapsed} 秒")
+        self.activity_changed.emit()
+
+    def _stage_progress(self, role: str, stage: str) -> None:
+        self._active_role = role
+        self._active_stage = {"client_init": "连接中", "strict_json_schema": "验证结构化输出",
+                              "vision": "验证图片识别", "web_search": "验证联网搜索与来源"}.get(stage, stage)
+        self._stage_started = time.monotonic()
+        self._activity_tick()
+
+    def _role_finished(self, report: RoleCapabilityReport) -> None:
+        self._active_role = ""
+        if report.passed:
+            self._completed_roles += 1
+            self._set_capability(report.role, "pass", "✓ 测试通过")
+        else:
+            self._set_capability(report.role, "fail", "✕ 测试失败 · " + report.error)
+        self._activity_tick()
+
+    def _open_probe_logs(self) -> None:
+        if self._probe_log_path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(self._probe_log_path).parent)))
+
     def _start_probe(self) -> None:
         if self._busy:
             return
@@ -701,13 +778,17 @@ class AISettingsContent(QWidget):
             return
         signatures = {item.role: binding_signature(item) for item in bindings}
         self._set_busy(True)
+        self.probe_log_button.setEnabled(False)
         for role in _ROLES:
-            self._set_capability(role, "warn", "正在执行真实能力测试…")
+            self._set_capability(role, "warn", "等待测试")
+        self._begin_activity("probe")
         def worker() -> None:
             reports: list[RoleCapabilityReport] = []
             for binding in bindings:
-                report = probe_role(binding)
+                report = probe_role(binding, timeout=120.0,
+                                    progress_callback=lambda stage, role=binding.role: self.probe_progress.emit(role, stage))
                 reports.append(report)
+                self.probe_role_finished.emit(report)
                 if not report.passed:
                     break
             self.probe_finished.emit((signatures, tuple(reports)))
@@ -738,15 +819,30 @@ class AISettingsContent(QWidget):
                 self._set_capability(role, "pass", "✓ 通过 · " + checks)
             else:
                 failed = True
-                self._set_capability(role, "fail", "✕ 失败 · " + (report.error or "能力不匹配"))
+                stage = getattr(report, "failed_stage", "")
+                stage = {"client_init": "连接初始化", "strict_json_schema": "严格 JSON 测试",
+                         "vision": "图片识别测试", "web_search": "联网搜索测试"}.get(stage, stage)
+                self._set_capability(role, "fail", "✕ 失败 · " + (stage + " · " if stage else "") + (report.error or "能力不匹配"))
+            if report is not None:
+                self.capability_status[role].setToolTip("")
         if failed:
             self._verified_signatures.clear()
             self._verified_reports = report_by_role
-            QMessageBox.warning(self, "能力不匹配", "至少一个角色没有通过；可以给失败角色换另一条连接或模型后重新测试。")
+            paths = [getattr(item, "log_path", "") for item in reports if getattr(item, "log_path", "")]
+            if paths:
+                self._probe_log_path = paths[-1]
+                self.probe_log_button.setEnabled(True)
+                self.probe_summary.setText("测试未通过，诊断日志已保存。")
+            else:
+                self.probe_summary.setText("测试未通过，诊断日志写入失败。")
             return
         self._verified_signatures = dict(signatures)
         self._verified_reports = report_by_role
-        QMessageBox.information(self, "能力测试通过", "三个角色都通过，可以保存并使用当前中转站组合。")
+        self.probe_summary.setText("三个角色均通过，可以保存并使用当前中转站组合。")
+        paths = [getattr(item, "log_path", "") for item in reports if getattr(item, "log_path", "")]
+        if paths:
+            self._probe_log_path = paths[-1]
+            self.probe_log_button.setEnabled(True)
 
     def _set_capability(self, role: str, state: str, text: str) -> None:
         label = self.capability_status[role]
@@ -865,6 +961,12 @@ class AISettingsContent(QWidget):
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
+        if not busy:
+            self._activity_timer.stop()
+            self._activity_kind = ""
+            self.catalog_button.setText("探测当前连接模型")
+            self.verify_button.setText("测试三个角色的实际能力")
+            self.activity_changed.emit()
         self.catalog_button.setEnabled(not busy and self._drafts[self._current_connection_id()].enabled)
         self.verify_button.setEnabled(not busy)
         self.save_button.setEnabled(not busy)
@@ -884,6 +986,10 @@ class AISettingsModalController(_BaseAISettingsModalController):
         def populate() -> None:
             panel = AISettingsContent(body)
             self._panel = panel
+            quick = getattr(self.window, "_static_qml_view_controller", None)
+            refresh = getattr(getattr(quick, "bridge", None), "schedule_refresh", None)
+            if callable(refresh):
+                panel.activity_changed.connect(refresh)
             body_layout.addWidget(panel, 1)
         open_custom(title="AI 服务设置", eyebrow="SETTINGS · AI PROFILES", populate=populate, ratio=(0.72, 0.84))
 

@@ -77,6 +77,8 @@ class RoleCapabilityReport:
     passed: bool
     checks: tuple[CapabilityCheck, ...] = ()
     error: str = ""
+    failed_stage: str = ""
+    log_path: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +88,8 @@ class RoleCapabilityReport:
             "passed": self.passed,
             "checks": [asdict(item) for item in self.checks],
             "error": self.error,
+            "failed_stage": self.failed_stage,
+            "log_path": self.log_path,
         }
 
 
@@ -95,6 +99,8 @@ class ModelCatalogResult:
     models: tuple[str, ...] = ()
     catalog_available: bool = True
     error: str = ""
+    log_path: str = ""
+    elapsed_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,11 +209,26 @@ def discover_models(
     api_key: str,
     timeout: float = 20.0,
     client_factory: Callable[..., Any] | None = None,
+    diagnostic_dir: Path | None = None,
 ) -> ModelCatalogResult:
+    from dataclasses import replace
+    import time
+    from .ai_probe_diagnostics import ProbeDiagnostics
     binding = RoleBinding("fact", base_url, "_catalog_probe_", api_key).normalized()
+    diagnostics = ProbeDiagnostics(binding, timeout, diagnostic_dir)
+    diagnostics.stage = "model_catalog"
+    result = _discover_models(binding, timeout=timeout, client_factory=client_factory, diagnostics=diagnostics)
+    elapsed = round(time.monotonic() - diagnostics.started, 3)
+    diagnostics.write("catalog_finished", catalog_available=result.catalog_available,
+                      model_count=len(result.models), elapsed_seconds=elapsed, error=diagnostics.clean(result.error))
+    return replace(result, log_path=str(diagnostics.path) if diagnostics.path else "", elapsed_seconds=elapsed)
+
+
+def _discover_models(binding, *, timeout, client_factory, diagnostics):
+    api_key = binding.api_key
     try:
         client = _client(binding, timeout=timeout, client_factory=client_factory)
-        response = client.models.list()
+        response = diagnostics.call("/models", client.models.list)
         data = list(getattr(response, "data", response) or [])
         models = sorted(
             {
@@ -359,12 +380,27 @@ def probe_role(
     timeout: float = 30.0,
     client_factory: Callable[..., Any] | None = None,
     vision_sequence: tuple[str, str, str] | None = None,
+    diagnostic_dir: Path | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> RoleCapabilityReport:
+    from .ai_probe_diagnostics import ProbeDiagnostics
+    normalized = binding.normalized()
+    diagnostics = ProbeDiagnostics(normalized, timeout, diagnostic_dir)
+    diagnostics.progress_callback = progress_callback
+    diagnostics.set_stage("client_init")
+    report = _probe_role(normalized, timeout=timeout, client_factory=client_factory,
+                         vision_sequence=vision_sequence, diagnostics=diagnostics)
+    return diagnostics.finish(report)
+
+
+def _probe_role(binding, *, timeout, client_factory, vision_sequence, diagnostics):
     normalized = binding.normalized()
     checks: list[CapabilityCheck] = []
     try:
         client = _client(normalized, timeout=timeout, client_factory=client_factory)
+        client = diagnostics.wrap(client)
         if normalized.role in {"semantic", "fact"}:
+            diagnostics.set_stage("strict_json_schema")
             try:
                 _strict_json_probe(client, model=normalized.model, timeout=timeout)
                 checks.extend(
@@ -391,6 +427,7 @@ def probe_role(
                 )
 
         if normalized.role == "semantic":
+            diagnostics.set_stage("vision")
             try:
                 _vision_probe(
                     client,
@@ -414,6 +451,7 @@ def probe_role(
                 )
 
         if normalized.role == "web":
+            diagnostics.set_stage("web_search")
             try:
                 protocol = _web_probe(
                     client,

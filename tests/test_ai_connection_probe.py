@@ -326,3 +326,167 @@ def test_binding_signature_changes_for_url_model_or_key() -> None:
     assert binding_signature(original) != binding_signature(
         RoleBinding("fact", original.base_url, original.model, "different-key")
     )
+
+
+def test_timeout_diagnostics_preserve_stage_cause_and_redact_key(tmp_path):
+    cause = TimeoutError("read timeout secret-key")
+    error = RuntimeError("Request timed out. Bearer secret-key")
+    error.__cause__ = cause
+    report = probe_role(_binding("semantic"), diagnostic_dir=tmp_path,
+                        client_factory=_Factory(_Client(chat_payloads=(error,))))
+    assert not report.passed
+    assert report.failed_stage == "strict_json_schema"
+    raw = Path(report.log_path).read_text(encoding="utf-8")
+    assert "secret-key" not in raw
+    records = [json.loads(line) for line in raw.splitlines()]
+    failure = next(item for item in records if item["event"] == "request_failed")
+    assert failure["endpoint"] == "/chat/completions"
+    assert failure["timeout_seconds"] == 30.0
+    assert failure["causes"][0]["type"] == "TimeoutError"
+    assert failure["elapsed_seconds"] >= 0
+    assert records[-1]["event"] == "probe_finished"
+
+
+def test_vision_failure_is_distinguished_from_successful_json_request(tmp_path):
+    report = probe_role(_binding("semantic"), diagnostic_dir=tmp_path,
+                        client_factory=_Factory(_Client(chat_payloads=(
+                            {"probe": "ok"}, {"colors": ["yellow"]}))),
+                        vision_sequence=("red", "green", "blue"))
+    assert report.failed_stage == "vision"
+    records = [json.loads(line) for line in Path(report.log_path).read_text(encoding="utf-8").splitlines()]
+    assert [item["stage"] for item in records if item["event"] == "request_succeeded"] == [
+        "strict_json_schema", "vision"]
+    assert records[-1]["passed"] is False
+
+
+def test_parameter_rejection_logs_status_and_request_id_without_body(tmp_path):
+    error = RuntimeError("unsupported parameter enable_thinking")
+    error.status_code = 400
+    error.request_id = "request-123"
+    error.body = {"api_key": "secret-key"}
+    report = probe_role(_binding("fact"), diagnostic_dir=tmp_path,
+                        client_factory=_Factory(_Client(chat_payloads=(error,))))
+    records = [json.loads(line) for line in Path(report.log_path).read_text(encoding="utf-8").splitlines()]
+    failure = next(item for item in records if item["event"] == "request_failed")
+    assert failure["status_code"] == 400
+    assert failure["request_id"] == "request-123"
+    assert "body" not in failure
+
+
+def test_unwritable_diagnostics_do_not_change_capability_result(tmp_path):
+    blocked = tmp_path / "file"
+    blocked.write_text("not a directory")
+    report = probe_role(_binding("fact"), diagnostic_dir=blocked,
+                        client_factory=_Factory(_Client(chat_payloads=({"probe": "ok"},))))
+    assert report.passed
+    assert report.log_path == ""
+
+
+def test_catalog_diagnostics_log_network_failure_and_elapsed_time(tmp_path):
+    class BrokenModels:
+        def list(self):
+            raise TimeoutError("secret-key connection timeout")
+    client = _Client()
+    client.models = BrokenModels()
+    result = discover_models(base_url="https://relay.example/v1", api_key="secret-key",
+                             client_factory=_Factory(client), diagnostic_dir=tmp_path)
+    assert not result.catalog_available
+    raw = Path(result.log_path).read_text(encoding="utf-8")
+    assert "secret-key" not in raw
+    records = [json.loads(line) for line in raw.splitlines()]
+    failure = next(item for item in records if item["event"] == "request_failed")
+    assert failure["stage"] == "model_catalog"
+    assert failure["endpoint"] == "/models"
+    assert failure["timeout_seconds"] == 20.0
+    assert records[-1]["event"] == "catalog_finished"
+    assert result.elapsed_seconds >= 0
+
+
+def test_failed_probe_shows_inline_summary_instead_of_message_box(monkeypatch, tmp_path):
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from gui.ai_settings_pool_surface import AISettingsContent
+    application = QApplication.instance() or QApplication([])
+    widget = AISettingsContent()
+    bindings = tuple(_binding(role) for role in ("semantic", "fact", "web"))
+    monkeypatch.setattr(widget, "_bindings_from_ui", lambda **kwargs: bindings)
+    def unexpected_popup(*args, **kwargs):
+        raise AssertionError("Failure should stay inside the settings panel")
+    monkeypatch.setattr(QMessageBox, "warning", unexpected_popup)
+    report = probe_role(bindings[0], diagnostic_dir=tmp_path,
+                        client_factory=_Factory(_Client(chat_payloads=(TimeoutError("read timeout"),))))
+    widget._probe_done(({item.role: binding_signature(item) for item in bindings}, (report,)))
+    assert widget.probe_summary.text() == "测试未通过，诊断日志已保存。"
+    assert widget.probe_log_button.isEnabled()
+    assert "严格 JSON 测试" in widget.capability_status["semantic"].text()
+    assert str(tmp_path) not in widget.probe_summary.text()
+    widget.close()
+    widget.deleteLater()
+    application.processEvents()
+
+
+def test_gui_worker_uses_production_timeout_and_verifies_all_roles(monkeypatch, tmp_path):
+    from PySide6.QtWidgets import QApplication
+    from gui import ai_settings_pool_surface as surface
+    application = QApplication.instance() or QApplication([])
+    widget = surface.AISettingsContent()
+    bindings = tuple(_binding(role) for role in ("semantic", "fact", "web"))
+    monkeypatch.setattr(widget, "_bindings_from_ui", lambda **kwargs: bindings)
+    client_timeouts = []
+    def actual_probe_with_fake_transport(binding, **kwargs):
+        client = _Client(chat_payloads=({"probe": "ok"}, {"colors": ["red", "green", "blue"]}),
+                         web_output=_web_call_with_sources())
+        factory = _Factory(client)
+        report = probe_role(binding, **kwargs, client_factory=factory, diagnostic_dir=tmp_path,
+                            vision_sequence=("red", "green", "blue"))
+        client_timeouts.append(factory.kwargs["timeout"])
+        return report
+    class InlineThread:
+        def __init__(self, *, target, **kwargs):
+            self.target = target
+        def start(self):
+            self.target()
+    monkeypatch.setattr(surface, "probe_role", actual_probe_with_fake_transport)
+    monkeypatch.setattr(surface.threading, "Thread", InlineThread)
+    widget._start_probe()
+    assert client_timeouts == [120.0, 120.0, 120.0]
+    assert set(widget._verified_reports) == {"semantic", "fact", "web"}
+    assert all(report.passed for report in widget._verified_reports.values())
+    assert not widget._busy
+    widget.close()
+    widget.deleteLater()
+    application.processEvents()
+
+
+def test_activity_shows_elapsed_stage_and_completed_roles_then_stops():
+    import time
+    from PySide6.QtWidgets import QApplication
+    from gui.ai_settings_pool_surface import AISettingsContent
+    application = QApplication.instance() or QApplication([])
+    widget = AISettingsContent()
+    widget._set_busy(True)
+    widget._begin_activity("probe")
+    widget._stage_progress("semantic", "vision")
+    widget._activity_started = time.monotonic() - 8
+    widget._stage_started = time.monotonic() - 3
+    widget._activity_tick()
+    assert "验证图片识别" in widget.capability_status["semantic"].text()
+    assert "已等待 3 秒" in widget.capability_status["semantic"].text()
+    assert "已用 8 秒" in widget.probe_summary.text()
+    report = probe_role(_binding("fact"), client_factory=_Factory(_Client(chat_payloads=({"probe": "ok"},))))
+    widget._role_finished(report)
+    assert "1/3" in widget.verify_button.text()
+    widget._set_busy(False)
+    assert not widget._activity_timer.isActive()
+    summary = widget.probe_summary.text()
+    widget._activity_tick()
+    assert widget.probe_summary.text() == summary
+    widget._set_busy(True)
+    widget._begin_activity("catalog")
+    first = widget.catalog_button.text()
+    widget._activity_tick()
+    assert first != widget.catalog_button.text()
+    assert "获取模型列表" in widget.catalog_status.text()
+    widget._set_busy(False)
+    widget.close()
+    widget.deleteLater()
+    application.processEvents()
