@@ -19,10 +19,17 @@ from PySide6.QtWidgets import (
 
 from app.ai_service_settings import (
     AIServiceSettings,
+    RUNTIME_FACT_BASE_URL_ENV,
+    RUNTIME_FACT_KEY_ENV,
+    RUNTIME_WEB_BASE_URL_ENV,
+    RUNTIME_WEB_KEY_ENV,
     clear_ai_service_key,
     has_ai_service_key,
+    has_ai_service_role_key,
+    load_ai_service_role_key,
     load_ai_service_settings,
     resolved_ai_runtime,
+    save_ai_service_role_key,
     save_ai_service_settings,
 )
 from app.image_optimization_gate import (
@@ -40,6 +47,7 @@ QWidget#aiSettingsContent { background: transparent; }
 QLabel#aiSettingsHint { color: rgba(255,255,255,196); font-size: 11px; }
 QLabel#aiSettingsProvider { color: rgba(255,255,255,238); font-size: 12px; font-weight: 720; }
 QLabel#imageOptimizationState { color: rgba(255,255,255,138); font-size: 11px; }
+QLabel#aiRoleStatus { color: rgba(255,255,255,138); font-size: 10px; }
 QCheckBox#imageOptimizationSwitch {
     color: rgba(255,255,255,226);
     spacing: 9px;
@@ -97,6 +105,11 @@ class AISettingsContent(QWidget):
         self.setStyleSheet(_CONTENT_STYLE)
         self._key_configured = False
         self._editing_key = False
+        self._role_key_configured = {"fact": False, "web": False}
+        self._role_key_editing = {"fact": False, "web": False}
+        self._role_key_inputs: dict[str, QLineEdit] = {}
+        self._role_key_actions: dict[str, QPushButton] = {}
+        self._role_key_status: dict[str, QLabel] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -185,6 +198,61 @@ class AISettingsContent(QWidget):
         self.key_status.setWordWrap(True)
         layout.addWidget(self.key_status)
 
+        advanced_hint = QLabel(
+            "高级 · 中转站兼容。默认关闭时 Fact / Web 继续复用上面的连接与密钥，旧配置无需迁移。"
+            "只有明确开启某个角色后，才使用该角色自己的 Base URL 与加密密钥。"
+        )
+        advanced_hint.setObjectName("aiSettingsHint")
+        advanced_hint.setWordWrap(True)
+        layout.addWidget(advanced_hint)
+
+        advanced = QFrame()
+        advanced.setObjectName("cardDetailSection")
+        advanced_form = QGridLayout(advanced)
+        advanced_form.setContentsMargins(15, 14, 15, 15)
+        advanced_form.setHorizontalSpacing(16)
+        advanced_form.setVerticalSpacing(10)
+        advanced_form.setColumnStretch(1, 1)
+
+        self.fact_override = QCheckBox("独立 Fact 连接")
+        self.fact_override.setObjectName("imageOptimizationSwitch")
+        self.fact_override.toggled.connect(self._sync_override_controls)
+        self.fact_base_url = self._input("Fact 中转 Base URL")
+        fact_key_row = self._role_key_row("fact", "Fact API Key")
+        fact_status = self._role_key_status["fact"]
+
+        self.web_override = QCheckBox("独立 Web 连接")
+        self.web_override.setObjectName("imageOptimizationSwitch")
+        self.web_override.toggled.connect(self._sync_override_controls)
+        self.web_base_url = self._input("兼容 DashScope Responses Web Search 的 Base URL")
+        web_key_row = self._role_key_row("web", "Web API Key")
+        web_status = self._role_key_status["web"]
+
+        advanced_rows: list[tuple[str, Any]] = [
+            ("Fact", self.fact_override),
+            ("Fact Base URL", self.fact_base_url),
+            ("Fact API Key", fact_key_row),
+            ("", fact_status),
+            ("Web", self.web_override),
+            ("Web Base URL", self.web_base_url),
+            ("Web API Key", web_key_row),
+            ("", web_status),
+        ]
+        for row, (text, widget) in enumerate(advanced_rows):
+            label = QLabel(text)
+            label.setObjectName("modalFieldLabel")
+            advanced_form.addWidget(label, row, 0, Qt.AlignmentFlag.AlignVCenter)
+            advanced_form.addWidget(widget, row, 1)
+        layout.addWidget(advanced)
+
+        web_policy = QLabel(
+            "Web 独立连接仍使用 DashScope Responses `web_search` 能力。普通 OpenAI-compatible 中转如果没有"
+            "兼容该能力，会明确失败，不会静默退化为普通对话模型或伪造联网结果。"
+        )
+        web_policy.setObjectName("cardDetailText")
+        web_policy.setWordWrap(True)
+        layout.addWidget(web_policy)
+
         policy = QLabel(
             "正式客户端只使用这里配置的用户密钥。图像优化默认关闭时继续使用原有图片选择路径，"
             "不会启动额外的 Ownership / Gallery 多模态调用。以后如果提供平台内置 AI 额度，"
@@ -216,6 +284,28 @@ class AISettingsContent(QWidget):
         editor.setPlaceholderText(placeholder)
         return editor
 
+    def _role_key_row(self, role: str, placeholder: str) -> QWidget:
+        editor = self._input(placeholder)
+        editor.setEchoMode(QLineEdit.EchoMode.Password)
+        action = QPushButton("显示")
+        action.setObjectName("modalPrimaryButton")
+        action.setMaximumWidth(72)
+        action.clicked.connect(lambda _checked=False, name=role: self._role_key_action_clicked(name))
+        status = QLabel()
+        status.setObjectName("aiRoleStatus")
+        status.setWordWrap(True)
+        self._role_key_inputs[role] = editor
+        self._role_key_actions[role] = action
+        self._role_key_status[role] = status
+
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(8)
+        row_layout.addWidget(editor, 1)
+        row_layout.addWidget(action)
+        return row
+
     def reload(self) -> None:
         try:
             settings = load_ai_service_settings()
@@ -226,8 +316,15 @@ class AISettingsContent(QWidget):
         self.model.setText(settings.model)
         self.fact_model.setText(settings.fact_model)
         self.web_model.setText(settings.web_model)
+        self.fact_override.setChecked(settings.fact_override_enabled)
+        self.fact_base_url.setText(settings.fact_base_url)
+        self.web_override.setChecked(settings.web_override_enabled)
+        self.web_base_url.setText(settings.web_base_url)
         self._set_key_state(has_ai_service_key(settings))
+        self._set_role_key_state("fact", has_ai_service_role_key("fact"))
+        self._set_role_key_state("web", has_ai_service_role_key("web"))
         self._refresh_key_status(settings)
+        self._sync_override_controls()
         self._sync_image_optimization()
 
     def _sync_image_optimization(self) -> None:
@@ -272,6 +369,26 @@ class AISettingsContent(QWidget):
             self.key_action.setText("显示")
             self.key_action.setToolTip("显示 / 隐藏当前正在输入的新密钥")
 
+    def _set_role_key_state(self, role: str, configured: bool) -> None:
+        editor = self._role_key_inputs[role]
+        action = self._role_key_actions[role]
+        status = self._role_key_status[role]
+        self._role_key_configured[role] = bool(configured)
+        self._role_key_editing[role] = not bool(configured)
+        editor.setEchoMode(QLineEdit.EchoMode.Password)
+        if configured:
+            editor.setReadOnly(True)
+            editor.setText(_MASKED_KEY)
+            editor.setPlaceholderText("")
+            action.setText("更改")
+            status.setText("独立密钥已安全保存；关闭覆盖不会删除密钥。")
+        else:
+            editor.setReadOnly(False)
+            editor.clear()
+            editor.setPlaceholderText(f"{role.title()} API Key")
+            action.setText("显示")
+            status.setText("尚未保存独立密钥。只有开启该角色覆盖时才需要。")
+
     def _begin_key_edit(self) -> None:
         self._editing_key = True
         self.api_key.setReadOnly(False)
@@ -284,6 +401,18 @@ class AISettingsContent(QWidget):
         self.key_status.setText("API Key · 正在更改。输入新密钥后点击“保存设置”即可覆盖旧密钥。")
         self.key_status.setStyleSheet("color: #b9d9f2; font-weight: 650;")
 
+    def _begin_role_key_edit(self, role: str) -> None:
+        self._role_key_editing[role] = True
+        editor = self._role_key_inputs[role]
+        action = self._role_key_actions[role]
+        editor.setReadOnly(False)
+        editor.clear()
+        editor.setPlaceholderText(f"输入新的 {role.title()} API Key")
+        editor.setEchoMode(QLineEdit.EchoMode.Password)
+        action.setText("显示")
+        editor.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._role_key_status[role].setText("正在更改；保存设置后覆盖旧密钥。")
+
     def _key_action_clicked(self) -> None:
         if self._key_configured and not self._editing_key:
             self._begin_key_edit()
@@ -293,6 +422,26 @@ class AISettingsContent(QWidget):
             QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
         )
         self.key_action.setText("隐藏" if visible else "显示")
+
+    def _role_key_action_clicked(self, role: str) -> None:
+        if self._role_key_configured[role] and not self._role_key_editing[role]:
+            self._begin_role_key_edit(role)
+            return
+        editor = self._role_key_inputs[role]
+        action = self._role_key_actions[role]
+        visible = editor.echoMode() == QLineEdit.EchoMode.Password
+        editor.setEchoMode(QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password)
+        action.setText("隐藏" if visible else "显示")
+
+    def _sync_override_controls(self, *_args) -> None:
+        for role, enabled, base_editor in (
+            ("fact", self.fact_override.isChecked(), self.fact_base_url),
+            ("web", self.web_override.isChecked(), self.web_base_url),
+        ):
+            base_editor.setEnabled(enabled)
+            self._role_key_inputs[role].setEnabled(enabled)
+            self._role_key_actions[role].setEnabled(enabled)
+            self._role_key_status[role].setEnabled(enabled)
 
     def _refresh_key_status(self, settings: AIServiceSettings | None = None) -> None:
         configured = settings or load_ai_service_settings()
@@ -312,6 +461,10 @@ class AISettingsContent(QWidget):
             model=self.model.text().strip(),
             fact_model=self.fact_model.text().strip(),
             web_model=self.web_model.text().strip(),
+            fact_override_enabled=self.fact_override.isChecked(),
+            fact_base_url=self.fact_base_url.text().strip(),
+            web_override_enabled=self.web_override.isChecked(),
+            web_base_url=self.web_base_url.text().strip(),
         )
 
         api_key: str | None = None
@@ -329,7 +482,42 @@ class AISettingsContent(QWidget):
                 return
             api_key = value
 
+        role_values: dict[str, str | None] = {"fact": None, "web": None}
+        for role, enabled in (
+            ("fact", settings.fact_override_enabled),
+            ("web", settings.web_override_enabled),
+        ):
+            if self._role_key_editing[role]:
+                value = self._role_key_inputs[role].text().strip()
+                if value:
+                    role_values[role] = value
+                elif enabled and not self._role_key_configured[role]:
+                    QMessageBox.warning(
+                        self,
+                        f"{role.title()} API Key 未配置",
+                        f"已开启 {role.title()} 独立连接，请填写该角色自己的 API Key。",
+                    )
+                    return
+                elif enabled and self._role_key_configured[role]:
+                    QMessageBox.warning(
+                        self,
+                        f"{role.title()} API Key 尚未更改",
+                        "请输入新的密钥；如不想更改旧密钥，请重新打开设置页后直接保存。",
+                    )
+                    return
+            elif enabled and not self._role_key_configured[role]:
+                QMessageBox.warning(
+                    self,
+                    f"{role.title()} API Key 未配置",
+                    f"已开启 {role.title()} 独立连接，请先配置独立密钥。",
+                )
+                return
+
         try:
+            settings.validated()
+            for role, value in role_values.items():
+                if value is not None:
+                    save_ai_service_role_key(role, value)
             normalized = save_ai_service_settings(settings, api_key=api_key)
             if not has_ai_service_key(normalized):
                 raise ValueError("请填写你自己的 API Key。")
@@ -338,14 +526,17 @@ class AISettingsContent(QWidget):
             return
 
         self._set_key_state(True)
-        self.key_status.setText("AI 服务配置已保存 · API Key 已安全保存，可随时点击“更改”进行替换。")
+        self._set_role_key_state("fact", has_ai_service_role_key("fact"))
+        self._set_role_key_state("web", has_ai_service_role_key("web"))
+        self._sync_override_controls()
+        self.key_status.setText("AI 服务配置已保存 · 密钥已安全保存，可随时点击“更改”进行替换。")
         self.key_status.setStyleSheet("color: #9fe2bd; font-weight: 700;")
 
     def _clear_key(self) -> None:
         answer = QMessageBox.question(
             self,
             "清除 API Key",
-            "确定删除本机保存的 AI API Key？删除后新的 AI 任务将无法开始，直到重新配置。",
+            "确定删除本机保存的主 AI API Key？独立 Fact / Web 密钥不会被删除。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -394,7 +585,7 @@ class AISettingsModalController:
             title="AI 服务设置",
             eyebrow="SETTINGS · AI SERVICE",
             populate=populate,
-            ratio=(0.72, 0.78),
+            ratio=(0.72, 0.82),
         )
 
     def _install_header_button(self) -> None:
@@ -406,6 +597,16 @@ class AISettingsModalController:
             raise RuntimeError("AI settings expected the common application header")
         header.addWidget(self.button, 0, Qt.AlignmentFlag.AlignBottom)
 
+    @staticmethod
+    def _clear_role_runtime() -> None:
+        for name in (
+            RUNTIME_FACT_BASE_URL_ENV,
+            RUNTIME_FACT_KEY_ENV,
+            RUNTIME_WEB_BASE_URL_ENV,
+            RUNTIME_WEB_KEY_ENV,
+        ):
+            os.environ.pop(name, None)
+
     def _apply_runtime(self, config) -> None:
         settings, api_key = resolved_ai_runtime()
         config.provider = "openai-compatible"
@@ -415,6 +616,20 @@ class AISettingsModalController:
         config.web_model = settings.web_model
         config.api_key_env = _RUNTIME_KEY_ENV
         os.environ[_RUNTIME_KEY_ENV] = api_key
+
+        self._clear_role_runtime()
+        if settings.fact_override_enabled:
+            fact_key = load_ai_service_role_key("fact")
+            if not fact_key:
+                raise ValueError("Fact 独立连接已启用，但没有可用的 Fact API Key。")
+            os.environ[RUNTIME_FACT_BASE_URL_ENV] = settings.fact_base_url
+            os.environ[RUNTIME_FACT_KEY_ENV] = fact_key
+        if settings.web_override_enabled:
+            web_key = load_ai_service_role_key("web")
+            if not web_key:
+                raise ValueError("Web 独立连接已启用，但没有可用的 Web API Key。")
+            os.environ[RUNTIME_WEB_BASE_URL_ENV] = settings.web_base_url
+            os.environ[RUNTIME_WEB_KEY_ENV] = web_key
 
     def _install_runtime_binding(self) -> None:
         runner = self.window.runner
