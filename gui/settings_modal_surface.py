@@ -1,13 +1,11 @@
 """Backward-compatible import surface for the AI connection settings panel.
 
-The implementation keeps the verified connection/probe core in
-:mod:`gui.ai_settings_surface`, while :mod:`gui.ai_settings_compact_surface`
-presents the normal setup as one simple flow: connection -> model discovery ->
-role selection -> capability validation. Existing imports intentionally keep
-working unchanged.
+The active implementation keeps the proven official-Qwen profile intact while
+allowing the relay side to use a small connection pool. Each AI role can bind to
+its own relay URL / key / model and is capability-tested before runtime use.
 """
 
-from .ai_settings_compact_surface import (
+from .ai_settings_pool_surface import (
     AISettingsContent,
     AISettingsModalController,
     install_ai_settings_modal,
