@@ -24,6 +24,7 @@ on:
       - "run_packaged_worker.py"
       - "run_local_gui.py"
       - "native/sakana-helper/**"
+      - "native/installer-bootstrapper/**"
       - "packaging/**"
       - "scripts/build_windows.ps1"
       - "scripts/velopack_cli.ps1"
@@ -35,6 +36,7 @@ on:
       - "requirements-build.txt"
       - "tests/test_batch_architecture_contract.py"
       - "tests/test_cdp_transport_lane.py"
+      - "tests/test_customer_installer_contract.py"
       - "tests/test_execute_owned_worker.py"
       - "tests/test_windows_packaging_contract.py"
       - "tests/test_velopack_update_contract.py"
@@ -60,7 +62,7 @@ jobs:
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "8.0.x"
+          dotnet-version: "8.0.424"
 
       - name: Install build dependencies
         shell: pwsh
@@ -77,27 +79,60 @@ jobs:
             tests/test_velopack_update_contract.py `
             tests/test_app_update_ui_contract.py `
             tests/test_updater_browser_shutdown_contract.py `
+            tests/test_customer_installer_contract.py `
             tests/test_batch_architecture_contract.py `
             tests/test_cdp_transport_lane.py `
             tests/test_execute_owned_worker.py
+
+      - name: Resolve routine package version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Routine packages are validated in place and discarded, but the build
+          # hydrates the latest public Stable for delta generation and Velopack
+          # refuses to pack a version at or below it. Pack the next patch, the
+          # same rule Publish Update uses in auto mode.
+          $version = (Get-Content "packaging\VERSION" -Raw).Trim()
+          $latestRaw = & gh api "repos/$env:GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>$null
+          if ($LASTEXITCODE -eq 0 -and (($latestRaw | Out-String).Trim() -match '^v(\d+\.\d+\.\d+)$')) {
+            $latest = [version]$Matches[1]
+            $next = [version]::new($latest.Major, $latest.Minor, $latest.Build + 1)
+            if ($version -notmatch '^\d+\.\d+\.\d+$' -or $next -gt [version]$version) {
+              $version = $next.ToString()
+            }
+          }
+          $global:LASTEXITCODE = 0
+          Write-Host "Routine package version: $version"
+          Set-Content "packaging\VERSION" $version -Encoding ascii -NoNewline
 
       - name: Build Velopack installer and portable package
         shell: pwsh
         run: .\scripts\build_windows.ps1
 
-      - name: Silent Velopack install and uninstall smoke test
+      - name: Silent customer install recovery and uninstall smoke test
         shell: pwsh
         run: |
           $setups = @(Get-ChildItem artifacts\EcommerceAgent-Setup-*.exe -File)
-          if ($setups.Count -ne 1) { throw "Expected exactly one friendly Velopack installer artifact, found $($setups.Count)" }
+          if ($setups.Count -ne 1) { throw "Expected exactly one customer installer artifact, found $($setups.Count)" }
           $setup = $setups[0]
           $expectedVersion = (Get-Content packaging\VERSION -Raw).Trim()
-          $installDir = Join-Path $env:RUNNER_TEMP "ListingStudioVelopackInstalled"
+          $installDir = Join-Path $env:LOCALAPPDATA "Smirel.ListingStudio"
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
-          $install = Start-Process -FilePath $setup.FullName -ArgumentList @(
-            "--silent", "--installto", $installDir
-          ) -Wait -PassThru
-          if ($install.ExitCode -ne 0) { throw "Velopack install failed: $($install.ExitCode)" }
+
+          # Reproduce the customer's real double-click failure mode at the
+          # canonical per-user location: the old app is gone but stale files
+          # keep Velopack in overwrite/repair mode.
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+          Set-Content (Join-Path $installDir "orphaned-velopack-state.txt") "stale" -Encoding ascii
+
+          $install = Start-Process -FilePath $setup.FullName -ArgumentList @("--silent") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Customer installer failed: $($install.ExitCode)" }
+
+          $staleBackups = @(Get-ChildItem $env:LOCALAPPDATA -Directory -Filter "Smirel.ListingStudio.stale-*" -ErrorAction SilentlyContinue)
+          if ($staleBackups.Count -ne 0) {
+            throw "Customer installer left stale rollback directories behind: $($staleBackups.FullName -join ', ')"
+          }
 
           $stub = Join-Path $installDir "EcommerceAgent.exe"
           $update = Join-Path $installDir "Update.exe"
@@ -125,13 +160,5 @@ jobs:
           }
           if (Test-Path $installDir) { throw "Velopack uninstall left installation root behind: $installDir" }
 
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: EcommerceAgent-Windows-${{ github.sha }}
-          path: |
-            artifacts/EcommerceAgent-Setup-*.exe
-            artifacts/EcommerceAgent-*-portable.zip
-            artifacts/velopack/*
-          if-no-files-found: error
-          retention-days: 14
+      # Routine CI validates the package in-place and then lets the runner discard it.
+      # Distribution artifacts belong to verified GitHub Releases, not Actions storage.
