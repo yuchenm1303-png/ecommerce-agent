@@ -7,6 +7,7 @@ from typing import Any, Callable
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QLabel, QVBoxLayout
 
+from app.browser_recovery_guard import BrowserRecoveryGuard
 from app.browser_session import (
     DEFAULT_CDP_PORT,
     DEFAULT_START_URL,
@@ -40,6 +41,7 @@ class ManagedMakroBrowser(QObject):
     endpoint_observed = Signal(str)
     _POLL_MS = 1500
     _PROBE_TIMEOUT_MS = 6_000
+    _OFFLINE_CONFIRM_POLLS = 2
     _HOT_STATES = {"READY", "LOGIN"}
 
     def __init__(self, window: Any, *, port: int = DEFAULT_CDP_PORT) -> None:
@@ -55,6 +57,9 @@ class ManagedMakroBrowser(QObject):
         self._launch_thread: threading.Thread | None = None
         self._endpoint_thread: threading.Thread | None = None
         self._poison_thread: threading.Thread | None = None
+        self._recovery_guard = BrowserRecoveryGuard(
+            offline_threshold=self._OFFLINE_CONFIRM_POLLS
+        )
         self._instance_token = ""
         self._generation = 0
         self._single_prepared_generation: int | None = None
@@ -304,6 +309,12 @@ class ManagedMakroBrowser(QObject):
         # Never turn Start back into a network wait. Ask the lifecycle worker to
         # recover/verify and fail immediately with a deterministic UI message.
         self.ensure_async()
+        if self._recovery_guard.launch_attempted and not token:
+            raise RuntimeError(
+                "Makro Browser 自动恢复已经尝试一次，但 CDP 仍不可用。"
+                "程序已暂停重复启动，避免继续打开 Makro 标签页；"
+                "请关闭残留的 Makro Browser 后重新打开 Listing Studio 再重试。"
+            )
         raise RuntimeError(
             "Makro Browser 正在后台启动或验证自动化控制。"
             "界面不会再为浏览器探针卡住；状态变为 READY 后请直接再次点击启动。"
@@ -315,6 +326,13 @@ class ManagedMakroBrowser(QObject):
                 "Makro Browser automation generation 已失效，但当前任务仍在运行；"
                 "为保护现场不会中途重启，任务结束后会自动恢复。"
             )
+
+        if not self._recovery_guard.claim_launch(require_offline_confirmation=False):
+            self._emit_status(
+                "POISONED",
+                "自动恢复已尝试一次 · 已暂停重复启动，避免继续打开 Makro 标签页",
+            )
+            return False
 
         self._emit_status("RECOVERING", f"{reason} · 正在安全重建 Makro Browser")
         closed = close_managed_browser(port=self.port, deadline_s=6.0)
@@ -344,6 +362,7 @@ class ManagedMakroBrowser(QObject):
             )
 
         self._observe_recovered_instance(probe.endpoint_token, previous_token)
+        self._recovery_guard.record_automation_ready()
         clear_cdp_poison(self.port)
         self._emit_status(
             "READY",
@@ -363,6 +382,7 @@ class ManagedMakroBrowser(QObject):
 
             token = self._cdp_instance_token()
             if token:
+                self._recovery_guard.observe_endpoint(True)
                 if self._is_busy():
                     if poison_matches_current_generation(self.port, token):
                         raise RuntimeError(
@@ -374,6 +394,7 @@ class ManagedMakroBrowser(QObject):
                 probe = probe_cdp_automation(self.port, timeout_ms=self._PROBE_TIMEOUT_MS)
                 if probe.automation_ready:
                     self._observe_instance(probe.endpoint_token)
+                    self._recovery_guard.record_automation_ready()
                     clear_cdp_poison(self.port)
                     self._emit_status("READY", "Makro Browser 自动化就绪 · 复用现有登录会话")
                     return False
@@ -394,6 +415,19 @@ class ManagedMakroBrowser(QObject):
                     "Makro Browser 在任务运行期间离线；为保护当前页面现场不会中途启动新 generation。"
                 )
 
+            if not self._recovery_guard.claim_launch(require_offline_confirmation=True):
+                if self._recovery_guard.launch_attempted:
+                    self._emit_status(
+                        "OFFLINE",
+                        "自动恢复已尝试一次 · 已暂停重复启动，避免继续打开 Makro 标签页",
+                    )
+                else:
+                    self._emit_status(
+                        "CHECKING",
+                        "CDP 暂时无响应 · 正在确认是否为瞬时连接抖动",
+                    )
+                return False
+
             self._emit_status("STARTING", f"{reason} · 正在启动 Makro Browser")
             try:
                 launch_detached_edge(
@@ -413,6 +447,7 @@ class ManagedMakroBrowser(QObject):
                         f"{probe.error or probe.state}"
                     )
                 self._observe_instance(probe.endpoint_token)
+                self._recovery_guard.record_automation_ready()
                 clear_cdp_poison(self.port)
                 self._emit_status("READY", "Makro Browser 已自动启动 · 专用登录 Profile 已载入")
                 return True
@@ -420,9 +455,13 @@ class ManagedMakroBrowser(QObject):
                 if self._update_quiesced:
                     raise RuntimeError("更新准备期间已取消 Makro Browser 自动恢复。") from exc
                 if self._state != "POISONED":
-                    self._emit_status("ERROR", f"Makro Browser 启动失败：{exc}")
+                    self._emit_status(
+                        "ERROR",
+                        "Makro Browser 启动失败 · 已暂停重复启动以避免继续打开标签页",
+                    )
                 raise RuntimeError(
-                    "无法建立可自动化的 Makro Browser。请确认 Microsoft Edge 已安装且专用浏览器端口未被其他程序占用。"
+                    "无法建立可自动化的 Makro Browser。程序不会继续重复打开 Makro 标签页；"
+                    "请关闭残留的 Makro Browser 后重新打开 Listing Studio。"
                 ) from exc
 
     def ensure_async(self) -> None:
@@ -475,6 +514,7 @@ class ManagedMakroBrowser(QObject):
         if self._update_quiesced:
             return
         token = str(token or "").strip()
+        self._recovery_guard.observe_endpoint(bool(token))
         if token:
             previous_generation = self._generation
             self._observe_instance(token)
@@ -521,8 +561,29 @@ class ManagedMakroBrowser(QObject):
                     "浏览器在任务运行中被关闭 · 当前任务会安全失败，空闲后自动恢复",
                 )
             return
+
+        if self._launch_thread is not None and self._launch_thread.is_alive():
+            if self._state != "STARTING":
+                self._emit_status("STARTING", "Makro Browser 正在进行一次受控恢复")
+            return
+
+        if not self._recovery_guard.offline_confirmed:
+            self._emit_status(
+                "CHECKING",
+                "CDP 暂时无响应 · 正在确认是否为瞬时连接抖动",
+            )
+            return
+
+        if self._recovery_guard.launch_attempted:
+            if self._state != "OFFLINE":
+                self._emit_status(
+                    "OFFLINE",
+                    "自动恢复已尝试一次 · 已暂停重复启动，避免继续打开 Makro 标签页",
+                )
+            return
+
         if self._state != "STARTING":
-            self._emit_status("STARTING", "Makro Browser 已关闭 · 正在自动恢复")
+            self._emit_status("STARTING", "Makro Browser 已确认离线 · 正在执行一次自动恢复")
         self.ensure_async()
 
     def _start_single(self, config: Any, *, mode: str = "full") -> Any:
