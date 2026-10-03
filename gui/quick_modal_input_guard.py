@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, Property, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, Property, QUrl, Signal
+from PySide6.QtGui import QWheelEvent
 from PySide6.QtQml import QQmlComponent
 from PySide6.QtQuick import QQuickItem, QQuickWindow
 from PySide6.QtWidgets import QWidget
@@ -19,7 +20,10 @@ Item {
     anchors.fill: parent
     visible: modalInputGuard.active
     enabled: visible
-    z: 20000
+    // Keep this immediately below the detail modal (z=25000).  The main Quick
+    // scene contains nested overlays with their own z values, so a low guard z
+    // can still leave an interactive main-scene item above the blocker.
+    z: 24990
 
     MouseArea {
         anchors.fill: parent
@@ -37,14 +41,19 @@ Item {
 
 
 class QuickModalInputGuard(QObject):
-    """Give an active Quick modal exclusive pointer ownership over the main scene.
+    """Give an active Quick modal exclusive input ownership over the main scene.
 
     The main scene and detail modal are siblings in one QQuickWindow. Pointer
     handlers may both observe the same physical sequence unless an intermediate
     owner consumes any event that the modal does not keep. This transparent guard
-    lives between the main scene (z=10000) and modal (z=25000), so modal controls
-    remain fully interactive while no click/release can fall through to the main
-    workspace during open, visible, or closing states.
+    lives immediately below the modal (z=25000), so modal controls remain fully
+    interactive while no click/release can fall through to the main workspace.
+
+    The visible modal is a QML mirror of an off-screen QWidget detail drawer. The
+    QWidget side already owns the canonical QScrollArea, therefore wheel/touchpad
+    input is intercepted at the QQuickWindow and forwarded to that scroll bar.
+    Re-snapshotting the controls after the scroll keeps the QML mirror in sync and
+    lets long settings panels expose their complete lower content.
     """
 
     activeChanged = Signal()
@@ -69,6 +78,9 @@ class QuickModalInputGuard(QObject):
             raise RuntimeError("Quick modal input guard requires the unified QQuickWindow")
 
         self._create_guard()
+        # Catch wheel input before QML dispatch.  The QML detail surface is only a
+        # mirror, while the real scroll state lives in FastCardDetailController.
+        self.quick.installEventFilter(self)
         self.modal.changed.connect(self._sync_active)
         window.destroyed.connect(self.cleanup)
 
@@ -106,7 +118,71 @@ class QuickModalInputGuard(QObject):
         self._active = active
         self.activeChanged.emit()
 
+    def _point_inside_modal(self, x: float, y: float) -> bool:
+        modal_x = int(getattr(self.modal, "_modal_x", 0))
+        modal_y = int(getattr(self.modal, "_modal_y", 0))
+        modal_w = int(getattr(self.modal, "_modal_w", 0))
+        modal_h = int(getattr(self.modal, "_modal_h", 0))
+        return (
+            modal_w > 0
+            and modal_h > 0
+            and modal_x <= x < modal_x + modal_w
+            and modal_y <= y < modal_y + modal_h
+        )
+
+    def _scroll_modal(self, event: QWheelEvent) -> None:
+        position = event.position()
+        if not self._point_inside_modal(position.x(), position.y()):
+            return
+
+        details = getattr(self.modal, "details", None)
+        scroll = getattr(details, "scroll", None)
+        if scroll is None:
+            return
+        try:
+            bar = scroll.verticalScrollBar()
+        except RuntimeError:
+            return
+
+        pixel_y = int(event.pixelDelta().y())
+        if pixel_y:
+            delta = -pixel_y
+        else:
+            angle_y = int(event.angleDelta().y())
+            if not angle_y:
+                return
+            # One traditional wheel notch is 120 units. Keep a useful minimum
+            # distance while respecting a larger widget-configured single step.
+            per_notch = max(48, int(bar.singleStep()) * 3)
+            delta = -int(round((angle_y / 120.0) * per_notch))
+
+        if not delta:
+            return
+        current = int(bar.value())
+        target = max(int(bar.minimum()), min(int(bar.maximum()), current + delta))
+        if target == current:
+            return
+        bar.setValue(target)
+        try:
+            self.modal._refresh_controls(force=True)  # noqa: SLF001
+        except RuntimeError:
+            return
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if watched is not self.quick or not self._active:
+            return False
+        if event.type() == QEvent.Type.Wheel and isinstance(event, QWheelEvent):
+            # While a modal is presented the wheel belongs to that modal, even
+            # over its backdrop. Never let the main workspace scroll underneath.
+            self._scroll_modal(event)
+            return True
+        return False
+
     def cleanup(self) -> None:
+        try:
+            self.quick.removeEventFilter(self)
+        except RuntimeError:
+            pass
         try:
             self.modal.changed.disconnect(self._sync_active)
         except (RuntimeError, TypeError):
