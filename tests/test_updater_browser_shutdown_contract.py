@@ -27,8 +27,8 @@ def test_managed_browser_gate_kills_only_exact_msedge_cdp_owner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(gate, "listener_pid", lambda _port: 4242)
-    monkeypatch.setattr(gate, "_pid_image_name", lambda _pid: "msedge.exe")
+    monkeypatch.setattr(gate, "listener_pid", lambda _port, **_k: 4242)
+    monkeypatch.setattr(gate, "_pid_image_name", lambda _pid, **_k: "msedge.exe")
     monkeypatch.setattr(gate, "_wait_listener_closed", lambda *_a, **_k: True)
     commands: list[list[str]] = []
 
@@ -44,14 +44,49 @@ def test_managed_browser_gate_kills_only_exact_msedge_cdp_owner(
 
 
 def test_browser_gate_fails_closed_for_unexpected_port_owner(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gate, "listener_pid", lambda _port: 5151)
-    monkeypatch.setattr(gate, "_pid_image_name", lambda _pid: "python.exe")
+    monkeypatch.setattr(gate, "listener_pid", lambda _port, **_k: 5151)
+    monkeypatch.setattr(gate, "_pid_image_name", lambda _pid, **_k: "python.exe")
     commands: list[list[str]] = []
     monkeypatch.setattr(gate.subprocess, "run", lambda command, **k: commands.append(list(command)) or _Proc())
     result = gate.close_managed_browser(port=9222)
     assert result.ok is False
     assert "unexpected process" in result.detail
     assert commands == []
+
+
+def test_velopack_transition_uses_bounded_headless_browser_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def _close(**kwargs):
+        calls.append(dict(kwargs))
+        return gate.BrowserCloseResult(True, pid=4242)
+
+    monkeypatch.setattr(gate, "close_managed_browser", _close)
+    log_path = tmp_path / "velopack-transition.log"
+    result = gate.prepare_for_velopack_transition(port=9222, log_path=log_path)
+    assert result.ok is True
+    assert calls == [
+        {
+            "port": 9222,
+            "deadline_s": gate._VELOPACK_HOOK_CLOSE_DEADLINE_S,
+            "command_timeout_s": gate._VELOPACK_HOOK_COMMAND_TIMEOUT_S,
+            "log_path": log_path,
+        }
+    ]
+    assert gate._VELOPACK_HOOK_CLOSE_DEADLINE_S < 15
+    assert gate._VELOPACK_HOOK_COMMAND_TIMEOUT_S < 15
+
+
+def test_manual_setup_and_uninstall_register_fast_cleanup_before_velopack_run() -> None:
+    hook = Path("packaging/velopack_runtime_hook.py").read_text(encoding="utf-8")
+    assert "prepare_for_velopack_transition" in hook
+    assert "on_before_update_fast_callback(_prepare_for_transition)" in hook
+    assert "on_before_uninstall_fast_callback(_prepare_for_transition)" in hook
+    assert hook.index("on_before_update_fast_callback") < hook.index("_velopack_app.run()")
+    assert hook.index("on_before_uninstall_fast_callback") < hook.index("_velopack_app.run()")
 
 
 def test_velopack_update_quiesces_business_browser_before_framework_handoff() -> None:

@@ -14,6 +14,9 @@ BUILD = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
 E2E = (ROOT / "scripts" / "test_velopack_update_e2e.ps1").read_text(encoding="utf-8")
 PUBLISH = (ROOT / ".github" / "workflows" / "publish-update.yml").read_text(encoding="utf-8")
 TEST_PUBLISH = (ROOT / ".github" / "workflows" / "publish-test-build.yml").read_text(encoding="utf-8")
+DOTNET_TOOLS = (ROOT / ".config" / "dotnet-tools.json").read_text(encoding="utf-8")
+DEV_REQUIREMENTS = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+RELEASE_REQUIREMENTS = (ROOT / "requirements-release.lock").read_text(encoding="utf-8")
 PORTAL_DOWNLOAD = (ROOT / "supabase" / "functions" / "portal-download" / "index.ts").read_text(encoding="utf-8")
 PORTAL_RELEASE = (ROOT / "supabase" / "functions" / "portal-release" / "index.ts").read_text(encoding="utf-8")
 UPDATE_MIRROR_MIGRATION = (
@@ -38,12 +41,26 @@ def test_github_remains_release_authority_while_control_plane_routes_identical_v
     assert 'current.name.casefold() != "current"' in RUNTIME
 
 
-def test_velopack_app_runs_before_normal_pyinstaller_entrypoint() -> None:
-    assert "velopack.App().run()" in RUNTIME_HOOK
+def test_velopack_app_registers_external_cleanup_before_normal_pyinstaller_entrypoint() -> None:
+    assert "_velopack_app = velopack.App()" in RUNTIME_HOOK
+    assert "on_before_update_fast_callback(_prepare_for_transition)" in RUNTIME_HOOK
+    assert "on_before_uninstall_fast_callback(_prepare_for_transition)" in RUNTIME_HOOK
+    assert "prepare_for_velopack_transition" in RUNTIME_HOOK
+    assert RUNTIME_HOOK.index("on_before_update_fast_callback") < RUNTIME_HOOK.index("_velopack_app.run()")
+    assert RUNTIME_HOOK.index("on_before_uninstall_fast_callback") < RUNTIME_HOOK.index("_velopack_app.run()")
     assert "get_update_pending_restart()" in RUNTIME_HOOK
     assert "apply_updates_and_restart_with_args" in RUNTIME_HOOK
     assert "wait_exit_then_apply_updates" not in RUNTIME_HOOK
     assert "ECOMMERCE_AGENT_UPDATE_E2E_MARKER" in RUNTIME_HOOK
+
+
+def test_release_toolchain_pins_same_current_velopack_version() -> None:
+    expected = "1.2.161"
+    assert f'"version": "{expected}"' in DOTNET_TOOLS
+    assert f"velopack=={expected}" in DEV_REQUIREMENTS
+    assert f"velopack=={expected}" in RELEASE_REQUIREMENTS
+    assert "velopack==1.2.0" not in DEV_REQUIREMENTS
+    assert "velopack==1.2.0" not in RELEASE_REQUIREMENTS
 
 
 def test_application_update_flow_delegates_package_semantics_install_and_restart_to_velopack() -> None:
