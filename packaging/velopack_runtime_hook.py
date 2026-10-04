@@ -3,13 +3,19 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
 
 import velopack
+
+from app.update_browser_gate import prepare_for_velopack_transition
 
 _E2E_SOURCE = "--velopack-e2e-source"
 _E2E_TARGET = "--velopack-e2e-target"
 _E2E_MARKER = "--velopack-e2e-marker"
 _GUI_MARKER_ENV = "ECOMMERCE_AGENT_UPDATE_E2E_MARKER"
+_TRANSITION_LOG = Path(tempfile.gettempdir()) / "listing-studio-velopack-transition.log"
 
 
 def _arg(name: str) -> str:
@@ -22,7 +28,38 @@ def _arg(name: str) -> str:
     return str(sys.argv[index + 1] or "").strip()
 
 
-velopack.App().run()
+def _log_transition(message: str) -> None:
+    try:
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with _TRANSITION_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(f"{stamp}\t{message}\n")
+    except OSError:
+        pass
+
+
+def _prepare_for_transition(*_args: object) -> None:
+    """Release the external managed browser before Velopack mutates app files."""
+
+    try:
+        result = prepare_for_velopack_transition(log_path=_TRANSITION_LOG)
+    except Exception as exc:
+        # Fast lifecycle hooks must not become a new installation failure mode.
+        # Velopack still performs its own process and file-lock checks afterward.
+        _log_transition(f"transition cleanup raised {type(exc).__name__}: {exc}")
+        return
+    if result.ok:
+        _log_transition("transition cleanup completed")
+    else:
+        _log_transition(f"transition cleanup incomplete: {result.detail}")
+
+
+# Register the fast lifecycle hooks before Run(). This covers both the in-app
+# handoff and the external path where a user launches a newer Setup.exe over an
+# installation whose dedicated Makro Edge process is still alive.
+_velopack_app = velopack.App()
+_velopack_app.on_before_update_fast_callback(_prepare_for_transition)
+_velopack_app.on_before_uninstall_fast_callback(_prepare_for_transition)
+_velopack_app.run()
 
 _source = _arg(_E2E_SOURCE)
 _target = _arg(_E2E_TARGET).lstrip("v")

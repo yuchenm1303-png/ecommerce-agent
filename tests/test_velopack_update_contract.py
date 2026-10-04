@@ -41,8 +41,13 @@ def test_github_remains_release_authority_while_control_plane_routes_identical_v
     assert 'current.name.casefold() != "current"' in RUNTIME
 
 
-def test_velopack_app_runs_before_normal_pyinstaller_entrypoint() -> None:
-    assert "velopack.App().run()" in RUNTIME_HOOK
+def test_velopack_app_registers_external_cleanup_before_normal_pyinstaller_entrypoint() -> None:
+    assert "_velopack_app = velopack.App()" in RUNTIME_HOOK
+    assert "on_before_update_fast_callback(_prepare_for_transition)" in RUNTIME_HOOK
+    assert "on_before_uninstall_fast_callback(_prepare_for_transition)" in RUNTIME_HOOK
+    assert "prepare_for_velopack_transition" in RUNTIME_HOOK
+    assert RUNTIME_HOOK.index("on_before_update_fast_callback") < RUNTIME_HOOK.index("_velopack_app.run()")
+    assert RUNTIME_HOOK.index("on_before_uninstall_fast_callback") < RUNTIME_HOOK.index("_velopack_app.run()")
     assert "get_update_pending_restart()" in RUNTIME_HOOK
     assert "apply_updates_and_restart_with_args" in RUNTIME_HOOK
     assert "wait_exit_then_apply_updates" not in RUNTIME_HOOK
