@@ -33,6 +33,42 @@ jobs:
             tests/test_listing_offer_support_contract.py \
             tests/test_makro_multi_account_ui_contract.py
 
+  windows-updater-contract:
+    runs-on: windows-2025
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.9"
+          cache: pip
+          cache-dependency-path: requirements-release.lock
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.424"
+
+      - name: Install pinned updater runtime
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements-release.lock
+          if ($LASTEXITCODE -ne 0) { throw "Updater runtime dependency install failed: $LASTEXITCODE" }
+          dotnet tool restore
+          if ($LASTEXITCODE -ne 0) { throw "Pinned Velopack CLI restore failed: $LASTEXITCODE" }
+          dotnet tool run vpk -- --help *> $null
+          if ($LASTEXITCODE -ne 0) { throw "Pinned Velopack CLI failed to start: $LASTEXITCODE" }
+
+      - name: Verify Windows installer and lifecycle contracts
+        shell: pwsh
+        run: |
+          python -m pytest -q `
+            tests/test_velopack_lifecycle_api.py `
+            tests/test_velopack_update_contract.py `
+            tests/test_updater_browser_shutdown_contract.py
+
   tests:
     runs-on: ubuntu-latest
     steps:
